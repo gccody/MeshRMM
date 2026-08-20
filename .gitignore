@@ -1,0 +1,41 @@
+# Rust build output and backups
+target/
+*.rs.bk
+
+# Cloudflare Worker build output and local state
+server/build/
+server/build-*/
+.wrangler/
+
+# JavaScript dependencies and generated output
+node_modules/
+
+# Locally provisioned binaries and credentials
+dist/
+
+# Local environment files and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Logs and transient files
+*.log
+*.swp
+*.swo
+*~
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.vs/
+*.user

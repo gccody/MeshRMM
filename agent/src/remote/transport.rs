@@ -1,0 +1,475 @@
+use std::sync::{Arc, Mutex};
+
+use anyhow::Context;
+use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
+use pulsermm_protocol::{
+    DEFAULT_FRAGMENT_PAYLOAD, IceServer, RemoteSessionId, SessionMessage, SessionState,
+    SignalMessage, VideoStreamId, fragment_frame,
+};
+use tokio::sync::{Notify, mpsc};
+use tokio_tungstenite::tungstenite::Message;
+use url::Url;
+use webrtc::api::APIBuilder;
+use webrtc::data_channel::{RTCDataChannel, data_channel_init::RTCDataChannelInit};
+use webrtc::ice_transport::{ice_candidate::RTCIceCandidateInit, ice_server::RTCIceServer};
+use webrtc::peer_connection::{
+    RTCPeerConnection, configuration::RTCConfiguration,
+    peer_connection_state::RTCPeerConnectionState, sdp::session_description::RTCSessionDescription,
+};
+use webrtc::stats::StatsReportType;
+
+use super::platform::{ScreenStreamer, monotonic_timestamp_us};
+use super::signaling::authenticated_websocket;
+use super::video::LatestFrameSlot;
+
+enum ControlCommand {
+    Keyframe,
+    Bitrate(u32),
+    Stop,
+}
+
+pub async fn run_sender(
+    signal_url: Url,
+    signaling_token: &str,
+    ice_servers: Vec<IceServer>,
+    streamer: Arc<Mutex<Box<dyn ScreenStreamer>>>,
+    session_id: RemoteSessionId,
+) -> anyhow::Result<()> {
+    let (socket, _) = authenticated_websocket(signal_url, signaling_token).await?;
+    let (mut signal_writer, mut signal_reader) = socket.split();
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<SignalMessage>();
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ControlCommand>();
+    let (state_tx, mut state_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
+    let (video_failure_tx, mut video_failure_rx) = mpsc::unbounded_channel::<String>();
+    let peer = create_peer(&ice_servers, outgoing_tx.clone(), state_tx).await?;
+
+    let video_open = Arc::new(Notify::new());
+    let control_open = Arc::new(Notify::new());
+    let decoder_ready = Arc::new(Notify::new());
+    let video_channel = peer
+        .create_data_channel(
+            "pulsermm-video-v1",
+            Some(RTCDataChannelInit {
+                ordered: Some(false),
+                max_retransmits: Some(0),
+                protocol: Some("pulsermm.video.v1".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .context("failed to create unreliable video data channel")?;
+    {
+        let notify = Arc::clone(&video_open);
+        video_channel.on_open(Box::new(move || {
+            let notify = Arc::clone(&notify);
+            Box::pin(async move { notify.notify_one() })
+        }));
+    }
+    let control_channel = peer
+        .create_data_channel(
+            "pulsermm-control-v1",
+            Some(RTCDataChannelInit {
+                ordered: Some(true),
+                protocol: Some("pulsermm.control.v1".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .context("failed to create reliable control data channel")?;
+    {
+        let notify = Arc::clone(&control_open);
+        let decoder_ready = Arc::clone(&decoder_ready);
+        control_channel.on_open(Box::new(move || {
+            let notify = Arc::clone(&notify);
+            Box::pin(async move { notify.notify_one() })
+        }));
+        control_channel.on_message(Box::new(move |message| {
+            let tx = control_tx.clone();
+            let decoder_ready = Arc::clone(&decoder_ready);
+            Box::pin(async move {
+                let command = match SessionMessage::decode(&message.data) {
+                    Ok(SessionMessage::RequestKeyframe { .. }) => {
+                        decoder_ready.notify_one();
+                        Some(ControlCommand::Keyframe)
+                    }
+                    Ok(SessionMessage::SetBitrate { bits_per_second }) => {
+                        Some(ControlCommand::Bitrate(bits_per_second))
+                    }
+                    Ok(SessionMessage::Stop { .. }) => Some(ControlCommand::Stop),
+                    Ok(_) => None,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "discarding invalid control message");
+                        None
+                    }
+                };
+                if let Some(command) = command {
+                    let _ = tx.send(command);
+                }
+            })
+        }));
+    }
+
+    let slot = Arc::new(LatestFrameSlot::default());
+    let format = {
+        let mut streamer = streamer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("screen streamer lock is poisoned"))?;
+        streamer.start(Arc::clone(&slot))?
+    };
+    let video_sender = spawn_video_sender(
+        Arc::clone(&video_channel),
+        Arc::clone(&video_open),
+        decoder_ready,
+        Arc::clone(&slot),
+        video_failure_tx,
+    );
+    spawn_control_start(
+        Arc::clone(&control_channel),
+        Arc::clone(&control_open),
+        session_id.clone(),
+        format,
+    );
+
+    let mut session_state = SessionState::Requested.transition(SessionState::Signaling)?;
+    outgoing_tx.send(SignalMessage::Ready)?;
+    session_state = session_state.transition(SessionState::Connecting)?;
+    let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    stats_interval.tick().await;
+    let mut offer_sent = false;
+    let mut remote_description_set = false;
+    let mut pending_candidates = Vec::new();
+    let result: anyhow::Result<()> = async {
+        loop {
+            tokio::select! {
+            Some(signal) = outgoing_rx.recv() => {
+                let json = serde_json::to_string(&signal)?;
+                signal_writer.send(Message::Text(json.into())).await?;
+            }
+            incoming = signal_reader.next() => {
+                let Some(incoming) = incoming else { break Err(anyhow::anyhow!("signaling connection closed")); };
+                match incoming? {
+                    Message::Text(text) => {
+                        let signal: SignalMessage = serde_json::from_str(text.as_str())?;
+                        match signal {
+                            SignalMessage::Ready if !offer_sent => {
+                                let offer = peer.create_offer(None).await?;
+                                peer.set_local_description(offer).await?;
+                                let local = peer.local_description().await
+                                    .ok_or_else(|| anyhow::anyhow!("WebRTC did not retain its local offer"))?;
+                                outgoing_tx.send(SignalMessage::Offer { sdp: local.sdp })?;
+                                offer_sent = true;
+                            }
+                            SignalMessage::Answer { sdp } => {
+                                peer.set_remote_description(RTCSessionDescription::answer(sdp)?).await?;
+                                remote_description_set = true;
+                                for candidate in pending_candidates.drain(..) {
+                                    peer.add_ice_candidate(candidate).await?;
+                                }
+                            }
+                            SignalMessage::IceCandidate { candidate, sdp_mid, sdp_mline_index, username_fragment } => {
+                                let candidate = RTCIceCandidateInit { candidate, sdp_mid, sdp_mline_index, username_fragment };
+                                if remote_description_set {
+                                    peer.add_ice_candidate(candidate).await?;
+                                } else {
+                                    pending_candidates.push(candidate);
+                                }
+                            }
+                            SignalMessage::PeerLeft => break Ok(()),
+                            SignalMessage::Error { message } => break Err(anyhow::anyhow!(message)),
+                            _ => {}
+                        }
+                    }
+                    Message::Ping(payload) => signal_writer.send(Message::Pong(payload)).await?,
+                    Message::Close(_) => break Ok(()),
+                    _ => {}
+                }
+            }
+            Some(command) = control_rx.recv() => {
+                match command {
+                    ControlCommand::Keyframe => lock_streamer(&streamer)?.request_keyframe()?,
+                    ControlCommand::Bitrate(value) => lock_streamer(&streamer)?.set_bitrate(value)?,
+                    ControlCommand::Stop => break Ok(()),
+                }
+            }
+            Some(state) = state_rx.recv() => {
+                tracing::info!(?state, session_id = %session_id, "WebRTC connection state changed");
+                if state == RTCPeerConnectionState::Connected
+                    && session_state == SessionState::Connecting
+                {
+                    session_state = session_state.transition(SessionState::Streaming)?;
+                }
+                if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed | RTCPeerConnectionState::Disconnected) {
+                    break Err(anyhow::anyhow!("WebRTC connection ended in state {state:?}"));
+                }
+            }
+            Some(error) = video_failure_rx.recv() => break Err(anyhow::anyhow!(error)),
+            _ = stats_interval.tick() => {
+                let capture_ended = lock_streamer(&streamer)?.poll_ended();
+                if let Some(capture_result) = capture_ended {
+                    if let Err(error) = capture_result {
+                        tracing::error!(error = ?error, "Windows GPU capture/encode worker failed");
+                        break Err(error);
+                    }
+                    break Err(anyhow::anyhow!("Windows GPU capture/encode worker stopped unexpectedly"));
+                }
+                log_network_stats(&peer).await;
+            },
+            }
+        }
+    }
+    .await;
+
+    video_sender.abort();
+    if matches!(
+        session_state,
+        SessionState::Requested
+            | SessionState::Signaling
+            | SessionState::Connecting
+            | SessionState::Streaming
+    ) {
+        session_state = session_state.transition(SessionState::Closing)?;
+    }
+    let mut result = result;
+    let stop_result = lock_streamer(&streamer).and_then(|mut streamer| streamer.stop());
+    if let Err(error) = stop_result {
+        tracing::warn!(error = %error, "screen streamer did not stop cleanly");
+        if result.is_ok() {
+            result = Err(error.context("screen streamer cleanup failed"));
+        }
+    }
+    if let Err(error) = peer.close().await {
+        tracing::warn!(error = %error, "WebRTC peer did not close cleanly");
+        if result.is_ok() {
+            result = Err(error).context("failed to close WebRTC peer");
+        }
+    }
+    session_state = session_state.transition(SessionState::Idle)?;
+    tracing::info!(
+        session_id = %session_id,
+        ?session_state,
+        latest_frames_dropped = slot.dropped(),
+        "remote sender session stopped"
+    );
+    result
+}
+
+async fn log_network_stats(peer: &RTCPeerConnection) {
+    for report in peer.get_stats().await.reports.into_values() {
+        if let StatsReportType::CandidatePair(pair) = report
+            && pair.nominated
+        {
+            tracing::info!(
+                rtt_ms = pair.current_round_trip_time * 1_000.0,
+                available_outgoing_bitrate = pair.available_outgoing_bitrate,
+                packets_sent = pair.packets_sent,
+                bytes_sent = pair.bytes_sent,
+                "WebRTC network statistics"
+            );
+        }
+    }
+}
+
+fn lock_streamer(
+    streamer: &Arc<Mutex<Box<dyn ScreenStreamer>>>,
+) -> anyhow::Result<std::sync::MutexGuard<'_, Box<dyn ScreenStreamer>>> {
+    streamer
+        .lock()
+        .map_err(|_| anyhow::anyhow!("screen streamer lock is poisoned"))
+}
+
+async fn create_peer(
+    ice_servers: &[IceServer],
+    outgoing: mpsc::UnboundedSender<SignalMessage>,
+    state: mpsc::UnboundedSender<RTCPeerConnectionState>,
+) -> anyhow::Result<Arc<RTCPeerConnection>> {
+    let api = APIBuilder::new().build();
+    let configuration = RTCConfiguration {
+        ice_servers: ice_servers
+            .iter()
+            .map(|server| RTCIceServer {
+                urls: server.urls.clone(),
+                username: server.username.clone().unwrap_or_default(),
+                credential: server.credential.clone().unwrap_or_default(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let peer = Arc::new(api.new_peer_connection(configuration).await?);
+    peer.sctp()
+        .transport()
+        .ice_transport()
+        .on_selected_candidate_pair_change(Box::new(|pair| {
+            Box::pin(async move {
+                let pair = pair.to_string();
+                let path = if pair.to_ascii_lowercase().contains("relay") {
+                    "turn"
+                } else {
+                    "direct"
+                };
+                tracing::info!(connection_path = path, candidate_pair = %pair, "ICE selected candidate pair");
+            })
+        }));
+    peer.on_ice_candidate(Box::new(move |candidate| {
+        let outgoing = outgoing.clone();
+        Box::pin(async move {
+            let signal = match candidate {
+                Some(candidate) => match candidate.to_json() {
+                    Ok(candidate) => SignalMessage::IceCandidate {
+                        candidate: candidate.candidate,
+                        sdp_mid: candidate.sdp_mid,
+                        sdp_mline_index: candidate.sdp_mline_index,
+                        username_fragment: candidate.username_fragment,
+                    },
+                    Err(error) => {
+                        tracing::warn!(error = %error, "failed to serialize local ICE candidate");
+                        return;
+                    }
+                },
+                None => SignalMessage::IceComplete,
+            };
+            let _ = outgoing.send(signal);
+        })
+    }));
+    peer.on_peer_connection_state_change(Box::new(move |new_state| {
+        let state = state.clone();
+        Box::pin(async move {
+            let _ = state.send(new_state);
+        })
+    }));
+    Ok(peer)
+}
+
+fn spawn_control_start(
+    channel: Arc<RTCDataChannel>,
+    open: Arc<Notify>,
+    session_id: RemoteSessionId,
+    format: pulsermm_protocol::VideoFormat,
+) {
+    tokio::spawn(async move {
+        open.notified().await;
+        let message = SessionMessage::Accepted {
+            stream_id: VideoStreamId(1),
+            format,
+        };
+        match message.encode() {
+            Ok(bytes) => {
+                if let Err(error) = channel.send(&Bytes::from(bytes)).await {
+                    tracing::warn!(error = %error, %session_id, "failed to send stream configuration");
+                }
+            }
+            Err(error) => tracing::warn!(error = %error, "failed to encode stream configuration"),
+        }
+    });
+}
+
+fn spawn_video_sender(
+    channel: Arc<RTCDataChannel>,
+    open: Arc<Notify>,
+    decoder_ready: Arc<Notify>,
+    slot: Arc<LatestFrameSlot>,
+    failure: mpsc::UnboundedSender<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        open.notified().await;
+        // Control and video use independent SCTP streams. Wait for the viewer
+        // to confirm its decoder/presenter is initialized before sending the
+        // retained bootstrap keyframe.
+        decoder_ready.notified().await;
+        let mut bootstrap_keyframe =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), slot.keyframe()).await {
+                Ok(frame) => Some(frame),
+                Err(_) => {
+                    let _ = failure.send(
+                        "capture/encoder produced no bootstrap keyframe for 10 seconds".into(),
+                    );
+                    return;
+                }
+            };
+        let mut frames_sent = 0_u64;
+        let mut buffered_frames_dropped = 0_u64;
+        let mut obsolete_frames_dropped = 0_u64;
+        let mut bytes_sent = 0_u64;
+        let mut stats_started_us = monotonic_timestamp_us();
+        loop {
+            let (source, is_bootstrap) = if let Some(frame) = bootstrap_keyframe.take() {
+                (frame, true)
+            } else {
+                let source =
+                    match tokio::time::timeout(std::time::Duration::from_secs(10), slot.next())
+                        .await
+                    {
+                        Ok(source) => source,
+                        Err(_) => {
+                            let _ = failure.send(
+                                "capture/encoder produced no encoded frame for 10 seconds".into(),
+                            );
+                            return;
+                        }
+                    };
+                (source, false)
+            };
+            if channel.buffered_amount().await > 256 * 1024 {
+                buffered_frames_dropped += 1;
+                tracing::debug!(
+                    frame_id = source.frame_id,
+                    "dropping frame because data channel is buffered"
+                );
+                continue;
+            }
+            let mut frame = (*source).clone();
+            frame.send_timestamp_us = monotonic_timestamp_us();
+            let packets = match fragment_frame(&frame, DEFAULT_FRAGMENT_PAYLOAD) {
+                Ok(packets) => packets,
+                Err(error) => {
+                    tracing::warn!(error = %error, frame_id = frame.frame_id, "failed to fragment encoded frame");
+                    continue;
+                }
+            };
+            let mut complete = true;
+            for packet in packets {
+                if !is_bootstrap && slot.has_newer().await {
+                    complete = false;
+                    obsolete_frames_dropped += 1;
+                    break;
+                }
+                let bytes = match packet.encode() {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "failed to encode video packet");
+                        complete = false;
+                        break;
+                    }
+                };
+                bytes_sent = bytes_sent.saturating_add(bytes.len() as u64);
+                if let Err(error) = channel.send(&Bytes::from(bytes)).await {
+                    tracing::warn!(error = %error, "video data channel send failed");
+                    let _ = failure.send(format!("video data channel send failed: {error}"));
+                    return;
+                }
+            }
+            if complete {
+                frames_sent += 1;
+            }
+            let now_us = monotonic_timestamp_us();
+            let elapsed_us = now_us.saturating_sub(stats_started_us);
+            if elapsed_us >= 2_000_000 {
+                let elapsed_seconds = elapsed_us as f64 / 1_000_000.0;
+                tracing::info!(
+                    stream_fps = frames_sent as f64 / elapsed_seconds,
+                    transport_bitrate_bits_per_second = bytes_sent as f64 * 8.0 / elapsed_seconds,
+                    frames_sent,
+                    buffered_frames_dropped,
+                    obsolete_frames_dropped,
+                    latest_frames_replaced = slot.dropped(),
+                    "video transport statistics"
+                );
+                frames_sent = 0;
+                buffered_frames_dropped = 0;
+                obsolete_frames_dropped = 0;
+                bytes_sent = 0;
+                stats_started_us = now_us;
+            }
+        }
+    })
+}

@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["protocol", "windows/remote-screen"]
+
+[package]
+name = "pulsermm-agent"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The native PulseRMM endpoint agent"
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1.12.1"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+futures-util = { version = "0.3.34", features = ["sink"] }
+pulsermm-protocol = { version = "0.1.0", path = "protocol" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+url = "2.5.8"
+webrtc = "0.14.0"
+
+[target."cfg(windows)".dependencies]
+pulsermm-remote-screen = { version = "0.1.0", path = "windows/remote-screen" }
+
