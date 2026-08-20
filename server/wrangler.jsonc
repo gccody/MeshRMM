@@ -1,0 +1,46 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pulsermm-server",
+  "main": "build/index.js",
+  "compatibility_date": "2026-08-20",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "pulsermm-production",
+      "database_id": "4650d279-149e-4a0b-8ec9-3058711885ea"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "AGENT_COORDINATOR",
+        "class_name": "AgentCoordinator"
+      },
+      {
+        "name": "REMOTE_SESSION",
+        "class_name": "RemoteSession"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["AgentCoordinator", "RemoteSession"]
+    }
+  ],
+  "vars": {
+    "REMOTE_SESSION_TTL_SECONDS": "900",
+    "DASHBOARD_ORIGIN": "https://pulsermm.gccody.dev",
+    "PUBLIC_API_URL": "https://pulsermm-server.gccody2010.workers.dev",
+    "WORKOS_CLIENT_ID": "client_01M0FT1AN01PAT37N98EMRSNVW",
+    "WORKOS_ISSUER": "https://api.workos.com/user_management/client_01M0FT1AN01PAT37N98EMRSNVW"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "build": {
+    "command": "cargo install -q \"worker-build@^0.8\" && worker-build --release"
+  }
+}

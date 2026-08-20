@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+
+[package]
+name = "pulsermm-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The PulseRMM server on Cloudflare Workers"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+getrandom = { version = "0.2.17", features = ["js"] }
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
+pulsermm-protocol = { version = "0.1.0", path = "../agent/protocol" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+subtle = "2.6.1"
+uuid = { version = "1.24.1", features = ["v4", "js"] }
+worker = { version = "0.8.5", features = ["d1", "http"] }
+worker-macros = { version = "0.8.5", features = ["http"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
