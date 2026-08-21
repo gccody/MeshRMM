@@ -12,6 +12,8 @@ node_modules/
 
 # Locally provisioned binaries and credentials
 dist/
+dashboard/public/downloads/*.exe
+dashboard/public/downloads/*.sha256
 
 # Local environment files and credentials
 .env

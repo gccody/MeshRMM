@@ -13,7 +13,7 @@ import {
   Check,
   ChevronDown,
   Clock3,
-  Copy,
+  Download,
   Filter,
   KeyRound,
   LoaderCircle,
@@ -42,16 +42,22 @@ type Account = {
   roles: string[];
   permissions: string[];
 };
-type AgentConfig = {
+type AgentInstallerBootstrap = {
   server: string;
-  device_id: string;
-  agent_token: string;
-  frames_per_second: number;
-  bitrate_bits_per_second: number;
-  json_logs: boolean;
+  install_token: string;
+  expires_at_unix_ms: number;
 };
-type Enrollment = { agent: Agent; config: AgentConfig };
+type AgentPlatform = "windows-x64";
 type View = "agents" | "team" | "sso";
+
+const INSTALLER_ASSETS: Record<AgentPlatform, { label: string; binary: string; checksum: string }> = {
+  "windows-x64": {
+    label: "Windows 10/11 (x64)",
+    binary: "/downloads/pulsermm-agent-windows-x64.exe",
+    checksum: "/downloads/pulsermm-agent-windows-x64.exe.sha256",
+  },
+};
+const ENROLLMENT_MAGIC = "PULSERMM-BOOTSTRAP-V1";
 
 class AuthenticationRedirectStarted extends Error {}
 
@@ -94,11 +100,11 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
   const [companyName, setCompanyName] = useState("");
-  const [agentId, setAgentId] = useState("");
-  const [agentName, setAgentName] = useState("");
+  const [agentPlatform, setAgentPlatform] = useState<AgentPlatform>("windows-x64");
   const [isSaving, setIsSaving] = useState(false);
-  const [enrollment, setEnrollment] = useState<Enrollment | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [isDownloadingInstaller, setIsDownloadingInstaller] = useState(false);
+  const [installerDownloaded, setInstallerDownloaded] = useState(false);
+  const [installerError, setInstallerError] = useState<string | null>(null);
 
   const isAdmin = role === "admin" || roles?.includes("admin") || account?.role === "admin" || account?.roles.includes("admin");
 
@@ -218,29 +224,6 @@ export default function Dashboard() {
     }
   };
 
-  const createAgent = async (event: FormEvent) => {
-    event.preventDefault();
-    setIsSaving(true);
-    setError(null);
-    try {
-      const response = await authorizedFetch("/v1/agents", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: agentId, name: agentName }),
-      });
-      if (!response.ok) throw new Error(await errorMessage(response, "The Agent could not be created."));
-      const data = (await response.json()) as Enrollment;
-      setEnrollment(data);
-      setAgentId("");
-      setAgentName("");
-      await loadAgents();
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "The Agent could not be created.");
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
   const remoteInto = async (agent: Agent) => {
     if (!agent.connected) return;
     setConnectingId(agent.id);
@@ -261,11 +244,59 @@ export default function Dashboard() {
     }
   };
 
-  const copyEnrollment = async () => {
-    if (!enrollment) return;
-    await navigator.clipboard.writeText(JSON.stringify(enrollment.config, null, 2));
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1800);
+  const downloadInstaller = async (event: FormEvent) => {
+    event.preventDefault();
+    setIsDownloadingInstaller(true);
+    setInstallerError(null);
+    try {
+      const bootstrapResponse = await authorizedFetch("/v1/agent-installers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ platform: agentPlatform }),
+      });
+      if (!bootstrapResponse.ok) {
+        throw new Error(await errorMessage(bootstrapResponse, "The Agent installer could not be authorized."));
+      }
+      const bootstrap = (await bootstrapResponse.json()) as AgentInstallerBootstrap;
+      const asset = INSTALLER_ASSETS[agentPlatform];
+      const [binaryResponse, checksumResponse] = await Promise.all([
+        fetch(asset.binary, { cache: "no-store" }),
+        fetch(asset.checksum, { cache: "no-store" }),
+      ]);
+      if (!binaryResponse.ok || !checksumResponse.ok) {
+        throw new Error("The selected Agent installer has not been published yet.");
+      }
+      const binary = await binaryResponse.arrayBuffer();
+      const expectedChecksum = (await checksumResponse.text()).trim().split(/\s+/)[0]?.toLowerCase();
+      if (!expectedChecksum?.match(/^[a-f0-9]{64}$/)) {
+        throw new Error("The published Agent installer checksum is invalid.");
+      }
+      const digest = await crypto.subtle.digest("SHA-256", binary);
+      const actualChecksum = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      if (actualChecksum !== expectedChecksum) {
+        throw new Error("The Agent installer failed its SHA-256 integrity check.");
+      }
+
+      const config = new TextEncoder().encode(JSON.stringify(bootstrap));
+      const magic = new TextEncoder().encode(ENROLLMENT_MAGIC);
+      const trailer = new Uint8Array(8 + magic.length);
+      new DataView(trailer.buffer).setBigUint64(0, BigInt(config.length), true);
+      trailer.set(magic, 8);
+      const installer = new Blob([binary, config, trailer], { type: "application/vnd.microsoft.portable-executable" });
+      const downloadUrl = URL.createObjectURL(installer);
+      const link = document.createElement("a");
+      link.href = downloadUrl;
+      link.download = "PulseRMM-Agent-Setup-Windows-x64.exe";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1_000);
+      setInstallerDownloaded(true);
+    } catch (downloadError) {
+      setInstallerError(downloadError instanceof Error ? downloadError.message : "The Agent installer could not be created.");
+    } finally {
+      setIsDownloadingInstaller(false);
+    }
   };
 
   const handleSignOut = () => {
@@ -363,7 +394,7 @@ export default function Dashboard() {
                 </div>
                 {view === "agents" && <div className="heading-actions">
                   <button className="secondary-button" onClick={() => void loadAgents()}><RefreshCw size={16} className={isRefreshing ? "spin" : ""} /> Refresh</button>
-                  {isAdmin && <button className="primary-button" onClick={() => { setEnrollment(null); setIsAgentOpen(true); }}><Plus size={16} /> Add Agent</button>}
+                  {isAdmin && <button className="primary-button" onClick={() => { setAgentPlatform("windows-x64"); setInstallerDownloaded(false); setInstallerError(null); setIsAgentOpen(true); }}><Plus size={16} /> Add Agent</button>}
                 </div>}
               </section>
 
@@ -416,7 +447,30 @@ export default function Dashboard() {
 
       {isOrganizationOpen && user && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsOrganizationOpen(false)}><section className="settings-modal organization-modal" role="dialog" aria-modal="true" aria-labelledby="organization-title"><button className="modal-close" onClick={() => setIsOrganizationOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><Building2 size={22} /></div><p className="eyebrow">Tenant boundary</p><h2 id="organization-title">Switch company</h2><p>Changing companies refreshes your WorkOS token before any other company inventory is requested.</p><div className="organization-widget"><OrganizationSwitcher authToken={getAccessToken} switchToOrganization={switchToOrganization} /></div></section></div>}
 
-      {isAgentOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !enrollment && setIsAgentOpen(false)}><section className={`settings-modal ${enrollment ? "enrollment-modal" : ""}`} role="dialog" aria-modal="true" aria-labelledby="agent-title"><button className="modal-close" onClick={() => { setEnrollment(null); setIsAgentOpen(false); }} aria-label="Close"><X size={19} /></button><div className="modal-icon"><Monitor size={22} /></div><p className="eyebrow">{enrollment ? "Credential issued once" : account?.company?.name}</p><h2 id="agent-title">{enrollment ? `${enrollment.agent.name} is ready to install` : "Create Agent"}</h2>{enrollment ? <><p>Copy this live enrollment configuration now. PulseRMM stores only its SHA-256 credential hash and cannot show the token again.</p><pre className="enrollment-config">{JSON.stringify(enrollment.config, null, 2)}</pre><button className="primary-button modal-submit" onClick={() => void copyEnrollment()}>{copied ? <Check size={16} /> : <Copy size={16} />}{copied ? "Copied" : "Copy agent.json"}</button></> : <><p>The device ID is globally unique. The Agent will only appear inside this company.</p><form onSubmit={createAgent}><label>Display name<input required maxLength={120} value={agentName} onChange={(event) => setAgentName(event.target.value)} placeholder="Reception workstation" /></label><label>Device ID<input required maxLength={128} pattern="[A-Za-z0-9._-]+" value={agentId} onChange={(event) => setAgentId(event.target.value)} placeholder="reception-ws-01" /></label><button className="primary-button modal-submit" disabled={isSaving}>{isSaving ? <LoaderCircle size={16} className="spin" /> : <Plus size={16} />} Create Agent</button></form></>}</section></div>}
+      {isAgentOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsAgentOpen(false)}>
+          <section className="settings-modal enrollment-modal" role="dialog" aria-modal="true" aria-labelledby="agent-title">
+            <button className="modal-close" onClick={() => setIsAgentOpen(false)} aria-label="Close"><X size={19} /></button>
+            <div className="modal-icon"><Monitor size={22} /></div>
+            <p className="eyebrow">{account?.company?.name}</p>
+            <h2 id="agent-title">Download Agent installer</h2>
+            <p>Select the endpoint platform and download one installer. Setup will use the Windows computer name automatically, generate the device ID on the server, configure the Agent, and install the LocalSystem service.</p>
+            <form onSubmit={downloadInstaller}>
+              <label>Installer platform<select required value={agentPlatform} onChange={(event) => setAgentPlatform(event.target.value as AgentPlatform)}><option value="windows-x64">Windows 10/11 (x64)</option></select><small className="field-help">The Agent currently supports 64-bit Windows endpoints.</small></label>
+              <div className="installer-summary">
+                <div><Monitor size={18} /><span><strong>Automatic machine identity</strong><small>Computer name from Windows · server-generated device ID</small></span></div>
+                <div><ShieldCheck size={18} /><span><strong>Administrator installation</strong><small>Automatic LocalSystem service with recovery</small></span></div>
+              </div>
+              {installerError && <div className="installer-error" role="alert">{installerError}</div>}
+              <button className="primary-button modal-submit" disabled={isDownloadingInstaller}>
+                {isDownloadingInstaller ? <LoaderCircle size={16} className="spin" /> : installerDownloaded ? <Check size={16} /> : <Download size={16} />}
+                {isDownloadingInstaller ? "Preparing installer..." : installerDownloaded ? "Download another installer" : "Download installer"}
+              </button>
+              <p className="installer-secret-note">Run the downloaded EXE and approve the Windows User Account Control prompt. Its enrollment authorization expires after 30 minutes and can only be used once.</p>
+            </form>
+          </section>
+        </div>
+      )}
     </div>
   );
 }
