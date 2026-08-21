@@ -51,12 +51,21 @@ struct LinkedSession {
 }
 
 impl Config {
+    #[cfg(not(target_os = "macos"))]
     pub fn load() -> anyhow::Result<Self> {
+        Self::load_inner(None)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn load_with_deep_link(deep_link: Option<&str>) -> anyhow::Result<Self> {
+        Self::load_inner(deep_link)
+    }
+
+    fn load_inner(launch_deep_link: Option<&str>) -> anyhow::Result<Self> {
         let arguments = Arguments::parse();
         let file = load_file(arguments.config.as_deref(), "remote.json")?;
-        let linked = arguments
-            .deep_link
-            .as_deref()
+        let linked = launch_deep_link
+            .or(arguments.deep_link.as_deref())
             .map(session_from_deep_link)
             .transpose()?;
 
