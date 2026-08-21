@@ -27,6 +27,53 @@ struct ActivePresenter {
     presenter: Presenter,
 }
 
+/// Mouse-move events can arrive substantially faster than the network can
+/// usefully deliver them. Keep only the newest unsent position so transient
+/// congestion cannot put keyboard and button events behind an unbounded trail
+/// of stale pointer positions on the reliable control stream.
+#[derive(Clone)]
+struct ViewerControlQueue {
+    outgoing: mpsc::UnboundedSender<SessionMessage>,
+    pending_pointer: Arc<Mutex<Option<SessionMessage>>>,
+}
+
+impl ViewerControlQueue {
+    fn new(outgoing: mpsc::UnboundedSender<SessionMessage>) -> Self {
+        Self {
+            outgoing,
+            pending_pointer: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn send(&self, message: SessionMessage) {
+        if matches!(
+            message,
+            SessionMessage::Input(pulsermm_protocol::RemoteInput::PointerMove { .. })
+        ) {
+            if let Ok(mut pending) = self.pending_pointer.lock() {
+                *pending = Some(message);
+            }
+            return;
+        }
+
+        // Preserve the pointer-before-click ordering emitted by the native
+        // viewers while still coalescing ordinary motion.
+        self.flush_pointer();
+        let _ = self.outgoing.send(message);
+    }
+
+    fn flush_pointer(&self) {
+        let pending = self
+            .pending_pointer
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take());
+        if let Some(message) = pending {
+            let _ = self.outgoing.send(message);
+        }
+    }
+}
+
 pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyhow::Result<()> {
     let url = session_signal_url(&config.server, bootstrap.session_id.as_str())?;
     let socket = authenticated_websocket(url, &bootstrap.signaling_token).await?;
@@ -37,13 +84,14 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
     let presenter = Arc::new(Mutex::new(None::<ActivePresenter>));
     let control_channel = Arc::new(Mutex::new(None::<Arc<RTCDataChannel>>));
     let (viewer_control_tx, mut viewer_control_rx) = mpsc::unbounded_channel::<SessionMessage>();
+    let viewer_control = ViewerControlQueue::new(viewer_control_tx);
     let (presentation_failure_tx, mut presentation_failure_rx) =
         mpsc::unbounded_channel::<String>();
     install_data_channel_handler(
         &peer,
         Arc::clone(&presenter),
         Arc::clone(&control_channel),
-        viewer_control_tx,
+        viewer_control.clone(),
         presentation_failure_tx,
     );
 
@@ -53,6 +101,9 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
     let startup_started = tokio::time::Instant::now();
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     stats_interval.tick().await;
+    let mut pointer_interval = tokio::time::interval(std::time::Duration::from_millis(8));
+    pointer_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    pointer_interval.tick().await;
     let mut remote_description_set = false;
     let mut pending_candidates = Vec::new();
     let result: anyhow::Result<()> = async {
@@ -71,6 +122,7 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                 channel.send(&Bytes::from(bytes)).await
                     .context("failed to send viewer control message")?;
             }
+            _ = pointer_interval.tick() => viewer_control.flush_pointer(),
             incoming = signal_reader.next() => {
                 let Some(incoming) = incoming else {
                     break Err(anyhow::anyhow!("signaling connection closed"));
@@ -258,7 +310,7 @@ fn install_data_channel_handler(
     peer: &Arc<RTCPeerConnection>,
     presenter: Arc<Mutex<Option<ActivePresenter>>>,
     control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
-    viewer_control: mpsc::UnboundedSender<SessionMessage>,
+    viewer_control: ViewerControlQueue,
     presentation_failure: mpsc::UnboundedSender<String>,
 ) {
     peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
@@ -289,9 +341,20 @@ fn install_data_channel_handler(
 fn install_control_handler(
     channel: Arc<RTCDataChannel>,
     presenter: Arc<Mutex<Option<ActivePresenter>>>,
-    viewer_control: mpsc::UnboundedSender<SessionMessage>,
+    viewer_control: ViewerControlQueue,
     presentation_failure: mpsc::UnboundedSender<String>,
 ) {
+    {
+        let presentation_failure = presentation_failure.clone();
+        channel.on_close(Box::new(move || {
+            let presentation_failure = presentation_failure.clone();
+            Box::pin(async move {
+                let _ = presentation_failure.send(
+                    "remote input/control channel closed while video was still active".into(),
+                );
+            })
+        }));
+    }
     channel.on_message(Box::new(move |message| {
         let presenter = Arc::clone(&presenter);
         let viewer_control = viewer_control.clone();
@@ -314,7 +377,7 @@ fn install_control_handler(
                     };
                     let sink_tx = viewer_control.clone();
                     let sink: ControlSink = Arc::new(move |message| {
-                        let _ = sink_tx.send(message);
+                        sink_tx.send(message);
                     });
                     match Presenter::start(format, active_display.clone(), displays, sink) {
                         Ok(new_presenter) => {
@@ -329,7 +392,7 @@ fn install_control_handler(
                                 old.presenter.stop();
                             }
                             let request = SessionMessage::RequestKeyframe { stream_id };
-                            let _ = viewer_control.send(request);
+                            viewer_control.send(request);
                             tracing::info!(display_id = active_display_id.0, display_name = %active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, codec = ?format.codec, "remote control stream configured");
                         }
                         Err(error) => {
@@ -396,4 +459,51 @@ fn install_video_handler(
             }
         })
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use pulsermm_protocol::{DisplayId, PointerButton, RemoteInput};
+
+    use super::*;
+
+    fn pointer(x: u16, y: u16) -> SessionMessage {
+        SessionMessage::Input(RemoteInput::PointerMove {
+            display_id: DisplayId(1),
+            x,
+            y,
+        })
+    }
+
+    #[test]
+    fn pointer_motion_is_coalesced_to_the_latest_position() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let queue = ViewerControlQueue::new(tx);
+
+        queue.send(pointer(10, 20));
+        queue.send(pointer(30, 40));
+        assert!(rx.try_recv().is_err());
+
+        queue.flush_pointer();
+        assert_eq!(rx.try_recv().unwrap(), pointer(30, 40));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn pointer_position_is_flushed_before_a_button_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let queue = ViewerControlQueue::new(tx);
+        let button = SessionMessage::Input(RemoteInput::PointerButton {
+            display_id: DisplayId(1),
+            button: PointerButton::Left,
+            pressed: true,
+        });
+
+        queue.send(pointer(30, 40));
+        queue.send(button.clone());
+
+        assert_eq!(rx.try_recv().unwrap(), pointer(30, 40));
+        assert_eq!(rx.try_recv().unwrap(), button);
+        assert!(rx.try_recv().is_err());
+    }
 }
