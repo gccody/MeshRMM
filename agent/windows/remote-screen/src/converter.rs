@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::core::Interface;
 
-const SURFACE_COUNT: usize = 3;
+pub(crate) const SURFACE_COUNT: usize = 3;
 
 #[derive(Debug, Error)]
 pub enum Error {

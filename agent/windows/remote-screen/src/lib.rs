@@ -102,6 +102,9 @@ struct CaptureHandler {
     frames_encoded: u64,
     encoded_bytes: u64,
     stats_started_us: u64,
+    logged_first_capture: bool,
+    logged_first_conversion: bool,
+    logged_first_submission: bool,
 }
 
 // Safety: windows-capture constructs and invokes CaptureHandler exclusively on
@@ -144,6 +147,9 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             frames_encoded: 0,
             encoded_bytes: 0,
             stats_started_us: monotonic_timestamp_us()?,
+            logged_first_capture: false,
+            logged_first_conversion: false,
+            logged_first_submission: false,
         })
     }
 
@@ -163,19 +169,30 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         let encode_start_us = monotonic_timestamp_us()?;
         let capture_delivery_us = encode_start_us.saturating_sub(capture_timestamp_us);
         self.frames_captured += 1;
-        if self.frames_captured == 1 {
+        if !self.logged_first_capture {
+            self.logged_first_capture = true;
             tracing::info!(capture_delivery_us, "first desktop frame captured on GPU");
         }
-        let nv12 = self.converter.convert(frame.as_raw_texture())?;
-        if self.frames_captured == 1 {
-            tracing::info!("first desktop frame converted to NV12 on GPU");
-        }
-        let access_units = self.encoder.encode(nv12, capture_timestamp_us)?;
-        if self.frames_captured == 1 {
-            tracing::info!(
-                access_units = access_units.len(),
-                "first desktop frame submitted to hardware H.264 encoder"
-            );
+        // Poll before converting so an NV12 surface is only written when the
+        // asynchronous MFT has requested another input. Converting every
+        // captured frame would rotate through the fixed surface pool and could
+        // overwrite a texture that the encoder was still reading.
+        let mut access_units = self.encoder.poll()?;
+        if self.encoder.wants_input() {
+            let nv12 = self.converter.convert(frame.as_raw_texture())?;
+            if !self.logged_first_conversion {
+                self.logged_first_conversion = true;
+                tracing::info!("first desktop frame converted to NV12 on GPU");
+            }
+            let submitted = self.encoder.submit(nv12, capture_timestamp_us)?;
+            if !self.logged_first_submission {
+                self.logged_first_submission = true;
+                tracing::info!(
+                    immediate_access_units = submitted.len(),
+                    "first desktop frame submitted to hardware H.264 encoder"
+                );
+            }
+            access_units.extend(submitted);
         }
         for access_unit in access_units {
             self.frames_encoded += 1;
