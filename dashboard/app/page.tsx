@@ -30,10 +30,26 @@ import {
   WifiOff,
   X,
 } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRuntimeConfig } from "./providers";
 
 type Agent = { id: string; name: string; connected: boolean };
+type AgentSnapshot = {
+  type: "snapshot";
+  revision: number;
+  agents: Agent[];
+  generated_at_unix_ms: number;
+};
+type AgentEvent =
+  | AgentSnapshot
+  | { type: "agent_upsert"; revision: number; agent: Agent }
+  | { type: "agent_deleted"; revision: number; agent_id: string };
+type AgentDelta = Exclude<AgentEvent, AgentSnapshot>;
+type AgentEventSubscription = {
+  subscription_token: string;
+  websocket_url: string;
+  expires_at_unix_ms: number;
+};
 type Company = { id: string; name: string };
 type Account = {
   user_id: string;
@@ -58,10 +74,20 @@ const INSTALLER_ASSETS: Record<AgentPlatform, { label: string; binary: string; c
   },
 };
 const ENROLLMENT_MAGIC = "PULSERMM-BOOTSTRAP-V1";
+const MAX_EVENT_RECONNECT_DELAY_MS = 30_000;
 
 class AuthenticationRedirectStarted extends Error {}
 
 const normalizeServer = (server: string) => server.trim().replace(/\/+$/, "");
+
+const sortAgents = (items: Agent[]) => [...items].sort((left, right) =>
+  Number(right.connected) - Number(left.connected)
+  || left.name.localeCompare(right.name)
+  || left.id.localeCompare(right.id));
+
+const applyAgentDelta = (items: Agent[], event: AgentDelta) => event.type === "agent_upsert"
+  ? sortAgents([...items.filter((agent) => agent.id !== event.agent.id), event.agent])
+  : items.filter((agent) => agent.id !== event.agent_id);
 
 async function errorMessage(response: Response, fallback: string) {
   try {
@@ -105,8 +131,10 @@ export default function Dashboard() {
   const [isDownloadingInstaller, setIsDownloadingInstaller] = useState(false);
   const [installerDownloaded, setInstallerDownloaded] = useState(false);
   const [installerError, setInstallerError] = useState<string | null>(null);
+  const agentRevision = useRef(-1);
 
   const isAdmin = role === "admin" || roles?.includes("admin") || account?.role === "admin" || account?.roles.includes("admin");
+  const companyId = account?.company?.id;
 
   const authorizedFetch = useCallback(async (path: string, init: RequestInit = {}) => {
     let token: string;
@@ -131,6 +159,7 @@ export default function Dashboard() {
       setAccount(null);
       setAgents([]);
       setIsLive(false);
+      agentRevision.current = -1;
       return null;
     }
     const response = await authorizedFetch("/v1/account");
@@ -147,8 +176,11 @@ export default function Dashboard() {
     try {
       const response = await authorizedFetch("/v1/agents");
       if (!response.ok) throw new Error(await errorMessage(response, "The live agent service could not be reached."));
-      const data = (await response.json()) as { agents?: Agent[] };
-      setAgents(Array.isArray(data.agents) ? data.agents : []);
+      const data = (await response.json()) as { agents?: Agent[]; revision?: number };
+      const revision = Number.isSafeInteger(data.revision) ? data.revision! : -1;
+      if (revision < agentRevision.current) return true;
+      agentRevision.current = revision;
+      setAgents(sortAgents(Array.isArray(data.agents) ? data.agents : []));
       setIsLive(true);
       setLastUpdated(new Date());
       return true;
@@ -181,10 +213,122 @@ export default function Dashboard() {
   }, [isAuthLoading, loadAccount, loadAgents, organizationId, user]);
 
   useEffect(() => {
-    if (!user || !organizationId || !account?.company) return;
-    const timer = window.setInterval(() => void loadAgents(true), 15_000);
-    return () => window.clearInterval(timer);
-  }, [account?.company, loadAgents, organizationId, user]);
+    if (!user || !organizationId || !companyId) return;
+    agentRevision.current = -1;
+    let disposed = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | undefined;
+    let reconnectDelay = 1_000;
+    let awaitingSnapshot = true;
+    let pendingEvents: AgentDelta[] = [];
+
+    const scheduleReconnect = () => {
+      if (disposed || reconnectTimer !== undefined) return;
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = undefined;
+        void connect();
+      }, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, MAX_EVENT_RECONNECT_DELAY_MS);
+    };
+
+    const connect = async () => {
+      try {
+        const response = await authorizedFetch("/v1/agents/events/subscriptions", { method: "POST" });
+        if (!response.ok) {
+          throw new Error(await errorMessage(response, "The live Agent event stream could not be opened."));
+        }
+        const subscription = (await response.json()) as AgentEventSubscription;
+        if (disposed) return;
+        const websocketUrl = new URL(subscription.websocket_url);
+        websocketUrl.searchParams.set("token", subscription.subscription_token);
+        const nextSocket = new WebSocket(websocketUrl);
+        socket = nextSocket;
+        awaitingSnapshot = true;
+        pendingEvents = [];
+
+        const requestSnapshot = () => {
+          if (nextSocket.readyState === WebSocket.OPEN) nextSocket.send("refresh");
+        };
+
+        nextSocket.addEventListener("open", () => {
+          if (disposed || socket !== nextSocket) return;
+          reconnectDelay = 1_000;
+          setIsLive(true);
+          setError(null);
+        });
+        nextSocket.addEventListener("message", (message) => {
+          if (disposed || socket !== nextSocket || typeof message.data !== "string") return;
+          try {
+            const event = JSON.parse(message.data) as AgentEvent;
+            if (!Number.isSafeInteger(event.revision) || event.revision < 0) return;
+            if (event.type === "snapshot") {
+              if (!Array.isArray(event.agents)) return;
+              if (event.revision < agentRevision.current) {
+                requestSnapshot();
+                return;
+              }
+              let nextAgents = sortAgents(event.agents);
+              let nextRevision = event.revision;
+              for (const pending of pendingEvents.sort((left, right) => left.revision - right.revision)) {
+                if (pending.revision <= nextRevision) continue;
+                if (pending.revision !== nextRevision + 1) {
+                  pendingEvents = [];
+                  awaitingSnapshot = true;
+                  requestSnapshot();
+                  return;
+                }
+                nextAgents = applyAgentDelta(nextAgents, pending);
+                nextRevision = pending.revision;
+              }
+              pendingEvents = [];
+              awaitingSnapshot = false;
+              agentRevision.current = nextRevision;
+              setAgents(nextAgents);
+            } else {
+              if (event.type !== "agent_upsert" && event.type !== "agent_deleted") return;
+              if (awaitingSnapshot) {
+                pendingEvents.push(event);
+                if (pendingEvents.length > 1_000) nextSocket.close(1009, "too many pending Agent events");
+                return;
+              }
+              if (event.revision <= agentRevision.current) return;
+              if (event.revision !== agentRevision.current + 1) {
+                awaitingSnapshot = true;
+                pendingEvents = [event];
+                requestSnapshot();
+                return;
+              }
+              agentRevision.current = event.revision;
+              setAgents((current) => applyAgentDelta(current, event));
+            }
+            setIsLive(true);
+            setLastUpdated(new Date());
+          } catch {
+            requestSnapshot();
+          }
+        });
+        nextSocket.addEventListener("error", () => nextSocket.close());
+        nextSocket.addEventListener("close", () => {
+          if (disposed || socket !== nextSocket) return;
+          socket = null;
+          setIsLive(false);
+          scheduleReconnect();
+        });
+      } catch (requestError) {
+        if (disposed || requestError instanceof AuthenticationRedirectStarted) return;
+        setIsLive(false);
+        setError(requestError instanceof Error ? requestError.message : "The live Agent event stream could not be opened.");
+        scheduleReconnect();
+      }
+    };
+
+    void connect();
+    return () => {
+      disposed = true;
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+      socket?.close(1000, "dashboard subscription ended");
+    };
+  }, [authorizedFetch, companyId, organizationId, user]);
 
   const filteredAgents = useMemo(() => {
     const search = query.trim().toLowerCase();
@@ -427,7 +571,7 @@ export default function Dashboard() {
                       ))}
                       {!filteredAgents.length && <div className="empty-state"><Search size={24} /><strong>{isLive ? "No Agents found" : "No live Agent data"}</strong><span>{isLive ? "Create an Agent or adjust the current filters." : "The company inventory has not returned a live response."}</span></div>}
                     </div>
-                    <div className="panel-footer"><span>Auto-refreshes every 15 seconds</span><span className={isLive ? "" : "disconnected"}><i /> {isLive ? "Tenant-scoped signaling ready" : "Signaling unavailable"}</span></div>
+                    <div className="panel-footer"><span>Updates arrive in real time</span><span className={isLive ? "" : "disconnected"}><i /> {isLive ? "Tenant-scoped event stream ready" : "Reconnecting event stream"}</span></div>
                   </section>
                 </>
               ) : view === "team" ? (

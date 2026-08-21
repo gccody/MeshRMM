@@ -9,31 +9,14 @@ use uuid::Uuid;
 use worker::{query, *};
 
 mod agent_coordinator;
+mod company_presence;
 mod remote_session;
 
 const DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 900;
 const MAX_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 3600;
 const HANDOFF_TTL_MS: u64 = 60_000;
 const AGENT_INSTALL_TTL_MS: u64 = 30 * 60 * 1000;
-
-#[derive(Debug, Clone, Serialize)]
-struct AgentSummary {
-    id: String,
-    name: String,
-    connected: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct AgentList {
-    agents: Vec<AgentSummary>,
-    generated_at_unix_ms: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct AgentRow {
-    id: String,
-    name: String,
-}
+const AGENT_EVENT_SUBSCRIPTION_TTL_MS: u64 = 60_000;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Company {
@@ -44,6 +27,7 @@ struct Company {
 #[derive(Debug, Deserialize)]
 struct AgentCredentialRow {
     auth_token_hash: String,
+    company_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +42,11 @@ struct AgentInstallTokenRow {
     id: String,
     company_id: String,
     created_by_user_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentEventSubscriptionRow {
+    company_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,6 +103,13 @@ struct CreateAgentInstallerRequest {
 struct AgentInstallerBootstrap {
     server: String,
     install_token: String,
+    expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentEventSubscription {
+    subscription_token: String,
+    websocket_url: String,
     expires_at_unix_ms: u64,
 }
 
@@ -174,6 +170,12 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
             bootstrap_company(&mut request, &environment).await
         }
         (Method::Get, ["v1", "agents"]) => list_agents(&request, &environment).await,
+        (Method::Post, ["v1", "agents", "events", "subscriptions"]) => {
+            create_agent_event_subscription(&request, &environment).await
+        }
+        (Method::Get, ["v1", "agents", "events"]) => {
+            subscribe_agent_events(request, &environment).await
+        }
         (Method::Post, ["v1", "agent-installers"]) => {
             create_agent_installer(&mut request, &environment).await
         }
@@ -187,12 +189,14 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
             rotate_agent_token(&request, &environment, device_id).await
         }
         (Method::Get, ["v1", "agents", device_id, "connect"]) => {
-            if authorize_agent(&request, &environment, device_id)
-                .await
-                .is_err()
-            {
-                return cors(api_error(401, "Agent authentication failed")?, &environment);
-            }
+            let company_id = match authorize_agent(&request, &environment, device_id).await {
+                Ok(company_id) => company_id,
+                Err(_) => {
+                    return cors(api_error(401, "Agent authentication failed")?, &environment);
+                }
+            };
+            company_presence::set_company_header(&mut request, &company_id)?;
+            request.headers_mut()?.set("X-Pulse-Device-Id", device_id)?;
             forward_to_object(
                 &environment,
                 "AGENT_COORDINATOR",
@@ -296,47 +300,90 @@ async fn list_agents(request: &Request, environment: &Env) -> Result<Response> {
         Ok(identity) => identity,
         Err(error) => return workos_auth_error(error),
     };
+    company_presence::snapshot(environment, &identity.company_id).await
+}
+
+async fn create_agent_event_subscription(request: &Request, environment: &Env) -> Result<Response> {
+    let identity = match authorize_workos_user(request, environment).await {
+        Ok(identity) => identity,
+        Err(error) => return workos_auth_error(error),
+    };
     let db = environment.d1("DB")?;
-    let result = query!(
+    ensure_company_exists(&db, &identity.company_id).await?;
+    let now = now_ms_i64()?;
+    query!(
         &db,
-        "SELECT id, name FROM agents WHERE company_id = ?1 ORDER BY name COLLATE NOCASE, id",
-        identity.company_id
+        "DELETE FROM agent_event_subscriptions WHERE expires_at <= ?1",
+        now
     )?
-    .all()
+    .run()
     .await?;
-    let rows = result.results::<AgentRow>()?;
-    let mut agents = Vec::with_capacity(rows.len());
-    for row in rows {
-        let status_request = Request::new("https://agent.internal/status", Method::Get)?;
-        let mut status_response = object_stub(environment, "AGENT_COORDINATOR", &row.id)?
-            .fetch_with_request(status_request)
-            .await?;
-        let connected = if (200..300).contains(&status_response.status_code()) {
-            status_response
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|value| value.get("connected").and_then(|value| value.as_bool()))
-                .unwrap_or(false)
-        } else {
-            false
-        };
-        agents.push(AgentSummary {
-            id: row.id,
-            name: row.name,
-            connected,
-        });
-    }
-    agents.sort_by(|left, right| {
-        right
-            .connected
-            .cmp(&left.connected)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    Response::from_json(&AgentList {
-        agents,
-        generated_at_unix_ms: Date::now().as_millis(),
+    let subscription_token = random_token();
+    let token_hash = sha256_hex(&subscription_token);
+    let expires_at = Date::now().as_millis() + AGENT_EVENT_SUBSCRIPTION_TTL_MS;
+    let expires_at_i64 =
+        i64::try_from(expires_at).map_err(|_| Error::RustError("clock overflow".into()))?;
+    query!(
+        &db,
+        "INSERT INTO agent_event_subscriptions (token_hash, company_id, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        token_hash,
+        identity.company_id,
+        identity.user_id,
+        now,
+        expires_at_i64
+    )?
+    .run()
+    .await?;
+    Response::from_json(&AgentEventSubscription {
+        subscription_token,
+        websocket_url: agent_event_websocket_url(environment)?,
+        expires_at_unix_ms: expires_at,
     })
+}
+
+async fn subscribe_agent_events(mut request: Request, environment: &Env) -> Result<Response> {
+    if request
+        .headers()
+        .get("Upgrade")?
+        .is_none_or(|value| !value.eq_ignore_ascii_case("websocket"))
+    {
+        return api_error(426, "WebSocket upgrade required");
+    }
+    let expected_origin = environment.var("DASHBOARD_ORIGIN")?.to_string();
+    if request.headers().get("Origin")?.as_deref() != Some(expected_origin.as_str()) {
+        return api_error(403, "dashboard origin is not allowed");
+    }
+    let supplied = request
+        .url()?
+        .query_pairs()
+        .find_map(|(key, value)| (key == "token").then(|| value.into_owned()))
+        .unwrap_or_default();
+    if supplied.len() != 64 || !supplied.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return api_error(401, "Agent event subscription is invalid or expired");
+    }
+    let now = now_ms_i64()?;
+    let token_hash = sha256_hex(&supplied);
+    let db = environment.d1("DB")?;
+    let subscription = query!(
+        &db,
+        "UPDATE agent_event_subscriptions SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 RETURNING company_id",
+        now,
+        token_hash
+    )?
+    .first::<AgentEventSubscriptionRow>(None)
+    .await?;
+    let Some(subscription) = subscription else {
+        return api_error(401, "Agent event subscription is invalid or expired");
+    };
+    company_presence::set_company_header(&mut request, &subscription.company_id)?;
+    forward_to_object(
+        environment,
+        "COMPANY_PRESENCE",
+        &subscription.company_id,
+        request,
+        "https://presence.internal/subscribe",
+    )
+    .await
 }
 
 async fn create_agent_installer(request: &mut Request, environment: &Env) -> Result<Response> {
@@ -454,6 +501,15 @@ async fn redeem_agent_installer(request: &mut Request, environment: &Env) -> Res
         &serde_json::json!({ "installer_id": ticket.id }).to_string(),
     )
     .await?;
+    let created = company_presence::PresenceMutation::Upsert {
+        agent_id: device_id.clone(),
+        name: Some(name.clone()),
+        connected: Some(false),
+    };
+    if let Err(error) = company_presence::publish(environment, &identity.company_id, &created).await
+    {
+        console_error!("event=agent_created_publish_failed error={}", error);
+    }
     Response::from_json(&AgentConfig {
         server: public_api_url(environment)?,
         device_id,
@@ -489,6 +545,13 @@ async fn delete_agent(request: &Request, environment: &Env, device_id: &str) -> 
         return api_error(404, "Agent not found");
     }
     audit(&db, &identity, "agent.delete", "agent", device_id, "{}").await?;
+    let deleted = company_presence::PresenceMutation::Delete {
+        agent_id: device_id.to_owned(),
+    };
+    if let Err(error) = company_presence::publish(environment, &identity.company_id, &deleted).await
+    {
+        console_error!("event=agent_deleted_publish_failed error={}", error);
+    }
     Response::empty().map(|response| response.with_status(204))
 }
 
@@ -553,11 +616,11 @@ async fn create_handoff(request: &mut Request, environment: &Env) -> Result<Resp
     let db = environment.d1("DB")?;
     let permitted = query!(
         &db,
-        "SELECT id, name FROM agents WHERE id = ?1 AND company_id = ?2",
+        "SELECT 1 AS permitted FROM agents WHERE id = ?1 AND company_id = ?2",
         body.device_id,
         identity.company_id
     )?
-    .first::<AgentRow>(None)
+    .first::<i64>(Some("permitted"))
     .await?
     .is_some();
     if !permitted {
@@ -694,13 +757,13 @@ async fn create_session_for_device(environment: &Env, device_id: &str) -> Result
     })
 }
 
-async fn authorize_agent(request: &Request, environment: &Env, device_id: &str) -> Result<()> {
+async fn authorize_agent(request: &Request, environment: &Env, device_id: &str) -> Result<String> {
     validate_identifier(device_id, "device ID")?;
     let supplied = bearer_token(request)?;
     let db = environment.d1("DB")?;
     let credential = query!(
         &db,
-        "SELECT auth_token_hash FROM agents WHERE id = ?1",
+        "SELECT auth_token_hash, company_id FROM agents WHERE id = ?1",
         device_id
     )?
     .first::<AgentCredentialRow>(None)
@@ -712,7 +775,7 @@ async fn authorize_agent(request: &Request, environment: &Env, device_id: &str) 
     ) {
         return Err(Error::RustError("invalid Agent token".into()));
     }
-    Ok(())
+    Ok(credential.company_id)
 }
 
 async fn authorize_workos_user(request: &Request, environment: &Env) -> Result<Identity> {
@@ -868,6 +931,14 @@ fn public_api_url(environment: &Env) -> Result<String> {
         .to_string()
         .trim_end_matches('/')
         .to_owned())
+}
+
+fn agent_event_websocket_url(environment: &Env) -> Result<String> {
+    let api_url = public_api_url(environment)?;
+    let host = api_url
+        .strip_prefix("https://")
+        .ok_or_else(|| Error::RustError("PUBLIC_API_URL must use HTTPS".into()))?;
+    Ok(format!("wss://{host}/v1/agents/events"))
 }
 
 fn now_ms_i64() -> Result<i64> {

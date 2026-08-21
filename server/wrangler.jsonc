@@ -20,6 +20,10 @@
       {
         "name": "REMOTE_SESSION",
         "class_name": "RemoteSession"
+      },
+      {
+        "name": "COMPANY_PRESENCE",
+        "class_name": "CompanyPresence"
       }
     ]
   },
@@ -27,6 +31,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["AgentCoordinator", "RemoteSession"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["CompanyPresence"]
     }
   ],
   "vars": {

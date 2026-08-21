@@ -123,10 +123,14 @@ Pop-Location
 ### Web dashboard
 
 The responsive dashboard at `https://pulsermm.gccody.dev` lists only Agents
-owned by the organization in the current WorkOS token and refreshes connection
-state every 15 seconds. **Remote** requests a one-time server handoff, then
-opens the native viewer with a `pulsermm://connect?handoff=...&server=...` deep
-link. No service credential is entered into or retained by the browser.
+owned by the organization in the current WorkOS token. It receives inventory
+and connection changes from a company-scoped, hibernating WebSocket event
+stream instead of polling. The browser obtains a 60-second, one-use
+subscription token and reconnects automatically; **Refresh** requests a single
+authoritative snapshot when needed. **Remote** requests a one-time server
+handoff, then opens the native viewer with a
+`pulsermm://connect?handoff=...&server=...` deep link. No service credential is
+entered into or retained by the browser.
 
 Company administrators use the embedded WorkOS user-management, domain, and
 SSO widgets to invite users, assign roles, verify domains, and configure a SAML
