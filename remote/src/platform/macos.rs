@@ -266,6 +266,10 @@ impl MacUi {
                 false,
             )
         };
+        // NSWindow releases itself when the user closes it by default. Keep the
+        // window alive until MacUi is dropped so queued frames can safely detect
+        // that it is no longer visible and end the remote session.
+        unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(&NSString::from_str("PulseRMM Remote Desktop"));
         let view = window
             .contentView()

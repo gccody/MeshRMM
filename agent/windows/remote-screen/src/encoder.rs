@@ -11,6 +11,7 @@ use windows::Win32::System::Variant::VARIANT;
 use windows::core::{Interface, Result as WindowsResult};
 
 use crate::EncodedAccessUnit;
+use crate::converter::SURFACE_COUNT;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -35,7 +36,10 @@ pub enum Error {
 }
 
 pub trait VideoEncoder {
-    fn encode(
+    /// Drain completed output and refresh the transform's input demand.
+    fn poll(&mut self) -> Result<Vec<EncodedAccessUnit>, Error>;
+    fn wants_input(&self) -> bool;
+    fn submit(
         &mut self,
         texture: &ID3D11Texture2D,
         capture_timestamp_us: u64,
@@ -193,7 +197,7 @@ impl MediaFoundationH264Encoder {
                 have_output: 0,
                 sequence_header,
                 sequence_header_sent: false,
-                pending_capture_timestamps: VecDeque::with_capacity(3),
+                pending_capture_timestamps: VecDeque::with_capacity(SURFACE_COUNT),
             };
             encoder.pump_events(false)?;
             Ok(encoder)
@@ -302,22 +306,21 @@ impl MediaFoundationH264Encoder {
 }
 
 impl VideoEncoder for MediaFoundationH264Encoder {
-    fn encode(
+    fn poll(&mut self) -> Result<Vec<EncodedAccessUnit>, Error> {
+        self.pump_events(false)?;
+        self.take_available_outputs()
+    }
+
+    fn wants_input(&self) -> bool {
+        self.need_input > 0 && self.pending_capture_timestamps.len() < SURFACE_COUNT
+    }
+
+    fn submit(
         &mut self,
         texture: &ID3D11Texture2D,
         capture_timestamp_us: u64,
     ) -> Result<Vec<EncodedAccessUnit>, Error> {
-        // Never block the Windows capture callback waiting for an encoder
-        // event. A newer desktop frame is preferable to stalling capture and
-        // accumulating latency behind an older surface.
-        self.pump_events(false)?;
-        let mut outputs = self.take_available_outputs()?;
-        if self.need_input == 0 {
-            return Ok(outputs);
-        }
-        if self.pending_capture_timestamps.len() >= 3 {
-            return Ok(outputs);
-        }
+        debug_assert!(self.wants_input());
         // Safety: the DXGI surface buffer holds a COM reference to a texture in
         // the converter pool until the transform releases the input sample.
         unsafe {
@@ -339,8 +342,7 @@ impl VideoEncoder for MediaFoundationH264Encoder {
         self.pending_capture_timestamps
             .push_back(capture_timestamp_us);
         self.pump_events(false)?;
-        outputs.extend(self.take_available_outputs()?);
-        Ok(outputs)
+        self.take_available_outputs()
     }
 
     fn request_keyframe(&self) -> Result<(), Error> {
