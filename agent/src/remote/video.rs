@@ -42,6 +42,11 @@ impl LatestFrameSlot {
         self.frame.lock().await.is_some()
     }
 
+    pub async fn clear(&self) {
+        *self.frame.lock().await = None;
+        *self.keyframe.lock().await = None;
+    }
+
     /// Returns the newest compressed keyframe without consuming the normal
     /// latest-frame slot. This retains one decoder bootstrap frame, not a
     /// playback queue.

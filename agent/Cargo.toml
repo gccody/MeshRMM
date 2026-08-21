@@ -27,4 +27,4 @@ webrtc = "0.14.0"
 
 [target."cfg(windows)".dependencies]
 pulsermm-remote-screen = { version = "0.1.0", path = "windows/remote-screen" }
-
+windows = { version = "0.62.2", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

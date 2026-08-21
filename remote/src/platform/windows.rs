@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr;
@@ -8,7 +8,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use pulsermm_protocol::{EncodedFrame, VideoFormat};
+use pulsermm_protocol::{
+    Display, EncodedFrame, PointerButton, RemoteInput, SessionMessage, VideoFormat,
+};
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
@@ -16,14 +18,18 @@ use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_F8};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{Interface, w};
+use windows::core::{HSTRING, Interface, PCWSTR, w};
+
+use super::ControlSink;
 
 const MAX_DECODER_PENDING_FRAMES: usize = 4;
 
@@ -47,7 +53,12 @@ pub struct Presenter {
 }
 
 impl Presenter {
-    pub fn start(format: VideoFormat) -> anyhow::Result<Self> {
+    pub fn start(
+        format: VideoFormat,
+        active_display: Display,
+        displays: Vec<Display>,
+        control: ControlSink,
+    ) -> anyhow::Result<Self> {
         let shared = Arc::new(Shared {
             latest: Mutex::new(None),
             ready: Condvar::new(),
@@ -60,7 +71,16 @@ impl Presenter {
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("pulsermm-decode-present".into())
-            .spawn(move || run_worker(worker_shared, format, started_tx))
+            .spawn(move || {
+                run_worker(
+                    worker_shared,
+                    format,
+                    active_display,
+                    displays,
+                    control,
+                    started_tx,
+                )
+            })
             .context("failed to spawn Windows decode/presentation worker")?;
         started_rx
             .recv()
@@ -124,9 +144,12 @@ impl Drop for Presenter {
 fn run_worker(
     shared: Arc<Shared>,
     format: VideoFormat,
+    active_display: Display,
+    displays: Vec<Display>,
+    control: ControlSink,
     started: std::sync::mpsc::SyncSender<anyhow::Result<()>>,
 ) {
-    let initialized = unsafe { WorkerPipeline::new(format) };
+    let initialized = unsafe { WorkerPipeline::new(format, active_display, displays, control) };
     let mut pipeline = match initialized {
         Ok(pipeline) => {
             shared.running.store(true, Ordering::Release);
@@ -190,11 +213,18 @@ struct WorkerPipeline {
 }
 
 impl WorkerPipeline {
-    unsafe fn new(format: VideoFormat) -> anyhow::Result<Self> {
+    unsafe fn new(
+        format: VideoFormat,
+        active_display: Display,
+        displays: Vec<Display>,
+        control: ControlSink,
+    ) -> anyhow::Result<Self> {
         let com = unsafe { ComRuntime::start()? };
         let mf = unsafe { MediaFoundationRuntime::start()? };
         let (device, context) = unsafe { create_device()? };
-        let renderer = unsafe { D3d11Renderer::new(&device, &context, format)? };
+        let renderer = unsafe {
+            D3d11Renderer::new(&device, &context, format, active_display, displays, control)?
+        };
         let decoder = unsafe { HardwareDecoder::new(&device, format)? };
         Ok(Self {
             _com: com,
@@ -694,8 +724,11 @@ impl D3d11Renderer {
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         format: VideoFormat,
+        active_display: Display,
+        displays: Vec<Display>,
+        control: ControlSink,
     ) -> anyhow::Result<Self> {
-        let window = unsafe { create_window(format.width, format.height)? };
+        let window = unsafe { create_window(format, active_display, displays, control)? };
         let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
             .context("DXGI factory creation failed")?;
         let swap_desc = DXGI_SWAP_CHAIN_DESC1 {
@@ -853,21 +886,242 @@ impl Drop for D3d11Renderer {
     }
 }
 
-unsafe fn create_window(width: u32, height: u32) -> anyhow::Result<HWND> {
+struct WindowContext {
+    active_display: Display,
+    displays: Vec<Display>,
+    control: ControlSink,
+    pressed_keys: HashSet<(u16, bool)>,
+    pressed_buttons: HashSet<PointerButton>,
+}
+
+impl WindowContext {
+    fn send(&self, message: SessionMessage) {
+        (self.control)(message);
+    }
+
+    fn pointer_position(&self, window: HWND, lparam: LPARAM) -> Option<(u16, u16)> {
+        self.normalized_client_position(
+            window,
+            signed_low_word(lparam.0),
+            signed_high_word(lparam.0),
+        )
+    }
+
+    fn normalized_client_position(&self, window: HWND, x: i32, y: i32) -> Option<(u16, u16)> {
+        let mut rect = RECT::default();
+        if unsafe { GetClientRect(window, &mut rect) }.is_err() {
+            return None;
+        }
+        let width = rect.right.saturating_sub(rect.left).max(1);
+        let height = rect.bottom.saturating_sub(rect.top).max(1);
+        let x = x.clamp(0, width - 1);
+        let y = y.clamp(0, height - 1);
+        Some((
+            (i64::from(x) * 65_535 / i64::from((width - 1).max(1))) as u16,
+            (i64::from(y) * 65_535 / i64::from((height - 1).max(1))) as u16,
+        ))
+    }
+
+    fn move_pointer(&self, window: HWND, lparam: LPARAM) {
+        if let Some((x, y)) = self.pointer_position(window, lparam) {
+            self.send(SessionMessage::Input(RemoteInput::PointerMove {
+                display_id: self.active_display.id,
+                x,
+                y,
+            }));
+        }
+    }
+
+    fn move_pointer_from_screen(&self, window: HWND, lparam: LPARAM) {
+        let mut point = windows::Win32::Foundation::POINT {
+            x: signed_low_word(lparam.0),
+            y: signed_high_word(lparam.0),
+        };
+        if unsafe { ScreenToClient(window, &mut point) }.as_bool()
+            && let Some((x, y)) = self.normalized_client_position(window, point.x, point.y)
+        {
+            self.send(SessionMessage::Input(RemoteInput::PointerMove {
+                display_id: self.active_display.id,
+                x,
+                y,
+            }));
+        }
+    }
+
+    fn button(&mut self, window: HWND, lparam: LPARAM, button: PointerButton, pressed: bool) {
+        self.move_pointer(window, lparam);
+        self.send(SessionMessage::Input(RemoteInput::PointerButton {
+            display_id: self.active_display.id,
+            button,
+            pressed,
+        }));
+        if pressed {
+            self.pressed_buttons.insert(button);
+            let _ = unsafe { SetCapture(window) };
+        } else {
+            self.pressed_buttons.remove(&button);
+            if self.pressed_buttons.is_empty() {
+                let _ = unsafe { ReleaseCapture() };
+            }
+        }
+    }
+
+    fn release_input(&mut self) {
+        for (scan_code, extended) in self.pressed_keys.drain().collect::<Vec<_>>() {
+            self.send(SessionMessage::Input(RemoteInput::Key {
+                display_id: self.active_display.id,
+                scan_code,
+                extended,
+                pressed: false,
+            }));
+        }
+        for button in self.pressed_buttons.drain().collect::<Vec<_>>() {
+            self.send(SessionMessage::Input(RemoteInput::PointerButton {
+                display_id: self.active_display.id,
+                button,
+                pressed: false,
+            }));
+        }
+    }
+
+    fn select_next_display(&self) {
+        if self.displays.len() < 2 {
+            return;
+        }
+        let current = self
+            .displays
+            .iter()
+            .position(|display| display.id == self.active_display.id)
+            .unwrap_or(0);
+        let next = self.displays[(current + 1) % self.displays.len()].id;
+        self.send(SessionMessage::SelectDisplay { display_id: next });
+    }
+}
+
+unsafe fn window_context(window: HWND) -> Option<&'static mut WindowContext> {
+    let pointer = unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) } as *mut WindowContext;
+    unsafe { pointer.as_mut() }
+}
+
+fn signed_low_word(value: isize) -> i32 {
+    i32::from(value as u16 as i16)
+}
+
+fn signed_high_word(value: isize) -> i32 {
+    i32::from(((value as usize >> 16) as u16) as i16)
+}
+
+unsafe fn create_window(
+    format: VideoFormat,
+    active_display: Display,
+    displays: Vec<Display>,
+    control: ControlSink,
+) -> anyhow::Result<HWND> {
     unsafe extern "system" fn window_proc(
         window: HWND,
         message: u32,
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        if message == WM_NCCREATE {
+            let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
+            unsafe {
+                SetWindowLongPtrW(window, GWLP_USERDATA, create.lpCreateParams as isize);
+            }
+        }
+        let context = unsafe { window_context(window) };
         match message {
+            WM_MOUSEMOVE => {
+                if let Some(context) = context {
+                    context.move_pointer(window, lparam);
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
+            | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                if let Some(context) = context {
+                    let button = match message {
+                        WM_LBUTTONDOWN | WM_LBUTTONUP => PointerButton::Left,
+                        WM_RBUTTONDOWN | WM_RBUTTONUP => PointerButton::Right,
+                        WM_MBUTTONDOWN | WM_MBUTTONUP => PointerButton::Middle,
+                        _ if ((wparam.0 >> 16) as u16) == XBUTTON1 => PointerButton::Back,
+                        _ => PointerButton::Forward,
+                    };
+                    let pressed = matches!(
+                        message,
+                        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+                    );
+                    context.button(window, lparam, button, pressed);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                if let Some(context) = context {
+                    context.move_pointer_from_screen(window, lparam);
+                    let delta = ((wparam.0 >> 16) as u16) as i16;
+                    context.send(SessionMessage::Input(RemoteInput::Wheel {
+                        display_id: context.active_display.id,
+                        horizontal: if message == WM_MOUSEHWHEEL { delta } else { 0 },
+                        vertical: if message == WM_MOUSEWHEEL { delta } else { 0 },
+                    }));
+                }
+                LRESULT(0)
+            }
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
+                if let Some(context) = context {
+                    let pressed = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+                    if wparam.0 as u16 == VK_F8.0 && pressed {
+                        if lparam.0 & (1 << 30) == 0 {
+                            context.select_next_display();
+                        }
+                        return LRESULT(0);
+                    }
+                    if wparam.0 as u16 == VK_F8.0 {
+                        return LRESULT(0);
+                    }
+                    let scan_code = ((lparam.0 >> 16) & 0xff) as u16;
+                    let extended = lparam.0 & (1 << 24) != 0;
+                    if scan_code != 0 {
+                        context.send(SessionMessage::Input(RemoteInput::Key {
+                            display_id: context.active_display.id,
+                            scan_code,
+                            extended,
+                            pressed,
+                        }));
+                        if pressed {
+                            context.pressed_keys.insert((scan_code, extended));
+                        } else {
+                            context.pressed_keys.remove(&(scan_code, extended));
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_KILLFOCUS => {
+                if let Some(context) = context {
+                    context.release_input();
+                }
+                LRESULT(0)
+            }
             WM_CLOSE => {
+                if let Some(context) = context {
+                    context.release_input();
+                }
                 let _ = unsafe { DestroyWindow(window) };
                 LRESULT(0)
             }
             WM_DESTROY => {
                 unsafe { PostQuitMessage(0) };
                 LRESULT(0)
+            }
+            WM_NCDESTROY => {
+                let pointer =
+                    unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) } as *mut WindowContext;
+                unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, 0) };
+                if !pointer.is_null() {
+                    drop(unsafe { Box::from_raw(pointer) });
+                }
+                unsafe { DefWindowProcW(window, message, wparam, lparam) }
             }
             _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
         }
@@ -894,16 +1148,33 @@ unsafe fn create_window(width: u32, height: u32) -> anyhow::Result<HWND> {
     let mut rect = RECT {
         left: 0,
         top: 0,
-        right: width as i32,
-        bottom: height as i32,
+        right: format.width as i32,
+        bottom: format.height as i32,
     };
     unsafe { AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false) }
         .context("remote window bounds calculation failed")?;
+    let title = HSTRING::from(format!(
+        "PulseRMM Remote Desktop — {} ({}) — F8 switches display",
+        active_display.name,
+        if active_display.primary {
+            "primary"
+        } else {
+            "secondary"
+        }
+    ));
+    let context = Box::new(WindowContext {
+        active_display,
+        displays,
+        control,
+        pressed_keys: HashSet::new(),
+        pressed_buttons: HashSet::new(),
+    });
+    let context = Box::into_raw(context);
     let window = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class,
-            w!("PulseRMM Remote Desktop"),
+            PCWSTR(title.as_ptr()),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -912,10 +1183,16 @@ unsafe fn create_window(width: u32, height: u32) -> anyhow::Result<HWND> {
             None,
             None,
             Some(instance),
-            None,
+            Some(context.cast()),
         )
-    }
-    .context("native remote desktop window creation failed")?;
+    };
+    let window = match window {
+        Ok(window) => window,
+        Err(error) => {
+            drop(unsafe { Box::from_raw(context) });
+            return Err(error).context("native remote desktop window creation failed");
+        }
+    };
     let _ = unsafe { ShowWindow(window, SW_SHOW) };
     Ok(window)
 }

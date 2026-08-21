@@ -1,7 +1,7 @@
 # PulseRMM
 
 PulseRMM is a multi-tenant remote monitoring and management project. It adds
-view-only, low-latency Windows desktop streaming while retaining the
+low-latency Windows desktop streaming and remote control while retaining the
 repository's three independent Rust workspaces:
 
 - `agent/` — the native endpoint Agent, shared remote protocol, and the
@@ -57,12 +57,13 @@ plane is deployed at `https://pulsermm.gccody.dev`. WorkOS organizations and
 memberships define the company boundary, Cloudflare D1 stores company-owned
 Agent records and audit events, and Durable Objects retain live signaling state.
 
-The following commands are only for rebuilding the portable binaries:
+The following commands are only for rebuilding the portable binaries. The
+Agent wrapper automatically copies the finished executable into `dist/agent/`
+without changing its `agent.json`:
 
 ```powershell
-cargo build --release --manifest-path agent/Cargo.toml
+& .\scripts\build-agent.ps1
 cargo build --release --manifest-path remote/Cargo.toml
-Copy-Item agent/target/release/pulsermm-agent.exe dist/agent/
 Copy-Item remote/target/release/pulsermm-remote.exe dist/remote/
 ```
 
@@ -142,6 +143,15 @@ in `agent.json`. CLI flags remain available for development overrides. ICE
 candidate-pair logs identify a `direct` or `turn` connection; periodic WebRTC
 logs include measured RTT.
 
+The native viewer sends mouse, wheel, and physical keyboard input over the
+reliable control channel. Pointer coordinates are normalized to the display
+currently being streamed and every event carries that display ID, so the Agent
+rejects input left over from a previous display after a switch. On Windows,
+press **F8** in the viewer to cycle displays. On macOS, use
+**Control-Option-Left/Right Arrow**. The active display name is shown in the
+viewer title. Unfocusing the viewer, switching displays, or ending a session
+releases held buttons and keys.
+
 Closing the viewer or pressing Ctrl+C tears down its peer connection. Capture,
 encoder, decoder, and presentation failures terminate only the remote session;
 the Agent returns to its signaling loop and remains available.
@@ -180,11 +190,12 @@ above; do not infer performance measurements from a successful build.
 ## Intentional MVP limits
 
 The Agent/capture implementation remains Windows-only; the viewer supports
-Windows and macOS. The primary display and captured cursor are streamed; there
-is no input, audio, clipboard, file transfer, recording, multi-monitor UI,
-browser client, or concurrent viewer. H.264 is sent over a purpose-built
-unreliable WebRTC DataChannel rather than an RTP track. Encoded H.264 necessarily
-crosses CPU memory for packetization and decoder input. Windows keeps full-size
-captured and decoded images in D3D11 textures; macOS hands compressed samples to
-AVSampleBufferDisplayLayer and does not create a CPU RGBA frame in application
-code.
+Windows and macOS. The selected display and captured cursor are streamed; there
+is no audio, clipboard, file transfer, recording, simultaneous multi-monitor
+view, browser client, or concurrent viewer. Windows secure-attention sequences
+such as Ctrl+Alt+Delete cannot be synthesized by a normal user-mode Agent. H.264
+is sent over a purpose-built unreliable WebRTC DataChannel rather than an RTP
+track. Encoded H.264 necessarily crosses CPU memory for packetization and decoder
+input. Windows keeps full-size captured and decoded images in D3D11 textures;
+macOS hands compressed samples to AVSampleBufferDisplayLayer and does not create
+a CPU RGBA frame in application code.

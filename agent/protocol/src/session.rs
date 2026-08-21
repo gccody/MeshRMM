@@ -25,6 +25,10 @@ impl std::fmt::Display for RemoteSessionId {
 #[serde(transparent)]
 pub struct VideoStreamId(pub u32);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DisplayId(pub u32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
     Idle,

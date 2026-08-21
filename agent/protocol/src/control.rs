@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{RemoteSessionId, VideoStreamId};
+use crate::{DisplayId, RemoteInput, RemoteSessionId, VideoStreamId};
 
-/// Reliable, low-frequency messages carried by the control data channel.
+/// Reliable session-control and input messages carried by the control data channel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SessionMessage {
     Start {
@@ -31,6 +31,19 @@ pub enum SessionMessage {
     Stop {
         reason: String,
     },
+    /// Announces the displays available on the Agent and the display whose
+    /// pixels are carried by `stream_id`. Input for any other display is
+    /// rejected by the Agent.
+    DisplayConfiguration {
+        displays: Vec<Display>,
+        active_display_id: DisplayId,
+        stream_id: VideoStreamId,
+        format: VideoFormat,
+    },
+    SelectDisplay {
+        display_id: DisplayId,
+    },
+    Input(RemoteInput),
 }
 
 impl SessionMessage {
@@ -41,6 +54,19 @@ impl SessionMessage {
     pub fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
         postcard::from_bytes(bytes)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Display {
+    pub id: DisplayId,
+    pub name: String,
+    /// Desktop-space coordinates. These may be negative when a display is to
+    /// the left of or above the primary display.
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub primary: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +133,35 @@ mod tests {
                 pixel_format: PixelFormat::Nv12,
                 bitrate_bits_per_second: 12_000_000,
             },
+        };
+
+        let encoded = message.encode().unwrap();
+        assert_eq!(SessionMessage::decode(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn display_configuration_round_trip_preserves_negative_coordinates() {
+        let format = VideoFormat {
+            width: 2_560,
+            height: 1_440,
+            frames_per_second: 60,
+            codec: Codec::H264,
+            pixel_format: PixelFormat::Nv12,
+            bitrate_bits_per_second: 12_000_000,
+        };
+        let message = SessionMessage::DisplayConfiguration {
+            displays: vec![Display {
+                id: DisplayId(2),
+                name: "Left display".into(),
+                x: -2_560,
+                y: -180,
+                width: 2_560,
+                height: 1_440,
+                primary: false,
+            }],
+            active_display_id: DisplayId(2),
+            stream_id: VideoStreamId(9),
+            format,
         };
 
         let encoded = message.encode().unwrap();

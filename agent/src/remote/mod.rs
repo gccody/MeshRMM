@@ -1,4 +1,6 @@
 pub mod config;
+#[cfg(windows)]
+mod input;
 mod platform;
 mod session;
 mod signaling;

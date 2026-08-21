@@ -14,7 +14,7 @@ pub struct Config {
 #[derive(Debug, Parser)]
 #[command(
     name = "pulsermm-remote",
-    about = "PulseRMM low-latency view-only client"
+    about = "PulseRMM low-latency remote-control client"
 )]
 struct Arguments {
     /// Single-use PulseRMM dashboard link.
