@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use thiserror::Error;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
 use windows_capture::graphics_capture_api::InternalCaptureControl;
@@ -51,6 +52,67 @@ pub struct ActiveFormat {
     pub height: u32,
     pub frames_per_second: u32,
     pub bitrate_bits_per_second: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayInfo {
+    pub id: u32,
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub primary: bool,
+}
+
+pub fn enumerate_displays() -> Result<Vec<DisplayInfo>, Error> {
+    Monitor::enumerate()
+        .map_err(capture_error)?
+        .into_iter()
+        .map(display_info)
+        .collect()
+}
+
+fn display_info(monitor: Monitor) -> Result<DisplayInfo, Error> {
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe {
+        GetMonitorInfoW(
+            windows::Win32::Graphics::Gdi::HMONITOR(monitor.as_raw_hmonitor()),
+            &mut info,
+        )
+    }
+    .as_bool()
+    {
+        return Err(Error::CaptureInitialization(
+            windows::core::Error::from_thread().to_string(),
+        ));
+    }
+    let width = u32::try_from(info.rcMonitor.right.saturating_sub(info.rcMonitor.left))
+        .map_err(|_| Error::InvalidDisplayDimensions)?;
+    let height = u32::try_from(info.rcMonitor.bottom.saturating_sub(info.rcMonitor.top))
+        .map_err(|_| Error::InvalidDisplayDimensions)?;
+    let id = u32::try_from(monitor.index().map_err(capture_error)?)
+        .map_err(|_| Error::InvalidDisplayDimensions)?;
+    let name = monitor
+        .name()
+        .or_else(|_| monitor.device_name())
+        .unwrap_or_else(|_| format!("Display {id}"));
+    Ok(DisplayInfo {
+        id,
+        name,
+        x: info.rcMonitor.left,
+        y: info.rcMonitor.top,
+        width,
+        height,
+        primary: info.dwFlags & 1 != 0,
+    })
+}
+
+fn capture_error(error: impl std::fmt::Display) -> Error {
+    Error::CaptureInitialization(error.to_string())
 }
 
 #[derive(Debug)]
@@ -263,13 +325,19 @@ impl WindowsScreenStreamer {
     pub fn start(
         &mut self,
         config: StreamConfig,
+        display_id: u32,
         sink: EncodedFrameSink,
     ) -> Result<ActiveFormat, Error> {
         if self.control.is_some() {
             return Err(Error::AlreadyRunning);
         }
-        let monitor =
-            Monitor::primary().map_err(|error| Error::CaptureInitialization(error.to_string()))?;
+        let monitor = Monitor::enumerate()
+            .map_err(capture_error)?
+            .into_iter()
+            .find(|monitor| monitor.index().is_ok_and(|id| id == display_id as usize))
+            .ok_or_else(|| {
+                Error::CaptureInitialization(format!("display {display_id} is unavailable"))
+            })?;
         // NV12 requires even dimensions. Cropping a possible final odd row/column
         // keeps all normal frame traffic on the GPU.
         let width = monitor

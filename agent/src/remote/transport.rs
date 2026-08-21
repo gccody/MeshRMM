@@ -4,8 +4,8 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use pulsermm_protocol::{
-    DEFAULT_FRAGMENT_PAYLOAD, IceServer, RemoteSessionId, SessionMessage, SessionState,
-    SignalMessage, VideoStreamId, fragment_frame,
+    DEFAULT_FRAGMENT_PAYLOAD, Display, DisplayId, IceServer, RemoteInput, RemoteSessionId,
+    SessionMessage, SessionState, SignalMessage, VideoStreamId, fragment_frame,
 };
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -19,6 +19,7 @@ use webrtc::peer_connection::{
 };
 use webrtc::stats::StatsReportType;
 
+use super::input::WindowsInputController;
 use super::platform::{ScreenStreamer, monotonic_timestamp_us};
 use super::signaling::authenticated_websocket;
 use super::video::LatestFrameSlot;
@@ -26,6 +27,8 @@ use super::video::LatestFrameSlot;
 enum ControlCommand {
     Keyframe,
     Bitrate(u32),
+    SelectDisplay(DisplayId),
+    Input(RemoteInput),
     Stop,
 }
 
@@ -68,10 +71,10 @@ pub async fn run_sender(
     }
     let control_channel = peer
         .create_data_channel(
-            "pulsermm-control-v1",
+            "pulsermm-control-v2",
             Some(RTCDataChannelInit {
                 ordered: Some(true),
-                protocol: Some("pulsermm.control.v1".into()),
+                protocol: Some("pulsermm.control.v2".into()),
                 ..Default::default()
             }),
         )
@@ -96,6 +99,10 @@ pub async fn run_sender(
                     Ok(SessionMessage::SetBitrate { bits_per_second }) => {
                         Some(ControlCommand::Bitrate(bits_per_second))
                     }
+                    Ok(SessionMessage::SelectDisplay { display_id }) => {
+                        Some(ControlCommand::SelectDisplay(display_id))
+                    }
+                    Ok(SessionMessage::Input(input)) => Some(ControlCommand::Input(input)),
                     Ok(SessionMessage::Stop { .. }) => Some(ControlCommand::Stop),
                     Ok(_) => None,
                     Err(error) => {
@@ -111,12 +118,22 @@ pub async fn run_sender(
     }
 
     let slot = Arc::new(LatestFrameSlot::default());
+    let displays = lock_streamer(&streamer)?.displays()?;
+    let mut active_display = displays
+        .iter()
+        .find(|display| display.primary)
+        .or_else(|| displays.first())
+        .cloned()
+        .context("Windows reported no active displays")?;
+    let mut stream_id = VideoStreamId(1);
     let format = {
         let mut streamer = streamer
             .lock()
             .map_err(|_| anyhow::anyhow!("screen streamer lock is poisoned"))?;
-        streamer.start(Arc::clone(&slot))?
+        streamer.start(active_display.id, stream_id, Arc::clone(&slot))?
     };
+    let mut input = WindowsInputController::new();
+    input.set_active_display(active_display.clone())?;
     let video_sender = spawn_video_sender(
         Arc::clone(&video_channel),
         Arc::clone(&video_open),
@@ -128,6 +145,9 @@ pub async fn run_sender(
         Arc::clone(&control_channel),
         Arc::clone(&control_open),
         session_id.clone(),
+        displays.clone(),
+        active_display.id,
+        stream_id,
         format,
     );
 
@@ -189,6 +209,40 @@ pub async fn run_sender(
                 match command {
                     ControlCommand::Keyframe => lock_streamer(&streamer)?.request_keyframe()?,
                     ControlCommand::Bitrate(value) => lock_streamer(&streamer)?.set_bitrate(value)?,
+                    ControlCommand::Input(event) => {
+                        if let Err(error) = input.apply(event) {
+                            tracing::warn!(error = %error, "discarding invalid remote input");
+                        }
+                    }
+                    ControlCommand::SelectDisplay(display_id) => {
+                        if display_id == active_display.id {
+                            continue;
+                        }
+                        let Some(selected) = displays.iter().find(|display| display.id == display_id).cloned() else {
+                            tracing::warn!(display_id = display_id.0, "viewer requested an unavailable display");
+                            continue;
+                        };
+                        lock_streamer(&streamer)?.stop()?;
+                        slot.clear().await;
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                        let format = lock_streamer(&streamer)?.start(
+                            selected.id,
+                            stream_id,
+                            Arc::clone(&slot),
+                        )?;
+                        input.set_active_display(selected.clone())?;
+                        active_display = selected;
+                        send_control_message(
+                            &control_channel,
+                            SessionMessage::DisplayConfiguration {
+                                displays: displays.clone(),
+                                active_display_id: active_display.id,
+                                stream_id,
+                                format,
+                            },
+                        ).await?;
+                        tracing::info!(display_id = active_display.id.0, display_name = %active_display.name, stream_id = stream_id.0, "remote display switched");
+                    }
                     ControlCommand::Stop => break Ok(()),
                 }
             }
@@ -221,6 +275,9 @@ pub async fn run_sender(
     .await;
 
     video_sender.abort();
+    if let Err(error) = input.release_all() {
+        tracing::warn!(error = %error, "failed to release remote input during cleanup");
+    }
     if matches!(
         session_state,
         SessionState::Requested
@@ -344,23 +401,37 @@ fn spawn_control_start(
     channel: Arc<RTCDataChannel>,
     open: Arc<Notify>,
     session_id: RemoteSessionId,
+    displays: Vec<Display>,
+    active_display_id: DisplayId,
+    stream_id: VideoStreamId,
     format: pulsermm_protocol::VideoFormat,
 ) {
     tokio::spawn(async move {
         open.notified().await;
-        let message = SessionMessage::Accepted {
-            stream_id: VideoStreamId(1),
+        let message = SessionMessage::DisplayConfiguration {
+            displays,
+            active_display_id,
+            stream_id,
             format,
         };
-        match message.encode() {
-            Ok(bytes) => {
-                if let Err(error) = channel.send(&Bytes::from(bytes)).await {
-                    tracing::warn!(error = %error, %session_id, "failed to send stream configuration");
-                }
-            }
-            Err(error) => tracing::warn!(error = %error, "failed to encode stream configuration"),
+        if let Err(error) = send_control_message(&channel, message).await {
+            tracing::warn!(error = %error, %session_id, "failed to send stream configuration");
         }
     });
+}
+
+async fn send_control_message(
+    channel: &RTCDataChannel,
+    message: SessionMessage,
+) -> anyhow::Result<()> {
+    let bytes = message
+        .encode()
+        .context("failed to encode remote control message")?;
+    channel
+        .send(&Bytes::from(bytes))
+        .await
+        .context("failed to send remote control message")?;
+    Ok(())
 }
 
 fn spawn_video_sender(

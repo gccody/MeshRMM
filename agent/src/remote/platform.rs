@@ -2,12 +2,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
-use pulsermm_protocol::{Codec, EncodedFrame, PixelFormat, VideoFormat, VideoStreamId};
+use pulsermm_protocol::{
+    Codec, Display, DisplayId, EncodedFrame, PixelFormat, VideoFormat, VideoStreamId,
+};
 
 use super::video::LatestFrameSlot;
 
 pub trait ScreenStreamer: Send {
-    fn start(&mut self, slot: Arc<LatestFrameSlot>) -> anyhow::Result<VideoFormat>;
+    fn displays(&self) -> anyhow::Result<Vec<Display>>;
+    fn start(
+        &mut self,
+        display_id: DisplayId,
+        stream_id: VideoStreamId,
+        slot: Arc<LatestFrameSlot>,
+    ) -> anyhow::Result<VideoFormat>;
     fn stop(&mut self) -> anyhow::Result<()>;
     fn poll_ended(&mut self) -> Option<anyhow::Result<()>>;
     fn request_keyframe(&self) -> anyhow::Result<()>;
@@ -19,6 +27,7 @@ pub struct PlatformScreenStreamer {
     inner: pulsermm_remote_screen::WindowsScreenStreamer,
     frames_per_second: u32,
     bitrate_bits_per_second: u32,
+    next_frame_id: Arc<AtomicU64>,
 }
 
 #[cfg(windows)]
@@ -28,14 +37,38 @@ impl PlatformScreenStreamer {
             inner: pulsermm_remote_screen::WindowsScreenStreamer::new(),
             frames_per_second,
             bitrate_bits_per_second,
+            next_frame_id: Arc::new(AtomicU64::new(1)),
         }
     }
 }
 
 #[cfg(windows)]
 impl ScreenStreamer for PlatformScreenStreamer {
-    fn start(&mut self, slot: Arc<LatestFrameSlot>) -> anyhow::Result<VideoFormat> {
-        let next_frame_id = Arc::new(AtomicU64::new(1));
+    fn displays(&self) -> anyhow::Result<Vec<Display>> {
+        pulsermm_remote_screen::enumerate_displays()
+            .context("failed to enumerate Windows displays")?
+            .into_iter()
+            .map(|display| {
+                Ok(Display {
+                    id: DisplayId(display.id),
+                    name: display.name,
+                    x: display.x,
+                    y: display.y,
+                    width: display.width,
+                    height: display.height,
+                    primary: display.primary,
+                })
+            })
+            .collect()
+    }
+
+    fn start(
+        &mut self,
+        display_id: DisplayId,
+        stream_id: VideoStreamId,
+        slot: Arc<LatestFrameSlot>,
+    ) -> anyhow::Result<VideoFormat> {
+        let next_frame_id = Arc::clone(&self.next_frame_id);
         let runtime = tokio::runtime::Handle::current();
         let sink = Arc::new(
             move |access_unit: pulsermm_remote_screen::EncodedAccessUnit| {
@@ -44,7 +77,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
                 let mut data = access_unit.codec_config.unwrap_or_default();
                 data.extend_from_slice(&access_unit.data);
                 let frame = EncodedFrame {
-                    stream_id: VideoStreamId(1),
+                    stream_id,
                     frame_id,
                     capture_timestamp_us: access_unit.capture_timestamp_us,
                     encode_complete_timestamp_us: access_unit.encode_complete_timestamp_us,
@@ -62,6 +95,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
                     frames_per_second: self.frames_per_second,
                     bitrate_bits_per_second: self.bitrate_bits_per_second,
                 },
+                display_id.0,
                 sink,
             )
             .context("Windows GPU capture/encode startup failed")?;

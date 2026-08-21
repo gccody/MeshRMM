@@ -5,7 +5,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use pulsermm_protocol::{
     FrameReassembler, IceServer, ReassemblyConfig, ReassemblyOutcome, SessionBootstrap,
-    SessionMessage, SessionState, SignalMessage, VideoPacket,
+    SessionMessage, SessionState, SignalMessage, VideoPacket, VideoStreamId,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -19,8 +19,13 @@ use webrtc::peer_connection::{
 use webrtc::stats::StatsReportType;
 
 use crate::config::Config;
-use crate::platform::{Presenter, monotonic_timestamp_us};
+use crate::platform::{ControlSink, Presenter, monotonic_timestamp_us};
 use crate::signaling::{authenticated_websocket, session_signal_url};
+
+struct ActivePresenter {
+    stream_id: VideoStreamId,
+    presenter: Presenter,
+}
 
 pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyhow::Result<()> {
     let url = session_signal_url(&config.server, bootstrap.session_id.as_str())?;
@@ -29,8 +34,15 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<SignalMessage>();
     let (state_tx, mut state_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
     let peer = create_peer(&bootstrap.ice_servers, outgoing_tx.clone(), state_tx).await?;
-    let presenter = Arc::new(Mutex::new(None::<Presenter>));
-    install_data_channel_handler(&peer, Arc::clone(&presenter));
+    let presenter = Arc::new(Mutex::new(None::<ActivePresenter>));
+    let control_channel = Arc::new(Mutex::new(None::<Arc<RTCDataChannel>>));
+    let (viewer_control_tx, mut viewer_control_rx) = mpsc::unbounded_channel::<SessionMessage>();
+    install_data_channel_handler(
+        &peer,
+        Arc::clone(&presenter),
+        Arc::clone(&control_channel),
+        viewer_control_tx,
+    );
 
     let mut session_state = SessionState::Requested.transition(SessionState::Signaling)?;
     outgoing_tx.send(SignalMessage::Ready)?;
@@ -44,6 +56,16 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
             tokio::select! {
             Some(signal) = outgoing_rx.recv() => {
                 signal_writer.send(Message::Text(serde_json::to_string(&signal)?.into())).await?;
+            }
+            Some(message) = viewer_control_rx.recv() => {
+                let channel = control_channel
+                    .lock()
+                    .ok()
+                    .and_then(|channel| channel.clone())
+                    .context("control data channel is unavailable")?;
+                let bytes = message.encode().context("failed to encode viewer control message")?;
+                channel.send(&Bytes::from(bytes)).await
+                    .context("failed to send viewer control message")?;
             }
             incoming = signal_reader.next() => {
                 let Some(incoming) = incoming else {
@@ -99,7 +121,7 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                 let ended = presenter
                     .lock()
                     .ok()
-                    .and_then(|guard| guard.as_ref().and_then(Presenter::poll_ended));
+                    .and_then(|guard| guard.as_ref().and_then(|active| active.presenter.poll_ended()));
                 if let Some(ended) = ended {
                     break ended.map_err(anyhow::Error::msg);
                 }
@@ -120,9 +142,9 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
         session_state = session_state.transition(SessionState::Closing)?;
     }
     if let Ok(mut guard) = presenter.lock()
-        && let Some(mut presenter) = guard.take()
+        && let Some(mut active) = guard.take()
     {
-        presenter.stop();
+        active.presenter.stop();
     }
     let mut result = result;
     if let Err(error) = peer.close().await {
@@ -219,13 +241,22 @@ async fn create_peer(
 
 fn install_data_channel_handler(
     peer: &Arc<RTCPeerConnection>,
-    presenter: Arc<Mutex<Option<Presenter>>>,
+    presenter: Arc<Mutex<Option<ActivePresenter>>>,
+    control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    viewer_control: mpsc::UnboundedSender<SessionMessage>,
 ) {
     peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
         let presenter = Arc::clone(&presenter);
+        let control_channel = Arc::clone(&control_channel);
+        let viewer_control = viewer_control.clone();
         Box::pin(async move {
             match channel.label() {
-                "pulsermm-control-v1" => install_control_handler(channel, presenter),
+                "pulsermm-control-v2" => {
+                    if let Ok(mut active) = control_channel.lock() {
+                        *active = Some(Arc::clone(&channel));
+                    }
+                    install_control_handler(channel, presenter, viewer_control)
+                }
                 "pulsermm-video-v1" => install_video_handler(channel, presenter),
                 label => tracing::warn!(label, "ignoring unknown WebRTC data channel"),
             }
@@ -233,28 +264,49 @@ fn install_data_channel_handler(
     }));
 }
 
-fn install_control_handler(channel: Arc<RTCDataChannel>, presenter: Arc<Mutex<Option<Presenter>>>) {
-    let request_channel = Arc::clone(&channel);
+fn install_control_handler(
+    channel: Arc<RTCDataChannel>,
+    presenter: Arc<Mutex<Option<ActivePresenter>>>,
+    viewer_control: mpsc::UnboundedSender<SessionMessage>,
+) {
     channel.on_message(Box::new(move |message| {
         let presenter = Arc::clone(&presenter);
-        let request_channel = Arc::clone(&request_channel);
+        let viewer_control = viewer_control.clone();
         Box::pin(async move {
             match SessionMessage::decode(&message.data) {
-                Ok(SessionMessage::Accepted { stream_id, format }) => {
-                    match Presenter::start(format) {
+                Ok(SessionMessage::DisplayConfiguration {
+                    displays,
+                    active_display_id,
+                    stream_id,
+                    format,
+                }) => {
+                    let Some(active_display) = displays
+                        .iter()
+                        .find(|display| display.id == active_display_id)
+                        .cloned()
+                    else {
+                        tracing::error!(display_id = active_display_id.0, "Agent selected an unknown display");
+                        return;
+                    };
+                    let sink_tx = viewer_control.clone();
+                    let sink: ControlSink = Arc::new(move |message| {
+                        let _ = sink_tx.send(message);
+                    });
+                    match Presenter::start(format, active_display.clone(), displays, sink) {
                         Ok(new_presenter) => {
                             let mut old = presenter
                                 .lock()
                                 .ok()
-                                .and_then(|mut guard| guard.replace(new_presenter));
+                                .and_then(|mut guard| guard.replace(ActivePresenter {
+                                    stream_id,
+                                    presenter: new_presenter,
+                                }));
                             if let Some(old) = old.as_mut() {
-                                old.stop();
+                                old.presenter.stop();
                             }
                             let request = SessionMessage::RequestKeyframe { stream_id };
-                            if let Ok(bytes) = request.encode() {
-                                let _ = request_channel.send(&Bytes::from(bytes)).await;
-                            }
-                            tracing::info!(width = format.width, height = format.height, fps = format.frames_per_second, codec = ?format.codec, "video stream configured");
+                            let _ = viewer_control.send(request);
+                            tracing::info!(display_id = active_display_id.0, display_name = %active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, codec = ?format.codec, "remote control stream configured");
                         }
                         Err(error) => tracing::error!(error = %error, "hardware decoder/presenter initialization failed"),
                     }
@@ -267,7 +319,10 @@ fn install_control_handler(channel: Arc<RTCDataChannel>, presenter: Arc<Mutex<Op
     }));
 }
 
-fn install_video_handler(channel: Arc<RTCDataChannel>, presenter: Arc<Mutex<Option<Presenter>>>) {
+fn install_video_handler(
+    channel: Arc<RTCDataChannel>,
+    presenter: Arc<Mutex<Option<ActivePresenter>>>,
+) {
     let reassembler = Arc::new(tokio::sync::Mutex::new(FrameReassembler::new(
         ReassemblyConfig::default(),
     )));
@@ -292,9 +347,10 @@ fn install_video_handler(channel: Arc<RTCDataChannel>, presenter: Arc<Mutex<Opti
                     .encode_complete_timestamp_us
                     .saturating_sub(frame.capture_timestamp_us);
                 if let Ok(guard) = presenter.lock()
-                    && let Some(presenter) = guard.as_ref()
+                    && let Some(active) = guard.as_ref()
+                    && active.stream_id == frame.stream_id
                 {
-                    presenter.publish(frame, received_at_us);
+                    active.presenter.publish(frame, received_at_us);
                 }
                 tracing::trace!(encode_us, received_at_us, "encoded frame reassembled");
                 if stats.completed_frames.is_multiple_of(120) {
