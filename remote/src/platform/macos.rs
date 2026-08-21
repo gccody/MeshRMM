@@ -55,14 +55,34 @@ define_class!(
 
     unsafe impl NSApplicationDelegate for AppDelegate {
         #[unsafe(method(application:openURLs:))]
-        fn application_open_urls(&self, _application: &NSApplication, urls: &NSArray<NSURL>) {
+        fn application_open_urls(&self, application: &NSApplication, urls: &NSArray<NSURL>) {
             let Some(url) = urls.firstObject() else {
                 return;
             };
             let Some(value) = url.absoluteString() else {
                 return;
             };
-            let _ = self.ivars().deep_link_tx.send(value.to_string());
+            let value = value.to_string();
+            if let Err(error) = self.ivars().deep_link_tx.send(value) {
+                // The launch receiver is intentionally consumed by the first
+                // session. A later dashboard handoff means the user is
+                // replacing a stale/broken session, so start a fresh process
+                // with that single-use URL before terminating this one.
+                let replacement = std::env::current_exe()
+                    .context("could not locate the macOS viewer executable")
+                    .and_then(|executable| {
+                        std::process::Command::new(executable)
+                            .arg(error.0)
+                            .spawn()
+                            .context("could not launch the replacement macOS viewer")
+                    });
+                match replacement {
+                    Ok(_) => application.terminate(None),
+                    Err(error) => {
+                        tracing::error!(error = %error, "failed to restart the macOS viewer")
+                    }
+                }
+            }
         }
     }
 );
@@ -96,6 +116,15 @@ define_class!(
     unsafe impl NSObjectProtocol for RemoteView {}
 
     unsafe impl NSWindowDelegate for RemoteView {
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn window_did_become_key(&self, _notification: &NSNotification) {
+            if let Some(window) = self.window()
+                && !window.makeFirstResponder(Some(self))
+            {
+                tracing::warn!("macOS viewer could not restore remote-input focus");
+            }
+        }
+
         #[unsafe(method(windowDidResignKey:))]
         fn window_did_resign_key(&self, _notification: &NSNotification) {
             self.release_input();
@@ -806,12 +835,14 @@ impl MacUi {
         view.setWantsLayer(true);
         view.setLayer(Some(&layer));
         window.setAcceptsMouseMovedEvents(true);
-        window.makeFirstResponder(Some(&view));
         window.center();
         close_connecting_window();
         activate_application(mtm);
         window.makeKeyAndOrderFront(None);
         window.orderFrontRegardless();
+        if !window.makeFirstResponder(Some(&view)) {
+            tracing::warn!("macOS viewer could not acquire remote-input focus");
+        }
 
         Ok(Self {
             id,

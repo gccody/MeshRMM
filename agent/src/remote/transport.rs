@@ -29,6 +29,7 @@ enum ControlCommand {
     Bitrate(u32),
     SelectDisplay(DisplayId),
     Input(RemoteInput),
+    ChannelClosed,
     Stop,
 }
 
@@ -83,9 +84,16 @@ pub async fn run_sender(
     {
         let notify = Arc::clone(&control_open);
         let decoder_ready = Arc::clone(&decoder_ready);
+        let closed_tx = control_tx.clone();
         control_channel.on_open(Box::new(move || {
             let notify = Arc::clone(&notify);
             Box::pin(async move { notify.notify_one() })
+        }));
+        control_channel.on_close(Box::new(move || {
+            let closed_tx = closed_tx.clone();
+            Box::pin(async move {
+                let _ = closed_tx.send(ControlCommand::ChannelClosed);
+            })
         }));
         control_channel.on_message(Box::new(move |message| {
             let tx = control_tx.clone();
@@ -244,6 +252,11 @@ pub async fn run_sender(
                         tracing::info!(display_id = active_display.id.0, display_name = %active_display.name, stream_id = stream_id.0, "remote display switched");
                     }
                     ControlCommand::Stop => break Ok(()),
+                    ControlCommand::ChannelClosed => {
+                        break Err(anyhow::anyhow!(
+                            "remote input/control channel closed unexpectedly"
+                        ));
+                    }
                 }
             }
             Some(state) = state_rx.recv() => {
