@@ -14,11 +14,11 @@ if [ ! -f "$CONFIG_PATH" ]; then
     exit 1
 fi
 
-cargo build --release --manifest-path "$ROOT_DIR/remote/Cargo.toml"
+cargo build --locked --release --manifest-path "$ROOT_DIR/remote/Cargo.toml"
 
 rm -rf -- "$APP_DIR"
 mkdir -p -- "$MACOS_DIR"
-cp -- "$ROOT_DIR/remote/target/release/pulsermm-remote" "$MACOS_DIR/pulsermm-remote"
+cp -- "$ROOT_DIR/target/release/pulsermm-remote" "$MACOS_DIR/pulsermm-remote"
 cp -- "$CONFIG_PATH" "$MACOS_DIR/remote.json"
 
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'

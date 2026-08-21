@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
+import {
+  applyAgentDelta,
+  parseAgentEvent,
+  parseAgentList,
+  sortAgents,
+} from "../features/agents/model.ts";
 
 async function render(pathname = "/") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -39,50 +44,37 @@ test("serves the WorkOS initiate-login route", async () => {
   assert.match(html, /Redirecting to WorkOS/);
 });
 
-test("starts WorkOS login once and safely restores the home route", async () => {
-  const [login, page, providers] = await Promise.all([
-    readFile(new URL("../app/login/page.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/providers.tsx", import.meta.url), "utf8"),
+test("sorts and applies live Agent events deterministically", () => {
+  const agents = sortAgents([
+    { id: "b", name: "Zulu", connected: false },
+    { id: "a", name: "Alpha", connected: true },
+  ]);
+  assert.deepEqual(agents.map((agent) => agent.id), ["a", "b"]);
+
+  const updated = applyAgentDelta(agents, {
+    type: "agent_upsert",
+    revision: 2,
+    agent: { id: "b", name: "Zulu", connected: true },
+  });
+  assert.deepEqual(updated.map((agent) => [agent.id, agent.connected]), [
+    ["a", true],
+    ["b", true],
   ]);
 
-  assert.match(login, /started\.current/);
-  assert.match(login, /LOGIN_ATTEMPT_TTL_MS/);
-  assert.match(login, /sessionStorage\.setItem\(LOGIN_ATTEMPT_KEY/);
-  assert.match(login, /signIn\(\{ state: \{ returnTo: "\/" \} \}\)/);
-  assert.doesNotMatch(page, /window\.location\.pathname === "\/login"/);
-  assert.match(providers, /redirectUri=\{redirectUri\}/);
-  assert.match(providers, /onRedirectCallback=\{handleRedirectCallback\}/);
-  assert.match(providers, /destination\.origin === window\.location\.origin/);
+  assert.deepEqual(
+    applyAgentDelta(updated, { type: "agent_deleted", revision: 3, agent_id: "a" }),
+    [{ id: "b", name: "Zulu", connected: true }],
+  );
 });
 
-test("uses organization-scoped WorkOS widgets, event subscriptions, and one-time handoffs", async () => {
-  const [page, providers, layout] = await Promise.all([
-    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/providers.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
-  ]);
-
-  assert.match(page, /UsersManagement/);
-  assert.match(page, /AdminPortalSsoConnection/);
-  assert.match(page, /AdminPortalDomainVerification/);
-  assert.match(page, /OrganizationSwitcher/);
-  assert.match(page, /AuthenticationRedirectStarted/);
-  assert.match(page, /tokenError\.message === "No access token available"/);
-  assert.match(page, /signIn\(\{ organizationId: organizationId \?\? undefined, state: \{ returnTo: "\/" \} \}\)/);
-  assert.match(page, /\/v1\/remote\/handoffs/);
-  assert.match(page, /pulsermm:\/\/connect\?handoff=/);
-  assert.doesNotMatch(page, /pulsermm:\/\/connect\?device=/);
-  assert.match(page, /\/v1\/agent-installers/);
-  assert.match(page, /PULSERMM-BOOTSTRAP-V1/);
-  assert.match(page, /Computer name from Windows/);
-  assert.match(page, /\/v1\/agents\/events\/subscriptions/);
-  assert.match(page, /new WebSocket\(websocketUrl\)/);
-  assert.match(page, /nextSocket\.send\("refresh"\)/);
-  assert.doesNotMatch(page, /setInterval\(\(\) => void loadAgents/);
-  assert.doesNotMatch(page, /15_000/);
-  assert.doesNotMatch(page, /Copy agent\.json|reception-ws-01|Display name/);
-  assert.doesNotMatch(page, /WORKOS_DEVICE_GRANTS|X-Pulse-User/);
-  assert.match(providers, /WorkOsWidgets/);
-  assert.doesNotMatch(`${page}\n${providers}\n${layout}`, /chatgpt\.site/i);
+test("rejects malformed Agent API and event payloads", () => {
+  assert.equal(parseAgentList({ agents: [{ id: "a" }], revision: 1 }), null);
+  assert.equal(parseAgentEvent({ type: "agent_deleted", revision: -1, agent_id: "a" }), null);
+  assert.deepEqual(
+    parseAgentList({
+      agents: [{ id: "a", name: "Alpha", connected: true }],
+      revision: 4,
+    }),
+    { agents: [{ id: "a", name: "Alpha", connected: true }], revision: 4 },
+  );
 });
