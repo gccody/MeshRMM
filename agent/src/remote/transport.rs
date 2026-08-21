@@ -4,8 +4,9 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use pulsermm_protocol::{
-    DEFAULT_FRAGMENT_PAYLOAD, Display, DisplayId, IceServer, RemoteInput, RemoteSessionId,
-    SessionMessage, SessionState, SignalMessage, VideoStreamId, fragment_frame,
+    CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, DEFAULT_FRAGMENT_PAYLOAD, Display, DisplayId,
+    IceServer, RemoteInput, RemoteSessionId, SessionMessage, SessionState, SignalMessage,
+    VideoStreamId, fragment_frame,
 };
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -72,10 +73,10 @@ pub async fn run_sender(
     }
     let control_channel = peer
         .create_data_channel(
-            "pulsermm-control-v2",
+            CONTROL_CHANNEL_LABEL,
             Some(RTCDataChannelInit {
                 ordered: Some(true),
-                protocol: Some("pulsermm.control.v2".into()),
+                protocol: Some(CONTROL_CHANNEL_PROTOCOL.into()),
                 ..Default::default()
             }),
         )

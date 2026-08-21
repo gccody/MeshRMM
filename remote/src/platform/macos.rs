@@ -194,15 +194,17 @@ define_class!(
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
-            self.send_pointer(event);
+            let (x, y) = self.pointer_position(event);
             let horizontal = (event.scrollingDeltaX() * 120.0)
                 .round()
                 .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
             let vertical = (event.scrollingDeltaY() * 120.0)
                 .round()
                 .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
-            self.send(SessionMessage::Input(RemoteInput::Wheel {
+            self.send(SessionMessage::Input(RemoteInput::WheelAt {
                 display_id: self.ivars().active_display.id,
+                x,
+                y,
                 horizontal,
                 vertical,
             }));
@@ -273,13 +275,7 @@ impl RemoteView {
     }
 
     fn send_pointer(&self, event: &NSEvent) {
-        let point = self.convertPoint_fromView(event.locationInWindow(), None);
-        let (x, y) = normalized_video_position(
-            point,
-            self.bounds(),
-            self.ivars().video_width,
-            self.ivars().video_height,
-        );
+        let (x, y) = self.pointer_position(event);
         self.send(SessionMessage::Input(RemoteInput::PointerMove {
             display_id: self.ivars().active_display.id,
             x,
@@ -287,10 +283,22 @@ impl RemoteView {
         }));
     }
 
+    fn pointer_position(&self, event: &NSEvent) -> (u16, u16) {
+        let point = self.convertPoint_fromView(event.locationInWindow(), None);
+        normalized_video_position(
+            point,
+            self.bounds(),
+            self.ivars().video_width,
+            self.ivars().video_height,
+        )
+    }
+
     fn send_button(&self, event: &NSEvent, button: PointerButton, pressed: bool) {
-        self.send_pointer(event);
-        self.send(SessionMessage::Input(RemoteInput::PointerButton {
+        let (x, y) = self.pointer_position(event);
+        self.send(SessionMessage::Input(RemoteInput::PointerButtonAt {
             display_id: self.ivars().active_display.id,
+            x,
+            y,
             button,
             pressed,
         }));

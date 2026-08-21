@@ -152,6 +152,11 @@ press **F8** in the viewer to cycle displays. On macOS, use
 viewer title. Unfocusing the viewer, switching displays, or ending a session
 releases held buttons and keys.
 
+Endpoint and remote input are collaborative: neither side locks out the other.
+The newest local or remote action takes effect. Remote clicks and wheel actions
+include their intended pointer position and are injected atomically so physical
+endpoint activity cannot split a remote action across two cursor positions.
+
 Closing the viewer or pressing Ctrl+C tears down its peer connection. Capture,
 encoder, decoder, and presentation failures terminate only the remote session;
 the Agent returns to its signaling loop and remains available.
