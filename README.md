@@ -29,8 +29,8 @@ Cloudflare is not in that data path. An Agent coordinator Durable Object keeps
 the authenticated Agent reachable, and a temporary remote-session Durable
 Object forwards bounded JSON SDP/ICE messages between exactly one Agent and one
 client. The P2P connection itself is encrypted by WebRTC DTLS. Cloudflare TURN
-credentials are created server-side with the same short lifetime as the remote
-session and are used by ICE only when a direct candidate pair cannot connect.
+credentials are created server-side with the configured idle-timeout lifetime
+and are used by ICE only when a direct candidate pair cannot connect.
 
 ## Prerequisites
 
@@ -88,9 +88,11 @@ dashboard and are stored in D1 only as SHA-256 hashes.
 
 Keep `dist/agent/agent.json` only with the target Agent. It contains the
 one-time Agent credential. `dist/remote/remote.json` contains no viewer
-credential. Browser handoffs expire after 60 seconds; session signaling tokens
-and TURN credentials expire after `REMOTE_SESSION_TTL_SECONDS` (900 seconds by
-default).
+credential. Browser handoffs expire after 60 seconds. Remote sessions use the
+sliding `REMOTE_SESSION_IDLE_TIMEOUT_SECONDS` idle timeout (900 seconds by
+default): a connected viewer renews the deadline every 30 seconds, and the
+session expires after the viewer stops reporting activity for the configured
+interval. TURN credentials use the same configured lifetime when issued.
 
 For local Worker development, bind a local D1 database, put the two TURN values
 in an ignored `server/.dev.vars` file, and use `npx wrangler dev`. Cloudflare

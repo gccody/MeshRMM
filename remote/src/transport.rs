@@ -22,6 +22,8 @@ use crate::config::Config;
 use crate::platform::{ControlSink, Presenter, monotonic_timestamp_us};
 use crate::signaling::{authenticated_websocket, session_signal_url};
 
+const SESSION_ACTIVITY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 struct ActivePresenter {
     stream_id: VideoStreamId,
     presenter: Presenter,
@@ -117,6 +119,9 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
     let mut pointer_interval = tokio::time::interval(std::time::Duration::from_millis(8));
     pointer_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     pointer_interval.tick().await;
+    let mut activity_interval = tokio::time::interval(SESSION_ACTIVITY_INTERVAL);
+    activity_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    activity_interval.tick().await;
     let mut remote_description_set = false;
     let mut pending_candidates = Vec::new();
     let result: anyhow::Result<()> = async {
@@ -136,6 +141,9 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                     .context("failed to send viewer control message")?;
             }
             _ = pointer_interval.tick() => viewer_control.flush_pointer(),
+            _ = activity_interval.tick(), if session_state == SessionState::Streaming => {
+                outgoing_tx.send(SignalMessage::Activity)?;
+            }
             incoming = signal_reader.next() => {
                 let Some(incoming) = incoming else {
                     break Err(anyhow::anyhow!("signaling connection closed"));
@@ -182,6 +190,7 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                     && session_state == SessionState::Connecting
                 {
                     session_state = session_state.transition(SessionState::Streaming)?;
+                    outgoing_tx.send(SignalMessage::Activity)?;
                 }
                 if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed | RTCPeerConnectionState::Disconnected) {
                     break Err(anyhow::anyhow!("WebRTC connection ended in state {state:?}"));

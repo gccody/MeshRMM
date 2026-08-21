@@ -30,7 +30,7 @@
     }
   ],
   "vars": {
-    "REMOTE_SESSION_TTL_SECONDS": "900",
+    "REMOTE_SESSION_IDLE_TIMEOUT_SECONDS": "900",
     "DASHBOARD_ORIGIN": "https://pulsermm.gccody.dev",
     "PUBLIC_API_URL": "https://pulsermm-server.gccody2010.workers.dev",
     "WORKOS_CLIENT_ID": "client_01M0FT1AN01PAT37N98EMRSNVW",

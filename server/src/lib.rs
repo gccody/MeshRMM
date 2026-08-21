@@ -11,8 +11,8 @@ use worker::{query, *};
 mod agent_coordinator;
 mod remote_session;
 
-const DEFAULT_SESSION_TTL_SECONDS: u64 = 900;
-const MAX_SESSION_TTL_SECONDS: u64 = 3600;
+const DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 900;
+const MAX_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 3600;
 const HANDOFF_TTL_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Serialize)]
@@ -136,6 +136,7 @@ struct SessionInit<'a> {
     client_token: &'a str,
     agent_token: &'a str,
     expires_at_unix_ms: u64,
+    idle_timeout_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -555,14 +556,16 @@ async fn create_session_for_device(environment: &Env, device_id: &str) -> Result
     let session_id = Uuid::new_v4().to_string();
     let client_token = random_token();
     let agent_token = random_token();
-    let ttl_seconds = session_ttl(environment)?;
-    let expires_at_unix_ms = Date::now().as_millis() + ttl_seconds * 1000;
-    let ice_servers = generate_ice_servers(environment, ttl_seconds).await?;
+    let idle_timeout_seconds = session_idle_timeout(environment)?;
+    let idle_timeout_ms = idle_timeout_seconds * 1000;
+    let expires_at_unix_ms = Date::now().as_millis() + idle_timeout_ms;
+    let ice_servers = generate_ice_servers(environment, idle_timeout_seconds).await?;
 
     let init = SessionInit {
         client_token: &client_token,
         agent_token: &agent_token,
         expires_at_unix_ms,
+        idle_timeout_ms,
     };
     let init_request = internal_json_request("https://session.internal/init", &init)?;
     let session_stub = object_stub(environment, "REMOTE_SESSION", &session_id)?;
@@ -782,17 +785,20 @@ fn now_ms_i64() -> Result<i64> {
     i64::try_from(Date::now().as_millis()).map_err(|_| Error::RustError("clock overflow".into()))
 }
 
-fn session_ttl(environment: &Env) -> Result<u64> {
-    let ttl = environment
-        .var("REMOTE_SESSION_TTL_SECONDS")
+fn session_idle_timeout(environment: &Env) -> Result<u64> {
+    let timeout = environment
+        .var("REMOTE_SESSION_IDLE_TIMEOUT_SECONDS")
+        // Preserve deployments that still inject the former variable name
+        // outside wrangler.jsonc while changing its semantics to idle time.
+        .or_else(|_| environment.var("REMOTE_SESSION_TTL_SECONDS"))
         .ok()
         .and_then(|value| value.to_string().parse().ok())
-        .unwrap_or(DEFAULT_SESSION_TTL_SECONDS);
-    if (60..=MAX_SESSION_TTL_SECONDS).contains(&ttl) {
-        Ok(ttl)
+        .unwrap_or(DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS);
+    if (60..=MAX_SESSION_IDLE_TIMEOUT_SECONDS).contains(&timeout) {
+        Ok(timeout)
     } else {
         Err(Error::RustError(
-            "REMOTE_SESSION_TTL_SECONDS must be between 60 and 3600".into(),
+            "REMOTE_SESSION_IDLE_TIMEOUT_SECONDS must be between 60 and 3600".into(),
         ))
     }
 }

@@ -6,12 +6,20 @@ use worker::*;
 const CLIENT_TAG: &str = "client";
 const AGENT_TAG: &str = "agent";
 const MAX_SIGNAL_BYTES: usize = 64 * 1024;
+const DEFAULT_IDLE_TIMEOUT_MS: u64 = 15 * 60 * 1000;
+
+fn default_idle_timeout_ms() -> u64 {
+    DEFAULT_IDLE_TIMEOUT_MS
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionRecord {
     client_token: String,
     agent_token: String,
     expires_at_unix_ms: u64,
+    // Keep existing Durable Object records readable during a rolling deploy.
+    #[serde(default = "default_idle_timeout_ms")]
+    idle_timeout_ms: u64,
 }
 
 #[durable_object]
@@ -40,6 +48,9 @@ impl DurableObject for RemoteSession {
                 if record.expires_at_unix_ms <= Date::now().as_millis() {
                     return Response::error("session already expired", 400);
                 }
+                if record.idle_timeout_ms == 0 {
+                    return Response::error("idle timeout must be positive", 400);
+                }
                 self.state.storage().put("session", &record).await?;
                 let alarm_delay = record.expires_at_unix_ms - Date::now().as_millis();
                 self.state.storage().set_alarm(alarm_delay as i64).await?;
@@ -55,7 +66,19 @@ impl DurableObject for RemoteSession {
     }
 
     async fn alarm(&self) -> Result<Response> {
-        self.expire("session authorization expired").await?;
+        let Some(record) = self.state.storage().get::<SessionRecord>("session").await? else {
+            return Response::ok("already expired");
+        };
+        let now = Date::now().as_millis();
+        if record.expires_at_unix_ms > now {
+            self.state
+                .storage()
+                .set_alarm((record.expires_at_unix_ms - now) as i64)
+                .await?;
+            return Response::ok("idle deadline advanced");
+        }
+
+        self.expire("session idle timeout").await?;
         Response::ok("expired")
     }
 
@@ -78,14 +101,24 @@ impl DurableObject for RemoteSession {
                 return Ok(());
             }
         };
+        let tags = self.state.get_tags(&socket);
+        let is_client = tags.iter().any(|tag| tag == CLIENT_TAG);
+        let is_agent = tags.iter().any(|tag| tag == AGENT_TAG);
+        if matches!(signal, SignalMessage::Activity) {
+            if !is_client {
+                socket.close(Some(1008), Some("only the client may report activity"))?;
+                return Ok(());
+            }
+            self.refresh_idle_deadline().await?;
+            return Ok(());
+        }
         if matches!(signal, SignalMessage::Error { .. }) {
             console_log!("event=peer_reported_signaling_error");
         }
 
-        let tags = self.state.get_tags(&socket);
-        let destination = if tags.iter().any(|tag| tag == CLIENT_TAG) {
+        let destination = if is_client {
             AGENT_TAG
-        } else if tags.iter().any(|tag| tag == AGENT_TAG) {
+        } else if is_agent {
             CLIENT_TAG
         } else {
             socket.close(Some(1008), Some("unrecognized peer"))?;
@@ -121,6 +154,25 @@ impl DurableObject for RemoteSession {
 }
 
 impl RemoteSession {
+    async fn refresh_idle_deadline(&self) -> Result<()> {
+        let Some(mut record) = self.state.storage().get::<SessionRecord>("session").await? else {
+            return Ok(());
+        };
+        let now = Date::now().as_millis();
+        if record.expires_at_unix_ms <= now {
+            self.expire("session idle timeout").await?;
+            return Ok(());
+        }
+
+        record.expires_at_unix_ms = now.saturating_add(record.idle_timeout_ms);
+        self.state.storage().put("session", &record).await?;
+        self.state
+            .storage()
+            .set_alarm(record.idle_timeout_ms as i64)
+            .await?;
+        Ok(())
+    }
+
     async fn accept_peer(&self, request: &Request) -> Result<Response> {
         let record = self
             .state
