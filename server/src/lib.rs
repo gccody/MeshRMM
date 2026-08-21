@@ -195,14 +195,16 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
                     return cors(api_error(401, "Agent authentication failed")?, &environment);
                 }
             };
-            company_presence::set_company_header(&mut request, &company_id)?;
-            request.headers_mut()?.set("X-Pulse-Device-Id", device_id)?;
             forward_to_object(
                 &environment,
                 "AGENT_COORDINATOR",
                 device_id,
                 request,
                 "https://agent.internal/connect",
+                &[
+                    ("X-Pulse-Company-Id", company_id.as_str()),
+                    ("X-Pulse-Device-Id", device_id),
+                ],
             )
             .await
         }
@@ -227,6 +229,7 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
                 session_id,
                 request,
                 &internal_url,
+                &[],
             )
             .await
         }
@@ -341,7 +344,7 @@ async fn create_agent_event_subscription(request: &Request, environment: &Env) -
     })
 }
 
-async fn subscribe_agent_events(mut request: Request, environment: &Env) -> Result<Response> {
+async fn subscribe_agent_events(request: Request, environment: &Env) -> Result<Response> {
     if request
         .headers()
         .get("Upgrade")?
@@ -375,13 +378,13 @@ async fn subscribe_agent_events(mut request: Request, environment: &Env) -> Resu
     let Some(subscription) = subscription else {
         return api_error(401, "Agent event subscription is invalid or expired");
     };
-    company_presence::set_company_header(&mut request, &subscription.company_id)?;
     forward_to_object(
         environment,
         "COMPANY_PRESENCE",
         &subscription.company_id,
         request,
         "https://presence.internal/subscribe",
+        &[("X-Pulse-Company-Id", subscription.company_id.as_str())],
     )
     .await
 }
@@ -1020,10 +1023,14 @@ async fn forward_to_object(
     name: &str,
     request: Request,
     internal_url: &str,
+    internal_headers: &[(&str, &str)],
 ) -> Result<Response> {
+    let headers = request.headers().clone();
+    for (name, value) in internal_headers {
+        headers.set(name, value)?;
+    }
     let mut init = RequestInit::new();
-    init.with_method(request.method())
-        .with_headers(request.headers().clone());
+    init.with_method(request.method()).with_headers(headers);
     let internal = Request::new_with_init(internal_url, &init)?;
     object_stub(environment, binding, name)?
         .fetch_with_request(internal)
