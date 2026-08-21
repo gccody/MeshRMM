@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub config_path: PathBuf,
     pub server: String,
     pub device_id: String,
     pub agent_token: String,
@@ -14,9 +15,28 @@ pub struct Config {
     pub json_logs: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Service,
+    Worker,
+    Console,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "pulsermm-agent", about = "PulseRMM Windows endpoint Agent")]
 struct Arguments {
+    /// Run as the Windows Service Control Manager entry point.
+    #[arg(long, hide = true, conflicts_with_all = ["worker", "console"])]
+    service: bool,
+
+    /// Run the SYSTEM capture worker in the active desktop session.
+    #[arg(long, hide = true, conflicts_with_all = ["service", "console"])]
+    worker: bool,
+
+    /// Run interactively for local development only.
+    #[arg(long, conflicts_with_all = ["service", "worker"])]
+    console: bool,
+
     /// JSON configuration file. Defaults to agent.json beside the executable.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -54,9 +74,21 @@ struct FileConfig {
 }
 
 impl Config {
-    pub fn load() -> anyhow::Result<Self> {
+    pub fn load() -> anyhow::Result<(ExecutionMode, Self)> {
         let arguments = Arguments::parse();
-        let file = load_file(arguments.config.as_deref(), "agent.json")?;
+        let mode = if arguments.service {
+            ExecutionMode::Service
+        } else if arguments.worker {
+            ExecutionMode::Worker
+        } else if arguments.console {
+            ExecutionMode::Console
+        } else {
+            anyhow::bail!(
+                "this Agent must be installed as a Windows service from the PulseRMM dashboard; use --console only for local development"
+            );
+        };
+        let config_path = resolve_path(arguments.config.as_deref(), "agent.json")?;
+        let file = load_file(&config_path, arguments.config.is_some())?;
         let server = arguments
             .server
             .or(file.server)
@@ -80,30 +112,37 @@ impl Config {
         if frames_per_second == 0 || bitrate_bits_per_second == 0 {
             anyhow::bail!("frame rate and bitrate must be greater than zero");
         }
-        Ok(Self {
-            server,
-            device_id,
-            agent_token,
-            frames_per_second,
-            bitrate_bits_per_second,
-            json_logs: arguments.json_logs || file.json_logs.unwrap_or(false),
-        })
+        Ok((
+            mode,
+            Self {
+                config_path,
+                server,
+                device_id,
+                agent_token,
+                frames_per_second,
+                bitrate_bits_per_second,
+                json_logs: arguments.json_logs || file.json_logs.unwrap_or(false),
+            },
+        ))
     }
 }
 
-fn load_file(explicit: Option<&Path>, default_name: &str) -> anyhow::Result<FileConfig> {
-    let path = match explicit {
+fn resolve_path(explicit: Option<&Path>, default_name: &str) -> anyhow::Result<PathBuf> {
+    Ok(match explicit {
         Some(path) => path.to_owned(),
         None => std::env::current_exe()
             .context("could not locate the Agent executable")?
             .parent()
             .context("Agent executable has no parent directory")?
             .join(default_name),
-    };
-    if explicit.is_none() && !path.exists() {
+    })
+}
+
+fn load_file(path: &Path, explicit: bool) -> anyhow::Result<FileConfig> {
+    if !explicit && !path.exists() {
         return Ok(FileConfig::default());
     }
-    let contents = std::fs::read_to_string(&path)
+    let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_str(contents.trim_start_matches('\u{feff}'))
         .with_context(|| format!("invalid JSON in {}", path.display()))

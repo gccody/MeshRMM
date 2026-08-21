@@ -14,6 +14,7 @@ mod remote_session;
 const DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 900;
 const MAX_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 3600;
 const HANDOFF_TTL_MS: u64 = 60_000;
+const AGENT_INSTALL_TTL_MS: u64 = 30 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize)]
 struct AgentSummary {
@@ -50,6 +51,13 @@ struct HandoffRow {
     company_id: String,
     device_id: String,
     user_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentInstallTokenRow {
+    id: String,
+    company_id: String,
+    created_by_user_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,15 +106,20 @@ struct BootstrapCompanyRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct NewAgentRequest {
-    id: String,
-    name: String,
+struct CreateAgentInstallerRequest {
+    platform: String,
 }
 
 #[derive(Debug, Serialize)]
-struct AgentEnrollment {
-    agent: AgentSummary,
-    config: AgentConfig,
+struct AgentInstallerBootstrap {
+    server: String,
+    install_token: String,
+    expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RedeemAgentInstallerRequest {
+    name: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,7 +174,12 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
             bootstrap_company(&mut request, &environment).await
         }
         (Method::Get, ["v1", "agents"]) => list_agents(&request, &environment).await,
-        (Method::Post, ["v1", "agents"]) => create_agent(&mut request, &environment).await,
+        (Method::Post, ["v1", "agent-installers"]) => {
+            create_agent_installer(&mut request, &environment).await
+        }
+        (Method::Post, ["v1", "agent-installers", "redeem"]) => {
+            redeem_agent_installer(&mut request, &environment).await
+        }
         (Method::Delete, ["v1", "agents", device_id]) => {
             delete_agent(&request, &environment, device_id).await
         }
@@ -321,57 +339,128 @@ async fn list_agents(request: &Request, environment: &Env) -> Result<Response> {
     })
 }
 
-async fn create_agent(request: &mut Request, environment: &Env) -> Result<Response> {
+async fn create_agent_installer(request: &mut Request, environment: &Env) -> Result<Response> {
     let identity = match authorize_workos_user(request, environment).await {
         Ok(identity) if identity.is_admin() => identity,
         Ok(_) => return api_error(403, "company administrator access is required"),
         Err(error) => return workos_auth_error(error),
     };
-    let body: NewAgentRequest = request
+    let body: CreateAgentInstallerRequest = request
         .json()
         .await
-        .map_err(|_| Error::RustError("invalid Agent request".into()))?;
-    validate_identifier(&body.id, "device ID")?;
-    let name = validate_name(&body.name, "Agent name")?;
-    let db = environment.d1("DB")?;
-    if query!(&db, "SELECT id, name FROM agents WHERE id = ?1", body.id)?
-        .first::<AgentRow>(None)
-        .await?
-        .is_some()
-    {
-        return api_error(409, "that device ID is already registered");
+        .map_err(|_| Error::RustError("invalid Agent installer request".into()))?;
+    if body.platform != "windows-x64" {
+        return api_error(400, "unsupported Agent installer platform");
     }
+
+    let db = environment.d1("DB")?;
     ensure_company_exists(&db, &identity.company_id).await?;
-    let agent_token = random_token();
-    let token_hash = sha256_hex(&agent_token);
     let now = now_ms_i64()?;
     query!(
         &db,
-        "INSERT INTO agents (id, company_id, name, auth_token_hash, created_by_user_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-        body.id,
-        identity.company_id,
-        name,
-        token_hash,
-        identity.user_id,
+        "DELETE FROM agent_install_tokens WHERE expires_at <= ?1",
         now
     )?
     .run()
     .await?;
-    audit(&db, &identity, "agent.create", "agent", &body.id, "{}").await?;
-    Response::from_json(&AgentEnrollment {
-        agent: AgentSummary {
-            id: body.id.clone(),
-            name: name.to_owned(),
-            connected: false,
-        },
-        config: AgentConfig {
-            server: public_api_url(environment)?,
-            device_id: body.id,
-            agent_token,
-            frames_per_second: 60,
-            bitrate_bits_per_second: 12_000_000,
-            json_logs: false,
-        },
+    let install_id = Uuid::new_v4().to_string();
+    let install_token = random_token();
+    let token_hash = sha256_hex(&install_token);
+    let expires_at = Date::now().as_millis() + AGENT_INSTALL_TTL_MS;
+    let expires_at_i64 =
+        i64::try_from(expires_at).map_err(|_| Error::RustError("clock overflow".into()))?;
+    query!(
+        &db,
+        "INSERT INTO agent_install_tokens (id, token_hash, company_id, created_by_user_id, platform, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        install_id,
+        token_hash,
+        identity.company_id,
+        identity.user_id,
+        body.platform,
+        now,
+        expires_at_i64
+    )?
+    .run()
+    .await?;
+    audit(
+        &db,
+        &identity,
+        "agent_installer.issue",
+        "agent_installer",
+        &install_id,
+        &serde_json::json!({ "platform": body.platform }).to_string(),
+    )
+    .await?;
+    Response::from_json(&AgentInstallerBootstrap {
+        server: public_api_url(environment)?,
+        install_token,
+        expires_at_unix_ms: expires_at,
+    })
+}
+
+async fn redeem_agent_installer(request: &mut Request, environment: &Env) -> Result<Response> {
+    let supplied = match bearer_token(request) {
+        Ok(token) => token,
+        Err(_) => return api_error(401, "Agent installer token is required"),
+    };
+    let body: RedeemAgentInstallerRequest = request
+        .json()
+        .await
+        .map_err(|_| Error::RustError("invalid Agent installer redemption".into()))?;
+    let name = validate_name(&body.name, "computer name")?.to_owned();
+    let now = now_ms_i64()?;
+    let db = environment.d1("DB")?;
+    let token_hash = sha256_hex(&supplied);
+    let ticket = query!(
+        &db,
+        "UPDATE agent_install_tokens SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 RETURNING id, company_id, created_by_user_id",
+        now,
+        token_hash
+    )?
+    .first::<AgentInstallTokenRow>(None)
+    .await?;
+    let Some(ticket) = ticket else {
+        return api_error(401, "Agent installer is invalid, expired, or already used");
+    };
+
+    let device_id = Uuid::new_v4().to_string();
+    let agent_token = random_token();
+    let agent_token_hash = sha256_hex(&agent_token);
+    query!(
+        &db,
+        "INSERT INTO agents (id, company_id, name, auth_token_hash, created_by_user_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        device_id,
+        ticket.company_id,
+        name,
+        agent_token_hash,
+        ticket.created_by_user_id,
+        now
+    )?
+    .run()
+    .await?;
+    let identity = Identity {
+        user_id: ticket.created_by_user_id,
+        company_id: ticket.company_id,
+        role: None,
+        roles: Vec::new(),
+        permissions: Vec::new(),
+    };
+    audit(
+        &db,
+        &identity,
+        "agent_installer.redeem",
+        "agent",
+        &device_id,
+        &serde_json::json!({ "installer_id": ticket.id }).to_string(),
+    )
+    .await?;
+    Response::from_json(&AgentConfig {
+        server: public_api_url(environment)?,
+        device_id,
+        agent_token,
+        frames_per_second: 60,
+        bitrate_bits_per_second: 12_000_000,
+        json_logs: false,
     })
 }
 
