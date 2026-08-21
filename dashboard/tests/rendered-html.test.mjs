@@ -56,7 +56,7 @@ test("starts WorkOS login once and safely restores the home route", async () => 
   assert.match(providers, /destination\.origin === window\.location\.origin/);
 });
 
-test("uses organization-scoped WorkOS widgets and one-time installer and remote handoffs", async () => {
+test("uses organization-scoped WorkOS widgets, event subscriptions, and one-time handoffs", async () => {
   const [page, providers, layout] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/providers.tsx", import.meta.url), "utf8"),
@@ -76,6 +76,11 @@ test("uses organization-scoped WorkOS widgets and one-time installer and remote 
   assert.match(page, /\/v1\/agent-installers/);
   assert.match(page, /PULSERMM-BOOTSTRAP-V1/);
   assert.match(page, /Computer name from Windows/);
+  assert.match(page, /\/v1\/agents\/events\/subscriptions/);
+  assert.match(page, /new WebSocket\(websocketUrl\)/);
+  assert.match(page, /nextSocket\.send\("refresh"\)/);
+  assert.doesNotMatch(page, /setInterval\(\(\) => void loadAgents/);
+  assert.doesNotMatch(page, /15_000/);
   assert.doesNotMatch(page, /Copy agent\.json|reception-ws-01|Display name/);
   assert.doesNotMatch(page, /WORKOS_DEVICE_GRANTS|X-Pulse-User/);
   assert.match(providers, /WorkOsWidgets/);
