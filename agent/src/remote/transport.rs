@@ -274,6 +274,21 @@ pub async fn run_sender(
     }
     .await;
 
+    if let Err(error) = &result {
+        let signal = SignalMessage::Error {
+            message: format!("{error:#}"),
+        };
+        match serde_json::to_string(&signal) {
+            Ok(message) => {
+                if let Err(send_error) = signal_writer.send(Message::Text(message.into())).await {
+                    tracing::warn!(error = %send_error, "failed to report sender failure to viewer");
+                }
+            }
+            Err(send_error) => {
+                tracing::warn!(error = %send_error, "failed to encode sender failure for viewer");
+            }
+        }
+    }
     video_sender.abort();
     if let Err(error) = input.release_all() {
         tracing::warn!(error = %error, "failed to release remote input during cleanup");
@@ -466,18 +481,11 @@ fn spawn_video_sender(
             let (source, is_bootstrap) = if let Some(frame) = bootstrap_keyframe.take() {
                 (frame, true)
             } else {
-                let source =
-                    match tokio::time::timeout(std::time::Duration::from_secs(10), slot.next())
-                        .await
-                    {
-                        Ok(source) => source,
-                        Err(_) => {
-                            let _ = failure.send(
-                                "capture/encoder produced no encoded frame for 10 seconds".into(),
-                            );
-                            return;
-                        }
-                    };
+                // Desktop Duplication may produce no frame while the display is
+                // completely static. The main sender loop independently polls
+                // the capture worker for real failures, so idleness is not an
+                // error and this task can wait until the next changed frame.
+                let source = slot.next().await;
                 (source, false)
             };
             if channel.buffered_amount().await > 256 * 1024 {
