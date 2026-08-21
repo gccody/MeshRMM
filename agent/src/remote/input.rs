@@ -53,6 +53,21 @@ impl WindowsInputController {
                 }
                 Ok(())
             }
+            RemoteInput::PointerButtonAt {
+                x,
+                y,
+                button,
+                pressed,
+                ..
+            } => {
+                send_mouse_button_at(display, x, y, button, pressed)?;
+                if pressed {
+                    self.pressed_buttons.insert(button);
+                } else {
+                    self.pressed_buttons.remove(&button);
+                }
+                Ok(())
+            }
             RemoteInput::Wheel {
                 horizontal,
                 vertical,
@@ -66,6 +81,13 @@ impl WindowsInputController {
                 }
                 Ok(())
             }
+            RemoteInput::WheelAt {
+                x,
+                y,
+                horizontal,
+                vertical,
+                ..
+            } => send_wheel_at(display, x, y, horizontal, vertical),
             RemoteInput::Key {
                 scan_code,
                 extended,
@@ -106,6 +128,10 @@ impl Drop for WindowsInputController {
 }
 
 fn move_pointer(display: &Display, x: u16, y: u16) -> anyhow::Result<()> {
+    send(&[pointer_move_input(display, x, y)?])
+}
+
+fn pointer_move_input(display: &Display, x: u16, y: u16) -> anyhow::Result<INPUT> {
     let virtual_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
     let virtual_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
     let virtual_width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
@@ -121,15 +147,35 @@ fn move_pointer(display: &Display, x: u16, y: u16) -> anyhow::Result<()> {
         .clamp(0, 65_535) as i32;
     let normalized_y = ((desktop_y - i64::from(virtual_y)) * 65_535 / i64::from(virtual_height - 1))
         .clamp(0, 65_535) as i32;
-    send_mouse_at(
-        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+    Ok(mouse_input(
+        MOUSEEVENTF_MOVE
+            | MOUSEEVENTF_MOVE_NOCOALESCE
+            | MOUSEEVENTF_ABSOLUTE
+            | MOUSEEVENTF_VIRTUALDESK,
         normalized_x,
         normalized_y,
         0,
-    )
+    ))
 }
 
 fn send_mouse_button(button: PointerButton, pressed: bool) -> anyhow::Result<()> {
+    send(&[mouse_button_input(button, pressed)])
+}
+
+fn send_mouse_button_at(
+    display: &Display,
+    x: u16,
+    y: u16,
+    button: PointerButton,
+    pressed: bool,
+) -> anyhow::Result<()> {
+    send(&[
+        pointer_move_input(display, x, y)?,
+        mouse_button_input(button, pressed),
+    ])
+}
+
+fn mouse_button_input(button: PointerButton, pressed: bool) -> INPUT {
     let (flag, data) = match (button, pressed) {
         (PointerButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
         (PointerButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
@@ -142,7 +188,7 @@ fn send_mouse_button(button: PointerButton, pressed: bool) -> anyhow::Result<()>
         (PointerButton::Forward, true) => (MOUSEEVENTF_XDOWN, 2),
         (PointerButton::Forward, false) => (MOUSEEVENTF_XUP, 2),
     };
-    send_mouse(flag, data)
+    mouse_input(flag, 0, 0, data)
 }
 
 fn send_mouse(flags: MOUSE_EVENT_FLAGS, data: u32) -> anyhow::Result<()> {
@@ -150,7 +196,38 @@ fn send_mouse(flags: MOUSE_EVENT_FLAGS, data: u32) -> anyhow::Result<()> {
 }
 
 fn send_mouse_at(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> anyhow::Result<()> {
-    let input = INPUT {
+    send(&[mouse_input(flags, dx, dy, data)])
+}
+
+fn send_wheel_at(
+    display: &Display,
+    x: u16,
+    y: u16,
+    horizontal: i16,
+    vertical: i16,
+) -> anyhow::Result<()> {
+    let mut inputs = vec![pointer_move_input(display, x, y)?];
+    if vertical != 0 {
+        inputs.push(mouse_input(
+            MOUSEEVENTF_WHEEL,
+            0,
+            0,
+            i32::from(vertical) as u32,
+        ));
+    }
+    if horizontal != 0 {
+        inputs.push(mouse_input(
+            MOUSEEVENTF_HWHEEL,
+            0,
+            0,
+            i32::from(horizontal) as u32,
+        ));
+    }
+    send(&inputs)
+}
+
+fn mouse_input(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> INPUT {
+    INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
             mi: MOUSEINPUT {
@@ -162,8 +239,7 @@ fn send_mouse_at(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> anyho
                 dwExtraInfo: 0,
             },
         },
-    };
-    send(&[input])
+    }
 }
 
 fn send_key(scan_code: u16, extended: bool, pressed: bool) -> anyhow::Result<()> {

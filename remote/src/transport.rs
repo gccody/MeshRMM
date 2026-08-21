@@ -4,8 +4,8 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use pulsermm_protocol::{
-    FrameReassembler, IceServer, ReassemblyConfig, ReassemblyOutcome, SessionBootstrap,
-    SessionMessage, SessionState, SignalMessage, VideoPacket, VideoStreamId,
+    CONTROL_CHANNEL_LABEL, FrameReassembler, IceServer, ReassemblyConfig, ReassemblyOutcome,
+    SessionBootstrap, SessionMessage, SessionState, SignalMessage, VideoPacket, VideoStreamId,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -56,9 +56,22 @@ impl ViewerControlQueue {
             return;
         }
 
-        // Preserve the pointer-before-click ordering emitted by the native
-        // viewers while still coalescing ordinary motion.
-        self.flush_pointer();
+        if matches!(
+            message,
+            SessionMessage::Input(
+                pulsermm_protocol::RemoteInput::PointerButtonAt { .. }
+                    | pulsermm_protocol::RemoteInput::WheelAt { .. }
+            )
+        ) {
+            // The positioned action supersedes any older unsent motion.
+            if let Ok(mut pending) = self.pending_pointer.lock() {
+                pending.take();
+            }
+        } else {
+            // Preserve pointer-before-action ordering for legacy/non-positioned
+            // messages while still coalescing ordinary motion.
+            self.flush_pointer();
+        }
         let _ = self.outgoing.send(message);
     }
 
@@ -320,7 +333,7 @@ fn install_data_channel_handler(
         let presentation_failure = presentation_failure.clone();
         Box::pin(async move {
             match channel.label() {
-                "pulsermm-control-v2" => {
+                CONTROL_CHANNEL_LABEL => {
                     if let Ok(mut active) = control_channel.lock() {
                         *active = Some(Arc::clone(&channel));
                     }
@@ -503,6 +516,25 @@ mod tests {
         queue.send(button.clone());
 
         assert_eq!(rx.try_recv().unwrap(), pointer(30, 40));
+        assert_eq!(rx.try_recv().unwrap(), button);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn positioned_button_supersedes_pending_pointer_motion() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let queue = ViewerControlQueue::new(tx);
+        let button = SessionMessage::Input(RemoteInput::PointerButtonAt {
+            display_id: DisplayId(1),
+            x: 50,
+            y: 60,
+            button: PointerButton::Left,
+            pressed: true,
+        });
+
+        queue.send(pointer(30, 40));
+        queue.send(button.clone());
+
         assert_eq!(rx.try_recv().unwrap(), button);
         assert!(rx.try_recv().is_err());
     }

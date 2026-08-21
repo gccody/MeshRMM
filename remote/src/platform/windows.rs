@@ -932,26 +932,14 @@ impl WindowContext {
         }
     }
 
-    fn move_pointer_from_screen(&self, window: HWND, lparam: LPARAM) {
-        let mut point = windows::Win32::Foundation::POINT {
-            x: signed_low_word(lparam.0),
-            y: signed_high_word(lparam.0),
-        };
-        if unsafe { ScreenToClient(window, &mut point) }.as_bool()
-            && let Some((x, y)) = self.normalized_client_position(window, point.x, point.y)
-        {
-            self.send(SessionMessage::Input(RemoteInput::PointerMove {
-                display_id: self.active_display.id,
-                x,
-                y,
-            }));
-        }
-    }
-
     fn button(&mut self, window: HWND, lparam: LPARAM, button: PointerButton, pressed: bool) {
-        self.move_pointer(window, lparam);
-        self.send(SessionMessage::Input(RemoteInput::PointerButton {
+        let Some((x, y)) = self.pointer_position(window, lparam) else {
+            return;
+        };
+        self.send(SessionMessage::Input(RemoteInput::PointerButtonAt {
             display_id: self.active_display.id,
+            x,
+            y,
             button,
             pressed,
         }));
@@ -1057,13 +1045,23 @@ unsafe fn create_window(
             }
             WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
                 if let Some(context) = context {
-                    context.move_pointer_from_screen(window, lparam);
-                    let delta = ((wparam.0 >> 16) as u16) as i16;
-                    context.send(SessionMessage::Input(RemoteInput::Wheel {
-                        display_id: context.active_display.id,
-                        horizontal: if message == WM_MOUSEHWHEEL { delta } else { 0 },
-                        vertical: if message == WM_MOUSEWHEEL { delta } else { 0 },
-                    }));
+                    let mut point = windows::Win32::Foundation::POINT {
+                        x: signed_low_word(lparam.0),
+                        y: signed_high_word(lparam.0),
+                    };
+                    if unsafe { ScreenToClient(window, &mut point) }.as_bool()
+                        && let Some((x, y)) =
+                            context.normalized_client_position(window, point.x, point.y)
+                    {
+                        let delta = ((wparam.0 >> 16) as u16) as i16;
+                        context.send(SessionMessage::Input(RemoteInput::WheelAt {
+                            display_id: context.active_display.id,
+                            x,
+                            y,
+                            horizontal: if message == WM_MOUSEHWHEEL { delta } else { 0 },
+                            vertical: if message == WM_MOUSEWHEEL { delta } else { 0 },
+                        }));
+                    }
                 }
                 LRESULT(0)
             }
