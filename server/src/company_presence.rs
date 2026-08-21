@@ -313,10 +313,6 @@ pub async fn snapshot(environment: &Env, company_id: &str) -> Result<Response> {
         .await
 }
 
-pub fn set_company_header(request: &mut Request, company_id: &str) -> Result<()> {
-    request.headers_mut()?.set(COMPANY_HEADER, company_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
