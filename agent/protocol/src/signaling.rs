@@ -15,6 +15,8 @@ pub struct IceServer {
 pub struct SessionBootstrap {
     pub session_id: RemoteSessionId,
     pub signaling_token: String,
+    /// Initial signaling deadline. Once connected, client activity advances
+    /// the server-side idle deadline.
     pub expires_at_unix_ms: u64,
     pub ice_servers: Vec<IceServer>,
 }
@@ -31,6 +33,9 @@ pub struct AgentSessionRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SignalMessage {
     Ready,
+    /// Sent periodically by a connected viewer to advance the session's idle
+    /// deadline without putting Cloudflare in the media/input data path.
+    Activity,
     Offer {
         sdp: String,
     },
