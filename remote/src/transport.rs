@@ -37,16 +37,20 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
     let presenter = Arc::new(Mutex::new(None::<ActivePresenter>));
     let control_channel = Arc::new(Mutex::new(None::<Arc<RTCDataChannel>>));
     let (viewer_control_tx, mut viewer_control_rx) = mpsc::unbounded_channel::<SessionMessage>();
+    let (presentation_failure_tx, mut presentation_failure_rx) =
+        mpsc::unbounded_channel::<String>();
     install_data_channel_handler(
         &peer,
         Arc::clone(&presenter),
         Arc::clone(&control_channel),
         viewer_control_tx,
+        presentation_failure_tx,
     );
 
     let mut session_state = SessionState::Requested.transition(SessionState::Signaling)?;
     outgoing_tx.send(SignalMessage::Ready)?;
     session_state = session_state.transition(SessionState::Connecting)?;
+    let startup_started = tokio::time::Instant::now();
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     stats_interval.tick().await;
     let mut remote_description_set = false;
@@ -95,7 +99,9 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                                     pending_candidates.push(candidate);
                                 }
                             }
-                            SignalMessage::PeerLeft => break Ok(()),
+                            SignalMessage::PeerLeft => {
+                                break Err(anyhow::anyhow!("Agent disconnected from the remote session"));
+                            }
                             SignalMessage::Error { message } => break Err(anyhow::anyhow!(message)),
                             _ => {}
                         }
@@ -116,7 +122,16 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                     break Err(anyhow::anyhow!("WebRTC connection ended in state {state:?}"));
                 }
             }
+            Some(error) = presentation_failure_rx.recv() => {
+                break Err(anyhow::anyhow!(error));
+            }
             _ = stats_interval.tick() => {
+                let presenter_missing = presenter.lock().is_ok_and(|guard| guard.is_none());
+                if presenter_missing && startup_started.elapsed() >= std::time::Duration::from_secs(30) {
+                    break Err(anyhow::anyhow!(
+                        "timed out waiting 30 seconds for the remote video stream; check the Agent's WebRTC and ICE logs"
+                    ));
+                }
                 log_network_stats(&peer).await;
                 let ended = presenter
                     .lock()
@@ -244,18 +259,25 @@ fn install_data_channel_handler(
     presenter: Arc<Mutex<Option<ActivePresenter>>>,
     control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     viewer_control: mpsc::UnboundedSender<SessionMessage>,
+    presentation_failure: mpsc::UnboundedSender<String>,
 ) {
     peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
         let presenter = Arc::clone(&presenter);
         let control_channel = Arc::clone(&control_channel);
         let viewer_control = viewer_control.clone();
+        let presentation_failure = presentation_failure.clone();
         Box::pin(async move {
             match channel.label() {
                 "pulsermm-control-v2" => {
                     if let Ok(mut active) = control_channel.lock() {
                         *active = Some(Arc::clone(&channel));
                     }
-                    install_control_handler(channel, presenter, viewer_control)
+                    install_control_handler(
+                        channel,
+                        presenter,
+                        viewer_control,
+                        presentation_failure,
+                    )
                 }
                 "pulsermm-video-v1" => install_video_handler(channel, presenter),
                 label => tracing::warn!(label, "ignoring unknown WebRTC data channel"),
@@ -268,10 +290,12 @@ fn install_control_handler(
     channel: Arc<RTCDataChannel>,
     presenter: Arc<Mutex<Option<ActivePresenter>>>,
     viewer_control: mpsc::UnboundedSender<SessionMessage>,
+    presentation_failure: mpsc::UnboundedSender<String>,
 ) {
     channel.on_message(Box::new(move |message| {
         let presenter = Arc::clone(&presenter);
         let viewer_control = viewer_control.clone();
+        let presentation_failure = presentation_failure.clone();
         Box::pin(async move {
             match SessionMessage::decode(&message.data) {
                 Ok(SessionMessage::DisplayConfiguration {
@@ -308,7 +332,13 @@ fn install_control_handler(
                             let _ = viewer_control.send(request);
                             tracing::info!(display_id = active_display_id.0, display_name = %active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, codec = ?format.codec, "remote control stream configured");
                         }
-                        Err(error) => tracing::error!(error = %error, "hardware decoder/presenter initialization failed"),
+                        Err(error) => {
+                            let message = format!(
+                                "hardware decoder/presenter initialization failed: {error:#}"
+                            );
+                            tracing::error!(error = %error, "hardware decoder/presenter initialization failed");
+                            let _ = presentation_failure.send(message);
+                        }
                     }
                 }
                 Ok(SessionMessage::Stop { reason }) => tracing::info!(reason, "Agent stopped stream"),

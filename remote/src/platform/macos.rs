@@ -12,8 +12,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSEvent, NSEventModifierFlags, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
+    NSBackingStoreType, NSEvent, NSEventModifierFlags, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_av_foundation::{AVLayerVideoGravityResizeAspect, AVSampleBufferDisplayLayer};
 use objc2_core_foundation::{CFBoolean, CFMutableDictionary, CFRetained, CFString, kCFBooleanTrue};
@@ -76,6 +78,8 @@ impl AppDelegate {
 struct RemoteViewIvars {
     active_display: Display,
     displays: Vec<Display>,
+    video_width: u32,
+    video_height: u32,
     control: ControlSink,
     pressed_keys: RefCell<Vec<(u16, bool)>>,
     pressed_buttons: RefCell<Vec<PointerButton>>,
@@ -219,11 +223,15 @@ impl RemoteView {
         frame: NSRect,
         active_display: Display,
         displays: Vec<Display>,
+        video_width: u32,
+        video_height: u32,
         control: ControlSink,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(RemoteViewIvars {
             active_display,
             displays,
+            video_width,
+            video_height,
             control,
             pressed_keys: RefCell::new(Vec::new()),
             pressed_buttons: RefCell::new(Vec::new()),
@@ -237,11 +245,12 @@ impl RemoteView {
 
     fn send_pointer(&self, event: &NSEvent) {
         let point = self.convertPoint_fromView(event.locationInWindow(), None);
-        let bounds = self.bounds();
-        let width = bounds.size.width.max(1.0);
-        let height = bounds.size.height.max(1.0);
-        let x = ((point.x / width).clamp(0.0, 1.0) * 65_535.0).round() as u16;
-        let y = ((1.0 - point.y / height).clamp(0.0, 1.0) * 65_535.0).round() as u16;
+        let (x, y) = normalized_video_position(
+            point,
+            self.bounds(),
+            self.ivars().video_width,
+            self.ivars().video_height,
+        );
         self.send(SessionMessage::Input(RemoteInput::PointerMove {
             display_id: self.ivars().active_display.id,
             x,
@@ -322,6 +331,29 @@ impl RemoteView {
             }));
         }
     }
+}
+
+fn normalized_video_position(
+    point: NSPoint,
+    bounds: NSRect,
+    video_width: u32,
+    video_height: u32,
+) -> (u16, u16) {
+    let bounds_width = bounds.size.width.max(1.0);
+    let bounds_height = bounds.size.height.max(1.0);
+    let video_width = f64::from(video_width.max(1));
+    let video_height = f64::from(video_height.max(1));
+    let scale = (bounds_width / video_width).min(bounds_height / video_height);
+    let presented_width = (video_width * scale).max(1.0);
+    let presented_height = (video_height * scale).max(1.0);
+    let presented_x = bounds.origin.x + (bounds_width - presented_width) / 2.0;
+    let presented_y = bounds.origin.y + (bounds_height - presented_height) / 2.0;
+    let normalized_x = ((point.x - presented_x) / presented_width).clamp(0.0, 1.0);
+    let normalized_y = ((point.y - presented_y) / presented_height).clamp(0.0, 1.0);
+    (
+        (normalized_x * 65_535.0).round() as u16,
+        ((1.0 - normalized_y) * 65_535.0).round() as u16,
+    )
 }
 
 fn mac_button(event: &NSEvent) -> PointerButton {
@@ -442,6 +474,94 @@ fn mac_key_to_windows_scan_code(code: u16) -> Option<(u16, bool)> {
 thread_local! {
     /// AppKit and Core Animation objects never leave the main thread.
     static UI: RefCell<Option<MacUi>> = const { RefCell::new(None) };
+    static CONNECTING_WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
+}
+
+fn activate_application(mtm: MainThreadMarker) {
+    let application = NSApplication::sharedApplication(mtm);
+    // `activate` is newer than the MVP's macOS 12 deployment target.
+    #[allow(deprecated)]
+    application.activateIgnoringOtherApps(true);
+}
+
+fn show_connecting_window(mtm: MainThreadMarker) -> anyhow::Result<()> {
+    let rect = NSRect {
+        origin: NSPoint { x: 0.0, y: 0.0 },
+        size: NSSize {
+            width: 420.0,
+            height: 150.0,
+        },
+    };
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            rect,
+            NSWindowStyleMask::Titled,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    unsafe { window.setReleasedWhenClosed(false) };
+    window.setTitle(&NSString::from_str("PulseRMM Remote"));
+    let view = window
+        .contentView()
+        .context("AppKit connecting window has no content view")?;
+
+    let spinner = NSProgressIndicator::new(mtm);
+    spinner.setStyle(NSProgressIndicatorStyle::Spinning);
+    spinner.setIndeterminate(true);
+    spinner.setDisplayedWhenStopped(true);
+    spinner.setFrame(NSRect {
+        origin: NSPoint { x: 198.0, y: 82.0 },
+        size: NSSize {
+            width: 24.0,
+            height: 24.0,
+        },
+    });
+    unsafe { spinner.startAnimation(None) };
+    view.addSubview(&spinner);
+
+    let label = NSTextField::labelWithString(
+        &NSString::from_str("Connecting to the remote computer…"),
+        mtm,
+    );
+    label.setAlignment(NSTextAlignment::Center);
+    label.setFrame(NSRect {
+        origin: NSPoint { x: 30.0, y: 45.0 },
+        size: NSSize {
+            width: 360.0,
+            height: 24.0,
+        },
+    });
+    view.addSubview(&label);
+
+    window.center();
+    activate_application(mtm);
+    window.makeKeyAndOrderFront(None);
+    window.orderFrontRegardless();
+    CONNECTING_WINDOW.with(|state| {
+        if let Some(old) = state.borrow_mut().replace(window) {
+            old.orderOut(None);
+        }
+    });
+    Ok(())
+}
+
+fn close_connecting_window() {
+    CONNECTING_WINDOW.with(|state| {
+        if let Some(window) = state.borrow_mut().take() {
+            window.orderOut(None);
+        }
+    });
+}
+
+fn show_connection_error(mtm: MainThreadMarker, error: &str) {
+    close_connecting_window();
+    activate_application(mtm);
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Remote connection failed"));
+    alert.setInformativeText(&NSString::from_str(error));
+    alert.runModal();
 }
 
 struct QueuedFrame {
@@ -527,7 +647,13 @@ impl Presenter {
             .lock()
             .ok()
             .and_then(|mut failure| failure.take())
-            .map(Err)
+            .map(|failure| {
+                if failure == "macOS viewer window was closed" {
+                    Ok(())
+                } else {
+                    Err(failure)
+                }
+            })
     }
 
     pub fn stop(&mut self) {
@@ -655,7 +781,15 @@ impl MacUi {
             "PulseRMM Remote Desktop — {} — Control-Option-Arrow switches display",
             active_display.name
         )));
-        let view = RemoteView::new(mtm, rect, active_display, displays, control);
+        let view = RemoteView::new(
+            mtm,
+            rect,
+            active_display,
+            displays,
+            format.width,
+            format.height,
+            control,
+        );
         window.setContentView(Some(&view));
         window.setDelegate(Some(ProtocolObject::from_ref(&*view)));
         let layer = unsafe { AVSampleBufferDisplayLayer::new() };
@@ -674,7 +808,10 @@ impl MacUi {
         window.setAcceptsMouseMovedEvents(true);
         window.makeFirstResponder(Some(&view));
         window.center();
+        close_connecting_window();
+        activate_application(mtm);
         window.makeKeyAndOrderFront(None);
+        window.orderFrontRegardless();
 
         Ok(Self {
             id,
@@ -899,6 +1036,7 @@ where
     application.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     application.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     application.finishLaunching();
+    show_connecting_window(mtm)?;
 
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let has_command_line_session = std::env::args_os()
@@ -914,21 +1052,62 @@ where
                 deep_link_rx.recv_timeout(Duration::from_secs(5)).ok()
             };
             let result = network(deep_link);
+            let error = result.as_ref().err().map(|error| format!("{error:#}"));
             let _ = result_tx.send(result);
-            DispatchQueue::main().exec_async(|| {
+            DispatchQueue::main().exec_async(move || {
                 if let Some(mtm) = MainThreadMarker::new() {
+                    if let Some(error) = error.as_deref() {
+                        show_connection_error(mtm, error);
+                    } else {
+                        close_connecting_window();
+                    }
                     NSApplication::sharedApplication(mtm).stop(None);
                 }
             });
         })
         .context("failed to start macOS network runtime")?;
 
-    // `activate` is newer than the MVP's macOS 12 deployment target.
-    #[allow(deprecated)]
-    application.activateIgnoringOtherApps(true);
+    activate_application(mtm);
     application.run();
     drop(delegate);
     result_rx
         .recv()
         .context("macOS network runtime exited without a result")?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pointer_position_uses_aspect_fit_video_rect() {
+        let bounds = NSRect {
+            origin: NSPoint { x: 0.0, y: 0.0 },
+            size: NSSize {
+                width: 1_000.0,
+                height: 1_000.0,
+            },
+        };
+
+        assert_eq!(
+            normalized_video_position(NSPoint { x: 500.0, y: 500.0 }, bounds, 1_920, 1_080,),
+            (32_768, 32_768)
+        );
+        assert_eq!(
+            normalized_video_position(NSPoint { x: 0.0, y: 0.0 }, bounds, 1_920, 1_080),
+            (0, 65_535)
+        );
+        assert_eq!(
+            normalized_video_position(
+                NSPoint {
+                    x: 1_000.0,
+                    y: 1_000.0,
+                },
+                bounds,
+                1_920,
+                1_080,
+            ),
+            (65_535, 0)
+        );
+    }
 }
