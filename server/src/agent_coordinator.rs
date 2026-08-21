@@ -1,4 +1,4 @@
-use pulsermm_protocol::AgentSessionRequest;
+use pulsermm_protocol_types::AgentSessionRequest;
 use serde::{Deserialize, Serialize};
 use worker::*;
 
