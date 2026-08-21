@@ -1,7 +1,5 @@
 @import "@radix-ui/themes/styles.css";
 @import "@workos-inc/widgets/styles.css";
-@import "tailwindcss";
-
 :root {
   --ink: #171824;
   --muted: #6e7183;

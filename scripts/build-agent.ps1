@@ -2,17 +2,18 @@
 param()
 
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $manifestPath = Join-Path $repositoryRoot 'agent\Cargo.toml'
-$sourceExecutable = Join-Path $repositoryRoot 'agent\target\release\pulsermm-agent.exe'
+$sourceExecutable = Join-Path $repositoryRoot 'target\release\pulsermm-agent.exe'
 $distributionDirectory = Join-Path $repositoryRoot 'dist\agent'
 $destinationExecutable = Join-Path $distributionDirectory 'pulsermm-agent.exe'
 $dashboardDownloadDirectory = Join-Path $repositoryRoot 'dashboard\public\downloads'
 $dashboardExecutable = Join-Path $dashboardDownloadDirectory 'pulsermm-agent-windows-x64.exe'
 $dashboardChecksum = "$dashboardExecutable.sha256"
 
-& cargo build --release --manifest-path $manifestPath
+& cargo build --locked --release --manifest-path $manifestPath
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }

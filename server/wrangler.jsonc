@@ -2,7 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "pulsermm-server",
   "main": "build/index.js",
-  "compatibility_date": "2026-08-20",
+  "compatibility_date": "2026-08-21",
   "compatibility_flags": ["nodejs_compat"],
   "d1_databases": [
     {
@@ -49,6 +49,6 @@
     "head_sampling_rate": 1
   },
   "build": {
-    "command": "cargo install -q \"worker-build@^0.8\" && worker-build --release"
+    "command": "worker-build --profile server-release"
   }
 }
