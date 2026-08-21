@@ -1,0 +1,17 @@
+[package]
+name = "pulsermm-signaling-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Shared PulseRMM HTTP/WebSocket endpoint and authentication client"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+url.workspace = true
+

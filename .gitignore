@@ -9,6 +9,7 @@ server/build-*/
 
 # JavaScript dependencies and generated output
 node_modules/
+*.tsbuildinfo
 
 # Locally provisioned binaries and credentials
 dist/

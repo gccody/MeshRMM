@@ -1,11 +1,12 @@
 # PulseRMM
 
 PulseRMM is a multi-tenant remote monitoring and management project. It adds
-low-latency Windows desktop streaming and remote control while retaining the
-repository's three independent Rust workspaces:
+low-latency Windows desktop streaming and remote control in a single Cargo
+workspace with platform and transport responsibilities kept in focused crates:
 
-- `agent/` — the native endpoint Agent, shared remote protocol, and the
+- `agent/` — the native endpoint Agent, binary control/video protocol, and the
   Windows-specific `windows/remote-screen` capture/encoder package.
+- `crates/` — lightweight shared JSON protocol types and signaling client code.
 - `server/` — the Rust Cloudflare Worker and Durable Objects used only for
   authentication and WebRTC signaling.
 - `remote/` — the native Windows/macOS viewer. Windows uses Media Foundation
@@ -68,8 +69,8 @@ verified per-device installers:
 
 ```powershell
 & .\scripts\build-agent.ps1
-cargo build --release --manifest-path remote/Cargo.toml
-Copy-Item remote/target/release/pulsermm-remote.exe dist/remote/
+cargo build --locked --release -p pulsermm-remote
+Copy-Item target/release/pulsermm-remote.exe dist/remote/
 ```
 
 On a Mac, build an application bundle using the `dist/remote/remote.json`
@@ -203,20 +204,16 @@ the Agent returns to its signaling loop and remains available.
 ## Verify
 
 ```powershell
-cargo fmt --manifest-path agent/Cargo.toml --all -- --check
-cargo check --manifest-path agent/Cargo.toml --workspace
-cargo clippy --manifest-path agent/Cargo.toml --workspace --all-targets -- -D warnings
-cargo test --manifest-path agent/Cargo.toml --workspace
+cargo fmt --all -- --check
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo check -p pulsermm-server --target wasm32-unknown-unknown
 
-cargo fmt --manifest-path remote/Cargo.toml --all -- --check
-cargo check --manifest-path remote/Cargo.toml
-cargo clippy --manifest-path remote/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path remote/Cargo.toml
-
-cargo fmt --manifest-path server/Cargo.toml --all -- --check
-cargo check --manifest-path server/Cargo.toml --target wasm32-unknown-unknown
-cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path server/Cargo.toml
+Push-Location dashboard
+npm ci
+npm run verify
+Pop-Location
 ```
 
 The macOS target can be checked on macOS with:
