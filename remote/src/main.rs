@@ -7,13 +7,19 @@ mod transport;
 
 use anyhow::Context;
 
-fn initialize() -> anyhow::Result<config::Config> {
+fn initialize(launch_deep_link: Option<&str>) -> anyhow::Result<config::Config> {
     #[cfg(windows)]
     register_windows_deep_link_handler();
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install the Rustls ring crypto provider"))?;
-    let config = config::Config::load()?;
+    #[cfg(target_os = "macos")]
+    let config = config::Config::load_with_deep_link(launch_deep_link)?;
+    #[cfg(not(target_os = "macos"))]
+    let config = {
+        let _ = launch_deep_link;
+        config::Config::load()?
+    };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     if config.json_logs {
@@ -76,13 +82,13 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
 #[cfg(windows)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    run_session(initialize()?).await
+    run_session(initialize(None)?).await
 }
 
 #[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
-    let config = initialize()?;
-    platform::run_application(move || {
+    platform::run_application(move |deep_link| {
+        let config = initialize(deep_link.as_deref())?;
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

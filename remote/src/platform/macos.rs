@@ -2,15 +2,18 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
-use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2::runtime::ProtocolObject;
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSWindow, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
+    NSWindow, NSWindowStyleMask,
 };
 use objc2_av_foundation::{AVLayerVideoGravityResizeAspect, AVSampleBufferDisplayLayer};
 use objc2_core_foundation::{CFBoolean, CFMutableDictionary, CFRetained, CFString, kCFBooleanTrue};
@@ -19,13 +22,53 @@ use objc2_core_media::{
     CMVideoFormatDescriptionCreateFromH264ParameterSets, kCMSampleAttachmentKey_DisplayImmediately,
     kCMTimeInvalid,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
+};
 use objc2_quartz_core::CAAutoresizingMask;
 use pulsermm_protocol::{Codec, EncodedFrame, VideoFormat};
 
 use crate::h264::annex_b_to_avcc;
 
 static NEXT_PRESENTER_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct AppDelegateIvars {
+    deep_link_tx: Sender<String>,
+}
+
+define_class!(
+    // Safety: NSObject has no subclassing requirements and AppDelegate does
+    // not implement Drop.
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = AppDelegateIvars]
+    struct AppDelegate;
+
+    // Safety: these protocols have no additional safety requirements.
+    unsafe impl NSObjectProtocol for AppDelegate {}
+
+    unsafe impl NSApplicationDelegate for AppDelegate {
+        #[unsafe(method(application:openURLs:))]
+        fn application_open_urls(&self, _application: &NSApplication, urls: &NSArray<NSURL>) {
+            let Some(url) = urls.firstObject() else {
+                return;
+            };
+            let Some(value) = url.absoluteString() else {
+                return;
+            };
+            let _ = self.ivars().deep_link_tx.send(value.to_string());
+        }
+    }
+);
+
+impl AppDelegate {
+    fn new(mtm: MainThreadMarker, deep_link_tx: Sender<String>) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(AppDelegateIvars { deep_link_tx });
+        // Safety: this invokes NSObject's parameterless initializer.
+        unsafe { msg_send![super(this), init] }
+    }
+}
 
 thread_local! {
     /// AppKit and Core Animation objects never leave the main thread.
@@ -455,18 +498,30 @@ pub fn monotonic_timestamp_us() -> u64 {
 
 pub fn run_application<F>(network: F) -> anyhow::Result<()>
 where
-    F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+    F: FnOnce(Option<String>) -> anyhow::Result<()> + Send + 'static,
 {
     let mtm = MainThreadMarker::new().context("PulseRMM must start on the macOS main thread")?;
     let application = NSApplication::sharedApplication(mtm);
+    let (deep_link_tx, deep_link_rx) = std::sync::mpsc::channel();
+    let delegate = AppDelegate::new(mtm, deep_link_tx);
+    application.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     application.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     application.finishLaunching();
 
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let has_command_line_session = std::env::args_os()
+        .skip(1)
+        .any(|argument| !argument.to_string_lossy().starts_with("-psn_"))
+        || std::env::var_os("PULSERMM_HANDOFF_TOKEN").is_some();
     std::thread::Builder::new()
         .name("pulsermm-network".into())
         .spawn(move || {
-            let result = network();
+            let deep_link = if has_command_line_session {
+                None
+            } else {
+                deep_link_rx.recv_timeout(Duration::from_secs(5)).ok()
+            };
+            let result = network(deep_link);
             let _ = result_tx.send(result);
             DispatchQueue::main().exec_async(|| {
                 if let Some(mtm) = MainThreadMarker::new() {
@@ -480,6 +535,7 @@ where
     #[allow(deprecated)]
     application.activateIgnoringOtherApps(true);
     application.run();
+    drop(delegate);
     result_rx
         .recv()
         .context("macOS network runtime exited without a result")?
