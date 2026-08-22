@@ -330,7 +330,14 @@ impl MacUi {
 
     #[allow(deprecated)]
     fn close(self) {
-        self.input_view.release_input();
+        if self.window.isKeyWindow() {
+            self.input_view.disable_input();
+        } else {
+            // A replaced/background window already disabled input when it
+            // resigned key status. Do not disable a newer foreground window
+            // that shares the same transport gate.
+            self.input_view.release_input();
+        }
         unsafe { self.layer.flushAndRemoveImage() };
         self.window.orderOut(None);
     }

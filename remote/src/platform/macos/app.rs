@@ -80,6 +80,7 @@ define_class!(
     unsafe impl NSWindowDelegate for RemoteView {
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _notification: &NSNotification) {
+            self.ivars().control.set_input_enabled(true);
             if let Some(window) = self.window()
                 && !window.makeFirstResponder(Some(self))
             {
@@ -89,7 +90,7 @@ define_class!(
 
         #[unsafe(method(windowDidResignKey:))]
         fn window_did_resign_key(&self, _notification: &NSNotification) {
-            self.release_input();
+            self.disable_input();
         }
     }
 
@@ -101,7 +102,7 @@ define_class!(
 
         #[unsafe(method(acceptsFirstMouse:))]
         fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
-            true
+            false
         }
 
         #[unsafe(method(mouseMoved:))]
@@ -156,7 +157,9 @@ define_class!(
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
-            let (x, y) = self.pointer_position(event);
+            let Some((x, y)) = self.pointer_position(event) else {
+                return;
+            };
             let horizontal = (event.scrollingDeltaX() * 120.0)
                 .round()
                 .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
@@ -233,11 +236,13 @@ impl RemoteView {
     }
 
     fn send(&self, message: SessionMessage) {
-        (self.ivars().control)(message);
+        self.ivars().control.send(message);
     }
 
     fn send_pointer(&self, event: &NSEvent) {
-        let (x, y) = self.pointer_position(event);
+        let Some((x, y)) = self.pointer_position(event) else {
+            return;
+        };
         self.send(SessionMessage::Input(RemoteInput::PointerMove {
             display_id: self.ivars().active_display.id,
             x,
@@ -245,7 +250,7 @@ impl RemoteView {
         }));
     }
 
-    fn pointer_position(&self, event: &NSEvent) -> (u16, u16) {
+    fn pointer_position(&self, event: &NSEvent) -> Option<(u16, u16)> {
         let point = self.convertPoint_fromView(event.locationInWindow(), None);
         normalized_video_position(
             point,
@@ -256,15 +261,27 @@ impl RemoteView {
     }
 
     fn send_button(&self, event: &NSEvent, button: PointerButton, pressed: bool) {
-        let (x, y) = self.pointer_position(event);
-        self.send(SessionMessage::Input(RemoteInput::PointerButtonAt {
-            display_id: self.ivars().active_display.id,
-            x,
-            y,
-            button,
-            pressed,
-        }));
         let mut buttons = self.ivars().pressed_buttons.borrow_mut();
+        let position = self.pointer_position(event);
+        match position {
+            Some((x, y)) => self.send(SessionMessage::Input(RemoteInput::PointerButtonAt {
+                display_id: self.ivars().active_display.id,
+                x,
+                y,
+                button,
+                pressed,
+            })),
+            None if !pressed && buttons.contains(&button) => {
+                // Finish a drag that began over the video without moving the
+                // remote pointer to an out-of-bounds/clamped position.
+                self.send(SessionMessage::Input(RemoteInput::PointerButton {
+                    display_id: self.ivars().active_display.id,
+                    button,
+                    pressed: false,
+                }));
+            }
+            None => return,
+        }
         if pressed {
             if !buttons.contains(&button) {
                 buttons.push(button);
@@ -330,6 +347,11 @@ impl RemoteView {
             }));
         }
     }
+
+    pub(super) fn disable_input(&self) {
+        self.release_input();
+        self.ivars().control.set_input_enabled(false);
+    }
 }
 
 pub(super) fn normalized_video_position(
@@ -337,7 +359,7 @@ pub(super) fn normalized_video_position(
     bounds: NSRect,
     video_width: u32,
     video_height: u32,
-) -> (u16, u16) {
+) -> Option<(u16, u16)> {
     let bounds_width = bounds.size.width.max(1.0);
     let bounds_height = bounds.size.height.max(1.0);
     let video_width = f64::from(video_width.max(1));
@@ -347,12 +369,19 @@ pub(super) fn normalized_video_position(
     let presented_height = (video_height * scale).max(1.0);
     let presented_x = bounds.origin.x + (bounds_width - presented_width) / 2.0;
     let presented_y = bounds.origin.y + (bounds_height - presented_height) / 2.0;
+    if point.x < presented_x
+        || point.x > presented_x + presented_width
+        || point.y < presented_y
+        || point.y > presented_y + presented_height
+    {
+        return None;
+    }
     let normalized_x = ((point.x - presented_x) / presented_width).clamp(0.0, 1.0);
     let normalized_y = ((point.y - presented_y) / presented_height).clamp(0.0, 1.0);
-    (
+    Some((
         (normalized_x * 65_535.0).round() as u16,
         ((1.0 - normalized_y) * 65_535.0).round() as u16,
-    )
+    ))
 }
 
 fn mac_button(event: &NSEvent) -> PointerButton {

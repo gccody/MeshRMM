@@ -36,55 +36,81 @@ struct ActivePresenter {
 #[derive(Clone)]
 struct ViewerControlQueue {
     outgoing: mpsc::UnboundedSender<SessionMessage>,
-    pending_pointer: Arc<Mutex<Option<SessionMessage>>>,
+    input: Arc<Mutex<ViewerInputState>>,
+}
+
+struct ViewerInputState {
+    enabled: bool,
+    pending_pointer: Option<SessionMessage>,
 }
 
 impl ViewerControlQueue {
     fn new(outgoing: mpsc::UnboundedSender<SessionMessage>) -> Self {
         Self {
             outgoing,
-            pending_pointer: Arc::new(Mutex::new(None)),
+            input: Arc::new(Mutex::new(ViewerInputState {
+                enabled: false,
+                pending_pointer: None,
+            })),
         }
     }
 
     fn send(&self, message: SessionMessage) {
+        let is_input = matches!(&message, SessionMessage::Input(_));
+        let Ok(mut input) = self.input.lock() else {
+            return;
+        };
+        if is_input && !input.enabled {
+            return;
+        }
         if matches!(
-            message,
+            &message,
             SessionMessage::Input(pulsermm_protocol::RemoteInput::PointerMove { .. })
         ) {
-            if let Ok(mut pending) = self.pending_pointer.lock() {
-                *pending = Some(message);
-            }
+            input.pending_pointer = Some(message);
             return;
         }
 
-        if matches!(
-            message,
+        let pending_pointer = if matches!(
+            &message,
             SessionMessage::Input(
                 pulsermm_protocol::RemoteInput::PointerButtonAt { .. }
                     | pulsermm_protocol::RemoteInput::WheelAt { .. }
             )
         ) {
             // The positioned action supersedes any older unsent motion.
-            if let Ok(mut pending) = self.pending_pointer.lock() {
-                pending.take();
-            }
+            input.pending_pointer.take();
+            None
         } else {
             // Preserve pointer-before-action ordering for legacy/non-positioned
             // messages while still coalescing ordinary motion.
-            self.flush_pointer();
+            input.pending_pointer.take()
+        };
+        drop(input);
+        if let Some(pending_pointer) = pending_pointer {
+            let _ = self.outgoing.send(pending_pointer);
         }
         let _ = self.outgoing.send(message);
     }
 
     fn flush_pointer(&self) {
-        let pending = self
-            .pending_pointer
-            .lock()
-            .ok()
-            .and_then(|mut pending| pending.take());
+        let pending = self.input.lock().ok().and_then(|mut input| {
+            input
+                .enabled
+                .then(|| input.pending_pointer.take())
+                .flatten()
+        });
         if let Some(message) = pending {
             let _ = self.outgoing.send(message);
+        }
+    }
+
+    fn set_input_enabled(&self, enabled: bool) {
+        if let Ok(mut input) = self.input.lock() {
+            input.enabled = enabled;
+            if !enabled {
+                input.pending_pointer = None;
+            }
         }
     }
 }
@@ -397,10 +423,12 @@ fn install_control_handler(
                         tracing::error!(display_id = active_display_id.0, "Agent selected an unknown display");
                         return;
                     };
-                    let sink_tx = viewer_control.clone();
-                    let sink: ControlSink = Arc::new(move |message| {
-                        sink_tx.send(message);
-                    });
+                    let message_queue = viewer_control.clone();
+                    let input_gate = viewer_control.clone();
+                    let sink = ControlSink::new(
+                        move |message| message_queue.send(message),
+                        move |enabled| input_gate.set_input_enabled(enabled),
+                    );
                     match Presenter::start(format, active_display.clone(), displays, sink) {
                         Ok(new_presenter) => {
                             let mut old = presenter
@@ -497,10 +525,16 @@ mod tests {
         })
     }
 
+    fn active_queue() -> (ViewerControlQueue, mpsc::UnboundedReceiver<SessionMessage>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let queue = ViewerControlQueue::new(tx);
+        queue.set_input_enabled(true);
+        (queue, rx)
+    }
+
     #[test]
     fn pointer_motion_is_coalesced_to_the_latest_position() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let queue = ViewerControlQueue::new(tx);
+        let (queue, mut rx) = active_queue();
 
         queue.send(pointer(10, 20));
         queue.send(pointer(30, 40));
@@ -513,8 +547,7 @@ mod tests {
 
     #[test]
     fn pointer_position_is_flushed_before_a_button_event() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let queue = ViewerControlQueue::new(tx);
+        let (queue, mut rx) = active_queue();
         let button = SessionMessage::Input(RemoteInput::PointerButton {
             display_id: DisplayId(1),
             button: PointerButton::Left,
@@ -531,8 +564,7 @@ mod tests {
 
     #[test]
     fn positioned_button_supersedes_pending_pointer_motion() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let queue = ViewerControlQueue::new(tx);
+        let (queue, mut rx) = active_queue();
         let button = SessionMessage::Input(RemoteInput::PointerButtonAt {
             display_id: DisplayId(1),
             x: 50,
@@ -545,6 +577,38 @@ mod tests {
         queue.send(button.clone());
 
         assert_eq!(rx.try_recv().unwrap(), button);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn input_is_discarded_until_the_viewer_is_foreground() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let queue = ViewerControlQueue::new(tx);
+        let button = SessionMessage::Input(RemoteInput::PointerButton {
+            display_id: DisplayId(1),
+            button: PointerButton::Left,
+            pressed: true,
+        });
+
+        queue.send(pointer(10, 20));
+        queue.send(button);
+        queue.flush_pointer();
+        assert!(rx.try_recv().is_err());
+
+        queue.set_input_enabled(true);
+        queue.send(pointer(30, 40));
+        queue.flush_pointer();
+        assert_eq!(rx.try_recv().unwrap(), pointer(30, 40));
+    }
+
+    #[test]
+    fn backgrounding_discards_pending_pointer_motion() {
+        let (queue, mut rx) = active_queue();
+
+        queue.send(pointer(30, 40));
+        queue.set_input_enabled(false);
+        queue.flush_pointer();
+
         assert!(rx.try_recv().is_err());
     }
 }

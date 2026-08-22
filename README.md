@@ -189,8 +189,15 @@ currently being streamed and every event carries that display ID, so the Agent
 rejects input left over from a previous display after a switch. On Windows,
 press **F8** in the viewer to cycle displays. On macOS, use
 **Control-Option-Left/Right Arrow**. The active display name is shown in the
-viewer title. Unfocusing the viewer, switching displays, or ending a session
-releases held buttons and keys.
+viewer title. The viewer sends input only while its remote-desktop window is in
+the foreground. The click that activates an inactive macOS viewer is not
+forwarded. Unfocusing the viewer, switching displays, or ending a session
+releases held buttons and keys, and any unsent pointer movement is discarded.
+Mouse movement, clicks, and wheel input are forwarded only while the pointer is
+inside the displayed video. Letterbox bars and positions outside the client
+area do not control the Agent, so the local pointer remains free to leave the
+remote view. Releasing a drag outside the video still releases the held remote
+button without moving the remote pointer.
 
 Endpoint and remote input are collaborative: neither side locks out the other.
 The newest local or remote action takes effect. Remote clicks and wheel actions
