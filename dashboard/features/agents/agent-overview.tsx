@@ -8,6 +8,7 @@ import {
   LoaderCircle,
   Monitor,
   Search,
+  Trash2,
   Wifi,
   WifiOff,
 } from "lucide-react";
@@ -23,9 +24,12 @@ type Props = {
   query: string;
   status: AgentStatusFilter;
   connectingId: string | null;
+  deletingId: string | null;
+  canDelete: boolean;
   onQueryChange: (query: string) => void;
   onStatusChange: (status: AgentStatusFilter) => void;
   onRemote: (agent: Agent) => void;
+  onDelete: (agent: Agent) => void;
 };
 
 export function AgentOverview({
@@ -36,9 +40,12 @@ export function AgentOverview({
   query,
   status,
   connectingId,
+  deletingId,
+  canDelete,
   onQueryChange,
   onStatusChange,
   onRemote,
+  onDelete,
 }: Props) {
   const online = agents.filter((agent) => agent.connected).length;
   const offline = agents.length - online;
@@ -81,7 +88,10 @@ export function AgentOverview({
               <div className="device-cell"><div className={`device-avatar ${agent.connected ? "online" : ""}`}>{(agent.name.match(/[a-z0-9]/i)?.[0] ?? "A").toUpperCase()}<span /></div><div><strong>{agent.name}</strong><code>Cloudflare live inventory</code></div></div>
               <div><span className={`status-badge ${agent.connected ? "online" : "offline"}`}><i />{agent.connected ? "Online" : "Offline"}</span></div>
               <div className="device-id-cell"><code>{agent.id}</code></div>
-              <div className="row-actions"><button className={`remote-button ${!agent.connected ? "disabled" : ""}`} disabled={!agent.connected || connectingId === agent.id} onClick={() => onRemote(agent)}>{connectingId === agent.id ? <LoaderCircle size={15} className="spin" /> : <Monitor size={15} />}{connectingId === agent.id ? "Authorizing..." : "Remote"}</button></div>
+              <div className="row-actions">
+                <button className={`remote-button ${!agent.connected ? "disabled" : ""}`} disabled={!agent.connected || connectingId === agent.id || deletingId === agent.id} onClick={() => onRemote(agent)}>{connectingId === agent.id ? <LoaderCircle size={15} className="spin" /> : <Monitor size={15} />}{connectingId === agent.id ? "Authorizing..." : "Remote"}</button>
+                {canDelete && <button className="agent-delete-button" disabled={deletingId === agent.id} onClick={() => onDelete(agent)} aria-label={`Delete ${agent.name}`} title="Delete Agent">{deletingId === agent.id ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}</button>}
+              </div>
             </div>
           ))}
           {!filteredAgents.length && <div className="empty-state"><Search size={24} /><strong>{isLive ? "No Agents found" : "No live Agent data"}</strong><span>{isLive ? "Create an Agent or adjust the current filters." : "The company inventory has not returned a live response."}</span></div>}
@@ -91,4 +101,3 @@ export function AgentOverview({
     </>
   );
 }
-

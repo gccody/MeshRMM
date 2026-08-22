@@ -27,6 +27,20 @@ pub struct AgentSessionRequest {
     pub ice_servers: Vec<IceServer>,
 }
 
+/// Commands sent over the authenticated Agent coordinator connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentCommand {
+    Uninstall,
+}
+
+/// Agent-to-coordinator lifecycle notifications.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentStatusMessage {
+    UninstallScheduled,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SignalMessage {
@@ -62,4 +76,21 @@ pub struct CreateSessionRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiError {
     pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_lifecycle_messages_use_tagged_json() {
+        assert_eq!(
+            serde_json::to_string(&AgentCommand::Uninstall).unwrap(),
+            r#"{"type":"uninstall"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentStatusMessage::UninstallScheduled).unwrap(),
+            r#"{"type":"uninstall_scheduled"}"#
+        );
+    }
 }

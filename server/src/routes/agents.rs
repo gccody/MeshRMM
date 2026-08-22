@@ -152,9 +152,11 @@ pub(crate) async fn delete_agent(
         Err(error) => return workos_auth_error(error),
     };
     let db = environment.d1("DB")?;
+    let now = now_ms_i64()?;
     let result = query!(
         &db,
-        "DELETE FROM agents WHERE id = ?1 AND company_id = ?2",
+        "UPDATE agents SET deletion_requested_at = ?1, updated_at = ?1 WHERE id = ?2 AND company_id = ?3 AND deletion_requested_at IS NULL",
+        now,
         device_id,
         identity.company_id
     )?
@@ -176,6 +178,9 @@ pub(crate) async fn delete_agent(
     {
         console_error!("event=agent_deleted_publish_failed error={}", error);
     }
+    if let Err(error) = crate::agent_coordinator::request_uninstall(environment, device_id).await {
+        console_error!("event=agent_uninstall_notify_failed error={}", error);
+    }
     Response::empty().map(|response| response.with_status(204))
 }
 
@@ -196,7 +201,7 @@ pub(crate) async fn rotate_agent_token(
     let db = environment.d1("DB")?;
     let result = query!(
         &db,
-        "UPDATE agents SET auth_token_hash = ?1, updated_at = ?2 WHERE id = ?3 AND company_id = ?4",
+        "UPDATE agents SET auth_token_hash = ?1, updated_at = ?2 WHERE id = ?3 AND company_id = ?4 AND deletion_requested_at IS NULL",
         token_hash,
         now,
         device_id,

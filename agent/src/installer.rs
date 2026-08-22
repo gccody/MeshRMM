@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
@@ -23,6 +24,8 @@ use crate::service::SERVICE_NAME;
 
 const ENROLLMENT_MAGIC: &[u8] = b"PULSERMM-BOOTSTRAP-V1";
 const CONFIG_LENGTH_BYTES: usize = 8;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 #[derive(Debug, Deserialize)]
 struct InstallerBootstrap {
@@ -97,6 +100,64 @@ pub fn install_and_notify() -> anyhow::Result<()> {
             Err(error)
         }
     }
+}
+
+/// Starts an independent LocalSystem helper before the service worker exits. The helper can then
+/// stop and remove the service without trying to delete the executable that is currently running.
+pub fn schedule_uninstall() -> anyhow::Result<()> {
+    let source = std::env::current_exe().context("could not locate the Agent executable")?;
+    let helper_directory = std::env::temp_dir().join("PulseRMM");
+    std::fs::create_dir_all(&helper_directory).with_context(|| {
+        format!(
+            "failed to create uninstall helper directory {}",
+            helper_directory.display()
+        )
+    })?;
+    let helper = helper_directory.join(format!(
+        "uninstall-{}-{}.exe",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+    std::fs::copy(&source, &helper)
+        .with_context(|| format!("failed to create uninstall helper {}", helper.display()))?;
+    Command::new(&helper)
+        .arg("--uninstall")
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn()
+        .with_context(|| format!("failed to start uninstall helper {}", helper.display()))?;
+    Ok(())
+}
+
+pub fn uninstall() -> anyhow::Result<()> {
+    // Give the worker enough time to flush its coordinator acknowledgement before stopping the
+    // service terminates that worker process.
+    sleep(Duration::from_secs(1));
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("administrator access is required to uninstall the Agent service")?;
+    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
+    if let Ok(service) = manager.open_service(SERVICE_NAME, service_access) {
+        stop_service(&service)?;
+        service
+            .delete()
+            .context("failed to unregister the Agent service")?;
+    }
+    drop(manager);
+
+    let install_directory = required_system_directory("ProgramFiles")?
+        .join("PulseRMM")
+        .join("Agent");
+    let config_directory = required_system_directory("ProgramData")?
+        .join("PulseRMM")
+        .join("Agent");
+    remove_directory_if_present(&config_directory)?;
+    remove_directory_if_present(&install_directory)?;
+    remove_empty_parent(&config_directory);
+    remove_empty_parent(&install_directory);
+    schedule_helper_cleanup()?;
+    Ok(())
 }
 
 fn install() -> anyhow::Result<()> {
@@ -195,6 +256,41 @@ fn stop_service(service: &windows_service::service::Service) -> anyhow::Result<(
             .context("failed to stop the existing Agent service")?;
         wait_for_state(service, ServiceState::Stopped, Duration::from_secs(20))?;
     }
+    Ok(())
+}
+
+fn remove_directory_if_present(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to remove Agent data at {}", path.display()))
+        }
+    }
+}
+
+fn remove_empty_parent(path: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+}
+
+fn schedule_helper_cleanup() -> anyhow::Result<()> {
+    let helper = std::env::current_exe().context("could not locate the uninstall helper")?;
+    let helper_directory = helper
+        .parent()
+        .context("the uninstall helper has no parent directory")?;
+    let cleanup = format!(
+        "ping.exe 127.0.0.1 -n 3 >NUL & del.exe /f /q \"{}\" & rmdir \"{}\"",
+        helper.display(),
+        helper_directory.display()
+    );
+    Command::new("cmd.exe")
+        .args(["/D", "/S", "/C"])
+        .arg(cleanup)
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn()
+        .context("failed to schedule uninstall helper cleanup")?;
     Ok(())
 }
 

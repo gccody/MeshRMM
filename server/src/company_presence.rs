@@ -166,7 +166,7 @@ impl CompanyPresence {
         let db = self.environment.d1("DB")?;
         let result = query!(
             &db,
-            "SELECT id, name FROM agents WHERE company_id = ?1 ORDER BY name COLLATE NOCASE, id",
+            "SELECT id, name FROM agents WHERE company_id = ?1 AND deletion_requested_at IS NULL ORDER BY name COLLATE NOCASE, id",
             company_id
         )?
         .all()
@@ -252,7 +252,7 @@ impl CompanyPresence {
                 let db = self.environment.d1("DB")?;
                 let row = query!(
                     &db,
-                    "SELECT id, name FROM agents WHERE id = ?1 AND company_id = ?2",
+                    "SELECT id, name FROM agents WHERE id = ?1 AND company_id = ?2 AND deletion_requested_at IS NULL",
                     agent_id,
                     company_id
                 )?

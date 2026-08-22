@@ -37,6 +37,12 @@ struct Company {
 struct AgentCredentialRow {
     auth_token_hash: String,
     company_id: String,
+    deletion_requested_at: Option<i64>,
+}
+
+struct AgentAuthorization {
+    company_id: String,
+    deletion_requested: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,8 +212,8 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
             rotate_agent_token(&request, &environment, device_id).await
         }
         (Method::Get, ["v1", "agents", device_id, "connect"]) => {
-            let company_id = match authorize_agent(&request, &environment, device_id).await {
-                Ok(company_id) => company_id,
+            let authorization = match authorize_agent(&request, &environment, device_id).await {
+                Ok(authorization) => authorization,
                 Err(_) => {
                     return cors(api_error(401, "Agent authentication failed")?, &environment);
                 }
@@ -219,8 +225,16 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
                 request,
                 "https://agent.internal/connect",
                 &[
-                    ("X-Pulse-Company-Id", company_id.as_str()),
+                    ("X-Pulse-Company-Id", authorization.company_id.as_str()),
                     ("X-Pulse-Device-Id", device_id),
+                    (
+                        "X-Pulse-Uninstall-Requested",
+                        if authorization.deletion_requested {
+                            "true"
+                        } else {
+                            "false"
+                        },
+                    ),
                 ],
             )
             .await
@@ -255,13 +269,17 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
     cors(response, &environment)
 }
 
-async fn authorize_agent(request: &Request, environment: &Env, device_id: &str) -> Result<String> {
+async fn authorize_agent(
+    request: &Request,
+    environment: &Env,
+    device_id: &str,
+) -> Result<AgentAuthorization> {
     validate_identifier(device_id, "device ID")?;
     let supplied = bearer_token(request)?;
     let db = environment.d1("DB")?;
     let credential = query!(
         &db,
-        "SELECT auth_token_hash, company_id FROM agents WHERE id = ?1",
+        "SELECT auth_token_hash, company_id, deletion_requested_at FROM agents WHERE id = ?1",
         device_id
     )?
     .first::<AgentCredentialRow>(None)
@@ -273,7 +291,10 @@ async fn authorize_agent(request: &Request, environment: &Env, device_id: &str) 
     ) {
         return Err(Error::RustError("invalid Agent token".into()));
     }
-    Ok(credential.company_id)
+    Ok(AgentAuthorization {
+        company_id: credential.company_id,
+        deletion_requested: credential.deletion_requested_at.is_some(),
+    })
 }
 
 async fn authorize_workos_user(request: &Request, environment: &Env) -> Result<Identity> {
