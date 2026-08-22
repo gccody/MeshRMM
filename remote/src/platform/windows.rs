@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use pulsermm_protocol::{
-    Display, EncodedFrame, PointerButton, RemoteInput, SessionMessage, VideoFormat,
+    CursorShape, Display, EncodedFrame, PointerButton, RemoteInput, SessionMessage, VideoFormat,
 };
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,
@@ -40,7 +40,7 @@ mod window;
 
 use pipeline::WorkerPipeline;
 use renderer::D3d11Renderer;
-use window::{create_window, pump_window_messages};
+use window::{create_window, pump_window_messages, set_window_cursor};
 
 const MAX_DECODER_PENDING_FRAMES: usize = 4;
 
@@ -51,6 +51,7 @@ struct QueuedFrame {
 
 struct Shared {
     latest: Mutex<Option<QueuedFrame>>,
+    cursor_shape: Mutex<Option<CursorShape>>,
     ready: Condvar,
     stopping: AtomicBool,
     running: AtomicBool,
@@ -74,6 +75,7 @@ impl Presenter {
     ) -> anyhow::Result<Self> {
         let shared = Arc::new(Shared {
             latest: Mutex::new(None),
+            cursor_shape: Mutex::new(None),
             ready: Condvar::new(),
             stopping: AtomicBool::new(false),
             running: AtomicBool::new(false),
@@ -82,6 +84,7 @@ impl Presenter {
             debug,
         });
         let worker_shared = Arc::clone(&shared);
+        let worker_debug = worker_shared.debug.clone();
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("pulsermm-decode-present".into())
@@ -92,7 +95,7 @@ impl Presenter {
                     active_display,
                     displays,
                     control,
-                    worker_shared.debug.clone(),
+                    worker_debug,
                     started_tx,
                 )
             })
@@ -120,6 +123,12 @@ impl Presenter {
             self.shared.replaced_frames.fetch_add(1, Ordering::Relaxed);
         }
         self.shared.ready.notify_one();
+    }
+
+    pub fn set_cursor_shape(&self, shape: CursorShape) {
+        if let Ok(mut pending) = self.shared.cursor_shape.lock() {
+            *pending = Some(shape);
+        }
     }
 
     pub fn stop(&mut self) {
@@ -198,6 +207,14 @@ fn run_worker(
             };
             latest.take()
         };
+        if let Some(shape) = shared
+            .cursor_shape
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
+        {
+            unsafe { pipeline.set_cursor_shape(shape) };
+        }
         let Some(queued) = queued else {
             continue;
         };

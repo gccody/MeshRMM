@@ -5,8 +5,9 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use pulsermm_protocol::{
-    CONTROL_CHANNEL_LABEL, FrameReassembler, IceServer, ReassemblyConfig, ReassemblyOutcome,
-    SessionBootstrap, SessionMessage, SessionState, SignalMessage, VideoPacket, VideoStreamId,
+    CONTROL_CHANNEL_LABEL, CursorShape, FrameReassembler, IceServer, ReassemblyConfig,
+    ReassemblyOutcome, SessionBootstrap, SessionMessage, SessionState, SignalMessage, VideoPacket,
+    VideoStreamId,
 };
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -491,8 +492,10 @@ fn install_control_handler(
             })
         }));
     }
+    let cursor_shape = Arc::new(Mutex::new(CursorShape::Default));
     channel.on_message(Box::new(move |message| {
         let presenter = Arc::clone(&presenter);
+        let cursor_shape = Arc::clone(&cursor_shape);
         let viewer_control = viewer_control.clone();
         let presentation_failure = presentation_failure.clone();
         let debug = debug.clone();
@@ -533,6 +536,9 @@ fn install_control_handler(
                         debug.clone(),
                     ) {
                         Ok(new_presenter) => {
+                            if let Ok(shape) = cursor_shape.lock() {
+                                new_presenter.set_cursor_shape(*shape);
+                            }
                             let mut old = presenter
                                 .lock()
                                 .ok()
@@ -557,6 +563,16 @@ fn install_control_handler(
                     }
                 }
                 Ok(SessionMessage::Stop { reason }) => tracing::info!(reason, "Agent stopped stream"),
+                Ok(SessionMessage::CursorShape { shape }) => {
+                    if let Ok(mut current) = cursor_shape.lock() {
+                        *current = shape;
+                    }
+                    if let Ok(guard) = presenter.lock()
+                        && let Some(active) = guard.as_ref()
+                    {
+                        active.presenter.set_cursor_shape(shape);
+                    }
+                }
                 Ok(_) => {}
                 Err(error) => tracing::warn!(error = %error, "discarding invalid control message"),
             }

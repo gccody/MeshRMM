@@ -1,16 +1,20 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, bail};
-use pulsermm_protocol::{Display, PointerButton, RemoteInput};
+use pulsermm_protocol::{CursorShape, Display, PointerButton, RemoteInput};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    CURSOR_SHOWING, CURSORINFO, GetCursorInfo, GetSystemMetrics, IDC_APPSTARTING, IDC_ARROW,
+    IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_NO, IDC_PERSON, IDC_PIN, IDC_SIZEALL,
+    IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_UPARROW, IDC_WAIT, LoadCursorW,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 pub struct WindowsInputController {
     active_display: Option<Display>,
     pressed_keys: HashSet<(u16, bool)>,
     pressed_buttons: HashSet<PointerButton>,
+    system_cursors: Vec<(usize, CursorShape)>,
 }
 
 impl WindowsInputController {
@@ -19,7 +23,23 @@ impl WindowsInputController {
             active_display: None,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
+            system_cursors: system_cursor_handles(),
         }
+    }
+
+    pub fn cursor_shape(&self) -> CursorShape {
+        let mut info = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetCursorInfo(&mut info) }.is_err() || info.flags.0 & CURSOR_SHOWING.0 == 0 {
+            return CursorShape::Default;
+        }
+        let handle = info.hCursor.0 as usize;
+        self.system_cursors
+            .iter()
+            .find_map(|(candidate, shape)| (*candidate == handle).then_some(*shape))
+            .unwrap_or_default()
     }
 
     pub fn set_active_display(&mut self, display: Display) -> anyhow::Result<()> {
@@ -117,6 +137,34 @@ impl WindowsInputController {
         }
         Ok(())
     }
+}
+
+fn system_cursor_handles() -> Vec<(usize, CursorShape)> {
+    [
+        (IDC_ARROW, CursorShape::Default),
+        (IDC_IBEAM, CursorShape::Text),
+        (IDC_WAIT, CursorShape::Wait),
+        (IDC_CROSS, CursorShape::Crosshair),
+        (IDC_UPARROW, CursorShape::UpArrow),
+        (IDC_SIZENWSE, CursorShape::ResizeNorthWestSouthEast),
+        (IDC_SIZENESW, CursorShape::ResizeNorthEastSouthWest),
+        (IDC_SIZEWE, CursorShape::ResizeWestEast),
+        (IDC_SIZENS, CursorShape::ResizeNorthSouth),
+        (IDC_SIZEALL, CursorShape::Move),
+        (IDC_NO, CursorShape::NotAllowed),
+        (IDC_HAND, CursorShape::Pointer),
+        (IDC_APPSTARTING, CursorShape::Progress),
+        (IDC_HELP, CursorShape::Help),
+        (IDC_PIN, CursorShape::Pin),
+        (IDC_PERSON, CursorShape::Person),
+    ]
+    .into_iter()
+    .filter_map(|(resource, shape)| {
+        unsafe { LoadCursorW(None, resource) }
+            .ok()
+            .map(|cursor| (cursor.0 as usize, shape))
+    })
+    .collect()
 }
 
 impl Drop for WindowsInputController {

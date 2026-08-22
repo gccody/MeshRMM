@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{DisplayId, RemoteInput, RemoteSessionId, VideoStreamId};
+use crate::{CursorShape, DisplayId, RemoteInput, RemoteSessionId, VideoStreamId};
 
 pub const CONTROL_CHANNEL_LABEL: &str = "pulsermm-control-v3";
 pub const CONTROL_CHANNEL_PROTOCOL: &str = "pulsermm.control.v3";
@@ -47,6 +47,11 @@ pub enum SessionMessage {
         display_id: DisplayId,
     },
     Input(RemoteInput),
+    /// The semantic shape of the cursor currently active on the Agent. Native
+    /// viewers map unsupported shapes back to their normal default cursor.
+    CursorShape {
+        shape: CursorShape,
+    },
 }
 
 impl SessionMessage {
@@ -165,6 +170,16 @@ mod tests {
             active_display_id: DisplayId(2),
             stream_id: VideoStreamId(9),
             format,
+        };
+
+        let encoded = message.encode().unwrap();
+        assert_eq!(SessionMessage::decode(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn cursor_shape_round_trips_through_control_channel() {
+        let message = SessionMessage::CursorShape {
+            shape: CursorShape::Text,
         };
 
         let encoded = message.encode().unwrap();

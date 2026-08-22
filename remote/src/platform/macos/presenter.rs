@@ -91,6 +91,17 @@ impl Presenter {
         schedule_latest(Arc::clone(&self.shared));
     }
 
+    pub fn set_cursor_shape(&self, shape: CursorShape) {
+        let id = self.shared.id;
+        DispatchQueue::main().exec_async(move || {
+            UI.with(|state| {
+                if let Some(ui) = state.borrow().as_ref().filter(|ui| ui.id == id) {
+                    ui.input_view.set_cursor_shape(shape);
+                }
+            });
+        });
+    }
+
     pub fn poll_ended(&self) -> Option<Result<(), String>> {
         self.shared
             .failure

@@ -5,15 +5,16 @@ use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use pulsermm_protocol::{
-    CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, DEFAULT_FRAGMENT_PAYLOAD, Display, DisplayId,
-    IceServer, RemoteInput, RemoteSessionId, SessionMessage, SessionState, SignalMessage,
-    VideoStreamId, fragment_frame,
+    CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, CursorShape, DEFAULT_FRAGMENT_PAYLOAD,
+    Display, DisplayId, IceServer, RemoteInput, RemoteSessionId, SessionMessage, SessionState,
+    SignalMessage, VideoStreamId, fragment_frame,
 };
 use pulsermm_signaling_client::Socket;
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::data_channel::{RTCDataChannel, data_channel_init::RTCDataChannelInit};
 use webrtc::ice_transport::{ice_candidate::RTCIceCandidateInit, ice_server::RTCIceServer};
 use webrtc::peer_connection::{
@@ -193,6 +194,9 @@ async fn run_connected_sender(
     session_state = session_state.transition(SessionState::Connecting)?;
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     stats_interval.tick().await;
+    let mut cursor_interval = tokio::time::interval(std::time::Duration::from_millis(16));
+    cursor_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut sent_cursor_shape = None::<CursorShape>;
     let mut offer_sent = false;
     let mut remote_description_set = false;
     let mut pending_candidates = Vec::new();
@@ -286,6 +290,18 @@ async fn run_connected_sender(
                             "remote input/control channel closed unexpectedly"
                         ));
                     }
+                }
+            }
+            _ = cursor_interval.tick(), if session_state == SessionState::Streaming => {
+                let shape = input.cursor_shape();
+                if sent_cursor_shape != Some(shape)
+                    && control_channel.ready_state() == RTCDataChannelState::Open
+                {
+                    send_control_message(
+                        &control_channel,
+                        SessionMessage::CursorShape { shape },
+                    ).await?;
+                    sent_cursor_shape = Some(shape);
                 }
             }
             Some(state) = state_rx.recv() => {
