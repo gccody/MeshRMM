@@ -1,4 +1,10 @@
+use super::app::{RemoteView, activate_application};
 use super::*;
+
+thread_local! {
+    /// AppKit and Core Animation objects never leave the main thread.
+    static UI: RefCell<Option<MacUi>> = const { RefCell::new(None) };
+}
 
 struct QueuedFrame {
     frame: EncodedFrame,

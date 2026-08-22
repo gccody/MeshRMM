@@ -57,7 +57,7 @@ impl AppDelegate {
     }
 }
 
-struct RemoteViewIvars {
+pub(super) struct RemoteViewIvars {
     active_display: Display,
     displays: Vec<Display>,
     video_width: u32,
@@ -73,7 +73,7 @@ define_class!(
     #[unsafe(super = NSView)]
     #[thread_kind = MainThreadOnly]
     #[ivars = RemoteViewIvars]
-    struct RemoteView;
+    pub(super) struct RemoteView;
 
     unsafe impl NSObjectProtocol for RemoteView {}
 
@@ -211,7 +211,7 @@ define_class!(
 );
 
 impl RemoteView {
-    fn new(
+    pub(super) fn new(
         mtm: MainThreadMarker,
         frame: NSRect,
         active_display: Display,
@@ -313,7 +313,7 @@ impl RemoteView {
         });
     }
 
-    fn release_input(&self) {
+    pub(super) fn release_input(&self) {
         for (scan_code, extended) in self.ivars().pressed_keys.take() {
             self.send(SessionMessage::Input(RemoteInput::Key {
                 display_id: self.ivars().active_display.id,
@@ -471,12 +471,10 @@ fn mac_key_to_windows_scan_code(code: u16) -> Option<(u16, bool)> {
 }
 
 thread_local! {
-    /// AppKit and Core Animation objects never leave the main thread.
-    static UI: RefCell<Option<MacUi>> = const { RefCell::new(None) };
     static CONNECTING_WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
 }
 
-fn activate_application(mtm: MainThreadMarker) {
+pub(super) fn activate_application(mtm: MainThreadMarker) {
     let application = NSApplication::sharedApplication(mtm);
     // `activate` is newer than the MVP's macOS 12 deployment target.
     #[allow(deprecated)]

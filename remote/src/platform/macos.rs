@@ -41,12 +41,11 @@ mod presenter;
 use app::close_connecting_window;
 #[cfg(test)]
 use app::normalized_video_position;
-pub use app::run_application;
-pub use presenter::{Presenter, monotonic_timestamp_us};
+pub use app::{monotonic_timestamp_us, run_application};
+pub use presenter::Presenter;
 
 static NEXT_PRESENTER_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug)]
 #[cfg(test)]
 mod tests {
     use super::*;
