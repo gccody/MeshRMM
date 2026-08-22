@@ -1,3 +1,5 @@
+#[cfg(windows)]
+pub(crate) mod capture_helper;
 pub mod config;
 #[cfg(windows)]
 mod input;
@@ -15,10 +17,10 @@ use pulsermm_protocol::AgentSessionRequest;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message;
 
-use self::config::Config;
+use self::config::{Config, ExecutionMode};
 use self::signaling::{agent_connection_url, authenticated_websocket};
 
-pub async fn run(config: Config) -> anyhow::Result<()> {
+pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
     #[cfg(not(windows))]
     anyhow::bail!("the first PulseRMM remote-screen MVP requires Windows");
 
@@ -47,7 +49,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                                                 }
                                             };
                                             // The MVP intentionally permits one viewer/session at a time.
-                                            if let Err(error) = session::run(&config, request).await {
+                                            if let Err(error) = session::run(&config, request, mode).await {
                                                 tracing::error!(error = ?error, "remote session ended with an error");
                                             }
                                         }

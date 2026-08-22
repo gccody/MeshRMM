@@ -33,6 +33,8 @@ windows-service = "0.8.1"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_Environment",
+    "Win32_System_Pipes",
     "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",

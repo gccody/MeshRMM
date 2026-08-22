@@ -5,6 +5,7 @@ use worker::*;
 
 const CLIENT_TAG: &str = "client";
 const AGENT_TAG: &str = "agent";
+const PENDING_TERMINAL_SIGNAL_KEY: &str = "pending-terminal-signal";
 const MAX_SIGNAL_BYTES: usize = 64 * 1024;
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 
@@ -20,6 +21,12 @@ struct SessionRecord {
     // Keep existing Durable Object records readable during a rolling deploy.
     #[serde(default = "default_idle_timeout_ms")]
     idle_timeout_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingTerminalSignal {
+    destination: String,
+    text: String,
 }
 
 #[durable_object]
@@ -112,10 +119,6 @@ impl DurableObject for RemoteSession {
             self.refresh_idle_deadline().await?;
             return Ok(());
         }
-        if matches!(signal, SignalMessage::Error { .. }) {
-            console_log!("event=peer_reported_signaling_error");
-        }
-
         let destination = if is_client {
             AGENT_TAG
         } else if is_agent {
@@ -124,8 +127,39 @@ impl DurableObject for RemoteSession {
             socket.close(Some(1008), Some("unrecognized peer"))?;
             return Ok(());
         };
+        let terminal = matches!(signal, SignalMessage::Error { .. });
+        if terminal {
+            // The Agent can fail capture before the viewer has completed its
+            // WebSocket upgrade. Persist the terminal signal first so a DO
+            // eviction or deployment cannot turn that failure into a client
+            // timeout with no actionable explanation.
+            self.state
+                .storage()
+                .put(
+                    PENDING_TERMINAL_SIGNAL_KEY,
+                    &PendingTerminalSignal {
+                        destination: destination.into(),
+                        text: text.clone(),
+                    },
+                )
+                .await?;
+            console_log!("event=peer_reported_signaling_error");
+        }
+
+        let mut delivered = false;
         for peer in self.state.get_websockets_with_tag(destination) {
-            peer.send_with_str(&text)?;
+            match peer.send_with_str(&text) {
+                Ok(()) => delivered = true,
+                Err(error) => {
+                    console_error!("event=remote_signal_forward_failed error={}", error)
+                }
+            }
+        }
+        if terminal && delivered {
+            self.state
+                .storage()
+                .delete(PENDING_TERMINAL_SIGNAL_KEY)
+                .await?;
         }
         Ok(())
     }
@@ -207,6 +241,20 @@ impl RemoteSession {
         let pair = WebSocketPair::new()?;
         self.state
             .accept_websocket_with_tags(&pair.server, &[role.as_str()]);
+        if let Some(pending) = self
+            .state
+            .storage()
+            .get::<PendingTerminalSignal>(PENDING_TERMINAL_SIGNAL_KEY)
+            .await?
+            && pending.destination == role
+        {
+            pair.server.send_with_str(&pending.text)?;
+            self.state
+                .storage()
+                .delete(PENDING_TERMINAL_SIGNAL_KEY)
+                .await?;
+            console_log!("event=pending_terminal_signal_delivered role={}", role);
+        }
         console_log!("event=remote_signal_peer_connected role={}", role);
         Response::from_websocket(pair.client)
     }
