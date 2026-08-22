@@ -26,7 +26,7 @@ export async function generateMetadata(): Promise<Metadata> {
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   const clientId = process.env.WORKOS_CLIENT_ID ?? "client_01M0FT1AN01PAT37N98EMRSNVW";
   const redirectUri = process.env.WORKOS_REDIRECT_URI ?? "https://meshrmm.com";
-  const serverUrl = process.env.MESHRMM_SERVER_URL ?? "https://meshrmm-server.gccody2010.workers.dev";
+  const serverUrl = process.env.MESHRMM_SERVER_URL ?? "https://api.meshrmm.com";
   return (
     <html lang="en">
       <body className={`${geistSans.variable} ${geistMono.variable}`}>

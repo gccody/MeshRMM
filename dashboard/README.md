@@ -14,6 +14,7 @@ Worker for all tenant-scoped Agent operations.
 npm install
 npm run dev
 npm run build
+npm run deploy
 ```
 
 Application code is organized by responsibility:
@@ -23,7 +24,7 @@ Application code is organized by responsibility:
 - `features/enrollment/` owns installer enrollment UI.
 - `features/session/` owns organization-scoped dashboard inactivity handling.
 - `lib/` contains shared browser HTTP behavior.
-- `worker/` contains the Cloudflare hosting entry point.
+- `wrangler.jsonc` owns the production Worker, domain, and runtime settings.
 
 ## Session policy
 

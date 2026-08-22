@@ -198,7 +198,7 @@ then be launched from the dashboard. A viewer can also redeem a handoff from
 the command line:
 
 ```powershell
-.\meshrmm-remote.exe "meshrmm://connect?handoff=<one-time-token>&server=https%3A%2F%2Fmeshrmm-server.gccody2010.workers.dev"
+.\meshrmm-remote.exe "meshrmm://connect?handoff=<one-time-token>&server=https%3A%2F%2Fapi.meshrmm.com"
 ```
 
 For macOS, copy `MeshRMM Remote.app` from `dist/remote-macos/` to the
