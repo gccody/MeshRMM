@@ -3,23 +3,36 @@ pub(crate) mod capture_helper;
 pub mod config;
 #[cfg(windows)]
 mod input;
+#[cfg(windows)]
 mod platform;
+#[cfg(windows)]
 mod session;
+#[cfg(windows)]
 mod signaling;
+#[cfg(windows)]
 mod transport;
+#[cfg(windows)]
 mod video;
 
+#[cfg(windows)]
 use std::time::Duration;
 
+#[cfg(windows)]
 use anyhow::Context;
+#[cfg(windows)]
 use futures_util::{SinkExt, StreamExt};
+#[cfg(windows)]
 use pulsermm_protocol::{AgentCommand, AgentSessionRequest, AgentStatusMessage};
+#[cfg(windows)]
 use tokio::time::sleep;
+#[cfg(windows)]
 use tokio_tungstenite::tungstenite::Message;
 
 use self::config::{Config, ExecutionMode};
+#[cfg(windows)]
 use self::signaling::{agent_connection_url, authenticated_websocket};
 
+#[cfg_attr(not(windows), allow(unused_variables))]
 pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
     #[cfg(not(windows))]
     anyhow::bail!("the first PulseRMM remote-screen MVP requires Windows");

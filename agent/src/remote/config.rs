@@ -5,6 +5,7 @@ use clap::{ArgAction, Parser};
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub struct Config {
     pub config_path: PathBuf,
     pub server: String,

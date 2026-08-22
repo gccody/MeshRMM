@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 //! Windows.Graphics.Capture + D3D11 + Media Foundation H.264 implementation.
 //!
 //! COM and GPU objects remain on the capture worker thread. Only compressed
