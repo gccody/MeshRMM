@@ -2,12 +2,14 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use bytes::Bytes;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use pulsermm_protocol::{
     CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, DEFAULT_FRAGMENT_PAYLOAD, Display, DisplayId,
     IceServer, RemoteInput, RemoteSessionId, SessionMessage, SessionState, SignalMessage,
     VideoStreamId, fragment_frame,
 };
+use pulsermm_signaling_client::Socket;
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
@@ -43,6 +45,32 @@ pub async fn run_sender(
 ) -> anyhow::Result<()> {
     let (socket, _) = authenticated_websocket(signal_url, signaling_token).await?;
     let (mut signal_writer, mut signal_reader) = socket.split();
+    let mut failure_reported = false;
+    let result = run_connected_sender(
+        &mut signal_writer,
+        &mut signal_reader,
+        ice_servers,
+        streamer,
+        session_id,
+        &mut failure_reported,
+    )
+    .await;
+    if let Err(error) = &result
+        && !failure_reported
+    {
+        report_sender_failure(&mut signal_writer, error).await;
+    }
+    result
+}
+
+async fn run_connected_sender(
+    signal_writer: &mut SplitSink<Socket, Message>,
+    signal_reader: &mut SplitStream<Socket>,
+    ice_servers: Vec<IceServer>,
+    streamer: Arc<Mutex<Box<dyn ScreenStreamer>>>,
+    session_id: RemoteSessionId,
+    failure_reported: &mut bool,
+) -> anyhow::Result<()> {
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<SignalMessage>();
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ControlCommand>();
     let (state_tx, mut state_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
@@ -289,19 +317,8 @@ pub async fn run_sender(
     .await;
 
     if let Err(error) = &result {
-        let signal = SignalMessage::Error {
-            message: format!("{error:#}"),
-        };
-        match serde_json::to_string(&signal) {
-            Ok(message) => {
-                if let Err(send_error) = signal_writer.send(Message::Text(message.into())).await {
-                    tracing::warn!(error = %send_error, "failed to report sender failure to viewer");
-                }
-            }
-            Err(send_error) => {
-                tracing::warn!(error = %send_error, "failed to encode sender failure for viewer");
-            }
-        }
+        report_sender_failure(signal_writer, error).await;
+        *failure_reported = true;
     }
     video_sender.abort();
     if let Err(error) = input.release_all() {
@@ -338,6 +355,25 @@ pub async fn run_sender(
         "remote sender session stopped"
     );
     result
+}
+
+async fn report_sender_failure(
+    signal_writer: &mut SplitSink<Socket, Message>,
+    error: &anyhow::Error,
+) {
+    let signal = SignalMessage::Error {
+        message: format!("{error:#}"),
+    };
+    match serde_json::to_string(&signal) {
+        Ok(message) => {
+            if let Err(send_error) = signal_writer.send(Message::Text(message.into())).await {
+                tracing::warn!(error = %send_error, "failed to report sender failure to viewer");
+            }
+        }
+        Err(send_error) => {
+            tracing::warn!(error = %send_error, "failed to encode sender failure for viewer");
+        }
+    }
 }
 
 async fn log_network_stats(peer: &RTCPeerConnection) {
