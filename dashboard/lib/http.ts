@@ -1,4 +1,4 @@
-export class AuthenticationRedirectStarted extends Error {}
+export class AuthenticationRequired extends Error {}
 
 export const normalizeServer = (server: string) =>
   server.trim().replace(/\/+$/, "");
@@ -19,4 +19,3 @@ export async function errorMessage(response: Response, fallback: string) {
     return fallback;
   }
 }
-

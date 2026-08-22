@@ -1,6 +1,6 @@
 "use client";
 
-import { useAuth } from "@workos-inc/authkit-react";
+import { LoginRequiredError, useAuth } from "@workos-inc/authkit-react";
 import {
   AdminPortalDomainVerification,
   AdminPortalSsoConnection,
@@ -11,6 +11,7 @@ import {
   Activity,
   Building2,
   ChevronDown,
+  Clock3,
   KeyRound,
   LoaderCircle,
   LogOut,
@@ -26,14 +27,19 @@ import {
   X,
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { useRuntimeConfig } from "./providers";
+import { AUTH_REFRESH_FAILED_EVENT, useRuntimeConfig } from "./providers";
 import { AgentOverview, type AgentStatusFilter } from "../features/agents/agent-overview";
 import { useAgentInventory } from "../features/agents/use-agent-inventory";
 import type { Agent } from "../features/agents/types";
 import { EnrollmentModal, type AgentPlatform } from "../features/enrollment/enrollment-modal";
-import { AuthenticationRedirectStarted, errorMessage, normalizeServer } from "../lib/http";
+import { AuthenticationRequired, errorMessage, normalizeServer } from "../lib/http";
+import {
+  DEFAULT_IDLE_TIMEOUT_MINUTES,
+  formatIdleTimeout,
+} from "../features/session/idle-session";
+import { useIdleSession } from "../features/session/use-idle-session";
 
-type Company = { id: string; name: string };
+type Company = { id: string; name: string; dashboard_idle_timeout_minutes: number };
 type Account = {
   user_id: string;
   company: Company | null;
@@ -47,6 +53,7 @@ type AgentInstallerBootstrap = {
   expires_at_unix_ms: number;
 };
 type View = "agents" | "team" | "sso";
+type SessionPauseReason = "idle" | "expired";
 
 const INSTALLER_ASSETS: Record<AgentPlatform, { label: string; binary: string; checksum: string }> = {
   "windows-x64": {
@@ -85,35 +92,80 @@ export default function Dashboard() {
   const [isDownloadingInstaller, setIsDownloadingInstaller] = useState(false);
   const [installerDownloaded, setInstallerDownloaded] = useState(false);
   const [installerError, setInstallerError] = useState<string | null>(null);
+  const [sessionPauseReason, setSessionPauseReason] = useState<SessionPauseReason | null>(null);
+  const [isResumingSession, setIsResumingSession] = useState(false);
+  const [idleTimeoutDraft, setIdleTimeoutDraft] = useState(DEFAULT_IDLE_TIMEOUT_MINUTES);
+  const [isSavingSessionPolicy, setIsSavingSessionPolicy] = useState(false);
 
   const isAdmin = role === "admin" || roles?.includes("admin") || account?.role === "admin" || account?.roles.includes("admin");
   const companyId = account?.company?.id;
+  const idleTimeoutMinutes = account?.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES;
+
+  const lockSession = useCallback((reason: SessionPauseReason) => {
+    setSessionPauseReason((current) => current ?? reason);
+    setIsAuthOpen(false);
+    setIsOrganizationOpen(false);
+    setIsAgentOpen(false);
+    setIsSidebarOpen(false);
+  }, []);
 
   const authorizedFetch = useCallback(async (path: string, init: RequestInit = {}) => {
     let token: string;
     try {
       token = await getAccessToken();
     } catch (tokenError) {
-      if (tokenError instanceof Error && tokenError.message === "No access token available") {
-        void signIn({ organizationId: organizationId ?? undefined, state: { returnTo: "/" } });
-        throw new AuthenticationRedirectStarted();
+      if (
+        tokenError instanceof LoginRequiredError ||
+        (tokenError instanceof Error && tokenError.message === "No access token available")
+      ) {
+        lockSession("expired");
+        throw new AuthenticationRequired();
       }
       throw tokenError;
     }
     if (!token) throw new Error("Your WorkOS session has expired. Please sign in again.");
-    return fetch(`${normalizeServer(serverUrl)}${path}`, {
+    const response = await fetch(`${normalizeServer(serverUrl)}${path}`, {
       ...init,
       headers: { ...init.headers, Authorization: `Bearer ${token}` },
     });
-  }, [getAccessToken, organizationId, serverUrl, signIn]);
+    if (response.status === 401) {
+      lockSession("expired");
+      throw new AuthenticationRequired();
+    }
+    return response;
+  }, [getAccessToken, lockSession, serverUrl]);
 
   const { agents, isLive, isRefreshing, lastUpdated, loadAgents, reset: resetInventory } =
     useAgentInventory({
-      enabled: Boolean(user && organizationId),
+      enabled: Boolean(user && organizationId && !sessionPauseReason),
       companyId,
       authorizedFetch,
       reportError: setError,
     });
+
+  const pauseIdleSession = useCallback(() => {
+    resetInventory();
+    lockSession("idle");
+    void signOut({ navigate: false }).catch(() => {
+      // The UI is already locked. A missing/expired WorkOS session needs no further cleanup.
+    });
+  }, [lockSession, resetInventory, signOut]);
+
+  useIdleSession({
+    enabled: Boolean(user && organizationId && !sessionPauseReason),
+    organizationId,
+    timeoutMinutes: idleTimeoutMinutes,
+    onTimeout: pauseIdleSession,
+  });
+
+  useEffect(() => {
+    const handleRefreshFailure = () => {
+      resetInventory();
+      lockSession("expired");
+    };
+    window.addEventListener(AUTH_REFRESH_FAILED_EVENT, handleRefreshFailure);
+    return () => window.removeEventListener(AUTH_REFRESH_FAILED_EVENT, handleRefreshFailure);
+  }, [lockSession, resetInventory]);
 
   const loadAccount = useCallback(async () => {
     if (!user || !organizationId) {
@@ -124,6 +176,7 @@ export default function Dashboard() {
     if (!response.ok) throw new Error(await errorMessage(response, "The company account could not be loaded."));
     const data = (await response.json()) as Account;
     setAccount(data);
+    setIdleTimeoutDraft(data.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES);
     return data;
   }, [authorizedFetch, organizationId, user]);
 
@@ -135,7 +188,7 @@ export default function Dashboard() {
         const loaded = await loadAccount();
         if (!cancelled && loaded?.company) await loadAgents();
       } catch (requestError) {
-        if (!cancelled && !(requestError instanceof AuthenticationRedirectStarted)) {
+        if (!cancelled && !(requestError instanceof AuthenticationRequired)) {
           setError(requestError instanceof Error ? requestError.message : "The company account could not be loaded.");
         }
       }
@@ -170,12 +223,49 @@ export default function Dashboard() {
       if (!response.ok) throw new Error(await errorMessage(response, "The company could not be provisioned."));
       const data = (await response.json()) as Account;
       setAccount(data);
+      setIdleTimeoutDraft(data.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES);
       setCompanyName("");
       await loadAgents();
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "The company could not be provisioned.");
     } finally {
       setIsSaving(false);
+    }
+  };
+
+  const saveSessionPolicy = async (event: FormEvent) => {
+    event.preventDefault();
+    setIsSavingSessionPolicy(true);
+    setError(null);
+    try {
+      const response = await authorizedFetch("/v1/company/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dashboard_idle_timeout_minutes: idleTimeoutDraft }),
+      });
+      if (!response.ok) {
+        throw new Error(await errorMessage(response, "The session policy could not be saved."));
+      }
+      const data = (await response.json()) as Account;
+      setAccount(data);
+      setIdleTimeoutDraft(data.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES);
+    } catch (requestError) {
+      if (!(requestError instanceof AuthenticationRequired)) {
+        setError(requestError instanceof Error ? requestError.message : "The session policy could not be saved.");
+      }
+    } finally {
+      setIsSavingSessionPolicy(false);
+    }
+  };
+
+  const resumeSession = async () => {
+    setIsResumingSession(true);
+    setError(null);
+    try {
+      await signIn({ organizationId: organizationId ?? undefined, state: { returnTo: "/" } });
+    } catch (resumeError) {
+      setError(resumeError instanceof Error ? resumeError.message : "The WorkOS session could not be resumed.");
+      setIsResumingSession(false);
     }
   };
 
@@ -275,7 +365,7 @@ export default function Dashboard() {
           <button className="sidebar-close" onClick={() => setIsSidebarOpen(false)} aria-label="Close navigation"><X size={20} /></button>
         </div>
 
-        <button className="workspace-switcher" onClick={() => setIsOrganizationOpen(true)} disabled={!user}>
+        <button className="workspace-switcher" onClick={() => setIsOrganizationOpen(true)} disabled={!user || Boolean(sessionPauseReason)}>
           <div className="workspace-avatar">{account?.company?.name.slice(0, 2).toUpperCase() ?? "CO"}</div>
           <div><strong>{companyLabel}</strong><span>{organizationId ? "WorkOS organization" : "Organization required"}</span></div>
           <ChevronDown size={16} />
@@ -283,14 +373,14 @@ export default function Dashboard() {
 
         <nav aria-label="Primary navigation">
           <p className="nav-label">Company</p>
-          <button className={`nav-item ${view === "agents" ? "active" : ""}`} onClick={() => setActiveView("agents")}><Monitor size={18} /><span>Agents</span>{isLive ? <em>{agents.length}</em> : null}</button>
-          <button className={`nav-item ${view === "team" ? "active" : ""}`} onClick={() => setActiveView("team")} disabled={!organizationId}><Users size={18} /><span>Users</span></button>
-          <button className={`nav-item ${view === "sso" ? "active" : ""}`} onClick={() => setActiveView("sso")} disabled={!organizationId}><KeyRound size={18} /><span>Single sign-on</span></button>
+          <button className={`nav-item ${view === "agents" ? "active" : ""}`} onClick={() => setActiveView("agents")} disabled={Boolean(sessionPauseReason)}><Monitor size={18} /><span>Agents</span>{isLive ? <em>{agents.length}</em> : null}</button>
+          <button className={`nav-item ${view === "team" ? "active" : ""}`} onClick={() => setActiveView("team")} disabled={!organizationId || Boolean(sessionPauseReason)}><Users size={18} /><span>Users</span></button>
+          <button className={`nav-item ${view === "sso" ? "active" : ""}`} onClick={() => setActiveView("sso")} disabled={!organizationId || Boolean(sessionPauseReason)}><KeyRound size={18} /><span>Single sign-on</span></button>
           <p className="nav-label nav-label-spaced">Account</p>
-          <button className="nav-item" onClick={() => setIsAuthOpen(true)}><Settings size={18} /><span>Profile & session</span></button>
+          <button className="nav-item" onClick={() => setIsAuthOpen(true)} disabled={Boolean(sessionPauseReason)}><Settings size={18} /><span>Profile & session</span></button>
         </nav>
 
-        <button className="profile-row profile-button" onClick={() => setIsAuthOpen(true)}>
+        <button className="profile-row profile-button" onClick={() => setIsAuthOpen(true)} disabled={Boolean(sessionPauseReason)}>
           <div className="profile-avatar">{initials}</div>
           <div><strong>{displayName}</strong><span>{user?.email ?? "WorkOS authentication"}</span></div>
         </button>
@@ -300,18 +390,26 @@ export default function Dashboard() {
 
       <main className="main-content">
         <header className="topbar">
-          <button className="mobile-menu" onClick={() => setIsSidebarOpen(true)} aria-label="Open navigation"><Menu size={21} /></button>
+          <button className="mobile-menu" onClick={() => setIsSidebarOpen(true)} aria-label="Open navigation" disabled={Boolean(sessionPauseReason)}><Menu size={21} /></button>
           {view === "agents" ? <label className="global-search"><Search size={18} /><input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="Search Agents" placeholder="Search Agents by name or device ID..." /></label> : <div />}
           <div className="topbar-actions">
-            <button className="connection-pill" onClick={() => setIsAuthOpen(true)}>
+            <button className="connection-pill" onClick={() => setIsAuthOpen(true)} disabled={Boolean(sessionPauseReason)}>
               <span className={`pulse-dot ${isLive ? "live" : ""}`} />
-              {isAuthLoading ? "Checking session" : isLive ? "Service live" : user ? "Signed in" : "Sign in"}
+              {sessionPauseReason ? "Session paused" : isAuthLoading ? "Checking session" : isLive ? "Service live" : user ? "Signed in" : "Sign in"}
             </button>
           </div>
         </header>
 
         <div className="page-wrap">
-          {!user && !isAuthLoading ? (
+          {sessionPauseReason ? (
+            <section className="signed-out-card session-paused-card">
+              <div className="modal-icon"><Clock3 size={22} /></div>
+              <p className="eyebrow">Session paused</p>
+              <h1>{sessionPauseReason === "idle" ? "You’ve been signed out for inactivity" : "Your session needs to be renewed"}</h1>
+              <p>{sessionPauseReason === "idle" ? `Your organization pauses inactive dashboards after ${formatIdleTimeout(idleTimeoutMinutes)}.` : "PulseRMM could not renew your WorkOS session. Your dashboard stayed in place and no organization data will be requested until you continue."}</p>
+              <button className="primary-button" onClick={() => void resumeSession()} disabled={isResumingSession}>{isResumingSession ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />} Continue securely</button>
+            </section>
+          ) : !user && !isAuthLoading ? (
             <section className="signed-out-card">
               <div className="modal-icon"><ShieldCheck size={22} /></div>
               <p className="eyebrow">Secure company access</p>
@@ -380,7 +478,7 @@ export default function Dashboard() {
         </div>
       </main>
 
-      {isAuthOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsAuthOpen(false)}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="account-title"><button className="modal-close" onClick={() => setIsAuthOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><ShieldCheck size={22} /></div><p className="eyebrow">Authenticated</p><h2 id="account-title">WorkOS account</h2><p>Your session carries the selected organization and role used for every PulseRMM API request.</p>{user ? <><div className="account-summary"><div className="profile-avatar">{initials}</div><div><strong>{displayName}</strong><span>{user.email}</span></div></div><button className="secondary-button modal-submit" onClick={handleSignOut}><LogOut size={16} /> Sign out</button></> : <button className="primary-button modal-submit" onClick={() => void signIn({ state: { returnTo: "/" } })}><ShieldCheck size={16} /> Continue with WorkOS</button>}</section></div>}
+      {isAuthOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsAuthOpen(false)}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="account-title"><button className="modal-close" onClick={() => setIsAuthOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><ShieldCheck size={22} /></div><p className="eyebrow">Authenticated</p><h2 id="account-title">WorkOS account</h2><p>Your session carries the selected organization and role used for every PulseRMM API request.</p>{user ? <><div className="account-summary"><div className="profile-avatar">{initials}</div><div><strong>{displayName}</strong><span>{user.email}</span></div></div>{account?.company && <div className="session-policy"><div className="session-policy-heading"><Clock3 size={16} /><div><strong>Organization idle timeout</strong><span>Currently {formatIdleTimeout(idleTimeoutMinutes)}</span></div></div>{isAdmin ? <form onSubmit={saveSessionPolicy}><label htmlFor="idle-timeout">Sign out inactive dashboards after<select id="idle-timeout" value={idleTimeoutDraft} onChange={(event) => setIdleTimeoutDraft(Number(event.target.value))}><option value={5}>5 minutes</option><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={120}>2 hours</option><option value={240}>4 hours</option><option value={480}>8 hours</option><option value={720}>12 hours</option><option value={1440}>24 hours</option></select></label><button className="primary-button" disabled={isSavingSessionPolicy || idleTimeoutDraft === idleTimeoutMinutes}>{isSavingSessionPolicy ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save session policy</button></form> : <p>Only an organization administrator can change this policy.</p>}</div>}<button className="secondary-button modal-submit" onClick={handleSignOut}><LogOut size={16} /> Sign out</button></> : <button className="primary-button modal-submit" onClick={() => void signIn({ state: { returnTo: "/" } })}><ShieldCheck size={16} /> Continue with WorkOS</button>}</section></div>}
 
       {isOrganizationOpen && user && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsOrganizationOpen(false)}><section className="settings-modal organization-modal" role="dialog" aria-modal="true" aria-labelledby="organization-title"><button className="modal-close" onClick={() => setIsOrganizationOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><Building2 size={22} /></div><p className="eyebrow">Tenant boundary</p><h2 id="organization-title">Switch company</h2><p>Changing companies refreshes your WorkOS token before any other company inventory is requested.</p><div className="organization-widget"><OrganizationSwitcher authToken={getAccessToken} switchToOrganization={switchToOrganization} /></div></section></div>}
 

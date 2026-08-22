@@ -20,6 +20,16 @@ pub(crate) fn validate_name<'a>(value: &'a str, label: &str) -> Result<&'a str> 
     }
 }
 
+pub(crate) fn validate_dashboard_idle_timeout(value: u32) -> Result<u32> {
+    if (MIN_DASHBOARD_IDLE_TIMEOUT_MINUTES..=MAX_DASHBOARD_IDLE_TIMEOUT_MINUTES).contains(&value) {
+        Ok(value)
+    } else {
+        Err(Error::RustError(format!(
+            "dashboard idle timeout must be between {MIN_DASHBOARD_IDLE_TIMEOUT_MINUTES} and {MAX_DASHBOARD_IDLE_TIMEOUT_MINUTES} minutes"
+        )))
+    }
+}
+
 pub(crate) fn random_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }

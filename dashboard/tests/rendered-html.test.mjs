@@ -6,6 +6,12 @@ import {
   parseAgentList,
   sortAgents,
 } from "../features/agents/model.ts";
+import {
+  DEFAULT_IDLE_TIMEOUT_MINUTES,
+  formatIdleTimeout,
+  hasIdleTimeoutElapsed,
+  timeoutMilliseconds,
+} from "../features/session/idle-session.ts";
 
 async function render(pathname = "/") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -77,4 +83,17 @@ test("rejects malformed Agent API and event payloads", () => {
     }),
     { agents: [{ id: "a", name: "Alpha", connected: true }], revision: 4 },
   );
+});
+
+test("uses a four-hour dashboard idle timeout by default", () => {
+  assert.equal(DEFAULT_IDLE_TIMEOUT_MINUTES, 240);
+  assert.equal(timeoutMilliseconds(DEFAULT_IDLE_TIMEOUT_MINUTES), 14_400_000);
+  assert.equal(formatIdleTimeout(DEFAULT_IDLE_TIMEOUT_MINUTES), "4 hours");
+  assert.equal(hasIdleTimeoutElapsed(1_000, 240, 14_400_999), false);
+  assert.equal(hasIdleTimeoutElapsed(1_000, 240, 14_401_000), true);
+});
+
+test("falls back to the safe idle default for an invalid policy", () => {
+  assert.equal(timeoutMilliseconds(0), 14_400_000);
+  assert.equal(timeoutMilliseconds(1_441), 14_400_000);
 });

@@ -47,6 +47,7 @@ button { color: inherit; }
 .profile-avatar { color: #6049d1; background: #ece8ff; }
 .profile-button { width: 100%; border-right: 0; border-bottom: 0; border-left: 0; background: transparent; text-align: left; cursor: pointer; }
 .profile-button:hover strong { color: var(--purple); }
+.profile-button:disabled { cursor: default; opacity: .7; }
 
 .main-content { min-height: 100vh; margin-left: 242px; }
 .topbar { height: 69px; position: sticky; top: 0; z-index: 20; padding: 0 34px; display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,.95); border-bottom: 1px solid var(--line); backdrop-filter: blur(12px); }
@@ -57,8 +58,10 @@ button { color: inherit; }
 .topbar-actions { display: flex; align-items: center; gap: 12px; }
 .icon-button, .mobile-menu { width: 35px; height: 35px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 8px; background: #fff; cursor: pointer; }
 .mobile-menu { display: none; }
+.mobile-menu:disabled { cursor: default; opacity: .65; }
 .topbar-divider { width: 1px; height: 25px; background: var(--line); }
 .connection-pill { height: 33px; padding: 0 11px; display: flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 8px; background: #fff; font-size: 10px; font-weight: 650; cursor: pointer; }
+.connection-pill:disabled { cursor: default; }
 .pulse-dot { width: 7px; height: 7px; border-radius: 50%; background: #a6a8b1; }
 .pulse-dot.live { background: #27a874; box-shadow: 0 0 0 4px #e9f8f1; }
 
@@ -185,6 +188,14 @@ button { color: inherit; }
 .account-summary strong, .account-summary span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .account-summary strong { font-size: 11px; }
 .account-summary span { margin-top: 3px; color: #858795; font-size: 9px; }
+.session-policy { margin: 14px 0 12px; padding: 13px; border: 1px solid var(--line); border-radius: 10px; background: #fafaff; }
+.session-policy-heading { display: flex; align-items: center; gap: 9px; color: var(--purple); }
+.session-policy-heading strong, .session-policy-heading span { display: block; }
+.session-policy-heading strong { color: #41434f; font-size: 10px; }
+.session-policy-heading span { margin-top: 2px; color: #8b8d99; font-size: 8px; }
+.session-policy form { margin-top: 12px; }
+.session-policy form .primary-button { width: 100%; }
+.session-policy > p { margin: 10px 0 0; color: #8b8d99; font-size: 8px; line-height: 1.45; }
 .privacy-note { margin-top: 14px; display: flex; align-items: center; justify-content: center; gap: 5px; color: #9395a0; font-size: 8px; }
 .organization-modal { width: min(620px, 100%); }
 .enrollment-modal { width: min(600px, 100%); }
@@ -227,6 +238,7 @@ button { color: inherit; }
   .page-wrap { padding: 25px 14px 36px; }
   .login-route { padding: 25px 14px 36px; }
   .signed-out-card { margin-top: 4vh; padding: 25px; }
+  .settings-modal { max-height: calc(100vh - 24px); overflow-y: auto; }
   .inline-provision-form { flex-direction: column; }
   .page-heading { align-items: flex-start; }
   .page-heading h1 { font-size: 25px; }
