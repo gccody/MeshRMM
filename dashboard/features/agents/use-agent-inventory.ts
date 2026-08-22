@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { errorMessage } from "../../lib/http";
-import { AuthenticationRedirectStarted } from "../../lib/http";
+import { AuthenticationRequired } from "../../lib/http";
 import { applyAgentDelta, parseAgentEvent, parseAgentList, sortAgents } from "./model";
 import type { Agent, AgentDelta, AgentEventSubscription } from "./types";
 
@@ -56,7 +56,7 @@ export function useAgentInventory({
         setLastUpdated(new Date());
         return true;
       } catch (requestError) {
-        if (requestError instanceof AuthenticationRedirectStarted) return false;
+        if (requestError instanceof AuthenticationRequired) return false;
         setIsLive(false);
         setAgents([]);
         reportError(
@@ -184,7 +184,7 @@ export function useAgentInventory({
           scheduleReconnect();
         });
       } catch (requestError) {
-        if (disposed || requestError instanceof AuthenticationRedirectStarted) return;
+        if (disposed || requestError instanceof AuthenticationRequired) return;
         setIsLive(false);
         reportError(
           requestError instanceof Error

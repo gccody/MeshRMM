@@ -19,6 +19,9 @@ use routes::*;
 
 const DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 900;
 const MAX_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 3600;
+const DEFAULT_DASHBOARD_IDLE_TIMEOUT_MINUTES: u32 = 4 * 60;
+const MIN_DASHBOARD_IDLE_TIMEOUT_MINUTES: u32 = 5;
+const MAX_DASHBOARD_IDLE_TIMEOUT_MINUTES: u32 = 24 * 60;
 const HANDOFF_TTL_MS: u64 = 60_000;
 const AGENT_INSTALL_TTL_MS: u64 = 30 * 60 * 1000;
 const AGENT_EVENT_SUBSCRIPTION_TTL_MS: u64 = 60_000;
@@ -27,6 +30,7 @@ const AGENT_EVENT_SUBSCRIPTION_TTL_MS: u64 = 60_000;
 struct Company {
     id: String,
     name: String,
+    dashboard_idle_timeout_minutes: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +101,11 @@ struct AccountResponse {
 #[derive(Debug, Deserialize)]
 struct BootstrapCompanyRequest {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateCompanySettingsRequest {
+    dashboard_idle_timeout_minutes: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +182,9 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
         (Method::Get, ["v1", "account"]) => account(&request, &environment).await,
         (Method::Post, ["v1", "company", "bootstrap"]) => {
             bootstrap_company(&mut request, &environment).await
+        }
+        (Method::Put, ["v1", "company", "settings"]) => {
+            update_company_settings(&mut request, &environment).await
         }
         (Method::Get, ["v1", "agents"]) => list_agents(&request, &environment).await,
         (Method::Post, ["v1", "agents", "events", "subscriptions"]) => {
@@ -329,7 +341,7 @@ async fn authorize_workos_user(request: &Request, environment: &Env) -> Result<I
 async fn ensure_company_exists(db: &D1Database, company_id: &str) -> Result<()> {
     if query!(
         db,
-        "SELECT id, name FROM companies WHERE id = ?1",
+        "SELECT id, name, dashboard_idle_timeout_minutes FROM companies WHERE id = ?1",
         company_id
     )?
     .first::<Company>(None)
@@ -374,6 +386,7 @@ fn cors(response: Response, environment: &Env) -> Result<Response> {
             .with_methods(vec![
                 Method::Get,
                 Method::Post,
+                Method::Put,
                 Method::Delete,
                 Method::Options,
             ])
@@ -408,5 +421,14 @@ mod tests {
         assert!(!supported_ice_url(
             "turns:turn.cloudflare.com:5349?transport=tcp"
         ));
+    }
+
+    #[test]
+    fn dashboard_idle_timeout_has_safe_bounds() {
+        assert!(validate_dashboard_idle_timeout(5).is_ok());
+        assert!(validate_dashboard_idle_timeout(240).is_ok());
+        assert!(validate_dashboard_idle_timeout(1440).is_ok());
+        assert!(validate_dashboard_idle_timeout(4).is_err());
+        assert!(validate_dashboard_idle_timeout(1441).is_err());
     }
 }

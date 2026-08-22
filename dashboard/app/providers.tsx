@@ -3,19 +3,25 @@
 import { AuthKitProvider } from "@workos-inc/authkit-react";
 import { WorkOsWidgets } from "@workos-inc/widgets";
 import { createContext, useContext } from "react";
+import { activityStorageKey } from "../features/session/idle-session";
 
 type RuntimeConfig = {
   serverUrl: string;
 };
 
 export const LOGIN_ATTEMPT_KEY = "pulsermm:workos-login-attempt";
+export const AUTH_REFRESH_FAILED_EVENT = "pulsermm:workos-refresh-failed";
 
 type RedirectCallbackParams = {
   state?: Record<string, unknown> | null;
+  organizationId?: string | null;
 };
 
-function handleRedirectCallback({ state }: RedirectCallbackParams) {
+function handleRedirectCallback({ state, organizationId }: RedirectCallbackParams) {
   window.sessionStorage.removeItem(LOGIN_ATTEMPT_KEY);
+  if (organizationId) {
+    window.localStorage.setItem(activityStorageKey(organizationId), String(Date.now()));
+  }
 
   const returnTo = state?.returnTo;
   if (typeof returnTo !== "string") return;
@@ -54,6 +60,7 @@ export default function Providers({
       clientId={clientId}
       redirectUri={redirectUri}
       onRedirectCallback={handleRedirectCallback}
+      onRefreshFailure={() => window.dispatchEvent(new Event(AUTH_REFRESH_FAILED_EVENT))}
     >
       <WorkOsWidgets theme={{ accentColor: "violet", radius: "medium", fontFamily: "var(--font-geist-sans)" }}>
         <RuntimeConfigContext.Provider value={{ serverUrl }}>
