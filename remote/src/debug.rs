@@ -184,6 +184,7 @@ impl DebugInfo {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub fn set_presenter_frames_dropped(&self, frames: u64) {
         if let Ok(mut debug) = self.state.lock() {
             debug.presenter_frames_dropped = frames;
