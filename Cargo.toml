@@ -13,7 +13,7 @@ members = [
 default-members = ["agent", "remote"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.97"
 publish = false

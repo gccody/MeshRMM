@@ -2,6 +2,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::DisplayId;
 
+/// Platform-neutral cursor shapes that can be represented by native viewers.
+/// Endpoint-specific or custom cursors are sent as `Default`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CursorShape {
+    #[default]
+    Default,
+    Text,
+    Wait,
+    Crosshair,
+    UpArrow,
+    ResizeNorthWestSouthEast,
+    ResizeNorthEastSouthWest,
+    ResizeWestEast,
+    ResizeNorthSouth,
+    Move,
+    NotAllowed,
+    Pointer,
+    Progress,
+    Help,
+    Pin,
+    Person,
+}
+
 /// Input coordinates are normalized to a display rather than the full virtual
 /// desktop. This keeps pointer input correctly bound to the displayed monitor,
 /// including monitors with negative desktop coordinates.

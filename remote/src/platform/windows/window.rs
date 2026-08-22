@@ -6,6 +6,7 @@ struct WindowContext {
     control: ControlSink,
     pressed_keys: HashSet<(u16, bool)>,
     pressed_buttons: HashSet<PointerButton>,
+    cursor_shape: CursorShape,
     debug: DebugInfo,
     debug_overlay: HWND,
     debug_visible: bool,
@@ -175,6 +176,15 @@ pub(super) unsafe fn create_window(
                 }
                 LRESULT(0)
             }
+            WM_SETCURSOR => {
+                if let Some(context) = context
+                    && (lparam.0 as u32 & 0xffff) == HTCLIENT
+                {
+                    unsafe { apply_cursor(context.cursor_shape) };
+                    return LRESULT(1);
+                }
+                unsafe { DefWindowProcW(window, message, wparam, lparam) }
+            }
             WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
             | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
                 if let Some(context) = context {
@@ -260,7 +270,7 @@ pub(super) unsafe fn create_window(
             WM_CTLCOLORSTATIC => unsafe {
                 SetTextColor(
                     windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
-                    windows::Win32::Foundation::COLORREF(0x00f4_f4_f4),
+                    windows::Win32::Foundation::COLORREF(0x00f4_f4f4),
                 );
                 SetBkColor(
                     windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
@@ -341,6 +351,7 @@ pub(super) unsafe fn create_window(
         control,
         pressed_keys: HashSet::new(),
         pressed_buttons: HashSet::new(),
+        cursor_shape: CursorShape::Default,
         debug,
         debug_overlay: HWND::default(),
         debug_visible: false,
@@ -392,6 +403,39 @@ pub(super) unsafe fn create_window(
     }
     let _ = unsafe { ShowWindow(window, SW_SHOW) };
     Ok(window)
+}
+
+pub(super) unsafe fn set_window_cursor(window: HWND, shape: CursorShape) {
+    if let Some(context) = unsafe { window_context(window) } {
+        context.cursor_shape = shape;
+        unsafe { apply_cursor(shape) };
+    }
+}
+
+unsafe fn apply_cursor(shape: CursorShape) {
+    let resource = match shape {
+        CursorShape::Default => IDC_ARROW,
+        CursorShape::Text => IDC_IBEAM,
+        CursorShape::Wait => IDC_WAIT,
+        CursorShape::Crosshair => IDC_CROSS,
+        CursorShape::UpArrow => IDC_UPARROW,
+        CursorShape::ResizeNorthWestSouthEast => IDC_SIZENWSE,
+        CursorShape::ResizeNorthEastSouthWest => IDC_SIZENESW,
+        CursorShape::ResizeWestEast => IDC_SIZEWE,
+        CursorShape::ResizeNorthSouth => IDC_SIZENS,
+        CursorShape::Move => IDC_SIZEALL,
+        CursorShape::NotAllowed => IDC_NO,
+        CursorShape::Pointer => IDC_HAND,
+        CursorShape::Progress => IDC_APPSTARTING,
+        CursorShape::Help => IDC_HELP,
+        CursorShape::Pin => IDC_PIN,
+        CursorShape::Person => IDC_PERSON,
+    };
+    let cursor =
+        unsafe { LoadCursorW(None, resource) }.or_else(|_| unsafe { LoadCursorW(None, IDC_ARROW) });
+    if let Ok(cursor) = cursor {
+        unsafe { SetCursor(Some(cursor)) };
+    }
 }
 
 pub(super) unsafe fn pump_window_messages(window: HWND) -> bool {

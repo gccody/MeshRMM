@@ -2266,7 +2266,7 @@ dependencies = [
 
 [[package]]
 name = "pulsermm-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2292,7 +2292,7 @@ dependencies = [
 
 [[package]]
 name = "pulsermm-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "postcard",
  "pulsermm-protocol-types",
@@ -2302,7 +2302,7 @@ dependencies = [
 
 [[package]]
 name = "pulsermm-protocol-types"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2310,7 +2310,7 @@ dependencies = [
 
 [[package]]
 name = "pulsermm-remote"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2343,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "pulsermm-remote-screen"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror 2.0.20",
  "tracing",
@@ -2353,7 +2353,7 @@ dependencies = [
 
 [[package]]
 name = "pulsermm-self-update"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "semver",
@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "pulsermm-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "getrandom 0.2.17",
  "jsonwebtoken",
@@ -2381,7 +2381,7 @@ dependencies = [
 
 [[package]]
 name = "pulsermm-signaling-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "tokio",

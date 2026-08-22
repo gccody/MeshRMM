@@ -13,9 +13,10 @@ use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEvent, NSEventModifierFlags, NSFont,
-    NSFontWeightRegular, NSProgressIndicator, NSProgressIndicatorStyle, NSTextAlignment,
-    NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSCursor, NSEvent,
+    NSEventModifierFlags, NSFont, NSFontWeightRegular, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_av_foundation::{AVLayerVideoGravityResizeAspect, AVSampleBufferDisplayLayer};
 use objc2_core_foundation::{CFBoolean, CFMutableDictionary, CFRetained, CFString, kCFBooleanTrue};
@@ -29,7 +30,8 @@ use objc2_foundation::{
 };
 use objc2_quartz_core::CAAutoresizingMask;
 use pulsermm_protocol::{
-    Codec, Display, EncodedFrame, PointerButton, RemoteInput, SessionMessage, VideoFormat,
+    Codec, CursorShape, Display, EncodedFrame, PointerButton, RemoteInput, SessionMessage,
+    VideoFormat,
 };
 
 use super::ControlSink;

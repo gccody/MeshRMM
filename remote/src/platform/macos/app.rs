@@ -65,6 +65,7 @@ pub(super) struct RemoteViewIvars {
     control: ControlSink,
     pressed_keys: RefCell<Vec<(u16, bool)>>,
     pressed_buttons: RefCell<Vec<PointerButton>>,
+    cursor_shape: RefCell<CursorShape>,
     debug: DebugInfo,
     debug_label: Retained<NSTextField>,
     debug_visible: RefCell<bool>,
@@ -107,6 +108,12 @@ define_class!(
         #[unsafe(method(acceptsFirstMouse:))]
         fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
             false
+        }
+
+        #[unsafe(method(resetCursorRects))]
+        fn reset_cursor_rects(&self) {
+            let cursor = mac_cursor(*self.ivars().cursor_shape.borrow());
+            self.addCursorRect_cursor(self.bounds(), &cursor);
         }
 
         #[unsafe(method(mouseMoved:))]
@@ -269,6 +276,7 @@ impl RemoteView {
             control,
             pressed_keys: RefCell::new(Vec::new()),
             pressed_buttons: RefCell::new(Vec::new()),
+            cursor_shape: RefCell::new(CursorShape::Default),
             debug,
             debug_label,
             debug_visible: RefCell::new(false),
@@ -281,6 +289,17 @@ impl RemoteView {
 
     fn send(&self, message: SessionMessage) {
         self.ivars().control.send(message);
+    }
+
+    pub(super) fn set_cursor_shape(&self, shape: CursorShape) {
+        if *self.ivars().cursor_shape.borrow() == shape {
+            return;
+        }
+        *self.ivars().cursor_shape.borrow_mut() = shape;
+        if let Some(window) = self.window() {
+            window.invalidateCursorRectsForView(self);
+        }
+        mac_cursor(shape).set();
     }
 
     fn send_pointer(&self, event: &NSEvent) {
@@ -455,6 +474,21 @@ fn mac_button(event: &NSEvent) -> PointerButton {
         2 => PointerButton::Middle,
         3 => PointerButton::Back,
         _ => PointerButton::Forward,
+    }
+}
+
+#[allow(deprecated)]
+fn mac_cursor(shape: CursorShape) -> Retained<NSCursor> {
+    match shape {
+        CursorShape::Text => NSCursor::IBeamCursor(),
+        CursorShape::Crosshair => NSCursor::crosshairCursor(),
+        CursorShape::ResizeWestEast => NSCursor::resizeLeftRightCursor(),
+        CursorShape::ResizeNorthSouth => NSCursor::resizeUpDownCursor(),
+        CursorShape::Move => NSCursor::openHandCursor(),
+        CursorShape::NotAllowed => NSCursor::operationNotAllowedCursor(),
+        CursorShape::Pointer => NSCursor::pointingHandCursor(),
+        // AppKit has no public equivalent for these Windows system cursors.
+        _ => NSCursor::arrowCursor(),
     }
 }
 

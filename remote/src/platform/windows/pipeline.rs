@@ -19,6 +19,10 @@ impl WorkerPipeline {
         self.renderer.window()
     }
 
+    pub(super) unsafe fn set_cursor_shape(&self, shape: CursorShape) {
+        unsafe { set_window_cursor(self.window(), shape) };
+    }
+
     pub(super) unsafe fn new(
         format: VideoFormat,
         active_display: Display,
