@@ -19,6 +19,7 @@ struct Shared {
     replaced: AtomicU64,
     submitted: AtomicU64,
     dropped_by_renderer: AtomicU64,
+    debug: DebugInfo,
 }
 
 pub struct Presenter {
@@ -32,6 +33,7 @@ impl Presenter {
         active_display: Display,
         displays: Vec<Display>,
         control: ControlSink,
+        debug: DebugInfo,
     ) -> anyhow::Result<Self> {
         if format.codec != Codec::H264 {
             bail!("macOS viewer supports only H.264");
@@ -45,16 +47,18 @@ impl Presenter {
             replaced: AtomicU64::new(0),
             submitted: AtomicU64::new(0),
             dropped_by_renderer: AtomicU64::new(0),
+            debug: debug.clone(),
         });
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         DispatchQueue::main().exec_async(move || {
-            let result = MacUi::new(id, format, active_display, displays, control).map(|ui| {
-                UI.with(|state| {
-                    if let Some(old) = state.borrow_mut().replace(ui) {
-                        old.close();
-                    }
+            let result =
+                MacUi::new(id, format, active_display, displays, control, debug).map(|ui| {
+                    UI.with(|state| {
+                        if let Some(old) = state.borrow_mut().replace(ui) {
+                            old.close();
+                        }
+                    });
                 });
-            });
             let _ = started_tx.send(result);
         });
         started_rx
@@ -78,6 +82,10 @@ impl Presenter {
             .is_some()
         {
             self.shared.replaced.fetch_add(1, Ordering::Relaxed);
+            self.shared.debug.set_presenter_frames_dropped(
+                self.shared.replaced.load(Ordering::Relaxed)
+                    + self.shared.dropped_by_renderer.load(Ordering::Relaxed),
+            );
         }
         drop(latest);
         schedule_latest(Arc::clone(&self.shared));
@@ -154,6 +162,10 @@ fn schedule_latest(shared: Arc<Shared>) {
                 }
                 Ok(false) => {
                     shared.dropped_by_renderer.fetch_add(1, Ordering::Relaxed);
+                    shared.debug.set_presenter_frames_dropped(
+                        shared.replaced.load(Ordering::Relaxed)
+                            + shared.dropped_by_renderer.load(Ordering::Relaxed),
+                    );
                 }
                 Err(error) => {
                     if let Ok(mut failure) = shared.failure.lock() {
@@ -178,7 +190,9 @@ struct MacUi {
     waiting_for_keyframe: bool,
     frames_per_second: i32,
     frames_submitted: u64,
+    total_frames_submitted: u64,
     stats_started: Instant,
+    debug: DebugInfo,
 }
 
 impl MacUi {
@@ -188,6 +202,7 @@ impl MacUi {
         active_display: Display,
         displays: Vec<Display>,
         control: ControlSink,
+        debug: DebugInfo,
     ) -> anyhow::Result<Self> {
         let mtm =
             MainThreadMarker::new().context("AppKit must be initialized on the main thread")?;
@@ -220,7 +235,7 @@ impl MacUi {
         // that it is no longer visible and end the remote session.
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(&NSString::from_str(&format!(
-            "PulseRMM Remote Desktop — {} — Control-Option-Arrow switches display",
+            "PulseRMM Remote Desktop — {} — Control-Option-Arrow display · F12 diagnostics",
             active_display.name
         )));
         let view = RemoteView::new(
@@ -231,6 +246,7 @@ impl MacUi {
             format.width,
             format.height,
             control,
+            debug.clone(),
         );
         window.setContentView(Some(&view));
         window.setDelegate(Some(ProtocolObject::from_ref(&*view)));
@@ -266,7 +282,9 @@ impl MacUi {
             waiting_for_keyframe: true,
             frames_per_second: i32::from(format.frames_per_second.max(1)),
             frames_submitted: 0,
+            total_frames_submitted: 0,
             stats_started: Instant::now(),
+            debug,
         })
     }
 
@@ -311,10 +329,15 @@ impl MacUi {
         )?;
         unsafe { self.layer.enqueueSampleBuffer(&sample) };
         self.frames_submitted += 1;
+        self.total_frames_submitted += 1;
+        self.input_view.refresh_debug(false);
         let elapsed = self.stats_started.elapsed();
         if elapsed >= Duration::from_secs(2) {
+            let present_fps = self.frames_submitted as f64 / elapsed.as_secs_f64();
+            self.debug
+                .update_presentation(None, present_fps, self.total_frames_submitted, None, 0);
             tracing::info!(
-                submit_fps = self.frames_submitted as f64 / elapsed.as_secs_f64(),
+                submit_fps = present_fps,
                 frames_submitted = self.frames_submitted,
                 receive_to_submit_us =
                     monotonic_timestamp_us().saturating_sub(queued.received_at_us),

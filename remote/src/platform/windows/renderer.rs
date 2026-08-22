@@ -11,6 +11,10 @@ pub(super) struct D3d11Renderer {
 }
 
 impl D3d11Renderer {
+    pub(super) fn window(&self) -> HWND {
+        self.window
+    }
+
     pub(super) unsafe fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
@@ -18,8 +22,9 @@ impl D3d11Renderer {
         active_display: Display,
         displays: Vec<Display>,
         control: ControlSink,
+        debug: DebugInfo,
     ) -> anyhow::Result<Self> {
-        let window = unsafe { create_window(format, active_display, displays, control)? };
+        let window = unsafe { create_window(format, active_display, displays, control, debug)? };
         let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
             .context("DXGI factory creation failed")?;
         let swap_desc = DXGI_SWAP_CHAIN_DESC1 {

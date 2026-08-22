@@ -13,9 +13,9 @@ use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSBackingStoreType, NSEvent, NSEventModifierFlags, NSProgressIndicator,
-    NSProgressIndicatorStyle, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEvent, NSEventModifierFlags, NSFont,
+    NSFontWeightRegular, NSProgressIndicator, NSProgressIndicatorStyle, NSTextAlignment,
+    NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_av_foundation::{AVLayerVideoGravityResizeAspect, AVSampleBufferDisplayLayer};
 use objc2_core_foundation::{CFBoolean, CFMutableDictionary, CFRetained, CFString, kCFBooleanTrue};
@@ -33,6 +33,7 @@ use pulsermm_protocol::{
 };
 
 use super::ControlSink;
+use crate::debug::DebugInfo;
 use crate::h264::annex_b_to_avcc;
 
 mod app;

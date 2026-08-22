@@ -11,20 +11,34 @@ pub(super) struct WorkerPipeline {
     interval_decoded: u64,
     interval_presented: u64,
     stats_started_us: u64,
+    debug: DebugInfo,
 }
 
 impl WorkerPipeline {
+    pub(super) fn window(&self) -> HWND {
+        self.renderer.window()
+    }
+
     pub(super) unsafe fn new(
         format: VideoFormat,
         active_display: Display,
         displays: Vec<Display>,
         control: ControlSink,
+        debug: DebugInfo,
     ) -> anyhow::Result<Self> {
         let com = unsafe { ComRuntime::start()? };
         let mf = unsafe { MediaFoundationRuntime::start()? };
         let (device, context) = unsafe { create_device()? };
         let renderer = unsafe {
-            D3d11Renderer::new(&device, &context, format, active_display, displays, control)?
+            D3d11Renderer::new(
+                &device,
+                &context,
+                format,
+                active_display,
+                displays,
+                control,
+                debug.clone(),
+            )?
         };
         let decoder = unsafe { HardwareDecoder::new(&device, format)? };
         Ok(Self {
@@ -38,10 +52,15 @@ impl WorkerPipeline {
             interval_decoded: 0,
             interval_presented: 0,
             stats_started_us: monotonic_timestamp_us(),
+            debug,
         })
     }
 
-    pub(super) unsafe fn process(&mut self, queued: QueuedFrame) -> anyhow::Result<()> {
+    pub(super) unsafe fn process(
+        &mut self,
+        queued: QueuedFrame,
+        presenter_frames_dropped: u64,
+    ) -> anyhow::Result<()> {
         let receive_to_decode_start_us =
             monotonic_timestamp_us().saturating_sub(queued.received_at_us);
         let frames = unsafe { self.decoder.decode(queued)? };
@@ -74,9 +93,18 @@ impl WorkerPipeline {
         let elapsed_us = now_us.saturating_sub(self.stats_started_us);
         if elapsed_us >= 2_000_000 {
             let elapsed_seconds = elapsed_us as f64 / 1_000_000.0;
+            let decode_fps = self.interval_decoded as f64 / elapsed_seconds;
+            let present_fps = self.interval_presented as f64 / elapsed_seconds;
+            self.debug.update_presentation(
+                Some(decode_fps),
+                present_fps,
+                self.presented,
+                Some(presenter_frames_dropped),
+                self.decoded_frames_dropped,
+            );
             tracing::info!(
-                decode_fps = self.interval_decoded as f64 / elapsed_seconds,
-                present_fps = self.interval_presented as f64 / elapsed_seconds,
+                decode_fps,
+                present_fps,
                 frames_decoded = self.decoded,
                 frames_presented = self.presented,
                 decoded_frames_dropped = self.decoded_frames_dropped,

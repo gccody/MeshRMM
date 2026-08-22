@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -19,6 +20,7 @@ use webrtc::peer_connection::{
 use webrtc::stats::StatsReportType;
 
 use crate::config::Config;
+use crate::debug::DebugInfo;
 use crate::platform::{ControlSink, Presenter, monotonic_timestamp_us};
 use crate::signaling::{authenticated_websocket, session_signal_url};
 
@@ -129,12 +131,19 @@ async fn flush_pointer_motion(queue: ViewerControlQueue) {
 }
 
 pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyhow::Result<()> {
+    let debug = DebugInfo::new(bootstrap.session_id.as_str());
     let url = session_signal_url(&config.server, bootstrap.session_id.as_str())?;
     let socket = authenticated_websocket(url, &bootstrap.signaling_token).await?;
     let (mut signal_writer, mut signal_reader) = socket.split();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<SignalMessage>();
     let (state_tx, mut state_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
-    let peer = create_peer(&bootstrap.ice_servers, outgoing_tx.clone(), state_tx).await?;
+    let peer = create_peer(
+        &bootstrap.ice_servers,
+        outgoing_tx.clone(),
+        state_tx,
+        debug.clone(),
+    )
+    .await?;
     let presenter = Arc::new(Mutex::new(None::<ActivePresenter>));
     let control_channel = Arc::new(Mutex::new(None::<Arc<RTCDataChannel>>));
     let (viewer_control_tx, mut viewer_control_rx) = mpsc::unbounded_channel::<SessionMessage>();
@@ -147,6 +156,7 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
         Arc::clone(&control_channel),
         viewer_control.clone(),
         presentation_failure_tx,
+        debug.clone(),
     );
 
     let mut session_state = SessionState::Requested.transition(SessionState::Signaling)?;
@@ -226,6 +236,7 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
             }
             Some(state) = state_rx.recv() => {
                 tracing::info!(?state, session_id = %bootstrap.session_id, "WebRTC connection state changed");
+                debug.set_connection_state(format!("{state:?}").to_ascii_lowercase());
                 if state == RTCPeerConnectionState::Connected
                     && session_state == SessionState::Connecting
                 {
@@ -246,7 +257,7 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                         "timed out waiting 30 seconds for the remote video stream; check the Agent's WebRTC and ICE logs"
                     ));
                 }
-                log_network_stats(&peer).await;
+                update_network_stats(&peer, &debug).await;
                 let ended = presenter
                     .lock()
                     .ok()
@@ -289,11 +300,61 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
     result
 }
 
-async fn log_network_stats(peer: &RTCPeerConnection) {
-    for report in peer.get_stats().await.reports.into_values() {
+async fn update_network_stats(peer: &RTCPeerConnection, debug: &DebugInfo) {
+    let reports = peer.get_stats().await.reports;
+    let mut candidates = HashMap::new();
+    for report in reports.values() {
+        if let StatsReportType::LocalCandidate(candidate)
+        | StatsReportType::RemoteCandidate(candidate) = report
+        {
+            let relay = candidate.candidate_type.to_string() == "relay";
+            let relay_protocol = if candidate.relay_protocol.is_empty() {
+                String::new()
+            } else {
+                format!(" via {}", candidate.relay_protocol)
+            };
+            candidates.insert(
+                candidate.id.clone(),
+                (
+                    format!(
+                        "{} {} {}:{}{}",
+                        candidate.candidate_type,
+                        candidate.network_type,
+                        candidate.ip,
+                        candidate.port,
+                        relay_protocol,
+                    ),
+                    relay,
+                ),
+            );
+        }
+    }
+    for report in reports.into_values() {
         if let StatsReportType::CandidatePair(pair) = report
             && pair.nominated
         {
+            let local = candidates
+                .get(&pair.local_candidate_id)
+                .cloned()
+                .unwrap_or_else(|| (pair.local_candidate_id.clone(), false));
+            let remote = candidates
+                .get(&pair.remote_candidate_id)
+                .cloned()
+                .unwrap_or_else(|| (pair.remote_candidate_id.clone(), false));
+            let path = if local.1 || remote.1 {
+                "TURN relay"
+            } else {
+                "P2P / direct"
+            };
+            debug.update_network(
+                pair.current_round_trip_time * 1_000.0,
+                pair.available_incoming_bitrate,
+                pair.packets_received,
+                pair.bytes_received,
+                local.0,
+                remote.0,
+                path,
+            );
             tracing::info!(
                 rtt_ms = pair.current_round_trip_time * 1_000.0,
                 available_incoming_bitrate = pair.available_incoming_bitrate,
@@ -309,6 +370,7 @@ async fn create_peer(
     ice_servers: &[IceServer],
     outgoing: mpsc::UnboundedSender<SignalMessage>,
     state: mpsc::UnboundedSender<RTCPeerConnectionState>,
+    debug: DebugInfo,
 ) -> anyhow::Result<Arc<RTCPeerConnection>> {
     let peer = Arc::new(
         APIBuilder::new()
@@ -329,14 +391,16 @@ async fn create_peer(
     peer.sctp()
         .transport()
         .ice_transport()
-        .on_selected_candidate_pair_change(Box::new(|pair| {
+        .on_selected_candidate_pair_change(Box::new(move |pair| {
+            let debug = debug.clone();
             Box::pin(async move {
                 let pair = pair.to_string();
                 let path = if pair.to_ascii_lowercase().contains("relay") {
-                    "turn"
+                    "TURN relay"
                 } else {
-                    "direct"
+                    "P2P / direct"
                 };
+                debug.set_selected_pair(path, &pair);
                 tracing::info!(connection_path = path, candidate_pair = %pair, "ICE selected candidate pair");
             })
         }));
@@ -376,13 +440,16 @@ fn install_data_channel_handler(
     control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     viewer_control: ViewerControlQueue,
     presentation_failure: mpsc::UnboundedSender<String>,
+    debug: DebugInfo,
 ) {
     peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
         let presenter = Arc::clone(&presenter);
         let control_channel = Arc::clone(&control_channel);
         let viewer_control = viewer_control.clone();
         let presentation_failure = presentation_failure.clone();
+        let debug = debug.clone();
         Box::pin(async move {
+            debug.set_data_channel(channel.label(), "open");
             match channel.label() {
                 CONTROL_CHANNEL_LABEL => {
                     if let Ok(mut active) = control_channel.lock() {
@@ -393,9 +460,10 @@ fn install_data_channel_handler(
                         presenter,
                         viewer_control,
                         presentation_failure,
+                        debug,
                     )
                 }
-                "pulsermm-video-v1" => install_video_handler(channel, presenter),
+                "pulsermm-video-v1" => install_video_handler(channel, presenter, debug),
                 label => tracing::warn!(label, "ignoring unknown WebRTC data channel"),
             }
         })
@@ -407,12 +475,16 @@ fn install_control_handler(
     presenter: Arc<Mutex<Option<ActivePresenter>>>,
     viewer_control: ViewerControlQueue,
     presentation_failure: mpsc::UnboundedSender<String>,
+    debug: DebugInfo,
 ) {
     {
         let presentation_failure = presentation_failure.clone();
+        let debug = debug.clone();
         channel.on_close(Box::new(move || {
             let presentation_failure = presentation_failure.clone();
+            let debug = debug.clone();
             Box::pin(async move {
+                debug.set_data_channel(CONTROL_CHANNEL_LABEL, "closed");
                 let _ = presentation_failure.send(
                     "remote input/control channel closed while video was still active".into(),
                 );
@@ -423,6 +495,7 @@ fn install_control_handler(
         let presenter = Arc::clone(&presenter);
         let viewer_control = viewer_control.clone();
         let presentation_failure = presentation_failure.clone();
+        let debug = debug.clone();
         Box::pin(async move {
             match SessionMessage::decode(&message.data) {
                 Ok(SessionMessage::DisplayConfiguration {
@@ -445,7 +518,20 @@ fn install_control_handler(
                         move |message| message_queue.send(message),
                         move |enabled| input_gate.set_input_enabled(enabled),
                     );
-                    match Presenter::start(format, active_display.clone(), displays, sink) {
+                    debug.configure_stream(
+                        active_display.name.clone(),
+                        format.width,
+                        format.height,
+                        format.frames_per_second,
+                        format!("{:?}", format.codec),
+                    );
+                    match Presenter::start(
+                        format,
+                        active_display.clone(),
+                        displays,
+                        sink,
+                        debug.clone(),
+                    ) {
                         Ok(new_presenter) => {
                             let mut old = presenter
                                 .lock()
@@ -481,13 +567,24 @@ fn install_control_handler(
 fn install_video_handler(
     channel: Arc<RTCDataChannel>,
     presenter: Arc<Mutex<Option<ActivePresenter>>>,
+    debug: DebugInfo,
 ) {
+    {
+        let debug = debug.clone();
+        channel.on_close(Box::new(move || {
+            let debug = debug.clone();
+            Box::pin(async move {
+                debug.set_data_channel("pulsermm-video-v1", "closed");
+            })
+        }));
+    }
     let reassembler = Arc::new(tokio::sync::Mutex::new(FrameReassembler::new(
         ReassemblyConfig::default(),
     )));
     channel.on_message(Box::new(move |message| {
         let reassembler = Arc::clone(&reassembler);
         let presenter = Arc::clone(&presenter);
+        let debug = debug.clone();
         Box::pin(async move {
             let received_at_us = monotonic_timestamp_us();
             let packet = match VideoPacket::decode(&message.data) {
@@ -505,6 +602,14 @@ fn install_video_handler(
                 let encode_us = frame
                     .encode_complete_timestamp_us
                     .saturating_sub(frame.capture_timestamp_us);
+                debug.record_received_frame(
+                    encode_us,
+                    stats.completed_frames,
+                    stats.incomplete_frames_dropped,
+                    stats.stale_packets_dropped,
+                    stats.duplicate_packets,
+                    stats.invalid_packets,
+                );
                 if let Ok(guard) = presenter.lock()
                     && let Some(active) = guard.as_ref()
                     && active.stream_id == frame.stream_id

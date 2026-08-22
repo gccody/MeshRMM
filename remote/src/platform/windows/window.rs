@@ -6,6 +6,10 @@ struct WindowContext {
     control: ControlSink,
     pressed_keys: HashSet<(u16, bool)>,
     pressed_buttons: HashSet<PointerButton>,
+    debug: DebugInfo,
+    debug_overlay: HWND,
+    debug_visible: bool,
+    debug_refreshed: std::time::Instant,
 }
 
 impl WindowContext {
@@ -109,6 +113,26 @@ impl WindowContext {
         let next = self.displays[(current + 1) % self.displays.len()].id;
         self.send(SessionMessage::SelectDisplay { display_id: next });
     }
+
+    fn toggle_debug(&mut self) {
+        self.debug_visible = !self.debug_visible;
+        let command = if self.debug_visible { SW_SHOW } else { SW_HIDE };
+        let _ = unsafe { ShowWindow(self.debug_overlay, command) };
+        if self.debug_visible {
+            self.refresh_debug(true);
+        }
+    }
+
+    fn refresh_debug(&mut self, force: bool) {
+        if !self.debug_visible
+            || (!force && self.debug_refreshed.elapsed() < Duration::from_millis(250))
+        {
+            return;
+        }
+        self.debug_refreshed = std::time::Instant::now();
+        let text = HSTRING::from(self.debug.render().replace('\n', "\r\n"));
+        let _ = unsafe { SetWindowTextW(self.debug_overlay, PCWSTR(text.as_ptr())) };
+    }
 }
 
 unsafe fn window_context(window: HWND) -> Option<&'static mut WindowContext> {
@@ -129,6 +153,7 @@ pub(super) unsafe fn create_window(
     active_display: Display,
     displays: Vec<Display>,
     control: ControlSink,
+    debug: DebugInfo,
 ) -> anyhow::Result<HWND> {
     unsafe extern "system" fn window_proc(
         window: HWND,
@@ -202,6 +227,12 @@ pub(super) unsafe fn create_window(
                     if wparam.0 as u16 == VK_F8.0 {
                         return LRESULT(0);
                     }
+                    if wparam.0 as u16 == VK_F12.0 {
+                        if pressed && lparam.0 & (1 << 30) == 0 {
+                            context.toggle_debug();
+                        }
+                        return LRESULT(0);
+                    }
                     let scan_code = ((lparam.0 >> 16) & 0xff) as u16;
                     let extended = lparam.0 & (1 << 24) != 0;
                     if scan_code != 0 {
@@ -226,6 +257,17 @@ pub(super) unsafe fn create_window(
                 }
                 LRESULT(0)
             }
+            WM_CTLCOLORSTATIC => unsafe {
+                SetTextColor(
+                    windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
+                    windows::Win32::Foundation::COLORREF(0x00f4_f4_f4),
+                );
+                SetBkColor(
+                    windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
+                    windows::Win32::Foundation::COLORREF(0x0014_1414),
+                );
+                LRESULT(GetStockObject(BLACK_BRUSH).0 as isize)
+            },
             WM_KILLFOCUS => {
                 if let Some(context) = context {
                     context.release_input();
@@ -285,7 +327,7 @@ pub(super) unsafe fn create_window(
     unsafe { AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false) }
         .context("remote window bounds calculation failed")?;
     let title = HSTRING::from(format!(
-        "PulseRMM Remote Desktop — {} ({}) — F8 switches display",
+        "PulseRMM Remote Desktop — {} ({}) — F8 display · F12 diagnostics",
         active_display.name,
         if active_display.primary {
             "primary"
@@ -299,6 +341,10 @@ pub(super) unsafe fn create_window(
         control,
         pressed_keys: HashSet::new(),
         pressed_buttons: HashSet::new(),
+        debug,
+        debug_overlay: HWND::default(),
+        debug_visible: false,
+        debug_refreshed: std::time::Instant::now(),
     });
     let context = Box::into_raw(context);
     let window = unsafe {
@@ -324,11 +370,34 @@ pub(super) unsafe fn create_window(
             return Err(error).context("native remote desktop window creation failed");
         }
     };
+    let overlay = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!(""),
+            WS_CHILD | WS_BORDER,
+            12,
+            12,
+            640,
+            300,
+            Some(window),
+            None,
+            Some(instance),
+            None,
+        )
+    }
+    .context("debug overlay creation failed")?;
+    if let Some(context) = unsafe { window_context(window) } {
+        context.debug_overlay = overlay;
+    }
     let _ = unsafe { ShowWindow(window, SW_SHOW) };
     Ok(window)
 }
 
-pub(super) unsafe fn pump_window_messages() -> bool {
+pub(super) unsafe fn pump_window_messages(window: HWND) -> bool {
+    if let Some(context) = unsafe { window_context(window) } {
+        context.refresh_debug(false);
+    }
     let mut message = MSG::default();
     while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
         if message.message == WM_QUIT {

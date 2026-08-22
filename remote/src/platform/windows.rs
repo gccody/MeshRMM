@@ -18,18 +18,21 @@ use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::Graphics::Gdi::{
+    BLACK_BRUSH, GetStockObject, ScreenToClient, SetBkColor, SetTextColor,
+};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_F8};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_F8, VK_F12};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, Interface, PCWSTR, w};
 
 use super::ControlSink;
+use crate::debug::DebugInfo;
 
 mod pipeline;
 mod renderer;
@@ -53,6 +56,7 @@ struct Shared {
     running: AtomicBool,
     failure: Mutex<Option<String>>,
     replaced_frames: AtomicU64,
+    debug: DebugInfo,
 }
 
 pub struct Presenter {
@@ -66,6 +70,7 @@ impl Presenter {
         active_display: Display,
         displays: Vec<Display>,
         control: ControlSink,
+        debug: DebugInfo,
     ) -> anyhow::Result<Self> {
         let shared = Arc::new(Shared {
             latest: Mutex::new(None),
@@ -74,6 +79,7 @@ impl Presenter {
             running: AtomicBool::new(false),
             failure: Mutex::new(None),
             replaced_frames: AtomicU64::new(0),
+            debug,
         });
         let worker_shared = Arc::clone(&shared);
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
@@ -86,6 +92,7 @@ impl Presenter {
                     active_display,
                     displays,
                     control,
+                    worker_shared.debug.clone(),
                     started_tx,
                 )
             })
@@ -155,9 +162,11 @@ fn run_worker(
     active_display: Display,
     displays: Vec<Display>,
     control: ControlSink,
+    debug: DebugInfo,
     started: std::sync::mpsc::SyncSender<anyhow::Result<()>>,
 ) {
-    let initialized = unsafe { WorkerPipeline::new(format, active_display, displays, control) };
+    let initialized =
+        unsafe { WorkerPipeline::new(format, active_display, displays, control, debug) };
     let mut pipeline = match initialized {
         Ok(pipeline) => {
             shared.running.store(true, Ordering::Release);
@@ -171,7 +180,7 @@ fn run_worker(
     };
 
     while !shared.stopping.load(Ordering::Acquire) {
-        if unsafe { pump_window_messages() } {
+        if unsafe { pump_window_messages(pipeline.window()) } {
             break;
         }
         let queued = {
@@ -193,7 +202,7 @@ fn run_worker(
             continue;
         };
         let frame_id = queued.frame.frame_id;
-        match unsafe { pipeline.process(queued) } {
+        match unsafe { pipeline.process(queued, shared.replaced_frames.load(Ordering::Relaxed)) } {
             Ok(()) => {}
             Err(error) => {
                 tracing::error!(error = %error, frame_id, "hardware decode/presentation failed");

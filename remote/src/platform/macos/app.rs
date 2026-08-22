@@ -65,6 +65,10 @@ pub(super) struct RemoteViewIvars {
     control: ControlSink,
     pressed_keys: RefCell<Vec<(u16, bool)>>,
     pressed_buttons: RefCell<Vec<PointerButton>>,
+    debug: DebugInfo,
+    debug_label: Retained<NSTextField>,
+    debug_visible: RefCell<bool>,
+    debug_refreshed: RefCell<Instant>,
 }
 
 define_class!(
@@ -177,6 +181,12 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            if event.keyCode() == 111 {
+                if !event.isARepeat() {
+                    self.toggle_debug();
+                }
+                return;
+            }
             let modifiers = event.modifierFlags();
             if modifiers.contains(NSEventModifierFlags::Control)
                 && modifiers.contains(NSEventModifierFlags::Option)
@@ -190,6 +200,9 @@ define_class!(
 
         #[unsafe(method(keyUp:))]
         fn key_up(&self, event: &NSEvent) {
+            if event.keyCode() == 111 {
+                return;
+            }
             self.send_key(event.keyCode(), false);
         }
 
@@ -214,6 +227,7 @@ define_class!(
 );
 
 impl RemoteView {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         mtm: MainThreadMarker,
         frame: NSRect,
@@ -222,7 +236,31 @@ impl RemoteView {
         video_width: u32,
         video_height: u32,
         control: ControlSink,
+        debug: DebugInfo,
     ) -> Retained<Self> {
+        let debug_label =
+            NSTextField::wrappingLabelWithString(&NSString::from_str("PulseRMM diagnostics"), mtm);
+        debug_label.setFrame(NSRect {
+            origin: NSPoint {
+                x: 12.0,
+                y: (frame.size.height - 312.0).max(12.0),
+            },
+            size: NSSize {
+                width: (frame.size.width - 24.0).clamp(300.0, 640.0),
+                height: 300.0,
+            },
+        });
+        debug_label.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+        debug_label.setDrawsBackground(true);
+        debug_label.setBackgroundColor(Some(&NSColor::colorWithWhite_alpha(0.04, 0.88)));
+        debug_label.setTextColor(Some(&NSColor::whiteColor()));
+        debug_label.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(
+            12.0,
+            unsafe { NSFontWeightRegular },
+        )));
+        debug_label.setHidden(true);
         let this = Self::alloc(mtm).set_ivars(RemoteViewIvars {
             active_display,
             displays,
@@ -231,8 +269,14 @@ impl RemoteView {
             control,
             pressed_keys: RefCell::new(Vec::new()),
             pressed_buttons: RefCell::new(Vec::new()),
+            debug,
+            debug_label,
+            debug_visible: RefCell::new(false),
+            debug_refreshed: RefCell::new(Instant::now()),
         });
-        unsafe { msg_send![super(this), initWithFrame: frame] }
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        this.addSubview(&this.ivars().debug_label);
+        this
     }
 
     fn send(&self, message: SessionMessage) {
@@ -328,6 +372,28 @@ impl RemoteView {
         self.send(SessionMessage::SelectDisplay {
             display_id: displays[selected].id,
         });
+    }
+
+    fn toggle_debug(&self) {
+        let visible = !*self.ivars().debug_visible.borrow();
+        *self.ivars().debug_visible.borrow_mut() = visible;
+        self.ivars().debug_label.setHidden(!visible);
+        if visible {
+            self.refresh_debug(true);
+        }
+    }
+
+    pub(super) fn refresh_debug(&self, force: bool) {
+        if !*self.ivars().debug_visible.borrow()
+            || (!force
+                && self.ivars().debug_refreshed.borrow().elapsed() < Duration::from_millis(250))
+        {
+            return;
+        }
+        *self.ivars().debug_refreshed.borrow_mut() = Instant::now();
+        self.ivars()
+            .debug_label
+            .setStringValue(&NSString::from_str(&self.ivars().debug.render()));
     }
 
     pub(super) fn release_input(&self) {
