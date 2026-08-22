@@ -13,7 +13,7 @@ pub(crate) async fn create_handoff(request: &mut Request, environment: &Env) -> 
     let db = environment.d1("DB")?;
     let permitted = query!(
         &db,
-        "SELECT 1 AS permitted FROM agents WHERE id = ?1 AND company_id = ?2",
+        "SELECT 1 AS permitted FROM agents WHERE id = ?1 AND company_id = ?2 AND deletion_requested_at IS NULL",
         body.device_id,
         identity.company_id
     )?
@@ -72,7 +72,7 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
     let db = environment.d1("DB")?;
     let handoff = query!(
         &db,
-        "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 RETURNING company_id, device_id, user_id",
+        "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id",
         now,
         token_hash
     )?

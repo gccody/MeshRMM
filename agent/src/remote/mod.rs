@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
-use pulsermm_protocol::AgentSessionRequest;
+use pulsermm_protocol::{AgentCommand, AgentSessionRequest, AgentStatusMessage};
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -41,6 +41,22 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
                                     let Some(message) = message else { break Ok(false); };
                                     match message.context("Agent signaling WebSocket read failed")? {
                                         Message::Text(text) => {
+                                            if let Ok(AgentCommand::Uninstall) = serde_json::from_str(text.as_str()) {
+                                                crate::installer::schedule_uninstall()
+                                                    .context("failed to schedule Agent self-uninstall")?;
+                                                socket
+                                                    .send(Message::Text(
+                                                        serde_json::to_string(&AgentStatusMessage::UninstallScheduled)?
+                                                            .into(),
+                                                    ))
+                                                    .await
+                                                    .context("failed to acknowledge Agent self-uninstall")?;
+                                                socket.flush().await.context(
+                                                    "failed to flush Agent self-uninstall acknowledgement",
+                                                )?;
+                                                sleep(Duration::from_millis(250)).await;
+                                                break Ok(true);
+                                            }
                                             let request: AgentSessionRequest = match serde_json::from_str(text.as_str()) {
                                                 Ok(request) => request,
                                                 Err(error) => {

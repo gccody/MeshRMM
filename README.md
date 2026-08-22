@@ -159,6 +159,11 @@ credential, installs the binary under `%ProgramFiles%\PulseRMM\Agent`, registers
 the automatic `PulseRMMAgent` LocalSystem service with recovery actions,
 protects its configuration under `%ProgramData%\PulseRMM\Agent`, and starts it.
 
+Deleting an Agent from the dashboard immediately removes it from inventory and
+queues an authenticated self-uninstall. Online Agents remove the service,
+binary, configuration, log, and empty PulseRMM directories immediately; offline
+Agents perform the same cleanup the next time they connect.
+
 The service remains in Session 0 and supervises a separate worker carrying the
 same LocalSystem token in the active console session. This allows
 Windows.Graphics.Capture and `SendInput` to target the interactive desktop

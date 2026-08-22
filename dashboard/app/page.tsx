@@ -85,6 +85,7 @@ export default function Dashboard() {
   const [isAgentOpen, setIsAgentOpen] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [connectingId, setConnectingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [companyName, setCompanyName] = useState("");
   const [agentPlatform, setAgentPlatform] = useState<AgentPlatform>("windows-x64");
@@ -97,7 +98,7 @@ export default function Dashboard() {
   const [idleTimeoutDraft, setIdleTimeoutDraft] = useState(DEFAULT_IDLE_TIMEOUT_MINUTES);
   const [isSavingSessionPolicy, setIsSavingSessionPolicy] = useState(false);
 
-  const isAdmin = role === "admin" || roles?.includes("admin") || account?.role === "admin" || account?.roles.includes("admin");
+  const isAdmin = Boolean(role === "admin" || roles?.includes("admin") || account?.role === "admin" || account?.roles.includes("admin"));
   const companyId = account?.company?.id;
   const idleTimeoutMinutes = account?.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES;
 
@@ -289,6 +290,30 @@ export default function Dashboard() {
     }
   };
 
+  const deleteAgent = async (agent: Agent) => {
+    const confirmed = window.confirm(
+      `Delete ${agent.name}? The Agent will uninstall itself and remove its local files. If it is offline, cleanup will run the next time it connects.`,
+    );
+    if (!confirmed) return;
+    setDeletingId(agent.id);
+    setError(null);
+    try {
+      const response = await authorizedFetch(`/v1/agents/${encodeURIComponent(agent.id)}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        throw new Error(await errorMessage(response, "The Agent could not be deleted."));
+      }
+      await loadAgents(true);
+    } catch (requestError) {
+      if (!(requestError instanceof AuthenticationRequired)) {
+        setError(requestError instanceof Error ? requestError.message : "The Agent could not be deleted.");
+      }
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
   const downloadInstaller = async (event: FormEvent) => {
     event.preventDefault();
     setIsDownloadingInstaller(true);
@@ -461,9 +486,12 @@ export default function Dashboard() {
                     query={query}
                     status={status}
                     connectingId={connectingId}
+                    deletingId={deletingId}
+                    canDelete={isAdmin}
                     onQueryChange={setQuery}
                     onStatusChange={setStatus}
                     onRemote={(agent) => void remoteInto(agent)}
+                    onDelete={(agent) => void deleteAgent(agent)}
                   />
                 ) : view === "team" ? (
                 <section className="management-panel"><UsersManagement authToken={getAccessToken} /></section>

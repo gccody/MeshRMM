@@ -17,6 +17,14 @@ async fn main() -> anyhow::Result<()> {
         return remote::capture_helper::run_child();
     }
 
+    #[cfg(windows)]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--uninstall")
+    {
+        return installer::uninstall();
+    }
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install the Rustls ring crypto provider"))?;
