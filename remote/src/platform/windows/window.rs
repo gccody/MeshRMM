@@ -10,7 +10,7 @@ struct WindowContext {
 
 impl WindowContext {
     fn send(&self, message: SessionMessage) {
-        (self.control)(message);
+        self.control.send(message);
     }
 
     fn pointer_position(&self, window: HWND, lparam: LPARAM) -> Option<(u16, u16)> {
@@ -28,8 +28,9 @@ impl WindowContext {
         }
         let width = rect.right.saturating_sub(rect.left).max(1);
         let height = rect.bottom.saturating_sub(rect.top).max(1);
-        let x = x.clamp(0, width - 1);
-        let y = y.clamp(0, height - 1);
+        if x < 0 || x >= width || y < 0 || y >= height {
+            return None;
+        }
         Some((
             (i64::from(x) * 65_535 / i64::from((width - 1).max(1))) as u16,
             (i64::from(y) * 65_535 / i64::from((height - 1).max(1))) as u16,
@@ -47,16 +48,26 @@ impl WindowContext {
     }
 
     fn button(&mut self, window: HWND, lparam: LPARAM, button: PointerButton, pressed: bool) {
-        let Some((x, y)) = self.pointer_position(window, lparam) else {
-            return;
-        };
-        self.send(SessionMessage::Input(RemoteInput::PointerButtonAt {
-            display_id: self.active_display.id,
-            x,
-            y,
-            button,
-            pressed,
-        }));
+        let position = self.pointer_position(window, lparam);
+        match position {
+            Some((x, y)) => self.send(SessionMessage::Input(RemoteInput::PointerButtonAt {
+                display_id: self.active_display.id,
+                x,
+                y,
+                button,
+                pressed,
+            })),
+            None if !pressed && self.pressed_buttons.contains(&button) => {
+                // Finish a drag that began over the video without moving the
+                // remote pointer to an out-of-bounds/clamped position.
+                self.send(SessionMessage::Input(RemoteInput::PointerButton {
+                    display_id: self.active_display.id,
+                    button,
+                    pressed: false,
+                }));
+            }
+            None => return,
+        }
         if pressed {
             self.pressed_buttons.insert(button);
             let _ = unsafe { SetCapture(window) };
@@ -209,15 +220,23 @@ pub(super) unsafe fn create_window(
                 }
                 LRESULT(0)
             }
+            WM_SETFOCUS => {
+                if let Some(context) = context {
+                    context.control.set_input_enabled(true);
+                }
+                LRESULT(0)
+            }
             WM_KILLFOCUS => {
                 if let Some(context) = context {
                     context.release_input();
+                    context.control.set_input_enabled(false);
                 }
                 LRESULT(0)
             }
             WM_CLOSE => {
                 if let Some(context) = context {
                     context.release_input();
+                    context.control.set_input_enabled(false);
                 }
                 let _ = unsafe { DestroyWindow(window) };
                 LRESULT(0)

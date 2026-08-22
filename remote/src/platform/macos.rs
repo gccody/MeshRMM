@@ -62,23 +62,39 @@ mod tests {
 
         assert_eq!(
             normalized_video_position(NSPoint { x: 500.0, y: 500.0 }, bounds, 1_920, 1_080,),
-            (32_768, 32_768)
+            Some((32_768, 32_768))
         );
         assert_eq!(
-            normalized_video_position(NSPoint { x: 0.0, y: 0.0 }, bounds, 1_920, 1_080),
-            (0, 65_535)
+            normalized_video_position(NSPoint { x: 0.0, y: 500.0 }, bounds, 1_920, 1_080),
+            Some((0, 32_768))
         );
         assert_eq!(
             normalized_video_position(
                 NSPoint {
                     x: 1_000.0,
-                    y: 1_000.0,
+                    y: 500.0,
                 },
                 bounds,
                 1_920,
                 1_080,
             ),
-            (65_535, 0)
+            Some((65_535, 32_768))
+        );
+        assert_eq!(
+            normalized_video_position(NSPoint { x: 500.0, y: 0.0 }, bounds, 1_920, 1_080),
+            None
+        );
+        assert_eq!(
+            normalized_video_position(
+                NSPoint {
+                    x: 500.0,
+                    y: 1_000.0
+                },
+                bounds,
+                1_920,
+                1_080
+            ),
+            None
         );
     }
 }
