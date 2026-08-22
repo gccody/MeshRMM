@@ -22,7 +22,7 @@ use anyhow::Context;
 #[cfg(windows)]
 use futures_util::{SinkExt, StreamExt};
 #[cfg(windows)]
-use pulsermm_protocol::{AgentCommand, AgentSessionRequest, AgentStatusMessage};
+use meshrmm_protocol::{AgentCommand, AgentSessionRequest, AgentStatusMessage};
 #[cfg(windows)]
 use tokio::time::sleep;
 #[cfg(windows)]
@@ -35,7 +35,7 @@ use self::signaling::{agent_connection_url, authenticated_websocket};
 #[cfg_attr(not(windows), allow(unused_variables))]
 pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
     #[cfg(not(windows))]
-    anyhow::bail!("the first PulseRMM remote-screen MVP requires Windows");
+    anyhow::bail!("the first MeshRMM remote-screen MVP requires Windows");
 
     #[cfg(windows)]
     {

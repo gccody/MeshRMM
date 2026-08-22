@@ -6,7 +6,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use pulsermm_self_update::{CLIENT_WINDOWS_X64, UpdateManifest};
+use meshrmm_self_update::{CLIENT_WINDOWS_X64, UpdateManifest};
 
 use crate::config::Config;
 
@@ -54,13 +54,13 @@ pub async fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
         .context("client executable has no parent directory")?;
     let suffix = unique_suffix();
     let staged = parent.join(format!(
-        "pulsermm-remote-{}.update-{suffix}.exe",
+        "meshrmm-remote-{}.update-{suffix}.exe",
         release.version
     ));
     write_new_file(&staged, &executable)?;
 
     let helper_directory = std::env::temp_dir()
-        .join("PulseRMM")
+        .join("MeshRMM")
         .join(format!("client-update-{suffix}"));
     std::fs::create_dir_all(&helper_directory).with_context(|| {
         format!(

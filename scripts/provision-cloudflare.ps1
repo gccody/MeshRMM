@@ -22,7 +22,7 @@ try {
         -Uri "https://api.cloudflare.com/client/v4/accounts/$AccountId/calls/turn_keys" `
         -Headers @{ Authorization = "Bearer $callsToken" } `
         -ContentType "application/json" `
-        -Body (@{ name = "pulsermm-production" } | ConvertTo-Json -Compress)
+        -Body (@{ name = "meshrmm-production" } | ConvertTo-Json -Compress)
 
     if (-not $turnResponse.success -or -not $turnResponse.result.uid -or -not $turnResponse.result.key) {
         throw "Cloudflare did not return a usable TURN key."
@@ -60,4 +60,4 @@ finally {
 }
 
 Write-Host "Cloudflare TURN credentials are configured."
-Write-Host "Create companies in WorkOS and create tenant-scoped Agents from https://pulsermm.gccody.dev."
+Write-Host "Create companies in WorkOS and create tenant-scoped Agents from https://meshrmm.com."

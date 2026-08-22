@@ -19,8 +19,8 @@ async function render(pathname = "/") {
   const { default: worker } = await import(workerUrl.href);
 
   return worker.fetch(
-    new Request(`https://pulsermm.gccody.dev${pathname}`, {
-      headers: { accept: "text/html", host: "pulsermm.gccody.dev" },
+    new Request(`https://meshrmm.com${pathname}`, {
+      headers: { accept: "text/html", host: "meshrmm.com" },
     }),
     { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } },
     { waitUntil() {}, passThroughOnException() {} },
@@ -33,7 +33,7 @@ test("server-renders the production WorkOS shell without inventory data", async 
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
-  assert.match(html, /<title>Agents \| PulseRMM<\/title>/i);
+  assert.match(html, /<title>Agents \| MeshRMM<\/title>/i);
   assert.match(html, /data-woswidgets-root="true"/);
   assert.match(html, /WorkOS authentication/);
   assert.match(html, /Select company/);
@@ -45,7 +45,7 @@ test("serves the WorkOS initiate-login route", async () => {
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
-  assert.match(html, /<title>Agents \| PulseRMM<\/title>/i);
+  assert.match(html, /<title>Agents \| MeshRMM<\/title>/i);
   assert.match(html, /Preparing secure sign-in/);
   assert.match(html, /Redirecting to WorkOS/);
 });

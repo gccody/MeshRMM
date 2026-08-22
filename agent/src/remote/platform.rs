@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
-use pulsermm_protocol::{
+use meshrmm_protocol::{
     Codec, Display, DisplayId, EncodedFrame, PixelFormat, VideoFormat, VideoStreamId,
 };
 
@@ -41,7 +41,7 @@ impl PlatformScreenStreamer {
             inner: if capture_as_active_user {
                 CaptureBackend::ActiveUser(super::capture_helper::UserCaptureStreamer::new())
             } else {
-                CaptureBackend::Direct(pulsermm_remote_screen::WindowsScreenStreamer::new())
+                CaptureBackend::Direct(meshrmm_remote_screen::WindowsScreenStreamer::new())
             },
             frames_per_second,
             bitrate_bits_per_second,
@@ -53,7 +53,7 @@ impl PlatformScreenStreamer {
 #[cfg(windows)]
 impl ScreenStreamer for PlatformScreenStreamer {
     fn displays(&self) -> anyhow::Result<Vec<Display>> {
-        pulsermm_remote_screen::enumerate_displays()
+        meshrmm_remote_screen::enumerate_displays()
             .context("failed to enumerate Windows displays")?
             .into_iter()
             .map(|display| {
@@ -79,7 +79,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
         let next_frame_id = Arc::clone(&self.next_frame_id);
         let runtime = tokio::runtime::Handle::current();
         let sink = Arc::new(
-            move |access_unit: pulsermm_remote_screen::EncodedAccessUnit| {
+            move |access_unit: meshrmm_remote_screen::EncodedAccessUnit| {
                 let slot = Arc::clone(&slot);
                 let frame_id = next_frame_id.fetch_add(1, Ordering::Relaxed);
                 let mut data = access_unit.codec_config.unwrap_or_default();
@@ -96,7 +96,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
                 runtime.spawn(async move { slot.publish(frame).await });
             },
         );
-        let config = pulsermm_remote_screen::StreamConfig {
+        let config = meshrmm_remote_screen::StreamConfig {
             frames_per_second: self.frames_per_second,
             bitrate_bits_per_second: self.bitrate_bits_per_second,
         };
@@ -155,11 +155,11 @@ impl ScreenStreamer for PlatformScreenStreamer {
 
 #[cfg(windows)]
 enum CaptureBackend {
-    Direct(pulsermm_remote_screen::WindowsScreenStreamer),
+    Direct(meshrmm_remote_screen::WindowsScreenStreamer),
     ActiveUser(super::capture_helper::UserCaptureStreamer),
 }
 
 #[cfg(windows)]
 pub fn monotonic_timestamp_us() -> u64 {
-    pulsermm_remote_screen::monotonic_timestamp_us().unwrap_or(0)
+    meshrmm_remote_screen::monotonic_timestamp_us().unwrap_or(0)
 }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use worker::*;
 
 const DASHBOARD_TAG: &str = "dashboard";
-const COMPANY_HEADER: &str = "X-Pulse-Company-Id";
+const COMPANY_HEADER: &str = "X-Mesh-Company-Id";
 const COMPANY_KEY: &str = "company_id";
 const PRESENCE_KEY: &str = "presence";
 

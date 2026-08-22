@@ -1,10 +1,10 @@
 [package]
-name = "pulsermm-agent"
+name = "meshrmm-agent"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "The native PulseRMM endpoint agent"
+description = "The native MeshRMM endpoint agent"
 
 [lints]
 workspace = true
@@ -14,9 +14,9 @@ anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
-pulsermm-protocol.workspace = true
-pulsermm-self-update.workspace = true
-pulsermm-signaling-client.workspace = true
+meshrmm-protocol.workspace = true
+meshrmm-self-update.workspace = true
+meshrmm-signaling-client.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,7 +28,7 @@ url.workspace = true
 webrtc.workspace = true
 
 [target."cfg(windows)".dependencies]
-pulsermm-remote-screen = { version = "0.1.0", path = "windows/remote-screen" }
+meshrmm-remote-screen = { version = "0.2.0", path = "windows/remote-screen" }
 ureq = { version = "3.4.0", features = ["json", "platform-verifier"] }
 windows-service = "0.8.1"
 windows = { version = "0.62.2", features = [

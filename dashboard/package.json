@@ -1,6 +1,6 @@
 {
-  "name": "pulsermm-dashboard",
-  "version": "0.1.0",
+  "name": "meshrmm-dashboard",
+  "version": "0.2.0",
   "private": true,
   "engines": {
     "node": ">=22.13.0"

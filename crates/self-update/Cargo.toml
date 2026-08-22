@@ -1,10 +1,10 @@
 [package]
-name = "pulsermm-self-update"
+name = "meshrmm-self-update"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "PulseRMM release manifest and update integrity checks"
+description = "MeshRMM release manifest and update integrity checks"
 
 [lints]
 workspace = true

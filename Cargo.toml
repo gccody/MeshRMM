@@ -13,7 +13,7 @@ members = [
 default-members = ["agent", "remote"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 publish = false
@@ -23,10 +23,10 @@ anyhow = "1.0.104"
 bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 futures-util = { version = "0.3.34", features = ["sink"] }
-pulsermm-protocol = { version = "0.1.0", path = "agent/protocol" }
-pulsermm-protocol-types = { version = "0.1.0", path = "crates/protocol-types" }
-pulsermm-self-update = { version = "0.1.0", path = "crates/self-update" }
-pulsermm-signaling-client = { version = "0.1.0", path = "crates/signaling-client" }
+meshrmm-protocol = { version = "0.2.0", path = "agent/protocol" }
+meshrmm-protocol-types = { version = "0.2.0", path = "crates/protocol-types" }
+meshrmm-self-update = { version = "0.2.0", path = "crates/self-update" }
+meshrmm-signaling-client = { version = "0.2.0", path = "crates/signaling-client" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

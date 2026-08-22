@@ -1,10 +1,10 @@
 [package]
-name = "pulsermm-remote"
+name = "meshrmm-remote"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "The native PulseRMM computer-remoting application"
+description = "The native MeshRMM computer-remoting application"
 
 [lints]
 workspace = true
@@ -14,9 +14,9 @@ anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
-pulsermm-protocol.workspace = true
-pulsermm-self-update.workspace = true
-pulsermm-signaling-client.workspace = true
+meshrmm-protocol.workspace = true
+meshrmm-self-update.workspace = true
+meshrmm-signaling-client.workspace = true
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 rustls.workspace = true
 serde.workspace = true

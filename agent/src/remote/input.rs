@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, bail};
-use pulsermm_protocol::{CursorShape, Display, PointerButton, RemoteInput};
+use meshrmm_protocol::{CursorShape, Display, PointerButton, RemoteInput};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, GetCursorInfo, GetSystemMetrics, IDC_APPSTARTING, IDC_ARROW,

@@ -10,13 +10,13 @@ use std::sync::Arc;
 /// with the native window's foreground state.
 #[derive(Clone)]
 pub struct ControlSink {
-    send: Arc<dyn Fn(pulsermm_protocol::SessionMessage) + Send + Sync>,
+    send: Arc<dyn Fn(meshrmm_protocol::SessionMessage) + Send + Sync>,
     set_input_enabled: Arc<dyn Fn(bool) + Send + Sync>,
 }
 
 impl ControlSink {
     pub fn new(
-        send: impl Fn(pulsermm_protocol::SessionMessage) + Send + Sync + 'static,
+        send: impl Fn(meshrmm_protocol::SessionMessage) + Send + Sync + 'static,
         set_input_enabled: impl Fn(bool) + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -25,7 +25,7 @@ impl ControlSink {
         }
     }
 
-    pub fn send(&self, message: pulsermm_protocol::SessionMessage) {
+    pub fn send(&self, message: meshrmm_protocol::SessionMessage) {
         (self.send)(message);
     }
 

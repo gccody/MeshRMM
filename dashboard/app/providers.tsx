@@ -9,8 +9,8 @@ type RuntimeConfig = {
   serverUrl: string;
 };
 
-export const LOGIN_ATTEMPT_KEY = "pulsermm:workos-login-attempt";
-export const AUTH_REFRESH_FAILED_EVENT = "pulsermm:workos-refresh-failed";
+export const LOGIN_ATTEMPT_KEY = "meshrmm:workos-login-attempt";
+export const AUTH_REFRESH_FAILED_EVENT = "meshrmm:workos-refresh-failed";
 
 type RedirectCallbackParams = {
   state?: Record<string, unknown> | null;

@@ -47,12 +47,12 @@ fn register_windows_deep_link_handler() {
     let command = format!("\"{}\" \"%1\"", executable.display());
     let entries = [
         (
-            r"HKCU\Software\Classes\pulsermm",
-            "URL:PulseRMM Remote Protocol",
+            r"HKCU\Software\Classes\meshrmm",
+            "URL:MeshRMM Remote Protocol",
         ),
-        (r"HKCU\Software\Classes\pulsermm", ""),
+        (r"HKCU\Software\Classes\meshrmm", ""),
         (
-            r"HKCU\Software\Classes\pulsermm\shell\open\command",
+            r"HKCU\Software\Classes\meshrmm\shell\open\command",
             command.as_str(),
         ),
     ];
@@ -123,5 +123,5 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn main() -> anyhow::Result<()> {
-    anyhow::bail!("PulseRMM remote-client supports Windows and macOS")
+    anyhow::bail!("MeshRMM remote-client supports Windows and macOS")
 }

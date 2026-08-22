@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use pulsermm_protocol::{
+use meshrmm_protocol::{
     CursorShape, Display, EncodedFrame, PointerButton, RemoteInput, SessionMessage, VideoFormat,
 };
 use windows::Win32::Foundation::{
@@ -87,7 +87,7 @@ impl Presenter {
         let worker_debug = worker_shared.debug.clone();
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
-            .name("pulsermm-decode-present".into())
+            .name("meshrmm-decode-present".into())
             .spawn(move || {
                 run_worker(
                     worker_shared,

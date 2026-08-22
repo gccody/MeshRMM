@@ -25,7 +25,7 @@ pub enum ExecutionMode {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "pulsermm-agent", about = "PulseRMM Windows endpoint Agent")]
+#[command(name = "meshrmm-agent", about = "MeshRMM Windows endpoint Agent")]
 struct Arguments {
     /// Run as the Windows Service Control Manager entry point.
     #[arg(long, hide = true, conflicts_with_all = ["worker", "console"])]
@@ -43,29 +43,29 @@ struct Arguments {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// HTTPS base URL of the deployed PulseRMM Cloudflare Worker.
-    #[arg(long, env = "PULSERMM_SERVER")]
+    /// HTTPS base URL of the deployed MeshRMM Cloudflare Worker.
+    #[arg(long, env = "MESHRMM_SERVER")]
     server: Option<String>,
 
     /// Stable device identity provisioned for this Agent.
-    #[arg(long, env = "PULSERMM_DEVICE_ID")]
+    #[arg(long, env = "MESHRMM_DEVICE_ID")]
     device_id: Option<String>,
 
-    /// Per-device secret issued once by the company-scoped PulseRMM dashboard.
-    #[arg(long, env = "PULSERMM_AGENT_TOKEN", hide_env_values = true)]
+    /// Per-device secret issued once by the company-scoped MeshRMM dashboard.
+    #[arg(long, env = "MESHRMM_AGENT_TOKEN", hide_env_values = true)]
     agent_token: Option<String>,
 
     /// HTTPS release manifest used for automatic Agent updates.
-    #[arg(long, env = "PULSERMM_UPDATE_MANIFEST_URL")]
+    #[arg(long, env = "MESHRMM_UPDATE_MANIFEST_URL")]
     update_manifest_url: Option<String>,
 
-    #[arg(long, env = "PULSERMM_REMOTE_FPS")]
+    #[arg(long, env = "MESHRMM_REMOTE_FPS")]
     frames_per_second: Option<u32>,
 
-    #[arg(long, env = "PULSERMM_REMOTE_BITRATE")]
+    #[arg(long, env = "MESHRMM_REMOTE_BITRATE")]
     bitrate_bits_per_second: Option<u32>,
 
-    #[arg(long, env = "PULSERMM_JSON_LOGS", action = ArgAction::SetTrue)]
+    #[arg(long, env = "MESHRMM_JSON_LOGS", action = ArgAction::SetTrue)]
     json_logs: bool,
 }
 
@@ -91,7 +91,7 @@ impl Config {
             ExecutionMode::Console
         } else {
             anyhow::bail!(
-                "this Agent must be installed as a Windows service from the PulseRMM dashboard; use --console only for local development"
+                "this Agent must be installed as a Windows service from the MeshRMM dashboard; use --console only for local development"
             );
         };
         let config_path = resolve_path(arguments.config.as_deref(), "agent.json")?;
@@ -111,8 +111,8 @@ impl Config {
         let update_manifest_url = arguments
             .update_manifest_url
             .or(file.update_manifest_url)
-            .unwrap_or_else(|| pulsermm_self_update::DEFAULT_MANIFEST_URL.to_owned());
-        pulsermm_self_update::validate_manifest_url(&update_manifest_url)?;
+            .unwrap_or_else(|| meshrmm_self_update::DEFAULT_MANIFEST_URL.to_owned());
+        meshrmm_self_update::validate_manifest_url(&update_manifest_url)?;
         let frames_per_second = arguments
             .frames_per_second
             .or(file.frames_per_second)

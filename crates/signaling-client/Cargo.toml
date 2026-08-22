@@ -1,10 +1,10 @@
 [package]
-name = "pulsermm-signaling-client"
+name = "meshrmm-signaling-client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "Shared PulseRMM HTTP/WebSocket endpoint and authentication client"
+description = "Shared MeshRMM HTTP/WebSocket endpoint and authentication client"
 
 [lints]
 workspace = true

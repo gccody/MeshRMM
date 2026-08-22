@@ -6,12 +6,12 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use pulsermm_self_update::{AGENT_WINDOWS_X64, UpdateManifest};
+use meshrmm_self_update::{AGENT_WINDOWS_X64, UpdateManifest};
 use windows_service::service::{ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use crate::remote::config::Config;
-use crate::service::SERVICE_NAME;
+use crate::service::service_name_for_path;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -93,12 +93,13 @@ pub fn apply_scheduled_update() -> anyhow::Result<()> {
             .with_context(|| format!("failed to install Agent update {}", target.display()));
     }
 
-    if let Err(update_error) = start_service_and_wait() {
-        let _ = stop_service_if_running();
+    let service_name = service_name_for_path(&target);
+    if let Err(update_error) = start_service_and_wait(service_name) {
+        let _ = stop_service_if_running(service_name);
         let _ = std::fs::remove_file(&target);
         std::fs::rename(&backup, &target)
             .context("the Agent update failed and the previous executable could not be restored")?;
-        start_service_and_wait().context(
+        start_service_and_wait(service_name).context(
             "the Agent update failed; the previous executable was restored but could not be restarted",
         )?;
         return Err(update_error).context("the updated Agent service did not start");
@@ -162,10 +163,10 @@ fn wait_until_replaceable(target: &Path, timeout: Duration) -> anyhow::Result<()
     }
 }
 
-fn start_service_and_wait() -> anyhow::Result<()> {
+fn start_service_and_wait(service_name: &str) -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(
-        SERVICE_NAME,
+        service_name,
         ServiceAccess::START | ServiceAccess::QUERY_STATUS,
     )?;
     service.start::<&OsStr>(&[])?;
@@ -182,10 +183,10 @@ fn start_service_and_wait() -> anyhow::Result<()> {
     }
 }
 
-fn stop_service_if_running() -> anyhow::Result<()> {
+fn stop_service_if_running(service_name: &str) -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(
-        SERVICE_NAME,
+        service_name,
         ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
     )?;
     if service.query_status()?.current_state != ServiceState::Stopped {

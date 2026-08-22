@@ -20,9 +20,9 @@ use windows_service::service::{
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use crate::service::SERVICE_NAME;
+use crate::service::{LEGACY_SERVICE_NAME, SERVICE_NAME};
 
-const ENROLLMENT_MAGIC: &[u8] = b"PULSERMM-BOOTSTRAP-V1";
+const ENROLLMENT_MAGIC: &[u8] = b"MESHRMM-BOOTSTRAP-V1";
 const CONFIG_LENGTH_BYTES: usize = 8;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -57,7 +57,7 @@ struct ApiError {
 }
 
 fn default_update_manifest_url() -> String {
-    pulsermm_self_update::DEFAULT_MANIFEST_URL.to_owned()
+    meshrmm_self_update::DEFAULT_MANIFEST_URL.to_owned()
 }
 
 pub fn launch_if_embedded() -> anyhow::Result<bool> {
@@ -93,14 +93,14 @@ pub fn install_and_notify() -> anyhow::Result<()> {
     match install() {
         Ok(()) => {
             message(
-                "PulseRMM Agent installed successfully. The LocalSystem service is running. You can now delete the downloaded installer.",
+                "MeshRMM Agent installed successfully. The LocalSystem service is running. You can now delete the downloaded installer.",
                 false,
             );
             Ok(())
         }
         Err(error) => {
             message(
-                &format!("PulseRMM Agent installation failed:\n\n{error:#}"),
+                &format!("MeshRMM Agent installation failed:\n\n{error:#}"),
                 true,
             );
             Err(error)
@@ -112,7 +112,7 @@ pub fn install_and_notify() -> anyhow::Result<()> {
 /// stop and remove the service without trying to delete the executable that is currently running.
 pub fn schedule_uninstall() -> anyhow::Result<()> {
     let source = std::env::current_exe().context("could not locate the Agent executable")?;
-    let helper_directory = std::env::temp_dir().join("PulseRMM");
+    let helper_directory = std::env::temp_dir().join("MeshRMM");
     std::fs::create_dir_all(&helper_directory).with_context(|| {
         format!(
             "failed to create uninstall helper directory {}",
@@ -148,24 +148,27 @@ pub fn uninstall() -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .context("administrator access is required to uninstall the Agent service")?;
     let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
-    if let Ok(service) = manager.open_service(SERVICE_NAME, service_access) {
-        stop_service(&service)?;
-        service
-            .delete()
-            .context("failed to unregister the Agent service")?;
+    for service_name in [SERVICE_NAME, LEGACY_SERVICE_NAME] {
+        if let Ok(service) = manager.open_service(service_name, service_access) {
+            stop_service(&service)?;
+            service
+                .delete()
+                .context("failed to unregister the Agent service")?;
+        }
     }
     drop(manager);
 
     let install_directory = required_system_directory("ProgramFiles")?
-        .join("PulseRMM")
+        .join("MeshRMM")
         .join("Agent");
     let config_directory = required_system_directory("ProgramData")?
-        .join("PulseRMM")
+        .join("MeshRMM")
         .join("Agent");
     remove_directory_if_present(&config_directory)?;
     remove_directory_if_present(&install_directory)?;
     remove_empty_parent(&config_directory);
     remove_empty_parent(&install_directory);
+    remove_legacy_directories()?;
     schedule_helper_cleanup()?;
     Ok(())
 }
@@ -174,7 +177,7 @@ fn install() -> anyhow::Result<()> {
     let source_path = std::env::current_exe().context("could not locate the Agent installer")?;
     let source_bytes = std::fs::read(&source_path).context("could not read the Agent installer")?;
     let embedded = parse_embedded(&source_bytes)?
-        .context("this executable does not contain a PulseRMM Agent enrollment")?;
+        .context("this executable does not contain a MeshRMM Agent enrollment")?;
     let bootstrap = validate_bootstrap(embedded.bootstrap)?;
 
     let manager = ServiceManager::local_computer(
@@ -187,11 +190,14 @@ fn install() -> anyhow::Result<()> {
         | ServiceAccess::START
         | ServiceAccess::CHANGE_CONFIG;
     let existing_service = manager.open_service(SERVICE_NAME, service_access).ok();
+    let legacy_service = manager
+        .open_service(LEGACY_SERVICE_NAME, service_access | ServiceAccess::DELETE)
+        .ok();
 
     let program_files = required_system_directory("ProgramFiles")?;
     let program_data = required_system_directory("ProgramData")?;
-    let install_directory = program_files.join("PulseRMM").join("Agent");
-    let config_directory = program_data.join("PulseRMM").join("Agent");
+    let install_directory = program_files.join("MeshRMM").join("Agent");
+    let config_directory = program_data.join("MeshRMM").join("Agent");
     std::fs::create_dir_all(&install_directory)
         .with_context(|| format!("failed to create {}", install_directory.display()))?;
     std::fs::create_dir_all(&config_directory)
@@ -205,15 +211,18 @@ fn install() -> anyhow::Result<()> {
     if let Some(service) = existing_service.as_ref() {
         stop_service(service)?;
     }
+    if let Some(service) = legacy_service.as_ref() {
+        stop_service(service)?;
+    }
 
-    let agent_path = install_directory.join("pulsermm-agent.exe");
+    let agent_path = install_directory.join("meshrmm-agent.exe");
     let config_path = config_directory.join("agent.json");
     replace_file(&agent_path, embedded.executable)?;
     replace_file(&config_path, &config_bytes)?;
 
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
-        display_name: OsString::from("PulseRMM Agent"),
+        display_name: OsString::from("MeshRMM Agent"),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
@@ -239,7 +248,7 @@ fn install() -> anyhow::Result<()> {
             .context("failed to register the Agent service")?,
     };
     service
-        .set_description("PulseRMM LocalSystem supervisor for the active desktop Agent")
+        .set_description("MeshRMM LocalSystem supervisor for the active desktop Agent")
         .context("failed to set the Agent service description")?;
     service
         .update_failure_actions(ServiceFailureActions {
@@ -252,10 +261,36 @@ fn install() -> anyhow::Result<()> {
     service
         .set_failure_actions_on_non_crash_failures(true)
         .context("failed to enable Agent service recovery")?;
-    service
+    let start_result = service
         .start::<&OsStr>(&[])
-        .context("failed to start the Agent service")?;
-    wait_for_state(&service, ServiceState::Running, Duration::from_secs(20))?;
+        .context("failed to start the Agent service")
+        .and_then(|()| wait_for_state(&service, ServiceState::Running, Duration::from_secs(20)));
+    if let Err(error) = start_result {
+        if let Some(legacy_service) = legacy_service.as_ref() {
+            let _ = legacy_service.start::<&OsStr>(&[]);
+        }
+        return Err(error);
+    }
+    if let Some(legacy_service) = legacy_service {
+        legacy_service
+            .delete()
+            .context("failed to unregister the legacy Agent service")?;
+        remove_legacy_directories()?;
+    }
+    Ok(())
+}
+
+fn remove_legacy_directories() -> anyhow::Result<()> {
+    let install_directory = required_system_directory("ProgramFiles")?
+        .join("PulseRMM")
+        .join("Agent");
+    let config_directory = required_system_directory("ProgramData")?
+        .join("PulseRMM")
+        .join("Agent");
+    remove_directory_if_present(&config_directory)?;
+    remove_directory_if_present(&install_directory)?;
+    remove_empty_parent(&config_directory);
+    remove_empty_parent(&install_directory);
     Ok(())
 }
 
@@ -458,7 +493,7 @@ fn redeem_installer(
             &format!("Bearer {}", bootstrap.install_token),
         )
         .send_json(&RedeemInstallerRequest { name: machine_name })
-        .context("failed to contact the PulseRMM Agent enrollment service")?;
+        .context("failed to contact the MeshRMM Agent enrollment service")?;
     if !response.status().is_success() {
         let status = response.status();
         let detail = response
@@ -475,7 +510,7 @@ fn redeem_installer(
     if config.device_id.is_empty() || config.agent_token.is_empty() || config.server.is_empty() {
         bail!("the Agent enrollment service returned an incomplete configuration");
     }
-    pulsermm_self_update::validate_manifest_url(&config.update_manifest_url)
+    meshrmm_self_update::validate_manifest_url(&config.update_manifest_url)
         .context("the Agent enrollment service returned an invalid update manifest URL")?;
     Ok(config)
 }
@@ -510,7 +545,7 @@ fn parse_embedded(bytes: &[u8]) -> anyhow::Result<Option<EmbeddedInstaller<'_>>>
 
 fn message(text: &str, error: bool) {
     let text = wide(OsStr::new(text));
-    let title = wide(OsStr::new("PulseRMM Agent Setup"));
+    let title = wide(OsStr::new("MeshRMM Agent Setup"));
     let style = MB_OK
         | if error {
             MB_ICONERROR

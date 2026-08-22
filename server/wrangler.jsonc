@@ -1,12 +1,14 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "pulsermm-server",
+  "name": "meshrmm-server",
   "main": "build/index.js",
   "compatibility_date": "2026-08-21",
   "compatibility_flags": ["nodejs_compat"],
   "d1_databases": [
     {
       "binding": "DB",
+      // D1 database names are immutable. Keep the existing production database
+      // bound by its stable UUID while the application and Worker are rebranded.
       "database_name": "pulsermm-production",
       "database_id": "4650d279-149e-4a0b-8ec9-3058711885ea"
     }
@@ -39,8 +41,8 @@
   ],
   "vars": {
     "REMOTE_SESSION_IDLE_TIMEOUT_SECONDS": "900",
-    "DASHBOARD_ORIGIN": "https://pulsermm.gccody.dev",
-    "PUBLIC_API_URL": "https://pulsermm-server.gccody2010.workers.dev",
+    "DASHBOARD_ORIGIN": "https://meshrmm.com",
+    "PUBLIC_API_URL": "https://meshrmm-server.gccody2010.workers.dev",
     "WORKOS_CLIENT_ID": "client_01M0FT1AN01PAT37N98EMRSNVW",
     "WORKOS_ISSUER": "https://api.workos.com/user_management/client_01M0FT1AN01PAT37N98EMRSNVW"
   },

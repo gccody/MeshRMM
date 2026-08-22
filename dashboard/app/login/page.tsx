@@ -51,8 +51,8 @@ export default function LoginRoute() {
         <h1>{isPaused ? "Sign-in paused" : error ? "Sign-in unavailable" : "Preparing secure sign-in"}</h1>
         <p>
           {isPaused
-            ? "PulseRMM stopped a repeated authentication redirect before it could loop. You can safely retry when ready."
-            : error ?? "Redirecting to WorkOS to authenticate your PulseRMM account."}
+            ? "MeshRMM stopped a repeated authentication redirect before it could loop. You can safely retry when ready."
+            : error ?? "Redirecting to WorkOS to authenticate your MeshRMM account."}
         </p>
         {isPaused || error ? (
           <div className="login-actions">

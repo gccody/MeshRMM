@@ -57,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
         ExecutionMode::Service => service::run(config),
         ExecutionMode::Worker | ExecutionMode::Console => remote::run(config, mode).await,
         #[cfg(not(windows))]
-        ExecutionMode::Service => anyhow::bail!("the PulseRMM Agent service requires Windows"),
+        ExecutionMode::Service => anyhow::bail!("the MeshRMM Agent service requires Windows"),
     }
 }
 

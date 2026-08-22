@@ -92,7 +92,7 @@ pub(crate) async fn subscribe_agent_events(
         &subscription.company_id,
         request,
         "https://presence.internal/subscribe",
-        &[("X-Pulse-Company-Id", subscription.company_id.as_str())],
+        &[("X-Mesh-Company-Id", subscription.company_id.as_str())],
     )
     .await
 }

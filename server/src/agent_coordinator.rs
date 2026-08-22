@@ -1,13 +1,13 @@
-use pulsermm_protocol_types::{AgentCommand, AgentSessionRequest, AgentStatusMessage};
+use meshrmm_protocol_types::{AgentCommand, AgentSessionRequest, AgentStatusMessage};
 use serde::{Deserialize, Serialize};
 use worker::*;
 
 use crate::company_presence::{self, PresenceMutation};
 
 const AGENT_TAG: &str = "agent";
-const COMPANY_HEADER: &str = "X-Pulse-Company-Id";
-const DEVICE_HEADER: &str = "X-Pulse-Device-Id";
-const UNINSTALL_HEADER: &str = "X-Pulse-Uninstall-Requested";
+const COMPANY_HEADER: &str = "X-Mesh-Company-Id";
+const DEVICE_HEADER: &str = "X-Mesh-Device-Id";
+const UNINSTALL_HEADER: &str = "X-Mesh-Uninstall-Requested";
 const IDENTITY_KEY: &str = "agent_identity";
 
 #[derive(Debug, Deserialize, Serialize)]

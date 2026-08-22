@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const DEFAULT_MANIFEST_URL: &str = "https://pulsermm.gccody.dev/downloads/update-manifest.json";
+pub const DEFAULT_MANIFEST_URL: &str = "https://meshrmm.com/downloads/update-manifest.json";
 pub const AGENT_WINDOWS_X64: &str = "agent-windows-x64";
 pub const CLIENT_WINDOWS_X64: &str = "client-windows-x64";
 pub const CLIENT_MACOS_X64: &str = "client-macos-x64";

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use pulsermm_protocol::{
+use meshrmm_protocol::{
     CONTROL_CHANNEL_LABEL, CursorShape, FrameReassembler, IceServer, ReassemblyConfig,
     ReassemblyOutcome, SessionBootstrap, SessionMessage, SessionState, SignalMessage, VideoPacket,
     VideoStreamId,
@@ -71,7 +71,7 @@ impl ViewerControlQueue {
         }
         if matches!(
             &message,
-            SessionMessage::Input(pulsermm_protocol::RemoteInput::PointerMove { .. })
+            SessionMessage::Input(meshrmm_protocol::RemoteInput::PointerMove { .. })
         ) {
             input.pending_pointer = Some(message);
             drop(input);
@@ -82,8 +82,8 @@ impl ViewerControlQueue {
         let pending_pointer = if matches!(
             &message,
             SessionMessage::Input(
-                pulsermm_protocol::RemoteInput::PointerButtonAt { .. }
-                    | pulsermm_protocol::RemoteInput::WheelAt { .. }
+                meshrmm_protocol::RemoteInput::PointerButtonAt { .. }
+                    | meshrmm_protocol::RemoteInput::WheelAt { .. }
             )
         ) {
             // The positioned action supersedes any older unsent motion.
@@ -464,7 +464,7 @@ fn install_data_channel_handler(
                         debug,
                     )
                 }
-                "pulsermm-video-v1" => install_video_handler(channel, presenter, debug),
+                "meshrmm-video-v1" => install_video_handler(channel, presenter, debug),
                 label => tracing::warn!(label, "ignoring unknown WebRTC data channel"),
             }
         })
@@ -590,7 +590,7 @@ fn install_video_handler(
         channel.on_close(Box::new(move || {
             let debug = debug.clone();
             Box::pin(async move {
-                debug.set_data_channel("pulsermm-video-v1", "closed");
+                debug.set_data_channel("meshrmm-video-v1", "closed");
             })
         }));
     }
@@ -650,7 +650,7 @@ fn install_video_handler(
 
 #[cfg(test)]
 mod tests {
-    use pulsermm_protocol::{DisplayId, PointerButton, RemoteInput};
+    use meshrmm_protocol::{DisplayId, PointerButton, RemoteInput};
 
     use super::*;
 

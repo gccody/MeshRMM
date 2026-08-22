@@ -1,4 +1,4 @@
-use pulsermm_protocol_types::SignalMessage;
+use meshrmm_protocol_types::SignalMessage;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use worker::*;

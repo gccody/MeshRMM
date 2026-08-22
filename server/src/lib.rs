@@ -1,5 +1,5 @@
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
-use pulsermm_protocol_types::{
+use meshrmm_protocol_types::{
     AgentSessionRequest, ApiError, IceServer, RemoteSessionId, SessionBootstrap,
 };
 use serde::{Deserialize, Serialize};
@@ -226,10 +226,10 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
                 request,
                 "https://agent.internal/connect",
                 &[
-                    ("X-Pulse-Company-Id", authorization.company_id.as_str()),
-                    ("X-Pulse-Device-Id", device_id),
+                    ("X-Mesh-Company-Id", authorization.company_id.as_str()),
+                    ("X-Mesh-Device-Id", device_id),
                     (
-                        "X-Pulse-Uninstall-Requested",
+                        "X-Mesh-Uninstall-Requested",
                         if authorization.deletion_requested {
                             "true"
                         } else {

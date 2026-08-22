@@ -12,12 +12,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked --release -p pulsermm-agent -p pulsermm-remote
+      - run: cargo build --locked --release -p meshrmm-agent -p meshrmm-remote
       - uses: actions/upload-artifact@v4
         with:
-          name: pulsermm-windows-x64
+          name: meshrmm-windows-x64
           path: |
-            target/release/pulsermm-agent.exe
-            target/release/pulsermm-remote.exe
+            target/release/meshrmm-agent.exe
+            target/release/meshrmm-remote.exe
           if-no-files-found: error
           retention-days: 7

@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use dispatch2::DispatchQueue;
+use meshrmm_protocol::{
+    Codec, CursorShape, Display, EncodedFrame, PointerButton, RemoteInput, SessionMessage,
+    VideoFormat,
+};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
@@ -29,10 +33,6 @@ use objc2_foundation::{
     NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
 };
 use objc2_quartz_core::CAAutoresizingMask;
-use pulsermm_protocol::{
-    Codec, CursorShape, Display, EncodedFrame, PointerButton, RemoteInput, SessionMessage,
-    VideoFormat,
-};
 
 use super::ControlSink;
 use crate::debug::DebugInfo;

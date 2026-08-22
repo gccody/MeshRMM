@@ -22,7 +22,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
-use pulsermm_remote_screen::{
+use meshrmm_remote_screen::{
     ActiveFormat, EncodedAccessUnit, EncodedFrameSink, StreamConfig, WindowsScreenStreamer,
 };
 
@@ -86,11 +86,11 @@ impl UserCaptureStreamer {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let reader_status = Arc::clone(&status);
         let reader = thread::Builder::new()
-            .name("pulsermm-capture-ipc".into())
+            .name("meshrmm-capture-ipc".into())
             .spawn(move || dispatch_child_events(launched.output, sink, started_tx, reader_status))
             .context("failed to start the capture-helper IPC reader")?;
         let stderr = thread::Builder::new()
-            .name("pulsermm-capture-stderr".into())
+            .name("meshrmm-capture-stderr".into())
             .spawn(move || drain_child_stderr(launched.stderr))
             .context("failed to start the capture-helper error reader")?;
 
@@ -427,7 +427,7 @@ fn send_command(
 pub fn run_child() -> anyhow::Result<()> {
     let (command_tx, command_rx) = mpsc::channel();
     thread::Builder::new()
-        .name("pulsermm-capture-commands".into())
+        .name("meshrmm-capture-commands".into())
         .spawn(move || {
             let mut input = io::stdin().lock();
             loop {
