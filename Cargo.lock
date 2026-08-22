@@ -1632,6 +1632,131 @@ dependencies = [
 ]
 
 [[package]]
+name = "meshrmm-agent"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "futures-util",
+ "meshrmm-protocol",
+ "meshrmm-remote-screen",
+ "meshrmm-self-update",
+ "meshrmm-signaling-client",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "url",
+ "webrtc",
+ "windows",
+ "windows-service",
+]
+
+[[package]]
+name = "meshrmm-protocol"
+version = "0.2.0"
+dependencies = [
+ "meshrmm-protocol-types",
+ "postcard",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "meshrmm-protocol-types"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "meshrmm-remote"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "dispatch2",
+ "futures-util",
+ "libc",
+ "meshrmm-protocol",
+ "meshrmm-self-update",
+ "meshrmm-signaling-client",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-av-foundation",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-foundation",
+ "objc2-quartz-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "webrtc",
+ "windows",
+]
+
+[[package]]
+name = "meshrmm-remote-screen"
+version = "0.2.0"
+dependencies = [
+ "thiserror 2.0.20",
+ "tracing",
+ "windows",
+ "windows-capture",
+]
+
+[[package]]
+name = "meshrmm-self-update"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "url",
+]
+
+[[package]]
+name = "meshrmm-server"
+version = "0.2.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "jsonwebtoken",
+ "meshrmm-protocol-types",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "subtle",
+ "uuid",
+ "worker",
+ "worker-macros",
+]
+
+[[package]]
+name = "meshrmm-signaling-client"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "tokio",
+ "tokio-tungstenite",
+ "url",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2262,131 +2387,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "pulsermm-agent"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "bytes",
- "clap",
- "futures-util",
- "pulsermm-protocol",
- "pulsermm-remote-screen",
- "pulsermm-self-update",
- "pulsermm-signaling-client",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "ureq",
- "url",
- "webrtc",
- "windows",
- "windows-service",
-]
-
-[[package]]
-name = "pulsermm-protocol"
-version = "0.1.1"
-dependencies = [
- "postcard",
- "pulsermm-protocol-types",
- "serde",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "pulsermm-protocol-types"
-version = "0.1.1"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "pulsermm-remote"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "bytes",
- "clap",
- "dispatch2",
- "futures-util",
- "libc",
- "objc2",
- "objc2-app-kit",
- "objc2-av-foundation",
- "objc2-core-foundation",
- "objc2-core-media",
- "objc2-foundation",
- "objc2-quartz-core",
- "pulsermm-protocol",
- "pulsermm-self-update",
- "pulsermm-signaling-client",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "url",
- "webrtc",
- "windows",
-]
-
-[[package]]
-name = "pulsermm-remote-screen"
-version = "0.1.1"
-dependencies = [
- "thiserror 2.0.20",
- "tracing",
- "windows",
- "windows-capture",
-]
-
-[[package]]
-name = "pulsermm-self-update"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "semver",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "url",
-]
-
-[[package]]
-name = "pulsermm-server"
-version = "0.1.1"
-dependencies = [
- "getrandom 0.2.17",
- "jsonwebtoken",
- "pulsermm-protocol-types",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "subtle",
- "uuid",
- "worker",
- "worker-macros",
-]
-
-[[package]]
-name = "pulsermm-signaling-client"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "tokio",
- "tokio-tungstenite",
- "url",
 ]
 
 [[package]]

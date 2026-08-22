@@ -1,10 +1,10 @@
 [package]
-name = "pulsermm-server"
+name = "meshrmm-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "The PulseRMM server on Cloudflare Workers"
+description = "The MeshRMM server on Cloudflare Workers"
 
 [lints]
 workspace = true
@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 getrandom = { version = "0.2.17", features = ["js"] }
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
-pulsermm-protocol-types.workspace = true
+meshrmm-protocol-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11.0"

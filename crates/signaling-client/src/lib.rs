@@ -22,7 +22,7 @@ pub fn endpoint_url(
     query: &[(&str, &str)],
     websocket: bool,
 ) -> anyhow::Result<Url> {
-    let mut url = Url::parse(server).context("PulseRMM server is not a valid URL")?;
+    let mut url = Url::parse(server).context("MeshRMM server is not a valid URL")?;
     if websocket {
         match url.scheme() {
             "https" => url
@@ -35,7 +35,7 @@ pub fn endpoint_url(
             scheme => bail!("unsupported signaling URL scheme {scheme}"),
         }
     } else if !matches!(url.scheme(), "https" | "http") {
-        bail!("PulseRMM API URL must use HTTP or HTTPS");
+        bail!("MeshRMM API URL must use HTTP or HTTPS");
     }
     url.set_query(None);
     url.set_fragment(None);

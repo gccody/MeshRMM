@@ -1,5 +1,5 @@
-pub use pulsermm_signaling_client::authenticated_websocket;
-use pulsermm_signaling_client::endpoint_url;
+pub use meshrmm_signaling_client::authenticated_websocket;
+use meshrmm_signaling_client::endpoint_url;
 use url::Url;
 
 pub fn agent_connection_url(server: &str, device_id: &str) -> anyhow::Result<Url> {

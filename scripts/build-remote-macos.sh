@@ -4,14 +4,12 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 CONFIG_PATH=${1:-"$ROOT_DIR/dist/remote/remote.json"}
-APP_DIR="$ROOT_DIR/dist/remote-macos/PulseRMM Remote.app"
-CONTENTS_DIR="$APP_DIR/Contents"
-MACOS_DIR="$CONTENTS_DIR/MacOS"
 DASHBOARD_DOWNLOAD_DIR="$ROOT_DIR/dashboard/public/downloads"
 UPDATE_MANIFEST="$DASHBOARD_DOWNLOAD_DIR/update-manifest.json"
-DOWNLOAD_ORIGIN=${PULSERMM_DOWNLOAD_ORIGIN:-https://pulsermm.gccody.dev}
-CODESIGN_IDENTITY=${PULSERMM_CODESIGN_IDENTITY:--}
-VERSION=$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT_DIR/Cargo.toml" | node -e 'let input=""; process.stdin.on("data", chunk => input += chunk).on("end", () => console.log(JSON.parse(input).packages.find(pkg => pkg.name === "pulsermm-remote").version))')
+DOWNLOAD_ORIGIN=${MESHRMM_DOWNLOAD_ORIGIN:-https://meshrmm.com}
+CODESIGN_IDENTITY=${MESHRMM_CODESIGN_IDENTITY:--}
+BUILD_TARGET=${MESHRMM_BUILD_TARGET:-}
+VERSION=$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT_DIR/Cargo.toml" | node -e 'let input=""; process.stdin.on("data", chunk => input += chunk).on("end", () => console.log(JSON.parse(input).packages.find(pkg => pkg.name === "meshrmm-remote").version))')
 
 if [ ! -f "$CONFIG_PATH" ]; then
     echo "Missing preconfigured viewer settings: $CONFIG_PATH" >&2
@@ -19,11 +17,32 @@ if [ ! -f "$CONFIG_PATH" ]; then
     exit 1
 fi
 
-cargo build --locked --release --manifest-path "$ROOT_DIR/remote/Cargo.toml"
+if [ -n "$BUILD_TARGET" ]; then
+    cargo build --locked --release --target "$BUILD_TARGET" --manifest-path "$ROOT_DIR/remote/Cargo.toml"
+    SOURCE_EXECUTABLE="$ROOT_DIR/target/$BUILD_TARGET/release/meshrmm-remote"
+    case "$BUILD_TARGET" in
+        aarch64-apple-darwin) UPDATE_TARGET=client-macos-arm64 ; OUTPUT_DIRECTORY=dist/remote-macos ;;
+        x86_64-apple-darwin) UPDATE_TARGET=client-macos-x64 ; OUTPUT_DIRECTORY=dist/remote-macos-x64 ;;
+        *) echo "Unsupported macOS build target: $BUILD_TARGET" >&2; exit 1 ;;
+    esac
+else
+    cargo build --locked --release --manifest-path "$ROOT_DIR/remote/Cargo.toml"
+    SOURCE_EXECUTABLE="$ROOT_DIR/target/release/meshrmm-remote"
+    OUTPUT_DIRECTORY=dist/remote-macos
+    case "$(uname -m)" in
+        arm64) UPDATE_TARGET=client-macos-arm64 ;;
+        x86_64) UPDATE_TARGET=client-macos-x64 ;;
+        *) echo "Unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
+    esac
+fi
+
+APP_DIR="$ROOT_DIR/$OUTPUT_DIRECTORY/MeshRMM Remote.app"
+CONTENTS_DIR="$APP_DIR/Contents"
+MACOS_DIR="$CONTENTS_DIR/MacOS"
 
 rm -rf -- "$APP_DIR"
 mkdir -p -- "$MACOS_DIR"
-cp -- "$ROOT_DIR/target/release/pulsermm-remote" "$MACOS_DIR/pulsermm-remote"
+cp -- "$SOURCE_EXECUTABLE" "$MACOS_DIR/meshrmm-remote"
 cp -- "$CONFIG_PATH" "$MACOS_DIR/remote.json"
 
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST
@@ -34,15 +53,15 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
-    <string>PulseRMM Remote</string>
+    <string>MeshRMM Remote</string>
     <key>CFBundleExecutable</key>
-    <string>pulsermm-remote</string>
+    <string>meshrmm-remote</string>
     <key>CFBundleIdentifier</key>
-    <string>com.pulsermm.remote</string>
+    <string>com.meshrmm.remote</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>PulseRMM Remote</string>
+    <string>MeshRMM Remote</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -55,10 +74,10 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     <array>
         <dict>
             <key>CFBundleURLName</key>
-            <string>PulseRMM Remote Protocol</string>
+            <string>MeshRMM Remote Protocol</string>
             <key>CFBundleURLSchemes</key>
             <array>
-                <string>pulsermm</string>
+                <string>meshrmm</string>
             </array>
         </dict>
     </array>
@@ -76,12 +95,7 @@ else
 fi
 
 mkdir -p -- "$DASHBOARD_DOWNLOAD_DIR"
-case "$(uname -m)" in
-    arm64) UPDATE_TARGET=client-macos-arm64 ;;
-    x86_64) UPDATE_TARGET=client-macos-x64 ;;
-    *) echo "Unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
-esac
-ARCHIVE_PATH="$DASHBOARD_DOWNLOAD_DIR/pulsermm-remote-${UPDATE_TARGET#client-}.zip"
+ARCHIVE_PATH="$DASHBOARD_DOWNLOAD_DIR/meshrmm-remote-${UPDATE_TARGET#client-}.zip"
 rm -f -- "$ARCHIVE_PATH"
 ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ARCHIVE_PATH"
 node "$ROOT_DIR/scripts/update-release-manifest.mjs" \

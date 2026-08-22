@@ -313,7 +313,7 @@ pub(super) unsafe fn create_window(
     let module =
         unsafe { GetModuleHandleW(None) }.context("application module handle unavailable")?;
     let instance = HINSTANCE(module.0);
-    let class = w!("PulseRmmRemoteDesktopWindow");
+    let class = w!("MeshRmmRemoteDesktopWindow");
     let window_class = WNDCLASSW {
         lpfnWndProc: Some(window_proc),
         hInstance: instance,
@@ -337,7 +337,7 @@ pub(super) unsafe fn create_window(
     unsafe { AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false) }
         .context("remote window bounds calculation failed")?;
     let title = HSTRING::from(format!(
-        "PulseRMM Remote Desktop — {} ({}) — F8 display · F12 diagnostics",
+        "MeshRMM Remote Desktop — {} ({}) — F8 display · F12 diagnostics",
         active_display.name,
         if active_display.primary {
             "primary"

@@ -24,7 +24,8 @@ use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::remote::config::Config;
 
-pub const SERVICE_NAME: &str = "PulseRMMAgent";
+pub const SERVICE_NAME: &str = "MeshRMMAgent";
+pub const LEGACY_SERVICE_NAME: &str = "PulseRMMAgent";
 const NO_ACTIVE_SESSION: u32 = u32::MAX;
 static SERVICE_CONFIG: OnceLock<Config> = OnceLock::new();
 
@@ -32,15 +33,36 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     SERVICE_CONFIG
         .set(config)
         .map_err(|_| anyhow::anyhow!("the Agent service configuration was already initialized"))?;
-    service_dispatcher::start(SERVICE_NAME, ffi_service_main)
+    service_dispatcher::start(active_service_name(), ffi_service_main)
         .context("failed to connect the Agent to the Windows Service Control Manager")
+}
+
+pub fn active_service_name() -> &'static str {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .map(service_name_for_path)
+        .unwrap_or(SERVICE_NAME)
+}
+
+pub fn service_name_for_path(path: &Path) -> &'static str {
+    if path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("PulseRMM")
+    }) {
+        LEGACY_SERVICE_NAME
+    } else {
+        SERVICE_NAME
+    }
 }
 
 define_windows_service!(ffi_service_main, service_main);
 
 fn service_main(_arguments: Vec<OsString>) {
     if let Err(error) = run_service() {
-        tracing::error!(error = ?error, "PulseRMM Agent service stopped with an error");
+        tracing::error!(error = ?error, "MeshRMM Agent service stopped with an error");
     }
 }
 
@@ -68,7 +90,7 @@ fn run_service() -> anyhow::Result<()> {
             _ => ServiceControlHandlerResult::NotImplemented,
         }
     };
-    let status = service_control_handler::register(SERVICE_NAME, event_handler)
+    let status = service_control_handler::register(active_service_name(), event_handler)
         .context("failed to register the Agent service control handler")?;
     status.set_service_status(service_status(
         ServiceState::Running,
@@ -269,4 +291,25 @@ impl Drop for WorkerProcess {
 
 fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_the_legacy_service_for_in_place_updates() {
+        assert_eq!(
+            service_name_for_path(Path::new(
+                r"C:\Program Files\PulseRMM\Agent\pulsermm-agent.exe"
+            )),
+            LEGACY_SERVICE_NAME
+        );
+        assert_eq!(
+            service_name_for_path(Path::new(
+                r"C:\Program Files\MeshRMM\Agent\meshrmm-agent.exe"
+            )),
+            SERVICE_NAME
+        );
+    }
 }

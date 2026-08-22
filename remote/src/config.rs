@@ -14,11 +14,11 @@ pub struct Config {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "pulsermm-remote",
-    about = "PulseRMM low-latency remote-control client"
+    name = "meshrmm-remote",
+    about = "MeshRMM low-latency remote-control client"
 )]
 struct Arguments {
-    /// Single-use PulseRMM dashboard link.
+    /// Single-use MeshRMM dashboard link.
     #[arg(value_name = "DEEP_LINK")]
     deep_link: Option<String>,
 
@@ -26,19 +26,19 @@ struct Arguments {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Base URL of the PulseRMM Cloudflare Worker.
-    #[arg(long, env = "PULSERMM_SERVER")]
+    /// Base URL of the MeshRMM Cloudflare Worker.
+    #[arg(long, env = "MESHRMM_SERVER")]
     server: Option<String>,
 
     /// Short-lived, single-use browser handoff token.
-    #[arg(long, env = "PULSERMM_HANDOFF_TOKEN", hide_env_values = true)]
+    #[arg(long, env = "MESHRMM_HANDOFF_TOKEN", hide_env_values = true)]
     handoff_token: Option<String>,
 
     /// HTTPS release manifest checked before starting a remote session.
-    #[arg(long, env = "PULSERMM_UPDATE_MANIFEST_URL")]
+    #[arg(long, env = "MESHRMM_UPDATE_MANIFEST_URL")]
     update_manifest_url: Option<String>,
 
-    #[arg(long, env = "PULSERMM_JSON_LOGS", action = ArgAction::SetTrue)]
+    #[arg(long, env = "MESHRMM_JSON_LOGS", action = ArgAction::SetTrue)]
     json_logs: bool,
 }
 
@@ -80,19 +80,19 @@ impl Config {
             .map(|session| session.server.clone())
             .or(arguments.server)
             .or(file.server)
-            .context("missing server URL in the PulseRMM handoff link or --server")?;
+            .context("missing server URL in the MeshRMM handoff link or --server")?;
         let handoff_token = linked
             .map(|session| session.handoff_token)
             .or(arguments.handoff_token)
             .or(file.handoff_token)
-            .context("missing single-use PulseRMM handoff token")?;
+            .context("missing single-use MeshRMM handoff token")?;
         validate_server(&server)?;
         validate_handoff_token(&handoff_token)?;
         let update_manifest_url = arguments
             .update_manifest_url
             .or(file.update_manifest_url)
-            .unwrap_or_else(|| pulsermm_self_update::DEFAULT_MANIFEST_URL.to_owned());
-        pulsermm_self_update::validate_manifest_url(&update_manifest_url)?;
+            .unwrap_or_else(|| meshrmm_self_update::DEFAULT_MANIFEST_URL.to_owned());
+        meshrmm_self_update::validate_manifest_url(&update_manifest_url)?;
 
         Ok(Self {
             server,
@@ -104,9 +104,9 @@ impl Config {
 }
 
 fn session_from_deep_link(value: &str) -> anyhow::Result<LinkedSession> {
-    let link = url::Url::parse(value).context("invalid PulseRMM deep link")?;
-    if link.scheme() != "pulsermm" || link.host_str() != Some("connect") {
-        anyhow::bail!("deep link must use pulsermm://connect");
+    let link = url::Url::parse(value).context("invalid MeshRMM deep link")?;
+    if link.scheme() != "meshrmm" || link.host_str() != Some("connect") {
+        anyhow::bail!("deep link must use meshrmm://connect");
     }
     let mut server = None;
     let mut handoff_token = None;
@@ -117,9 +117,9 @@ fn session_from_deep_link(value: &str) -> anyhow::Result<LinkedSession> {
             _ => {}
         }
     }
-    let server = server.context("PulseRMM deep link is missing the server parameter")?;
+    let server = server.context("MeshRMM deep link is missing the server parameter")?;
     let handoff_token =
-        handoff_token.context("PulseRMM deep link is missing the handoff parameter")?;
+        handoff_token.context("MeshRMM deep link is missing the handoff parameter")?;
     validate_server(&server)?;
     validate_handoff_token(&handoff_token)?;
     Ok(LinkedSession {
@@ -129,9 +129,9 @@ fn session_from_deep_link(value: &str) -> anyhow::Result<LinkedSession> {
 }
 
 fn validate_server(value: &str) -> anyhow::Result<()> {
-    let url = url::Url::parse(value).context("PulseRMM server is not a valid URL")?;
+    let url = url::Url::parse(value).context("MeshRMM server is not a valid URL")?;
     if url.scheme() != "https" || url.host_str().is_none() {
-        anyhow::bail!("PulseRMM server must use HTTPS");
+        anyhow::bail!("MeshRMM server must use HTTPS");
     }
     Ok(())
 }
@@ -140,7 +140,7 @@ fn validate_handoff_token(value: &str) -> anyhow::Result<()> {
     if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
     } else {
-        anyhow::bail!("PulseRMM handoff token is invalid")
+        anyhow::bail!("MeshRMM handoff token is invalid")
     }
 }
 
@@ -170,7 +170,7 @@ mod tests {
     fn parses_single_use_dashboard_handoff() {
         let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let linked = session_from_deep_link(&format!(
-            "pulsermm://connect?handoff={token}&server=https%3A%2F%2Fapi.example.com"
+            "meshrmm://connect?handoff={token}&server=https%3A%2F%2Fapi.example.com"
         ))
         .unwrap();
         assert_eq!(linked.server, "https://api.example.com");
@@ -179,11 +179,11 @@ mod tests {
 
     #[test]
     fn rejects_permanent_or_insecure_links() {
-        assert!(session_from_deep_link("pulsermm://connect?device=office-pc").is_err());
+        assert!(session_from_deep_link("meshrmm://connect?device=office-pc").is_err());
         let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert!(
             session_from_deep_link(&format!(
-                "pulsermm://connect?handoff={token}&server=http%3A%2F%2Fapi.example.com"
+                "meshrmm://connect?handoff={token}&server=http%3A%2F%2Fapi.example.com"
             ))
             .is_err()
         );

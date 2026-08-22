@@ -1,4 +1,4 @@
-//! Lightweight, transport-independent PulseRMM wire types.
+//! Lightweight, transport-independent MeshRMM wire types.
 
 #![forbid(unsafe_code)]
 

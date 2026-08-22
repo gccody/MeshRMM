@@ -8,7 +8,7 @@ import {
   UsersManagement,
 } from "@workos-inc/widgets";
 import {
-  Activity,
+  Network,
   Building2,
   ChevronDown,
   Clock3,
@@ -58,11 +58,11 @@ type SessionPauseReason = "idle" | "expired";
 const INSTALLER_ASSETS: Record<AgentPlatform, { label: string; binary: string; checksum: string }> = {
   "windows-x64": {
     label: "Windows 10/11 (x64)",
-    binary: "/downloads/pulsermm-agent-windows-x64.exe",
-    checksum: "/downloads/pulsermm-agent-windows-x64.exe.sha256",
+    binary: "/downloads/meshrmm-agent-windows-x64.exe",
+    checksum: "/downloads/meshrmm-agent-windows-x64.exe.sha256",
   },
 };
-const ENROLLMENT_MAGIC = "PULSERMM-BOOTSTRAP-V1";
+const ENROLLMENT_MAGIC = "MESHRMM-BOOTSTRAP-V1";
 export default function Dashboard() {
   const { serverUrl } = useRuntimeConfig();
   const {
@@ -282,7 +282,7 @@ export default function Dashboard() {
       });
       if (!response.ok) throw new Error(await errorMessage(response, "A secure remote handoff could not be created."));
       const handoff = (await response.json()) as { handoff_token: string; api_url: string };
-      window.location.assign(`pulsermm://connect?handoff=${encodeURIComponent(handoff.handoff_token)}&server=${encodeURIComponent(handoff.api_url)}`);
+      window.location.assign(`meshrmm://connect?handoff=${encodeURIComponent(handoff.handoff_token)}&server=${encodeURIComponent(handoff.api_url)}`);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "A secure remote handoff could not be created.");
     } finally {
@@ -356,7 +356,7 @@ export default function Dashboard() {
       const downloadUrl = URL.createObjectURL(installer);
       const link = document.createElement("a");
       link.href = downloadUrl;
-      link.download = "PulseRMM-Agent-Setup-Windows-x64.exe";
+      link.download = "MeshRMM-Agent-Setup-Windows-x64.exe";
       document.body.appendChild(link);
       link.click();
       link.remove();
@@ -373,7 +373,7 @@ export default function Dashboard() {
     resetInventory();
     setAccount(null);
     setIsAuthOpen(false);
-    signOut({ returnTo: "https://pulsermm.gccody.dev" });
+    signOut({ returnTo: "https://meshrmm.com" });
   };
 
   const setActiveView = (next: View) => {
@@ -385,8 +385,8 @@ export default function Dashboard() {
     <div className="app-shell">
       <aside className={`sidebar ${isSidebarOpen ? "sidebar-open" : ""}`}>
         <div className="brand-row">
-          <div className="brand-mark"><Activity size={19} strokeWidth={2.5} /></div>
-          <span>Pulse<span>RMM</span></span>
+          <div className="brand-mark"><Network size={19} strokeWidth={2.5} /></div>
+          <span>Mesh<span>RMM</span></span>
           <button className="sidebar-close" onClick={() => setIsSidebarOpen(false)} aria-label="Close navigation"><X size={20} /></button>
         </div>
 
@@ -419,7 +419,7 @@ export default function Dashboard() {
           {view === "agents" ? <label className="global-search"><Search size={18} /><input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="Search Agents" placeholder="Search Agents by name or device ID..." /></label> : <div />}
           <div className="topbar-actions">
             <button className="connection-pill" onClick={() => setIsAuthOpen(true)} disabled={Boolean(sessionPauseReason)}>
-              <span className={`pulse-dot ${isLive ? "live" : ""}`} />
+              <span className={`status-dot ${isLive ? "live" : ""}`} />
               {sessionPauseReason ? "Session paused" : isAuthLoading ? "Checking session" : isLive ? "Service live" : user ? "Signed in" : "Sign in"}
             </button>
           </div>
@@ -431,14 +431,14 @@ export default function Dashboard() {
               <div className="modal-icon"><Clock3 size={22} /></div>
               <p className="eyebrow">Session paused</p>
               <h1>{sessionPauseReason === "idle" ? "You’ve been signed out for inactivity" : "Your session needs to be renewed"}</h1>
-              <p>{sessionPauseReason === "idle" ? `Your organization pauses inactive dashboards after ${formatIdleTimeout(idleTimeoutMinutes)}.` : "PulseRMM could not renew your WorkOS session. Your dashboard stayed in place and no organization data will be requested until you continue."}</p>
+              <p>{sessionPauseReason === "idle" ? `Your organization pauses inactive dashboards after ${formatIdleTimeout(idleTimeoutMinutes)}.` : "MeshRMM could not renew your WorkOS session. Your dashboard stayed in place and no organization data will be requested until you continue."}</p>
               <button className="primary-button" onClick={() => void resumeSession()} disabled={isResumingSession}>{isResumingSession ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />} Continue securely</button>
             </section>
           ) : !user && !isAuthLoading ? (
             <section className="signed-out-card">
               <div className="modal-icon"><ShieldCheck size={22} /></div>
               <p className="eyebrow">Secure company access</p>
-              <h1>Sign in to PulseRMM</h1>
+              <h1>Sign in to MeshRMM</h1>
               <p>WorkOS authenticates each user and selects the company boundary before any Agent data is requested.</p>
               <button className="primary-button" onClick={() => void signIn({ state: { returnTo: "/" } })}><ShieldCheck size={16} /> Continue with WorkOS</button>
             </section>
@@ -447,7 +447,7 @@ export default function Dashboard() {
               <div className="modal-icon"><Building2 size={22} /></div>
               <p className="eyebrow">Company required</p>
               <h1>Select your company</h1>
-              <p>Your identity is valid, but PulseRMM only serves Agent data inside a WorkOS organization.</p>
+              <p>Your identity is valid, but MeshRMM only serves Agent data inside a WorkOS organization.</p>
               <div className="organization-widget"><OrganizationSwitcher authToken={getAccessToken} switchToOrganization={switchToOrganization} /></div>
             </section>
           ) : account && !account.company ? (
@@ -506,7 +506,7 @@ export default function Dashboard() {
         </div>
       </main>
 
-      {isAuthOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsAuthOpen(false)}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="account-title"><button className="modal-close" onClick={() => setIsAuthOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><ShieldCheck size={22} /></div><p className="eyebrow">Authenticated</p><h2 id="account-title">WorkOS account</h2><p>Your session carries the selected organization and role used for every PulseRMM API request.</p>{user ? <><div className="account-summary"><div className="profile-avatar">{initials}</div><div><strong>{displayName}</strong><span>{user.email}</span></div></div>{account?.company && <div className="session-policy"><div className="session-policy-heading"><Clock3 size={16} /><div><strong>Organization idle timeout</strong><span>Currently {formatIdleTimeout(idleTimeoutMinutes)}</span></div></div>{isAdmin ? <form onSubmit={saveSessionPolicy}><label htmlFor="idle-timeout">Sign out inactive dashboards after<select id="idle-timeout" value={idleTimeoutDraft} onChange={(event) => setIdleTimeoutDraft(Number(event.target.value))}><option value={5}>5 minutes</option><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={120}>2 hours</option><option value={240}>4 hours</option><option value={480}>8 hours</option><option value={720}>12 hours</option><option value={1440}>24 hours</option></select></label><button className="primary-button" disabled={isSavingSessionPolicy || idleTimeoutDraft === idleTimeoutMinutes}>{isSavingSessionPolicy ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save session policy</button></form> : <p>Only an organization administrator can change this policy.</p>}</div>}<button className="secondary-button modal-submit" onClick={handleSignOut}><LogOut size={16} /> Sign out</button></> : <button className="primary-button modal-submit" onClick={() => void signIn({ state: { returnTo: "/" } })}><ShieldCheck size={16} /> Continue with WorkOS</button>}</section></div>}
+      {isAuthOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsAuthOpen(false)}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="account-title"><button className="modal-close" onClick={() => setIsAuthOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><ShieldCheck size={22} /></div><p className="eyebrow">Authenticated</p><h2 id="account-title">WorkOS account</h2><p>Your session carries the selected organization and role used for every MeshRMM API request.</p>{user ? <><div className="account-summary"><div className="profile-avatar">{initials}</div><div><strong>{displayName}</strong><span>{user.email}</span></div></div>{account?.company && <div className="session-policy"><div className="session-policy-heading"><Clock3 size={16} /><div><strong>Organization idle timeout</strong><span>Currently {formatIdleTimeout(idleTimeoutMinutes)}</span></div></div>{isAdmin ? <form onSubmit={saveSessionPolicy}><label htmlFor="idle-timeout">Sign out inactive dashboards after<select id="idle-timeout" value={idleTimeoutDraft} onChange={(event) => setIdleTimeoutDraft(Number(event.target.value))}><option value={5}>5 minutes</option><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={120}>2 hours</option><option value={240}>4 hours</option><option value={480}>8 hours</option><option value={720}>12 hours</option><option value={1440}>24 hours</option></select></label><button className="primary-button" disabled={isSavingSessionPolicy || idleTimeoutDraft === idleTimeoutMinutes}>{isSavingSessionPolicy ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save session policy</button></form> : <p>Only an organization administrator can change this policy.</p>}</div>}<button className="secondary-button modal-submit" onClick={handleSignOut}><LogOut size={16} /> Sign out</button></> : <button className="primary-button modal-submit" onClick={() => void signIn({ state: { returnTo: "/" } })}><ShieldCheck size={16} /> Continue with WorkOS</button>}</section></div>}
 
       {isOrganizationOpen && user && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsOrganizationOpen(false)}><section className="settings-modal organization-modal" role="dialog" aria-modal="true" aria-labelledby="organization-title"><button className="modal-close" onClick={() => setIsOrganizationOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><Building2 size={22} /></div><p className="eyebrow">Tenant boundary</p><h2 id="organization-title">Switch company</h2><p>Changing companies refreshes your WorkOS token before any other company inventory is requested.</p><div className="organization-widget"><OrganizationSwitcher authToken={getAccessToken} switchToOrganization={switchToOrganization} /></div></section></div>}
 

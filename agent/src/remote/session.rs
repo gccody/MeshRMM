@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use pulsermm_protocol::AgentSessionRequest;
+use meshrmm_protocol::AgentSessionRequest;
 
 use super::config::{Config, ExecutionMode};
 use super::platform::{PlatformScreenStreamer, ScreenStreamer};

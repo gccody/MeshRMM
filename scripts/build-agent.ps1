@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$DownloadOrigin = 'https://pulsermm.gccody.dev'
+    [string]$DownloadOrigin = 'https://meshrmm.com'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -8,11 +8,11 @@ Set-StrictMode -Version Latest
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $manifestPath = Join-Path $repositoryRoot 'agent\Cargo.toml'
-$sourceExecutable = Join-Path $repositoryRoot 'target\release\pulsermm-agent.exe'
+$sourceExecutable = Join-Path $repositoryRoot 'target\release\meshrmm-agent.exe'
 $distributionDirectory = Join-Path $repositoryRoot 'dist\agent'
-$destinationExecutable = Join-Path $distributionDirectory 'pulsermm-agent.exe'
+$destinationExecutable = Join-Path $distributionDirectory 'meshrmm-agent.exe'
 $dashboardDownloadDirectory = Join-Path $repositoryRoot 'dashboard\public\downloads'
-$dashboardExecutable = Join-Path $dashboardDownloadDirectory 'pulsermm-agent-windows-x64.exe'
+$dashboardExecutable = Join-Path $dashboardDownloadDirectory 'meshrmm-agent-windows-x64.exe'
 $dashboardChecksum = "$dashboardExecutable.sha256"
 $updateManifest = Join-Path $dashboardDownloadDirectory 'update-manifest.json'
 $manifestWriter = Join-Path $PSScriptRoot 'update-release-manifest.mjs'
@@ -36,12 +36,12 @@ $artifact = Get-Item -LiteralPath $sourceExecutable
 $checksum = Get-FileHash -Algorithm SHA256 -LiteralPath $sourceExecutable
 $checksum.Hash.ToLowerInvariant() | Set-Content -LiteralPath $dashboardChecksum -Encoding ascii -NoNewline
 $metadata = (& cargo metadata --no-deps --format-version 1 --manifest-path $workspaceManifest) | ConvertFrom-Json
-$version = ($metadata.packages | Where-Object name -EQ 'pulsermm-agent').version
+$version = ($metadata.packages | Where-Object name -EQ 'meshrmm-agent').version
 & node $manifestWriter `
     $updateManifest `
     'agent-windows-x64' `
     $version `
-    "$($DownloadOrigin.TrimEnd('/'))/downloads/pulsermm-agent-windows-x64.exe" `
+    "$($DownloadOrigin.TrimEnd('/'))/downloads/meshrmm-agent-windows-x64.exe" `
     $dashboardExecutable
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE

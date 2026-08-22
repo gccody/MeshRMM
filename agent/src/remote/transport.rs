@@ -4,12 +4,12 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use pulsermm_protocol::{
+use meshrmm_protocol::{
     CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, CursorShape, DEFAULT_FRAGMENT_PAYLOAD,
     Display, DisplayId, IceServer, RemoteInput, RemoteSessionId, SessionMessage, SessionState,
     SignalMessage, VideoStreamId, fragment_frame,
 };
-use pulsermm_signaling_client::Socket;
+use meshrmm_signaling_client::Socket;
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
@@ -83,11 +83,11 @@ async fn run_connected_sender(
     let decoder_ready = Arc::new(Notify::new());
     let video_channel = peer
         .create_data_channel(
-            "pulsermm-video-v1",
+            "meshrmm-video-v1",
             Some(RTCDataChannelInit {
                 ordered: Some(false),
                 max_retransmits: Some(0),
-                protocol: Some("pulsermm.video.v1".into()),
+                protocol: Some("meshrmm.video.v1".into()),
                 ..Default::default()
             }),
         )
@@ -485,7 +485,7 @@ fn spawn_control_start(
     displays: Vec<Display>,
     active_display_id: DisplayId,
     stream_id: VideoStreamId,
-    format: pulsermm_protocol::VideoFormat,
+    format: meshrmm_protocol::VideoFormat,
 ) {
     tokio::spawn(async move {
         open.notified().await;

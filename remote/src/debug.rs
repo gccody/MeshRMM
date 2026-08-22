@@ -94,8 +94,8 @@ impl DebugInfo {
     pub fn set_data_channel(&self, label: &str, state: &str) {
         if let Ok(mut debug) = self.state.lock() {
             match label {
-                "pulsermm-control-v1" => debug.control_channel = state.into(),
-                "pulsermm-video-v1" => debug.video_channel = state.into(),
+                "meshrmm-control-v1" => debug.control_channel = state.into(),
+                "meshrmm-video-v1" => debug.video_channel = state.into(),
                 _ => {}
             }
         }
@@ -193,7 +193,7 @@ impl DebugInfo {
 
     pub fn render(&self) -> String {
         let Ok(debug) = self.state.lock() else {
-            return "PulseRMM debug information unavailable".into();
+            return "MeshRMM debug information unavailable".into();
         };
         let rtt = debug
             .rtt_ms
@@ -209,7 +209,7 @@ impl DebugInfo {
             .present_fps
             .map_or_else(|| "--".into(), |value| format!("{value:.1}"));
         format!(
-            "PulseRMM diagnostics  [F12 to close]\n\
+            "MeshRMM diagnostics  [F12 to close]\n\
              Session: {}  Uptime: {}\n\
              State: {}  Route: {}\n\
              Local: {}\n\

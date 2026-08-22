@@ -246,7 +246,7 @@ impl RemoteView {
         debug: DebugInfo,
     ) -> Retained<Self> {
         let debug_label =
-            NSTextField::wrappingLabelWithString(&NSString::from_str("PulseRMM diagnostics"), mtm);
+            NSTextField::wrappingLabelWithString(&NSString::from_str("MeshRMM diagnostics"), mtm);
         debug_label.setFrame(NSRect {
             origin: NSPoint {
                 x: 12.0,
@@ -628,7 +628,7 @@ fn show_connecting_window(mtm: MainThreadMarker) -> anyhow::Result<()> {
         )
     };
     unsafe { window.setReleasedWhenClosed(false) };
-    window.setTitle(&NSString::from_str("PulseRMM Remote"));
+    window.setTitle(&NSString::from_str("MeshRMM Remote"));
     let view = window
         .contentView()
         .context("AppKit connecting window has no content view")?;
@@ -704,7 +704,7 @@ pub fn run_application<F>(network: F) -> anyhow::Result<()>
 where
     F: FnOnce(Option<String>) -> anyhow::Result<()> + Send + 'static,
 {
-    let mtm = MainThreadMarker::new().context("PulseRMM must start on the macOS main thread")?;
+    let mtm = MainThreadMarker::new().context("MeshRMM must start on the macOS main thread")?;
     let application = NSApplication::sharedApplication(mtm);
     let (deep_link_tx, deep_link_rx) = std::sync::mpsc::channel();
     let delegate = AppDelegate::new(mtm, deep_link_tx);
@@ -717,9 +717,9 @@ where
     let has_command_line_session = std::env::args_os()
         .skip(1)
         .any(|argument| !argument.to_string_lossy().starts_with("-psn_"))
-        || std::env::var_os("PULSERMM_HANDOFF_TOKEN").is_some();
+        || std::env::var_os("MESHRMM_HANDOFF_TOKEN").is_some();
     std::thread::Builder::new()
-        .name("pulsermm-network".into())
+        .name("meshrmm-network".into())
         .spawn(move || {
             let deep_link = if has_command_line_session {
                 None

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pulsermm_protocol::EncodedFrame;
+use meshrmm_protocol::EncodedFrame;
 use tokio::sync::{Mutex, Notify};
 
 #[derive(Default)]
@@ -67,7 +67,7 @@ impl LatestFrameSlot {
 
 #[cfg(test)]
 mod tests {
-    use pulsermm_protocol::VideoStreamId;
+    use meshrmm_protocol::VideoStreamId;
 
     use super::*;
 

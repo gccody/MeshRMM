@@ -6,7 +6,7 @@ use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use pulsermm_self_update::{CLIENT_MACOS_ARM64, CLIENT_MACOS_X64, UpdateManifest};
+use meshrmm_self_update::{CLIENT_MACOS_ARM64, CLIENT_MACOS_X64, UpdateManifest};
 
 use crate::config::Config;
 
@@ -54,7 +54,7 @@ pub async fn check_and_schedule(
     let app_bundle = app_bundle_for_executable(&executable)?;
     let suffix = unique_suffix();
     let helper_directory = std::env::temp_dir()
-        .join("PulseRMM")
+        .join("MeshRMM")
         .join(format!("client-update-{suffix}"));
     std::fs::create_dir_all(&helper_directory).with_context(|| {
         format!(
@@ -121,7 +121,7 @@ pub fn apply_scheduled_update() -> anyhow::Result<()> {
         );
     }
     let replacement = find_app_bundle(&extracted_directory)?;
-    let replacement_executable = replacement.join("Contents/MacOS/pulsermm-remote");
+    let replacement_executable = replacement.join("Contents/MacOS/meshrmm-remote");
     if !replacement_executable.is_file() {
         bail!("macOS client update does not contain the expected executable");
     }
@@ -131,7 +131,7 @@ pub fn apply_scheduled_update() -> anyhow::Result<()> {
         target
             .file_name()
             .and_then(OsStr::to_str)
-            .unwrap_or("PulseRMM Remote.app")
+            .unwrap_or("MeshRMM Remote.app")
     ));
     if backup.exists() {
         std::fs::remove_dir_all(&backup)

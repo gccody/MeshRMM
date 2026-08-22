@@ -1,6 +1,6 @@
-# PulseRMM Dashboard
+# MeshRMM Dashboard
 
-The PulseRMM dashboard is a vinext/React application hosted on Cloudflare. It
+The MeshRMM dashboard is a vinext/React application hosted on Cloudflare. It
 uses WorkOS for user and organization identity and calls the Rust control-plane
 Worker for all tenant-scoped Agent operations.
 
@@ -27,7 +27,7 @@ Application code is organized by responsibility:
 
 ## Session policy
 
-PulseRMM enforces a per-organization dashboard inactivity timeout. New
+MeshRMM enforces a per-organization dashboard inactivity timeout. New
 organizations default to four hours, and organization administrators can change
 the value under **Profile & session**. Expiry locks the dashboard and ends the
 WorkOS session without navigating away; the user deliberately resumes through
@@ -35,9 +35,9 @@ WorkOS when they return.
 
 WorkOS also has an application-wide inactivity timeout based on token refreshes.
 Set it in the WorkOS Dashboard under **Applications → Sessions** to at least the
-largest PulseRMM organization timeout (24 hours). If it remains at five minutes,
-WorkOS can expire a suspended browser tab before PulseRMM's tenant policy does.
-PulseRMM permits AuthKit's automatic refresh while the page is in the background,
+largest MeshRMM organization timeout (24 hours). If it remains at five minutes,
+WorkOS can expire a suspended browser tab before MeshRMM's tenant policy does.
+MeshRMM permits AuthKit's automatic refresh while the page is in the background,
 so an open dashboard remains active whenever the browser is still running it.
 
 ## Verification

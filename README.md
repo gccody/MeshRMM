@@ -1,6 +1,6 @@
-# PulseRMM
+# MeshRMM
 
-PulseRMM is a multi-tenant remote monitoring and management project. It adds
+MeshRMM is a multi-tenant remote monitoring and management project. It adds
 low-latency Windows desktop streaming and remote control in a single Cargo
 workspace with platform and transport responsibilities kept in focused crates:
 
@@ -54,9 +54,9 @@ contextual error if the required hardware path is unavailable.
 ## Preconfigured deployment
 
 The viewer loads sidecar JSON next to its executable. The installed Agent reads
-its protected configuration from `%ProgramData%\PulseRMM\Agent\agent.json`.
+its protected configuration from `%ProgramData%\MeshRMM\Agent\agent.json`.
 No environment variables are required on Agent or viewer machines. The
-production control plane is deployed at `https://pulsermm.gccody.dev`. WorkOS
+production control plane is deployed at `https://meshrmm.com`. WorkOS
 organizations and memberships define the company boundary, Cloudflare D1 stores
 company-owned Agent records and audit events, and Durable Objects retain live
 signaling state.
@@ -78,7 +78,7 @@ sidecar:
 
 ```sh
 sh scripts/build-remote-macos.sh
-open "dist/remote-macos/PulseRMM Remote.app"
+open "dist/remote-macos/MeshRMM Remote.app"
 ```
 
 The script builds for the Mac architecture it runs on, copies the Cloudflare
@@ -88,7 +88,7 @@ you distribute. A browser deep link supplies a 60-second, single-use handoff
 token when a remote session starts.
 Developer ID signing and notarization are still required before distributing
 the app through normal Gatekeeper-protected download channels.
-Set `PULSERMM_CODESIGN_IDENTITY` to the Developer ID Application certificate
+Set `MESHRMM_CODESIGN_IDENTITY` to the Developer ID Application certificate
 name before running the script for a production archive; the default is an
 ad-hoc development signature.
 
@@ -127,7 +127,7 @@ endpoints:
 
 ```powershell
 Push-Location server
-npx wrangler d1 migrations apply pulsermm-production --remote
+npx wrangler d1 migrations apply DB --remote
 Pop-Location
 ```
 
@@ -135,14 +135,14 @@ Pop-Location
 
 ### Web dashboard
 
-The responsive dashboard at `https://pulsermm.gccody.dev` lists only Agents
+The responsive dashboard at `https://meshrmm.com` lists only Agents
 owned by the organization in the current WorkOS token. It receives inventory
 and connection changes from a company-scoped, hibernating WebSocket event
 stream instead of polling. The browser obtains a 60-second, one-use
 subscription token and reconnects automatically; **Refresh** requests a single
 authoritative snapshot when needed. **Remote** requests a one-time server
 handoff, then opens the native viewer with a
-`pulsermm://connect?handoff=...&server=...` deep link. No service credential is
+`meshrmm://connect?handoff=...&server=...` deep link. No service credential is
 entered into or retained by the browser.
 
 Company administrators use the embedded WorkOS user-management, domain, and
@@ -160,7 +160,7 @@ The dashboard never substitutes sample inventory or exposes a loose
 `agent.json`.
 
 The Worker exposes organization-scoped Agent, enrollment, and handoff APIs. On
-Windows, opening the viewer once registers the `pulsermm` protocol for the
+Windows, opening the viewer once registers the `meshrmm` protocol for the
 current user. The macOS application bundle declares the same protocol in its
 `Info.plist`.
 
@@ -168,13 +168,13 @@ On the target endpoint, sign in to the dashboard as a company administrator,
 choose **Add Agent**, select **Windows 10/11 (x64)**, and download the installer.
 Run it within 30 minutes and approve the Windows User Account Control prompt.
 Setup reads the Windows computer name, obtains a server-generated device ID and
-credential, installs the binary under `%ProgramFiles%\PulseRMM\Agent`, registers
-the automatic `PulseRMMAgent` LocalSystem service with recovery actions,
-protects its configuration under `%ProgramData%\PulseRMM\Agent`, and starts it.
+credential, installs the binary under `%ProgramFiles%\MeshRMM\Agent`, registers
+the automatic `MeshRMMAgent` LocalSystem service with recovery actions,
+protects its configuration under `%ProgramData%\MeshRMM\Agent`, and starts it.
 
 Deleting an Agent from the dashboard immediately removes it from inventory and
 queues an authenticated self-uninstall. Online Agents remove the service,
-binary, configuration, log, and empty PulseRMM directories immediately; offline
+binary, configuration, log, and empty MeshRMM directories immediately; offline
 Agents perform the same cleanup the next time they connect.
 
 The service remains in Session 0 and supervises a separate worker carrying the
@@ -193,15 +193,15 @@ restores and starts the previous binary. Update-check failures are logged and
 do not disconnect the installed Agent.
 
 Copy `dist/remote/` to the authorized viewer computer and open
-`pulsermm-remote.exe` once to register the protocol. Remote sessions should
+`meshrmm-remote.exe` once to register the protocol. Remote sessions should
 then be launched from the dashboard. A viewer can also redeem a handoff from
 the command line:
 
 ```powershell
-.\pulsermm-remote.exe "pulsermm://connect?handoff=<one-time-token>&server=https%3A%2F%2Fpulsermm-server.gccody2010.workers.dev"
+.\meshrmm-remote.exe "meshrmm://connect?handoff=<one-time-token>&server=https%3A%2F%2Fmeshrmm-server.gccody2010.workers.dev"
 ```
 
-For macOS, copy `PulseRMM Remote.app` from `dist/remote-macos/` to the
+For macOS, copy `MeshRMM Remote.app` from `dist/remote-macos/` to the
 authorized Mac and open it. The app reads `remote.json` from its own
 `Contents/MacOS` directory; it connects to the same preconfigured Cloudflare
 deployment as the Windows viewer.
@@ -253,7 +253,7 @@ cargo fmt --all -- --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo check -p pulsermm-server --target wasm32-unknown-unknown
+cargo check -p meshrmm-server --target wasm32-unknown-unknown
 
 Push-Location dashboard
 npm ci

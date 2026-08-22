@@ -62,8 +62,8 @@ button { color: inherit; }
 .topbar-divider { width: 1px; height: 25px; background: var(--line); }
 .connection-pill { height: 33px; padding: 0 11px; display: flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 8px; background: #fff; font-size: 10px; font-weight: 650; cursor: pointer; }
 .connection-pill:disabled { cursor: default; }
-.pulse-dot { width: 7px; height: 7px; border-radius: 50%; background: #a6a8b1; }
-.pulse-dot.live { background: #27a874; box-shadow: 0 0 0 4px #e9f8f1; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; background: #a6a8b1; }
+.status-dot.live { background: #27a874; box-shadow: 0 0 0 4px #e9f8f1; }
 
 .page-wrap { max-width: 1440px; margin: 0 auto; padding: 34px 34px 48px; }
 .login-route { min-height: 100vh; padding: 34px; overflow: auto; }

@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CursorShape, DisplayId, RemoteInput, RemoteSessionId, VideoStreamId};
 
-pub const CONTROL_CHANNEL_LABEL: &str = "pulsermm-control-v3";
-pub const CONTROL_CHANNEL_PROTOCOL: &str = "pulsermm.control.v3";
+pub const CONTROL_CHANNEL_LABEL: &str = "meshrmm-control-v3";
+pub const CONTROL_CHANNEL_PROTOCOL: &str = "meshrmm.control.v3";
 
 /// Reliable session-control and input messages carried by the control data channel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -1,4 +1,4 @@
-//! Shared, platform-neutral protocol for PulseRMM remote-control sessions.
+//! Shared, platform-neutral protocol for MeshRMM remote-control sessions.
 
 pub mod control;
 pub mod input;
@@ -7,7 +7,7 @@ pub mod video;
 
 pub use control::*;
 pub use input::*;
-pub use pulsermm_protocol_types::*;
+pub use meshrmm_protocol_types::*;
 pub use session::*;
 pub use video::*;
 

@@ -246,7 +246,7 @@ impl MacUi {
         // that it is no longer visible and end the remote session.
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(&NSString::from_str(&format!(
-            "PulseRMM Remote Desktop — {} — Control-Option-Arrow display · F12 diagnostics",
+            "MeshRMM Remote Desktop — {} — Control-Option-Arrow display · F12 diagnostics",
             active_display.name
         )));
         let view = RemoteView::new(

@@ -22,16 +22,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p pulsermm-remote --all-targets -- -D warnings
-      - run: cargo test -p pulsermm-remote
+      - run: cargo clippy -p meshrmm-remote --all-targets -- -D warnings
+      - run: cargo test -p meshrmm-remote
 
   server-wasm:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p pulsermm-server --target wasm32-unknown-unknown
-      - run: cargo test -p pulsermm-server
+      - run: cargo check -p meshrmm-server --target wasm32-unknown-unknown
+      - run: cargo test -p meshrmm-server
 
   dashboard:
     runs-on: ubuntu-latest
