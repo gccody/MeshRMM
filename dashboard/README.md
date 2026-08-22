@@ -36,7 +36,9 @@ WorkOS when they return.
 WorkOS also has an application-wide inactivity timeout based on token refreshes.
 Set it in the WorkOS Dashboard under **Applications → Sessions** to at least the
 largest PulseRMM organization timeout (24 hours). If it remains at five minutes,
-WorkOS can expire a background tab before PulseRMM's tenant policy does.
+WorkOS can expire a suspended browser tab before PulseRMM's tenant policy does.
+PulseRMM permits AuthKit's automatic refresh while the page is in the background,
+so an open dashboard remains active whenever the browser is still running it.
 
 ## Verification
 

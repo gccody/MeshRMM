@@ -38,6 +38,10 @@ function handleRedirectCallback({ state, organizationId }: RedirectCallbackParam
 
 const RuntimeConfigContext = createContext<RuntimeConfig | null>(null);
 
+function keepWorkOSSessionFresh() {
+  return true;
+}
+
 export function useRuntimeConfig() {
   const config = useContext(RuntimeConfigContext);
   if (!config) throw new Error("Runtime configuration is unavailable.");
@@ -60,6 +64,7 @@ export default function Providers({
       clientId={clientId}
       redirectUri={redirectUri}
       onRedirectCallback={handleRedirectCallback}
+      onBeforeAutoRefresh={keepWorkOSSessionFresh}
       onRefreshFailure={() => window.dispatchEvent(new Event(AUTH_REFRESH_FAILED_EVENT))}
     >
       <WorkOsWidgets theme={{ accentColor: "violet", radius: "medium", fontFamily: "var(--font-geist-sans)" }}>
