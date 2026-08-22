@@ -7,7 +7,7 @@ use pulsermm_protocol::{
     CONTROL_CHANNEL_LABEL, FrameReassembler, IceServer, ReassemblyConfig, ReassemblyOutcome,
     SessionBootstrap, SessionMessage, SessionState, SignalMessage, VideoPacket, VideoStreamId,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::RTCDataChannel;
@@ -23,6 +23,7 @@ use crate::platform::{ControlSink, Presenter, monotonic_timestamp_us};
 use crate::signaling::{authenticated_websocket, session_signal_url};
 
 const SESSION_ACTIVITY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const POINTER_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
 
 struct ActivePresenter {
     stream_id: VideoStreamId,
@@ -37,6 +38,7 @@ struct ActivePresenter {
 struct ViewerControlQueue {
     outgoing: mpsc::UnboundedSender<SessionMessage>,
     input: Arc<Mutex<ViewerInputState>>,
+    pointer_changed: Arc<Notify>,
 }
 
 struct ViewerInputState {
@@ -52,6 +54,7 @@ impl ViewerControlQueue {
                 enabled: false,
                 pending_pointer: None,
             })),
+            pointer_changed: Arc::new(Notify::new()),
         }
     }
 
@@ -68,6 +71,8 @@ impl ViewerControlQueue {
             SessionMessage::Input(pulsermm_protocol::RemoteInput::PointerMove { .. })
         ) {
             input.pending_pointer = Some(message);
+            drop(input);
+            self.pointer_changed.notify_one();
             return;
         }
 
@@ -115,6 +120,14 @@ impl ViewerControlQueue {
     }
 }
 
+async fn flush_pointer_motion(queue: ViewerControlQueue) {
+    loop {
+        queue.pointer_changed.notified().await;
+        tokio::time::sleep(POINTER_FLUSH_INTERVAL).await;
+        queue.flush_pointer();
+    }
+}
+
 pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyhow::Result<()> {
     let url = session_signal_url(&config.server, bootstrap.session_id.as_str())?;
     let socket = authenticated_websocket(url, &bootstrap.signaling_token).await?;
@@ -142,14 +155,16 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
     let startup_started = tokio::time::Instant::now();
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     stats_interval.tick().await;
-    let mut pointer_interval = tokio::time::interval(std::time::Duration::from_millis(8));
-    pointer_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    pointer_interval.tick().await;
     let mut activity_interval = tokio::time::interval(SESSION_ACTIVITY_INTERVAL);
     activity_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     activity_interval.tick().await;
     let mut remote_description_set = false;
     let mut pending_candidates = Vec::new();
+    // Pointer pacing must not depend on the receiver loop being available: a
+    // control-channel send can await long enough for a short movement burst to
+    // end. This activity-driven flusher always queues that burst's newest
+    // position after the coalescing window.
+    let pointer_flusher = tokio::spawn(flush_pointer_motion(viewer_control.clone()));
     let result: anyhow::Result<()> = async {
         loop {
             tokio::select! {
@@ -166,7 +181,6 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                 channel.send(&Bytes::from(bytes)).await
                     .context("failed to send viewer control message")?;
             }
-            _ = pointer_interval.tick() => viewer_control.flush_pointer(),
             _ = activity_interval.tick(), if session_state == SessionState::Streaming => {
                 outgoing_tx.send(SignalMessage::Activity)?;
             }
@@ -246,6 +260,8 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
         }
     }
     .await;
+    pointer_flusher.abort();
+    let _ = pointer_flusher.await;
 
     if matches!(
         session_state,
@@ -610,5 +626,24 @@ mod tests {
         queue.flush_pointer();
 
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn movement_burst_automatically_flushes_its_final_position() {
+        let (queue, mut rx) = active_queue();
+        let flusher = tokio::spawn(flush_pointer_motion(queue.clone()));
+
+        queue.send(pointer(10, 20));
+        queue.send(pointer(30, 40));
+        queue.send(pointer(50, 60));
+
+        let sent = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("pointer flush timed out")
+            .expect("pointer queue closed");
+        assert_eq!(sent, pointer(50, 60));
+        assert!(rx.try_recv().is_err());
+
+        flusher.abort();
     }
 }
