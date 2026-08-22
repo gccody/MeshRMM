@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{OnceLock, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
@@ -78,6 +78,7 @@ fn run_service() -> anyhow::Result<()> {
     ))?;
 
     let mut worker: Option<WorkerProcess> = None;
+    let mut next_update_check = Instant::now();
     let result = loop {
         let session_id = unsafe { WTSGetActiveConsoleSessionId() };
         let needs_worker = session_id != NO_ACTIVE_SESSION
@@ -104,6 +105,20 @@ fn run_service() -> anyhow::Result<()> {
             && let Some(mut process) = worker.take()
         {
             process.stop();
+        }
+
+        if Instant::now() >= next_update_check {
+            next_update_check = Instant::now() + Duration::from_secs(6 * 60 * 60);
+            match crate::updater::check_and_schedule(config) {
+                Ok(true) => {
+                    tracing::info!("staged an Agent update; stopping the service for replacement");
+                    break Ok(());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(error = ?error, "automatic Agent update check failed");
+                }
+            }
         }
 
         match control_rx.recv_timeout(Duration::from_secs(2)) {

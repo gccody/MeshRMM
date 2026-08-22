@@ -4,6 +4,8 @@ mod h264;
 mod platform;
 mod signaling;
 mod transport;
+#[cfg(any(windows, target_os = "macos"))]
+mod updater;
 
 use anyhow::Context;
 
@@ -82,18 +84,39 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
 #[cfg(windows)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    run_session(initialize(None)?).await
+    if updater::is_helper_invocation() {
+        return updater::apply_scheduled_update();
+    }
+    let config = initialize(None)?;
+    match updater::check_and_schedule(&config).await {
+        Ok(true) => Ok(()),
+        Ok(false) => run_session(config).await,
+        Err(error) => {
+            tracing::warn!(error = ?error, "client update check failed; continuing with this launch");
+            run_session(config).await
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
+    if updater::is_helper_invocation() {
+        return updater::apply_scheduled_update();
+    }
     platform::run_application(move |deep_link| {
         let config = initialize(deep_link.as_deref())?;
-        tokio::runtime::Builder::new_multi_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .context("failed to create the macOS network runtime")?
-            .block_on(run_session(config))
+            .context("failed to create the macOS network runtime")?;
+        match runtime.block_on(updater::check_and_schedule(&config, deep_link.as_deref())) {
+            Ok(true) => Ok(()),
+            Ok(false) => runtime.block_on(run_session(config)),
+            Err(error) => {
+                tracing::warn!(error = ?error, "client update check failed; continuing with this launch");
+                runtime.block_on(run_session(config))
+            }
+        }
     })
 }
 

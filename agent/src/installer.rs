@@ -44,6 +44,8 @@ struct ProvisionedAgentConfig {
     server: String,
     device_id: String,
     agent_token: String,
+    #[serde(default = "default_update_manifest_url")]
+    update_manifest_url: String,
     frames_per_second: u32,
     bitrate_bits_per_second: u32,
     json_logs: bool,
@@ -52,6 +54,10 @@ struct ProvisionedAgentConfig {
 #[derive(Debug, Deserialize)]
 struct ApiError {
     error: String,
+}
+
+fn default_update_manifest_url() -> String {
+    pulsermm_self_update::DEFAULT_MANIFEST_URL.to_owned()
 }
 
 pub fn launch_if_embedded() -> anyhow::Result<bool> {
@@ -125,6 +131,10 @@ pub fn schedule_uninstall() -> anyhow::Result<()> {
         .with_context(|| format!("failed to create uninstall helper {}", helper.display()))?;
     Command::new(&helper)
         .arg("--uninstall")
+        // The desktop worker normally runs from the install directory. Do not let the helper
+        // inherit that working directory or Windows will keep the otherwise-empty directory
+        // in use while the helper tries to remove it.
+        .current_dir(&helper_directory)
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn()
         .with_context(|| format!("failed to start uninstall helper {}", helper.display()))?;
@@ -280,14 +290,19 @@ fn schedule_helper_cleanup() -> anyhow::Result<()> {
     let helper_directory = helper
         .parent()
         .context("the uninstall helper has no parent directory")?;
+    let cleanup_working_directory = helper_directory
+        .parent()
+        .context("the uninstall helper directory has no parent directory")?;
     let cleanup = format!(
-        "ping.exe 127.0.0.1 -n 3 >NUL & del.exe /f /q \"{}\" & rmdir \"{}\"",
+        "ping.exe 127.0.0.1 -n 3 >NUL & del /f /q \"{}\" & rmdir /q \"{}\"",
         helper.display(),
         helper_directory.display()
     );
     Command::new("cmd.exe")
         .args(["/D", "/S", "/C"])
         .arg(cleanup)
+        // The cleanup process must not keep the helper directory open while removing it.
+        .current_dir(cleanup_working_directory)
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn()
         .context("failed to schedule uninstall helper cleanup")?;
@@ -460,6 +475,8 @@ fn redeem_installer(
     if config.device_id.is_empty() || config.agent_token.is_empty() || config.server.is_empty() {
         bail!("the Agent enrollment service returned an incomplete configuration");
     }
+    pulsermm_self_update::validate_manifest_url(&config.update_manifest_url)
+        .context("the Agent enrollment service returned an invalid update manifest URL")?;
     Ok(config)
 }
 

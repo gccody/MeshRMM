@@ -63,14 +63,14 @@ signaling state.
 
 The following commands rebuild the native binaries. The Agent wrapper copies
 the finished generic executable into both `dist/agent/` and the dashboard's
-ignored `public/downloads/` release directory, then publishes its SHA-256 file.
-Build the Agent before building/deploying the dashboard so it can generate
-verified per-device installers:
+ignored `public/downloads/` release directory, then publishes its SHA-256 file
+and release-manifest entry. The remote-client wrapper does the same for the
+Windows client. Build both before building/deploying the dashboard so it can
+generate verified per-device installers and serve self-update artifacts:
 
 ```powershell
 & .\scripts\build-agent.ps1
-cargo build --locked --release -p pulsermm-remote
-Copy-Item target/release/pulsermm-remote.exe dist/remote/
+& .\scripts\build-remote.ps1
 ```
 
 On a Mac, build an application bundle using the `dist/remote/remote.json`
@@ -81,11 +81,23 @@ sh scripts/build-remote-macos.sh
 open "dist/remote-macos/PulseRMM Remote.app"
 ```
 
-The script builds for the Mac it runs on, copies the Cloudflare API URL into
-the app bundle, and applies an ad-hoc signature. A browser deep link supplies a
-60-second, single-use handoff token when a remote session starts.
+The script builds for the Mac architecture it runs on, copies the Cloudflare
+API URL into the app bundle, signs it, and publishes a zipped update artifact
+plus the corresponding manifest entry. Run it on each macOS architecture that
+you distribute. A browser deep link supplies a 60-second, single-use handoff
+token when a remote session starts.
 Developer ID signing and notarization are still required before distributing
 the app through normal Gatekeeper-protected download channels.
+Set `PULSERMM_CODESIGN_IDENTITY` to the Developer ID Application certificate
+name before running the script for a production archive; the default is an
+ad-hoc development signature.
+
+All native packages share the workspace version in `Cargo.toml`. Increase that
+semantic version before publishing a release, run the platform build scripts,
+and deploy the dashboard only after `dashboard/public/downloads/update-manifest.json`
+contains every intended platform entry. The manifest and release URLs must use
+HTTPS. Each updater verifies the downloaded artifact against the manifest's
+SHA-256 digest before replacing anything.
 
 Creating a new TURN key requires an explicit secure API token with Cloudflare
 Calls Write permission. `scripts/provision-cloudflare.ps1` installs only those
@@ -172,6 +184,13 @@ logged on, the service stays available and starts a worker when an interactive
 console session appears. `--console` remains available only for local
 development.
 
+The Agent supervisor checks for a newer release when the service starts and
+every six hours afterward. It stages a verified executable, stops cleanly,
+replaces the installed binary from an independent LocalSystem helper, and
+restarts the service. If the new service does not reach `Running`, the helper
+restores and starts the previous binary. Update-check failures are logged and
+do not disconnect the installed Agent.
+
 Copy `dist/remote/` to the authorized viewer computer and open
 `pulsermm-remote.exe` once to register the protocol. Remote sessions should
 then be launched from the dashboard. A viewer can also redeem a handoff from
@@ -185,6 +204,14 @@ For macOS, copy `PulseRMM Remote.app` from `dist/remote-macos/` to the
 authorized Mac and open it. The app reads `remote.json` from its own
 `Contents/MacOS` directory; it connects to the same preconfigured Cloudflare
 deployment as the Windows viewer.
+
+The Windows and macOS clients check for a newer release at the start of each
+dashboard launch. When one is available, the client verifies it, replaces the
+installed executable or signed application bundle through a helper, and
+relaunches with the same one-time handoff so the requested session continues.
+If no update is available, or the check cannot reach the release host, the
+current client continues immediately. A failed replacement rolls back to the
+previous client.
 
 The Agent defaults to the primary display's actual resolution (cropped by at
 most one row/column for NV12), 60 FPS, and 12 Mbps. These values can be edited

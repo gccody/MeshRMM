@@ -7,12 +7,12 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-$manifestPath = Join-Path $repositoryRoot 'agent\Cargo.toml'
-$sourceExecutable = Join-Path $repositoryRoot 'target\release\pulsermm-agent.exe'
-$distributionDirectory = Join-Path $repositoryRoot 'dist\agent'
-$destinationExecutable = Join-Path $distributionDirectory 'pulsermm-agent.exe'
+$manifestPath = Join-Path $repositoryRoot 'remote\Cargo.toml'
+$sourceExecutable = Join-Path $repositoryRoot 'target\release\pulsermm-remote.exe'
+$distributionDirectory = Join-Path $repositoryRoot 'dist\remote'
+$destinationExecutable = Join-Path $distributionDirectory 'pulsermm-remote.exe'
 $dashboardDownloadDirectory = Join-Path $repositoryRoot 'dashboard\public\downloads'
-$dashboardExecutable = Join-Path $dashboardDownloadDirectory 'pulsermm-agent-windows-x64.exe'
+$dashboardExecutable = Join-Path $dashboardDownloadDirectory 'pulsermm-remote-windows-x64.exe'
 $dashboardChecksum = "$dashboardExecutable.sha256"
 $updateManifest = Join-Path $dashboardDownloadDirectory 'update-manifest.json'
 $manifestWriter = Join-Path $PSScriptRoot 'update-release-manifest.mjs'
@@ -25,28 +25,25 @@ if ($LASTEXITCODE -ne 0) {
 
 New-Item -ItemType Directory -Path $distributionDirectory -Force | Out-Null
 New-Item -ItemType Directory -Path $dashboardDownloadDirectory -Force | Out-Null
+Copy-Item -LiteralPath $sourceExecutable -Destination $destinationExecutable -Force
 Copy-Item -LiteralPath $sourceExecutable -Destination $dashboardExecutable -Force
-try {
-    Copy-Item -LiteralPath $sourceExecutable -Destination $destinationExecutable -Force
-} catch [System.IO.IOException] {
-    Write-Warning "The portable dist Agent is currently running and could not be replaced. The dashboard installer asset was still published."
-}
 
 $artifact = Get-Item -LiteralPath $sourceExecutable
 $checksum = Get-FileHash -Algorithm SHA256 -LiteralPath $sourceExecutable
 $checksum.Hash.ToLowerInvariant() | Set-Content -LiteralPath $dashboardChecksum -Encoding ascii -NoNewline
 $metadata = (& cargo metadata --no-deps --format-version 1 --manifest-path $workspaceManifest) | ConvertFrom-Json
-$version = ($metadata.packages | Where-Object name -EQ 'pulsermm-agent').version
+$version = ($metadata.packages | Where-Object name -EQ 'pulsermm-remote').version
 & node $manifestWriter `
     $updateManifest `
-    'agent-windows-x64' `
+    'client-windows-x64' `
     $version `
-    "$($DownloadOrigin.TrimEnd('/'))/downloads/pulsermm-agent-windows-x64.exe" `
+    "$($DownloadOrigin.TrimEnd('/'))/downloads/pulsermm-remote-windows-x64.exe" `
     $dashboardExecutable
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
-Write-Output "Agent built at $($artifact.FullName)"
-Write-Output "Dashboard installer asset copied to $dashboardExecutable"
+
+Write-Output "Remote client built at $($artifact.FullName)"
+Write-Output "Dashboard update asset copied to $dashboardExecutable"
 Write-Output "Size: $($artifact.Length) bytes"
 Write-Output "SHA256: $($checksum.Hash)"
