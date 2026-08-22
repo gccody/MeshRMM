@@ -1,9 +1,18 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "meshrmm-server",
+  // Preserve the original script identity so existing Durable Object state and
+  // encrypted TURN credentials remain attached during the public rebrand.
+  "name": "pulsermm-server",
+  "account_id": "023f5fc9ffca88a15dac8e9f27b8d21f",
   "main": "build/index.js",
-  "compatibility_date": "2026-08-21",
+  "compatibility_date": "2026-08-22",
   "compatibility_flags": ["nodejs_compat"],
+  "routes": [
+    {
+      "pattern": "api.meshrmm.com",
+      "custom_domain": true
+    }
+  ],
   "d1_databases": [
     {
       "binding": "DB",
@@ -42,7 +51,7 @@
   "vars": {
     "REMOTE_SESSION_IDLE_TIMEOUT_SECONDS": "900",
     "DASHBOARD_ORIGIN": "https://meshrmm.com",
-    "PUBLIC_API_URL": "https://meshrmm-server.gccody2010.workers.dev",
+    "PUBLIC_API_URL": "https://api.meshrmm.com",
     "WORKOS_CLIENT_ID": "client_01M0FT1AN01PAT37N98EMRSNVW",
     "WORKOS_ISSUER": "https://api.workos.com/user_management/client_01M0FT1AN01PAT37N98EMRSNVW"
   },

@@ -1,0 +1,32 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "meshrmm-dashboard",
+  "account_id": "023f5fc9ffca88a15dac8e9f27b8d21f",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2026-08-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "dist/client",
+    "not_found_handling": "none",
+    "binding": "ASSETS"
+  },
+  "routes": [
+    {
+      "pattern": "meshrmm.com",
+      "custom_domain": true
+    },
+    {
+      "pattern": "www.meshrmm.com",
+      "custom_domain": true
+    }
+  ],
+  "vars": {
+    "WORKOS_CLIENT_ID": "client_01M0FT1AN01PAT37N98EMRSNVW",
+    "WORKOS_REDIRECT_URI": "https://meshrmm.com",
+    "MESHRMM_SERVER_URL": "https://api.meshrmm.com"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}

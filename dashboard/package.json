@@ -9,8 +9,10 @@
     "dev": "vinext dev",
     "build": "vinext build",
     "start": "vinext start",
+    "deploy": "vinext-cloudflare deploy",
+    "deploy:dry-run": "vinext-cloudflare deploy --dry-run",
     "test": "npm run build && node --experimental-strip-types --test tests/*.test.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern worker-configuration.d.ts",
     "typecheck": "tsc --noEmit",
     "verify": "npm run typecheck && npm run lint && npm test"
   },
@@ -24,7 +26,7 @@
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.53.1",
-    "@cloudflare/workers-types": "5.20260821.1",
+    "@vinext/cloudflare": "1.0.0-beta.6",
     "@eslint/js": "9.39.4",
     "@next/eslint-plugin-next": "16.3.2",
     "@types/node": "22.19.19",
