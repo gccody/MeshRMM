@@ -3,6 +3,8 @@ mod installer;
 mod remote;
 #[cfg(windows)]
 mod service;
+#[cfg(windows)]
+mod updater;
 
 use remote::config::{Config, ExecutionMode};
 use tracing_subscriber::EnvFilter;
@@ -23,6 +25,14 @@ async fn main() -> anyhow::Result<()> {
         .is_some_and(|argument| argument == "--uninstall")
     {
         return installer::uninstall();
+    }
+
+    #[cfg(windows)]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--apply-agent-update")
+    {
+        return updater::apply_scheduled_update();
     }
 
     rustls::crypto::ring::default_provider()

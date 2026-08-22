@@ -2274,6 +2274,7 @@ dependencies = [
  "futures-util",
  "pulsermm-protocol",
  "pulsermm-remote-screen",
+ "pulsermm-self-update",
  "pulsermm-signaling-client",
  "rustls",
  "serde",
@@ -2316,6 +2317,7 @@ dependencies = [
  "clap",
  "dispatch2",
  "futures-util",
+ "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-av-foundation",
@@ -2324,6 +2326,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-quartz-core",
  "pulsermm-protocol",
+ "pulsermm-self-update",
  "pulsermm-signaling-client",
  "reqwest",
  "rustls",
@@ -2346,6 +2349,18 @@ dependencies = [
  "tracing",
  "windows",
  "windows-capture",
+]
+
+[[package]]
+name = "pulsermm-self-update"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "url",
 ]
 
 [[package]]

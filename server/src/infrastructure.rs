@@ -63,6 +63,15 @@ pub(crate) fn public_api_url(environment: &Env) -> Result<String> {
         .to_owned())
 }
 
+pub(crate) fn update_manifest_url(environment: &Env) -> Result<String> {
+    let dashboard = environment
+        .var("DASHBOARD_ORIGIN")?
+        .to_string()
+        .trim_end_matches('/')
+        .to_owned();
+    Ok(format!("{dashboard}/downloads/update-manifest.json"))
+}
+
 pub(crate) fn agent_event_websocket_url(environment: &Env) -> Result<String> {
     let api_url = public_api_url(environment)?;
     let host = api_url

@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$DownloadOrigin = 'https://pulsermm.gccody.dev'
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -12,6 +14,9 @@ $destinationExecutable = Join-Path $distributionDirectory 'pulsermm-agent.exe'
 $dashboardDownloadDirectory = Join-Path $repositoryRoot 'dashboard\public\downloads'
 $dashboardExecutable = Join-Path $dashboardDownloadDirectory 'pulsermm-agent-windows-x64.exe'
 $dashboardChecksum = "$dashboardExecutable.sha256"
+$updateManifest = Join-Path $dashboardDownloadDirectory 'update-manifest.json'
+$manifestWriter = Join-Path $PSScriptRoot 'update-release-manifest.mjs'
+$workspaceManifest = Join-Path $repositoryRoot 'Cargo.toml'
 
 & cargo build --locked --release --manifest-path $manifestPath
 if ($LASTEXITCODE -ne 0) {
@@ -30,6 +35,17 @@ try {
 $artifact = Get-Item -LiteralPath $sourceExecutable
 $checksum = Get-FileHash -Algorithm SHA256 -LiteralPath $sourceExecutable
 $checksum.Hash.ToLowerInvariant() | Set-Content -LiteralPath $dashboardChecksum -Encoding ascii -NoNewline
+$metadata = (& cargo metadata --no-deps --format-version 1 --manifest-path $workspaceManifest) | ConvertFrom-Json
+$version = ($metadata.packages | Where-Object name -EQ 'pulsermm-agent').version
+& node $manifestWriter `
+    $updateManifest `
+    'agent-windows-x64' `
+    $version `
+    "$($DownloadOrigin.TrimEnd('/'))/downloads/pulsermm-agent-windows-x64.exe" `
+    $dashboardExecutable
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
 Write-Output "Agent built at $($artifact.FullName)"
 Write-Output "Dashboard installer asset copied to $dashboardExecutable"
 Write-Output "Size: $($artifact.Length) bytes"

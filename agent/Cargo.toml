@@ -15,6 +15,7 @@ bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 pulsermm-protocol.workspace = true
+pulsermm-self-update.workspace = true
 pulsermm-signaling-client.workspace = true
 rustls.workspace = true
 serde.workspace = true

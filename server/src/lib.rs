@@ -143,6 +143,7 @@ struct AgentConfig {
     server: String,
     device_id: String,
     agent_token: String,
+    update_manifest_url: String,
     frames_per_second: u32,
     bitrate_bits_per_second: u32,
     json_logs: bool,

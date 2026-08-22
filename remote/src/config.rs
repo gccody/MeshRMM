@@ -8,6 +8,7 @@ use serde::Deserialize;
 pub struct Config {
     pub server: String,
     pub handoff_token: String,
+    pub update_manifest_url: String,
     pub json_logs: bool,
 }
 
@@ -33,6 +34,10 @@ struct Arguments {
     #[arg(long, env = "PULSERMM_HANDOFF_TOKEN", hide_env_values = true)]
     handoff_token: Option<String>,
 
+    /// HTTPS release manifest checked before starting a remote session.
+    #[arg(long, env = "PULSERMM_UPDATE_MANIFEST_URL")]
+    update_manifest_url: Option<String>,
+
     #[arg(long, env = "PULSERMM_JSON_LOGS", action = ArgAction::SetTrue)]
     json_logs: bool,
 }
@@ -41,6 +46,7 @@ struct Arguments {
 struct FileConfig {
     server: Option<String>,
     handoff_token: Option<String>,
+    update_manifest_url: Option<String>,
     json_logs: Option<bool>,
 }
 
@@ -82,10 +88,16 @@ impl Config {
             .context("missing single-use PulseRMM handoff token")?;
         validate_server(&server)?;
         validate_handoff_token(&handoff_token)?;
+        let update_manifest_url = arguments
+            .update_manifest_url
+            .or(file.update_manifest_url)
+            .unwrap_or_else(|| pulsermm_self_update::DEFAULT_MANIFEST_URL.to_owned());
+        pulsermm_self_update::validate_manifest_url(&update_manifest_url)?;
 
         Ok(Self {
             server,
             handoff_token,
+            update_manifest_url,
             json_logs: arguments.json_logs || file.json_logs.unwrap_or(false),
         })
     }

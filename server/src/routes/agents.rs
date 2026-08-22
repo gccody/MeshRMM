@@ -134,6 +134,7 @@ pub(crate) async fn redeem_agent_installer(
         server: public_api_url(environment)?,
         device_id,
         agent_token,
+        update_manifest_url: update_manifest_url(environment)?,
         frames_per_second: 60,
         bitrate_bits_per_second: 12_000_000,
         json_logs: false,
