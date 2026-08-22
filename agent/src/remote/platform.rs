@@ -24,7 +24,7 @@ pub trait ScreenStreamer: Send {
 
 #[cfg(windows)]
 pub struct PlatformScreenStreamer {
-    inner: pulsermm_remote_screen::WindowsScreenStreamer,
+    inner: CaptureBackend,
     frames_per_second: u32,
     bitrate_bits_per_second: u32,
     next_frame_id: Arc<AtomicU64>,
@@ -32,9 +32,17 @@ pub struct PlatformScreenStreamer {
 
 #[cfg(windows)]
 impl PlatformScreenStreamer {
-    pub fn new(frames_per_second: u32, bitrate_bits_per_second: u32) -> Self {
+    pub fn new(
+        frames_per_second: u32,
+        bitrate_bits_per_second: u32,
+        capture_as_active_user: bool,
+    ) -> Self {
         Self {
-            inner: pulsermm_remote_screen::WindowsScreenStreamer::new(),
+            inner: if capture_as_active_user {
+                CaptureBackend::ActiveUser(super::capture_helper::UserCaptureStreamer::new())
+            } else {
+                CaptureBackend::Direct(pulsermm_remote_screen::WindowsScreenStreamer::new())
+            },
             frames_per_second,
             bitrate_bits_per_second,
             next_frame_id: Arc::new(AtomicU64::new(1)),
@@ -88,17 +96,14 @@ impl ScreenStreamer for PlatformScreenStreamer {
                 runtime.spawn(async move { slot.publish(frame).await });
             },
         );
-        let active = self
-            .inner
-            .start(
-                pulsermm_remote_screen::StreamConfig {
-                    frames_per_second: self.frames_per_second,
-                    bitrate_bits_per_second: self.bitrate_bits_per_second,
-                },
-                display_id.0,
-                sink,
-            )
-            .context("Windows GPU capture/encode startup failed")?;
+        let config = pulsermm_remote_screen::StreamConfig {
+            frames_per_second: self.frames_per_second,
+            bitrate_bits_per_second: self.bitrate_bits_per_second,
+        };
+        let active = match &mut self.inner {
+            CaptureBackend::Direct(streamer) => streamer.start(config, display_id.0, sink)?,
+            CaptureBackend::ActiveUser(streamer) => streamer.start(config, display_id.0, sink)?,
+        };
         Ok(VideoFormat {
             width: active.width,
             height: active.height,
@@ -110,26 +115,48 @@ impl ScreenStreamer for PlatformScreenStreamer {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        self.inner.stop().context("Windows capture stop failed")
+        match &mut self.inner {
+            CaptureBackend::Direct(streamer) => streamer.stop().map_err(anyhow::Error::from),
+            CaptureBackend::ActiveUser(streamer) => streamer.stop(),
+        }
+        .context("Windows capture stop failed")
     }
 
     fn poll_ended(&mut self) -> Option<anyhow::Result<()>> {
-        self.inner
-            .poll_ended()
-            .map(|result| result.context("Windows GPU capture/encode worker stopped"))
+        match &mut self.inner {
+            CaptureBackend::Direct(streamer) => streamer
+                .poll_ended()
+                .map(|result| result.map_err(anyhow::Error::from)),
+            CaptureBackend::ActiveUser(streamer) => streamer.poll_ended(),
+        }
+        .map(|result| result.context("Windows GPU capture/encode worker stopped"))
     }
 
     fn request_keyframe(&self) -> anyhow::Result<()> {
-        self.inner
-            .request_keyframe()
-            .context("hardware keyframe request failed")
+        match &self.inner {
+            CaptureBackend::Direct(streamer) => {
+                streamer.request_keyframe().map_err(anyhow::Error::from)
+            }
+            CaptureBackend::ActiveUser(streamer) => streamer.request_keyframe(),
+        }
+        .context("hardware keyframe request failed")
     }
 
     fn set_bitrate(&self, bits_per_second: u32) -> anyhow::Result<()> {
-        self.inner
-            .set_bitrate(bits_per_second)
-            .context("hardware encoder bitrate change failed")
+        match &self.inner {
+            CaptureBackend::Direct(streamer) => streamer
+                .set_bitrate(bits_per_second)
+                .map_err(anyhow::Error::from),
+            CaptureBackend::ActiveUser(streamer) => streamer.set_bitrate(bits_per_second),
+        }
+        .context("hardware encoder bitrate change failed")
     }
+}
+
+#[cfg(windows)]
+enum CaptureBackend {
+    Direct(pulsermm_remote_screen::WindowsScreenStreamer),
+    ActiveUser(super::capture_helper::UserCaptureStreamer),
 }
 
 #[cfg(windows)]
