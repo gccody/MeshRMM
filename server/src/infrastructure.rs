@@ -1,5 +1,15 @@
 use crate::*;
 
+const RESERVED_TENANT_SLUGS: &[&str] = &[
+    "admin",
+    "api",
+    "auth",
+    "downloads",
+    "status",
+    "support",
+    "www",
+];
+
 pub(crate) fn validate_identifier(value: &str, label: &str) -> Result<()> {
     let valid = !value.is_empty()
         && value.len() <= 128
@@ -17,6 +27,146 @@ pub(crate) fn validate_name<'a>(value: &'a str, label: &str) -> Result<&'a str> 
         Ok(value)
     } else {
         Err(Error::RustError(format!("invalid {label}")))
+    }
+}
+
+pub(crate) fn validate_slug(value: &str) -> Result<String> {
+    let slug = value.trim().to_ascii_lowercase();
+    let valid = (2..=63).contains(&slug.len())
+        && !slug.starts_with('-')
+        && !slug.ends_with('-')
+        && slug
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !RESERVED_TENANT_SLUGS.contains(&slug.as_str());
+    valid
+        .then_some(slug)
+        .ok_or_else(|| Error::RustError("invalid or reserved company slug".into()))
+}
+
+pub(crate) fn validate_email(value: &str) -> Result<String> {
+    let email = value.trim().to_ascii_lowercase();
+    let valid = email.len() <= 254
+        && !email.chars().any(char::is_control)
+        && email.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty()
+                && !domain.is_empty()
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+        });
+    valid
+        .then_some(email)
+        .ok_or_else(|| Error::RustError("invalid company administrator email".into()))
+}
+
+pub(crate) fn tenant_root_domain(environment: &Env) -> Result<String> {
+    Ok(environment
+        .var("TENANT_ROOT_DOMAIN")?
+        .to_string()
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase())
+}
+
+pub(crate) fn request_hostname(request: &Request) -> Result<String> {
+    request
+        .url()?
+        .host_str()
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| Error::RustError("request hostname is missing".into()))
+}
+
+pub(crate) fn is_legacy_control_plane_request(
+    request: &Request,
+    environment: &Env,
+) -> Result<bool> {
+    let hostname = request_hostname(request)?;
+    let legacy_api_host = public_api_url(environment)?
+        .parse::<url::Url>()
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+    Ok(legacy_api_host.as_deref() == Some(hostname.as_str())
+        || matches!(hostname.as_str(), "localhost" | "127.0.0.1"))
+}
+
+fn tenant_slug_from_hostname<'a>(hostname: &'a str, root_domain: &str) -> Option<&'a str> {
+    let suffix = format!(".{root_domain}");
+    let slug = hostname.strip_suffix(&suffix)?;
+    (!slug.is_empty() && !slug.contains('.')).then_some(slug)
+}
+
+pub(crate) async fn company_for_request(
+    db: &D1Database,
+    request: &Request,
+    environment: &Env,
+    workos_organization_id: Option<&str>,
+) -> Result<Option<TenantCompany>> {
+    let hostname = request_hostname(request)?;
+    let root_domain = tenant_root_domain(environment)?;
+    if let Some(slug) = tenant_slug_from_hostname(&hostname, &root_domain) {
+        return query!(
+            db,
+            "SELECT id, workos_organization_id, status FROM companies WHERE slug = ?1 COLLATE NOCASE",
+            slug
+        )?
+        .first::<TenantCompany>(None)
+        .await;
+    }
+
+    if !is_legacy_control_plane_request(request, environment)? {
+        return Ok(None);
+    }
+    let Some(workos_organization_id) = workos_organization_id else {
+        return Ok(None);
+    };
+    query!(
+        db,
+        "SELECT id, workos_organization_id, status FROM companies WHERE workos_organization_id = ?1",
+        workos_organization_id
+    )?
+    .first::<TenantCompany>(None)
+    .await
+}
+
+pub(crate) async fn request_tenant_company(
+    db: &D1Database,
+    request: &Request,
+    environment: &Env,
+) -> Result<Option<TenantCompany>> {
+    let hostname = request_hostname(request)?;
+    let root_domain = tenant_root_domain(environment)?;
+    let Some(slug) = tenant_slug_from_hostname(&hostname, &root_domain) else {
+        return Ok(None);
+    };
+    query!(
+        db,
+        "SELECT id, workos_organization_id, status FROM companies WHERE slug = ?1 COLLATE NOCASE",
+        slug
+    )?
+    .first::<TenantCompany>(None)
+    .await
+}
+
+pub(crate) async fn canonical_company_url(
+    db: &D1Database,
+    environment: &Env,
+    company_id: &str,
+) -> Result<String> {
+    #[derive(Deserialize)]
+    struct CompanySlug {
+        slug: Option<String>,
+    }
+    let company = query!(db, "SELECT slug FROM companies WHERE id = ?1", company_id)?
+        .first::<CompanySlug>(None)
+        .await?
+        .ok_or_else(|| Error::RustError("company has not been provisioned".into()))?;
+    match company.slug {
+        Some(slug) => Ok(format!(
+            "https://{slug}.{}",
+            tenant_root_domain(environment)?
+        )),
+        None => public_api_url(environment),
     }
 }
 
@@ -72,12 +222,18 @@ pub(crate) fn update_manifest_url(environment: &Env) -> Result<String> {
     Ok(format!("{dashboard}/downloads/update-manifest.json"))
 }
 
-pub(crate) fn agent_event_websocket_url(environment: &Env) -> Result<String> {
-    let api_url = public_api_url(environment)?;
+pub(crate) fn agent_event_websocket_url(api_url: &str) -> Result<String> {
     let host = api_url
         .strip_prefix("https://")
-        .ok_or_else(|| Error::RustError("PUBLIC_API_URL must use HTTPS".into()))?;
+        .ok_or_else(|| Error::RustError("Agent event URL must use HTTPS".into()))?;
     Ok(format!("wss://{host}/v1/agents/events"))
+}
+
+pub(crate) fn expected_request_origin(request: &Request, environment: &Env) -> Result<String> {
+    if is_legacy_control_plane_request(request, environment)? {
+        return Ok(environment.var("DASHBOARD_ORIGIN")?.to_string());
+    }
+    Ok(format!("https://{}", request_hostname(request)?))
 }
 
 pub(crate) fn now_ms_i64() -> Result<i64> {
@@ -250,7 +406,20 @@ pub(crate) fn workos_auth_error(error: Error) -> Result<Response> {
         })
     );
 
-    if reason == "missing_organization" {
+    if detail.contains("platform owner access is required")
+        || detail.contains("platform owner access is restricted")
+    {
+        api_error(403, "platform owner access is required")
+    } else if detail.contains("does not match the company hostname") {
+        api_error(
+            403,
+            "this account cannot access the requested company hostname",
+        )
+    } else if detail.contains("company is not active") {
+        api_error(403, "this company is not active")
+    } else if detail.contains("company has not been provisioned") {
+        api_error(404, "company hostname was not found")
+    } else if reason == "missing_organization" {
         api_error(
             401,
             "select a WorkOS organization before accessing company data",

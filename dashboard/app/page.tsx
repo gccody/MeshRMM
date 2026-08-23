@@ -4,13 +4,11 @@ import { LoginRequiredError, useAuth } from "@workos-inc/authkit-react";
 import {
   AdminPortalDomainVerification,
   AdminPortalSsoConnection,
-  OrganizationSwitcher,
   UsersManagement,
 } from "@workos-inc/widgets";
 import {
   Network,
   Building2,
-  ChevronDown,
   Clock3,
   KeyRound,
   LoaderCircle,
@@ -38,8 +36,10 @@ import {
   formatIdleTimeout,
 } from "../features/session/idle-session";
 import { useIdleSession } from "../features/session/use-idle-session";
+import { MarketingPage } from "../features/marketing/marketing-page";
+import { PlatformDashboard } from "../features/platform/platform-dashboard";
 
-type Company = { id: string; name: string; dashboard_idle_timeout_minutes: number };
+type Company = { id: string; name: string; slug: string | null; status: string; dashboard_idle_timeout_minutes: number };
 type Account = {
   user_id: string;
   company: Company | null;
@@ -64,7 +64,14 @@ const INSTALLER_ASSETS: Record<AgentPlatform, { label: string; binary: string; c
 };
 const ENROLLMENT_MAGIC = "MESHRMM-BOOTSTRAP-V1";
 export default function Dashboard() {
-  const { serverUrl } = useRuntimeConfig();
+  const { surface } = useRuntimeConfig();
+  if (surface === "marketing") return <MarketingPage />;
+  if (surface === "platform") return <PlatformDashboard />;
+  return <TenantDashboard />;
+}
+
+function TenantDashboard() {
+  const { serverUrl, workosOrganizationId } = useRuntimeConfig();
   const {
     isLoading: isAuthLoading,
     user,
@@ -74,22 +81,18 @@ export default function Dashboard() {
     organizationId,
     role,
     roles,
-    switchToOrganization,
   } = useAuth();
   const [view, setView] = useState<View>("agents");
   const [account, setAccount] = useState<Account | null>(null);
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<AgentStatusFilter>("all");
   const [isAuthOpen, setIsAuthOpen] = useState(false);
-  const [isOrganizationOpen, setIsOrganizationOpen] = useState(false);
   const [isAgentOpen, setIsAgentOpen] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [connectingId, setConnectingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [companyName, setCompanyName] = useState("");
   const [agentPlatform, setAgentPlatform] = useState<AgentPlatform>("windows-x64");
-  const [isSaving, setIsSaving] = useState(false);
   const [isDownloadingInstaller, setIsDownloadingInstaller] = useState(false);
   const [installerDownloaded, setInstallerDownloaded] = useState(false);
   const [installerError, setInstallerError] = useState<string | null>(null);
@@ -98,14 +101,22 @@ export default function Dashboard() {
   const [idleTimeoutDraft, setIdleTimeoutDraft] = useState(DEFAULT_IDLE_TIMEOUT_MINUTES);
   const [isSavingSessionPolicy, setIsSavingSessionPolicy] = useState(false);
 
-  const isAdmin = Boolean(role === "admin" || roles?.includes("admin") || account?.role === "admin" || account?.roles.includes("admin"));
+  const hasTenantSession = Boolean(user && workosOrganizationId && organizationId === workosOrganizationId);
+  const isAdmin = Boolean(
+    role === "admin" ||
+    role === "company_admin" ||
+    roles?.some((candidate) => candidate === "admin" || candidate === "company_admin") ||
+    account?.role === "admin" ||
+    account?.role === "company_admin" ||
+    account?.roles.some((candidate) => candidate === "admin" || candidate === "company_admin") ||
+    account?.permissions.includes("company:settings:manage"),
+  );
   const companyId = account?.company?.id;
   const idleTimeoutMinutes = account?.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES;
 
   const lockSession = useCallback((reason: SessionPauseReason) => {
     setSessionPauseReason((current) => current ?? reason);
     setIsAuthOpen(false);
-    setIsOrganizationOpen(false);
     setIsAgentOpen(false);
     setIsSidebarOpen(false);
   }, []);
@@ -138,7 +149,7 @@ export default function Dashboard() {
 
   const { agents, isLive, isRefreshing, lastUpdated, loadAgents, reset: resetInventory } =
     useAgentInventory({
-      enabled: Boolean(user && organizationId && !sessionPauseReason),
+      enabled: Boolean(hasTenantSession && !sessionPauseReason),
       companyId,
       authorizedFetch,
       reportError: setError,
@@ -153,8 +164,8 @@ export default function Dashboard() {
   }, [lockSession, resetInventory, signOut]);
 
   useIdleSession({
-    enabled: Boolean(user && organizationId && !sessionPauseReason),
-    organizationId,
+    enabled: Boolean(hasTenantSession && !sessionPauseReason),
+    organizationId: workosOrganizationId,
     timeoutMinutes: idleTimeoutMinutes,
     onTimeout: pauseIdleSession,
   });
@@ -169,7 +180,7 @@ export default function Dashboard() {
   }, [lockSession, resetInventory]);
 
   const loadAccount = useCallback(async () => {
-    if (!user || !organizationId) {
+    if (!hasTenantSession) {
       setAccount(null);
       return null;
     }
@@ -179,10 +190,10 @@ export default function Dashboard() {
     setAccount(data);
     setIdleTimeoutDraft(data.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES);
     return data;
-  }, [authorizedFetch, organizationId, user]);
+  }, [authorizedFetch, hasTenantSession]);
 
   useEffect(() => {
-    if (isAuthLoading || !user || !organizationId) return;
+    if (isAuthLoading || !hasTenantSession) return;
     let cancelled = false;
     const start = async () => {
       try {
@@ -196,7 +207,7 @@ export default function Dashboard() {
     };
     void start();
     return () => { cancelled = true; };
-  }, [isAuthLoading, loadAccount, loadAgents, organizationId, user]);
+  }, [hasTenantSession, isAuthLoading, loadAccount, loadAgents]);
 
   const filteredAgents = useMemo(() => {
     const search = query.trim().toLowerCase();
@@ -209,30 +220,7 @@ export default function Dashboard() {
 
   const displayName = user ? [user.firstName, user.lastName].filter(Boolean).join(" ") || user.email : "Not signed in";
   const initials = user ? `${user.firstName?.[0] ?? user.email[0] ?? ""}${user.lastName?.[0] ?? ""}`.toUpperCase() : "--";
-  const companyLabel = account?.company?.name ?? (organizationId ? "Provision company" : "Select company");
-
-  const bootstrapCompany = async (event: FormEvent) => {
-    event.preventDefault();
-    setIsSaving(true);
-    setError(null);
-    try {
-      const response = await authorizedFetch("/v1/company/bootstrap", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: companyName }),
-      });
-      if (!response.ok) throw new Error(await errorMessage(response, "The company could not be provisioned."));
-      const data = (await response.json()) as Account;
-      setAccount(data);
-      setIdleTimeoutDraft(data.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES);
-      setCompanyName("");
-      await loadAgents();
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "The company could not be provisioned.");
-    } finally {
-      setIsSaving(false);
-    }
-  };
+  const companyLabel = account?.company?.name ?? "Company workspace";
 
   const saveSessionPolicy = async (event: FormEvent) => {
     event.preventDefault();
@@ -263,7 +251,7 @@ export default function Dashboard() {
     setIsResumingSession(true);
     setError(null);
     try {
-      await signIn({ organizationId: organizationId ?? undefined, state: { returnTo: "/" } });
+      await signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } });
     } catch (resumeError) {
       setError(resumeError instanceof Error ? resumeError.message : "The WorkOS session could not be resumed.");
       setIsResumingSession(false);
@@ -390,17 +378,16 @@ export default function Dashboard() {
           <button className="sidebar-close" onClick={() => setIsSidebarOpen(false)} aria-label="Close navigation"><X size={20} /></button>
         </div>
 
-        <button className="workspace-switcher" onClick={() => setIsOrganizationOpen(true)} disabled={!user || Boolean(sessionPauseReason)}>
+        <div className="workspace-switcher workspace-identity">
           <div className="workspace-avatar">{account?.company?.name.slice(0, 2).toUpperCase() ?? "CO"}</div>
-          <div><strong>{companyLabel}</strong><span>{organizationId ? "WorkOS organization" : "Organization required"}</span></div>
-          <ChevronDown size={16} />
-        </button>
+          <div><strong>{companyLabel}</strong><span>Fixed company workspace</span></div>
+        </div>
 
         <nav aria-label="Primary navigation">
           <p className="nav-label">Company</p>
           <button className={`nav-item ${view === "agents" ? "active" : ""}`} onClick={() => setActiveView("agents")} disabled={Boolean(sessionPauseReason)}><Monitor size={18} /><span>Agents</span>{isLive ? <em>{agents.length}</em> : null}</button>
-          <button className={`nav-item ${view === "team" ? "active" : ""}`} onClick={() => setActiveView("team")} disabled={!organizationId || Boolean(sessionPauseReason)}><Users size={18} /><span>Users</span></button>
-          <button className={`nav-item ${view === "sso" ? "active" : ""}`} onClick={() => setActiveView("sso")} disabled={!organizationId || Boolean(sessionPauseReason)}><KeyRound size={18} /><span>Single sign-on</span></button>
+          {isAdmin && <button className={`nav-item ${view === "team" ? "active" : ""}`} onClick={() => setActiveView("team")} disabled={!hasTenantSession || Boolean(sessionPauseReason)}><Users size={18} /><span>Users</span></button>}
+          {isAdmin && <button className={`nav-item ${view === "sso" ? "active" : ""}`} onClick={() => setActiveView("sso")} disabled={!hasTenantSession || Boolean(sessionPauseReason)}><KeyRound size={18} /><span>Authentication</span></button>}
           <p className="nav-label nav-label-spaced">Account</p>
           <button className="nav-item" onClick={() => setIsAuthOpen(true)} disabled={Boolean(sessionPauseReason)}><Settings size={18} /><span>Profile & session</span></button>
         </nav>
@@ -440,34 +427,30 @@ export default function Dashboard() {
               <p className="eyebrow">Secure company access</p>
               <h1>Sign in to MeshRMM</h1>
               <p>WorkOS authenticates each user and selects the company boundary before any Agent data is requested.</p>
-              <button className="primary-button" onClick={() => void signIn({ state: { returnTo: "/" } })}><ShieldCheck size={16} /> Continue with WorkOS</button>
+              <button className="primary-button" onClick={() => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } })}><ShieldCheck size={16} /> Continue with WorkOS</button>
             </section>
-          ) : user && !organizationId ? (
+          ) : user && !hasTenantSession ? (
             <section className="signed-out-card organization-required">
               <div className="modal-icon"><Building2 size={22} /></div>
-              <p className="eyebrow">Company required</p>
-              <h1>Select your company</h1>
-              <p>Your identity is valid, but MeshRMM only serves Agent data inside a WorkOS organization.</p>
-              <div className="organization-widget"><OrganizationSwitcher authToken={getAccessToken} switchToOrganization={switchToOrganization} /></div>
+              <p className="eyebrow">Company-specific access</p>
+              <h1>Continue to this company</h1>
+              <p>Your current WorkOS session belongs to a different company. Continue securely to authenticate for this URL. MeshRMM does not provide in-app company switching.</p>
+              <button className="primary-button" onClick={() => void signOut({ navigate: false }).then(() => signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } }))}><ShieldCheck size={16} /> Continue to company</button>
             </section>
           ) : account && !account.company ? (
             <section className="signed-out-card organization-required">
               <div className="modal-icon"><Building2 size={22} /></div>
-              <p className="eyebrow">First-time setup</p>
-              <h1>Provision this company</h1>
-              <p>This creates the tenant record in Cloudflare D1 for the selected WorkOS organization.</p>
-              <form className="inline-provision-form" onSubmit={bootstrapCompany}>
-                <input required maxLength={120} value={companyName} onChange={(event) => setCompanyName(event.target.value)} placeholder="Company name" aria-label="Company name" />
-                <button className="primary-button" disabled={isSaving}>{isSaving ? <LoaderCircle size={16} className="spin" /> : <Building2 size={16} />} Provision company</button>
-              </form>
+              <p className="eyebrow">Workspace unavailable</p>
+              <h1>This company is not ready</h1>
+              <p>The workspace must be provisioned by the MeshRMM platform owner before it can be used.</p>
             </section>
           ) : (
             <>
               <section className="page-heading">
                 <div>
                   <p className="eyebrow">{account?.company?.name ?? "Company"}</p>
-                  <h1>{view === "agents" ? "Agents" : view === "team" ? "Users" : "Single sign-on"}</h1>
-                  <p>{view === "agents" ? "Live company inventory with secure, one-time remote handoffs." : view === "team" ? "Invite users and manage company roles through WorkOS." : "Configure company domains and an enterprise identity provider."}</p>
+                  <h1>{view === "agents" ? "Agents" : view === "team" ? "Users" : "Authentication"}</h1>
+                  <p>{view === "agents" ? "Live company inventory with secure, one-time remote handoffs." : view === "team" ? "Invite users and manage company roles through WorkOS." : "Manage this company’s verified domains and enterprise sign-in connection."}</p>
                 </div>
                 {view === "agents" && <div className="heading-actions">
                   <button className="secondary-button" onClick={() => void loadAgents()}><RefreshCw size={16} className={isRefreshing ? "spin" : ""} /> Refresh</button>
@@ -506,9 +489,7 @@ export default function Dashboard() {
         </div>
       </main>
 
-      {isAuthOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsAuthOpen(false)}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="account-title"><button className="modal-close" onClick={() => setIsAuthOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><ShieldCheck size={22} /></div><p className="eyebrow">Authenticated</p><h2 id="account-title">WorkOS account</h2><p>Your session carries the selected organization and role used for every MeshRMM API request.</p>{user ? <><div className="account-summary"><div className="profile-avatar">{initials}</div><div><strong>{displayName}</strong><span>{user.email}</span></div></div>{account?.company && <div className="session-policy"><div className="session-policy-heading"><Clock3 size={16} /><div><strong>Organization idle timeout</strong><span>Currently {formatIdleTimeout(idleTimeoutMinutes)}</span></div></div>{isAdmin ? <form onSubmit={saveSessionPolicy}><label htmlFor="idle-timeout">Sign out inactive dashboards after<select id="idle-timeout" value={idleTimeoutDraft} onChange={(event) => setIdleTimeoutDraft(Number(event.target.value))}><option value={5}>5 minutes</option><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={120}>2 hours</option><option value={240}>4 hours</option><option value={480}>8 hours</option><option value={720}>12 hours</option><option value={1440}>24 hours</option></select></label><button className="primary-button" disabled={isSavingSessionPolicy || idleTimeoutDraft === idleTimeoutMinutes}>{isSavingSessionPolicy ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save session policy</button></form> : <p>Only an organization administrator can change this policy.</p>}</div>}<button className="secondary-button modal-submit" onClick={handleSignOut}><LogOut size={16} /> Sign out</button></> : <button className="primary-button modal-submit" onClick={() => void signIn({ state: { returnTo: "/" } })}><ShieldCheck size={16} /> Continue with WorkOS</button>}</section></div>}
-
-      {isOrganizationOpen && user && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsOrganizationOpen(false)}><section className="settings-modal organization-modal" role="dialog" aria-modal="true" aria-labelledby="organization-title"><button className="modal-close" onClick={() => setIsOrganizationOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><Building2 size={22} /></div><p className="eyebrow">Tenant boundary</p><h2 id="organization-title">Switch company</h2><p>Changing companies refreshes your WorkOS token before any other company inventory is requested.</p><div className="organization-widget"><OrganizationSwitcher authToken={getAccessToken} switchToOrganization={switchToOrganization} /></div></section></div>}
+      {isAuthOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsAuthOpen(false)}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="account-title"><button className="modal-close" onClick={() => setIsAuthOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><ShieldCheck size={22} /></div><p className="eyebrow">Authenticated</p><h2 id="account-title">WorkOS account</h2><p>Your session is restricted to the company represented by this URL.</p>{user ? <><div className="account-summary"><div className="profile-avatar">{initials}</div><div><strong>{displayName}</strong><span>{user.email}</span></div></div>{account?.company && <div className="session-policy"><div className="session-policy-heading"><Clock3 size={16} /><div><strong>Company idle timeout</strong><span>Currently {formatIdleTimeout(idleTimeoutMinutes)}</span></div></div>{isAdmin ? <form onSubmit={saveSessionPolicy}><label htmlFor="idle-timeout">Sign out inactive dashboards after<select id="idle-timeout" value={idleTimeoutDraft} onChange={(event) => setIdleTimeoutDraft(Number(event.target.value))}><option value={5}>5 minutes</option><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={120}>2 hours</option><option value={240}>4 hours</option><option value={480}>8 hours</option><option value={720}>12 hours</option><option value={1440}>24 hours</option></select></label><button className="primary-button" disabled={isSavingSessionPolicy || idleTimeoutDraft === idleTimeoutMinutes}>{isSavingSessionPolicy ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save session policy</button></form> : <p>Only a company administrator can change this policy.</p>}</div>}<button className="secondary-button modal-submit" onClick={handleSignOut}><LogOut size={16} /> Sign out</button></> : <button className="primary-button modal-submit" onClick={() => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } })}><ShieldCheck size={16} /> Continue with WorkOS</button>}</section></div>}
 
       {isAgentOpen && (
         <EnrollmentModal

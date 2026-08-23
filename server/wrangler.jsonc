@@ -52,6 +52,10 @@
     "REMOTE_SESSION_IDLE_TIMEOUT_SECONDS": "900",
     "DASHBOARD_ORIGIN": "https://meshrmm.com",
     "PUBLIC_API_URL": "https://api.meshrmm.com",
+    "TENANT_ROOT_DOMAIN": "meshrmm.com",
+    // Set this to the immutable WorkOS user ID allowed to use admin.meshrmm.com.
+    // Multiple emergency owner IDs may be comma-separated.
+    "PLATFORM_OWNER_USER_IDS": "user_01M0FX7EVSBWF41FK70SW36N4P",
     "WORKOS_CLIENT_ID": "client_01M0FT1AN01PAT37N98EMRSNVW",
     "WORKOS_ISSUER": "https://api.workos.com/user_management/client_01M0FT1AN01PAT37N98EMRSNVW"
   },

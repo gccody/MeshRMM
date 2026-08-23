@@ -42,9 +42,10 @@ pub(crate) async fn create_agent_event_subscription(
     )?
     .run()
     .await?;
+    let company_url = canonical_company_url(&db, environment, &identity.company_id).await?;
     Response::from_json(&AgentEventSubscription {
         subscription_token,
-        websocket_url: agent_event_websocket_url(environment)?,
+        websocket_url: agent_event_websocket_url(&company_url)?,
         expires_at_unix_ms: expires_at,
     })
 }
@@ -60,7 +61,7 @@ pub(crate) async fn subscribe_agent_events(
     {
         return api_error(426, "WebSocket upgrade required");
     }
-    let expected_origin = environment.var("DASHBOARD_ORIGIN")?.to_string();
+    let expected_origin = expected_request_origin(&request, environment)?;
     if request.headers().get("Origin")?.as_deref() != Some(expected_origin.as_str()) {
         return api_error(403, "dashboard origin is not allowed");
     }

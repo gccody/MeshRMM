@@ -7,6 +7,10 @@ import { activityStorageKey } from "../features/session/idle-session";
 
 type RuntimeConfig = {
   serverUrl: string;
+  surface: "marketing" | "platform" | "tenant";
+  hostname: string;
+  tenantSlug?: string;
+  workosOrganizationId?: string;
 };
 
 export const LOGIN_ATTEMPT_KEY = "meshrmm:workos-login-attempt";
@@ -53,11 +57,19 @@ export default function Providers({
   clientId,
   redirectUri,
   serverUrl,
+  surface,
+  hostname,
+  tenantSlug,
+  workosOrganizationId,
 }: Readonly<{
   children: React.ReactNode;
   clientId: string;
   redirectUri: string;
   serverUrl: string;
+  surface: RuntimeConfig["surface"];
+  hostname: string;
+  tenantSlug?: string;
+  workosOrganizationId?: string;
 }>) {
   return (
     <AuthKitProvider
@@ -68,7 +80,7 @@ export default function Providers({
       onRefreshFailure={() => window.dispatchEvent(new Event(AUTH_REFRESH_FAILED_EVENT))}
     >
       <WorkOsWidgets theme={{ accentColor: "violet", radius: "medium", fontFamily: "var(--font-geist-sans)" }}>
-        <RuntimeConfigContext.Provider value={{ serverUrl }}>
+        <RuntimeConfigContext.Provider value={{ serverUrl, surface, hostname, tenantSlug, workosOrganizationId }}>
           {children}
         </RuntimeConfigContext.Provider>
       </WorkOsWidgets>

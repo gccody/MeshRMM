@@ -31,6 +31,15 @@ struct Company {
     id: String,
     name: String,
     dashboard_idle_timeout_minutes: u32,
+    slug: Option<String>,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TenantCompany {
+    id: String,
+    workos_organization_id: Option<String>,
+    status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,8 +99,22 @@ struct Identity {
 }
 
 impl Identity {
-    fn is_admin(&self) -> bool {
-        self.role.as_deref() == Some("admin") || self.roles.iter().any(|role| role == "admin")
+    fn has_permission(&self, permission: &str) -> bool {
+        self.permissions
+            .iter()
+            .any(|candidate| candidate == permission)
+            || self
+                .role
+                .as_deref()
+                .is_some_and(|role| matches!(role, "admin" | "company_admin"))
+            || self
+                .roles
+                .iter()
+                .any(|role| matches!(role.as_str(), "admin" | "company_admin"))
+    }
+
+    fn is_company_admin(&self) -> bool {
+        self.has_permission("company:settings:manage")
     }
 }
 
@@ -102,11 +125,6 @@ struct AccountResponse {
     role: Option<String>,
     roles: Vec<String>,
     permissions: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BootstrapCompanyRequest {
-    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,12 +204,30 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
     let segments: Vec<_> = path.trim_matches('/').split('/').collect();
     let response = match (method, segments.as_slice()) {
         (Method::Get, ["healthz"]) => Response::ok("ok"),
-        (Method::Get, ["v1", "account"]) => account(&request, &environment).await,
-        (Method::Post, ["v1", "company", "bootstrap"]) => {
-            bootstrap_company(&mut request, &environment).await
+        (Method::Get, ["v1", "auth", "invitations", "resolve"]) => {
+            resolve_workos_invitation(&request, &environment).await
         }
+        (Method::Get, ["v1", "account"]) => account(&request, &environment).await,
         (Method::Put, ["v1", "company", "settings"]) => {
             update_company_settings(&mut request, &environment).await
+        }
+        (Method::Get, ["v1", "platform", "companies"]) => {
+            list_platform_companies(&request, &environment).await
+        }
+        (Method::Post, ["v1", "platform", "companies"]) => {
+            create_platform_company(&mut request, &environment).await
+        }
+        (Method::Post, ["v1", "platform", "companies", company_id, "retry"]) => {
+            retry_platform_company(&request, &environment, company_id).await
+        }
+        (Method::Post, ["v1", "platform", "companies", company_id, "domain"]) => {
+            assign_platform_company_domain(&mut request, &environment, company_id).await
+        }
+        (Method::Post, ["v1", "platform", "companies", company_id, "suspend"]) => {
+            suspend_platform_company(&request, &environment, company_id).await
+        }
+        (Method::Post, ["v1", "platform", "companies", company_id, "activate"]) => {
+            activate_platform_company(&request, &environment, company_id).await
         }
         (Method::Get, ["v1", "agents"]) => list_agents(&request, &environment).await,
         (Method::Post, ["v1", "agents", "events", "subscriptions"]) => {
@@ -292,6 +328,15 @@ async fn authorize_agent(
     ) {
         return Err(Error::RustError("invalid Agent token".into()));
     }
+    if let Some(tenant) = request_tenant_company(&db, request, environment).await? {
+        if tenant.id != credential.company_id || tenant.status != "active" {
+            return Err(Error::RustError(
+                "Agent credential does not match the company hostname".into(),
+            ));
+        }
+    } else if !is_legacy_control_plane_request(request, environment)? {
+        return Err(Error::RustError("Agent company hostname is invalid".into()));
+    }
     Ok(AgentAuthorization {
         company_id: credential.company_id,
         deletion_requested: credential.deletion_requested_at.is_some(),
@@ -299,6 +344,44 @@ async fn authorize_agent(
 }
 
 async fn authorize_workos_user(request: &Request, environment: &Env) -> Result<Identity> {
+    let claims = authorize_workos_claims(request, environment).await?;
+    let workos_organization_id = claims
+        .org_id
+        .as_deref()
+        .ok_or_else(|| Error::RustError("WorkOS session has no organization".into()))?;
+    validate_identifier(workos_organization_id, "WorkOS organization ID")?;
+    let db = environment.d1("DB")?;
+    let company = company_for_request(&db, request, environment, Some(workos_organization_id))
+        .await?
+        .ok_or_else(|| Error::RustError("company has not been provisioned".into()))?;
+    if company.status != "active" && company.status != "awaiting_admin" {
+        return Err(Error::RustError("company is not active".into()));
+    }
+    if company.workos_organization_id.as_deref() != Some(workos_organization_id) {
+        return Err(Error::RustError(
+            "WorkOS organization does not match the company hostname".into(),
+        ));
+    }
+    if company.status == "awaiting_admin" {
+        query!(
+            &db,
+            "UPDATE companies SET status = 'active', provisioning_error = NULL, updated_at = ?1 WHERE id = ?2 AND status = 'awaiting_admin'",
+            now_ms_i64()?,
+            company.id
+        )?
+        .run()
+        .await?;
+    }
+    Ok(Identity {
+        user_id: claims.sub,
+        company_id: company.id,
+        role: claims.role,
+        roles: claims.roles,
+        permissions: claims.permissions,
+    })
+}
+
+async fn authorize_workos_claims(request: &Request, environment: &Env) -> Result<WorkOsClaims> {
     let token = bearer_token(request)?;
     let client_id = environment.var("WORKOS_CLIENT_ID")?.to_string();
     validate_identifier(&client_id, "WorkOS client ID")?;
@@ -347,23 +430,34 @@ async fn authorize_workos_user(request: &Request, environment: &Env) -> Result<I
             "invalid WorkOS access token claims".into(),
         ));
     }
-    let company_id = claims
-        .org_id
-        .ok_or_else(|| Error::RustError("WorkOS session has no organization".into()))?;
-    validate_identifier(&company_id, "WorkOS organization ID")?;
-    Ok(Identity {
-        user_id: claims.sub,
-        company_id,
-        role: claims.role,
-        roles: claims.roles,
-        permissions: claims.permissions,
-    })
+    Ok(claims)
+}
+
+async fn authorize_platform_owner(request: &Request, environment: &Env) -> Result<String> {
+    let hostname = request_hostname(request)?;
+    let expected_hostname = format!("admin.{}", tenant_root_domain(environment)?);
+    if hostname != expected_hostname && !matches!(hostname.as_str(), "localhost" | "127.0.0.1") {
+        return Err(Error::RustError(
+            "platform owner access is restricted to the admin hostname".into(),
+        ));
+    }
+    let claims = authorize_workos_claims(request, environment).await?;
+    let owners = environment.var("PLATFORM_OWNER_USER_IDS")?.to_string();
+    if !owners
+        .split(',')
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty())
+        .any(|owner| owner == claims.sub)
+    {
+        return Err(Error::RustError("platform owner access is required".into()));
+    }
+    Ok(claims.sub)
 }
 
 async fn ensure_company_exists(db: &D1Database, company_id: &str) -> Result<()> {
     if query!(
         db,
-        "SELECT id, name, dashboard_idle_timeout_minutes FROM companies WHERE id = ?1",
+        "SELECT id, name, dashboard_idle_timeout_minutes, slug, status FROM companies WHERE id = ?1",
         company_id
     )?
     .first::<Company>(None)
@@ -432,6 +526,16 @@ mod tests {
         assert!(validate_identifier("device-01.example", "device ID").is_ok());
         assert!(validate_identifier("../device", "device ID").is_err());
         assert!(validate_identifier("device/01", "device ID").is_err());
+    }
+
+    #[test]
+    fn company_slugs_are_dns_safe_and_reserved_names_are_rejected() {
+        assert_eq!(validate_slug("Acme-Support").unwrap(), "acme-support");
+        assert!(validate_slug("admin").is_err());
+        assert!(validate_slug("api").is_err());
+        assert!(validate_slug("-acme").is_err());
+        assert!(validate_slug("acme.example").is_err());
+        assert!(validate_slug("a").is_err());
     }
 
     #[test]
