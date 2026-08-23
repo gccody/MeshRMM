@@ -3,17 +3,22 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-CONFIG_PATH=${1:-"$ROOT_DIR/dist/remote/remote.json"}
+if [ "$#" -gt 0 ]; then
+    CONFIG_PATH=$1
+else
+    CONFIG_PATH="$ROOT_DIR/dist/remote/remote.json"
+    node "$ROOT_DIR/scripts/release-config.mjs" viewer-config "$CONFIG_PATH"
+fi
 DASHBOARD_DOWNLOAD_DIR="$ROOT_DIR/dashboard/public/downloads"
 UPDATE_MANIFEST="$DASHBOARD_DOWNLOAD_DIR/update-manifest.json"
-DOWNLOAD_ORIGIN=${MESHRMM_DOWNLOAD_ORIGIN:-https://meshrmm.com}
+CONFIGURED_DOWNLOAD_ORIGIN=$(node "$ROOT_DIR/scripts/release-config.mjs" download-origin)
+DOWNLOAD_ORIGIN=${MESHRMM_DOWNLOAD_ORIGIN:-$CONFIGURED_DOWNLOAD_ORIGIN}
 CODESIGN_IDENTITY=${MESHRMM_CODESIGN_IDENTITY:--}
 BUILD_TARGET=${MESHRMM_BUILD_TARGET:-}
-VERSION=$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT_DIR/Cargo.toml" | node -e 'let input=""; process.stdin.on("data", chunk => input += chunk).on("end", () => console.log(JSON.parse(input).packages.find(pkg => pkg.name === "meshrmm-remote").version))')
+VERSION=$(node "$ROOT_DIR/scripts/release-config.mjs" version)
 
 if [ ! -f "$CONFIG_PATH" ]; then
     echo "Missing preconfigured viewer settings: $CONFIG_PATH" >&2
-    echo "Run scripts/provision-cloudflare.ps1 on the provisioning machine, then copy remote.json here." >&2
     exit 1
 fi
 

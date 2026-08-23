@@ -64,20 +64,43 @@ stores company-owned Agent records and audit events, and Durable Objects retain
 live signaling state. See [company domains and provisioning](docs/company-domains.md)
 for production setup and onboarding details.
 
-The following commands rebuild the native binaries. The Agent wrapper copies
-the finished generic executable into both `dist/agent/` and the dashboard's
-ignored `public/downloads/` release directory, then publishes its SHA-256 file
-and release-manifest entry. The remote-client wrapper does the same for the
-Windows client. Build both before building/deploying the dashboard so it can
-generate verified per-device installers and serve self-update artifacts:
+### Automated native releases
+
+`release.json` is the single source of truth for the deployed Agent and viewer
+version. To publish an update, increase only its `version` field, commit the
+change, and push it to `main`:
+
+```json
+{
+  "version": "0.2.2",
+  "download_origin": "https://meshrmm.com",
+  "viewer_server": "https://api.meshrmm.com"
+}
+```
+
+The **Publish native release** GitHub Actions workflow validates that the
+version increased, builds the Windows Agent plus Windows, macOS arm64, and
+macOS x64 viewers, generates one verified release manifest, and deploys the
+dashboard containing all update assets. The only required GitHub Actions secret
+is `CLOUDFLARE_API_TOKEN`; configure the optional Apple signing and notarization
+secrets before distributing production macOS builds. See
+[automated native releases](docs/native-releases.md) for the one-time setup and
+recovery procedure.
+
+For local builds, the following wrappers read the same `release.json`. The
+Agent wrapper copies the finished generic executable into both `dist/agent/`
+and the dashboard's ignored `public/downloads/` release directory, then writes
+its SHA-256 file and release-manifest entry. The remote-client wrapper does the
+same for the Windows client:
 
 ```powershell
 & .\scripts\build-agent.ps1
 & .\scripts\build-remote.ps1
 ```
 
-On a Mac, build an application bundle using the `dist/remote/remote.json`
-sidecar:
+On a Mac, build an application bundle. The wrapper generates its non-secret
+`dist/remote/remote.json` sidecar from `release.json` (or accepts an explicit
+sidecar path as its first argument):
 
 ```sh
 sh scripts/build-remote-macos.sh
@@ -95,12 +118,10 @@ Set `MESHRMM_CODESIGN_IDENTITY` to the Developer ID Application certificate
 name before running the script for a production archive; the default is an
 ad-hoc development signature.
 
-All native packages share the workspace version in `Cargo.toml`. Increase that
-semantic version before publishing a release, run the platform build scripts,
-and deploy the dashboard only after `dashboard/public/downloads/update-manifest.json`
-contains every intended platform entry. The manifest and release URLs must use
-HTTPS. Each updater verifies the downloaded artifact against the manifest's
-SHA-256 digest before replacing anything.
+The native update version is compiled from `release.json`; Cargo package
+metadata is not used to decide whether an update is newer. Manifest and release
+URLs must use HTTPS. Each updater verifies the downloaded artifact against the
+manifest's SHA-256 digest before replacing anything.
 
 Creating a new TURN key requires an explicit secure API token with Cloudflare
 Calls Write permission. `scripts/provision-cloudflare.ps1` installs only those

@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const DEFAULT_MANIFEST_URL: &str = "https://meshrmm.com/downloads/update-manifest.json";
+pub const CURRENT_VERSION: &str = env!("MESHRMM_RELEASE_VERSION");
+pub const DEFAULT_MANIFEST_URL: &str = env!("MESHRMM_UPDATE_MANIFEST_URL");
 pub const AGENT_WINDOWS_X64: &str = "agent-windows-x64";
 pub const CLIENT_WINDOWS_X64: &str = "client-windows-x64";
 pub const CLIENT_MACOS_X64: &str = "client-macos-x64";
@@ -102,6 +103,12 @@ mod tests {
             .into_iter()
             .collect(),
         }
+    }
+
+    #[test]
+    fn embeds_valid_release_configuration() {
+        Version::parse(CURRENT_VERSION).unwrap();
+        validate_manifest_url(DEFAULT_MANIFEST_URL).unwrap();
     }
 
     #[test]

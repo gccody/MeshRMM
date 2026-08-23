@@ -6,7 +6,7 @@ use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use meshrmm_self_update::{CLIENT_MACOS_ARM64, CLIENT_MACOS_X64, UpdateManifest};
+use meshrmm_self_update::{CLIENT_MACOS_ARM64, CLIENT_MACOS_X64, CURRENT_VERSION, UpdateManifest};
 
 use crate::config::Config;
 
@@ -36,12 +36,12 @@ pub async fn check_and_schedule(
     } else {
         CLIENT_MACOS_X64
     };
-    let Some(release) = manifest.newer_release(target, env!("CARGO_PKG_VERSION"))? else {
+    let Some(release) = manifest.newer_release(target, CURRENT_VERSION)? else {
         return Ok(false);
     };
 
     tracing::info!(
-        current_version = env!("CARGO_PKG_VERSION"),
+        current_version = CURRENT_VERSION,
         release_version = %release.version,
         "downloading signed macOS client update for this launch"
     );
