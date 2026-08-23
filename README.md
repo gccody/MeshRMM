@@ -226,8 +226,13 @@ development overrides. ICE
 candidate-pair logs identify a `direct` or `turn` connection; periodic WebRTC
 logs include measured RTT.
 
-The native viewer sends mouse, wheel, and physical keyboard input over the
-reliable control channel. Pointer coordinates are normalized to the display
+The native viewer sends mouse, wheel, physical keyboard input, and bidirectional
+plain-text clipboard updates over the reliable control channel. The viewer's
+current text clipboard is copied to the Agent when the session connects; later
+text copies on either computer are mirrored within 250 ms. Clipboard payloads
+are capped at 60 KiB to stay within the control channel's message limit, and
+rich text, images, and file lists remain local.
+Pointer coordinates are normalized to the display
 currently being streamed and every event carries that display ID, so the Agent
 rejects input left over from a previous display after a switch. On Windows,
 press **F8** in the viewer to cycle displays. On macOS, use
@@ -281,9 +286,10 @@ above; do not infer performance measurements from a successful build.
 ## Intentional MVP limits
 
 The Agent/capture implementation remains Windows-only; the viewer supports
-Windows and macOS. The selected display and captured cursor are streamed; there
-is no audio, clipboard, file transfer, recording, simultaneous multi-monitor
-view, browser client, or concurrent viewer. Windows secure-attention sequences
+Windows and macOS. The selected display and captured cursor are streamed.
+Clipboard synchronization is plain text only; there is no audio, file transfer,
+recording, simultaneous multi-monitor view, browser client, or concurrent
+viewer. Windows secure-attention sequences
 such as Ctrl+Alt+Delete cannot be synthesized by a normal user-mode Agent. H.264
 is sent over a purpose-built unreliable WebRTC DataChannel rather than an RTP
 track. Encoded H.264 necessarily crosses CPU memory for packetization and decoder
