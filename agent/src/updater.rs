@@ -6,7 +6,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use meshrmm_self_update::{AGENT_WINDOWS_X64, UpdateManifest};
+use meshrmm_self_update::{AGENT_WINDOWS_X64, CURRENT_VERSION, UpdateManifest};
 use windows_service::service::{ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -23,13 +23,12 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
     let manifest_bytes = download(&http, &config.update_manifest_url, MAX_MANIFEST_BYTES)
         .context("failed to download the Agent update manifest")?;
     let manifest = UpdateManifest::parse(&manifest_bytes)?;
-    let Some(release) = manifest.newer_release(AGENT_WINDOWS_X64, env!("CARGO_PKG_VERSION"))?
-    else {
+    let Some(release) = manifest.newer_release(AGENT_WINDOWS_X64, CURRENT_VERSION)? else {
         return Ok(false);
     };
 
     tracing::info!(
-        current_version = env!("CARGO_PKG_VERSION"),
+        current_version = CURRENT_VERSION,
         release_version = %release.version,
         "downloading automatic Agent update"
     );

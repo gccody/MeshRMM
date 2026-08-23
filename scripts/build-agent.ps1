@@ -1,7 +1,5 @@
 [CmdletBinding()]
-param(
-    [string]$DownloadOrigin = 'https://meshrmm.com'
-)
+param([string]$DownloadOrigin)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -16,7 +14,20 @@ $dashboardExecutable = Join-Path $dashboardDownloadDirectory 'meshrmm-agent-wind
 $dashboardChecksum = "$dashboardExecutable.sha256"
 $updateManifest = Join-Path $dashboardDownloadDirectory 'update-manifest.json'
 $manifestWriter = Join-Path $PSScriptRoot 'update-release-manifest.mjs'
-$workspaceManifest = Join-Path $repositoryRoot 'Cargo.toml'
+$releaseConfig = Join-Path $repositoryRoot 'scripts\release-config.mjs'
+
+if (-not $DownloadOrigin) {
+    $configuredDownloadOrigin = & node $releaseConfig 'download-origin'
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+    $DownloadOrigin = $configuredDownloadOrigin.Trim()
+}
+$configuredVersion = & node $releaseConfig 'version'
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+$version = $configuredVersion.Trim()
 
 & cargo build --locked --release --manifest-path $manifestPath
 if ($LASTEXITCODE -ne 0) {
@@ -35,8 +46,6 @@ try {
 $artifact = Get-Item -LiteralPath $sourceExecutable
 $checksum = Get-FileHash -Algorithm SHA256 -LiteralPath $sourceExecutable
 $checksum.Hash.ToLowerInvariant() | Set-Content -LiteralPath $dashboardChecksum -Encoding ascii -NoNewline
-$metadata = (& cargo metadata --no-deps --format-version 1 --manifest-path $workspaceManifest) | ConvertFrom-Json
-$version = ($metadata.packages | Where-Object name -EQ 'meshrmm-agent').version
 & node $manifestWriter `
     $updateManifest `
     'agent-windows-x64' `

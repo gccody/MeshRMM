@@ -1,23 +1,230 @@
-name: Native release build
+name: Publish native release
 
 on:
+  push:
+    branches: [main]
+    paths: [release.json]
   workflow_dispatch:
+
+concurrency:
+  group: native-release-production
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - id: release
+        name: Read release configuration
+        shell: bash
+        run: |
+          node --test scripts/release-config.test.mjs
+          version=$(node scripts/release-config.mjs version)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Require an increased version
+        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        env:
+          PREVIOUS_COMMIT: ${{ github.event.before }}
+        shell: bash
+        run: |
+          if git show "$PREVIOUS_COMMIT:release.json" > "$RUNNER_TEMP/previous-release.json"; then
+            node scripts/release-config.mjs assert-newer "$RUNNER_TEMP/previous-release.json"
+          else
+            echo "This is the first release.json-backed native release."
+          fi
+
   windows:
+    name: Build Windows Agent and viewer
+    needs: validate
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked --release -p meshrmm-agent -p meshrmm-remote
+      - name: Build release binaries
+        shell: pwsh
+        run: |
+          & .\scripts\build-agent.ps1
+          & .\scripts\build-remote.ps1
+      - name: Collect release artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release-output -Force | Out-Null
+          Copy-Item dashboard\public\downloads\*.exe release-output\
+          Copy-Item dashboard\public\downloads\*.sha256 release-output\
       - uses: actions/upload-artifact@v4
         with:
-          name: meshrmm-windows-x64
-          path: |
-            target/release/meshrmm-agent.exe
-            target/release/meshrmm-remote.exe
+          name: native-windows-${{ needs.validate.outputs.version }}
+          path: release-output/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
+
+  macos:
+    name: Build macOS viewer (${{ matrix.arch }})
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            archive: meshrmm-remote-macos-arm64.zip
+            app_directory: dist/remote-macos/MeshRMM Remote.app
+          - arch: x64
+            runner: macos-15-intel
+            archive: meshrmm-remote-macos-x64.zip
+            app_directory: dist/remote-macos-x64/MeshRMM Remote.app
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Configure Developer ID signing
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+        shell: bash
+        run: |
+          if [ -z "$CERTIFICATE_P12_BASE64" ]; then
+            echo "::warning::No macOS signing certificate is configured; using an ad-hoc signature."
+            echo "MESHRMM_CODESIGN_IDENTITY=-" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if [ -z "$CERTIFICATE_PASSWORD" ] || [ -z "$CODESIGN_IDENTITY" ]; then
+            echo "::error::The macOS certificate password and signing identity secrets are required with the certificate."
+            exit 1
+          fi
+          certificate_path="$RUNNER_TEMP/meshrmm-release.p12"
+          keychain_path="$RUNNER_TEMP/meshrmm-signing.keychain-db"
+          keychain_password=$(openssl rand -base64 24)
+          printf '%s' "$CERTIFICATE_P12_BASE64" | openssl base64 -d -A > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain_path"
+          security list-keychain -d user -s "$keychain_path"
+          echo "MESHRMM_CODESIGN_IDENTITY=$CODESIGN_IDENTITY" >> "$GITHUB_ENV"
+      - name: Build signed viewer archive
+        shell: bash
+        run: sh scripts/build-remote-macos.sh
+      - name: Notarize and staple viewer when credentials are configured
+        env:
+          NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          ARCHIVE: dashboard/public/downloads/${{ matrix.archive }}
+          APP_DIRECTORY: ${{ matrix.app_directory }}
+        shell: bash
+        run: |
+          if [ -z "$NOTARY_APPLE_ID" ] && [ -z "$NOTARY_TEAM_ID" ] && [ -z "$NOTARY_PASSWORD" ]; then
+            echo "::warning::No Apple notarization credentials are configured; publishing the signed archive without notarization."
+            exit 0
+          fi
+          if [ -z "$NOTARY_APPLE_ID" ] || [ -z "$NOTARY_TEAM_ID" ] || [ -z "$NOTARY_PASSWORD" ]; then
+            echo "::error::All three macOS notarization secrets must be configured together."
+            exit 1
+          fi
+          xcrun notarytool submit "$ARCHIVE" \
+            --apple-id "$NOTARY_APPLE_ID" \
+            --team-id "$NOTARY_TEAM_ID" \
+            --password "$NOTARY_PASSWORD" \
+            --wait
+          xcrun stapler staple "$APP_DIRECTORY"
+          rm -f -- "$ARCHIVE"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_DIRECTORY" "$ARCHIVE"
+      - name: Collect release artifact
+        env:
+          ARCHIVE: dashboard/public/downloads/${{ matrix.archive }}
+        shell: bash
+        run: |
+          mkdir -p release-output
+          cp "$ARCHIVE" release-output/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-macos-${{ matrix.arch }}-${{ needs.validate.outputs.version }}
+          path: release-output/
+          if-no-files-found: error
+          retention-days: 14
+
+  deploy:
+    name: Publish downloads to Cloudflare
+    needs: [validate, windows, macos]
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      CLOUDFLARE_ACCOUNT_ID: "023f5fc9ffca88a15dac8e9f27b8d21f"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-windows-${{ needs.validate.outputs.version }}
+          path: dashboard/public/downloads
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-macos-arm64-${{ needs.validate.outputs.version }}
+          path: dashboard/public/downloads
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-macos-x64-${{ needs.validate.outputs.version }}
+          path: dashboard/public/downloads
+      - name: Generate the release manifest
+        shell: bash
+        run: |
+          version=$(node scripts/release-config.mjs version)
+          origin=$(node scripts/release-config.mjs download-origin)
+          manifest=dashboard/public/downloads/update-manifest.json
+          rm -f -- "$manifest"
+          node scripts/update-release-manifest.mjs "$manifest" agent-windows-x64 "$version" "$origin/downloads/meshrmm-agent-windows-x64.exe" dashboard/public/downloads/meshrmm-agent-windows-x64.exe
+          node scripts/update-release-manifest.mjs "$manifest" client-windows-x64 "$version" "$origin/downloads/meshrmm-remote-windows-x64.exe" dashboard/public/downloads/meshrmm-remote-windows-x64.exe
+          node scripts/update-release-manifest.mjs "$manifest" client-macos-arm64 "$version" "$origin/downloads/meshrmm-remote-macos-arm64.zip" dashboard/public/downloads/meshrmm-remote-macos-arm64.zip
+          node scripts/update-release-manifest.mjs "$manifest" client-macos-x64 "$version" "$origin/downloads/meshrmm-remote-macos-x64.zip" dashboard/public/downloads/meshrmm-remote-macos-x64.zip
+          node scripts/verify-release-assets.mjs "$manifest"
+      - name: Upload assembled release for recovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-release-${{ needs.validate.outputs.version }}
+          path: dashboard/public/downloads/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Install dashboard dependencies
+        working-directory: dashboard
+        run: npm ci
+      - name: Verify Cloudflare credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::error::Add CLOUDFLARE_API_TOKEN to the production GitHub environment or repository secrets."
+            exit 1
+          fi
+      - name: Build and deploy dashboard with native downloads
+        working-directory: dashboard
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npm run deploy
