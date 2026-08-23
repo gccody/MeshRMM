@@ -12,7 +12,6 @@ const expected = {
   "agent-windows-x64": "meshrmm-agent-windows-x64.exe",
   "client-windows-x64": "meshrmm-remote-windows-x64.exe",
   "client-macos-arm64": "meshrmm-remote-macos-arm64.zip",
-  "client-macos-x64": "meshrmm-remote-macos-x64.zip",
 };
 
 if (manifest.schema_version !== 1) throw new Error("release manifest schema must be 1");

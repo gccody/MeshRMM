@@ -55,7 +55,14 @@ jobs:
         with:
           node-version: 22
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore Windows Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-windows-x64
+          workspaces: ". -> target"
+          cache-targets: true
+          cache-workspace-crates: true
+          cache-on-failure: true
       - name: Build release binaries
         shell: pwsh
         run: |
@@ -75,28 +82,23 @@ jobs:
           retention-days: 14
 
   macos:
-    name: Build macOS viewer (${{ matrix.arch }})
+    name: Build macOS viewer (Apple Silicon)
     needs: validate
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-15
-            archive: meshrmm-remote-macos-arm64.zip
-            app_directory: dist/remote-macos/MeshRMM Remote.app
-          - arch: x64
-            runner: macos-15-intel
-            archive: meshrmm-remote-macos-x64.zip
-            app_directory: dist/remote-macos-x64/MeshRMM Remote.app
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore Apple Silicon Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-macos-arm64
+          workspaces: ". -> target"
+          cache-targets: true
+          cache-workspace-crates: true
+          cache-on-failure: true
       - name: Configure Developer ID signing
         env:
           CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -132,8 +134,8 @@ jobs:
           NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
           NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
           NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
-          ARCHIVE: dashboard/public/downloads/${{ matrix.archive }}
-          APP_DIRECTORY: ${{ matrix.app_directory }}
+          ARCHIVE: dashboard/public/downloads/meshrmm-remote-macos-arm64.zip
+          APP_DIRECTORY: dist/remote-macos/MeshRMM Remote.app
         shell: bash
         run: |
           if [ -z "$NOTARY_APPLE_ID" ] && [ -z "$NOTARY_TEAM_ID" ] && [ -z "$NOTARY_PASSWORD" ]; then
@@ -154,14 +156,14 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "$APP_DIRECTORY" "$ARCHIVE"
       - name: Collect release artifact
         env:
-          ARCHIVE: dashboard/public/downloads/${{ matrix.archive }}
+          ARCHIVE: dashboard/public/downloads/meshrmm-remote-macos-arm64.zip
         shell: bash
         run: |
           mkdir -p release-output
           cp "$ARCHIVE" release-output/
       - uses: actions/upload-artifact@v4
         with:
-          name: native-macos-${{ matrix.arch }}-${{ needs.validate.outputs.version }}
+          name: native-macos-arm64-${{ needs.validate.outputs.version }}
           path: release-output/
           if-no-files-found: error
           retention-days: 14
@@ -188,10 +190,6 @@ jobs:
         with:
           name: native-macos-arm64-${{ needs.validate.outputs.version }}
           path: dashboard/public/downloads
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-macos-x64-${{ needs.validate.outputs.version }}
-          path: dashboard/public/downloads
       - name: Generate the release manifest
         shell: bash
         run: |
@@ -202,7 +200,6 @@ jobs:
           node scripts/update-release-manifest.mjs "$manifest" agent-windows-x64 "$version" "$origin/downloads/meshrmm-agent-windows-x64.exe" dashboard/public/downloads/meshrmm-agent-windows-x64.exe
           node scripts/update-release-manifest.mjs "$manifest" client-windows-x64 "$version" "$origin/downloads/meshrmm-remote-windows-x64.exe" dashboard/public/downloads/meshrmm-remote-windows-x64.exe
           node scripts/update-release-manifest.mjs "$manifest" client-macos-arm64 "$version" "$origin/downloads/meshrmm-remote-macos-arm64.zip" dashboard/public/downloads/meshrmm-remote-macos-arm64.zip
-          node scripts/update-release-manifest.mjs "$manifest" client-macos-x64 "$version" "$origin/downloads/meshrmm-remote-macos-x64.zip" dashboard/public/downloads/meshrmm-remote-macos-x64.zip
           node scripts/verify-release-assets.mjs "$manifest"
       - name: Upload assembled release for recovery
         uses: actions/upload-artifact@v4
