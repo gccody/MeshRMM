@@ -2,7 +2,9 @@
 
 The MeshRMM dashboard is a vinext/React application hosted on Cloudflare. It
 uses WorkOS for user and organization identity and calls the Rust control-plane
-Worker for all tenant-scoped Agent operations.
+Worker for all tenant-scoped Agent operations. It serves marketing on
+`meshrmm.com`, the owner console on `admin.meshrmm.com`, and company dashboards
+on immutable `<slug>.meshrmm.com` hostnames.
 
 ## Prerequisites
 
@@ -23,6 +25,8 @@ Application code is organized by responsibility:
 - `features/agents/` owns Agent models, event-stream synchronization, and UI.
 - `features/enrollment/` owns installer enrollment UI.
 - `features/session/` owns organization-scoped dashboard inactivity handling.
+- `features/platform/` owns invite-only company provisioning for the platform owner.
+- `features/marketing/` owns the public root-domain experience.
 - `lib/` contains shared browser HTTP behavior.
 - `wrangler.jsonc` owns the production Worker, domain, and runtime settings.
 
@@ -40,6 +44,9 @@ largest MeshRMM organization timeout (24 hours). If it remains at five minutes,
 WorkOS can expire a suspended browser tab before MeshRMM's tenant policy does.
 MeshRMM permits AuthKit's automatic refresh while the page is in the background,
 so an open dashboard remains active whenever the browser is still running it.
+
+See [company domains and provisioning](../docs/company-domains.md) for wildcard
+DNS, WorkOS redirect/CORS configuration, owner identity, and deployment order.
 
 ## Verification
 

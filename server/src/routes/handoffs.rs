@@ -57,7 +57,7 @@ pub(crate) async fn create_handoff(request: &mut Request, environment: &Env) -> 
     .await?;
     Response::from_json(&HandoffResponse {
         handoff_token,
-        api_url: public_api_url(environment)?,
+        api_url: canonical_company_url(&db, environment, &identity.company_id).await?,
         expires_at_unix_ms: expires_at,
     })
 }
@@ -70,14 +70,30 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
     let token_hash = sha256_hex(&supplied);
     let now = now_ms_i64()?;
     let db = environment.d1("DB")?;
-    let handoff = query!(
-        &db,
-        "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id",
-        now,
-        token_hash
-    )?
-    .first::<HandoffRow>(None)
-    .await?;
+    let request_tenant = request_tenant_company(&db, request, environment).await?;
+    if request_tenant.is_none() && !is_legacy_control_plane_request(request, environment)? {
+        return api_error(404, "company hostname was not found");
+    }
+    let handoff = if let Some(tenant) = request_tenant.as_ref() {
+        query!(
+            &db,
+            "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND company_id = ?3 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id",
+            now,
+            token_hash,
+            tenant.id
+        )?
+        .first::<HandoffRow>(None)
+        .await?
+    } else {
+        query!(
+            &db,
+            "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id",
+            now,
+            token_hash
+        )?
+        .first::<HandoffRow>(None)
+        .await?
+    };
     let Some(handoff) = handoff else {
         return api_error(401, "remote handoff is invalid, expired, or already used");
     };

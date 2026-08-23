@@ -18,12 +18,37 @@
     {
       "pattern": "www.meshrmm.com",
       "custom_domain": true
+    },
+    {
+      "pattern": "admin.meshrmm.com",
+      "custom_domain": true
+    },
+    {
+      "pattern": "auth.meshrmm.com",
+      "custom_domain": true
+    },
+    {
+      "pattern": "*.meshrmm.com/*",
+      "zone_name": "meshrmm.com"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "pulsermm-production",
+      "database_id": "4650d279-149e-4a0b-8ec9-3058711885ea"
+    }
+  ],
+  "services": [
+    {
+      "binding": "MESHRMM_API",
+      "service": "pulsermm-server"
     }
   ],
   "vars": {
     "WORKOS_CLIENT_ID": "client_01M0FT1AN01PAT37N98EMRSNVW",
     "WORKOS_REDIRECT_URI": "https://meshrmm.com",
-    "MESHRMM_SERVER_URL": "https://api.meshrmm.com"
+    "MESHRMM_SERVER_URL": ""
   },
   "observability": {
     "enabled": true,

@@ -21,5 +21,6 @@ serde_json.workspace = true
 sha2 = "0.11.0"
 subtle = "2.6.1"
 uuid = { version = "1.24.1", features = ["v4", "js"] }
+url.workspace = true
 worker = { version = "0.8.5", features = ["d1", "http"] }
 worker-macros = { version = "0.8.5", features = ["http"] }

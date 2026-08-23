@@ -55,11 +55,14 @@ contextual error if the required hardware path is unavailable.
 
 The viewer loads sidecar JSON next to its executable. The installed Agent reads
 its protected configuration from `%ProgramData%\MeshRMM\Agent\agent.json`.
-No environment variables are required on Agent or viewer machines. The
-production control plane is deployed at `https://meshrmm.com`. WorkOS
-organizations and memberships define the company boundary, Cloudflare D1 stores
-company-owned Agent records and audit events, and Durable Objects retain live
-signaling state.
+No environment variables are required on Agent or viewer machines. The public
+site is deployed at `https://meshrmm.com`; the owner console lives at
+`https://admin.meshrmm.com`, and each company uses an immutable
+`https://<slug>.meshrmm.com` dashboard and Agent control-plane endpoint. WorkOS
+organizations and memberships define the identity boundary, Cloudflare D1
+stores company-owned Agent records and audit events, and Durable Objects retain
+live signaling state. See [company domains and provisioning](docs/company-domains.md)
+for production setup and onboarding details.
 
 The following commands rebuild the native binaries. The Agent wrapper copies
 the finished generic executable into both `dist/agent/` and the dashboard's
@@ -135,8 +138,8 @@ Pop-Location
 
 ### Web dashboard
 
-The responsive dashboard at `https://meshrmm.com` lists only Agents
-owned by the organization in the current WorkOS token. It receives inventory
+The responsive dashboard at `https://<company>.meshrmm.com` lists only Agents
+owned by the organization bound to that hostname and the current WorkOS token. It receives inventory
 and connection changes from a company-scoped, hibernating WebSocket event
 stream instead of polling. The browser obtains a 60-second, one-use
 subscription token and reconnects automatically; **Refresh** requests a single
@@ -147,7 +150,9 @@ entered into or retained by the browser.
 
 Company administrators use the embedded WorkOS user-management, domain, and
 SSO widgets to invite users, assign roles, verify domains, and configure a SAML
-or OIDC identity provider. They can also set an organization-specific dashboard
+or OIDC identity provider. The application has no company switcher; a user with
+multiple memberships signs into another company by visiting its URL. Company
+administrators can also set an organization-specific dashboard
 idle timeout under **Profile & session**; new organizations default to four
 hours. WorkOS's application-wide inactivity timeout must be at least as long as
 the largest permitted organization policy (24 hours) so WorkOS's session policy

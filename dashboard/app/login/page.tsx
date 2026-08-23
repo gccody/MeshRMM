@@ -3,18 +3,24 @@
 import { useAuth } from "@workos-inc/authkit-react";
 import { LoaderCircle, ShieldCheck } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { LOGIN_ATTEMPT_KEY } from "../providers";
+import { LOGIN_ATTEMPT_KEY, useRuntimeConfig } from "../providers";
 
 const LOGIN_ATTEMPT_TTL_MS = 30_000;
 
 export default function LoginRoute() {
   const { isLoading, user, signIn } = useAuth();
+  const { surface, workosOrganizationId } = useRuntimeConfig();
   const started = useRef(false);
   const [isPaused, setIsPaused] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (isLoading || started.current) return;
+
+    if (surface === "marketing") {
+      window.location.replace("/");
+      return;
+    }
 
     if (user) {
       window.sessionStorage.removeItem(LOGIN_ATTEMPT_KEY);
@@ -32,11 +38,16 @@ export default function LoginRoute() {
     }
 
     window.sessionStorage.setItem(LOGIN_ATTEMPT_KEY, String(now));
-    void signIn({ state: { returnTo: "/" } }).catch((signInError: unknown) => {
+    const invitationToken = new URLSearchParams(window.location.search).get("invitation_token") ?? undefined;
+    void signIn({
+      invitationToken,
+      organizationId: surface === "tenant" ? workosOrganizationId : undefined,
+      state: { returnTo: "/" },
+    }).catch((signInError: unknown) => {
       window.sessionStorage.removeItem(LOGIN_ATTEMPT_KEY);
       setError(signInError instanceof Error ? signInError.message : "WorkOS sign-in could not be started.");
     });
-  }, [isLoading, signIn, user]);
+  }, [isLoading, signIn, surface, user, workosOrganizationId]);
 
   const retry = () => {
     window.sessionStorage.removeItem(LOGIN_ATTEMPT_KEY);

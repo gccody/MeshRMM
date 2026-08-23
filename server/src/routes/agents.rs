@@ -5,7 +5,7 @@ pub(crate) async fn create_agent_installer(
     environment: &Env,
 ) -> Result<Response> {
     let identity = match authorize_workos_user(request, environment).await {
-        Ok(identity) if identity.is_admin() => identity,
+        Ok(identity) if identity.has_permission("agents:manage") => identity,
         Ok(_) => return api_error(403, "company administrator access is required"),
         Err(error) => return workos_auth_error(error),
     };
@@ -56,7 +56,7 @@ pub(crate) async fn create_agent_installer(
     )
     .await?;
     Response::from_json(&AgentInstallerBootstrap {
-        server: public_api_url(environment)?,
+        server: canonical_company_url(&db, environment, &identity.company_id).await?,
         install_token,
         expires_at_unix_ms: expires_at,
     })
@@ -78,14 +78,33 @@ pub(crate) async fn redeem_agent_installer(
     let now = now_ms_i64()?;
     let db = environment.d1("DB")?;
     let token_hash = sha256_hex(&supplied);
-    let ticket = query!(
-        &db,
-        "UPDATE agent_install_tokens SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 RETURNING id, company_id, created_by_user_id",
-        now,
-        token_hash
-    )?
-    .first::<AgentInstallTokenRow>(None)
-    .await?;
+    let request_tenant = request_tenant_company(&db, request, environment).await?;
+    if request_tenant.is_none() && !is_legacy_control_plane_request(request, environment)? {
+        return api_error(404, "company hostname was not found");
+    }
+    let ticket = if let Some(tenant) = request_tenant.as_ref() {
+        if tenant.status != "active" && tenant.status != "awaiting_admin" {
+            return api_error(403, "company is not active");
+        }
+        query!(
+            &db,
+            "UPDATE agent_install_tokens SET used_at = ?1 WHERE token_hash = ?2 AND company_id = ?3 AND used_at IS NULL AND expires_at > ?1 RETURNING id, company_id, created_by_user_id",
+            now,
+            token_hash,
+            tenant.id
+        )?
+        .first::<AgentInstallTokenRow>(None)
+        .await?
+    } else {
+        query!(
+            &db,
+            "UPDATE agent_install_tokens SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 RETURNING id, company_id, created_by_user_id",
+            now,
+            token_hash
+        )?
+        .first::<AgentInstallTokenRow>(None)
+        .await?
+    };
     let Some(ticket) = ticket else {
         return api_error(401, "Agent installer is invalid, expired, or already used");
     };
@@ -131,7 +150,7 @@ pub(crate) async fn redeem_agent_installer(
         console_error!("event=agent_created_publish_failed error={}", error);
     }
     Response::from_json(&AgentConfig {
-        server: public_api_url(environment)?,
+        server: canonical_company_url(&db, environment, &identity.company_id).await?,
         device_id,
         agent_token,
         update_manifest_url: update_manifest_url(environment)?,
@@ -148,7 +167,7 @@ pub(crate) async fn delete_agent(
 ) -> Result<Response> {
     validate_identifier(device_id, "device ID")?;
     let identity = match authorize_workos_user(request, environment).await {
-        Ok(identity) if identity.is_admin() => identity,
+        Ok(identity) if identity.has_permission("agents:manage") => identity,
         Ok(_) => return api_error(403, "company administrator access is required"),
         Err(error) => return workos_auth_error(error),
     };
@@ -192,7 +211,7 @@ pub(crate) async fn rotate_agent_token(
 ) -> Result<Response> {
     validate_identifier(device_id, "device ID")?;
     let identity = match authorize_workos_user(request, environment).await {
-        Ok(identity) if identity.is_admin() => identity,
+        Ok(identity) if identity.has_permission("agents:manage") => identity,
         Ok(_) => return api_error(403, "company administrator access is required"),
         Err(error) => return workos_auth_error(error),
     };
