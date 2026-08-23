@@ -79,10 +79,10 @@ change, and push it to `main`:
 ```
 
 The **Publish native release** GitHub Actions workflow validates that the
-version increased, builds the Windows Agent plus Windows, macOS arm64, and
-macOS x64 viewers, generates one verified release manifest, and deploys the
-dashboard containing all update assets. The only required GitHub Actions secret
-is `CLOUDFLARE_API_TOKEN`; configure the optional Apple signing and notarization
+version increased, builds the Windows Agent plus Windows and Apple Silicon
+macOS viewers, generates one verified release manifest, and deploys the
+dashboard containing all update assets. The only required GitHub Actions secret is
+`CLOUDFLARE_API_TOKEN`; configure the optional Apple signing and notarization
 secrets before distributing production macOS builds. See
 [automated native releases](docs/native-releases.md) for the one-time setup and
 recovery procedure.

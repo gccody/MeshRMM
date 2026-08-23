@@ -58,7 +58,17 @@ CI builds these targets in parallel:
 - `agent-windows-x64`
 - `client-windows-x64`
 - `client-macos-arm64`
-- `client-macos-x64`
+
+GitHub CI publishes only the current Apple Silicon macOS viewer. The local
+macOS wrapper retains its x64 build path for development or manual legacy
+builds, but x64 is not included in the automated update manifest.
+
+Windows and Apple Silicon use separate persistent Rust build caches. CI restores
+the Cargo registry, dependency artifacts, and unchanged workspace crates before
+building, and saves useful compiler output even when a later packaging or
+deployment step fails. The first build on each platform is still a cold build;
+subsequent releases reuse the cache until the Rust toolchain or Cargo dependency
+configuration changes.
 
 The deploy job waits for every build, assembles
 `dashboard/public/downloads/update-manifest.json`, uploads a recoverable copy of
