@@ -1,3 +1,4 @@
+mod clipboard;
 mod config;
 mod debug;
 #[cfg(any(target_os = "macos", test))]

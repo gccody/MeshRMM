@@ -23,6 +23,7 @@ use webrtc::peer_connection::{
 };
 use webrtc::stats::StatsReportType;
 
+use super::clipboard::ClipboardSync;
 use super::input::WindowsInputController;
 use super::platform::{ScreenStreamer, monotonic_timestamp_us};
 use super::signaling::authenticated_websocket;
@@ -33,6 +34,7 @@ enum ControlCommand {
     Bitrate(u32),
     SelectDisplay(DisplayId),
     Input(RemoteInput),
+    Clipboard(String),
     ChannelClosed,
     Stop,
 }
@@ -141,6 +143,7 @@ async fn run_connected_sender(
                         Some(ControlCommand::SelectDisplay(display_id))
                     }
                     Ok(SessionMessage::Input(input)) => Some(ControlCommand::Input(input)),
+                    Ok(SessionMessage::Clipboard { text }) => Some(ControlCommand::Clipboard(text)),
                     Ok(SessionMessage::Stop { .. }) => Some(ControlCommand::Stop),
                     Ok(_) => None,
                     Err(error) => {
@@ -172,6 +175,13 @@ async fn run_connected_sender(
     };
     let mut input = WindowsInputController::new();
     input.set_active_display(active_display.clone())?;
+    let mut clipboard = match ClipboardSync::new() {
+        Ok(clipboard) => Some(clipboard),
+        Err(error) => {
+            tracing::warn!(error = %error, "clipboard sync is unavailable for this Agent session");
+            None
+        }
+    };
     let video_sender = spawn_video_sender(
         Arc::clone(&video_channel),
         Arc::clone(&video_open),
@@ -196,6 +206,8 @@ async fn run_connected_sender(
     stats_interval.tick().await;
     let mut cursor_interval = tokio::time::interval(std::time::Duration::from_millis(16));
     cursor_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut clipboard_interval = tokio::time::interval(std::time::Duration::from_millis(250));
+    clipboard_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut sent_cursor_shape = None::<CursorShape>;
     let mut offer_sent = false;
     let mut remote_description_set = false;
@@ -255,6 +267,13 @@ async fn run_connected_sender(
                             tracing::warn!(error = %error, "discarding invalid remote input");
                         }
                     }
+                    ControlCommand::Clipboard(text) => {
+                        if let Some(clipboard) = clipboard.as_mut()
+                            && let Err(error) = clipboard.apply(text)
+                        {
+                            tracing::warn!(error = %error, "discarding viewer clipboard update");
+                        }
+                    }
                     ControlCommand::SelectDisplay(display_id) => {
                         if display_id == active_display.id {
                             continue;
@@ -289,6 +308,22 @@ async fn run_connected_sender(
                         break Err(anyhow::anyhow!(
                             "remote input/control channel closed unexpectedly"
                         ));
+                    }
+                }
+            }
+            _ = clipboard_interval.tick(), if session_state == SessionState::Streaming
+                && clipboard.is_some()
+                && control_channel.ready_state() == RTCDataChannelState::Open => {
+                if let Some(clipboard) = clipboard.as_mut() {
+                    match clipboard.poll() {
+                        Ok(Some(text)) => {
+                            send_control_message(
+                                &control_channel,
+                                SessionMessage::Clipboard { text },
+                            ).await?;
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(error = %error, "could not synchronize the Agent clipboard"),
                     }
                 }
             }

@@ -4,6 +4,9 @@ use crate::{CursorShape, DisplayId, RemoteInput, RemoteSessionId, VideoStreamId}
 
 pub const CONTROL_CHANNEL_LABEL: &str = "meshrmm-control-v3";
 pub const CONTROL_CHANNEL_PROTOCOL: &str = "meshrmm.control.v3";
+/// Maximum UTF-8 payload accepted for a clipboard update. Clipboard messages
+/// share the reliable control channel with latency-sensitive input.
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 60 * 1024;
 
 /// Reliable session-control and input messages carried by the control data channel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,6 +54,11 @@ pub enum SessionMessage {
     /// viewers map unsupported shapes back to their normal default cursor.
     CursorShape {
         shape: CursorShape,
+    },
+    /// Replaces the peer's clipboard with UTF-8 plain text. Rich text, images,
+    /// and file lists are intentionally not carried by the control channel.
+    Clipboard {
+        text: String,
     },
 }
 
@@ -184,5 +192,24 @@ mod tests {
 
         let encoded = message.encode().unwrap();
         assert_eq!(SessionMessage::decode(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn clipboard_text_round_trips_through_control_channel() {
+        let message = SessionMessage::Clipboard {
+            text: "copied on the other computer — 📋".into(),
+        };
+
+        let encoded = message.encode().unwrap();
+        assert_eq!(SessionMessage::decode(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn maximum_clipboard_text_fits_the_sctp_message_limit() {
+        let message = SessionMessage::Clipboard {
+            text: "a".repeat(MAX_CLIPBOARD_TEXT_BYTES),
+        };
+
+        assert!(message.encode().unwrap().len() <= 65_536);
     }
 }

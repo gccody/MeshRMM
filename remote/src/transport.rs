@@ -12,7 +12,7 @@ use meshrmm_protocol::{
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use webrtc::api::APIBuilder;
-use webrtc::data_channel::RTCDataChannel;
+use webrtc::data_channel::{RTCDataChannel, data_channel_state::RTCDataChannelState};
 use webrtc::ice_transport::{ice_candidate::RTCIceCandidateInit, ice_server::RTCIceServer};
 use webrtc::peer_connection::{
     RTCPeerConnection, configuration::RTCConfiguration,
@@ -20,12 +20,14 @@ use webrtc::peer_connection::{
 };
 use webrtc::stats::StatsReportType;
 
+use crate::clipboard::ClipboardSync;
 use crate::config::Config;
 use crate::debug::DebugInfo;
 use crate::platform::{ControlSink, Presenter, monotonic_timestamp_us};
 use crate::signaling::{authenticated_websocket, session_signal_url};
 
 const SESSION_ACTIVITY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const CLIPBOARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const POINTER_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
 
 struct ActivePresenter {
@@ -149,6 +151,7 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
     let control_channel = Arc::new(Mutex::new(None::<Arc<RTCDataChannel>>));
     let (viewer_control_tx, mut viewer_control_rx) = mpsc::unbounded_channel::<SessionMessage>();
     let viewer_control = ViewerControlQueue::new(viewer_control_tx);
+    let (remote_clipboard_tx, mut remote_clipboard_rx) = mpsc::unbounded_channel::<String>();
     let (presentation_failure_tx, mut presentation_failure_rx) =
         mpsc::unbounded_channel::<String>();
     install_data_channel_handler(
@@ -156,6 +159,7 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
         Arc::clone(&presenter),
         Arc::clone(&control_channel),
         viewer_control.clone(),
+        remote_clipboard_tx,
         presentation_failure_tx,
         debug.clone(),
     );
@@ -169,6 +173,15 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
     let mut activity_interval = tokio::time::interval(SESSION_ACTIVITY_INTERVAL);
     activity_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     activity_interval.tick().await;
+    let mut clipboard = match ClipboardSync::new(true) {
+        Ok(clipboard) => Some(clipboard),
+        Err(error) => {
+            tracing::warn!(error = %error, "clipboard sync is unavailable for this viewer session");
+            None
+        }
+    };
+    let mut clipboard_interval = tokio::time::interval(CLIPBOARD_POLL_INTERVAL);
+    clipboard_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut remote_description_set = false;
     let mut pending_candidates = Vec::new();
     // Pointer pacing must not depend on the receiver loop being available: a
@@ -191,6 +204,27 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                 let bytes = message.encode().context("failed to encode viewer control message")?;
                 channel.send(&Bytes::from(bytes)).await
                     .context("failed to send viewer control message")?;
+            }
+            Some(text) = remote_clipboard_rx.recv() => {
+                if let Some(clipboard) = clipboard.as_mut()
+                    && let Err(error) = clipboard.apply(text)
+                {
+                    tracing::warn!(error = %error, "discarding remote clipboard update");
+                }
+            }
+            _ = clipboard_interval.tick(), if session_state == SessionState::Streaming && clipboard.is_some() => {
+                let channel_open = control_channel
+                    .lock()
+                    .ok()
+                    .and_then(|channel| channel.clone())
+                    .is_some_and(|channel| channel.ready_state() == RTCDataChannelState::Open);
+                if channel_open && let Some(clipboard) = clipboard.as_mut() {
+                    match clipboard.poll() {
+                        Ok(Some(text)) => viewer_control.send(SessionMessage::Clipboard { text }),
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(error = %error, "could not synchronize the viewer clipboard"),
+                    }
+                }
             }
             _ = activity_interval.tick(), if session_state == SessionState::Streaming => {
                 outgoing_tx.send(SignalMessage::Activity)?;
@@ -440,6 +474,7 @@ fn install_data_channel_handler(
     presenter: Arc<Mutex<Option<ActivePresenter>>>,
     control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     viewer_control: ViewerControlQueue,
+    remote_clipboard: mpsc::UnboundedSender<String>,
     presentation_failure: mpsc::UnboundedSender<String>,
     debug: DebugInfo,
 ) {
@@ -447,6 +482,7 @@ fn install_data_channel_handler(
         let presenter = Arc::clone(&presenter);
         let control_channel = Arc::clone(&control_channel);
         let viewer_control = viewer_control.clone();
+        let remote_clipboard = remote_clipboard.clone();
         let presentation_failure = presentation_failure.clone();
         let debug = debug.clone();
         Box::pin(async move {
@@ -460,6 +496,7 @@ fn install_data_channel_handler(
                         channel,
                         presenter,
                         viewer_control,
+                        remote_clipboard,
                         presentation_failure,
                         debug,
                     )
@@ -475,6 +512,7 @@ fn install_control_handler(
     channel: Arc<RTCDataChannel>,
     presenter: Arc<Mutex<Option<ActivePresenter>>>,
     viewer_control: ViewerControlQueue,
+    remote_clipboard: mpsc::UnboundedSender<String>,
     presentation_failure: mpsc::UnboundedSender<String>,
     debug: DebugInfo,
 ) {
@@ -497,6 +535,7 @@ fn install_control_handler(
         let presenter = Arc::clone(&presenter);
         let cursor_shape = Arc::clone(&cursor_shape);
         let viewer_control = viewer_control.clone();
+        let remote_clipboard = remote_clipboard.clone();
         let presentation_failure = presentation_failure.clone();
         let debug = debug.clone();
         Box::pin(async move {
@@ -572,6 +611,9 @@ fn install_control_handler(
                     {
                         active.presenter.set_cursor_shape(shape);
                     }
+                }
+                Ok(SessionMessage::Clipboard { text }) => {
+                    let _ = remote_clipboard.send(text);
                 }
                 Ok(_) => {}
                 Err(error) => tracing::warn!(error = %error, "discarding invalid control message"),
