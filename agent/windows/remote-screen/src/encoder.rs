@@ -259,7 +259,7 @@ impl MediaFoundationH264Encoder {
             let _ = ManuallyDrop::take(&mut output.pEvents);
             process_result.map_err(Error::Output)?;
             let sample = sample.ok_or(Error::MissingOutputSample)?;
-            let keyframe = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
+            let clean_point = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
             let buffer = sample.ConvertToContiguousBuffer().map_err(Error::Output)?;
             let mut data_ptr = ptr::null_mut();
             let mut current_length = 0_u32;
@@ -272,6 +272,10 @@ impl MediaFoundationH264Encoder {
                 std::slice::from_raw_parts(data_ptr, current_length as usize).to_vec()
             };
             buffer.Unlock().map_err(Error::Output)?;
+            // Several hardware MFTs omit CleanPoint on forced IDRs. Inspecting
+            // the access unit prevents a valid recovery frame from being
+            // mislabeled and discarded by a decoder waiting for an IDR.
+            let keyframe = clean_point || contains_h264_idr(&data);
             let mut codec_config = None;
             // Some hardware MFTs omit MFSampleExtension_CleanPoint on their
             // first IDR. The decoder still needs SPS/PPS before that first
@@ -450,7 +454,10 @@ fn configure_codec(
         (&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0_i32)),
         (
             &CODECAPI_AVEncMPVGOPSize,
-            VARIANT::from((frames_per_second.saturating_mul(2)) as i32),
+            // A one-second periodic IDR is a cheap safety net for hardware
+            // encoders that reject runtime keyframe requests. On-demand IDRs
+            // remain the normal fast recovery path.
+            VARIANT::from(frames_per_second as i32),
         ),
     ];
     for (key, value) in settings {
@@ -466,6 +473,26 @@ fn configure_codec(
         }
     }
     Ok(())
+}
+
+fn contains_h264_idr(data: &[u8]) -> bool {
+    let mut index = 0;
+    while index + 4 <= data.len() {
+        let start_len = if data[index..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if data[index..].starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            index += 1;
+            continue;
+        };
+        let nal = index + start_len;
+        if nal < data.len() && data[nal] & 0x1f == 5 {
+            return true;
+        }
+        index = nal.saturating_add(1);
+    }
+    false
 }
 
 fn set_optional_codec_value(
@@ -521,3 +548,14 @@ pub(crate) fn performance_counter_us() -> Result<u64, Error> {
 
 #[allow(dead_code)]
 fn _windows_result_type(_: WindowsResult<()>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_h264_idr;
+
+    #[test]
+    fn detects_idr_in_annex_b_access_units() {
+        assert!(contains_h264_idr(&[0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x65, 2]));
+        assert!(!contains_h264_idr(&[0, 0, 1, 0x41, 1, 2, 3]));
+    }
+}
