@@ -674,7 +674,7 @@ fn install_control_handler(
                         format.width,
                         format.height,
                         format.frames_per_second,
-                        format!("{:?}", format.codec),
+                        format.codec,
                     );
                     match Presenter::start(
                         format,
