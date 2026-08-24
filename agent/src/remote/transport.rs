@@ -388,12 +388,7 @@ async fn run_connected_sender(
                         // bootstrap keyframe. Keep HEVC at the selected quality
                         // preset; congestion handling can still drop frames and
                         // request recovery without destabilizing the encoder.
-                        if active_codec == Codec::H265 {
-                            tracing::debug!(
-                                bits_per_second = value,
-                                "skipping an unsafe live HEVC bitrate adjustment"
-                            );
-                        } else if let Err(error) = lock_streamer(&streamer)?.set_bitrate(value) {
+                        if let Err(error) = lock_streamer(&streamer)?.set_adaptive_bitrate(value) {
                             tracing::warn!(error = %error, "could not set bitrate while the desktop is changing");
                         }
                     }

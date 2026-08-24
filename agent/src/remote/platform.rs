@@ -26,6 +26,9 @@ pub trait ScreenStreamer: Send {
     fn poll_ended(&mut self) -> Option<anyhow::Result<()>>;
     fn request_keyframe(&self) -> anyhow::Result<()>;
     fn set_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()>;
+    fn set_adaptive_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()> {
+        self.set_bitrate(bits_per_second)
+    }
     fn set_codec(&mut self, codec: Codec);
     fn apply_input(&mut self, input: RemoteInput) -> anyhow::Result<()>;
     fn release_input(&mut self) -> anyhow::Result<()>;
@@ -160,6 +163,17 @@ impl ScreenStreamer for PlatformScreenStreamer {
             CaptureBackend::Desktop(streamer) => streamer.set_bitrate(bits_per_second),
         }
         .context("hardware encoder bitrate change failed")
+    }
+
+    fn set_adaptive_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()> {
+        if self.codec == Codec::H265 {
+            tracing::info!(
+                bits_per_second,
+                "skipping an unsafe live HEVC bitrate adjustment"
+            );
+            return Ok(());
+        }
+        self.set_bitrate(bits_per_second)
     }
 
     fn set_codec(&mut self, codec: Codec) {
