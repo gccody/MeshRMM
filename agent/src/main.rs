@@ -6,6 +6,7 @@ mod service;
 #[cfg(windows)]
 mod updater;
 
+use anyhow::Context;
 use remote::config::{Config, ExecutionMode};
 use tracing_subscriber::EnvFilter;
 
@@ -52,6 +53,17 @@ async fn main() -> anyhow::Result<()> {
 
     let (mode, config) = Config::load()?;
     initialize_tracing(mode, &config)?;
+    let executable =
+        std::env::current_exe().context("could not locate the running Agent executable")?;
+    tracing::info!(
+        process_id = std::process::id(),
+        ?mode,
+        release_version = meshrmm_self_update::CURRENT_VERSION,
+        package_version = env!("CARGO_PKG_VERSION"),
+        executable = %executable.display(),
+        config_path = %config.config_path.display(),
+        "MeshRMM Agent process started"
+    );
     match mode {
         #[cfg(windows)]
         ExecutionMode::Service => service::run(config),

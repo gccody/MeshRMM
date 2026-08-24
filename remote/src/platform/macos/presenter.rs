@@ -454,7 +454,10 @@ impl MacUi {
             bitrate_bits_per_second = format.bitrate_bits_per_second,
             "resetting macOS video decoder without replacing its window"
         );
-        unsafe { self.layer.flushAndRemoveImage() };
+        // Keep the last decoded desktop visible while the replacement capture
+        // stream produces its bootstrap keyframe. Removing the current image
+        // makes every Agent-side encoder restart look like a viewer refresh.
+        unsafe { self.layer.flush() };
         self.format_description = None;
         self.waiting_for_keyframe = true;
         self.frames_per_second = i32::from(format.frames_per_second.max(1));
