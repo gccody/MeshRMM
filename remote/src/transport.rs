@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -34,8 +34,24 @@ const KEYFRAME_RETRY_INTERVAL_US: u64 = 250_000;
 
 struct ActivePresenter {
     stream_id: VideoStreamId,
+    display_id: meshrmm_protocol::DisplayId,
+    format: meshrmm_protocol::VideoFormat,
     codec: Codec,
     presenter: Presenter,
+}
+
+#[cfg(target_os = "macos")]
+fn can_reset_presenter_in_place(
+    active: &ActivePresenter,
+    display_id: meshrmm_protocol::DisplayId,
+    format: meshrmm_protocol::VideoFormat,
+) -> bool {
+    active.display_id == display_id
+        && active.format.width == format.width
+        && active.format.height == format.height
+        && active.format.frames_per_second == format.frames_per_second
+        && active.format.codec == format.codec
+        && active.format.pixel_format == format.pixel_format
 }
 
 struct VideoReceiveState {
@@ -360,6 +376,7 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                 }
             }
             Some(error) = presentation_failure_rx.recv() => {
+                tracing::error!(%error, "viewer presentation path reported a terminal failure");
                 break Err(anyhow::anyhow!(error));
             }
             _ = stats_interval.tick() => {
@@ -433,7 +450,12 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
         }
     }
     session_state = session_state.transition(SessionState::Idle)?;
-    tracing::info!(?session_state, "remote viewer session stopped");
+    match &result {
+        Ok(()) => tracing::info!(?session_state, "remote viewer session stopped cleanly"),
+        Err(error) => {
+            tracing::error!(error = ?error, ?session_state, "remote viewer session stopped with an error")
+        }
+    }
     result
 }
 
@@ -628,6 +650,7 @@ fn install_control_handler(
             let debug = debug.clone();
             Box::pin(async move {
                 debug.set_data_channel(CONTROL_CHANNEL_LABEL, "closed");
+                tracing::error!("viewer control data channel closed while video was active");
                 let _ = presentation_failure.send(
                     "remote input/control channel closed while video was still active".into(),
                 );
@@ -636,11 +659,13 @@ fn install_control_handler(
     }
     let cursor_shape = Arc::new(Mutex::new(CursorShape::Default));
     let capabilities_sent = Arc::new(AtomicBool::new(false));
+    let configurations_seen = Arc::new(AtomicU64::new(0));
     let quality_preset = Arc::new(Mutex::new(QualityPreset::default()));
     channel.on_message(Box::new(move |message| {
         let presenter = Arc::clone(&presenter);
         let cursor_shape = Arc::clone(&cursor_shape);
         let capabilities_sent = Arc::clone(&capabilities_sent);
+        let configurations_seen = Arc::clone(&configurations_seen);
         let quality_preset = Arc::clone(&quality_preset);
         let viewer_control = viewer_control.clone();
         let remote_clipboard = remote_clipboard.clone();
@@ -654,6 +679,26 @@ fn install_control_handler(
                     stream_id,
                     format,
                 }) => {
+                    let configuration_sequence =
+                        configurations_seen.fetch_add(1, Ordering::AcqRel) + 1;
+                    let previous = presenter.lock().ok().and_then(|guard| {
+                        guard
+                            .as_ref()
+                            .map(|active| (active.stream_id, active.codec))
+                    });
+                    tracing::info!(
+                        configuration_sequence,
+                        previous_stream_id = previous.map(|value| value.0.0),
+                        previous_codec = ?previous.map(|value| value.1),
+                        stream_id = stream_id.0,
+                        display_id = active_display_id.0,
+                        width = format.width,
+                        height = format.height,
+                        fps = format.frames_per_second,
+                        bitrate_bits_per_second = format.bitrate_bits_per_second,
+                        codec = ?format.codec,
+                        "viewer received display configuration"
+                    );
                     let Some(active_display) = displays
                         .iter()
                         .find(|display| display.id == active_display_id)
@@ -676,6 +721,48 @@ fn install_control_handler(
                         format.frames_per_second,
                         format.codec,
                     );
+                    #[cfg(target_os = "macos")]
+                    let reset_in_place = if let Ok(mut guard) = presenter.lock()
+                        && let Some(active) = guard.as_mut()
+                        && can_reset_presenter_in_place(active, active_display_id, format)
+                    {
+                        match active.presenter.reset_stream(format) {
+                            Ok(()) => {
+                                let previous_stream_id = active.stream_id;
+                                active.stream_id = stream_id;
+                                active.format = format;
+                                tracing::info!(
+                                    configuration_sequence,
+                                    previous_stream_id = previous_stream_id.0,
+                                    stream_id = stream_id.0,
+                                    bitrate_bits_per_second = format.bitrate_bits_per_second,
+                                    codec = ?format.codec,
+                                    "reset the macOS decoder in place for a replacement stream"
+                                );
+                                true
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    configuration_sequence,
+                                    previous_stream_id = active.stream_id.0,
+                                    stream_id = stream_id.0,
+                                    "could not reset the macOS decoder in place; replacing the presenter"
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let reset_in_place = false;
+
+                    if reset_in_place {
+                        viewer_control.send(SessionMessage::RequestKeyframe { stream_id });
+                        tracing::info!(configuration_sequence, stream_id = stream_id.0, display_id = active_display_id.0, display_name = %active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, bitrate_bits_per_second = format.bitrate_bits_per_second, codec = ?format.codec, "remote control stream reconfigured without replacing its window");
+                        return;
+                    }
                     match Presenter::start(
                         format,
                         active_display.clone(),
@@ -692,10 +779,20 @@ fn install_control_handler(
                                 .ok()
                                 .and_then(|mut guard| guard.replace(ActivePresenter {
                                     stream_id,
+                                    display_id: active_display_id,
+                                    format,
                                     codec: format.codec,
                                     presenter: new_presenter,
                                 }));
                             if let Some(old) = old.as_mut() {
+                                tracing::warn!(
+                                    configuration_sequence,
+                                    previous_stream_id = old.stream_id.0,
+                                    previous_codec = ?old.codec,
+                                    stream_id = stream_id.0,
+                                    codec = ?format.codec,
+                                    "replacing the active macOS presenter after display configuration"
+                                );
                                 old.presenter.stop();
                             }
                             let request = SessionMessage::RequestKeyframe { stream_id };
@@ -706,7 +803,7 @@ fn install_control_handler(
                                     quality: sink.quality_preset(),
                                 });
                             }
-                            tracing::info!(display_id = active_display_id.0, display_name = %active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, codec = ?format.codec, "remote control stream configured");
+                            tracing::info!(configuration_sequence, stream_id = stream_id.0, display_id = active_display_id.0, display_name = %active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, bitrate_bits_per_second = format.bitrate_bits_per_second, codec = ?format.codec, "remote control stream configured");
                         }
                         Err(error) => {
                             let message = format!(

@@ -148,7 +148,11 @@ impl ScreenStreamer for PlatformScreenStreamer {
     }
 
     fn set_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()> {
-        self.bitrate_bits_per_second = bits_per_second.max(1);
+        let bits_per_second = bits_per_second.max(1);
+        if self.bitrate_bits_per_second == bits_per_second {
+            return Ok(());
+        }
+        self.bitrate_bits_per_second = bits_per_second;
         match &self.inner {
             CaptureBackend::Direct(streamer) => streamer
                 .set_bitrate(bits_per_second)

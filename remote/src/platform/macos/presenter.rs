@@ -20,6 +20,7 @@ struct Shared {
     submitted: AtomicU64,
     dropped_by_renderer: AtomicU64,
     recovering: AtomicBool,
+    resetting: AtomicBool,
     control: ControlSink,
     debug: DebugInfo,
 }
@@ -56,6 +57,16 @@ impl Presenter {
             bail!("macOS has no hardware decoder for {:?}", format.codec);
         }
         let id = NEXT_PRESENTER_ID.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            presenter_id = id,
+            display_id = active_display.id.0,
+            width = format.width,
+            height = format.height,
+            fps = format.frames_per_second,
+            bitrate_bits_per_second = format.bitrate_bits_per_second,
+            codec = ?format.codec,
+            "starting macOS video presenter"
+        );
         let shared = Arc::new(Shared {
             id,
             queued: Mutex::new(VecDeque::with_capacity(MAX_PRESENTER_QUEUE_FRAMES)),
@@ -65,6 +76,7 @@ impl Presenter {
             submitted: AtomicU64::new(0),
             dropped_by_renderer: AtomicU64::new(0),
             recovering: AtomicBool::new(false),
+            resetting: AtomicBool::new(false),
             control: control.clone(),
             debug: debug.clone(),
         });
@@ -94,6 +106,10 @@ impl Presenter {
         let Ok(mut queued) = self.shared.queued.lock() else {
             return false;
         };
+        if self.shared.resetting.load(Ordering::Acquire) {
+            self.shared.replaced.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         if self.shared.recovering.load(Ordering::Acquire) && !frame.keyframe {
             self.shared.replaced.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -128,6 +144,37 @@ impl Presenter {
         drop(queued);
         schedule_latest(Arc::clone(&self.shared));
         true
+    }
+
+    pub fn reset_stream(&self, format: VideoFormat) -> anyhow::Result<()> {
+        self.shared.resetting.store(true, Ordering::Release);
+        self.shared.recovering.store(true, Ordering::Release);
+        if let Ok(mut queued) = self.shared.queued.lock() {
+            self.shared
+                .replaced
+                .fetch_add(queued.len() as u64, Ordering::Relaxed);
+            queued.clear();
+        }
+
+        let id = self.shared.id;
+        let (reset_tx, reset_rx) = std::sync::mpsc::sync_channel(1);
+        DispatchQueue::main().exec_async(move || {
+            let result = UI.with(|state| {
+                let mut state = state.borrow_mut();
+                let ui = state
+                    .as_mut()
+                    .filter(|ui| ui.id == id)
+                    .context("macOS viewer window is no longer available")?;
+                ui.reset_stream(format)
+            });
+            let _ = reset_tx.send(result);
+        });
+        let result = reset_rx
+            .recv_timeout(Duration::from_secs(5))
+            .context("macOS main thread did not reset the video decoder")
+            .and_then(|result| result);
+        self.shared.resetting.store(false, Ordering::Release);
+        result
     }
 
     pub fn set_cursor_shape(&self, shape: CursorShape) {
@@ -193,6 +240,7 @@ impl Presenter {
             });
         });
         tracing::info!(
+            presenter_id = self.shared.id,
             latest_frames_dropped = self.shared.replaced.load(Ordering::Relaxed),
             renderer_frames_dropped = self.shared.dropped_by_renderer.load(Ordering::Relaxed),
             frames_submitted = self.shared.submitted.load(Ordering::Relaxed),
@@ -276,6 +324,7 @@ struct MacUi {
     stats_started: Instant,
     debug: DebugInfo,
     codec: Codec,
+    layer_backpressured: bool,
 }
 
 impl MacUi {
@@ -289,6 +338,12 @@ impl MacUi {
     ) -> anyhow::Result<Self> {
         let mtm =
             MainThreadMarker::new().context("AppKit must be initialized on the main thread")?;
+        tracing::info!(
+            presenter_id = id,
+            display_id = active_display.id.0,
+            codec = ?format.codec,
+            "creating macOS viewer window"
+        );
         let scale = ((1440.0_f64 - SETTINGS_PANEL_WIDTH) / f64::from(format.width))
             .min(900.0_f64 / f64::from(format.height))
             .min(1.0);
@@ -361,6 +416,11 @@ impl MacUi {
         if !window.makeFirstResponder(Some(&view)) {
             tracing::warn!("macOS viewer could not acquire remote-input focus");
         }
+        tracing::info!(
+            presenter_id = id,
+            codec = ?format.codec,
+            "macOS viewer window is visible"
+        );
 
         Ok(Self {
             id,
@@ -375,7 +435,33 @@ impl MacUi {
             stats_started: Instant::now(),
             debug,
             codec: format.codec,
+            layer_backpressured: false,
         })
+    }
+
+    #[allow(deprecated)]
+    fn reset_stream(&mut self, format: VideoFormat) -> anyhow::Result<()> {
+        if self.codec != format.codec {
+            bail!(
+                "cannot reset a {:?} presenter for a {:?} stream",
+                self.codec,
+                format.codec
+            );
+        }
+        tracing::info!(
+            presenter_id = self.id,
+            codec = ?self.codec,
+            bitrate_bits_per_second = format.bitrate_bits_per_second,
+            "resetting macOS video decoder without replacing its window"
+        );
+        unsafe { self.layer.flushAndRemoveImage() };
+        self.format_description = None;
+        self.waiting_for_keyframe = true;
+        self.frames_per_second = i32::from(format.frames_per_second.max(1));
+        self.frames_submitted = 0;
+        self.stats_started = Instant::now();
+        self.layer_backpressured = false;
+        Ok(())
     }
 
     #[allow(deprecated)]
@@ -384,6 +470,11 @@ impl MacUi {
             bail!("macOS viewer window was closed");
         }
         if unsafe { self.layer.requiresFlushToResumeDecoding() } {
+            tracing::warn!(
+                presenter_id = self.id,
+                codec = ?self.codec,
+                "AVSampleBufferDisplayLayer requires a flush to resume decoding"
+            );
             unsafe { self.layer.flush() };
             self.format_description = None;
             self.waiting_for_keyframe = true;
@@ -418,7 +509,25 @@ impl MacUi {
             self.waiting_for_keyframe = false;
         }
         if !unsafe { self.layer.isReadyForMoreMediaData() } {
+            if !self.layer_backpressured {
+                tracing::warn!(
+                    presenter_id = self.id,
+                    codec = ?self.codec,
+                    frame_id = queued.frame.frame_id,
+                    "macOS video layer stopped accepting media data"
+                );
+                self.layer_backpressured = true;
+            }
             return Ok(false);
+        }
+        if self.layer_backpressured {
+            tracing::info!(
+                presenter_id = self.id,
+                codec = ?self.codec,
+                frame_id = queued.frame.frame_id,
+                "macOS video layer resumed accepting media data"
+            );
+            self.layer_backpressured = false;
         }
 
         let sample = create_sample_buffer(
@@ -478,6 +587,13 @@ impl MacUi {
 
     #[allow(deprecated)]
     fn close(self) {
+        tracing::info!(
+            presenter_id = self.id,
+            codec = ?self.codec,
+            visible = self.window.isVisible(),
+            key_window = self.window.isKeyWindow(),
+            "closing macOS viewer window"
+        );
         if self.window.isKeyWindow() {
             self.input_view.disable_input();
         } else {
