@@ -221,12 +221,9 @@ define_class!(
             let Some((x, y)) = self.pointer_position(event) else {
                 return;
             };
-            let horizontal = (event.scrollingDeltaX() * 120.0)
-                .round()
-                .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
-            let vertical = (event.scrollingDeltaY() * 120.0)
-                .round()
-                .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
+            let precise = event.hasPreciseScrollingDeltas();
+            let horizontal = windows_wheel_delta(event.scrollingDeltaX(), precise);
+            let vertical = windows_wheel_delta(event.scrollingDeltaY(), precise);
             self.send(SessionMessage::Input(RemoteInput::WheelAt {
                 display_id: self.ivars().active_display.id,
                 x,
@@ -357,6 +354,17 @@ define_class!(
         }
     }
 );
+
+/// Convert AppKit scroll values to the units expected by Windows wheel input.
+/// A coarse mouse-wheel delta represents a whole notch, while precise devices
+/// such as trackpads already report fine-grained deltas and must not receive
+/// the same 120x amplification.
+pub(super) fn windows_wheel_delta(delta: f64, precise: bool) -> i16 {
+    let delta = if precise { delta } else { delta * 120.0 };
+    delta
+        .round()
+        .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+}
 
 impl RemoteView {
     #[allow(clippy::too_many_arguments)]

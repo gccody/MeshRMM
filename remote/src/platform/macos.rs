@@ -49,9 +49,9 @@ mod app;
 mod presenter;
 
 use app::close_connecting_window;
-#[cfg(test)]
-use app::normalized_video_position;
 pub use app::{monotonic_timestamp_us, run_application};
+#[cfg(test)]
+use app::{normalized_video_position, windows_wheel_delta};
 pub use presenter::Presenter;
 
 #[link(name = "VideoToolbox", kind = "framework")]
@@ -84,6 +84,18 @@ const VIEWER_TOOLBAR_HEIGHT: f64 = 36.0;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_delta_preserves_precise_trackpad_movement() {
+        assert_eq!(windows_wheel_delta(2.0, true), 2);
+        assert_eq!(windows_wheel_delta(-2.0, true), -2);
+    }
+
+    #[test]
+    fn wheel_delta_converts_coarse_mouse_steps_to_windows_notches() {
+        assert_eq!(windows_wheel_delta(1.0, false), 120);
+        assert_eq!(windows_wheel_delta(-2.0, false), -240);
+    }
 
     #[test]
     fn pointer_position_uses_aspect_fit_video_rect() {
