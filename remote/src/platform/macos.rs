@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,7 +11,7 @@ use anyhow::{Context, bail};
 use dispatch2::DispatchQueue;
 use meshrmm_protocol::{
     Codec, CursorShape, Display, EncodedFrame, PointerButton, RemoteInput, SessionMessage,
-    VideoFormat,
+    VideoFormat, VideoStreamId,
 };
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;

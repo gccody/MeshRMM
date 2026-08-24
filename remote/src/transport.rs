@@ -5,9 +5,9 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use meshrmm_protocol::{
-    CONTROL_CHANNEL_LABEL, CursorShape, FrameReassembler, IceServer, ReassemblyConfig,
-    ReassemblyOutcome, SessionBootstrap, SessionMessage, SessionState, SignalMessage, VideoPacket,
-    VideoStreamId,
+    CONTROL_CHANNEL_LABEL, CursorShape, EncodedFrame, FrameReassembler, IceServer,
+    ReassemblyConfig, ReassemblyOutcome, SessionBootstrap, SessionMessage, SessionState,
+    SignalMessage, VideoPacket, VideoStreamId,
 };
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -29,10 +29,85 @@ use crate::signaling::{authenticated_websocket, session_signal_url};
 const SESSION_ACTIVITY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const CLIPBOARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const POINTER_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
+const KEYFRAME_RETRY_INTERVAL_US: u64 = 250_000;
 
 struct ActivePresenter {
     stream_id: VideoStreamId,
     presenter: Presenter,
+}
+
+struct VideoReceiveState {
+    reassembler: FrameReassembler,
+    stream_id: Option<VideoStreamId>,
+    last_accepted_frame_id: Option<u64>,
+    waiting_for_keyframe: bool,
+    last_keyframe_request_us: u64,
+}
+
+impl VideoReceiveState {
+    fn new() -> Self {
+        Self {
+            reassembler: FrameReassembler::new(ReassemblyConfig::default()),
+            stream_id: None,
+            last_accepted_frame_id: None,
+            waiting_for_keyframe: true,
+            last_keyframe_request_us: 0,
+        }
+    }
+
+    fn mark_loss(&mut self) {
+        self.waiting_for_keyframe = true;
+    }
+
+    fn keyframe_request_due(&mut self, now_us: u64) -> bool {
+        if self.last_keyframe_request_us == 0
+            || now_us.saturating_sub(self.last_keyframe_request_us) >= KEYFRAME_RETRY_INTERVAL_US
+        {
+            self.last_keyframe_request_us = now_us.max(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn accept_completed(
+        &mut self,
+        frame: EncodedFrame,
+        now_us: u64,
+    ) -> (Option<EncodedFrame>, bool) {
+        if self.stream_id != Some(frame.stream_id) {
+            self.stream_id = Some(frame.stream_id);
+            self.last_accepted_frame_id = None;
+            self.waiting_for_keyframe = true;
+            self.last_keyframe_request_us = 0;
+        }
+
+        let gap = self
+            .last_accepted_frame_id
+            .is_some_and(|last| frame.frame_id != last.wrapping_add(1));
+        if gap && !frame.keyframe {
+            self.waiting_for_keyframe = true;
+            tracing::warn!(
+                last_frame_id = ?self.last_accepted_frame_id,
+                frame_id = frame.frame_id,
+                stream_id = frame.stream_id.0,
+                "H.264 frame gap detected; suppressing deltas until a keyframe arrives"
+            );
+        }
+
+        if frame.keyframe {
+            self.waiting_for_keyframe = false;
+            self.last_keyframe_request_us = 0;
+            self.last_accepted_frame_id = Some(frame.frame_id);
+            return (Some(frame), false);
+        }
+        if self.waiting_for_keyframe {
+            return (None, self.keyframe_request_due(now_us));
+        }
+
+        self.last_accepted_frame_id = Some(frame.frame_id);
+        (Some(frame), false)
+    }
 }
 
 /// Mouse-move events can arrive substantially faster than the network can
@@ -501,7 +576,9 @@ fn install_data_channel_handler(
                         debug,
                     )
                 }
-                "meshrmm-video-v1" => install_video_handler(channel, presenter, debug),
+                "meshrmm-video-v1" => {
+                    install_video_handler(channel, presenter, viewer_control, debug)
+                }
                 label => tracing::warn!(label, "ignoring unknown WebRTC data channel"),
             }
         })
@@ -625,6 +702,7 @@ fn install_control_handler(
 fn install_video_handler(
     channel: Arc<RTCDataChannel>,
     presenter: Arc<Mutex<Option<ActivePresenter>>>,
+    viewer_control: ViewerControlQueue,
     debug: DebugInfo,
 ) {
     {
@@ -636,12 +714,11 @@ fn install_video_handler(
             })
         }));
     }
-    let reassembler = Arc::new(tokio::sync::Mutex::new(FrameReassembler::new(
-        ReassemblyConfig::default(),
-    )));
+    let receive_state = Arc::new(tokio::sync::Mutex::new(VideoReceiveState::new()));
     channel.on_message(Box::new(move |message| {
-        let reassembler = Arc::clone(&reassembler);
+        let receive_state = Arc::clone(&receive_state);
         let presenter = Arc::clone(&presenter);
+        let viewer_control = viewer_control.clone();
         let debug = debug.clone();
         Box::pin(async move {
             let received_at_us = monotonic_timestamp_us();
@@ -652,11 +729,34 @@ fn install_video_handler(
                     return;
                 }
             };
-            let mut reassembler = reassembler.lock().await;
-            let outcome = reassembler.push(packet, received_at_us);
-            let stats = reassembler.stats();
-            drop(reassembler);
-            if let ReassemblyOutcome::Completed(frame) = outcome {
+            let packet_stream_id = packet.stream_id;
+            let mut receive_state = receive_state.lock().await;
+            let incomplete_before = receive_state.reassembler.stats().incomplete_frames_dropped;
+            let outcome = receive_state.reassembler.push(packet, received_at_us);
+            let stats = receive_state.reassembler.stats();
+            let mut request_keyframe = false;
+            if stats.incomplete_frames_dropped > incomplete_before {
+                receive_state.mark_loss();
+                request_keyframe = receive_state.keyframe_request_due(received_at_us);
+            }
+            let completed = if let ReassemblyOutcome::Completed(frame) = outcome {
+                let (frame, request) = receive_state.accept_completed(frame, received_at_us);
+                request_keyframe |= request;
+                frame
+            } else {
+                None
+            };
+            drop(receive_state);
+            if request_keyframe {
+                viewer_control.send(SessionMessage::RequestKeyframe {
+                    stream_id: packet_stream_id,
+                });
+                tracing::warn!(
+                    stream_id = packet_stream_id.0,
+                    "requested an H.264 recovery keyframe"
+                );
+            }
+            if let Some(frame) = completed {
                 let encode_us = frame
                     .encode_complete_timestamp_us
                     .saturating_sub(frame.capture_timestamp_us);
@@ -709,6 +809,57 @@ mod tests {
         let queue = ViewerControlQueue::new(tx);
         queue.set_input_enabled(true);
         (queue, rx)
+    }
+
+    fn encoded_frame(frame_id: u64, keyframe: bool) -> EncodedFrame {
+        EncodedFrame {
+            stream_id: VideoStreamId(7),
+            frame_id,
+            capture_timestamp_us: 1,
+            encode_complete_timestamp_us: 2,
+            send_timestamp_us: 3,
+            keyframe,
+            data: vec![1],
+        }
+    }
+
+    #[test]
+    fn video_recovery_suppresses_deltas_across_a_frame_gap() {
+        let mut state = VideoReceiveState::new();
+
+        let (frame, request) = state.accept_completed(encoded_frame(10, false), 1_000);
+        assert!(frame.is_none());
+        assert!(request);
+
+        let (frame, request) = state.accept_completed(encoded_frame(11, true), 2_000);
+        assert_eq!(frame.unwrap().frame_id, 11);
+        assert!(!request);
+
+        let (frame, request) = state.accept_completed(encoded_frame(12, false), 3_000);
+        assert_eq!(frame.unwrap().frame_id, 12);
+        assert!(!request);
+
+        let (frame, request) = state.accept_completed(encoded_frame(14, false), 4_000);
+        assert!(frame.is_none());
+        assert!(request);
+
+        let (frame, request) = state.accept_completed(encoded_frame(15, false), 5_000);
+        assert!(frame.is_none());
+        assert!(!request, "recovery requests are rate limited");
+
+        let (frame, request) = state.accept_completed(encoded_frame(16, true), 6_000);
+        assert_eq!(frame.unwrap().frame_id, 16);
+        assert!(!request);
+    }
+
+    #[test]
+    fn video_recovery_retries_a_missing_keyframe() {
+        let mut state = VideoReceiveState::new();
+        let (_, first_request) = state.accept_completed(encoded_frame(1, false), 1_000);
+        let (_, retry) =
+            state.accept_completed(encoded_frame(2, false), 1_000 + KEYFRAME_RETRY_INTERVAL_US);
+        assert!(first_request);
+        assert!(retry);
     }
 
     #[test]

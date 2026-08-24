@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use meshrmm_protocol::EncodedFrame;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 
 #[derive(Default)]
 pub struct LatestFrameSlot {
@@ -14,13 +14,20 @@ pub struct LatestFrameSlot {
 }
 
 impl LatestFrameSlot {
-    pub async fn publish(&self, frame: EncodedFrame) {
+    /// Publishes directly from the capture callback. Keeping this operation
+    /// synchronous preserves encoder output order and avoids spawning one
+    /// Tokio task per video frame.
+    pub fn publish(&self, frame: EncodedFrame) {
         let frame = Arc::new(frame);
         if frame.keyframe {
-            *self.keyframe.lock().await = Some(Arc::clone(&frame));
+            if let Ok(mut keyframe) = self.keyframe.lock() {
+                *keyframe = Some(Arc::clone(&frame));
+            }
             self.keyframe_changed.notify_waiters();
         }
-        let mut current = self.frame.lock().await;
+        let Ok(mut current) = self.frame.lock() else {
+            return;
+        };
         if current.replace(frame).is_some() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -31,20 +38,20 @@ impl LatestFrameSlot {
     pub async fn next(&self) -> Arc<EncodedFrame> {
         loop {
             let notified = self.changed.notified();
-            if let Some(frame) = self.frame.lock().await.take() {
+            if let Some(frame) = self.frame.lock().ok().and_then(|mut frame| frame.take()) {
                 return frame;
             }
             notified.await;
         }
     }
 
-    pub async fn has_newer(&self) -> bool {
-        self.frame.lock().await.is_some()
-    }
-
-    pub async fn clear(&self) {
-        *self.frame.lock().await = None;
-        *self.keyframe.lock().await = None;
+    pub fn clear(&self) {
+        if let Ok(mut frame) = self.frame.lock() {
+            *frame = None;
+        }
+        if let Ok(mut keyframe) = self.keyframe.lock() {
+            *keyframe = None;
+        }
     }
 
     /// Returns the newest compressed keyframe without consuming the normal
@@ -53,7 +60,7 @@ impl LatestFrameSlot {
     pub async fn keyframe(&self) -> Arc<EncodedFrame> {
         loop {
             let notified = self.keyframe_changed.notified();
-            if let Some(frame) = self.keyframe.lock().await.clone() {
+            if let Some(frame) = self.keyframe.lock().ok().and_then(|frame| frame.clone()) {
                 return frame;
             }
             notified.await;
@@ -93,8 +100,8 @@ mod tests {
     #[tokio::test]
     async fn publishing_replaces_obsolete_frame() {
         let slot = LatestFrameSlot::default();
-        slot.publish(frame(10)).await;
-        slot.publish(frame(11)).await;
+        slot.publish(frame(10));
+        slot.publish(frame(11));
         assert_eq!(slot.next().await.frame_id, 11);
         assert_eq!(slot.dropped(), 1);
     }
@@ -102,8 +109,8 @@ mod tests {
     #[tokio::test]
     async fn keyframe_is_retained_when_latest_frame_is_replaced() {
         let slot = LatestFrameSlot::default();
-        slot.publish(keyframe(10)).await;
-        slot.publish(frame(11)).await;
+        slot.publish(keyframe(10));
+        slot.publish(frame(11));
         assert_eq!(slot.keyframe().await.frame_id, 10);
         assert_eq!(slot.next().await.frame_id, 11);
     }

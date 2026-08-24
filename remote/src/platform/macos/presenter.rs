@@ -13,13 +13,30 @@ struct QueuedFrame {
 
 struct Shared {
     id: u64,
-    latest: Mutex<Option<QueuedFrame>>,
+    queued: Mutex<VecDeque<QueuedFrame>>,
     scheduled: AtomicBool,
     failure: Mutex<Option<String>>,
     replaced: AtomicU64,
     submitted: AtomicU64,
     dropped_by_renderer: AtomicU64,
+    recovering: AtomicBool,
+    control: ControlSink,
     debug: DebugInfo,
+}
+
+const MAX_PRESENTER_QUEUE_FRAMES: usize = 3;
+
+impl Shared {
+    fn begin_recovery(&self, stream_id: VideoStreamId) {
+        if !self.recovering.swap(true, Ordering::AcqRel) {
+            self.control
+                .send(SessionMessage::RequestKeyframe { stream_id });
+            tracing::warn!(
+                stream_id = stream_id.0,
+                "macOS presenter dropped an H.264 reference; requesting a recovery keyframe"
+            );
+        }
+    }
 }
 
 pub struct Presenter {
@@ -41,12 +58,14 @@ impl Presenter {
         let id = NEXT_PRESENTER_ID.fetch_add(1, Ordering::Relaxed);
         let shared = Arc::new(Shared {
             id,
-            latest: Mutex::new(None),
+            queued: Mutex::new(VecDeque::with_capacity(MAX_PRESENTER_QUEUE_FRAMES)),
             scheduled: AtomicBool::new(false),
             failure: Mutex::new(None),
             replaced: AtomicU64::new(0),
             submitted: AtomicU64::new(0),
             dropped_by_renderer: AtomicU64::new(0),
+            recovering: AtomicBool::new(false),
+            control: control.clone(),
             debug: debug.clone(),
         });
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
@@ -70,25 +89,45 @@ impl Presenter {
         })
     }
 
-    pub fn publish(&self, frame: EncodedFrame, received_at_us: u64) {
-        let Ok(mut latest) = self.shared.latest.lock() else {
-            return;
+    pub fn publish(&self, frame: EncodedFrame, received_at_us: u64) -> bool {
+        let stream_id = frame.stream_id;
+        let Ok(mut queued) = self.shared.queued.lock() else {
+            return false;
         };
-        if latest
-            .replace(QueuedFrame {
-                frame,
-                received_at_us,
-            })
-            .is_some()
-        {
+        if self.shared.recovering.load(Ordering::Acquire) && !frame.keyframe {
             self.shared.replaced.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if queued.len() >= MAX_PRESENTER_QUEUE_FRAMES && !frame.keyframe {
+            self.shared
+                .replaced
+                .fetch_add(queued.len() as u64 + 1, Ordering::Relaxed);
+            queued.clear();
+            drop(queued);
+            self.shared.begin_recovery(stream_id);
+            return false;
+        }
+        if frame.keyframe
+            && (self.shared.recovering.load(Ordering::Acquire)
+                || queued.len() >= MAX_PRESENTER_QUEUE_FRAMES)
+        {
+            self.shared
+                .replaced
+                .fetch_add(queued.len() as u64, Ordering::Relaxed);
+            queued.clear();
             self.shared.debug.set_presenter_frames_dropped(
                 self.shared.replaced.load(Ordering::Relaxed)
                     + self.shared.dropped_by_renderer.load(Ordering::Relaxed),
             );
         }
-        drop(latest);
+        queued.push_back(QueuedFrame {
+            frame,
+            received_at_us,
+        });
+        self.shared.recovering.store(false, Ordering::Release);
+        drop(queued);
         schedule_latest(Arc::clone(&self.shared));
+        true
     }
 
     pub fn set_cursor_shape(&self, shape: CursorShape) {
@@ -157,8 +196,13 @@ fn schedule_latest(shared: Arc<Shared>) {
         return;
     }
     DispatchQueue::main().exec_async(move || {
-        let queued = shared.latest.lock().ok().and_then(|mut frame| frame.take());
+        let queued = shared
+            .queued
+            .lock()
+            .ok()
+            .and_then(|mut frames| frames.pop_front());
         if let Some(queued) = queued {
+            let stream_id = queued.frame.stream_id;
             let result = UI.with(|state| {
                 let mut state = state.borrow_mut();
                 let ui = state
@@ -173,6 +217,13 @@ fn schedule_latest(shared: Arc<Shared>) {
                 }
                 Ok(false) => {
                     shared.dropped_by_renderer.fetch_add(1, Ordering::Relaxed);
+                    shared.begin_recovery(stream_id);
+                    if let Ok(mut frames) = shared.queued.lock() {
+                        shared
+                            .replaced
+                            .fetch_add(frames.len() as u64, Ordering::Relaxed);
+                        frames.clear();
+                    }
                     shared.debug.set_presenter_frames_dropped(
                         shared.replaced.load(Ordering::Relaxed)
                             + shared.dropped_by_renderer.load(Ordering::Relaxed),
@@ -186,7 +237,7 @@ fn schedule_latest(shared: Arc<Shared>) {
             }
         }
         shared.scheduled.store(false, Ordering::Release);
-        if shared.latest.lock().is_ok_and(|latest| latest.is_some()) {
+        if shared.queued.lock().is_ok_and(|queued| !queued.is_empty()) {
             schedule_latest(shared);
         }
     });

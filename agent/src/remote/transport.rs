@@ -39,6 +39,9 @@ enum ControlCommand {
     Stop,
 }
 
+const MAX_VIDEO_BUFFERED_BYTES: usize = 256 * 1024;
+const KEYFRAME_RETRY_INTERVAL_US: u64 = 250_000;
+
 pub async fn run_sender(
     signal_url: Url,
     signaling_token: &str,
@@ -88,7 +91,10 @@ async fn run_connected_sender(
             "meshrmm-video-v1",
             Some(RTCDataChannelInit {
                 ordered: Some(false),
-                max_retransmits: Some(0),
+                // One bounded retransmission removes most incidental Wi-Fi and
+                // WAN loss without allowing reliable-channel head-of-line
+                // blocking to build a remote-control latency queue.
+                max_retransmits: Some(1),
                 protocol: Some("meshrmm.video.v1".into()),
                 ..Default::default()
             }),
@@ -127,8 +133,9 @@ async fn run_connected_sender(
                 let _ = closed_tx.send(ControlCommand::ChannelClosed);
             })
         }));
+        let control_messages_tx = control_tx.clone();
         control_channel.on_message(Box::new(move |message| {
-            let tx = control_tx.clone();
+            let tx = control_messages_tx.clone();
             let decoder_ready = Arc::clone(&decoder_ready);
             Box::pin(async move {
                 let command = match SessionMessage::decode(&message.data) {
@@ -187,6 +194,7 @@ async fn run_connected_sender(
         Arc::clone(&video_open),
         decoder_ready,
         Arc::clone(&slot),
+        control_tx.clone(),
         video_failure_tx,
     );
     spawn_control_start(
@@ -283,7 +291,7 @@ async fn run_connected_sender(
                             continue;
                         };
                         lock_streamer(&streamer)?.stop()?;
-                        slot.clear().await;
+                        slot.clear();
                         stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
                         let format = lock_streamer(&streamer)?.start(
                             selected.id,
@@ -555,6 +563,7 @@ fn spawn_video_sender(
     open: Arc<Notify>,
     decoder_ready: Arc<Notify>,
     slot: Arc<LatestFrameSlot>,
+    recovery: mpsc::UnboundedSender<ControlCommand>,
     failure: mpsc::UnboundedSender<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -576,24 +585,61 @@ fn spawn_video_sender(
         let mut frames_sent = 0_u64;
         let mut buffered_frames_dropped = 0_u64;
         let mut obsolete_frames_dropped = 0_u64;
+        let mut recovery_frames_dropped = 0_u64;
         let mut bytes_sent = 0_u64;
         let mut stats_started_us = monotonic_timestamp_us();
+        let mut last_sent = None::<(VideoStreamId, u64)>;
+        let mut recovering = false;
+        let mut last_keyframe_request_us = 0_u64;
         loop {
-            let (source, is_bootstrap) = if let Some(frame) = bootstrap_keyframe.take() {
-                (frame, true)
+            let source = if let Some(frame) = bootstrap_keyframe.take() {
+                frame
             } else {
                 // Desktop Duplication may produce no frame while the display is
                 // completely static. The main sender loop independently polls
                 // the capture worker for real failures, so idleness is not an
                 // error and this task can wait until the next changed frame.
-                let source = slot.next().await;
-                (source, false)
+                slot.next().await
             };
-            if channel.buffered_amount().await > 256 * 1024 {
+
+            if let Some((last_stream_id, last_frame_id)) = last_sent
+                && (source.stream_id != last_stream_id
+                    || source.frame_id != last_frame_id.wrapping_add(1))
+                && !source.keyframe
+            {
+                recovering = true;
+                tracing::warn!(
+                    last_frame_id,
+                    frame_id = source.frame_id,
+                    stream_id = source.stream_id.0,
+                    "encoded reference frame was skipped; waiting for a recovery keyframe"
+                );
+            }
+
+            let now_us = monotonic_timestamp_us();
+            if recovering && !source.keyframe {
+                recovery_frames_dropped += 1;
+                if last_keyframe_request_us == 0
+                    || now_us.saturating_sub(last_keyframe_request_us) >= KEYFRAME_RETRY_INTERVAL_US
+                {
+                    let _ = recovery.send(ControlCommand::Keyframe);
+                    last_keyframe_request_us = now_us.max(1);
+                }
+                continue;
+            }
+
+            if channel.buffered_amount().await > MAX_VIDEO_BUFFERED_BYTES {
                 buffered_frames_dropped += 1;
+                recovering = true;
+                if last_keyframe_request_us == 0
+                    || now_us.saturating_sub(last_keyframe_request_us) >= KEYFRAME_RETRY_INTERVAL_US
+                {
+                    let _ = recovery.send(ControlCommand::Keyframe);
+                    last_keyframe_request_us = now_us.max(1);
+                }
                 tracing::debug!(
                     frame_id = source.frame_id,
-                    "dropping frame because data channel is buffered"
+                    "dropping frame and requesting H.264 recovery because the data channel is buffered"
                 );
                 continue;
             }
@@ -608,11 +654,6 @@ fn spawn_video_sender(
             };
             let mut complete = true;
             for packet in packets {
-                if !is_bootstrap && slot.has_newer().await {
-                    complete = false;
-                    obsolete_frames_dropped += 1;
-                    break;
-                }
                 let bytes = match packet.encode() {
                     Ok(bytes) => bytes,
                     Err(error) => {
@@ -630,6 +671,15 @@ fn spawn_video_sender(
             }
             if complete {
                 frames_sent += 1;
+                last_sent = Some((source.stream_id, source.frame_id));
+                if source.keyframe {
+                    recovering = false;
+                }
+            } else {
+                // Never continue a predictive chain after only part of an
+                // access unit was submitted to SCTP.
+                recovering = true;
+                obsolete_frames_dropped += 1;
             }
             let now_us = monotonic_timestamp_us();
             let elapsed_us = now_us.saturating_sub(stats_started_us);
@@ -641,12 +691,14 @@ fn spawn_video_sender(
                     frames_sent,
                     buffered_frames_dropped,
                     obsolete_frames_dropped,
+                    recovery_frames_dropped,
                     latest_frames_replaced = slot.dropped(),
                     "video transport statistics"
                 );
                 frames_sent = 0;
                 buffered_frames_dropped = 0;
                 obsolete_frames_dropped = 0;
+                recovery_frames_dropped = 0;
                 bytes_sent = 0;
                 stats_started_us = now_us;
             }

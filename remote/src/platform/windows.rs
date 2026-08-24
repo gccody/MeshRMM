@@ -43,6 +43,7 @@ use renderer::D3d11Renderer;
 use window::{create_window, pump_window_messages, set_window_cursor};
 
 const MAX_DECODER_PENDING_FRAMES: usize = 4;
+const MAX_PRESENTER_QUEUE_FRAMES: usize = 3;
 
 struct QueuedFrame {
     frame: EncodedFrame,
@@ -50,13 +51,15 @@ struct QueuedFrame {
 }
 
 struct Shared {
-    latest: Mutex<Option<QueuedFrame>>,
+    queued: Mutex<VecDeque<QueuedFrame>>,
     cursor_shape: Mutex<Option<CursorShape>>,
     ready: Condvar,
     stopping: AtomicBool,
     running: AtomicBool,
     failure: Mutex<Option<String>>,
     replaced_frames: AtomicU64,
+    recovering: AtomicBool,
+    control: ControlSink,
     debug: DebugInfo,
 }
 
@@ -74,13 +77,15 @@ impl Presenter {
         debug: DebugInfo,
     ) -> anyhow::Result<Self> {
         let shared = Arc::new(Shared {
-            latest: Mutex::new(None),
+            queued: Mutex::new(VecDeque::with_capacity(MAX_PRESENTER_QUEUE_FRAMES)),
             cursor_shape: Mutex::new(None),
             ready: Condvar::new(),
             stopping: AtomicBool::new(false),
             running: AtomicBool::new(false),
             failure: Mutex::new(None),
             replaced_frames: AtomicU64::new(0),
+            recovering: AtomicBool::new(false),
+            control: control.clone(),
             debug,
         });
         let worker_shared = Arc::clone(&shared);
@@ -109,20 +114,49 @@ impl Presenter {
         })
     }
 
-    pub fn publish(&self, frame: EncodedFrame, received_at_us: u64) {
-        let Ok(mut latest) = self.shared.latest.lock() else {
-            return;
+    pub fn publish(&self, frame: EncodedFrame, received_at_us: u64) -> bool {
+        let stream_id = frame.stream_id;
+        let Ok(mut queued) = self.shared.queued.lock() else {
+            return false;
         };
-        if latest
-            .replace(QueuedFrame {
-                frame,
-                received_at_us,
-            })
-            .is_some()
-        {
+        if self.shared.recovering.load(Ordering::Acquire) && !frame.keyframe {
             self.shared.replaced_frames.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
+        if queued.len() >= MAX_PRESENTER_QUEUE_FRAMES && !frame.keyframe {
+            self.shared
+                .replaced_frames
+                .fetch_add(queued.len() as u64 + 1, Ordering::Relaxed);
+            queued.clear();
+            let first_loss = !self.shared.recovering.swap(true, Ordering::AcqRel);
+            drop(queued);
+            if first_loss {
+                self.shared
+                    .control
+                    .send(SessionMessage::RequestKeyframe { stream_id });
+                tracing::warn!(
+                    stream_id = stream_id.0,
+                    "decoder could not keep up; requesting a recovery keyframe"
+                );
+            }
+            return false;
+        }
+        if frame.keyframe
+            && (self.shared.recovering.load(Ordering::Acquire)
+                || queued.len() >= MAX_PRESENTER_QUEUE_FRAMES)
+        {
+            self.shared
+                .replaced_frames
+                .fetch_add(queued.len() as u64, Ordering::Relaxed);
+            queued.clear();
+        }
+        queued.push_back(QueuedFrame {
+            frame,
+            received_at_us,
+        });
+        self.shared.recovering.store(false, Ordering::Release);
         self.shared.ready.notify_one();
+        true
     }
 
     pub fn set_cursor_shape(&self, shape: CursorShape) {
@@ -193,19 +227,19 @@ fn run_worker(
             break;
         }
         let queued = {
-            let Ok(latest) = shared.latest.lock() else {
+            let Ok(queued) = shared.queued.lock() else {
                 break;
             };
-            let Ok((mut latest, _)) =
+            let Ok((mut queued, _)) =
                 shared
                     .ready
-                    .wait_timeout_while(latest, Duration::from_millis(4), |slot| {
-                        slot.is_none() && !shared.stopping.load(Ordering::Acquire)
+                    .wait_timeout_while(queued, Duration::from_millis(4), |queue| {
+                        queue.is_empty() && !shared.stopping.load(Ordering::Acquire)
                     })
             else {
                 break;
             };
-            latest.take()
+            queued.pop_front()
         };
         if let Some(shape) = shared
             .cursor_shape

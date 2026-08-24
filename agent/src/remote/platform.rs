@@ -77,10 +77,8 @@ impl ScreenStreamer for PlatformScreenStreamer {
         slot: Arc<LatestFrameSlot>,
     ) -> anyhow::Result<VideoFormat> {
         let next_frame_id = Arc::clone(&self.next_frame_id);
-        let runtime = tokio::runtime::Handle::current();
         let sink = Arc::new(
             move |access_unit: meshrmm_remote_screen::EncodedAccessUnit| {
-                let slot = Arc::clone(&slot);
                 let frame_id = next_frame_id.fetch_add(1, Ordering::Relaxed);
                 let mut data = access_unit.codec_config.unwrap_or_default();
                 data.extend_from_slice(&access_unit.data);
@@ -93,7 +91,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
                     keyframe: access_unit.keyframe,
                     data,
                 };
-                runtime.spawn(async move { slot.publish(frame).await });
+                slot.publish(frame);
             },
         );
         let config = meshrmm_remote_screen::StreamConfig {
