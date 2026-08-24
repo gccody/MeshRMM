@@ -9,7 +9,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use meshrmm_protocol::{CursorShape, Display, DisplayId, RemoteInput, SessionMessage};
+use meshrmm_protocol::{
+    CursorShape, Display, DisplayId, MAX_CLIPBOARD_TEXT_BYTES, RemoteInput, SessionMessage,
+};
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_TIMEOUT,
 };
@@ -40,12 +42,14 @@ const COMMAND_STOP: u8 = 4;
 const COMMAND_INPUT: u8 = 5;
 const COMMAND_RELEASE_INPUT: u8 = 6;
 const COMMAND_START_INPUT: u8 = 7;
+const COMMAND_CLIPBOARD: u8 = 8;
 const EVENT_STARTED: u8 = 1;
 const EVENT_FRAME: u8 = 2;
 const EVENT_ERROR: u8 = 3;
 const EVENT_STOPPED: u8 = 4;
 const EVENT_CURSOR: u8 = 5;
 const EVENT_INPUT_STARTED: u8 = 6;
+const EVENT_CLIPBOARD: u8 = 7;
 const MAX_CODEC_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
@@ -53,6 +57,7 @@ const MAX_CONTROL_BYTES: usize = 64 * 1024;
 const MAX_DISPLAY_NAME_BYTES: usize = 4 * 1024;
 const MAX_DISPLAYS: usize = 64;
 const START_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const STOP_TIMEOUT_MS: u32 = 5_000;
 const NO_DISPLAY: u32 = u32::MAX;
 const NO_ACTIVE_SESSION: u32 = u32::MAX;
@@ -94,6 +99,7 @@ enum ParentCommand {
     },
     Input(RemoteInput),
     ReleaseInput,
+    Clipboard(String),
     Stop,
 }
 
@@ -108,12 +114,14 @@ enum ChildEvent {
     InputStarted,
     Frame(EncodedAccessUnit),
     Cursor(CursorShape),
+    Clipboard(String),
     Error(String),
     Stopped,
 }
 
 type HelperStatus = Arc<Mutex<Option<Result<(), String>>>>;
 type HelperCursor = Arc<Mutex<CursorShape>>;
+type HelperClipboard = Arc<Mutex<Option<String>>>;
 type InputWriter = Arc<Mutex<BufWriter<File>>>;
 type InputRoute = Arc<Mutex<Option<InputWriter>>>;
 
@@ -126,6 +134,7 @@ pub struct DesktopCaptureStreamer {
     input_route: InputRoute,
     preferred_desktop: Option<DesktopTarget>,
     cursor: HelperCursor,
+    clipboard: HelperClipboard,
 }
 
 impl DesktopCaptureStreamer {
@@ -136,6 +145,7 @@ impl DesktopCaptureStreamer {
             input_route: Arc::new(Mutex::new(None)),
             preferred_desktop: None,
             cursor: Arc::new(Mutex::new(CursorShape::Default)),
+            clipboard: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -279,6 +289,7 @@ impl DesktopCaptureStreamer {
         Arc::new(DesktopInputController {
             route: Arc::clone(&self.input_route),
             cursor: Arc::clone(&self.cursor),
+            clipboard: Arc::clone(&self.clipboard),
         })
     }
 
@@ -341,7 +352,16 @@ impl DesktopCaptureStreamer {
             return Ok(());
         }
         self.stop_input_helper();
-        let helper = start_input_helper(target, display_id, Arc::clone(&self.cursor))?;
+        *self
+            .clipboard
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        let helper = start_input_helper(
+            target,
+            display_id,
+            Arc::clone(&self.cursor),
+            Arc::clone(&self.clipboard),
+        )?;
         *self
             .input_route
             .lock()
@@ -410,6 +430,7 @@ struct RunningInputHelper {
 struct DesktopInputController {
     route: InputRoute,
     cursor: HelperCursor,
+    clipboard: HelperClipboard,
 }
 
 impl ScreenInput for DesktopInputController {
@@ -442,6 +463,25 @@ impl ScreenInput for DesktopInputController {
             .cursor
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn apply_clipboard(&self, text: String) -> anyhow::Result<()> {
+        let writer = self
+            .route
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .context("desktop input helper is not running")?;
+        send_command(&writer, &ParentCommand::Clipboard(text))
+            .context("failed to send clipboard text to the active desktop")
+    }
+
+    fn poll_clipboard(&self) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .clipboard
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take())
     }
 }
 
@@ -598,6 +638,7 @@ fn start_input_helper(
     target: DesktopTarget,
     display_id: DisplayId,
     cursor: HelperCursor,
+    clipboard: HelperClipboard,
 ) -> anyhow::Result<RunningInputHelper> {
     let launched = launch_system_helper(target)?;
     let status: HelperStatus = Arc::new(Mutex::new(None));
@@ -605,7 +646,15 @@ fn start_input_helper(
     let reader_status = Arc::clone(&status);
     let reader = thread::Builder::new()
         .name("meshrmm-desktop-input-ipc".into())
-        .spawn(move || dispatch_input_events(launched.output, started_tx, reader_status, cursor))
+        .spawn(move || {
+            dispatch_input_events(
+                launched.output,
+                started_tx,
+                reader_status,
+                cursor,
+                clipboard,
+            )
+        })
         .context("failed to start desktop input-helper IPC reader")?;
     let stderr = thread::Builder::new()
         .name("meshrmm-desktop-input-stderr".into())
@@ -710,6 +759,13 @@ fn dispatch_child_events(
             Ok(ChildEvent::Cursor(shape)) => {
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) = shape;
             }
+            Ok(ChildEvent::Clipboard(_)) => {
+                set_status(
+                    &status,
+                    Err("capture helper reported an input-only clipboard event".into()),
+                );
+                break;
+            }
             Ok(ChildEvent::Error(message)) => {
                 if let Some(sender) = started_tx.take() {
                     let _ = sender.send(Err(message.clone()));
@@ -742,6 +798,7 @@ fn dispatch_input_events(
     started_tx: mpsc::SyncSender<Result<(), String>>,
     status: HelperStatus,
     cursor: HelperCursor,
+    clipboard: HelperClipboard,
 ) {
     let mut output = BufReader::new(output);
     let mut started_tx = Some(started_tx);
@@ -760,6 +817,9 @@ fn dispatch_input_events(
             }
             Ok(ChildEvent::Cursor(shape)) => {
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) = shape;
+            }
+            Ok(ChildEvent::Clipboard(text)) => {
+                *clipboard.lock().unwrap_or_else(|error| error.into_inner()) = Some(text);
             }
             Ok(ChildEvent::Error(message)) => {
                 if let Some(sender) = started_tx.take() {
@@ -958,7 +1018,8 @@ fn run_capture_child(
                 ParentCommand::Start { .. }
                 | ParentCommand::StartInput { .. }
                 | ParentCommand::Input(_)
-                | ParentCommand::ReleaseInput,
+                | ParentCommand::ReleaseInput
+                | ParentCommand::Clipboard(_),
             )) => {
                 terminal_error =
                     Some("capture helper received a command reserved for input".into());
@@ -994,6 +1055,14 @@ fn run_input_child(
     emit_child_event(&output, ChildEvent::InputStarted)?;
 
     let mut sent_cursor = None;
+    let mut clipboard = match super::clipboard::ClipboardSync::new() {
+        Ok(clipboard) => Some(clipboard),
+        Err(error) => {
+            eprintln!("interactive Windows clipboard is unavailable: {error:#}");
+            None
+        }
+    };
+    let mut next_clipboard_poll = Instant::now();
     let mut terminal_error = None;
     loop {
         let cursor = input.cursor_shape();
@@ -1014,6 +1083,13 @@ fn run_input_child(
                     tracing::warn!(%error, "desktop input helper could not release input");
                 }
             }
+            Ok(Ok(ParentCommand::Clipboard(text))) => {
+                if let Some(clipboard) = clipboard.as_mut()
+                    && let Err(error) = clipboard.apply(text)
+                {
+                    eprintln!("failed to apply viewer clipboard text: {error:#}");
+                }
+            }
             Ok(Ok(ParentCommand::Stop)) => break,
             Ok(Ok(_)) => {
                 terminal_error = Some("input helper received a video command".into());
@@ -1021,6 +1097,25 @@ fn run_input_child(
             }
             Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if Instant::now() >= next_clipboard_poll {
+            next_clipboard_poll = Instant::now() + CLIPBOARD_POLL_INTERVAL;
+            if let Some(clipboard) = clipboard.as_mut() {
+                match clipboard.poll() {
+                    Ok(Some(text)) => {
+                        if let Err(error) = emit_child_event(&output, ChildEvent::Clipboard(text)) {
+                            terminal_error = Some(format!(
+                                "failed to send clipboard text to the Agent coordinator: {error}"
+                            ));
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("failed to poll the interactive Windows clipboard: {error:#}");
+                    }
+                }
+            }
         }
     }
     let _ = input.release_all();
@@ -1093,6 +1188,15 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             writer.write_all(&bytes)
         }
         ParentCommand::ReleaseInput => writer.write_all(&[COMMAND_RELEASE_INPUT]),
+        ParentCommand::Clipboard(text) => {
+            let bytes = SessionMessage::Clipboard { text: text.clone() }
+                .encode()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            checked_len(bytes.len(), MAX_CONTROL_BYTES, "desktop clipboard")?;
+            writer.write_all(&[COMMAND_CLIPBOARD])?;
+            write_u32(&mut writer, bytes.len() as u32)?;
+            writer.write_all(&bytes)
+        }
         ParentCommand::Stop => writer.write_all(&[COMMAND_STOP]),
     }
 }
@@ -1128,6 +1232,31 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
             }
         }
         COMMAND_RELEASE_INPUT => Ok(ParentCommand::ReleaseInput),
+        COMMAND_CLIPBOARD => {
+            let length = bounded_len(
+                read_u32(&mut reader)?,
+                MAX_CONTROL_BYTES,
+                "desktop clipboard",
+            )?;
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes)?;
+            match SessionMessage::decode(&bytes) {
+                Ok(SessionMessage::Clipboard { text })
+                    if text.len() <= MAX_CLIPBOARD_TEXT_BYTES =>
+                {
+                    Ok(ParentCommand::Clipboard(text))
+                }
+                Ok(SessionMessage::Clipboard { .. }) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "desktop clipboard exceeds the text size limit",
+                )),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "desktop clipboard contained a non-clipboard message",
+                )),
+                Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+            }
+        }
         COMMAND_STOP => Ok(ParentCommand::Stop),
         opcode => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1178,6 +1307,15 @@ fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             checked_len(bytes.len(), MAX_CONTROL_BYTES, "cursor shape")?;
             writer.write_all(&[EVENT_CURSOR])?;
+            write_u32(&mut writer, bytes.len() as u32)?;
+            writer.write_all(&bytes)
+        }
+        ChildEvent::Clipboard(text) => {
+            let bytes = SessionMessage::Clipboard { text: text.clone() }
+                .encode()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            checked_len(bytes.len(), MAX_CONTROL_BYTES, "clipboard text")?;
+            writer.write_all(&[EVENT_CLIPBOARD])?;
             write_u32(&mut writer, bytes.len() as u32)?;
             writer.write_all(&bytes)
         }
@@ -1266,6 +1404,27 @@ fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
                 Ok(_) => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "cursor event contained an unexpected message",
+                )),
+                Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+            }
+        }
+        EVENT_CLIPBOARD => {
+            let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "clipboard text")?;
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes)?;
+            match SessionMessage::decode(&bytes) {
+                Ok(SessionMessage::Clipboard { text })
+                    if text.len() <= MAX_CLIPBOARD_TEXT_BYTES =>
+                {
+                    Ok(ChildEvent::Clipboard(text))
+                }
+                Ok(SessionMessage::Clipboard { .. }) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "clipboard event exceeds the text size limit",
+                )),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "clipboard event contained an unexpected message",
                 )),
                 Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
             }
@@ -1454,6 +1613,7 @@ mod tests {
                 pressed: true,
             }),
             ParentCommand::ReleaseInput,
+            ParentCommand::Clipboard("winget install Example.Package\n".into()),
             ParentCommand::Stop,
         ];
         for command in commands {
@@ -1528,6 +1688,28 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_event_round_trips() {
+        let text = "winget install Example.Package\n";
+        let mut bytes = Vec::new();
+        write_event(&mut bytes, &ChildEvent::Clipboard(text.into())).unwrap();
+        let ChildEvent::Clipboard(decoded) = read_event(bytes.as_slice()).unwrap() else {
+            panic!("expected clipboard event");
+        };
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn clipboard_command_round_trips() {
+        let text = "winget install Example.Package\n";
+        let mut bytes = Vec::new();
+        write_command(&mut bytes, &ParentCommand::Clipboard(text.into())).unwrap();
+        let ParentCommand::Clipboard(decoded) = read_command(bytes.as_slice()).unwrap() else {
+            panic!("expected clipboard command");
+        };
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
     fn desktop_targets_alternate() {
         assert_eq!(DesktopTarget::Default.alternate(), DesktopTarget::Winlogon);
         assert_eq!(DesktopTarget::Winlogon.alternate(), DesktopTarget::Default);
@@ -1541,6 +1723,7 @@ mod tests {
             ParentCommand::StartInput { .. } => COMMAND_START_INPUT,
             ParentCommand::Input(_) => COMMAND_INPUT,
             ParentCommand::ReleaseInput => COMMAND_RELEASE_INPUT,
+            ParentCommand::Clipboard(_) => COMMAND_CLIPBOARD,
             ParentCommand::Stop => COMMAND_STOP,
         }
     }

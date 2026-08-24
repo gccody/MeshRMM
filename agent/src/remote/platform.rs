@@ -38,6 +38,8 @@ pub trait ScreenInput: Send + Sync {
     fn apply(&self, input: RemoteInput) -> anyhow::Result<()>;
     fn release_all(&self) -> anyhow::Result<()>;
     fn cursor_shape(&self) -> CursorShape;
+    fn apply_clipboard(&self, text: String) -> anyhow::Result<()>;
+    fn poll_clipboard(&self) -> anyhow::Result<Option<String>>;
 }
 
 #[cfg(windows)]
@@ -49,6 +51,7 @@ pub struct PlatformScreenStreamer {
     chroma: ChromaMode,
     next_frame_id: Arc<AtomicU64>,
     direct_input: Arc<Mutex<super::input::WindowsInputController>>,
+    direct_clipboard: Option<Arc<Mutex<super::clipboard::ClipboardSync>>>,
 }
 
 #[cfg(windows)]
@@ -70,6 +73,16 @@ impl PlatformScreenStreamer {
             chroma: ChromaMode::Yuv420,
             next_frame_id: Arc::new(AtomicU64::new(1)),
             direct_input: Arc::new(Mutex::new(super::input::WindowsInputController::new())),
+            // Service workers live in non-interactive Session 0. Their clipboard
+            // is neither the user's clipboard nor a safe place to perform
+            // desktop-bound operations, so the desktop helper owns clipboard
+            // access for that mode. Console mode is already interactive.
+            direct_clipboard: (!capture_as_active_user)
+                .then(super::clipboard::ClipboardSync::new)
+                .transpose()
+                .ok()
+                .flatten()
+                .map(|clipboard| Arc::new(Mutex::new(clipboard))),
         }
     }
 }
@@ -198,6 +211,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
         match &self.inner {
             CaptureBackend::Direct(_) => Arc::new(DirectInputController {
                 controller: Arc::clone(&self.direct_input),
+                clipboard: self.direct_clipboard.clone(),
             }),
             CaptureBackend::Desktop(streamer) => streamer.input_controller(),
         }
@@ -207,6 +221,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
 #[cfg(windows)]
 struct DirectInputController {
     controller: Arc<Mutex<super::input::WindowsInputController>>,
+    clipboard: Option<Arc<Mutex<super::clipboard::ClipboardSync>>>,
 }
 
 #[cfg(windows)]
@@ -229,6 +244,24 @@ impl ScreenInput for DirectInputController {
         self.controller
             .lock()
             .map_or(CursorShape::Default, |input| input.cursor_shape())
+    }
+
+    fn apply_clipboard(&self, text: String) -> anyhow::Result<()> {
+        self.clipboard
+            .as_ref()
+            .context("interactive Windows clipboard is unavailable")?
+            .lock()
+            .map_err(|_| anyhow::anyhow!("direct clipboard lock was poisoned"))?
+            .apply(text)
+    }
+
+    fn poll_clipboard(&self) -> anyhow::Result<Option<String>> {
+        self.clipboard
+            .as_ref()
+            .context("interactive Windows clipboard is unavailable")?
+            .lock()
+            .map_err(|_| anyhow::anyhow!("direct clipboard lock was poisoned"))?
+            .poll()
     }
 }
 

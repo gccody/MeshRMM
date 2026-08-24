@@ -24,7 +24,6 @@ use webrtc::peer_connection::{
 };
 use webrtc::stats::StatsReportType;
 
-use super::clipboard::ClipboardSync;
 use super::platform::{ScreenStreamer, StartedScreen, monotonic_timestamp_us};
 use super::signaling::authenticated_websocket;
 use super::video::LatestFrameSlot;
@@ -372,13 +371,6 @@ async fn run_connected_sender(
     let mut requested_chroma = ChromaMode::Yuv420;
     let mut rejected_profiles = Vec::new();
     let mut capture_running = true;
-    let mut clipboard = match ClipboardSync::new() {
-        Ok(clipboard) => Some(clipboard),
-        Err(error) => {
-            tracing::warn!(error = %error, "clipboard sync is unavailable for this Agent session");
-            None
-        }
-    };
     let video_sender = spawn_video_sender(
         Arc::clone(&video_channel),
         Arc::clone(&video_open),
@@ -616,9 +608,7 @@ async fn run_connected_sender(
                         ).await?;
                     }
                     ControlCommand::Clipboard(text) => {
-                        if let Some(clipboard) = clipboard.as_mut()
-                            && let Err(error) = clipboard.apply(text)
-                        {
+                        if let Err(error) = input.apply_clipboard(text) {
                             tracing::warn!(error = %error, "discarding viewer clipboard update");
                         }
                     }
@@ -682,19 +672,16 @@ async fn run_connected_sender(
                 }
             }
             _ = clipboard_interval.tick(), if session_state == SessionState::Streaming
-                && clipboard.is_some()
                 && control_channel.ready_state() == RTCDataChannelState::Open => {
-                if let Some(clipboard) = clipboard.as_mut() {
-                    match clipboard.poll() {
-                        Ok(Some(text)) => {
-                            send_control_message(
-                                &control_channel,
-                                SessionMessage::Clipboard { text },
-                            ).await?;
-                        }
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(error = %error, "could not synchronize the Agent clipboard"),
+                match input.poll_clipboard() {
+                    Ok(Some(text)) => {
+                        send_control_message(
+                            &control_channel,
+                            SessionMessage::Clipboard { text },
+                        ).await?;
                     }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(error = %error, "could not synchronize the Agent clipboard"),
                 }
             }
             _ = cursor_interval.tick(), if session_state == SessionState::Streaming => {
