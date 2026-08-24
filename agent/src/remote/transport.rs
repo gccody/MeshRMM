@@ -7,8 +7,8 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use meshrmm_protocol::{
     CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, Codec, CursorShape, DEFAULT_FRAGMENT_PAYLOAD,
-    Display, DisplayId, IceServer, QualityPreset, RemoteInput, RemoteSessionId, SessionMessage,
-    SessionState, SignalMessage, VideoStreamId, fragment_frame,
+    Display, DisplayId, IceServer, QualityPreset, RemoteSessionId, SessionMessage, SessionState,
+    SignalMessage, VideoStreamId, fragment_frame,
 };
 use meshrmm_signaling_client::Socket;
 use tokio::sync::{Notify, mpsc};
@@ -42,7 +42,6 @@ enum ControlCommand {
         reason: String,
     },
     SelectDisplay(DisplayId),
-    Input(RemoteInput),
     Clipboard(String),
     ChannelClosed,
     Stop,
@@ -171,6 +170,9 @@ async fn run_connected_sender(
     session_id: RemoteSessionId,
     failure_reported: &mut bool,
 ) -> anyhow::Result<()> {
+    // Input has its own synchronized controller so capture startup, encoder
+    // recovery, and video teardown never hold the path used by control events.
+    let input = lock_streamer(&streamer)?.input_controller();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<SignalMessage>();
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ControlCommand>();
     let (state_tx, mut state_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
@@ -229,9 +231,11 @@ async fn run_connected_sender(
             })
         }));
         let control_messages_tx = control_tx.clone();
+        let control_input = Arc::clone(&input);
         control_channel.on_message(Box::new(move |message| {
             let tx = control_messages_tx.clone();
             let decoder_ready = Arc::clone(&decoder_ready);
+            let input = Arc::clone(&control_input);
             Box::pin(async move {
                 let command = match SessionMessage::decode(&message.data) {
                     Ok(SessionMessage::RequestKeyframe { .. }) => {
@@ -253,7 +257,12 @@ async fn run_connected_sender(
                     Ok(SessionMessage::SelectDisplay { display_id }) => {
                         Some(ControlCommand::SelectDisplay(display_id))
                     }
-                    Ok(SessionMessage::Input(input)) => Some(ControlCommand::Input(input)),
+                    Ok(SessionMessage::Input(event)) => {
+                        if let Err(error) = input.apply(event) {
+                            tracing::warn!(error = %error, "discarding invalid remote input");
+                        }
+                        None
+                    }
                     Ok(SessionMessage::Clipboard { text }) => Some(ControlCommand::Clipboard(text)),
                     Ok(SessionMessage::Stop { .. }) => Some(ControlCommand::Stop),
                     Ok(_) => None,
@@ -489,11 +498,6 @@ async fn run_connected_sender(
                             },
                         ).await?;
                     }
-                    ControlCommand::Input(event) => {
-                        if let Err(error) = lock_streamer(&streamer)?.apply_input(event) {
-                            tracing::warn!(error = %error, "discarding invalid remote input");
-                        }
-                    }
                     ControlCommand::Clipboard(text) => {
                         if let Some(clipboard) = clipboard.as_mut()
                             && let Err(error) = clipboard.apply(text)
@@ -570,7 +574,7 @@ async fn run_connected_sender(
                 }
             }
             _ = cursor_interval.tick(), if session_state == SessionState::Streaming => {
-                let shape = lock_streamer(&streamer)?.cursor_shape();
+                let shape = input.cursor_shape();
                 if sent_cursor_shape != Some(shape)
                     && control_channel.ready_state() == RTCDataChannelState::Open
                 {
@@ -669,7 +673,7 @@ async fn run_connected_sender(
         *failure_reported = true;
     }
     video_sender.abort();
-    if let Err(error) = lock_streamer(&streamer)?.release_input() {
+    if let Err(error) = input.release_all() {
         tracing::warn!(error = %error, "failed to release remote input during cleanup");
     }
     if matches!(

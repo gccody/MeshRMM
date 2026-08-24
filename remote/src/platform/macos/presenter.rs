@@ -375,7 +375,11 @@ impl MacUi {
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
         window.setTitlebarAppearsTransparent(true);
-        window.setMovableByWindowBackground(true);
+        // The content view handles mouse input for the remote desktop. Making
+        // the window movable by its background causes AppKit to turn drags on
+        // that view into local window moves instead of remote pointer drags.
+        // The native title bar remains draggable without this setting.
+        window.setMovableByWindowBackground(false);
         window.setTitle(&NSString::from_str(&format!(
             "MeshRMM Remote Desktop — {} — Control-Option-Arrow display · F12 diagnostics",
             active_display.name
