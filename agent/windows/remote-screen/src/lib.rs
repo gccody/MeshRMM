@@ -1,9 +1,9 @@
 #![cfg(windows)]
 
-//! Windows.Graphics.Capture + D3D11 + Media Foundation H.264 implementation.
+//! Windows.Graphics.Capture + D3D11 + Media Foundation hardware video implementation.
 //!
 //! COM and GPU objects remain on the capture worker thread. Only compressed
-//! H.264 access units cross the callback boundary.
+//! encoded access units cross the callback boundary.
 
 mod converter;
 mod duplication;
@@ -27,7 +27,7 @@ use windows_capture::settings::{
 };
 
 use crate::converter::BgraToNv12Converter;
-use crate::encoder::{MediaFoundationH264Encoder, VideoEncoder};
+use crate::encoder::{MediaFoundationVideoEncoder, VideoEncoder};
 
 pub type EncodedFrameSink = Arc<dyn Fn(EncodedAccessUnit) + Send + Sync + 'static>;
 
@@ -40,6 +40,7 @@ pub fn monotonic_timestamp_us() -> Result<u64, Error> {
 pub struct StreamConfig {
     pub frames_per_second: u32,
     pub bitrate_bits_per_second: u32,
+    pub codec: VideoCodec,
 }
 
 impl Default for StreamConfig {
@@ -47,6 +48,7 @@ impl Default for StreamConfig {
         Self {
             frames_per_second: 60,
             bitrate_bits_per_second: 12_000_000,
+            codec: VideoCodec::H264,
         }
     }
 }
@@ -57,6 +59,29 @@ pub struct ActiveFormat {
     pub height: u32,
     pub frames_per_second: u32,
     pub bitrate_bits_per_second: u32,
+    pub codec: VideoCodec,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    H265,
+}
+
+impl VideoCodec {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::H265 => "h265",
+        }
+    }
+}
+
+impl std::fmt::Display for VideoCodec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,7 +160,7 @@ pub enum Error {
     CaptureInitialization(String),
     #[error("D3D11 video conversion failed: {0}")]
     ColorConversion(#[from] converter::Error),
-    #[error("Media Foundation H.264 encoder failed: {0}")]
+    #[error("Media Foundation hardware encoder failed: {0}")]
     Encoder(#[from] encoder::Error),
     #[error("captured display dimensions must be at least 2x2")]
     InvalidDisplayDimensions,
@@ -163,7 +188,7 @@ struct ControlState {
 
 struct CaptureHandler {
     converter: BgraToNv12Converter,
-    encoder: MediaFoundationH264Encoder,
+    encoder: MediaFoundationVideoEncoder,
     sink: EncodedFrameSink,
     controls: Arc<ControlState>,
     format: ActiveFormat,
@@ -199,12 +224,13 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             format.height,
             format.frames_per_second,
         )?;
-        let encoder = MediaFoundationH264Encoder::new(
+        let encoder = MediaFoundationVideoEncoder::new(
             &context.device,
             format.width,
             format.height,
             format.frames_per_second,
             config.bitrate_bits_per_second,
+            config.codec,
         )?;
         Ok(Self {
             converter,
@@ -258,7 +284,8 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
                 self.logged_first_submission = true;
                 tracing::info!(
                     immediate_access_units = submitted.len(),
-                    "first desktop frame submitted to hardware H.264 encoder"
+                    codec = self.format.codec.name(),
+                    "first desktop frame submitted to hardware encoder"
                 );
             }
             access_units.extend(submitted);
@@ -291,7 +318,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
                 frames_encoded = self.frames_encoded,
                 width = self.format.width,
                 height = self.format.height,
-                codec = "h264",
+                codec = self.format.codec.name(),
                 "Windows capture/encoder statistics"
             );
             self.frames_captured = 0;
@@ -338,6 +365,12 @@ impl WindowsScreenStreamer {
         if self.control.is_some() {
             return Err(Error::AlreadyRunning);
         }
+        // The static media type already contains this start's bitrate. Do not
+        // replay a runtime request left behind by the previous encoder.
+        self.controls.requested_bitrate.store(0, Ordering::Release);
+        self.controls
+            .request_keyframe
+            .store(false, Ordering::Release);
         let monitor = Monitor::enumerate()
             .map_err(capture_error)?
             .into_iter()
@@ -363,6 +396,7 @@ impl WindowsScreenStreamer {
             height,
             frames_per_second: config.frames_per_second,
             bitrate_bits_per_second: config.bitrate_bits_per_second,
+            codec: config.codec,
         };
         let settings = Settings::new(
             monitor,

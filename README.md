@@ -17,14 +17,20 @@ workspace with platform and transport responsibilities kept in focused crates:
 ```text
 Windows.Graphics.Capture (BGRA ID3D11Texture2D)
   -> D3D11 video processor (pooled NV12 ID3D11Texture2D)
-  -> Media Foundation hardware H.264 encoder
+  -> Media Foundation hardware H.265 encoder (H.264 hardware fallback)
   -> latest encoded frame slot
   -> unordered/unreliable WebRTC DataChannel (12 KiB fragments)
   -> latest-only reassembly
   -> platform-native video presentation
-       Windows: Media Foundation H.264 decoder (DXGI surface) -> D3D11
+       Windows: Media Foundation H.265/H.264 decoder (DXGI surface) -> D3D11
        macOS: AVSampleBufferDisplayLayer -> Core Animation/AppKit window
 ```
+
+The viewer advertises only codecs for which it can initialize a hardware
+decoder. The Agent prefers H.265/HEVC when both ends expose a GPU path and
+falls back to hardware H.264 if HEVC initialization or playback fails. The
+viewer sidebar can change the live encoder ceiling between Data saver (3
+Mbps), Balanced (6 Mbps), and Best quality (the Agent's configured maximum).
 
 Cloudflare is not in that data path. An Agent coordinator Durable Object keeps
 the authenticated Agent reachable, and a temporary remote-session Durable
@@ -40,7 +46,8 @@ and are used by ICE only when a direct candidate pair cannot connect.
 - macOS 12 or newer for the macOS viewer.
 - A current stable Rust MSVC toolchain.
 - A GPU/driver exposing Media Foundation hardware H.264 encode and decode
-  transforms plus D3D11 NV12 video processing.
+  transforms plus D3D11 NV12 video processing. Hardware H.265/HEVC support is
+  optional and used automatically when it is available at both ends.
 - Node.js/npm and a Cloudflare account for the one-time server deployment.
 - The `wasm32-unknown-unknown` Rust target.
 
@@ -311,9 +318,9 @@ Windows and macOS. The selected display and captured cursor are streamed.
 Clipboard synchronization is plain text only; there is no audio, file transfer,
 recording, simultaneous multi-monitor view, browser client, or concurrent
 viewer. Windows secure-attention sequences
-such as Ctrl+Alt+Delete cannot be synthesized by a normal user-mode Agent. H.264
-is sent over a purpose-built unreliable WebRTC DataChannel rather than an RTP
-track. Encoded H.264 necessarily crosses CPU memory for packetization and decoder
-input. Windows keeps full-size captured and decoded images in D3D11 textures;
-macOS hands compressed samples to AVSampleBufferDisplayLayer and does not create
-a CPU RGBA frame in application code.
+such as Ctrl+Alt+Delete cannot be synthesized by a normal user-mode Agent. H.265
+or H.264 is sent over a purpose-built unreliable WebRTC DataChannel rather than
+an RTP track. Encoded video necessarily crosses CPU memory for packetization and
+decoder input. Windows keeps full-size captured and decoded images in D3D11
+textures; macOS hands compressed samples to AVSampleBufferDisplayLayer and does
+not create a CPU RGBA frame in application code.

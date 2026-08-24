@@ -11,7 +11,15 @@ struct WindowContext {
     debug_overlay: HWND,
     debug_visible: bool,
     debug_refreshed: std::time::Instant,
+    settings_panel: HWND,
+    settings_title: HWND,
+    settings_subtitle: HWND,
+    quality_buttons: [(HWND, QualityPreset); 3],
 }
+
+const QUALITY_DATA_SAVER_ID: usize = 4101;
+const QUALITY_BALANCED_ID: usize = 4102;
+const QUALITY_BEST_ID: usize = 4103;
 
 impl WindowContext {
     fn send(&self, message: SessionMessage) {
@@ -31,7 +39,11 @@ impl WindowContext {
         if unsafe { GetClientRect(window, &mut rect) }.is_err() {
             return None;
         }
-        let width = rect.right.saturating_sub(rect.left).max(1);
+        let width = rect
+            .right
+            .saturating_sub(rect.left)
+            .saturating_sub(SETTINGS_PANEL_WIDTH as i32)
+            .max(1);
         let height = rect.bottom.saturating_sub(rect.top).max(1);
         if x < 0 || x >= width || y < 0 || y >= height {
             return None;
@@ -40,6 +52,51 @@ impl WindowContext {
             (i64::from(x) * 65_535 / i64::from((width - 1).max(1))) as u16,
             (i64::from(y) * 65_535 / i64::from((height - 1).max(1))) as u16,
         ))
+    }
+
+    fn set_quality(&self, preset: QualityPreset) {
+        for (button, candidate) in self.quality_buttons {
+            let state = usize::from(candidate == preset);
+            unsafe { SendMessageW(button, BM_SETCHECK, Some(WPARAM(state)), None) };
+        }
+        self.send(SessionMessage::SetQuality { preset });
+    }
+
+    fn layout_settings(&self, window: HWND) {
+        let mut rect = RECT::default();
+        if unsafe { GetClientRect(window, &mut rect) }.is_err() {
+            return;
+        }
+        let width = rect.right.saturating_sub(rect.left);
+        let height = rect.bottom.saturating_sub(rect.top);
+        let panel_width = (SETTINGS_PANEL_WIDTH as i32).min(width.max(0));
+        let panel_x = width.saturating_sub(panel_width);
+        let _ = unsafe { MoveWindow(self.settings_panel, panel_x, 0, panel_width, height, true) };
+        let content_x = panel_x.saturating_add(22);
+        let content_width = panel_width.saturating_sub(44).max(1);
+        let _ = unsafe { MoveWindow(self.settings_title, content_x, 24, content_width, 28, true) };
+        let _ = unsafe {
+            MoveWindow(
+                self.settings_subtitle,
+                content_x,
+                64,
+                content_width,
+                22,
+                true,
+            )
+        };
+        for (index, (button, _)) in self.quality_buttons.iter().enumerate() {
+            let _ = unsafe {
+                MoveWindow(
+                    *button,
+                    content_x,
+                    98 + (index as i32 * 42),
+                    content_width,
+                    30,
+                    true,
+                )
+            };
+        }
     }
 
     fn move_pointer(&self, window: HWND, lparam: LPARAM) {
@@ -176,6 +233,29 @@ pub(super) unsafe fn create_window(
                 }
                 LRESULT(0)
             }
+            WM_SIZE => {
+                if let Some(context) = context {
+                    context.layout_settings(window);
+                }
+                LRESULT(0)
+            }
+            WM_COMMAND => {
+                if let Some(context) = context {
+                    let control_id = wparam.0 & 0xffff;
+                    let preset = match control_id {
+                        QUALITY_DATA_SAVER_ID => Some(QualityPreset::DataSaver),
+                        QUALITY_BALANCED_ID => Some(QualityPreset::Balanced),
+                        QUALITY_BEST_ID => Some(QualityPreset::BestQuality),
+                        _ => None,
+                    };
+                    if let Some(preset) = preset {
+                        context.set_quality(preset);
+                        let _ = unsafe { SetFocus(Some(window)) };
+                        return LRESULT(0);
+                    }
+                }
+                unsafe { DefWindowProcW(window, message, wparam, lparam) }
+            }
             WM_SETCURSOR => {
                 if let Some(context) = context
                     && (lparam.0 as u32 & 0xffff) == HTCLIENT
@@ -267,7 +347,7 @@ pub(super) unsafe fn create_window(
                 }
                 LRESULT(0)
             }
-            WM_CTLCOLORSTATIC => unsafe {
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => unsafe {
                 SetTextColor(
                     windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
                     windows::Win32::Foundation::COLORREF(0x00f4_f4f4),
@@ -331,7 +411,7 @@ pub(super) unsafe fn create_window(
     let mut rect = RECT {
         left: 0,
         top: 0,
-        right: format.width as i32,
+        right: format.width.saturating_add(SETTINGS_PANEL_WIDTH) as i32,
         bottom: format.height as i32,
     };
     unsafe { AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false) }
@@ -356,6 +436,14 @@ pub(super) unsafe fn create_window(
         debug_overlay: HWND::default(),
         debug_visible: false,
         debug_refreshed: std::time::Instant::now(),
+        settings_panel: HWND::default(),
+        settings_title: HWND::default(),
+        settings_subtitle: HWND::default(),
+        quality_buttons: [
+            (HWND::default(), QualityPreset::DataSaver),
+            (HWND::default(), QualityPreset::Balanced),
+            (HWND::default(), QualityPreset::BestQuality),
+        ],
     });
     let context = Box::into_raw(context);
     let window = unsafe {
@@ -398,8 +486,91 @@ pub(super) unsafe fn create_window(
         )
     }
     .context("debug overlay creation failed")?;
+    let panel = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!(""),
+            WS_CHILD | WS_VISIBLE | WS_BORDER,
+            format.width as i32,
+            0,
+            SETTINGS_PANEL_WIDTH as i32,
+            format.height as i32,
+            Some(window),
+            None,
+            Some(instance),
+            None,
+        )
+    }
+    .context("settings sidebar creation failed")?;
+    let settings_title = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!("Settings"),
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+            1,
+            1,
+            Some(window),
+            None,
+            Some(instance),
+            None,
+        )
+    }
+    .context("settings title creation failed")?;
+    let settings_subtitle = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!("Quality preset"),
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+            1,
+            1,
+            Some(window),
+            None,
+            Some(instance),
+            None,
+        )
+    }
+    .context("quality title creation failed")?;
+    let make_quality_button = |id: usize, text: PCWSTR| -> anyhow::Result<HWND> {
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("BUTTON"),
+                text,
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTORADIOBUTTON as u32),
+                0,
+                0,
+                1,
+                1,
+                Some(window),
+                Some(HMENU(id as *mut c_void)),
+                Some(instance),
+                None,
+            )
+        }
+        .context("quality preset button creation failed")
+    };
+    let data_saver = make_quality_button(QUALITY_DATA_SAVER_ID, w!("Data saver · 3 Mbps"))?;
+    let balanced = make_quality_button(QUALITY_BALANCED_ID, w!("Balanced · 6 Mbps"))?;
+    let best = make_quality_button(QUALITY_BEST_ID, w!("Best quality · configured maximum"))?;
     if let Some(context) = unsafe { window_context(window) } {
         context.debug_overlay = overlay;
+        context.settings_panel = panel;
+        context.settings_title = settings_title;
+        context.settings_subtitle = settings_subtitle;
+        context.quality_buttons = [
+            (data_saver, QualityPreset::DataSaver),
+            (balanced, QualityPreset::Balanced),
+            (best, QualityPreset::BestQuality),
+        ];
+        context.layout_settings(window);
+        context.set_quality(context.control.quality_preset());
     }
     let _ = unsafe { ShowWindow(window, SW_SHOW) };
     Ok(window)

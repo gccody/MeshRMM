@@ -33,7 +33,7 @@ impl Shared {
                 .send(SessionMessage::RequestKeyframe { stream_id });
             tracing::warn!(
                 stream_id = stream_id.0,
-                "macOS presenter dropped an H.264 reference; requesting a recovery keyframe"
+                "macOS presenter dropped a video reference; requesting a recovery keyframe"
             );
         }
     }
@@ -52,8 +52,8 @@ impl Presenter {
         control: ControlSink,
         debug: DebugInfo,
     ) -> anyhow::Result<Self> {
-        if format.codec != Codec::H264 {
-            bail!("macOS viewer supports only H.264");
+        if !hardware_decode_supported(format.codec) {
+            bail!("macOS has no hardware decoder for {:?}", format.codec);
         }
         let id = NEXT_PRESENTER_ID.fetch_add(1, Ordering::Relaxed);
         let shared = Arc::new(Shared {
@@ -255,6 +255,7 @@ struct MacUi {
     total_frames_submitted: u64,
     stats_started: Instant,
     debug: DebugInfo,
+    codec: Codec,
 }
 
 impl MacUi {
@@ -268,13 +269,13 @@ impl MacUi {
     ) -> anyhow::Result<Self> {
         let mtm =
             MainThreadMarker::new().context("AppKit must be initialized on the main thread")?;
-        let scale = (1440.0_f64 / f64::from(format.width))
+        let scale = ((1440.0_f64 - SETTINGS_PANEL_WIDTH) / f64::from(format.width))
             .min(900.0_f64 / f64::from(format.height))
             .min(1.0);
         let rect = NSRect {
             origin: NSPoint { x: 0.0, y: 0.0 },
             size: NSSize {
-                width: f64::from(format.width) * scale,
+                width: f64::from(format.width) * scale + SETTINGS_PANEL_WIDTH,
                 height: f64::from(format.height) * scale,
             },
         };
@@ -318,7 +319,9 @@ impl MacUi {
             .context("AVFoundation video gravity constant is unavailable")?;
         unsafe {
             layer.setVideoGravity(video_gravity);
-            layer.setFrame(view.bounds());
+            let mut video_bounds = view.bounds();
+            video_bounds.size.width = (video_bounds.size.width - SETTINGS_PANEL_WIDTH).max(1.0);
+            layer.setFrame(video_bounds);
             layer.setAutoresizingMask(
                 CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable,
             );
@@ -347,6 +350,7 @@ impl MacUi {
             total_frames_submitted: 0,
             stats_started: Instant::now(),
             debug,
+            codec: format.codec,
         })
     }
 
@@ -364,17 +368,26 @@ impl MacUi {
             return Ok(false);
         }
 
-        let converted = annex_b_to_avcc(&queued.frame.data)?;
+        let converted = annex_b_to_length_prefixed(&queued.frame.data, self.codec)?;
         if self.format_description.is_none() {
             let sps = converted
                 .sequence_parameter_set
                 .as_deref()
-                .context("bootstrap keyframe is missing an H.264 SPS")?;
+                .with_context(|| format!("bootstrap keyframe is missing a {:?} SPS", self.codec))?;
             let pps = converted
                 .picture_parameter_set
                 .as_deref()
-                .context("bootstrap keyframe is missing an H.264 PPS")?;
-            self.format_description = Some(create_h264_format_description(sps, pps)?);
+                .with_context(|| format!("bootstrap keyframe is missing a {:?} PPS", self.codec))?;
+            self.format_description = Some(match self.codec {
+                Codec::H264 => create_h264_format_description(sps, pps)?,
+                Codec::H265 => {
+                    let vps = converted
+                        .video_parameter_set
+                        .as_deref()
+                        .context("bootstrap keyframe is missing an H.265 VPS")?;
+                    create_h265_format_description(vps, sps, pps)?
+                }
+            });
             self.waiting_for_keyframe = false;
         }
         if !unsafe { self.layer.isReadyForMoreMediaData() } {
@@ -385,7 +398,7 @@ impl MacUi {
             &converted.data,
             self.format_description
                 .as_deref()
-                .context("H.264 format description is unavailable")?,
+                .context("video format description is unavailable")?,
             queued.frame.frame_id,
             self.frames_per_second,
         )?;
@@ -404,7 +417,7 @@ impl MacUi {
                 receive_to_submit_us =
                     monotonic_timestamp_us().saturating_sub(queued.received_at_us),
                 ready_for_display = unsafe { self.layer.isReadyForDisplay() },
-                codec = "h264",
+                codec = ?self.codec,
                 "macOS hardware decode/presentation statistics"
             );
             self.frames_submitted = 0;
@@ -426,6 +439,35 @@ impl MacUi {
         unsafe { self.layer.flushAndRemoveImage() };
         self.window.orderOut(None);
     }
+}
+
+fn create_h265_format_description(
+    vps: &[u8],
+    sps: &[u8],
+    pps: &[u8],
+) -> anyhow::Result<CFRetained<CMFormatDescription>> {
+    let mut pointers = [
+        NonNull::new(vps.as_ptr().cast_mut()).context("H.265 VPS is empty")?,
+        NonNull::new(sps.as_ptr().cast_mut()).context("H.265 SPS is empty")?,
+        NonNull::new(pps.as_ptr().cast_mut()).context("H.265 PPS is empty")?,
+    ];
+    let mut sizes = [vps.len(), sps.len(), pps.len()];
+    let mut description: *const CMFormatDescription = ptr::null();
+    let status = unsafe {
+        CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+            None,
+            pointers.len(),
+            NonNull::new(pointers.as_mut_ptr()).context("H.265 parameter pointers are null")?,
+            NonNull::new(sizes.as_mut_ptr()).context("H.265 parameter sizes are null")?,
+            4,
+            None,
+            NonNull::from(&mut description),
+        )
+    };
+    check_status(status, "CoreMedia rejected H.265 parameter sets")?;
+    let description = NonNull::new(description.cast_mut())
+        .context("CoreMedia returned no H.265 format description")?;
+    Ok(unsafe { CFRetained::from_raw(description) })
 }
 
 fn create_h264_format_description(
@@ -462,7 +504,7 @@ fn create_sample_buffer(
     frames_per_second: i32,
 ) -> anyhow::Result<CFRetained<CMSampleBuffer>> {
     if data.is_empty() {
-        bail!("cannot create an empty H.264 sample");
+        bail!("cannot create an empty video sample");
     }
     let mut block: *mut CMBlockBuffer = ptr::null_mut();
     let status = unsafe {

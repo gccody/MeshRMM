@@ -1,13 +1,14 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use meshrmm_protocol::{
-    CONTROL_CHANNEL_LABEL, CursorShape, EncodedFrame, FrameReassembler, IceServer,
-    ReassemblyConfig, ReassemblyOutcome, SessionBootstrap, SessionMessage, SessionState,
-    SignalMessage, VideoPacket, VideoStreamId,
+    CONTROL_CHANNEL_LABEL, Codec, CursorShape, EncodedFrame, FrameReassembler, IceServer,
+    QualityPreset, ReassemblyConfig, ReassemblyOutcome, SessionBootstrap, SessionMessage,
+    SessionState, SignalMessage, VideoPacket, VideoStreamId,
 };
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -33,6 +34,7 @@ const KEYFRAME_RETRY_INTERVAL_US: u64 = 250_000;
 
 struct ActivePresenter {
     stream_id: VideoStreamId,
+    codec: Codec,
     presenter: Presenter,
 }
 
@@ -91,7 +93,7 @@ impl VideoReceiveState {
                 last_frame_id = ?self.last_accepted_frame_id,
                 frame_id = frame.frame_id,
                 stream_id = frame.stream_id.0,
-                "H.264 frame gap detected; suppressing deltas until a keyframe arrives"
+                "video frame gap detected; suppressing deltas until a keyframe arrives"
             );
         }
 
@@ -242,7 +244,7 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
     let mut session_state = SessionState::Requested.transition(SessionState::Signaling)?;
     outgoing_tx.send(SignalMessage::Ready)?;
     session_state = session_state.transition(SessionState::Connecting)?;
-    let startup_started = tokio::time::Instant::now();
+    let mut presenter_missing_since = Some(tokio::time::Instant::now());
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     stats_interval.tick().await;
     let mut activity_interval = tokio::time::interval(SESSION_ACTIVITY_INTERVAL);
@@ -362,18 +364,43 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
             }
             _ = stats_interval.tick() => {
                 let presenter_missing = presenter.lock().is_ok_and(|guard| guard.is_none());
-                if presenter_missing && startup_started.elapsed() >= std::time::Duration::from_secs(30) {
-                    break Err(anyhow::anyhow!(
-                        "timed out waiting 30 seconds for the remote video stream; check the Agent's WebRTC and ICE logs"
-                    ));
+                if presenter_missing {
+                    let waiting_since = presenter_missing_since
+                        .get_or_insert_with(tokio::time::Instant::now);
+                    if waiting_since.elapsed() >= std::time::Duration::from_secs(30) {
+                        break Err(anyhow::anyhow!(
+                            "timed out waiting 30 seconds for the remote video stream; check the Agent's WebRTC and ICE logs"
+                        ));
+                    }
+                } else {
+                    presenter_missing_since = None;
                 }
                 update_network_stats(&peer, &debug).await;
                 let ended = presenter
                     .lock()
                     .ok()
-                    .and_then(|guard| guard.as_ref().and_then(|active| active.presenter.poll_ended()));
-                if let Some(ended) = ended {
-                    break ended.map_err(anyhow::Error::msg);
+                    .and_then(|guard| {
+                        guard.as_ref().and_then(|active| {
+                            active.presenter.poll_ended().map(|ended| (active.codec, ended))
+                        })
+                    });
+                if let Some((codec, ended)) = ended {
+                    match (codec, ended) {
+                        (Codec::H265, Err(reason)) => {
+                            tracing::warn!(%reason, "H.265 presentation failed; requesting H.264 fallback");
+                            viewer_control.send(SessionMessage::CodecRejected {
+                                codec: Codec::H265,
+                                reason,
+                            });
+                            if let Ok(mut guard) = presenter.lock()
+                                && let Some(mut failed) = guard.take()
+                            {
+                                failed.presenter.stop();
+                            }
+                            presenter_missing_since = Some(tokio::time::Instant::now());
+                        }
+                        (_, ended) => break ended.map_err(anyhow::Error::msg),
+                    }
                 }
             },
             _ = tokio::signal::ctrl_c() => break Ok(()),
@@ -608,9 +635,13 @@ fn install_control_handler(
         }));
     }
     let cursor_shape = Arc::new(Mutex::new(CursorShape::Default));
+    let capabilities_sent = Arc::new(AtomicBool::new(false));
+    let quality_preset = Arc::new(Mutex::new(QualityPreset::default()));
     channel.on_message(Box::new(move |message| {
         let presenter = Arc::clone(&presenter);
         let cursor_shape = Arc::clone(&cursor_shape);
+        let capabilities_sent = Arc::clone(&capabilities_sent);
+        let quality_preset = Arc::clone(&quality_preset);
         let viewer_control = viewer_control.clone();
         let remote_clipboard = remote_clipboard.clone();
         let presentation_failure = presentation_failure.clone();
@@ -636,6 +667,7 @@ fn install_control_handler(
                     let sink = ControlSink::new(
                         move |message| message_queue.send(message),
                         move |enabled| input_gate.set_input_enabled(enabled),
+                        Arc::clone(&quality_preset),
                     );
                     debug.configure_stream(
                         active_display.name.clone(),
@@ -648,7 +680,7 @@ fn install_control_handler(
                         format,
                         active_display.clone(),
                         displays,
-                        sink,
+                        sink.clone(),
                         debug.clone(),
                     ) {
                         Ok(new_presenter) => {
@@ -660,6 +692,7 @@ fn install_control_handler(
                                 .ok()
                                 .and_then(|mut guard| guard.replace(ActivePresenter {
                                     stream_id,
+                                    codec: format.codec,
                                     presenter: new_presenter,
                                 }));
                             if let Some(old) = old.as_mut() {
@@ -667,6 +700,12 @@ fn install_control_handler(
                             }
                             let request = SessionMessage::RequestKeyframe { stream_id };
                             viewer_control.send(request);
+                            if !capabilities_sent.swap(true, Ordering::AcqRel) {
+                                viewer_control.send(SessionMessage::ViewerCapabilities {
+                                    codecs: crate::platform::supported_video_codecs(format),
+                                    quality: sink.quality_preset(),
+                                });
+                            }
                             tracing::info!(display_id = active_display_id.0, display_name = %active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, codec = ?format.codec, "remote control stream configured");
                         }
                         Err(error) => {
@@ -674,7 +713,14 @@ fn install_control_handler(
                                 "hardware decoder/presenter initialization failed: {error:#}"
                             );
                             tracing::error!(error = %error, "hardware decoder/presenter initialization failed");
-                            let _ = presentation_failure.send(message);
+                            if format.codec == meshrmm_protocol::Codec::H265 {
+                                viewer_control.send(SessionMessage::CodecRejected {
+                                    codec: format.codec,
+                                    reason: message,
+                                });
+                            } else {
+                                let _ = presentation_failure.send(message);
+                            }
                         }
                     }
                 }
@@ -753,7 +799,7 @@ fn install_video_handler(
                 });
                 tracing::warn!(
                     stream_id = packet_stream_id.0,
-                    "requested an H.264 recovery keyframe"
+                    "requested a video recovery keyframe"
                 );
             }
             if let Some(frame) = completed {

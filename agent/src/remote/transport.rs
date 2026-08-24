@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -5,9 +6,9 @@ use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use meshrmm_protocol::{
-    CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, CursorShape, DEFAULT_FRAGMENT_PAYLOAD,
-    Display, DisplayId, IceServer, RemoteInput, RemoteSessionId, SessionMessage, SessionState,
-    SignalMessage, VideoStreamId, fragment_frame,
+    CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, Codec, CursorShape, DEFAULT_FRAGMENT_PAYLOAD,
+    Display, DisplayId, IceServer, QualityPreset, RemoteInput, RemoteSessionId, SessionMessage,
+    SessionState, SignalMessage, VideoStreamId, fragment_frame,
 };
 use meshrmm_signaling_client::Socket;
 use tokio::sync::{Notify, mpsc};
@@ -31,6 +32,15 @@ use super::video::LatestFrameSlot;
 enum ControlCommand {
     Keyframe,
     Bitrate(u32),
+    ViewerCapabilities {
+        codecs: Vec<Codec>,
+        quality: QualityPreset,
+    },
+    Quality(QualityPreset),
+    CodecRejected {
+        codec: Codec,
+        reason: String,
+    },
     SelectDisplay(DisplayId),
     Input(RemoteInput),
     Clipboard(String),
@@ -66,6 +76,19 @@ impl AdaptiveBitrate {
             last_decrease_us: 0,
             healthy_since_us: 0,
         }
+    }
+
+    fn set_maximum(&mut self, maximum: u32) -> Option<u32> {
+        let maximum = maximum.max(1);
+        if self.maximum == maximum {
+            return None;
+        }
+        self.maximum = maximum;
+        self.minimum = (maximum / 8).max(500_000).min(maximum);
+        self.current = maximum;
+        self.last_decrease_us = 0;
+        self.healthy_since_us = 0;
+        Some(maximum)
     }
 
     fn observe(
@@ -161,7 +184,7 @@ async fn run_connected_sender(
         .create_data_channel(
             "meshrmm-video-v1",
             Some(RTCDataChannelInit {
-                // H.264 access units form a predictive chain. Keep this
+                // Inter-frame video access units form a predictive chain. Keep this
                 // dedicated video stream ordered so benign SCTP reordering is
                 // not mistaken for packet loss. One retry bounds head-of-line
                 // delay, and input remains isolated on the control stream.
@@ -218,6 +241,15 @@ async fn run_connected_sender(
                     Ok(SessionMessage::SetBitrate { bits_per_second }) => {
                         Some(ControlCommand::Bitrate(bits_per_second))
                     }
+                    Ok(SessionMessage::ViewerCapabilities { codecs, quality }) => {
+                        Some(ControlCommand::ViewerCapabilities { codecs, quality })
+                    }
+                    Ok(SessionMessage::SetQuality { preset }) => {
+                        Some(ControlCommand::Quality(preset))
+                    }
+                    Ok(SessionMessage::CodecRejected { codec, reason }) => {
+                        Some(ControlCommand::CodecRejected { codec, reason })
+                    }
                     Ok(SessionMessage::SelectDisplay { display_id }) => {
                         Some(ControlCommand::SelectDisplay(display_id))
                     }
@@ -248,6 +280,9 @@ async fn run_connected_sender(
     let mut displays = started.displays;
     let mut active_display = started.active_display;
     let format = started.format;
+    let configured_maximum_bitrate = format.bitrate_bits_per_second;
+    let quality_ceiling = Arc::new(AtomicU32::new(configured_maximum_bitrate));
+    let mut active_codec = format.codec;
     let mut capture_running = true;
     let mut clipboard = match ClipboardSync::new() {
         Ok(clipboard) => Some(clipboard),
@@ -262,7 +297,7 @@ async fn run_connected_sender(
         decoder_ready,
         Arc::clone(&slot),
         control_tx.clone(),
-        format.bitrate_bits_per_second,
+        Arc::clone(&quality_ceiling),
         video_failure_tx,
     );
     spawn_control_start(
@@ -351,6 +386,103 @@ async fn run_connected_sender(
                             tracing::warn!(error = %error, "could not set bitrate while the desktop is changing");
                         }
                     }
+                    ControlCommand::Quality(preset) => {
+                        let value = preset.bitrate(configured_maximum_bitrate);
+                        quality_ceiling.store(value, Ordering::Release);
+                        if let Err(error) = lock_streamer(&streamer)?.set_bitrate(value) {
+                            tracing::warn!(error = %error, "could not apply viewer quality preset");
+                        } else {
+                            tracing::info!(?preset, bits_per_second = value, "viewer quality preset applied");
+                        }
+                    }
+                    ControlCommand::ViewerCapabilities { codecs, quality } => {
+                        let value = quality.bitrate(configured_maximum_bitrate);
+                        quality_ceiling.store(value, Ordering::Release);
+                        if let Err(error) = lock_streamer(&streamer)?.set_bitrate(value) {
+                            tracing::warn!(error = %error, "could not apply initial viewer quality preset");
+                        }
+                        let preferred = if codecs.contains(&Codec::H265) {
+                            Codec::H265
+                        } else {
+                            Codec::H264
+                        };
+                        if preferred == active_codec {
+                            tracing::info!(codec = ?active_codec, ?quality, "video codec negotiation retained active codec");
+                            continue;
+                        }
+
+                        lock_streamer(&streamer)?.stop()?;
+                        capture_running = false;
+                        slot.clear();
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                        lock_streamer(&streamer)?.set_codec(preferred);
+                        let negotiated = lock_streamer(&streamer)?.start(
+                            Some(active_display.id),
+                            stream_id,
+                            Arc::clone(&slot),
+                        );
+                        let started = match negotiated {
+                            Ok(started) => started,
+                            Err(error) if preferred == Codec::H265 => {
+                                tracing::warn!(error = ?error, "hardware HEVC encoder unavailable; falling back to H.264");
+                                lock_streamer(&streamer)?.set_codec(Codec::H264);
+                                lock_streamer(&streamer)?.start(
+                                    Some(active_display.id),
+                                    stream_id,
+                                    Arc::clone(&slot),
+                                )?
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        displays = started.displays;
+                        active_display = started.active_display;
+                        active_codec = started.format.codec;
+                        capture_running = true;
+                        capture_unavailable_since = None;
+                        sent_cursor_shape = None;
+                        send_control_message(
+                            &control_channel,
+                            SessionMessage::DisplayConfiguration {
+                                displays: displays.clone(),
+                                active_display_id: active_display.id,
+                                stream_id,
+                                format: started.format,
+                            },
+                        ).await?;
+                        tracing::info!(codec = ?active_codec, ?quality, bits_per_second = value, "video codec negotiation completed");
+                    }
+                    ControlCommand::CodecRejected { codec, reason } => {
+                        if codec != Codec::H265 || active_codec != Codec::H265 {
+                            tracing::warn!(?codec, reason, "viewer rejected an inactive codec");
+                            continue;
+                        }
+                        tracing::warn!(reason, "viewer rejected hardware HEVC; falling back to H.264");
+                        lock_streamer(&streamer)?.stop()?;
+                        capture_running = false;
+                        slot.clear();
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                        lock_streamer(&streamer)?.set_codec(Codec::H264);
+                        let started = lock_streamer(&streamer)?.start(
+                            Some(active_display.id),
+                            stream_id,
+                            Arc::clone(&slot),
+                        )?;
+                        displays = started.displays;
+                        active_display = started.active_display;
+                        active_codec = Codec::H264;
+                        capture_running = true;
+                        capture_unavailable_since = None;
+                        sent_cursor_shape = None;
+                        send_control_message(
+                            &control_channel,
+                            SessionMessage::DisplayConfiguration {
+                                displays: displays.clone(),
+                                active_display_id: active_display.id,
+                                stream_id,
+                                format: started.format,
+                            },
+                        ).await?;
+                    }
                     ControlCommand::Input(event) => {
                         if let Err(error) = lock_streamer(&streamer)?.apply_input(event) {
                             tracing::warn!(error = %error, "discarding invalid remote input");
@@ -385,6 +517,7 @@ async fn run_connected_sender(
                             Ok(started) => {
                                 displays = started.displays;
                                 active_display = started.active_display;
+                                active_codec = started.format.codec;
                                 capture_running = true;
                                 capture_unavailable_since = None;
                                 sent_cursor_shape = None;
@@ -476,10 +609,23 @@ async fn run_connected_sender(
                         stream_id,
                         Arc::clone(&slot),
                     );
+                    let restart = match restart {
+                        Err(error) if active_codec == Codec::H265 => {
+                            tracing::warn!(error = ?error, "hardware HEVC capture restart failed; falling back to H.264");
+                            lock_streamer(&streamer)?.set_codec(Codec::H264);
+                            lock_streamer(&streamer)?.start(
+                                Some(active_display.id),
+                                stream_id,
+                                Arc::clone(&slot),
+                            )
+                        }
+                        result => result,
+                    };
                     match restart {
                         Ok(started) => {
                             displays = started.displays;
                             active_display = started.active_display;
+                            active_codec = started.format.codec;
                             capture_running = true;
                             sent_cursor_shape = None;
                             let recovery_ms = capture_unavailable_since
@@ -701,7 +847,7 @@ fn spawn_video_sender(
     decoder_ready: Arc<Notify>,
     slot: Arc<LatestFrameSlot>,
     recovery: mpsc::UnboundedSender<ControlCommand>,
-    maximum_bitrate: u32,
+    quality_ceiling: Arc<AtomicU32>,
     failure: mpsc::UnboundedSender<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -737,7 +883,7 @@ fn spawn_video_sender(
         let mut last_sent = None::<(VideoStreamId, u64)>;
         let mut recovering = false;
         let mut last_keyframe_request_us = 0_u64;
-        let mut bitrate = AdaptiveBitrate::new(maximum_bitrate);
+        let mut bitrate = AdaptiveBitrate::new(quality_ceiling.load(Ordering::Acquire).max(1));
         loop {
             let source = if let Some(frame) = bootstrap_keyframe.take() {
                 frame
@@ -766,6 +912,10 @@ fn spawn_video_sender(
             }
 
             let now_us = monotonic_timestamp_us();
+            let requested_maximum = quality_ceiling.load(Ordering::Acquire).max(1);
+            if let Some(bits_per_second) = bitrate.set_maximum(requested_maximum) {
+                let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
+            }
             let mut buffered_bytes = channel.buffered_amount().await;
             if let Some(bits_per_second) =
                 bitrate.observe(now_us, buffered_bytes, slot.len(), reference_chain_lost)
@@ -931,5 +1081,17 @@ mod tests {
             now_us += BITRATE_DECREASE_INTERVAL_US;
         }
         assert_eq!(bitrate.current, 1_000_000);
+    }
+
+    #[test]
+    fn quality_ceiling_change_takes_effect_immediately() {
+        let mut bitrate = AdaptiveBitrate::new(12_000_000);
+        assert_eq!(bitrate.set_maximum(3_000_000), Some(3_000_000));
+        assert_eq!(bitrate.current, 3_000_000);
+        assert_eq!(bitrate.maximum, 3_000_000);
+
+        assert_eq!(bitrate.set_maximum(6_000_000), Some(6_000_000));
+        assert_eq!(bitrate.current, 6_000_000);
+        assert_eq!(bitrate.set_maximum(6_000_000), None);
     }
 }

@@ -10,15 +10,24 @@ use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerforma
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{Interface, Result as WindowsResult};
 
-use crate::EncodedAccessUnit;
 use crate::converter::SURFACE_COUNT;
+use crate::{EncodedAccessUnit, VideoCodec};
+
+impl VideoCodec {
+    fn media_foundation_subtype(self) -> windows::core::GUID {
+        match self {
+            Self::H264 => MFVideoFormat_H264,
+            Self::H265 => MFVideoFormat_HEVC,
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Media Foundation startup failed: {0}")]
     Startup(#[source] windows::core::Error),
-    #[error("no hardware Media Foundation H.264 encoder accepts NV12")]
-    HardwareEncoderUnavailable,
+    #[error("no hardware Media Foundation {0} encoder accepts NV12")]
+    HardwareEncoderUnavailable(VideoCodec),
     #[error("Media Foundation encoder configuration failed: {0}")]
     Configuration(#[source] windows::core::Error),
     #[error("Media Foundation encoder input failed: {0}")]
@@ -29,8 +38,10 @@ pub enum Error {
     MissingOutputSample,
     #[error("Media Foundation returned encoded output without matching input metadata")]
     MissingInputMetadata,
-    #[error("encoded H.264 output exceeded addressable memory")]
+    #[error("encoded video output exceeded addressable memory")]
     EncodedOutputTooLarge,
+    #[error("hardware encoder does not support runtime {0}")]
+    RuntimeControlUnavailable(&'static str),
     #[error("performance counter is unavailable")]
     PerformanceCounter,
 }
@@ -68,7 +79,7 @@ impl Drop for MediaFoundationRuntime {
     }
 }
 
-pub struct MediaFoundationH264Encoder {
+pub struct MediaFoundationVideoEncoder {
     _runtime: MediaFoundationRuntime,
     transform: IMFTransform,
     event_generator: IMFMediaEventGenerator,
@@ -81,15 +92,17 @@ pub struct MediaFoundationH264Encoder {
     sequence_header: Option<Vec<u8>>,
     sequence_header_sent: bool,
     pending_capture_timestamps: VecDeque<u64>,
+    codec: VideoCodec,
 }
 
-impl MediaFoundationH264Encoder {
+impl MediaFoundationVideoEncoder {
     pub fn new(
         device: &ID3D11Device,
         width: u32,
         height: u32,
         frames_per_second: u32,
         bitrate_bits_per_second: u32,
+        codec: VideoCodec,
     ) -> Result<Self, Error> {
         let runtime = MediaFoundationRuntime::start()?;
         // Safety: MFT enumeration returns a COM-allocated array which is freed
@@ -101,17 +114,16 @@ impl MediaFoundationH264Encoder {
             };
             let output_info = MFT_REGISTER_TYPE_INFO {
                 guidMajorType: MFMediaType_Video,
-                guidSubtype: MFVideoFormat_H264,
+                guidSubtype: codec.media_foundation_subtype(),
             };
             let mut activations_ptr: *mut Option<IMFActivate> = ptr::null_mut();
             let mut activation_count = 0_u32;
             MFTEnumEx(
                 MFT_CATEGORY_VIDEO_ENCODER,
-                MFT_ENUM_FLAG(
-                    MFT_ENUM_FLAG_HARDWARE.0
-                        | MFT_ENUM_FLAG_ASYNCMFT.0
-                        | MFT_ENUM_FLAG_SORTANDFILTER.0,
-                ),
+                // Hardware MFTs are their own enumeration category and are
+                // always asynchronous. Including ASYNCMFT here would also
+                // admit software asynchronous encoders.
+                MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0),
                 Some(&input_info),
                 Some(&output_info),
                 &mut activations_ptr,
@@ -119,7 +131,7 @@ impl MediaFoundationH264Encoder {
             )
             .map_err(Error::Configuration)?;
             if activation_count == 0 || activations_ptr.is_null() {
-                return Err(Error::HardwareEncoderUnavailable);
+                return Err(Error::HardwareEncoderUnavailable(codec));
             }
             let activations =
                 std::slice::from_raw_parts_mut(activations_ptr, activation_count as usize);
@@ -128,7 +140,7 @@ impl MediaFoundationH264Encoder {
                 let _ = item.take();
             }
             CoTaskMemFree(Some(activations_ptr.cast()));
-            let activation = activation.ok_or(Error::HardwareEncoderUnavailable)?;
+            let activation = activation.ok_or(Error::HardwareEncoderUnavailable(codec))?;
             let transform: IMFTransform =
                 activation.ActivateObject().map_err(Error::Configuration)?;
             let attributes = transform.GetAttributes().map_err(Error::Configuration)?;
@@ -145,7 +157,7 @@ impl MediaFoundationH264Encoder {
             let mut device_manager = None;
             MFCreateDXGIDeviceManager(&mut reset_token, &mut device_manager)
                 .map_err(Error::Configuration)?;
-            let device_manager = device_manager.ok_or(Error::HardwareEncoderUnavailable)?;
+            let device_manager = device_manager.ok_or(Error::HardwareEncoderUnavailable(codec))?;
             device_manager
                 .ResetDevice(device, reset_token)
                 .map_err(Error::Configuration)?;
@@ -158,15 +170,20 @@ impl MediaFoundationH264Encoder {
 
             configure_codec(&codec_api, bitrate_bits_per_second, frames_per_second)?;
             let output_type = make_video_type(
-                MFVideoFormat_H264,
+                codec.media_foundation_subtype(),
                 width,
                 height,
                 frames_per_second,
                 Some(bitrate_bits_per_second),
             )?;
-            output_type
-                .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)
-                .map_err(Error::Configuration)?;
+            match codec {
+                VideoCodec::H264 => output_type
+                    .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)
+                    .map_err(Error::Configuration)?,
+                VideoCodec::H265 => output_type
+                    .SetUINT32(&MF_MT_VIDEO_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)
+                    .map_err(Error::Configuration)?,
+            }
             transform
                 .SetOutputType(0, &output_type, 0)
                 .map_err(Error::Configuration)?;
@@ -198,6 +215,7 @@ impl MediaFoundationH264Encoder {
                 sequence_header,
                 sequence_header_sent: false,
                 pending_capture_timestamps: VecDeque::with_capacity(SURFACE_COUNT),
+                codec,
             };
             encoder.pump_events(false)?;
             Ok(encoder)
@@ -275,7 +293,7 @@ impl MediaFoundationH264Encoder {
             // Several hardware MFTs omit CleanPoint on forced IDRs. Inspecting
             // the access unit prevents a valid recovery frame from being
             // mislabeled and discarded by a decoder waiting for an IDR.
-            let keyframe = clean_point || contains_h264_idr(&data);
+            let keyframe = clean_point || contains_idr(self.codec, &data);
             let mut codec_config = None;
             // Some hardware MFTs omit MFSampleExtension_CleanPoint on their
             // first IDR. The decoder still needs SPS/PPS before that first
@@ -292,7 +310,8 @@ impl MediaFoundationH264Encoder {
                     codec_config_bytes = codec_config.as_ref().map_or(0, Vec::len),
                     keyframe,
                     annex_b = data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1]),
-                    "first H.264 access unit produced by hardware encoder"
+                    codec = self.codec.name(),
+                    "first access unit produced by hardware encoder"
                 );
             }
             Ok(EncodedAccessUnit {
@@ -309,7 +328,7 @@ impl MediaFoundationH264Encoder {
     }
 }
 
-impl VideoEncoder for MediaFoundationH264Encoder {
+impl VideoEncoder for MediaFoundationVideoEncoder {
     fn poll(&mut self) -> Result<Vec<EncodedAccessUnit>, Error> {
         self.pump_events(false)?;
         self.take_available_outputs()
@@ -359,7 +378,7 @@ impl VideoEncoder for MediaFoundationH264Encoder {
     }
 
     fn set_bitrate(&self, bits_per_second: u32) -> Result<(), Error> {
-        set_optional_codec_value(
+        set_required_runtime_codec_value(
             &self.codec_api,
             &CODECAPI_AVEncCommonMeanBitRate,
             (bits_per_second as i32).into(),
@@ -368,7 +387,7 @@ impl VideoEncoder for MediaFoundationH264Encoder {
     }
 }
 
-impl MediaFoundationH264Encoder {
+impl MediaFoundationVideoEncoder {
     fn take_available_outputs(&mut self) -> Result<Vec<EncodedAccessUnit>, Error> {
         let mut outputs = Vec::with_capacity(self.have_output as usize);
         while self.have_output > 0 {
@@ -379,7 +398,7 @@ impl MediaFoundationH264Encoder {
     }
 }
 
-impl Drop for MediaFoundationH264Encoder {
+impl Drop for MediaFoundationVideoEncoder {
     fn drop(&mut self) {
         // Safety: these messages terminate the transform owned by this object.
         unsafe {
@@ -442,7 +461,7 @@ fn configure_codec(
 ) -> Result<(), Error> {
     // Sunshine's default single-frame VBV/HRD budget prevents a keyframe or
     // complex desktop update from monopolizing the network for several frame
-    // intervals. Media Foundation expresses the H.264 HRD size in bytes.
+    // intervals. Media Foundation expresses this buffer size in bytes.
     let single_frame_buffer_bytes = bitrate_bits_per_second
         .div_ceil(8)
         .div_ceil(frames_per_second.max(1))
@@ -482,12 +501,12 @@ fn configure_codec(
         codec_api,
         &CODECAPI_AVEncCommonBufferSize,
         VARIANT::from(single_frame_buffer_bytes),
-        "single-frame H.264 HRD buffer",
+        "single-frame encoder buffer",
     )?;
     Ok(())
 }
 
-fn contains_h264_idr(data: &[u8]) -> bool {
+fn contains_idr(codec: VideoCodec, data: &[u8]) -> bool {
     let mut index = 0;
     while index + 4 <= data.len() {
         let start_len = if data[index..].starts_with(&[0, 0, 0, 1]) {
@@ -499,12 +518,40 @@ fn contains_h264_idr(data: &[u8]) -> bool {
             continue;
         };
         let nal = index + start_len;
-        if nal < data.len() && data[nal] & 0x1f == 5 {
-            return true;
+        if nal < data.len() {
+            let nal_type = match codec {
+                VideoCodec::H264 => data[nal] & 0x1f,
+                VideoCodec::H265 => (data[nal] >> 1) & 0x3f,
+            };
+            if matches!(
+                (codec, nal_type),
+                (VideoCodec::H264, 5) | (VideoCodec::H265, 16..=21)
+            ) {
+                return true;
+            }
         }
         index = nal.saturating_add(1);
     }
     false
+}
+
+fn set_required_runtime_codec_value(
+    codec_api: &ICodecAPI,
+    key: &windows::core::GUID,
+    value: VARIANT,
+    setting: &'static str,
+) -> Result<(), Error> {
+    // A bitrate selection must take effect. Returning an error causes the
+    // capture owner to restart the hardware encoder with the new bitrate in
+    // its static output media type when a driver cannot modify it in place.
+    unsafe {
+        if codec_api.IsSupported(key).is_err() || codec_api.IsModifiable(key).is_err() {
+            return Err(Error::RuntimeControlUnavailable(setting));
+        }
+        codec_api
+            .SetValue(key, &value)
+            .map_err(Error::Configuration)
+    }
 }
 
 fn set_optional_codec_value(
@@ -563,11 +610,16 @@ fn _windows_result_type(_: WindowsResult<()>) {}
 
 #[cfg(test)]
 mod tests {
-    use super::contains_h264_idr;
+    use super::contains_idr;
+    use crate::VideoCodec;
 
     #[test]
     fn detects_idr_in_annex_b_access_units() {
-        assert!(contains_h264_idr(&[0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x65, 2]));
-        assert!(!contains_h264_idr(&[0, 0, 1, 0x41, 1, 2, 3]));
+        assert!(contains_idr(
+            VideoCodec::H264,
+            &[0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x65, 2]
+        ));
+        assert!(!contains_idr(VideoCodec::H264, &[0, 0, 1, 0x41, 1, 2, 3]));
+        assert!(contains_idr(VideoCodec::H265, &[0, 0, 0, 1, 19 << 1, 1]));
     }
 }

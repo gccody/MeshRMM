@@ -9,7 +9,7 @@ use windows_capture::dxgi_duplication_api::{
 use windows_capture::monitor::Monitor;
 
 use crate::converter::BgraToNv12Converter;
-use crate::encoder::{MediaFoundationH264Encoder, VideoEncoder};
+use crate::encoder::{MediaFoundationVideoEncoder, VideoEncoder};
 use crate::{
     ActiveFormat, ControlState, EncodedAccessUnit, EncodedFrameSink, Error, StreamConfig,
     monotonic_timestamp_us,
@@ -51,6 +51,12 @@ impl WindowsDesktopDuplicationStreamer {
         if self.running.is_some() {
             return Err(Error::AlreadyRunning);
         }
+        // The static media type already contains this start's bitrate. Do not
+        // replay a runtime request left behind by the previous encoder.
+        self.controls.requested_bitrate.store(0, Ordering::Release);
+        self.controls
+            .request_keyframe
+            .store(false, Ordering::Release);
         let monitor = Monitor::enumerate()
             .map_err(|error| Error::DesktopDuplication(error.to_string()))?
             .into_iter()
@@ -225,6 +231,7 @@ fn capture_loop_inner(
         height,
         frames_per_second: config.frames_per_second,
         bitrate_bits_per_second: config.bitrate_bits_per_second,
+        codec: config.codec,
     };
     let mut converter = BgraToNv12Converter::new(
         duplication.device(),
@@ -233,12 +240,13 @@ fn capture_loop_inner(
         height,
         config.frames_per_second,
     )?;
-    let mut encoder = MediaFoundationH264Encoder::new(
+    let mut encoder = MediaFoundationVideoEncoder::new(
         duplication.device(),
         width,
         height,
         config.frames_per_second,
         config.bitrate_bits_per_second,
+        config.codec,
     )?;
     if let Some(started) = started.take() {
         let _ = started.send(Ok(format));
