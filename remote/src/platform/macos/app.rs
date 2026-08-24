@@ -57,6 +57,39 @@ impl AppDelegate {
     }
 }
 
+#[derive(Default)]
+pub(super) struct VideoHostViewIvars;
+
+define_class!(
+    // Safety: NSView is designed for subclassing; this view remains on the
+    // AppKit main thread and owns no resources requiring Drop.
+    #[unsafe(super = NSView)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = VideoHostViewIvars]
+    pub(super) struct VideoHostView;
+
+    unsafe impl NSObjectProtocol for VideoHostView {}
+
+    impl VideoHostView {
+        /// Let the parent RemoteView receive pointer input over the video while
+        /// the controls in the settings sidebar retain normal hit testing.
+        #[unsafe(method_id(hitTest:))]
+        #[unsafe(method_family = none)]
+        fn hit_test(&self, _point: NSPoint) -> Option<Retained<Self>> {
+            None
+        }
+    }
+);
+
+impl VideoHostView {
+    pub(super) fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(VideoHostViewIvars);
+        // Safety: NSView's frame initializer is the designated initializer for
+        // a programmatically created view.
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+}
+
 pub(super) struct RemoteViewIvars {
     active_display: Display,
     displays: Vec<Display>,

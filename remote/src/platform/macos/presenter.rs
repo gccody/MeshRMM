@@ -1,4 +1,4 @@
-use super::app::{RemoteView, activate_application};
+use super::app::{RemoteView, VideoHostView, activate_application};
 use super::*;
 
 thread_local! {
@@ -142,6 +142,26 @@ impl Presenter {
     }
 
     pub fn poll_ended(&self) -> Option<Result<(), String>> {
+        let id = self.shared.id;
+        let shared = Arc::clone(&self.shared);
+        // Decoder failures happen asynchronously and may be the last activity
+        // on a static desktop. Poll UI health independently of frame arrival
+        // so HEVC failures still trigger the negotiated H.264 fallback.
+        DispatchQueue::main().exec_async(move || {
+            let failure = UI.with(|state| {
+                state
+                    .borrow()
+                    .as_ref()
+                    .filter(|ui| ui.id == id)
+                    .and_then(MacUi::presentation_failure)
+            });
+            if let Some(failure) = failure
+                && let Ok(mut current) = shared.failure.lock()
+                && current.is_none()
+            {
+                *current = Some(failure);
+            }
+        });
         self.shared
             .failure
             .lock()
@@ -319,15 +339,19 @@ impl MacUi {
             .context("AVFoundation video gravity constant is unavailable")?;
         unsafe {
             layer.setVideoGravity(video_gravity);
-            let mut video_bounds = view.bounds();
-            video_bounds.size.width = (video_bounds.size.width - SETTINGS_PANEL_WIDTH).max(1.0);
-            layer.setFrame(video_bounds);
-            layer.setAutoresizingMask(
-                CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable,
-            );
         }
-        view.setWantsLayer(true);
-        view.setLayer(Some(&layer));
+        let mut video_bounds = view.bounds();
+        video_bounds.size.width = (video_bounds.size.width - SETTINGS_PANEL_WIDTH).max(1.0);
+        let video_host = VideoHostView::new(mtm, video_bounds);
+        video_host.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        // This child has no subviews, so it can safely be layer-hosting. Keep
+        // RemoteView itself as a normal AppKit hierarchy for the sidebar.
+        video_host.setLayer(Some(&layer));
+        video_host.setWantsLayer(true);
+        view.addSubview_positioned_relativeTo(&video_host, NSWindowOrderingMode::Below, None);
         window.setAcceptsMouseMovedEvents(true);
         window.center();
         close_connecting_window();
@@ -363,6 +387,9 @@ impl MacUi {
             unsafe { self.layer.flush() };
             self.format_description = None;
             self.waiting_for_keyframe = true;
+        }
+        if let Some(failure) = self.decoder_failure() {
+            bail!(failure);
         }
         if self.waiting_for_keyframe && !queued.frame.keyframe {
             return Ok(false);
@@ -424,6 +451,29 @@ impl MacUi {
             self.stats_started = Instant::now();
         }
         Ok(true)
+    }
+
+    #[allow(deprecated)]
+    fn decoder_failure(&self) -> Option<String> {
+        if unsafe { self.layer.status() } != AVQueuedSampleBufferRenderingStatus::Failed
+            || unsafe { self.layer.requiresFlushToResumeDecoding() }
+        {
+            return None;
+        }
+        let detail = unsafe { self.layer.error() }
+            .map(|error| error.localizedDescription().to_string())
+            .unwrap_or_else(|| "unknown AVFoundation decoder error".into());
+        Some(format!(
+            "macOS {:?} hardware decoder failed: {detail}",
+            self.codec
+        ))
+    }
+
+    fn presentation_failure(&self) -> Option<String> {
+        if !self.window.isVisible() {
+            return Some("macOS viewer window was closed".into());
+        }
+        self.decoder_failure()
     }
 
     #[allow(deprecated)]

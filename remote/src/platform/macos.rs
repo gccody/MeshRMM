@@ -21,9 +21,12 @@ use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor, NSControlStateValueOn,
     NSCursor, NSEvent, NSEventModifierFlags, NSFont, NSFontWeightRegular, NSProgressIndicator,
     NSProgressIndicatorStyle, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSWindowOrderingMode, NSWindowStyleMask,
 };
-use objc2_av_foundation::{AVLayerVideoGravityResizeAspect, AVSampleBufferDisplayLayer};
+use objc2_av_foundation::{
+    AVLayerVideoGravityResizeAspect, AVQueuedSampleBufferRenderingStatus,
+    AVSampleBufferDisplayLayer,
+};
 use objc2_core_foundation::{CFBoolean, CFMutableDictionary, CFRetained, CFString, kCFBooleanTrue};
 use objc2_core_media::{
     CMBlockBuffer, CMFormatDescription, CMSampleBuffer, CMSampleTimingInfo, CMTime,
@@ -34,7 +37,6 @@ use objc2_core_media::{
 use objc2_foundation::{
     NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
 };
-use objc2_quartz_core::CAAutoresizingMask;
 
 use super::ControlSink;
 use crate::debug::DebugInfo;
