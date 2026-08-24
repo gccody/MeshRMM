@@ -107,6 +107,7 @@ pub(super) struct RemoteViewIvars {
     control: ControlSink,
     pressed_keys: RefCell<Vec<(u16, bool)>>,
     pressed_buttons: RefCell<Vec<PointerButton>>,
+    wheel_normalizer: RefCell<WheelNormalizer>,
     cursor_shape: RefCell<CursorShape>,
     debug: DebugInfo,
     debug_label: Retained<NSTextField>,
@@ -221,9 +222,14 @@ define_class!(
             let Some((x, y)) = self.pointer_position(event) else {
                 return;
             };
-            let precise = event.hasPreciseScrollingDeltas();
-            let horizontal = windows_wheel_delta(event.scrollingDeltaX(), precise);
-            let vertical = windows_wheel_delta(event.scrollingDeltaY(), precise);
+            let (horizontal, vertical) = self.ivars().wheel_normalizer.borrow_mut().normalize(
+                event.scrollingDeltaX(),
+                event.scrollingDeltaY(),
+                event.hasPreciseScrollingDeltas(),
+            );
+            if horizontal == 0 && vertical == 0 {
+                return;
+            }
             self.send(SessionMessage::Input(RemoteInput::WheelAt {
                 display_id: self.ivars().active_display.id,
                 x,
@@ -355,12 +361,59 @@ define_class!(
     }
 );
 
-/// Convert AppKit scroll values to the units expected by Windows wheel input.
-/// A coarse mouse-wheel delta represents a whole notch, while precise devices
-/// such as trackpads already report fine-grained deltas and must not receive
-/// the same 120x amplification.
-pub(super) fn windows_wheel_delta(delta: f64, precise: bool) -> i16 {
-    let delta = if precise { delta } else { delta * 120.0 };
+const WINDOWS_WHEEL_DELTA: f64 = 120.0;
+const PRECISE_SCROLL_POINTS_PER_NOTCH: f64 = 60.0;
+const PRECISE_SCROLL_STEPS_PER_NOTCH: f64 = 8.0;
+
+/// Converts high-frequency trackpad motion into small, high-resolution Windows
+/// wheel steps. Accumulation prevents every tiny AppKit event from becoming a
+/// scroll action, while subdivisions avoid the jump caused by full notches.
+#[derive(Default)]
+pub(super) struct WheelNormalizer {
+    horizontal_remainder: f64,
+    vertical_remainder: f64,
+}
+
+impl WheelNormalizer {
+    pub(super) fn normalize(
+        &mut self,
+        horizontal: f64,
+        vertical: f64,
+        precise: bool,
+    ) -> (i16, i16) {
+        if precise {
+            (
+                precise_wheel_delta(horizontal, &mut self.horizontal_remainder),
+                precise_wheel_delta(vertical, &mut self.vertical_remainder),
+            )
+        } else {
+            self.horizontal_remainder = 0.0;
+            self.vertical_remainder = 0.0;
+            (coarse_wheel_delta(horizontal), coarse_wheel_delta(vertical))
+        }
+    }
+}
+
+fn precise_wheel_delta(delta: f64, remainder: &mut f64) -> i16 {
+    if !delta.is_finite() || delta == 0.0 {
+        return 0;
+    }
+    if *remainder != 0.0 && remainder.signum() != delta.signum() {
+        *remainder = 0.0;
+    }
+    *remainder += delta;
+    let points_per_step = PRECISE_SCROLL_POINTS_PER_NOTCH / PRECISE_SCROLL_STEPS_PER_NOTCH;
+    let wheel_delta_per_step = WINDOWS_WHEEL_DELTA / PRECISE_SCROLL_STEPS_PER_NOTCH;
+    let steps = (*remainder / points_per_step).trunc();
+    *remainder -= steps * points_per_step;
+    clamp_wheel_delta(steps * wheel_delta_per_step)
+}
+
+fn coarse_wheel_delta(delta: f64) -> i16 {
+    clamp_wheel_delta(delta * WINDOWS_WHEEL_DELTA)
+}
+
+fn clamp_wheel_delta(delta: f64) -> i16 {
     delta
         .round()
         .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
@@ -409,6 +462,7 @@ impl RemoteView {
             control,
             pressed_keys: RefCell::new(Vec::new()),
             pressed_buttons: RefCell::new(Vec::new()),
+            wheel_normalizer: RefCell::new(WheelNormalizer::default()),
             cursor_shape: RefCell::new(CursorShape::Default),
             debug,
             debug_label,

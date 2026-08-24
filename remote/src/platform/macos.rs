@@ -49,9 +49,9 @@ mod app;
 mod presenter;
 
 use app::close_connecting_window;
-pub use app::{monotonic_timestamp_us, run_application};
 #[cfg(test)]
-use app::{normalized_video_position, windows_wheel_delta};
+use app::{WheelNormalizer, normalized_video_position};
+pub use app::{monotonic_timestamp_us, run_application};
 pub use presenter::Presenter;
 
 #[link(name = "VideoToolbox", kind = "framework")]
@@ -86,15 +86,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wheel_delta_preserves_precise_trackpad_movement() {
-        assert_eq!(windows_wheel_delta(2.0, true), 2);
-        assert_eq!(windows_wheel_delta(-2.0, true), -2);
+    fn wheel_delta_accumulates_precise_trackpad_movement_into_smooth_steps() {
+        let mut normalizer = WheelNormalizer::default();
+
+        assert_eq!(normalizer.normalize(0.0, 2.5, true), (0, 0));
+        assert_eq!(normalizer.normalize(0.0, 2.5, true), (0, 0));
+        assert_eq!(normalizer.normalize(0.0, 2.5, true), (0, 15));
+        assert_eq!(normalizer.normalize(0.0, 52.5, true), (0, 105));
+        assert_eq!(normalizer.normalize(-120.0, 0.0, true), (-240, 0));
     }
 
     #[test]
     fn wheel_delta_converts_coarse_mouse_steps_to_windows_notches() {
-        assert_eq!(windows_wheel_delta(1.0, false), 120);
-        assert_eq!(windows_wheel_delta(-2.0, false), -240);
+        let mut normalizer = WheelNormalizer::default();
+
+        assert_eq!(normalizer.normalize(1.0, -2.0, false), (120, -240));
+    }
+
+    #[test]
+    fn wheel_delta_discards_stale_remainder_when_direction_changes() {
+        let mut normalizer = WheelNormalizer::default();
+
+        assert_eq!(normalizer.normalize(0.0, 3.75, true), (0, 0));
+        assert_eq!(normalizer.normalize(0.0, -3.75, true), (0, 0));
+        assert_eq!(normalizer.normalize(0.0, -3.75, true), (0, -15));
     }
 
     #[test]
