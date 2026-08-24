@@ -1,6 +1,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use meshrmm_protocol::Codec;
+
 #[derive(Clone)]
 pub struct DebugInfo {
     state: Arc<Mutex<DebugState>>,
@@ -18,6 +20,7 @@ struct DebugState {
     video_channel: String,
     display: String,
     stream: String,
+    codec: String,
     target_fps: u16,
     received_fps: f64,
     decode_fps: Option<f64>,
@@ -55,6 +58,7 @@ impl DebugInfo {
                 video_channel: "waiting".into(),
                 display: "waiting for stream".into(),
                 stream: "not configured".into(),
+                codec: "not negotiated".into(),
                 target_fps: 0,
                 received_fps: 0.0,
                 decode_fps: None,
@@ -107,11 +111,16 @@ impl DebugInfo {
         width: u32,
         height: u32,
         frames_per_second: u16,
-        codec: impl Into<String>,
+        codec: Codec,
     ) {
         if let Ok(mut debug) = self.state.lock() {
             debug.display = display.into();
-            debug.stream = format!("{width}x{height} {}", codec.into());
+            debug.stream = format!("{width}x{height}");
+            debug.codec = match codec {
+                Codec::H264 => "H.264 / AVC",
+                Codec::H265 => "H.265 / HEVC",
+            }
+            .into();
             debug.target_fps = frames_per_second;
         }
     }
@@ -219,6 +228,7 @@ impl DebugInfo {
              RTT: {}  Available in: {}\n\
              Network received: {} packets / {}\n\
              Display: {}  Stream: {} @ {} fps\n\
+             Codec: {}\n\
              FPS: receive={:.1} decode={} present={}\n\
              Frames: received={} presented={}\n\
              Drops: network={} stale={} presenter={} decoder={}\n\
@@ -240,6 +250,7 @@ impl DebugInfo {
             debug.display,
             debug.stream,
             debug.target_fps,
+            debug.codec,
             debug.received_fps,
             decode_fps,
             present_fps,
@@ -286,11 +297,12 @@ mod tests {
     fn rendered_diagnostics_include_the_essential_sections() {
         let debug = DebugInfo::new("session-123");
         debug.set_selected_pair("TURN relay", "relay -> host");
-        debug.configure_stream("Display 1", 1920, 1080, 60, "H264");
+        debug.configure_stream("Display 1", 1920, 1080, 60, Codec::H264);
         let text = debug.render();
         assert!(text.contains("session-123"));
         assert!(text.contains("TURN relay"));
-        assert!(text.contains("1920x1080 H264 @ 60 fps"));
+        assert!(text.contains("Stream: 1920x1080 @ 60 fps"));
+        assert!(text.contains("Codec: H.264 / AVC"));
         assert!(text.contains("FPS:"));
         assert!(text.contains("Drops:"));
     }
