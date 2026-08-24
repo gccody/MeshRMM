@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{
-    BLACK_BRUSH, GetStockObject, ScreenToClient, SetBkColor, SetTextColor,
+    BLACK_BRUSH, DEFAULT_GUI_FONT, GetStockObject, HBRUSH, ScreenToClient, SetBkColor, SetTextColor,
 };
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{
@@ -50,7 +50,7 @@ const MAX_DECODER_PENDING_FRAMES: usize = 16;
 // enough for short delivery/decoder bursts without treating normal jitter as
 // reference loss; the worker still presents only the newest decoded surface.
 const MAX_PRESENTER_QUEUE_FRAMES: usize = 15;
-const SETTINGS_PANEL_WIDTH: u32 = 280;
+const VIEWER_TOOLBAR_HEIGHT: u32 = 34;
 
 struct QueuedFrame {
     frame: EncodedFrame,
