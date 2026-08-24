@@ -163,7 +163,9 @@ pub struct ReassemblyConfig {
 impl Default for ReassemblyConfig {
     fn default() -> Self {
         Self {
-            stale_after: Duration::from_millis(100),
+            // Allow one bounded SCTP retransmission on typical WAN RTTs before
+            // declaring an access unit incomplete.
+            stale_after: Duration::from_millis(250),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             max_packets: DEFAULT_MAX_PACKETS,
         }

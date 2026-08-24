@@ -42,8 +42,11 @@ use pipeline::WorkerPipeline;
 use renderer::D3d11Renderer;
 use window::{create_window, pump_window_messages, set_window_cursor};
 
-const MAX_DECODER_PENDING_FRAMES: usize = 4;
-const MAX_PRESENTER_QUEUE_FRAMES: usize = 3;
+const MAX_DECODER_PENDING_FRAMES: usize = 16;
+// Moonlight's depacketizer permits 15 queued decode units. This is large
+// enough for short delivery/decoder bursts without treating normal jitter as
+// reference loss; the worker still presents only the newest decoded surface.
+const MAX_PRESENTER_QUEUE_FRAMES: usize = 15;
 
 struct QueuedFrame {
     frame: EncodedFrame,

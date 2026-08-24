@@ -440,6 +440,13 @@ fn configure_codec(
     bitrate_bits_per_second: u32,
     frames_per_second: u32,
 ) -> Result<(), Error> {
+    // Sunshine's default single-frame VBV/HRD budget prevents a keyframe or
+    // complex desktop update from monopolizing the network for several frame
+    // intervals. Media Foundation expresses the H.264 HRD size in bytes.
+    let single_frame_buffer_bytes = bitrate_bits_per_second
+        .div_ceil(8)
+        .div_ceil(frames_per_second.max(1))
+        .max(16 * 1024);
     let settings = [
         (&CODECAPI_AVEncCommonLowLatency, VARIANT::from(true)),
         (&CODECAPI_AVEncCommonRealTime, VARIANT::from(true)),
@@ -454,10 +461,9 @@ fn configure_codec(
         (&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0_i32)),
         (
             &CODECAPI_AVEncMPVGOPSize,
-            // A one-second periodic IDR is a cheap safety net for hardware
-            // encoders that reject runtime keyframe requests. On-demand IDRs
-            // remain the normal fast recovery path.
-            VARIANT::from(frames_per_second as i32),
+            // Recovery requests are the fast path. A two-second fallback avoids
+            // the visible bitrate spike caused by forcing a full IDR each second.
+            VARIANT::from((frames_per_second.saturating_mul(2)) as i32),
         ),
     ];
     for (key, value) in settings {
@@ -472,6 +478,12 @@ fn configure_codec(
             }
         }
     }
+    set_optional_codec_value(
+        codec_api,
+        &CODECAPI_AVEncCommonBufferSize,
+        VARIANT::from(single_frame_buffer_bytes),
+        "single-frame H.264 HRD buffer",
+    )?;
     Ok(())
 }
 

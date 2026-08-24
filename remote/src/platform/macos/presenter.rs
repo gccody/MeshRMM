@@ -24,7 +24,7 @@ struct Shared {
     debug: DebugInfo,
 }
 
-const MAX_PRESENTER_QUEUE_FRAMES: usize = 3;
+const MAX_PRESENTER_QUEUE_FRAMES: usize = 15;
 
 impl Shared {
     fn begin_recovery(&self, stream_id: VideoStreamId) {

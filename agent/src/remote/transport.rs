@@ -39,8 +39,78 @@ enum ControlCommand {
     Stop,
 }
 
-const MAX_VIDEO_BUFFERED_BYTES: usize = 256 * 1024;
+const VIDEO_BUFFER_DRAIN_BYTES: usize = 64 * 1024;
+const VIDEO_BUFFER_CONGESTED_BYTES: usize = 192 * 1024;
+const VIDEO_BUFFER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(80);
 const KEYFRAME_RETRY_INTERVAL_US: u64 = 250_000;
+const BITRATE_DECREASE_INTERVAL_US: u64 = 500_000;
+const BITRATE_INCREASE_INTERVAL_US: u64 = 5_000_000;
+
+#[derive(Debug)]
+struct AdaptiveBitrate {
+    minimum: u32,
+    maximum: u32,
+    current: u32,
+    last_decrease_us: u64,
+    healthy_since_us: u64,
+}
+
+impl AdaptiveBitrate {
+    fn new(maximum: u32) -> Self {
+        let minimum = (maximum / 8).max(1_000_000).min(maximum);
+        Self {
+            minimum,
+            maximum,
+            current: maximum,
+            last_decrease_us: 0,
+            healthy_since_us: 0,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        now_us: u64,
+        buffered_bytes: usize,
+        queued_frames: usize,
+        reference_chain_lost: bool,
+    ) -> Option<u32> {
+        let congested = reference_chain_lost
+            || buffered_bytes >= VIDEO_BUFFER_CONGESTED_BYTES
+            || queued_frames >= (super::video::MAX_ENCODED_FRAME_QUEUE * 4) / 5;
+        if congested {
+            self.healthy_since_us = 0;
+            if self.last_decrease_us == 0
+                || now_us.saturating_sub(self.last_decrease_us) >= BITRATE_DECREASE_INTERVAL_US
+            {
+                self.last_decrease_us = now_us.max(1);
+                let reduced = ((u64::from(self.current) * 3) / 4) as u32;
+                let reduced = reduced.max(self.minimum);
+                if reduced < self.current {
+                    self.current = reduced;
+                    return Some(self.current);
+                }
+            }
+            return None;
+        }
+
+        let healthy = buffered_bytes <= VIDEO_BUFFER_DRAIN_BYTES && queued_frames <= 1;
+        if !healthy || self.current >= self.maximum {
+            self.healthy_since_us = 0;
+            return None;
+        }
+        if self.healthy_since_us == 0 {
+            self.healthy_since_us = now_us.max(1);
+            return None;
+        }
+        if now_us.saturating_sub(self.healthy_since_us) >= BITRATE_INCREASE_INTERVAL_US {
+            self.healthy_since_us = now_us.max(1);
+            let increase = (self.current / 10).max(250_000);
+            self.current = self.current.saturating_add(increase).min(self.maximum);
+            return Some(self.current);
+        }
+        None
+    }
+}
 
 pub async fn run_sender(
     signal_url: Url,
@@ -90,10 +160,11 @@ async fn run_connected_sender(
         .create_data_channel(
             "meshrmm-video-v1",
             Some(RTCDataChannelInit {
-                ordered: Some(false),
-                // One bounded retransmission removes most incidental Wi-Fi and
-                // WAN loss without allowing reliable-channel head-of-line
-                // blocking to build a remote-control latency queue.
+                // H.264 access units form a predictive chain. Keep this
+                // dedicated video stream ordered so benign SCTP reordering is
+                // not mistaken for packet loss. One retry bounds head-of-line
+                // delay, and input remains isolated on the control stream.
+                ordered: Some(true),
                 max_retransmits: Some(1),
                 protocol: Some("meshrmm.video.v1".into()),
                 ..Default::default()
@@ -195,6 +266,7 @@ async fn run_connected_sender(
         decoder_ready,
         Arc::clone(&slot),
         control_tx.clone(),
+        format.bitrate_bits_per_second,
         video_failure_tx,
     );
     spawn_control_start(
@@ -410,7 +482,7 @@ async fn run_connected_sender(
     tracing::info!(
         session_id = %session_id,
         ?session_state,
-        latest_frames_dropped = slot.dropped(),
+        encoded_frames_dropped = slot.dropped(),
         "remote sender session stopped"
     );
     result
@@ -564,17 +636,24 @@ fn spawn_video_sender(
     decoder_ready: Arc<Notify>,
     slot: Arc<LatestFrameSlot>,
     recovery: mpsc::UnboundedSender<ControlCommand>,
+    maximum_bitrate: u32,
     failure: mpsc::UnboundedSender<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         open.notified().await;
         // Control and video use independent SCTP streams. Wait for the viewer
         // to confirm its decoder/presenter is initialized before sending the
-        // retained bootstrap keyframe.
+        // bootstrap keyframe. Discard frames captured during connection setup,
+        // then wait for the fresh IDR requested by the initialized viewer.
         decoder_ready.notified().await;
+        slot.clear();
+        let _ = recovery.send(ControlCommand::Keyframe);
         let mut bootstrap_keyframe =
             match tokio::time::timeout(std::time::Duration::from_secs(10), slot.keyframe()).await {
-                Ok(frame) => Some(frame),
+                Ok(frame) => {
+                    slot.discard_through(frame.frame_id);
+                    Some(frame)
+                }
                 Err(_) => {
                     let _ = failure.send(
                         "capture/encoder produced no bootstrap keyframe for 10 seconds".into(),
@@ -591,6 +670,7 @@ fn spawn_video_sender(
         let mut last_sent = None::<(VideoStreamId, u64)>;
         let mut recovering = false;
         let mut last_keyframe_request_us = 0_u64;
+        let mut bitrate = AdaptiveBitrate::new(maximum_bitrate);
         loop {
             let source = if let Some(frame) = bootstrap_keyframe.take() {
                 frame
@@ -602,12 +682,14 @@ fn spawn_video_sender(
                 slot.next().await
             };
 
+            let mut reference_chain_lost = false;
             if let Some((last_stream_id, last_frame_id)) = last_sent
                 && (source.stream_id != last_stream_id
                     || source.frame_id != last_frame_id.wrapping_add(1))
                 && !source.keyframe
             {
                 recovering = true;
+                reference_chain_lost = true;
                 tracing::warn!(
                     last_frame_id,
                     frame_id = source.frame_id,
@@ -617,6 +699,16 @@ fn spawn_video_sender(
             }
 
             let now_us = monotonic_timestamp_us();
+            let mut buffered_bytes = channel.buffered_amount().await;
+            if let Some(bits_per_second) =
+                bitrate.observe(now_us, buffered_bytes, slot.len(), reference_chain_lost)
+            {
+                let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
+                tracing::info!(
+                    bits_per_second,
+                    "adapted video bitrate to current transport capacity"
+                );
+            }
             if recovering && !source.keyframe {
                 recovery_frames_dropped += 1;
                 if last_keyframe_request_us == 0
@@ -628,9 +720,30 @@ fn spawn_video_sender(
                 continue;
             }
 
-            if channel.buffered_amount().await > MAX_VIDEO_BUFFERED_BYTES {
+            if buffered_bytes >= VIDEO_BUFFER_CONGESTED_BYTES {
+                let drain_started = tokio::time::Instant::now();
+                while buffered_bytes > VIDEO_BUFFER_DRAIN_BYTES
+                    && drain_started.elapsed() < VIDEO_BUFFER_DRAIN_TIMEOUT
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    buffered_bytes = channel.buffered_amount().await;
+                }
+            }
+            if buffered_bytes >= VIDEO_BUFFER_CONGESTED_BYTES {
                 buffered_frames_dropped += 1;
                 recovering = true;
+                let queued_frames_dropped = slot.drop_pending();
+                if let Some(bits_per_second) =
+                    bitrate.observe(now_us, buffered_bytes, queued_frames_dropped, true)
+                {
+                    let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
+                    tracing::warn!(
+                        bits_per_second,
+                        buffered_bytes,
+                        queued_frames_dropped,
+                        "transport stayed congested; reduced bitrate and reset the predictive chain"
+                    );
+                }
                 if last_keyframe_request_us == 0
                     || now_us.saturating_sub(last_keyframe_request_us) >= KEYFRAME_RETRY_INTERVAL_US
                 {
@@ -639,7 +752,8 @@ fn spawn_video_sender(
                 }
                 tracing::debug!(
                     frame_id = source.frame_id,
-                    "dropping frame and requesting H.264 recovery because the data channel is buffered"
+                    buffered_bytes,
+                    "dropping frame and requesting H.264 recovery after the transport drain deadline"
                 );
                 continue;
             }
@@ -692,7 +806,7 @@ fn spawn_video_sender(
                     buffered_frames_dropped,
                     obsolete_frames_dropped,
                     recovery_frames_dropped,
-                    latest_frames_replaced = slot.dropped(),
+                    encoded_frames_dropped = slot.dropped(),
                     "video transport statistics"
                 );
                 frames_sent = 0;
@@ -704,4 +818,51 @@ fn spawn_video_sender(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_bitrate_uses_aimd_without_oscillating() {
+        let mut bitrate = AdaptiveBitrate::new(12_000_000);
+
+        assert_eq!(
+            bitrate.observe(1_000, VIDEO_BUFFER_CONGESTED_BYTES, 0, false),
+            Some(9_000_000)
+        );
+        assert_eq!(
+            bitrate.observe(2_000, VIDEO_BUFFER_CONGESTED_BYTES, 0, false),
+            None,
+            "decreases are rate limited"
+        );
+        assert_eq!(
+            bitrate.observe(
+                1_000 + BITRATE_DECREASE_INTERVAL_US,
+                VIDEO_BUFFER_CONGESTED_BYTES,
+                0,
+                false,
+            ),
+            Some(6_750_000)
+        );
+
+        let healthy_start = 2_000_000;
+        assert_eq!(bitrate.observe(healthy_start, 0, 0, false), None);
+        assert_eq!(
+            bitrate.observe(healthy_start + BITRATE_INCREASE_INTERVAL_US, 0, 0, false),
+            Some(7_425_000)
+        );
+    }
+
+    #[test]
+    fn adaptive_bitrate_never_drops_below_its_floor() {
+        let mut bitrate = AdaptiveBitrate::new(4_000_000);
+        let mut now_us = 1;
+        for _ in 0..20 {
+            let _ = bitrate.observe(now_us, usize::MAX, usize::MAX, true);
+            now_us += BITRATE_DECREASE_INTERVAL_US;
+        }
+        assert_eq!(bitrate.current, 1_000_000);
+    }
 }

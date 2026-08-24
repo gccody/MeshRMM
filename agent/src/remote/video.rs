@@ -1,16 +1,33 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use meshrmm_protocol::EncodedFrame;
 use tokio::sync::Notify;
 
-#[derive(Default)]
+/// Moonlight uses a bounded 15-unit decode queue. Matching that amount on the
+/// encoded sender side absorbs short scheduler/network bursts while keeping
+/// the maximum queued media below 250 ms at 60 FPS.
+pub const MAX_ENCODED_FRAME_QUEUE: usize = 15;
+
 pub struct LatestFrameSlot {
-    frame: Mutex<Option<Arc<EncodedFrame>>>,
+    frames: Mutex<VecDeque<Arc<EncodedFrame>>>,
     keyframe: Mutex<Option<Arc<EncodedFrame>>>,
     changed: Notify,
     keyframe_changed: Notify,
     dropped: AtomicU64,
+}
+
+impl Default for LatestFrameSlot {
+    fn default() -> Self {
+        Self {
+            frames: Mutex::new(VecDeque::with_capacity(MAX_ENCODED_FRAME_QUEUE)),
+            keyframe: Mutex::new(None),
+            changed: Notify::new(),
+            keyframe_changed: Notify::new(),
+            dropped: AtomicU64::new(0),
+        }
+    }
 }
 
 impl LatestFrameSlot {
@@ -25,20 +42,28 @@ impl LatestFrameSlot {
             }
             self.keyframe_changed.notify_waiters();
         }
-        let Ok(mut current) = self.frame.lock() else {
+        let Ok(mut frames) = self.frames.lock() else {
             return;
         };
-        if current.replace(frame).is_some() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+        if frames.len() >= MAX_ENCODED_FRAME_QUEUE {
+            self.dropped
+                .fetch_add(frames.len() as u64, Ordering::Relaxed);
+            frames.clear();
         }
-        drop(current);
+        frames.push_back(frame);
+        drop(frames);
         self.changed.notify_one();
     }
 
     pub async fn next(&self) -> Arc<EncodedFrame> {
         loop {
             let notified = self.changed.notified();
-            if let Some(frame) = self.frame.lock().ok().and_then(|mut frame| frame.take()) {
+            if let Some(frame) = self
+                .frames
+                .lock()
+                .ok()
+                .and_then(|mut frames| frames.pop_front())
+            {
                 return frame;
             }
             notified.await;
@@ -46,11 +71,35 @@ impl LatestFrameSlot {
     }
 
     pub fn clear(&self) {
-        if let Ok(mut frame) = self.frame.lock() {
-            *frame = None;
+        if let Ok(mut frames) = self.frames.lock() {
+            frames.clear();
         }
         if let Ok(mut keyframe) = self.keyframe.lock() {
             *keyframe = None;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.frames.lock().map_or(0, |frames| frames.len())
+    }
+
+    pub fn drop_pending(&self) -> usize {
+        self.frames.lock().map_or(0, |mut frames| {
+            let dropped = frames.len();
+            frames.clear();
+            self.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
+            dropped
+        })
+    }
+
+    pub fn discard_through(&self, frame_id: u64) {
+        if let Ok(mut frames) = self.frames.lock() {
+            while frames
+                .front()
+                .is_some_and(|frame| frame.frame_id <= frame_id)
+            {
+                frames.pop_front();
+            }
         }
     }
 
@@ -98,20 +147,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publishing_replaces_obsolete_frame() {
+    async fn publishing_preserves_encoder_order() {
         let slot = LatestFrameSlot::default();
         slot.publish(frame(10));
         slot.publish(frame(11));
+        assert_eq!(slot.next().await.frame_id, 10);
         assert_eq!(slot.next().await.frame_id, 11);
-        assert_eq!(slot.dropped(), 1);
+        assert_eq!(slot.dropped(), 0);
     }
 
     #[tokio::test]
-    async fn keyframe_is_retained_when_latest_frame_is_replaced() {
+    async fn keyframe_is_retained_alongside_the_ordered_queue() {
         let slot = LatestFrameSlot::default();
         slot.publish(keyframe(10));
         slot.publish(frame(11));
         assert_eq!(slot.keyframe().await.frame_id, 10);
+        assert_eq!(slot.next().await.frame_id, 10);
         assert_eq!(slot.next().await.frame_id, 11);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_frame_is_removed_from_the_normal_queue() {
+        let slot = LatestFrameSlot::default();
+        slot.publish(keyframe(10));
+        slot.publish(frame(11));
+        slot.discard_through(10);
+        assert_eq!(slot.next().await.frame_id, 11);
+    }
+
+    #[tokio::test]
+    async fn overflow_drops_a_whole_stale_chain_instead_of_individual_frames() {
+        let slot = LatestFrameSlot::default();
+        for frame_id in 1..=MAX_ENCODED_FRAME_QUEUE as u64 + 1 {
+            slot.publish(frame(frame_id));
+        }
+        assert_eq!(slot.len(), 1);
+        assert_eq!(slot.dropped(), MAX_ENCODED_FRAME_QUEUE as u64,);
+        assert_eq!(
+            slot.next().await.frame_id,
+            MAX_ENCODED_FRAME_QUEUE as u64 + 1
+        );
     }
 }
