@@ -32,8 +32,15 @@ fn initialize_tracing(config: &config::Config) -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(windows, target_os = "macos"))]
     let log_path = {
+        #[cfg(windows)]
+        let path = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .context("Windows did not provide LOCALAPPDATA for viewer logging")?
+            .join("MeshRMM")
+            .join("remote.log");
+        #[cfg(target_os = "macos")]
         let path = std::path::PathBuf::from(objc2_foundation::NSHomeDirectory().to_string())
             .join("Library")
             .join("Logs")
@@ -71,7 +78,7 @@ fn initialize_tracing(config: &config::Config) -> anyhow::Result<()> {
         path
     };
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     if config.json_logs {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -81,12 +88,12 @@ fn initialize_tracing(config: &config::Config) -> anyhow::Result<()> {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(windows, target_os = "macos"))]
     tracing::info!(
         process_id = std::process::id(),
         version = env!("CARGO_PKG_VERSION"),
         log_path = %log_path.display(),
-        "macOS viewer logging initialized"
+        "viewer logging initialized"
     );
     Ok(())
 }

@@ -233,6 +233,28 @@ fn run_worker(
         if unsafe { pump_window_messages(pipeline.window()) } {
             break;
         }
+        if let Some(shape) = shared
+            .cursor_shape
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
+        {
+            unsafe { pipeline.set_cursor_shape(shape) };
+        }
+        if let Err(error) = unsafe { pipeline.poll(shared.replaced_frames.load(Ordering::Relaxed)) }
+        {
+            tracing::error!(error = %error, "hardware decoder polling failed");
+            if let Ok(mut failure) = shared.failure.lock() {
+                *failure = Some(error.to_string());
+            }
+            break;
+        }
+        if !pipeline.wants_input() {
+            // Keep the native window responsive while an asynchronous
+            // Media Foundation decoder is between NeedInput events.
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
         let queued = {
             let Ok(queued) = shared.queued.lock() else {
                 break;
@@ -248,20 +270,21 @@ fn run_worker(
             };
             queued.pop_front()
         };
-        if let Some(shape) = shared
-            .cursor_shape
-            .lock()
-            .ok()
-            .and_then(|mut pending| pending.take())
-        {
-            unsafe { pipeline.set_cursor_shape(shape) };
-        }
         let Some(queued) = queued else {
             continue;
         };
         let frame_id = queued.frame.frame_id;
         match unsafe { pipeline.process(queued, shared.replaced_frames.load(Ordering::Relaxed)) } {
-            Ok(()) => {}
+            Ok(None) => {}
+            Ok(Some(queued)) => {
+                tracing::warn!(
+                    frame_id,
+                    "hardware decoder readiness changed before frame submission"
+                );
+                if let Ok(mut pending) = shared.queued.lock() {
+                    pending.push_front(queued);
+                }
+            }
             Err(error) => {
                 tracing::error!(error = %error, frame_id, "hardware decode/presentation failed");
                 if let Ok(mut failure) = shared.failure.lock() {

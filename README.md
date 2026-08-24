@@ -273,6 +273,8 @@ current text clipboard is copied to the Agent when the session connects; later
 text copies on either computer are mirrored within 250 ms. Clipboard payloads
 are capped at 60 KiB to stay within the control channel's message limit, and
 rich text, images, and file lists remain local.
+Viewer diagnostics are written to `%LOCALAPPDATA%\MeshRMM\remote.log` on
+Windows and `~/Library/Logs/MeshRMM/remote.log` on macOS.
 Pointer coordinates are normalized to the display
 currently being streamed and every event carries that display ID, so the Agent
 rejects input left over from a previous display after a switch. On Windows,
