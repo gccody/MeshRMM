@@ -381,7 +381,7 @@ impl VideoEncoder for MediaFoundationVideoEncoder {
         set_required_runtime_codec_value(
             &self.codec_api,
             &CODECAPI_AVEncCommonMeanBitRate,
-            (bits_per_second as i32).into(),
+            bits_per_second.into(),
             "dynamic bitrate",
         )
     }
@@ -464,25 +464,24 @@ fn configure_codec(
     // intervals. Media Foundation expresses this buffer size in bytes.
     let single_frame_buffer_bytes = bitrate_bits_per_second
         .div_ceil(8)
-        .div_ceil(frames_per_second.max(1))
-        .max(16 * 1024);
+        .div_ceil(frames_per_second.max(1));
     let settings = [
         (&CODECAPI_AVEncCommonLowLatency, VARIANT::from(true)),
         (&CODECAPI_AVEncCommonRealTime, VARIANT::from(true)),
         (
             &CODECAPI_AVEncCommonRateControlMode,
-            VARIANT::from(eAVEncCommonRateControlMode_CBR.0),
+            VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32),
         ),
         (
             &CODECAPI_AVEncCommonMeanBitRate,
-            VARIANT::from(bitrate_bits_per_second as i32),
+            VARIANT::from(bitrate_bits_per_second),
         ),
-        (&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0_i32)),
+        (&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0_u32)),
         (
             &CODECAPI_AVEncMPVGOPSize,
             // Recovery requests are the fast path. A two-second fallback avoids
             // the visible bitrate spike caused by forcing a full IDR each second.
-            VARIANT::from((frames_per_second.saturating_mul(2)) as i32),
+            VARIANT::from(frames_per_second.saturating_mul(2)),
         ),
     ];
     for (key, value) in settings {
@@ -541,9 +540,10 @@ fn set_required_runtime_codec_value(
     value: VARIANT,
     setting: &'static str,
 ) -> Result<(), Error> {
-    // A bitrate selection must take effect. Returning an error causes the
-    // capture owner to restart the hardware encoder with the new bitrate in
-    // its static output media type when a driver cannot modify it in place.
+    // Report unsupported runtime controls to the capture backend. It keeps the
+    // current encoder alive and disables further live updates for this start;
+    // a later legitimate stream restart applies the requested rate through the
+    // static output media type instead.
     unsafe {
         if codec_api.IsSupported(key).is_err() || codec_api.IsModifiable(key).is_err() {
             return Err(Error::RuntimeControlUnavailable(setting));
