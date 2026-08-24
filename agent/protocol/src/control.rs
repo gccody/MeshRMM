@@ -115,13 +115,16 @@ pub enum QualityPreset {
     BestQuality,
 }
 
+pub const MAX_QUALITY_BITRATE_BITS_PER_SECOND: u32 = 12_000_000;
+
 impl QualityPreset {
-    /// Applies the preset without exceeding the administrator-configured cap.
+    /// Applies the preset without exceeding the 12 Mbps application cap or the
+    /// lower administrator-configured cap.
     pub fn bitrate(self, configured_maximum: u32) -> u32 {
         let preferred = match self {
             Self::DataSaver => 3_000_000,
             Self::Balanced => 6_000_000,
-            Self::BestQuality => configured_maximum,
+            Self::BestQuality => MAX_QUALITY_BITRATE_BITS_PER_SECOND,
         };
         preferred.min(configured_maximum).max(1)
     }
@@ -265,6 +268,7 @@ mod tests {
         assert_eq!(QualityPreset::DataSaver.bitrate(12_000_000), 3_000_000);
         assert_eq!(QualityPreset::Balanced.bitrate(12_000_000), 6_000_000);
         assert_eq!(QualityPreset::BestQuality.bitrate(12_000_000), 12_000_000);
+        assert_eq!(QualityPreset::BestQuality.bitrate(100_000_000), 12_000_000);
         assert_eq!(QualityPreset::Balanced.bitrate(4_000_000), 4_000_000);
     }
 }
