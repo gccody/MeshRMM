@@ -459,11 +459,12 @@ async fn run_connected_sender(
                     }
                 }
                 if !capture_running {
-                    match lock_streamer(&streamer)?.start(
+                    let restart = lock_streamer(&streamer)?.start(
                         Some(active_display.id),
                         stream_id,
                         Arc::clone(&slot),
-                    ) {
+                    );
+                    match restart {
                         Ok(started) => {
                             displays = started.displays;
                             active_display = started.active_display;
