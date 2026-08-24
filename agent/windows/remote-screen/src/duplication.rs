@@ -15,8 +15,11 @@ use crate::{
     monotonic_timestamp_us,
 };
 
-const ACQUIRE_TIMEOUT_MS: u32 = 50;
-const START_TIMEOUT: Duration = Duration::from_secs(20);
+// Desktop Duplication blocks until pixels change. Keep the wait short because
+// the asynchronous Media Foundation encoder can finish an access unit while
+// the desktop is otherwise completely static (especially on Winlogon).
+const ACQUIRE_TIMEOUT_MS: u32 = 10;
+const START_TIMEOUT: Duration = Duration::from_secs(5);
 
 type CaptureStatus = Arc<Mutex<Option<Result<(), String>>>>;
 
@@ -83,7 +86,7 @@ impl WindowsDesktopDuplicationStreamer {
                 stop.store(true, Ordering::Release);
                 let _ = worker.join();
                 return Err(Error::DesktopDuplication(
-                    "capture did not initialize within 20 seconds".into(),
+                    "capture did not initialize within 5 seconds".into(),
                 ));
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -245,30 +248,54 @@ fn capture_loop_inner(
     let mut frames_encoded = 0_u64;
     let mut encoded_bytes = 0_u64;
     let mut stats_started_us = monotonic_timestamp_us()?;
+    let mut cached_nv12 = None;
+    let mut keyframe_input_pending = false;
     while !stop.load(Ordering::Acquire) {
-        let frame = match duplication.acquire_next_frame(ACQUIRE_TIMEOUT_MS) {
-            Ok(frame) => frame,
-            Err(DuplicationError::Timeout) => continue,
-            Err(error) => return Err(duplication_error(error)),
-        };
-        if frame.width() < width || frame.height() < height {
-            return Err(Error::DesktopDuplication(
-                "captured display dimensions changed".into(),
-            ));
-        }
+        // Apply controls and drain output independently of desktop damage.
+        // Media Foundation encoders are asynchronous: submit() may return no
+        // output and signal it a few milliseconds later. Previously a static
+        // desktop meant poll() was never called again, leaving the first IDR
+        // frame queued inside the encoder until a mouse/pixel update occurred.
         if controls.request_keyframe.swap(false, Ordering::AcqRel) {
             encoder.request_keyframe()?;
+            keyframe_input_pending = true;
         }
         let requested_bitrate = controls.requested_bitrate.swap(0, Ordering::AcqRel);
         if requested_bitrate != 0 {
             encoder.set_bitrate(requested_bitrate)?;
         }
-        let capture_timestamp_us = monotonic_timestamp_us()?;
-        frames_captured += 1;
+
+        let frame = match duplication.acquire_next_frame(ACQUIRE_TIMEOUT_MS) {
+            Ok(frame) => Some(frame),
+            Err(DuplicationError::Timeout) => None,
+            Err(error) => return Err(duplication_error(error)),
+        };
         let mut access_units = encoder.poll()?;
-        if encoder.wants_input() {
-            let nv12 = converter.convert(frame.texture())?;
+        if let Some(frame) = frame {
+            if frame.width() < width || frame.height() < height {
+                return Err(Error::DesktopDuplication(
+                    "captured display dimensions changed".into(),
+                ));
+            }
+            let capture_timestamp_us = monotonic_timestamp_us()?;
+            frames_captured += 1;
+            if encoder.wants_input() {
+                let nv12 = converter.convert(frame.texture())?;
+                cached_nv12 = Some(nv12.clone());
+                access_units.extend(encoder.submit(nv12, capture_timestamp_us)?);
+                keyframe_input_pending = false;
+            }
+        } else if keyframe_input_pending
+            && encoder.wants_input()
+            && let Some(nv12) = cached_nv12.as_ref()
+        {
+            // A keyframe request must work even when Desktop Duplication has
+            // no new damage to report. Re-submit the last GPU surface so a
+            // newly created viewer/presenter can recover immediately instead
+            // of waiting for the login screen to change a pixel.
+            let capture_timestamp_us = monotonic_timestamp_us()?;
             access_units.extend(encoder.submit(nv12, capture_timestamp_us)?);
+            keyframe_input_pending = false;
         }
         for access_unit in access_units {
             frames_encoded += 1;

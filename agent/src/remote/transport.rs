@@ -44,6 +44,8 @@ const VIDEO_BUFFER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::fro
 const KEYFRAME_RETRY_INTERVAL_US: u64 = 250_000;
 const BITRATE_DECREASE_INTERVAL_US: u64 = 500_000;
 const BITRATE_INCREASE_INTERVAL_US: u64 = 5_000_000;
+const DESKTOP_LIFECYCLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const DESKTOP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Debug)]
 struct AdaptiveBitrate {
@@ -278,6 +280,9 @@ async fn run_connected_sender(
     session_state = session_state.transition(SessionState::Connecting)?;
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     stats_interval.tick().await;
+    let mut desktop_interval = tokio::time::interval(DESKTOP_LIFECYCLE_INTERVAL);
+    desktop_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    desktop_interval.tick().await;
     let mut cursor_interval = tokio::time::interval(std::time::Duration::from_millis(16));
     cursor_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut clipboard_interval = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -286,6 +291,8 @@ async fn run_connected_sender(
     let mut offer_sent = false;
     let mut remote_description_set = false;
     let mut pending_candidates = Vec::new();
+    let mut capture_unavailable_since = None::<std::time::Instant>;
+    let mut capture_retry_after = std::time::Instant::now();
     let result: anyhow::Result<()> = async {
         loop {
             tokio::select! {
@@ -366,6 +373,7 @@ async fn run_connected_sender(
                         };
                         lock_streamer(&streamer)?.stop()?;
                         capture_running = false;
+                        capture_unavailable_since = Some(std::time::Instant::now());
                         slot.clear();
                         stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
                         let restart = lock_streamer(&streamer)?.start(
@@ -378,6 +386,7 @@ async fn run_connected_sender(
                                 displays = started.displays;
                                 active_display = started.active_display;
                                 capture_running = true;
+                                capture_unavailable_since = None;
                                 sent_cursor_shape = None;
                                 send_control_message(
                                     &control_channel,
@@ -392,6 +401,7 @@ async fn run_connected_sender(
                             }
                             Err(error) => {
                                 active_display = selected;
+                                capture_retry_after = std::time::Instant::now() + DESKTOP_RETRY_INTERVAL;
                                 tracing::warn!(error = ?error, "display switch is waiting for an interactive desktop");
                             }
                         }
@@ -444,7 +454,7 @@ async fn run_connected_sender(
                 }
             }
             Some(error) = video_failure_rx.recv() => break Err(anyhow::anyhow!(error)),
-            _ = stats_interval.tick() => {
+            _ = desktop_interval.tick() => {
                 if capture_running {
                     let capture_ended = lock_streamer(&streamer)?.poll_ended();
                     if let Some(capture_result) = capture_ended {
@@ -454,11 +464,13 @@ async fn run_connected_sender(
                             tracing::warn!("desktop capture helper stopped; replacing it");
                         }
                         capture_running = false;
+                        capture_unavailable_since = Some(std::time::Instant::now());
+                        capture_retry_after = std::time::Instant::now();
                         slot.clear();
                         stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
                     }
                 }
-                if !capture_running {
+                if !capture_running && std::time::Instant::now() >= capture_retry_after {
                     let restart = lock_streamer(&streamer)?.start(
                         Some(active_display.id),
                         stream_id,
@@ -470,6 +482,10 @@ async fn run_connected_sender(
                             active_display = started.active_display;
                             capture_running = true;
                             sent_cursor_shape = None;
+                            let recovery_ms = capture_unavailable_since
+                                .take()
+                                .map(|started| started.elapsed().as_millis())
+                                .unwrap_or_default();
                             send_control_message(
                                 &control_channel,
                                 SessionMessage::DisplayConfiguration {
@@ -479,13 +495,16 @@ async fn run_connected_sender(
                                     format: started.format,
                                 },
                             ).await?;
-                            tracing::info!(stream_id = stream_id.0, display_id = active_display.id.0, "remote session moved to the visible Windows desktop");
+                            tracing::info!(stream_id = stream_id.0, display_id = active_display.id.0, recovery_ms, "remote session moved to the visible Windows desktop");
                         }
                         Err(error) => {
+                            capture_retry_after = std::time::Instant::now() + DESKTOP_RETRY_INTERVAL;
                             tracing::warn!(error = ?error, "waiting for a Windows login or application desktop");
                         }
                     }
                 }
+            },
+            _ = stats_interval.tick() => {
                 log_network_stats(&peer).await;
             },
             }
@@ -689,10 +708,12 @@ fn spawn_video_sender(
         open.notified().await;
         // Control and video use independent SCTP streams. Wait for the viewer
         // to confirm its decoder/presenter is initialized before sending the
-        // bootstrap keyframe. Discard frames captured during connection setup,
-        // then wait for the fresh IDR requested by the initialized viewer.
+        // bootstrap keyframe. Discard predictive frames captured during
+        // connection setup, but retain the newest IDR so a completely static
+        // login screen can paint immediately. We still request a fresh IDR to
+        // establish a current predictive chain for subsequent frames.
         decoder_ready.notified().await;
-        slot.clear();
+        slot.clear_pending();
         let _ = recovery.send(ControlCommand::Keyframe);
         let mut bootstrap_keyframe =
             match tokio::time::timeout(std::time::Duration::from_secs(10), slot.keyframe()).await {

@@ -71,11 +71,18 @@ impl LatestFrameSlot {
     }
 
     pub fn clear(&self) {
-        if let Ok(mut frames) = self.frames.lock() {
-            frames.clear();
-        }
+        self.clear_pending();
         if let Ok(mut keyframe) = self.keyframe.lock() {
             *keyframe = None;
+        }
+    }
+
+    /// Discards queued playback frames while retaining the newest keyframe.
+    /// The retained IDR can paint a newly initialized decoder immediately,
+    /// even when the Windows login desktop is completely static.
+    pub fn clear_pending(&self) {
+        if let Ok(mut frames) = self.frames.lock() {
+            frames.clear();
         }
     }
 
@@ -173,6 +180,16 @@ mod tests {
         slot.publish(frame(11));
         slot.discard_through(10);
         assert_eq!(slot.next().await.frame_id, 11);
+    }
+
+    #[tokio::test]
+    async fn clearing_pending_frames_retains_the_bootstrap_keyframe() {
+        let slot = LatestFrameSlot::default();
+        slot.publish(keyframe(10));
+        slot.publish(frame(11));
+        slot.clear_pending();
+        assert_eq!(slot.len(), 0);
+        assert_eq!(slot.keyframe().await.frame_id, 10);
     }
 
     #[tokio::test]
