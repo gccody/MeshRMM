@@ -43,7 +43,16 @@ impl WindowsInputController {
     }
 
     pub fn set_active_display(&mut self, display: Display) -> anyhow::Result<()> {
-        self.release_all()?;
+        // Capture/encoder restarts commonly rediscover the same display. Keep
+        // held input intact in that case; input state belongs to the control
+        // session, not to the current video capture instance.
+        if self
+            .active_display
+            .as_ref()
+            .is_some_and(|active| active.id != display.id)
+        {
+            self.release_all()?;
+        }
         self.active_display = Some(display);
         Ok(())
     }

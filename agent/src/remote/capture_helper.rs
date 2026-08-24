@@ -31,6 +31,7 @@ use meshrmm_remote_screen::{
 };
 
 use super::input::WindowsInputController;
+use super::platform::ScreenInput;
 
 const COMMAND_START: u8 = 1;
 const COMMAND_REQUEST_KEYFRAME: u8 = 2;
@@ -38,11 +39,13 @@ const COMMAND_SET_BITRATE: u8 = 3;
 const COMMAND_STOP: u8 = 4;
 const COMMAND_INPUT: u8 = 5;
 const COMMAND_RELEASE_INPUT: u8 = 6;
+const COMMAND_START_INPUT: u8 = 7;
 const EVENT_STARTED: u8 = 1;
 const EVENT_FRAME: u8 = 2;
 const EVENT_ERROR: u8 = 3;
 const EVENT_STOPPED: u8 = 4;
 const EVENT_CURSOR: u8 = 5;
+const EVENT_INPUT_STARTED: u8 = 6;
 const MAX_CODEC_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
@@ -85,6 +88,9 @@ enum ParentCommand {
     },
     RequestKeyframe,
     SetBitrate(u32),
+    StartInput {
+        display_id: DisplayId,
+    },
     Input(RemoteInput),
     ReleaseInput,
     Stop,
@@ -98,6 +104,7 @@ pub struct StartedDesktop {
 
 enum ChildEvent {
     Started(StartedDesktop),
+    InputStarted,
     Frame(EncodedAccessUnit),
     Cursor(CursorShape),
     Error(String),
@@ -106,12 +113,16 @@ enum ChildEvent {
 
 type HelperStatus = Arc<Mutex<Option<Result<(), String>>>>;
 type HelperCursor = Arc<Mutex<CursorShape>>;
+type InputWriter = Arc<Mutex<BufWriter<File>>>;
+type InputRoute = Arc<Mutex<Option<InputWriter>>>;
 
 /// Brokers a credential-free LocalSystem helper on the visible Windows
 /// desktop. Only frames and remote-control events cross the inherited pipes;
 /// the Agent token, configuration, and network stack remain in Session 0.
 pub struct DesktopCaptureStreamer {
     running: Option<RunningHelper>,
+    input: Option<RunningInputHelper>,
+    input_route: InputRoute,
     preferred_desktop: Option<DesktopTarget>,
     cursor: HelperCursor,
 }
@@ -120,6 +131,8 @@ impl DesktopCaptureStreamer {
     pub fn new() -> Self {
         Self {
             running: None,
+            input: None,
+            input_route: Arc::new(Mutex::new(None)),
             preferred_desktop: None,
             cursor: Arc::new(Mutex::new(CursorShape::Default)),
         }
@@ -231,6 +244,12 @@ impl DesktopCaptureStreamer {
             height = started.format.height,
             "LocalSystem desktop helper started"
         );
+        if let Err(error) = self.ensure_input_helper(target, started.active_display.id) {
+            terminate_and_wait(&launched.process);
+            let _ = reader.join();
+            let _ = stderr.join();
+            return Err(error).context("failed to start the independent desktop input helper");
+        }
         self.preferred_desktop = Some(target);
         self.running = Some(RunningHelper {
             process: launched.process,
@@ -254,24 +273,11 @@ impl DesktopCaptureStreamer {
             .context("failed to change the desktop-helper bitrate")
     }
 
-    pub fn apply_input(&self, input: RemoteInput) -> anyhow::Result<()> {
-        self.send(ParentCommand::Input(input))
-            .context("failed to send input to the active desktop")
-    }
-
-    pub fn release_input(&self) -> anyhow::Result<()> {
-        let Some(running) = self.running.as_ref() else {
-            return Ok(());
-        };
-        send_command(&running.input, &ParentCommand::ReleaseInput)
-            .context("failed to release input on the active desktop")
-    }
-
-    pub fn cursor_shape(&self) -> CursorShape {
-        *self
-            .cursor
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+    pub fn input_controller(&self) -> Arc<dyn ScreenInput> {
+        Arc::new(DesktopInputController {
+            route: Arc::clone(&self.input_route),
+            cursor: Arc::clone(&self.cursor),
+        })
     }
 
     fn send(&self, command: ParentCommand) -> anyhow::Result<()> {
@@ -291,7 +297,10 @@ impl DesktopCaptureStreamer {
         status.as_ref()?;
         drop(status);
         let mut running = self.running.take()?;
-        self.preferred_desktop = Some(running.target.alternate());
+        // Retry the same desktop first. Encoder/capture failures do not imply
+        // that the interactive desktop changed, and switching desktops would
+        // unnecessarily replace the independent input helper.
+        self.preferred_desktop = Some(running.target);
         let result = running.take_status();
         running.finish();
         Some(result)
@@ -301,7 +310,6 @@ impl DesktopCaptureStreamer {
         let Some(mut running) = self.running.take() else {
             return Ok(());
         };
-        let _ = send_command(&running.input, &ParentCommand::ReleaseInput);
         let send_result = send_command(&running.input, &ParentCommand::Stop);
         if unsafe { WaitForSingleObject(running.process.0, STOP_TIMEOUT_MS) } == WAIT_TIMEOUT {
             tracing::warn!(
@@ -312,6 +320,52 @@ impl DesktopCaptureStreamer {
         }
         running.finish();
         send_result.context("failed to stop the desktop helper")
+    }
+
+    fn ensure_input_helper(
+        &mut self,
+        target: DesktopTarget,
+        display_id: DisplayId,
+    ) -> anyhow::Result<()> {
+        if self.input.as_ref().is_some_and(|helper| {
+            helper.target == target
+                && helper.display_id == display_id
+                && helper
+                    .status
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_none()
+        }) {
+            return Ok(());
+        }
+        self.stop_input_helper();
+        let helper = start_input_helper(target, display_id, Arc::clone(&self.cursor))?;
+        *self
+            .input_route
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&helper.input));
+        self.input = Some(helper);
+        Ok(())
+    }
+
+    fn stop_input_helper(&mut self) {
+        let Some(mut helper) = self.input.take() else {
+            return;
+        };
+        *self
+            .input_route
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        let _ = send_command(&helper.input, &ParentCommand::ReleaseInput);
+        let _ = send_command(&helper.input, &ParentCommand::Stop);
+        if unsafe { WaitForSingleObject(helper.process.0, STOP_TIMEOUT_MS) } == WAIT_TIMEOUT {
+            tracing::warn!(
+                process_id = helper.process_id,
+                "desktop input helper did not stop promptly; terminating it"
+            );
+            terminate_and_wait(&helper.process);
+        }
+        helper.finish();
     }
 }
 
@@ -326,6 +380,7 @@ impl Drop for DesktopCaptureStreamer {
         if let Err(error) = self.stop() {
             tracing::warn!(%error, "failed to stop desktop helper cleanly");
         }
+        self.stop_input_helper();
     }
 }
 
@@ -337,6 +392,66 @@ struct RunningHelper {
     status: HelperStatus,
     reader: Option<JoinHandle<()>>,
     stderr: Option<JoinHandle<()>>,
+}
+
+struct RunningInputHelper {
+    process: OwnedHandle,
+    process_id: u32,
+    target: DesktopTarget,
+    display_id: DisplayId,
+    input: Arc<Mutex<BufWriter<File>>>,
+    status: HelperStatus,
+    reader: Option<JoinHandle<()>>,
+    stderr: Option<JoinHandle<()>>,
+}
+
+struct DesktopInputController {
+    route: InputRoute,
+    cursor: HelperCursor,
+}
+
+impl ScreenInput for DesktopInputController {
+    fn apply(&self, input: RemoteInput) -> anyhow::Result<()> {
+        let writer = self
+            .route
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .context("desktop input helper is not running")?;
+        send_command(&writer, &ParentCommand::Input(input))
+            .context("failed to send input to the active desktop")
+    }
+
+    fn release_all(&self) -> anyhow::Result<()> {
+        let Some(writer) = self
+            .route
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        else {
+            return Ok(());
+        };
+        send_command(&writer, &ParentCommand::ReleaseInput)
+            .context("failed to release input on the active desktop")
+    }
+
+    fn cursor_shape(&self) -> CursorShape {
+        *self
+            .cursor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+impl RunningInputHelper {
+    fn finish(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        if let Some(stderr) = self.stderr.take() {
+            let _ = stderr.join();
+        }
+    }
 }
 
 impl RunningHelper {
@@ -477,6 +592,70 @@ fn launch_system_helper(target: DesktopTarget) -> anyhow::Result<LaunchedHelper>
     })
 }
 
+fn start_input_helper(
+    target: DesktopTarget,
+    display_id: DisplayId,
+    cursor: HelperCursor,
+) -> anyhow::Result<RunningInputHelper> {
+    let launched = launch_system_helper(target)?;
+    let status: HelperStatus = Arc::new(Mutex::new(None));
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let reader_status = Arc::clone(&status);
+    let reader = thread::Builder::new()
+        .name("meshrmm-desktop-input-ipc".into())
+        .spawn(move || dispatch_input_events(launched.output, started_tx, reader_status, cursor))
+        .context("failed to start desktop input-helper IPC reader")?;
+    let stderr = thread::Builder::new()
+        .name("meshrmm-desktop-input-stderr".into())
+        .spawn(move || drain_child_stderr(launched.stderr))
+        .context("failed to start desktop input-helper error reader")?;
+    let input = Arc::new(Mutex::new(BufWriter::new(launched.input)));
+    if let Err(error) = send_command(&input, &ParentCommand::StartInput { display_id }) {
+        terminate_and_wait(&launched.process);
+        let _ = reader.join();
+        let _ = stderr.join();
+        return Err(error).context("failed to initialize the desktop input helper");
+    }
+    match started_rx.recv_timeout(START_TIMEOUT) {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => {
+            terminate_and_wait(&launched.process);
+            let _ = reader.join();
+            let _ = stderr.join();
+            anyhow::bail!("desktop input helper failed: {message}");
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            terminate_and_wait(&launched.process);
+            let _ = reader.join();
+            let _ = stderr.join();
+            anyhow::bail!("desktop input helper did not start within 5 seconds");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            terminate_and_wait(&launched.process);
+            let _ = reader.join();
+            let _ = stderr.join();
+            anyhow::bail!("desktop input helper exited before startup");
+        }
+    }
+    tracing::info!(
+        process_id = launched.process_id,
+        session_id = launched.session_id,
+        desktop = target.name(),
+        display_id = display_id.0,
+        "independent LocalSystem desktop input helper started"
+    );
+    Ok(RunningInputHelper {
+        process: launched.process,
+        process_id: launched.process_id,
+        target,
+        display_id,
+        input,
+        status,
+        reader: Some(reader),
+        stderr: Some(stderr),
+    })
+}
+
 fn create_inherited_pipe(parent_reads: bool) -> anyhow::Result<(OwnedHandle, OwnedHandle)> {
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -517,6 +696,14 @@ fn dispatch_child_events(
                     break;
                 }
             }
+            Ok(ChildEvent::InputStarted) => {
+                if let Some(sender) = started_tx.take() {
+                    let message = "capture helper reported input-only startup".to_string();
+                    let _ = sender.send(Err(message.clone()));
+                    set_status(&status, Err(message));
+                }
+                break;
+            }
             Ok(ChildEvent::Frame(frame)) => (sink)(frame),
             Ok(ChildEvent::Cursor(shape)) => {
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) = shape;
@@ -538,6 +725,64 @@ fn dispatch_child_events(
             }
             Err(error) => {
                 let message = format!("desktop-helper IPC failed: {error}");
+                if let Some(sender) = started_tx.take() {
+                    let _ = sender.send(Err(message.clone()));
+                }
+                set_status(&status, Err(message));
+                break;
+            }
+        }
+    }
+}
+
+fn dispatch_input_events(
+    output: File,
+    started_tx: mpsc::SyncSender<Result<(), String>>,
+    status: HelperStatus,
+    cursor: HelperCursor,
+) {
+    let mut output = BufReader::new(output);
+    let mut started_tx = Some(started_tx);
+    loop {
+        match read_event(&mut output) {
+            Ok(ChildEvent::InputStarted) => {
+                if let Some(sender) = started_tx.take() {
+                    let _ = sender.send(Ok(()));
+                } else {
+                    set_status(
+                        &status,
+                        Err("desktop input helper sent duplicate start event".into()),
+                    );
+                    break;
+                }
+            }
+            Ok(ChildEvent::Cursor(shape)) => {
+                *cursor.lock().unwrap_or_else(|error| error.into_inner()) = shape;
+            }
+            Ok(ChildEvent::Error(message)) => {
+                if let Some(sender) = started_tx.take() {
+                    let _ = sender.send(Err(message.clone()));
+                }
+                set_status(&status, Err(message));
+                break;
+            }
+            Ok(ChildEvent::Stopped) => {
+                if let Some(sender) = started_tx.take() {
+                    let _ = sender.send(Err("desktop input helper stopped before startup".into()));
+                }
+                set_status(&status, Ok(()));
+                break;
+            }
+            Ok(ChildEvent::Started(_) | ChildEvent::Frame(_)) => {
+                let message = "desktop input helper reported a video event".to_string();
+                if let Some(sender) = started_tx.take() {
+                    let _ = sender.send(Err(message.clone()));
+                }
+                set_status(&status, Err(message));
+                break;
+            }
+            Err(error) => {
+                let message = format!("desktop input-helper IPC failed: {error}");
                 if let Some(sender) = started_tx.take() {
                     let _ = sender.send(Err(message.clone()));
                 }
@@ -600,18 +845,34 @@ pub fn run_child() -> anyhow::Result<()> {
         })
         .context("failed to start desktop-helper command reader")?;
 
-    let first = command_rx
+    match command_rx
         .recv()
-        .context("desktop-helper command pipe closed before startup")??;
-    let ParentCommand::Start {
-        display_id,
-        frames_per_second,
-        bitrate_bits_per_second,
-        codec,
-    } = first
-    else {
-        anyhow::bail!("desktop helper expected a start command");
-    };
+        .context("desktop-helper command pipe closed before startup")??
+    {
+        ParentCommand::Start {
+            display_id,
+            frames_per_second,
+            bitrate_bits_per_second,
+            codec,
+        } => run_capture_child(
+            command_rx,
+            display_id,
+            frames_per_second,
+            bitrate_bits_per_second,
+            codec,
+        ),
+        ParentCommand::StartInput { display_id } => run_input_child(command_rx, display_id),
+        _ => anyhow::bail!("desktop helper expected a capture or input start command"),
+    }
+}
+
+fn run_capture_child(
+    command_rx: mpsc::Receiver<io::Result<ParentCommand>>,
+    display_id: Option<DisplayId>,
+    frames_per_second: u32,
+    bitrate_bits_per_second: u32,
+    codec: VideoCodec,
+) -> anyhow::Result<()> {
     if frames_per_second == 0 || bitrate_bits_per_second == 0 {
         anyhow::bail!("desktop-helper frame rate and bitrate must be positive");
     }
@@ -637,8 +898,6 @@ pub fn run_child() -> anyhow::Result<()> {
             sink_failed.store(true, Ordering::Release);
         }
     });
-    let mut input = WindowsInputController::new();
-    input.set_active_display(active_display.clone())?;
     let mut streamer = WindowsDesktopDuplicationStreamer::new();
     let active = match streamer.start(
         StreamConfig {
@@ -664,7 +923,6 @@ pub fn run_child() -> anyhow::Result<()> {
         }),
     )?;
 
-    let mut sent_cursor = None;
     let mut terminal_error = None;
     loop {
         if ipc_failed.load(Ordering::Acquire) {
@@ -675,13 +933,6 @@ pub fn run_child() -> anyhow::Result<()> {
                 terminal_error = Some(error.to_string());
             }
             break;
-        }
-        let cursor = input.cursor_shape();
-        if sent_cursor != Some(cursor) {
-            if emit_child_event(&output, ChildEvent::Cursor(cursor)).is_err() {
-                break;
-            }
-            sent_cursor = Some(cursor);
         }
         match command_rx.recv_timeout(Duration::from_millis(16)) {
             Ok(Ok(ParentCommand::RequestKeyframe)) => {
@@ -696,19 +947,70 @@ pub fn run_child() -> anyhow::Result<()> {
                     break;
                 }
             }
+            Ok(Ok(ParentCommand::Stop)) => break,
+            Ok(Ok(
+                ParentCommand::Start { .. }
+                | ParentCommand::StartInput { .. }
+                | ParentCommand::Input(_)
+                | ParentCommand::ReleaseInput,
+            )) => {
+                terminal_error =
+                    Some("capture helper received a command reserved for input".into());
+                break;
+            }
+            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+    let _ = streamer.stop();
+    if ipc_failed.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    match terminal_error {
+        Some(message) => emit_child_event(&output, ChildEvent::Error(message))?,
+        None => emit_child_event(&output, ChildEvent::Stopped)?,
+    }
+    Ok(())
+}
+
+fn run_input_child(
+    command_rx: mpsc::Receiver<io::Result<ParentCommand>>,
+    display_id: DisplayId,
+) -> anyhow::Result<()> {
+    let displays = enumerate_displays()?;
+    let active_display = displays
+        .into_iter()
+        .find(|display| display.id == display_id)
+        .context("input helper could not find the selected display")?;
+    let mut input = WindowsInputController::new();
+    input.set_active_display(active_display)?;
+    let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+    emit_child_event(&output, ChildEvent::InputStarted)?;
+
+    let mut sent_cursor = None;
+    let mut terminal_error = None;
+    loop {
+        let cursor = input.cursor_shape();
+        if sent_cursor != Some(cursor) {
+            if emit_child_event(&output, ChildEvent::Cursor(cursor)).is_err() {
+                break;
+            }
+            sent_cursor = Some(cursor);
+        }
+        match command_rx.recv_timeout(Duration::from_millis(16)) {
             Ok(Ok(ParentCommand::Input(event))) => {
                 if let Err(error) = input.apply(event) {
-                    tracing::warn!(%error, "desktop helper discarded invalid input");
+                    tracing::warn!(%error, "desktop input helper discarded invalid input");
                 }
             }
             Ok(Ok(ParentCommand::ReleaseInput)) => {
                 if let Err(error) = input.release_all() {
-                    tracing::warn!(%error, "desktop helper could not release input");
+                    tracing::warn!(%error, "desktop input helper could not release input");
                 }
             }
             Ok(Ok(ParentCommand::Stop)) => break,
-            Ok(Ok(ParentCommand::Start { .. })) => {
-                terminal_error = Some("desktop helper received a duplicate start command".into());
+            Ok(Ok(_)) => {
+                terminal_error = Some("input helper received a video command".into());
                 break;
             }
             Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -716,10 +1018,6 @@ pub fn run_child() -> anyhow::Result<()> {
         }
     }
     let _ = input.release_all();
-    let _ = streamer.stop();
-    if ipc_failed.load(Ordering::Acquire) {
-        return Ok(());
-    }
     match terminal_error {
         Some(message) => emit_child_event(&output, ChildEvent::Error(message))?,
         None => emit_child_event(&output, ChildEvent::Stopped)?,
@@ -773,6 +1071,10 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             writer.write_all(&[COMMAND_SET_BITRATE])?;
             write_u32(&mut writer, *bits_per_second)
         }
+        ParentCommand::StartInput { display_id } => {
+            writer.write_all(&[COMMAND_START_INPUT])?;
+            write_u32(&mut writer, display_id.0)
+        }
         ParentCommand::Input(input) => {
             let bytes = SessionMessage::Input(*input)
                 .encode()
@@ -800,6 +1102,9 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
         }
         COMMAND_REQUEST_KEYFRAME => Ok(ParentCommand::RequestKeyframe),
         COMMAND_SET_BITRATE => Ok(ParentCommand::SetBitrate(read_u32(&mut reader)?)),
+        COMMAND_START_INPUT => Ok(ParentCommand::StartInput {
+            display_id: DisplayId(read_u32(&mut reader)?),
+        }),
         COMMAND_INPUT => {
             let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "desktop input")?;
             let mut bytes = vec![0; length];
@@ -839,6 +1144,7 @@ fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
             }
             Ok(())
         }
+        ChildEvent::InputStarted => writer.write_all(&[EVENT_INPUT_STARTED]),
         ChildEvent::Frame(frame) => {
             let codec_config = frame.codec_config.as_deref().unwrap_or_default();
             checked_len(
@@ -908,6 +1214,7 @@ fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
                 active_display,
             }))
         }
+        EVENT_INPUT_STARTED => Ok(ChildEvent::InputStarted),
         EVENT_FRAME => {
             let capture_timestamp_us = read_u64(&mut reader)?;
             let encode_complete_timestamp_us = read_u64(&mut reader)?;
@@ -1110,6 +1417,9 @@ mod tests {
             },
             ParentCommand::RequestKeyframe,
             ParentCommand::SetBitrate(4_000_000),
+            ParentCommand::StartInput {
+                display_id: DisplayId(3),
+            },
             ParentCommand::Input(RemoteInput::PointerButton {
                 display_id: DisplayId(3),
                 button: PointerButton::Left,
@@ -1178,6 +1488,16 @@ mod tests {
     }
 
     #[test]
+    fn input_started_event_round_trips() {
+        let mut bytes = Vec::new();
+        write_event(&mut bytes, &ChildEvent::InputStarted).unwrap();
+        assert!(matches!(
+            read_event(bytes.as_slice()).unwrap(),
+            ChildEvent::InputStarted
+        ));
+    }
+
+    #[test]
     fn desktop_targets_alternate() {
         assert_eq!(DesktopTarget::Default.alternate(), DesktopTarget::Winlogon);
         assert_eq!(DesktopTarget::Winlogon.alternate(), DesktopTarget::Default);
@@ -1188,6 +1508,7 @@ mod tests {
             ParentCommand::Start { .. } => COMMAND_START,
             ParentCommand::RequestKeyframe => COMMAND_REQUEST_KEYFRAME,
             ParentCommand::SetBitrate(_) => COMMAND_SET_BITRATE,
+            ParentCommand::StartInput { .. } => COMMAND_START_INPUT,
             ParentCommand::Input(_) => COMMAND_INPUT,
             ParentCommand::ReleaseInput => COMMAND_RELEASE_INPUT,
             ParentCommand::Stop => COMMAND_STOP,

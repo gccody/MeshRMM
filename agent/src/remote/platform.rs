@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use meshrmm_protocol::{
@@ -30,8 +30,12 @@ pub trait ScreenStreamer: Send {
         self.set_bitrate(bits_per_second)
     }
     fn set_codec(&mut self, codec: Codec);
-    fn apply_input(&mut self, input: RemoteInput) -> anyhow::Result<()>;
-    fn release_input(&mut self) -> anyhow::Result<()>;
+    fn input_controller(&self) -> Arc<dyn ScreenInput>;
+}
+
+pub trait ScreenInput: Send + Sync {
+    fn apply(&self, input: RemoteInput) -> anyhow::Result<()>;
+    fn release_all(&self) -> anyhow::Result<()>;
     fn cursor_shape(&self) -> CursorShape;
 }
 
@@ -42,7 +46,7 @@ pub struct PlatformScreenStreamer {
     bitrate_bits_per_second: u32,
     codec: Codec,
     next_frame_id: Arc<AtomicU64>,
-    direct_input: super::input::WindowsInputController,
+    direct_input: Arc<Mutex<super::input::WindowsInputController>>,
 }
 
 #[cfg(windows)]
@@ -62,7 +66,7 @@ impl PlatformScreenStreamer {
             bitrate_bits_per_second,
             codec: Codec::H264,
             next_frame_id: Arc::new(AtomicU64::new(1)),
-            direct_input: super::input::WindowsInputController::new(),
+            direct_input: Arc::new(Mutex::new(super::input::WindowsInputController::new())),
         }
     }
 }
@@ -103,6 +107,8 @@ impl ScreenStreamer for PlatformScreenStreamer {
                 let displays = enumerate_displays()?;
                 let active_display = choose_display(&displays, requested_display_id)?;
                 self.direct_input
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("direct input controller lock was poisoned"))?
                     .set_active_display(active_display.clone())?;
                 let active = streamer.start(config, active_display.id.0, sink)?;
                 Ok(StartedScreen {
@@ -180,25 +186,41 @@ impl ScreenStreamer for PlatformScreenStreamer {
         self.codec = codec;
     }
 
-    fn apply_input(&mut self, input: RemoteInput) -> anyhow::Result<()> {
-        match &mut self.inner {
-            CaptureBackend::Direct(_) => self.direct_input.apply(input),
-            CaptureBackend::Desktop(streamer) => streamer.apply_input(input),
+    fn input_controller(&self) -> Arc<dyn ScreenInput> {
+        match &self.inner {
+            CaptureBackend::Direct(_) => Arc::new(DirectInputController {
+                controller: Arc::clone(&self.direct_input),
+            }),
+            CaptureBackend::Desktop(streamer) => streamer.input_controller(),
         }
     }
+}
 
-    fn release_input(&mut self) -> anyhow::Result<()> {
-        match &mut self.inner {
-            CaptureBackend::Direct(_) => self.direct_input.release_all(),
-            CaptureBackend::Desktop(streamer) => streamer.release_input(),
-        }
+#[cfg(windows)]
+struct DirectInputController {
+    controller: Arc<Mutex<super::input::WindowsInputController>>,
+}
+
+#[cfg(windows)]
+impl ScreenInput for DirectInputController {
+    fn apply(&self, input: RemoteInput) -> anyhow::Result<()> {
+        self.controller
+            .lock()
+            .map_err(|_| anyhow::anyhow!("direct input controller lock was poisoned"))?
+            .apply(input)
+    }
+
+    fn release_all(&self) -> anyhow::Result<()> {
+        self.controller
+            .lock()
+            .map_err(|_| anyhow::anyhow!("direct input controller lock was poisoned"))?
+            .release_all()
     }
 
     fn cursor_shape(&self) -> CursorShape {
-        match &self.inner {
-            CaptureBackend::Direct(_) => self.direct_input.cursor_shape(),
-            CaptureBackend::Desktop(streamer) => streamer.cursor_shape(),
-        }
+        self.controller
+            .lock()
+            .map_or(CursorShape::Default, |input| input.cursor_shape())
     }
 }
 
