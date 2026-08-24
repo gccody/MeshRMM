@@ -6,7 +6,7 @@ use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use meshrmm_protocol::{CursorShape, Display, DisplayId, RemoteInput, SessionMessage};
@@ -49,7 +49,7 @@ const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
 const MAX_DISPLAY_NAME_BYTES: usize = 4 * 1024;
 const MAX_DISPLAYS: usize = 64;
-const START_TIMEOUT: Duration = Duration::from_secs(20);
+const START_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT_MS: u32 = 5_000;
 const NO_DISPLAY: u32 = u32::MAX;
 const NO_ACTIVE_SESSION: u32 = u32::MAX;
@@ -136,10 +136,23 @@ impl DesktopCaptureStreamer {
         let preferred = self.preferred_desktop.unwrap_or_else(preferred_desktop);
         let mut last_error = None;
         for target in [preferred, preferred.alternate()] {
+            let attempt_started = Instant::now();
             match self.start_on_desktop(target, config, display_id, Arc::clone(&sink)) {
-                Ok(started) => return Ok(started),
+                Ok(started) => {
+                    tracing::info!(
+                        desktop = target.name(),
+                        startup_ms = attempt_started.elapsed().as_millis(),
+                        "desktop helper capture became ready"
+                    );
+                    return Ok(started);
+                }
                 Err(error) => {
-                    tracing::warn!(desktop = target.name(), error = ?error, "desktop helper could not start");
+                    tracing::warn!(
+                        desktop = target.name(),
+                        startup_ms = attempt_started.elapsed().as_millis(),
+                        error = ?error,
+                        "desktop helper could not start"
+                    );
                     last_error = Some(error);
                 }
             }
@@ -199,7 +212,7 @@ impl DesktopCaptureStreamer {
                 terminate_and_wait(&launched.process);
                 let _ = reader.join();
                 let _ = stderr.join();
-                anyhow::bail!("desktop helper did not start within 20 seconds");
+                anyhow::bail!("desktop helper did not start within 5 seconds");
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 terminate_and_wait(&launched.process);
