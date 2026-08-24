@@ -1,4 +1,4 @@
-use std::ffi::{OsStr, c_void};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::os::windows::ffi::OsStrExt;
@@ -9,91 +9,172 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::Context;
+use meshrmm_protocol::{CursorShape, Display, DisplayId, RemoteInput, SessionMessage};
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_TIMEOUT,
 };
-use windows::Win32::Security::SECURITY_ATTRIBUTES;
-use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+use windows::Win32::Security::{
+    DuplicateTokenEx, SECURITY_ATTRIBUTES, SecurityImpersonation, SetTokenInformation,
+    TOKEN_ALL_ACCESS, TokenPrimary, TokenSessionId,
+};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
 use meshrmm_remote_screen::{
-    ActiveFormat, EncodedAccessUnit, EncodedFrameSink, StreamConfig, WindowsScreenStreamer,
+    ActiveFormat, EncodedAccessUnit, EncodedFrameSink, StreamConfig,
+    WindowsDesktopDuplicationStreamer,
 };
+
+use super::input::WindowsInputController;
 
 const COMMAND_START: u8 = 1;
 const COMMAND_REQUEST_KEYFRAME: u8 = 2;
 const COMMAND_SET_BITRATE: u8 = 3;
 const COMMAND_STOP: u8 = 4;
+const COMMAND_INPUT: u8 = 5;
+const COMMAND_RELEASE_INPUT: u8 = 6;
 const EVENT_STARTED: u8 = 1;
 const EVENT_FRAME: u8 = 2;
 const EVENT_ERROR: u8 = 3;
 const EVENT_STOPPED: u8 = 4;
+const EVENT_CURSOR: u8 = 5;
 const MAX_CODEC_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
+const MAX_CONTROL_BYTES: usize = 64 * 1024;
+const MAX_DISPLAY_NAME_BYTES: usize = 4 * 1024;
+const MAX_DISPLAYS: usize = 64;
 const START_TIMEOUT: Duration = Duration::from_secs(20);
 const STOP_TIMEOUT_MS: u32 = 5_000;
+const NO_DISPLAY: u32 = u32::MAX;
+const NO_ACTIVE_SESSION: u32 = u32::MAX;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopTarget {
+    Default,
+    Winlogon,
+}
+
+impl DesktopTarget {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Winlogon => "Winlogon",
+        }
+    }
+
+    fn alternate(self) -> Self {
+        match self {
+            Self::Default => Self::Winlogon,
+            Self::Winlogon => Self::Default,
+        }
+    }
+}
 
 enum ParentCommand {
     Start {
-        display_id: u32,
+        display_id: Option<DisplayId>,
         frames_per_second: u32,
         bitrate_bits_per_second: u32,
     },
     RequestKeyframe,
     SetBitrate(u32),
+    Input(RemoteInput),
+    ReleaseInput,
     Stop,
 }
 
+pub struct StartedDesktop {
+    pub format: ActiveFormat,
+    pub displays: Vec<Display>,
+    pub active_display: Display,
+}
+
 enum ChildEvent {
-    Started(ActiveFormat),
+    Started(StartedDesktop),
     Frame(EncodedAccessUnit),
+    Cursor(CursorShape),
     Error(String),
     Stopped,
 }
 
 type HelperStatus = Arc<Mutex<Option<Result<(), String>>>>;
+type HelperCursor = Arc<Mutex<CursorShape>>;
 
-/// Capture-only process launched with the active interactive user's token.
-/// The inherited anonymous pipes carry no Agent credential or remote input.
-pub struct UserCaptureStreamer {
+/// Brokers a credential-free LocalSystem helper on the visible Windows
+/// desktop. Only frames and remote-control events cross the inherited pipes;
+/// the Agent token, configuration, and network stack remain in Session 0.
+pub struct DesktopCaptureStreamer {
     running: Option<RunningHelper>,
+    preferred_desktop: Option<DesktopTarget>,
+    cursor: HelperCursor,
 }
 
-impl UserCaptureStreamer {
+impl DesktopCaptureStreamer {
     pub fn new() -> Self {
-        Self { running: None }
+        Self {
+            running: None,
+            preferred_desktop: None,
+            cursor: Arc::new(Mutex::new(CursorShape::Default)),
+        }
     }
 
     pub fn start(
         &mut self,
         config: StreamConfig,
-        display_id: u32,
+        display_id: Option<DisplayId>,
         sink: EncodedFrameSink,
-    ) -> anyhow::Result<ActiveFormat> {
+    ) -> anyhow::Result<StartedDesktop> {
         if self.running.is_some() {
-            anyhow::bail!("capture helper is already running");
+            anyhow::bail!("desktop helper is already running");
         }
+        let preferred = self.preferred_desktop.unwrap_or_else(preferred_desktop);
+        let mut last_error = None;
+        for target in [preferred, preferred.alternate()] {
+            match self.start_on_desktop(target, config, display_id, Arc::clone(&sink)) {
+                Ok(started) => return Ok(started),
+                Err(error) => {
+                    tracing::warn!(desktop = target.name(), error = ?error, "desktop helper could not start");
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no interactive desktop is available")))
+    }
 
-        let launched = launch_active_user_helper()?;
+    fn start_on_desktop(
+        &mut self,
+        target: DesktopTarget,
+        config: StreamConfig,
+        display_id: Option<DisplayId>,
+        sink: EncodedFrameSink,
+    ) -> anyhow::Result<StartedDesktop> {
+        let launched = launch_system_helper(target)?;
         let status: HelperStatus = Arc::new(Mutex::new(None));
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let reader_status = Arc::clone(&status);
+        let reader_cursor = Arc::clone(&self.cursor);
         let reader = thread::Builder::new()
-            .name("meshrmm-capture-ipc".into())
-            .spawn(move || dispatch_child_events(launched.output, sink, started_tx, reader_status))
-            .context("failed to start the capture-helper IPC reader")?;
+            .name("meshrmm-desktop-ipc".into())
+            .spawn(move || {
+                dispatch_child_events(
+                    launched.output,
+                    sink,
+                    started_tx,
+                    reader_status,
+                    reader_cursor,
+                )
+            })
+            .context("failed to start desktop-helper IPC reader")?;
         let stderr = thread::Builder::new()
-            .name("meshrmm-capture-stderr".into())
+            .name("meshrmm-desktop-stderr".into())
             .spawn(move || drain_child_stderr(launched.stderr))
-            .context("failed to start the capture-helper error reader")?;
-
+            .context("failed to start desktop-helper error reader")?;
         let input = Arc::new(Mutex::new(BufWriter::new(launched.input)));
         let start = ParentCommand::Start {
             display_id,
@@ -104,67 +185,86 @@ impl UserCaptureStreamer {
             terminate_and_wait(&launched.process);
             let _ = reader.join();
             let _ = stderr.join();
-            return Err(error).context("failed to start the active-user capture helper");
+            return Err(error).context("failed to start the desktop helper");
         }
-
-        let active = match started_rx.recv_timeout(START_TIMEOUT) {
-            Ok(Ok(active)) => active,
+        let started = match started_rx.recv_timeout(START_TIMEOUT) {
+            Ok(Ok(started)) => started,
             Ok(Err(message)) => {
                 terminate_and_wait(&launched.process);
                 let _ = reader.join();
                 let _ = stderr.join();
-                anyhow::bail!("active-user capture helper failed: {message}");
+                anyhow::bail!("desktop helper failed: {message}");
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 terminate_and_wait(&launched.process);
                 let _ = reader.join();
                 let _ = stderr.join();
-                anyhow::bail!("active-user capture helper did not start within 20 seconds");
+                anyhow::bail!("desktop helper did not start within 20 seconds");
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 terminate_and_wait(&launched.process);
                 let _ = reader.join();
                 let _ = stderr.join();
-                anyhow::bail!("active-user capture helper exited before capture started");
+                anyhow::bail!("desktop helper exited before capture started");
             }
         };
-
         tracing::info!(
             process_id = launched.process_id,
-            width = active.width,
-            height = active.height,
-            "active-user capture helper started"
+            session_id = launched.session_id,
+            desktop = target.name(),
+            width = started.format.width,
+            height = started.format.height,
+            "LocalSystem desktop helper started"
         );
+        self.preferred_desktop = Some(target);
         self.running = Some(RunningHelper {
             process: launched.process,
             process_id: launched.process_id,
+            target,
             input,
             status,
             reader: Some(reader),
             stderr: Some(stderr),
         });
-        Ok(active)
+        Ok(started)
     }
 
     pub fn request_keyframe(&self) -> anyhow::Result<()> {
-        let running = self
-            .running
-            .as_ref()
-            .context("capture helper is not running")?;
-        send_command(&running.input, &ParentCommand::RequestKeyframe)
-            .context("failed to request a capture-helper keyframe")
+        self.send(ParentCommand::RequestKeyframe)
+            .context("failed to request a desktop-helper keyframe")
     }
 
     pub fn set_bitrate(&self, bits_per_second: u32) -> anyhow::Result<()> {
+        self.send(ParentCommand::SetBitrate(bits_per_second.max(1)))
+            .context("failed to change the desktop-helper bitrate")
+    }
+
+    pub fn apply_input(&self, input: RemoteInput) -> anyhow::Result<()> {
+        self.send(ParentCommand::Input(input))
+            .context("failed to send input to the active desktop")
+    }
+
+    pub fn release_input(&self) -> anyhow::Result<()> {
+        let Some(running) = self.running.as_ref() else {
+            return Ok(());
+        };
+        send_command(&running.input, &ParentCommand::ReleaseInput)
+            .context("failed to release input on the active desktop")
+    }
+
+    pub fn cursor_shape(&self) -> CursorShape {
+        *self
+            .cursor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn send(&self, command: ParentCommand) -> anyhow::Result<()> {
         let running = self
             .running
             .as_ref()
-            .context("capture helper is not running")?;
-        send_command(
-            &running.input,
-            &ParentCommand::SetBitrate(bits_per_second.max(1)),
-        )
-        .context("failed to change the capture-helper bitrate")
+            .context("desktop helper is not running")?;
+        send_command(&running.input, &command)
     }
 
     pub fn poll_ended(&mut self) -> Option<anyhow::Result<()>> {
@@ -176,6 +276,7 @@ impl UserCaptureStreamer {
         status.as_ref()?;
         drop(status);
         let mut running = self.running.take()?;
+        self.preferred_desktop = Some(running.target.alternate());
         let result = running.take_status();
         running.finish();
         Some(result)
@@ -185,29 +286,30 @@ impl UserCaptureStreamer {
         let Some(mut running) = self.running.take() else {
             return Ok(());
         };
+        let _ = send_command(&running.input, &ParentCommand::ReleaseInput);
         let send_result = send_command(&running.input, &ParentCommand::Stop);
         if unsafe { WaitForSingleObject(running.process.0, STOP_TIMEOUT_MS) } == WAIT_TIMEOUT {
             tracing::warn!(
                 process_id = running.process_id,
-                "capture helper did not stop promptly; terminating it"
+                "desktop helper did not stop promptly; terminating it"
             );
             terminate_and_wait(&running.process);
         }
         running.finish();
-        send_result.context("failed to stop the active-user capture helper")
+        send_result.context("failed to stop the desktop helper")
     }
 }
 
-impl Default for UserCaptureStreamer {
+impl Default for DesktopCaptureStreamer {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Drop for UserCaptureStreamer {
+impl Drop for DesktopCaptureStreamer {
     fn drop(&mut self) {
         if let Err(error) = self.stop() {
-            tracing::warn!(%error, "failed to stop active-user capture helper cleanly");
+            tracing::warn!(%error, "failed to stop desktop helper cleanly");
         }
     }
 }
@@ -215,6 +317,7 @@ impl Drop for UserCaptureStreamer {
 struct RunningHelper {
     process: OwnedHandle,
     process_id: u32,
+    target: DesktopTarget,
     input: Arc<Mutex<BufWriter<File>>>,
     status: HelperStatus,
     reader: Option<JoinHandle<()>>,
@@ -231,7 +334,7 @@ impl RunningHelper {
         {
             Some(Ok(())) => Ok(()),
             Some(Err(message)) => Err(anyhow::anyhow!(message)),
-            None => anyhow::bail!("capture helper exited without a final status"),
+            None => anyhow::bail!("desktop helper exited without a final status"),
         }
     }
 
@@ -248,38 +351,72 @@ impl RunningHelper {
 struct LaunchedHelper {
     process: OwnedHandle,
     process_id: u32,
+    session_id: u32,
     input: File,
     output: File,
     stderr: File,
 }
 
-fn launch_active_user_helper() -> anyhow::Result<LaunchedHelper> {
+fn preferred_desktop() -> DesktopTarget {
+    let session_id = unsafe { WTSGetActiveConsoleSessionId() };
+    if session_id == NO_ACTIVE_SESSION {
+        return DesktopTarget::Winlogon;
+    }
+    let mut token = HANDLE::default();
+    if unsafe { WTSQueryUserToken(session_id, &mut token) }.is_ok() {
+        drop(OwnedHandle(token));
+        DesktopTarget::Default
+    } else {
+        DesktopTarget::Winlogon
+    }
+}
+
+fn launch_system_helper(target: DesktopTarget) -> anyhow::Result<LaunchedHelper> {
     let executable = std::env::current_exe().context("could not locate the Agent executable")?;
     let working_directory = executable
         .parent()
         .context("Agent executable has no parent directory")?;
     let session_id = unsafe { WTSGetActiveConsoleSessionId() };
-    if session_id == u32::MAX {
-        anyhow::bail!("Windows reported no active console user for screen capture");
+    if session_id == NO_ACTIVE_SESSION {
+        anyhow::bail!("Windows reported no active console session");
     }
-
-    let mut token = HANDLE::default();
-    unsafe { WTSQueryUserToken(session_id, &mut token) }
-        .context("failed to obtain the active console user's process token")?;
-    let token = OwnedHandle(token);
-    let environment = UserEnvironment::create(&token)?;
+    let mut process_token = HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut process_token) }
+        .context("failed to open the LocalSystem coordinator token")?;
+    let process_token = OwnedHandle(process_token);
+    let mut session_token = HANDLE::default();
+    unsafe {
+        DuplicateTokenEx(
+            process_token.0,
+            TOKEN_ALL_ACCESS,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut session_token,
+        )
+    }
+    .context("failed to duplicate the LocalSystem coordinator token")?;
+    let session_token = OwnedHandle(session_token);
+    unsafe {
+        SetTokenInformation(
+            session_token.0,
+            TokenSessionId,
+            (&session_id as *const u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    }
+    .context("failed to move the desktop helper token into the console session")?;
 
     let (child_input, parent_input) = create_inherited_pipe(false)?;
     let (parent_output, child_output) = create_inherited_pipe(true)?;
     let (parent_stderr, child_stderr) = create_inherited_pipe(true)?;
-
     let executable_wide = wide(executable.as_os_str());
     let working_directory_wide = wide(working_directory.as_os_str());
     let mut command_line = wide(OsStr::new(&format!(
         "\"{}\" --capture-helper",
         executable.display()
     )));
-    let mut desktop = wide(OsStr::new("winsta0\\default"));
+    let mut desktop = wide(OsStr::new(&format!("winsta0\\{}", target.name())));
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         lpDesktop: PWSTR(desktop.as_mut_ptr()),
@@ -292,30 +429,33 @@ fn launch_active_user_helper() -> anyhow::Result<LaunchedHelper> {
     let mut process_info = PROCESS_INFORMATION::default();
     unsafe {
         CreateProcessAsUserW(
-            Some(token.0),
+            Some(session_token.0),
             PCWSTR(executable_wide.as_ptr()),
             Some(PWSTR(command_line.as_mut_ptr())),
             None,
             None,
             true,
-            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            Some(environment.0.cast_const()),
+            CREATE_NO_WINDOW,
+            None,
             PCWSTR(working_directory_wide.as_ptr()),
             &startup,
             &mut process_info,
         )
     }
-    .context("failed to launch capture helper as the active console user")?;
+    .with_context(|| {
+        format!(
+            "failed to launch LocalSystem helper on winsta0\\{}",
+            target.name()
+        )
+    })?;
     let _thread = OwnedHandle(process_info.hThread);
-
-    // These endpoints belong only to the child. Closing the parent copies here
-    // also guarantees EOF propagates in both directions on process shutdown.
     drop(child_input);
     drop(child_output);
     drop(child_stderr);
     Ok(LaunchedHelper {
         process: OwnedHandle(process_info.hProcess),
         process_id: process_info.dwProcessId,
+        session_id,
         input: parent_input.into_file(),
         output: parent_output.into_file(),
         stderr: parent_stderr.into_file(),
@@ -331,37 +471,41 @@ fn create_inherited_pipe(parent_reads: bool) -> anyhow::Result<(OwnedHandle, Own
     let mut read = HANDLE::default();
     let mut write = HANDLE::default();
     unsafe { CreatePipe(&mut read, &mut write, Some(&attributes), 0) }
-        .context("failed to create capture-helper IPC pipe")?;
+        .context("failed to create desktop-helper IPC pipe")?;
     let read = OwnedHandle(read);
     let write = OwnedHandle(write);
     let parent = if parent_reads { &read } else { &write };
     unsafe { SetHandleInformation(parent.0, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) }
-        .context("failed to protect the parent capture-helper pipe handle")?;
+        .context("failed to protect the parent desktop-helper pipe handle")?;
     Ok((read, write))
 }
 
 fn dispatch_child_events(
     output: File,
     sink: EncodedFrameSink,
-    started_tx: mpsc::SyncSender<Result<ActiveFormat, String>>,
+    started_tx: mpsc::SyncSender<Result<StartedDesktop, String>>,
     status: HelperStatus,
+    cursor: HelperCursor,
 ) {
     let mut output = BufReader::new(output);
     let mut started_tx = Some(started_tx);
     loop {
         match read_event(&mut output) {
-            Ok(ChildEvent::Started(format)) => {
+            Ok(ChildEvent::Started(started)) => {
                 if let Some(sender) = started_tx.take() {
-                    let _ = sender.send(Ok(format));
+                    let _ = sender.send(Ok(started));
                 } else {
                     set_status(
                         &status,
-                        Err("capture helper sent duplicate start event".into()),
+                        Err("desktop helper sent duplicate start event".into()),
                     );
                     break;
                 }
             }
             Ok(ChildEvent::Frame(frame)) => (sink)(frame),
+            Ok(ChildEvent::Cursor(shape)) => {
+                *cursor.lock().unwrap_or_else(|error| error.into_inner()) = shape;
+            }
             Ok(ChildEvent::Error(message)) => {
                 if let Some(sender) = started_tx.take() {
                     let _ = sender.send(Err(message.clone()));
@@ -372,16 +516,17 @@ fn dispatch_child_events(
             Ok(ChildEvent::Stopped) => {
                 if let Some(sender) = started_tx.take() {
                     let _ =
-                        sender.send(Err("capture helper stopped before capture started".into()));
+                        sender.send(Err("desktop helper stopped before capture started".into()));
                 }
                 set_status(&status, Ok(()));
                 break;
             }
             Err(error) => {
+                let message = format!("desktop-helper IPC failed: {error}");
                 if let Some(sender) = started_tx.take() {
-                    let _ = sender.send(Err(format!("capture-helper IPC failed: {error}")));
+                    let _ = sender.send(Err(message.clone()));
                 }
-                set_status(&status, Err(format!("capture-helper IPC failed: {error}")));
+                set_status(&status, Err(message));
                 break;
             }
         }
@@ -398,9 +543,9 @@ fn set_status(status: &HelperStatus, value: Result<(), String>) {
 fn drain_child_stderr(stderr: File) {
     for line in BufReader::new(stderr).lines() {
         match line {
-            Ok(line) => tracing::warn!(message = %line, "capture helper wrote to stderr"),
+            Ok(line) => tracing::warn!(message = %line, "desktop helper wrote to stderr"),
             Err(error) => {
-                tracing::warn!(%error, "failed to read capture-helper stderr");
+                tracing::warn!(%error, "failed to read desktop-helper stderr");
                 break;
             }
         }
@@ -422,12 +567,12 @@ fn send_command(
     Ok(())
 }
 
-/// Entry point for the unprivileged child. It intentionally loads no config,
-/// initializes no network stack, and receives no remote-control messages.
+/// Entry point for the isolated LocalSystem desktop helper. It loads no Agent
+/// configuration, opens no network sockets, and receives no Agent credential.
 pub fn run_child() -> anyhow::Result<()> {
     let (command_tx, command_rx) = mpsc::channel();
     thread::Builder::new()
-        .name("meshrmm-capture-commands".into())
+        .name("meshrmm-desktop-commands".into())
         .spawn(move || {
             let mut input = io::stdin().lock();
             loop {
@@ -438,23 +583,29 @@ pub fn run_child() -> anyhow::Result<()> {
                 }
             }
         })
-        .context("failed to start capture-helper command reader")?;
+        .context("failed to start desktop-helper command reader")?;
 
     let first = command_rx
         .recv()
-        .context("capture-helper command pipe closed before startup")??;
+        .context("desktop-helper command pipe closed before startup")??;
     let ParentCommand::Start {
         display_id,
         frames_per_second,
         bitrate_bits_per_second,
     } = first
     else {
-        anyhow::bail!("capture helper expected a start command");
+        anyhow::bail!("desktop helper expected a start command");
     };
     if frames_per_second == 0 || bitrate_bits_per_second == 0 {
-        anyhow::bail!("capture-helper frame rate and bitrate must be positive");
+        anyhow::bail!("desktop-helper frame rate and bitrate must be positive");
     }
-
+    let displays = enumerate_displays()?;
+    let active_display = display_id
+        .and_then(|id| displays.iter().find(|display| display.id == id))
+        .or_else(|| displays.iter().find(|display| display.primary))
+        .or_else(|| displays.first())
+        .cloned()
+        .context("Windows reported no displays on the active desktop")?;
     let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
     let ipc_failed = Arc::new(AtomicBool::new(false));
     let sink_output = Arc::clone(&output);
@@ -470,14 +621,15 @@ pub fn run_child() -> anyhow::Result<()> {
             sink_failed.store(true, Ordering::Release);
         }
     });
-
-    let mut streamer = WindowsScreenStreamer::new();
+    let mut input = WindowsInputController::new();
+    input.set_active_display(active_display.clone())?;
+    let mut streamer = WindowsDesktopDuplicationStreamer::new();
     let active = match streamer.start(
         StreamConfig {
             frames_per_second,
             bitrate_bits_per_second,
         },
-        display_id,
+        active_display.id.0,
         sink,
     ) {
         Ok(active) => active,
@@ -486,8 +638,16 @@ pub fn run_child() -> anyhow::Result<()> {
             return Ok(());
         }
     };
-    emit_child_event(&output, ChildEvent::Started(active))?;
+    emit_child_event(
+        &output,
+        ChildEvent::Started(StartedDesktop {
+            format: active,
+            displays,
+            active_display,
+        }),
+    )?;
 
+    let mut sent_cursor = None;
     let mut terminal_error = None;
     loop {
         if ipc_failed.load(Ordering::Acquire) {
@@ -499,7 +659,14 @@ pub fn run_child() -> anyhow::Result<()> {
             }
             break;
         }
-        match command_rx.recv_timeout(Duration::from_millis(100)) {
+        let cursor = input.cursor_shape();
+        if sent_cursor != Some(cursor) {
+            if emit_child_event(&output, ChildEvent::Cursor(cursor)).is_err() {
+                break;
+            }
+            sent_cursor = Some(cursor);
+        }
+        match command_rx.recv_timeout(Duration::from_millis(16)) {
             Ok(Ok(ParentCommand::RequestKeyframe)) => {
                 if let Err(error) = streamer.request_keyframe() {
                     terminal_error = Some(error.to_string());
@@ -512,15 +679,26 @@ pub fn run_child() -> anyhow::Result<()> {
                     break;
                 }
             }
+            Ok(Ok(ParentCommand::Input(event))) => {
+                if let Err(error) = input.apply(event) {
+                    tracing::warn!(%error, "desktop helper discarded invalid input");
+                }
+            }
+            Ok(Ok(ParentCommand::ReleaseInput)) => {
+                if let Err(error) = input.release_all() {
+                    tracing::warn!(%error, "desktop helper could not release input");
+                }
+            }
             Ok(Ok(ParentCommand::Stop)) => break,
             Ok(Ok(ParentCommand::Start { .. })) => {
-                terminal_error = Some("capture helper received a duplicate start command".into());
+                terminal_error = Some("desktop helper received a duplicate start command".into());
                 break;
             }
             Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
+    let _ = input.release_all();
     let _ = streamer.stop();
     if ipc_failed.load(Ordering::Acquire) {
         return Ok(());
@@ -530,6 +708,24 @@ pub fn run_child() -> anyhow::Result<()> {
         None => emit_child_event(&output, ChildEvent::Stopped)?,
     }
     Ok(())
+}
+
+fn enumerate_displays() -> anyhow::Result<Vec<Display>> {
+    meshrmm_remote_screen::enumerate_displays()
+        .context("failed to enumerate displays on the active desktop")?
+        .into_iter()
+        .map(|display| {
+            Ok(Display {
+                id: DisplayId(display.id),
+                name: display.name,
+                x: display.x,
+                y: display.y,
+                width: display.width,
+                height: display.height,
+                primary: display.primary,
+            })
+        })
+        .collect()
 }
 
 fn emit_child_event(
@@ -549,7 +745,7 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             bitrate_bits_per_second,
         } => {
             writer.write_all(&[COMMAND_START])?;
-            write_u32(&mut writer, *display_id)?;
+            write_u32(&mut writer, display_id.map_or(NO_DISPLAY, |id| id.0))?;
             write_u32(&mut writer, *frames_per_second)?;
             write_u32(&mut writer, *bitrate_bits_per_second)
         }
@@ -558,35 +754,69 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             writer.write_all(&[COMMAND_SET_BITRATE])?;
             write_u32(&mut writer, *bits_per_second)
         }
+        ParentCommand::Input(input) => {
+            let bytes = SessionMessage::Input(*input)
+                .encode()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            checked_len(bytes.len(), MAX_CONTROL_BYTES, "desktop input")?;
+            writer.write_all(&[COMMAND_INPUT])?;
+            write_u32(&mut writer, bytes.len() as u32)?;
+            writer.write_all(&bytes)
+        }
+        ParentCommand::ReleaseInput => writer.write_all(&[COMMAND_RELEASE_INPUT]),
         ParentCommand::Stop => writer.write_all(&[COMMAND_STOP]),
     }
 }
 
 fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
     match read_u8(&mut reader)? {
-        COMMAND_START => Ok(ParentCommand::Start {
-            display_id: read_u32(&mut reader)?,
-            frames_per_second: read_u32(&mut reader)?,
-            bitrate_bits_per_second: read_u32(&mut reader)?,
-        }),
+        COMMAND_START => {
+            let display_id = read_u32(&mut reader)?;
+            Ok(ParentCommand::Start {
+                display_id: (display_id != NO_DISPLAY).then_some(DisplayId(display_id)),
+                frames_per_second: read_u32(&mut reader)?,
+                bitrate_bits_per_second: read_u32(&mut reader)?,
+            })
+        }
         COMMAND_REQUEST_KEYFRAME => Ok(ParentCommand::RequestKeyframe),
         COMMAND_SET_BITRATE => Ok(ParentCommand::SetBitrate(read_u32(&mut reader)?)),
+        COMMAND_INPUT => {
+            let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "desktop input")?;
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes)?;
+            match SessionMessage::decode(&bytes) {
+                Ok(SessionMessage::Input(input)) => Ok(ParentCommand::Input(input)),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "desktop input contained a non-input message",
+                )),
+                Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+            }
+        }
+        COMMAND_RELEASE_INPUT => Ok(ParentCommand::ReleaseInput),
         COMMAND_STOP => Ok(ParentCommand::Stop),
         opcode => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unknown capture-helper command opcode {opcode}"),
+            format!("unknown desktop-helper command opcode {opcode}"),
         )),
     }
 }
 
 fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
     match event {
-        ChildEvent::Started(format) => {
+        ChildEvent::Started(started) => {
             writer.write_all(&[EVENT_STARTED])?;
-            write_u32(&mut writer, format.width)?;
-            write_u32(&mut writer, format.height)?;
-            write_u32(&mut writer, format.frames_per_second)?;
-            write_u32(&mut writer, format.bitrate_bits_per_second)
+            write_u32(&mut writer, started.format.width)?;
+            write_u32(&mut writer, started.format.height)?;
+            write_u32(&mut writer, started.format.frames_per_second)?;
+            write_u32(&mut writer, started.format.bitrate_bits_per_second)?;
+            write_u32(&mut writer, started.active_display.id.0)?;
+            checked_len(started.displays.len(), MAX_DISPLAYS, "display list")?;
+            write_u32(&mut writer, started.displays.len() as u32)?;
+            for display in &started.displays {
+                write_display(&mut writer, display)?;
+            }
+            Ok(())
         }
         ChildEvent::Frame(frame) => {
             let codec_config = frame.codec_config.as_deref().unwrap_or_default();
@@ -605,9 +835,18 @@ fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
             writer.write_all(codec_config)?;
             writer.write_all(&frame.data)
         }
+        ChildEvent::Cursor(shape) => {
+            let bytes = SessionMessage::CursorShape { shape: *shape }
+                .encode()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            checked_len(bytes.len(), MAX_CONTROL_BYTES, "cursor shape")?;
+            writer.write_all(&[EVENT_CURSOR])?;
+            write_u32(&mut writer, bytes.len() as u32)?;
+            writer.write_all(&bytes)
+        }
         ChildEvent::Error(message) => {
             let message = message.as_bytes();
-            checked_len(message.len(), MAX_ERROR_BYTES, "capture-helper error")?;
+            checked_len(message.len(), MAX_ERROR_BYTES, "desktop-helper error")?;
             writer.write_all(&[EVENT_ERROR])?;
             write_u32(&mut writer, message.len() as u32)?;
             writer.write_all(message)
@@ -618,12 +857,35 @@ fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
 
 fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
     match read_u8(&mut reader)? {
-        EVENT_STARTED => Ok(ChildEvent::Started(ActiveFormat {
-            width: read_u32(&mut reader)?,
-            height: read_u32(&mut reader)?,
-            frames_per_second: read_u32(&mut reader)?,
-            bitrate_bits_per_second: read_u32(&mut reader)?,
-        })),
+        EVENT_STARTED => {
+            let format = ActiveFormat {
+                width: read_u32(&mut reader)?,
+                height: read_u32(&mut reader)?,
+                frames_per_second: read_u32(&mut reader)?,
+                bitrate_bits_per_second: read_u32(&mut reader)?,
+            };
+            let active_display_id = DisplayId(read_u32(&mut reader)?);
+            let count = bounded_len(read_u32(&mut reader)?, MAX_DISPLAYS, "display list")?;
+            let mut displays = Vec::with_capacity(count);
+            for _ in 0..count {
+                displays.push(read_display(&mut reader)?);
+            }
+            let active_display = displays
+                .iter()
+                .find(|display| display.id == active_display_id)
+                .cloned()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "desktop helper selected an unknown display",
+                    )
+                })?;
+            Ok(ChildEvent::Started(StartedDesktop {
+                format,
+                displays,
+                active_display,
+            }))
+        }
         EVENT_FRAME => {
             let capture_timestamp_us = read_u64(&mut reader)?;
             let encode_complete_timestamp_us = read_u64(&mut reader)?;
@@ -633,7 +895,7 @@ fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
                 value => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("invalid capture-helper keyframe flag {value}"),
+                        format!("invalid keyframe flag {value}"),
                     ));
                 }
             };
@@ -655,11 +917,24 @@ fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
                 data,
             }))
         }
+        EVENT_CURSOR => {
+            let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "cursor shape")?;
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes)?;
+            match SessionMessage::decode(&bytes) {
+                Ok(SessionMessage::CursorShape { shape }) => Ok(ChildEvent::Cursor(shape)),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cursor event contained an unexpected message",
+                )),
+                Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+            }
+        }
         EVENT_ERROR => {
             let length = bounded_len(
                 read_u32(&mut reader)?,
                 MAX_ERROR_BYTES,
-                "capture-helper error",
+                "desktop-helper error",
             )?;
             let mut message = vec![0; length];
             reader.read_exact(&mut message)?;
@@ -670,9 +945,54 @@ fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
         EVENT_STOPPED => Ok(ChildEvent::Stopped),
         opcode => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unknown capture-helper event opcode {opcode}"),
+            format!("unknown desktop-helper event opcode {opcode}"),
         )),
     }
+}
+
+fn write_display(writer: &mut impl Write, display: &Display) -> io::Result<()> {
+    let name = display.name.as_bytes();
+    checked_len(name.len(), MAX_DISPLAY_NAME_BYTES, "display name")?;
+    write_u32(writer, display.id.0)?;
+    write_u32(writer, display.x as u32)?;
+    write_u32(writer, display.y as u32)?;
+    write_u32(writer, display.width)?;
+    write_u32(writer, display.height)?;
+    writer.write_all(&[u8::from(display.primary)])?;
+    write_u32(writer, name.len() as u32)?;
+    writer.write_all(name)
+}
+
+fn read_display(reader: &mut impl Read) -> io::Result<Display> {
+    let id = DisplayId(read_u32(reader)?);
+    let x = read_u32(reader)? as i32;
+    let y = read_u32(reader)? as i32;
+    let width = read_u32(reader)?;
+    let height = read_u32(reader)?;
+    let primary = match read_u8(reader)? {
+        0 => false,
+        1 => true,
+        value => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid display primary flag {value}"),
+            ));
+        }
+    };
+    let name_len = bounded_len(read_u32(reader)?, MAX_DISPLAY_NAME_BYTES, "display name")?;
+    let mut name = vec![0; name_len];
+    reader.read_exact(&mut name)?;
+    let name = String::from_utf8(name)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(Display {
+        id,
+        name,
+        x,
+        y,
+        width,
+        height,
+        primary,
+    })
 }
 
 fn checked_len(length: usize, maximum: usize, label: &str) -> io::Result<()> {
@@ -694,23 +1014,19 @@ fn bounded_len(length: u32, maximum: usize, label: &str) -> io::Result<usize> {
 fn write_u32(writer: &mut impl Write, value: u32) -> io::Result<()> {
     writer.write_all(&value.to_le_bytes())
 }
-
 fn write_u64(writer: &mut impl Write, value: u64) -> io::Result<()> {
     writer.write_all(&value.to_le_bytes())
 }
-
 fn read_u8(reader: &mut impl Read) -> io::Result<u8> {
     let mut value = [0; 1];
     reader.read_exact(&mut value)?;
     Ok(value[0])
 }
-
 fn read_u32(reader: &mut impl Read) -> io::Result<u32> {
     let mut value = [0; 4];
     reader.read_exact(&mut value)?;
     Ok(u32::from_le_bytes(value))
 }
-
 fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
     let mut value = [0; 8];
     reader.read_exact(&mut value)?;
@@ -718,16 +1034,12 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 }
 
 struct OwnedHandle(HANDLE);
-
-// Kernel handles may be waited on and closed from any thread. Ownership still
-// remains unique because OwnedHandle is not Clone.
 unsafe impl Send for OwnedHandle {}
 
 impl OwnedHandle {
     fn into_file(self) -> File {
         let raw = self.0.0;
         std::mem::forget(self);
-        // SAFETY: ownership of this valid parent pipe endpoint moves to File.
         unsafe { File::from_raw_handle(raw) }
     }
 }
@@ -740,25 +1052,6 @@ impl Drop for OwnedHandle {
     }
 }
 
-struct UserEnvironment(*mut c_void);
-
-impl UserEnvironment {
-    fn create(token: &OwnedHandle) -> anyhow::Result<Self> {
-        let mut environment = std::ptr::null_mut();
-        unsafe { CreateEnvironmentBlock(&mut environment, Some(token.0), false) }
-            .context("failed to create the active console user's environment")?;
-        Ok(Self(environment))
-    }
-}
-
-impl Drop for UserEnvironment {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            let _ = unsafe { DestroyEnvironmentBlock(self.0) };
-        }
-    }
-}
-
 fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()
 }
@@ -766,17 +1059,24 @@ fn wide(value: &OsStr) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meshrmm_protocol::PointerButton;
 
     #[test]
-    fn command_protocol_round_trips() {
+    fn command_protocol_round_trips_desktop_input() {
         let commands = [
             ParentCommand::Start {
-                display_id: 3,
+                display_id: Some(DisplayId(3)),
                 frames_per_second: 60,
                 bitrate_bits_per_second: 12_000_000,
             },
             ParentCommand::RequestKeyframe,
             ParentCommand::SetBitrate(4_000_000),
+            ParentCommand::Input(RemoteInput::PointerButton {
+                display_id: DisplayId(3),
+                button: PointerButton::Left,
+                pressed: true,
+            }),
+            ParentCommand::ReleaseInput,
             ParentCommand::Stop,
         ];
         for command in commands {
@@ -785,6 +1085,36 @@ mod tests {
             let decoded = read_command(bytes.as_slice()).unwrap();
             assert_eq!(command_name(&decoded), command_name(&command));
         }
+    }
+
+    #[test]
+    fn started_event_round_trips_display_metadata() {
+        let display = Display {
+            id: DisplayId(2),
+            name: "Secure display".into(),
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+        };
+        let event = ChildEvent::Started(StartedDesktop {
+            format: ActiveFormat {
+                width: 1920,
+                height: 1080,
+                frames_per_second: 60,
+                bitrate_bits_per_second: 12_000_000,
+            },
+            displays: vec![display.clone()],
+            active_display: display,
+        });
+        let mut bytes = Vec::new();
+        write_event(&mut bytes, &event).unwrap();
+        let ChildEvent::Started(decoded) = read_event(bytes.as_slice()).unwrap() else {
+            panic!("expected started event");
+        };
+        assert_eq!(decoded.active_display.id, DisplayId(2));
+        assert_eq!(decoded.displays[0].x, -1920);
     }
 
     #[test]
@@ -802,10 +1132,14 @@ mod tests {
             panic!("expected frame event");
         };
         assert_eq!(decoded.capture_timestamp_us, 11);
-        assert_eq!(decoded.encode_complete_timestamp_us, 22);
-        assert!(decoded.keyframe);
         assert_eq!(decoded.codec_config, Some(vec![1, 2, 3]));
         assert_eq!(decoded.data, vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn desktop_targets_alternate() {
+        assert_eq!(DesktopTarget::Default.alternate(), DesktopTarget::Winlogon);
+        assert_eq!(DesktopTarget::Winlogon.alternate(), DesktopTarget::Default);
     }
 
     fn command_name(command: &ParentCommand) -> u8 {
@@ -813,6 +1147,8 @@ mod tests {
             ParentCommand::Start { .. } => COMMAND_START,
             ParentCommand::RequestKeyframe => COMMAND_REQUEST_KEYFRAME,
             ParentCommand::SetBitrate(_) => COMMAND_SET_BITRATE,
+            ParentCommand::Input(_) => COMMAND_INPUT,
+            ParentCommand::ReleaseInput => COMMAND_RELEASE_INPUT,
             ParentCommand::Stop => COMMAND_STOP,
         }
     }

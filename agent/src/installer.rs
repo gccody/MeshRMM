@@ -248,7 +248,7 @@ fn install() -> anyhow::Result<()> {
             .context("failed to register the Agent service")?,
     };
     service
-        .set_description("MeshRMM LocalSystem supervisor for the active desktop Agent")
+        .set_description("MeshRMM LocalSystem supervisor for persistent remote access")
         .context("failed to set the Agent service description")?;
     service
         .update_failure_actions(ServiceFailureActions {

@@ -31,7 +31,7 @@ struct Arguments {
     #[arg(long, hide = true, conflicts_with_all = ["worker", "console"])]
     service: bool,
 
-    /// Run the SYSTEM capture worker in the active desktop session.
+    /// Run the persistent SYSTEM coordinator used by the Windows service.
     #[arg(long, hide = true, conflicts_with_all = ["service", "console"])]
     worker: bool,
 

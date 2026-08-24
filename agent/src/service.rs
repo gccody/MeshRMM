@@ -6,14 +6,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
-use windows::Win32::Security::{
-    DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TokenPrimary,
-    TokenSessionId,
-};
-use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken,
-    PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess,
+    WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 use windows_service::service::{
@@ -26,7 +21,6 @@ use crate::remote::config::Config;
 
 pub const SERVICE_NAME: &str = "MeshRMMAgent";
 pub const LEGACY_SERVICE_NAME: &str = "PulseRMMAgent";
-const NO_ACTIVE_SESSION: u32 = u32::MAX;
 static SERVICE_CONFIG: OnceLock<Config> = OnceLock::new();
 
 pub fn run(config: Config) -> anyhow::Result<()> {
@@ -102,31 +96,25 @@ fn run_service() -> anyhow::Result<()> {
     let mut worker: Option<WorkerProcess> = None;
     let mut next_update_check = Instant::now();
     let result = loop {
-        let session_id = unsafe { WTSGetActiveConsoleSessionId() };
-        let needs_worker = session_id != NO_ACTIVE_SESSION
-            && worker
-                .as_ref()
-                .is_none_or(|process| process.session_id != session_id || !process.is_running());
+        // The authenticated coordinator deliberately remains in the service's
+        // non-interactive Session 0. Desktop-bound helpers are launched by the
+        // worker into the active console session without receiving Agent
+        // credentials. Keeping this process stable preserves signaling and an
+        // active WebRTC connection across lock, logoff, and user switching.
+        let needs_worker = worker.as_ref().is_none_or(|process| !process.is_running());
         if needs_worker {
             if let Some(mut process) = worker.take() {
                 process.stop();
             }
-            match WorkerProcess::launch(session_id, &config.config_path) {
+            match WorkerProcess::launch(&config.config_path) {
                 Ok(process) => {
-                    tracing::info!(
-                        session_id,
-                        "started SYSTEM Agent worker in active desktop session"
-                    );
+                    tracing::info!("started persistent SYSTEM Agent coordinator in Session 0");
                     worker = Some(process);
                 }
                 Err(error) => {
-                    tracing::warn!(session_id, error = ?error, "could not start Agent worker in active desktop session");
+                    tracing::warn!(error = ?error, "could not start persistent Agent coordinator");
                 }
             }
-        } else if session_id == NO_ACTIVE_SESSION
-            && let Some(mut process) = worker.take()
-        {
-            process.stop();
         }
 
         if Instant::now() >= next_update_check {
@@ -192,44 +180,15 @@ impl Drop for OwnedHandle {
 
 struct WorkerProcess {
     process: OwnedHandle,
-    session_id: u32,
 }
 
 impl WorkerProcess {
-    fn launch(session_id: u32, config_path: &Path) -> anyhow::Result<Self> {
+    fn launch(config_path: &Path) -> anyhow::Result<Self> {
         let executable =
             std::env::current_exe().context("could not locate the Agent executable")?;
         let working_directory = executable
             .parent()
             .context("Agent executable has no parent directory")?;
-
-        let mut process_token = HANDLE::default();
-        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut process_token) }
-            .context("failed to open the LocalSystem service token")?;
-        let process_token = OwnedHandle(process_token);
-
-        let mut session_token = HANDLE::default();
-        unsafe {
-            DuplicateTokenEx(
-                process_token.0,
-                TOKEN_ALL_ACCESS,
-                None,
-                SecurityImpersonation,
-                TokenPrimary,
-                &mut session_token,
-            )
-        }
-        .context("failed to duplicate the LocalSystem service token")?;
-        let session_token = OwnedHandle(session_token);
-        unsafe {
-            SetTokenInformation(
-                session_token.0,
-                TokenSessionId,
-                (&session_id as *const u32).cast(),
-                std::mem::size_of::<u32>() as u32,
-            )
-        }
-        .context("failed to move the LocalSystem worker token into the active session")?;
 
         let executable_wide = wide(executable.as_os_str());
         let working_directory_wide = wide(working_directory.as_os_str());
@@ -238,16 +197,13 @@ impl WorkerProcess {
             executable.display(),
             config_path.display()
         )));
-        let mut desktop = wide(OsStr::new("winsta0\\default"));
         let startup = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-            lpDesktop: PWSTR(desktop.as_mut_ptr()),
             ..Default::default()
         };
         let mut process_info = PROCESS_INFORMATION::default();
         unsafe {
-            CreateProcessAsUserW(
-                Some(session_token.0),
+            CreateProcessW(
                 PCWSTR(executable_wide.as_ptr()),
                 Some(PWSTR(command_line.as_mut_ptr())),
                 None,
@@ -260,11 +216,10 @@ impl WorkerProcess {
                 &mut process_info,
             )
         }
-        .context("failed to launch the SYSTEM Agent worker on winsta0\\default")?;
+        .context("failed to launch the persistent SYSTEM Agent coordinator")?;
         let _thread = OwnedHandle(process_info.hThread);
         Ok(Self {
             process: OwnedHandle(process_info.hProcess),
-            session_id,
         })
     }
 
@@ -275,7 +230,7 @@ impl WorkerProcess {
     fn stop(&mut self) {
         if self.is_running() {
             if let Err(error) = unsafe { TerminateProcess(self.process.0, 0) } {
-                tracing::warn!(error = %error, "failed to stop the Agent desktop worker");
+                tracing::warn!(error = %error, "failed to stop the Agent coordinator");
             } else {
                 let _ = unsafe { WaitForSingleObject(self.process.0, 5_000) };
             }

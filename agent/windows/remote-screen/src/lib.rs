@@ -6,7 +6,10 @@
 //! H.264 access units cross the callback boundary.
 
 mod converter;
+mod duplication;
 mod encoder;
+
+pub use duplication::WindowsDesktopDuplicationStreamer;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -140,6 +143,8 @@ pub enum Error {
     AlreadyRunning,
     #[error("capture is not running")]
     NotRunning,
+    #[error("Windows Desktop Duplication failed: {0}")]
+    DesktopDuplication(String),
 }
 
 #[derive(Clone)]
