@@ -60,14 +60,31 @@ impl WorkerPipeline {
         })
     }
 
+    pub(super) fn wants_input(&self) -> bool {
+        self.decoder.wants_input()
+    }
+
+    pub(super) unsafe fn poll(&mut self, presenter_frames_dropped: u64) -> anyhow::Result<()> {
+        let frames = unsafe { self.decoder.poll()? };
+        unsafe { self.present_decoded(frames, presenter_frames_dropped) }
+    }
+
     pub(super) unsafe fn process(
         &mut self,
         queued: QueuedFrame,
         presenter_frames_dropped: u64,
+    ) -> anyhow::Result<Option<QueuedFrame>> {
+        let decoded = unsafe { self.decoder.decode(&queued)? };
+        let accepted = decoded.accepted;
+        unsafe { self.present_decoded(decoded.frames, presenter_frames_dropped)? };
+        Ok((!accepted).then_some(queued))
+    }
+
+    unsafe fn present_decoded(
+        &mut self,
+        frames: Vec<DecodedFrame>,
+        presenter_frames_dropped: u64,
     ) -> anyhow::Result<()> {
-        let receive_to_decode_start_us =
-            monotonic_timestamp_us().saturating_sub(queued.received_at_us);
-        let frames = unsafe { self.decoder.decode(queued)? };
         self.decoded += frames.len() as u64;
         self.interval_decoded += frames.len() as u64;
         self.decoded_frames_dropped = self
@@ -76,6 +93,8 @@ impl WorkerPipeline {
         // The decoder may release more than one surface at once. Present only
         // the newest one so decoder scheduling cannot create a display queue.
         if let Some(frame) = frames.into_iter().last() {
+            let receive_to_decode_start_us =
+                frame.decode_start_us.saturating_sub(frame.received_at_us);
             let render_start = monotonic_timestamp_us();
             unsafe { self.renderer.present(&frame.texture, frame.subresource)? };
             let presentation_us = monotonic_timestamp_us();
@@ -248,6 +267,7 @@ pub(super) unsafe fn supported_video_profiles(format: VideoFormat) -> Vec<VideoP
 
 struct PendingMetadata {
     frame_id: u64,
+    received_at_us: u64,
     decode_start_us: u64,
 }
 
@@ -255,8 +275,14 @@ struct DecodedFrame {
     texture: ID3D11Texture2D,
     subresource: u32,
     frame_id: u64,
+    received_at_us: u64,
     decode_start_us: u64,
     decode_complete_us: u64,
+}
+
+struct DecodeResult {
+    accepted: bool,
+    frames: Vec<DecodedFrame>,
 }
 
 struct HardwareDecoder {
@@ -388,23 +414,20 @@ impl HardwareDecoder {
             codec: format.codec,
             pixel_format: format.pixel_format,
         };
-        unsafe { decoder.pump_events(false)? };
+        unsafe { decoder.pump_events()? };
         Ok(decoder)
     }
 
-    unsafe fn pump_events(&mut self, blocking_once: bool) -> anyhow::Result<()> {
+    unsafe fn pump_events(&mut self) -> anyhow::Result<()> {
         let Some(events) = self.events.as_ref() else {
             return Ok(());
         };
-        let mut first = true;
         loop {
-            let flags = if blocking_once && first {
-                MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0)
-            } else {
-                MF_EVENT_FLAG_NO_WAIT
-            };
-            first = false;
-            match unsafe { events.GetEvent(flags) } {
+            // This decoder runs on the same thread as the native window pump.
+            // A blocking GetEvent call can therefore freeze the entire viewer
+            // when a hardware MFT stops requesting input while the desktop is
+            // idle. Poll and retain the encoded frame until the MFT is ready.
+            match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                 Ok(event) => match unsafe { event.GetType() } {
                     Ok(value) if value == METransformNeedInput.0 as u32 => self.need_input += 1,
                     Ok(value) if value == METransformHaveOutput.0 as u32 => self.have_output += 1,
@@ -418,12 +441,32 @@ impl HardwareDecoder {
         Ok(())
     }
 
-    unsafe fn decode(&mut self, queued: QueuedFrame) -> anyhow::Result<Vec<DecodedFrame>> {
+    fn wants_input(&self) -> bool {
+        !self.asynchronous || self.need_input > 0
+    }
+
+    unsafe fn poll(&mut self) -> anyhow::Result<Vec<DecodedFrame>> {
         if self.asynchronous {
-            unsafe { self.pump_events(self.need_input == 0)? };
-            if self.need_input == 0 {
-                return Ok(Vec::new());
+            unsafe { self.pump_events()? };
+            let mut decoded = Vec::with_capacity(self.have_output as usize);
+            while self.have_output > 0 {
+                if let Some(frame) = unsafe { self.take_output()? } {
+                    decoded.push(frame);
+                }
+                self.have_output -= 1;
             }
+            return Ok(decoded);
+        }
+        Ok(Vec::new())
+    }
+
+    unsafe fn decode(&mut self, queued: &QueuedFrame) -> anyhow::Result<DecodeResult> {
+        let mut decoded = unsafe { self.poll()? };
+        if !self.wants_input() {
+            return Ok(DecodeResult {
+                accepted: false,
+                frames: decoded,
+            });
         }
         if self.pending.len() >= MAX_DECODER_PENDING_FRAMES {
             bail!(
@@ -487,23 +530,20 @@ impl HardwareDecoder {
         }
         self.pending.push_back(PendingMetadata {
             frame_id: queued.frame.frame_id,
+            received_at_us: queued.received_at_us,
             decode_start_us,
         });
-        let mut decoded = Vec::with_capacity(self.have_output.max(1) as usize);
         if self.asynchronous {
-            unsafe { self.pump_events(false)? };
-            while self.have_output > 0 {
-                if let Some(frame) = unsafe { self.take_output()? } {
-                    decoded.push(frame);
-                }
-                self.have_output -= 1;
-            }
+            decoded.extend(unsafe { self.poll()? });
         } else {
             while let Some(frame) = unsafe { self.take_output()? } {
                 decoded.push(frame);
             }
         }
-        Ok(decoded)
+        Ok(DecodeResult {
+            accepted: true,
+            frames: decoded,
+        })
     }
 
     unsafe fn take_output(&mut self) -> anyhow::Result<Option<DecodedFrame>> {
@@ -552,6 +592,7 @@ impl HardwareDecoder {
             texture,
             subresource,
             frame_id: metadata.frame_id,
+            received_at_us: metadata.received_at_us,
             decode_start_us: metadata.decode_start_us,
             decode_complete_us: monotonic_timestamp_us(),
         }))
