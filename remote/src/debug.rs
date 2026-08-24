@@ -26,7 +26,8 @@ struct DebugState {
     decode_fps: Option<f64>,
     present_fps: Option<f64>,
     rtt_ms: Option<f64>,
-    incoming_bitrate_bps: Option<f64>,
+    available_incoming_bitrate_bps: Option<f64>,
+    receive_bitrate_bps: Option<f64>,
     packets_received: u32,
     bytes_received: u64,
     frames_received: u64,
@@ -40,6 +41,7 @@ struct DebugState {
     last_encode_ms: f64,
     received_window_started: Instant,
     received_window_frames: u64,
+    network_sample: Option<(Instant, u64)>,
 }
 
 impl DebugInfo {
@@ -64,7 +66,8 @@ impl DebugInfo {
                 decode_fps: None,
                 present_fps: None,
                 rtt_ms: None,
-                incoming_bitrate_bps: None,
+                available_incoming_bitrate_bps: None,
+                receive_bitrate_bps: None,
                 packets_received: 0,
                 bytes_received: 0,
                 frames_received: 0,
@@ -78,6 +81,7 @@ impl DebugInfo {
                 last_encode_ms: 0.0,
                 received_window_started: now,
                 received_window_frames: 0,
+                network_sample: None,
             })),
         }
     }
@@ -129,7 +133,7 @@ impl DebugInfo {
     pub fn update_network(
         &self,
         rtt_ms: f64,
-        incoming_bitrate_bps: f64,
+        available_incoming_bitrate_bps: f64,
         packets_received: u32,
         bytes_received: u64,
         local_candidate: impl Into<String>,
@@ -137,8 +141,19 @@ impl DebugInfo {
         path: impl Into<String>,
     ) {
         if let Ok(mut debug) = self.state.lock() {
+            let now = Instant::now();
+            if let Some((sampled_at, sampled_bytes)) = debug.network_sample
+                && bytes_received >= sampled_bytes
+            {
+                let elapsed = now.duration_since(sampled_at).as_secs_f64();
+                if elapsed > 0.0 {
+                    debug.receive_bitrate_bps =
+                        Some(bytes_received.saturating_sub(sampled_bytes) as f64 * 8.0 / elapsed);
+                }
+            }
+            debug.network_sample = Some((now, bytes_received));
             debug.rtt_ms = Some(rtt_ms);
-            debug.incoming_bitrate_bps = Some(incoming_bitrate_bps);
+            debug.available_incoming_bitrate_bps = Some(available_incoming_bitrate_bps);
             debug.packets_received = packets_received;
             debug.bytes_received = bytes_received;
             debug.local_candidate = local_candidate.into();
@@ -207,7 +222,11 @@ impl DebugInfo {
         let rtt = debug
             .rtt_ms
             .map_or_else(|| "--".into(), |value| format!("{value:.1} ms"));
-        let bandwidth = debug.incoming_bitrate_bps.map_or_else(
+        let available_bandwidth = debug.available_incoming_bitrate_bps.map_or_else(
+            || "--".into(),
+            |value| format!("{:.2} Mbps", value / 1_000_000.0),
+        );
+        let receive_bandwidth = debug.receive_bitrate_bps.map_or_else(
             || "--".into(),
             |value| format!("{:.2} Mbps", value / 1_000_000.0),
         );
@@ -225,7 +244,7 @@ impl DebugInfo {
              Remote: {}\n\
              ICE pair: {}\n\
              Channels: control={} video={}\n\
-             RTT: {}  Available in: {}\n\
+             RTT: {}  Bandwidth: receive={} available={}\n\
              Network received: {} packets / {}\n\
              Display: {}  Stream: {} @ {} fps\n\
              Codec: {}\n\
@@ -244,7 +263,8 @@ impl DebugInfo {
             debug.control_channel,
             debug.video_channel,
             rtt,
-            bandwidth,
+            receive_bandwidth,
+            available_bandwidth,
             debug.packets_received,
             format_bytes(debug.bytes_received),
             debug.display,
@@ -303,6 +323,7 @@ mod tests {
         assert!(text.contains("TURN relay"));
         assert!(text.contains("Stream: 1920x1080 @ 60 fps"));
         assert!(text.contains("Codec: H.264 / AVC"));
+        assert!(text.contains("Bandwidth: receive=-- available=--"));
         assert!(text.contains("FPS:"));
         assert!(text.contains("Drops:"));
     }

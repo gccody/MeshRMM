@@ -184,6 +184,7 @@ struct CaptureFlags {
 struct ControlState {
     request_keyframe: AtomicBool,
     requested_bitrate: AtomicU32,
+    runtime_bitrate_disabled: AtomicBool,
 }
 
 struct CaptureHandler {
@@ -258,7 +259,20 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         }
         let requested_bitrate = self.controls.requested_bitrate.swap(0, Ordering::AcqRel);
         if requested_bitrate != 0 {
-            self.encoder.set_bitrate(requested_bitrate)?;
+            if let Err(error) = self.encoder.set_bitrate(requested_bitrate) {
+                // Some hardware MFTs advertise a modifiable bitrate but reject
+                // the update at runtime. Keep the current encoder alive: ending
+                // this worker makes the transport rebuild the stream and viewer
+                // for every adaptive-bitrate attempt.
+                tracing::warn!(
+                    %error,
+                    bits_per_second = requested_bitrate,
+                    "hardware encoder rejected a runtime bitrate update; continuing at the previous bitrate"
+                );
+                self.controls
+                    .runtime_bitrate_disabled
+                    .store(true, Ordering::Release);
+            }
         }
         let capture_timestamp_us = frame.timestamp()?.Duration.max(0) as u64 / 10;
         let encode_start_us = monotonic_timestamp_us()?;
@@ -369,6 +383,9 @@ impl WindowsScreenStreamer {
         // replay a runtime request left behind by the previous encoder.
         self.controls.requested_bitrate.store(0, Ordering::Release);
         self.controls
+            .runtime_bitrate_disabled
+            .store(false, Ordering::Release);
+        self.controls
             .request_keyframe
             .store(false, Ordering::Release);
         let monitor = Monitor::enumerate()
@@ -435,6 +452,13 @@ impl WindowsScreenStreamer {
     pub fn set_bitrate(&self, bits_per_second: u32) -> Result<(), Error> {
         if self.control.is_none() {
             return Err(Error::NotRunning);
+        }
+        if self
+            .controls
+            .runtime_bitrate_disabled
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
         }
         self.controls
             .requested_bitrate
