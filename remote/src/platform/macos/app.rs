@@ -18,6 +18,10 @@ define_class!(
     unsafe impl NSApplicationDelegate for AppDelegate {
         #[unsafe(method(application:openURLs:))]
         fn application_open_urls(&self, application: &NSApplication, urls: &NSArray<NSURL>) {
+            tracing::info!(
+                url_count = urls.len(),
+                "macOS viewer received a dashboard handoff"
+            );
             let Some(url) = urls.firstObject() else {
                 return;
             };
@@ -39,7 +43,12 @@ define_class!(
                             .context("could not launch the replacement macOS viewer")
                     });
                 match replacement {
-                    Ok(_) => application.terminate(None),
+                    Ok(_) => {
+                        tracing::warn!(
+                            "replacing the macOS viewer process for a new dashboard handoff"
+                        );
+                        application.terminate(None);
+                    }
                     Err(error) => {
                         tracing::error!(error = %error, "failed to restart the macOS viewer")
                     }
@@ -748,6 +757,7 @@ thread_local! {
 }
 
 pub(super) fn activate_application(mtm: MainThreadMarker) {
+    tracing::info!("bringing the macOS viewer application to the foreground");
     let application = NSApplication::sharedApplication(mtm);
     // `activate` is newer than the MVP's macOS 12 deployment target.
     #[allow(deprecated)]
@@ -755,6 +765,7 @@ pub(super) fn activate_application(mtm: MainThreadMarker) {
 }
 
 fn show_connecting_window(mtm: MainThreadMarker) -> anyhow::Result<()> {
+    tracing::info!("showing macOS viewer connecting window");
     let rect = NSRect {
         origin: NSPoint { x: 0.0, y: 0.0 },
         size: NSSize {
@@ -820,12 +831,14 @@ fn show_connecting_window(mtm: MainThreadMarker) -> anyhow::Result<()> {
 pub(super) fn close_connecting_window() {
     CONNECTING_WINDOW.with(|state| {
         if let Some(window) = state.borrow_mut().take() {
+            tracing::info!("closing macOS viewer connecting window");
             window.orderOut(None);
         }
     });
 }
 
 fn show_connection_error(mtm: MainThreadMarker, error: &str) {
+    tracing::error!(%error, "showing macOS viewer connection error");
     close_connecting_window();
     activate_application(mtm);
     let alert = NSAlert::new(mtm);
@@ -871,6 +884,12 @@ where
                 deep_link_rx.recv_timeout(Duration::from_secs(5)).ok()
             };
             let result = network(deep_link);
+            match &result {
+                Ok(()) => tracing::info!("macOS viewer network session finished cleanly"),
+                Err(error) => {
+                    tracing::error!(error = ?error, "macOS viewer network session failed")
+                }
+            }
             let error = result.as_ref().err().map(|error| format!("{error:#}"));
             let _ = result_tx.send(result);
             DispatchQueue::main().exec_async(move || {

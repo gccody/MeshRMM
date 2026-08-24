@@ -24,8 +24,54 @@ fn initialize(launch_deep_link: Option<&str>) -> anyhow::Result<config::Config> 
         let _ = launch_deep_link;
         config::Config::load()?
     };
+    initialize_tracing(&config)?;
+    Ok(config)
+}
+
+fn initialize_tracing(config: &config::Config) -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    #[cfg(target_os = "macos")]
+    let log_path = {
+        let path = std::path::PathBuf::from(objc2_foundation::NSHomeDirectory().to_string())
+            .join("Library")
+            .join("Logs")
+            .join("MeshRMM")
+            .join("remote.log");
+        let parent = path
+            .parent()
+            .context("macOS viewer log has no parent directory")?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create viewer log directory {}", parent.display())
+        })?;
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open viewer log {}", path.display()))?;
+        let writer = std::sync::Mutex::new(log);
+        if config.json_logs {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(writer)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .json()
+                .init();
+        } else {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(writer)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .with_ansi(false)
+                .init();
+        }
+        path
+    };
+
+    #[cfg(not(target_os = "macos"))]
     if config.json_logs {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -34,7 +80,15 @@ fn initialize(launch_deep_link: Option<&str>) -> anyhow::Result<config::Config> 
     } else {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
-    Ok(config)
+
+    #[cfg(target_os = "macos")]
+    tracing::info!(
+        process_id = std::process::id(),
+        version = env!("CARGO_PKG_VERSION"),
+        log_path = %log_path.display(),
+        "macOS viewer logging initialized"
+    );
+    Ok(())
 }
 
 #[cfg(windows)]

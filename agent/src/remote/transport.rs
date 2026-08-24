@@ -382,7 +382,18 @@ async fn run_connected_sender(
                         }
                     }
                     ControlCommand::Bitrate(value) => {
-                        if let Err(error) = lock_streamer(&streamer)?.set_bitrate(value) {
+                        // Several hardware HEVC MFTs accept the CodecAPI call and
+                        // then terminate asynchronously on the next frame. That
+                        // turns every AIMD adjustment into a capture restart and
+                        // bootstrap keyframe. Keep HEVC at the selected quality
+                        // preset; congestion handling can still drop frames and
+                        // request recovery without destabilizing the encoder.
+                        if active_codec == Codec::H265 {
+                            tracing::debug!(
+                                bits_per_second = value,
+                                "skipping an unsafe live HEVC bitrate adjustment"
+                            );
+                        } else if let Err(error) = lock_streamer(&streamer)?.set_bitrate(value) {
                             tracing::warn!(error = %error, "could not set bitrate while the desktop is changing");
                         }
                     }
@@ -592,9 +603,9 @@ async fn run_connected_sender(
                     let capture_ended = lock_streamer(&streamer)?.poll_ended();
                     if let Some(capture_result) = capture_ended {
                         if let Err(error) = capture_result {
-                            tracing::warn!(error = ?error, "visible Windows desktop changed; replacing capture helper");
+                            tracing::warn!(error = ?error, stream_id = stream_id.0, codec = ?active_codec, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "visible Windows desktop changed; replacing capture helper");
                         } else {
-                            tracing::warn!("desktop capture helper stopped; replacing it");
+                            tracing::warn!(stream_id = stream_id.0, codec = ?active_codec, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "desktop capture helper stopped; replacing it");
                         }
                         capture_running = false;
                         capture_unavailable_since = Some(std::time::Instant::now());
