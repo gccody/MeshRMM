@@ -6,9 +6,9 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use meshrmm_protocol::{
-    CONTROL_CHANNEL_LABEL, Codec, CursorShape, EncodedFrame, FrameReassembler, IceServer,
-    QualityPreset, ReassemblyConfig, ReassemblyOutcome, SessionBootstrap, SessionMessage,
-    SessionState, SignalMessage, VideoPacket, VideoStreamId,
+    CONTROL_CHANNEL_LABEL, ChromaMode, Codec, CursorShape, EncodedFrame, FrameReassembler,
+    IceServer, QualityPreset, ReassemblyConfig, ReassemblyOutcome, SessionBootstrap,
+    SessionMessage, SessionState, SignalMessage, VideoPacket, VideoProfile, VideoStreamId,
 };
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -38,7 +38,7 @@ struct ActivePresenter {
     display_id: meshrmm_protocol::DisplayId,
     #[cfg(target_os = "macos")]
     format: meshrmm_protocol::VideoFormat,
-    codec: Codec,
+    profile: VideoProfile,
     presenter: Presenter,
 }
 
@@ -400,15 +400,24 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                     .ok()
                     .and_then(|guard| {
                         guard.as_ref().and_then(|active| {
-                            active.presenter.poll_ended().map(|ended| (active.codec, ended))
+                            active
+                                .presenter
+                                .poll_ended()
+                                .map(|ended| (active.profile, ended))
                         })
                     });
-                if let Some((codec, ended)) = ended {
-                    match (codec, ended) {
-                        (Codec::H265, Err(reason)) => {
-                            tracing::warn!(%reason, "H.265 presentation failed; requesting H.264 fallback");
-                            viewer_control.send(SessionMessage::CodecRejected {
-                                codec: Codec::H265,
+                if let Some((profile, ended)) = ended {
+                    match (profile, ended) {
+                        (profile, Err(reason))
+                            if profile
+                                != (VideoProfile {
+                                    codec: Codec::H264,
+                                    chroma: ChromaMode::Yuv420,
+                                }) =>
+                        {
+                            tracing::warn!(%reason, ?profile, "video presentation failed; requesting profile fallback");
+                            viewer_control.send(SessionMessage::VideoProfileRejected {
+                                profile,
                                 reason,
                             });
                             if let Ok(mut guard) = presenter.lock()
@@ -663,12 +672,14 @@ fn install_control_handler(
     let capabilities_sent = Arc::new(AtomicBool::new(false));
     let configurations_seen = Arc::new(AtomicU64::new(0));
     let quality_preset = Arc::new(Mutex::new(QualityPreset::default()));
+    let chroma_mode = Arc::new(Mutex::new(ChromaMode::default()));
     channel.on_message(Box::new(move |message| {
         let presenter = Arc::clone(&presenter);
         let cursor_shape = Arc::clone(&cursor_shape);
         let capabilities_sent = Arc::clone(&capabilities_sent);
         let configurations_seen = Arc::clone(&configurations_seen);
         let quality_preset = Arc::clone(&quality_preset);
+        let chroma_mode = Arc::clone(&chroma_mode);
         let viewer_control = viewer_control.clone();
         let remote_clipboard = remote_clipboard.clone();
         let presentation_failure = presentation_failure.clone();
@@ -686,12 +697,12 @@ fn install_control_handler(
                     let previous = presenter.lock().ok().and_then(|guard| {
                         guard
                             .as_ref()
-                            .map(|active| (active.stream_id, active.codec))
+                            .map(|active| (active.stream_id, active.profile))
                     });
                     tracing::info!(
                         configuration_sequence,
                         previous_stream_id = previous.map(|value| value.0.0),
-                        previous_codec = ?previous.map(|value| value.1),
+                        previous_profile = ?previous.map(|value| value.1),
                         stream_id = stream_id.0,
                         display_id = active_display_id.0,
                         width = format.width,
@@ -711,10 +722,16 @@ fn install_control_handler(
                     };
                     let message_queue = viewer_control.clone();
                     let input_gate = viewer_control.clone();
+                    let profiles = Arc::new(crate::platform::supported_video_profiles(format));
+                    if let Ok(mut selected_chroma) = chroma_mode.lock() {
+                        *selected_chroma = format.pixel_format.chroma();
+                    }
                     let sink = ControlSink::new(
                         move |message| message_queue.send(message),
                         move |enabled| input_gate.set_input_enabled(enabled),
                         Arc::clone(&quality_preset),
+                        Arc::clone(&chroma_mode),
+                        Arc::clone(&profiles),
                     );
                     debug.configure_stream(
                         active_display.name.clone(),
@@ -785,14 +802,14 @@ fn install_control_handler(
                                     display_id: active_display_id,
                                     #[cfg(target_os = "macos")]
                                     format,
-                                    codec: format.codec,
+                                    profile: format.profile(),
                                     presenter: new_presenter,
                                 }));
                             if let Some(old) = old.as_mut() {
                                 tracing::warn!(
                                     configuration_sequence,
                                     previous_stream_id = old.stream_id.0,
-                                    previous_codec = ?old.codec,
+                                    previous_profile = ?old.profile,
                                     stream_id = stream_id.0,
                                     codec = ?format.codec,
                                     "replacing the active macOS presenter after display configuration"
@@ -803,8 +820,9 @@ fn install_control_handler(
                             viewer_control.send(request);
                             if !capabilities_sent.swap(true, Ordering::AcqRel) {
                                 viewer_control.send(SessionMessage::ViewerCapabilities {
-                                    codecs: crate::platform::supported_video_codecs(format),
+                                    profiles: profiles.as_ref().clone(),
                                     quality: sink.quality_preset(),
+                                    chroma: sink.chroma_mode(),
                                 });
                             }
                             tracing::info!(configuration_sequence, stream_id = stream_id.0, display_id = active_display_id.0, display_name = %active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, bitrate_bits_per_second = format.bitrate_bits_per_second, codec = ?format.codec, "remote control stream configured");
@@ -814,9 +832,14 @@ fn install_control_handler(
                                 "hardware decoder/presenter initialization failed: {error:#}"
                             );
                             tracing::error!(error = %error, "hardware decoder/presenter initialization failed");
-                            if format.codec == meshrmm_protocol::Codec::H265 {
-                                viewer_control.send(SessionMessage::CodecRejected {
-                                    codec: format.codec,
+                            if format.profile()
+                                != (VideoProfile {
+                                    codec: Codec::H264,
+                                    chroma: ChromaMode::Yuv420,
+                                })
+                            {
+                                viewer_control.send(SessionMessage::VideoProfileRejected {
+                                    profile: format.profile(),
                                     reason: message,
                                 });
                             } else {

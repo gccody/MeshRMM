@@ -70,13 +70,17 @@ impl D3d11Renderer {
         };
         let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&content) }
             .context("D3D11 presentation video processor enumeration failed")?;
-        let input_support = unsafe { enumerator.CheckVideoProcessorFormat(DXGI_FORMAT_NV12) }?;
+        let input_format = match format.pixel_format {
+            meshrmm_protocol::PixelFormat::Nv12 => DXGI_FORMAT_NV12,
+            meshrmm_protocol::PixelFormat::Ayuv => DXGI_FORMAT_AYUV,
+        };
+        let input_support = unsafe { enumerator.CheckVideoProcessorFormat(input_format) }?;
         let output_support =
             unsafe { enumerator.CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM) }?;
         if input_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT.0 as u32 == 0
             || output_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32 == 0
         {
-            bail!("GPU cannot convert NV12 decoder surfaces to BGRA presentation surfaces");
+            bail!("GPU cannot convert the decoded YUV surfaces to BGRA presentation surfaces");
         }
         let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
             .context("D3D11 presentation video processor creation failed")?;
@@ -122,6 +126,21 @@ impl D3d11Renderer {
             video_context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&source_rect))
         };
         unsafe { video_context.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&rect)) };
+        if let Ok(video_context1) = video_context.cast::<ID3D11VideoContext1>() {
+            unsafe {
+                video_context1.VideoProcessorSetStreamColorSpace1(
+                    &processor,
+                    0,
+                    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+                )
+            };
+            unsafe {
+                video_context1.VideoProcessorSetOutputColorSpace1(
+                    &processor,
+                    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                )
+            };
+        }
         Ok(Self {
             window,
             video_device,
@@ -175,7 +194,7 @@ impl D3d11Renderer {
             )
         };
         let _ = unsafe { ManuallyDrop::take(&mut stream.pInputSurface) };
-        result.context("GPU NV12-to-BGRA presentation blit failed")?;
+        result.context("GPU YUV-to-BGRA presentation blit failed")?;
         // One-interval presentation avoids tearing. Flip-discard plus maximum
         // frame latency 1 prevents an additional multi-frame swap-chain queue.
         unsafe { self.swap_chain.Present(1, DXGI_PRESENT(0)) }

@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CursorShape, DisplayId, RemoteInput, RemoteSessionId, VideoStreamId};
 
-pub const CONTROL_CHANNEL_LABEL: &str = "meshrmm-control-v3";
-pub const CONTROL_CHANNEL_PROTOCOL: &str = "meshrmm.control.v3";
+pub const CONTROL_CHANNEL_LABEL: &str = "meshrmm-control-v4";
+pub const CONTROL_CHANNEL_PROTOCOL: &str = "meshrmm.control.v4";
 /// Maximum UTF-8 payload accepted for a clipboard update. Clipboard messages
 /// share the reliable control channel with latency-sensitive input.
 pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 60 * 1024;
@@ -60,20 +60,26 @@ pub enum SessionMessage {
     Clipboard {
         text: String,
     },
-    /// Hardware video decoders and the initial quality preference available
-    /// to the viewer. Codecs are ordered from most to least preferred.
+    /// Hardware video profiles and the initial viewer preferences. Profiles
+    /// are ordered from most to least preferred.
     ViewerCapabilities {
-        codecs: Vec<Codec>,
+        profiles: Vec<VideoProfile>,
         quality: QualityPreset,
+        chroma: ChromaMode,
     },
     /// Changes the encoder quality ceiling without changing the network path.
     SetQuality {
         preset: QualityPreset,
     },
-    /// The viewer could advertise a decoder but could not initialize it for
-    /// the negotiated stream. The sender must retry with H.264.
-    CodecRejected {
-        codec: Codec,
+    /// Changes chroma fidelity. The sender selects the best mutually supported
+    /// codec profile and restarts only the video stream.
+    SetChroma {
+        mode: ChromaMode,
+    },
+    /// The viewer advertised a profile but could not initialize it for the
+    /// negotiated stream. The sender must try the next compatible profile.
+    VideoProfileRejected {
+        profile: VideoProfile,
         reason: String,
     },
 }
@@ -108,6 +114,19 @@ pub enum Codec {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChromaMode {
+    #[default]
+    Yuv420,
+    Yuv444,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoProfile {
+    pub codec: Codec,
+    pub chroma: ChromaMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QualityPreset {
     DataSaver,
     #[default]
@@ -133,6 +152,16 @@ impl QualityPreset {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PixelFormat {
     Nv12,
+    Ayuv,
+}
+
+impl PixelFormat {
+    pub fn chroma(self) -> ChromaMode {
+        match self {
+            Self::Nv12 => ChromaMode::Yuv420,
+            Self::Ayuv => ChromaMode::Yuv444,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +172,15 @@ pub struct VideoFormat {
     pub codec: Codec,
     pub pixel_format: PixelFormat,
     pub bitrate_bits_per_second: u32,
+}
+
+impl VideoFormat {
+    pub fn profile(self) -> VideoProfile {
+        VideoProfile {
+            codec: self.codec,
+            chroma: self.pixel_format.chroma(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -256,8 +294,18 @@ mod tests {
     #[test]
     fn viewer_capabilities_round_trip() {
         let message = SessionMessage::ViewerCapabilities {
-            codecs: vec![Codec::H265, Codec::H264],
+            profiles: vec![
+                VideoProfile {
+                    codec: Codec::H265,
+                    chroma: ChromaMode::Yuv444,
+                },
+                VideoProfile {
+                    codec: Codec::H265,
+                    chroma: ChromaMode::Yuv420,
+                },
+            ],
             quality: QualityPreset::Balanced,
+            chroma: ChromaMode::Yuv444,
         };
         let encoded = message.encode().unwrap();
         assert_eq!(SessionMessage::decode(&encoded).unwrap(), message);

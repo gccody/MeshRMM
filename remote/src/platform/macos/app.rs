@@ -113,7 +113,9 @@ pub(super) struct RemoteViewIvars {
     debug_visible: RefCell<bool>,
     debug_refreshed: RefCell<Instant>,
     quality_popup: RefCell<Option<Retained<NSPopUpButton>>>,
+    chroma_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     settings_quality_buttons: RefCell<Vec<Retained<NSButton>>>,
+    settings_chroma_buttons: RefCell<Vec<Retained<NSButton>>>,
     settings_debug_button: RefCell<Option<Retained<NSButton>>>,
     settings_window: RefCell<Option<Retained<NSWindow>>>,
 }
@@ -294,6 +296,16 @@ define_class!(
             self.select_quality(QualityPreset::BestQuality);
         }
 
+        #[unsafe(method(selectChroma420:))]
+        fn select_chroma_420(&self, _sender: &NSButton) {
+            self.select_chroma(ChromaMode::Yuv420);
+        }
+
+        #[unsafe(method(selectChroma444:))]
+        fn select_chroma_444(&self, _sender: &NSButton) {
+            self.select_chroma(ChromaMode::Yuv444);
+        }
+
         #[unsafe(method(selectDisplayFromToolbar:))]
         fn select_display_from_toolbar(&self, sender: &NSPopUpButton) {
             let index = sender.indexOfSelectedItem();
@@ -315,6 +327,16 @@ define_class!(
                 _ => QualityPreset::Balanced,
             };
             self.select_quality(preset);
+        }
+
+        #[unsafe(method(selectChromaFromToolbar:))]
+        fn select_chroma_from_toolbar(&self, sender: &NSPopUpButton) {
+            let mode = if sender.indexOfSelectedItem() == 1 {
+                ChromaMode::Yuv444
+            } else {
+                ChromaMode::Yuv420
+            };
+            self.select_chroma(mode);
         }
 
         #[unsafe(method(toggleDiagnostics:))]
@@ -385,7 +407,9 @@ impl RemoteView {
             debug_visible: RefCell::new(false),
             debug_refreshed: RefCell::new(Instant::now()),
             quality_popup: RefCell::new(None),
+            chroma_popup: RefCell::new(None),
             settings_quality_buttons: RefCell::new(Vec::new()),
+            settings_chroma_buttons: RefCell::new(Vec::new()),
             settings_debug_button: RefCell::new(None),
             settings_window: RefCell::new(None),
         });
@@ -467,6 +491,28 @@ impl RemoteView {
         toolbar.addSubview(&quality_popup);
         *self.ivars().quality_popup.borrow_mut() = Some(quality_popup);
 
+        let chroma_popup = NSPopUpButton::initWithFrame_pullsDown(
+            NSPopUpButton::alloc(mtm),
+            NSRect {
+                origin: NSPoint { x: 374.0, y: 6.0 },
+                size: NSSize {
+                    width: 124.0,
+                    height: 24.0,
+                },
+            },
+            false,
+        );
+        for title in ["4:2:0 efficient", "4:4:4 crisp"] {
+            chroma_popup.addItemWithTitle(&NSString::from_str(title));
+        }
+        chroma_popup.selectItemAtIndex(chroma_index(self.ivars().control.chroma_mode()));
+        unsafe {
+            chroma_popup.setTarget(Some(self));
+            chroma_popup.setAction(Some(sel!(selectChromaFromToolbar:)));
+        }
+        toolbar.addSubview(&chroma_popup);
+        *self.ivars().chroma_popup.borrow_mut() = Some(chroma_popup);
+
         let diagnostics = unsafe {
             NSButton::buttonWithTitle_target_action(
                 &NSString::from_str("Diagnostics"),
@@ -476,7 +522,7 @@ impl RemoteView {
             )
         };
         diagnostics.setFrame(NSRect {
-            origin: NSPoint { x: 374.0, y: 6.0 },
+            origin: NSPoint { x: 504.0, y: 6.0 },
             size: NSSize {
                 width: 88.0,
                 height: 24.0,
@@ -493,7 +539,7 @@ impl RemoteView {
             )
         };
         fullscreen.setFrame(NSRect {
-            origin: NSPoint { x: 468.0, y: 6.0 },
+            origin: NSPoint { x: 598.0, y: 6.0 },
             size: NSSize {
                 width: 84.0,
                 height: 24.0,
@@ -510,7 +556,7 @@ impl RemoteView {
             )
         };
         settings.setFrame(NSRect {
-            origin: NSPoint { x: 558.0, y: 6.0 },
+            origin: NSPoint { x: 688.0, y: 6.0 },
             size: NSSize {
                 width: 34.0,
                 height: 24.0,
@@ -624,6 +670,51 @@ impl RemoteView {
         quality_buttons[quality_index(self.ivars().control.quality_preset()) as usize]
             .setState(NSControlStateValueOn);
         *self.ivars().settings_quality_buttons.borrow_mut() = quality_buttons.into_iter().collect();
+        let chroma_heading = NSTextField::labelWithString(&NSString::from_str("Color detail"), mtm);
+        chroma_heading.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+        chroma_heading.setFrame(NSRect {
+            origin: NSPoint { x: 270.0, y: 166.0 },
+            size: NSSize {
+                width: 200.0,
+                height: 24.0,
+            },
+        });
+        display_pane.addSubview(&chroma_heading);
+        let chroma_buttons = [
+            unsafe {
+                NSButton::radioButtonWithTitle_target_action(
+                    &NSString::from_str("4:2:0 · bandwidth efficient"),
+                    Some(self),
+                    Some(sel!(selectChroma420:)),
+                    mtm,
+                )
+            },
+            unsafe {
+                NSButton::radioButtonWithTitle_target_action(
+                    &NSString::from_str("4:4:4 · crisp text"),
+                    Some(self),
+                    Some(sel!(selectChroma444:)),
+                    mtm,
+                )
+            },
+        ];
+        for (index, button) in chroma_buttons.iter().enumerate() {
+            button.setFrame(NSRect {
+                origin: NSPoint {
+                    x: 270.0,
+                    y: 126.0 - index as f64 * 42.0,
+                },
+                size: NSSize {
+                    width: 220.0,
+                    height: 26.0,
+                },
+            });
+            display_pane.addSubview(button);
+        }
+        chroma_buttons[chroma_index(self.ivars().control.chroma_mode()) as usize]
+            .setState(NSControlStateValueOn);
+        chroma_buttons[1].setEnabled(self.ivars().control.supports_chroma(ChromaMode::Yuv444));
+        *self.ivars().settings_chroma_buttons.borrow_mut() = chroma_buttons.into_iter().collect();
         display_item.setView(Some(&display_pane));
         tabs.addTabViewItem(&display_item);
 
@@ -732,6 +823,33 @@ impl RemoteView {
         {
             tracing::warn!("macOS viewer could not restore input focus after changing quality");
         }
+    }
+
+    fn select_chroma(&self, mode: ChromaMode) {
+        if !self.ivars().control.supports_chroma(mode) {
+            if let Some(popup) = self.ivars().chroma_popup.borrow().as_ref() {
+                popup.selectItemAtIndex(chroma_index(self.ivars().control.chroma_mode()));
+            }
+            return;
+        }
+        let selected = chroma_index(mode);
+        if let Some(popup) = self.ivars().chroma_popup.borrow().as_ref() {
+            popup.selectItemAtIndex(selected);
+        }
+        for (index, button) in self
+            .ivars()
+            .settings_chroma_buttons
+            .borrow()
+            .iter()
+            .enumerate()
+        {
+            button.setState(if index as isize == selected {
+                NSControlStateValueOn
+            } else {
+                objc2_app_kit::NSControlStateValueOff
+            });
+        }
+        self.send(SessionMessage::SetChroma { mode });
     }
 
     pub(super) fn set_cursor_shape(&self, shape: CursorShape) {
@@ -896,6 +1014,13 @@ fn quality_index(preset: QualityPreset) -> isize {
         QualityPreset::DataSaver => 0,
         QualityPreset::Balanced => 1,
         QualityPreset::BestQuality => 2,
+    }
+}
+
+fn chroma_index(mode: ChromaMode) -> isize {
+    match mode {
+        ChromaMode::Yuv420 => 0,
+        ChromaMode::Yuv444 => 1,
     }
 }
 

@@ -8,7 +8,7 @@ use windows_capture::dxgi_duplication_api::{
 };
 use windows_capture::monitor::Monitor;
 
-use crate::converter::BgraToNv12Converter;
+use crate::converter::BgraToYuvConverter;
 use crate::encoder::{MediaFoundationVideoEncoder, VideoEncoder};
 use crate::{
     ActiveFormat, ControlState, EncodedAccessUnit, EncodedFrameSink, Error, StreamConfig,
@@ -242,13 +242,15 @@ fn capture_loop_inner(
         frames_per_second: config.frames_per_second,
         bitrate_bits_per_second: config.bitrate_bits_per_second,
         codec: config.codec,
+        pixel_format: config.pixel_format,
     };
-    let mut converter = BgraToNv12Converter::new(
+    let mut converter = BgraToYuvConverter::new(
         duplication.device(),
         duplication.device_context(),
         width,
         height,
         config.frames_per_second,
+        config.pixel_format,
     )?;
     let mut encoder = MediaFoundationVideoEncoder::new(
         duplication.device(),
@@ -257,6 +259,7 @@ fn capture_loop_inner(
         config.frames_per_second,
         config.bitrate_bits_per_second,
         config.codec,
+        config.pixel_format,
     )?;
     if let Some(started) = started.take() {
         let _ = started.send(Ok(format));
@@ -266,7 +269,7 @@ fn capture_loop_inner(
     let mut frames_encoded = 0_u64;
     let mut encoded_bytes = 0_u64;
     let mut stats_started_us = monotonic_timestamp_us()?;
-    let mut cached_nv12 = None;
+    let mut cached_yuv = None;
     let mut keyframe_input_pending = false;
     while !stop.load(Ordering::Acquire) {
         // Apply controls and drain output independently of desktop damage.
@@ -310,21 +313,21 @@ fn capture_loop_inner(
             let capture_timestamp_us = monotonic_timestamp_us()?;
             frames_captured += 1;
             if encoder.wants_input() {
-                let nv12 = converter.convert(frame.texture())?;
-                cached_nv12 = Some(nv12.clone());
-                access_units.extend(encoder.submit(nv12, capture_timestamp_us)?);
+                let yuv = converter.convert(frame.texture())?;
+                cached_yuv = Some(yuv.clone());
+                access_units.extend(encoder.submit(yuv, capture_timestamp_us)?);
                 keyframe_input_pending = false;
             }
         } else if keyframe_input_pending
             && encoder.wants_input()
-            && let Some(nv12) = cached_nv12.as_ref()
+            && let Some(yuv) = cached_yuv.as_ref()
         {
             // A keyframe request must work even when Desktop Duplication has
             // no new damage to report. Re-submit the last GPU surface so a
             // newly created viewer/presenter can recover immediately instead
             // of waiting for the login screen to change a pixel.
             let capture_timestamp_us = monotonic_timestamp_us()?;
-            access_units.extend(encoder.submit(nv12, capture_timestamp_us)?);
+            access_units.extend(encoder.submit(yuv, capture_timestamp_us)?);
             keyframe_input_pending = false;
         }
         for access_unit in access_units {

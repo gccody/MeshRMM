@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use dispatch2::DispatchQueue;
 use meshrmm_protocol::{
-    Codec, CursorShape, Display, EncodedFrame, PointerButton, QualityPreset, RemoteInput,
-    SessionMessage, VideoFormat, VideoStreamId,
+    ChromaMode, Codec, CursorShape, Display, EncodedFrame, PointerButton, QualityPreset,
+    RemoteInput, SessionMessage, VideoFormat, VideoProfile, VideoStreamId,
 };
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -67,10 +67,14 @@ fn hardware_decode_supported(codec: Codec) -> bool {
     unsafe { VTIsHardwareDecodeSupported(codec_type) != 0 }
 }
 
-pub fn supported_video_codecs(_format: VideoFormat) -> Vec<Codec> {
+pub fn supported_video_profiles(_format: VideoFormat) -> Vec<VideoProfile> {
     [Codec::H265, Codec::H264]
         .into_iter()
         .filter(|codec| hardware_decode_supported(*codec))
+        .map(|codec| VideoProfile {
+            codec,
+            chroma: ChromaMode::Yuv420,
+        })
         .collect()
 }
 

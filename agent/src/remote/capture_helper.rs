@@ -26,7 +26,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
 use meshrmm_remote_screen::{
-    ActiveFormat, EncodedAccessUnit, EncodedFrameSink, StreamConfig, VideoCodec,
+    ActiveFormat, EncodedAccessUnit, EncodedFrameSink, StreamConfig, VideoCodec, VideoPixelFormat,
     WindowsDesktopDuplicationStreamer,
 };
 
@@ -85,6 +85,7 @@ enum ParentCommand {
         frames_per_second: u32,
         bitrate_bits_per_second: u32,
         codec: VideoCodec,
+        pixel_format: VideoPixelFormat,
     },
     RequestKeyframe,
     SetBitrate(u32),
@@ -208,6 +209,7 @@ impl DesktopCaptureStreamer {
             frames_per_second: config.frames_per_second,
             bitrate_bits_per_second: config.bitrate_bits_per_second,
             codec: config.codec,
+            pixel_format: config.pixel_format,
         };
         if let Err(error) = send_command(&input, &start) {
             terminate_and_wait(&launched.process);
@@ -854,12 +856,14 @@ pub fn run_child() -> anyhow::Result<()> {
             frames_per_second,
             bitrate_bits_per_second,
             codec,
+            pixel_format,
         } => run_capture_child(
             command_rx,
             display_id,
             frames_per_second,
             bitrate_bits_per_second,
             codec,
+            pixel_format,
         ),
         ParentCommand::StartInput { display_id } => run_input_child(command_rx, display_id),
         _ => anyhow::bail!("desktop helper expected a capture or input start command"),
@@ -872,6 +876,7 @@ fn run_capture_child(
     frames_per_second: u32,
     bitrate_bits_per_second: u32,
     codec: VideoCodec,
+    pixel_format: VideoPixelFormat,
 ) -> anyhow::Result<()> {
     if frames_per_second == 0 || bitrate_bits_per_second == 0 {
         anyhow::bail!("desktop-helper frame rate and bitrate must be positive");
@@ -904,6 +909,7 @@ fn run_capture_child(
             frames_per_second,
             bitrate_bits_per_second,
             codec,
+            pixel_format,
         },
         active_display.id.0,
         sink,
@@ -1059,12 +1065,14 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             frames_per_second,
             bitrate_bits_per_second,
             codec,
+            pixel_format,
         } => {
             writer.write_all(&[COMMAND_START])?;
             write_u32(&mut writer, display_id.map_or(NO_DISPLAY, |id| id.0))?;
             write_u32(&mut writer, *frames_per_second)?;
             write_u32(&mut writer, *bitrate_bits_per_second)
                 .and_then(|()| writer.write_all(&[codec_byte(*codec)]))
+                .and_then(|()| writer.write_all(&[pixel_format_byte(*pixel_format)]))
         }
         ParentCommand::RequestKeyframe => writer.write_all(&[COMMAND_REQUEST_KEYFRAME]),
         ParentCommand::SetBitrate(bits_per_second) => {
@@ -1098,6 +1106,7 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
                 frames_per_second: read_u32(&mut reader)?,
                 bitrate_bits_per_second: read_u32(&mut reader)?,
                 codec: read_codec(&mut reader)?,
+                pixel_format: read_pixel_format(&mut reader)?,
             })
         }
         COMMAND_REQUEST_KEYFRAME => Ok(ParentCommand::RequestKeyframe),
@@ -1136,6 +1145,7 @@ fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
             write_u32(&mut writer, started.format.frames_per_second)?;
             write_u32(&mut writer, started.format.bitrate_bits_per_second)?;
             writer.write_all(&[codec_byte(started.format.codec)])?;
+            writer.write_all(&[pixel_format_byte(started.format.pixel_format)])?;
             write_u32(&mut writer, started.active_display.id.0)?;
             checked_len(started.displays.len(), MAX_DISPLAYS, "display list")?;
             write_u32(&mut writer, started.displays.len() as u32)?;
@@ -1191,6 +1201,7 @@ fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
                 frames_per_second: read_u32(&mut reader)?,
                 bitrate_bits_per_second: read_u32(&mut reader)?,
                 codec: read_codec(&mut reader)?,
+                pixel_format: read_pixel_format(&mut reader)?,
             };
             let active_display_id = DisplayId(read_u32(&mut reader)?);
             let count = bounded_len(read_u32(&mut reader)?, MAX_DISPLAYS, "display list")?;
@@ -1367,6 +1378,22 @@ fn read_codec(reader: &mut impl Read) -> io::Result<VideoCodec> {
         )),
     }
 }
+fn pixel_format_byte(pixel_format: VideoPixelFormat) -> u8 {
+    match pixel_format {
+        VideoPixelFormat::Yuv420 => 1,
+        VideoPixelFormat::Yuv444 => 2,
+    }
+}
+fn read_pixel_format(reader: &mut impl Read) -> io::Result<VideoPixelFormat> {
+    match read_u8(reader)? {
+        1 => Ok(VideoPixelFormat::Yuv420),
+        2 => Ok(VideoPixelFormat::Yuv444),
+        value => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid desktop-helper pixel format {value}"),
+        )),
+    }
+}
 fn read_u32(reader: &mut impl Read) -> io::Result<u32> {
     let mut value = [0; 4];
     reader.read_exact(&mut value)?;
@@ -1414,6 +1441,7 @@ mod tests {
                 frames_per_second: 60,
                 bitrate_bits_per_second: 12_000_000,
                 codec: VideoCodec::H265,
+                pixel_format: VideoPixelFormat::Yuv444,
             },
             ParentCommand::RequestKeyframe,
             ParentCommand::SetBitrate(4_000_000),
@@ -1454,6 +1482,7 @@ mod tests {
                 frames_per_second: 60,
                 bitrate_bits_per_second: 12_000_000,
                 codec: VideoCodec::H265,
+                pixel_format: VideoPixelFormat::Yuv444,
             },
             displays: vec![display.clone()],
             active_display: display,
@@ -1466,6 +1495,7 @@ mod tests {
         assert_eq!(decoded.active_display.id, DisplayId(2));
         assert_eq!(decoded.displays[0].x, -1920);
         assert_eq!(decoded.format.codec, VideoCodec::H265);
+        assert_eq!(decoded.format.pixel_format, VideoPixelFormat::Yuv444);
     }
 
     #[test]

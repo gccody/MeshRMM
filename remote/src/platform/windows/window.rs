@@ -14,6 +14,7 @@ struct WindowContext {
     toolbar: HWND,
     display_combo: HWND,
     quality_combo: HWND,
+    chroma_combo: HWND,
     diagnostics_button: HWND,
     settings_button: HWND,
     minimize_button: HWND,
@@ -21,10 +22,18 @@ struct WindowContext {
     close_button: HWND,
     settings_window: HWND,
     quality_buttons: [(HWND, QualityPreset); 3],
+    chroma_buttons: [(HWND, ChromaMode); 2],
+}
+
+struct SettingsControls {
+    window: HWND,
+    quality_buttons: [(HWND, QualityPreset); 3],
+    chroma_buttons: [(HWND, ChromaMode); 2],
 }
 
 const DISPLAY_COMBO_ID: usize = 4001;
 const QUALITY_COMBO_ID: usize = 4002;
+const CHROMA_COMBO_ID: usize = 4008;
 const DIAGNOSTICS_BUTTON_ID: usize = 4003;
 const SETTINGS_BUTTON_ID: usize = 4004;
 const MINIMIZE_BUTTON_ID: usize = 4005;
@@ -33,10 +42,13 @@ const CLOSE_BUTTON_ID: usize = 4007;
 const QUALITY_DATA_SAVER_ID: usize = 4101;
 const QUALITY_BALANCED_ID: usize = 4102;
 const QUALITY_BEST_ID: usize = 4103;
+const CHROMA_420_ID: usize = 4111;
+const CHROMA_444_ID: usize = 4112;
 const SETTINGS_DISPLAY_TAB_ID: usize = 4201;
 const SETTINGS_ADVANCED_TAB_ID: usize = 4202;
 const SETTINGS_DISPLAY_TITLE_ID: i32 = 4211;
 const SETTINGS_QUALITY_TITLE_ID: i32 = 4212;
+const SETTINGS_CHROMA_TITLE_ID: i32 = 4213;
 const SETTINGS_ADVANCED_TITLE_ID: i32 = 4221;
 const SETTINGS_DIAGNOSTICS_ID: usize = 4222;
 
@@ -91,6 +103,34 @@ impl WindowContext {
         self.send(SessionMessage::SetQuality { preset });
     }
 
+    fn set_chroma(&self, mode: ChromaMode) {
+        if !self.control.supports_chroma(mode) {
+            unsafe {
+                SendMessageW(
+                    self.chroma_combo,
+                    CB_SETCURSEL,
+                    Some(WPARAM(chroma_index(self.control.chroma_mode()))),
+                    None,
+                )
+            };
+            return;
+        }
+        let selected = chroma_index(mode);
+        unsafe {
+            SendMessageW(
+                self.chroma_combo,
+                CB_SETCURSEL,
+                Some(WPARAM(selected)),
+                None,
+            )
+        };
+        for (button, candidate) in self.chroma_buttons {
+            let state = usize::from(candidate == mode);
+            unsafe { SendMessageW(button, BM_SETCHECK, Some(WPARAM(state)), None) };
+        }
+        self.send(SessionMessage::SetChroma { mode });
+    }
+
     fn layout_toolbar(&self, window: HWND) {
         let mut rect = RECT::default();
         if unsafe { GetClientRect(window, &mut rect) }.is_err() {
@@ -109,6 +149,7 @@ impl WindowContext {
         };
         let _ = unsafe { MoveWindow(self.display_combo, 8, 5, 158, 300, true) };
         let _ = unsafe { MoveWindow(self.quality_combo, 172, 5, 124, 300, true) };
+        let _ = unsafe { MoveWindow(self.chroma_combo, 302, 5, 124, 300, true) };
         let caption_x = width.saturating_sub(138);
         let _ = unsafe { MoveWindow(self.minimize_button, caption_x, 0, 46, 34, true) };
         let _ = unsafe { MoveWindow(self.maximize_button, caption_x + 46, 0, 46, 34, true) };
@@ -291,15 +332,25 @@ fn quality_index(preset: QualityPreset) -> usize {
     }
 }
 
+fn chroma_index(mode: ChromaMode) -> usize {
+    match mode {
+        ChromaMode::Yuv420 => 0,
+        ChromaMode::Yuv444 => 1,
+    }
+}
+
 unsafe fn show_settings_category(window: HWND, display: bool) {
     let display_command = if display { SW_SHOW } else { SW_HIDE };
     let advanced_command = if display { SW_HIDE } else { SW_SHOW };
     for id in [
         SETTINGS_DISPLAY_TITLE_ID,
         SETTINGS_QUALITY_TITLE_ID,
+        SETTINGS_CHROMA_TITLE_ID,
         QUALITY_DATA_SAVER_ID as i32,
         QUALITY_BALANCED_ID as i32,
         QUALITY_BEST_ID as i32,
+        CHROMA_420_ID as i32,
+        CHROMA_444_ID as i32,
     ] {
         if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
             let _ = unsafe { ShowWindow(control, display_command) };
@@ -360,6 +411,15 @@ unsafe extern "system" fn settings_window_proc(
                     context.set_quality(preset);
                     return LRESULT(0);
                 }
+                let chroma = match control_id {
+                    CHROMA_420_ID => Some(ChromaMode::Yuv420),
+                    CHROMA_444_ID => Some(ChromaMode::Yuv444),
+                    _ => None,
+                };
+                if let Some(chroma) = chroma {
+                    context.set_chroma(chroma);
+                    return LRESULT(0);
+                }
                 if control_id == SETTINGS_DIAGNOSTICS_ID {
                     context.toggle_debug();
                     return LRESULT(0);
@@ -389,7 +449,7 @@ unsafe extern "system" fn settings_window_proc(
 unsafe fn create_settings_window(
     owner: HWND,
     instance: HINSTANCE,
-) -> anyhow::Result<(HWND, [(HWND, QualityPreset); 3])> {
+) -> anyhow::Result<SettingsControls> {
     let class = w!("MeshRmmRemoteSettingsWindow");
     let window_class = WNDCLASSW {
         lpfnWndProc: Some(settings_window_proc),
@@ -528,6 +588,36 @@ unsafe fn create_settings_window(
     )?;
     let _ = make_control(
         w!("STATIC"),
+        w!("Color detail"),
+        static_style,
+        162,
+        224,
+        340,
+        24,
+        SETTINGS_CHROMA_TITLE_ID as usize,
+    )?;
+    let chroma_420 = make_control(
+        w!("BUTTON"),
+        w!("4:2:0 · bandwidth efficient"),
+        WINDOW_STYLE(radio_style.0 | WS_GROUP.0),
+        162,
+        254,
+        340,
+        28,
+        CHROMA_420_ID,
+    )?;
+    let chroma_444 = make_control(
+        w!("BUTTON"),
+        w!("4:4:4 · crisp text and color"),
+        radio_style,
+        162,
+        294,
+        340,
+        28,
+        CHROMA_444_ID,
+    )?;
+    let _ = make_control(
+        w!("STATIC"),
         w!("Troubleshooting"),
         static_style,
         162,
@@ -547,14 +637,18 @@ unsafe fn create_settings_window(
         SETTINGS_DIAGNOSTICS_ID,
     )?;
     unsafe { show_settings_category(settings, true) };
-    Ok((
-        settings,
-        [
+    Ok(SettingsControls {
+        window: settings,
+        quality_buttons: [
             (data_saver, QualityPreset::DataSaver),
             (balanced, QualityPreset::Balanced),
             (best, QualityPreset::BestQuality),
         ],
-    ))
+        chroma_buttons: [
+            (chroma_420, ChromaMode::Yuv420),
+            (chroma_444, ChromaMode::Yuv444),
+        ],
+    })
 }
 
 pub(super) unsafe fn create_window(
@@ -638,6 +732,19 @@ pub(super) unsafe fn create_window(
                             _ => QualityPreset::Balanced,
                         };
                         context.set_quality(preset);
+                        let _ = unsafe { SetFocus(Some(window)) };
+                        return LRESULT(0);
+                    }
+                    if control_id == CHROMA_COMBO_ID && notification == CBN_SELCHANGE as usize {
+                        let selected = unsafe {
+                            SendMessageW(context.chroma_combo, CB_GETCURSEL, None, None).0
+                        };
+                        let mode = if selected == 1 {
+                            ChromaMode::Yuv444
+                        } else {
+                            ChromaMode::Yuv420
+                        };
+                        context.set_chroma(mode);
                         let _ = unsafe { SetFocus(Some(window)) };
                         return LRESULT(0);
                     }
@@ -855,6 +962,7 @@ pub(super) unsafe fn create_window(
         toolbar: HWND::default(),
         display_combo: HWND::default(),
         quality_combo: HWND::default(),
+        chroma_combo: HWND::default(),
         diagnostics_button: HWND::default(),
         settings_button: HWND::default(),
         minimize_button: HWND::default(),
@@ -865,6 +973,10 @@ pub(super) unsafe fn create_window(
             (HWND::default(), QualityPreset::DataSaver),
             (HWND::default(), QualityPreset::Balanced),
             (HWND::default(), QualityPreset::BestQuality),
+        ],
+        chroma_buttons: [
+            (HWND::default(), ChromaMode::Yuv420),
+            (HWND::default(), ChromaMode::Yuv444),
         ],
     });
     let context = Box::into_raw(context);
@@ -1003,6 +1115,35 @@ pub(super) unsafe fn create_window(
             )
         };
     }
+    let chroma_combo = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("COMBOBOX"),
+            w!(""),
+            WINDOW_STYLE(
+                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
+            ),
+            378,
+            10,
+            150,
+            300,
+            Some(window),
+            Some(HMENU(CHROMA_COMBO_ID as *mut c_void)),
+            Some(instance),
+            None,
+        )
+    }
+    .context("chroma dropdown creation failed")?;
+    for title in [w!("4:2:0 efficient"), w!("4:4:4 crisp")] {
+        unsafe {
+            SendMessageW(
+                chroma_combo,
+                CB_ADDSTRING,
+                None,
+                Some(LPARAM(title.as_ptr() as isize)),
+            )
+        };
+    }
     let make_toolbar_button =
         |id: usize, text: PCWSTR, style: WINDOW_STYLE| -> anyhow::Result<HWND> {
             unsafe {
@@ -1039,6 +1180,7 @@ pub(super) unsafe fn create_window(
     for control in [
         display_combo,
         quality_combo,
+        chroma_combo,
         diagnostics_button,
         settings_button,
         minimize_button,
@@ -1054,21 +1196,27 @@ pub(super) unsafe fn create_window(
             )
         };
     }
-    let (settings_window, quality_buttons) = unsafe { create_settings_window(window, instance) }?;
+    let settings = unsafe { create_settings_window(window, instance) }?;
     if let Some(context) = unsafe { window_context(window) } {
         context.debug_overlay = overlay;
         context.toolbar = toolbar;
         context.display_combo = display_combo;
         context.quality_combo = quality_combo;
+        context.chroma_combo = chroma_combo;
         context.diagnostics_button = diagnostics_button;
         context.settings_button = settings_button;
         context.minimize_button = minimize_button;
         context.maximize_button = maximize_button;
         context.close_button = close_button;
-        context.settings_window = settings_window;
-        context.quality_buttons = quality_buttons;
+        context.settings_window = settings.window;
+        context.quality_buttons = settings.quality_buttons;
+        context.chroma_buttons = settings.chroma_buttons;
+        if !context.control.supports_chroma(ChromaMode::Yuv444) {
+            let _ = unsafe { EnableWindow(context.chroma_buttons[1].0, false) };
+        }
         context.layout_toolbar(window);
         context.set_quality(context.control.quality_preset());
+        context.set_chroma(context.control.chroma_mode());
     }
     let _ = unsafe { ShowWindow(window, SW_SHOW) };
     Ok(window)

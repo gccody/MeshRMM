@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use meshrmm_protocol::{
-    Codec, CursorShape, Display, EncodedFrame, PointerButton, QualityPreset, RemoteInput,
-    SessionMessage, VideoFormat,
+    ChromaMode, Codec, CursorShape, Display, EncodedFrame, PointerButton, QualityPreset,
+    RemoteInput, SessionMessage, VideoFormat, VideoProfile,
 };
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,
@@ -29,7 +29,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, SetFocus, VK_F8, VK_F12,
+    EnableWindow, ReleaseCapture, SetCapture, SetFocus, VK_F8, VK_F12,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, Interface, PCWSTR, w};
@@ -289,6 +289,6 @@ pub fn monotonic_timestamp_us() -> u64 {
     }
 }
 
-pub fn supported_video_codecs(format: VideoFormat) -> Vec<Codec> {
-    unsafe { pipeline::supported_video_codecs(format) }
+pub fn supported_video_profiles(format: VideoFormat) -> Vec<VideoProfile> {
+    unsafe { pipeline::supported_video_profiles(format) }
 }

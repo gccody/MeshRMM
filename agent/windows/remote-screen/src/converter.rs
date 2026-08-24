@@ -4,9 +4,13 @@ use thiserror::Error;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+    DXGI_FORMAT_AYUV, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL,
+    DXGI_SAMPLE_DESC,
 };
 use windows::core::Interface;
+
+use crate::VideoPixelFormat;
 
 pub(crate) const SURFACE_COUNT: usize = 3;
 
@@ -14,15 +18,15 @@ pub(crate) const SURFACE_COUNT: usize = 3;
 pub enum Error {
     #[error("D3D11 video processor creation failed: {0}")]
     Processor(#[source] windows::core::Error),
-    #[error("GPU does not support BGRA input and NV12 output video processing")]
-    UnsupportedFormatConversion,
-    #[error("D3D11 NV12 texture allocation returned no texture")]
+    #[error("GPU does not support BGRA input and {0} output video processing")]
+    UnsupportedFormatConversion(VideoPixelFormat),
+    #[error("D3D11 YUV texture allocation returned no texture")]
     MissingTexture,
     #[error("D3D11 video processor view creation returned no view")]
     MissingView,
 }
 
-pub struct BgraToNv12Converter {
+pub struct BgraToYuvConverter {
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
     enumerator: ID3D11VideoProcessorEnumerator,
@@ -31,13 +35,14 @@ pub struct BgraToNv12Converter {
     next_surface: usize,
 }
 
-impl BgraToNv12Converter {
+impl BgraToYuvConverter {
     pub fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         width: u32,
         height: u32,
         frames_per_second: u32,
+        pixel_format: VideoPixelFormat,
     ) -> Result<Self, Error> {
         // Safety: all COM interfaces originate from one D3D11 device and remain
         // owned by this converter on the capture worker thread.
@@ -66,13 +71,17 @@ impl BgraToNv12Converter {
             let bgra_support = enumerator
                 .CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM)
                 .map_err(Error::Processor)?;
-            let nv12_support = enumerator
-                .CheckVideoProcessorFormat(DXGI_FORMAT_NV12)
+            let output_format = match pixel_format {
+                VideoPixelFormat::Yuv420 => DXGI_FORMAT_NV12,
+                VideoPixelFormat::Yuv444 => DXGI_FORMAT_AYUV,
+            };
+            let output_support = enumerator
+                .CheckVideoProcessorFormat(output_format)
                 .map_err(Error::Processor)?;
             if bgra_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT.0 as u32 == 0
-                || nv12_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32 == 0
+                || output_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32 == 0
             {
-                return Err(Error::UnsupportedFormatConversion);
+                return Err(Error::UnsupportedFormatConversion(pixel_format));
             }
             let processor = video_device
                 .CreateVideoProcessor(&enumerator, 0)
@@ -91,13 +100,27 @@ impl BgraToNv12Converter {
             );
             video_context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&rect));
             video_context.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&rect));
+            // Desktop capture is full-range RGB. Make the RGB -> studio-range
+            // BT.709 conversion explicit so drivers do not choose SD-video
+            // defaults and the bitstream's color metadata matches its pixels.
+            if let Ok(video_context1) = video_context.cast::<ID3D11VideoContext1>() {
+                video_context1.VideoProcessorSetStreamColorSpace1(
+                    &processor,
+                    0,
+                    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                );
+                video_context1.VideoProcessorSetOutputColorSpace1(
+                    &processor,
+                    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+                );
+            }
 
             let texture_desc = D3D11_TEXTURE2D_DESC {
                 Width: width,
                 Height: height,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_NV12,
+                Format: output_format,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
@@ -144,7 +167,7 @@ impl BgraToNv12Converter {
 
     pub fn convert(&mut self, bgra: &ID3D11Texture2D) -> Result<&ID3D11Texture2D, Error> {
         // Safety: the input texture belongs to the same device and the returned
-        // NV12 texture stays alive in the converter's fixed three-surface pool.
+        // YUV texture stays alive in the converter's fixed three-surface pool.
         unsafe {
             let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
                 FourCC: 0,
