@@ -258,21 +258,21 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             self.encoder.request_keyframe()?;
         }
         let requested_bitrate = self.controls.requested_bitrate.swap(0, Ordering::AcqRel);
-        if requested_bitrate != 0 {
-            if let Err(error) = self.encoder.set_bitrate(requested_bitrate) {
-                // Some hardware MFTs advertise a modifiable bitrate but reject
-                // the update at runtime. Keep the current encoder alive: ending
-                // this worker makes the transport rebuild the stream and viewer
-                // for every adaptive-bitrate attempt.
-                tracing::warn!(
-                    %error,
-                    bits_per_second = requested_bitrate,
-                    "hardware encoder rejected a runtime bitrate update; continuing at the previous bitrate"
-                );
-                self.controls
-                    .runtime_bitrate_disabled
-                    .store(true, Ordering::Release);
-            }
+        if requested_bitrate != 0
+            && let Err(error) = self.encoder.set_bitrate(requested_bitrate)
+        {
+            // Some hardware MFTs advertise a modifiable bitrate but reject
+            // the update at runtime. Keep the current encoder alive: ending
+            // this worker makes the transport rebuild the stream and viewer
+            // for every adaptive-bitrate attempt.
+            tracing::warn!(
+                %error,
+                bits_per_second = requested_bitrate,
+                "hardware encoder rejected a runtime bitrate update; continuing at the previous bitrate"
+            );
+            self.controls
+                .runtime_bitrate_disabled
+                .store(true, Ordering::Release);
         }
         let capture_timestamp_us = frame.timestamp()?.Duration.max(0) as u64 / 10;
         let encode_start_us = monotonic_timestamp_us()?;

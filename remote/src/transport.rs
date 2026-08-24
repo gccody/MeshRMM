@@ -34,7 +34,9 @@ const KEYFRAME_RETRY_INTERVAL_US: u64 = 250_000;
 
 struct ActivePresenter {
     stream_id: VideoStreamId,
+    #[cfg(target_os = "macos")]
     display_id: meshrmm_protocol::DisplayId,
+    #[cfg(target_os = "macos")]
     format: meshrmm_protocol::VideoFormat,
     codec: Codec,
     presenter: Presenter,
@@ -779,7 +781,9 @@ fn install_control_handler(
                                 .ok()
                                 .and_then(|mut guard| guard.replace(ActivePresenter {
                                     stream_id,
+                                    #[cfg(target_os = "macos")]
                                     display_id: active_display_id,
+                                    #[cfg(target_os = "macos")]
                                     format,
                                     codec: format.codec,
                                     presenter: new_presenter,
