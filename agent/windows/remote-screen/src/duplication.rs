@@ -279,20 +279,20 @@ fn capture_loop_inner(
             keyframe_input_pending = true;
         }
         let requested_bitrate = controls.requested_bitrate.swap(0, Ordering::AcqRel);
-        if requested_bitrate != 0 {
-            if let Err(error) = encoder.set_bitrate(requested_bitrate) {
-                // A bitrate-control failure must not look like a desktop or GPU
-                // loss. Otherwise the Agent repeatedly recreates the stream,
-                // forcing a new viewer window and a large bootstrap keyframe.
-                tracing::warn!(
-                    %error,
-                    bits_per_second = requested_bitrate,
-                    "hardware encoder rejected a runtime bitrate update; continuing at the previous bitrate"
-                );
-                controls
-                    .runtime_bitrate_disabled
-                    .store(true, Ordering::Release);
-            }
+        if requested_bitrate != 0
+            && let Err(error) = encoder.set_bitrate(requested_bitrate)
+        {
+            // A bitrate-control failure must not look like a desktop or GPU
+            // loss. Otherwise the Agent repeatedly recreates the stream,
+            // forcing a new viewer window and a large bootstrap keyframe.
+            tracing::warn!(
+                %error,
+                bits_per_second = requested_bitrate,
+                "hardware encoder rejected a runtime bitrate update; continuing at the previous bitrate"
+            );
+            controls
+                .runtime_bitrate_disabled
+                .store(true, Ordering::Release);
         }
 
         let frame = match duplication.acquire_next_frame(ACQUIRE_TIMEOUT_MS) {
