@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use meshrmm_protocol::AgentSessionRequest;
+use meshrmm_protocol::{AgentSessionRequest, QualityPreset};
 
 use super::config::{Config, ExecutionMode};
 use super::platform::{PlatformScreenStreamer, ScreenStreamer};
@@ -14,10 +14,12 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let session_id = request.session_id.clone();
     let signal_url = session_signal_url(config.server.as_str(), session_id.as_str(), "agent")?;
+    let bitrate_bits_per_second =
+        QualityPreset::BestQuality.bitrate(config.bitrate_bits_per_second);
     let streamer: Arc<Mutex<Box<dyn ScreenStreamer>>> =
         Arc::new(Mutex::new(Box::new(PlatformScreenStreamer::new(
             config.frames_per_second,
-            config.bitrate_bits_per_second,
+            bitrate_bits_per_second,
             mode == ExecutionMode::Worker,
         ))));
     tracing::info!(session_id = %session_id, "remote session requested");

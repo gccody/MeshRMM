@@ -601,7 +601,7 @@ impl RemoteView {
             },
             unsafe {
                 NSButton::radioButtonWithTitle_target_action(
-                    &NSString::from_str("Best quality · configured maximum"),
+                    &NSString::from_str("Best quality · 12 Mbps maximum"),
                     Some(self),
                     Some(sel!(selectBestQuality:)),
                     mtm,

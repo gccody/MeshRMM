@@ -30,7 +30,7 @@ The viewer advertises only codecs for which it can initialize a hardware
 decoder. The Agent prefers H.265/HEVC when both ends expose a GPU path and
 falls back to hardware H.264 if HEVC initialization or playback fails. The
 viewer sidebar can change the live encoder ceiling between Data saver (3
-Mbps), Balanced (6 Mbps), and Best quality (the Agent's configured maximum).
+Mbps), Balanced (6 Mbps), and Best quality (up to 12 Mbps).
 
 Cloudflare is not in that data path. An Agent coordinator Durable Object keeps
 the authenticated Agent reachable, and a temporary remote-session Durable
@@ -248,8 +248,9 @@ current client continues immediately. A failed replacement rolls back to the
 previous client.
 
 The Agent defaults to the primary display's actual resolution (cropped by at
-most one row/column for NV12), 60 FPS, and 12 Mbps. These values can be edited
-in the protected Agent configuration. CLI flags remain available for
+most one row/column for NV12), 60 FPS, and 12 Mbps. Frame rate and a lower
+bitrate can be selected in the protected Agent configuration; the application
+always caps the configured bitrate at 12 Mbps. CLI flags remain available for
 development overrides. ICE
 candidate-pair logs identify a `direct` or `turn` connection; periodic WebRTC
 logs include measured RTT.

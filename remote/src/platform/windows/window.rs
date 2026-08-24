@@ -518,7 +518,7 @@ unsafe fn create_settings_window(
     )?;
     let best = make_control(
         w!("BUTTON"),
-        w!("Best quality · configured maximum"),
+        w!("Best quality · 12 Mbps maximum"),
         radio_style,
         162,
         184,
