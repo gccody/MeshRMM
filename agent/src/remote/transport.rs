@@ -24,7 +24,6 @@ use webrtc::peer_connection::{
 use webrtc::stats::StatsReportType;
 
 use super::clipboard::ClipboardSync;
-use super::input::WindowsInputController;
 use super::platform::{ScreenStreamer, monotonic_timestamp_us};
 use super::signaling::authenticated_websocket;
 use super::video::LatestFrameSlot;
@@ -237,22 +236,17 @@ async fn run_connected_sender(
     }
 
     let slot = Arc::new(LatestFrameSlot::default());
-    let displays = lock_streamer(&streamer)?.displays()?;
-    let mut active_display = displays
-        .iter()
-        .find(|display| display.primary)
-        .or_else(|| displays.first())
-        .cloned()
-        .context("Windows reported no active displays")?;
     let mut stream_id = VideoStreamId(1);
-    let format = {
+    let started = {
         let mut streamer = streamer
             .lock()
             .map_err(|_| anyhow::anyhow!("screen streamer lock is poisoned"))?;
-        streamer.start(active_display.id, stream_id, Arc::clone(&slot))?
+        streamer.start(None, stream_id, Arc::clone(&slot))?
     };
-    let mut input = WindowsInputController::new();
-    input.set_active_display(active_display.clone())?;
+    let mut displays = started.displays;
+    let mut active_display = started.active_display;
+    let format = started.format;
+    let mut capture_running = true;
     let mut clipboard = match ClipboardSync::new() {
         Ok(clipboard) => Some(clipboard),
         Err(error) => {
@@ -340,10 +334,18 @@ async fn run_connected_sender(
             }
             Some(command) = control_rx.recv() => {
                 match command {
-                    ControlCommand::Keyframe => lock_streamer(&streamer)?.request_keyframe()?,
-                    ControlCommand::Bitrate(value) => lock_streamer(&streamer)?.set_bitrate(value)?,
+                    ControlCommand::Keyframe => {
+                        if let Err(error) = lock_streamer(&streamer)?.request_keyframe() {
+                            tracing::warn!(error = %error, "could not request a keyframe while the desktop is changing");
+                        }
+                    }
+                    ControlCommand::Bitrate(value) => {
+                        if let Err(error) = lock_streamer(&streamer)?.set_bitrate(value) {
+                            tracing::warn!(error = %error, "could not set bitrate while the desktop is changing");
+                        }
+                    }
                     ControlCommand::Input(event) => {
-                        if let Err(error) = input.apply(event) {
+                        if let Err(error) = lock_streamer(&streamer)?.apply_input(event) {
                             tracing::warn!(error = %error, "discarding invalid remote input");
                         }
                     }
@@ -355,7 +357,7 @@ async fn run_connected_sender(
                         }
                     }
                     ControlCommand::SelectDisplay(display_id) => {
-                        if display_id == active_display.id {
+                        if display_id == active_display.id && capture_running {
                             continue;
                         }
                         let Some(selected) = displays.iter().find(|display| display.id == display_id).cloned() else {
@@ -363,25 +365,36 @@ async fn run_connected_sender(
                             continue;
                         };
                         lock_streamer(&streamer)?.stop()?;
+                        capture_running = false;
                         slot.clear();
                         stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
-                        let format = lock_streamer(&streamer)?.start(
-                            selected.id,
+                        let restart = lock_streamer(&streamer)?.start(
+                            Some(selected.id),
                             stream_id,
                             Arc::clone(&slot),
-                        )?;
-                        input.set_active_display(selected.clone())?;
-                        active_display = selected;
-                        send_control_message(
-                            &control_channel,
-                            SessionMessage::DisplayConfiguration {
-                                displays: displays.clone(),
-                                active_display_id: active_display.id,
-                                stream_id,
-                                format,
-                            },
-                        ).await?;
-                        tracing::info!(display_id = active_display.id.0, display_name = %active_display.name, stream_id = stream_id.0, "remote display switched");
+                        );
+                        match restart {
+                            Ok(started) => {
+                                displays = started.displays;
+                                active_display = started.active_display;
+                                capture_running = true;
+                                sent_cursor_shape = None;
+                                send_control_message(
+                                    &control_channel,
+                                    SessionMessage::DisplayConfiguration {
+                                        displays: displays.clone(),
+                                        active_display_id: active_display.id,
+                                        stream_id,
+                                        format: started.format,
+                                    },
+                                ).await?;
+                                tracing::info!(display_id = active_display.id.0, display_name = %active_display.name, stream_id = stream_id.0, "remote display switched");
+                            }
+                            Err(error) => {
+                                active_display = selected;
+                                tracing::warn!(error = ?error, "display switch is waiting for an interactive desktop");
+                            }
+                        }
                     }
                     ControlCommand::Stop => break Ok(()),
                     ControlCommand::ChannelClosed => {
@@ -408,7 +421,7 @@ async fn run_connected_sender(
                 }
             }
             _ = cursor_interval.tick(), if session_state == SessionState::Streaming => {
-                let shape = input.cursor_shape();
+                let shape = lock_streamer(&streamer)?.cursor_shape();
                 if sent_cursor_shape != Some(shape)
                     && control_channel.ready_state() == RTCDataChannelState::Open
                 {
@@ -432,13 +445,45 @@ async fn run_connected_sender(
             }
             Some(error) = video_failure_rx.recv() => break Err(anyhow::anyhow!(error)),
             _ = stats_interval.tick() => {
-                let capture_ended = lock_streamer(&streamer)?.poll_ended();
-                if let Some(capture_result) = capture_ended {
-                    if let Err(error) = capture_result {
-                        tracing::error!(error = ?error, "Windows GPU capture/encode worker failed");
-                        break Err(error);
+                if capture_running {
+                    let capture_ended = lock_streamer(&streamer)?.poll_ended();
+                    if let Some(capture_result) = capture_ended {
+                        if let Err(error) = capture_result {
+                            tracing::warn!(error = ?error, "visible Windows desktop changed; replacing capture helper");
+                        } else {
+                            tracing::warn!("desktop capture helper stopped; replacing it");
+                        }
+                        capture_running = false;
+                        slot.clear();
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
                     }
-                    break Err(anyhow::anyhow!("Windows GPU capture/encode worker stopped unexpectedly"));
+                }
+                if !capture_running {
+                    match lock_streamer(&streamer)?.start(
+                        Some(active_display.id),
+                        stream_id,
+                        Arc::clone(&slot),
+                    ) {
+                        Ok(started) => {
+                            displays = started.displays;
+                            active_display = started.active_display;
+                            capture_running = true;
+                            sent_cursor_shape = None;
+                            send_control_message(
+                                &control_channel,
+                                SessionMessage::DisplayConfiguration {
+                                    displays: displays.clone(),
+                                    active_display_id: active_display.id,
+                                    stream_id,
+                                    format: started.format,
+                                },
+                            ).await?;
+                            tracing::info!(stream_id = stream_id.0, display_id = active_display.id.0, "remote session moved to the visible Windows desktop");
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = ?error, "waiting for a Windows login or application desktop");
+                        }
+                    }
                 }
                 log_network_stats(&peer).await;
             },
@@ -452,7 +497,7 @@ async fn run_connected_sender(
         *failure_reported = true;
     }
     video_sender.abort();
-    if let Err(error) = input.release_all() {
+    if let Err(error) = lock_streamer(&streamer)?.release_input() {
         tracing::warn!(error = %error, "failed to release remote input during cleanup");
     }
     if matches!(
