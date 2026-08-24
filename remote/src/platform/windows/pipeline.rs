@@ -189,27 +189,60 @@ fn codec_subtype(codec: Codec) -> windows::core::GUID {
     }
 }
 
-pub(super) unsafe fn supported_video_codecs(format: VideoFormat) -> Vec<Codec> {
+fn decoded_subtype(format: VideoFormat) -> windows::core::GUID {
+    match format.pixel_format {
+        meshrmm_protocol::PixelFormat::Nv12 => MFVideoFormat_NV12,
+        meshrmm_protocol::PixelFormat::Ayuv => MFVideoFormat_AYUV,
+    }
+}
+
+pub(super) unsafe fn supported_video_profiles(format: VideoFormat) -> Vec<VideoProfile> {
     let Ok(_com) = (unsafe { ComRuntime::start() }) else {
-        return vec![Codec::H264];
+        return vec![VideoProfile {
+            codec: Codec::H264,
+            chroma: ChromaMode::Yuv420,
+        }];
     };
     let Ok(_mf) = (unsafe { MediaFoundationRuntime::start() }) else {
-        return vec![Codec::H264];
+        return vec![VideoProfile {
+            codec: Codec::H264,
+            chroma: ChromaMode::Yuv420,
+        }];
     };
     let Ok((device, _context)) = (unsafe { create_device() }) else {
-        return vec![Codec::H264];
+        return vec![VideoProfile {
+            codec: Codec::H264,
+            chroma: ChromaMode::Yuv420,
+        }];
     };
-    let mut candidate = format;
-    candidate.codec = Codec::H265;
     let mut supported = Vec::new();
-    match unsafe { HardwareDecoder::new(&device, candidate) } {
-        Ok(_) => supported.push(Codec::H265),
-        Err(error) => {
-            tracing::info!(codec = ?Codec::H265, error = %error, "hardware decoder capability unavailable")
+    for chroma in [ChromaMode::Yuv444, ChromaMode::Yuv420] {
+        for codec in [Codec::H265, Codec::H264] {
+            let mut candidate = format;
+            candidate.codec = codec;
+            candidate.pixel_format = match chroma {
+                ChromaMode::Yuv420 => meshrmm_protocol::PixelFormat::Nv12,
+                ChromaMode::Yuv444 => meshrmm_protocol::PixelFormat::Ayuv,
+            };
+            match unsafe { HardwareDecoder::new(&device, candidate) } {
+                Ok(_) => supported.push(VideoProfile { codec, chroma }),
+                Err(error) => tracing::info!(
+                    ?codec,
+                    ?chroma,
+                    error = %error,
+                    "hardware decoder profile unavailable"
+                ),
+            }
         }
     }
-    // The active presenter has already proven the mandatory H.264 GPU path.
-    supported.push(Codec::H264);
+    let mandatory = VideoProfile {
+        codec: Codec::H264,
+        chroma: ChromaMode::Yuv420,
+    };
+    if !supported.contains(&mandatory) {
+        // The active presenter has already proven the mandatory H.264 GPU path.
+        supported.push(mandatory);
+    }
     supported
 }
 
@@ -238,6 +271,7 @@ struct HardwareDecoder {
     pending: VecDeque<PendingMetadata>,
     first_input_logged: bool,
     codec: Codec,
+    pixel_format: meshrmm_protocol::PixelFormat,
 }
 
 impl HardwareDecoder {
@@ -257,8 +291,8 @@ impl HardwareDecoder {
                 MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0),
                 Some(&input_info),
                 // Hardware decoder activation objects frequently advertise a
-                // driver-specific output type. Negotiate NV12 with the active
-                // transform after attaching our D3D11 device manager.
+                // driver-specific output type. Negotiate the requested GPU YUV
+                // surface after attaching our D3D11 device manager.
                 None,
                 &mut activations_ptr,
                 &mut activation_count,
@@ -312,11 +346,12 @@ impl HardwareDecoder {
         .context("failed to attach D3D manager to decoder")?;
 
         let input_type = unsafe { video_type(subtype, format)? };
-        let output_type = unsafe { video_type(MFVideoFormat_NV12, format)? };
+        let output_type = unsafe { video_type(decoded_subtype(format), format)? };
         unsafe { transform.SetInputType(0, &input_type, 0) }
             .with_context(|| format!("decoder rejected {:?} input type", format.codec))?;
-        unsafe { transform.SetOutputType(0, &output_type, 0) }
-            .context("decoder rejected GPU NV12 output type")?;
+        unsafe { transform.SetOutputType(0, &output_type, 0) }.with_context(|| {
+            format!("decoder rejected GPU {:?} output type", format.pixel_format)
+        })?;
         let output_info = unsafe { transform.GetOutputStreamInfo(0) }
             .context("decoder output stream info unavailable")?;
         let provides_samples = output_info.dwFlags
@@ -351,6 +386,7 @@ impl HardwareDecoder {
             pending: VecDeque::new(),
             first_input_logged: false,
             codec: format.codec,
+            pixel_format: format.pixel_format,
         };
         unsafe { decoder.pump_events(false)? };
         Ok(decoder)
@@ -485,7 +521,7 @@ impl HardwareDecoder {
         let _ = unsafe { ManuallyDrop::take(&mut output.pEvents) };
         if let Err(error) = result {
             if error.code() == MF_E_TRANSFORM_STREAM_CHANGE {
-                unsafe { self.select_nv12_output_type()? };
+                unsafe { self.select_output_type()? };
                 return unsafe { self.take_output() };
             }
             if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
@@ -521,7 +557,11 @@ impl HardwareDecoder {
         }))
     }
 
-    unsafe fn select_nv12_output_type(&self) -> anyhow::Result<()> {
+    unsafe fn select_output_type(&self) -> anyhow::Result<()> {
+        let wanted = match self.pixel_format {
+            meshrmm_protocol::PixelFormat::Nv12 => MFVideoFormat_NV12,
+            meshrmm_protocol::PixelFormat::Ayuv => MFVideoFormat_AYUV,
+        };
         for index in 0.. {
             let media_type = match unsafe { self.transform.GetOutputAvailableType(0, index) } {
                 Ok(media_type) => media_type,
@@ -530,14 +570,14 @@ impl HardwareDecoder {
                     return Err(error).context("decoder output-type enumeration failed");
                 }
             };
-            if unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }.ok() == Some(MFVideoFormat_NV12) {
+            if unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }.ok() == Some(wanted) {
                 unsafe { self.transform.SetOutputType(0, &media_type, 0) }
-                    .context("decoder rejected its available NV12 output type")?;
-                tracing::info!(codec = ?self.codec, "hardware decoder applied a stream format change");
+                    .context("decoder rejected its available GPU output type")?;
+                tracing::info!(codec = ?self.codec, pixel_format = ?self.pixel_format, "hardware decoder applied a stream format change");
                 return Ok(());
             }
         }
-        bail!("hardware decoder stream changed without an NV12 GPU output type")
+        bail!("hardware decoder stream changed without the requested GPU output type")
     }
 }
 
@@ -563,13 +603,19 @@ unsafe fn video_type(
     let media_type = unsafe { MFCreateMediaType() }.context("video media type creation failed")?;
     unsafe { media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video) }?;
     unsafe { media_type.SetGUID(&MF_MT_SUBTYPE, &subtype) }?;
-    if subtype != MFVideoFormat_NV12 {
-        match format.codec {
-            Codec::H264 => unsafe {
-                media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)
+    if subtype == MFVideoFormat_H264 || subtype == MFVideoFormat_HEVC {
+        match (format.codec, format.pixel_format) {
+            (Codec::H264, meshrmm_protocol::PixelFormat::Nv12) => unsafe {
+                media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)
             }?,
-            Codec::H265 => unsafe {
+            (Codec::H264, meshrmm_protocol::PixelFormat::Ayuv) => unsafe {
+                media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_444.0 as u32)
+            }?,
+            (Codec::H265, meshrmm_protocol::PixelFormat::Nv12) => unsafe {
                 media_type.SetUINT32(&MF_MT_VIDEO_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)
+            }?,
+            (Codec::H265, meshrmm_protocol::PixelFormat::Ayuv) => unsafe {
+                media_type.SetUINT32(&MF_MT_VIDEO_PROFILE, eAVEncH265VProfile_Main_444_8.0 as u32)
             }?,
         }
     }
@@ -587,5 +633,9 @@ unsafe fn video_type(
     }?;
     unsafe { media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1_u64 << 32) | 1) }?;
     unsafe { media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32) }?;
+    unsafe { media_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32) }?;
+    unsafe { media_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32) }?;
+    unsafe { media_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32) }?;
+    unsafe { media_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32) }?;
     Ok(media_type)
 }

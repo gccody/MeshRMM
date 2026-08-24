@@ -26,7 +26,7 @@ use windows_capture::settings::{
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 
-use crate::converter::BgraToNv12Converter;
+use crate::converter::BgraToYuvConverter;
 use crate::encoder::{MediaFoundationVideoEncoder, VideoEncoder};
 
 pub type EncodedFrameSink = Arc<dyn Fn(EncodedAccessUnit) + Send + Sync + 'static>;
@@ -41,6 +41,7 @@ pub struct StreamConfig {
     pub frames_per_second: u32,
     pub bitrate_bits_per_second: u32,
     pub codec: VideoCodec,
+    pub pixel_format: VideoPixelFormat,
 }
 
 impl Default for StreamConfig {
@@ -49,6 +50,7 @@ impl Default for StreamConfig {
             frames_per_second: 60,
             bitrate_bits_per_second: 12_000_000,
             codec: VideoCodec::H264,
+            pixel_format: VideoPixelFormat::Yuv420,
         }
     }
 }
@@ -60,6 +62,7 @@ pub struct ActiveFormat {
     pub frames_per_second: u32,
     pub bitrate_bits_per_second: u32,
     pub codec: VideoCodec,
+    pub pixel_format: VideoPixelFormat,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,6 +70,28 @@ pub enum VideoCodec {
     #[default]
     H264,
     H265,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VideoPixelFormat {
+    #[default]
+    Yuv420,
+    Yuv444,
+}
+
+impl VideoPixelFormat {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Yuv420 => "4:2:0",
+            Self::Yuv444 => "4:4:4",
+        }
+    }
+}
+
+impl std::fmt::Display for VideoPixelFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
 }
 
 impl VideoCodec {
@@ -188,7 +213,7 @@ struct ControlState {
 }
 
 struct CaptureHandler {
-    converter: BgraToNv12Converter,
+    converter: BgraToYuvConverter,
     encoder: MediaFoundationVideoEncoder,
     sink: EncodedFrameSink,
     controls: Arc<ControlState>,
@@ -218,12 +243,13 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             sink,
             controls,
         } = context.flags;
-        let converter = BgraToNv12Converter::new(
+        let converter = BgraToYuvConverter::new(
             &context.device,
             &context.device_context,
             format.width,
             format.height,
             format.frames_per_second,
+            config.pixel_format,
         )?;
         let encoder = MediaFoundationVideoEncoder::new(
             &context.device,
@@ -232,6 +258,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             format.frames_per_second,
             config.bitrate_bits_per_second,
             config.codec,
+            config.pixel_format,
         )?;
         Ok(Self {
             converter,
@@ -282,18 +309,21 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             self.logged_first_capture = true;
             tracing::info!(capture_delivery_us, "first desktop frame captured on GPU");
         }
-        // Poll before converting so an NV12 surface is only written when the
+        // Poll before converting so a YUV surface is only written when the
         // asynchronous MFT has requested another input. Converting every
         // captured frame would rotate through the fixed surface pool and could
         // overwrite a texture that the encoder was still reading.
         let mut access_units = self.encoder.poll()?;
         if self.encoder.wants_input() {
-            let nv12 = self.converter.convert(frame.as_raw_texture())?;
+            let yuv = self.converter.convert(frame.as_raw_texture())?;
             if !self.logged_first_conversion {
                 self.logged_first_conversion = true;
-                tracing::info!("first desktop frame converted to NV12 on GPU");
+                tracing::info!(
+                    pixel_format = %self.format.pixel_format,
+                    "first desktop frame converted to YUV on GPU"
+                );
             }
-            let submitted = self.encoder.submit(nv12, capture_timestamp_us)?;
+            let submitted = self.encoder.submit(yuv, capture_timestamp_us)?;
             if !self.logged_first_submission {
                 self.logged_first_submission = true;
                 tracing::info!(
@@ -395,8 +425,9 @@ impl WindowsScreenStreamer {
             .ok_or_else(|| {
                 Error::CaptureInitialization(format!("display {display_id} is unavailable"))
             })?;
-        // NV12 requires even dimensions. Cropping a possible final odd row/column
-        // keeps all normal frame traffic on the GPU.
+        // NV12 and the hardware codec profiles require even dimensions.
+        // Cropping a possible final odd row/column keeps all normal frame
+        // traffic on the GPU.
         let width = monitor
             .width()
             .map_err(|error| Error::CaptureInitialization(error.to_string()))?
@@ -414,6 +445,7 @@ impl WindowsScreenStreamer {
             frames_per_second: config.frames_per_second,
             bitrate_bits_per_second: config.bitrate_bits_per_second,
             codec: config.codec,
+            pixel_format: config.pixel_format,
         };
         let settings = Settings::new(
             monitor,

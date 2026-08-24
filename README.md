@@ -16,8 +16,8 @@ workspace with platform and transport responsibilities kept in focused crates:
 
 ```text
 Windows.Graphics.Capture (BGRA ID3D11Texture2D)
-  -> D3D11 video processor (pooled NV12 ID3D11Texture2D)
-  -> Media Foundation hardware H.265 encoder (H.264 hardware fallback)
+  -> D3D11 video processor (pooled NV12 4:2:0 or AYUV 4:4:4 texture)
+  -> Media Foundation hardware H.265/H.264 encoder
   -> latest encoded frame slot
   -> unordered/unreliable WebRTC DataChannel (12 KiB fragments)
   -> latest-only reassembly
@@ -26,11 +26,23 @@ Windows.Graphics.Capture (BGRA ID3D11Texture2D)
        macOS: AVSampleBufferDisplayLayer -> Core Animation/AppKit window
 ```
 
-The viewer advertises only codecs for which it can initialize a hardware
-decoder. The Agent prefers H.265/HEVC when both ends expose a GPU path and
-falls back to hardware H.264 if HEVC initialization or playback fails. The
-viewer sidebar can change the live encoder ceiling between Data saver (3
-Mbps), Balanced (6 Mbps), and Best quality (up to 12 Mbps).
+The viewer advertises only codec/chroma profiles for which it can initialize a
+hardware decoder. The Agent prefers H.265/HEVC within the selected chroma mode,
+then falls back through the mutually supported hardware profiles if encoder or
+playback initialization fails. Windows viewers can select bandwidth-efficient
+4:2:0 or crisp-text 4:4:4 when the GPU driver exposes the required AYUV and
+High 4:4:4/RExt hardware path. Unsupported 4:4:4 controls are disabled and
+macOS currently advertises 4:2:0 only. Quality remains independently
+configurable as Data saver (3 Mbps), Balanced (6 Mbps), or Best quality (up to
+12 Mbps).
+
+The hardware encoders use a streaming-oriented CBR configuration: real-time
+and low-latency modes, no B-frames/reordering, a short recovery GOP, an
+approximately one-frame VBV with a 16 KiB detail floor, a speed-biased
+quality-versus-speed setting, and an optional maximum-QP guard. The video data
+channel drains and declares congestion using bitrate-relative time budgets
+instead of fixed byte counts, keeping the three quality presets similarly
+responsive.
 
 Cloudflare is not in that data path. An Agent coordinator Durable Object keeps
 the authenticated Agent reachable, and a temporary remote-session Durable
@@ -46,8 +58,8 @@ and are used by ICE only when a direct candidate pair cannot connect.
 - macOS 12 or newer for the macOS viewer.
 - A current stable Rust MSVC toolchain.
 - A GPU/driver exposing Media Foundation hardware H.264 encode and decode
-  transforms plus D3D11 NV12 video processing. Hardware H.265/HEVC support is
-  optional and used automatically when it is available at both ends.
+  transforms plus D3D11 NV12 video processing. Hardware H.265/HEVC and AYUV
+  4:4:4 support are optional and negotiated only when available at both ends.
 - Node.js/npm and a Cloudflare account for the one-time server deployment.
 - The `wasm32-unknown-unknown` Rust target.
 

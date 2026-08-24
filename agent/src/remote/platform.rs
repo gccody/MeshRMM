@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use meshrmm_protocol::{
-    Codec, CursorShape, Display, DisplayId, EncodedFrame, PixelFormat, RemoteInput, VideoFormat,
-    VideoStreamId,
+    ChromaMode, Codec, CursorShape, Display, DisplayId, EncodedFrame, PixelFormat, RemoteInput,
+    VideoFormat, VideoStreamId,
 };
 
 use super::video::LatestFrameSlot;
@@ -30,6 +30,7 @@ pub trait ScreenStreamer: Send {
         self.set_bitrate(bits_per_second)
     }
     fn set_codec(&mut self, codec: Codec);
+    fn set_chroma(&mut self, chroma: ChromaMode);
     fn input_controller(&self) -> Arc<dyn ScreenInput>;
 }
 
@@ -45,6 +46,7 @@ pub struct PlatformScreenStreamer {
     frames_per_second: u32,
     bitrate_bits_per_second: u32,
     codec: Codec,
+    chroma: ChromaMode,
     next_frame_id: Arc<AtomicU64>,
     direct_input: Arc<Mutex<super::input::WindowsInputController>>,
 }
@@ -65,6 +67,7 @@ impl PlatformScreenStreamer {
             frames_per_second,
             bitrate_bits_per_second,
             codec: Codec::H264,
+            chroma: ChromaMode::Yuv420,
             next_frame_id: Arc::new(AtomicU64::new(1)),
             direct_input: Arc::new(Mutex::new(super::input::WindowsInputController::new())),
         }
@@ -101,6 +104,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
             frames_per_second: self.frames_per_second,
             bitrate_bits_per_second: self.bitrate_bits_per_second,
             codec: remote_screen_codec(self.codec),
+            pixel_format: remote_screen_pixel_format(self.chroma),
         };
         match &mut self.inner {
             CaptureBackend::Direct(streamer) => {
@@ -186,6 +190,10 @@ impl ScreenStreamer for PlatformScreenStreamer {
         self.codec = codec;
     }
 
+    fn set_chroma(&mut self, chroma: ChromaMode) {
+        self.chroma = chroma;
+    }
+
     fn input_controller(&self) -> Arc<dyn ScreenInput> {
         match &self.inner {
             CaptureBackend::Direct(_) => Arc::new(DirectInputController {
@@ -240,7 +248,10 @@ fn video_format(active: meshrmm_remote_screen::ActiveFormat) -> VideoFormat {
             meshrmm_remote_screen::VideoCodec::H264 => Codec::H264,
             meshrmm_remote_screen::VideoCodec::H265 => Codec::H265,
         },
-        pixel_format: PixelFormat::Nv12,
+        pixel_format: match active.pixel_format {
+            meshrmm_remote_screen::VideoPixelFormat::Yuv420 => PixelFormat::Nv12,
+            meshrmm_remote_screen::VideoPixelFormat::Yuv444 => PixelFormat::Ayuv,
+        },
         bitrate_bits_per_second: active.bitrate_bits_per_second,
     }
 }
@@ -250,6 +261,14 @@ fn remote_screen_codec(codec: Codec) -> meshrmm_remote_screen::VideoCodec {
     match codec {
         Codec::H264 => meshrmm_remote_screen::VideoCodec::H264,
         Codec::H265 => meshrmm_remote_screen::VideoCodec::H265,
+    }
+}
+
+#[cfg(windows)]
+fn remote_screen_pixel_format(chroma: ChromaMode) -> meshrmm_remote_screen::VideoPixelFormat {
+    match chroma {
+        ChromaMode::Yuv420 => meshrmm_remote_screen::VideoPixelFormat::Yuv420,
+        ChromaMode::Yuv444 => meshrmm_remote_screen::VideoPixelFormat::Yuv444,
     }
 }
 

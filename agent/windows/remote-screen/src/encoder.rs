@@ -11,7 +11,7 @@ use windows::Win32::System::Variant::VARIANT;
 use windows::core::{Interface, Result as WindowsResult};
 
 use crate::converter::SURFACE_COUNT;
-use crate::{EncodedAccessUnit, VideoCodec};
+use crate::{EncodedAccessUnit, VideoCodec, VideoPixelFormat};
 
 impl VideoCodec {
     fn media_foundation_subtype(self) -> windows::core::GUID {
@@ -22,12 +22,24 @@ impl VideoCodec {
     }
 }
 
+impl VideoPixelFormat {
+    fn media_foundation_subtype(self) -> windows::core::GUID {
+        match self {
+            Self::Yuv420 => MFVideoFormat_NV12,
+            Self::Yuv444 => MFVideoFormat_AYUV,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Media Foundation startup failed: {0}")]
     Startup(#[source] windows::core::Error),
-    #[error("no hardware Media Foundation {0} encoder accepts NV12")]
-    HardwareEncoderUnavailable(VideoCodec),
+    #[error("no hardware Media Foundation {codec} encoder accepts {pixel_format}")]
+    HardwareEncoderUnavailable {
+        codec: VideoCodec,
+        pixel_format: VideoPixelFormat,
+    },
     #[error("Media Foundation encoder configuration failed: {0}")]
     Configuration(#[source] windows::core::Error),
     #[error("Media Foundation encoder input failed: {0}")]
@@ -103,6 +115,7 @@ impl MediaFoundationVideoEncoder {
         frames_per_second: u32,
         bitrate_bits_per_second: u32,
         codec: VideoCodec,
+        pixel_format: VideoPixelFormat,
     ) -> Result<Self, Error> {
         let runtime = MediaFoundationRuntime::start()?;
         // Safety: MFT enumeration returns a COM-allocated array which is freed
@@ -110,7 +123,7 @@ impl MediaFoundationVideoEncoder {
         unsafe {
             let input_info = MFT_REGISTER_TYPE_INFO {
                 guidMajorType: MFMediaType_Video,
-                guidSubtype: MFVideoFormat_NV12,
+                guidSubtype: pixel_format.media_foundation_subtype(),
             };
             let output_info = MFT_REGISTER_TYPE_INFO {
                 guidMajorType: MFMediaType_Video,
@@ -131,7 +144,10 @@ impl MediaFoundationVideoEncoder {
             )
             .map_err(Error::Configuration)?;
             if activation_count == 0 || activations_ptr.is_null() {
-                return Err(Error::HardwareEncoderUnavailable(codec));
+                return Err(Error::HardwareEncoderUnavailable {
+                    codec,
+                    pixel_format,
+                });
             }
             let activations =
                 std::slice::from_raw_parts_mut(activations_ptr, activation_count as usize);
@@ -140,7 +156,10 @@ impl MediaFoundationVideoEncoder {
                 let _ = item.take();
             }
             CoTaskMemFree(Some(activations_ptr.cast()));
-            let activation = activation.ok_or(Error::HardwareEncoderUnavailable(codec))?;
+            let activation = activation.ok_or(Error::HardwareEncoderUnavailable {
+                codec,
+                pixel_format,
+            })?;
             let transform: IMFTransform =
                 activation.ActivateObject().map_err(Error::Configuration)?;
             let attributes = transform.GetAttributes().map_err(Error::Configuration)?;
@@ -157,7 +176,10 @@ impl MediaFoundationVideoEncoder {
             let mut device_manager = None;
             MFCreateDXGIDeviceManager(&mut reset_token, &mut device_manager)
                 .map_err(Error::Configuration)?;
-            let device_manager = device_manager.ok_or(Error::HardwareEncoderUnavailable(codec))?;
+            let device_manager = device_manager.ok_or(Error::HardwareEncoderUnavailable {
+                codec,
+                pixel_format,
+            })?;
             device_manager
                 .ResetDevice(device, reset_token)
                 .map_err(Error::Configuration)?;
@@ -176,19 +198,30 @@ impl MediaFoundationVideoEncoder {
                 frames_per_second,
                 Some(bitrate_bits_per_second),
             )?;
-            match codec {
-                VideoCodec::H264 => output_type
-                    .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)
+            match (codec, pixel_format) {
+                (VideoCodec::H264, VideoPixelFormat::Yuv420) => output_type
+                    .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)
                     .map_err(Error::Configuration)?,
-                VideoCodec::H265 => output_type
+                (VideoCodec::H264, VideoPixelFormat::Yuv444) => output_type
+                    .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_444.0 as u32)
+                    .map_err(Error::Configuration)?,
+                (VideoCodec::H265, VideoPixelFormat::Yuv420) => output_type
                     .SetUINT32(&MF_MT_VIDEO_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)
+                    .map_err(Error::Configuration)?,
+                (VideoCodec::H265, VideoPixelFormat::Yuv444) => output_type
+                    .SetUINT32(&MF_MT_VIDEO_PROFILE, eAVEncH265VProfile_Main_444_8.0 as u32)
                     .map_err(Error::Configuration)?,
             }
             transform
                 .SetOutputType(0, &output_type, 0)
                 .map_err(Error::Configuration)?;
-            let input_type =
-                make_video_type(MFVideoFormat_NV12, width, height, frames_per_second, None)?;
+            let input_type = make_video_type(
+                pixel_format.media_foundation_subtype(),
+                width,
+                height,
+                frames_per_second,
+                None,
+            )?;
             transform
                 .SetInputType(0, &input_type, 0)
                 .map_err(Error::Configuration)?;
@@ -445,6 +478,18 @@ fn make_video_type(
         media_type
             .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
             .map_err(Error::Configuration)?;
+        media_type
+            .SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)
+            .map_err(Error::Configuration)?;
+        media_type
+            .SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)
+            .map_err(Error::Configuration)?;
+        media_type
+            .SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)
+            .map_err(Error::Configuration)?;
+        media_type
+            .SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)
+            .map_err(Error::Configuration)?;
         if let Some(bitrate) = bitrate {
             media_type
                 .SetUINT32(&MF_MT_AVG_BITRATE, bitrate)
@@ -459,12 +504,13 @@ fn configure_codec(
     bitrate_bits_per_second: u32,
     frames_per_second: u32,
 ) -> Result<(), Error> {
-    // Sunshine's default single-frame VBV/HRD budget prevents a keyframe or
-    // complex desktop update from monopolizing the network for several frame
-    // intervals. Media Foundation expresses this buffer size in bytes.
+    // Sunshine uses a single-frame VBV/HRD budget for its ultra-low-latency
+    // path. Preserve the historical 16 KiB floor so low-bandwidth presets do
+    // not starve detailed text and keyframes below a useful hardware budget.
     let single_frame_buffer_bytes = bitrate_bits_per_second
         .div_ceil(8)
-        .div_ceil(frames_per_second.max(1));
+        .div_ceil(frames_per_second.max(1))
+        .max(16 * 1024);
     let settings = [
         (&CODECAPI_AVEncCommonLowLatency, VARIANT::from(true)),
         (&CODECAPI_AVEncCommonRealTime, VARIANT::from(true)),
@@ -485,9 +531,10 @@ fn configure_codec(
         ),
     ];
     for (key, value) in settings {
-        // Unsupported tuning properties are logged rather than blindly set.
+        // IsModifiable describes live changes, not whether an initial value can
+        // be supplied. These are all configured before streaming begins.
         unsafe {
-            if codec_api.IsSupported(key).is_ok() && codec_api.IsModifiable(key).is_ok() {
+            if codec_api.IsSupported(key).is_ok() {
                 codec_api
                     .SetValue(key, &value)
                     .map_err(Error::Configuration)?;
@@ -496,7 +543,33 @@ fn configure_codec(
             }
         }
     }
-    set_optional_codec_value(
+    // Sunshine defaults to NVENC P1 with ultra-low-latency tuning and Parsec
+    // prioritizes sub-frame encode latency. Media Foundation's portable
+    // equivalent retains the fast path while allowing modestly better motion
+    // estimation at a fixed bitrate.
+    set_optional_initial_codec_value(
+        codec_api,
+        &CODECAPI_AVEncCommonQualityVsSpeed,
+        VARIANT::from(35_u32),
+        "quality versus speed",
+    )?;
+    // Hint that this is mixed desktop/UI content rather than a full-screen
+    // camera or movie. Supporting hardware can choose its screen-content path.
+    set_optional_initial_codec_value(
+        codec_api,
+        &CODECAPI_VideoEncoderDisplayContentType,
+        VARIANT::from(0_u32),
+        "desktop content type",
+    )?;
+    // Bound destructive quantization during complex desktop updates. Drivers
+    // may ignore this optional hint to preserve their CBR guarantees.
+    set_optional_initial_codec_value(
+        codec_api,
+        &CODECAPI_AVEncVideoMaxQP,
+        VARIANT::from(36_u32),
+        "maximum quantizer",
+    )?;
+    set_optional_initial_codec_value(
         codec_api,
         &CODECAPI_AVEncCommonBufferSize,
         VARIANT::from(single_frame_buffer_bytes),
@@ -551,6 +624,26 @@ fn set_required_runtime_codec_value(
         codec_api
             .SetValue(key, &value)
             .map_err(Error::Configuration)
+    }
+}
+
+fn set_optional_initial_codec_value(
+    codec_api: &ICodecAPI,
+    key: &windows::core::GUID,
+    value: VARIANT,
+    setting: &'static str,
+) -> Result<(), Error> {
+    // IsModifiable only reports whether a value can change after the codec is
+    // running. Startup-only properties must still be attempted when supported.
+    unsafe {
+        if codec_api.IsSupported(key).is_err() {
+            tracing::warn!(setting, "hardware encoder does not support initial control");
+            return Ok(());
+        }
+        if let Err(error) = codec_api.SetValue(key, &value) {
+            tracing::warn!(setting, %error, "hardware encoder rejected optional initial control");
+        }
+        Ok(())
     }
 }
 

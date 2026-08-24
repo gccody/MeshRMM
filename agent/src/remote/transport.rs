@@ -6,9 +6,9 @@ use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use meshrmm_protocol::{
-    CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, Codec, CursorShape, DEFAULT_FRAGMENT_PAYLOAD,
-    Display, DisplayId, IceServer, QualityPreset, RemoteSessionId, SessionMessage, SessionState,
-    SignalMessage, VideoStreamId, fragment_frame,
+    CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, ChromaMode, Codec, CursorShape,
+    DEFAULT_FRAGMENT_PAYLOAD, Display, DisplayId, IceServer, QualityPreset, RemoteSessionId,
+    SessionMessage, SessionState, SignalMessage, VideoProfile, VideoStreamId, fragment_frame,
 };
 use meshrmm_signaling_client::Socket;
 use tokio::sync::{Notify, mpsc};
@@ -25,7 +25,7 @@ use webrtc::peer_connection::{
 use webrtc::stats::StatsReportType;
 
 use super::clipboard::ClipboardSync;
-use super::platform::{ScreenStreamer, monotonic_timestamp_us};
+use super::platform::{ScreenStreamer, StartedScreen, monotonic_timestamp_us};
 use super::signaling::authenticated_websocket;
 use super::video::LatestFrameSlot;
 
@@ -33,12 +33,14 @@ enum ControlCommand {
     Keyframe,
     Bitrate(u32),
     ViewerCapabilities {
-        codecs: Vec<Codec>,
+        profiles: Vec<VideoProfile>,
         quality: QualityPreset,
+        chroma: ChromaMode,
     },
     Quality(QualityPreset),
-    CodecRejected {
-        codec: Codec,
+    Chroma(ChromaMode),
+    VideoProfileRejected {
+        profile: VideoProfile,
         reason: String,
     },
     SelectDisplay(DisplayId),
@@ -47,8 +49,8 @@ enum ControlCommand {
     Stop,
 }
 
-const VIDEO_BUFFER_DRAIN_BYTES: usize = 64 * 1024;
-const VIDEO_BUFFER_CONGESTED_BYTES: usize = 192 * 1024;
+const VIDEO_BUFFER_DRAIN_MS: u32 = 50;
+const VIDEO_BUFFER_CONGESTED_MS: u32 = 150;
 const VIDEO_BUFFER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(80);
 const KEYFRAME_RETRY_INTERVAL_US: u64 = 250_000;
 const BITRATE_DECREASE_INTERVAL_US: u64 = 500_000;
@@ -98,7 +100,7 @@ impl AdaptiveBitrate {
         reference_chain_lost: bool,
     ) -> Option<u32> {
         let congested = reference_chain_lost
-            || buffered_bytes >= VIDEO_BUFFER_CONGESTED_BYTES
+            || buffered_bytes >= self.congested_bytes()
             || queued_frames >= (super::video::MAX_ENCODED_FRAME_QUEUE * 4) / 5;
         if congested {
             self.healthy_since_us = 0;
@@ -116,7 +118,7 @@ impl AdaptiveBitrate {
             return None;
         }
 
-        let healthy = buffered_bytes <= VIDEO_BUFFER_DRAIN_BYTES && queued_frames <= 1;
+        let healthy = buffered_bytes <= self.drain_bytes() && queued_frames <= 1;
         if !healthy || self.current >= self.maximum {
             self.healthy_since_us = 0;
             return None;
@@ -133,6 +135,73 @@ impl AdaptiveBitrate {
         }
         None
     }
+
+    fn drain_bytes(&self) -> usize {
+        bitrate_duration_bytes(self.current, VIDEO_BUFFER_DRAIN_MS)
+    }
+
+    fn congested_bytes(&self) -> usize {
+        bitrate_duration_bytes(self.current, VIDEO_BUFFER_CONGESTED_MS)
+    }
+}
+
+fn bitrate_duration_bytes(bits_per_second: u32, duration_ms: u32) -> usize {
+    usize::try_from(
+        u64::from(bits_per_second)
+            .saturating_mul(u64::from(duration_ms))
+            .div_ceil(8_000),
+    )
+    .unwrap_or(usize::MAX)
+    .max(16 * 1024)
+}
+
+fn profile_candidates(
+    profiles: &[VideoProfile],
+    requested_chroma: ChromaMode,
+    rejected: &[VideoProfile],
+) -> Vec<VideoProfile> {
+    let mut candidates = Vec::new();
+    for chroma in [requested_chroma, ChromaMode::Yuv420] {
+        for codec in [Codec::H265, Codec::H264] {
+            let profile = VideoProfile { codec, chroma };
+            if profiles.contains(&profile)
+                && !rejected.contains(&profile)
+                && !candidates.contains(&profile)
+            {
+                candidates.push(profile);
+            }
+        }
+    }
+    candidates
+}
+
+fn start_first_profile(
+    streamer: &Arc<Mutex<Box<dyn ScreenStreamer>>>,
+    display_id: DisplayId,
+    stream_id: VideoStreamId,
+    slot: &Arc<LatestFrameSlot>,
+    candidates: &[VideoProfile],
+) -> anyhow::Result<StartedScreen> {
+    let mut failures = Vec::new();
+    for profile in candidates {
+        let result = {
+            let mut streamer = lock_streamer(streamer)?;
+            streamer.set_codec(profile.codec);
+            streamer.set_chroma(profile.chroma);
+            streamer.start(Some(display_id), stream_id, Arc::clone(slot))
+        };
+        match result {
+            Ok(started) => return Ok(started),
+            Err(error) => {
+                tracing::warn!(?profile, error = ?error, "hardware encoder profile unavailable");
+                failures.push(format!("{profile:?}: {error:#}"));
+            }
+        }
+    }
+    anyhow::bail!(
+        "no mutually supported hardware video profile could start: {}",
+        failures.join("; ")
+    )
 }
 
 pub async fn run_sender(
@@ -245,14 +314,21 @@ async fn run_connected_sender(
                     Ok(SessionMessage::SetBitrate { bits_per_second }) => {
                         Some(ControlCommand::Bitrate(bits_per_second))
                     }
-                    Ok(SessionMessage::ViewerCapabilities { codecs, quality }) => {
-                        Some(ControlCommand::ViewerCapabilities { codecs, quality })
-                    }
+                    Ok(SessionMessage::ViewerCapabilities {
+                        profiles,
+                        quality,
+                        chroma,
+                    }) => Some(ControlCommand::ViewerCapabilities {
+                        profiles,
+                        quality,
+                        chroma,
+                    }),
                     Ok(SessionMessage::SetQuality { preset }) => {
                         Some(ControlCommand::Quality(preset))
                     }
-                    Ok(SessionMessage::CodecRejected { codec, reason }) => {
-                        Some(ControlCommand::CodecRejected { codec, reason })
+                    Ok(SessionMessage::SetChroma { mode }) => Some(ControlCommand::Chroma(mode)),
+                    Ok(SessionMessage::VideoProfileRejected { profile, reason }) => {
+                        Some(ControlCommand::VideoProfileRejected { profile, reason })
                     }
                     Ok(SessionMessage::SelectDisplay { display_id }) => {
                         Some(ControlCommand::SelectDisplay(display_id))
@@ -291,7 +367,10 @@ async fn run_connected_sender(
     let format = started.format;
     let configured_maximum_bitrate = format.bitrate_bits_per_second;
     let quality_ceiling = Arc::new(AtomicU32::new(configured_maximum_bitrate));
-    let mut active_codec = format.codec;
+    let mut active_profile = format.profile();
+    let mut viewer_profiles = vec![active_profile];
+    let mut requested_chroma = ChromaMode::Yuv420;
+    let mut rejected_profiles = Vec::new();
     let mut capture_running = true;
     let mut clipboard = match ClipboardSync::new() {
         Ok(clipboard) => Some(clipboard),
@@ -410,19 +489,22 @@ async fn run_connected_sender(
                             tracing::info!(?preset, bits_per_second = value, "viewer quality preset applied");
                         }
                     }
-                    ControlCommand::ViewerCapabilities { codecs, quality } => {
+                    ControlCommand::ViewerCapabilities { profiles, quality, chroma } => {
                         let value = quality.bitrate(configured_maximum_bitrate);
                         quality_ceiling.store(value, Ordering::Release);
                         if let Err(error) = lock_streamer(&streamer)?.set_bitrate(value) {
                             tracing::warn!(error = %error, "could not apply initial viewer quality preset");
                         }
-                        let preferred = if codecs.contains(&Codec::H265) {
-                            Codec::H265
-                        } else {
-                            Codec::H264
-                        };
-                        if preferred == active_codec {
-                            tracing::info!(codec = ?active_codec, ?quality, "video codec negotiation retained active codec");
+                        viewer_profiles = profiles;
+                        requested_chroma = chroma;
+                        rejected_profiles.clear();
+                        let candidates = profile_candidates(
+                            &viewer_profiles,
+                            requested_chroma,
+                            &rejected_profiles,
+                        );
+                        if candidates.first() == Some(&active_profile) {
+                            tracing::info!(?active_profile, ?quality, ?requested_chroma, "video profile negotiation retained active profile");
                             continue;
                         }
 
@@ -430,28 +512,16 @@ async fn run_connected_sender(
                         capture_running = false;
                         slot.clear();
                         stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
-                        lock_streamer(&streamer)?.set_codec(preferred);
-                        let negotiated = lock_streamer(&streamer)?.start(
-                            Some(active_display.id),
+                        let started = start_first_profile(
+                            &streamer,
+                            active_display.id,
                             stream_id,
-                            Arc::clone(&slot),
-                        );
-                        let started = match negotiated {
-                            Ok(started) => started,
-                            Err(error) if preferred == Codec::H265 => {
-                                tracing::warn!(error = ?error, "hardware HEVC encoder unavailable; falling back to H.264");
-                                lock_streamer(&streamer)?.set_codec(Codec::H264);
-                                lock_streamer(&streamer)?.start(
-                                    Some(active_display.id),
-                                    stream_id,
-                                    Arc::clone(&slot),
-                                )?
-                            }
-                            Err(error) => return Err(error),
-                        };
+                            &slot,
+                            &candidates,
+                        )?;
                         displays = started.displays;
                         active_display = started.active_display;
-                        active_codec = started.format.codec;
+                        active_profile = started.format.profile();
                         capture_running = true;
                         capture_unavailable_since = None;
                         sent_cursor_shape = None;
@@ -464,27 +534,74 @@ async fn run_connected_sender(
                                 format: started.format,
                             },
                         ).await?;
-                        tracing::info!(codec = ?active_codec, ?quality, bits_per_second = value, "video codec negotiation completed");
+                        tracing::info!(?active_profile, ?quality, bits_per_second = value, "video profile negotiation completed");
                     }
-                    ControlCommand::CodecRejected { codec, reason } => {
-                        if codec != Codec::H265 || active_codec != Codec::H265 {
-                            tracing::warn!(?codec, reason, "viewer rejected an inactive codec");
+                    ControlCommand::Chroma(chroma) => {
+                        requested_chroma = chroma;
+                        rejected_profiles.clear();
+                        let candidates = profile_candidates(
+                            &viewer_profiles,
+                            requested_chroma,
+                            &rejected_profiles,
+                        );
+                        if candidates.first() == Some(&active_profile) {
+                            tracing::info!(?active_profile, ?requested_chroma, "chroma selection retained active profile");
                             continue;
                         }
-                        tracing::warn!(reason, "viewer rejected hardware HEVC; falling back to H.264");
                         lock_streamer(&streamer)?.stop()?;
                         capture_running = false;
                         slot.clear();
                         stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
-                        lock_streamer(&streamer)?.set_codec(Codec::H264);
-                        let started = lock_streamer(&streamer)?.start(
-                            Some(active_display.id),
+                        let started = start_first_profile(
+                            &streamer,
+                            active_display.id,
                             stream_id,
-                            Arc::clone(&slot),
+                            &slot,
+                            &candidates,
                         )?;
                         displays = started.displays;
                         active_display = started.active_display;
-                        active_codec = Codec::H264;
+                        active_profile = started.format.profile();
+                        capture_running = true;
+                        capture_unavailable_since = None;
+                        sent_cursor_shape = None;
+                        send_control_message(
+                            &control_channel,
+                            SessionMessage::DisplayConfiguration {
+                                displays: displays.clone(),
+                                active_display_id: active_display.id,
+                                stream_id,
+                                format: started.format,
+                            },
+                        ).await?;
+                        tracing::info!(?active_profile, ?requested_chroma, "viewer chroma selection applied");
+                    }
+                    ControlCommand::VideoProfileRejected { profile, reason } => {
+                        if profile != active_profile {
+                            tracing::warn!(?profile, reason, "viewer rejected an inactive video profile");
+                            continue;
+                        }
+                        rejected_profiles.push(profile);
+                        tracing::warn!(?profile, reason, "viewer rejected hardware video profile; trying fallback");
+                        let candidates = profile_candidates(
+                            &viewer_profiles,
+                            requested_chroma,
+                            &rejected_profiles,
+                        );
+                        lock_streamer(&streamer)?.stop()?;
+                        capture_running = false;
+                        slot.clear();
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                        let started = start_first_profile(
+                            &streamer,
+                            active_display.id,
+                            stream_id,
+                            &slot,
+                            &candidates,
+                        )?;
+                        displays = started.displays;
+                        active_display = started.active_display;
+                        active_profile = started.format.profile();
                         capture_running = true;
                         capture_unavailable_since = None;
                         sent_cursor_shape = None;
@@ -518,16 +635,23 @@ async fn run_connected_sender(
                         capture_unavailable_since = Some(std::time::Instant::now());
                         slot.clear();
                         stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
-                        let restart = lock_streamer(&streamer)?.start(
-                            Some(selected.id),
+                        let candidates = profile_candidates(
+                            &viewer_profiles,
+                            requested_chroma,
+                            &rejected_profiles,
+                        );
+                        let restart = start_first_profile(
+                            &streamer,
+                            selected.id,
                             stream_id,
-                            Arc::clone(&slot),
+                            &slot,
+                            &candidates,
                         );
                         match restart {
                             Ok(started) => {
                                 displays = started.displays;
                                 active_display = started.active_display;
-                                active_codec = started.format.codec;
+                                active_profile = started.format.profile();
                                 capture_running = true;
                                 capture_unavailable_since = None;
                                 sent_cursor_shape = None;
@@ -602,9 +726,9 @@ async fn run_connected_sender(
                     let capture_ended = lock_streamer(&streamer)?.poll_ended();
                     if let Some(capture_result) = capture_ended {
                         if let Err(error) = capture_result {
-                            tracing::warn!(error = ?error, stream_id = stream_id.0, codec = ?active_codec, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "visible Windows desktop changed; replacing capture helper");
+                            tracing::warn!(error = ?error, stream_id = stream_id.0, ?active_profile, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "visible Windows desktop changed; replacing capture helper");
                         } else {
-                            tracing::warn!(stream_id = stream_id.0, codec = ?active_codec, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "desktop capture helper stopped; replacing it");
+                            tracing::warn!(stream_id = stream_id.0, ?active_profile, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "desktop capture helper stopped; replacing it");
                         }
                         capture_running = false;
                         capture_unavailable_since = Some(std::time::Instant::now());
@@ -614,28 +738,23 @@ async fn run_connected_sender(
                     }
                 }
                 if !capture_running && std::time::Instant::now() >= capture_retry_after {
-                    let restart = lock_streamer(&streamer)?.start(
-                        Some(active_display.id),
-                        stream_id,
-                        Arc::clone(&slot),
+                    let candidates = profile_candidates(
+                        &viewer_profiles,
+                        requested_chroma,
+                        &rejected_profiles,
                     );
-                    let restart = match restart {
-                        Err(error) if active_codec == Codec::H265 => {
-                            tracing::warn!(error = ?error, "hardware HEVC capture restart failed; falling back to H.264");
-                            lock_streamer(&streamer)?.set_codec(Codec::H264);
-                            lock_streamer(&streamer)?.start(
-                                Some(active_display.id),
-                                stream_id,
-                                Arc::clone(&slot),
-                            )
-                        }
-                        result => result,
-                    };
+                    let restart = start_first_profile(
+                        &streamer,
+                        active_display.id,
+                        stream_id,
+                        &slot,
+                        &candidates,
+                    );
                     match restart {
                         Ok(started) => {
                             displays = started.displays;
                             active_display = started.active_display;
-                            active_codec = started.format.codec;
+                            active_profile = started.format.profile();
                             capture_running = true;
                             sent_cursor_shape = None;
                             let recovery_ms = capture_unavailable_since
@@ -947,16 +1066,18 @@ fn spawn_video_sender(
                 continue;
             }
 
-            if buffered_bytes >= VIDEO_BUFFER_CONGESTED_BYTES {
+            let congested_bytes = bitrate.congested_bytes();
+            let drain_bytes = bitrate.drain_bytes();
+            if buffered_bytes >= congested_bytes {
                 let drain_started = tokio::time::Instant::now();
-                while buffered_bytes > VIDEO_BUFFER_DRAIN_BYTES
+                while buffered_bytes > drain_bytes
                     && drain_started.elapsed() < VIDEO_BUFFER_DRAIN_TIMEOUT
                 {
                     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                     buffered_bytes = channel.buffered_amount().await;
                 }
             }
-            if buffered_bytes >= VIDEO_BUFFER_CONGESTED_BYTES {
+            if buffered_bytes >= congested_bytes {
                 buffered_frames_dropped += 1;
                 recovering = true;
                 let queued_frames_dropped = slot.drop_pending();
@@ -1054,20 +1175,23 @@ mod tests {
     #[test]
     fn adaptive_bitrate_uses_aimd_without_oscillating() {
         let mut bitrate = AdaptiveBitrate::new(12_000_000);
+        let congested_bytes = bitrate.congested_bytes();
 
         assert_eq!(
-            bitrate.observe(1_000, VIDEO_BUFFER_CONGESTED_BYTES, 0, false),
+            bitrate.observe(1_000, congested_bytes, 0, false),
             Some(9_000_000)
         );
+        let congested_bytes = bitrate.congested_bytes();
         assert_eq!(
-            bitrate.observe(2_000, VIDEO_BUFFER_CONGESTED_BYTES, 0, false),
+            bitrate.observe(2_000, congested_bytes, 0, false),
             None,
             "decreases are rate limited"
         );
+        let congested_bytes = bitrate.congested_bytes();
         assert_eq!(
             bitrate.observe(
                 1_000 + BITRATE_DECREASE_INTERVAL_US,
-                VIDEO_BUFFER_CONGESTED_BYTES,
+                congested_bytes,
                 0,
                 false,
             ),
@@ -1103,5 +1227,77 @@ mod tests {
         assert_eq!(bitrate.set_maximum(6_000_000), Some(6_000_000));
         assert_eq!(bitrate.current, 6_000_000);
         assert_eq!(bitrate.set_maximum(6_000_000), None);
+    }
+
+    #[test]
+    fn transport_buffer_thresholds_represent_time_not_a_fixed_byte_count() {
+        let low = AdaptiveBitrate::new(3_000_000);
+        let high = AdaptiveBitrate::new(12_000_000);
+
+        assert_eq!(low.drain_bytes(), 18_750);
+        assert_eq!(low.congested_bytes(), 56_250);
+        assert_eq!(high.drain_bytes(), 75_000);
+        assert_eq!(high.congested_bytes(), 225_000);
+    }
+
+    #[test]
+    fn profile_negotiation_prefers_hevc_and_falls_back_to_420() {
+        let profiles = [
+            VideoProfile {
+                codec: Codec::H264,
+                chroma: ChromaMode::Yuv420,
+            },
+            VideoProfile {
+                codec: Codec::H265,
+                chroma: ChromaMode::Yuv420,
+            },
+            VideoProfile {
+                codec: Codec::H264,
+                chroma: ChromaMode::Yuv444,
+            },
+        ];
+
+        assert_eq!(
+            profile_candidates(&profiles, ChromaMode::Yuv444, &[]),
+            vec![
+                VideoProfile {
+                    codec: Codec::H264,
+                    chroma: ChromaMode::Yuv444,
+                },
+                VideoProfile {
+                    codec: Codec::H265,
+                    chroma: ChromaMode::Yuv420,
+                },
+                VideoProfile {
+                    codec: Codec::H264,
+                    chroma: ChromaMode::Yuv420,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejected_video_profiles_are_not_retried() {
+        let h265_444 = VideoProfile {
+            codec: Codec::H265,
+            chroma: ChromaMode::Yuv444,
+        };
+        let h264_444 = VideoProfile {
+            codec: Codec::H264,
+            chroma: ChromaMode::Yuv444,
+        };
+        let h264_420 = VideoProfile {
+            codec: Codec::H264,
+            chroma: ChromaMode::Yuv420,
+        };
+
+        assert_eq!(
+            profile_candidates(
+                &[h265_444, h264_444, h264_420],
+                ChromaMode::Yuv444,
+                &[h265_444],
+            ),
+            vec![h264_444, h264_420]
+        );
     }
 }
