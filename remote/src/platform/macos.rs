@@ -10,16 +10,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use dispatch2::DispatchQueue;
 use meshrmm_protocol::{
-    Codec, CursorShape, Display, EncodedFrame, PointerButton, RemoteInput, SessionMessage,
-    VideoFormat, VideoStreamId,
+    Codec, CursorShape, Display, EncodedFrame, PointerButton, QualityPreset, RemoteInput,
+    SessionMessage, VideoFormat, VideoStreamId,
 };
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSCursor, NSEvent,
-    NSEventModifierFlags, NSFont, NSFontWeightRegular, NSProgressIndicator,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor, NSControlStateValueOn,
+    NSCursor, NSEvent, NSEventModifierFlags, NSFont, NSFontWeightRegular, NSProgressIndicator,
     NSProgressIndicatorStyle, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowDelegate,
     NSWindowStyleMask,
 };
@@ -27,8 +27,9 @@ use objc2_av_foundation::{AVLayerVideoGravityResizeAspect, AVSampleBufferDisplay
 use objc2_core_foundation::{CFBoolean, CFMutableDictionary, CFRetained, CFString, kCFBooleanTrue};
 use objc2_core_media::{
     CMBlockBuffer, CMFormatDescription, CMSampleBuffer, CMSampleTimingInfo, CMTime,
-    CMVideoFormatDescriptionCreateFromH264ParameterSets, kCMSampleAttachmentKey_DisplayImmediately,
-    kCMTimeInvalid,
+    CMVideoFormatDescriptionCreateFromH264ParameterSets,
+    CMVideoFormatDescriptionCreateFromHEVCParameterSets, kCMSampleAttachmentKey_DisplayImmediately,
+    kCMTimeInvalid, kCMVideoCodecType_H264, kCMVideoCodecType_HEVC,
 };
 use objc2_foundation::{
     NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
@@ -37,7 +38,7 @@ use objc2_quartz_core::CAAutoresizingMask;
 
 use super::ControlSink;
 use crate::debug::DebugInfo;
-use crate::h264::annex_b_to_avcc;
+use crate::h264::annex_b_to_length_prefixed;
 
 mod app;
 mod presenter;
@@ -48,7 +49,28 @@ use app::normalized_video_position;
 pub use app::{monotonic_timestamp_us, run_application};
 pub use presenter::Presenter;
 
+#[link(name = "VideoToolbox", kind = "framework")]
+unsafe extern "C" {
+    fn VTIsHardwareDecodeSupported(codec_type: u32) -> u8;
+}
+
+fn hardware_decode_supported(codec: Codec) -> bool {
+    let codec_type = match codec {
+        Codec::H264 => kCMVideoCodecType_H264,
+        Codec::H265 => kCMVideoCodecType_HEVC,
+    };
+    unsafe { VTIsHardwareDecodeSupported(codec_type) != 0 }
+}
+
+pub fn supported_video_codecs(_format: VideoFormat) -> Vec<Codec> {
+    [Codec::H265, Codec::H264]
+        .into_iter()
+        .filter(|codec| hardware_decode_supported(*codec))
+        .collect()
+}
+
 static NEXT_PRESENTER_ID: AtomicU64 = AtomicU64::new(1);
+const SETTINGS_PANEL_WIDTH: f64 = 260.0;
 
 #[cfg(test)]
 mod tests {

@@ -60,6 +60,22 @@ pub enum SessionMessage {
     Clipboard {
         text: String,
     },
+    /// Hardware video decoders and the initial quality preference available
+    /// to the viewer. Codecs are ordered from most to least preferred.
+    ViewerCapabilities {
+        codecs: Vec<Codec>,
+        quality: QualityPreset,
+    },
+    /// Changes the encoder quality ceiling without changing the network path.
+    SetQuality {
+        preset: QualityPreset,
+    },
+    /// The viewer could advertise a decoder but could not initialize it for
+    /// the negotiated stream. The sender must retry with H.264.
+    CodecRejected {
+        codec: Codec,
+        reason: String,
+    },
 }
 
 impl SessionMessage {
@@ -88,6 +104,27 @@ pub struct Display {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Codec {
     H264,
+    H265,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QualityPreset {
+    DataSaver,
+    #[default]
+    Balanced,
+    BestQuality,
+}
+
+impl QualityPreset {
+    /// Applies the preset without exceeding the administrator-configured cap.
+    pub fn bitrate(self, configured_maximum: u32) -> u32 {
+        let preferred = match self {
+            Self::DataSaver => 3_000_000,
+            Self::Balanced => 6_000_000,
+            Self::BestQuality => configured_maximum,
+        };
+        preferred.min(configured_maximum).max(1)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,5 +248,23 @@ mod tests {
         };
 
         assert!(message.encode().unwrap().len() <= 65_536);
+    }
+
+    #[test]
+    fn viewer_capabilities_round_trip() {
+        let message = SessionMessage::ViewerCapabilities {
+            codecs: vec![Codec::H265, Codec::H264],
+            quality: QualityPreset::Balanced,
+        };
+        let encoded = message.encode().unwrap();
+        assert_eq!(SessionMessage::decode(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn quality_presets_respect_the_configured_cap() {
+        assert_eq!(QualityPreset::DataSaver.bitrate(12_000_000), 3_000_000);
+        assert_eq!(QualityPreset::Balanced.bitrate(12_000_000), 6_000_000);
+        assert_eq!(QualityPreset::BestQuality.bitrate(12_000_000), 12_000_000);
+        assert_eq!(QualityPreset::Balanced.bitrate(4_000_000), 4_000_000);
     }
 }

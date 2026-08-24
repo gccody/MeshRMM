@@ -25,7 +25,8 @@ pub trait ScreenStreamer: Send {
     fn stop(&mut self) -> anyhow::Result<()>;
     fn poll_ended(&mut self) -> Option<anyhow::Result<()>>;
     fn request_keyframe(&self) -> anyhow::Result<()>;
-    fn set_bitrate(&self, bits_per_second: u32) -> anyhow::Result<()>;
+    fn set_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()>;
+    fn set_codec(&mut self, codec: Codec);
     fn apply_input(&mut self, input: RemoteInput) -> anyhow::Result<()>;
     fn release_input(&mut self) -> anyhow::Result<()>;
     fn cursor_shape(&self) -> CursorShape;
@@ -36,6 +37,7 @@ pub struct PlatformScreenStreamer {
     inner: CaptureBackend,
     frames_per_second: u32,
     bitrate_bits_per_second: u32,
+    codec: Codec,
     next_frame_id: Arc<AtomicU64>,
     direct_input: super::input::WindowsInputController,
 }
@@ -55,6 +57,7 @@ impl PlatformScreenStreamer {
             },
             frames_per_second,
             bitrate_bits_per_second,
+            codec: Codec::H264,
             next_frame_id: Arc::new(AtomicU64::new(1)),
             direct_input: super::input::WindowsInputController::new(),
         }
@@ -90,6 +93,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
         let config = meshrmm_remote_screen::StreamConfig {
             frames_per_second: self.frames_per_second,
             bitrate_bits_per_second: self.bitrate_bits_per_second,
+            codec: remote_screen_codec(self.codec),
         };
         match &mut self.inner {
             CaptureBackend::Direct(streamer) => {
@@ -143,7 +147,8 @@ impl ScreenStreamer for PlatformScreenStreamer {
         .context("hardware keyframe request failed")
     }
 
-    fn set_bitrate(&self, bits_per_second: u32) -> anyhow::Result<()> {
+    fn set_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()> {
+        self.bitrate_bits_per_second = bits_per_second.max(1);
         match &self.inner {
             CaptureBackend::Direct(streamer) => streamer
                 .set_bitrate(bits_per_second)
@@ -151,6 +156,10 @@ impl ScreenStreamer for PlatformScreenStreamer {
             CaptureBackend::Desktop(streamer) => streamer.set_bitrate(bits_per_second),
         }
         .context("hardware encoder bitrate change failed")
+    }
+
+    fn set_codec(&mut self, codec: Codec) {
+        self.codec = codec;
     }
 
     fn apply_input(&mut self, input: RemoteInput) -> anyhow::Result<()> {
@@ -187,9 +196,20 @@ fn video_format(active: meshrmm_remote_screen::ActiveFormat) -> VideoFormat {
         width: active.width,
         height: active.height,
         frames_per_second: active.frames_per_second as u16,
-        codec: Codec::H264,
+        codec: match active.codec {
+            meshrmm_remote_screen::VideoCodec::H264 => Codec::H264,
+            meshrmm_remote_screen::VideoCodec::H265 => Codec::H265,
+        },
         pixel_format: PixelFormat::Nv12,
         bitrate_bits_per_second: active.bitrate_bits_per_second,
+    }
+}
+
+#[cfg(windows)]
+fn remote_screen_codec(codec: Codec) -> meshrmm_remote_screen::VideoCodec {
+    match codec {
+        Codec::H264 => meshrmm_remote_screen::VideoCodec::H264,
+        Codec::H265 => meshrmm_remote_screen::VideoCodec::H265,
     }
 }
 

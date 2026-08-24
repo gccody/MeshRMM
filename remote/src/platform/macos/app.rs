@@ -113,7 +113,9 @@ define_class!(
         #[unsafe(method(resetCursorRects))]
         fn reset_cursor_rects(&self) {
             let cursor = mac_cursor(*self.ivars().cursor_shape.borrow());
-            self.addCursorRect_cursor(self.bounds(), &cursor);
+            let mut bounds = self.bounds();
+            bounds.size.width = (bounds.size.width - SETTINGS_PANEL_WIDTH).max(1.0);
+            self.addCursorRect_cursor(bounds, &cursor);
         }
 
         #[unsafe(method(mouseMoved:))]
@@ -230,6 +232,21 @@ define_class!(
             };
             self.send_key(code, event.modifierFlags().contains(flag));
         }
+
+        #[unsafe(method(selectDataSaver:))]
+        fn select_data_saver(&self, _sender: &NSButton) {
+            self.select_quality(QualityPreset::DataSaver);
+        }
+
+        #[unsafe(method(selectBalanced:))]
+        fn select_balanced(&self, _sender: &NSButton) {
+            self.select_quality(QualityPreset::Balanced);
+        }
+
+        #[unsafe(method(selectBestQuality:))]
+        fn select_best_quality(&self, _sender: &NSButton) {
+            self.select_quality(QualityPreset::BestQuality);
+        }
     }
 );
 
@@ -253,7 +270,7 @@ impl RemoteView {
                 y: (frame.size.height - 312.0).max(12.0),
             },
             size: NSSize {
-                width: (frame.size.width - 24.0).clamp(300.0, 640.0),
+                width: (frame.size.width - SETTINGS_PANEL_WIDTH - 24.0).clamp(300.0, 640.0),
                 height: 300.0,
             },
         });
@@ -284,11 +301,103 @@ impl RemoteView {
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         this.addSubview(&this.ivars().debug_label);
+        let sidebar_x = (frame.size.width - SETTINGS_PANEL_WIDTH).max(0.0);
+        let title = NSTextField::labelWithString(&NSString::from_str("Settings"), mtm);
+        title.setFont(Some(&NSFont::boldSystemFontOfSize(18.0)));
+        title.setFrame(NSRect {
+            origin: NSPoint {
+                x: sidebar_x + 22.0,
+                y: frame.size.height - 54.0,
+            },
+            size: NSSize {
+                width: SETTINGS_PANEL_WIDTH - 44.0,
+                height: 26.0,
+            },
+        });
+        title.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+        this.addSubview(&title);
+
+        let quality = NSTextField::labelWithString(&NSString::from_str("Quality preset"), mtm);
+        quality.setFrame(NSRect {
+            origin: NSPoint {
+                x: sidebar_x + 22.0,
+                y: frame.size.height - 94.0,
+            },
+            size: NSSize {
+                width: SETTINGS_PANEL_WIDTH - 44.0,
+                height: 22.0,
+            },
+        });
+        quality.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+        this.addSubview(&quality);
+
+        let buttons = [
+            unsafe {
+                NSButton::radioButtonWithTitle_target_action(
+                    &NSString::from_str("Data saver · 3 Mbps"),
+                    Some(&*this),
+                    Some(sel!(selectDataSaver:)),
+                    mtm,
+                )
+            },
+            unsafe {
+                NSButton::radioButtonWithTitle_target_action(
+                    &NSString::from_str("Balanced · 6 Mbps"),
+                    Some(&*this),
+                    Some(sel!(selectBalanced:)),
+                    mtm,
+                )
+            },
+            unsafe {
+                NSButton::radioButtonWithTitle_target_action(
+                    &NSString::from_str("Best quality · maximum"),
+                    Some(&*this),
+                    Some(sel!(selectBestQuality:)),
+                    mtm,
+                )
+            },
+        ];
+        for (index, button) in buttons.iter().enumerate() {
+            button.setFrame(NSRect {
+                origin: NSPoint {
+                    x: sidebar_x + 22.0,
+                    y: frame.size.height - 132.0 - index as f64 * 36.0,
+                },
+                size: NSSize {
+                    width: SETTINGS_PANEL_WIDTH - 44.0,
+                    height: 24.0,
+                },
+            });
+            button.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewMinXMargin
+                    | NSAutoresizingMaskOptions::ViewMinYMargin,
+            );
+            this.addSubview(button);
+        }
+        let selected = match this.ivars().control.quality_preset() {
+            QualityPreset::DataSaver => 0,
+            QualityPreset::Balanced => 1,
+            QualityPreset::BestQuality => 2,
+        };
+        buttons[selected].setState(NSControlStateValueOn);
         this
     }
 
     fn send(&self, message: SessionMessage) {
         self.ivars().control.send(message);
+    }
+
+    fn select_quality(&self, preset: QualityPreset) {
+        self.send(SessionMessage::SetQuality { preset });
+        if let Some(window) = self.window()
+            && !window.makeFirstResponder(Some(self))
+        {
+            tracing::warn!("macOS viewer could not restore input focus after changing quality");
+        }
     }
 
     pub(super) fn set_cursor_shape(&self, shape: CursorShape) {
@@ -315,9 +424,11 @@ impl RemoteView {
 
     fn pointer_position(&self, event: &NSEvent) -> Option<(u16, u16)> {
         let point = self.convertPoint_fromView(event.locationInWindow(), None);
+        let mut bounds = self.bounds();
+        bounds.size.width = (bounds.size.width - SETTINGS_PANEL_WIDTH).max(1.0);
         normalized_video_position(
             point,
-            self.bounds(),
+            bounds,
             self.ivars().video_width,
             self.ivars().video_height,
         )

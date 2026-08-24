@@ -26,7 +26,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
 use meshrmm_remote_screen::{
-    ActiveFormat, EncodedAccessUnit, EncodedFrameSink, StreamConfig,
+    ActiveFormat, EncodedAccessUnit, EncodedFrameSink, StreamConfig, VideoCodec,
     WindowsDesktopDuplicationStreamer,
 };
 
@@ -81,6 +81,7 @@ enum ParentCommand {
         display_id: Option<DisplayId>,
         frames_per_second: u32,
         bitrate_bits_per_second: u32,
+        codec: VideoCodec,
     },
     RequestKeyframe,
     SetBitrate(u32),
@@ -193,6 +194,7 @@ impl DesktopCaptureStreamer {
             display_id,
             frames_per_second: config.frames_per_second,
             bitrate_bits_per_second: config.bitrate_bits_per_second,
+            codec: config.codec,
         };
         if let Err(error) = send_command(&input, &start) {
             terminate_and_wait(&launched.process);
@@ -605,6 +607,7 @@ pub fn run_child() -> anyhow::Result<()> {
         display_id,
         frames_per_second,
         bitrate_bits_per_second,
+        codec,
     } = first
     else {
         anyhow::bail!("desktop helper expected a start command");
@@ -641,6 +644,7 @@ pub fn run_child() -> anyhow::Result<()> {
         StreamConfig {
             frames_per_second,
             bitrate_bits_per_second,
+            codec,
         },
         active_display.id.0,
         sink,
@@ -756,11 +760,13 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             display_id,
             frames_per_second,
             bitrate_bits_per_second,
+            codec,
         } => {
             writer.write_all(&[COMMAND_START])?;
             write_u32(&mut writer, display_id.map_or(NO_DISPLAY, |id| id.0))?;
             write_u32(&mut writer, *frames_per_second)?;
             write_u32(&mut writer, *bitrate_bits_per_second)
+                .and_then(|()| writer.write_all(&[codec_byte(*codec)]))
         }
         ParentCommand::RequestKeyframe => writer.write_all(&[COMMAND_REQUEST_KEYFRAME]),
         ParentCommand::SetBitrate(bits_per_second) => {
@@ -789,6 +795,7 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
                 display_id: (display_id != NO_DISPLAY).then_some(DisplayId(display_id)),
                 frames_per_second: read_u32(&mut reader)?,
                 bitrate_bits_per_second: read_u32(&mut reader)?,
+                codec: read_codec(&mut reader)?,
             })
         }
         COMMAND_REQUEST_KEYFRAME => Ok(ParentCommand::RequestKeyframe),
@@ -823,6 +830,7 @@ fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
             write_u32(&mut writer, started.format.height)?;
             write_u32(&mut writer, started.format.frames_per_second)?;
             write_u32(&mut writer, started.format.bitrate_bits_per_second)?;
+            writer.write_all(&[codec_byte(started.format.codec)])?;
             write_u32(&mut writer, started.active_display.id.0)?;
             checked_len(started.displays.len(), MAX_DISPLAYS, "display list")?;
             write_u32(&mut writer, started.displays.len() as u32)?;
@@ -876,6 +884,7 @@ fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
                 height: read_u32(&mut reader)?,
                 frames_per_second: read_u32(&mut reader)?,
                 bitrate_bits_per_second: read_u32(&mut reader)?,
+                codec: read_codec(&mut reader)?,
             };
             let active_display_id = DisplayId(read_u32(&mut reader)?);
             let count = bounded_len(read_u32(&mut reader)?, MAX_DISPLAYS, "display list")?;
@@ -1035,6 +1044,22 @@ fn read_u8(reader: &mut impl Read) -> io::Result<u8> {
     reader.read_exact(&mut value)?;
     Ok(value[0])
 }
+fn codec_byte(codec: VideoCodec) -> u8 {
+    match codec {
+        VideoCodec::H264 => 1,
+        VideoCodec::H265 => 2,
+    }
+}
+fn read_codec(reader: &mut impl Read) -> io::Result<VideoCodec> {
+    match read_u8(reader)? {
+        1 => Ok(VideoCodec::H264),
+        2 => Ok(VideoCodec::H265),
+        value => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid desktop-helper codec {value}"),
+        )),
+    }
+}
 fn read_u32(reader: &mut impl Read) -> io::Result<u32> {
     let mut value = [0; 4];
     reader.read_exact(&mut value)?;
@@ -1081,6 +1106,7 @@ mod tests {
                 display_id: Some(DisplayId(3)),
                 frames_per_second: 60,
                 bitrate_bits_per_second: 12_000_000,
+                codec: VideoCodec::H265,
             },
             ParentCommand::RequestKeyframe,
             ParentCommand::SetBitrate(4_000_000),
@@ -1117,6 +1143,7 @@ mod tests {
                 height: 1080,
                 frames_per_second: 60,
                 bitrate_bits_per_second: 12_000_000,
+                codec: VideoCodec::H265,
             },
             displays: vec![display.clone()],
             active_display: display,
@@ -1128,6 +1155,7 @@ mod tests {
         };
         assert_eq!(decoded.active_display.id, DisplayId(2));
         assert_eq!(decoded.displays[0].x, -1920);
+        assert_eq!(decoded.format.codec, VideoCodec::H265);
     }
 
     #[test]

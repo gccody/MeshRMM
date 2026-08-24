@@ -28,7 +28,7 @@ impl D3d11Renderer {
         let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
             .context("DXGI factory creation failed")?;
         let swap_desc = DXGI_SWAP_CHAIN_DESC1 {
-            Width: format.width,
+            Width: format.width.saturating_add(SETTINGS_PANEL_WIDTH),
             Height: format.height,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
             Stereo: false.into(),
@@ -64,7 +64,7 @@ impl D3d11Renderer {
                 Numerator: u32::from(format.frames_per_second),
                 Denominator: 1,
             },
-            OutputWidth: format.width,
+            OutputWidth: format.width.saturating_add(SETTINGS_PANEL_WIDTH),
             OutputHeight: format.height,
             Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
         };

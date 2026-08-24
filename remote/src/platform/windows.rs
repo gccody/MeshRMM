@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use meshrmm_protocol::{
-    CursorShape, Display, EncodedFrame, PointerButton, RemoteInput, SessionMessage, VideoFormat,
+    Codec, CursorShape, Display, EncodedFrame, PointerButton, QualityPreset, RemoteInput,
+    SessionMessage, VideoFormat,
 };
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,
@@ -27,7 +28,9 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_F8, VK_F12};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, SetFocus, VK_F8, VK_F12,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, Interface, PCWSTR, w};
 
@@ -47,6 +50,7 @@ const MAX_DECODER_PENDING_FRAMES: usize = 16;
 // enough for short delivery/decoder bursts without treating normal jitter as
 // reference loss; the worker still presents only the newest decoded surface.
 const MAX_PRESENTER_QUEUE_FRAMES: usize = 15;
+const SETTINGS_PANEL_WIDTH: u32 = 280;
 
 struct QueuedFrame {
     frame: EncodedFrame,
@@ -283,4 +287,8 @@ pub fn monotonic_timestamp_us() -> u64 {
         }
         (counter as u64).saturating_mul(1_000_000) / frequency as u64
     }
+}
+
+pub fn supported_video_codecs(format: VideoFormat) -> Vec<Codec> {
+    unsafe { pipeline::supported_video_codecs(format) }
 }

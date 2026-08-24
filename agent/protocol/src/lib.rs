@@ -11,4 +11,4 @@ pub use meshrmm_protocol_types::*;
 pub use session::*;
 pub use video::*;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;

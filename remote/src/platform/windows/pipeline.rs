@@ -182,6 +182,37 @@ unsafe fn create_device() -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext)>
     ))
 }
 
+fn codec_subtype(codec: Codec) -> windows::core::GUID {
+    match codec {
+        Codec::H264 => MFVideoFormat_H264,
+        Codec::H265 => MFVideoFormat_HEVC,
+    }
+}
+
+pub(super) unsafe fn supported_video_codecs(format: VideoFormat) -> Vec<Codec> {
+    let Ok(_com) = (unsafe { ComRuntime::start() }) else {
+        return vec![Codec::H264];
+    };
+    let Ok(_mf) = (unsafe { MediaFoundationRuntime::start() }) else {
+        return vec![Codec::H264];
+    };
+    let Ok((device, _context)) = (unsafe { create_device() }) else {
+        return vec![Codec::H264];
+    };
+    let mut candidate = format;
+    candidate.codec = Codec::H265;
+    let mut supported = Vec::new();
+    match unsafe { HardwareDecoder::new(&device, candidate) } {
+        Ok(_) => supported.push(Codec::H265),
+        Err(error) => {
+            tracing::info!(codec = ?Codec::H265, error = %error, "hardware decoder capability unavailable")
+        }
+    }
+    // The active presenter has already proven the mandatory H.264 GPU path.
+    supported.push(Codec::H264);
+    supported
+}
+
 struct PendingMetadata {
     frame_id: u64,
     decode_start_us: u64,
@@ -206,25 +237,24 @@ struct HardwareDecoder {
     have_output: u32,
     pending: VecDeque<PendingMetadata>,
     first_input_logged: bool,
+    codec: Codec,
 }
 
 impl HardwareDecoder {
     pub(super) unsafe fn new(device: &ID3D11Device, format: VideoFormat) -> anyhow::Result<Self> {
+        let subtype = codec_subtype(format.codec);
         let input_info = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
-            guidSubtype: MFVideoFormat_H264,
+            guidSubtype: subtype,
         };
         let mut activations_ptr: *mut Option<IMFActivate> = ptr::null_mut();
         let mut activation_count = 0;
         unsafe {
             MFTEnumEx(
                 MFT_CATEGORY_VIDEO_DECODER,
-                MFT_ENUM_FLAG(
-                    MFT_ENUM_FLAG_HARDWARE.0
-                        | MFT_ENUM_FLAG_ASYNCMFT.0
-                        | MFT_ENUM_FLAG_SYNCMFT.0
-                        | MFT_ENUM_FLAG_SORTANDFILTER.0,
-                ),
+                // Keep software synchronous/asynchronous MFT categories out
+                // of the candidate list. Hardware MFTs are always async.
+                MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0),
                 Some(&input_info),
                 // Hardware decoder activation objects frequently advertise a
                 // driver-specific output type. Negotiate NV12 with the active
@@ -234,9 +264,12 @@ impl HardwareDecoder {
                 &mut activation_count,
             )
         }
-        .context("hardware H.264 decoder enumeration failed")?;
+        .with_context(|| format!("hardware {:?} decoder enumeration failed", format.codec))?;
         if activation_count == 0 || activations_ptr.is_null() {
-            bail!("no Media Foundation H.264 decoder is installed");
+            bail!(
+                "no Media Foundation {:?} hardware decoder is installed",
+                format.codec
+            );
         }
         let activations =
             unsafe { std::slice::from_raw_parts_mut(activations_ptr, activation_count as usize) };
@@ -247,7 +280,7 @@ impl HardwareDecoder {
         unsafe { CoTaskMemFree(Some(activations_ptr.cast())) };
         let activation = activation.context("hardware decoder activation was empty")?;
         let transform: IMFTransform = unsafe { activation.ActivateObject() }
-            .context("hardware H.264 decoder activation failed")?;
+            .with_context(|| format!("hardware {:?} decoder activation failed", format.codec))?;
         let attributes =
             unsafe { transform.GetAttributes() }.context("decoder attributes unavailable")?;
         let asynchronous = unsafe { attributes.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) != 0;
@@ -256,7 +289,10 @@ impl HardwareDecoder {
                 .context("failed to unlock asynchronous decoder")?;
         }
         if unsafe { attributes.GetUINT32(&MF_SA_D3D11_AWARE) }.unwrap_or(0) == 0 {
-            bail!("H.264 decoder is not D3D11-aware and cannot guarantee GPU decoding");
+            bail!(
+                "{:?} decoder is not D3D11-aware and cannot guarantee GPU decoding",
+                format.codec
+            );
         }
         let _ = unsafe { attributes.SetUINT32(&MF_LOW_LATENCY, 1) };
 
@@ -275,10 +311,10 @@ impl HardwareDecoder {
         }
         .context("failed to attach D3D manager to decoder")?;
 
-        let input_type = unsafe { video_type(MFVideoFormat_H264, format)? };
+        let input_type = unsafe { video_type(subtype, format)? };
         let output_type = unsafe { video_type(MFVideoFormat_NV12, format)? };
         unsafe { transform.SetInputType(0, &input_type, 0) }
-            .context("decoder rejected H.264 input type")?;
+            .with_context(|| format!("decoder rejected {:?} input type", format.codec))?;
         unsafe { transform.SetOutputType(0, &output_type, 0) }
             .context("decoder rejected GPU NV12 output type")?;
         let output_info = unsafe { transform.GetOutputStreamInfo(0) }
@@ -314,6 +350,7 @@ impl HardwareDecoder {
             have_output: 0,
             pending: VecDeque::new(),
             first_input_logged: false,
+            codec: format.codec,
         };
         unsafe { decoder.pump_events(false)? };
         Ok(decoder)
@@ -365,7 +402,8 @@ impl HardwareDecoder {
                 encoded_bytes = queued.frame.data.len(),
                 annex_b = queued.frame.data.starts_with(&[0, 0, 1])
                     || queued.frame.data.starts_with(&[0, 0, 0, 1]),
-                "first H.264 access unit submitted to hardware decoder"
+                codec = ?self.codec,
+                "first access unit submitted to hardware decoder"
             );
             self.first_input_logged = true;
         }
@@ -407,7 +445,7 @@ impl HardwareDecoder {
         unsafe { sample.SetSampleDuration(self.frame_duration_100ns) }
             .context("decoder input duration failed")?;
         unsafe { self.transform.ProcessInput(0, &sample, 0) }
-            .context("hardware H.264 decoder rejected input")?;
+            .with_context(|| format!("hardware {:?} decoder rejected input", self.codec))?;
         if self.asynchronous {
             self.need_input -= 1;
         }
@@ -495,7 +533,7 @@ impl HardwareDecoder {
             if unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }.ok() == Some(MFVideoFormat_NV12) {
                 unsafe { self.transform.SetOutputType(0, &media_type, 0) }
                     .context("decoder rejected its available NV12 output type")?;
-                tracing::info!("hardware decoder applied an H.264 stream format change");
+                tracing::info!(codec = ?self.codec, "hardware decoder applied a stream format change");
                 return Ok(());
             }
         }
@@ -525,6 +563,16 @@ unsafe fn video_type(
     let media_type = unsafe { MFCreateMediaType() }.context("video media type creation failed")?;
     unsafe { media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video) }?;
     unsafe { media_type.SetGUID(&MF_MT_SUBTYPE, &subtype) }?;
+    if subtype != MFVideoFormat_NV12 {
+        match format.codec {
+            Codec::H264 => unsafe {
+                media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)
+            }?,
+            Codec::H265 => unsafe {
+                media_type.SetUINT32(&MF_MT_VIDEO_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)
+            }?,
+        }
+    }
     unsafe {
         media_type.SetUINT64(
             &MF_MT_FRAME_SIZE,
