@@ -344,20 +344,21 @@ impl MacUi {
             codec = ?format.codec,
             "creating macOS viewer window"
         );
-        let scale = ((1440.0_f64 - SETTINGS_PANEL_WIDTH) / f64::from(format.width))
-            .min(900.0_f64 / f64::from(format.height))
+        let scale = (1440.0_f64 / f64::from(format.width))
+            .min((900.0_f64 - VIEWER_TOOLBAR_HEIGHT) / f64::from(format.height))
             .min(1.0);
         let rect = NSRect {
             origin: NSPoint { x: 0.0, y: 0.0 },
             size: NSSize {
-                width: f64::from(format.width) * scale + SETTINGS_PANEL_WIDTH,
-                height: f64::from(format.height) * scale,
+                width: f64::from(format.width) * scale,
+                height: f64::from(format.height) * scale + VIEWER_TOOLBAR_HEIGHT,
             },
         };
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
             | NSWindowStyleMask::Miniaturizable
-            | NSWindowStyleMask::Resizable;
+            | NSWindowStyleMask::Resizable
+            | NSWindowStyleMask::FullSizeContentView;
         // Safety: all AppKit construction occurs on the process main thread.
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -372,6 +373,9 @@ impl MacUi {
         // window alive until MacUi is dropped so queued frames can safely detect
         // that it is no longer visible and end the remote session.
         unsafe { window.setReleasedWhenClosed(false) };
+        window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+        window.setTitlebarAppearsTransparent(true);
+        window.setMovableByWindowBackground(true);
         window.setTitle(&NSString::from_str(&format!(
             "MeshRMM Remote Desktop — {} — Control-Option-Arrow display · F12 diagnostics",
             active_display.name
@@ -396,14 +400,14 @@ impl MacUi {
             layer.setVideoGravity(video_gravity);
         }
         let mut video_bounds = view.bounds();
-        video_bounds.size.width = (video_bounds.size.width - SETTINGS_PANEL_WIDTH).max(1.0);
+        video_bounds.size.height = (video_bounds.size.height - VIEWER_TOOLBAR_HEIGHT).max(1.0);
         let video_host = VideoHostView::new(mtm, video_bounds);
         video_host.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
         // This child has no subviews, so it can safely be layer-hosting. Keep
-        // RemoteView itself as a normal AppKit hierarchy for the sidebar.
+        // RemoteView itself as a normal AppKit hierarchy for the title bar controls.
         video_host.setLayer(Some(&layer));
         video_host.setWantsLayer(true);
         view.addSubview_positioned_relativeTo(&video_host, NSWindowOrderingMode::Below, None);

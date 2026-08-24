@@ -112,6 +112,10 @@ pub(super) struct RemoteViewIvars {
     debug_label: Retained<NSTextField>,
     debug_visible: RefCell<bool>,
     debug_refreshed: RefCell<Instant>,
+    quality_popup: RefCell<Option<Retained<NSPopUpButton>>>,
+    settings_quality_buttons: RefCell<Vec<Retained<NSButton>>>,
+    settings_debug_button: RefCell<Option<Retained<NSButton>>>,
+    settings_window: RefCell<Option<Retained<NSWindow>>>,
 }
 
 define_class!(
@@ -156,7 +160,7 @@ define_class!(
         fn reset_cursor_rects(&self) {
             let cursor = mac_cursor(*self.ivars().cursor_shape.borrow());
             let mut bounds = self.bounds();
-            bounds.size.width = (bounds.size.width - SETTINGS_PANEL_WIDTH).max(1.0);
+            bounds.size.height = (bounds.size.height - VIEWER_TOOLBAR_HEIGHT).max(1.0);
             self.addCursorRect_cursor(bounds, &cursor);
         }
 
@@ -289,6 +293,46 @@ define_class!(
         fn select_best_quality(&self, _sender: &NSButton) {
             self.select_quality(QualityPreset::BestQuality);
         }
+
+        #[unsafe(method(selectDisplayFromToolbar:))]
+        fn select_display_from_toolbar(&self, sender: &NSPopUpButton) {
+            let index = sender.indexOfSelectedItem();
+            if index >= 0
+                && let Some(display) = self.ivars().displays.get(index as usize)
+                && display.id != self.ivars().active_display.id
+            {
+                self.send(SessionMessage::SelectDisplay {
+                    display_id: display.id,
+                });
+            }
+        }
+
+        #[unsafe(method(selectQualityFromToolbar:))]
+        fn select_quality_from_toolbar(&self, sender: &NSPopUpButton) {
+            let preset = match sender.indexOfSelectedItem() {
+                0 => QualityPreset::DataSaver,
+                2 => QualityPreset::BestQuality,
+                _ => QualityPreset::Balanced,
+            };
+            self.select_quality(preset);
+        }
+
+        #[unsafe(method(toggleDiagnostics:))]
+        fn toggle_diagnostics_action(&self, _sender: &NSButton) {
+            self.toggle_debug();
+        }
+
+        #[unsafe(method(toggleViewerFullscreen:))]
+        fn toggle_viewer_fullscreen(&self, _sender: &NSButton) {
+            if let Some(window) = self.window() {
+                window.toggleFullScreen(None);
+            }
+        }
+
+        #[unsafe(method(openViewerSettings:))]
+        fn open_viewer_settings(&self, _sender: &NSButton) {
+            self.open_settings();
+        }
     }
 );
 
@@ -309,10 +353,10 @@ impl RemoteView {
         debug_label.setFrame(NSRect {
             origin: NSPoint {
                 x: 12.0,
-                y: (frame.size.height - 312.0).max(12.0),
+                y: (frame.size.height - VIEWER_TOOLBAR_HEIGHT - 312.0).max(12.0),
             },
             size: NSSize {
-                width: (frame.size.width - SETTINGS_PANEL_WIDTH - 24.0).clamp(300.0, 640.0),
+                width: (frame.size.width - 24.0).clamp(300.0, 640.0),
                 height: 300.0,
             },
         });
@@ -340,48 +384,209 @@ impl RemoteView {
             debug_label,
             debug_visible: RefCell::new(false),
             debug_refreshed: RefCell::new(Instant::now()),
+            quality_popup: RefCell::new(None),
+            settings_quality_buttons: RefCell::new(Vec::new()),
+            settings_debug_button: RefCell::new(None),
+            settings_window: RefCell::new(None),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         this.addSubview(&this.ivars().debug_label);
-        let sidebar_x = (frame.size.width - SETTINGS_PANEL_WIDTH).max(0.0);
-        let title = NSTextField::labelWithString(&NSString::from_str("Settings"), mtm);
-        title.setFont(Some(&NSFont::boldSystemFontOfSize(18.0)));
-        title.setFrame(NSRect {
-            origin: NSPoint {
-                x: sidebar_x + 22.0,
-                y: frame.size.height - 54.0,
+        this.install_toolbar(mtm, frame);
+        this
+    }
+
+    fn install_toolbar(&self, mtm: MainThreadMarker, frame: NSRect) {
+        let toolbar = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect {
+                origin: NSPoint {
+                    x: 0.0,
+                    y: (frame.size.height - VIEWER_TOOLBAR_HEIGHT).max(0.0),
+                },
+                size: NSSize {
+                    width: frame.size.width,
+                    height: VIEWER_TOOLBAR_HEIGHT,
+                },
             },
+        );
+        toolbar.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+        toolbar.setWantsLayer(true);
+        if let Some(layer) = toolbar.layer() {
+            let background = NSColor::colorWithWhite_alpha(0.08, 0.96).CGColor();
+            layer.setBackgroundColor(Some(&background));
+        }
+
+        let display_popup = NSPopUpButton::initWithFrame_pullsDown(
+            NSPopUpButton::alloc(mtm),
+            NSRect {
+                origin: NSPoint { x: 78.0, y: 6.0 },
+                size: NSSize {
+                    width: 160.0,
+                    height: 24.0,
+                },
+            },
+            false,
+        );
+        for display in &self.ivars().displays {
+            display_popup.addItemWithTitle(&NSString::from_str(&display.name));
+        }
+        let active_index = self
+            .ivars()
+            .displays
+            .iter()
+            .position(|display| display.id == self.ivars().active_display.id)
+            .unwrap_or(0);
+        display_popup.selectItemAtIndex(active_index as isize);
+        unsafe {
+            display_popup.setTarget(Some(self));
+            display_popup.setAction(Some(sel!(selectDisplayFromToolbar:)));
+        }
+        toolbar.addSubview(&display_popup);
+
+        let quality_popup = NSPopUpButton::initWithFrame_pullsDown(
+            NSPopUpButton::alloc(mtm),
+            NSRect {
+                origin: NSPoint { x: 244.0, y: 6.0 },
+                size: NSSize {
+                    width: 124.0,
+                    height: 24.0,
+                },
+            },
+            false,
+        );
+        for title in ["Data saver", "Balanced", "Best quality"] {
+            quality_popup.addItemWithTitle(&NSString::from_str(title));
+        }
+        quality_popup.selectItemAtIndex(quality_index(self.ivars().control.quality_preset()));
+        unsafe {
+            quality_popup.setTarget(Some(self));
+            quality_popup.setAction(Some(sel!(selectQualityFromToolbar:)));
+        }
+        toolbar.addSubview(&quality_popup);
+        *self.ivars().quality_popup.borrow_mut() = Some(quality_popup);
+
+        let diagnostics = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Diagnostics"),
+                Some(self),
+                Some(sel!(toggleDiagnostics:)),
+                mtm,
+            )
+        };
+        diagnostics.setFrame(NSRect {
+            origin: NSPoint { x: 374.0, y: 6.0 },
             size: NSSize {
-                width: SETTINGS_PANEL_WIDTH - 44.0,
+                width: 88.0,
+                height: 24.0,
+            },
+        });
+        toolbar.addSubview(&diagnostics);
+
+        let fullscreen = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Full screen"),
+                Some(self),
+                Some(sel!(toggleViewerFullscreen:)),
+                mtm,
+            )
+        };
+        fullscreen.setFrame(NSRect {
+            origin: NSPoint { x: 468.0, y: 6.0 },
+            size: NSSize {
+                width: 84.0,
+                height: 24.0,
+            },
+        });
+        toolbar.addSubview(&fullscreen);
+
+        let settings = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("⚙"),
+                Some(self),
+                Some(sel!(openViewerSettings:)),
+                mtm,
+            )
+        };
+        settings.setFrame(NSRect {
+            origin: NSPoint { x: 558.0, y: 6.0 },
+            size: NSSize {
+                width: 34.0,
+                height: 24.0,
+            },
+        });
+        settings.setToolTip(Some(&NSString::from_str("Viewer settings")));
+        toolbar.addSubview(&settings);
+        self.addSubview(&toolbar);
+    }
+
+    fn open_settings(&self) {
+        if let Some(window) = self.ivars().settings_window.borrow().as_ref() {
+            window.makeKeyAndOrderFront(None);
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let rect = NSRect {
+            origin: NSPoint { x: 0.0, y: 0.0 },
+            size: NSSize {
+                width: 520.0,
+                height: 350.0,
+            },
+        };
+        let style = NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Miniaturizable;
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                rect,
+                style,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setTitle(&NSString::from_str("Viewer settings"));
+
+        let tabs = NSTabView::initWithFrame(NSTabView::alloc(mtm), rect);
+
+        let display_item =
+            unsafe { NSTabViewItem::initWithIdentifier(NSTabViewItem::alloc(), None) };
+        display_item.setLabel(&NSString::from_str("Display"));
+        let display_pane = NSView::initWithFrame(NSView::alloc(mtm), rect);
+        let display_heading =
+            NSTextField::labelWithString(&NSString::from_str("Image quality"), mtm);
+        display_heading.setFont(Some(&NSFont::boldSystemFontOfSize(17.0)));
+        display_heading.setFrame(NSRect {
+            origin: NSPoint { x: 26.0, y: 248.0 },
+            size: NSSize {
+                width: 420.0,
                 height: 26.0,
             },
         });
-        title.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
+        display_pane.addSubview(&display_heading);
+        let display_copy = NSTextField::wrappingLabelWithString(
+            &NSString::from_str(
+                "Choose how much bandwidth the remote desktop may use. Changes apply immediately.",
+            ),
+            mtm,
         );
-        this.addSubview(&title);
-
-        let quality = NSTextField::labelWithString(&NSString::from_str("Quality preset"), mtm);
-        quality.setFrame(NSRect {
-            origin: NSPoint {
-                x: sidebar_x + 22.0,
-                y: frame.size.height - 94.0,
-            },
+        display_copy.setFrame(NSRect {
+            origin: NSPoint { x: 26.0, y: 202.0 },
             size: NSSize {
-                width: SETTINGS_PANEL_WIDTH - 44.0,
-                height: 22.0,
+                width: 450.0,
+                height: 42.0,
             },
         });
-        quality.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
-        );
-        this.addSubview(&quality);
-
-        let buttons = [
+        display_pane.addSubview(&display_copy);
+        let quality_buttons = [
             unsafe {
                 NSButton::radioButtonWithTitle_target_action(
                     &NSString::from_str("Data saver · 3 Mbps"),
-                    Some(&*this),
+                    Some(self),
                     Some(sel!(selectDataSaver:)),
                     mtm,
                 )
@@ -389,44 +594,114 @@ impl RemoteView {
             unsafe {
                 NSButton::radioButtonWithTitle_target_action(
                     &NSString::from_str("Balanced · 6 Mbps"),
-                    Some(&*this),
+                    Some(self),
                     Some(sel!(selectBalanced:)),
                     mtm,
                 )
             },
             unsafe {
                 NSButton::radioButtonWithTitle_target_action(
-                    &NSString::from_str("Best quality · maximum"),
-                    Some(&*this),
+                    &NSString::from_str("Best quality · configured maximum"),
+                    Some(self),
                     Some(sel!(selectBestQuality:)),
                     mtm,
                 )
             },
         ];
-        for (index, button) in buttons.iter().enumerate() {
+        for (index, button) in quality_buttons.iter().enumerate() {
             button.setFrame(NSRect {
                 origin: NSPoint {
-                    x: sidebar_x + 22.0,
-                    y: frame.size.height - 132.0 - index as f64 * 36.0,
+                    x: 26.0,
+                    y: 158.0 - index as f64 * 42.0,
                 },
                 size: NSSize {
-                    width: SETTINGS_PANEL_WIDTH - 44.0,
-                    height: 24.0,
+                    width: 430.0,
+                    height: 26.0,
                 },
             });
-            button.setAutoresizingMask(
-                NSAutoresizingMaskOptions::ViewMinXMargin
-                    | NSAutoresizingMaskOptions::ViewMinYMargin,
-            );
-            this.addSubview(button);
+            display_pane.addSubview(button);
         }
-        let selected = match this.ivars().control.quality_preset() {
-            QualityPreset::DataSaver => 0,
-            QualityPreset::Balanced => 1,
-            QualityPreset::BestQuality => 2,
+        quality_buttons[quality_index(self.ivars().control.quality_preset()) as usize]
+            .setState(NSControlStateValueOn);
+        *self.ivars().settings_quality_buttons.borrow_mut() = quality_buttons.into_iter().collect();
+        display_item.setView(Some(&display_pane));
+        tabs.addTabViewItem(&display_item);
+
+        let input_item = unsafe { NSTabViewItem::initWithIdentifier(NSTabViewItem::alloc(), None) };
+        input_item.setLabel(&NSString::from_str("Input"));
+        let input_pane = NSView::initWithFrame(NSView::alloc(mtm), rect);
+        let input_heading =
+            NSTextField::labelWithString(&NSString::from_str("Keyboard and pointer"), mtm);
+        input_heading.setFont(Some(&NSFont::boldSystemFontOfSize(17.0)));
+        input_heading.setFrame(NSRect {
+            origin: NSPoint { x: 26.0, y: 248.0 },
+            size: NSSize {
+                width: 420.0,
+                height: 26.0,
+            },
+        });
+        input_pane.addSubview(&input_heading);
+        let input_copy = NSTextField::wrappingLabelWithString(
+            &NSString::from_str(
+                "Remote input is active while the viewer is focused. Display shortcuts remain available from the top bar.",
+            ),
+            mtm,
+        );
+        input_copy.setFrame(NSRect {
+            origin: NSPoint { x: 26.0, y: 186.0 },
+            size: NSSize {
+                width: 450.0,
+                height: 56.0,
+            },
+        });
+        input_pane.addSubview(&input_copy);
+        input_item.setView(Some(&input_pane));
+        tabs.addTabViewItem(&input_item);
+
+        let advanced_item =
+            unsafe { NSTabViewItem::initWithIdentifier(NSTabViewItem::alloc(), None) };
+        advanced_item.setLabel(&NSString::from_str("Advanced"));
+        let advanced_pane = NSView::initWithFrame(NSView::alloc(mtm), rect);
+        let advanced_heading =
+            NSTextField::labelWithString(&NSString::from_str("Troubleshooting"), mtm);
+        advanced_heading.setFont(Some(&NSFont::boldSystemFontOfSize(17.0)));
+        advanced_heading.setFrame(NSRect {
+            origin: NSPoint { x: 26.0, y: 248.0 },
+            size: NSSize {
+                width: 420.0,
+                height: 26.0,
+            },
+        });
+        advanced_pane.addSubview(&advanced_heading);
+        let diagnostics = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                &NSString::from_str("Show diagnostics overlay"),
+                Some(self),
+                Some(sel!(toggleDiagnostics:)),
+                mtm,
+            )
         };
-        buttons[selected].setState(NSControlStateValueOn);
-        this
+        diagnostics.setFrame(NSRect {
+            origin: NSPoint { x: 26.0, y: 196.0 },
+            size: NSSize {
+                width: 300.0,
+                height: 28.0,
+            },
+        });
+        diagnostics.setState(if *self.ivars().debug_visible.borrow() {
+            NSControlStateValueOn
+        } else {
+            objc2_app_kit::NSControlStateValueOff
+        });
+        advanced_pane.addSubview(&diagnostics);
+        *self.ivars().settings_debug_button.borrow_mut() = Some(diagnostics);
+        advanced_item.setView(Some(&advanced_pane));
+        tabs.addTabViewItem(&advanced_item);
+
+        window.setContentView(Some(&tabs));
+        window.center();
+        window.makeKeyAndOrderFront(None);
+        *self.ivars().settings_window.borrow_mut() = Some(window);
     }
 
     fn send(&self, message: SessionMessage) {
@@ -434,6 +709,23 @@ impl RemoteView {
     }
 
     fn select_quality(&self, preset: QualityPreset) {
+        let selected = quality_index(preset);
+        if let Some(popup) = self.ivars().quality_popup.borrow().as_ref() {
+            popup.selectItemAtIndex(selected);
+        }
+        for (index, button) in self
+            .ivars()
+            .settings_quality_buttons
+            .borrow()
+            .iter()
+            .enumerate()
+        {
+            button.setState(if index as isize == selected {
+                NSControlStateValueOn
+            } else {
+                objc2_app_kit::NSControlStateValueOff
+            });
+        }
         self.send(SessionMessage::SetQuality { preset });
         if let Some(window) = self.window()
             && !window.makeFirstResponder(Some(self))
@@ -467,7 +759,7 @@ impl RemoteView {
     fn pointer_position(&self, event: &NSEvent) -> Option<(u16, u16)> {
         let point = self.convertPoint_fromView(event.locationInWindow(), None);
         let mut bounds = self.bounds();
-        bounds.size.width = (bounds.size.width - SETTINGS_PANEL_WIDTH).max(1.0);
+        bounds.size.height = (bounds.size.height - VIEWER_TOOLBAR_HEIGHT).max(1.0);
         normalized_video_position(
             point,
             bounds,
@@ -550,6 +842,13 @@ impl RemoteView {
         let visible = !*self.ivars().debug_visible.borrow();
         *self.ivars().debug_visible.borrow_mut() = visible;
         self.ivars().debug_label.setHidden(!visible);
+        if let Some(button) = self.ivars().settings_debug_button.borrow().as_ref() {
+            button.setState(if visible {
+                NSControlStateValueOn
+            } else {
+                objc2_app_kit::NSControlStateValueOff
+            });
+        }
         if visible {
             self.refresh_debug(true);
         }
@@ -589,6 +888,14 @@ impl RemoteView {
     pub(super) fn disable_input(&self) {
         self.release_input();
         self.ivars().control.set_input_enabled(false);
+    }
+}
+
+fn quality_index(preset: QualityPreset) -> isize {
+    match preset {
+        QualityPreset::DataSaver => 0,
+        QualityPreset::Balanced => 1,
+        QualityPreset::BestQuality => 2,
     }
 }
 

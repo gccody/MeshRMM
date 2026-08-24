@@ -15,13 +15,16 @@ use meshrmm_protocol::{
 };
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{
+    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
+};
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor, NSControlStateValueOn,
-    NSCursor, NSEvent, NSEventModifierFlags, NSFont, NSFontWeightRegular, NSProgressIndicator,
-    NSProgressIndicatorStyle, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowDelegate,
-    NSWindowOrderingMode, NSWindowStyleMask,
+    NSCursor, NSEvent, NSEventModifierFlags, NSFont, NSFontWeightRegular, NSPopUpButton,
+    NSProgressIndicator, NSProgressIndicatorStyle, NSTabView, NSTabViewItem, NSTextAlignment,
+    NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowOrderingMode, NSWindowStyleMask,
+    NSWindowTitleVisibility,
 };
 use objc2_av_foundation::{
     AVLayerVideoGravityResizeAspect, AVQueuedSampleBufferRenderingStatus,
@@ -72,7 +75,7 @@ pub fn supported_video_codecs(_format: VideoFormat) -> Vec<Codec> {
 }
 
 static NEXT_PRESENTER_ID: AtomicU64 = AtomicU64::new(1);
-const SETTINGS_PANEL_WIDTH: f64 = 260.0;
+const VIEWER_TOOLBAR_HEIGHT: f64 = 36.0;
 
 #[cfg(test)]
 mod tests {

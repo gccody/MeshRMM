@@ -28,8 +28,8 @@ impl D3d11Renderer {
         let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
             .context("DXGI factory creation failed")?;
         let swap_desc = DXGI_SWAP_CHAIN_DESC1 {
-            Width: format.width.saturating_add(SETTINGS_PANEL_WIDTH),
-            Height: format.height,
+            Width: format.width,
+            Height: format.height.saturating_add(VIEWER_TOOLBAR_HEIGHT),
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
             Stereo: false.into(),
             SampleDesc: DXGI_SAMPLE_DESC {
@@ -64,8 +64,8 @@ impl D3d11Renderer {
                 Numerator: u32::from(format.frames_per_second),
                 Denominator: 1,
             },
-            OutputWidth: format.width.saturating_add(SETTINGS_PANEL_WIDTH),
-            OutputHeight: format.height,
+            OutputWidth: format.width,
+            OutputHeight: format.height.saturating_add(VIEWER_TOOLBAR_HEIGHT),
             Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
         };
         let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&content) }
@@ -100,9 +100,9 @@ impl D3d11Renderer {
         .context("swap-chain video output view creation failed")?;
         let rect = RECT {
             left: 0,
-            top: 0,
+            top: VIEWER_TOOLBAR_HEIGHT as i32,
             right: format.width as i32,
-            bottom: format.height as i32,
+            bottom: format.height.saturating_add(VIEWER_TOOLBAR_HEIGHT) as i32,
         };
         unsafe { video_context.VideoProcessorSetOutputTargetRect(&processor, true, Some(&rect)) };
         unsafe {
@@ -112,8 +112,14 @@ impl D3d11Renderer {
                 D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
             )
         };
+        let source_rect = RECT {
+            left: 0,
+            top: 0,
+            right: format.width as i32,
+            bottom: format.height as i32,
+        };
         unsafe {
-            video_context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&rect))
+            video_context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&source_rect))
         };
         unsafe { video_context.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&rect)) };
         Ok(Self {
