@@ -56,6 +56,9 @@ const BITRATE_DECREASE_INTERVAL_US: u64 = 500_000;
 const BITRATE_INCREASE_INTERVAL_US: u64 = 5_000_000;
 const DESKTOP_LIFECYCLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const DESKTOP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+const DISCONNECTED_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+const SIGNAL_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+const SIGNAL_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Debug)]
 struct AdaptiveBitrate {
@@ -395,6 +398,9 @@ async fn run_connected_sender(
     session_state = session_state.transition(SessionState::Connecting)?;
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     stats_interval.tick().await;
+    let mut heartbeat_interval = tokio::time::interval(SIGNAL_HEARTBEAT_INTERVAL);
+    heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat_interval.tick().await;
     let mut desktop_interval = tokio::time::interval(DESKTOP_LIFECYCLE_INTERVAL);
     desktop_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     desktop_interval.tick().await;
@@ -408,6 +414,8 @@ async fn run_connected_sender(
     let mut pending_candidates = Vec::new();
     let mut capture_unavailable_since = None::<std::time::Instant>;
     let mut capture_retry_after = std::time::Instant::now();
+    let mut disconnected_since = None::<tokio::time::Instant>;
+    let mut last_signal_message = tokio::time::Instant::now();
     let result: anyhow::Result<()> = async {
         loop {
             tokio::select! {
@@ -417,6 +425,7 @@ async fn run_connected_sender(
             }
             incoming = signal_reader.next() => {
                 let Some(incoming) = incoming else { break Err(anyhow::anyhow!("signaling connection closed")); };
+                last_signal_message = tokio::time::Instant::now();
                 match incoming? {
                     Message::Text(text) => {
                         let signal: SignalMessage = serde_json::from_str(text.as_str())?;
@@ -444,15 +453,29 @@ async fn run_connected_sender(
                                     pending_candidates.push(candidate);
                                 }
                             }
-                            SignalMessage::PeerLeft => break Ok(()),
+                            SignalMessage::PeerLeft => {
+                                break Err(anyhow::anyhow!("viewer disconnected from the remote session"));
+                            }
                             SignalMessage::Error { message } => break Err(anyhow::anyhow!(message)),
                             _ => {}
                         }
                     }
                     Message::Ping(payload) => signal_writer.send(Message::Pong(payload)).await?,
-                    Message::Close(_) => break Ok(()),
+                    Message::Close(frame) => {
+                        break Err(anyhow::anyhow!("signaling connection closed: {frame:?}"));
+                    }
                     _ => {}
                 }
+            }
+            _ = heartbeat_interval.tick() => {
+                if last_signal_message.elapsed() >= SIGNAL_LIVENESS_TIMEOUT {
+                    break Err(anyhow::anyhow!(
+                        "signaling server did not respond for {} seconds",
+                        SIGNAL_LIVENESS_TIMEOUT.as_secs()
+                    ));
+                }
+                signal_writer.send(Message::Ping(Default::default())).await
+                    .context("failed to send signaling heartbeat")?;
             }
             Some(command) = control_rx.recv() => {
                 match command {
@@ -703,7 +726,12 @@ async fn run_connected_sender(
                 {
                     session_state = session_state.transition(SessionState::Streaming)?;
                 }
-                if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed | RTCPeerConnectionState::Disconnected) {
+                if state == RTCPeerConnectionState::Connected {
+                    disconnected_since = None;
+                } else if state == RTCPeerConnectionState::Disconnected {
+                    disconnected_since.get_or_insert_with(tokio::time::Instant::now);
+                }
+                if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
                     break Err(anyhow::anyhow!("WebRTC connection ended in state {state:?}"));
                 }
             }
@@ -767,6 +795,12 @@ async fn run_connected_sender(
                 }
             },
             _ = stats_interval.tick() => {
+                if disconnected_since.is_some_and(|since| since.elapsed() >= DISCONNECTED_GRACE_PERIOD) {
+                    break Err(anyhow::anyhow!(
+                        "WebRTC remained disconnected for {} seconds",
+                        DISCONNECTED_GRACE_PERIOD.as_secs()
+                    ));
+                }
                 log_network_stats(&peer).await;
             },
             }

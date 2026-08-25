@@ -10,6 +10,8 @@ mod transport;
 mod updater;
 
 use anyhow::Context;
+use meshrmm_signaling_client::ReconnectBackoff;
+use std::time::Duration;
 
 fn initialize(launch_deep_link: Option<&str>) -> anyhow::Result<config::Config> {
     #[cfg(windows)]
@@ -131,7 +133,7 @@ fn register_windows_deep_link_handler() {
 }
 
 async fn run_session(config: config::Config) -> anyhow::Result<()> {
-    let bootstrap = signaling::create_session(&config)
+    let mut bootstrap = signaling::create_session(&config)
         .await
         .context("remote session request failed")?;
     tracing::info!(
@@ -139,9 +141,47 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
         expires_at_unix_ms = bootstrap.expires_at_unix_ms,
         "remote session authorized"
     );
-    transport::run_receiver(&config, bootstrap)
-        .await
-        .context("remote viewer session failed")
+    let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(15));
+    let resume_state = transport::ViewerResumeState::default();
+    loop {
+        match transport::run_receiver(&config, bootstrap.clone(), resume_state.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(error) if signaling::is_terminal_session_error(&error) => {
+                return Err(error).context("remote viewer session can no longer be resumed");
+            }
+            Err(error) => {
+                let delay = backoff.next_delay();
+                tracing::warn!(
+                    error = ?error,
+                    session_id = %bootstrap.session_id,
+                    retry_seconds = delay.as_secs(),
+                    "remote viewer disconnected; waiting to resume"
+                );
+                match signaling::resume_session(&config, &bootstrap).await {
+                    Ok(refreshed) => {
+                        bootstrap = refreshed;
+                        tracing::info!(
+                            session_id = %bootstrap.session_id,
+                            expires_at_unix_ms = bootstrap.expires_at_unix_ms,
+                            "refreshed remote-session credentials for reconnect"
+                        );
+                    }
+                    Err(error) if signaling::is_terminal_session_error(&error) => {
+                        return Err(error)
+                            .context("remote viewer session can no longer be resumed");
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = ?error,
+                            session_id = %bootstrap.session_id,
+                            "could not refresh resume credentials; retrying the existing session"
+                        );
+                    }
+                }
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
 }
 
 #[cfg(windows)]

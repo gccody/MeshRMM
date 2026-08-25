@@ -1,7 +1,8 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use anyhow::Context;
 use meshrmm_protocol::{AgentSessionRequest, QualityPreset};
+use meshrmm_signaling_client::{ReconnectBackoff, is_terminal_websocket_error};
 
 use super::config::{Config, ExecutionMode};
 use super::platform::{PlatformScreenStreamer, ScreenStreamer};
@@ -23,13 +24,31 @@ pub async fn run(
             mode == ExecutionMode::Worker,
         ))));
     tracing::info!(session_id = %session_id, "remote session requested");
-    super::transport::run_sender(
-        signal_url,
-        request.signaling_token.as_str(),
-        request.ice_servers,
-        streamer,
-        session_id,
-    )
-    .await
-    .context("P2P sender session failed")
+    let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(15));
+    loop {
+        match super::transport::run_sender(
+            signal_url.clone(),
+            request.signaling_token.as_str(),
+            request.ice_servers.clone(),
+            Arc::clone(&streamer),
+            session_id.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) if is_terminal_websocket_error(&error) => {
+                return Err(error);
+            }
+            Err(error) => {
+                let delay = backoff.next_delay();
+                tracing::warn!(
+                    error = ?error,
+                    session_id = %session_id,
+                    retry_seconds = delay.as_secs(),
+                    "remote sender disconnected; waiting to resume"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
 }

@@ -130,6 +130,8 @@ pub(crate) async fn create_session_for_device(
     let ice_servers = generate_ice_servers(environment, idle_timeout_seconds).await?;
 
     let init = SessionInit {
+        session_id: &session_id,
+        device_id,
         client_token: &client_token,
         agent_token: &agent_token,
         expires_at_unix_ms,
