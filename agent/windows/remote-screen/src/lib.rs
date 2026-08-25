@@ -220,11 +220,52 @@ struct CaptureHandler {
     format: ActiveFormat,
     frames_captured: u64,
     frames_encoded: u64,
+    frames_rate_limited: u64,
     encoded_bytes: u64,
     stats_started_us: u64,
     logged_first_capture: bool,
     logged_first_conversion: bool,
     logged_first_submission: bool,
+    frame_pacer: FramePacer,
+}
+
+/// Keeps game and high-refresh desktops from feeding the encoder faster than
+/// the negotiated stream rate. Capture APIs may treat their requested update
+/// interval as advisory, so the encoder boundary must enforce it as well.
+#[derive(Debug)]
+struct FramePacer {
+    frame_interval_us: u64,
+    next_due_us: Option<u64>,
+}
+
+impl FramePacer {
+    fn new(frames_per_second: u32) -> Self {
+        let frames_per_second = u64::from(frames_per_second.max(1));
+        Self {
+            // Capture timestamps have microsecond precision. Retaining the
+            // fractional deadline phase below prevents a 120/144 Hz source
+            // from falling well below the requested 60 FPS after rounding.
+            frame_interval_us: (1_000_000_u64 / frames_per_second).max(1),
+            next_due_us: None,
+        }
+    }
+
+    fn allow(&mut self, now_us: u64) -> bool {
+        if self.next_due_us.is_some_and(|due| now_us < due) {
+            return false;
+        }
+        let next_due_us = self.next_due_us.map_or_else(
+            || now_us.saturating_add(self.frame_interval_us),
+            |due| due.saturating_add(self.frame_interval_us),
+        );
+        // Do not catch up with a burst after capture was idle or blocked.
+        self.next_due_us = Some(if next_due_us <= now_us {
+            now_us.saturating_add(self.frame_interval_us)
+        } else {
+            next_due_us
+        });
+        true
+    }
 }
 
 // Safety: windows-capture constructs and invokes CaptureHandler exclusively on
@@ -268,11 +309,13 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             format,
             frames_captured: 0,
             frames_encoded: 0,
+            frames_rate_limited: 0,
             encoded_bytes: 0,
             stats_started_us: monotonic_timestamp_us()?,
             logged_first_capture: false,
             logged_first_conversion: false,
             logged_first_submission: false,
+            frame_pacer: FramePacer::new(format.frames_per_second),
         })
     }
 
@@ -314,7 +357,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         // captured frame would rotate through the fixed surface pool and could
         // overwrite a texture that the encoder was still reading.
         let mut access_units = self.encoder.poll()?;
-        if self.encoder.wants_input() {
+        if self.encoder.wants_input() && self.frame_pacer.allow(encode_start_us) {
             let yuv = self.converter.convert(frame.as_raw_texture())?;
             if !self.logged_first_conversion {
                 self.logged_first_conversion = true;
@@ -333,6 +376,8 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
                 );
             }
             access_units.extend(submitted);
+        } else if self.encoder.wants_input() {
+            self.frames_rate_limited += 1;
         }
         for access_unit in access_units {
             self.frames_encoded += 1;
@@ -360,6 +405,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
                 bitrate_bits_per_second = self.encoded_bytes as f64 * 8.0 / elapsed_seconds,
                 frames_captured = self.frames_captured,
                 frames_encoded = self.frames_encoded,
+                frames_rate_limited = self.frames_rate_limited,
                 width = self.format.width,
                 height = self.format.height,
                 codec = self.format.codec.name(),
@@ -367,6 +413,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             );
             self.frames_captured = 0;
             self.frames_encoded = 0;
+            self.frames_rate_limited = 0;
             self.encoded_bytes = 0;
             self.stats_started_us = now_us;
         }
@@ -547,3 +594,32 @@ impl Drop for WindowsScreenStreamer {
 // and windows-capture invokes it on the single capture/GPU worker thread.
 #[allow(dead_code)]
 fn _assert_device_types(_: &ID3D11Device, _: &ID3D11DeviceContext) {}
+
+#[cfg(test)]
+mod tests {
+    use super::FramePacer;
+
+    #[test]
+    fn frame_pacer_caps_high_refresh_capture_to_configured_rate() {
+        let mut pacer = FramePacer::new(60);
+        assert!(pacer.allow(1_000_000));
+        assert!(!pacer.allow(1_008_333));
+        assert!(pacer.allow(1_016_666));
+        assert!(!pacer.allow(1_016_667));
+    }
+
+    #[test]
+    fn frame_pacer_retains_rate_across_a_144_hz_source() {
+        let mut pacer = FramePacer::new(60);
+        let submitted = (0..=144).filter(|frame| pacer.allow(frame * 6_944)).count();
+        assert!((59..=61).contains(&submitted));
+    }
+
+    #[test]
+    fn frame_pacer_recovers_without_emitting_a_burst() {
+        let mut pacer = FramePacer::new(60);
+        assert!(pacer.allow(1_000_000));
+        assert!(pacer.allow(2_000_000));
+        assert!(!pacer.allow(2_000_001));
+    }
+}

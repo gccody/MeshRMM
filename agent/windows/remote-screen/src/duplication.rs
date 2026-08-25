@@ -11,8 +11,8 @@ use windows_capture::monitor::Monitor;
 use crate::converter::BgraToYuvConverter;
 use crate::encoder::{MediaFoundationVideoEncoder, VideoEncoder};
 use crate::{
-    ActiveFormat, ControlState, EncodedAccessUnit, EncodedFrameSink, Error, StreamConfig,
-    monotonic_timestamp_us,
+    ActiveFormat, ControlState, EncodedAccessUnit, EncodedFrameSink, Error, FramePacer,
+    StreamConfig, monotonic_timestamp_us,
 };
 
 // Desktop Duplication blocks until pixels change. Keep the wait short because
@@ -267,10 +267,12 @@ fn capture_loop_inner(
 
     let mut frames_captured = 0_u64;
     let mut frames_encoded = 0_u64;
+    let mut frames_rate_limited = 0_u64;
     let mut encoded_bytes = 0_u64;
     let mut stats_started_us = monotonic_timestamp_us()?;
     let mut cached_yuv = None;
     let mut keyframe_input_pending = false;
+    let mut frame_pacer = FramePacer::new(config.frames_per_second);
     while !stop.load(Ordering::Acquire) {
         // Apply controls and drain output independently of desktop damage.
         // Media Foundation encoders are asynchronous: submit() may return no
@@ -312,11 +314,13 @@ fn capture_loop_inner(
             }
             let capture_timestamp_us = monotonic_timestamp_us()?;
             frames_captured += 1;
-            if encoder.wants_input() {
+            if encoder.wants_input() && frame_pacer.allow(capture_timestamp_us) {
                 let yuv = converter.convert(frame.texture())?;
                 cached_yuv = Some(yuv.clone());
                 access_units.extend(encoder.submit(yuv, capture_timestamp_us)?);
                 keyframe_input_pending = false;
+            } else if encoder.wants_input() {
+                frames_rate_limited += 1;
             }
         } else if keyframe_input_pending
             && encoder.wants_input()
@@ -349,12 +353,14 @@ fn capture_loop_inner(
                 capture_fps = frames_captured as f64 / elapsed_seconds,
                 stream_fps = frames_encoded as f64 / elapsed_seconds,
                 bitrate_bits_per_second = encoded_bytes as f64 * 8.0 / elapsed_seconds,
+                frames_rate_limited,
                 width,
                 height,
                 "Desktop Duplication capture/encoder statistics"
             );
             frames_captured = 0;
             frames_encoded = 0;
+            frames_rate_limited = 0;
             encoded_bytes = 0;
             stats_started_us = now_us;
         }
