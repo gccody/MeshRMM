@@ -519,6 +519,20 @@ async fn run_connected_sender(
                             &rejected_profiles,
                         );
                         if candidates.first() == Some(&active_profile) {
+                            // Echo the settled configuration even when no
+                            // restart is needed. The viewer deliberately does
+                            // not paint the mandatory bootstrap profile until
+                            // capability negotiation has completed.
+                            send_control_message(
+                                &control_channel,
+                                SessionMessage::DisplayConfiguration {
+                                    displays: displays.clone(),
+                                    active_display_id: active_display.id,
+                                    stream_id,
+                                    format,
+                                },
+                            )
+                            .await?;
                             tracing::info!(?active_profile, ?quality, ?requested_chroma, "video profile negotiation retained active profile");
                             continue;
                         }
