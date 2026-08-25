@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -92,6 +92,15 @@ impl VideoReceiveState {
         self.waiting_for_keyframe = true;
     }
 
+    fn observe_stream(&mut self, stream_id: VideoStreamId) {
+        if self.stream_id != Some(stream_id) {
+            self.stream_id = Some(stream_id);
+            self.last_accepted_frame_id = None;
+            self.waiting_for_keyframe = true;
+            self.last_keyframe_request_us = 0;
+        }
+    }
+
     fn keyframe_request_due(&mut self, now_us: u64) -> bool {
         if self.last_keyframe_request_us == 0
             || now_us.saturating_sub(self.last_keyframe_request_us) >= KEYFRAME_RETRY_INTERVAL_US
@@ -108,12 +117,7 @@ impl VideoReceiveState {
         frame: EncodedFrame,
         now_us: u64,
     ) -> (Option<EncodedFrame>, bool) {
-        if self.stream_id != Some(frame.stream_id) {
-            self.stream_id = Some(frame.stream_id);
-            self.last_accepted_frame_id = None;
-            self.waiting_for_keyframe = true;
-            self.last_keyframe_request_us = 0;
-        }
+        self.observe_stream(frame.stream_id);
 
         let gap = self
             .last_accepted_frame_id
@@ -740,6 +744,7 @@ fn install_control_handler(
     }
     let cursor_shape = Arc::new(Mutex::new(CursorShape::Default));
     let capabilities_sent = Arc::new(AtomicBool::new(false));
+    let supported_profiles = Arc::new(OnceLock::<Arc<Vec<VideoProfile>>>::new());
     let configurations_seen = Arc::new(AtomicU64::new(0));
     let resume_state = viewer_control.resume_state.clone();
     let quality_preset = Arc::clone(&resume_state.quality);
@@ -749,6 +754,7 @@ fn install_control_handler(
         let presenter = Arc::clone(&presenter);
         let cursor_shape = Arc::clone(&cursor_shape);
         let capabilities_sent = Arc::clone(&capabilities_sent);
+        let supported_profiles = Arc::clone(&supported_profiles);
         let configurations_seen = Arc::clone(&configurations_seen);
         let quality_preset = Arc::clone(&quality_preset);
         let chroma_mode = Arc::clone(&chroma_mode);
@@ -795,7 +801,14 @@ fn install_control_handler(
                     };
                     let message_queue = viewer_control.clone();
                     let input_gate = viewer_control.clone();
-                    let profiles = Arc::new(crate::platform::supported_video_profiles(format));
+                    // Probing Windows hardware MFTs can take noticeable time.
+                    // Codec support is a viewer capability, so do it once per
+                    // connection rather than again for the negotiated echo.
+                    let profiles = supported_profiles
+                        .get_or_init(|| {
+                            Arc::new(crate::platform::supported_video_profiles(format))
+                        })
+                        .clone();
                     let resumed_display = selected_display_id
                         .lock()
                         .ok()
@@ -860,6 +873,23 @@ fn install_control_handler(
                         tracing::info!(configuration_sequence, stream_id = stream_id.0, display_id = active_display_id.0, display_name = %active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, bitrate_bits_per_second = format.bitrate_bits_per_second, codec = ?format.codec, "remote control stream reconfigured without replacing its window");
                         return;
                     }
+                    if !capabilities_sent.swap(true, Ordering::AcqRel) {
+                        // The first configuration describes the Agent's mandatory
+                        // bootstrap profile. Negotiate the best common profile
+                        // before creating a visible presenter; the Agent echoes a
+                        // settled configuration even when that profile is retained.
+                        viewer_control.send(SessionMessage::ViewerCapabilities {
+                            profiles: profiles.as_ref().clone(),
+                            quality: sink.quality_preset(),
+                            chroma: sink.chroma_mode(),
+                        });
+                        tracing::info!(
+                            configuration_sequence,
+                            stream_id = stream_id.0,
+                            "viewer capabilities sent; waiting for the settled video profile"
+                        );
+                        return;
+                    }
                     match Presenter::start(
                         format,
                         active_display.clone(),
@@ -896,13 +926,6 @@ fn install_control_handler(
                             }
                             let request = SessionMessage::RequestKeyframe { stream_id };
                             viewer_control.send(request);
-                            if !capabilities_sent.swap(true, Ordering::AcqRel) {
-                                viewer_control.send(SessionMessage::ViewerCapabilities {
-                                    profiles: profiles.as_ref().clone(),
-                                    quality: sink.quality_preset(),
-                                    chroma: sink.chroma_mode(),
-                                });
-                            }
                             if let Some(display_id) = resumed_display {
                                 viewer_control.send(SessionMessage::SelectDisplay { display_id });
                                 tracing::info!(
@@ -960,16 +983,47 @@ fn install_video_handler(
     viewer_control: ViewerControlQueue,
     debug: DebugInfo,
 ) {
+    let closed = Arc::new(AtomicBool::new(false));
     {
         let debug = debug.clone();
+        let closed = Arc::clone(&closed);
         channel.on_close(Box::new(move || {
             let debug = debug.clone();
+            let closed = Arc::clone(&closed);
             Box::pin(async move {
+                closed.store(true, Ordering::Release);
                 debug.set_data_channel("meshrmm-video-v1", "closed");
             })
         }));
     }
     let receive_state = Arc::new(tokio::sync::Mutex::new(VideoReceiveState::new()));
+    {
+        let receive_state = Arc::clone(&receive_state);
+        let viewer_control = viewer_control.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_micros(KEYFRAME_RETRY_INTERVAL_US));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            while !closed.load(Ordering::Acquire) {
+                interval.tick().await;
+                let now_us = monotonic_timestamp_us();
+                let stream_id = {
+                    let mut state = receive_state.lock().await;
+                    (state.waiting_for_keyframe && state.keyframe_request_due(now_us))
+                        .then_some(state.stream_id)
+                        .flatten()
+                };
+                if let Some(stream_id) = stream_id {
+                    viewer_control.send(SessionMessage::RequestKeyframe { stream_id });
+                    tracing::debug!(
+                        stream_id = stream_id.0,
+                        "retrying a video recovery keyframe while no decodable frames arrive"
+                    );
+                }
+            }
+        });
+    }
     channel.on_message(Box::new(move |message| {
         let receive_state = Arc::clone(&receive_state);
         let presenter = Arc::clone(&presenter);
@@ -986,6 +1040,7 @@ fn install_video_handler(
             };
             let packet_stream_id = packet.stream_id;
             let mut receive_state = receive_state.lock().await;
+            receive_state.observe_stream(packet_stream_id);
             let incomplete_before = receive_state.reassembler.stats().incomplete_frames_dropped;
             let outcome = receive_state.reassembler.push(packet, received_at_us);
             let stats = receive_state.reassembler.stats();
@@ -1115,6 +1170,20 @@ mod tests {
             state.accept_completed(encoded_frame(2, false), 1_000 + KEYFRAME_RETRY_INTERVAL_US);
         assert!(first_request);
         assert!(retry);
+    }
+
+    #[test]
+    fn video_recovery_can_retry_when_only_packet_fragments_arrive() {
+        let mut state = VideoReceiveState::new();
+        let stream_id = VideoStreamId(7);
+        state.observe_stream(stream_id);
+        state.mark_loss();
+
+        assert_eq!(state.stream_id, Some(stream_id));
+        assert!(state.waiting_for_keyframe);
+        assert!(state.keyframe_request_due(1_000));
+        assert!(!state.keyframe_request_due(1_001));
+        assert!(state.keyframe_request_due(1_000 + KEYFRAME_RETRY_INTERVAL_US));
     }
 
     #[test]

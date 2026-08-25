@@ -50,6 +50,7 @@ const MAX_DECODER_PENDING_FRAMES: usize = 16;
 // enough for short delivery/decoder bursts without treating normal jitter as
 // reference loss; the worker still presents only the newest decoded surface.
 const MAX_PRESENTER_QUEUE_FRAMES: usize = 15;
+const DECODER_INPUT_STALL_TIMEOUT: Duration = Duration::from_secs(3);
 const VIEWER_TOOLBAR_HEIGHT: u32 = 34;
 
 struct QueuedFrame {
@@ -229,6 +230,7 @@ fn run_worker(
         }
     };
 
+    let mut decoder_blocked_since = None::<std::time::Instant>;
     while !shared.stopping.load(Ordering::Acquire) {
         if unsafe { pump_window_messages(pipeline.window()) } {
             break;
@@ -250,11 +252,30 @@ fn run_worker(
             break;
         }
         if !pipeline.wants_input() {
+            let frames_are_waiting = shared.queued.lock().is_ok_and(|queued| !queued.is_empty());
+            if frames_are_waiting {
+                let blocked_since =
+                    decoder_blocked_since.get_or_insert_with(std::time::Instant::now);
+                if blocked_since.elapsed() >= DECODER_INPUT_STALL_TIMEOUT {
+                    let message = format!(
+                        "hardware decoder stopped requesting input for {} seconds while video frames were queued",
+                        DECODER_INPUT_STALL_TIMEOUT.as_secs()
+                    );
+                    tracing::error!(message, "hardware decoder input watchdog expired");
+                    if let Ok(mut failure) = shared.failure.lock() {
+                        *failure = Some(message);
+                    }
+                    break;
+                }
+            } else {
+                decoder_blocked_since = None;
+            }
             // Keep the native window responsive while an asynchronous
             // Media Foundation decoder is between NeedInput events.
             std::thread::sleep(Duration::from_millis(1));
             continue;
         }
+        decoder_blocked_since = None;
         let queued = {
             let Ok(queued) = shared.queued.lock() else {
                 break;
