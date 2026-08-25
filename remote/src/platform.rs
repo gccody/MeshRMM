@@ -15,6 +15,7 @@ pub struct ControlSink {
     set_input_enabled: Arc<dyn Fn(bool) + Send + Sync>,
     quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
     chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
+    #[cfg(windows)]
     profiles: Arc<Vec<meshrmm_protocol::VideoProfile>>,
 }
 
@@ -24,13 +25,14 @@ impl ControlSink {
         set_input_enabled: impl Fn(bool) + Send + Sync + 'static,
         quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
         chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
-        profiles: Arc<Vec<meshrmm_protocol::VideoProfile>>,
+        #[cfg(windows)] profiles: Arc<Vec<meshrmm_protocol::VideoProfile>>,
     ) -> Self {
         Self {
             send: Arc::new(send),
             set_input_enabled: Arc::new(set_input_enabled),
             quality,
             chroma,
+            #[cfg(windows)]
             profiles,
         }
     }
@@ -67,6 +69,7 @@ impl ControlSink {
         )
     }
 
+    #[cfg(windows)]
     pub fn supports_chroma(&self, chroma: meshrmm_protocol::ChromaMode) -> bool {
         self.profiles.iter().any(|profile| profile.chroma == chroma)
     }
