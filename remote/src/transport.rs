@@ -822,6 +822,7 @@ fn install_control_handler(
                         move |enabled| input_gate.set_input_enabled(enabled),
                         Arc::clone(&quality_preset),
                         Arc::clone(&chroma_mode),
+                        #[cfg(windows)]
                         Arc::clone(&profiles),
                     );
                     debug.configure_stream(

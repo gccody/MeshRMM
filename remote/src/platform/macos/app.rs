@@ -81,7 +81,7 @@ define_class!(
 
     impl VideoHostView {
         /// Let the parent RemoteView receive pointer input over the video while
-        /// the controls in the settings sidebar retain normal hit testing.
+        /// the toolbar controls retain normal hit testing.
         #[unsafe(method_id(hitTest:))]
         #[unsafe(method_family = none)]
         fn hit_test(&self, _point: NSPoint) -> Option<Retained<Self>> {
@@ -113,12 +113,6 @@ pub(super) struct RemoteViewIvars {
     debug_label: Retained<NSTextField>,
     debug_visible: RefCell<bool>,
     debug_refreshed: RefCell<Instant>,
-    quality_popup: RefCell<Option<Retained<NSPopUpButton>>>,
-    chroma_popup: RefCell<Option<Retained<NSPopUpButton>>>,
-    settings_quality_buttons: RefCell<Vec<Retained<NSButton>>>,
-    settings_chroma_buttons: RefCell<Vec<Retained<NSButton>>>,
-    settings_debug_button: RefCell<Option<Retained<NSButton>>>,
-    settings_window: RefCell<Option<Retained<NSWindow>>>,
 }
 
 define_class!(
@@ -284,31 +278,6 @@ define_class!(
             self.send_key(code, event.modifierFlags().contains(flag));
         }
 
-        #[unsafe(method(selectDataSaver:))]
-        fn select_data_saver(&self, _sender: &NSButton) {
-            self.select_quality(QualityPreset::DataSaver);
-        }
-
-        #[unsafe(method(selectBalanced:))]
-        fn select_balanced(&self, _sender: &NSButton) {
-            self.select_quality(QualityPreset::Balanced);
-        }
-
-        #[unsafe(method(selectBestQuality:))]
-        fn select_best_quality(&self, _sender: &NSButton) {
-            self.select_quality(QualityPreset::BestQuality);
-        }
-
-        #[unsafe(method(selectChroma420:))]
-        fn select_chroma_420(&self, _sender: &NSButton) {
-            self.select_chroma(ChromaMode::Yuv420);
-        }
-
-        #[unsafe(method(selectChroma444:))]
-        fn select_chroma_444(&self, _sender: &NSButton) {
-            self.select_chroma(ChromaMode::Yuv444);
-        }
-
         #[unsafe(method(selectDisplayFromToolbar:))]
         fn select_display_from_toolbar(&self, sender: &NSPopUpButton) {
             let index = sender.indexOfSelectedItem();
@@ -329,34 +298,19 @@ define_class!(
                 2 => QualityPreset::BestQuality,
                 _ => QualityPreset::Balanced,
             };
-            self.select_quality(preset);
-        }
-
-        #[unsafe(method(selectChromaFromToolbar:))]
-        fn select_chroma_from_toolbar(&self, sender: &NSPopUpButton) {
-            let mode = if sender.indexOfSelectedItem() == 1 {
-                ChromaMode::Yuv444
-            } else {
-                ChromaMode::Yuv420
-            };
-            self.select_chroma(mode);
+            self.send(SessionMessage::SetQuality { preset });
+            if let Some(window) = self.window()
+                && !window.makeFirstResponder(Some(self))
+            {
+                tracing::warn!(
+                    "macOS viewer could not restore input focus after changing quality"
+                );
+            }
         }
 
         #[unsafe(method(toggleDiagnostics:))]
         fn toggle_diagnostics_action(&self, _sender: &NSButton) {
             self.toggle_debug();
-        }
-
-        #[unsafe(method(toggleViewerFullscreen:))]
-        fn toggle_viewer_fullscreen(&self, _sender: &NSButton) {
-            if let Some(window) = self.window() {
-                window.toggleFullScreen(None);
-            }
-        }
-
-        #[unsafe(method(openViewerSettings:))]
-        fn open_viewer_settings(&self, _sender: &NSButton) {
-            self.open_settings();
         }
     }
 );
@@ -468,12 +422,6 @@ impl RemoteView {
             debug_label,
             debug_visible: RefCell::new(false),
             debug_refreshed: RefCell::new(Instant::now()),
-            quality_popup: RefCell::new(None),
-            chroma_popup: RefCell::new(None),
-            settings_quality_buttons: RefCell::new(Vec::new()),
-            settings_chroma_buttons: RefCell::new(Vec::new()),
-            settings_debug_button: RefCell::new(None),
-            settings_window: RefCell::new(None),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         this.addSubview(&this.ivars().debug_label);
@@ -551,29 +499,6 @@ impl RemoteView {
             quality_popup.setAction(Some(sel!(selectQualityFromToolbar:)));
         }
         toolbar.addSubview(&quality_popup);
-        *self.ivars().quality_popup.borrow_mut() = Some(quality_popup);
-
-        let chroma_popup = NSPopUpButton::initWithFrame_pullsDown(
-            NSPopUpButton::alloc(mtm),
-            NSRect {
-                origin: NSPoint { x: 374.0, y: 6.0 },
-                size: NSSize {
-                    width: 124.0,
-                    height: 24.0,
-                },
-            },
-            false,
-        );
-        for title in ["4:2:0 efficient", "4:4:4 crisp"] {
-            chroma_popup.addItemWithTitle(&NSString::from_str(title));
-        }
-        chroma_popup.selectItemAtIndex(chroma_index(self.ivars().control.chroma_mode()));
-        unsafe {
-            chroma_popup.setTarget(Some(self));
-            chroma_popup.setAction(Some(sel!(selectChromaFromToolbar:)));
-        }
-        toolbar.addSubview(&chroma_popup);
-        *self.ivars().chroma_popup.borrow_mut() = Some(chroma_popup);
 
         let diagnostics = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -584,334 +509,18 @@ impl RemoteView {
             )
         };
         diagnostics.setFrame(NSRect {
-            origin: NSPoint { x: 504.0, y: 6.0 },
+            origin: NSPoint { x: 374.0, y: 6.0 },
             size: NSSize {
                 width: 88.0,
                 height: 24.0,
             },
         });
         toolbar.addSubview(&diagnostics);
-
-        let fullscreen = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("Full screen"),
-                Some(self),
-                Some(sel!(toggleViewerFullscreen:)),
-                mtm,
-            )
-        };
-        fullscreen.setFrame(NSRect {
-            origin: NSPoint { x: 598.0, y: 6.0 },
-            size: NSSize {
-                width: 84.0,
-                height: 24.0,
-            },
-        });
-        toolbar.addSubview(&fullscreen);
-
-        let settings = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("⚙"),
-                Some(self),
-                Some(sel!(openViewerSettings:)),
-                mtm,
-            )
-        };
-        settings.setFrame(NSRect {
-            origin: NSPoint { x: 688.0, y: 6.0 },
-            size: NSSize {
-                width: 34.0,
-                height: 24.0,
-            },
-        });
-        settings.setToolTip(Some(&NSString::from_str("Viewer settings")));
-        toolbar.addSubview(&settings);
         self.addSubview(&toolbar);
-    }
-
-    fn open_settings(&self) {
-        if let Some(window) = self.ivars().settings_window.borrow().as_ref() {
-            window.makeKeyAndOrderFront(None);
-            return;
-        }
-        let Some(mtm) = MainThreadMarker::new() else {
-            return;
-        };
-        let rect = NSRect {
-            origin: NSPoint { x: 0.0, y: 0.0 },
-            size: NSSize {
-                width: 520.0,
-                height: 350.0,
-            },
-        };
-        let style = NSWindowStyleMask::Titled
-            | NSWindowStyleMask::Closable
-            | NSWindowStyleMask::Miniaturizable;
-        let window = unsafe {
-            NSWindow::initWithContentRect_styleMask_backing_defer(
-                NSWindow::alloc(mtm),
-                rect,
-                style,
-                NSBackingStoreType::Buffered,
-                false,
-            )
-        };
-        unsafe { window.setReleasedWhenClosed(false) };
-        window.setTitle(&NSString::from_str("Viewer settings"));
-
-        let tabs = NSTabView::initWithFrame(NSTabView::alloc(mtm), rect);
-
-        let display_item =
-            unsafe { NSTabViewItem::initWithIdentifier(NSTabViewItem::alloc(), None) };
-        display_item.setLabel(&NSString::from_str("Display"));
-        let display_pane = NSView::initWithFrame(NSView::alloc(mtm), rect);
-        let display_heading =
-            NSTextField::labelWithString(&NSString::from_str("Image quality"), mtm);
-        display_heading.setFont(Some(&NSFont::boldSystemFontOfSize(17.0)));
-        display_heading.setFrame(NSRect {
-            origin: NSPoint { x: 26.0, y: 248.0 },
-            size: NSSize {
-                width: 420.0,
-                height: 26.0,
-            },
-        });
-        display_pane.addSubview(&display_heading);
-        let display_copy = NSTextField::wrappingLabelWithString(
-            &NSString::from_str(
-                "Choose how much bandwidth the remote desktop may use. Changes apply immediately.",
-            ),
-            mtm,
-        );
-        display_copy.setFrame(NSRect {
-            origin: NSPoint { x: 26.0, y: 202.0 },
-            size: NSSize {
-                width: 450.0,
-                height: 42.0,
-            },
-        });
-        display_pane.addSubview(&display_copy);
-        let quality_buttons = [
-            unsafe {
-                NSButton::radioButtonWithTitle_target_action(
-                    &NSString::from_str("Data saver · 3 Mbps"),
-                    Some(self),
-                    Some(sel!(selectDataSaver:)),
-                    mtm,
-                )
-            },
-            unsafe {
-                NSButton::radioButtonWithTitle_target_action(
-                    &NSString::from_str("Balanced · 6 Mbps"),
-                    Some(self),
-                    Some(sel!(selectBalanced:)),
-                    mtm,
-                )
-            },
-            unsafe {
-                NSButton::radioButtonWithTitle_target_action(
-                    &NSString::from_str("Best quality · 12 Mbps maximum"),
-                    Some(self),
-                    Some(sel!(selectBestQuality:)),
-                    mtm,
-                )
-            },
-        ];
-        for (index, button) in quality_buttons.iter().enumerate() {
-            button.setFrame(NSRect {
-                origin: NSPoint {
-                    x: 26.0,
-                    y: 158.0 - index as f64 * 42.0,
-                },
-                size: NSSize {
-                    width: 430.0,
-                    height: 26.0,
-                },
-            });
-            display_pane.addSubview(button);
-        }
-        quality_buttons[quality_index(self.ivars().control.quality_preset()) as usize]
-            .setState(NSControlStateValueOn);
-        *self.ivars().settings_quality_buttons.borrow_mut() = quality_buttons.into_iter().collect();
-        let chroma_heading = NSTextField::labelWithString(&NSString::from_str("Color detail"), mtm);
-        chroma_heading.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-        chroma_heading.setFrame(NSRect {
-            origin: NSPoint { x: 270.0, y: 166.0 },
-            size: NSSize {
-                width: 200.0,
-                height: 24.0,
-            },
-        });
-        display_pane.addSubview(&chroma_heading);
-        let chroma_buttons = [
-            unsafe {
-                NSButton::radioButtonWithTitle_target_action(
-                    &NSString::from_str("4:2:0 · bandwidth efficient"),
-                    Some(self),
-                    Some(sel!(selectChroma420:)),
-                    mtm,
-                )
-            },
-            unsafe {
-                NSButton::radioButtonWithTitle_target_action(
-                    &NSString::from_str("4:4:4 · crisp text"),
-                    Some(self),
-                    Some(sel!(selectChroma444:)),
-                    mtm,
-                )
-            },
-        ];
-        for (index, button) in chroma_buttons.iter().enumerate() {
-            button.setFrame(NSRect {
-                origin: NSPoint {
-                    x: 270.0,
-                    y: 126.0 - index as f64 * 42.0,
-                },
-                size: NSSize {
-                    width: 220.0,
-                    height: 26.0,
-                },
-            });
-            display_pane.addSubview(button);
-        }
-        chroma_buttons[chroma_index(self.ivars().control.chroma_mode()) as usize]
-            .setState(NSControlStateValueOn);
-        chroma_buttons[1].setEnabled(self.ivars().control.supports_chroma(ChromaMode::Yuv444));
-        *self.ivars().settings_chroma_buttons.borrow_mut() = chroma_buttons.into_iter().collect();
-        display_item.setView(Some(&display_pane));
-        tabs.addTabViewItem(&display_item);
-
-        let input_item = unsafe { NSTabViewItem::initWithIdentifier(NSTabViewItem::alloc(), None) };
-        input_item.setLabel(&NSString::from_str("Input"));
-        let input_pane = NSView::initWithFrame(NSView::alloc(mtm), rect);
-        let input_heading =
-            NSTextField::labelWithString(&NSString::from_str("Keyboard and pointer"), mtm);
-        input_heading.setFont(Some(&NSFont::boldSystemFontOfSize(17.0)));
-        input_heading.setFrame(NSRect {
-            origin: NSPoint { x: 26.0, y: 248.0 },
-            size: NSSize {
-                width: 420.0,
-                height: 26.0,
-            },
-        });
-        input_pane.addSubview(&input_heading);
-        let input_copy = NSTextField::wrappingLabelWithString(
-            &NSString::from_str(
-                "Remote input is active while the viewer is focused. Display shortcuts remain available from the top bar.",
-            ),
-            mtm,
-        );
-        input_copy.setFrame(NSRect {
-            origin: NSPoint { x: 26.0, y: 186.0 },
-            size: NSSize {
-                width: 450.0,
-                height: 56.0,
-            },
-        });
-        input_pane.addSubview(&input_copy);
-        input_item.setView(Some(&input_pane));
-        tabs.addTabViewItem(&input_item);
-
-        let advanced_item =
-            unsafe { NSTabViewItem::initWithIdentifier(NSTabViewItem::alloc(), None) };
-        advanced_item.setLabel(&NSString::from_str("Advanced"));
-        let advanced_pane = NSView::initWithFrame(NSView::alloc(mtm), rect);
-        let advanced_heading =
-            NSTextField::labelWithString(&NSString::from_str("Troubleshooting"), mtm);
-        advanced_heading.setFont(Some(&NSFont::boldSystemFontOfSize(17.0)));
-        advanced_heading.setFrame(NSRect {
-            origin: NSPoint { x: 26.0, y: 248.0 },
-            size: NSSize {
-                width: 420.0,
-                height: 26.0,
-            },
-        });
-        advanced_pane.addSubview(&advanced_heading);
-        let diagnostics = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                &NSString::from_str("Show diagnostics overlay"),
-                Some(self),
-                Some(sel!(toggleDiagnostics:)),
-                mtm,
-            )
-        };
-        diagnostics.setFrame(NSRect {
-            origin: NSPoint { x: 26.0, y: 196.0 },
-            size: NSSize {
-                width: 300.0,
-                height: 28.0,
-            },
-        });
-        diagnostics.setState(if *self.ivars().debug_visible.borrow() {
-            NSControlStateValueOn
-        } else {
-            objc2_app_kit::NSControlStateValueOff
-        });
-        advanced_pane.addSubview(&diagnostics);
-        *self.ivars().settings_debug_button.borrow_mut() = Some(diagnostics);
-        advanced_item.setView(Some(&advanced_pane));
-        tabs.addTabViewItem(&advanced_item);
-
-        window.setContentView(Some(&tabs));
-        window.center();
-        window.makeKeyAndOrderFront(None);
-        *self.ivars().settings_window.borrow_mut() = Some(window);
     }
 
     fn send(&self, message: SessionMessage) {
         self.ivars().control.send(message);
-    }
-
-    fn select_quality(&self, preset: QualityPreset) {
-        let selected = quality_index(preset);
-        if let Some(popup) = self.ivars().quality_popup.borrow().as_ref() {
-            popup.selectItemAtIndex(selected);
-        }
-        for (index, button) in self
-            .ivars()
-            .settings_quality_buttons
-            .borrow()
-            .iter()
-            .enumerate()
-        {
-            button.setState(if index as isize == selected {
-                NSControlStateValueOn
-            } else {
-                objc2_app_kit::NSControlStateValueOff
-            });
-        }
-        self.send(SessionMessage::SetQuality { preset });
-        if let Some(window) = self.window()
-            && !window.makeFirstResponder(Some(self))
-        {
-            tracing::warn!("macOS viewer could not restore input focus after changing quality");
-        }
-    }
-
-    fn select_chroma(&self, mode: ChromaMode) {
-        if !self.ivars().control.supports_chroma(mode) {
-            if let Some(popup) = self.ivars().chroma_popup.borrow().as_ref() {
-                popup.selectItemAtIndex(chroma_index(self.ivars().control.chroma_mode()));
-            }
-            return;
-        }
-        let selected = chroma_index(mode);
-        if let Some(popup) = self.ivars().chroma_popup.borrow().as_ref() {
-            popup.selectItemAtIndex(selected);
-        }
-        for (index, button) in self
-            .ivars()
-            .settings_chroma_buttons
-            .borrow()
-            .iter()
-            .enumerate()
-        {
-            button.setState(if index as isize == selected {
-                NSControlStateValueOn
-            } else {
-                objc2_app_kit::NSControlStateValueOff
-            });
-        }
-        self.send(SessionMessage::SetChroma { mode });
     }
 
     pub(super) fn set_cursor_shape(&self, shape: CursorShape) {
@@ -1022,13 +631,6 @@ impl RemoteView {
         let visible = !*self.ivars().debug_visible.borrow();
         *self.ivars().debug_visible.borrow_mut() = visible;
         self.ivars().debug_label.setHidden(!visible);
-        if let Some(button) = self.ivars().settings_debug_button.borrow().as_ref() {
-            button.setState(if visible {
-                NSControlStateValueOn
-            } else {
-                objc2_app_kit::NSControlStateValueOff
-            });
-        }
         if visible {
             self.refresh_debug(true);
         }
@@ -1076,13 +678,6 @@ fn quality_index(preset: QualityPreset) -> isize {
         QualityPreset::DataSaver => 0,
         QualityPreset::Balanced => 1,
         QualityPreset::BestQuality => 2,
-    }
-}
-
-fn chroma_index(mode: ChromaMode) -> isize {
-    match mode {
-        ChromaMode::Yuv420 => 0,
-        ChromaMode::Yuv444 => 1,
     }
 }
 

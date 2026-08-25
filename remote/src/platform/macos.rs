@@ -15,16 +15,13 @@ use meshrmm_protocol::{
 };
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{
-    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
-};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor, NSControlStateValueOn,
-    NSCursor, NSEvent, NSEventModifierFlags, NSFont, NSFontWeightRegular, NSPopUpButton,
-    NSProgressIndicator, NSProgressIndicatorStyle, NSTabView, NSTabViewItem, NSTextAlignment,
-    NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowOrderingMode, NSWindowStyleMask,
-    NSWindowTitleVisibility,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor, NSCursor, NSEvent,
+    NSEventModifierFlags, NSFont, NSFontWeightRegular, NSPopUpButton, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowDelegate,
+    NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_av_foundation::{
     AVLayerVideoGravityResizeAspect, AVQueuedSampleBufferRenderingStatus,
