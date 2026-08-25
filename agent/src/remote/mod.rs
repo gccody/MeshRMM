@@ -71,10 +71,9 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
                             if active_session
                                 .as_ref()
                                 .is_some_and(|session| session.task.is_finished())
+                                && let Some(session) = active_session.take()
                             {
-                                if let Some(session) = active_session.take() {
-                                    let _ = session.task.await;
-                                }
+                                let _ = session.task.await;
                             }
                             tokio::select! {
                                 message = socket.next() => {
