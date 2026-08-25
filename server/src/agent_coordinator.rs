@@ -9,12 +9,18 @@ const COMPANY_HEADER: &str = "X-Mesh-Company-Id";
 const DEVICE_HEADER: &str = "X-Mesh-Device-Id";
 const UNINSTALL_HEADER: &str = "X-Mesh-Uninstall-Requested";
 const IDENTITY_KEY: &str = "agent_identity";
+const ACTIVE_SESSION_KEY: &str = "active_session";
 
 #[derive(Debug, Deserialize, Serialize)]
 struct AgentIdentity {
     company_id: String,
     device_id: String,
     connection_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionEnded {
+    session_id: String,
 }
 
 #[durable_object]
@@ -56,6 +62,18 @@ impl DurableObject for AgentCoordinator {
                         .server
                         .close(Some(1011), Some("Agent presence could not be registered"));
                     return Err(error);
+                } else if let Some(session) = self
+                    .state
+                    .storage()
+                    .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
+                    .await?
+                {
+                    pair.server
+                        .send_with_str(serde_json::to_string(&session)?)?;
+                    console_log!(
+                        "event=agent_session_resumed session_id={}",
+                        session.session_id
+                    );
                 }
                 console_log!("event=agent_signaling_connected");
                 Response::from_websocket(pair.client)
@@ -81,12 +99,65 @@ impl DurableObject for AgentCoordinator {
                 else {
                     return Response::error("Agent is offline", 409);
                 };
+                self.state
+                    .storage()
+                    .put(ACTIVE_SESSION_KEY, &session)
+                    .await?;
                 agent.send_with_str(serde_json::to_string(&session)?)?;
                 console_log!(
                     "event=agent_session_notified session_id={}",
                     session.session_id
                 );
                 Response::ok("notified")
+            }
+            (Method::Post, "/resume-request") => {
+                let session: AgentSessionRequest = request.json().await?;
+                self.state
+                    .storage()
+                    .put(ACTIVE_SESSION_KEY, &session)
+                    .await?;
+                if let Some(agent) = self
+                    .state
+                    .get_websockets_with_tag(AGENT_TAG)
+                    .into_iter()
+                    .next()
+                {
+                    agent.send_with_str(serde_json::to_string(&session)?)?;
+                }
+                console_log!(
+                    "event=agent_session_resume_refreshed session_id={}",
+                    session.session_id
+                );
+                Response::ok("refreshed")
+            }
+            (Method::Post, "/session-ended") => {
+                let ended: SessionEnded = request.json().await?;
+                if self
+                    .state
+                    .storage()
+                    .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
+                    .await?
+                    .is_some_and(|active| active.session_id.as_str() == ended.session_id)
+                {
+                    self.state.storage().delete(ACTIVE_SESSION_KEY).await?;
+                    if let Some(agent) = self
+                        .state
+                        .get_websockets_with_tag(AGENT_TAG)
+                        .into_iter()
+                        .next()
+                    {
+                        agent.send_with_str(serde_json::to_string(&AgentCommand::EndSession {
+                            session_id: meshrmm_protocol_types::RemoteSessionId::new(
+                                ended.session_id.clone(),
+                            ),
+                        })?)?;
+                    }
+                    console_log!(
+                        "event=agent_session_cleared session_id={}",
+                        ended.session_id
+                    );
+                }
+                Response::ok("cleared")
             }
             (Method::Get, "/status") => {
                 let connected = !self.state.get_websockets_with_tag(AGENT_TAG).is_empty();

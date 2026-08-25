@@ -32,6 +32,7 @@ pub struct AgentSessionRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentCommand {
     Uninstall,
+    EndSession { session_id: RemoteSessionId },
 }
 
 /// Agent-to-coordinator lifecycle notifications.
@@ -46,6 +47,7 @@ pub enum AgentStatusMessage {
 pub enum SignalMessage {
     Ready,
     Activity,
+    EndSession,
     Offer {
         sdp: String,
     },
@@ -91,6 +93,13 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AgentStatusMessage::UninstallScheduled).unwrap(),
             r#"{"type":"uninstall_scheduled"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentCommand::EndSession {
+                session_id: RemoteSessionId::new("session-123"),
+            })
+            .unwrap(),
+            r#"{"type":"end_session","session_id":"session-123"}"#
         );
     }
 }

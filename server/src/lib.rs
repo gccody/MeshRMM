@@ -181,6 +181,8 @@ struct HandoffResponse {
 
 #[derive(Debug, Serialize)]
 struct SessionInit<'a> {
+    session_id: &'a str,
+    device_id: &'a str,
     client_token: &'a str,
     agent_token: &'a str,
     expires_at_unix_ms: u64,
@@ -281,6 +283,20 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
         }
         (Method::Post, ["v1", "remote", "handoffs", "redeem"]) => {
             redeem_handoff(&request, &environment).await
+        }
+        (Method::Post, ["v1", "remote", "sessions", session_id, "resume"]) => {
+            if Uuid::parse_str(session_id).is_err() {
+                return cors(api_error(400, "invalid session ID")?, &environment);
+            }
+            forward_to_object(
+                &environment,
+                "REMOTE_SESSION",
+                session_id,
+                request,
+                "https://session.internal/resume",
+                &[],
+            )
+            .await
         }
         (Method::Get, ["v1", "remote", "sessions", session_id, "signal"]) => {
             if Uuid::parse_str(session_id).is_err() {

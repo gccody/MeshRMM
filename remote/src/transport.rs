@@ -31,6 +31,10 @@ const SESSION_ACTIVITY_INTERVAL: std::time::Duration = std::time::Duration::from
 const CLIPBOARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const POINTER_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
 const KEYFRAME_RETRY_INTERVAL_US: u64 = 250_000;
+const NEGOTIATION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const DISCONNECTED_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+const SIGNAL_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+const SIGNAL_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 struct ActivePresenter {
     stream_id: VideoStreamId,
@@ -40,6 +44,15 @@ struct ActivePresenter {
     format: meshrmm_protocol::VideoFormat,
     profile: VideoProfile,
     presenter: Presenter,
+}
+
+/// Viewer choices that should survive rebuilding the signaling and WebRTC
+/// transports after a network change or remote reboot.
+#[derive(Clone, Default)]
+pub struct ViewerResumeState {
+    quality: Arc<Mutex<QualityPreset>>,
+    chroma: Arc<Mutex<ChromaMode>>,
+    display_id: Arc<Mutex<Option<meshrmm_protocol::DisplayId>>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -139,6 +152,7 @@ struct ViewerControlQueue {
     outgoing: mpsc::UnboundedSender<SessionMessage>,
     input: Arc<Mutex<ViewerInputState>>,
     pointer_changed: Arc<Notify>,
+    resume_state: ViewerResumeState,
 }
 
 struct ViewerInputState {
@@ -147,7 +161,10 @@ struct ViewerInputState {
 }
 
 impl ViewerControlQueue {
-    fn new(outgoing: mpsc::UnboundedSender<SessionMessage>) -> Self {
+    fn new(
+        outgoing: mpsc::UnboundedSender<SessionMessage>,
+        resume_state: ViewerResumeState,
+    ) -> Self {
         Self {
             outgoing,
             input: Arc::new(Mutex::new(ViewerInputState {
@@ -155,10 +172,16 @@ impl ViewerControlQueue {
                 pending_pointer: None,
             })),
             pointer_changed: Arc::new(Notify::new()),
+            resume_state,
         }
     }
 
     fn send(&self, message: SessionMessage) {
+        if let SessionMessage::SelectDisplay { display_id } = &message
+            && let Ok(mut selected) = self.resume_state.display_id.lock()
+        {
+            *selected = Some(*display_id);
+        }
         let is_input = matches!(&message, SessionMessage::Input(_));
         let Ok(mut input) = self.input.lock() else {
             return;
@@ -228,7 +251,11 @@ async fn flush_pointer_motion(queue: ViewerControlQueue) {
     }
 }
 
-pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyhow::Result<()> {
+pub async fn run_receiver(
+    config: &Config,
+    bootstrap: SessionBootstrap,
+    resume_state: ViewerResumeState,
+) -> anyhow::Result<()> {
     let debug = DebugInfo::new(bootstrap.session_id.as_str());
     let url = session_signal_url(&config.server, bootstrap.session_id.as_str())?;
     let socket = authenticated_websocket(url, &bootstrap.signaling_token).await?;
@@ -245,7 +272,7 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
     let presenter = Arc::new(Mutex::new(None::<ActivePresenter>));
     let control_channel = Arc::new(Mutex::new(None::<Arc<RTCDataChannel>>));
     let (viewer_control_tx, mut viewer_control_rx) = mpsc::unbounded_channel::<SessionMessage>();
-    let viewer_control = ViewerControlQueue::new(viewer_control_tx);
+    let viewer_control = ViewerControlQueue::new(viewer_control_tx, resume_state.clone());
     let (remote_clipboard_tx, mut remote_clipboard_rx) = mpsc::unbounded_channel::<String>();
     let (presentation_failure_tx, mut presentation_failure_rx) =
         mpsc::unbounded_channel::<String>();
@@ -261,13 +288,20 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
 
     let mut session_state = SessionState::Requested.transition(SessionState::Signaling)?;
     outgoing_tx.send(SignalMessage::Ready)?;
+    outgoing_tx.send(SignalMessage::Activity)?;
     session_state = session_state.transition(SessionState::Connecting)?;
     let mut presenter_missing_since = Some(tokio::time::Instant::now());
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     stats_interval.tick().await;
+    let mut heartbeat_interval = tokio::time::interval(SIGNAL_HEARTBEAT_INTERVAL);
+    heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat_interval.tick().await;
     let mut activity_interval = tokio::time::interval(SESSION_ACTIVITY_INTERVAL);
     activity_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     activity_interval.tick().await;
+    let mut negotiation_interval = tokio::time::interval(NEGOTIATION_RETRY_INTERVAL);
+    negotiation_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    negotiation_interval.tick().await;
     let mut clipboard = match ClipboardSync::new(true) {
         Ok(clipboard) => Some(clipboard),
         Err(error) => {
@@ -279,6 +313,8 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
     clipboard_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut remote_description_set = false;
     let mut pending_candidates = Vec::new();
+    let mut disconnected_since = None::<tokio::time::Instant>;
+    let mut last_signal_message = tokio::time::Instant::now();
     // Pointer pacing must not depend on the receiver loop being available: a
     // control-channel send can await long enough for a short movement burst to
     // end. This activity-driven flusher always queues that burst's newest
@@ -321,13 +357,17 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                     }
                 }
             }
-            _ = activity_interval.tick(), if session_state == SessionState::Streaming => {
+            _ = activity_interval.tick() => {
                 outgoing_tx.send(SignalMessage::Activity)?;
+            }
+            _ = negotiation_interval.tick(), if session_state == SessionState::Connecting => {
+                outgoing_tx.send(SignalMessage::Ready)?;
             }
             incoming = signal_reader.next() => {
                 let Some(incoming) = incoming else {
                     break Err(anyhow::anyhow!("signaling connection closed"));
                 };
+                last_signal_message = tokio::time::Instant::now();
                 match incoming? {
                     Message::Text(text) => {
                         let signal: SignalMessage = serde_json::from_str(text.as_str())?;
@@ -360,9 +400,21 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                         }
                     }
                     Message::Ping(payload) => signal_writer.send(Message::Pong(payload)).await?,
-                    Message::Close(_) => break Ok(()),
+                    Message::Close(frame) => {
+                        break Err(anyhow::anyhow!("signaling connection closed: {frame:?}"));
+                    }
                     _ => {}
                 }
+            }
+            _ = heartbeat_interval.tick() => {
+                if last_signal_message.elapsed() >= SIGNAL_LIVENESS_TIMEOUT {
+                    break Err(anyhow::anyhow!(
+                        "signaling server did not respond for {} seconds",
+                        SIGNAL_LIVENESS_TIMEOUT.as_secs()
+                    ));
+                }
+                signal_writer.send(Message::Ping(Default::default())).await
+                    .context("failed to send signaling heartbeat")?;
             }
             Some(state) = state_rx.recv() => {
                 tracing::info!(?state, session_id = %bootstrap.session_id, "WebRTC connection state changed");
@@ -373,7 +425,12 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                     session_state = session_state.transition(SessionState::Streaming)?;
                     outgoing_tx.send(SignalMessage::Activity)?;
                 }
-                if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed | RTCPeerConnectionState::Disconnected) {
+                if state == RTCPeerConnectionState::Connected {
+                    disconnected_since = None;
+                } else if state == RTCPeerConnectionState::Disconnected {
+                    disconnected_since.get_or_insert_with(tokio::time::Instant::now);
+                }
+                if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
                     break Err(anyhow::anyhow!("WebRTC connection ended in state {state:?}"));
                 }
             }
@@ -382,6 +439,12 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
                 break Err(anyhow::anyhow!(error));
             }
             _ = stats_interval.tick() => {
+                if disconnected_since.is_some_and(|since| since.elapsed() >= DISCONNECTED_GRACE_PERIOD) {
+                    break Err(anyhow::anyhow!(
+                        "WebRTC remained disconnected for {} seconds",
+                        DISCONNECTED_GRACE_PERIOD.as_secs()
+                    ));
+                }
                 let presenter_missing = presenter.lock().is_ok_and(|guard| guard.is_none());
                 if presenter_missing {
                     let waiting_since = presenter_missing_since
@@ -438,6 +501,13 @@ pub async fn run_receiver(config: &Config, bootstrap: SessionBootstrap) -> anyho
     .await;
     pointer_flusher.abort();
     let _ = pointer_flusher.await;
+
+    if result.is_ok() {
+        let end_message = serde_json::to_string(&SignalMessage::EndSession)?;
+        if let Err(error) = signal_writer.send(Message::Text(end_message.into())).await {
+            tracing::warn!(error = %error, "failed to notify the server that the viewer ended the session");
+        }
+    }
 
     if matches!(
         session_state,
@@ -671,8 +741,10 @@ fn install_control_handler(
     let cursor_shape = Arc::new(Mutex::new(CursorShape::Default));
     let capabilities_sent = Arc::new(AtomicBool::new(false));
     let configurations_seen = Arc::new(AtomicU64::new(0));
-    let quality_preset = Arc::new(Mutex::new(QualityPreset::default()));
-    let chroma_mode = Arc::new(Mutex::new(ChromaMode::default()));
+    let resume_state = viewer_control.resume_state.clone();
+    let quality_preset = Arc::clone(&resume_state.quality);
+    let chroma_mode = Arc::clone(&resume_state.chroma);
+    let selected_display_id = Arc::clone(&resume_state.display_id);
     channel.on_message(Box::new(move |message| {
         let presenter = Arc::clone(&presenter);
         let cursor_shape = Arc::clone(&cursor_shape);
@@ -684,6 +756,7 @@ fn install_control_handler(
         let remote_clipboard = remote_clipboard.clone();
         let presentation_failure = presentation_failure.clone();
         let debug = debug.clone();
+        let selected_display_id = Arc::clone(&selected_display_id);
         Box::pin(async move {
             match SessionMessage::decode(&message.data) {
                 Ok(SessionMessage::DisplayConfiguration {
@@ -723,9 +796,14 @@ fn install_control_handler(
                     let message_queue = viewer_control.clone();
                     let input_gate = viewer_control.clone();
                     let profiles = Arc::new(crate::platform::supported_video_profiles(format));
-                    if let Ok(mut selected_chroma) = chroma_mode.lock() {
-                        *selected_chroma = format.pixel_format.chroma();
-                    }
+                    let resumed_display = selected_display_id
+                        .lock()
+                        .ok()
+                        .and_then(|selected| *selected)
+                        .filter(|selected| {
+                            *selected != active_display_id
+                                && displays.iter().any(|display| display.id == *selected)
+                        });
                     let sink = ControlSink::new(
                         move |message| message_queue.send(message),
                         move |enabled| input_gate.set_input_enabled(enabled),
@@ -824,6 +902,13 @@ fn install_control_handler(
                                     quality: sink.quality_preset(),
                                     chroma: sink.chroma_mode(),
                                 });
+                            }
+                            if let Some(display_id) = resumed_display {
+                                viewer_control.send(SessionMessage::SelectDisplay { display_id });
+                                tracing::info!(
+                                    display_id = display_id.0,
+                                    "restored viewer display selection after reconnect"
+                                );
                             }
                             tracing::info!(configuration_sequence, stream_id = stream_id.0, display_id = active_display_id.0, display_name = %active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, bitrate_bits_per_second = format.bitrate_bits_per_second, codec = ?format.codec, "remote control stream configured");
                         }
@@ -976,7 +1061,7 @@ mod tests {
 
     fn active_queue() -> (ViewerControlQueue, mpsc::UnboundedReceiver<SessionMessage>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let queue = ViewerControlQueue::new(tx);
+        let queue = ViewerControlQueue::new(tx, ViewerResumeState::default());
         queue.set_input_enabled(true);
         (queue, rx)
     }
@@ -1083,7 +1168,7 @@ mod tests {
     #[test]
     fn input_is_discarded_until_the_viewer_is_foreground() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let queue = ViewerControlQueue::new(tx);
+        let queue = ViewerControlQueue::new(tx, ViewerResumeState::default());
         let button = SessionMessage::Input(RemoteInput::PointerButton {
             display_id: DisplayId(1),
             button: PointerButton::Left,
@@ -1110,6 +1195,28 @@ mod tests {
         queue.flush_pointer();
 
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn display_selection_is_retained_for_a_reconnected_transport() {
+        let resume_state = ViewerResumeState::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let queue = ViewerControlQueue::new(tx, resume_state.clone());
+
+        queue.send(SessionMessage::SelectDisplay {
+            display_id: DisplayId(42),
+        });
+
+        assert_eq!(
+            *resume_state.display_id.lock().unwrap(),
+            Some(DisplayId(42))
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SessionMessage::SelectDisplay {
+                display_id: DisplayId(42)
+            }
+        );
     }
 
     #[tokio::test]
