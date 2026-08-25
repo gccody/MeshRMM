@@ -46,6 +46,12 @@ struct ActivePresenter {
     presenter: Presenter,
 }
 
+#[derive(Clone)]
+struct ReceiverLifecycle {
+    presentation_failure: mpsc::UnboundedSender<String>,
+    shutting_down: Arc<AtomicBool>,
+}
+
 /// Viewer choices that should survive rebuilding the signaling and WebRTC
 /// transports after a network change or remote reboot.
 #[derive(Clone, Default)]
@@ -280,14 +286,18 @@ pub async fn run_receiver(
     let (remote_clipboard_tx, mut remote_clipboard_rx) = mpsc::unbounded_channel::<String>();
     let (presentation_failure_tx, mut presentation_failure_rx) =
         mpsc::unbounded_channel::<String>();
+    let lifecycle = ReceiverLifecycle {
+        presentation_failure: presentation_failure_tx,
+        shutting_down: Arc::new(AtomicBool::new(false)),
+    };
     install_data_channel_handler(
         &peer,
         Arc::clone(&presenter),
         Arc::clone(&control_channel),
         viewer_control.clone(),
         remote_clipboard_tx,
-        presentation_failure_tx,
         debug.clone(),
+        lifecycle.clone(),
     );
 
     let mut session_state = SessionState::Requested.transition(SessionState::Signaling)?;
@@ -503,6 +513,7 @@ pub async fn run_receiver(
         }
     }
     .await;
+    lifecycle.shutting_down.store(true, Ordering::Release);
     pointer_flusher.abort();
     let _ = pointer_flusher.await;
 
@@ -684,16 +695,16 @@ fn install_data_channel_handler(
     control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     viewer_control: ViewerControlQueue,
     remote_clipboard: mpsc::UnboundedSender<String>,
-    presentation_failure: mpsc::UnboundedSender<String>,
     debug: DebugInfo,
+    lifecycle: ReceiverLifecycle,
 ) {
     peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
         let presenter = Arc::clone(&presenter);
         let control_channel = Arc::clone(&control_channel);
         let viewer_control = viewer_control.clone();
         let remote_clipboard = remote_clipboard.clone();
-        let presentation_failure = presentation_failure.clone();
         let debug = debug.clone();
+        let lifecycle = lifecycle.clone();
         Box::pin(async move {
             debug.set_data_channel(channel.label(), "open");
             match channel.label() {
@@ -706,8 +717,9 @@ fn install_data_channel_handler(
                         presenter,
                         viewer_control,
                         remote_clipboard,
-                        presentation_failure,
+                        lifecycle.presentation_failure,
                         debug,
+                        lifecycle.shutting_down,
                     )
                 }
                 "meshrmm-video-v1" => {
@@ -726,15 +738,22 @@ fn install_control_handler(
     remote_clipboard: mpsc::UnboundedSender<String>,
     presentation_failure: mpsc::UnboundedSender<String>,
     debug: DebugInfo,
+    shutting_down: Arc<AtomicBool>,
 ) {
     {
         let presentation_failure = presentation_failure.clone();
         let debug = debug.clone();
+        let shutting_down = Arc::clone(&shutting_down);
         channel.on_close(Box::new(move || {
             let presentation_failure = presentation_failure.clone();
             let debug = debug.clone();
+            let shutting_down = Arc::clone(&shutting_down);
             Box::pin(async move {
                 debug.set_data_channel(CONTROL_CHANNEL_LABEL, "closed");
+                if shutting_down.load(Ordering::Acquire) {
+                    tracing::info!("viewer control data channel closed during viewer shutdown");
+                    return;
+                }
                 tracing::error!("viewer control data channel closed while video was active");
                 let _ = presentation_failure.send(
                     "remote input/control channel closed while video was still active".into(),
