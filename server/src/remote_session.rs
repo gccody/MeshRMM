@@ -116,6 +116,17 @@ impl DurableObject for RemoteSession {
                 return Ok(());
             }
         };
+        if matches!(
+            &signal,
+            SignalMessage::Error { message }
+                if message == "remote input/control channel closed unexpectedly"
+        ) {
+            // Older Agents report the viewer's intentional reconnect teardown
+            // as fatal. Recovery is driven by the client's resume request, so
+            // forwarding or persisting this message only poisons the new peer.
+            console_log!("event=recoverable_control_channel_close_ignored");
+            return Ok(());
+        }
         let tags = self.state.get_tags(&socket);
         let is_client = tags.iter().any(|tag| tag == CLIENT_TAG);
         let is_agent = tags.iter().any(|tag| tag == AGENT_TAG);
@@ -182,12 +193,16 @@ impl DurableObject for RemoteSession {
 
     async fn websocket_close(
         &self,
-        socket: WebSocket,
+        _socket: WebSocket,
         code: usize,
         _reason: String,
         was_clean: bool,
     ) -> Result<()> {
-        self.notify_other_peer(&socket, &SignalMessage::PeerLeft)?;
+        // A resumed session replaces both signaling sockets. The superseded
+        // sockets can close after their replacements are already connected;
+        // forwarding PeerLeft from those stale callbacks tears down the new
+        // WebRTC negotiation. Both peers already have transport liveness
+        // detection, so socket closure is advisory rather than terminal.
         console_log!(
             "event=remote_signal_peer_closed code={} clean={}",
             code,
@@ -196,8 +211,7 @@ impl DurableObject for RemoteSession {
         Ok(())
     }
 
-    async fn websocket_error(&self, socket: WebSocket, error: Error) -> Result<()> {
-        self.notify_other_peer(&socket, &SignalMessage::PeerLeft)?;
+    async fn websocket_error(&self, _socket: WebSocket, error: Error) -> Result<()> {
         console_error!("event=remote_signal_peer_error error={}", error);
         Ok(())
     }
@@ -334,20 +348,6 @@ impl RemoteSession {
         }
         console_log!("event=remote_signal_peer_connected role={}", role);
         Response::from_websocket(pair.client)
-    }
-
-    fn notify_other_peer(&self, socket: &WebSocket, signal: &SignalMessage) -> Result<()> {
-        let tags = self.state.get_tags(socket);
-        let destination = if tags.iter().any(|tag| tag == CLIENT_TAG) {
-            AGENT_TAG
-        } else {
-            CLIENT_TAG
-        };
-        let text = serde_json::to_string(signal)?;
-        for peer in self.state.get_websockets_with_tag(destination) {
-            let _ = peer.send_with_str(&text);
-        }
-        Ok(())
     }
 
     async fn expire(&self, reason: &str) -> Result<()> {

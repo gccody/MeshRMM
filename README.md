@@ -11,6 +11,8 @@ workspace with platform and transport responsibilities kept in focused crates:
   authentication and WebRTC signaling.
 - `remote/` — the native Windows/macOS viewer. Windows uses Media Foundation
   and D3D11; macOS uses AVFoundation, CoreMedia, Core Animation, and AppKit.
+- `ios/` — the native SwiftUI iPhone/iPad viewer. It uses WorkOS PKCE,
+  Keychain-backed sessions, WebRTC data channels, and hardware H.264 playback.
 
 ## MVP data path
 

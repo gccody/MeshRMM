@@ -312,6 +312,48 @@ mod tests {
     }
 
     #[test]
+    fn ios_postcard_compatibility_vectors_are_stable() {
+        let capabilities = SessionMessage::ViewerCapabilities {
+            profiles: vec![VideoProfile {
+                codec: Codec::H264,
+                chroma: ChromaMode::Yuv420,
+            }],
+            quality: QualityPreset::Balanced,
+            chroma: ChromaMode::Yuv420,
+        };
+        assert_eq!(capabilities.encode().unwrap(), [13, 1, 0, 0, 1, 0]);
+
+        let configuration = SessionMessage::DisplayConfiguration {
+            displays: vec![Display {
+                id: DisplayId(2),
+                name: "Left".into(),
+                x: -2_560,
+                y: -180,
+                width: 2_560,
+                height: 1_440,
+                primary: false,
+            }],
+            active_display_id: DisplayId(2),
+            stream_id: VideoStreamId(9),
+            format: VideoFormat {
+                width: 2_560,
+                height: 1_440,
+                frames_per_second: 60,
+                codec: Codec::H264,
+                pixel_format: PixelFormat::Nv12,
+                bitrate_bits_per_second: 12_000_000,
+            },
+        };
+        assert_eq!(
+            configuration.encode().unwrap(),
+            [
+                8, 1, 2, 4, b'L', b'e', b'f', b't', 0xff, 0x27, 0xe7, 0x02, 0x80, 0x14, 0xa0, 0x0b,
+                0, 2, 9, 0x80, 0x14, 0xa0, 0x0b, 60, 0, 0, 0x80, 0xb6, 0xdc, 0x05,
+            ]
+        );
+    }
+
+    #[test]
     fn quality_presets_respect_the_configured_cap() {
         assert_eq!(QualityPreset::DataSaver.bitrate(12_000_000), 3_000_000);
         assert_eq!(QualityPreset::Balanced.bitrate(12_000_000), 6_000_000);
