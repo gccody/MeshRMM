@@ -127,6 +127,14 @@ struct AccountResponse {
     permissions: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct MobileClientConfig {
+    api_url: String,
+    company_name: String,
+    workos_client_id: String,
+    workos_organization_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct UpdateCompanySettingsRequest {
     dashboard_idle_timeout_minutes: u32,
@@ -208,6 +216,9 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
         (Method::Get, ["healthz"]) => Response::ok("ok"),
         (Method::Get, ["v1", "auth", "invitations", "resolve"]) => {
             resolve_workos_invitation(&request, &environment).await
+        }
+        (Method::Get, ["v1", "mobile", "config"]) => {
+            mobile_client_config(&request, &environment).await
         }
         (Method::Get, ["v1", "account"]) => account(&request, &environment).await,
         (Method::Put, ["v1", "company", "settings"]) => {

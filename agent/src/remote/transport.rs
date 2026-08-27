@@ -257,11 +257,10 @@ async fn run_connected_sender(
         .create_data_channel(
             "meshrmm-video-v1",
             Some(RTCDataChannelInit {
-                // Inter-frame video access units form a predictive chain. Keep this
-                // dedicated video stream ordered so benign SCTP reordering is
-                // not mistaken for packet loss. One retry bounds head-of-line
-                // delay, and input remains isolated on the control stream.
-                ordered: Some(true),
+                // Video must not sit behind a lost SCTP message. Frame IDs and
+                // keyframe recovery already protect the predictive chain, while
+                // the reliable control stream remains independently ordered.
+                ordered: Some(false),
                 max_retransmits: Some(1),
                 protocol: Some("meshrmm.video.v1".into()),
                 ..Default::default()
@@ -702,9 +701,12 @@ async fn run_connected_sender(
                     }
                     ControlCommand::Stop => break Ok(()),
                     ControlCommand::ChannelClosed => {
-                        break Err(anyhow::anyhow!(
-                            "remote input/control channel closed unexpectedly"
-                        ));
+                        // The viewer closes its old channels before resuming the
+                        // session. End this sender quietly so its expected
+                        // teardown cannot surface as a fatal error in the new
+                        // connection.
+                        tracing::info!("viewer control channel closed; awaiting session resume");
+                        break Ok(());
                     }
                 }
             }

@@ -44,3 +44,6 @@ Thumbs.db
 .vscode/
 .vs/
 *.user
+
+# Downloaded iOS binary dependencies (run ios/scripts/bootstrap.sh)
+ios/Vendor/

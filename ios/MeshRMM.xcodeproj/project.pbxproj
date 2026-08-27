@@ -1,0 +1,506 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		2028320FF66C2459008F026F /* VideoProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 610CB6DC9AD5F4649DAC55EF /* VideoProtocolTests.swift */; };
+		5C0E9414931A0D7319B12432 /* VideoProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C392773751F9CE7EF723542 /* VideoProtocol.swift */; };
+		60707EAF7C74DB7ED1A3A52C /* RemoteDesktopView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77DB98321A78C8644CABE264 /* RemoteDesktopView.swift */; };
+		6D134807403FF55471C01393 /* MeshRMMApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 642373C4BDE90446D55D609D /* MeshRMMApp.swift */; };
+		720919EEE3A1A8C1A4686FD9 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B61D1AE926188327508BF304 /* RootView.swift */; };
+		7CA34396850BE317412F81C4 /* PostcardCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15DF5EA8AD78E363D93871A /* PostcardCodec.swift */; };
+		7EC0320B9F1B9750AC0EF61F /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC65863165747AB11EE096E1 /* APIClient.swift */; };
+		8A1030C8597C8E0C02E4EDB1 /* APIModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C729AEF25B5D174E186CEC49 /* APIModelsTests.swift */; };
+		958F3582F8C971934B4C8EB6 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 183DD69C2B4D483BADC311D2 /* AppModel.swift */; };
+		A0952996782A62C2D6371BA7 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E77C89791A8377CA9D6C5CCE /* KeychainStore.swift */; };
+		AE110E14899A58F58FFFFAE5 /* H264Renderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCED37030002D74CAA0C7DD4 /* H264Renderer.swift */; };
+		AF9336EA2FDD3806CDC9EDE8 /* RemoteSessionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E88FD6B1FC0B4E02CF754AE /* RemoteSessionController.swift */; };
+		C2301CF7A18F3D0D94943E59 /* WebRTC.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = BCD1B7D8747C62D6D0B78D07 /* WebRTC.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		DD3B4881EA45A8CFA9CF0888 /* PostcardCodecTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AFC944930A9D802ABD1DDC15 /* PostcardCodecTests.swift */; };
+		F4C1CB5D7495379ACDACD69B /* WebRTC.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = BCD1B7D8747C62D6D0B78D07 /* WebRTC.xcframework */; };
+		F578F43C4CA38498824101D1 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1B109A4CD093AF4505467D82 /* Assets.xcassets */; };
+		F57BB6BFD30CAEEF3DCF8230 /* APIModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DD4C2C762766038F90D23BD /* APIModels.swift */; };
+		F5BBAD3CAE95A37DF730A045 /* AuthService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3083C61416CDA7372E75E03E /* AuthService.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		AD34AF3B3487BAFCDB843930 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 0C123FE01986E07E54D71838 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A72534084BC8C2E713FF6821;
+			remoteInfo = MeshRMM;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		26B1776F1AC76EF03893017F /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				C2301CF7A18F3D0D94943E59 /* WebRTC.xcframework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		183DD69C2B4D483BADC311D2 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		1B109A4CD093AF4505467D82 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		3083C61416CDA7372E75E03E /* AuthService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthService.swift; sourceTree = "<group>"; };
+		610CB6DC9AD5F4649DAC55EF /* VideoProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoProtocolTests.swift; sourceTree = "<group>"; };
+		642373C4BDE90446D55D609D /* MeshRMMApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshRMMApp.swift; sourceTree = "<group>"; };
+		6E88FD6B1FC0B4E02CF754AE /* RemoteSessionController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteSessionController.swift; sourceTree = "<group>"; };
+		77DB98321A78C8644CABE264 /* RemoteDesktopView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteDesktopView.swift; sourceTree = "<group>"; };
+		7DD4C2C762766038F90D23BD /* APIModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIModels.swift; sourceTree = "<group>"; };
+		9C392773751F9CE7EF723542 /* VideoProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoProtocol.swift; sourceTree = "<group>"; };
+		A15DF5EA8AD78E363D93871A /* PostcardCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PostcardCodec.swift; sourceTree = "<group>"; };
+		A68BF2122E2AD26415C42DA6 /* MeshRMM.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = MeshRMM.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AFC944930A9D802ABD1DDC15 /* PostcardCodecTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PostcardCodecTests.swift; sourceTree = "<group>"; };
+		B61D1AE926188327508BF304 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		BCD1B7D8747C62D6D0B78D07 /* WebRTC.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = WebRTC.xcframework; path = Vendor/WebRTC.xcframework; sourceTree = "<group>"; };
+		BCED37030002D74CAA0C7DD4 /* H264Renderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = H264Renderer.swift; sourceTree = "<group>"; };
+		C729AEF25B5D174E186CEC49 /* APIModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIModelsTests.swift; sourceTree = "<group>"; };
+		CC65863165747AB11EE096E1 /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
+		D425A23BF1A1F1C96F6358D5 /* MeshRMMTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = MeshRMMTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		E77C89791A8377CA9D6C5CCE /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
+		FDCD4A3EB4EA150377F364B5 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		BF68C94FD37685459D431DC2 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F4C1CB5D7495379ACDACD69B /* WebRTC.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		013523117C893AA6B337DF00 = {
+			isa = PBXGroup;
+			children = (
+				E7EB68621A9C705DBA69AED7 /* MeshRMM */,
+				DC38D018D20CCACB31A31345 /* MeshRMMTests */,
+				E5D2EEE53507DD60525DA71C /* Frameworks */,
+				0D3F2EE9C13188F44C270345 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		0D3F2EE9C13188F44C270345 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A68BF2122E2AD26415C42DA6 /* MeshRMM.app */,
+				D425A23BF1A1F1C96F6358D5 /* MeshRMMTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		DC38D018D20CCACB31A31345 /* MeshRMMTests */ = {
+			isa = PBXGroup;
+			children = (
+				C729AEF25B5D174E186CEC49 /* APIModelsTests.swift */,
+				AFC944930A9D802ABD1DDC15 /* PostcardCodecTests.swift */,
+				610CB6DC9AD5F4649DAC55EF /* VideoProtocolTests.swift */,
+			);
+			path = MeshRMMTests;
+			sourceTree = "<group>";
+		};
+		E5D2EEE53507DD60525DA71C /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				BCD1B7D8747C62D6D0B78D07 /* WebRTC.xcframework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		E7EB68621A9C705DBA69AED7 /* MeshRMM */ = {
+			isa = PBXGroup;
+			children = (
+				CC65863165747AB11EE096E1 /* APIClient.swift */,
+				7DD4C2C762766038F90D23BD /* APIModels.swift */,
+				183DD69C2B4D483BADC311D2 /* AppModel.swift */,
+				1B109A4CD093AF4505467D82 /* Assets.xcassets */,
+				3083C61416CDA7372E75E03E /* AuthService.swift */,
+				BCED37030002D74CAA0C7DD4 /* H264Renderer.swift */,
+				FDCD4A3EB4EA150377F364B5 /* Info.plist */,
+				E77C89791A8377CA9D6C5CCE /* KeychainStore.swift */,
+				642373C4BDE90446D55D609D /* MeshRMMApp.swift */,
+				A15DF5EA8AD78E363D93871A /* PostcardCodec.swift */,
+				77DB98321A78C8644CABE264 /* RemoteDesktopView.swift */,
+				6E88FD6B1FC0B4E02CF754AE /* RemoteSessionController.swift */,
+				B61D1AE926188327508BF304 /* RootView.swift */,
+				9C392773751F9CE7EF723542 /* VideoProtocol.swift */,
+			);
+			path = MeshRMM;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A72534084BC8C2E713FF6821 /* MeshRMM */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C3C54C339B88060EB9405CFE /* Build configuration list for PBXNativeTarget "MeshRMM" */;
+			buildPhases = (
+				83F3EFD13AC2ACA6E292D4F5 /* Sources */,
+				88813A8C652E3EE23F3DC8D1 /* Resources */,
+				BF68C94FD37685459D431DC2 /* Frameworks */,
+				26B1776F1AC76EF03893017F /* Embed Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MeshRMM;
+			packageProductDependencies = (
+			);
+			productName = MeshRMM;
+			productReference = A68BF2122E2AD26415C42DA6 /* MeshRMM.app */;
+			productType = "com.apple.product-type.application";
+		};
+		DC397A1F63EF378811E586BB /* MeshRMMTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0F7F781EC36EE0B9652B9610 /* Build configuration list for PBXNativeTarget "MeshRMMTests" */;
+			buildPhases = (
+				403B26C9F4E33CD23F580AED /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A24189CD3DE998A14D17935B /* PBXTargetDependency */,
+			);
+			name = MeshRMMTests;
+			packageProductDependencies = (
+			);
+			productName = MeshRMMTests;
+			productReference = D425A23BF1A1F1C96F6358D5 /* MeshRMMTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		0C123FE01986E07E54D71838 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 2600;
+				TargetAttributes = {
+					A72534084BC8C2E713FF6821 = {
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 3FAD4CA11940E04CC890AF55 /* Build configuration list for PBXProject "MeshRMM" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 013523117C893AA6B337DF00;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 0D3F2EE9C13188F44C270345 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A72534084BC8C2E713FF6821 /* MeshRMM */,
+				DC397A1F63EF378811E586BB /* MeshRMMTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		88813A8C652E3EE23F3DC8D1 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F578F43C4CA38498824101D1 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		403B26C9F4E33CD23F580AED /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				8A1030C8597C8E0C02E4EDB1 /* APIModelsTests.swift in Sources */,
+				DD3B4881EA45A8CFA9CF0888 /* PostcardCodecTests.swift in Sources */,
+				2028320FF66C2459008F026F /* VideoProtocolTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		83F3EFD13AC2ACA6E292D4F5 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7EC0320B9F1B9750AC0EF61F /* APIClient.swift in Sources */,
+				F57BB6BFD30CAEEF3DCF8230 /* APIModels.swift in Sources */,
+				958F3582F8C971934B4C8EB6 /* AppModel.swift in Sources */,
+				F5BBAD3CAE95A37DF730A045 /* AuthService.swift in Sources */,
+				AE110E14899A58F58FFFFAE5 /* H264Renderer.swift in Sources */,
+				A0952996782A62C2D6371BA7 /* KeychainStore.swift in Sources */,
+				6D134807403FF55471C01393 /* MeshRMMApp.swift in Sources */,
+				7CA34396850BE317412F81C4 /* PostcardCodec.swift in Sources */,
+				60707EAF7C74DB7ED1A3A52C /* RemoteDesktopView.swift in Sources */,
+				AF9336EA2FDD3806CDC9EDE8 /* RemoteSessionController.swift in Sources */,
+				720919EEE3A1A8C1A4686FD9 /* RootView.swift in Sources */,
+				5C0E9414931A0D7319B12432 /* VideoProtocol.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A24189CD3DE998A14D17935B /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A72534084BC8C2E713FF6821 /* MeshRMM */;
+			targetProxy = AD34AF3B3487BAFCDB843930 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		094E539A97C60CCFFAF35C64 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"Vendor\"",
+				);
+				INFOPLIST_FILE = MeshRMM/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.meshrmm.ios;
+				PRODUCT_NAME = MeshRMM;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		0AD1A926885366AD970A7B1E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		613332E7249466AE4238061C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"Vendor\"",
+				);
+				INFOPLIST_FILE = MeshRMM/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.meshrmm.ios;
+				PRODUCT_NAME = MeshRMM;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		A57425B95E8DC08D4A267BB5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		B677822F62965E616357E33A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.meshrmm.ios.tests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/MeshRMM.app/MeshRMM";
+			};
+			name = Debug;
+		};
+		E2BAC62B0925A4753F72E4C1 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.meshrmm.ios.tests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/MeshRMM.app/MeshRMM";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		0F7F781EC36EE0B9652B9610 /* Build configuration list for PBXNativeTarget "MeshRMMTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B677822F62965E616357E33A /* Debug */,
+				E2BAC62B0925A4753F72E4C1 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		3FAD4CA11940E04CC890AF55 /* Build configuration list for PBXProject "MeshRMM" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A57425B95E8DC08D4A267BB5 /* Debug */,
+				0AD1A926885366AD970A7B1E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		C3C54C339B88060EB9405CFE /* Build configuration list for PBXNativeTarget "MeshRMM" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				094E539A97C60CCFFAF35C64 /* Debug */,
+				613332E7249466AE4238061C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 0C123FE01986E07E54D71838 /* Project object */;
+}

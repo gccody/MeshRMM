@@ -1,5 +1,39 @@
 use crate::*;
 
+pub(crate) async fn mobile_client_config(request: &Request, environment: &Env) -> Result<Response> {
+    #[derive(Deserialize)]
+    struct MobileCompany {
+        name: String,
+        workos_organization_id: Option<String>,
+        status: String,
+    }
+
+    let db = environment.d1("DB")?;
+    let Some(tenant) = request_tenant_company(&db, request, environment).await? else {
+        return api_error(404, "company hostname was not found");
+    };
+    let company = query!(
+        &db,
+        "SELECT name, workos_organization_id, status FROM companies WHERE id = ?1",
+        tenant.id
+    )?
+    .first::<MobileCompany>(None)
+    .await?
+    .ok_or_else(|| Error::RustError("company has not been provisioned".into()))?;
+    if !matches!(company.status.as_str(), "active" | "awaiting_admin") {
+        return api_error(403, "company is not active");
+    }
+    let workos_organization_id = company
+        .workos_organization_id
+        .ok_or_else(|| Error::RustError("company authentication is not configured".into()))?;
+    Response::from_json(&MobileClientConfig {
+        api_url: format!("https://{}", request_hostname(request)?),
+        company_name: company.name,
+        workos_client_id: environment.var("WORKOS_CLIENT_ID")?.to_string(),
+        workos_organization_id,
+    })
+}
+
 pub(crate) async fn account(request: &Request, environment: &Env) -> Result<Response> {
     let identity = match authorize_workos_user(request, environment).await {
         Ok(identity) => identity,

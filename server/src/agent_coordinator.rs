@@ -91,19 +91,32 @@ impl DurableObject for AgentCoordinator {
             }
             (Method::Post, "/request") => {
                 let session: AgentSessionRequest = request.json().await?;
-                let Some(agent) = self
-                    .state
-                    .get_websockets_with_tag(AGENT_TAG)
-                    .into_iter()
-                    .next()
-                else {
+                let agents = self.state.get_websockets_with_tag(AGENT_TAG);
+                if agents.is_empty() {
                     return Response::error("Agent is offline", 409);
-                };
+                }
                 self.state
                     .storage()
                     .put(ACTIVE_SESSION_KEY, &session)
                     .await?;
-                agent.send_with_str(serde_json::to_string(&session)?)?;
+                let payload = serde_json::to_string(&session)?;
+                let mut delivered = false;
+                for agent in agents {
+                    match agent.send_with_str(&payload) {
+                        Ok(()) => {
+                            delivered = true;
+                            break;
+                        }
+                        Err(error) => {
+                            console_error!("event=agent_session_notify_failed error={}", error);
+                            let _ = agent.close(Some(1011), Some("stale Agent connection"));
+                        }
+                    }
+                }
+                if !delivered {
+                    self.state.storage().delete(ACTIVE_SESSION_KEY).await?;
+                    return Response::error("Agent is offline", 409);
+                }
                 console_log!(
                     "event=agent_session_notified session_id={}",
                     session.session_id
@@ -116,13 +129,25 @@ impl DurableObject for AgentCoordinator {
                     .storage()
                     .put(ACTIVE_SESSION_KEY, &session)
                     .await?;
-                if let Some(agent) = self
-                    .state
-                    .get_websockets_with_tag(AGENT_TAG)
-                    .into_iter()
-                    .next()
-                {
-                    agent.send_with_str(serde_json::to_string(&session)?)?;
+                let payload = serde_json::to_string(&session)?;
+                let mut delivered = false;
+                for agent in self.state.get_websockets_with_tag(AGENT_TAG) {
+                    match agent.send_with_str(&payload) {
+                        Ok(()) => {
+                            delivered = true;
+                            break;
+                        }
+                        Err(error) => {
+                            console_error!(
+                                "event=agent_session_resume_notify_failed error={}",
+                                error
+                            );
+                            let _ = agent.close(Some(1011), Some("stale Agent connection"));
+                        }
+                    }
+                }
+                if !delivered {
+                    return Response::error("Agent is offline", 409);
                 }
                 console_log!(
                     "event=agent_session_resume_refreshed session_id={}",
