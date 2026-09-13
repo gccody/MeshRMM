@@ -6,8 +6,10 @@
 //! encoded access units cross the callback boundary.
 
 mod converter;
+mod desktop;
 mod duplication;
 mod encoder;
+mod layout;
 
 pub use duplication::WindowsDesktopDuplicationStreamer;
 
@@ -120,12 +122,40 @@ pub struct DisplayInfo {
     pub primary: bool,
 }
 
+/// Reserved synthetic display; distinct from the helper's `None` sentinel.
+pub const ALL_MONITORS_ID: u32 = u32::MAX - 1;
+
 pub fn enumerate_displays() -> Result<Vec<DisplayInfo>, Error> {
-    Monitor::enumerate()
+    // Enumerate physical coordinates before either capture backend starts.
+    // A process whose DPI context is already set returns access denied.
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    };
+    if let Err(error) =
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+        && error.code() != windows::Win32::Foundation::E_ACCESSDENIED
+    {
+        return Err(error.into());
+    }
+    let mut displays: Vec<DisplayInfo> = Monitor::enumerate()
         .map_err(capture_error)?
         .into_iter()
         .map(display_info)
-        .collect()
+        .collect::<Result<_, _>>()?;
+    if displays.len() > 1 {
+        let bounds = layout::desktop_bounds(displays.iter().map(|d| (d.x, d.y, d.width, d.height)))
+            .ok_or(Error::InvalidDisplayDimensions)?;
+        displays.push(DisplayInfo {
+            id: ALL_MONITORS_ID,
+            name: "All monitors".into(),
+            x: bounds.0,
+            y: bounds.1,
+            width: bounds.2,
+            height: bounds.3,
+            primary: false,
+        });
+    }
+    Ok(displays)
 }
 
 fn display_info(monitor: Monitor) -> Result<DisplayInfo, Error> {
@@ -434,6 +464,7 @@ impl From<windows::core::Error> for Error {
 
 pub struct WindowsScreenStreamer {
     control: Option<CaptureControl<CaptureHandler, Error>>,
+    desktop: WindowsDesktopDuplicationStreamer,
     active_format: Option<ActiveFormat>,
     controls: Arc<ControlState>,
 }
@@ -442,6 +473,7 @@ impl WindowsScreenStreamer {
     pub fn new() -> Self {
         Self {
             control: None,
+            desktop: WindowsDesktopDuplicationStreamer::new(),
             active_format: None,
             controls: Arc::new(ControlState::default()),
         }
@@ -453,8 +485,13 @@ impl WindowsScreenStreamer {
         display_id: u32,
         sink: EncodedFrameSink,
     ) -> Result<ActiveFormat, Error> {
-        if self.control.is_some() {
+        if self.active_format.is_some() {
             return Err(Error::AlreadyRunning);
+        }
+        if display_id == ALL_MONITORS_ID {
+            let format = self.desktop.start(config, display_id, sink)?;
+            self.active_format = Some(format);
+            return Ok(format);
         }
         // The static media type already contains this start's bitrate. Do not
         // replay a runtime request left behind by the previous encoder.
@@ -519,6 +556,9 @@ impl WindowsScreenStreamer {
     }
 
     pub fn request_keyframe(&self) -> Result<(), Error> {
+        if self.control.is_none() && self.active_format.is_some() {
+            return self.desktop.request_keyframe();
+        }
         if self.control.is_none() {
             return Err(Error::NotRunning);
         }
@@ -529,6 +569,9 @@ impl WindowsScreenStreamer {
     }
 
     pub fn set_bitrate(&self, bits_per_second: u32) -> Result<(), Error> {
+        if self.control.is_none() && self.active_format.is_some() {
+            return self.desktop.set_bitrate(bits_per_second);
+        }
         if self.control.is_none() {
             return Err(Error::NotRunning);
         }
@@ -550,6 +593,11 @@ impl WindowsScreenStreamer {
     }
 
     pub fn poll_ended(&mut self) -> Option<Result<(), Error>> {
+        if self.control.is_none() {
+            let result = self.desktop.poll_ended()?;
+            self.active_format = None;
+            return Some(result);
+        }
         if !self.control.as_ref()?.is_finished() {
             return None;
         }
@@ -563,6 +611,7 @@ impl WindowsScreenStreamer {
     }
 
     pub fn stop(&mut self) -> Result<(), Error> {
+        self.desktop.stop()?;
         let Some(control) = self.control.take() else {
             self.active_format = None;
             return Ok(());
@@ -598,6 +647,46 @@ fn _assert_device_types(_: &ID3D11Device, _: &ID3D11DeviceContext) {}
 #[cfg(test)]
 mod tests {
     use super::FramePacer;
+
+    #[test]
+    #[ignore = "requires Windows, at least two monitors, and a hardware video encoder"]
+    fn all_monitors_stream_and_switch_back() {
+        use super::*;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let displays = enumerate_displays().unwrap();
+        let combined = displays
+            .iter()
+            .find(|d| d.id == ALL_MONITORS_ID)
+            .expect("connect at least two monitors");
+        let primary = displays.iter().find(|d| d.primary).unwrap();
+        let mut streamer = WindowsScreenStreamer::new();
+        for id in [ALL_MONITORS_ID, primary.id, ALL_MONITORS_ID] {
+            let (tx, rx) = mpsc::channel();
+            let format = streamer
+                .start(
+                    StreamConfig::default(),
+                    id,
+                    Arc::new(move |frame| {
+                        let _ = tx.send(frame);
+                    }),
+                )
+                .unwrap();
+            if id == ALL_MONITORS_ID {
+                assert_eq!(
+                    (format.width, format.height),
+                    (combined.width, combined.height)
+                );
+            }
+            let frame = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(!frame.data.is_empty());
+            streamer.request_keyframe().unwrap();
+            assert!(streamer.poll_ended().is_none());
+            streamer.stop().unwrap();
+            assert!(streamer.active_format().is_none());
+        }
+    }
 
     #[test]
     #[ignore = "requires an interactive Windows desktop and hardware HEVC encoder; runs for 60 seconds"]

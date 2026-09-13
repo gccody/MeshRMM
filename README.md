@@ -320,7 +320,17 @@ Pointer coordinates are normalized to the display
 currently being streamed and every event carries that display ID, so the Agent
 rejects input left over from a previous display after a switch. On Windows,
 press **F8** in the viewer to cycle displays. On macOS, use
-**Control-Option-Left/Right Arrow**. The active display name is shown in the
+**Control-Option-Left/Right Arrow**. On endpoints with multiple monitors,
+select **All monitors** from the viewer's display dropdown (also included in
+keyboard cycling) to view and control the complete desktop in one window.
+The combined view preserves monitor positions, including negative coordinates,
+with black space between monitors. Select an individual monitor to return to
+its full-resolution view. This option requires an updated Windows Agent and
+appears automatically in both native viewers; the primary monitor remains the
+default. Combined capture uses GDI with a CPU-to-GPU upload and hardware video
+encoding, so frame rate can be lower than individual-monitor GPU capture.
+The combined resolution must be supported by the agent's hardware encoder and
+the viewer's decoder. The active display name is shown in the
 viewer title. The viewer sends input only while its remote-desktop window is in
 the foreground. The click that activates an inactive macOS viewer is not
 forwarded. Unfocusing the viewer, switching displays, or ending a session
@@ -372,13 +382,13 @@ above; do not infer performance measurements from a successful build.
 The Agent/capture implementation remains Windows-only; the viewer supports
 Windows and macOS. The selected display and captured cursor are streamed.
 Clipboard synchronization is plain text only; there is no audio, file transfer,
-recording, simultaneous multi-monitor view, browser client, or concurrent
+recording, browser client, or concurrent
 viewer. Windows secure-attention sequences
 such as Ctrl+Alt+Delete cannot be synthesized by a normal user-mode Agent. H.265
 or H.264 is sent over a purpose-built unreliable WebRTC DataChannel rather than
 an RTP track. Encoded video necessarily crosses CPU memory for packetization and
-decoder input. Windows keeps full-size captured and decoded images in D3D11
-textures; macOS hands compressed samples to AVSampleBufferDisplayLayer and does
+decoder input. Single-monitor Windows capture and decoding keep full-size
+images in D3D11 textures; macOS hands compressed samples to AVSampleBufferDisplayLayer and does
 not create a CPU RGBA frame in application code.
 
 

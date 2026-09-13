@@ -46,3 +46,25 @@ cargo test -p meshrmm-remote-screen --release hardware_encode_1440p60 -- --ignor
 
 Periodic agent capture statistics now include `frames_encoder_busy` and
 `mean_encode_us` alongside capture FPS, stream FPS, and rate-limited frames.
+
+## All-monitors capture
+
+The **All monitors** display choice combines the Windows desktop into one video
+stream. It uses GDI capture and one CPU-to-GPU upload per frame, followed by the
+existing hardware encoder. The single-monitor DXGI path is unchanged. Combined
+capture has different performance characteristics; the measurements above do
+not apply to it. Large desktop bounds are subject to GPU encoder/decoder limits.
+
+On Windows with two or more monitors, verify startup and switching with:
+
+```powershell
+cargo test -p meshrmm-remote-screen all_monitors_stream_and_switch_back -- --ignored --nocapture
+```
+
+For the end-to-end smoke test, select **All monitors** in each native viewer and
+check that both displays update in the same window, the cursor and clicks align
+on each display, and individual-monitor selection still works. Include a monitor
+left of or above the primary, mixed DPI, portrait orientation, a monitor layout
+change, and lock/unlock. Reconnect the session while All monitors is selected to
+check selection restoration. These hardware checks cannot run on the macOS
+build host.
