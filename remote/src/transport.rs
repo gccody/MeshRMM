@@ -98,6 +98,20 @@ impl VideoReceiveState {
         self.waiting_for_keyframe = true;
     }
 
+    fn poll_recovery(&mut self, now_us: u64) -> Option<VideoStreamId> {
+        // The last packet of a burst can be lost on a static desktop. Expire
+        // its incomplete frame even when no subsequent packets arrive.
+        if self.reassembler.expire_stale(now_us) {
+            self.mark_loss();
+            tracing::warn!("incomplete video frame expired while waiting for more packets");
+        }
+        if self.waiting_for_keyframe && self.keyframe_request_due(now_us) {
+            self.stream_id
+        } else {
+            None
+        }
+    }
+
     fn observe_stream(&mut self, stream_id: VideoStreamId) {
         if self.stream_id != Some(stream_id) {
             self.stream_id = Some(stream_id);
@@ -560,6 +574,19 @@ async fn update_network_stats(peer: &RTCPeerConnection, debug: &DebugInfo) {
     let reports = peer.get_stats().await.reports;
     let mut candidates = HashMap::new();
     for report in reports.values() {
+        if let StatsReportType::DataChannel(channel) = report {
+            // ICE candidate-pair counters are not populated by webrtc-ice.
+            // Data-channel counters measure the actual video/control traffic.
+            tracing::info!(
+                label = %channel.label,
+                state = ?channel.state,
+                messages_received = channel.messages_received,
+                bytes_received = channel.bytes_received,
+                messages_sent = channel.messages_sent,
+                bytes_sent = channel.bytes_sent,
+                "WebRTC data channel statistics"
+            );
+        }
         if let StatsReportType::LocalCandidate(candidate)
         | StatsReportType::RemoteCandidate(candidate) = report
         {
@@ -724,7 +751,7 @@ fn install_data_channel_handler(
                     )
                 }
                 "meshrmm-video-v1" => {
-                    install_video_handler(channel, presenter, viewer_control, debug)
+                    install_video_handler(channel, presenter, viewer_control, debug, lifecycle)
                 }
                 label => tracing::warn!(label, "ignoring unknown WebRTC data channel"),
             }
@@ -1003,6 +1030,7 @@ fn install_video_handler(
     presenter: Arc<Mutex<Option<ActivePresenter>>>,
     viewer_control: ViewerControlQueue,
     debug: DebugInfo,
+    lifecycle: ReceiverLifecycle,
 ) {
     let closed = Arc::new(AtomicBool::new(false));
     {
@@ -1011,9 +1039,16 @@ fn install_video_handler(
         channel.on_close(Box::new(move || {
             let debug = debug.clone();
             let closed = Arc::clone(&closed);
+            let lifecycle = lifecycle.clone();
             Box::pin(async move {
                 closed.store(true, Ordering::Release);
                 debug.set_data_channel("meshrmm-video-v1", "closed");
+                if !lifecycle.shutting_down.load(Ordering::Acquire) {
+                    tracing::error!("viewer video data channel closed during an active session");
+                    let _ = lifecycle
+                        .presentation_failure
+                        .send("remote video channel closed during an active session".into());
+                }
             })
         }));
     }
@@ -1031,9 +1066,7 @@ fn install_video_handler(
                 let now_us = monotonic_timestamp_us();
                 let stream_id = {
                     let mut state = receive_state.lock().await;
-                    (state.waiting_for_keyframe && state.keyframe_request_due(now_us))
-                        .then_some(state.stream_id)
-                        .flatten()
+                    state.poll_recovery(now_us)
                 };
                 if let Some(stream_id) = stream_id {
                     viewer_control.send(SessionMessage::RequestKeyframe { stream_id });
@@ -1205,6 +1238,47 @@ mod tests {
         assert!(state.keyframe_request_due(1_000));
         assert!(!state.keyframe_request_due(1_001));
         assert!(state.keyframe_request_due(1_000 + KEYFRAME_RETRY_INTERVAL_US));
+    }
+
+    #[test]
+    fn video_recovery_expires_a_trailing_fragment_without_new_packets() {
+        let mut state = VideoReceiveState::new();
+        state.accept_completed(encoded_frame(1, true), 1_000);
+        let mut frame = encoded_frame(2, false);
+        frame.data = vec![1; 6];
+        let packet = meshrmm_protocol::fragment_frame(&frame, 3)
+            .unwrap()
+            .remove(0);
+        assert!(matches!(
+            state.reassembler.push(packet, 2_000),
+            ReassemblyOutcome::Accepted
+        ));
+        assert_eq!(state.poll_recovery(2_001), None);
+
+        let expired_at = 2_000 + ReassemblyConfig::default().stale_after.as_micros() as u64;
+        assert_eq!(state.poll_recovery(expired_at), Some(VideoStreamId(7)));
+        assert_eq!(state.reassembler.stats().incomplete_frames_dropped, 1);
+        assert_eq!(state.poll_recovery(expired_at + 1), None);
+        assert_eq!(
+            state.poll_recovery(expired_at + KEYFRAME_RETRY_INTERVAL_US),
+            Some(VideoStreamId(7))
+        );
+        state.accept_completed(
+            encoded_frame(3, true),
+            expired_at + KEYFRAME_RETRY_INTERVAL_US + 1,
+        );
+        assert_eq!(
+            state.poll_recovery(expired_at + 2 * KEYFRAME_RETRY_INTERVAL_US),
+            None
+        );
+    }
+
+    #[test]
+    fn video_recovery_does_not_treat_a_static_desktop_as_packet_loss() {
+        let mut state = VideoReceiveState::new();
+        state.accept_completed(encoded_frame(1, true), 1_000);
+        assert_eq!(state.poll_recovery(60_000_000), None);
+        assert!(!state.waiting_for_keyframe);
     }
 
     #[test]
