@@ -302,6 +302,14 @@ struct HardwareDecoder {
 
 impl HardwareDecoder {
     pub(super) unsafe fn new(device: &ID3D11Device, format: VideoFormat) -> anyhow::Result<Self> {
+        // The renderer and asynchronous decoder use the same immediate
+        // context. Protect it before the MFT receives the D3D device manager.
+        let context = unsafe { device.GetImmediateContext() }
+            .context("decoder immediate context unavailable")?;
+        let multithread: ID3D11Multithread = context
+            .cast()
+            .context("decoder D3D multithread protection unavailable")?;
+        let _ = unsafe { multithread.SetMultithreadProtected(true) };
         let subtype = codec_subtype(format.codec);
         let input_info = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
@@ -428,12 +436,20 @@ impl HardwareDecoder {
             // when a hardware MFT stops requesting input while the desktop is
             // idle. Poll and retain the encoded frame until the MFT is ready.
             match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                Ok(event) => match unsafe { event.GetType() } {
-                    Ok(value) if value == METransformNeedInput.0 as u32 => self.need_input += 1,
-                    Ok(value) if value == METransformHaveOutput.0 as u32 => self.have_output += 1,
-                    Ok(_) => {}
-                    Err(error) => return Err(error).context("decoder event type failed"),
-                },
+                Ok(event) => {
+                    unsafe { event.GetStatus() }
+                        .context("decoder event status unavailable")?
+                        .ok()
+                        .context("hardware decoder reported an asynchronous failure")?;
+                    match unsafe { event.GetType() } {
+                        Ok(value) if value == METransformNeedInput.0 as u32 => self.need_input += 1,
+                        Ok(value) if value == METransformHaveOutput.0 as u32 => {
+                            self.have_output += 1
+                        }
+                        Ok(_) => {}
+                        Err(error) => return Err(error).context("decoder event type failed"),
+                    }
+                }
                 Err(error) if error.code() == MF_E_NO_EVENTS_AVAILABLE => break,
                 Err(error) => return Err(error).context("decoder event pump failed"),
             }
