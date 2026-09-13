@@ -6,6 +6,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
@@ -83,9 +84,27 @@ struct State {
     collapsed: bool,
     work: RECT,
     expanded_width: i32,
+    center_x: Option<i32>,
+    drag: Option<Drag>,
+}
+
+struct Drag {
+    pointer_x: i32,
+    center_x: i32,
+    moved: bool,
 }
 
 impl State {
+    fn left(&self, width: i32) -> i32 {
+        let center = self
+            .center_x
+            .unwrap_or(self.work.left + (self.work.right - self.work.left) / 2);
+        (center - width / 2).clamp(
+            self.work.left,
+            (self.work.right - width).max(self.work.left),
+        )
+    }
+
     fn label(&self) -> String {
         if self.collapsed {
             "▾".to_owned()
@@ -111,7 +130,7 @@ unsafe fn create_window(name: String) -> windows::core::Result<(HWND, *mut State
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
             class,
-            w!("Remote session — click to collapse or expand"),
+            w!("Remote session — drag sideways; click to collapse or expand"),
             WS_POPUP,
             0,
             0,
@@ -127,6 +146,8 @@ unsafe fn create_window(name: String) -> windows::core::Result<(HWND, *mut State
             collapsed: false,
             work: RECT::default(),
             expanded_width: 320,
+            center_x: None,
+            drag: None,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
         refresh_layout(hwnd);
@@ -218,7 +239,7 @@ unsafe fn position(hwnd: HWND, collapsed: bool) -> windows::core::Result<()> {
         );
         SelectObject(dc, old_font);
         let destination = POINT {
-            x: work.left + (work.right - work.left - width) / 2,
+            x: (&*state).left(width),
             y: work.top,
         };
         let size = SIZE {
@@ -251,16 +272,74 @@ unsafe fn position(hwnd: HWND, collapsed: bool) -> windows::core::Result<()> {
     }
 }
 
+// Use signed client coordinates: captured mouse moves can lie outside the tab.
+unsafe fn pointer_x(hwnd: HWND, lp: LPARAM) -> i32 {
+    unsafe {
+        let mut point = POINT {
+            x: lp.0 as u16 as i16 as i32,
+            y: (lp.0 >> 16) as u16 as i16 as i32,
+        };
+        let _ = ClientToScreen(hwnd, &mut point);
+        point.x
+    }
+}
+
+unsafe fn drag_to(hwnd: HWND, state: *mut State, x: i32) {
+    unsafe {
+        let Some(drag) = (*state).drag.as_mut() else {
+            return;
+        };
+        let delta = x - drag.pointer_x;
+        // Small hand movements remain a click; dragging never toggles the tab.
+        if !drag.moved && delta.abs() < GetSystemMetrics(SM_CXDRAG).max(4) {
+            return;
+        }
+        drag.moved = true;
+        (*state).center_x = Some(drag.center_x + delta);
+        if let Err(error) = position(hwnd, (*state).collapsed) {
+            tracing::warn!(%error, "could not move session banner");
+        }
+    }
+}
+
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
         match msg {
             WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
             WM_CLOSE => return LRESULT(0),
+            WM_LBUTTONDOWN if !state.is_null() => {
+                let mut rect = RECT::default();
+                if GetWindowRect(hwnd, &mut rect).is_ok() {
+                    (*state).drag = Some(Drag {
+                        pointer_x: pointer_x(hwnd, lp),
+                        center_x: rect.left + (rect.right - rect.left) / 2,
+                        moved: false,
+                    });
+                    SetCapture(hwnd);
+                }
+                return LRESULT(0);
+            }
+            WM_MOUSEMOVE if !state.is_null() => {
+                drag_to(hwnd, state, pointer_x(hwnd, lp));
+                return LRESULT(0);
+            }
             WM_LBUTTONUP if !state.is_null() => {
-                (*state).collapsed = !(*state).collapsed;
-                if let Err(error) = position(hwnd, (*state).collapsed) {
-                    tracing::warn!(%error, "could not update session banner");
+                drag_to(hwnd, state, pointer_x(hwnd, lp));
+                let click = (*state).drag.take().is_some_and(|drag| !drag.moved);
+                let _ = ReleaseCapture();
+                if click {
+                    (*state).collapsed = !(*state).collapsed;
+                    if let Err(error) = position(hwnd, (*state).collapsed) {
+                        tracing::warn!(%error, "could not update session banner");
+                    }
+                }
+                return LRESULT(0);
+            }
+            WM_CAPTURECHANGED | WM_CANCELMODE if !state.is_null() => {
+                (*state).drag = None;
+                if msg == WM_CANCELMODE {
+                    let _ = ReleaseCapture();
                 }
                 return LRESULT(0);
             }
@@ -291,6 +370,31 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn horizontal_position_stays_on_screen_in_both_states() {
+        let mut state = State {
+            name: String::new(),
+            collapsed: false,
+            work: RECT {
+                left: -1920,
+                top: 0,
+                right: 0,
+                bottom: 1080,
+            },
+            expanded_width: 320,
+            center_x: Some(-3000),
+            drag: None,
+        };
+        for width in [32, 320] {
+            state.center_x = Some(-3000);
+            assert_eq!(state.left(width), -1920);
+            state.center_x = Some(200);
+            assert_eq!(state.left(width), -width);
+            state.center_x = Some(-1000);
+            assert_eq!(state.left(width), -1000 - width / 2);
+        }
+    }
+
+    #[test]
     fn toggles_and_repaints_without_waiting_for_idle() {
         let indicator = SessionIndicator::show("Banner latency check").unwrap();
         let hwnd = HWND(indicator.window as *mut _);
@@ -303,6 +407,7 @@ mod tests {
             let collapsed = click % 2 == 0;
             let start = Instant::now();
             unsafe {
+                PostMessageW(Some(hwnd), WM_LBUTTONDOWN, WPARAM(0), LPARAM(0)).unwrap();
                 PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0), LPARAM(0)).unwrap();
                 loop {
                     let mut rect = RECT::default();
@@ -341,6 +446,53 @@ mod tests {
                 );
             }
             maximum = maximum.max(start.elapsed());
+        }
+        unsafe {
+            let send = |message, x: i32| {
+                assert_ne!(
+                    SendMessageTimeoutW(
+                        hwnd,
+                        message,
+                        WPARAM(0),
+                        LPARAM(((4i32 << 16) | (x & 0xffff)) as isize),
+                        SMTO_ABORTIFHUNG,
+                        100,
+                        None
+                    )
+                    .0,
+                    0
+                );
+            };
+            // Drag the expanded banner, then collapse it in its new location.
+            send(WM_LBUTTONDOWN, 8);
+            send(WM_MOUSEMOVE, 58);
+            send(WM_LBUTTONUP, 8);
+            let mut moved = RECT::default();
+            GetWindowRect(hwnd, &mut moved).unwrap();
+            assert_eq!(moved.left, initial.left + 50);
+            assert_eq!(moved.right - moved.left, initial.right - initial.left);
+            assert_eq!(moved.top, initial.top);
+            send(WM_LBUTTONDOWN, 8);
+            send(WM_LBUTTONUP, 8);
+            let mut collapsed = RECT::default();
+            GetWindowRect(hwnd, &mut collapsed).unwrap();
+            assert_eq!(collapsed.right - collapsed.left, 32);
+            assert!(((collapsed.left + collapsed.right) - (moved.left + moved.right)).abs() <= 1);
+            // The tiny tab also drags without expanding.
+            send(WM_LBUTTONDOWN, 8);
+            send(WM_MOUSEMOVE, 58);
+            send(WM_LBUTTONUP, 8);
+            let mut tab = RECT::default();
+            GetWindowRect(hwnd, &mut tab).unwrap();
+            assert_eq!(tab.left, collapsed.left + 50);
+            assert_eq!(tab.right - tab.left, 32);
+            assert_eq!(tab.top, initial.top);
+            send(WM_LBUTTONDOWN, 8);
+            send(WM_LBUTTONUP, 8);
+            let mut expanded = RECT::default();
+            GetWindowRect(hwnd, &mut expanded).unwrap();
+            assert_eq!(expanded.right - expanded.left, initial.right - initial.left);
+            assert!(((expanded.left + expanded.right) - (tab.left + tab.right)).abs() <= 1);
         }
         let closing = Instant::now();
         drop(indicator);
