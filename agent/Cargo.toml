@@ -35,6 +35,8 @@ ureq = { version = "3.4.0", features = ["json", "platform-verifier"] }
 windows-service = "0.8.1"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
     "Win32_Storage_FileSystem",
     "Win32_Security",
     "Win32_System_Environment",

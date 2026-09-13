@@ -185,6 +185,7 @@ struct HandoffResponse {
 
 #[derive(Debug, Serialize)]
 struct SessionInit<'a> {
+    viewer_name: &'a str,
     session_id: &'a str,
     device_id: &'a str,
     client_token: &'a str,

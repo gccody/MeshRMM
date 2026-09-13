@@ -229,6 +229,15 @@ handoff, then opens the native viewer with a
 `meshrmm://connect?handoff=...&server=...` deep link. No service credential is
 entered into or retained by the browser.
 
+During desktop sharing, the Windows endpoint shows a translucent banner at the
+top of the primary screen with the connected user's dashboard name (WorkOS
+first and last name, or email when no name is set). Click the banner to collapse
+it to a tiny arrow tab with no name; click again to expand it. It does not take keyboard
+focus and disappears when capture stops. The server resolves the name from the
+authenticated handoff owner and retains it across session reconnects. Deploy
+both the server and updated Windows Agent to enable named banners; older
+session records use “Remote user”.
+
 Company administrators use the embedded WorkOS user-management, domain, and
 SSO widgets to invite users, assign roles, verify domains, and configure a SAML
 or OIDC identity provider. The application has no company switcher; a user with

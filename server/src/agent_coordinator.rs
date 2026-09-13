@@ -440,6 +440,7 @@ mod lease_tests {
     #[test]
     fn resume_cannot_take_over_another_or_expired_session() {
         let active = AgentSessionRequest {
+            viewer_name: "Ada Lovelace".into(),
             session_id: meshrmm_protocol_types::RemoteSessionId::new("one"),
             signaling_token: "token".into(),
             expires_at_unix_ms: 100,
