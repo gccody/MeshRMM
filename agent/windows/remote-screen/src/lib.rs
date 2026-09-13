@@ -649,6 +649,73 @@ mod tests {
     use super::FramePacer;
 
     #[test]
+    #[ignore = "requires an interactive multi-monitor Windows desktop and hardware encoder"]
+    fn every_display_produces_keyframes_without_capture_restarts() {
+        use super::*;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let displays = enumerate_displays().unwrap();
+        assert!(
+            displays.iter().any(|d| d.height > d.width),
+            "connect a portrait display"
+        );
+        let mut streamer = WindowsDesktopDuplicationStreamer::new();
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            for display in &displays {
+                let (tx, rx) = mpsc::channel();
+                let started = Instant::now();
+                let format = streamer
+                    .start(
+                        StreamConfig {
+                            codec,
+                            ..StreamConfig::default()
+                        },
+                        display.id,
+                        Arc::new(move |frame| {
+                            let _ = tx.send(frame);
+                        }),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    (format.width, format.height),
+                    ((display.width + 1) & !1, (display.height + 1) & !1)
+                );
+                let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(frame.keyframe && !frame.data.is_empty());
+                eprintln!(
+                    "{codec:?} {} first_frame_ms={}",
+                    display.name,
+                    started.elapsed().as_millis()
+                );
+                // Cross the periodic desktop-layout check while exercising
+                // recovery on both moving and completely static desktops.
+                for _ in 0..8 {
+                    std::thread::sleep(Duration::from_millis(250));
+                    assert!(
+                        streamer.poll_ended().is_none(),
+                        "{} capture restarted",
+                        display.name
+                    );
+                    while rx.try_recv().is_ok() {}
+                    streamer.request_keyframe().unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    loop {
+                        let frame = rx
+                            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                            .unwrap();
+                        if frame.keyframe {
+                            break;
+                        }
+                    }
+                }
+                streamer.stop().unwrap();
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires Windows, at least two monitors, and a hardware video encoder"]
     fn all_monitors_stream_and_switch_back() {
         use super::*;

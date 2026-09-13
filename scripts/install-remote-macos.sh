@@ -47,7 +47,9 @@ VIEWER_PIDS=$(pgrep -u "$(id -u)" -x meshrmm-remote || true)
 if [ -n "$VIEWER_PIDS" ]; then
     echo "Closing the running viewer to install the local build."
     for viewer_pid in $VIEWER_PIDS; do
-        kill -TERM "$viewer_pid" 2>/dev/null || true
+        # SIGINT follows the viewer's graceful shutdown path, releasing the
+        # server session before the replacement asks for a fresh handoff.
+        kill -INT "$viewer_pid" 2>/dev/null || true
     done
     attempts=0
     while pgrep -u "$(id -u)" -x meshrmm-remote >/dev/null; do

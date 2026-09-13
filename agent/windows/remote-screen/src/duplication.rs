@@ -83,13 +83,16 @@ impl WindowsDesktopDuplicationStreamer {
             .spawn(move || {
                 let result = capture_loop(
                     monitor,
-                    display_id == crate::ALL_MONITORS_ID,
+                    display_id,
                     config,
                     sink,
                     controls,
                     thread_stop,
                     started_tx,
                 );
+                if let Err(error) = &result {
+                    tracing::warn!(display_id, %error, "desktop capture worker stopped");
+                }
                 let mut status = thread_status
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
@@ -217,7 +220,7 @@ impl RunningCapture {
 
 fn capture_loop(
     monitor: Monitor,
-    all_monitors: bool,
+    display_id: u32,
     config: StreamConfig,
     sink: EncodedFrameSink,
     controls: Arc<ControlState>,
@@ -227,7 +230,7 @@ fn capture_loop(
     let mut started = Some(started);
     let result = capture_loop_inner(
         monitor,
-        all_monitors,
+        display_id,
         config,
         sink,
         controls,
@@ -245,14 +248,14 @@ fn capture_loop(
 
 fn capture_loop_inner(
     monitor: Monitor,
-    all_monitors: bool,
+    display_id: u32,
     config: StreamConfig,
     sink: EncodedFrameSink,
     controls: Arc<ControlState>,
     stop: Arc<AtomicBool>,
     started: &mut Option<mpsc::SyncSender<Result<ActiveFormat, String>>>,
 ) -> Result<(), Error> {
-    let mut duplication = if all_monitors {
+    let mut duplication = if display_id == crate::ALL_MONITORS_ID {
         None
     } else {
         Some(
@@ -269,10 +272,32 @@ fn capture_loop_inner(
         windows_capture::d3d11::create_d3d_device()
             .map_err(|error| Error::DesktopDuplication(error.to_string()))?
     };
-    let mut desktop = if all_monitors {
+    // DXGI surfaces remain in the output's native orientation. A portrait
+    // desktop can therefore have a landscape texture; treating that as a mode
+    // change causes an endless restart loop. Capture rotated outputs in physical
+    // desktop coordinates, using the same region path as the combined view.
+    if duplication.as_ref().is_some_and(|capture| {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
+        };
+        matches!(
+            capture.duplication_desc().Rotation,
+            DXGI_MODE_ROTATION_ROTATE90
+                | DXGI_MODE_ROTATION_ROTATE180
+                | DXGI_MODE_ROTATION_ROTATE270
+        )
+    }) {
+        tracing::info!(
+            display_id,
+            "using desktop-region capture for a rotated monitor"
+        );
+        duplication = None;
+    }
+    let mut desktop = if duplication.is_none() {
         Some(crate::desktop::DesktopCapture::new(
             &device,
             config.frames_per_second,
+            display_id,
         )?)
     } else {
         None

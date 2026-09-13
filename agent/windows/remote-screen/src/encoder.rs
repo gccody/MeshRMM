@@ -421,12 +421,15 @@ impl VideoEncoder for MediaFoundationVideoEncoder {
     }
 
     fn request_keyframe(&self) -> Result<(), Error> {
-        set_optional_codec_value(
-            &self.codec_api,
-            &CODECAPI_AVEncVideoForceKeyFrame,
-            true.into(),
-            "force keyframe",
-        )
+        // ForceKeyFrame is a one-shot ULONG command. Some hardware encoders
+        // reject IsModifiable even though they accept the command itself.
+        // Querying it first silently suppresses recovery on a static desktop.
+        // https://learn.microsoft.com/windows/win32/medfound/codecapi-avencvideoforcekeyframe
+        unsafe {
+            self.codec_api
+                .SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &1_u32.into())
+                .map_err(Error::Configuration)
+        }
     }
 
     fn set_bitrate(&self, bits_per_second: u32) -> Result<(), Error> {
@@ -661,28 +664,6 @@ fn set_optional_initial_codec_value(
         }
         if let Err(error) = codec_api.SetValue(key, &value) {
             tracing::warn!(setting, %error, "hardware encoder rejected optional initial control");
-        }
-        Ok(())
-    }
-}
-
-fn set_optional_codec_value(
-    codec_api: &ICodecAPI,
-    key: &windows::core::GUID,
-    value: VARIANT,
-    setting: &'static str,
-) -> Result<(), Error> {
-    // Safety: the VARIANT remains alive for the duration of SetValue. Runtime
-    // controls are optional because some hardware MFTs advertise ICodecAPI but
-    // return E_NOTIMPL for individual settings. Losing a keyframe request is
-    // preferable to terminating the entire remote session.
-    unsafe {
-        if codec_api.IsSupported(key).is_err() || codec_api.IsModifiable(key).is_err() {
-            tracing::warn!(setting, "hardware encoder does not support runtime control");
-            return Ok(());
-        }
-        if let Err(error) = codec_api.SetValue(key, &value) {
-            tracing::warn!(setting, %error, "hardware encoder rejected optional runtime control");
         }
         Ok(())
     }

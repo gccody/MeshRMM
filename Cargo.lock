@@ -1765,6 +1765,7 @@ version = "0.2.0"
 dependencies = [
  "thiserror 2.0.20",
  "tracing",
+ "tracing-subscriber",
  "windows",
  "windows-capture",
 ]
