@@ -10,6 +10,7 @@ pub struct Config {
     pub server: String,
     pub handoff_token: String,
     pub update_manifest_url: String,
+    pub auto_update: bool,
     pub json_logs: bool,
 }
 
@@ -48,6 +49,7 @@ struct FileConfig {
     server: Option<String>,
     handoff_token: Option<String>,
     update_manifest_url: Option<String>,
+    auto_update: Option<bool>,
     json_logs: Option<bool>,
 }
 
@@ -105,6 +107,7 @@ impl Config {
             server,
             handoff_token,
             update_manifest_url,
+            auto_update: file.auto_update.unwrap_or(true),
             json_logs: arguments.json_logs || file.json_logs.unwrap_or(false),
         })
     }

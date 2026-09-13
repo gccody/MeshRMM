@@ -3,6 +3,15 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+LOCAL_BUILD=false
+if [ "${1:-}" = "--local" ]; then
+    LOCAL_BUILD=true
+    shift
+fi
+if [ "$#" -gt 1 ]; then
+    echo "Usage: $0 [--local] [viewer-config.json]" >&2
+    exit 1
+fi
 if [ "$#" -gt 0 ]; then
     CONFIG_PATH=$1
 else
@@ -49,6 +58,15 @@ rm -rf -- "$APP_DIR"
 mkdir -p -- "$MACOS_DIR"
 cp -- "$SOURCE_EXECUTABLE" "$MACOS_DIR/meshrmm-remote"
 cp -- "$CONFIG_PATH" "$MACOS_DIR/remote.json"
+if [ "$LOCAL_BUILD" = true ]; then
+    node - "$MACOS_DIR/remote.json" <<'JS'
+const fs = require('node:fs');
+const path = process.argv[2];
+const config = JSON.parse(fs.readFileSync(path, 'utf8'));
+config.auto_update = false;
+fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
+JS
+fi
 
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -97,6 +115,11 @@ if [ "$CODESIGN_IDENTITY" = "-" ]; then
     codesign --force --deep --sign - "$APP_DIR"
 else
     codesign --force --deep --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP_DIR"
+fi
+
+if [ "$LOCAL_BUILD" = true ]; then
+    echo "Built local viewer (automatic updates disabled): $APP_DIR"
+    exit 0
 fi
 
 mkdir -p -- "$DASHBOARD_DOWNLOAD_DIR"
