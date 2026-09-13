@@ -117,6 +117,21 @@ same for the Windows client:
 & .\scripts\build-remote.ps1
 ```
 
+To test Agent changes on an already enrolled Windows machine without publishing
+download assets or deploying the website, run:
+
+```powershell
+& .\scripts\install-agent-local.ps1
+```
+
+The script builds the current checkout, requests UAC, preserves the installed
+configuration, and replaces the local Agent service executable. It verifies the
+installed hash and signaling reconnection, and restores the timestamped backup
+if installation or startup fails. The service restart interrupts active remote
+sessions. Use `-SkipBuild` to install an existing `target/release/meshrmm-agent.exe`.
+Results and a diagnostic log copy are saved under `dist/`. Normal automatic
+updates remain enabled; a newer published version can replace this local build.
+
 On a Mac, build an application bundle. The wrapper generates its non-secret
 `dist/remote/remote.json` sidecar from `release.json` (or accepts an explicit
 sidecar path as its first argument):
