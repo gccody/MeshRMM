@@ -23,6 +23,10 @@ pub async fn check_and_schedule(
     config: &Config,
     launch_deep_link: Option<&str>,
 ) -> anyhow::Result<bool> {
+    if !config.auto_update {
+        tracing::info!("automatic viewer updates disabled by local configuration");
+        return Ok(false);
+    }
     if std::env::var_os("MESHRMM_UPDATE_READY_FILE").is_some() {
         return Ok(false);
     }

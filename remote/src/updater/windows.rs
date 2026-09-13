@@ -22,6 +22,10 @@ pub fn is_helper_invocation() -> bool {
 }
 
 pub async fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
+    if !config.auto_update {
+        tracing::info!("automatic viewer updates disabled by local configuration");
+        return Ok(false);
+    }
     if std::env::var_os("MESHRMM_UPDATE_READY_FILE").is_some() {
         return Ok(false);
     }

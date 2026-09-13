@@ -141,6 +141,24 @@ sh scripts/build-remote-macos.sh
 open "dist/remote-macos/MeshRMM Remote.app"
 ```
 
+To build and install this checkout locally on your Mac without publishing a
+release, run:
+
+```sh
+sh scripts/install-remote-macos.sh
+```
+
+This builds a release-mode viewer with ad-hoc signing, closes any running viewer,
+installs it in `~/Applications/MeshRMM Remote.app`, and registers dashboard links.
+Use a fresh **Connect** link to start a session. Existing installs
+are retained in a `.meshrmm-backup.*` folder under `~/Applications`.
+An optional JSON configuration path can be passed as the first argument.
+The installed configuration sets `auto_update` to `false` so production releases
+cannot replace the local build. Normal builds default to automatic updates;
+reinstall a normal release to restore that behavior. This script does not change
+`release.json`, generate dashboard download assets, or deploy anything.
+For a local bundle without installation, use `sh scripts/build-remote-macos.sh --local`.
+
 The script builds for the Mac architecture it runs on, copies the Cloudflare
 API URL into the app bundle, signs it, and publishes a zipped update artifact
 plus the corresponding manifest entry. Run it on each macOS architecture that
