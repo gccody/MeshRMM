@@ -232,7 +232,8 @@ entered into or retained by the browser.
 During desktop sharing, the Windows endpoint shows a translucent banner at the
 top of the primary screen with the connected user's dashboard name (WorkOS
 first and last name, or email when no name is set). Click the banner to collapse
-it to a tiny arrow tab with no name; click again to expand it. It does not take keyboard
+it to a tiny arrow tab with no name; click again to expand it. Drag either state
+sideways to move it out of the way; its horizontal position persists when toggling. It does not take keyboard
 focus and disappears when capture stops. The server resolves the name from the
 authenticated handoff owner and retains it across session reconnects. Deploy
 both the server and updated Windows Agent to enable named banners; older
