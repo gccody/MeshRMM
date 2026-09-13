@@ -65,7 +65,10 @@ impl WindowsDesktopDuplicationStreamer {
         let monitor = Monitor::enumerate()
             .map_err(|error| Error::DesktopDuplication(error.to_string()))?
             .into_iter()
-            .find(|monitor| monitor.index().is_ok_and(|id| id == display_id as usize))
+            .find(|monitor| {
+                display_id == crate::ALL_MONITORS_ID
+                    || monitor.index().is_ok_and(|id| id == display_id as usize)
+            })
             .ok_or_else(|| {
                 Error::DesktopDuplication(format!("display {display_id} is unavailable"))
             })?;
@@ -78,7 +81,15 @@ impl WindowsDesktopDuplicationStreamer {
         let worker = thread::Builder::new()
             .name("meshrmm-desktop-duplication".into())
             .spawn(move || {
-                let result = capture_loop(monitor, config, sink, controls, thread_stop, started_tx);
+                let result = capture_loop(
+                    monitor,
+                    display_id == crate::ALL_MONITORS_ID,
+                    config,
+                    sink,
+                    controls,
+                    thread_stop,
+                    started_tx,
+                );
                 let mut status = thread_status
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
@@ -206,6 +217,7 @@ impl RunningCapture {
 
 fn capture_loop(
     monitor: Monitor,
+    all_monitors: bool,
     config: StreamConfig,
     sink: EncodedFrameSink,
     controls: Arc<ControlState>,
@@ -213,7 +225,15 @@ fn capture_loop(
     started: mpsc::SyncSender<Result<ActiveFormat, String>>,
 ) -> Result<(), Error> {
     let mut started = Some(started);
-    let result = capture_loop_inner(monitor, config, sink, controls, stop, &mut started);
+    let result = capture_loop_inner(
+        monitor,
+        all_monitors,
+        config,
+        sink,
+        controls,
+        stop,
+        &mut started,
+    );
     if let Some(started) = started.take() {
         let _ = started.send(Err(match &result {
             Ok(()) => "capture stopped before initialization".into(),
@@ -225,16 +245,46 @@ fn capture_loop(
 
 fn capture_loop_inner(
     monitor: Monitor,
+    all_monitors: bool,
     config: StreamConfig,
     sink: EncodedFrameSink,
     controls: Arc<ControlState>,
     stop: Arc<AtomicBool>,
     started: &mut Option<mpsc::SyncSender<Result<ActiveFormat, String>>>,
 ) -> Result<(), Error> {
-    let mut duplication = DxgiDuplicationApi::new_options(monitor, &[DxgiDuplicationFormat::Bgra8])
-        .map_err(duplication_error)?;
-    let width = duplication.width() & !1;
-    let height = duplication.height() & !1;
+    let mut duplication = if all_monitors {
+        None
+    } else {
+        Some(
+            DxgiDuplicationApi::new_options(monitor, &[DxgiDuplicationFormat::Bgra8])
+                .map_err(duplication_error)?,
+        )
+    };
+    let (device, context) = if let Some(duplication) = duplication.as_ref() {
+        (
+            duplication.device().clone(),
+            duplication.device_context().clone(),
+        )
+    } else {
+        windows_capture::d3d11::create_d3d_device()
+            .map_err(|error| Error::DesktopDuplication(error.to_string()))?
+    };
+    let mut desktop = if all_monitors {
+        Some(crate::desktop::DesktopCapture::new(
+            &device,
+            config.frames_per_second,
+        )?)
+    } else {
+        None
+    };
+    let (width, height) = if let Some(desktop) = desktop.as_ref() {
+        (desktop.width(), desktop.height())
+    } else {
+        let duplication = duplication
+            .as_ref()
+            .ok_or(Error::InvalidDisplayDimensions)?;
+        (duplication.width() & !1, duplication.height() & !1)
+    };
     if width < 2 || height < 2 {
         return Err(Error::InvalidDisplayDimensions);
     }
@@ -247,15 +297,15 @@ fn capture_loop_inner(
         pixel_format: config.pixel_format,
     };
     let mut converter = BgraToYuvConverter::new(
-        duplication.device(),
-        duplication.device_context(),
+        &device,
+        &context,
         width,
         height,
         config.frames_per_second,
         config.pixel_format,
     )?;
     let mut encoder = MediaFoundationVideoEncoder::new(
-        duplication.device(),
+        &device,
         width,
         height,
         config.frames_per_second,
@@ -304,23 +354,37 @@ fn capture_loop_inner(
                 .store(true, Ordering::Release);
         }
 
-        let frame = match duplication.acquire_next_frame(ACQUIRE_TIMEOUT_MS) {
-            Ok(frame) => Some(frame),
-            Err(DuplicationError::Timeout) => None,
-            Err(error) => return Err(duplication_error(error)),
+        let desktop_texture = match desktop.as_mut() {
+            Some(desktop) => desktop.capture(&context)?,
+            None => None,
         };
-        let capture_idle = frame.is_none();
-        let mut access_units = encoder.poll()?;
-        if let Some(frame) = frame {
-            if frame.width() < width || frame.height() < height {
-                return Err(Error::DesktopDuplication(
-                    "captured display dimensions changed".into(),
-                ));
+        let frame = if let Some(duplication) = duplication.as_mut() {
+            match duplication.acquire_next_frame(ACQUIRE_TIMEOUT_MS) {
+                Ok(frame) => Some(frame),
+                Err(DuplicationError::Timeout) => None,
+                Err(error) => return Err(duplication_error(error)),
             }
+        } else {
+            None
+        };
+        let capture_idle = frame.is_none() && desktop_texture.is_none();
+        let mut access_units = encoder.poll()?;
+        if frame
+            .as_ref()
+            .is_some_and(|frame| frame.width() < width || frame.height() < height)
+        {
+            return Err(Error::DesktopDuplication(
+                "captured display dimensions changed".into(),
+            ));
+        }
+        if let Some(texture) = desktop_texture
+            .as_ref()
+            .or_else(|| frame.as_ref().map(|frame| frame.texture()))
+        {
             let capture_timestamp_us = monotonic_timestamp_us()?;
             frames_captured += 1;
             if encoder.wants_input() && frame_pacer.allow(capture_timestamp_us) {
-                let yuv = converter.convert(frame.texture())?;
+                let yuv = converter.convert(texture)?;
                 cached_yuv = Some(yuv.clone());
                 access_units.extend(encoder.submit(yuv, capture_timestamp_us)?);
                 keyframe_input_pending = false;
@@ -341,6 +405,7 @@ fn capture_loop_inner(
             access_units.extend(encoder.submit(yuv, capture_timestamp_us)?);
             keyframe_input_pending = false;
         }
+        drop(frame);
         for access_unit in access_units {
             frames_encoded += 1;
             total_encode_us = total_encode_us.saturating_add(
