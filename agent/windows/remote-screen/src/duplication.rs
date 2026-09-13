@@ -15,10 +15,12 @@ use crate::{
     StreamConfig, monotonic_timestamp_us,
 };
 
-// Desktop Duplication blocks until pixels change. Keep the wait short because
-// the asynchronous Media Foundation encoder can finish an access unit while
-// the desktop is otherwise completely static (especially on Winlogon).
-const ACQUIRE_TIMEOUT_MS: u32 = 10;
+// Capture and the asynchronous MFT share a protected D3D11 device. A blocking
+// AcquireNextFrame can hold the driver's device lock while waiting for desktop
+// damage, starving the encoder's worker. Poll DXGI without blocking and wait
+// outside the graphics driver so encoding can progress independently.
+const ACQUIRE_TIMEOUT_MS: u32 = 0;
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 
 type CaptureStatus = Arc<Mutex<Option<Result<(), String>>>>;
@@ -268,6 +270,8 @@ fn capture_loop_inner(
     let mut frames_captured = 0_u64;
     let mut frames_encoded = 0_u64;
     let mut frames_rate_limited = 0_u64;
+    let mut frames_encoder_busy = 0_u64;
+    let mut total_encode_us = 0_u64;
     let mut encoded_bytes = 0_u64;
     let mut stats_started_us = monotonic_timestamp_us()?;
     let mut cached_yuv = None;
@@ -305,6 +309,7 @@ fn capture_loop_inner(
             Err(DuplicationError::Timeout) => None,
             Err(error) => return Err(duplication_error(error)),
         };
+        let capture_idle = frame.is_none();
         let mut access_units = encoder.poll()?;
         if let Some(frame) = frame {
             if frame.width() < width || frame.height() < height {
@@ -321,6 +326,8 @@ fn capture_loop_inner(
                 keyframe_input_pending = false;
             } else if encoder.wants_input() {
                 frames_rate_limited += 1;
+            } else {
+                frames_encoder_busy += 1;
             }
         } else if keyframe_input_pending
             && encoder.wants_input()
@@ -336,6 +343,11 @@ fn capture_loop_inner(
         }
         for access_unit in access_units {
             frames_encoded += 1;
+            total_encode_us = total_encode_us.saturating_add(
+                access_unit
+                    .encode_complete_timestamp_us
+                    .saturating_sub(access_unit.capture_timestamp_us),
+            );
             encoded_bytes = encoded_bytes.saturating_add(access_unit.data.len() as u64);
             (sink)(EncodedAccessUnit {
                 capture_timestamp_us: access_unit.capture_timestamp_us,
@@ -354,6 +366,8 @@ fn capture_loop_inner(
                 stream_fps = frames_encoded as f64 / elapsed_seconds,
                 bitrate_bits_per_second = encoded_bytes as f64 * 8.0 / elapsed_seconds,
                 frames_rate_limited,
+                frames_encoder_busy,
+                mean_encode_us = total_encode_us / frames_encoded.max(1),
                 width,
                 height,
                 "Desktop Duplication capture/encoder statistics"
@@ -361,8 +375,13 @@ fn capture_loop_inner(
             frames_captured = 0;
             frames_encoded = 0;
             frames_rate_limited = 0;
+            frames_encoder_busy = 0;
+            total_encode_us = 0;
             encoded_bytes = 0;
             stats_started_us = now_us;
+        }
+        if capture_idle {
+            thread::sleep(CAPTURE_POLL_INTERVAL);
         }
     }
     Ok(())

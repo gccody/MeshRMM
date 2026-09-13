@@ -667,3 +667,6 @@ mod tests {
         assert!(!pacer.allow(2_000_001));
     }
 }
+
+#[cfg(test)]
+mod throughput;
