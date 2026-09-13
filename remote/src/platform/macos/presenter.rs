@@ -146,7 +146,12 @@ impl Presenter {
         true
     }
 
-    pub fn reset_stream(&self, format: VideoFormat) -> anyhow::Result<()> {
+    pub fn reset_stream(
+        &self,
+        format: VideoFormat,
+        display: Display,
+        displays: Vec<Display>,
+    ) -> anyhow::Result<()> {
         self.shared.resetting.store(true, Ordering::Release);
         self.shared.recovering.store(true, Ordering::Release);
         if let Ok(mut queued) = self.shared.queued.lock() {
@@ -165,7 +170,14 @@ impl Presenter {
                     .as_mut()
                     .filter(|ui| ui.id == id)
                     .context("macOS viewer window is no longer available")?;
-                ui.reset_stream(format)
+                ui.reset_stream(format)?;
+                ui.window.setTitle(&NSString::from_str(&format!(
+                    "MeshRMM Remote Desktop — {} — Control-Option-Arrow display · F12 diagnostics",
+                    display.name
+                )));
+                ui.input_view
+                    .configure_display(display, displays, format.width, format.height);
+                Ok(())
             });
             let _ = reset_tx.send(result);
         });
