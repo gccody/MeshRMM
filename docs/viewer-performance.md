@@ -51,7 +51,8 @@ Periodic agent capture statistics now include `frames_encoder_busy` and
 
 The **All monitors** display choice combines the Windows desktop into one video
 stream. It uses GDI capture and one CPU-to-GPU upload per frame, followed by the
-existing hardware encoder. The single-monitor DXGI path is unchanged. Combined
+existing hardware encoder. Unrotated individual monitors use DXGI; rotated monitors use the same GDI
+region capture path with their physical desktop bounds. GDI
 capture has different performance characteristics; the measurements above do
 not apply to it. Large desktop bounds are subject to GPU encoder/decoder limits.
 
@@ -68,3 +69,50 @@ left of or above the primary, mixed DPI, portrait orientation, a monitor layout
 change, and lock/unlock. Reconnect the session while All monitors is selected to
 check selection restoration. These hardware checks cannot run on the macOS
 build host.
+
+## Monitor-switch regression (September 13, 2026)
+
+Live testing found three failures that compilation did not catch:
+
+- Portrait DXGI textures retain their native orientation. Comparing their height
+  with the rotated desktop height triggered continuous capture restarts.
+- GDI upload textures were created with only a shader-resource binding, which
+  this GPU rejected as video-processor input. They now include a render-target
+  binding.
+- The encoder rejected the `IsModifiable` probe for the one-shot keyframe
+  command, so the command was never sent. Issue `SetValue` directly with the
+  documented `VT_UI4` value. Repeated keyframes now work on a static desktop.
+
+The existing helper processes and Mac viewer window are reused during monitor
+selection. The local Mac installer sends SIGINT so the viewer releases its
+server session before a new handoff; abrupt termination leaves the previous
+session lease active until its idle deadline.
+
+Run the hardware regression from the logged-in Windows desktop (an SSH session
+alone can expose a different, non-capturable desktop):
+
+```powershell
+cargo test -p meshrmm-remote-screen every_display_produces_keyframes -- --ignored --nocapture
+```
+
+The test requires a portrait display, checks every display including the combined
+view in both codecs, and requests eight additional keyframes per view while
+crossing the periodic layout check. On the test RTX 3080 machine:
+
+| View | H.264 first encoded frame | HEVC first encoded frame |
+| --- | ---: | ---: |
+| LG ULTRAGEAR (landscape) | 286 ms | 233 ms |
+| AW2521HF (portrait) | 252 ms | 260 ms |
+| All monitors | 314 ms | 306 ms |
+
+These measure capture startup to first encoded frame, excluding transport and
+presentation. The agent logs `switch_ms` for capture reconfiguration; use the
+native viewer to verify the final displayed image and input mapping as well.
+
+Live Mac viewer checks on the same machine passed after installing both local
+builds: landscape → portrait → combined → landscape, reverse keyboard cycling,
+and correct Start-menu clicks on both sides of the combined desktop. The window
+and video layer stayed in place, with no capture restart loop. Agent-side switch
+setup measured 320–522 ms in the initial live cycle. Reinstalling the active Mac
+viewer then released its server lease cleanly; a fresh dashboard handoff connected
+immediately and portrait switching still rendered correctly.

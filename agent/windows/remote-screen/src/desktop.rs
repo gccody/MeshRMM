@@ -1,4 +1,4 @@
-//! Combined capture uses GDI so rotated monitors and displays on different GPUs
+//! Desktop-region capture uses GDI so rotated monitors and displays on different GPUs
 //! share one physical desktop coordinate space. Encoding remains hardware based.
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
@@ -28,13 +28,23 @@ pub(crate) struct DesktopCapture {
 }
 
 impl DesktopCapture {
-    pub fn new(device: &ID3D11Device, fps: u32) -> Result<Self, Error> {
+    pub fn new(device: &ID3D11Device, fps: u32, display_id: u32) -> Result<Self, Error> {
         let displays = enumerate_displays()?;
-        let bounds = displays
+        let mut bounds = displays
             .iter()
-            .find(|d| d.id == ALL_MONITORS_ID)
+            .find(|d| d.id == display_id)
             .cloned()
             .ok_or(Error::InvalidDisplayDimensions)?;
+        bounds.width = bounds
+            .width
+            .checked_add(1)
+            .ok_or(Error::InvalidDisplayDimensions)?
+            & !1;
+        bounds.height = bounds
+            .height
+            .checked_add(1)
+            .ok_or(Error::InvalidDisplayDimensions)?
+            & !1;
         if bounds.width > 16384 || bounds.height > 16384 {
             return Err(Error::InvalidDisplayDimensions);
         }
@@ -49,7 +59,9 @@ impl DesktopCapture {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            // VideoProcessorInputView requires a video-compatible binding.
+            // A shader-resource-only GDI upload texture is rejected by some GPUs.
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
             ..Default::default()
         };
         let mut texture = None;
@@ -145,7 +157,10 @@ impl DesktopCapture {
                 BLACKNESS,
             )
             .ok()?;
-            for display in self.displays.iter().filter(|d| d.id != ALL_MONITORS_ID) {
+            for display in self.displays.iter().filter(|d| {
+                d.id != ALL_MONITORS_ID
+                    && (self.bounds.id == ALL_MONITORS_ID || d.id == self.bounds.id)
+            }) {
                 BitBlt(
                     self.memory,
                     display.x - self.bounds.x,
