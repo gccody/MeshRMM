@@ -156,7 +156,12 @@ impl DesktopCaptureStreamer {
         sink: EncodedFrameSink,
     ) -> anyhow::Result<StartedDesktop> {
         if self.running.is_some() {
-            anyhow::bail!("desktop helper is already running");
+            let result = self.reconfigure(config, display_id, Arc::clone(&sink));
+            if result.is_ok() {
+                return result;
+            }
+            tracing::warn!(error = ?result.err(), "could not reuse capture helper; starting a replacement");
+            let _ = self.stop();
         }
         let preferred = self.preferred_desktop.unwrap_or_else(preferred_desktop);
         let mut last_error = None;
@@ -185,6 +190,51 @@ impl DesktopCaptureStreamer {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no interactive desktop is available")))
     }
 
+    fn reconfigure(
+        &mut self,
+        config: StreamConfig,
+        display_id: Option<DisplayId>,
+        sink: EncodedFrameSink,
+    ) -> anyhow::Result<StartedDesktop> {
+        let running = self
+            .running
+            .as_ref()
+            .context("capture helper is not running")?;
+        // Drop old-stream output before sending the command. The Started event
+        // is a pipe-order barrier: all old encoder output precedes its reply.
+        *running
+            .sink
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        send_command(
+            &running.input,
+            &ParentCommand::Start {
+                display_id,
+                frames_per_second: config.frames_per_second,
+                bitrate_bits_per_second: config.bitrate_bits_per_second,
+                codec: config.codec,
+                pixel_format: config.pixel_format,
+            },
+        )?;
+        let started = running
+            .started
+            .recv_timeout(START_TIMEOUT)
+            .context("capture helper did not reconfigure promptly")?
+            .map_err(anyhow::Error::msg)?;
+        let target = running.target;
+        self.ensure_input_helper(target, started.active_display.id)?;
+        let running = self
+            .running
+            .as_ref()
+            .context("capture helper disappeared")?;
+        *running
+            .sink
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(sink);
+        self.request_keyframe()?;
+        Ok(started)
+    }
+
     fn start_on_desktop(
         &mut self,
         target: DesktopTarget,
@@ -194,7 +244,9 @@ impl DesktopCaptureStreamer {
     ) -> anyhow::Result<StartedDesktop> {
         let launched = launch_system_helper(target)?;
         let status: HelperStatus = Arc::new(Mutex::new(None));
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (started_tx, started_rx) = mpsc::channel();
+        let sink = Arc::new(Mutex::new(Some(sink)));
+        let reader_sink = Arc::clone(&sink);
         let reader_status = Arc::clone(&status);
         let reader_cursor = Arc::clone(&self.cursor);
         let reader = thread::Builder::new()
@@ -202,7 +254,7 @@ impl DesktopCaptureStreamer {
             .spawn(move || {
                 dispatch_child_events(
                     launched.output,
-                    sink,
+                    reader_sink,
                     started_tx,
                     reader_status,
                     reader_cursor,
@@ -264,6 +316,8 @@ impl DesktopCaptureStreamer {
         }
         self.preferred_desktop = Some(target);
         self.running = Some(RunningHelper {
+            sink,
+            started: started_rx,
             process: launched.process,
             process_id: launched.process_id,
             target,
@@ -340,15 +394,20 @@ impl DesktopCaptureStreamer {
         target: DesktopTarget,
         display_id: DisplayId,
     ) -> anyhow::Result<()> {
-        if self.input.as_ref().is_some_and(|helper| {
-            helper.target == target
-                && helper.display_id == display_id
-                && helper
-                    .status
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .is_none()
-        }) {
+        if let Some(helper) = self.input.as_mut()
+            && helper.target == target
+            && helper
+                .status
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_none()
+        {
+            if helper.display_id != display_id {
+                // Commands share one ordered pipe, so the new display mapping
+                // is applied before any subsequent pointer/keyboard events.
+                send_command(&helper.input, &ParentCommand::StartInput { display_id })?;
+                helper.display_id = display_id;
+            }
             return Ok(());
         }
         self.stop_input_helper();
@@ -407,6 +466,8 @@ impl Drop for DesktopCaptureStreamer {
 }
 
 struct RunningHelper {
+    sink: Arc<Mutex<Option<EncodedFrameSink>>>,
+    started: mpsc::Receiver<Result<StartedDesktop, String>>,
     process: OwnedHandle,
     process_id: u32,
     target: DesktopTarget,
@@ -726,36 +787,35 @@ fn create_inherited_pipe(parent_reads: bool) -> anyhow::Result<(OwnedHandle, Own
 }
 
 fn dispatch_child_events(
-    output: File,
-    sink: EncodedFrameSink,
-    started_tx: mpsc::SyncSender<Result<StartedDesktop, String>>,
+    output: impl Read,
+    sink: Arc<Mutex<Option<EncodedFrameSink>>>,
+    started_tx: mpsc::Sender<Result<StartedDesktop, String>>,
     status: HelperStatus,
     cursor: HelperCursor,
 ) {
     let mut output = BufReader::new(output);
-    let mut started_tx = Some(started_tx);
     loop {
         match read_event(&mut output) {
             Ok(ChildEvent::Started(started)) => {
-                if let Some(sender) = started_tx.take() {
-                    let _ = sender.send(Ok(started));
-                } else {
-                    set_status(
-                        &status,
-                        Err("desktop helper sent duplicate start event".into()),
-                    );
+                if started_tx.send(Ok(started)).is_err() {
                     break;
                 }
             }
             Ok(ChildEvent::InputStarted) => {
-                if let Some(sender) = started_tx.take() {
-                    let message = "capture helper reported input-only startup".to_string();
-                    let _ = sender.send(Err(message.clone()));
-                    set_status(&status, Err(message));
-                }
+                let message = "capture helper reported input-only startup".to_string();
+                let _ = started_tx.send(Err(message.clone()));
+                set_status(&status, Err(message));
                 break;
             }
-            Ok(ChildEvent::Frame(frame)) => (sink)(frame),
+            Ok(ChildEvent::Frame(frame)) => {
+                if let Some(sink) = sink
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                {
+                    (sink)(frame);
+                }
+            }
             Ok(ChildEvent::Cursor(shape)) => {
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) = shape;
             }
@@ -767,25 +827,18 @@ fn dispatch_child_events(
                 break;
             }
             Ok(ChildEvent::Error(message)) => {
-                if let Some(sender) = started_tx.take() {
-                    let _ = sender.send(Err(message.clone()));
-                }
+                let _ = started_tx.send(Err(message.clone()));
                 set_status(&status, Err(message));
                 break;
             }
             Ok(ChildEvent::Stopped) => {
-                if let Some(sender) = started_tx.take() {
-                    let _ =
-                        sender.send(Err("desktop helper stopped before capture started".into()));
-                }
+                let _ = started_tx.send(Err("desktop helper stopped".into()));
                 set_status(&status, Ok(()));
                 break;
             }
             Err(error) => {
                 let message = format!("desktop-helper IPC failed: {error}");
-                if let Some(sender) = started_tx.take() {
-                    let _ = sender.send(Err(message.clone()));
-                }
+                let _ = started_tx.send(Err(message.clone()));
                 set_status(&status, Err(message));
                 break;
             }
@@ -944,112 +997,128 @@ pub fn run_child() -> anyhow::Result<()> {
 
 fn run_capture_child(
     command_rx: mpsc::Receiver<io::Result<ParentCommand>>,
-    display_id: Option<DisplayId>,
-    frames_per_second: u32,
-    bitrate_bits_per_second: u32,
-    codec: VideoCodec,
-    pixel_format: VideoPixelFormat,
+    mut display_id: Option<DisplayId>,
+    mut frames_per_second: u32,
+    mut bitrate_bits_per_second: u32,
+    mut codec: VideoCodec,
+    mut pixel_format: VideoPixelFormat,
 ) -> anyhow::Result<()> {
-    if frames_per_second == 0 || bitrate_bits_per_second == 0 {
-        anyhow::bail!("desktop-helper frame rate and bitrate must be positive");
-    }
-    let displays = enumerate_displays()?;
-    let active_display = display_id
-        .and_then(|id| displays.iter().find(|display| display.id == id))
-        .or_else(|| displays.iter().find(|display| display.primary))
-        .or_else(|| displays.first())
-        .cloned()
-        .context("Windows reported no displays on the active desktop")?;
-    let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
-    let ipc_failed = Arc::new(AtomicBool::new(false));
-    let sink_output = Arc::clone(&output);
-    let sink_failed = Arc::clone(&ipc_failed);
-    let sink: EncodedFrameSink = Arc::new(move |frame| {
-        let mut output = sink_output
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if write_event(&mut *output, &ChildEvent::Frame(frame))
-            .and_then(|()| output.flush())
-            .is_err()
-        {
-            sink_failed.store(true, Ordering::Release);
+    'capture: loop {
+        if frames_per_second == 0 || bitrate_bits_per_second == 0 {
+            anyhow::bail!("desktop-helper frame rate and bitrate must be positive");
         }
-    });
-    let mut streamer = WindowsDesktopDuplicationStreamer::new();
-    let active = match streamer.start(
-        StreamConfig {
-            frames_per_second,
-            bitrate_bits_per_second,
-            codec,
-            pixel_format,
-        },
-        active_display.id.0,
-        sink,
-    ) {
-        Ok(active) => active,
-        Err(error) => {
-            emit_child_event(&output, ChildEvent::Error(error.to_string()))?;
-            return Ok(());
-        }
-    };
-    emit_child_event(
-        &output,
-        ChildEvent::Started(StartedDesktop {
-            format: active,
-            displays,
-            active_display,
-        }),
-    )?;
+        let displays = enumerate_displays()?;
+        let active_display = display_id
+            .and_then(|id| displays.iter().find(|display| display.id == id))
+            .or_else(|| displays.iter().find(|display| display.primary))
+            .or_else(|| displays.first())
+            .cloned()
+            .context("Windows reported no displays on the active desktop")?;
+        let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+        let ipc_failed = Arc::new(AtomicBool::new(false));
+        let sink_output = Arc::clone(&output);
+        let sink_failed = Arc::clone(&ipc_failed);
+        let sink: EncodedFrameSink = Arc::new(move |frame| {
+            let mut output = sink_output
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if write_event(&mut *output, &ChildEvent::Frame(frame))
+                .and_then(|()| output.flush())
+                .is_err()
+            {
+                sink_failed.store(true, Ordering::Release);
+            }
+        });
+        let mut streamer = WindowsDesktopDuplicationStreamer::new();
+        let active = match streamer.start(
+            StreamConfig {
+                frames_per_second,
+                bitrate_bits_per_second,
+                codec,
+                pixel_format,
+            },
+            active_display.id.0,
+            sink,
+        ) {
+            Ok(active) => active,
+            Err(error) => {
+                emit_child_event(&output, ChildEvent::Error(error.to_string()))?;
+                return Ok(());
+            }
+        };
+        emit_child_event(
+            &output,
+            ChildEvent::Started(StartedDesktop {
+                format: active,
+                displays,
+                active_display,
+            }),
+        )?;
 
-    let mut terminal_error = None;
-    loop {
-        if ipc_failed.load(Ordering::Acquire) {
-            break;
-        }
-        if let Some(result) = streamer.poll_ended() {
-            if let Err(error) = result {
-                terminal_error = Some(error.to_string());
-            }
-            break;
-        }
-        match command_rx.recv_timeout(Duration::from_millis(16)) {
-            Ok(Ok(ParentCommand::RequestKeyframe)) => {
-                if let Err(error) = streamer.request_keyframe() {
-                    terminal_error = Some(error.to_string());
-                    break;
-                }
-            }
-            Ok(Ok(ParentCommand::SetBitrate(bits_per_second))) => {
-                if let Err(error) = streamer.set_bitrate(bits_per_second.max(1)) {
-                    terminal_error = Some(error.to_string());
-                    break;
-                }
-            }
-            Ok(Ok(ParentCommand::Stop)) => break,
-            Ok(Ok(
-                ParentCommand::Start { .. }
-                | ParentCommand::StartInput { .. }
-                | ParentCommand::Input(_)
-                | ParentCommand::ReleaseInput
-                | ParentCommand::Clipboard(_),
-            )) => {
-                terminal_error =
-                    Some("capture helper received a command reserved for input".into());
+        let mut terminal_error = None;
+        loop {
+            if ipc_failed.load(Ordering::Acquire) {
                 break;
             }
-            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            if let Some(result) = streamer.poll_ended() {
+                if let Err(error) = result {
+                    terminal_error = Some(error.to_string());
+                }
+                break;
+            }
+            match command_rx.recv_timeout(Duration::from_millis(16)) {
+                Ok(Ok(ParentCommand::RequestKeyframe)) => {
+                    if let Err(error) = streamer.request_keyframe() {
+                        terminal_error = Some(error.to_string());
+                        break;
+                    }
+                }
+                Ok(Ok(ParentCommand::SetBitrate(bits_per_second))) => {
+                    if let Err(error) = streamer.set_bitrate(bits_per_second.max(1)) {
+                        terminal_error = Some(error.to_string());
+                        break;
+                    }
+                }
+                Ok(Ok(ParentCommand::Stop)) => break,
+                Ok(Ok(ParentCommand::Start {
+                    display_id: next_display,
+                    frames_per_second: next_fps,
+                    bitrate_bits_per_second: next_bitrate,
+                    codec: next_codec,
+                    pixel_format: next_pixel_format,
+                })) => {
+                    streamer.stop()?;
+                    display_id = next_display;
+                    frames_per_second = next_fps;
+                    bitrate_bits_per_second = next_bitrate;
+                    codec = next_codec;
+                    pixel_format = next_pixel_format;
+                    continue 'capture;
+                }
+                Ok(Ok(
+                    ParentCommand::StartInput { .. }
+                    | ParentCommand::Input(_)
+                    | ParentCommand::ReleaseInput
+                    | ParentCommand::Clipboard(_),
+                )) => {
+                    terminal_error =
+                        Some("capture helper received a command reserved for input".into());
+                    break;
+                }
+                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
         }
-    }
-    let _ = streamer.stop();
-    if ipc_failed.load(Ordering::Acquire) {
+        let _ = streamer.stop();
+        if ipc_failed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match terminal_error {
+            Some(message) => emit_child_event(&output, ChildEvent::Error(message))?,
+            None => emit_child_event(&output, ChildEvent::Stopped)?,
+        }
         return Ok(());
     }
-    match terminal_error {
-        Some(message) => emit_child_event(&output, ChildEvent::Error(message))?,
-        None => emit_child_event(&output, ChildEvent::Stopped)?,
-    }
-    Ok(())
 }
 
 fn run_input_child(
@@ -1085,6 +1154,19 @@ fn run_input_child(
             sent_cursor = Some(cursor);
         }
         match command_rx.recv_timeout(Duration::from_millis(16)) {
+            Ok(Ok(ParentCommand::StartInput { display_id })) => {
+                let result = enumerate_displays().and_then(|displays| {
+                    let display = displays
+                        .into_iter()
+                        .find(|display| display.id == display_id)
+                        .context("input helper could not find the selected display")?;
+                    input.set_active_display(display)
+                });
+                if let Err(error) = result {
+                    terminal_error = Some(error.to_string());
+                    break;
+                }
+            }
             Ok(Ok(ParentCommand::Input(event))) => {
                 if let Err(error) = input.apply(event) {
                     tracing::warn!(%error, "desktop input helper discarded invalid input");
@@ -1603,6 +1685,87 @@ fn wide(value: &OsStr) -> Vec<u16> {
 mod tests {
     use super::*;
     use meshrmm_protocol::PointerButton;
+
+    #[test]
+    fn capture_reader_accepts_reconfiguration_and_discards_frames_while_unrouted() {
+        let display = Display {
+            id: DisplayId(1),
+            name: "Display".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+        };
+        let mut bytes = Vec::new();
+        for id in [1, 2] {
+            let selected = Display {
+                id: DisplayId(id),
+                ..display.clone()
+            };
+            write_event(
+                &mut bytes,
+                &ChildEvent::Started(StartedDesktop {
+                    format: ActiveFormat {
+                        width: 1920,
+                        height: 1080,
+                        frames_per_second: 60,
+                        bitrate_bits_per_second: 12_000_000,
+                        codec: VideoCodec::H264,
+                        pixel_format: VideoPixelFormat::Yuv420,
+                    },
+                    displays: vec![selected.clone()],
+                    active_display: selected,
+                }),
+            )
+            .unwrap();
+            write_event(
+                &mut bytes,
+                &ChildEvent::Frame(EncodedAccessUnit {
+                    capture_timestamp_us: id as u64,
+                    encode_complete_timestamp_us: id as u64,
+                    keyframe: true,
+                    codec_config: None,
+                    data: vec![id as u8],
+                }),
+            )
+            .unwrap();
+        }
+        write_event(&mut bytes, &ChildEvent::Stopped).unwrap();
+        for enabled in [false, true] {
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let received = Arc::clone(&frames);
+            let sink: EncodedFrameSink = Arc::new(move |frame| {
+                received.lock().unwrap().push(frame.data);
+            });
+            let (started_tx, started_rx) = mpsc::channel();
+            let status = Arc::new(Mutex::new(None));
+            dispatch_child_events(
+                bytes.as_slice(),
+                Arc::new(Mutex::new(enabled.then_some(sink))),
+                started_tx,
+                Arc::clone(&status),
+                Arc::new(Mutex::new(CursorShape::Default)),
+            );
+            assert_eq!(
+                started_rx.recv().unwrap().unwrap().active_display.id,
+                DisplayId(1)
+            );
+            assert_eq!(
+                started_rx.recv().unwrap().unwrap().active_display.id,
+                DisplayId(2)
+            );
+            assert_eq!(*status.lock().unwrap(), Some(Ok(())));
+            assert_eq!(
+                *frames.lock().unwrap(),
+                if enabled {
+                    vec![vec![1], vec![2]]
+                } else {
+                    vec![]
+                }
+            );
+        }
+    }
 
     #[test]
     fn command_protocol_round_trips_desktop_input() {

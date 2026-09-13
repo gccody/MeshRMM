@@ -102,10 +102,11 @@ impl VideoHostView {
 }
 
 pub(super) struct RemoteViewIvars {
-    active_display: Display,
-    displays: Vec<Display>,
-    video_width: u32,
-    video_height: u32,
+    active_display: RefCell<Display>,
+    displays: RefCell<Vec<Display>>,
+    video_width: std::cell::Cell<u32>,
+    video_height: std::cell::Cell<u32>,
+    display_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     control: ControlSink,
     pressed_keys: RefCell<Vec<(u16, bool)>>,
     pressed_buttons: RefCell<Vec<PointerButton>>,
@@ -227,7 +228,7 @@ define_class!(
                 return;
             }
             self.send(SessionMessage::Input(RemoteInput::WheelAt {
-                display_id: self.ivars().active_display.id,
+                display_id: self.ivars().active_display.borrow().id,
                 x,
                 y,
                 horizontal,
@@ -284,8 +285,8 @@ define_class!(
         fn select_display_from_toolbar(&self, sender: &NSPopUpButton) {
             let index = sender.indexOfSelectedItem();
             if index >= 0
-                && let Some(display) = self.ivars().displays.get(index as usize)
-                && display.id != self.ivars().active_display.id
+                && let Some(display) = self.ivars().displays.borrow().get(index as usize)
+                && display.id != self.ivars().active_display.borrow().id
             {
                 self.send(SessionMessage::SelectDisplay {
                     display_id: display.id,
@@ -411,10 +412,11 @@ impl RemoteView {
         )));
         debug_label.setHidden(true);
         let this = Self::alloc(mtm).set_ivars(RemoteViewIvars {
-            active_display,
-            displays,
-            video_width,
-            video_height,
+            active_display: RefCell::new(active_display),
+            displays: RefCell::new(displays),
+            video_width: std::cell::Cell::new(video_width),
+            video_height: std::cell::Cell::new(video_height),
+            display_popup: RefCell::new(None),
             control,
             pressed_keys: RefCell::new(Vec::new()),
             pressed_buttons: RefCell::new(Vec::new()),
@@ -465,14 +467,15 @@ impl RemoteView {
             },
             false,
         );
-        for display in &self.ivars().displays {
+        for display in self.ivars().displays.borrow().iter() {
             display_popup.addItemWithTitle(&NSString::from_str(&display.name));
         }
         let active_index = self
             .ivars()
             .displays
+            .borrow()
             .iter()
-            .position(|display| display.id == self.ivars().active_display.id)
+            .position(|display| display.id == self.ivars().active_display.borrow().id)
             .unwrap_or(0);
         display_popup.selectItemAtIndex(active_index as isize);
         unsafe {
@@ -480,6 +483,7 @@ impl RemoteView {
             display_popup.setAction(Some(sel!(selectDisplayFromToolbar:)));
         }
         toolbar.addSubview(&display_popup);
+        *self.ivars().display_popup.borrow_mut() = Some(display_popup);
 
         let quality_popup = NSPopUpButton::initWithFrame_pullsDown(
             NSPopUpButton::alloc(mtm),
@@ -541,7 +545,7 @@ impl RemoteView {
             return;
         };
         self.send(SessionMessage::Input(RemoteInput::PointerMove {
-            display_id: self.ivars().active_display.id,
+            display_id: self.ivars().active_display.borrow().id,
             x,
             y,
         }));
@@ -554,8 +558,8 @@ impl RemoteView {
         normalized_video_position(
             point,
             bounds,
-            self.ivars().video_width,
-            self.ivars().video_height,
+            self.ivars().video_width.get(),
+            self.ivars().video_height.get(),
         )
     }
 
@@ -564,7 +568,7 @@ impl RemoteView {
         let position = self.pointer_position(event);
         match position {
             Some((x, y)) => self.send(SessionMessage::Input(RemoteInput::PointerButtonAt {
-                display_id: self.ivars().active_display.id,
+                display_id: self.ivars().active_display.borrow().id,
                 x,
                 y,
                 button,
@@ -574,7 +578,7 @@ impl RemoteView {
                 // Finish a drag that began over the video without moving the
                 // remote pointer to an out-of-bounds/clamped position.
                 self.send(SessionMessage::Input(RemoteInput::PointerButton {
-                    display_id: self.ivars().active_display.id,
+                    display_id: self.ivars().active_display.borrow().id,
                     button,
                     pressed: false,
                 }));
@@ -595,7 +599,7 @@ impl RemoteView {
             return;
         };
         self.send(SessionMessage::Input(RemoteInput::Key {
-            display_id: self.ivars().active_display.id,
+            display_id: self.ivars().active_display.borrow().id,
             scan_code,
             extended,
             pressed,
@@ -611,13 +615,13 @@ impl RemoteView {
     }
 
     fn select_adjacent(&self, next: bool) {
-        let displays = &self.ivars().displays;
+        let displays = self.ivars().displays.borrow();
         if displays.len() < 2 {
             return;
         }
         let current = displays
             .iter()
-            .position(|display| display.id == self.ivars().active_display.id)
+            .position(|display| display.id == self.ivars().active_display.borrow().id)
             .unwrap_or(0);
         let selected = if next {
             (current + 1) % displays.len()
@@ -651,10 +655,37 @@ impl RemoteView {
             .setStringValue(&NSString::from_str(&self.ivars().debug.render()));
     }
 
+    pub(super) fn configure_display(
+        &self,
+        display: Display,
+        displays: Vec<Display>,
+        width: u32,
+        height: u32,
+    ) {
+        if self.ivars().active_display.borrow().id != display.id {
+            self.release_input();
+        }
+        if let Some(popup) = self.ivars().display_popup.borrow().as_ref() {
+            popup.removeAllItems();
+            for display in &displays {
+                popup.addItemWithTitle(&NSString::from_str(&display.name));
+            }
+            let index = displays
+                .iter()
+                .position(|candidate| candidate.id == display.id)
+                .unwrap_or(0);
+            popup.selectItemAtIndex(index as isize);
+        }
+        *self.ivars().active_display.borrow_mut() = display;
+        *self.ivars().displays.borrow_mut() = displays;
+        self.ivars().video_width.set(width);
+        self.ivars().video_height.set(height);
+    }
+
     pub(super) fn release_input(&self) {
         for (scan_code, extended) in self.ivars().pressed_keys.take() {
             self.send(SessionMessage::Input(RemoteInput::Key {
-                display_id: self.ivars().active_display.id,
+                display_id: self.ivars().active_display.borrow().id,
                 scan_code,
                 extended,
                 pressed: false,
@@ -662,7 +693,7 @@ impl RemoteView {
         }
         for button in self.ivars().pressed_buttons.take() {
             self.send(SessionMessage::Input(RemoteInput::PointerButton {
-                display_id: self.ivars().active_display.id,
+                display_id: self.ivars().active_display.borrow().id,
                 button,
                 pressed: false,
             }));

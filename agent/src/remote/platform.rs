@@ -22,6 +22,15 @@ pub trait ScreenStreamer: Send {
         stream_id: VideoStreamId,
         slot: Arc<LatestFrameSlot>,
     ) -> anyhow::Result<StartedScreen>;
+    fn switch_display(
+        &mut self,
+        display_id: DisplayId,
+        stream_id: VideoStreamId,
+        slot: Arc<LatestFrameSlot>,
+    ) -> anyhow::Result<StartedScreen> {
+        self.stop()?;
+        self.start(Some(display_id), stream_id, slot)
+    }
     fn stop(&mut self) -> anyhow::Result<()>;
     fn poll_ended(&mut self) -> Option<anyhow::Result<()>>;
     fn request_keyframe(&self) -> anyhow::Result<()>;
@@ -143,6 +152,18 @@ impl ScreenStreamer for PlatformScreenStreamer {
                 })
             }
         }
+    }
+
+    fn switch_display(
+        &mut self,
+        display_id: DisplayId,
+        stream_id: VideoStreamId,
+        slot: Arc<LatestFrameSlot>,
+    ) -> anyhow::Result<StartedScreen> {
+        if let CaptureBackend::Direct(streamer) = &mut self.inner {
+            streamer.stop()?;
+        }
+        self.start(Some(display_id), stream_id, slot)
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {

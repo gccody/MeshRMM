@@ -39,8 +39,6 @@ const SIGNAL_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 struct ActivePresenter {
     stream_id: VideoStreamId,
     #[cfg(target_os = "macos")]
-    display_id: meshrmm_protocol::DisplayId,
-    #[cfg(target_os = "macos")]
     format: meshrmm_protocol::VideoFormat,
     profile: VideoProfile,
     presenter: Presenter,
@@ -63,16 +61,12 @@ pub struct ViewerResumeState {
 
 #[cfg(target_os = "macos")]
 fn can_reset_presenter_in_place(
-    active: &ActivePresenter,
-    display_id: meshrmm_protocol::DisplayId,
+    current: meshrmm_protocol::VideoFormat,
     format: meshrmm_protocol::VideoFormat,
 ) -> bool {
-    active.display_id == display_id
-        && active.format.width == format.width
-        && active.format.height == format.height
-        && active.format.frames_per_second == format.frames_per_second
-        && active.format.codec == format.codec
-        && active.format.pixel_format == format.pixel_format
+    // The sample-buffer layer reads dimensions from the replacement keyframe.
+    // Display identity and resolution do not require a new native window.
+    current.codec == format.codec && current.pixel_format == format.pixel_format
 }
 
 struct VideoReceiveState {
@@ -880,15 +874,17 @@ fn install_control_handler(
                         format.codec,
                     );
                     #[cfg(target_os = "macos")]
-                    let reset_in_place = if let Ok(mut guard) = presenter.lock()
+                    let reset_in_place = if capabilities_sent.load(Ordering::Acquire)
+                        && let Ok(mut guard) = presenter.lock()
                         && let Some(active) = guard.as_mut()
-                        && can_reset_presenter_in_place(active, active_display_id, format)
+                        && can_reset_presenter_in_place(active.format, format)
                     {
-                        match active.presenter.reset_stream(format) {
+                        match active.presenter.reset_stream(format, active_display.clone(), displays.clone()) {
                             Ok(()) => {
                                 let previous_stream_id = active.stream_id;
                                 active.stream_id = stream_id;
                                 active.format = format;
+                                active.profile = format.profile();
                                 tracing::info!(
                                     configuration_sequence,
                                     previous_stream_id = previous_stream_id.0,
@@ -918,6 +914,9 @@ fn install_control_handler(
 
                     if reset_in_place {
                         viewer_control.send(SessionMessage::RequestKeyframe { stream_id });
+                        if let Some(display_id) = resumed_display {
+                            viewer_control.send(SessionMessage::SelectDisplay { display_id });
+                        }
                         tracing::info!(configuration_sequence, stream_id = stream_id.0, display_id = active_display_id.0, display_name = %active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, bitrate_bits_per_second = format.bitrate_bits_per_second, codec = ?format.codec, "remote control stream reconfigured without replacing its window");
                         return;
                     }
@@ -954,8 +953,6 @@ fn install_control_handler(
                                 .ok()
                                 .and_then(|mut guard| guard.replace(ActivePresenter {
                                     stream_id,
-                                    #[cfg(target_os = "macos")]
-                                    display_id: active_display_id,
                                     #[cfg(target_os = "macos")]
                                     format,
                                     profile: format.profile(),
@@ -1185,6 +1182,41 @@ mod tests {
             keyframe,
             data: vec![1],
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn monitor_resolution_changes_reuse_the_presenter_but_codec_changes_do_not() {
+        let current = meshrmm_protocol::VideoFormat {
+            width: 1920,
+            height: 1080,
+            frames_per_second: 60,
+            codec: Codec::H264,
+            pixel_format: meshrmm_protocol::PixelFormat::Nv12,
+            bitrate_bits_per_second: 12_000_000,
+        };
+        let replacement = meshrmm_protocol::VideoFormat {
+            width: 2560,
+            height: 1440,
+            frames_per_second: 30,
+            bitrate_bits_per_second: 8_000_000,
+            ..current
+        };
+        assert!(can_reset_presenter_in_place(current, replacement));
+        assert!(!can_reset_presenter_in_place(
+            current,
+            meshrmm_protocol::VideoFormat {
+                codec: Codec::H265,
+                ..replacement
+            }
+        ));
+        assert!(!can_reset_presenter_in_place(
+            current,
+            meshrmm_protocol::VideoFormat {
+                pixel_format: meshrmm_protocol::PixelFormat::Ayuv,
+                ..replacement
+            }
+        ));
     }
 
     #[test]

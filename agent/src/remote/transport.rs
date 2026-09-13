@@ -694,7 +694,7 @@ async fn run_connected_sender(
                             tracing::warn!(display_id = display_id.0, "viewer requested an unavailable display");
                             continue;
                         };
-                        lock_streamer(&streamer)?.stop()?;
+                        let switch_started = std::time::Instant::now();
                         capture_running = false;
                         capture_unavailable_since = Some(std::time::Instant::now());
                         slot.clear();
@@ -704,13 +704,17 @@ async fn run_connected_sender(
                             requested_chroma,
                             &rejected_profiles,
                         );
-                        let restart = start_first_profile(
-                            &streamer,
-                            selected.id,
-                            stream_id,
-                            &slot,
-                            &candidates,
+                        let restart = lock_streamer(&streamer)?.switch_display(
+                            selected.id, stream_id, Arc::clone(&slot),
                         );
+                        let restart = match restart {
+                            Ok(started) => Ok(started),
+                            Err(error) => {
+                                tracing::warn!(?error, "fast display switch failed; retrying supported profiles");
+                                lock_streamer(&streamer)?.stop()?;
+                                start_first_profile(&streamer, selected.id, stream_id, &slot, &candidates)
+                            }
+                        };
                         match restart {
                             Ok(started) => {
                                 displays = started.displays;
@@ -728,7 +732,7 @@ async fn run_connected_sender(
                                         format: started.format,
                                     },
                                 ).await?;
-                                tracing::info!(display_id = active_display.id.0, display_name = %active_display.name, stream_id = stream_id.0, "remote display switched");
+                                tracing::info!(switch_ms = switch_started.elapsed().as_millis(), display_id = active_display.id.0, display_name = %active_display.name, stream_id = stream_id.0, "remote display switched");
                             }
                             Err(error) => {
                                 active_display = selected;
