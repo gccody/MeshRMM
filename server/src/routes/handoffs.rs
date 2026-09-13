@@ -97,7 +97,20 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
     let Some(handoff) = handoff else {
         return api_error(401, "remote handoff is invalid, expired, or already used");
     };
-    let response = create_session_for_device(environment, &handoff.device_id).await?;
+    validate_identifier(&handoff.user_id, "user ID")?;
+    let mut profile_response = super::platform::workos_request(
+        environment,
+        Method::Get,
+        &format!("/user_management/users/{}", handoff.user_id),
+        None,
+    )
+    .await?;
+    if !(200..300).contains(&profile_response.status_code()) {
+        return api_error(502, "could not resolve the remote user's dashboard name");
+    }
+    let profile: serde_json::Value = profile_response.json().await?;
+    let viewer_name = dashboard_user_name(&profile);
+    let response = create_session_for_device(environment, &handoff.device_id, &viewer_name).await?;
     let identity = Identity {
         user_id: handoff.user_id,
         company_id: handoff.company_id,
@@ -120,6 +133,7 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
 pub(crate) async fn create_session_for_device(
     environment: &Env,
     device_id: &str,
+    viewer_name: &str,
 ) -> Result<Response> {
     let session_id = Uuid::new_v4().to_string();
     let client_token = random_token();
@@ -130,6 +144,7 @@ pub(crate) async fn create_session_for_device(
     let ice_servers = generate_ice_servers(environment, idle_timeout_seconds).await?;
 
     let init = SessionInit {
+        viewer_name,
         session_id: &session_id,
         device_id,
         client_token: &client_token,
@@ -146,6 +161,7 @@ pub(crate) async fn create_session_for_device(
     .await?;
 
     let agent_request = AgentSessionRequest {
+        viewer_name: viewer_name.to_owned(),
         session_id: RemoteSessionId::new(&session_id),
         signaling_token: agent_token,
         expires_at_unix_ms,
@@ -176,4 +192,39 @@ pub(crate) async fn create_session_for_device(
         expires_at_unix_ms,
         ice_servers,
     })
+}
+
+fn dashboard_user_name(profile: &serde_json::Value) -> String {
+    let name = ["first_name", "last_name"]
+        .iter()
+        .filter_map(|key| profile[*key].as_str())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if name.is_empty() {
+        profile["email"]
+            .as_str()
+            .unwrap_or("Remote user")
+            .to_owned()
+    } else {
+        name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn uses_dashboard_name_and_email_fallback() {
+        assert_eq!(
+            dashboard_user_name(
+                &serde_json::json!({"first_name":"Ada", "last_name":"Lovelace", "email":"ada@example.com"})
+            ),
+            "Ada Lovelace"
+        );
+        assert_eq!(
+            dashboard_user_name(&serde_json::json!({"first_name":null, "email":"ada@example.com"})),
+            "ada@example.com"
+        );
+    }
 }

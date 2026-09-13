@@ -21,6 +21,8 @@ pub struct SessionBootstrap {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSessionRequest {
+    #[serde(default)]
+    pub viewer_name: String,
     pub session_id: RemoteSessionId,
     pub signaling_token: String,
     pub expires_at_unix_ms: u64,
@@ -84,6 +86,20 @@ pub struct ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_names_survive_transport_and_legacy_requests_still_decode() {
+        let legacy = serde_json::json!({
+            "session_id": "session-123", "signaling_token": "token",
+            "expires_at_unix_ms": 123, "ice_servers": []
+        });
+        let mut request: AgentSessionRequest = serde_json::from_value(legacy).unwrap();
+        assert!(request.viewer_name.is_empty());
+        request.viewer_name = "Zoë 王".into();
+        let decoded: AgentSessionRequest =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        assert_eq!(decoded, request);
+    }
 
     #[test]
     fn agent_lifecycle_messages_use_tagged_json() {

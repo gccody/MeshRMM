@@ -22,6 +22,7 @@ pub async fn run(
             config.frames_per_second,
             bitrate_bits_per_second,
             mode == ExecutionMode::Worker,
+            request.viewer_name.clone(),
         ))));
     tracing::info!(session_id = %session_id, "remote session requested");
     let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(15));

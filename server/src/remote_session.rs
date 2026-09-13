@@ -18,6 +18,8 @@ fn default_idle_timeout_ms() -> u64 {
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionRecord {
     #[serde(default)]
+    viewer_name: String,
+    #[serde(default)]
     session_id: String,
     #[serde(default)]
     device_id: String,
@@ -281,6 +283,7 @@ impl RemoteSession {
             .await?;
 
         let agent_request = AgentSessionRequest {
+            viewer_name: record.viewer_name.clone(),
             session_id: RemoteSessionId::new(record.session_id.clone()),
             signaling_token: record.agent_token.clone(),
             expires_at_unix_ms: record.expires_at_unix_ms,
@@ -325,6 +328,7 @@ impl RemoteSession {
 
         record.expires_at_unix_ms = now.saturating_add(record.idle_timeout_ms);
         let lease = AgentSessionRequest {
+            viewer_name: record.viewer_name.clone(),
             session_id: RemoteSessionId::new(record.session_id.clone()),
             signaling_token: record.agent_token.clone(),
             expires_at_unix_ms: record.expires_at_unix_ms,

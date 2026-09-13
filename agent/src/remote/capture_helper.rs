@@ -86,6 +86,7 @@ impl DesktopTarget {
 
 enum ParentCommand {
     Start {
+        viewer_name: String,
         display_id: Option<DisplayId>,
         frames_per_second: u32,
         bitrate_bits_per_second: u32,
@@ -129,6 +130,7 @@ type InputRoute = Arc<Mutex<Option<InputWriter>>>;
 /// desktop. Only frames and remote-control events cross the inherited pipes;
 /// the Agent token, configuration, and network stack remain in Session 0.
 pub struct DesktopCaptureStreamer {
+    viewer_name: String,
     running: Option<RunningHelper>,
     input: Option<RunningInputHelper>,
     input_route: InputRoute,
@@ -138,8 +140,9 @@ pub struct DesktopCaptureStreamer {
 }
 
 impl DesktopCaptureStreamer {
-    pub fn new() -> Self {
+    pub fn new(viewer_name: String) -> Self {
         Self {
+            viewer_name,
             running: None,
             input: None,
             input_route: Arc::new(Mutex::new(None)),
@@ -209,6 +212,7 @@ impl DesktopCaptureStreamer {
         send_command(
             &running.input,
             &ParentCommand::Start {
+                viewer_name: self.viewer_name.clone(),
                 display_id,
                 frames_per_second: config.frames_per_second,
                 bitrate_bits_per_second: config.bitrate_bits_per_second,
@@ -267,6 +271,7 @@ impl DesktopCaptureStreamer {
             .context("failed to start desktop-helper error reader")?;
         let input = Arc::new(Mutex::new(BufWriter::new(launched.input)));
         let start = ParentCommand::Start {
+            viewer_name: self.viewer_name.clone(),
             display_id,
             frames_per_second: config.frames_per_second,
             bitrate_bits_per_second: config.bitrate_bits_per_second,
@@ -452,7 +457,7 @@ impl DesktopCaptureStreamer {
 
 impl Default for DesktopCaptureStreamer {
     fn default() -> Self {
-        Self::new()
+        Self::new(String::new())
     }
 }
 
@@ -977,19 +982,23 @@ pub fn run_child() -> anyhow::Result<()> {
         .context("desktop-helper command pipe closed before startup")??
     {
         ParentCommand::Start {
+            viewer_name,
             display_id,
             frames_per_second,
             bitrate_bits_per_second,
             codec,
             pixel_format,
-        } => run_capture_child(
-            command_rx,
-            display_id,
-            frames_per_second,
-            bitrate_bits_per_second,
-            codec,
-            pixel_format,
-        ),
+        } => {
+            let _indicator = super::indicator::SessionIndicator::show(&viewer_name)?;
+            run_capture_child(
+                command_rx,
+                display_id,
+                frames_per_second,
+                bitrate_bits_per_second,
+                codec,
+                pixel_format,
+            )
+        }
         ParentCommand::StartInput { display_id } => run_input_child(command_rx, display_id),
         _ => anyhow::bail!("desktop helper expected a capture or input start command"),
     }
@@ -1081,6 +1090,7 @@ fn run_capture_child(
                 }
                 Ok(Ok(ParentCommand::Stop)) => break,
                 Ok(Ok(ParentCommand::Start {
+                    viewer_name: _,
                     display_id: next_display,
                     frames_per_second: next_fps,
                     bitrate_bits_per_second: next_bitrate,
@@ -1250,6 +1260,7 @@ fn emit_child_event(
 fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<()> {
     match command {
         ParentCommand::Start {
+            viewer_name,
             display_id,
             frames_per_second,
             bitrate_bits_per_second,
@@ -1257,6 +1268,9 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             pixel_format,
         } => {
             writer.write_all(&[COMMAND_START])?;
+            checked_len(viewer_name.len(), MAX_DISPLAY_NAME_BYTES, "viewer name")?;
+            write_u32(&mut writer, viewer_name.len() as u32)?;
+            writer.write_all(viewer_name.as_bytes())?;
             write_u32(&mut writer, display_id.map_or(NO_DISPLAY, |id| id.0))?;
             write_u32(&mut writer, *frames_per_second)?;
             write_u32(&mut writer, *bitrate_bits_per_second)
@@ -1298,8 +1312,18 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
 fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
     match read_u8(&mut reader)? {
         COMMAND_START => {
+            let length = bounded_len(
+                read_u32(&mut reader)?,
+                MAX_DISPLAY_NAME_BYTES,
+                "viewer name",
+            )?;
+            let mut name = vec![0; length];
+            reader.read_exact(&mut name)?;
+            let viewer_name = String::from_utf8(name)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let display_id = read_u32(&mut reader)?;
             Ok(ParentCommand::Start {
+                viewer_name,
                 display_id: (display_id != NO_DISPLAY).then_some(DisplayId(display_id)),
                 frames_per_second: read_u32(&mut reader)?,
                 bitrate_bits_per_second: read_u32(&mut reader)?,
@@ -1771,6 +1795,7 @@ mod tests {
     fn command_protocol_round_trips_desktop_input() {
         let commands = [
             ParentCommand::Start {
+                viewer_name: "Zoë 王".into(),
                 display_id: Some(DisplayId(3)),
                 frames_per_second: 60,
                 bitrate_bits_per_second: 12_000_000,
@@ -1796,6 +1821,9 @@ mod tests {
             write_command(&mut bytes, &command).unwrap();
             let decoded = read_command(bytes.as_slice()).unwrap();
             assert_eq!(command_name(&decoded), command_name(&command));
+            if let ParentCommand::Start { viewer_name, .. } = decoded {
+                assert_eq!(viewer_name, "Zoë 王");
+            }
         }
     }
 

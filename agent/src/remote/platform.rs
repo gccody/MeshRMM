@@ -54,6 +54,8 @@ pub trait ScreenInput: Send + Sync {
 #[cfg(windows)]
 pub struct PlatformScreenStreamer {
     inner: CaptureBackend,
+    viewer_name: String,
+    indicator: Option<super::indicator::SessionIndicator>,
     frames_per_second: u32,
     bitrate_bits_per_second: u32,
     codec: Codec,
@@ -69,13 +71,18 @@ impl PlatformScreenStreamer {
         frames_per_second: u32,
         bitrate_bits_per_second: u32,
         capture_as_active_user: bool,
+        viewer_name: String,
     ) -> Self {
         Self {
             inner: if capture_as_active_user {
-                CaptureBackend::Desktop(super::capture_helper::DesktopCaptureStreamer::new())
+                CaptureBackend::Desktop(super::capture_helper::DesktopCaptureStreamer::new(
+                    viewer_name.clone(),
+                ))
             } else {
                 CaptureBackend::Direct(meshrmm_remote_screen::WindowsScreenStreamer::new())
             },
+            viewer_name,
+            indicator: None,
             frames_per_second,
             bitrate_bits_per_second,
             codec: Codec::H264,
@@ -137,6 +144,10 @@ impl ScreenStreamer for PlatformScreenStreamer {
                     .map_err(|_| anyhow::anyhow!("direct input controller lock was poisoned"))?
                     .set_active_display(active_display.clone())?;
                 let active = streamer.start(config, active_display.id.0, sink)?;
+                if self.indicator.is_none() {
+                    self.indicator =
+                        Some(super::indicator::SessionIndicator::show(&self.viewer_name)?);
+                }
                 Ok(StartedScreen {
                     displays,
                     active_display,
@@ -167,6 +178,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        self.indicator = None;
         match &mut self.inner {
             CaptureBackend::Direct(streamer) => streamer.stop().map_err(anyhow::Error::from),
             CaptureBackend::Desktop(streamer) => streamer.stop(),

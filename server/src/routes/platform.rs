@@ -812,7 +812,7 @@ async fn workos_json<T: for<'de> Deserialize<'de>>(
     response.json().await
 }
 
-async fn workos_request(
+pub(super) async fn workos_request(
     environment: &Env,
     method: Method,
     path: &str,

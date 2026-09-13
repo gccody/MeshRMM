@@ -1,4 +1,6 @@
 #[cfg(windows)]
+mod indicator;
+#[cfg(windows)]
 pub(crate) mod capture_helper;
 #[cfg(windows)]
 mod clipboard;
