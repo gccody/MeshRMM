@@ -1701,6 +1701,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "url",
+ "uuid",
  "webrtc",
  "windows",
  "windows-service",

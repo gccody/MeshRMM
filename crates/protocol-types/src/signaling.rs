@@ -32,6 +32,7 @@ pub struct AgentSessionRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentCommand {
     Uninstall,
+    RotateToken { token: String },
     EndSession { session_id: RemoteSessionId },
 }
 

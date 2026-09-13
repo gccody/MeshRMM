@@ -95,14 +95,18 @@ pub async fn authenticated_websocket(url: Url, token: &str) -> anyhow::Result<(S
         HeaderValue::from_str(&format!("Bearer {token}"))
             .context("invalid authentication token header")?,
     );
-    connect_async(request)
+    tokio::time::timeout(Duration::from_secs(15), connect_async(request))
         .await
+        .context("signaling WebSocket handshake timed out")?
         .context("signaling WebSocket handshake failed")
 }
 
 /// Returns true when retrying a WebSocket with the same credentials cannot
 /// succeed because the server rejected or no longer recognizes the session.
 pub fn is_terminal_websocket_error(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<TerminalClose>().is_some() {
+        return true;
+    }
     error.chain().any(|cause| {
         cause
             .downcast_ref::<tokio_tungstenite::tungstenite::Error>()
@@ -121,6 +125,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn revoked_sessions_stop_retrying_but_network_closures_do_not() {
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+        let revoked = signaling_close_error(Some(CloseFrame {
+            code: CloseCode::from(4001),
+            reason: "expired".into(),
+        }));
+        assert!(is_terminal_websocket_error(&revoked));
+        assert!(!is_terminal_websocket_error(&signaling_close_error(None)));
+    }
+
+    #[test]
     fn reconnect_backoff_grows_and_caps() {
         let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(15));
         assert_eq!(backoff.next_delay(), Duration::from_secs(1));
@@ -131,5 +146,27 @@ mod tests {
         assert_eq!(backoff.next_delay(), Duration::from_secs(15));
         backoff.reset();
         assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+    }
+}
+
+#[derive(Debug)]
+struct TerminalClose;
+impl std::fmt::Display for TerminalClose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "remote session was ended or revoked")
+    }
+}
+impl std::error::Error for TerminalClose {}
+
+pub fn signaling_close_error(
+    frame: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+) -> anyhow::Error {
+    if frame
+        .as_ref()
+        .is_some_and(|frame| matches!(u16::from(frame.code), 1008 | 4001))
+    {
+        TerminalClose.into()
+    } else {
+        anyhow::anyhow!("signaling connection closed: {frame:?}")
     }
 }

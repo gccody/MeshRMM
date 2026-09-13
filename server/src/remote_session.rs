@@ -59,7 +59,9 @@ impl DurableObject for RemoteSession {
                     return Response::error("session already initialized", 409);
                 }
                 let record: SessionRecord = request.json().await?;
-                if record.expires_at_unix_ms <= Date::now().as_millis() {
+                if !crate::device_is_active(&self.environment, &record.device_id).await?
+                    || record.expires_at_unix_ms <= Date::now().as_millis()
+                {
                     return Response::error("session already expired", 400);
                 }
                 if record.idle_timeout_ms == 0 {
@@ -218,13 +220,22 @@ impl DurableObject for RemoteSession {
 }
 
 impl RemoteSession {
+    async fn advance_deadline(&self, proposed: &SessionRecord) -> Result<bool> {
+        let Some(mut current) = self.state.storage().get::<SessionRecord>("session").await? else {
+            return Ok(false);
+        };
+        if current.expires_at_unix_ms <= Date::now().as_millis() {
+            return Ok(false);
+        }
+        current.expires_at_unix_ms = proposed.expires_at_unix_ms;
+        self.state.storage().put("session", &current).await?;
+        Ok(true)
+    }
+
     async fn resume(&self, request: &Request) -> Result<Response> {
-        let mut record = self
-            .state
-            .storage()
-            .get::<SessionRecord>("session")
-            .await?
-            .ok_or_else(|| Error::RustError("unknown session".into()))?;
+        let Some(mut record) = self.state.storage().get::<SessionRecord>("session").await? else {
+            return Response::error("session expired or unknown", 410);
+        };
         let supplied = request
             .headers()
             .get("Authorization")?
@@ -237,7 +248,9 @@ impl RemoteSession {
             return Response::error("session predates resume support", 409);
         }
         let now = Date::now().as_millis();
-        if record.expires_at_unix_ms <= now {
+        if !crate::device_is_active(&self.environment, &record.device_id).await?
+            || record.expires_at_unix_ms <= now
+        {
             self.expire("session idle timeout").await?;
             return Response::error("session expired", 401);
         }
@@ -245,8 +258,23 @@ impl RemoteSession {
         let idle_timeout_seconds = record.idle_timeout_ms.div_ceil(1000);
         let ice_servers =
             crate::generate_ice_servers(&self.environment, idle_timeout_seconds).await?;
+        // TURN generation yields to other requests; an expiry or revocation
+        // during that await must not be overwritten by this older record.
+        let Some(current) = self.state.storage().get::<SessionRecord>("session").await? else {
+            return Response::error("session expired", 410);
+        };
+        if current.expires_at_unix_ms <= Date::now().as_millis()
+            || !crate::device_is_active(&self.environment, &current.device_id).await?
+        {
+            self.expire("session authorization expired").await?;
+            return Response::error("session expired", 410);
+        }
+        record = current;
+        let now = Date::now().as_millis();
         record.expires_at_unix_ms = now.saturating_add(record.idle_timeout_ms);
-        self.state.storage().put("session", &record).await?;
+        if !self.advance_deadline(&record).await? {
+            return Response::error("session expired", 410);
+        }
         self.state
             .storage()
             .set_alarm(record.idle_timeout_ms as i64)
@@ -264,6 +292,10 @@ impl RemoteSession {
             crate::object_stub(&self.environment, "AGENT_COORDINATOR", &record.device_id)?
                 .fetch_with_request(notify)
                 .await?;
+        if response.status_code() == 410 {
+            self.expire("session ownership lost").await?;
+            return Response::error("session ownership lost", 410);
+        }
         crate::ensure_success(response, "refresh Agent remote session").await?;
 
         console_log!(
@@ -284,13 +316,34 @@ impl RemoteSession {
             return Ok(());
         };
         let now = Date::now().as_millis();
-        if record.expires_at_unix_ms <= now {
+        if !crate::device_is_active(&self.environment, &record.device_id).await?
+            || record.expires_at_unix_ms <= now
+        {
             self.expire("session idle timeout").await?;
             return Ok(());
         }
 
         record.expires_at_unix_ms = now.saturating_add(record.idle_timeout_ms);
-        self.state.storage().put("session", &record).await?;
+        let lease = AgentSessionRequest {
+            session_id: RemoteSessionId::new(record.session_id.clone()),
+            signaling_token: record.agent_token.clone(),
+            expires_at_unix_ms: record.expires_at_unix_ms,
+            ice_servers: Vec::new(),
+        };
+        let request = crate::internal_json_request("https://agent.internal/lease", &lease)?;
+        let response =
+            crate::object_stub(&self.environment, "AGENT_COORDINATOR", &record.device_id)?
+                .fetch_with_request(request)
+                .await?;
+        if response.status_code() == 410 {
+            self.expire("session ownership lost").await?;
+            return Ok(());
+        }
+        crate::ensure_success(response, "renew session lease").await?;
+
+        if !self.advance_deadline(&record).await? {
+            return Ok(());
+        }
         self.state
             .storage()
             .set_alarm(record.idle_timeout_ms as i64)
@@ -299,14 +352,22 @@ impl RemoteSession {
     }
 
     async fn accept_peer(&self, request: &Request) -> Result<Response> {
-        let record = self
+        let Some(record) = self.state.storage().get::<SessionRecord>("session").await? else {
+            return Response::error("session expired or unknown", 410);
+        };
+        if !crate::device_is_active(&self.environment, &record.device_id).await?
+            || record.expires_at_unix_ms <= Date::now().as_millis()
+        {
+            return Response::error("session expired", 401);
+        }
+        if self
             .state
             .storage()
             .get::<SessionRecord>("session")
             .await?
-            .ok_or_else(|| Error::RustError("unknown session".into()))?;
-        if record.expires_at_unix_ms <= Date::now().as_millis() {
-            return Response::error("session expired", 401);
+            .is_none()
+        {
+            return Response::error("session expired", 410);
         }
         let role = request
             .url()?

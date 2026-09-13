@@ -29,11 +29,13 @@ url.workspace = true
 webrtc.workspace = true
 
 [target."cfg(windows)".dependencies]
+uuid = { version = "1.24.1", features = ["v4"] }
 meshrmm-remote-screen = { version = "0.2.0", path = "windows/remote-screen" }
 ureq = { version = "3.4.0", features = ["json", "platform-verifier"] }
 windows-service = "0.8.1"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_Security",
     "Win32_System_Environment",
     "Win32_System_Pipes",

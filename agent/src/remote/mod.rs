@@ -47,7 +47,10 @@ const SIGNAL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const SIGNAL_LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[cfg_attr(not(windows), allow(unused_variables))]
-pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
+pub async fn run(
+    #[allow(unused_mut)] mut config: Config,
+    mode: ExecutionMode,
+) -> anyhow::Result<()> {
     #[cfg(not(windows))]
     anyhow::bail!("the first MeshRMM remote-screen MVP requires Windows");
 
@@ -83,6 +86,17 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
                                         Message::Text(text) => {
                                             if let Ok(command) = serde_json::from_str::<AgentCommand>(text.as_str()) {
                                                 match command {
+                                                    AgentCommand::RotateToken { token } => {
+                                                        if token == config.agent_token { continue; }
+                                                        if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                                                            anyhow::bail!("invalid rotated Agent credential");
+                                                        }
+                                                        let mut stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&config.config_path)?)?;
+                                                        stored["agent_token"] = serde_json::Value::String(token.clone());
+                                                        crate::installer::replace_file(&config.config_path, &serde_json::to_vec_pretty(&stored)?)?;
+                                                        config.agent_token = token;
+                                                        break Ok(false);
+                                                    }
                                                     AgentCommand::Uninstall => {
                                                         crate::installer::schedule_uninstall()
                                                             .context("failed to schedule Agent self-uninstall")?;

@@ -164,7 +164,7 @@ function TenantDashboard() {
   }, [lockSession, resetInventory, signOut]);
 
   useIdleSession({
-    enabled: Boolean(hasTenantSession && !sessionPauseReason),
+    enabled: Boolean(hasTenantSession && account?.company && !sessionPauseReason),
     organizationId: workosOrganizationId,
     timeoutMinutes: idleTimeoutMinutes,
     onTimeout: pauseIdleSession,

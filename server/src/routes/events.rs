@@ -78,7 +78,7 @@ pub(crate) async fn subscribe_agent_events(
     let db = environment.d1("DB")?;
     let subscription = query!(
         &db,
-        "UPDATE agent_event_subscriptions SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 RETURNING company_id",
+        "UPDATE agent_event_subscriptions SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = agent_event_subscriptions.company_id AND companies.status = 'active') RETURNING company_id",
         now,
         token_hash
     )?
@@ -87,6 +87,14 @@ pub(crate) async fn subscribe_agent_events(
     let Some(subscription) = subscription else {
         return api_error(401, "Agent event subscription is invalid or expired");
     };
+    let tenant = request_tenant_company(&db, &request, environment).await?;
+    if tenant
+        .as_ref()
+        .is_some_and(|tenant| tenant.id != subscription.company_id)
+        || (tenant.is_none() && !is_legacy_control_plane_request(&request, environment)?)
+    {
+        return api_error(403, "subscription does not match company hostname");
+    }
     forward_to_object(
         environment,
         "COMPANY_PRESENCE",

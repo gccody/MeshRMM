@@ -67,6 +67,7 @@ impl DurableObject for AgentCoordinator {
                     .storage()
                     .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
                     .await?
+                    && session.expires_at_unix_ms > Date::now().as_millis()
                 {
                     pair.server
                         .send_with_str(serde_json::to_string(&session)?)?;
@@ -75,8 +76,30 @@ impl DurableObject for AgentCoordinator {
                         session.session_id
                     );
                 }
+                if !uninstall_requested
+                    && let Some(command) = self
+                        .state
+                        .storage()
+                        .get::<AgentCommand>("pending_rotation")
+                        .await?
+                {
+                    pair.server
+                        .send_with_str(serde_json::to_string(&command)?)?;
+                }
+                self.state.storage().set_alarm(30_000_i64).await?;
                 console_log!("event=agent_signaling_connected");
                 Response::from_websocket(pair.client)
+            }
+            (Method::Post, "/rotate-token") => {
+                let command: AgentCommand = request.json().await?;
+                self.state
+                    .storage()
+                    .put("pending_rotation", &command)
+                    .await?;
+                for socket in self.state.get_websockets_with_tag(AGENT_TAG) {
+                    let _ = socket.send_with_str(serde_json::to_string(&command)?);
+                }
+                Response::ok("rotation delivered")
             }
             (Method::Post, "/uninstall") => {
                 if let Some(agent) = self
@@ -91,6 +114,15 @@ impl DurableObject for AgentCoordinator {
             }
             (Method::Post, "/request") => {
                 let session: AgentSessionRequest = request.json().await?;
+                if self
+                    .state
+                    .storage()
+                    .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
+                    .await?
+                    .is_some_and(|active| active.expires_at_unix_ms > Date::now().as_millis())
+                {
+                    return Response::error("Agent already has an active remote session", 409);
+                }
                 let agents = self.state.get_websockets_with_tag(AGENT_TAG);
                 if agents.is_empty() {
                     return Response::error("Agent is offline", 409);
@@ -125,6 +157,9 @@ impl DurableObject for AgentCoordinator {
             }
             (Method::Post, "/resume-request") => {
                 let session: AgentSessionRequest = request.json().await?;
+                if !self.owns_session(&session).await? {
+                    return Response::error("remote session no longer owns this Agent", 410);
+                }
                 self.state
                     .storage()
                     .put(ACTIVE_SESSION_KEY, &session)
@@ -154,6 +189,54 @@ impl DurableObject for AgentCoordinator {
                     session.session_id
                 );
                 Response::ok("refreshed")
+            }
+            (Method::Post, "/lease") => {
+                let session: AgentSessionRequest = request.json().await?;
+                if !self.owns_session(&session).await? {
+                    return Response::error("remote session no longer owns this Agent", 410);
+                }
+                if let Some(mut active) = self
+                    .state
+                    .storage()
+                    .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
+                    .await?
+                {
+                    active.expires_at_unix_ms = session.expires_at_unix_ms;
+                    self.state
+                        .storage()
+                        .put(ACTIVE_SESSION_KEY, &active)
+                        .await?;
+                }
+                Response::ok("renewed")
+            }
+            (Method::Post, "/revoke") => {
+                let session = self
+                    .state
+                    .storage()
+                    .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
+                    .await?;
+                self.state.storage().delete(ACTIVE_SESSION_KEY).await?;
+                for socket in self.state.get_websockets_with_tag(AGENT_TAG) {
+                    if let Some(active) = &session {
+                        let _ = socket.send_with_str(serde_json::to_string(
+                            &AgentCommand::EndSession {
+                                session_id: active.session_id.clone(),
+                            },
+                        )?);
+                    }
+                    let _ = socket.close(Some(4001), Some("Agent authorization revoked"));
+                }
+                if let Some(active) = session {
+                    let request = Request::new("https://session.internal/expire", Method::Post)?;
+                    crate::object_stub(
+                        &self.environment,
+                        "REMOTE_SESSION",
+                        active.session_id.as_str(),
+                    )?
+                    .fetch_with_request(request)
+                    .await?;
+                }
+                Response::ok("revoked")
             }
             (Method::Post, "/session-ended") => {
                 let ended: SessionEnded = request.json().await?;
@@ -190,6 +273,24 @@ impl DurableObject for AgentCoordinator {
             }
             _ => Response::error("not found", 404),
         }
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        if let Some(identity) = self
+            .state
+            .storage()
+            .get::<AgentIdentity>(IDENTITY_KEY)
+            .await?
+        {
+            let connected = !self.state.get_websockets_with_tag(AGENT_TAG).is_empty();
+            if let Err(error) = self.publish_presence(&identity, connected).await {
+                console_error!("presence reconciliation failed: {}", error);
+                self.state.storage().set_alarm(30_000_i64).await?;
+            } else if connected {
+                self.state.storage().set_alarm(30_000_i64).await?;
+            }
+        }
+        Response::ok("presence reconciled")
     }
 
     async fn websocket_message(
@@ -242,6 +343,15 @@ impl DurableObject for AgentCoordinator {
 }
 
 impl AgentCoordinator {
+    async fn owns_session(&self, requested: &AgentSessionRequest) -> Result<bool> {
+        Ok(self
+            .state
+            .storage()
+            .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
+            .await?
+            .is_some_and(|active| lease_matches(&active, requested, Date::now().as_millis())))
+    }
+
     async fn acknowledge_uninstall(&self, socket: &WebSocket) -> Result<()> {
         let Some(connection_id) = socket.deserialize_attachment::<String>()? else {
             return Ok(());
@@ -318,4 +428,27 @@ pub async fn request_uninstall(environment: &Env, device_id: &str) -> Result<()>
         .fetch_with_request(request)
         .await?;
     crate::ensure_success(response, "notify Agent uninstall").await
+}
+
+fn lease_matches(active: &AgentSessionRequest, requested: &AgentSessionRequest, now: u64) -> bool {
+    active.session_id == requested.session_id && active.expires_at_unix_ms > now
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    #[test]
+    fn resume_cannot_take_over_another_or_expired_session() {
+        let active = AgentSessionRequest {
+            session_id: meshrmm_protocol_types::RemoteSessionId::new("one"),
+            signaling_token: "token".into(),
+            expires_at_unix_ms: 100,
+            ice_servers: vec![],
+        };
+        assert!(lease_matches(&active, &active, 99));
+        assert!(!lease_matches(&active, &active, 100));
+        let mut other = active.clone();
+        other.session_id = meshrmm_protocol_types::RemoteSessionId::new("two");
+        assert!(!lease_matches(&active, &other, 1));
+    }
 }

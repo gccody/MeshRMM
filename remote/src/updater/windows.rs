@@ -22,6 +22,9 @@ pub fn is_helper_invocation() -> bool {
 }
 
 pub async fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
+    if std::env::var_os("MESHRMM_UPDATE_READY_FILE").is_some() {
+        return Ok(false);
+    }
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -72,6 +75,15 @@ pub async fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
         .with_context(|| format!("failed to create client update helper {}", helper.display()))?;
     let launch_arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     Command::new(&helper)
+        .env(
+            "MESHRMM_SESSION_BOOTSTRAP",
+            serde_json::to_string(
+                &config
+                    .bootstrap
+                    .as_ref()
+                    .context("missing launch session")?,
+            )?,
+        )
         .arg("--apply-client-update")
         .arg(&current)
         .arg(&staged)
@@ -84,6 +96,23 @@ pub async fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
 }
 
 pub fn apply_scheduled_update() -> anyhow::Result<()> {
+    let result = apply_update_inner();
+    if result.is_err() {
+        let arguments = std::env::args_os().skip(2).collect::<Vec<_>>();
+        let target_index = 0;
+        if let Some(target) = arguments.get(target_index) {
+            let target = PathBuf::from(target);
+            if target.exists() {
+                let launch_arguments = arguments.into_iter().skip(2).collect::<Vec<_>>();
+                launch(&target, &launch_arguments)
+                    .context("update failed and the restored viewer could not be relaunched")?;
+            }
+        }
+    }
+    result
+}
+
+fn apply_update_inner() -> anyhow::Result<()> {
     let arguments = std::env::args_os().skip(2).collect::<Vec<_>>();
     if arguments.len() < 2 {
         bail!("the client update helper requires target and staged executable paths");
@@ -103,7 +132,7 @@ pub fn apply_scheduled_update() -> anyhow::Result<()> {
     std::fs::rename(&target, &backup)
         .with_context(|| format!("failed to back up client {}", target.display()))?;
     if let Err(error) = std::fs::rename(&staged, &target) {
-        let _ = std::fs::rename(&backup, &target);
+        std::fs::rename(&backup, &target).context("could not restore the previous viewer")?;
         return Err(error)
             .with_context(|| format!("failed to install client update {}", target.display()));
     }
@@ -112,9 +141,6 @@ pub fn apply_scheduled_update() -> anyhow::Result<()> {
         let _ = std::fs::remove_file(&target);
         std::fs::rename(&backup, &target).context(
             "the client update failed and the previous executable could not be restored",
-        )?;
-        launch(&target, &launch_arguments).context(
-            "the client update failed; the previous executable was restored but could not be relaunched",
         )?;
         return Err(update_error).context("the updated client could not be launched");
     }
@@ -125,18 +151,21 @@ pub fn apply_scheduled_update() -> anyhow::Result<()> {
 }
 
 async fn download(http: &reqwest::Client, url: &str, maximum: usize) -> anyhow::Result<Vec<u8>> {
-    let response = http.get(url).send().await?.error_for_status()?;
+    let mut response = http.get(url).send().await?.error_for_status()?;
     if response
         .content_length()
         .is_some_and(|length| length > maximum as u64)
     {
         bail!("download exceeds the {maximum}-byte size limit");
     }
-    let contents = response.bytes().await?;
-    if contents.len() > maximum {
-        bail!("download exceeds the {maximum}-byte size limit");
+    let mut contents = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > maximum.saturating_sub(contents.len()) {
+            bail!("download exceeds the {maximum}-byte size limit");
+        }
+        contents.extend_from_slice(&chunk);
     }
-    Ok(contents.to_vec())
+    Ok(contents)
 }
 
 fn write_new_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
@@ -170,16 +199,9 @@ fn wait_until_replaceable(target: &Path, timeout: Duration) -> anyhow::Result<()
 }
 
 fn launch(target: &Path, arguments: &[OsString]) -> anyhow::Result<()> {
-    Command::new(target)
-        .args(arguments)
-        .current_dir(
-            target
-                .parent()
-                .context("client executable has no parent directory")?,
-        )
-        .spawn()
-        .with_context(|| format!("failed to relaunch updated client {}", target.display()))?;
-    Ok(())
+    let mut command = Command::new(target);
+    command.args(arguments);
+    super::launch_verified(command)
 }
 
 fn schedule_cleanup(helper: &Path, helper_directory: &Path) -> anyhow::Result<()> {

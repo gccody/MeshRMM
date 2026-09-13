@@ -138,11 +138,29 @@ impl WindowsInputController {
     }
 
     pub fn release_all(&mut self) -> anyhow::Result<()> {
-        for (scan_code, extended) in self.pressed_keys.drain().collect::<Vec<_>>() {
-            send_key(scan_code, extended, false)?;
+        let mut failure = None;
+        for (scan_code, extended) in self.pressed_keys.clone() {
+            match send_key(scan_code, extended, false) {
+                Ok(()) => {
+                    self.pressed_keys.remove(&(scan_code, extended));
+                }
+                Err(error) => {
+                    failure = Some(error);
+                }
+            }
         }
-        for button in self.pressed_buttons.drain().collect::<Vec<_>>() {
-            send_mouse_button(button, false)?;
+        for button in self.pressed_buttons.clone() {
+            match send_mouse_button(button, false) {
+                Ok(()) => {
+                    self.pressed_buttons.remove(&button);
+                }
+                Err(error) => {
+                    failure = Some(error);
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         Ok(())
     }

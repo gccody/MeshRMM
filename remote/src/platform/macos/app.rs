@@ -38,6 +38,8 @@ define_class!(
                     .context("could not locate the macOS viewer executable")
                     .and_then(|executable| {
                         std::process::Command::new(executable)
+                            .env_remove("MESHRMM_SESSION_BOOTSTRAP")
+                            .env_remove("MESHRMM_UPDATE_READY_FILE")
                             .arg(error.0)
                             .spawn()
                             .context("could not launch the replacement macOS viewer")
@@ -967,11 +969,7 @@ where
     std::thread::Builder::new()
         .name("meshrmm-network".into())
         .spawn(move || {
-            let deep_link = if has_command_line_session {
-                None
-            } else {
-                deep_link_rx.recv_timeout(Duration::from_secs(5)).ok()
-            };
+            let deep_link = receive_launch_link(deep_link_rx, has_command_line_session);
             let result = network(deep_link);
             match &result {
                 Ok(()) => tracing::info!("macOS viewer network session finished cleanly"),
@@ -1000,4 +998,30 @@ where
     result_rx
         .recv()
         .context("macOS network runtime exited without a result")?
+}
+
+fn receive_launch_link(
+    receiver: std::sync::mpsc::Receiver<String>,
+    command_line: bool,
+) -> Option<String> {
+    if command_line {
+        None
+    } else {
+        receiver.recv_timeout(Duration::from_secs(5)).ok()
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+    #[test]
+    fn later_links_trigger_replacement_for_both_launch_modes() {
+        for command_line in [false, true] {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            sender.send("first".to_owned()).unwrap();
+            let link = receive_launch_link(receiver, command_line);
+            assert_eq!(link.is_some(), !command_line);
+            assert!(sender.send("second".to_owned()).is_err());
+        }
+    }
 }

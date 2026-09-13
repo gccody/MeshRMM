@@ -27,6 +27,9 @@ fn initialize(launch_deep_link: Option<&str>) -> anyhow::Result<config::Config> 
         config::Config::load()?
     };
     initialize_tracing(&config)?;
+    if let Some(ready) = std::env::var_os("MESHRMM_UPDATE_READY_FILE") {
+        std::fs::write(ready, b"ready").context("could not acknowledge viewer initialization")?;
+    }
     Ok(config)
 }
 
@@ -133,9 +136,12 @@ fn register_windows_deep_link_handler() {
 }
 
 async fn run_session(config: config::Config) -> anyhow::Result<()> {
-    let mut bootstrap = signaling::create_session(&config)
-        .await
-        .context("remote session request failed")?;
+    let mut bootstrap = match config.bootstrap.clone() {
+        Some(bootstrap) => bootstrap,
+        None => signaling::create_session(&config)
+            .await
+            .context("remote session request failed")?,
+    };
     tracing::info!(
         session_id = %bootstrap.session_id,
         expires_at_unix_ms = bootstrap.expires_at_unix_ms,
@@ -190,7 +196,10 @@ async fn main() -> anyhow::Result<()> {
     if updater::is_helper_invocation() {
         return updater::apply_scheduled_update();
     }
-    let config = initialize(None)?;
+    let mut config = initialize(None)?;
+    if config.bootstrap.is_none() {
+        config.bootstrap = Some(signaling::create_session(&config).await?);
+    }
     match updater::check_and_schedule(&config).await {
         Ok(true) => Ok(()),
         Ok(false) => run_session(config).await,
@@ -207,11 +216,14 @@ fn main() -> anyhow::Result<()> {
         return updater::apply_scheduled_update();
     }
     platform::run_application(move |deep_link| {
-        let config = initialize(deep_link.as_deref())?;
+        let mut config = initialize(deep_link.as_deref())?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .context("failed to create the macOS network runtime")?;
+        if config.bootstrap.is_none() {
+            config.bootstrap = Some(runtime.block_on(signaling::create_session(&config))?);
+        }
         match runtime.block_on(updater::check_and_schedule(&config, deep_link.as_deref())) {
             Ok(true) => Ok(()),
             Ok(false) => runtime.block_on(run_session(config)),
