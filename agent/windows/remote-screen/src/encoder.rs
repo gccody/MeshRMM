@@ -332,7 +332,7 @@ impl MediaFoundationVideoEncoder {
             // first IDR. The decoder still needs SPS/PPS before that first
             // access unit, so attach the sequence header to the first output
             // regardless of the optional clean-point annotation.
-            if !self.sequence_header_sent {
+            if keyframe || !self.sequence_header_sent {
                 if self.sequence_header.is_none() {
                     self.sequence_header = read_sequence_header(&self.transform);
                 }

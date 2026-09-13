@@ -77,7 +77,7 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
     let handoff = if let Some(tenant) = request_tenant.as_ref() {
         query!(
             &db,
-            "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND company_id = ?3 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id",
+            "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND company_id = ?3 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = remote_handoffs.company_id AND companies.status IN ('active', 'awaiting_admin')) AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id",
             now,
             token_hash,
             tenant.id
@@ -87,7 +87,7 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
     } else {
         query!(
             &db,
-            "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id",
+            "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = remote_handoffs.company_id AND companies.status IN ('active', 'awaiting_admin')) AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id",
             now,
             token_hash
         )?
@@ -126,7 +126,7 @@ pub(crate) async fn create_session_for_device(
     let agent_token = random_token();
     let idle_timeout_seconds = session_idle_timeout(environment)?;
     let idle_timeout_ms = idle_timeout_seconds * 1000;
-    let expires_at_unix_ms = Date::now().as_millis() + idle_timeout_ms;
+    let expires_at_unix_ms = Date::now().as_millis() + idle_timeout_ms.max(15 * 60 * 1000);
     let ice_servers = generate_ice_servers(environment, idle_timeout_seconds).await?;
 
     let init = SessionInit {
@@ -158,7 +158,10 @@ pub(crate) async fn create_session_for_device(
     if !(200..300).contains(&notify_response.status_code()) {
         let cleanup = Request::new("https://session.internal/expire", Method::Post)?;
         let _ = session_stub.fetch_with_request(cleanup).await;
-        return api_error(409, "target Agent is not connected");
+        return api_error(
+            409,
+            "target Agent is offline or already has an active remote session",
+        );
     }
 
     console_log!(

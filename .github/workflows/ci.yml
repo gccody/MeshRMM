@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -32,6 +33,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p meshrmm-server --target wasm32-unknown-unknown
       - run: cargo test -p meshrmm-server
+      - run: python3 server/tests/sql_regressions.py
 
   dashboard:
     runs-on: ubuntu-latest

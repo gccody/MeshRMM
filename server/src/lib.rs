@@ -45,6 +45,7 @@ struct TenantCompany {
 #[derive(Debug, Deserialize)]
 struct AgentCredentialRow {
     auth_token_hash: String,
+    pending_auth_token_hash: Option<String>,
     company_id: String,
     deletion_requested_at: Option<i64>,
 }
@@ -66,6 +67,7 @@ struct AgentInstallTokenRow {
     id: String,
     company_id: String,
     created_by_user_id: String,
+    device_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +156,8 @@ struct AgentEventSubscription {
 #[derive(Debug, Deserialize)]
 struct RedeemAgentInstallerRequest {
     name: String,
+    #[serde(default)]
+    redemption_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -332,16 +336,23 @@ async fn authorize_agent(
     let db = environment.d1("DB")?;
     let credential = query!(
         &db,
-        "SELECT auth_token_hash, company_id, deletion_requested_at FROM agents WHERE id = ?1",
+        "SELECT auth_token_hash, pending_auth_token_hash, company_id, deletion_requested_at FROM agents WHERE id = ?1",
         device_id
     )?
     .first::<AgentCredentialRow>(None)
     .await?
     .ok_or_else(|| Error::RustError("unauthorized Agent".into()))?;
-    if !constant_time_eq(
-        sha256_hex(&supplied).as_bytes(),
-        credential.auth_token_hash.as_bytes(),
-    ) {
+    let supplied_hash = sha256_hex(&supplied);
+    let pending_matches = credential
+        .pending_auth_token_hash
+        .as_ref()
+        .is_some_and(|pending| constant_time_eq(supplied_hash.as_bytes(), pending.as_bytes()));
+    if !pending_matches
+        && !constant_time_eq(
+            supplied_hash.as_bytes(),
+            credential.auth_token_hash.as_bytes(),
+        )
+    {
         return Err(Error::RustError("invalid Agent token".into()));
     }
     if let Some(tenant) = request_tenant_company(&db, request, environment).await? {
@@ -352,6 +363,20 @@ async fn authorize_agent(
         }
     } else if !is_legacy_control_plane_request(request, environment)? {
         return Err(Error::RustError("Agent company hostname is invalid".into()));
+    }
+    let active = query!(
+        &db,
+        "SELECT 1 AS allowed FROM companies WHERE id = ?1 AND status = 'active'",
+        credential.company_id
+    )?
+    .first::<i64>(Some("allowed"))
+    .await?
+    .is_some();
+    if !active {
+        return Err(Error::RustError("company is not active".into()));
+    }
+    if pending_matches {
+        query!(&db, "UPDATE agents SET auth_token_hash = ?1, pending_auth_token_hash = NULL WHERE id = ?2 AND pending_auth_token_hash = ?1", supplied_hash, device_id)?.run().await?;
     }
     Ok(AgentAuthorization {
         company_id: credential.company_id,

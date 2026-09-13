@@ -70,6 +70,12 @@ impl DurableObject for CompanyPresence {
     async fn fetch(&self, mut request: Request) -> Result<Response> {
         let company_id = self.bind_company(&request).await?;
         match (request.method(), request.path().as_str()) {
+            (Method::Post, "/revoke") => {
+                for socket in self.state.get_websockets() {
+                    let _ = socket.close(Some(4001), Some("company access revoked"));
+                }
+                Response::ok("revoked")
+            }
             (Method::Get, "/subscribe") => self.subscribe(&company_id, &request).await,
             (Method::Get, "/snapshot") => Response::from_json(&self.snapshot(&company_id).await?),
             (Method::Post, "/presence") => {
@@ -81,11 +87,56 @@ impl DurableObject for CompanyPresence {
         }
     }
 
+    async fn alarm(&self) -> Result<Response> {
+        let now = Date::now().as_millis();
+        let company = self
+            .state
+            .storage()
+            .get::<String>(COMPANY_KEY)
+            .await?
+            .unwrap_or_default();
+        let db = self.environment.d1("DB")?;
+        let active = query!(
+            &db,
+            "SELECT 1 AS allowed FROM companies WHERE id = ?1 AND status = 'active'",
+            company
+        )?
+        .first::<i64>(Some("allowed"))
+        .await?
+        .is_some();
+        for socket in self.state.get_websockets() {
+            if !active
+                || socket
+                    .deserialize_attachment::<u64>()?
+                    .is_none_or(|deadline| deadline <= now)
+            {
+                let _ = socket.close(
+                    Some(4001),
+                    Some("subscription requires fresh authorization"),
+                );
+            }
+        }
+        if !self.state.get_websockets().is_empty() {
+            self.state.storage().set_alarm(30_000_i64).await?;
+        }
+        Response::ok("subscriptions checked")
+    }
+
     async fn websocket_message(
         &self,
         socket: WebSocket,
         message: WebSocketIncomingMessage,
     ) -> Result<()> {
+        if socket
+            .deserialize_attachment::<u64>()?
+            .is_none_or(|deadline| deadline <= Date::now().as_millis())
+        {
+            socket.close(
+                Some(4001),
+                Some("subscription requires fresh authorization"),
+            )?;
+            return Ok(());
+        }
         match message {
             WebSocketIncomingMessage::String(value) if value == "refresh" => {
                 let company_id = self
@@ -153,6 +204,9 @@ impl CompanyPresence {
             return Response::error("WebSocket upgrade required", 426);
         }
         let pair = WebSocketPair::new()?;
+        pair.server
+            .serialize_attachment(Date::now().as_millis() + 5 * 60_000)?;
+        self.state.storage().set_alarm(30_000_i64).await?;
         self.state
             .accept_websocket_with_tags(&pair.server, &[DASHBOARD_TAG]);
         pair.server
@@ -180,6 +234,19 @@ impl CompanyPresence {
                 name: row.name,
             })
             .collect::<Vec<_>>();
+        // A missed disconnect publication must not survive an authoritative refresh.
+        for agent in &mut agents {
+            let request = Request::new("https://agent.internal/status", Method::Get)?;
+            let mut response =
+                crate::object_stub(&self.environment, "AGENT_COORDINATOR", &agent.id)?
+                    .fetch_with_request(request)
+                    .await?;
+            #[derive(Deserialize)]
+            struct Status {
+                connected: bool,
+            }
+            agent.connected = response.json::<Status>().await?.connected;
+        }
         sort_agents(&mut agents);
         Ok(PresenceSnapshot {
             event_type: "snapshot".to_owned(),
@@ -231,6 +298,16 @@ impl CompanyPresence {
         self.state.storage().put(PRESENCE_KEY, &presence).await?;
         let payload = serde_json::to_string(&event)?;
         for socket in self.state.get_websockets_with_tag(DASHBOARD_TAG) {
+            if socket
+                .deserialize_attachment::<u64>()?
+                .is_none_or(|deadline| deadline <= Date::now().as_millis())
+            {
+                let _ = socket.close(
+                    Some(4001),
+                    Some("subscription requires fresh authorization"),
+                );
+                continue;
+            }
             if let Err(error) = socket.send_with_str(&payload) {
                 console_error!("event=agent_event_broadcast_failed error={}", error);
             }

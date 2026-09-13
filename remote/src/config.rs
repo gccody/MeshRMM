@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub bootstrap: Option<meshrmm_protocol::SessionBootstrap>,
     pub server: String,
     pub handoff_token: String,
     pub update_manifest_url: String,
@@ -94,7 +95,13 @@ impl Config {
             .unwrap_or_else(|| meshrmm_self_update::DEFAULT_MANIFEST_URL.to_owned());
         meshrmm_self_update::validate_manifest_url(&update_manifest_url)?;
 
+        let bootstrap = std::env::var("MESHRMM_SESSION_BOOTSTRAP")
+            .ok()
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .context("invalid resumed launch session")?;
         Ok(Self {
+            bootstrap,
             server,
             handoff_token,
             update_manifest_url,

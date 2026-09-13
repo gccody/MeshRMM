@@ -12,7 +12,10 @@ pub async fn create_session(config: &Config) -> anyhow::Result<SessionBootstrap>
         &[],
         false,
     )?;
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?
         .post(url)
         .bearer_auth(&config.handoff_token)
         .send()

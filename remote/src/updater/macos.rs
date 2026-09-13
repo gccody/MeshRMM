@@ -23,6 +23,9 @@ pub async fn check_and_schedule(
     config: &Config,
     launch_deep_link: Option<&str>,
 ) -> anyhow::Result<bool> {
+    if std::env::var_os("MESHRMM_UPDATE_READY_FILE").is_some() {
+        return Ok(false);
+    }
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
@@ -73,6 +76,15 @@ pub async fn check_and_schedule(
 
     let mut command = Command::new(&helper);
     command
+        .env(
+            "MESHRMM_SESSION_BOOTSTRAP",
+            serde_json::to_string(
+                &config
+                    .bootstrap
+                    .as_ref()
+                    .context("missing launch session")?,
+            )?,
+        )
         .arg("--apply-client-update")
         .arg(std::process::id().to_string())
         .arg(&app_bundle)
@@ -88,6 +100,23 @@ pub async fn check_and_schedule(
 }
 
 pub fn apply_scheduled_update() -> anyhow::Result<()> {
+    let result = apply_update_inner();
+    if result.is_err() {
+        let arguments = std::env::args_os().skip(2).collect::<Vec<_>>();
+        let target_index = 1;
+        if let Some(target) = arguments.get(target_index) {
+            let target = PathBuf::from(target);
+            if target.exists() {
+                let launch_arguments = arguments.into_iter().skip(3).collect::<Vec<_>>();
+                launch(&target, &launch_arguments)
+                    .context("update failed and the restored viewer could not be relaunched")?;
+            }
+        }
+    }
+    result
+}
+
+fn apply_update_inner() -> anyhow::Result<()> {
     let arguments = std::env::args_os().skip(2).collect::<Vec<_>>();
     if arguments.len() < 3 {
         bail!("the client update helper requires process, application, and archive arguments");
@@ -106,7 +135,10 @@ pub fn apply_scheduled_update() -> anyhow::Result<()> {
         .to_owned();
 
     wait_for_process_exit(old_process_id, Duration::from_secs(60))?;
-    let extracted_directory = helper_directory.join("extracted");
+    let extracted_directory = target
+        .parent()
+        .context("application has no parent")?
+        .join(format!(".meshrmm-update-{}", unique_suffix()));
     std::fs::create_dir(&extracted_directory)?;
     let output = Command::new("/usr/bin/ditto")
         .args([OsStr::new("-x"), OsStr::new("-k")])
@@ -140,7 +172,7 @@ pub fn apply_scheduled_update() -> anyhow::Result<()> {
     std::fs::rename(&target, &backup)
         .with_context(|| format!("failed to back up client application {}", target.display()))?;
     if let Err(error) = std::fs::rename(&replacement, &target) {
-        let _ = std::fs::rename(&backup, &target);
+        std::fs::rename(&backup, &target).context("could not restore the previous viewer")?;
         return Err(error).context("failed to install macOS client update");
     }
 
@@ -148,30 +180,31 @@ pub fn apply_scheduled_update() -> anyhow::Result<()> {
         let _ = std::fs::remove_dir_all(&target);
         std::fs::rename(&backup, &target)
             .context("the client update failed and the previous app could not be restored")?;
-        launch(&target, &launch_arguments).context(
-            "the client update failed; the previous app was restored but could not be relaunched",
-        )?;
         return Err(update_error).context("the updated macOS client could not be launched");
     }
 
+    let _ = std::fs::remove_dir_all(&extracted_directory);
     let _ = std::fs::remove_dir_all(backup);
     let _ = std::fs::remove_dir_all(helper_directory);
     Ok(())
 }
 
 async fn download(http: &reqwest::Client, url: &str, maximum: usize) -> anyhow::Result<Vec<u8>> {
-    let response = http.get(url).send().await?.error_for_status()?;
+    let mut response = http.get(url).send().await?.error_for_status()?;
     if response
         .content_length()
         .is_some_and(|length| length > maximum as u64)
     {
         bail!("download exceeds the {maximum}-byte size limit");
     }
-    let contents = response.bytes().await?;
-    if contents.len() > maximum {
-        bail!("download exceeds the {maximum}-byte size limit");
+    let mut contents = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > maximum.saturating_sub(contents.len()) {
+            bail!("download exceeds the {maximum}-byte size limit");
+        }
+        contents.extend_from_slice(&chunk);
     }
-    Ok(contents.to_vec())
+    Ok(contents)
 }
 
 fn app_bundle_for_executable(executable: &Path) -> anyhow::Result<PathBuf> {
@@ -213,14 +246,9 @@ fn wait_for_process_exit(process_id: u32, timeout: Duration) -> anyhow::Result<(
 }
 
 fn launch(target: &Path, arguments: &[OsString]) -> anyhow::Result<()> {
-    Command::new("/usr/bin/open")
-        .arg("-a")
-        .arg(target)
-        .arg("--args")
-        .args(arguments)
-        .spawn()
-        .with_context(|| format!("failed to relaunch updated client {}", target.display()))?;
-    Ok(())
+    let mut command = Command::new(target.join("Contents/MacOS/meshrmm-remote"));
+    command.args(arguments);
+    super::launch_verified(command)
 }
 
 fn write_new_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {

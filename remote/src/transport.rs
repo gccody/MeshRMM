@@ -403,6 +403,7 @@ pub async fn run_receiver(
                                 if remote_description_set {
                                     peer.add_ice_candidate(candidate).await?;
                                 } else {
+                                    if pending_candidates.len() >= 256 { anyhow::bail!("too many pending ICE candidates"); }
                                     pending_candidates.push(candidate);
                                 }
                             }
@@ -415,7 +416,7 @@ pub async fn run_receiver(
                     }
                     Message::Ping(payload) => signal_writer.send(Message::Pong(payload)).await?,
                     Message::Close(frame) => {
-                        break Err(anyhow::anyhow!("signaling connection closed: {frame:?}"));
+                        break Err(meshrmm_signaling_client::signaling_close_error(frame));
                     }
                     _ => {}
                 }

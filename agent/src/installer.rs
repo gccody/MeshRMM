@@ -37,6 +37,7 @@ struct InstallerBootstrap {
 #[derive(Debug, Serialize)]
 struct RedeemInstallerRequest {
     name: String,
+    redemption_key: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -205,7 +206,67 @@ fn install() -> anyhow::Result<()> {
     restrict_config_directory(&config_directory)?;
 
     let machine_name = machine_name()?;
-    let provisioned_config = redeem_installer(&bootstrap, machine_name)?;
+    let recovery_path = config_directory.join("enrollment-recovery.json");
+    let recovery_key = match std::fs::read_to_string(&recovery_path) {
+        Ok(key) => key,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let key = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            std::fs::write(&recovery_path, &key)?;
+            key
+        }
+        Err(error) => return Err(error).context("could not read enrollment recovery key"),
+    };
+    let config_path = config_directory.join("agent.json");
+    // Repair preserves the installed identity, including legacy installations.
+    let previous_config = if config_path.exists() {
+        Some(config_path.clone())
+    } else {
+        let legacy = program_data
+            .join("PulseRMM")
+            .join("Agent")
+            .join("agent.json");
+        legacy.exists().then_some(legacy)
+    };
+    let provisioned_config = if let Some(path) = previous_config {
+        serde_json::from_slice::<ProvisionedAgentConfig>(&std::fs::read(path)?)?
+    } else {
+        let pending = config_directory.join("enrollment-pending.json");
+        if pending.exists() {
+            serde_json::from_slice::<ProvisionedAgentConfig>(&std::fs::read(&pending)?)?
+        } else {
+            let config = redeem_installer(&bootstrap, machine_name, recovery_key)?;
+            replace_file(&pending, &serde_json::to_vec(&config)?)?;
+            config
+        }
+    };
+    if provisioned_config.server.trim_end_matches('/') != bootstrap.server.trim_end_matches('/') {
+        bail!(
+            "this endpoint is already enrolled with another server; uninstall it before enrolling in a different company"
+        );
+    }
+    let agent_path = install_directory.join("meshrmm-agent.exe");
+    let mut rollback = InstallationRollback {
+        files: vec![
+            (agent_path.clone(), read_optional(&agent_path)?),
+            (config_path.clone(), read_optional(&config_path)?),
+        ],
+        restart: Vec::new(),
+        committed: false,
+    };
+    for (name, service) in [
+        (SERVICE_NAME, existing_service.as_ref()),
+        (LEGACY_SERVICE_NAME, legacy_service.as_ref()),
+    ] {
+        if let Some(service) = service
+            && service.query_status()?.current_state == ServiceState::Running
+        {
+            rollback.restart.push(name);
+        }
+    }
     let config_bytes = serde_json::to_vec_pretty(&provisioned_config)
         .context("failed to encode the provisioned Agent configuration")?;
     if let Some(service) = existing_service.as_ref() {
@@ -271,6 +332,9 @@ fn install() -> anyhow::Result<()> {
         }
         return Err(error);
     }
+    rollback.committed = true;
+    let _ = std::fs::remove_file(config_directory.join("enrollment-pending.json"));
+    let _ = std::fs::remove_file(&recovery_path);
     if let Some(legacy_service) = legacy_service {
         legacy_service
             .delete()
@@ -278,6 +342,56 @@ fn install() -> anyhow::Result<()> {
         remove_legacy_directories()?;
     }
     Ok(())
+}
+
+fn read_optional(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("could not back up existing installation"),
+    }
+}
+
+struct InstallationRollback {
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+    restart: Vec<&'static str>,
+    committed: bool,
+}
+
+impl Drop for InstallationRollback {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Ok(manager) =
+            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        {
+            if let Ok(service) = manager.open_service(
+                SERVICE_NAME,
+                ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+            ) {
+                let _ = stop_service(&service);
+            }
+            for (path, original) in &self.files {
+                let result = match original {
+                    Some(bytes) => replace_file(path, bytes),
+                    None => match std::fs::remove_file(path) {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(error.into()),
+                    },
+                };
+                if let Err(error) = result {
+                    tracing::error!(%error, "installation rollback failed");
+                }
+            }
+            for name in &self.restart {
+                if let Ok(service) = manager.open_service(name, ServiceAccess::START) {
+                    let _ = service.start::<&OsStr>(&[]);
+                }
+            }
+        }
+    }
 }
 
 fn remove_legacy_directories() -> anyhow::Result<()> {
@@ -400,19 +514,27 @@ fn restrict_config_directory(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn replace_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn replace_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     let temporary = path.with_extension(format!(
         "{}.new",
         path.extension().and_then(OsStr::to_str).unwrap_or("tmp")
     ));
     std::fs::write(&temporary, contents)
         .with_context(|| format!("failed to write {}", temporary.display()))?;
-    if path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("failed to replace {}", path.display()))?;
+    let file = std::fs::OpenOptions::new().write(true).open(&temporary)?;
+    file.sync_all()?;
+    drop(file);
+    let source = wide(temporary.as_os_str());
+    let destination = wide(path.as_os_str());
+    unsafe {
+        windows::Win32::Storage::FileSystem::MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            windows::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
+                | windows::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+        )
     }
-    std::fs::rename(&temporary, path)
-        .with_context(|| format!("failed to move the new file into {}", path.display()))
+    .with_context(|| format!("failed to replace {}", path.display()))
 }
 
 fn required_system_directory(name: &str) -> anyhow::Result<PathBuf> {
@@ -471,6 +593,7 @@ fn machine_name() -> anyhow::Result<String> {
 fn redeem_installer(
     bootstrap: &InstallerBootstrap,
     machine_name: String,
+    redemption_key: String,
 ) -> anyhow::Result<ProvisionedAgentConfig> {
     let endpoint = format!(
         "{}/v1/agent-installers/redeem",
@@ -492,7 +615,10 @@ fn redeem_installer(
             "Authorization",
             &format!("Bearer {}", bootstrap.install_token),
         )
-        .send_json(&RedeemInstallerRequest { name: machine_name })
+        .send_json(&RedeemInstallerRequest {
+            name: machine_name,
+            redemption_key,
+        })
         .context("failed to contact the MeshRMM Agent enrollment service")?;
     if !response.status().is_success() {
         let status = response.status();

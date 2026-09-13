@@ -409,6 +409,40 @@ pub(crate) async fn suspend_platform_company(
     )?
     .run()
     .await?;
+    // Revoke live capabilities as well as blocking future authentication.
+    let agents = query!(
+        &db,
+        "SELECT id FROM agents WHERE company_id = ?1",
+        company_id
+    )?
+    .all()
+    .await?
+    .results::<serde_json::Value>()?;
+    for agent in agents {
+        if let Some(id) = agent.get("id").and_then(serde_json::Value::as_str) {
+            let request = Request::new("https://agent.internal/revoke", Method::Post)?;
+            ensure_success(
+                object_stub(environment, "AGENT_COORDINATOR", id)?
+                    .fetch_with_request(request)
+                    .await?,
+                "revoke Agent",
+            )
+            .await?;
+        }
+    }
+    let request =
+        internal_json_request("https://presence.internal/revoke", &serde_json::json!({}))?;
+    let mut request = request;
+    request
+        .headers_mut()?
+        .set("X-Mesh-Company-Id", company_id)?;
+    ensure_success(
+        object_stub(environment, "COMPANY_PRESENCE", company_id)?
+            .fetch_with_request(request)
+            .await?,
+        "revoke subscriptions",
+    )
+    .await?;
     Response::empty().map(|response| response.with_status(204))
 }
 

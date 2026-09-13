@@ -130,7 +130,9 @@ The script builds for the Mac architecture it runs on, copies the Cloudflare
 API URL into the app bundle, signs it, and publishes a zipped update artifact
 plus the corresponding manifest entry. Run it on each macOS architecture that
 you distribute. A browser deep link supplies a 60-second, single-use handoff
-token when a remote session starts.
+token. The viewer redeems it before checking for updates and carries the resulting
+session through an update relaunch. A session awaiting its first viewer has a
+15-minute startup window; connected sessions use the configured sliding timeout.
 Developer ID signing and notarization are still required before distributing
 the app through normal Gatekeeper-protected download channels.
 Set `MESHRMM_CODESIGN_IDENTITY` to the Developer ID Application certificate
@@ -141,6 +143,11 @@ The native update version is compiled from `release.json`; Cargo package
 metadata is not used to decide whether an update is newer. Manifest and release
 URLs must use HTTPS. Each updater verifies the downloaded artifact against the
 manifest's SHA-256 digest before replacing anything.
+
+Existing installations are repaired without replacing their device identity. New
+installations persist a private recovery key and pending configuration so a failed
+or interrupted enrollment can be retried. Installer authorization remains limited
+to its original expiry; recovery is restricted to the endpoint holding that key.
 
 Creating a new TURN key requires an explicit secure API token with Cloudflare
 Calls Write permission. `scripts/provision-cloudflare.ps1` installs only those
@@ -182,7 +189,8 @@ The responsive dashboard at `https://<company>.meshrmm.com` lists only Agents
 owned by the organization bound to that hostname and the current WorkOS token. It receives inventory
 and connection changes from a company-scoped, hibernating WebSocket event
 stream instead of polling. The browser obtains a 60-second, one-use
-subscription token and reconnects automatically; **Refresh** requests a single
+subscription token and reconnects automatically. Each inventory connection must
+reauthorize at least every five minutes; **Refresh** requests a single
 authoritative snapshot when needed. **Remote** requests a one-time server
 handoff, then opens the native viewer with a
 `meshrmm://connect?handoff=...&server=...` deep link. No service credential is
@@ -254,7 +262,7 @@ deployment as the Windows viewer.
 The Windows and macOS clients check for a newer release at the start of each
 dashboard launch. When one is available, the client verifies it, replaces the
 installed executable or signed application bundle through a helper, and
-relaunches with the same one-time handoff so the requested session continues.
+relaunches with the already-authorized session so the requested session continues.
 If no update is available, or the check cannot reach the release host, the
 current client continues immediately. A failed replacement rolls back to the
 previous client.
@@ -339,3 +347,16 @@ an RTP track. Encoded video necessarily crosses CPU memory for packetization and
 decoder input. Windows keeps full-size captured and decoded images in D3D11
 textures; macOS hands compressed samples to AVSampleBufferDisplayLayer and does
 not create a CPU RGBA frame in application code.
+
+
+Apply migration `0007_recoverable_enrollment.sql` before deploying the audit fixes.
+The new enrollment and credential-rotation queries require its columns. Publish
+updated native binaries with the server change to enable recoverable enrollment,
+acknowledged credential rotation, and cancellation cleanup on endpoints. Older
+installers retain one-shot enrollment, and older agents retain their current token
+when they do not understand the staged rotation command. Rotation returns HTTP 202
+with `rotation_pending`; the agent commits the credential by reconnecting with it.
+
+An agent accepts one active remote session. A second viewer receives a busy response;
+closing the current viewer releases the session. Suspending a company revokes its
+live coordinator/session/inventory connections and blocks token redemption.

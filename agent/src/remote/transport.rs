@@ -28,6 +28,34 @@ use super::platform::{ScreenStreamer, StartedScreen, monotonic_timestamp_us};
 use super::signaling::authenticated_websocket;
 use super::video::LatestFrameSlot;
 
+// Cancellation and startup errors must release resources just like normal teardown.
+struct SenderCleanup {
+    peer: Arc<RTCPeerConnection>,
+    streamer: Arc<Mutex<Box<dyn ScreenStreamer>>>,
+    input: Arc<dyn super::platform::ScreenInput>,
+    tasks: Vec<tokio::task::AbortHandle>,
+    closed: bool,
+}
+
+impl Drop for SenderCleanup {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        if self.closed {
+            return;
+        }
+        let _ = self.input.release_all();
+        if let Ok(mut streamer) = self.streamer.lock() {
+            let _ = streamer.stop();
+        }
+        let peer = Arc::clone(&self.peer);
+        tokio::spawn(async move {
+            let _ = peer.close().await;
+        });
+    }
+}
+
 enum ControlCommand {
     Keyframe,
     Bitrate(u32),
@@ -249,6 +277,13 @@ async fn run_connected_sender(
     let (state_tx, mut state_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
     let (video_failure_tx, mut video_failure_rx) = mpsc::unbounded_channel::<String>();
     let peer = create_peer(&ice_servers, outgoing_tx.clone(), state_tx).await?;
+    let mut cleanup = SenderCleanup {
+        peer: Arc::clone(&peer),
+        streamer: Arc::clone(&streamer),
+        input: Arc::clone(&input),
+        tasks: Vec::new(),
+        closed: false,
+    };
 
     let video_open = Arc::new(Notify::new());
     let control_open = Arc::new(Notify::new());
@@ -382,7 +417,8 @@ async fn run_connected_sender(
         Arc::clone(&quality_ceiling),
         video_failure_tx,
     );
-    spawn_control_start(
+    cleanup.tasks.push(video_sender.abort_handle());
+    let control_start = spawn_control_start(
         Arc::clone(&control_channel),
         Arc::clone(&control_open),
         session_id.clone(),
@@ -391,6 +427,7 @@ async fn run_connected_sender(
         stream_id,
         format,
     );
+    cleanup.tasks.push(control_start.abort_handle());
 
     let mut session_state = SessionState::Requested.transition(SessionState::Signaling)?;
     outgoing_tx.send(SignalMessage::Ready)?;
@@ -449,6 +486,7 @@ async fn run_connected_sender(
                                 if remote_description_set {
                                     peer.add_ice_candidate(candidate).await?;
                                 } else {
+                                    if pending_candidates.len() >= 256 { anyhow::bail!("too many pending ICE candidates"); }
                                     pending_candidates.push(candidate);
                                 }
                             }
@@ -461,7 +499,7 @@ async fn run_connected_sender(
                     }
                     Message::Ping(payload) => signal_writer.send(Message::Pong(payload)).await?,
                     Message::Close(frame) => {
-                        break Err(anyhow::anyhow!("signaling connection closed: {frame:?}"));
+                        break Err(meshrmm_signaling_client::signaling_close_error(frame));
                     }
                     _ => {}
                 }
@@ -829,6 +867,9 @@ async fn run_connected_sender(
         *failure_reported = true;
     }
     video_sender.abort();
+    let _ = video_sender.await;
+    control_start.abort();
+    let _ = control_start.await;
     if let Err(error) = input.release_all() {
         tracing::warn!(error = %error, "failed to release remote input during cleanup");
     }
@@ -855,6 +896,7 @@ async fn run_connected_sender(
             result = Err(error).context("failed to close WebRTC peer");
         }
     }
+    cleanup.closed = true;
     session_state = session_state.transition(SessionState::Idle)?;
     tracing::info!(
         session_id = %session_id,
@@ -978,7 +1020,7 @@ fn spawn_control_start(
     active_display_id: DisplayId,
     stream_id: VideoStreamId,
     format: meshrmm_protocol::VideoFormat,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         open.notified().await;
         let message = SessionMessage::DisplayConfiguration {
@@ -990,7 +1032,7 @@ fn spawn_control_start(
         if let Err(error) = send_control_message(&channel, message).await {
             tracing::warn!(error = %error, %session_id, "failed to send stream configuration");
         }
-    });
+    })
 }
 
 async fn send_control_message(
