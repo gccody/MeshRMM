@@ -600,6 +600,50 @@ mod tests {
     use super::FramePacer;
 
     #[test]
+    #[ignore = "requires an interactive Windows desktop and hardware HEVC encoder; runs for 60 seconds"]
+    fn desktop_duplication_survives_repeated_keyframes() {
+        use super::*;
+        use std::sync::atomic::AtomicU64;
+        use std::time::{Duration, Instant};
+
+        let display_id = Monitor::enumerate().unwrap()[0].index().unwrap() as u32;
+        let frames = Arc::new(AtomicU64::new(0));
+        let received = Arc::clone(&frames);
+        let mut streamer = WindowsDesktopDuplicationStreamer::new();
+        streamer
+            .start(
+                StreamConfig {
+                    frames_per_second: 60,
+                    bitrate_bits_per_second: 6_000_000,
+                    codec: VideoCodec::H265,
+                    pixel_format: VideoPixelFormat::Yuv420,
+                },
+                display_id,
+                Arc::new(move |_| {
+                    received.fetch_add(1, Ordering::Relaxed);
+                }),
+            )
+            .unwrap();
+        for _ in 0..12 {
+            let before = frames.load(Ordering::Relaxed);
+            streamer.request_keyframe().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                assert!(
+                    streamer.poll_ended().is_none(),
+                    "capture ended unexpectedly"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                frames.load(Ordering::Relaxed) > before,
+                "encoder stopped producing frames"
+            );
+        }
+        streamer.stop().unwrap();
+    }
+
+    #[test]
     fn frame_pacer_caps_high_refresh_capture_to_configured_rate() {
         let mut pacer = FramePacer::new(60);
         assert!(pacer.allow(1_000_000));

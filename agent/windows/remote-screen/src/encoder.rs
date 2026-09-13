@@ -3,7 +3,7 @@ use std::mem::ManuallyDrop;
 use std::ptr;
 
 use thiserror::Error;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Multithread, ID3D11Texture2D};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -118,6 +118,14 @@ impl MediaFoundationVideoEncoder {
         pixel_format: VideoPixelFormat,
     ) -> Result<Self, Error> {
         let runtime = MediaFoundationRuntime::start()?;
+        // Capture/conversion and the asynchronous hardware MFT share the
+        // immediate context. D3D11 does not serialize that access by default.
+        // Enable protection before handing the device to Media Foundation.
+        unsafe {
+            let context = device.GetImmediateContext().map_err(Error::Configuration)?;
+            let multithread: ID3D11Multithread = context.cast().map_err(Error::Configuration)?;
+            let _ = multithread.SetMultithreadProtected(true);
+        }
         // Safety: MFT enumeration returns a COM-allocated array which is freed
         // after every returned activation object has been cloned/dropped.
         unsafe {
@@ -267,12 +275,23 @@ impl MediaFoundationVideoEncoder {
             // Safety: event generator is owned by this encoder and called only
             // from the capture worker thread.
             match unsafe { self.event_generator.GetEvent(flags) } {
-                Ok(event) => match unsafe { event.GetType() } {
-                    Ok(value) if value == METransformNeedInput.0 as u32 => self.need_input += 1,
-                    Ok(value) if value == METransformHaveOutput.0 as u32 => self.have_output += 1,
-                    Ok(_) => {}
-                    Err(error) => return Err(Error::Output(error)),
-                },
+                Ok(event) => {
+                    // Async failures arrive in event status, not necessarily
+                    // as a failed GetEvent call. Ignoring them leaves capture
+                    // waiting forever for input/output that will never arrive.
+                    unsafe { event.GetStatus() }
+                        .map_err(Error::Output)?
+                        .ok()
+                        .map_err(Error::Output)?;
+                    match unsafe { event.GetType() } {
+                        Ok(value) if value == METransformNeedInput.0 as u32 => self.need_input += 1,
+                        Ok(value) if value == METransformHaveOutput.0 as u32 => {
+                            self.have_output += 1
+                        }
+                        Ok(_) => {}
+                        Err(error) => return Err(Error::Output(error)),
+                    }
+                }
                 Err(error) if error.code() == MF_E_NO_EVENTS_AVAILABLE => break,
                 Err(error) => return Err(Error::Output(error)),
             }

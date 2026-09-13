@@ -892,6 +892,18 @@ fn send_command(
 /// Entry point for the isolated LocalSystem desktop helper. It loads no Agent
 /// configuration, opens no network sockets, and receives no Agent credential.
 pub fn run_child() -> anyhow::Result<()> {
+    // stdout is the binary frame/control protocol. Forward diagnostics through
+    // stderr, which the parent already drains into the protected Agent log.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(io::stderr)
+        .with_ansi(false)
+        .with_thread_names(true)
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("failed to initialize helper logging: {error}"))?;
     let (command_tx, command_rx) = mpsc::channel();
     thread::Builder::new()
         .name("meshrmm-desktop-commands".into())
