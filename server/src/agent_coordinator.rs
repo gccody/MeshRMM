@@ -238,33 +238,34 @@ impl DurableObject for AgentCoordinator {
                 }
                 Response::ok("revoked")
             }
-            (Method::Post, "/session-ended") => {
-                let ended: SessionEnded = request.json().await?;
-                if self
+            (Method::Post, "/close-session") => {
+                let active = self
                     .state
                     .storage()
                     .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
-                    .await?
-                    .is_some_and(|active| active.session_id.as_str() == ended.session_id)
-                {
-                    self.state.storage().delete(ACTIVE_SESSION_KEY).await?;
-                    if let Some(agent) = self
-                        .state
-                        .get_websockets_with_tag(AGENT_TAG)
-                        .into_iter()
-                        .next()
-                    {
-                        agent.send_with_str(serde_json::to_string(&AgentCommand::EndSession {
-                            session_id: meshrmm_protocol_types::RemoteSessionId::new(
-                                ended.session_id.clone(),
-                            ),
-                        })?)?;
-                    }
-                    console_log!(
-                        "event=agent_session_cleared session_id={}",
-                        ended.session_id
-                    );
+                    .await?;
+                if let Some(active) = active {
+                    // Expire credentials and disconnect peers before releasing the lease.
+                    // The session callback and fallback both match the captured ID so a
+                    // concurrent replacement session can never be cleared accidentally.
+                    let request = Request::new("https://session.internal/expire", Method::Post)?;
+                    let response = crate::object_stub(
+                        &self.environment,
+                        "REMOTE_SESSION",
+                        active.session_id.as_str(),
+                    )?
+                    .fetch_with_request(request)
+                    .await?;
+                    crate::ensure_success(response, "close remote session").await?;
+                    self.clear_session(active.session_id.as_str()).await?;
+                    Response::from_json(&serde_json::json!({ "closed": true }))
+                } else {
+                    Response::from_json(&serde_json::json!({ "closed": false }))
                 }
+            }
+            (Method::Post, "/session-ended") => {
+                let ended: SessionEnded = request.json().await?;
+                self.clear_session(&ended.session_id).await?;
                 Response::ok("cleared")
             }
             (Method::Get, "/status") => {
@@ -343,6 +344,30 @@ impl DurableObject for AgentCoordinator {
 }
 
 impl AgentCoordinator {
+    async fn clear_session(&self, session_id: &str) -> Result<()> {
+        if self
+            .state
+            .storage()
+            .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
+            .await?
+            .is_some_and(|active| active.session_id.as_str() == session_id)
+        {
+            self.state.storage().delete(ACTIVE_SESSION_KEY).await?;
+            if let Some(agent) = self
+                .state
+                .get_websockets_with_tag(AGENT_TAG)
+                .into_iter()
+                .next()
+            {
+                agent.send_with_str(serde_json::to_string(&AgentCommand::EndSession {
+                    session_id: meshrmm_protocol_types::RemoteSessionId::new(session_id.to_owned()),
+                })?)?;
+            }
+            console_log!("event=agent_session_cleared session_id={}", session_id);
+        }
+        Ok(())
+    }
+
     async fn owns_session(&self, requested: &AgentSessionRequest) -> Result<bool> {
         Ok(self
             .state

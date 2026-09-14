@@ -45,6 +45,7 @@ impl Drop for SenderCleanup {
         if self.closed {
             return;
         }
+        self.input.stop_chat();
         let _ = self.input.release_all();
         if let Ok(mut streamer) = self.streamer.lock() {
             let _ = streamer.stop();
@@ -72,6 +73,8 @@ enum ControlCommand {
     },
     SelectDisplay(DisplayId),
     Clipboard(String),
+    Chat(String),
+    ChatAvailable,
     ChannelClosed,
     Stop,
 }
@@ -376,6 +379,8 @@ async fn run_connected_sender(
                         None
                     }
                     Ok(SessionMessage::Clipboard { text }) => Some(ControlCommand::Clipboard(text)),
+                    Ok(SessionMessage::ChatAvailable) => Some(ControlCommand::ChatAvailable),
+                    Ok(SessionMessage::Chat { text }) => Some(ControlCommand::Chat(text)),
                     Ok(SessionMessage::Stop { .. }) => Some(ControlCommand::Stop),
                     Ok(_) => None,
                     Err(error) => {
@@ -681,6 +686,15 @@ async fn run_connected_sender(
                             },
                         ).await?;
                     }
+                    ControlCommand::ChatAvailable => {
+                        input.start_chat()?;
+                        send_control_message(&control_channel, SessionMessage::ChatAvailable).await?;
+                    }
+                    ControlCommand::Chat(text) => {
+                        if let Err(error) = input.apply_chat(text) {
+                            tracing::warn!(%error, "could not display chat message");
+                        }
+                    }
                     ControlCommand::Clipboard(text) => {
                         if let Err(error) = input.apply_clipboard(text) {
                             tracing::warn!(error = %error, "discarding viewer clipboard update");
@@ -754,6 +768,9 @@ async fn run_connected_sender(
             }
             _ = clipboard_interval.tick(), if session_state == SessionState::Streaming
                 && control_channel.ready_state() == RTCDataChannelState::Open => {
+                if let Some(text) = input.poll_chat()? {
+                    send_control_message(&control_channel, SessionMessage::Chat { text }).await?;
+                }
                 match input.poll_clipboard() {
                     Ok(Some(text)) => {
                         send_control_message(
@@ -874,6 +891,7 @@ async fn run_connected_sender(
     let _ = video_sender.await;
     control_start.abort();
     let _ = control_start.await;
+    input.stop_chat();
     if let Err(error) = input.release_all() {
         tracing::warn!(error = %error, "failed to release remote input during cleanup");
     }

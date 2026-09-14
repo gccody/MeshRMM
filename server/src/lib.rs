@@ -252,6 +252,9 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
         (Method::Delete, ["v1", "agents", device_id]) => {
             delete_agent(&request, &environment, device_id).await
         }
+        (Method::Post, ["v1", "agents", device_id, "close-session"]) => {
+            close_agent_session(&request, &environment, device_id).await
+        }
         (Method::Post, ["v1", "agents", device_id, "rotate-token"]) => {
             rotate_agent_token(&request, &environment, device_id).await
         }

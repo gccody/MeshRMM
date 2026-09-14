@@ -1,10 +1,10 @@
 #[cfg(windows)]
-mod indicator;
-#[cfg(windows)]
 pub(crate) mod capture_helper;
 #[cfg(windows)]
 mod clipboard;
 pub mod config;
+#[cfg(windows)]
+mod indicator;
 #[cfg(windows)]
 mod input;
 #[cfg(windows)]

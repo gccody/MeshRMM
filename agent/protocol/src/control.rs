@@ -4,8 +4,14 @@ use crate::{CursorShape, DisplayId, RemoteInput, RemoteSessionId, VideoStreamId}
 
 pub const CONTROL_CHANNEL_LABEL: &str = "meshrmm-control-v4";
 pub const CONTROL_CHANNEL_PROTOCOL: &str = "meshrmm.control.v4";
-/// Maximum UTF-8 payload accepted for a clipboard update. Clipboard messages
-/// share the reliable control channel with latency-sensitive input.
+/// Maximum UTF-8 payload for a single session chat message.
+pub const MAX_CHAT_TEXT_BYTES: usize = 4 * 1024;
+
+pub fn valid_chat_text(text: &str) -> bool {
+    !text.trim().is_empty() && text.len() <= MAX_CHAT_TEXT_BYTES && !text.contains('\0')
+}
+
+/// Maximum plain-text clipboard payload on the reliable control channel.
 pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 60 * 1024;
 
 /// Reliable session-control and input messages carried by the control data channel.
@@ -82,6 +88,12 @@ pub enum SessionMessage {
         profile: VideoProfile,
         reason: String,
     },
+    /// Session-only plain text chat. Append variants to preserve postcard tags.
+    Chat {
+        text: String,
+    },
+    /// Announces support for session chat; both peers must opt in.
+    ChatAvailable,
 }
 
 impl SessionMessage {
@@ -90,7 +102,13 @@ impl SessionMessage {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes(bytes)
+        let message: Self = postcard::from_bytes(bytes)?;
+        if let Self::Chat { text } = &message
+            && !valid_chat_text(text)
+        {
+            return Err(postcard::Error::DeserializeBadEncoding);
+        }
+        Ok(message)
     }
 }
 
@@ -318,5 +336,47 @@ mod tests {
         assert_eq!(QualityPreset::BestQuality.bitrate(12_000_000), 12_000_000);
         assert_eq!(QualityPreset::BestQuality.bitrate(100_000_000), 12_000_000);
         assert_eq!(QualityPreset::Balanced.bitrate(4_000_000), 4_000_000);
+    }
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+    #[test]
+    fn unicode_chat_round_trips_and_rejects_invalid_payloads() {
+        for text in [
+            "Hello 👋\nHow can I help?".to_owned(),
+            "é".repeat(MAX_CHAT_TEXT_BYTES / 2),
+        ] {
+            let message = SessionMessage::Chat { text };
+            assert_eq!(
+                SessionMessage::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+        }
+        for text in [
+            "".to_owned(),
+            " \n".to_owned(),
+            "bad\0text".to_owned(),
+            "é".repeat(MAX_CHAT_TEXT_BYTES / 2 + 1),
+        ] {
+            assert!(
+                SessionMessage::decode(&SessionMessage::Chat { text }.encode().unwrap()).is_err()
+            );
+        }
+    }
+    #[test]
+    fn chat_is_appended_without_changing_existing_wire_tags() {
+        assert_eq!(
+            SessionMessage::Clipboard { text: "x".into() }
+                .encode()
+                .unwrap(),
+            vec![12, 1, b'x']
+        );
+        assert_eq!(
+            SessionMessage::Chat { text: "x".into() }.encode().unwrap(),
+            vec![17, 1, b'x']
+        );
+        assert_eq!(SessionMessage::ChatAvailable.encode().unwrap(), vec![18]);
     }
 }

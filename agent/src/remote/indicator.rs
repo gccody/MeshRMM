@@ -18,7 +18,7 @@ pub struct SessionIndicator {
 }
 
 impl SessionIndicator {
-    pub fn show(name: &str) -> anyhow::Result<Self> {
+    pub fn show(name: &str, chat: meshrmm_chat::ChatSession) -> anyhow::Result<Self> {
         // Keep untrusted profile text on one line; GDI draws it literally.
         let name: String = name.chars().filter(|c| !c.is_control()).take(256).collect();
         let name = if name.trim().is_empty() {
@@ -30,7 +30,7 @@ impl SessionIndicator {
         let thread = thread::Builder::new()
             .name("session-indicator".into())
             .spawn(move || {
-                let result = unsafe { create_window(name) };
+                let result = unsafe { create_window(name, chat) };
                 match result {
                     Ok((hwnd, state)) => {
                         unsafe {
@@ -38,10 +38,18 @@ impl SessionIndicator {
                             if tx.send(Ok((GetCurrentThreadId(), hwnd.0 as usize))).is_ok() {
                                 let mut message = MSG::default();
                                 while GetMessageW(&mut message, None, 0, 0).0 > 0 {
+                                    if (*state)
+                                        .popup
+                                        .as_ref()
+                                        .is_some_and(|popup| popup.handle_message(&message))
+                                    {
+                                        continue;
+                                    }
                                     let _ = TranslateMessage(&message);
                                     DispatchMessageW(&message);
                                 }
                             }
+                            (*state).popup = None;
                             let _ = DestroyWindow(hwnd);
                             drop(Box::from_raw(state));
                         }
@@ -86,6 +94,9 @@ struct State {
     expanded_width: i32,
     center_x: Option<i32>,
     drag: Option<Drag>,
+    chat: meshrmm_chat::ChatSession,
+    popup: Option<meshrmm_chat::ChatPopup>,
+    chat_status: (bool, usize),
 }
 
 struct Drag {
@@ -114,7 +125,10 @@ impl State {
     }
 }
 
-unsafe fn create_window(name: String) -> windows::core::Result<(HWND, *mut State)> {
+unsafe fn create_window(
+    name: String,
+    chat: meshrmm_chat::ChatSession,
+) -> windows::core::Result<(HWND, *mut State)> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let class = w!("MeshRMMSessionIndicator");
@@ -148,6 +162,9 @@ unsafe fn create_window(name: String) -> windows::core::Result<(HWND, *mut State
             expanded_width: 320,
             center_x: None,
             drag: None,
+            chat,
+            popup: None,
+            chat_status: (false, 0),
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
         refresh_layout(hwnd);
@@ -156,6 +173,16 @@ unsafe fn create_window(name: String) -> windows::core::Result<(HWND, *mut State
             drop(Box::from_raw(state));
             return Err(error);
         }
+        match meshrmm_chat::ChatPopup::for_banner(hwnd, (*state).chat.clone()) {
+            Ok(popup) => (*state).popup = Some(popup),
+            Err(error) => {
+                let _ = DestroyWindow(hwnd);
+                drop(Box::from_raw(state));
+                tracing::error!(%error, "could not create banner chat popup");
+                return Err(windows::core::Error::from_hresult(E_FAIL));
+            }
+        }
+        SetTimer(Some(hwnd), 1, 100, None);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         Ok((hwnd, state))
     }
@@ -195,13 +222,14 @@ unsafe fn position(hwnd: HWND, collapsed: bool) -> windows::core::Result<()> {
     unsafe {
         let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const State;
         let work = (*state).work;
-        let desired_width = if collapsed {
+        let chat_available = (*state).chat.available();
+        let desired_width = (if collapsed {
             32
         } else {
             (*state).expanded_width
-        };
+        }) + if chat_available { 32 } else { 0 };
         let width = desired_width.min((work.right - work.left).max(1));
-        let height = if collapsed { 16 } else { 24 };
+        let height = if collapsed && !chat_available { 16 } else { 24 };
         // Submit pixels, size, and location as one layered-window update. A
         // separate SetWindowPos/WM_PAINT pair lets capture see resized old pixels.
         let screen = GetDC(None);
@@ -230,7 +258,7 @@ unsafe fn position(hwnd: HWND, collapsed: bool) -> windows::core::Result<()> {
         let mut text: Vec<u16> = (&*state).label().encode_utf16().collect();
         let padding = if collapsed { 0 } else { 8 };
         rect.left += padding;
-        rect.right -= padding;
+        rect.right -= padding + if chat_available { 32 } else { 0 };
         DrawTextW(
             dc,
             &mut text,
@@ -238,6 +266,29 @@ unsafe fn position(hwnd: HWND, collapsed: bool) -> windows::core::Result<()> {
             DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
         SelectObject(dc, old_font);
+        if chat_available {
+            // A drawn outline and circle avoid missing emoji fonts and clipping.
+            let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00ffffff));
+            let old_pen = SelectObject(dc, pen.into());
+            let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            let x = width - 25;
+            let _ = RoundRect(dc, x, 6, x + 17, 18, 4, 4);
+            let _ = MoveToEx(dc, x + 4, 17, None);
+            let _ = LineTo(dc, x + 4, 21);
+            let _ = LineTo(dc, x + 8, 17);
+            SelectObject(dc, old_pen);
+            SelectObject(dc, old_brush);
+            let _ = DeleteObject(pen.into());
+            if (*state).chat.unread() > 0 {
+                let brush = CreateSolidBrush(COLORREF(0x004545ff));
+                let old_brush = SelectObject(dc, brush.into());
+                let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+                let _ = Ellipse(dc, width - 12, 1, width - 3, 10);
+                SelectObject(dc, old_pen);
+                SelectObject(dc, old_brush);
+                let _ = DeleteObject(brush.into());
+            }
+        }
         let destination = POINT {
             x: (&*state).left(width),
             y: work.top,
@@ -268,6 +319,9 @@ unsafe fn position(hwnd: HWND, collapsed: bool) -> windows::core::Result<()> {
         let _ = DeleteObject(bitmap.into());
         let _ = DeleteDC(dc);
         ReleaseDC(None, screen);
+        if let Some(popup) = &(*state).popup {
+            popup.layout();
+        }
         result
     }
 }
@@ -308,7 +362,37 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         match msg {
             WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
             WM_CLOSE => return LRESULT(0),
+            WM_TIMER if !state.is_null() => {
+                if let Some(popup) = &(*state).popup {
+                    popup.refresh();
+                    if (*state).chat.available()
+                        && !(*state).chat.visible()
+                        && (*state).chat.unread() > 0
+                    {
+                        popup.toggle();
+                    }
+                }
+                let status = ((*state).chat.available(), (*state).chat.unread());
+                if status != (*state).chat_status {
+                    (*state).chat_status = status;
+                    let _ = position(hwnd, (*state).collapsed);
+                }
+                return LRESULT(0);
+            }
             WM_LBUTTONDOWN if !state.is_null() => {
+                let mut client = RECT::default();
+                let _ = GetClientRect(hwnd, &mut client);
+                let x = lp.0 as u16 as i16 as i32;
+                if (*state).chat.available() && x >= client.right - 32 {
+                    if let Some(popup) = &(*state).popup {
+                        popup.toggle();
+                    }
+                    let _ = position(hwnd, (*state).collapsed);
+                    return LRESULT(0);
+                }
+                if let Some(popup) = &(*state).popup {
+                    popup.close();
+                }
                 let mut rect = RECT::default();
                 if GetWindowRect(hwnd, &mut rect).is_ok() {
                     (*state).drag = Some(Drag {
@@ -383,6 +467,9 @@ mod tests {
             expanded_width: 320,
             center_x: Some(-3000),
             drag: None,
+            chat: meshrmm_chat::ChatSession::default(),
+            popup: None,
+            chat_status: (false, 0),
         };
         for width in [32, 320] {
             state.center_x = Some(-3000);
@@ -395,8 +482,82 @@ mod tests {
     }
 
     #[test]
+    fn incoming_viewer_message_opens_banner_chat_without_reopening_after_dismissal() {
+        let chat = meshrmm_chat::ChatSession::with_peer("Viewer");
+        chat.set_available(true);
+        let indicator = SessionIndicator::show("Chat check", chat.clone()).unwrap();
+        let hwnd = HWND(indicator.window as *mut _);
+        unsafe {
+            let mut initial = RECT::default();
+            GetWindowRect(hwnd, &mut initial).unwrap();
+            let tick = || {
+                assert_ne!(
+                    SendMessageTimeoutW(
+                        hwnd,
+                        WM_TIMER,
+                        WPARAM(1),
+                        LPARAM(0),
+                        SMTO_ABORTIFHUNG,
+                        1000,
+                        None
+                    )
+                    .0,
+                    0
+                );
+            };
+            tick();
+            assert!(!chat.visible());
+            let x = initial.right - initial.left - 16;
+            let click = || {
+                for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+                    assert_ne!(
+                        SendMessageTimeoutW(
+                            hwnd,
+                            message,
+                            WPARAM(0),
+                            LPARAM(((12 << 16) | x) as isize),
+                            SMTO_ABORTIFHUNG,
+                            1000,
+                            None
+                        )
+                        .0,
+                        0
+                    );
+                }
+            };
+            chat.receive("Message while closed".into());
+            tick();
+            assert!(chat.visible());
+            assert_eq!(chat.unread(), 0);
+            chat.receive("Message while open".into());
+            tick();
+            assert!(chat.visible());
+            assert_eq!(chat.unread(), 0);
+            click();
+            assert!(!chat.visible());
+            tick();
+            assert!(
+                !chat.visible(),
+                "dismissed messages must not reopen the popup"
+            );
+            chat.receive("Another unread message".into());
+            assert_eq!(chat.unread(), 1);
+            let mut after = RECT::default();
+            GetWindowRect(hwnd, &mut after).unwrap();
+            assert_eq!(initial, after);
+            tick();
+            assert!(chat.visible());
+            assert_eq!(chat.unread(), 0);
+        }
+        drop(indicator);
+        assert!(!chat.visible());
+    }
+
+    #[test]
     fn toggles_and_repaints_without_waiting_for_idle() {
-        let indicator = SessionIndicator::show("Banner latency check").unwrap();
+        let indicator =
+            SessionIndicator::show("Banner latency check", meshrmm_chat::ChatSession::default())
+                .unwrap();
         let hwnd = HWND(indicator.window as *mut _);
         let mut initial = RECT::default();
         unsafe {

@@ -107,6 +107,7 @@ pub(super) struct RemoteViewIvars {
     video_width: std::cell::Cell<u32>,
     video_height: std::cell::Cell<u32>,
     display_popup: RefCell<Option<Retained<NSPopUpButton>>>,
+    chat_popup: RefCell<Option<meshrmm_chat::ChatPopup>>,
     control: ControlSink,
     pressed_keys: RefCell<Vec<(u16, bool)>>,
     pressed_buttons: RefCell<Vec<PointerButton>>,
@@ -311,6 +312,12 @@ define_class!(
             }
         }
 
+        #[unsafe(method(toggleChat:))]
+        fn toggle_chat_action(&self, _sender: &NSButton) {
+            self.disable_input();
+            if let Some(popup) = self.ivars().chat_popup.borrow().as_ref() { popup.toggle(); }
+        }
+
         #[unsafe(method(toggleDiagnostics:))]
         fn toggle_diagnostics_action(&self, _sender: &NSButton) {
             self.toggle_debug();
@@ -417,6 +424,7 @@ impl RemoteView {
             video_width: std::cell::Cell::new(video_width),
             video_height: std::cell::Cell::new(video_height),
             display_popup: RefCell::new(None),
+            chat_popup: RefCell::new(None),
             control,
             pressed_keys: RefCell::new(Vec::new()),
             pressed_buttons: RefCell::new(Vec::new()),
@@ -522,6 +530,22 @@ impl RemoteView {
             },
         });
         toolbar.addSubview(&diagnostics);
+        let chat_button = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Chat"),
+                Some(self),
+                Some(sel!(toggleChat:)),
+                mtm,
+            )
+        };
+        chat_button.setFrame(NSRect::new(NSPoint::new(468., 6.), NSSize::new(40., 24.)));
+        toolbar.addSubview(&chat_button);
+        let control = self.ivars().control.clone();
+        *self.ivars().chat_popup.borrow_mut() = Some(meshrmm_chat::ChatPopup::new(
+            control.chat(),
+            &chat_button,
+            move |enabled| control.set_input_enabled(enabled),
+        ));
         self.addSubview(&toolbar);
     }
 
@@ -1017,7 +1041,25 @@ where
                     } else {
                         close_connecting_window();
                     }
-                    NSApplication::sharedApplication(mtm).stop(None);
+                    let application = NSApplication::sharedApplication(mtm);
+                    application.stop(None);
+                    // stop: changes the run-loop flag but does not wake an
+                    // outstanding nextEvent wait. The network finishes on a
+                    // dispatch callback, so enqueue a harmless event to let
+                    // run() return even when the user provides no more input.
+                    if let Some(event) = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+                        objc2_app_kit::NSEventType::ApplicationDefined,
+                        NSPoint::new(0.0, 0.0),
+                        NSEventModifierFlags::empty(),
+                        0.0,
+                        0,
+                        None,
+                        0,
+                        0,
+                        0,
+                    ) {
+                        application.postEvent_atStart(&event, true);
+                    }
                 }
             });
         })

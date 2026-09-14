@@ -10,6 +10,7 @@ description = "The native MeshRMM endpoint agent"
 workspace = true
 
 [dependencies]
+meshrmm-chat = { path = "../crates/chat" }
 anyhow.workspace = true
 arboard.workspace = true
 bytes.workspace = true
