@@ -47,4 +47,10 @@ pub enum FileMessage {
         id: u64,
         reason: String,
     },
+    /// Aggregate manifest sizes for receiver-side progress. Appended for stable tags.
+    Totals {
+        id: u64,
+        bytes: u64,
+        entries: u64,
+    },
 }

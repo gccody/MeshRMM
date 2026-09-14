@@ -124,3 +124,101 @@ pub fn cache() -> anyhow::Result<PathBuf> {
         .join("MeshRMM"))
     })
 }
+
+struct ProgressWindow {
+    window: objc2::rc::Retained<objc2_app_kit::NSWindow>,
+    bar: objc2::rc::Retained<objc2_app_kit::NSProgressIndicator>,
+    name: objc2::rc::Retained<objc2_app_kit::NSTextField>,
+    detail: objc2::rc::Retained<objc2_app_kit::NSTextField>,
+}
+thread_local! {
+    static PROGRESS: std::cell::RefCell<std::collections::HashMap<u64, ProgressWindow>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+pub struct Progress(u64);
+impl Progress {
+    pub fn new(id: u64) -> anyhow::Result<Self> {
+        main_thread(move |mtm| {
+            use objc2::MainThreadOnly;
+            use objc2_app_kit::*;
+            use objc2_foundation::{NSPoint, NSRect, NSSize};
+            let rect = |x, y, width, height| NSRect {
+                origin: NSPoint { x, y },
+                size: NSSize { width, height },
+            };
+            let window = unsafe {
+                NSWindow::initWithContentRect_styleMask_backing_defer(
+                    NSWindow::alloc(mtm),
+                    rect(0., 0., 460., 135.),
+                    NSWindowStyleMask::Titled,
+                    NSBackingStoreType::Buffered,
+                    false,
+                )
+            };
+            unsafe {
+                window.setReleasedWhenClosed(false);
+            }
+            window.setTitle(&NSString::from_str("MeshRMM — Receiving files"));
+            let view = window.contentView().unwrap();
+            let name =
+                NSTextField::labelWithString(&NSString::from_str("Preparing transfer…"), mtm);
+            name.setFrame(rect(22., 88., 416., 24.));
+            view.addSubview(&name);
+            let bar = NSProgressIndicator::new(mtm);
+            bar.setStyle(NSProgressIndicatorStyle::Bar);
+            bar.setIndeterminate(false);
+            bar.setMinValue(0.);
+            bar.setMaxValue(100.);
+            bar.setFrame(rect(22., 58., 416., 20.));
+            view.addSubview(&bar);
+            let detail =
+                NSTextField::labelWithString(&NSString::from_str("Waiting for file details…"), mtm);
+            detail.setFrame(rect(22., 22., 416., 24.));
+            view.addSubview(&detail);
+            window.center();
+            window.orderFrontRegardless();
+            PROGRESS.with(|windows| {
+                windows.borrow_mut().insert(
+                    id,
+                    ProgressWindow {
+                        window,
+                        bar,
+                        name,
+                        detail,
+                    },
+                );
+            });
+        });
+        Ok(Self(id))
+    }
+    pub fn update(&self, bytes: u64, total: u64, name: &str, entries: usize, total_entries: u64) {
+        let id = self.0;
+        let name = name.to_owned();
+        let detail = crate::progress_detail(bytes, total, entries, total_entries);
+        main_thread(move |_| {
+            PROGRESS.with(|windows| {
+                if let Some(ui) = windows.borrow().get(&id) {
+                    let fraction = if total == 0 {
+                        entries as f64 / total_entries.max(1) as f64
+                    } else {
+                        bytes as f64 / total as f64
+                    };
+                    ui.bar.setDoubleValue((fraction * 100.).clamp(0., 100.));
+                    ui.name.setStringValue(&NSString::from_str(&name));
+                    ui.detail.setStringValue(&NSString::from_str(&detail));
+                }
+            });
+        });
+    }
+}
+impl Drop for Progress {
+    fn drop(&mut self) {
+        let id = self.0;
+        main_thread(move |_| {
+            PROGRESS.with(|windows| {
+                if let Some(ui) = windows.borrow_mut().remove(&id) {
+                    ui.window.orderOut(None);
+                }
+            });
+        });
+    }
+}

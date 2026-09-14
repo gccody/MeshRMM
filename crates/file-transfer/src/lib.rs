@@ -129,6 +129,8 @@ fn worker(
     };
     let _ = out.send(FileMessage::Available);
     let mut incoming: Option<Incoming> = None;
+    let mut progress: Option<native::Progress> = None;
+    let mut progress_updated = Instant::now();
     let mut sender: Option<(u64, mpsc::SyncSender<bool>)> = None;
     let mut sender_thread: Option<std::thread::JoinHandle<()>> = None;
     let mut pending = std::collections::VecDeque::new();
@@ -190,6 +192,7 @@ fn worker(
                 }
                 if incoming.as_ref().is_some_and(|i| i.id == id) {
                     incoming = None;
+                    progress = None;
                 }
             }
             Some(Command::Peer(message)) => {
@@ -204,11 +207,19 @@ fn worker(
                             native::cache()?
                         };
                         incoming = Some(Incoming::new(id, destination, storage)?);
+                        progress = native::Progress::new(id)
+                            .map_err(|error| {
+                                tracing::warn!(%error, "could not show file transfer progress");
+                            })
+                            .ok();
                     } else {
                         let state = incoming.as_mut().context("transfer has not started")?;
                         ensure!(state.id == packet_id, "transfer ID mismatch");
                         if let FileMessage::Finish { .. } = message {
                             let paths = state.finish()?;
+                            // Hide before native delivery so the progress window cannot
+                            // obscure the user's Explorer/browser drop target.
+                            progress = None;
                             match &state.destination {
                                 FileDestination::Clipboard
                                 | FileDestination::ClipboardPaste { .. } => {
@@ -236,7 +247,20 @@ fn worker(
                             *status.lock().unwrap() = "Transfer complete".into();
                             incoming = None;
                         } else {
+                            let refresh = !matches!(message, FileMessage::Chunk { .. });
                             state.accept(message)?;
+                            if refresh || progress_updated.elapsed() >= Duration::from_millis(100) {
+                                if let Some(progress) = &progress {
+                                    progress.update(
+                                        state.received_bytes,
+                                        state.total_bytes,
+                                        &state.current_name,
+                                        state.entries,
+                                        state.total_entries,
+                                    );
+                                }
+                                progress_updated = Instant::now();
+                            }
                         }
                     }
                     Ok(())
@@ -245,6 +269,7 @@ fn worker(
                     Ok(()) => FileMessage::Ack { id: packet_id },
                     Err(e) => {
                         incoming = None;
+                        progress = None;
                         let reason = format!("{e:#}");
                         *status.lock().unwrap() = reason.clone();
                         FileMessage::Error {
@@ -319,6 +344,20 @@ fn worker(
         }
     }
 }
+fn progress_detail(bytes: u64, total: u64, entries: usize, total_entries: u64) -> String {
+    let percent = if total == 0 {
+        entries as f64 / total_entries.max(1) as f64
+    } else {
+        bytes as f64 / total as f64
+    } * 100.;
+    format!(
+        "{:.0}% — {:.1} of {:.1} MiB · {entries}/{total_entries} items",
+        percent.clamp(0., 100.),
+        bytes as f64 / 1_048_576.,
+        total as f64 / 1_048_576.
+    )
+}
+
 fn message_id(m: &FileMessage) -> u64 {
     match m {
         FileMessage::Begin { id, .. }
@@ -327,7 +366,8 @@ fn message_id(m: &FileMessage) -> u64 {
         | FileMessage::EndEntry { id, .. }
         | FileMessage::Finish { id }
         | FileMessage::Ack { id }
-        | FileMessage::Error { id, .. } => *id,
+        | FileMessage::Error { id, .. }
+        | FileMessage::Totals { id, .. } => *id,
         _ => 0,
     }
 }
@@ -368,6 +408,10 @@ struct Incoming {
     roots: Vec<String>,
     file: Option<(File, u64, Sha256)>,
     entries: usize,
+    received_bytes: u64,
+    total_bytes: u64,
+    total_entries: u64,
+    current_name: String,
 }
 impl Incoming {
     fn new(id: u64, destination: FileDestination, documents: PathBuf) -> anyhow::Result<Self> {
@@ -387,11 +431,24 @@ impl Incoming {
             roots: Vec::new(),
             file: None,
             entries: 0,
+            received_bytes: 0,
+            total_bytes: 0,
+            total_entries: 0,
+            current_name: String::new(),
         })
     }
     fn accept(&mut self, message: FileMessage) -> anyhow::Result<()> {
         match message {
+            FileMessage::Totals { bytes, entries, .. } => {
+                ensure!(
+                    self.entries == 0 && entries > 0 && entries <= 100_000,
+                    "invalid transfer totals"
+                );
+                self.total_bytes = bytes;
+                self.total_entries = entries;
+            }
             FileMessage::Entry { path, size, .. } => {
+                self.current_name = path.clone();
                 ensure!(self.file.is_none(), "previous file is unfinished");
                 self.entries += 1;
                 ensure!(self.entries <= 100_000, "too many entries");
@@ -430,6 +487,10 @@ impl Incoming {
                 file.write_all(&data)?;
                 hash.update(&data);
                 *remaining -= data.len() as u64;
+                self.received_bytes = self
+                    .received_bytes
+                    .checked_add(data.len() as u64)
+                    .context("transfer size overflow")?;
             }
             FileMessage::EndEntry { sha256, .. } => {
                 let (file, remaining, hash) = self.file.take().context("no open file")?;
@@ -530,7 +591,16 @@ fn send_paths(
             .to_owned();
         visit(path, name, &mut entries, 0)?;
     }
+    let bytes = entries.iter().try_fold(0u64, |sum, (_, _, size)| {
+        sum.checked_add(size.unwrap_or(0))
+            .context("transfer size overflow")
+    })?;
     send(FileMessage::Begin { id, destination })?;
+    send(FileMessage::Totals {
+        id,
+        bytes,
+        entries: entries.len() as u64,
+    })?;
     for (path, relative, size) in entries {
         send(FileMessage::Entry {
             id,
@@ -647,6 +717,9 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        assert_eq!(receiver.received_bytes, data.len() as u64);
+        assert_eq!(receiver.total_bytes, data.len() as u64);
+        assert_eq!(receiver.total_entries, receiver.entries as u64);
         assert_eq!(received.len(), 1);
         assert_eq!(fs::read(received[0].join("large.bin")).unwrap(), data);
         assert!(received[0].join("empty folder").is_dir());

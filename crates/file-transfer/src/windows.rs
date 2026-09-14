@@ -567,6 +567,47 @@ pub fn cache() -> anyhow::Result<PathBuf> {
     }
 }
 
+/// Windows owns and pumps this standard shell progress dialog on its UI thread.
+pub struct Progress(IProgressDialog);
+impl Progress {
+    pub fn new(_: u64) -> anyhow::Result<Self> {
+        unsafe {
+            let dialog: IProgressDialog =
+                CoCreateInstance(&CLSID_ProgressDialog, None, CLSCTX_INPROC_SERVER)?;
+            dialog.SetTitle(windows::core::w!("MeshRMM — Receiving files"))?;
+            dialog.SetLine(1, windows::core::w!("Preparing transfer…"), false, None)?;
+            dialog.StartProgressDialog(None, None, PROGDLG_NOCANCEL | PROGDLG_AUTOTIME, None)?;
+            Ok(Self(dialog))
+        }
+    }
+    pub fn update(&self, bytes: u64, total: u64, name: &str, entries: usize, total_entries: u64) {
+        let name = wide(std::path::Path::new(name));
+        let detail = crate::progress_detail(bytes, total, entries, total_entries);
+        let detail = wide(std::path::Path::new(&detail));
+        unsafe {
+            let _ = self
+                .0
+                .SetLine(1, windows::core::PCWSTR(name.as_ptr()), true, None);
+            let _ = self
+                .0
+                .SetLine(2, windows::core::PCWSTR(detail.as_ptr()), false, None);
+            let (done, total) = if total == 0 {
+                (entries as u64, total_entries.max(1))
+            } else {
+                (bytes, total)
+            };
+            let _ = self.0.SetProgress64(done, total);
+        }
+    }
+}
+impl Drop for Progress {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.0.StopProgressDialog();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
