@@ -341,6 +341,9 @@ File clipboard changes also synchronize in both directions. Copy files/folders
 in Finder or Explorer, then paste into the destination folder or desktop.
 The receiver publishes files after all chunks and SHA-256 checks complete;
 a remote paste shortcut waits for the transfer before pasting.
+A native progress window appears on the receiving computer: on the Agent for
+Send, or on the client for Receive. It shows the current filename, overall
+percentage, transferred size, and item count, and closes when the transfer ends.
 Files use bounded, acknowledged chunks over the encrypted reliable channel.
 The Windows file helper runs as the signed-in user, separately from the
 privileged capture/input helper, so pickers and shell actions use that user’s

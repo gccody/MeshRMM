@@ -28,3 +28,16 @@ The native Windows drop source owns an OLE message queue. It seeds mouse message
 on that queue, supplies the requested screen position through a thread-scoped
 message hook, and pumps drag-over events before button release so browser targets
 can negotiate their drop effect. The file helper runs as the interactive user.
+
+## Receiver progress windows
+
+The September 14 progress update was installed on both endpoints. A 16 MiB
+Send/Receive round trip showed the standard Windows shell progress dialog on the
+Agent during Send (observed at 33%) and the AppKit progress window on the Mac
+during Receive (observed at 87–88%). Both showed the filename, overall percentage,
+transferred size, and item count, and both closed automatically on completion.
+The file matched SHA-256
+`341aacac661ccb210720bedaa9ead5d668fe5ea41a73532fc147c71e34040df1`
+on both computers. Windows workspace Clippy/tests and macOS protocol/viewer/
+file-transfer checks passed. Progress totals are included in the existing
+nested-folder wire round-trip test.
