@@ -43,6 +43,9 @@ const COMMAND_INPUT: u8 = 5;
 const COMMAND_RELEASE_INPUT: u8 = 6;
 const COMMAND_START_INPUT: u8 = 7;
 const COMMAND_CLIPBOARD: u8 = 8;
+const COMMAND_CHAT: u8 = 9;
+const COMMAND_START_CHAT: u8 = 10;
+const COMMAND_STOP_CHAT: u8 = 11;
 const EVENT_STARTED: u8 = 1;
 const EVENT_FRAME: u8 = 2;
 const EVENT_ERROR: u8 = 3;
@@ -50,6 +53,7 @@ const EVENT_STOPPED: u8 = 4;
 const EVENT_CURSOR: u8 = 5;
 const EVENT_INPUT_STARTED: u8 = 6;
 const EVENT_CLIPBOARD: u8 = 7;
+const EVENT_CHAT: u8 = 8;
 const MAX_CODEC_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
@@ -96,11 +100,15 @@ enum ParentCommand {
     RequestKeyframe,
     SetBitrate(u32),
     StartInput {
+        viewer_name: String,
         display_id: DisplayId,
     },
     Input(RemoteInput),
     ReleaseInput,
     Clipboard(String),
+    Chat(String),
+    StartChat,
+    StopChat,
     Stop,
 }
 
@@ -116,12 +124,14 @@ enum ChildEvent {
     Frame(EncodedAccessUnit),
     Cursor(CursorShape),
     Clipboard(String),
+    Chat(String),
     Error(String),
     Stopped,
 }
 
 type HelperStatus = Arc<Mutex<Option<Result<(), String>>>>;
 type HelperCursor = Arc<Mutex<CursorShape>>;
+type HelperChat = Arc<Mutex<std::collections::VecDeque<String>>>;
 type HelperClipboard = Arc<Mutex<Option<String>>>;
 type InputWriter = Arc<Mutex<BufWriter<File>>>;
 type InputRoute = Arc<Mutex<Option<InputWriter>>>;
@@ -137,6 +147,8 @@ pub struct DesktopCaptureStreamer {
     preferred_desktop: Option<DesktopTarget>,
     cursor: HelperCursor,
     clipboard: HelperClipboard,
+    chat: HelperChat,
+    chat_enabled: Arc<AtomicBool>,
 }
 
 impl DesktopCaptureStreamer {
@@ -149,6 +161,8 @@ impl DesktopCaptureStreamer {
             preferred_desktop: None,
             cursor: Arc::new(Mutex::new(CursorShape::Default)),
             clipboard: Arc::new(Mutex::new(None)),
+            chat: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            chat_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -349,6 +363,8 @@ impl DesktopCaptureStreamer {
             route: Arc::clone(&self.input_route),
             cursor: Arc::clone(&self.cursor),
             clipboard: Arc::clone(&self.clipboard),
+            chat: Arc::clone(&self.chat),
+            chat_enabled: Arc::clone(&self.chat_enabled),
         })
     }
 
@@ -410,7 +426,13 @@ impl DesktopCaptureStreamer {
             if helper.display_id != display_id {
                 // Commands share one ordered pipe, so the new display mapping
                 // is applied before any subsequent pointer/keyboard events.
-                send_command(&helper.input, &ParentCommand::StartInput { display_id })?;
+                send_command(
+                    &helper.input,
+                    &ParentCommand::StartInput {
+                        display_id,
+                        viewer_name: self.viewer_name.clone(),
+                    },
+                )?;
                 helper.display_id = display_id;
             }
             return Ok(());
@@ -421,15 +443,20 @@ impl DesktopCaptureStreamer {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
         let helper = start_input_helper(
+            &self.viewer_name,
             target,
             display_id,
             Arc::clone(&self.cursor),
             Arc::clone(&self.clipboard),
+            Arc::clone(&self.chat),
         )?;
         *self
             .input_route
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&helper.input));
+        if self.chat_enabled.load(Ordering::Acquire) {
+            send_command(&helper.input, &ParentCommand::StartChat)?;
+        }
         self.input = Some(helper);
         Ok(())
     }
@@ -497,9 +524,49 @@ struct DesktopInputController {
     route: InputRoute,
     cursor: HelperCursor,
     clipboard: HelperClipboard,
+    chat: HelperChat,
+    chat_enabled: Arc<AtomicBool>,
 }
 
 impl ScreenInput for DesktopInputController {
+    fn stop_chat(&self) {
+        self.chat_enabled.store(false, Ordering::Release);
+        self.chat.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if let Some(writer) = self.route.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            let _ = send_command(&writer, &ParentCommand::StopChat);
+        }
+    }
+
+    fn start_chat(&self) -> anyhow::Result<()> {
+        let writer = self
+            .route
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .context("interactive chat helper is unavailable")?;
+        send_command(&writer, &ParentCommand::StartChat)?;
+        self.chat_enabled.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn apply_chat(&self, text: String) -> anyhow::Result<()> {
+        let writer = self
+            .route
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .context("interactive chat helper is unavailable")?;
+        send_command(&writer, &ParentCommand::Chat(text))?;
+        Ok(())
+    }
+    fn poll_chat(&self) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .chat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front())
+    }
+
     fn apply(&self, input: RemoteInput) -> anyhow::Result<()> {
         let writer = self
             .route
@@ -701,10 +768,12 @@ fn launch_system_helper(target: DesktopTarget) -> anyhow::Result<LaunchedHelper>
 }
 
 fn start_input_helper(
+    viewer_name: &str,
     target: DesktopTarget,
     display_id: DisplayId,
     cursor: HelperCursor,
     clipboard: HelperClipboard,
+    chat: HelperChat,
 ) -> anyhow::Result<RunningInputHelper> {
     let launched = launch_system_helper(target)?;
     let status: HelperStatus = Arc::new(Mutex::new(None));
@@ -719,6 +788,7 @@ fn start_input_helper(
                 reader_status,
                 cursor,
                 clipboard,
+                chat,
             )
         })
         .context("failed to start desktop input-helper IPC reader")?;
@@ -727,7 +797,13 @@ fn start_input_helper(
         .spawn(move || drain_child_stderr(launched.stderr))
         .context("failed to start desktop input-helper error reader")?;
     let input = Arc::new(Mutex::new(BufWriter::new(launched.input)));
-    if let Err(error) = send_command(&input, &ParentCommand::StartInput { display_id }) {
+    if let Err(error) = send_command(
+        &input,
+        &ParentCommand::StartInput {
+            display_id,
+            viewer_name: viewer_name.to_owned(),
+        },
+    ) {
         terminate_and_wait(&launched.process);
         let _ = reader.join();
         let _ = stderr.join();
@@ -824,7 +900,7 @@ fn dispatch_child_events(
             Ok(ChildEvent::Cursor(shape)) => {
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) = shape;
             }
-            Ok(ChildEvent::Clipboard(_)) => {
+            Ok(ChildEvent::Clipboard(_) | ChildEvent::Chat(_)) => {
                 set_status(
                     &status,
                     Err("capture helper reported an input-only clipboard event".into()),
@@ -857,6 +933,7 @@ fn dispatch_input_events(
     status: HelperStatus,
     cursor: HelperCursor,
     clipboard: HelperClipboard,
+    chat: HelperChat,
 ) {
     let mut output = BufReader::new(output);
     let mut started_tx = Some(started_tx);
@@ -875,6 +952,12 @@ fn dispatch_input_events(
             }
             Ok(ChildEvent::Cursor(shape)) => {
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) = shape;
+            }
+            Ok(ChildEvent::Chat(text)) => {
+                let mut chat = chat.lock().unwrap_or_else(|e| e.into_inner());
+                if chat.len() < 32 {
+                    chat.push_back(text);
+                }
             }
             Ok(ChildEvent::Clipboard(text)) => {
                 *clipboard.lock().unwrap_or_else(|error| error.into_inner()) = Some(text);
@@ -982,24 +1065,24 @@ pub fn run_child() -> anyhow::Result<()> {
         .context("desktop-helper command pipe closed before startup")??
     {
         ParentCommand::Start {
-            viewer_name,
+            viewer_name: _,
             display_id,
             frames_per_second,
             bitrate_bits_per_second,
             codec,
             pixel_format,
-        } => {
-            let _indicator = super::indicator::SessionIndicator::show(&viewer_name)?;
-            run_capture_child(
-                command_rx,
-                display_id,
-                frames_per_second,
-                bitrate_bits_per_second,
-                codec,
-                pixel_format,
-            )
-        }
-        ParentCommand::StartInput { display_id } => run_input_child(command_rx, display_id),
+        } => run_capture_child(
+            command_rx,
+            display_id,
+            frames_per_second,
+            bitrate_bits_per_second,
+            codec,
+            pixel_format,
+        ),
+        ParentCommand::StartInput {
+            display_id,
+            viewer_name,
+        } => run_input_child(command_rx, display_id, viewer_name),
         _ => anyhow::bail!("desktop helper expected a capture or input start command"),
     }
 }
@@ -1109,7 +1192,10 @@ fn run_capture_child(
                     ParentCommand::StartInput { .. }
                     | ParentCommand::Input(_)
                     | ParentCommand::ReleaseInput
-                    | ParentCommand::Clipboard(_),
+                    | ParentCommand::Clipboard(_)
+                    | ParentCommand::Chat(_)
+                    | ParentCommand::StartChat
+                    | ParentCommand::StopChat,
                 )) => {
                     terminal_error =
                         Some("capture helper received a command reserved for input".into());
@@ -1134,6 +1220,7 @@ fn run_capture_child(
 fn run_input_child(
     command_rx: mpsc::Receiver<io::Result<ParentCommand>>,
     display_id: DisplayId,
+    viewer_name: String,
 ) -> anyhow::Result<()> {
     let displays = enumerate_displays()?;
     let active_display = displays
@@ -1143,8 +1230,9 @@ fn run_input_child(
     let mut input = WindowsInputController::new();
     input.set_active_display(active_display)?;
     let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+    let chat = meshrmm_chat::ChatSession::with_peer("Viewer");
+    let _indicator = super::indicator::SessionIndicator::show(&viewer_name, chat.clone())?;
     emit_child_event(&output, ChildEvent::InputStarted)?;
-
     let mut sent_cursor = None;
     let mut clipboard = match super::clipboard::ClipboardSync::new() {
         Ok(clipboard) => Some(clipboard),
@@ -1164,7 +1252,7 @@ fn run_input_child(
             sent_cursor = Some(cursor);
         }
         match command_rx.recv_timeout(Duration::from_millis(16)) {
-            Ok(Ok(ParentCommand::StartInput { display_id })) => {
+            Ok(Ok(ParentCommand::StartInput { display_id, .. })) => {
                 let result = enumerate_displays().and_then(|displays| {
                     let display = displays
                         .into_iter()
@@ -1187,6 +1275,17 @@ fn run_input_child(
                     tracing::warn!(%error, "desktop input helper could not release input");
                 }
             }
+            Ok(Ok(ParentCommand::StopChat)) => {
+                chat.set_available(false);
+            }
+            Ok(Ok(ParentCommand::StartChat)) => {
+                chat.set_available(true);
+            }
+            Ok(Ok(ParentCommand::Chat(text))) => {
+                if chat.available() {
+                    chat.receive(text);
+                }
+            }
             Ok(Ok(ParentCommand::Clipboard(text))) => {
                 if let Some(clipboard) = clipboard.as_mut()
                     && let Err(error) = clipboard.apply(text)
@@ -1201,6 +1300,9 @@ fn run_input_child(
             }
             Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if let Some(text) = chat.poll() {
+            emit_child_event(&output, ChildEvent::Chat(text))?;
         }
         if Instant::now() >= next_clipboard_poll {
             next_clipboard_poll = Instant::now() + CLIPBOARD_POLL_INTERVAL;
@@ -1282,9 +1384,15 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             writer.write_all(&[COMMAND_SET_BITRATE])?;
             write_u32(&mut writer, *bits_per_second)
         }
-        ParentCommand::StartInput { display_id } => {
+        ParentCommand::StartInput {
+            display_id,
+            viewer_name,
+        } => {
+            checked_len(viewer_name.len(), MAX_DISPLAY_NAME_BYTES, "viewer name")?;
             writer.write_all(&[COMMAND_START_INPUT])?;
-            write_u32(&mut writer, display_id.0)
+            write_u32(&mut writer, display_id.0)?;
+            write_u32(&mut writer, viewer_name.len() as u32)?;
+            writer.write_all(viewer_name.as_bytes())
         }
         ParentCommand::Input(input) => {
             let bytes = SessionMessage::Input(*input)
@@ -1304,6 +1412,19 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             writer.write_all(&[COMMAND_CLIPBOARD])?;
             write_u32(&mut writer, bytes.len() as u32)?;
             writer.write_all(&bytes)
+        }
+        ParentCommand::StopChat => writer.write_all(&[COMMAND_STOP_CHAT]),
+        ParentCommand::StartChat => writer.write_all(&[COMMAND_START_CHAT]),
+        ParentCommand::Chat(text) => {
+            if !meshrmm_protocol::valid_chat_text(text) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid chat text",
+                ));
+            }
+            writer.write_all(&[COMMAND_CHAT])?;
+            write_u32(&mut writer, text.len() as u32)?;
+            writer.write_all(text.as_bytes())
         }
         ParentCommand::Stop => writer.write_all(&[COMMAND_STOP]),
     }
@@ -1333,9 +1454,22 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
         }
         COMMAND_REQUEST_KEYFRAME => Ok(ParentCommand::RequestKeyframe),
         COMMAND_SET_BITRATE => Ok(ParentCommand::SetBitrate(read_u32(&mut reader)?)),
-        COMMAND_START_INPUT => Ok(ParentCommand::StartInput {
-            display_id: DisplayId(read_u32(&mut reader)?),
-        }),
+        COMMAND_START_INPUT => {
+            let display_id = DisplayId(read_u32(&mut reader)?);
+            let length = bounded_len(
+                read_u32(&mut reader)?,
+                MAX_DISPLAY_NAME_BYTES,
+                "viewer name",
+            )?;
+            let mut name = vec![0; length];
+            reader.read_exact(&mut name)?;
+            let viewer_name = String::from_utf8(name)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(ParentCommand::StartInput {
+                display_id,
+                viewer_name,
+            })
+        }
         COMMAND_INPUT => {
             let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "desktop input")?;
             let mut bytes = vec![0; length];
@@ -1374,6 +1508,26 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
                 )),
                 Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
             }
+        }
+        COMMAND_STOP_CHAT => Ok(ParentCommand::StopChat),
+        COMMAND_START_CHAT => Ok(ParentCommand::StartChat),
+        COMMAND_CHAT => {
+            let length = bounded_len(
+                read_u32(&mut reader)?,
+                meshrmm_protocol::MAX_CHAT_TEXT_BYTES,
+                "chat text",
+            )?;
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes)?;
+            let text = String::from_utf8(bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if !meshrmm_protocol::valid_chat_text(&text) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid chat text",
+                ));
+            }
+            Ok(ParentCommand::Chat(text))
         }
         COMMAND_STOP => Ok(ParentCommand::Stop),
         opcode => Err(io::Error::new(
@@ -1436,6 +1590,17 @@ fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
             writer.write_all(&[EVENT_CLIPBOARD])?;
             write_u32(&mut writer, bytes.len() as u32)?;
             writer.write_all(&bytes)
+        }
+        ChildEvent::Chat(text) => {
+            if !meshrmm_protocol::valid_chat_text(text) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid chat text",
+                ));
+            }
+            writer.write_all(&[EVENT_CHAT])?;
+            write_u32(&mut writer, text.len() as u32)?;
+            writer.write_all(text.as_bytes())
         }
         ChildEvent::Error(message) => {
             let message = message.as_bytes();
@@ -1546,6 +1711,24 @@ fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
                 )),
                 Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
             }
+        }
+        EVENT_CHAT => {
+            let length = bounded_len(
+                read_u32(&mut reader)?,
+                meshrmm_protocol::MAX_CHAT_TEXT_BYTES,
+                "chat text",
+            )?;
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes)?;
+            let text = String::from_utf8(bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if !meshrmm_protocol::valid_chat_text(&text) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid chat text",
+                ));
+            }
+            Ok(ChildEvent::Chat(text))
         }
         EVENT_ERROR => {
             let length = bounded_len(
@@ -1805,6 +1988,7 @@ mod tests {
             ParentCommand::RequestKeyframe,
             ParentCommand::SetBitrate(4_000_000),
             ParentCommand::StartInput {
+                viewer_name: "Zoë 王".into(),
                 display_id: DisplayId(3),
             },
             ParentCommand::Input(RemoteInput::PointerButton {
@@ -1821,7 +2005,9 @@ mod tests {
             write_command(&mut bytes, &command).unwrap();
             let decoded = read_command(bytes.as_slice()).unwrap();
             assert_eq!(command_name(&decoded), command_name(&command));
-            if let ParentCommand::Start { viewer_name, .. } = decoded {
+            if let ParentCommand::Start { viewer_name, .. }
+            | ParentCommand::StartInput { viewer_name, .. } = decoded
+            {
                 assert_eq!(viewer_name, "Zoë 王");
             }
         }
@@ -1927,7 +2113,48 @@ mod tests {
             ParentCommand::Input(_) => COMMAND_INPUT,
             ParentCommand::ReleaseInput => COMMAND_RELEASE_INPUT,
             ParentCommand::Clipboard(_) => COMMAND_CLIPBOARD,
+            ParentCommand::Chat(_) => COMMAND_CHAT,
+            ParentCommand::StartChat => COMMAND_START_CHAT,
+            ParentCommand::StopChat => COMMAND_STOP_CHAT,
             ParentCommand::Stop => COMMAND_STOP,
         }
+    }
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+    #[test]
+    fn chat_commands_and_events_round_trip() {
+        let text = "Hello 👋\nReply from the other computer";
+        let mut bytes = Vec::new();
+        write_command(&mut bytes, &ParentCommand::StartChat).unwrap();
+        assert!(matches!(
+            read_command(bytes.as_slice()).unwrap(),
+            ParentCommand::StartChat
+        ));
+        bytes.clear();
+        write_command(&mut bytes, &ParentCommand::Chat(text.into())).unwrap();
+        assert!(
+            matches!(read_command(bytes.as_slice()).unwrap(), ParentCommand::Chat(value) if value == text)
+        );
+        bytes.clear();
+        write_event(&mut bytes, &ChildEvent::Chat(text.into())).unwrap();
+        assert!(
+            matches!(read_event(bytes.as_slice()).unwrap(), ChildEvent::Chat(value) if value == text)
+        );
+    }
+    #[test]
+    fn oversized_chat_is_rejected_before_reading_payload() {
+        let mut command = vec![COMMAND_CHAT];
+        command
+            .extend_from_slice(&(meshrmm_protocol::MAX_CHAT_TEXT_BYTES as u32 + 1).to_le_bytes());
+        assert!(
+            matches!(read_command(command.as_slice()), Err(e) if e.kind() == io::ErrorKind::InvalidData)
+        );
+        command[0] = EVENT_CHAT;
+        assert!(
+            matches!(read_event(command.as_slice()), Err(e) if e.kind() == io::ErrorKind::InvalidData)
+        );
     }
 }

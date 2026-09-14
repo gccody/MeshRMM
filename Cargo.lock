@@ -1688,6 +1688,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures-util",
+ "meshrmm-chat",
  "meshrmm-protocol",
  "meshrmm-remote-screen",
  "meshrmm-self-update",
@@ -1705,6 +1706,19 @@ dependencies = [
  "webrtc",
  "windows",
  "windows-service",
+]
+
+[[package]]
+name = "meshrmm-chat"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "dispatch2",
+ "meshrmm-protocol",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "windows",
 ]
 
 [[package]]
@@ -1736,6 +1750,7 @@ dependencies = [
  "dispatch2",
  "futures-util",
  "libc",
+ "meshrmm-chat",
  "meshrmm-protocol",
  "meshrmm-self-update",
  "meshrmm-signaling-client",

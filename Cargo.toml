@@ -6,6 +6,7 @@ members = [
     "agent/windows/remote-screen",
     "crates/protocol-types",
     "crates/self-update",
+    "crates/chat",
     "crates/signaling-client",
     "remote",
     "server",

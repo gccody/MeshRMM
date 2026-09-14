@@ -211,6 +211,46 @@ fn dashboard_user_name(profile: &serde_json::Value) -> String {
     }
 }
 
+/// Company administrators can end an active or abandoned session without
+/// removing the Agent or interrupting its signaling connection.
+pub(crate) async fn close_agent_session(
+    request: &Request,
+    environment: &Env,
+    device_id: &str,
+) -> Result<Response> {
+    validate_identifier(device_id, "device ID")?;
+    let identity = match authorize_workos_user(request, environment).await {
+        Ok(identity) if identity.has_permission("agents:manage") => identity,
+        Ok(_) => return api_error(403, "company administrator access is required"),
+        Err(error) => return workos_auth_error(error),
+    };
+    let db = environment.d1("DB")?;
+    let permitted = query!(&db,
+        "SELECT 1 AS permitted FROM agents WHERE id = ?1 AND company_id = ?2 AND deletion_requested_at IS NULL",
+        device_id, identity.company_id
+    )?.first::<i64>(Some("permitted")).await?.is_some();
+    if !permitted {
+        return api_error(404, "Agent not found");
+    }
+    let close = Request::new("https://agent.internal/close-session", Method::Post)?;
+    let response = object_stub(environment, "AGENT_COORDINATOR", device_id)?
+        .fetch_with_request(close)
+        .await?;
+    if !(200..300).contains(&response.status_code()) {
+        return api_error(502, "The remote session could not be closed. Try again.");
+    }
+    audit(
+        &db,
+        &identity,
+        "remote.session_close",
+        "agent",
+        device_id,
+        "{}",
+    )
+    .await?;
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

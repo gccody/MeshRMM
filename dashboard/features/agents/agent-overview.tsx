@@ -7,6 +7,7 @@ import {
   Filter,
   LoaderCircle,
   Monitor,
+  Square,
   Search,
   Trash2,
   Wifi,
@@ -25,10 +26,12 @@ type Props = {
   status: AgentStatusFilter;
   connectingId: string | null;
   deletingId: string | null;
+  closingId: string | null;
   canDelete: boolean;
   onQueryChange: (query: string) => void;
   onStatusChange: (status: AgentStatusFilter) => void;
   onRemote: (agent: Agent) => void;
+  onCloseSession: (agent: Agent) => void;
   onDelete: (agent: Agent) => void;
 };
 
@@ -41,10 +44,12 @@ export function AgentOverview({
   status,
   connectingId,
   deletingId,
+  closingId,
   canDelete,
   onQueryChange,
   onStatusChange,
   onRemote,
+  onCloseSession,
   onDelete,
 }: Props) {
   const online = agents.filter((agent) => agent.connected).length;
@@ -89,8 +94,9 @@ export function AgentOverview({
               <div><span className={`status-badge ${agent.connected ? "online" : "offline"}`}><i />{agent.connected ? "Online" : "Offline"}</span></div>
               <div className="device-id-cell"><code>{agent.id}</code></div>
               <div className="row-actions">
-                <button className={`remote-button ${!agent.connected ? "disabled" : ""}`} disabled={!agent.connected || connectingId === agent.id || deletingId === agent.id} onClick={() => onRemote(agent)}>{connectingId === agent.id ? <LoaderCircle size={15} className="spin" /> : <Monitor size={15} />}{connectingId === agent.id ? "Authorizing..." : "Remote"}</button>
-                {canDelete && <button className="agent-delete-button" disabled={deletingId === agent.id} onClick={() => onDelete(agent)} aria-label={`Delete ${agent.name}`} title="Delete Agent">{deletingId === agent.id ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}</button>}
+                <button className={`remote-button ${!agent.connected ? "disabled" : ""}`} disabled={!agent.connected || connectingId === agent.id || deletingId === agent.id || closingId === agent.id} onClick={() => onRemote(agent)}>{connectingId === agent.id ? <LoaderCircle size={15} className="spin" /> : <Monitor size={15} />}{connectingId === agent.id ? "Authorizing..." : "Remote"}</button>
+                {canDelete && <button className="close-session-button" disabled={closingId !== null || connectingId === agent.id || deletingId === agent.id} onClick={() => onCloseSession(agent)} aria-label={`Close active session for ${agent.name}`} title="Disconnect the viewer and clear any stale remote session">{closingId === agent.id ? <LoaderCircle size={15} className="spin" /> : <Square size={15} />}{closingId === agent.id ? "Closing..." : "Close session"}</button>}
+                {canDelete && <button className="agent-delete-button" disabled={deletingId === agent.id || closingId === agent.id} onClick={() => onDelete(agent)} aria-label={`Delete ${agent.name}`} title="Delete Agent">{deletingId === agent.id ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}</button>}
               </div>
             </div>
           ))}

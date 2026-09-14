@@ -90,6 +90,8 @@ function TenantDashboard() {
   const [isAgentOpen, setIsAgentOpen] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [connectingId, setConnectingId] = useState<string | null>(null);
+  const [closingId, setClosingId] = useState<string | null>(null);
+  const [sessionNotice, setSessionNotice] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [agentPlatform, setAgentPlatform] = useState<AgentPlatform>("windows-x64");
@@ -258,7 +260,28 @@ function TenantDashboard() {
     }
   };
 
+  const closeAgentSession = async (agent: Agent) => {
+    setClosingId(agent.id);
+    setError(null);
+    setSessionNotice(null);
+    try {
+      const response = await authorizedFetch(`/v1/agents/${encodeURIComponent(agent.id)}/close-session`, { method: "POST" });
+      if (!response.ok) throw new Error(await errorMessage(response, "The remote session could not be closed."));
+      const result = (await response.json()) as { closed: boolean };
+      setSessionNotice(result.closed
+        ? `Closed the remote session for ${agent.name}. You can connect again.`
+        : `${agent.name} has no active remote session. You can connect now.`);
+    } catch (requestError) {
+      if (!(requestError instanceof AuthenticationRequired)) {
+        setError(requestError instanceof Error ? requestError.message : "The remote session could not be closed.");
+      }
+    } finally {
+      setClosingId(null);
+    }
+  };
+
   const remoteInto = async (agent: Agent) => {
+    setSessionNotice(null);
     if (!agent.connected) return;
     setConnectingId(agent.id);
     setError(null);
@@ -461,6 +484,8 @@ function TenantDashboard() {
               {error && <div className="error-banner"><WifiOff size={17} /><span>{error}</span><button onClick={() => setError(null)} aria-label="Dismiss"><X size={16} /></button></div>}
 
               {view === "agents" ? (
+                <>
+                {sessionNotice && <div className="session-notice" role="status">{sessionNotice}</div>}
                 <AgentOverview
                     agents={agents}
                     filteredAgents={filteredAgents}
@@ -470,12 +495,15 @@ function TenantDashboard() {
                     status={status}
                     connectingId={connectingId}
                     deletingId={deletingId}
+                    closingId={closingId}
                     canDelete={isAdmin}
                     onQueryChange={setQuery}
                     onStatusChange={setStatus}
                     onRemote={(agent) => void remoteInto(agent)}
+                    onCloseSession={(agent) => void closeAgentSession(agent)}
                     onDelete={(agent) => void deleteAgent(agent)}
                   />
+                </>
                 ) : view === "team" ? (
                 <section className="management-panel"><UsersManagement authToken={getAccessToken} /></section>
               ) : (

@@ -38,6 +38,15 @@ class EnrollmentTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT id FROM agents").fetchall(), [("device",)])
         self.assertEqual(self.db.execute("SELECT used_at FROM agent_install_tokens").fetchone(), (1,))
 
+    def test_session_cleanup_only_targets_own_non_deleted_agent(self):
+        self.redeem()
+        query = sql("server/src/routes/handoffs.rs", "SELECT 1 AS permitted FROM agents")
+        self.assertEqual(self.db.execute(query, ("device", "co")).fetchone(), (1,))
+        self.assertIsNone(self.db.execute(query, ("device", "another-company")).fetchone())
+        self.assertIsNone(self.db.execute(query, ("missing", "co")).fetchone())
+        self.db.execute("UPDATE agents SET deletion_requested_at=1")
+        self.assertIsNone(self.db.execute(query, ("device", "co")).fetchone())
+
     def test_another_endpoint_cannot_reclaim_ticket(self):
         self.redeem()
         self.redeem(key="attacker", name="other")

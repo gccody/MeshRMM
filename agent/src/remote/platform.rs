@@ -49,6 +49,10 @@ pub trait ScreenInput: Send + Sync {
     fn cursor_shape(&self) -> CursorShape;
     fn apply_clipboard(&self, text: String) -> anyhow::Result<()>;
     fn poll_clipboard(&self) -> anyhow::Result<Option<String>>;
+    fn start_chat(&self) -> anyhow::Result<()>;
+    fn stop_chat(&self);
+    fn apply_chat(&self, text: String) -> anyhow::Result<()>;
+    fn poll_chat(&self) -> anyhow::Result<Option<String>>;
 }
 
 #[cfg(windows)]
@@ -61,6 +65,7 @@ pub struct PlatformScreenStreamer {
     codec: Codec,
     chroma: ChromaMode,
     next_frame_id: Arc<AtomicU64>,
+    direct_chat: meshrmm_chat::ChatSession,
     direct_input: Arc<Mutex<super::input::WindowsInputController>>,
     direct_clipboard: Option<Arc<Mutex<super::clipboard::ClipboardSync>>>,
 }
@@ -88,6 +93,7 @@ impl PlatformScreenStreamer {
             codec: Codec::H264,
             chroma: ChromaMode::Yuv420,
             next_frame_id: Arc::new(AtomicU64::new(1)),
+            direct_chat: meshrmm_chat::ChatSession::with_peer("Viewer"),
             direct_input: Arc::new(Mutex::new(super::input::WindowsInputController::new())),
             // Service workers live in non-interactive Session 0. Their clipboard
             // is neither the user's clipboard nor a safe place to perform
@@ -145,8 +151,10 @@ impl ScreenStreamer for PlatformScreenStreamer {
                     .set_active_display(active_display.clone())?;
                 let active = streamer.start(config, active_display.id.0, sink)?;
                 if self.indicator.is_none() {
-                    self.indicator =
-                        Some(super::indicator::SessionIndicator::show(&self.viewer_name)?);
+                    self.indicator = Some(super::indicator::SessionIndicator::show(
+                        &self.viewer_name,
+                        self.direct_chat.clone(),
+                    )?);
                 }
                 Ok(StartedScreen {
                     displays,
@@ -245,6 +253,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
             CaptureBackend::Direct(_) => Arc::new(DirectInputController {
                 controller: Arc::clone(&self.direct_input),
                 clipboard: self.direct_clipboard.clone(),
+                chat: self.direct_chat.clone(),
             }),
             CaptureBackend::Desktop(streamer) => streamer.input_controller(),
         }
@@ -253,12 +262,29 @@ impl ScreenStreamer for PlatformScreenStreamer {
 
 #[cfg(windows)]
 struct DirectInputController {
+    chat: meshrmm_chat::ChatSession,
     controller: Arc<Mutex<super::input::WindowsInputController>>,
     clipboard: Option<Arc<Mutex<super::clipboard::ClipboardSync>>>,
 }
 
 #[cfg(windows)]
 impl ScreenInput for DirectInputController {
+    fn stop_chat(&self) {
+        self.chat.set_available(false);
+    }
+    fn start_chat(&self) -> anyhow::Result<()> {
+        self.chat.set_available(true);
+        Ok(())
+    }
+    fn apply_chat(&self, text: String) -> anyhow::Result<()> {
+        if self.chat.available() {
+            self.chat.receive(text);
+        }
+        Ok(())
+    }
+    fn poll_chat(&self) -> anyhow::Result<Option<String>> {
+        Ok(self.chat.poll())
+    }
     fn apply(&self, input: RemoteInput) -> anyhow::Result<()> {
         self.controller
             .lock()

@@ -17,6 +17,8 @@ struct WindowContext {
     chroma_combo: HWND,
     diagnostics_button: HWND,
     settings_button: HWND,
+    chat_button: HWND,
+    chat_popup: Option<meshrmm_chat::ChatPopup>,
     minimize_button: HWND,
     maximize_button: HWND,
     close_button: HWND,
@@ -36,6 +38,7 @@ const QUALITY_COMBO_ID: usize = 4002;
 const CHROMA_COMBO_ID: usize = 4008;
 const DIAGNOSTICS_BUTTON_ID: usize = 4003;
 const SETTINGS_BUTTON_ID: usize = 4004;
+const CHAT_BUTTON_ID: usize = 4009;
 const MINIMIZE_BUTTON_ID: usize = 4005;
 const MAXIMIZE_BUTTON_ID: usize = 4006;
 const CLOSE_BUTTON_ID: usize = 4007;
@@ -174,6 +177,19 @@ impl WindowContext {
                 true,
             )
         };
+        let _ = unsafe {
+            MoveWindow(
+                self.chat_button,
+                caption_x.saturating_sub(138),
+                5,
+                54,
+                24,
+                true,
+            )
+        };
+        if let Some(chat) = &self.chat_popup {
+            chat.layout();
+        }
         let maximize_title = if unsafe { IsZoomed(window) }.as_bool() {
             w!("❐")
         } else {
@@ -753,6 +769,14 @@ pub(super) unsafe fn create_window(
                         let _ = unsafe { SetFocus(Some(window)) };
                         return LRESULT(0);
                     }
+                    if control_id == CHAT_BUTTON_ID {
+                        context.release_input();
+                        context.control.set_input_enabled(false);
+                        if let Some(chat) = &context.chat_popup {
+                            chat.toggle();
+                        }
+                        return LRESULT(0);
+                    }
                     if control_id == SETTINGS_BUTTON_ID {
                         context.show_settings();
                         return LRESULT(0);
@@ -965,6 +989,8 @@ pub(super) unsafe fn create_window(
         chroma_combo: HWND::default(),
         diagnostics_button: HWND::default(),
         settings_button: HWND::default(),
+        chat_button: HWND::default(),
+        chat_popup: None,
         minimize_button: HWND::default(),
         maximize_button: HWND::default(),
         close_button: HWND::default(),
@@ -1171,6 +1197,7 @@ pub(super) unsafe fn create_window(
         WINDOW_STYLE(toolbar_button_style.0 | BS_AUTOCHECKBOX as u32),
     )?;
     let settings_button = make_toolbar_button(SETTINGS_BUTTON_ID, w!("⚙"), toolbar_button_style)?;
+    let chat_button = make_toolbar_button(CHAT_BUTTON_ID, w!("💬"), toolbar_button_style)?;
     let caption_button_style =
         WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | BS_PUSHBUTTON as u32 | BS_FLAT as u32);
     let minimize_button = make_toolbar_button(MINIMIZE_BUTTON_ID, w!("─"), caption_button_style)?;
@@ -1183,6 +1210,7 @@ pub(super) unsafe fn create_window(
         chroma_combo,
         diagnostics_button,
         settings_button,
+        chat_button,
         minimize_button,
         maximize_button,
         close_button,
@@ -1205,6 +1233,10 @@ pub(super) unsafe fn create_window(
         context.chroma_combo = chroma_combo;
         context.diagnostics_button = diagnostics_button;
         context.settings_button = settings_button;
+        context.chat_button = chat_button;
+        context.chat_popup = Some(unsafe {
+            meshrmm_chat::ChatPopup::new(window, chat_button, context.control.chat())
+        }?);
         context.minimize_button = minimize_button;
         context.maximize_button = maximize_button;
         context.close_button = close_button;
@@ -1258,11 +1290,20 @@ unsafe fn apply_cursor(shape: CursorShape) {
 pub(super) unsafe fn pump_window_messages(window: HWND) -> bool {
     if let Some(context) = unsafe { window_context(window) } {
         context.refresh_debug(false);
+        if let Some(chat) = &context.chat_popup {
+            chat.refresh();
+        }
     }
     let mut message = MSG::default();
     while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
         if message.message == WM_QUIT {
             return true;
+        }
+        if let Some(context) = unsafe { window_context(window) }
+            && let Some(chat) = &context.chat_popup
+            && chat.handle_message(&message)
+        {
+            continue;
         }
         let _ = unsafe { TranslateMessage(&message) };
         unsafe { DispatchMessageW(&message) };

@@ -229,6 +229,11 @@ handoff, then opens the native viewer with a
 `meshrmm://connect?handoff=...&server=...` deep link. No service credential is
 entered into or retained by the browser.
 
+Company administrators can use **Close session** beside an Agent's **Remote**
+button to disconnect its viewer and clear a stale session reservation. The Agent
+stays online and can accept a fresh connection immediately. This action is safe
+to repeat when no session exists and is recorded in the company audit log.
+
 During desktop sharing, the Windows endpoint shows a translucent banner at the
 top of the primary screen with the connected user's dashboard name (WorkOS
 first and last name, or email when no name is set). Click the banner to collapse
@@ -324,6 +329,22 @@ current text clipboard is copied to the Agent when the session connects; later
 text copies on either computer are mirrored within 250 ms. Clipboard payloads
 are capped at 60 KiB to stay within the control channel's message limit, and
 rich text, images, and file lists remain local.
+When both computers run a chat-capable version, click the **chat bubble** in the
+viewer's top bar or the Windows agent's connection banner to open an attached
+chat popup. The banner keeps its chat button when collapsed. Type a message and
+choose **Send** or press Enter. Incoming viewer messages automatically open the
+agent's chat popup. Incoming agent messages leave the viewer popup closed and
+show an unread indicator on its chat icon; opening it clears the indicator. Click the icon again,
+click outside the popup, or press Escape to close it. History and unsent drafts
+survive closing the popup and switching displays.
+
+Chat uses the reliable, encrypted peer-to-peer control channel; no server update
+is needed. Typing in the popup does not send remote keystrokes. Each message is
+limited to 4 KiB of UTF-8 text, with the latest 200 messages held in memory and no
+disk history. Chat ends with the connection. Switching Windows desktops (for
+example, a UAC prompt) recreates the endpoint chat popup and clears its local
+history. Older peers can still connect, but chat requires updated builds.
+
 Viewer diagnostics are written to `%LOCALAPPDATA%\MeshRMM\remote.log` on
 Windows and `~/Library/Logs/MeshRMM/remote.log` on macOS.
 Pointer coordinates are normalized to the display

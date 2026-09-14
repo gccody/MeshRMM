@@ -11,6 +11,7 @@ use std::sync::Mutex;
 /// with the native window's foreground state.
 #[derive(Clone)]
 pub struct ControlSink {
+    chat: meshrmm_chat::ChatSession,
     send: Arc<dyn Fn(meshrmm_protocol::SessionMessage) + Send + Sync>,
     set_input_enabled: Arc<dyn Fn(bool) + Send + Sync>,
     quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
@@ -23,11 +24,13 @@ impl ControlSink {
     pub fn new(
         send: impl Fn(meshrmm_protocol::SessionMessage) + Send + Sync + 'static,
         set_input_enabled: impl Fn(bool) + Send + Sync + 'static,
+        chat: meshrmm_chat::ChatSession,
         quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
         chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
         #[cfg(windows)] profiles: Arc<Vec<meshrmm_protocol::VideoProfile>>,
     ) -> Self {
         Self {
+            chat,
             send: Arc::new(send),
             set_input_enabled: Arc::new(set_input_enabled),
             quality,
@@ -51,8 +54,12 @@ impl ControlSink {
         (self.send)(message);
     }
 
+    pub fn chat(&self) -> meshrmm_chat::ChatSession {
+        self.chat.clone()
+    }
+
     pub fn set_input_enabled(&self, enabled: bool) {
-        (self.set_input_enabled)(enabled);
+        (self.set_input_enabled)(enabled && !self.chat.visible());
     }
 
     pub fn quality_preset(&self) -> meshrmm_protocol::QualityPreset {
