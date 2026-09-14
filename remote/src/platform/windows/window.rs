@@ -17,6 +17,7 @@ struct WindowContext {
     chroma_combo: HWND,
     diagnostics_button: HWND,
     settings_button: HWND,
+    file_button: HWND,
     chat_button: HWND,
     chat_popup: Option<meshrmm_chat::ChatPopup>,
     minimize_button: HWND,
@@ -38,6 +39,7 @@ const QUALITY_COMBO_ID: usize = 4002;
 const CHROMA_COMBO_ID: usize = 4008;
 const DIAGNOSTICS_BUTTON_ID: usize = 4003;
 const SETTINGS_BUTTON_ID: usize = 4004;
+const FILE_BUTTON_ID: usize = 4010;
 const CHAT_BUTTON_ID: usize = 4009;
 const MINIMIZE_BUTTON_ID: usize = 4005;
 const MAXIMIZE_BUTTON_ID: usize = 4006;
@@ -183,6 +185,16 @@ impl WindowContext {
                 caption_x.saturating_sub(138),
                 5,
                 54,
+                24,
+                true,
+            )
+        };
+        let _ = unsafe {
+            MoveWindow(
+                self.file_button,
+                caption_x.saturating_sub(180),
+                5,
+                38,
                 24,
                 true,
             )
@@ -712,6 +724,29 @@ pub(super) unsafe fn create_window(
                 }
                 default_hit
             }
+            WM_DROPFILES => {
+                let Some(context) = context else {
+                    return LRESULT(0);
+                };
+                let drop = windows::Win32::UI::Shell::HDROP(wparam.0 as *mut _);
+                let paths = unsafe { meshrmm_file_transfer::windows::paths_from_drop(drop) };
+                let mut point = windows::Win32::Foundation::POINT::default();
+                unsafe {
+                    let _ = windows::Win32::UI::Shell::DragQueryPoint(drop, &mut point);
+                    windows::Win32::UI::Shell::DragFinish(drop);
+                }
+                let destination = context
+                    .normalized_client_position(window, point.x, point.y)
+                    .map(|(x, y)| meshrmm_protocol::FileDestination::Drop {
+                        display_id: context.active_display.id,
+                        x,
+                        y,
+                    })
+                    .unwrap_or(meshrmm_protocol::FileDestination::Documents);
+                context.release_input();
+                context.control.files().send(paths, destination);
+                LRESULT(0)
+            }
             WM_MOUSEMOVE => {
                 if let Some(context) = context {
                     context.move_pointer(window, lparam);
@@ -767,6 +802,49 @@ pub(super) unsafe fn create_window(
                     if control_id == DIAGNOSTICS_BUTTON_ID {
                         context.toggle_debug();
                         let _ = unsafe { SetFocus(Some(window)) };
+                        return LRESULT(0);
+                    }
+                    if control_id == FILE_BUTTON_ID {
+                        context.release_input();
+                        context.control.set_input_enabled(false);
+                        unsafe {
+                            if let Ok(menu) = CreatePopupMenu() {
+                                let _ = AppendMenuW(menu, MF_STRING, 1, w!("Send"));
+                                let _ = AppendMenuW(menu, MF_STRING, 2, w!("Receive"));
+                                let status = context.control.files().status();
+                                if !status.is_empty() {
+                                    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                                    let _ = AppendMenuW(
+                                        menu,
+                                        MF_STRING | MF_DISABLED,
+                                        3,
+                                        &HSTRING::from(status),
+                                    );
+                                }
+                                let mut point = windows::Win32::Foundation::POINT::default();
+                                let _ = GetCursorPos(&mut point);
+                                let chosen = TrackPopupMenu(
+                                    menu,
+                                    TPM_RETURNCMD,
+                                    point.x,
+                                    point.y,
+                                    None,
+                                    window,
+                                    None,
+                                )
+                                .0;
+                                let _ = DestroyMenu(menu);
+                                if chosen == 1 {
+                                    context.control.files().pick();
+                                }
+                                if chosen == 2 {
+                                    context.control.send(SessionMessage::FileTransfer(
+                                        meshrmm_protocol::FileMessage::Pick,
+                                    ));
+                                }
+                            }
+                        }
+                        context.control.set_input_enabled(true);
                         return LRESULT(0);
                     }
                     if control_id == CHAT_BUTTON_ID {
@@ -867,6 +945,18 @@ pub(super) unsafe fn create_window(
                         if pressed && lparam.0 & (1 << 30) == 0 {
                             context.toggle_debug();
                         }
+                        return LRESULT(0);
+                    }
+                    if pressed
+                        && wparam.0 == 0x56
+                        && unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) }
+                            < 0
+                        && context
+                            .control
+                            .files()
+                            .paste_files(context.active_display.id)
+                    {
+                        context.release_input();
                         return LRESULT(0);
                     }
                     let scan_code = ((lparam.0 >> 16) & 0xff) as u16;
@@ -989,6 +1079,7 @@ pub(super) unsafe fn create_window(
         chroma_combo: HWND::default(),
         diagnostics_button: HWND::default(),
         settings_button: HWND::default(),
+        file_button: HWND::default(),
         chat_button: HWND::default(),
         chat_popup: None,
         minimize_button: HWND::default(),
@@ -1197,6 +1288,10 @@ pub(super) unsafe fn create_window(
         WINDOW_STYLE(toolbar_button_style.0 | BS_AUTOCHECKBOX as u32),
     )?;
     let settings_button = make_toolbar_button(SETTINGS_BUTTON_ID, w!("⚙"), toolbar_button_style)?;
+    unsafe {
+        windows::Win32::UI::Shell::DragAcceptFiles(window, true);
+    }
+    let file_button = make_toolbar_button(FILE_BUTTON_ID, w!("📁"), toolbar_button_style)?;
     let chat_button = make_toolbar_button(CHAT_BUTTON_ID, w!("💬"), toolbar_button_style)?;
     let caption_button_style =
         WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | BS_PUSHBUTTON as u32 | BS_FLAT as u32);
@@ -1210,6 +1305,7 @@ pub(super) unsafe fn create_window(
         chroma_combo,
         diagnostics_button,
         settings_button,
+        file_button,
         chat_button,
         minimize_button,
         maximize_button,
@@ -1233,6 +1329,7 @@ pub(super) unsafe fn create_window(
         context.chroma_combo = chroma_combo;
         context.diagnostics_button = diagnostics_button;
         context.settings_button = settings_button;
+        context.file_button = file_button;
         context.chat_button = chat_button;
         context.chat_popup = Some(unsafe {
             meshrmm_chat::ChatPopup::new(window, chat_button, context.control.chat())

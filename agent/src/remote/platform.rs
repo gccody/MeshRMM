@@ -44,6 +44,8 @@ pub trait ScreenStreamer: Send {
 }
 
 pub trait ScreenInput: Send + Sync {
+    fn apply_files(&self, message: meshrmm_protocol::FileMessage) -> anyhow::Result<()>;
+    fn poll_files(&self) -> Option<meshrmm_protocol::FileMessage>;
     fn apply(&self, input: RemoteInput) -> anyhow::Result<()>;
     fn release_all(&self) -> anyhow::Result<()>;
     fn cursor_shape(&self) -> CursorShape;
@@ -65,6 +67,7 @@ pub struct PlatformScreenStreamer {
     codec: Codec,
     chroma: ChromaMode,
     next_frame_id: Arc<AtomicU64>,
+    direct_files: Option<meshrmm_file_transfer::TransferSession>,
     direct_chat: meshrmm_chat::ChatSession,
     direct_input: Arc<Mutex<super::input::WindowsInputController>>,
     direct_clipboard: Option<Arc<Mutex<super::clipboard::ClipboardSync>>>,
@@ -80,8 +83,8 @@ impl PlatformScreenStreamer {
     ) -> Self {
         Self {
             inner: if capture_as_active_user {
-                CaptureBackend::Desktop(super::capture_helper::DesktopCaptureStreamer::new(
-                    viewer_name.clone(),
+                CaptureBackend::Desktop(Box::new(
+                    super::capture_helper::DesktopCaptureStreamer::new(viewer_name.clone()),
                 ))
             } else {
                 CaptureBackend::Direct(meshrmm_remote_screen::WindowsScreenStreamer::new())
@@ -93,6 +96,8 @@ impl PlatformScreenStreamer {
             codec: Codec::H264,
             chroma: ChromaMode::Yuv420,
             next_frame_id: Arc::new(AtomicU64::new(1)),
+            direct_files: (!capture_as_active_user)
+                .then(meshrmm_file_transfer::TransferSession::new),
             direct_chat: meshrmm_chat::ChatSession::with_peer("Viewer"),
             direct_input: Arc::new(Mutex::new(super::input::WindowsInputController::new())),
             // Service workers live in non-interactive Session 0. Their clipboard
@@ -144,6 +149,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
         match &mut self.inner {
             CaptureBackend::Direct(streamer) => {
                 let displays = enumerate_displays()?;
+                meshrmm_file_transfer::windows::set_displays(displays.clone());
                 let active_display = choose_display(&displays, requested_display_id)?;
                 self.direct_input
                     .lock()
@@ -252,6 +258,10 @@ impl ScreenStreamer for PlatformScreenStreamer {
         match &self.inner {
             CaptureBackend::Direct(_) => Arc::new(DirectInputController {
                 controller: Arc::clone(&self.direct_input),
+                files: self
+                    .direct_files
+                    .clone()
+                    .expect("direct input owns a transfer session"),
                 clipboard: self.direct_clipboard.clone(),
                 chat: self.direct_chat.clone(),
             }),
@@ -262,6 +272,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
 
 #[cfg(windows)]
 struct DirectInputController {
+    files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
     controller: Arc<Mutex<super::input::WindowsInputController>>,
     clipboard: Option<Arc<Mutex<super::clipboard::ClipboardSync>>>,
@@ -305,6 +316,13 @@ impl ScreenInput for DirectInputController {
             .map_or(CursorShape::Default, |input| input.cursor_shape())
     }
 
+    fn apply_files(&self, message: meshrmm_protocol::FileMessage) -> anyhow::Result<()> {
+        self.files.receive(message);
+        Ok(())
+    }
+    fn poll_files(&self) -> Option<meshrmm_protocol::FileMessage> {
+        self.files.poll()
+    }
     fn apply_clipboard(&self, text: String) -> anyhow::Result<()> {
         self.clipboard
             .as_ref()
@@ -327,7 +345,7 @@ impl ScreenInput for DirectInputController {
 #[cfg(windows)]
 enum CaptureBackend {
     Direct(meshrmm_remote_screen::WindowsScreenStreamer),
-    Desktop(super::capture_helper::DesktopCaptureStreamer),
+    Desktop(Box<super::capture_helper::DesktopCaptureStreamer>),
 }
 
 #[cfg(windows)]

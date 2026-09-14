@@ -94,6 +94,7 @@ pub enum SessionMessage {
     },
     /// Announces support for session chat; both peers must opt in.
     ChatAvailable,
+    FileTransfer(crate::FileMessage),
 }
 
 impl SessionMessage {
