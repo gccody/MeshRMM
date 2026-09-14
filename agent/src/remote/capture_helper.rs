@@ -89,6 +89,8 @@ impl DesktopTarget {
 }
 
 enum ParentCommand {
+    StartFiles,
+    Files(meshrmm_protocol::FileMessage),
     Start {
         viewer_name: String,
         display_id: Option<DisplayId>,
@@ -119,6 +121,7 @@ pub struct StartedDesktop {
 }
 
 enum ChildEvent {
+    Files(meshrmm_protocol::FileMessage),
     Started(StartedDesktop),
     InputStarted,
     Frame(EncodedAccessUnit),
@@ -131,6 +134,7 @@ enum ChildEvent {
 
 type HelperStatus = Arc<Mutex<Option<Result<(), String>>>>;
 type HelperCursor = Arc<Mutex<CursorShape>>;
+type HelperFiles = Arc<Mutex<std::collections::VecDeque<meshrmm_protocol::FileMessage>>>;
 type HelperChat = Arc<Mutex<std::collections::VecDeque<String>>>;
 type HelperClipboard = Arc<Mutex<Option<String>>>;
 type InputWriter = Arc<Mutex<BufWriter<File>>>;
@@ -143,10 +147,13 @@ pub struct DesktopCaptureStreamer {
     viewer_name: String,
     running: Option<RunningHelper>,
     input: Option<RunningInputHelper>,
+    file_helper: Option<RunningInputHelper>,
+    file_route: InputRoute,
     input_route: InputRoute,
     preferred_desktop: Option<DesktopTarget>,
     cursor: HelperCursor,
     clipboard: HelperClipboard,
+    files: HelperFiles,
     chat: HelperChat,
     chat_enabled: Arc<AtomicBool>,
 }
@@ -157,10 +164,13 @@ impl DesktopCaptureStreamer {
             viewer_name,
             running: None,
             input: None,
+            file_helper: None,
+            file_route: Arc::new(Mutex::new(None)),
             input_route: Arc::new(Mutex::new(None)),
             preferred_desktop: None,
             cursor: Arc::new(Mutex::new(CursorShape::Default)),
             clipboard: Arc::new(Mutex::new(None)),
+            files: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             chat: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             chat_enabled: Arc::new(AtomicBool::new(false)),
         }
@@ -361,8 +371,10 @@ impl DesktopCaptureStreamer {
     pub fn input_controller(&self) -> Arc<dyn ScreenInput> {
         Arc::new(DesktopInputController {
             route: Arc::clone(&self.input_route),
+            file_route: Arc::clone(&self.file_route),
             cursor: Arc::clone(&self.cursor),
             clipboard: Arc::clone(&self.clipboard),
+            files: Arc::clone(&self.files),
             chat: Arc::clone(&self.chat),
             chat_enabled: Arc::clone(&self.chat_enabled),
         })
@@ -415,6 +427,32 @@ impl DesktopCaptureStreamer {
         target: DesktopTarget,
         display_id: DisplayId,
     ) -> anyhow::Result<()> {
+        if self
+            .file_helper
+            .as_ref()
+            .is_none_or(|h| h.status.lock().unwrap().is_some())
+            || self.file_route.lock().unwrap().is_none()
+        {
+            self.stop_file_helper();
+            match start_input_helper(
+                &self.viewer_name,
+                DesktopTarget::Default,
+                display_id,
+                Arc::clone(&self.cursor),
+                Arc::clone(&self.clipboard),
+                Arc::clone(&self.files),
+                Arc::clone(&self.chat),
+                true,
+            ) {
+                Ok(helper) => {
+                    *self.file_route.lock().unwrap() = Some(Arc::clone(&helper.input));
+                    self.file_helper = Some(helper);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "file transfers require a signed-in interactive user")
+                }
+            }
+        }
         if let Some(helper) = self.input.as_mut()
             && helper.target == target
             && helper
@@ -448,7 +486,9 @@ impl DesktopCaptureStreamer {
             display_id,
             Arc::clone(&self.cursor),
             Arc::clone(&self.clipboard),
+            Arc::clone(&self.files),
             Arc::clone(&self.chat),
+            false,
         )?;
         *self
             .input_route
@@ -459,6 +499,18 @@ impl DesktopCaptureStreamer {
         }
         self.input = Some(helper);
         Ok(())
+    }
+
+    fn stop_file_helper(&mut self) {
+        *self.file_route.lock().unwrap() = None;
+        if let Some(mut helper) = self.file_helper.take() {
+            let _ = send_command(&helper.input, &ParentCommand::Stop);
+            if unsafe { WaitForSingleObject(helper.process.0, STOP_TIMEOUT_MS) } == WAIT_TIMEOUT {
+                terminate_and_wait(&helper.process);
+            }
+            helper.finish();
+        }
+        self.files.lock().unwrap().clear();
     }
 
     fn stop_input_helper(&mut self) {
@@ -490,6 +542,7 @@ impl Default for DesktopCaptureStreamer {
 
 impl Drop for DesktopCaptureStreamer {
     fn drop(&mut self) {
+        self.stop_file_helper();
         if let Err(error) = self.stop() {
             tracing::warn!(%error, "failed to stop desktop helper cleanly");
         }
@@ -521,15 +574,40 @@ struct RunningInputHelper {
 }
 
 struct DesktopInputController {
+    file_route: InputRoute,
     route: InputRoute,
     cursor: HelperCursor,
     clipboard: HelperClipboard,
+    files: HelperFiles,
     chat: HelperChat,
     chat_enabled: Arc<AtomicBool>,
 }
 
 impl ScreenInput for DesktopInputController {
+    fn apply_files(&self, message: meshrmm_protocol::FileMessage) -> anyhow::Result<()> {
+        let writer = self
+            .file_route
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .context("interactive file helper unavailable")?;
+        send_command(&writer, &ParentCommand::Files(message))?;
+        Ok(())
+    }
+    fn poll_files(&self) -> Option<meshrmm_protocol::FileMessage> {
+        self.files.lock().ok()?.pop_front()
+    }
+
     fn stop_chat(&self) {
+        if let Some(writer) = self
+            .file_route
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = send_command(&writer, &ParentCommand::Stop);
+        }
+
         self.chat_enabled.store(false, Ordering::Release);
         self.chat.lock().unwrap_or_else(|e| e.into_inner()).clear();
         if let Some(writer) = self.route.lock().unwrap_or_else(|e| e.into_inner()).clone() {
@@ -677,6 +755,9 @@ fn preferred_desktop() -> DesktopTarget {
 }
 
 fn launch_system_helper(target: DesktopTarget) -> anyhow::Result<LaunchedHelper> {
+    launch_helper(target, false)
+}
+fn launch_helper(target: DesktopTarget, as_user: bool) -> anyhow::Result<LaunchedHelper> {
     let executable = std::env::current_exe().context("could not locate the Agent executable")?;
     let working_directory = executable
         .parent()
@@ -685,33 +766,41 @@ fn launch_system_helper(target: DesktopTarget) -> anyhow::Result<LaunchedHelper>
     if session_id == NO_ACTIVE_SESSION {
         anyhow::bail!("Windows reported no active console session");
     }
-    let mut process_token = HANDLE::default();
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut process_token) }
-        .context("failed to open the LocalSystem coordinator token")?;
-    let process_token = OwnedHandle(process_token);
-    let mut session_token = HANDLE::default();
-    unsafe {
-        DuplicateTokenEx(
-            process_token.0,
-            TOKEN_ALL_ACCESS,
-            None,
-            SecurityImpersonation,
-            TokenPrimary,
-            &mut session_token,
-        )
-    }
-    .context("failed to duplicate the LocalSystem coordinator token")?;
-    let session_token = OwnedHandle(session_token);
-    unsafe {
-        SetTokenInformation(
-            session_token.0,
-            TokenSessionId,
-            (&session_id as *const u32).cast(),
-            std::mem::size_of::<u32>() as u32,
-        )
-    }
-    .context("failed to move the desktop helper token into the console session")?;
+    let session_token = if as_user {
+        let mut token = HANDLE::default();
+        unsafe { WTSQueryUserToken(session_id, &mut token) }
+            .context("no signed-in user for file transfers")?;
+        OwnedHandle(token)
+    } else {
+        let mut process_token = HANDLE::default();
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut process_token) }
+            .context("failed to open the LocalSystem coordinator token")?;
+        let process_token = OwnedHandle(process_token);
+        let mut session_token = HANDLE::default();
+        unsafe {
+            DuplicateTokenEx(
+                process_token.0,
+                TOKEN_ALL_ACCESS,
+                None,
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut session_token,
+            )
+        }
+        .context("failed to duplicate the LocalSystem coordinator token")?;
+        let session_token = OwnedHandle(session_token);
+        unsafe {
+            SetTokenInformation(
+                session_token.0,
+                TokenSessionId,
+                (&session_id as *const u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+            )
+        }
+        .context("failed to move the desktop helper token into the console session")?;
 
+        session_token
+    };
     let (child_input, parent_input) = create_inherited_pipe(false)?;
     let (parent_output, child_output) = create_inherited_pipe(true)?;
     let (parent_stderr, child_stderr) = create_inherited_pipe(true)?;
@@ -731,8 +820,18 @@ fn launch_system_helper(target: DesktopTarget) -> anyhow::Result<LaunchedHelper>
         hStdError: child_stderr.0,
         ..Default::default()
     };
+    let mut environment = std::ptr::null_mut();
+    if as_user {
+        unsafe {
+            windows::Win32::System::Environment::CreateEnvironmentBlock(
+                &mut environment,
+                Some(session_token.0),
+                false,
+            )
+        }?;
+    }
     let mut process_info = PROCESS_INFORMATION::default();
-    unsafe {
+    let launched = unsafe {
         CreateProcessAsUserW(
             Some(session_token.0),
             PCWSTR(executable_wide.as_ptr()),
@@ -740,14 +839,18 @@ fn launch_system_helper(target: DesktopTarget) -> anyhow::Result<LaunchedHelper>
             None,
             None,
             true,
-            CREATE_NO_WINDOW,
-            None,
+            CREATE_NO_WINDOW | windows::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT,
+            (!environment.is_null()).then_some(environment.cast_const()),
             PCWSTR(working_directory_wide.as_ptr()),
             &startup,
             &mut process_info,
         )
+    };
+    if !environment.is_null() {
+        let _ =
+            unsafe { windows::Win32::System::Environment::DestroyEnvironmentBlock(environment) };
     }
-    .with_context(|| {
+    launched.with_context(|| {
         format!(
             "failed to launch LocalSystem helper on winsta0\\{}",
             target.name()
@@ -767,15 +870,19 @@ fn launch_system_helper(target: DesktopTarget) -> anyhow::Result<LaunchedHelper>
     })
 }
 
+// Parameters mirror the input/file helper startup IPC payload.
+#[allow(clippy::too_many_arguments)]
 fn start_input_helper(
     viewer_name: &str,
     target: DesktopTarget,
     display_id: DisplayId,
     cursor: HelperCursor,
     clipboard: HelperClipboard,
+    files: HelperFiles,
     chat: HelperChat,
+    files_only: bool,
 ) -> anyhow::Result<RunningInputHelper> {
-    let launched = launch_system_helper(target)?;
+    let launched = launch_helper(target, files_only)?;
     let status: HelperStatus = Arc::new(Mutex::new(None));
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let reader_status = Arc::clone(&status);
@@ -788,6 +895,7 @@ fn start_input_helper(
                 reader_status,
                 cursor,
                 clipboard,
+                files,
                 chat,
             )
         })
@@ -799,9 +907,13 @@ fn start_input_helper(
     let input = Arc::new(Mutex::new(BufWriter::new(launched.input)));
     if let Err(error) = send_command(
         &input,
-        &ParentCommand::StartInput {
-            display_id,
-            viewer_name: viewer_name.to_owned(),
+        &if files_only {
+            ParentCommand::StartFiles
+        } else {
+            ParentCommand::StartInput {
+                display_id,
+                viewer_name: viewer_name.to_owned(),
+            }
         },
     ) {
         terminate_and_wait(&launched.process);
@@ -900,7 +1012,7 @@ fn dispatch_child_events(
             Ok(ChildEvent::Cursor(shape)) => {
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) = shape;
             }
-            Ok(ChildEvent::Clipboard(_) | ChildEvent::Chat(_)) => {
+            Ok(ChildEvent::Files(_) | ChildEvent::Clipboard(_) | ChildEvent::Chat(_)) => {
                 set_status(
                     &status,
                     Err("capture helper reported an input-only clipboard event".into()),
@@ -933,6 +1045,7 @@ fn dispatch_input_events(
     status: HelperStatus,
     cursor: HelperCursor,
     clipboard: HelperClipboard,
+    files: HelperFiles,
     chat: HelperChat,
 ) {
     let mut output = BufReader::new(output);
@@ -952,6 +1065,12 @@ fn dispatch_input_events(
             }
             Ok(ChildEvent::Cursor(shape)) => {
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) = shape;
+            }
+            Ok(ChildEvent::Files(message)) => {
+                let mut queue = files.lock().unwrap();
+                if queue.len() < 32 {
+                    queue.push_back(message);
+                }
             }
             Ok(ChildEvent::Chat(text)) => {
                 let mut chat = chat.lock().unwrap_or_else(|e| e.into_inner());
@@ -1079,6 +1198,7 @@ pub fn run_child() -> anyhow::Result<()> {
             codec,
             pixel_format,
         ),
+        ParentCommand::StartFiles => run_file_child(command_rx),
         ParentCommand::StartInput {
             display_id,
             viewer_name,
@@ -1189,10 +1309,12 @@ fn run_capture_child(
                     continue 'capture;
                 }
                 Ok(Ok(
-                    ParentCommand::StartInput { .. }
+                    ParentCommand::StartFiles
+                    | ParentCommand::StartInput { .. }
                     | ParentCommand::Input(_)
                     | ParentCommand::ReleaseInput
                     | ParentCommand::Clipboard(_)
+                    | ParentCommand::Files(_)
                     | ParentCommand::Chat(_)
                     | ParentCommand::StartChat
                     | ParentCommand::StopChat,
@@ -1281,6 +1403,7 @@ fn run_input_child(
             Ok(Ok(ParentCommand::StartChat)) => {
                 chat.set_available(true);
             }
+
             Ok(Ok(ParentCommand::Chat(text))) => {
                 if chat.available() {
                     chat.receive(text);
@@ -1361,6 +1484,11 @@ fn emit_child_event(
 
 fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<()> {
     match command {
+        ParentCommand::StartFiles => writer.write_all(&[13]),
+        ParentCommand::Files(message) => {
+            writer.write_all(&[12])?;
+            write_file_message(&mut writer, message)
+        }
         ParentCommand::Start {
             viewer_name,
             display_id,
@@ -1509,6 +1637,8 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
                 Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
             }
         }
+        13 => Ok(ParentCommand::StartFiles),
+        12 => Ok(ParentCommand::Files(read_file_message(&mut reader)?)),
         COMMAND_STOP_CHAT => Ok(ParentCommand::StopChat),
         COMMAND_START_CHAT => Ok(ParentCommand::StartChat),
         COMMAND_CHAT => {
@@ -1539,6 +1669,10 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
 
 fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
     match event {
+        ChildEvent::Files(message) => {
+            writer.write_all(&[9])?;
+            write_file_message(&mut writer, message)
+        }
         ChildEvent::Started(started) => {
             writer.write_all(&[EVENT_STARTED])?;
             write_u32(&mut writer, started.format.width)?;
@@ -1712,6 +1846,7 @@ fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
                 Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
             }
         }
+        9 => Ok(ChildEvent::Files(read_file_message(&mut reader)?)),
         EVENT_CHAT => {
             let length = bounded_len(
                 read_u32(&mut reader)?,
@@ -2113,6 +2248,8 @@ mod tests {
             ParentCommand::Input(_) => COMMAND_INPUT,
             ParentCommand::ReleaseInput => COMMAND_RELEASE_INPUT,
             ParentCommand::Clipboard(_) => COMMAND_CLIPBOARD,
+            ParentCommand::StartFiles => 13,
+            ParentCommand::Files(_) => 12,
             ParentCommand::Chat(_) => COMMAND_CHAT,
             ParentCommand::StartChat => COMMAND_START_CHAT,
             ParentCommand::StopChat => COMMAND_STOP_CHAT,
@@ -2157,4 +2294,46 @@ mod chat_tests {
             matches!(read_event(command.as_slice()), Err(e) if e.kind() == io::ErrorKind::InvalidData)
         );
     }
+}
+
+fn write_file_message(
+    mut writer: impl Write,
+    message: &meshrmm_protocol::FileMessage,
+) -> io::Result<()> {
+    let bytes = SessionMessage::FileTransfer(message.clone())
+        .encode()
+        .map_err(io::Error::other)?;
+    checked_len(bytes.len(), MAX_CONTROL_BYTES, "file transfer")?;
+    write_u32(&mut writer, bytes.len() as u32)?;
+    writer.write_all(&bytes)
+}
+fn read_file_message(mut reader: impl Read) -> io::Result<meshrmm_protocol::FileMessage> {
+    let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "file transfer")?;
+    let mut bytes = vec![0; length];
+    reader.read_exact(&mut bytes)?;
+    match SessionMessage::decode(&bytes).map_err(io::Error::other)? {
+        SessionMessage::FileTransfer(message) => Ok(message),
+        _ => Err(io::Error::other("invalid file transfer packet")),
+    }
+}
+
+fn run_file_child(commands: mpsc::Receiver<io::Result<ParentCommand>>) -> anyhow::Result<()> {
+    meshrmm_file_transfer::windows::set_displays(enumerate_displays()?);
+    meshrmm_file_transfer::TransferSession::run_on_current_thread(move |files| {
+        let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+        emit_child_event(&output, ChildEvent::InputStarted)?;
+        loop {
+            match commands.recv_timeout(Duration::from_millis(5)) {
+                Ok(Ok(ParentCommand::Files(message))) => files.receive(message),
+                Ok(Ok(ParentCommand::Stop)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                _ => anyhow::bail!("file helper received an unexpected command"),
+            }
+            if let Some(message) = files.poll() {
+                emit_child_event(&output, ChildEvent::Files(message))?;
+            }
+        }
+        emit_child_event(&output, ChildEvent::Stopped)?;
+        Ok(())
+    })
 }

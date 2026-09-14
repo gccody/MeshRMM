@@ -1689,6 +1689,7 @@ dependencies = [
  "clap",
  "futures-util",
  "meshrmm-chat",
+ "meshrmm-file-transfer",
  "meshrmm-protocol",
  "meshrmm-remote-screen",
  "meshrmm-self-update",
@@ -1722,6 +1723,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "meshrmm-file-transfer"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "dispatch2",
+ "meshrmm-protocol",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "sha2 0.10.9",
+ "tracing",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "meshrmm-protocol"
 version = "0.2.0"
 dependencies = [
@@ -1751,6 +1768,7 @@ dependencies = [
  "futures-util",
  "libc",
  "meshrmm-chat",
+ "meshrmm-file-transfer",
  "meshrmm-protocol",
  "meshrmm-self-update",
  "meshrmm-signaling-client",

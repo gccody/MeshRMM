@@ -11,6 +11,7 @@ use std::sync::Mutex;
 /// with the native window's foreground state.
 #[derive(Clone)]
 pub struct ControlSink {
+    files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
     send: Arc<dyn Fn(meshrmm_protocol::SessionMessage) + Send + Sync>,
     set_input_enabled: Arc<dyn Fn(bool) + Send + Sync>,
@@ -22,6 +23,7 @@ pub struct ControlSink {
 
 impl ControlSink {
     pub fn new(
+        files: meshrmm_file_transfer::TransferSession,
         send: impl Fn(meshrmm_protocol::SessionMessage) + Send + Sync + 'static,
         set_input_enabled: impl Fn(bool) + Send + Sync + 'static,
         chat: meshrmm_chat::ChatSession,
@@ -30,6 +32,7 @@ impl ControlSink {
         #[cfg(windows)] profiles: Arc<Vec<meshrmm_protocol::VideoProfile>>,
     ) -> Self {
         Self {
+            files,
             chat,
             send: Arc::new(send),
             set_input_enabled: Arc::new(set_input_enabled),
@@ -52,6 +55,10 @@ impl ControlSink {
             *chroma = *mode;
         }
         (self.send)(message);
+    }
+
+    pub fn files(&self) -> meshrmm_file_transfer::TransferSession {
+        self.files.clone()
     }
 
     pub fn chat(&self) -> meshrmm_chat::ChatSession {

@@ -167,6 +167,7 @@ impl VideoReceiveState {
 /// of stale pointer positions on the reliable control stream.
 #[derive(Clone)]
 struct ViewerControlQueue {
+    files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
     outgoing: mpsc::UnboundedSender<SessionMessage>,
     input: Arc<Mutex<ViewerInputState>>,
@@ -185,6 +186,7 @@ impl ViewerControlQueue {
         resume_state: ViewerResumeState,
     ) -> Self {
         Self {
+            files: meshrmm_file_transfer::TransferSession::new(),
             chat: meshrmm_chat::ChatSession::default(),
             outgoing,
             input: Arc::new(Mutex::new(ViewerInputState {
@@ -335,6 +337,7 @@ pub async fn run_receiver(
             None
         }
     };
+    let mut file_interval = tokio::time::interval(std::time::Duration::from_millis(5));
     let mut clipboard_interval = tokio::time::interval(CLIPBOARD_POLL_INTERVAL);
     clipboard_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut remote_description_set = false;
@@ -362,7 +365,12 @@ pub async fn run_receiver(
                 channel.send(&Bytes::from(bytes)).await
                     .context("failed to send viewer control message")?;
             }
+            _ = file_interval.tick(), if session_state == SessionState::Streaming => {
+                let channel_open = control_channel.lock().ok().and_then(|c| c.clone()).is_some_and(|c| c.ready_state() == RTCDataChannelState::Open);
+                if channel_open && let Some(message) = viewer_control.files.poll() { viewer_control.send(SessionMessage::FileTransfer(message)); }
+            }
             Some(message) = remote_text_rx.recv() => {
+                if let SessionMessage::FileTransfer(message) = message { viewer_control.files.receive(message); continue; }
                 if message == SessionMessage::ChatAvailable {
                     chat.set_available(true);
                     continue;
@@ -884,6 +892,7 @@ fn install_control_handler(
                                 && displays.iter().any(|display| display.id == *selected)
                         });
                     let sink = ControlSink::new(
+                        viewer_control.files.clone(),
                         move |message| message_queue.send(message),
                         move |enabled| input_gate.set_input_enabled(enabled),
                         viewer_control.chat.clone(),
@@ -1038,7 +1047,7 @@ fn install_control_handler(
                         active.presenter.set_cursor_shape(shape);
                     }
                 }
-                Ok(message @ (SessionMessage::Clipboard { .. } | SessionMessage::Chat { .. } | SessionMessage::ChatAvailable)) => {
+                Ok(message @ (SessionMessage::FileTransfer(_) | SessionMessage::Clipboard { .. } | SessionMessage::Chat { .. } | SessionMessage::ChatAvailable)) => {
                     let _ = remote_text.send(message).await;
                 }
                 Ok(_) => {}

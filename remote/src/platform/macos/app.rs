@@ -1,4 +1,8 @@
 use super::*;
+use objc2_app_kit::{
+    NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSMenu, NSMenuItem,
+    NSPasteboardTypeFileURL,
+};
 
 struct AppDelegateIvars {
     deep_link_tx: Sender<String>,
@@ -129,6 +133,35 @@ define_class!(
 
     unsafe impl NSObjectProtocol for RemoteView {}
 
+    unsafe impl NSDraggingDestination for RemoteView {
+        #[unsafe(method(draggingEntered:))]
+        fn dragging_entered(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            let paths = meshrmm_file_transfer::macos::paths_from_pasteboard(&sender.draggingPasteboard());
+            tracing::info!(files = paths.len(), "native file drag entered viewer");
+            if paths.is_empty() { NSDragOperation::None } else { NSDragOperation::Copy }
+        }
+        #[unsafe(method(draggingUpdated:))]
+        fn dragging_updated(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            if meshrmm_file_transfer::macos::paths_from_pasteboard(&sender.draggingPasteboard()).is_empty() { NSDragOperation::None } else { NSDragOperation::Copy }
+        }
+        #[unsafe(method(prepareForDragOperation:))]
+        fn prepare_drag(&self, _sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool { true }
+        #[unsafe(method(performDragOperation:))]
+        fn perform_drag(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+            let paths = meshrmm_file_transfer::macos::paths_from_pasteboard(&sender.draggingPasteboard());
+            if paths.is_empty() { false } else {
+            tracing::info!(files = paths.len(), "native file dropped on viewer");
+            let point = self.convertPoint_fromView(sender.draggingLocation(), None);
+            let mut bounds = self.bounds(); bounds.size.height = (bounds.size.height - VIEWER_TOOLBAR_HEIGHT).max(1.0);
+            let destination = normalized_video_position(point, bounds, self.ivars().video_width.get(), self.ivars().video_height.get())
+                .map(|(x,y)| meshrmm_protocol::FileDestination::Drop { display_id: self.ivars().active_display.borrow().id, x, y })
+                .unwrap_or(meshrmm_protocol::FileDestination::Documents);
+            self.release_input();
+            self.ivars().control.files().send(paths, destination); true
+            }
+        }
+    }
+
     unsafe impl NSWindowDelegate for RemoteView {
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _notification: &NSNotification) {
@@ -239,6 +272,7 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            self.sync_modifiers(event.modifierFlags());
             if event.keyCode() == 111 {
                 if !event.isARepeat() {
                     self.toggle_debug();
@@ -246,6 +280,10 @@ define_class!(
                 return;
             }
             let modifiers = event.modifierFlags();
+            if event.keyCode() == 9 && (modifiers.contains(NSEventModifierFlags::Control) || modifiers.contains(NSEventModifierFlags::Command))
+                && self.ivars().control.files().paste_files(self.ivars().active_display.borrow().id) {
+                self.release_input(); return;
+            }
             if modifiers.contains(NSEventModifierFlags::Control)
                 && modifiers.contains(NSEventModifierFlags::Option)
                 && matches!(event.keyCode(), 123 | 124)
@@ -258,6 +296,7 @@ define_class!(
 
         #[unsafe(method(keyUp:))]
         fn key_up(&self, event: &NSEvent) {
+            self.sync_modifiers(event.modifierFlags());
             if event.keyCode() == 111 {
                 return;
             }
@@ -311,6 +350,28 @@ define_class!(
                 );
             }
         }
+
+        #[unsafe(method(showFiles:))]
+        fn show_files(&self, sender: &NSButton) {
+            self.disable_input();
+            let menu = NSMenu::new(self.mtm());
+            for (title, action) in [("Send", sel!(sendFiles:)), ("Receive", sel!(receiveFiles:))] {
+                let item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(self.mtm()), &NSString::from_str(title), Some(action), &NSString::new()) };
+                unsafe { item.setTarget(Some(self)); } menu.addItem(&item);
+            }
+            let status = self.ivars().control.files().status();
+            if !status.is_empty() {
+                menu.addItem(&NSMenuItem::separatorItem(self.mtm()));
+                let item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(self.mtm()), &NSString::from_str(&status), None, &NSString::new()) };
+                item.setEnabled(false); menu.addItem(&item);
+            }
+            menu.popUpMenuPositioningItem_atLocation_inView(None, NSPoint::new(0., 0.), Some(sender));
+            self.ivars().control.set_input_enabled(true);
+        }
+        #[unsafe(method(sendFiles:))]
+        fn send_files(&self, _: &NSMenuItem) { self.ivars().control.files().pick(); }
+        #[unsafe(method(receiveFiles:))]
+        fn receive_files(&self, _: &NSMenuItem) { self.send(SessionMessage::FileTransfer(meshrmm_protocol::FileMessage::Pick)); }
 
         #[unsafe(method(toggleChat:))]
         fn toggle_chat_action(&self, _sender: &NSButton) {
@@ -530,6 +591,20 @@ impl RemoteView {
             },
         });
         toolbar.addSubview(&diagnostics);
+        self.registerForDraggedTypes(&NSArray::from_slice(&[unsafe { NSPasteboardTypeFileURL }]));
+        let file_button = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("📁"),
+                Some(self),
+                Some(sel!(showFiles:)),
+                self.mtm(),
+            )
+        };
+        file_button.setFrame(NSRect::new(NSPoint::new(512., 6.), NSSize::new(40., 24.)));
+        file_button.setToolTip(Some(&NSString::from_str(
+            "Send or receive files and folders",
+        )));
+        toolbar.addSubview(&file_button);
         let chat_button = unsafe {
             NSButton::buttonWithTitle_target_action(
                 &NSString::from_str("Chat"),
@@ -615,6 +690,28 @@ impl RemoteView {
             }
         } else {
             buttons.retain(|candidate| *candidate != button);
+        }
+    }
+
+    fn sync_modifiers(&self, flags: NSEventModifierFlags) {
+        for (left, right, flag) in [
+            (59, 62, NSEventModifierFlags::Control),
+            (56, 60, NSEventModifierFlags::Shift),
+            (58, 61, NSEventModifierFlags::Option),
+            (55, 54, NSEventModifierFlags::Command),
+        ] {
+            let left_scan = mac_key_to_windows_scan_code(left).unwrap();
+            let right_scan = mac_key_to_windows_scan_code(right).unwrap();
+            let keys = self.ivars().pressed_keys.borrow();
+            let held = keys.contains(&left_scan) || keys.contains(&right_scan);
+            drop(keys);
+            if flags.contains(flag) && !held {
+                self.send_key(left, true);
+            }
+            if !flags.contains(flag) && held {
+                self.send_key(left, false);
+                self.send_key(right, false);
+            }
         }
     }
 

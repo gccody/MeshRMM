@@ -12,3 +12,6 @@ pub use session::*;
 pub use video::*;
 
 pub const PROTOCOL_VERSION: u16 = 3;
+
+mod files;
+pub use files::*;

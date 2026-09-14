@@ -39,6 +39,11 @@ impl ClipboardSync {
     }
 
     pub fn poll(&mut self) -> anyhow::Result<Option<String>> {
+        if meshrmm_file_transfer::clipboard_has_files() {
+            self.initialized = true;
+            self.last_fingerprint = None;
+            return Ok(None);
+        }
         let text = match self.clipboard.get_text() {
             Ok(text) => text,
             Err(arboard::Error::ContentNotAvailable) => {
@@ -61,6 +66,7 @@ impl ClipboardSync {
     }
 
     pub fn apply(&mut self, text: String) -> anyhow::Result<()> {
+        tracing::info!(bytes = text.len(), "applying peer text clipboard");
         validate_text(&text)?;
         let fingerprint = ClipboardFingerprint::of(&text);
         if self.last_fingerprint == Some(fingerprint) {

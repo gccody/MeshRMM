@@ -58,6 +58,7 @@ impl Drop for SenderCleanup {
 }
 
 enum ControlCommand {
+    Files(meshrmm_protocol::FileMessage),
     Keyframe,
     Bitrate(u32),
     ViewerCapabilities {
@@ -379,6 +380,9 @@ async fn run_connected_sender(
                         None
                     }
                     Ok(SessionMessage::Clipboard { text }) => Some(ControlCommand::Clipboard(text)),
+                    Ok(SessionMessage::FileTransfer(message)) => {
+                        Some(ControlCommand::Files(message))
+                    }
                     Ok(SessionMessage::ChatAvailable) => Some(ControlCommand::ChatAvailable),
                     Ok(SessionMessage::Chat { text }) => Some(ControlCommand::Chat(text)),
                     Ok(SessionMessage::Stop { .. }) => Some(ControlCommand::Stop),
@@ -447,6 +451,7 @@ async fn run_connected_sender(
     desktop_interval.tick().await;
     let mut cursor_interval = tokio::time::interval(std::time::Duration::from_millis(16));
     cursor_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut file_interval = tokio::time::interval(std::time::Duration::from_millis(5));
     let mut clipboard_interval = tokio::time::interval(std::time::Duration::from_millis(250));
     clipboard_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut sent_cursor_shape = None::<CursorShape>;
@@ -518,6 +523,9 @@ async fn run_connected_sender(
                 }
                 signal_writer.send(Message::Ping(Default::default())).await
                     .context("failed to send signaling heartbeat")?;
+            }
+            _ = file_interval.tick(), if session_state == SessionState::Streaming && control_channel.ready_state() == RTCDataChannelState::Open => {
+                if let Some(message) = input.poll_files() { send_control_message(&control_channel, SessionMessage::FileTransfer(message)).await?; }
             }
             Some(command) = control_rx.recv() => {
                 match command {
@@ -686,6 +694,7 @@ async fn run_connected_sender(
                             },
                         ).await?;
                     }
+                    ControlCommand::Files(message) => { if let Err(error) = input.apply_files(message) { tracing::warn!(%error, "file transfer helper unavailable"); } }
                     ControlCommand::ChatAvailable => {
                         input.start_chat()?;
                         send_control_message(&control_channel, SessionMessage::ChatAvailable).await?;

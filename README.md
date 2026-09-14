@@ -328,7 +328,24 @@ plain-text clipboard updates over the reliable control channel. The viewer's
 current text clipboard is copied to the Agent when the session connects; later
 text copies on either computer are mirrored within 250 ms. Clipboard payloads
 are capped at 60 KiB to stay within the control channel's message limit, and
-rich text, images, and file lists remain local.
+rich text and images remain local.
+
+The **folder icon** offers **Send** and **Receive** using native multi-file/folder
+pickers on the source computer. Transfers preserve nested and empty folders and
+land in the signed-in user’s `Documents/MeshRMM Transferred Files` folder.
+Existing names are preserved by assigning a unique name to incoming duplicates.
+Drag files from Finder or Explorer onto the remote view to deliver a native
+Windows drop at that position (Explorer, desktop, or a browser drop target);
+if the target declines the drop, files go to the same Documents folder.
+File clipboard changes also synchronize in both directions. Copy files/folders
+in Finder or Explorer, then paste into the destination folder or desktop.
+The receiver publishes files after all chunks and SHA-256 checks complete;
+a remote paste shortcut waits for the transfer before pasting.
+Files use bounded, acknowledged chunks over the encrypted reliable channel.
+The Windows file helper runs as the signed-in user, separately from the
+privileged capture/input helper, so pickers and shell actions use that user’s
+profile. Both endpoints must run a file-transfer-capable build.
+
 When both computers run a chat-capable version, click the **chat bubble** in the
 viewer's top bar or the Windows agent's connection banner to open an attached
 chat popup. The banner keeps its chat button when collapsed. Type a message and
@@ -412,7 +429,7 @@ above; do not infer performance measurements from a successful build.
 
 The Agent/capture implementation remains Windows-only; the viewer supports
 Windows and macOS. The selected display and captured cursor are streamed.
-Clipboard synchronization is plain text only; there is no audio, file transfer,
+Clipboard synchronization supports plain text and files/folders; there is no audio,
 recording, browser client, or concurrent
 viewer. Windows secure-attention sequences
 such as Ctrl+Alt+Delete cannot be synthesized by a normal user-mode Agent. H.265
