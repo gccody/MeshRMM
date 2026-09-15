@@ -67,7 +67,6 @@ enum ControlCommand {
         reason: String,
     },
     SelectDisplay(DisplayId),
-    Clipboard(SessionMessage),
     Chat(String),
     ChatAvailable,
     ChannelClosed,
@@ -337,6 +336,8 @@ async fn run_connected_sender(
         },
     )?;
     cleanup.workers.push(maintenance_task);
+    let (clipboard_tx, clipboard_task) = spawn_clipboard_worker(Arc::clone(&input), Arc::clone(&control_channel))?;
+    cleanup.workers.push(clipboard_task);
     {
         let notify = Arc::clone(&control_open);
         let decoder_ready = Arc::clone(&decoder_ready);
@@ -353,11 +354,13 @@ async fn run_connected_sender(
         }));
         let control_messages_tx = control_tx.clone();
         let input_tx = input_tx.clone();
+        let clipboard_tx = clipboard_tx.clone();
         let maintenance_tx = maintenance_tx.clone();
         control_channel.on_message(Box::new(move |message| {
             let tx = control_messages_tx.clone();
             let decoder_ready = Arc::clone(&decoder_ready);
             let input_tx = input_tx.clone();
+            let clipboard_tx = clipboard_tx.clone();
             let maintenance_tx = maintenance_tx.clone();
             Box::pin(async move {
                 let command = match SessionMessage::decode(&message.data) {
@@ -402,7 +405,9 @@ async fn run_connected_sender(
                     Ok(
                         message @ (SessionMessage::Clipboard { .. }
                         | SessionMessage::ClipboardChunk { .. }),
-                    ) => Some(ControlCommand::Clipboard(message)),
+                    ) => {
+                        clipboard_tx.try_send(message).err().map(|_| ControlCommand::MaintenanceError("clipboard queue full or closed".into()))
+                    },
                     Ok(SessionMessage::FileTransfer(message)) => {
                         Some(ControlCommand::Files(message))
                     }
@@ -472,8 +477,6 @@ async fn run_connected_sender(
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     stats_interval.tick().await;
     let mut file_interval = tokio::time::interval(std::time::Duration::from_millis(5));
-    let mut clipboard_outgoing = std::collections::VecDeque::<SessionMessage>::new();
-    let mut clipboard_receiver = meshrmm_protocol::ClipboardReceiver::default();
     let mut clipboard_interval = tokio::time::interval(std::time::Duration::from_millis(250));
     clipboard_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut offer_sent = false;
@@ -533,8 +536,6 @@ async fn run_connected_sender(
             }
             _ = file_interval.tick(), if session_state == SessionState::Streaming && control_channel.ready_state() == RTCDataChannelState::Open => {
                 if let Some(message) = input.poll_files() { send_control_message(&control_channel, SessionMessage::FileTransfer(message)).await?; }
-                if control_channel.buffered_amount().await < 256 * 1024
-                    && let Some(message) = clipboard_outgoing.pop_front() { send_control_message(&control_channel, message).await?; }
             }
             Some(command) = control_rx.recv() => {
                 match command {
@@ -557,16 +558,6 @@ async fn run_connected_sender(
                             tracing::warn!(%error, "could not display chat message");
                         }
                     }
-                    ControlCommand::Clipboard(message) => {
-                        let content = match clipboard_receiver.receive(message) {
-                            Ok(Some(content)) => { clipboard_outgoing.clear(); content },
-                            Ok(None) => continue,
-                            Err(error) => { tracing::warn!(%error, "invalid clipboard payload"); continue; }
-                        };
-                        if let Err(error) = input.apply_clipboard(content) {
-                            tracing::warn!(error = %error, "discarding viewer clipboard update");
-                        }
-                    }
                     ControlCommand::Stop => break Ok(()),
                     ControlCommand::ChannelClosed => {
                         // The viewer closes its old channels before resuming the
@@ -582,13 +573,6 @@ async fn run_connected_sender(
                 && control_channel.ready_state() == RTCDataChannelState::Open => {
                 if let Some(text) = input.poll_chat()? {
                     send_control_message(&control_channel, SessionMessage::Chat { text }).await?;
-                }
-                match input.poll_clipboard() {
-                    Ok(Some(text)) => {
-                        clipboard_outgoing = text.messages()?.into();
-                    }
-                    Ok(None) => {}
-                    Err(error) => tracing::warn!(error = %error, "could not synchronize the Agent clipboard"),
                 }
             }
             Some(state) = state_rx.recv() => {
@@ -660,6 +644,54 @@ async fn run_connected_sender(
     result
 }
 
+fn spawn_clipboard_worker(
+    input: Arc<dyn super::platform::ScreenInput>,
+    channel: Arc<RTCDataChannel>,
+) -> anyhow::Result<(mpsc::Sender<SessionMessage>, super::native_task::NativeTask)> {
+    let (sender, mut commands) = mpsc::channel(64);
+    let task = super::native_task::NativeTask::spawn("meshrmm-clipboard", move |mut stop| async move {
+        let mut receiver = meshrmm_protocol::ClipboardReceiver::default();
+        let mut outgoing = std::collections::VecDeque::new();
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
+        let mut drain = tokio::time::interval(std::time::Duration::from_millis(5));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        drain.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if *stop.borrow() { break; }
+            tokio::select! {
+                _ = stop.changed() => break,
+                message = commands.recv() => {
+                    let Some(message) = message else { break; };
+                    match receiver.receive(message) {
+                        Ok(Some(content)) => {
+                            outgoing.clear();
+                            if let Err(error) = input.apply_clipboard(content) { tracing::warn!(%error, "clipboard apply failed"); }
+                        }
+                        Ok(None) => {},
+                        Err(error) => tracing::warn!(%error, "invalid clipboard payload"),
+                    }
+                }
+                _ = poll.tick(), if channel.ready_state() == RTCDataChannelState::Open => {
+                    match input.poll_clipboard().and_then(|content| Ok(content.map(|c| c.messages()).transpose()?)) {
+                        Ok(Some(messages)) => outgoing = messages.into(),
+                        Ok(None) => {},
+                        Err(error) => tracing::warn!(%error, "clipboard poll failed"),
+                    }
+                }
+                _ = drain.tick(), if channel.ready_state() == RTCDataChannelState::Open && !outgoing.is_empty() => {
+                    if channel.buffered_amount().await < 64 * 1024
+                        && let Some(message) = outgoing.pop_front()
+                        && let Err(error) = send_control_message(&channel, message).await {
+                            tracing::warn!(%error, "clipboard send failed");
+                            break;
+                        }
+                }
+            }
+        }
+    })?;
+    Ok((sender, task))
+}
+
 fn spawn_input_worker(
     input: Arc<dyn super::platform::ScreenInput>,
     channel: Arc<RTCDataChannel>,
@@ -667,6 +699,7 @@ fn spawn_input_worker(
 ) -> anyhow::Result<(mpsc::Sender<meshrmm_protocol::RemoteInput>, super::native_task::NativeTask)> {
     let cleanup_input = Arc::clone(&input);
     let status_channel = Arc::clone(&channel);
+    let input_errors = errors.clone();
     let (updates, mut pending) = mpsc::channel(8);
     // This task owns no native resources; dropping the worker closes its queue.
     tokio::spawn(async move {
@@ -683,7 +716,10 @@ fn spawn_input_worker(
     Ok(super::native_task::command_worker("meshrmm-input", 1024,
         std::time::Duration::from_millis(16), move |event| {
             if let Some(event) = event {
-                if let Err(error) = input.apply(event) { tracing::warn!(%error, "remote input failed"); }
+                if let Err(error) = input.apply(event) {
+                    tracing::warn!(%error, "remote input failed; releasing session input");
+                    let _ = input_errors.send(ControlCommand::Stop);
+                }
             } else if status_channel.ready_state() == RTCDataChannelState::Open {
                 let shape = input.cursor_shape();
                 if cursor != Some(shape) && updates.try_send(SessionMessage::CursorShape { shape }).is_ok() { cursor = Some(shape); }
