@@ -93,3 +93,101 @@ mod tests {
         cleanup.await.unwrap();
     }
 }
+
+/// Serializes commands for one native service without blocking its caller.
+/// Queues are bounded; callers must handle overload explicitly. Cancellation
+/// discards pending commands before running cleanup (especially key releases).
+pub fn command_worker<T, F, C>(
+    name: &str,
+    capacity: usize,
+    interval: std::time::Duration,
+    mut handle: F,
+    cleanup: C,
+) -> std::io::Result<(tokio::sync::mpsc::Sender<T>, NativeTask)>
+where
+    T: Send + 'static,
+    F: FnMut(Option<T>) + Send + 'static,
+    C: FnOnce() + Send + 'static,
+{
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(capacity);
+    let task = NativeTask::spawn(name, move |mut stop| async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if *stop.borrow() {
+                break;
+            }
+            tokio::select! {
+                _ = stop.changed() => break,
+                command = receiver.recv() => {
+                    let Some(command) = command else { break; };
+                    handle(Some(command));
+                }
+                _ = tick.tick() => handle(None),
+            }
+        }
+        cleanup();
+    })?;
+    Ok((sender, task))
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_service_does_not_block_another_and_overload_is_explicit() {
+        let (entered, mut started) = tokio::sync::mpsc::channel(1);
+        let (release, wait) = std::sync::mpsc::channel();
+        let (slow, mut slow_task) = command_worker(
+            "slow-service",
+            1,
+            Duration::from_secs(60),
+            move |command: Option<u8>| {
+                if command.is_some() {
+                    entered.try_send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+            },
+            || {},
+        )
+        .unwrap();
+        slow.try_send(1).unwrap();
+        started.recv().await.unwrap();
+        slow.try_send(2).unwrap();
+        assert!(matches!(
+            slow.try_send(3),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(3))
+        ));
+        let (events, mut received) = tokio::sync::mpsc::channel(4);
+        let (fast, mut fast_task) = command_worker(
+            "input-service",
+            4,
+            Duration::from_secs(60),
+            move |command| {
+                if let Some(command) = command {
+                    events.try_send(command).unwrap();
+                }
+            },
+            || {},
+        )
+        .unwrap();
+        for key in [1, 2, 3] {
+            fast.try_send(key).unwrap();
+        }
+        for key in [1, 2, 3] {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), received.recv())
+                    .await
+                    .unwrap(),
+                Some(key)
+            );
+        }
+        // Shutdown skips the queued command; only the operation in flight runs.
+        let _ = slow_task.stop.send(true);
+        release.send(()).unwrap();
+        slow_task.shutdown().await;
+        fast_task.shutdown().await;
+    }
+}
