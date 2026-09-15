@@ -489,7 +489,16 @@ async fn run_connected_sender(
         }
     })?;
     cleanup.capture = Some(capture_task);
-    let started = started_rx.await.context("capture worker stopped before startup")??;
+    let started = match started_rx.await.context("capture worker stopped before startup").and_then(|result| result) {
+        Ok(started) => started,
+        Err(error) => {
+            // Finish the old worker before a reconnect can reuse the streamer.
+            // Heartbeats continue in the independent signaling pump.
+            for worker in &mut cleanup.workers { worker.shutdown().await; }
+            if let Some(capture) = cleanup.capture.as_mut() { capture.shutdown().await; }
+            return Err(error);
+        }
+    };
     let displays = started.displays;
     let active_display = started.active_display;
     let format = started.format;
