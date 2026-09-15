@@ -376,6 +376,11 @@ async fn run_connected_sender(
                     Ok(SessionMessage::SelectDisplay { display_id }) => {
                         Some(ControlCommand::SelectDisplay(display_id))
                     }
+                    Ok(SessionMessage::SendSecureAttention) => {
+                        super::secure_attention::send()
+                            .err()
+                            .map(|error| ControlCommand::MaintenanceError(format!("{error:#}")))
+                    }
                     Ok(SessionMessage::SetBlackout { enabled }) => {
                         if let Err(error) = input.set_blackout(enabled) {
                             Some(ControlCommand::MaintenanceError(error.to_string()))

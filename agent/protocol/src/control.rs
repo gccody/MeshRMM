@@ -99,6 +99,9 @@ pub enum SessionMessage {
     MaintenanceState { agent_input_blocked: bool, blacked_out: bool },
     SetBlackout { enabled: bool },
     MaintenanceError { reason: String },
+    /// Request the Windows secure attention sequence (Ctrl+Alt+Del).
+    /// Keep appended so existing postcard message tags remain stable.
+    SendSecureAttention,
 }
 
 impl SessionMessage {
@@ -237,6 +240,17 @@ pub enum ConnectionPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secure_attention_appends_a_stable_control_message() {
+        let message = SessionMessage::SendSecureAttention;
+        assert_eq!(message.encode().unwrap(), vec![24]);
+        assert_eq!(SessionMessage::decode(&[24]).unwrap(), message);
+        assert_eq!(
+            SessionMessage::SetBlackout { enabled: true }.encode().unwrap(),
+            vec![22, 1]
+        );
+    }
 
     #[test]
     fn control_message_round_trip() {

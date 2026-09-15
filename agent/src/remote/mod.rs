@@ -16,6 +16,8 @@ mod platform;
 #[cfg(windows)]
 mod session;
 #[cfg(windows)]
+mod secure_attention;
+#[cfg(windows)]
 mod signaling;
 #[cfg(windows)]
 mod transport;

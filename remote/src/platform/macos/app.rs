@@ -416,6 +416,12 @@ define_class!(
         #[unsafe(method(receiveFiles:))]
         fn receive_files(&self, _: &NSMenuItem) { self.send(SessionMessage::FileTransfer(meshrmm_protocol::FileMessage::Pick)); }
 
+        #[unsafe(method(sendSecureAttention:))]
+        fn send_secure_attention(&self, _sender: &NSButton) {
+            self.release_input();
+            self.ivars().control.send_secure_attention();
+        }
+
         #[unsafe(method(toggleChat:))]
         fn toggle_chat_action(&self, _sender: &NSButton) {
             self.disable_input();
@@ -658,6 +664,19 @@ impl RemoteView {
         };
         chat_button.setFrame(NSRect::new(NSPoint::new(468., 6.), NSSize::new(40., 24.)));
         toolbar.addSubview(&chat_button);
+        let secure_attention_button = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Ctrl+Alt+Del"),
+                Some(self),
+                Some(sel!(sendSecureAttention:)),
+                mtm,
+            )
+        };
+        secure_attention_button.setFrame(NSRect::new(
+            NSPoint::new(558., 6.),
+            NSSize::new(110., 24.),
+        ));
+        toolbar.addSubview(&secure_attention_button);
         let control = self.ivars().control.clone();
         *self.ivars().chat_popup.borrow_mut() = Some(meshrmm_chat::ChatPopup::new(
             control.chat(),

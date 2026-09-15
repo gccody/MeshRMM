@@ -406,6 +406,7 @@ impl MacUi {
             control,
             debug.clone(),
         );
+        window.setContentMinSize(NSSize::new(680., 240.));
         window.setContentView(Some(&view));
         window.setDelegate(Some(ProtocolObject::from_ref(&*view)));
         let layer = unsafe { AVSampleBufferDisplayLayer::new() };

@@ -459,3 +459,16 @@ with `rotation_pending`; the agent commits the credential by reconnecting with i
 An agent accepts one active remote session. A second viewer receives a busy response;
 closing the current viewer releases the session. Suspending a company revokes its
 live coordinator/session/inventory connections and blocks token redemption.
+
+### Sending Ctrl+Alt+Del
+
+Use **Ctrl+Alt+Del** in the Windows or macOS remote client's toolbar to send the
+secure attention sequence to the Windows agent. Update both the client and agent
+for this command. The agent must run through its installed Windows service.
+
+Windows must allow services to generate secure attention: in Group Policy, go to
+**Computer Configuration > Administrative Templates > Windows Components > Windows
+Logon Options > Disable or enable software Secure Attention Sequence**, enable it,
+and select **Services** (or **Services and Ease of Access applications**). MeshRMM
+reports blocked requests in the client and does not change this policy.
+See [Microsoft's SendSAS documentation](https://learn.microsoft.com/en-us/windows/win32/api/sas/nf-sas-sendsas).

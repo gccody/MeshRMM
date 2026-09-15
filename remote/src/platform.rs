@@ -58,7 +58,13 @@ impl ControlSink {
     }
 
     pub fn send(&self, message: meshrmm_protocol::SessionMessage) {
-        if self.technician_blocked() && matches!(&message, meshrmm_protocol::SessionMessage::Input(_)) {
+        if self.technician_blocked()
+            && matches!(
+                &message,
+                meshrmm_protocol::SessionMessage::Input(_)
+                    | meshrmm_protocol::SessionMessage::SendSecureAttention
+            )
+        {
             return;
         }
         if let meshrmm_protocol::SessionMessage::SetQuality { preset } = &message
@@ -72,6 +78,10 @@ impl ControlSink {
             *chroma = *mode;
         }
         (self.send)(message);
+    }
+
+    pub fn send_secure_attention(&self) {
+        self.send(meshrmm_protocol::SessionMessage::SendSecureAttention);
     }
 
     pub fn files(&self) -> meshrmm_file_transfer::TransferSession {
