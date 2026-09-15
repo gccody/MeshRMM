@@ -1450,6 +1450,17 @@ mod tests {
     }
 
     #[test]
+    fn secure_attention_is_sent_while_toolbar_has_keyboard_focus() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let queue = ViewerControlQueue::new(tx, ViewerResumeState::default());
+        // Native toolbar controls can take focus away from the remote desktop.
+        queue.set_input_enabled(false);
+        queue.send(SessionMessage::SendSecureAttention);
+        assert_eq!(rx.try_recv().unwrap(), SessionMessage::SendSecureAttention);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn backgrounding_discards_pending_pointer_motion() {
         let (queue, mut rx) = active_queue();
 

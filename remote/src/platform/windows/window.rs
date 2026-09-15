@@ -19,6 +19,7 @@ struct WindowContext {
     settings_button: HWND,
     file_button: HWND,
     chat_button: HWND,
+    secure_attention_button: HWND,
     chat_popup: Option<meshrmm_chat::ChatPopup>,
     minimize_button: HWND,
     maximize_button: HWND,
@@ -41,6 +42,7 @@ const DIAGNOSTICS_BUTTON_ID: usize = 4003;
 const SETTINGS_BUTTON_ID: usize = 4004;
 const FILE_BUTTON_ID: usize = 4010;
 const CHAT_BUTTON_ID: usize = 4009;
+const SECURE_ATTENTION_BUTTON_ID: usize = 4011;
 const MINIMIZE_BUTTON_ID: usize = 4005;
 const MAXIMIZE_BUTTON_ID: usize = 4006;
 const CLOSE_BUTTON_ID: usize = 4007;
@@ -198,6 +200,16 @@ impl WindowContext {
                 caption_x.saturating_sub(180),
                 5,
                 38,
+                24,
+                true,
+            )
+        };
+        let _ = unsafe {
+            MoveWindow(
+                self.secure_attention_button,
+                caption_x.saturating_sub(296),
+                5,
+                110,
                 24,
                 true,
             )
@@ -749,6 +761,13 @@ pub(super) unsafe fn create_window(
         }
         let context = unsafe { window_context(window) };
         match message {
+            WM_GETMINMAXINFO => {
+                let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
+                // Leave room for display/quality controls, session actions and caption buttons.
+                info.ptMinTrackSize.x = 900;
+                info.ptMinTrackSize.y = 300;
+                LRESULT(0)
+            }
             WM_NCHITTEST => {
                 let default_hit = unsafe { DefWindowProcW(window, message, wparam, lparam) };
                 if default_hit.0 != HTCLIENT as isize {
@@ -850,6 +869,12 @@ pub(super) unsafe fn create_window(
                     }
                     if control_id == DIAGNOSTICS_BUTTON_ID {
                         context.toggle_debug();
+                        let _ = unsafe { SetFocus(Some(window)) };
+                        return LRESULT(0);
+                    }
+                    if control_id == SECURE_ATTENTION_BUTTON_ID {
+                        context.release_input();
+                        context.control.send_secure_attention();
                         let _ = unsafe { SetFocus(Some(window)) };
                         return LRESULT(0);
                     }
@@ -1130,6 +1155,7 @@ pub(super) unsafe fn create_window(
         settings_button: HWND::default(),
         file_button: HWND::default(),
         chat_button: HWND::default(),
+        secure_attention_button: HWND::default(),
         chat_popup: None,
         minimize_button: HWND::default(),
         maximize_button: HWND::default(),
@@ -1342,6 +1368,11 @@ pub(super) unsafe fn create_window(
     }
     let file_button = make_toolbar_button(FILE_BUTTON_ID, w!("📁"), toolbar_button_style)?;
     let chat_button = make_toolbar_button(CHAT_BUTTON_ID, w!("💬"), toolbar_button_style)?;
+    let secure_attention_button = make_toolbar_button(
+        SECURE_ATTENTION_BUTTON_ID,
+        w!("Ctrl+Alt+Del"),
+        toolbar_button_style,
+    )?;
     let caption_button_style =
         WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | BS_PUSHBUTTON as u32 | BS_FLAT as u32);
     let minimize_button = make_toolbar_button(MINIMIZE_BUTTON_ID, w!("─"), caption_button_style)?;
@@ -1356,6 +1387,7 @@ pub(super) unsafe fn create_window(
         settings_button,
         file_button,
         chat_button,
+        secure_attention_button,
         minimize_button,
         maximize_button,
         close_button,
@@ -1380,6 +1412,7 @@ pub(super) unsafe fn create_window(
         context.settings_button = settings_button;
         context.file_button = file_button;
         context.chat_button = chat_button;
+        context.secure_attention_button = secure_attention_button;
         context.chat_popup = Some(unsafe {
             meshrmm_chat::ChatPopup::new(window, chat_button, context.control.chat())
         }?);
