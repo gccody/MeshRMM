@@ -1,3 +1,4 @@
+use meshrmm_protocol::ClipboardContent;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use meshrmm_protocol::{
-    CursorShape, Display, DisplayId, MAX_CLIPBOARD_TEXT_BYTES, RemoteInput, SessionMessage,
+    CursorShape, Display, DisplayId, MAX_CLIPBOARD_WIRE_BYTES, RemoteInput, SessionMessage,
 };
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_TIMEOUT,
@@ -110,8 +111,11 @@ enum ParentCommand {
     Input(RemoteInput),
     ReleaseInput,
     BlockInput(bool),
-    Blackout { enabled: bool, text: String },
-    Clipboard(String),
+    Blackout {
+        enabled: bool,
+        text: String,
+    },
+    Clipboard(ClipboardContent),
     Chat(String),
     StartChat,
     StopChat,
@@ -132,7 +136,7 @@ enum ChildEvent {
     MaintenanceError(String),
     Frame(EncodedAccessUnit),
     Cursor(CursorShape),
-    Clipboard(String),
+    Clipboard(ClipboardContent),
     Chat(String),
     Error(String),
     Stopped,
@@ -143,7 +147,7 @@ type HelperCursor = Arc<Mutex<CursorShape>>;
 type HelperFiles = Arc<Mutex<std::collections::VecDeque<meshrmm_protocol::FileMessage>>>;
 type HelperMaintenance = Arc<Mutex<Option<SessionMessage>>>;
 type HelperChat = Arc<Mutex<std::collections::VecDeque<String>>>;
-type HelperClipboard = Arc<Mutex<Option<String>>>;
+type HelperClipboard = Arc<Mutex<Option<ClipboardContent>>>;
 type InputWriter = Arc<Mutex<BufWriter<File>>>;
 type InputRoute = Arc<Mutex<Option<InputWriter>>>;
 
@@ -709,7 +713,7 @@ impl ScreenInput for DesktopInputController {
             .unwrap_or_else(|error| error.into_inner())
     }
 
-    fn apply_clipboard(&self, text: String) -> anyhow::Result<()> {
+    fn apply_clipboard(&self, text: ClipboardContent) -> anyhow::Result<()> {
         let writer = self
             .route
             .lock()
@@ -717,10 +721,10 @@ impl ScreenInput for DesktopInputController {
             .clone()
             .context("desktop input helper is not running")?;
         send_command(&writer, &ParentCommand::Clipboard(text))
-            .context("failed to send clipboard text to the active desktop")
+            .context("failed to send clipboard content to the active desktop")
     }
 
-    fn poll_clipboard(&self) -> anyhow::Result<Option<String>> {
+    fn poll_clipboard(&self) -> anyhow::Result<Option<ClipboardContent>> {
         Ok(self
             .clipboard
             .lock()
@@ -1401,7 +1405,7 @@ fn run_input_child(
     emit_child_event(&output, ChildEvent::InputStarted)?;
     emit_child_event(&output, ChildEvent::MaintenanceState { agent_input_blocked: false, blacked_out: false })?;
     let mut sent_cursor = None;
-    let mut clipboard = match super::clipboard::ClipboardSync::new() {
+    let mut clipboard = match super::clipboard::ClipboardSync::new(false) {
         Ok(clipboard) => Some(clipboard),
         Err(error) => {
             eprintln!("interactive Windows clipboard is unavailable: {error:#}");
@@ -1472,7 +1476,7 @@ fn run_input_child(
                 if let Some(clipboard) = clipboard.as_mut()
                     && let Err(error) = clipboard.apply(text)
                 {
-                    eprintln!("failed to apply viewer clipboard text: {error:#}");
+                    eprintln!("failed to apply viewer clipboard content: {error:#}");
                 }
             }
             Ok(Ok(ParentCommand::Stop)) => break,
@@ -1493,7 +1497,7 @@ fn run_input_child(
                     Ok(Some(text)) => {
                         if let Err(error) = emit_child_event(&output, ChildEvent::Clipboard(text)) {
                             terminal_error = Some(format!(
-                                "failed to send clipboard text to the Agent coordinator: {error}"
+                                "failed to send clipboard content to the Agent coordinator: {error}"
                             ));
                             break;
                         }
@@ -1596,13 +1600,15 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             write_u32(&mut writer, text.len() as u32)?;
             writer.write_all(text.as_bytes())
         }
-        ParentCommand::BlockInput(blocked) => writer.write_all(&[COMMAND_BLOCK_INPUT, u8::from(*blocked)]),
+        ParentCommand::BlockInput(blocked) => {
+            writer.write_all(&[COMMAND_BLOCK_INPUT, u8::from(*blocked)])
+        }
         ParentCommand::ReleaseInput => writer.write_all(&[COMMAND_RELEASE_INPUT]),
         ParentCommand::Clipboard(text) => {
-            let bytes = SessionMessage::Clipboard { text: text.clone() }
+            let bytes = text
                 .encode()
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            checked_len(bytes.len(), MAX_CONTROL_BYTES, "desktop clipboard")?;
+            checked_len(bytes.len(), MAX_CLIPBOARD_WIRE_BYTES, "desktop clipboard")?;
             writer.write_all(&[COMMAND_CLIPBOARD])?;
             write_u32(&mut writer, bytes.len() as u32)?;
             writer.write_all(&bytes)
@@ -1697,27 +1703,14 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
         COMMAND_CLIPBOARD => {
             let length = bounded_len(
                 read_u32(&mut reader)?,
-                MAX_CONTROL_BYTES,
+                MAX_CLIPBOARD_WIRE_BYTES,
                 "desktop clipboard",
             )?;
             let mut bytes = vec![0; length];
             reader.read_exact(&mut bytes)?;
-            match SessionMessage::decode(&bytes) {
-                Ok(SessionMessage::Clipboard { text })
-                    if text.len() <= MAX_CLIPBOARD_TEXT_BYTES =>
-                {
-                    Ok(ParentCommand::Clipboard(text))
-                }
-                Ok(SessionMessage::Clipboard { .. }) => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "desktop clipboard exceeds the text size limit",
-                )),
-                Ok(_) => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "desktop clipboard contained a non-clipboard message",
-                )),
-                Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
-            }
+            ClipboardContent::decode(&bytes)
+                .map(ParentCommand::Clipboard)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
         }
         13 => Ok(ParentCommand::StartFiles),
         12 => Ok(ParentCommand::Files(read_file_message(&mut reader)?)),
@@ -1805,10 +1798,10 @@ fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
             writer.write_all(&bytes)
         }
         ChildEvent::Clipboard(text) => {
-            let bytes = SessionMessage::Clipboard { text: text.clone() }
+            let bytes = text
                 .encode()
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            checked_len(bytes.len(), MAX_CONTROL_BYTES, "clipboard text")?;
+            checked_len(bytes.len(), MAX_CLIPBOARD_WIRE_BYTES, "clipboard content")?;
             writer.write_all(&[EVENT_CLIPBOARD])?;
             write_u32(&mut writer, bytes.len() as u32)?;
             writer.write_all(&bytes)
@@ -1924,25 +1917,16 @@ fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
             }
         }
         EVENT_CLIPBOARD => {
-            let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "clipboard text")?;
+            let length = bounded_len(
+                read_u32(&mut reader)?,
+                MAX_CLIPBOARD_WIRE_BYTES,
+                "clipboard content",
+            )?;
             let mut bytes = vec![0; length];
             reader.read_exact(&mut bytes)?;
-            match SessionMessage::decode(&bytes) {
-                Ok(SessionMessage::Clipboard { text })
-                    if text.len() <= MAX_CLIPBOARD_TEXT_BYTES =>
-                {
-                    Ok(ChildEvent::Clipboard(text))
-                }
-                Ok(SessionMessage::Clipboard { .. }) => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "clipboard event exceeds the text size limit",
-                )),
-                Ok(_) => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "clipboard event contained an unexpected message",
-                )),
-                Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
-            }
+            ClipboardContent::decode(&bytes)
+                .map(ChildEvent::Clipboard)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
         }
         9 => Ok(ChildEvent::Files(read_file_message(&mut reader)?)),
         EVENT_CHAT => {
@@ -2333,25 +2317,32 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_event_round_trips() {
-        let text = "winget install Example.Package\n";
-        let mut bytes = Vec::new();
-        write_event(&mut bytes, &ChildEvent::Clipboard(text.into())).unwrap();
-        let ChildEvent::Clipboard(decoded) = read_event(bytes.as_slice()).unwrap() else {
-            panic!("expected clipboard event");
-        };
-        assert_eq!(decoded, text);
-    }
-
-    #[test]
-    fn clipboard_command_round_trips() {
-        let text = "winget install Example.Package\n";
-        let mut bytes = Vec::new();
-        write_command(&mut bytes, &ParentCommand::Clipboard(text.into())).unwrap();
-        let ParentCommand::Clipboard(decoded) = read_command(bytes.as_slice()).unwrap() else {
-            panic!("expected clipboard command");
-        };
-        assert_eq!(decoded, text);
+    fn clipboard_commands_and_events_round_trip_all_formats() {
+        for content in [
+            ClipboardContent::from("winget install Example.Package\n"),
+            ClipboardContent::Html {
+                html: "<b>Zoë 王</b>".repeat(10000),
+                text: "Zoë 王".into(),
+            },
+            ClipboardContent::Image {
+                width: 512,
+                height: 512,
+                rgba: vec![255; 512 * 512 * 4],
+            },
+        ] {
+            let mut bytes = Vec::new();
+            write_event(&mut bytes, &ChildEvent::Clipboard(content.clone())).unwrap();
+            let ChildEvent::Clipboard(decoded) = read_event(bytes.as_slice()).unwrap() else {
+                panic!("expected clipboard event");
+            };
+            assert_eq!(decoded, content);
+            let mut bytes = Vec::new();
+            write_command(&mut bytes, &ParentCommand::Clipboard(content.clone())).unwrap();
+            let ParentCommand::Clipboard(decoded) = read_command(bytes.as_slice()).unwrap() else {
+                panic!("expected clipboard command");
+            };
+            assert_eq!(decoded, content);
+        }
     }
 
     #[test]

@@ -18,6 +18,11 @@ use macos as native;
 #[cfg(windows)]
 use windows as native;
 
+/// Native change counter, shared by text/image and file clipboard polling.
+pub fn clipboard_sequence() -> u64 {
+    native::clipboard_sequence()
+}
+
 pub fn clipboard_has_files() -> bool {
     native::clipboard_files().is_ok_and(|paths| !paths.is_empty())
 }

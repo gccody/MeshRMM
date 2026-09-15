@@ -1,3 +1,4 @@
+use meshrmm_protocol::ClipboardContent;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -52,8 +53,8 @@ pub trait ScreenInput: Send + Sync {
     fn apply(&self, input: RemoteInput) -> anyhow::Result<()>;
     fn release_all(&self) -> anyhow::Result<()>;
     fn cursor_shape(&self) -> CursorShape;
-    fn apply_clipboard(&self, text: String) -> anyhow::Result<()>;
-    fn poll_clipboard(&self) -> anyhow::Result<Option<String>>;
+    fn apply_clipboard(&self, text: ClipboardContent) -> anyhow::Result<()>;
+    fn poll_clipboard(&self) -> anyhow::Result<Option<ClipboardContent>>;
     fn start_chat(&self) -> anyhow::Result<()>;
     fn stop_chat(&self);
     fn apply_chat(&self, text: String) -> anyhow::Result<()>;
@@ -111,7 +112,7 @@ impl PlatformScreenStreamer {
             // desktop-bound operations, so the desktop helper owns clipboard
             // access for that mode. Console mode is already interactive.
             direct_clipboard: (!capture_as_active_user)
-                .then(super::clipboard::ClipboardSync::new)
+                .then(|| super::clipboard::ClipboardSync::new(false))
                 .transpose()
                 .ok()
                 .flatten()
@@ -292,8 +293,11 @@ impl ScreenInput for DirectInputController {
         self.controller.lock().map_err(|_| anyhow::anyhow!("input lock poisoned"))?.set_blackout(enabled, &self.blackout_message)
     }
     fn maintenance_state(&self) -> Option<meshrmm_protocol::SessionMessage> {
-        self.controller.lock().ok().map(|input| meshrmm_protocol::SessionMessage::MaintenanceState {
-            agent_input_blocked: input.blocked(), blacked_out: input.blacked_out(),
+        self.controller.lock().ok().map(|input| {
+            meshrmm_protocol::SessionMessage::MaintenanceState {
+                agent_input_blocked: input.blocked(),
+                blacked_out: input.blacked_out(),
+            }
         })
     }
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()> {
@@ -342,7 +346,7 @@ impl ScreenInput for DirectInputController {
     fn poll_files(&self) -> Option<meshrmm_protocol::FileMessage> {
         self.files.poll()
     }
-    fn apply_clipboard(&self, text: String) -> anyhow::Result<()> {
+    fn apply_clipboard(&self, text: ClipboardContent) -> anyhow::Result<()> {
         self.clipboard
             .as_ref()
             .context("interactive Windows clipboard is unavailable")?
@@ -351,7 +355,7 @@ impl ScreenInput for DirectInputController {
             .apply(text)
     }
 
-    fn poll_clipboard(&self) -> anyhow::Result<Option<String>> {
+    fn poll_clipboard(&self) -> anyhow::Result<Option<ClipboardContent>> {
         self.clipboard
             .as_ref()
             .context("interactive Windows clipboard is unavailable")?

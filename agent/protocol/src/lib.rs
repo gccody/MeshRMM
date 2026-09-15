@@ -15,3 +15,6 @@ pub const PROTOCOL_VERSION: u16 = 3;
 
 mod files;
 pub use files::*;
+
+mod clipboard;
+pub use clipboard::*;

@@ -329,11 +329,13 @@ and all-monitor blackout. Company admins customize the blackout notice under
 for usage, Windows requirements, and cleanup behavior.
 
 The native viewer sends mouse, wheel, physical keyboard input, and bidirectional
-plain-text clipboard updates over the reliable control channel. The viewer's
-current text clipboard is copied to the Agent when the session connects; later
-text copies on either computer are mirrored within 250 ms. Clipboard payloads
-are capped at 60 KiB to stay within the control channel's message limit, and
-rich text and images remain local.
+clipboard updates over the reliable control channel: plain text, HTML rich text
+with a plain-text alternative, and images. The viewer's current clipboard is
+copied to the Agent when the session connects; later copies on either computer
+are detected every 250 ms. Rich text and images require updated peers on both
+ends. Payloads are capped at 32 MiB (uncompressed RGBA pixels for images) and
+sent in paced 60 KiB chunks; larger copies take longer to arrive. File lists
+continue to use the file-transfer path. RTF-only formatting is not synchronized.
 
 The **folder icon** offers **Send** and **Receive** using native multi-file/folder
 pickers on the source computer. Transfers preserve nested and empty folders and
@@ -437,7 +439,7 @@ above; do not infer performance measurements from a successful build.
 
 The Agent/capture implementation remains Windows-only; the viewer supports
 Windows and macOS. The selected display and captured cursor are streamed.
-Clipboard synchronization supports plain text and files/folders; there is no audio,
+Clipboard synchronization supports plain text, HTML rich text, images, and files/folders; there is no audio,
 recording, browser client, or concurrent
 viewer. Windows secure-attention sequences
 such as Ctrl+Alt+Delete cannot be synthesized by a normal user-mode Agent. H.265
