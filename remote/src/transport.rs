@@ -1041,9 +1041,12 @@ fn install_control_handler(
                         }
                     }
                 }
+                Ok(SessionMessage::MaintenanceError { reason }) => {
+                    if let Ok(mut state) = viewer_control.maintenance.lock() { state.error = Some(reason); }
+                }
                 Ok(SessionMessage::MaintenanceState { agent_input_blocked, blacked_out }) => {
                     if let Ok(mut state) = viewer_control.maintenance.lock() {
-                        *state = crate::platform::MaintenanceState { available: true, agent_input_blocked, blacked_out };
+                        *state = crate::platform::MaintenanceState { available: true, agent_input_blocked, blacked_out, error: None };
                     }
                 }
                 Ok(SessionMessage::Stop { reason }) => tracing::info!(reason, "Agent stopped stream"),

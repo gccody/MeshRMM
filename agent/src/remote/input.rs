@@ -12,6 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 pub struct WindowsInputController {
     block: Option<super::input_block::InputBlock>,
+    blackout: Option<super::blackout::Blackout>,
     active_display: Option<Display>,
     pressed_keys: HashSet<(u16, bool)>,
     pressed_buttons: HashSet<PointerButton>,
@@ -22,11 +23,19 @@ impl WindowsInputController {
     pub fn new() -> Self {
         Self {
             block: None,
+            blackout: None,
             active_display: None,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
             system_cursors: system_cursor_handles(),
         }
+    }
+
+    pub fn blacked_out(&self) -> bool { self.blackout.is_some() }
+    pub fn set_blackout(&mut self, enabled: bool, text: &str) -> anyhow::Result<()> {
+        if enabled && self.blackout.is_none() { self.blackout = Some(super::blackout::Blackout::show(text)?); }
+        else if !enabled { self.blackout = None; }
+        Ok(())
     }
 
     pub fn blocked(&self) -> bool { self.block.is_some() }

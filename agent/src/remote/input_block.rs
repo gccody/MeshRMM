@@ -73,3 +73,40 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+    use std::time::Duration;
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; briefly blocks physical input"]
+    fn live_input_block_allows_tagged_input_and_restores_local_input() {
+        unsafe fn key(pressed: bool, tag: usize) {
+            let input = INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT {
+                wVk: VK_F24, dwFlags: if pressed { KEYBD_EVENT_FLAGS(0) } else { KEYEVENTF_KEYUP },
+                dwExtraInfo: tag, ..Default::default()
+            } } };
+            assert_eq!(unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) }, 1);
+            thread::sleep(Duration::from_millis(100));
+        }
+        struct ReleaseKey;
+        impl Drop for ReleaseKey { fn drop(&mut self) { unsafe { key(false, INPUT_TAG); } } }
+        let _release = ReleaseKey;
+        let guard = InputBlock::start().unwrap();
+        unsafe {
+            key(true, 0);
+            assert_eq!(GetAsyncKeyState(VK_F24.0 as i32) & i16::MIN, 0, "untagged input was not blocked");
+            key(true, INPUT_TAG);
+            assert_ne!(GetAsyncKeyState(VK_F24.0 as i32) & i16::MIN, 0, "technician input was blocked");
+            key(false, INPUT_TAG);
+        }
+        drop(guard);
+        unsafe {
+            key(true, 0);
+            assert_ne!(GetAsyncKeyState(VK_F24.0 as i32) & i16::MIN, 0, "input did not recover on teardown");
+            key(false, 0);
+        }
+    }
+}

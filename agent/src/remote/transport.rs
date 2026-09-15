@@ -45,6 +45,7 @@ impl Drop for SenderCleanup {
         if self.closed {
             return;
         }
+        let _ = self.input.set_blackout(false);
         let _ = self.input.set_agent_input_blocked(false);
         self.input.stop_chat();
         let _ = self.input.release_all();
@@ -59,6 +60,7 @@ impl Drop for SenderCleanup {
 }
 
 enum ControlCommand {
+    MaintenanceError(String),
     Files(meshrmm_protocol::FileMessage),
     Keyframe,
     Bitrate(u32),
@@ -374,10 +376,14 @@ async fn run_connected_sender(
                     Ok(SessionMessage::SelectDisplay { display_id }) => {
                         Some(ControlCommand::SelectDisplay(display_id))
                     }
+                    Ok(SessionMessage::SetBlackout { enabled }) => {
+                        if let Err(error) = input.set_blackout(enabled) {
+                            Some(ControlCommand::MaintenanceError(error.to_string()))
+                        } else { None }
+                    }
                     Ok(SessionMessage::SetAgentInputBlocked { blocked }) => {
                         if let Err(error) = input.set_agent_input_blocked(blocked) {
-                            tracing::error!(%error, "endpoint input block failed");
-                            Some(ControlCommand::Stop)
+                            Some(ControlCommand::MaintenanceError(error.to_string()))
                         } else { None }
                     }
                     Ok(SessionMessage::Input(event)) => {
@@ -703,6 +709,9 @@ async fn run_connected_sender(
                         ).await?;
                     }
                     ControlCommand::Files(message) => { if let Err(error) = input.apply_files(message) { tracing::warn!(%error, "file transfer helper unavailable"); } }
+                    ControlCommand::MaintenanceError(reason) => {
+                        send_control_message(&control_channel, SessionMessage::MaintenanceError { reason }).await?;
+                    }
                     ControlCommand::ChatAvailable => {
                         input.start_chat()?;
                         send_control_message(&control_channel, SessionMessage::ChatAvailable).await?;
@@ -914,6 +923,7 @@ async fn run_connected_sender(
     let _ = video_sender.await;
     control_start.abort();
     let _ = control_start.await;
+    let _ = input.set_blackout(false);
     let _ = input.set_agent_input_blocked(false);
     input.stop_chat();
     if let Err(error) = input.release_all() {
