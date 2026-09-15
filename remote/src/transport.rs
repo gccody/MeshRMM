@@ -787,7 +787,7 @@ fn start_viewer_services(
             .service_senders
             .lock()
             .unwrap()
-            .insert(label, outgoing);
+            .insert(label, outgoing.clone());
         let fallback = control.clone();
         let writer = tokio::spawn(async move {
             let Ok(fallback) = wait_control_channel(&fallback).await else {
@@ -815,12 +815,15 @@ fn start_viewer_services(
         let stopping = lifecycle.shutting_down.clone();
         let runtime = tokio::runtime::Handle::current();
         let mut stop = stop.subscribe();
+        let service_sender = outgoing;
         std::thread::Builder::new().name(format!("viewer-{label}")).spawn(move || {
             runtime.block_on(async move {
                 let mut clipboard = if label == CLIPBOARD_CHANNEL { ClipboardSync::new(true).ok() } else { None };
                 let mut receiver = meshrmm_protocol::ClipboardReceiver::default();
                 let mut outgoing = std::collections::VecDeque::new();
                 let chat_ready = viewer.chat.outgoing_ready();
+                let files_ready = viewer.files.outgoing_ready();
+                let mut files_pending = true;
                 if label == CHAT_CHANNEL {
                     tokio::select! {
                         result = wait_control_channel(&control) => if result.is_err() { return; },
@@ -854,12 +857,17 @@ fn start_viewer_services(
                         _ = chat_ready.notified(), if label == CHAT_CHANNEL => {
                             while let Some(text) = viewer.chat.poll() { viewer.send(SessionMessage::Chat { text }); }
                         }
-                        _ = poll.tick(), if label != CHAT_CHANNEL => {
+                        _ = files_ready.notified(), if label == FILE_CHANNEL => files_pending = true,
+                        permit = service_sender.reserve(), if label == FILE_CHANNEL && files_pending => {
+                            let Ok(permit) = permit else { break; };
+                            if let Some(message) = viewer.files.poll() {
+                                permit.send(SessionMessage::FileTransfer(message));
+                            } else { files_pending = false; }
+                        }
+                        _ = poll.tick(), if label == CLIPBOARD_CHANNEL => {
                             let open = control.borrow().as_ref().is_some_and(|c| c.ready_state() == RTCDataChannelState::Open);
                             if !open { continue; }
-                            match label {
-                                FILE_CHANNEL => { if let Some(message) = viewer.files.poll() { viewer.send(SessionMessage::FileTransfer(message)); } }
-                                CLIPBOARD_CHANNEL => {
+                            {
                                     if clipboard_poll.elapsed() >= CLIPBOARD_POLL_INTERVAL {
                                         clipboard_poll = tokio::time::Instant::now();
                                         if let Some(clipboard) = clipboard.as_mut() {
@@ -872,8 +880,6 @@ fn start_viewer_services(
                                     }
                                     if let Some(message) = outgoing.pop_front() { viewer.send(message); }
                                 }
-                                _ => {},
-                            }
                         }
                     }
                 }

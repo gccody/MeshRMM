@@ -33,10 +33,24 @@ pub enum Command {
     Pick,
 }
 #[derive(Clone)]
+struct OutgoingFiles {
+    sender: mpsc::SyncSender<FileMessage>,
+    ready: Arc<tokio::sync::Notify>,
+}
+impl OutgoingFiles {
+    fn send(&self, message: FileMessage) -> Result<(), mpsc::SendError<FileMessage>> {
+        self.sender.send(message)?;
+        self.ready.notify_one();
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 pub struct TransferSession {
     tx: mpsc::SyncSender<Command>,
     rx: Arc<Mutex<mpsc::Receiver<FileMessage>>>,
     status: Arc<Mutex<String>>,
+    ready: Arc<tokio::sync::Notify>,
 }
 impl Default for TransferSession {
     fn default() -> Self {
@@ -46,13 +60,19 @@ impl Default for TransferSession {
 impl TransferSession {
     pub fn new() -> Self {
         let (tx, commands) = mpsc::sync_channel(32);
-        let (out, rx) = mpsc::sync_channel(8);
+        let (sender, rx) = mpsc::sync_channel(8);
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let out = OutgoingFiles {
+            sender,
+            ready: ready.clone(),
+        };
         let status = Arc::new(Mutex::new("Waiting for file-transfer support…".into()));
         let worker_status = status.clone();
         std::thread::spawn(move || worker(commands, out, worker_status));
         Self {
             tx,
             rx: Arc::new(Mutex::new(rx)),
+            ready,
             status,
         }
     }
@@ -62,12 +82,18 @@ impl TransferSession {
         client: impl FnOnce(Self) -> T + Send + 'static,
     ) -> T {
         let (tx, commands) = mpsc::sync_channel(32);
-        let (out, rx) = mpsc::sync_channel(8);
+        let (sender, rx) = mpsc::sync_channel(8);
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let out = OutgoingFiles {
+            sender,
+            ready: ready.clone(),
+        };
         let status = Arc::new(Mutex::new("Waiting for file-transfer support…".into()));
         let session = Self {
             tx,
             rx: Arc::new(Mutex::new(rx)),
             status: status.clone(),
+            ready,
         };
         let transport = std::thread::spawn(move || client(session));
         worker(commands, out, status);
@@ -95,6 +121,9 @@ impl TransferSession {
     pub fn pick(&self) {
         self.command(Command::Pick);
     }
+    pub fn outgoing_ready(&self) -> Arc<tokio::sync::Notify> {
+        self.ready.clone()
+    }
     pub fn poll(&self) -> Option<FileMessage> {
         self.rx.lock().ok()?.try_recv().ok()
     }
@@ -120,11 +149,7 @@ fn id() -> u64 {
     now.max(previous + 1)
 }
 
-fn worker(
-    commands: mpsc::Receiver<Command>,
-    out: mpsc::SyncSender<FileMessage>,
-    status: Arc<Mutex<String>>,
-) {
+fn worker(commands: mpsc::Receiver<Command>, out: OutgoingFiles, status: Arc<Mutex<String>>) {
     let _native = match native::initialize() {
         Ok(v) => v,
         Err(e) => {
@@ -835,5 +860,42 @@ mod tests {
         );
         drop(receiver);
         assert_eq!(fs::read_dir(base).unwrap().count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod outgoing_tests {
+    use super::*;
+    #[tokio::test]
+    async fn outgoing_notification_preserves_bounded_queue_and_order() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let out = OutgoingFiles {
+            sender,
+            ready: ready.clone(),
+        };
+        out.send(FileMessage::Available).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), ready.notified())
+            .await
+            .unwrap();
+        let (finished, mut done) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = out.send(FileMessage::Pick);
+            let _ = finished.send(result);
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut done)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            FileMessage::Available
+        ));
+        tokio::time::timeout(Duration::from_secs(1), ready.notified())
+            .await
+            .unwrap();
+        done.await.unwrap().unwrap();
+        assert!(matches!(receiver.try_recv().unwrap(), FileMessage::Pick));
     }
 }

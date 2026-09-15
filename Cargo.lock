@@ -1807,6 +1807,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "sha2 0.10.9",
+ "tokio",
  "tracing",
  "windows",
  "windows-core",

@@ -7,6 +7,7 @@ publish.workspace = true
 [lints]
 workspace = true
 [dependencies]
+tokio.workspace = true
 anyhow.workspace = true
 meshrmm-protocol.workspace = true
 sha2.workspace = true

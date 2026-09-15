@@ -29,3 +29,18 @@ Validation: macOS agent/viewer suites and Windows agent/viewer suites passed.
 The shared transport suite exercises real local WebRTC connections: waiting for
 open, a queued file burst with an application receiver paused, continued input,
 multiple capacity waiters, close handling and sticky legacy routes.
+
+## Files
+
+The native file producer notifies consumers after placing a message in its
+bounded output queue. The Windows file helper and parent transport await these
+notifications. Agent sends wait for network capacity; viewer consumers reserve
+space in the bounded sender queue before removing output. The protocol's
+per-message acknowledgements and existing queue limits remain in place. Native
+clipboard discovery/progress handling retains its own maintenance timer.
+
+Validation: macOS file-transfer 6, agent 10, viewer 27, chat 7 and shared transport
+3 tests passed. Windows file-transfer 7, agent 44, viewer 19, chat 7 and shared
+transport 3 passed (the same three invasive tests ignored). A new regression
+verifies a full output queue blocks its producer, freeing capacity preserves
+message order and the next message wakes its consumer. macOS Clippy passed.

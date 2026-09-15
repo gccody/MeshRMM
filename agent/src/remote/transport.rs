@@ -778,8 +778,8 @@ fn spawn_file_worker(
             } else {
                 channel
             };
-            let mut poll = tokio::time::interval(std::time::Duration::from_millis(5));
-            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let ready = input.files_ready();
+            let mut pending = true;
             loop {
                 if *stop.borrow() {
                     break;
@@ -790,13 +790,15 @@ fn spawn_file_worker(
                         let Some(message) = message else { break; };
                         if let Err(error) = input.apply_files(message) { tracing::warn!(%error, "file helper unavailable"); }
                     }
-                    _ = poll.tick(), if channel.ready_state() == RTCDataChannelState::Open => {
-                        if channel.buffered_amount().await < 64 * 1024
-                            && let Some(message) = input.poll_files()
-                            && let Err(error) = send_control_message(&channel, SessionMessage::FileTransfer(message)).await {
+                    _ = ready.notified() => pending = true,
+                    capacity = channel.writable(), if pending && channel.ready_state() == RTCDataChannelState::Open => {
+                        if let Err(error) = capacity { tracing::warn!(%error, "file channel unavailable"); break; }
+                        if let Some(message) = input.poll_files() {
+                            if let Err(error) = send_control_message(&channel, SessionMessage::FileTransfer(message)).await {
                                 tracing::warn!(%error, "file-transfer send failed");
                                 break;
                             }
+                        } else { pending = false; }
                     }
                 }
             }
@@ -1821,6 +1823,9 @@ mod service_isolation_tests {
         }
         fn cursor_shape(&self) -> CursorShape {
             CursorShape::Default
+        }
+        fn files_ready(&self) -> Arc<tokio::sync::Notify> {
+            Arc::new(tokio::sync::Notify::new())
         }
         fn poll_files(&self) -> Option<FileMessage> {
             None
