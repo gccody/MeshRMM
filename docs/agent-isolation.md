@@ -105,3 +105,14 @@ before a reconnect can reuse the streamer.
 
 Validation: Windows Agent suite and a logger test that stalls its writer, fills
 the queue and confirms producers return with explicit dropped-record accounting.
+
+## Clipboard issue found during live validation
+
+The Windows clipboard library reports an error when HTML is absent, including
+on ordinary plain-text clipboards. ClipboardSync now probes HTML availability
+before reading that format. The normal-desktop clipboard helper uses the
+signed-in user's token; secure-desktop input retains its LocalSystem token.
+Helper startup logs identify each service role for fault-injection tests.
+
+Validation: 42 enabled Windows Agent tests plus a native clipboard test covering
+plain text, HTML, images and suppression of clipboard echo all pass.

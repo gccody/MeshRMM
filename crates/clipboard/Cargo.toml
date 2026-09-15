@@ -11,3 +11,5 @@ anyhow.workspace = true
 arboard.workspace = true
 meshrmm-protocol.workspace = true
 meshrmm-file-transfer = { path = "../file-transfer" }
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4.1"

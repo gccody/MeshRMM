@@ -962,8 +962,12 @@ fn launch_helper(target: DesktopTarget, as_user: bool) -> anyhow::Result<Launche
 
 // Parameters mirror the input/file helper startup IPC payload.
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HelperKind { Input, Files, Clipboard, Chat }
+
+fn helper_uses_user_token(kind: HelperKind, target: DesktopTarget) -> bool {
+    kind == HelperKind::Files || (kind == HelperKind::Clipboard && target == DesktopTarget::Default)
+}
 
 fn start_input_helper(
     viewer_name: &str,
@@ -976,7 +980,9 @@ fn start_input_helper(
     maintenance: HelperMaintenance,
     kind: HelperKind,
 ) -> anyhow::Result<RunningInputHelper> {
-    let launched = launch_helper(target, kind == HelperKind::Files)?;
+    // Clipboard data can be owned/delayed-rendered by an interactive user app.
+    // Use that user's token on the normal desktop, as the file helper does.
+    let launched = launch_helper(target, helper_uses_user_token(kind, target))?;
     let status: HelperStatus = Arc::new(Mutex::new(None));
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let reader_status = Arc::clone(&status);
@@ -1040,7 +1046,8 @@ fn start_input_helper(
         session_id = launched.session_id,
         desktop = target.name(),
         display_id = display_id.0,
-        "independent LocalSystem desktop input helper started"
+        helper_kind = ?kind,
+        "independent desktop service helper started"
     );
     Ok(RunningInputHelper {
         process: launched.process,
@@ -2535,6 +2542,15 @@ fn run_clipboard_child(commands: mpsc::Receiver<io::Result<ParentCommand>>) -> a
 #[cfg(test)]
 mod isolation_tests {
     use super::*;
+    #[test]
+    fn interactive_clipboard_uses_user_token_but_secure_input_does_not() {
+        assert!(helper_uses_user_token(HelperKind::Clipboard, DesktopTarget::Default));
+        assert!(!helper_uses_user_token(HelperKind::Clipboard, DesktopTarget::Winlogon));
+        assert!(!helper_uses_user_token(HelperKind::Input, DesktopTarget::Default));
+        assert!(!helper_uses_user_token(HelperKind::Chat, DesktopTarget::Default));
+        assert!(helper_uses_user_token(HelperKind::Files, DesktopTarget::Default));
+    }
+
 
     #[test]
     fn stalled_clipboard_pipe_does_not_block_input_pipe() {
