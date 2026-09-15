@@ -46,6 +46,7 @@ const COMMAND_CLIPBOARD: u8 = 8;
 const COMMAND_CHAT: u8 = 9;
 const COMMAND_START_CHAT: u8 = 10;
 const COMMAND_STOP_CHAT: u8 = 11;
+const COMMAND_BLOCK_INPUT: u8 = 14;
 const EVENT_STARTED: u8 = 1;
 const EVENT_FRAME: u8 = 2;
 const EVENT_ERROR: u8 = 3;
@@ -107,6 +108,7 @@ enum ParentCommand {
     },
     Input(RemoteInput),
     ReleaseInput,
+    BlockInput(bool),
     Clipboard(String),
     Chat(String),
     StartChat,
@@ -124,6 +126,7 @@ enum ChildEvent {
     Files(meshrmm_protocol::FileMessage),
     Started(StartedDesktop),
     InputStarted,
+    MaintenanceState { agent_input_blocked: bool, blacked_out: bool },
     Frame(EncodedAccessUnit),
     Cursor(CursorShape),
     Clipboard(String),
@@ -135,6 +138,7 @@ enum ChildEvent {
 type HelperStatus = Arc<Mutex<Option<Result<(), String>>>>;
 type HelperCursor = Arc<Mutex<CursorShape>>;
 type HelperFiles = Arc<Mutex<std::collections::VecDeque<meshrmm_protocol::FileMessage>>>;
+type HelperMaintenance = Arc<Mutex<Option<SessionMessage>>>;
 type HelperChat = Arc<Mutex<std::collections::VecDeque<String>>>;
 type HelperClipboard = Arc<Mutex<Option<String>>>;
 type InputWriter = Arc<Mutex<BufWriter<File>>>;
@@ -155,6 +159,7 @@ pub struct DesktopCaptureStreamer {
     clipboard: HelperClipboard,
     files: HelperFiles,
     chat: HelperChat,
+    maintenance: HelperMaintenance,
     chat_enabled: Arc<AtomicBool>,
 }
 
@@ -172,6 +177,7 @@ impl DesktopCaptureStreamer {
             clipboard: Arc::new(Mutex::new(None)),
             files: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             chat: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            maintenance: Arc::new(Mutex::new(None)),
             chat_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -376,6 +382,7 @@ impl DesktopCaptureStreamer {
             clipboard: Arc::clone(&self.clipboard),
             files: Arc::clone(&self.files),
             chat: Arc::clone(&self.chat),
+            maintenance: Arc::clone(&self.maintenance),
             chat_enabled: Arc::clone(&self.chat_enabled),
         })
     }
@@ -442,6 +449,7 @@ impl DesktopCaptureStreamer {
                 Arc::clone(&self.clipboard),
                 Arc::clone(&self.files),
                 Arc::clone(&self.chat),
+                Arc::clone(&self.maintenance),
                 true,
             ) {
                 Ok(helper) => {
@@ -488,6 +496,7 @@ impl DesktopCaptureStreamer {
             Arc::clone(&self.clipboard),
             Arc::clone(&self.files),
             Arc::clone(&self.chat),
+            Arc::clone(&self.maintenance),
             false,
         )?;
         *self
@@ -580,10 +589,19 @@ struct DesktopInputController {
     clipboard: HelperClipboard,
     files: HelperFiles,
     chat: HelperChat,
+    maintenance: HelperMaintenance,
     chat_enabled: Arc<AtomicBool>,
 }
 
 impl ScreenInput for DesktopInputController {
+    fn maintenance_state(&self) -> Option<SessionMessage> {
+        self.maintenance.lock().ok().and_then(|value| value.clone())
+    }
+    fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()> {
+        let writer = self.route.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            .context("desktop input helper is not running")?;
+        send_command(&writer, &ParentCommand::BlockInput(blocked))
+    }
     fn apply_files(&self, message: meshrmm_protocol::FileMessage) -> anyhow::Result<()> {
         let writer = self
             .file_route
@@ -880,6 +898,7 @@ fn start_input_helper(
     clipboard: HelperClipboard,
     files: HelperFiles,
     chat: HelperChat,
+    maintenance: HelperMaintenance,
     files_only: bool,
 ) -> anyhow::Result<RunningInputHelper> {
     let launched = launch_helper(target, files_only)?;
@@ -897,6 +916,7 @@ fn start_input_helper(
                 clipboard,
                 files,
                 chat,
+                maintenance,
             )
         })
         .context("failed to start desktop input-helper IPC reader")?;
@@ -1012,7 +1032,7 @@ fn dispatch_child_events(
             Ok(ChildEvent::Cursor(shape)) => {
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) = shape;
             }
-            Ok(ChildEvent::Files(_) | ChildEvent::Clipboard(_) | ChildEvent::Chat(_)) => {
+            Ok(ChildEvent::MaintenanceState { .. } | ChildEvent::Files(_) | ChildEvent::Clipboard(_) | ChildEvent::Chat(_)) => {
                 set_status(
                     &status,
                     Err("capture helper reported an input-only clipboard event".into()),
@@ -1047,6 +1067,7 @@ fn dispatch_input_events(
     clipboard: HelperClipboard,
     files: HelperFiles,
     chat: HelperChat,
+    maintenance: HelperMaintenance,
 ) {
     let mut output = BufReader::new(output);
     let mut started_tx = Some(started_tx);
@@ -1062,6 +1083,9 @@ fn dispatch_input_events(
                     );
                     break;
                 }
+            }
+            Ok(ChildEvent::MaintenanceState { agent_input_blocked, blacked_out }) => {
+                *maintenance.lock().unwrap_or_else(|e| e.into_inner()) = Some(SessionMessage::MaintenanceState { agent_input_blocked, blacked_out });
             }
             Ok(ChildEvent::Cursor(shape)) => {
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) = shape;
@@ -1312,6 +1336,7 @@ fn run_capture_child(
                     ParentCommand::StartFiles
                     | ParentCommand::StartInput { .. }
                     | ParentCommand::Input(_)
+                    | ParentCommand::BlockInput(_)
                     | ParentCommand::ReleaseInput
                     | ParentCommand::Clipboard(_)
                     | ParentCommand::Files(_)
@@ -1355,6 +1380,7 @@ fn run_input_child(
     let chat = meshrmm_chat::ChatSession::with_peer("Viewer");
     let _indicator = super::indicator::SessionIndicator::show(&viewer_name, chat.clone())?;
     emit_child_event(&output, ChildEvent::InputStarted)?;
+    emit_child_event(&output, ChildEvent::MaintenanceState { agent_input_blocked: false, blacked_out: false })?;
     let mut sent_cursor = None;
     let mut clipboard = match super::clipboard::ClipboardSync::new() {
         Ok(clipboard) => Some(clipboard),
@@ -1391,6 +1417,13 @@ fn run_input_child(
                 if let Err(error) = input.apply(event) {
                     tracing::warn!(%error, "desktop input helper discarded invalid input");
                 }
+            }
+            Ok(Ok(ParentCommand::BlockInput(blocked))) => {
+                if let Err(error) = input.set_blocked(blocked) {
+                    terminal_error = Some(error.to_string());
+                    break;
+                }
+                emit_child_event(&output, ChildEvent::MaintenanceState { agent_input_blocked: input.blocked(), blacked_out: false })?;
             }
             Ok(Ok(ParentCommand::ReleaseInput)) => {
                 if let Err(error) = input.release_all() {
@@ -1531,6 +1564,7 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             write_u32(&mut writer, bytes.len() as u32)?;
             writer.write_all(&bytes)
         }
+        ParentCommand::BlockInput(blocked) => writer.write_all(&[COMMAND_BLOCK_INPUT, u8::from(*blocked)]),
         ParentCommand::ReleaseInput => writer.write_all(&[COMMAND_RELEASE_INPUT]),
         ParentCommand::Clipboard(text) => {
             let bytes = SessionMessage::Clipboard { text: text.clone() }
@@ -1611,6 +1645,14 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
                 Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
             }
         }
+        COMMAND_BLOCK_INPUT => {
+            let mut value = [0]; reader.read_exact(&mut value)?;
+            match value[0] {
+                0 => Ok(ParentCommand::BlockInput(false)),
+                1 => Ok(ParentCommand::BlockInput(true)),
+                _ => Err(io::Error::new(io::ErrorKind::InvalidData, "invalid input block flag")),
+            }
+        }
         COMMAND_RELEASE_INPUT => Ok(ParentCommand::ReleaseInput),
         COMMAND_CLIPBOARD => {
             let length = bounded_len(
@@ -1689,6 +1731,7 @@ fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
             }
             Ok(())
         }
+        ChildEvent::MaintenanceState { agent_input_blocked, blacked_out } => writer.write_all(&[10, u8::from(*agent_input_blocked), u8::from(*blacked_out)]),
         ChildEvent::InputStarted => writer.write_all(&[EVENT_INPUT_STARTED]),
         ChildEvent::Frame(frame) => {
             let codec_config = frame.codec_config.as_deref().unwrap_or_default();
@@ -1749,6 +1792,11 @@ fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
 
 fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
     match read_u8(&mut reader)? {
+        10 => {
+            let a = read_u8(&mut reader)?; let b = read_u8(&mut reader)?;
+            if a > 1 || b > 1 { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid maintenance state")); }
+            Ok(ChildEvent::MaintenanceState { agent_input_blocked: a == 1, blacked_out: b == 1 })
+        }
         EVENT_STARTED => {
             let format = ActiveFormat {
                 width: read_u32(&mut reader)?,
@@ -2132,6 +2180,8 @@ mod tests {
                 pressed: true,
             }),
             ParentCommand::ReleaseInput,
+            ParentCommand::BlockInput(true),
+            ParentCommand::BlockInput(false),
             ParentCommand::Clipboard("winget install Example.Package\n".into()),
             ParentCommand::Stop,
         ];
@@ -2247,6 +2297,7 @@ mod tests {
             ParentCommand::StartInput { .. } => COMMAND_START_INPUT,
             ParentCommand::Input(_) => COMMAND_INPUT,
             ParentCommand::ReleaseInput => COMMAND_RELEASE_INPUT,
+            ParentCommand::BlockInput(_) => COMMAND_BLOCK_INPUT,
             ParentCommand::Clipboard(_) => COMMAND_CLIPBOARD,
             ParentCommand::StartFiles => 13,
             ParentCommand::Files(_) => 12,

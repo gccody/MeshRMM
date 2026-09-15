@@ -44,6 +44,8 @@ pub trait ScreenStreamer: Send {
 }
 
 pub trait ScreenInput: Send + Sync {
+    fn maintenance_state(&self) -> Option<meshrmm_protocol::SessionMessage>;
+    fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()>;
     fn apply_files(&self, message: meshrmm_protocol::FileMessage) -> anyhow::Result<()>;
     fn poll_files(&self) -> Option<meshrmm_protocol::FileMessage>;
     fn apply(&self, input: RemoteInput) -> anyhow::Result<()>;
@@ -280,6 +282,14 @@ struct DirectInputController {
 
 #[cfg(windows)]
 impl ScreenInput for DirectInputController {
+    fn maintenance_state(&self) -> Option<meshrmm_protocol::SessionMessage> {
+        self.controller.lock().ok().map(|input| meshrmm_protocol::SessionMessage::MaintenanceState {
+            agent_input_blocked: input.blocked(), blacked_out: false,
+        })
+    }
+    fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()> {
+        self.controller.lock().map_err(|_| anyhow::anyhow!("input lock poisoned"))?.set_blocked(blocked)
+    }
     fn stop_chat(&self) {
         self.chat.set_available(false);
     }

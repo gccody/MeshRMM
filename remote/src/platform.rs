@@ -7,6 +7,13 @@ mod macos;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+#[derive(Default, Clone, Copy)]
+pub struct MaintenanceState {
+    pub available: bool,
+    pub agent_input_blocked: bool,
+    pub blacked_out: bool,
+}
+
 /// Sends viewer control messages and keeps the transport's input gate in sync
 /// with the native window's foreground state.
 #[derive(Clone)]
@@ -15,6 +22,7 @@ pub struct ControlSink {
     chat: meshrmm_chat::ChatSession,
     send: Arc<dyn Fn(meshrmm_protocol::SessionMessage) + Send + Sync>,
     set_input_enabled: Arc<dyn Fn(bool) + Send + Sync>,
+    maintenance: Arc<Mutex<MaintenanceState>>,
     technician_blocked: Arc<std::sync::atomic::AtomicBool>,
     quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
     chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
@@ -29,6 +37,7 @@ impl ControlSink {
         set_input_enabled: impl Fn(bool) + Send + Sync + 'static,
         chat: meshrmm_chat::ChatSession,
         technician_blocked: Arc<std::sync::atomic::AtomicBool>,
+        maintenance: Arc<Mutex<MaintenanceState>>,
         quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
         chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
         #[cfg(windows)] profiles: Arc<Vec<meshrmm_protocol::VideoProfile>>,
@@ -37,6 +46,7 @@ impl ControlSink {
             files,
             chat,
             technician_blocked,
+            maintenance,
             send: Arc::new(send),
             set_input_enabled: Arc::new(set_input_enabled),
             quality,
@@ -70,6 +80,17 @@ impl ControlSink {
     pub fn chat(&self) -> meshrmm_chat::ChatSession {
         self.chat.clone()
     }
+
+    pub fn maintenance_state(&self) -> MaintenanceState {
+        self.maintenance.lock().map(|s| *s).unwrap_or_default()
+    }
+    pub fn toggle_agent_input(&self) {
+        let state = self.maintenance_state();
+        if state.available {
+            self.send(meshrmm_protocol::SessionMessage::SetAgentInputBlocked { blocked: !state.agent_input_blocked });
+        }
+    }
+    pub fn agent_blocked(&self) -> bool { self.maintenance_state().agent_input_blocked }
 
     pub fn technician_blocked(&self) -> bool {
         self.technician_blocked.load(std::sync::atomic::Ordering::SeqCst)
