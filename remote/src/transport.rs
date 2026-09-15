@@ -808,7 +808,11 @@ fn start_viewer_services(
                 let mut clipboard = if label == CLIPBOARD_CHANNEL { ClipboardSync::new(true).ok() } else { None };
                 let mut receiver = meshrmm_protocol::ClipboardReceiver::default();
                 let mut outgoing = std::collections::VecDeque::new();
-                let mut announced = false;
+                let chat_ready = viewer.chat.outgoing_ready();
+                if label == CHAT_CHANNEL {
+                    wait_control_channel(&control).await;
+                    viewer.send(SessionMessage::ChatAvailable);
+                }
                 let mut poll = tokio::time::interval(std::time::Duration::from_millis(5));
                 poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut clipboard_poll = tokio::time::Instant::now();
@@ -831,15 +835,14 @@ fn start_viewer_services(
                                 },
                             }
                         }
-                        _ = poll.tick() => {
+                        _ = chat_ready.notified(), if label == CHAT_CHANNEL => {
+                            while let Some(text) = viewer.chat.poll() { viewer.send(SessionMessage::Chat { text }); }
+                        }
+                        _ = poll.tick(), if label != CHAT_CHANNEL => {
                             let open = control.lock().ok().and_then(|c| c.clone()).is_some_and(|c| c.ready_state() == RTCDataChannelState::Open);
                             if !open { continue; }
                             match label {
                                 FILE_CHANNEL => { if let Some(message) = viewer.files.poll() { viewer.send(SessionMessage::FileTransfer(message)); } }
-                                CHAT_CHANNEL => {
-                                    if !announced { viewer.send(SessionMessage::ChatAvailable); announced = true; }
-                                    if let Some(text) = viewer.chat.poll() { viewer.send(SessionMessage::Chat { text }); }
-                                }
                                 CLIPBOARD_CHANNEL => {
                                     if clipboard_poll.elapsed() >= CLIPBOARD_POLL_INTERVAL {
                                         clipboard_poll = tokio::time::Instant::now();

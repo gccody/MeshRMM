@@ -153,7 +153,12 @@ type HelperStatus = Arc<Mutex<Option<Result<(), String>>>>;
 type HelperCursor = Arc<Mutex<CursorShape>>;
 type HelperFiles = Arc<Mutex<std::collections::VecDeque<meshrmm_protocol::FileMessage>>>;
 type HelperMaintenance = Arc<Mutex<Option<SessionMessage>>>;
-type HelperChat = Arc<Mutex<std::collections::VecDeque<String>>>;
+#[derive(Default)]
+struct ChatEvents {
+    queue: Mutex<std::collections::VecDeque<String>>,
+    ready: Arc<tokio::sync::Notify>,
+}
+type HelperChat = Arc<ChatEvents>;
 type HelperClipboard = Arc<Mutex<Option<ClipboardContent>>>;
 type InputWriter = Arc<CommandWriter>;
 type InputRoute = Arc<Mutex<Option<InputWriter>>>;
@@ -200,7 +205,7 @@ impl DesktopCaptureStreamer {
             cursor: Arc::new(Mutex::new(CursorShape::Default)),
             clipboard: Arc::new(Mutex::new(None)),
             files: Arc::new(Mutex::new(std::collections::VecDeque::new())),
-            chat: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            chat: Arc::new(ChatEvents::default()),
             maintenance: Arc::new(Mutex::new(None)),
             chat_enabled: Arc::new(AtomicBool::new(false)),
         }
@@ -602,7 +607,7 @@ impl DesktopCaptureStreamer {
             }
             helper.finish();
         }
-        self.chat.lock().unwrap().clear();
+        self.chat.queue.lock().unwrap().clear();
     }
 
     fn stop_clipboard_helper(&mut self) {
@@ -752,7 +757,11 @@ impl ScreenInput for DesktopInputController {
 
     fn stop_chat(&self) {
         self.chat_enabled.store(false, Ordering::Release);
-        self.chat.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.chat
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         if let Some(writer) = self
             .chat_route
             .lock()
@@ -785,9 +794,13 @@ impl ScreenInput for DesktopInputController {
         send_command(&writer, &ParentCommand::Chat(text))?;
         Ok(())
     }
+    fn chat_ready(&self) -> Arc<tokio::sync::Notify> {
+        self.chat.ready.clone()
+    }
     fn poll_chat(&self) -> anyhow::Result<Option<String>> {
         Ok(self
             .chat
+            .queue
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pop_front())
@@ -1262,9 +1275,10 @@ fn dispatch_input_events(
                 }
             }
             Ok(ChildEvent::Chat(text)) => {
-                let mut chat = chat.lock().unwrap_or_else(|e| e.into_inner());
-                if chat.len() < 32 {
-                    chat.push_back(text);
+                let mut queue = chat.queue.lock().unwrap_or_else(|e| e.into_inner());
+                if queue.len() < 32 {
+                    queue.push_back(text);
+                    chat.ready.notify_one();
                 }
             }
             Ok(ChildEvent::Clipboard(text)) => {
@@ -2787,23 +2801,85 @@ fn run_chat_child(
     let chat = meshrmm_chat::ChatSession::with_peer("Viewer");
     let _indicator = super::indicator::SessionIndicator::show(&viewer_name, chat.clone())?;
     emit_child_event(&output, ChildEvent::InputStarted)?;
-    loop {
-        match commands.recv_timeout(Duration::from_millis(16)) {
-            Ok(Ok(ParentCommand::StartChat)) => chat.set_available(true),
-            Ok(Ok(ParentCommand::StopChat)) => chat.set_available(false),
-            Ok(Ok(ParentCommand::Chat(text))) => {
-                if chat.available() {
-                    chat.receive(text);
+    let mut commands = async_helper_commands(commands)?;
+    let ready = chat.outgoing_ready();
+    tokio::runtime::Builder::new_current_thread()
+        .build()?
+        .block_on(async {
+            loop {
+                tokio::select! {
+                    command = commands.recv() => match command {
+                        Some(Ok(ParentCommand::StartChat)) => chat.set_available(true),
+                        Some(Ok(ParentCommand::StopChat)) => chat.set_available(false),
+                        Some(Ok(ParentCommand::Chat(text))) => {
+                            if chat.available() { chat.receive(text); }
+                        }
+                        Some(Ok(ParentCommand::Stop)) | None => break,
+                        _ => anyhow::bail!("chat helper received an unexpected command"),
+                    },
+                    _ = ready.notified() => {
+                        while let Some(text) = chat.poll() {
+                            emit_child_event(&output, ChildEvent::Chat(text))?;
+                        }
+                    }
                 }
             }
-            Ok(Ok(ParentCommand::Stop)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            _ => anyhow::bail!("chat helper received an unexpected command"),
-        }
-        if let Some(text) = chat.poll() {
-            emit_child_event(&output, ChildEvent::Chat(text))?;
-        }
-    }
+            Ok::<(), anyhow::Error>(())
+        })?;
     emit_child_event(&output, ChildEvent::Stopped)?;
     Ok(())
+}
+
+// Adapt the bounded native pipe reader without periodic wakeups. The bridge
+// exits on Stop/EOF; blocking pipe work stays off the async service worker.
+fn async_helper_commands(
+    commands: mpsc::Receiver<io::Result<ParentCommand>>,
+) -> io::Result<tokio::sync::mpsc::Receiver<io::Result<ParentCommand>>> {
+    let (sender, receiver) = tokio::sync::mpsc::channel(64);
+    thread::Builder::new()
+        .name("meshrmm-service-commands".into())
+        .spawn(move || {
+            while let Ok(command) = commands.recv() {
+                let stop = matches!(&command, Ok(ParentCommand::Stop) | Err(_));
+                if sender.blocking_send(command).is_err() || stop {
+                    break;
+                }
+            }
+        })?;
+    Ok(receiver)
+}
+
+#[cfg(test)]
+mod service_command_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn command_bridge_preserves_order_and_closes_after_stop() {
+        let (sender, commands) = mpsc::sync_channel(64);
+        let mut receiver = async_helper_commands(commands).unwrap();
+        sender.send(Ok(ParentCommand::StartChat)).unwrap();
+        sender
+            .send(Ok(ParentCommand::Chat("hello".into())))
+            .unwrap();
+        sender.send(Ok(ParentCommand::Stop)).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            assert!(matches!(receiver.recv().await, Some(Ok(ParentCommand::StartChat))));
+            assert!(matches!(receiver.recv().await, Some(Ok(ParentCommand::Chat(text))) if text == "hello"));
+            assert!(matches!(receiver.recv().await, Some(Ok(ParentCommand::Stop))));
+            assert!(receiver.recv().await.is_none());
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn command_bridge_wakes_on_pipe_disconnect() {
+        let (sender, commands) = mpsc::sync_channel(64);
+        let mut receiver = async_helper_commands(commands).unwrap();
+        drop(sender);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }

@@ -809,8 +809,7 @@ fn spawn_chat_worker(
         } else {
             channel
         };
-        let mut poll = tokio::time::interval(std::time::Duration::from_millis(50));
-        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let ready = input.chat_ready();
         let result: anyhow::Result<()> = async {
             loop {
                 if *stop.borrow() { break; }
@@ -827,8 +826,8 @@ fn spawn_chat_worker(
                             _ => {},
                         }
                     }
-                    _ = poll.tick(), if channel.ready_state() == RTCDataChannelState::Open => {
-                        if let Some(text) = input.poll_chat()? {
+                    _ = ready.notified() => {
+                        while let Some(text) = input.poll_chat()? {
                             send_control_message(&channel, SessionMessage::Chat { text }).await?;
                         }
                     }
@@ -1819,6 +1818,9 @@ mod service_isolation_tests {
         }
         fn poll_files(&self) -> Option<FileMessage> {
             None
+        }
+        fn chat_ready(&self) -> Arc<tokio::sync::Notify> {
+            Arc::new(tokio::sync::Notify::new())
         }
         fn poll_chat(&self) -> anyhow::Result<Option<String>> {
             Ok(None)
