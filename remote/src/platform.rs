@@ -15,6 +15,7 @@ pub struct ControlSink {
     chat: meshrmm_chat::ChatSession,
     send: Arc<dyn Fn(meshrmm_protocol::SessionMessage) + Send + Sync>,
     set_input_enabled: Arc<dyn Fn(bool) + Send + Sync>,
+    technician_blocked: Arc<std::sync::atomic::AtomicBool>,
     quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
     chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
     #[cfg(windows)]
@@ -27,6 +28,7 @@ impl ControlSink {
         send: impl Fn(meshrmm_protocol::SessionMessage) + Send + Sync + 'static,
         set_input_enabled: impl Fn(bool) + Send + Sync + 'static,
         chat: meshrmm_chat::ChatSession,
+        technician_blocked: Arc<std::sync::atomic::AtomicBool>,
         quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
         chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
         #[cfg(windows)] profiles: Arc<Vec<meshrmm_protocol::VideoProfile>>,
@@ -34,6 +36,7 @@ impl ControlSink {
         Self {
             files,
             chat,
+            technician_blocked,
             send: Arc::new(send),
             set_input_enabled: Arc::new(set_input_enabled),
             quality,
@@ -44,6 +47,9 @@ impl ControlSink {
     }
 
     pub fn send(&self, message: meshrmm_protocol::SessionMessage) {
+        if self.technician_blocked() && matches!(&message, meshrmm_protocol::SessionMessage::Input(_)) {
+            return;
+        }
         if let meshrmm_protocol::SessionMessage::SetQuality { preset } = &message
             && let Ok(mut quality) = self.quality.lock()
         {
@@ -65,8 +71,18 @@ impl ControlSink {
         self.chat.clone()
     }
 
+    pub fn technician_blocked(&self) -> bool {
+        self.technician_blocked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Call after releasing held keys/buttons, before changing the gate.
+    pub fn set_technician_blocked(&self, blocked: bool) {
+        self.technician_blocked.store(blocked, std::sync::atomic::Ordering::SeqCst);
+        if blocked { (self.set_input_enabled)(false); }
+    }
+
     pub fn set_input_enabled(&self, enabled: bool) {
-        (self.set_input_enabled)(enabled && !self.chat.visible());
+        (self.set_input_enabled)(enabled && !self.chat.visible() && !self.technician_blocked());
     }
 
     pub fn quality_preset(&self) -> meshrmm_protocol::QualityPreset {

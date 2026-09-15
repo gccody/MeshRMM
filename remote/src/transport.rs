@@ -54,6 +54,7 @@ struct ReceiverLifecycle {
 /// transports after a network change or remote reboot.
 #[derive(Clone, Default)]
 pub struct ViewerResumeState {
+    technician_blocked: Arc<AtomicBool>,
     quality: Arc<Mutex<QualityPreset>>,
     chroma: Arc<Mutex<ChromaMode>>,
     display_id: Arc<Mutex<Option<meshrmm_protocol::DisplayId>>>,
@@ -208,7 +209,7 @@ impl ViewerControlQueue {
         let Ok(mut input) = self.input.lock() else {
             return;
         };
-        if is_input && !input.enabled {
+        if is_input && (!input.enabled || self.resume_state.technician_blocked.load(Ordering::SeqCst)) {
             return;
         }
         if matches!(
@@ -896,6 +897,7 @@ fn install_control_handler(
                         move |message| message_queue.send(message),
                         move |enabled| input_gate.set_input_enabled(enabled),
                         viewer_control.chat.clone(),
+                        Arc::clone(&viewer_control.resume_state.technician_blocked),
                         Arc::clone(&quality_preset),
                         Arc::clone(&chroma_mode),
                         #[cfg(windows)]
@@ -1220,6 +1222,24 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn technician_block_survives_focus_and_transport_rebuild() {
+        let state = ViewerResumeState::default();
+        state.technician_blocked.store(true, Ordering::SeqCst);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let queue = ViewerControlQueue::new(tx, state.clone());
+        queue.set_input_enabled(true);
+        queue.send(SessionMessage::Input(RemoteInput::Key {
+            display_id: DisplayId(1), scan_code: 30, extended: false, pressed: true,
+        }));
+        assert!(rx.try_recv().is_err());
+        state.technician_blocked.store(false, Ordering::SeqCst);
+        queue.send(SessionMessage::Input(RemoteInput::Key {
+            display_id: DisplayId(1), scan_code: 30, extended: false, pressed: true,
+        }));
+        assert!(rx.try_recv().is_ok());
+    }
+
     #[test]
     fn monitor_resolution_changes_reuse_the_presenter_but_codec_changes_do_not() {
         let current = meshrmm_protocol::VideoFormat {
