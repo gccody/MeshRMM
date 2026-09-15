@@ -67,8 +67,6 @@ enum ControlCommand {
         reason: String,
     },
     SelectDisplay(DisplayId),
-    Chat(String),
-    ChatAvailable,
     ChannelClosed,
     Stop,
 }
@@ -338,6 +336,8 @@ async fn run_connected_sender(
     cleanup.workers.push(maintenance_task);
     let (clipboard_tx, clipboard_task) = spawn_clipboard_worker(Arc::clone(&input), Arc::clone(&control_channel))?;
     cleanup.workers.push(clipboard_task);
+    let (chat_tx, chat_task) = spawn_chat_worker(Arc::clone(&input), Arc::clone(&control_channel))?;
+    cleanup.workers.push(chat_task);
     {
         let notify = Arc::clone(&control_open);
         let decoder_ready = Arc::clone(&decoder_ready);
@@ -354,12 +354,14 @@ async fn run_connected_sender(
         }));
         let control_messages_tx = control_tx.clone();
         let input_tx = input_tx.clone();
+        let chat_tx = chat_tx.clone();
         let clipboard_tx = clipboard_tx.clone();
         let maintenance_tx = maintenance_tx.clone();
         control_channel.on_message(Box::new(move |message| {
             let tx = control_messages_tx.clone();
             let decoder_ready = Arc::clone(&decoder_ready);
             let input_tx = input_tx.clone();
+            let chat_tx = chat_tx.clone();
             let clipboard_tx = clipboard_tx.clone();
             let maintenance_tx = maintenance_tx.clone();
             Box::pin(async move {
@@ -411,8 +413,9 @@ async fn run_connected_sender(
                     Ok(SessionMessage::FileTransfer(message)) => {
                         Some(ControlCommand::Files(message))
                     }
-                    Ok(SessionMessage::ChatAvailable) => Some(ControlCommand::ChatAvailable),
-                    Ok(SessionMessage::Chat { text }) => Some(ControlCommand::Chat(text)),
+                    Ok(message @ (SessionMessage::ChatAvailable | SessionMessage::Chat { .. })) => {
+                        chat_tx.try_send(message).err().map(|_| ControlCommand::MaintenanceError("chat queue full or closed".into()))
+                    },
                     Ok(SessionMessage::Stop { .. }) => Some(ControlCommand::Stop),
                     Ok(_) => None,
                     Err(error) => {
@@ -441,7 +444,7 @@ async fn run_connected_sender(
         let result = run_capture_control(capture_streamer.clone(), capture_slot, capture_channel,
             capture_ceiling, capture_rx, started_tx, stop).await;
         if let Err(error) = result { let _ = capture_failure.send(format!("capture worker: {error:#}")); }
-        if let Err(error) = lock_streamer(&capture_streamer).and_then(|mut s| s.stop()) {
+        if let Err(error) = lock_streamer(&capture_streamer).and_then(|mut s| s.shutdown()) {
             tracing::warn!(%error, "capture worker cleanup failed");
         }
     })?;
@@ -477,8 +480,6 @@ async fn run_connected_sender(
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     stats_interval.tick().await;
     let mut file_interval = tokio::time::interval(std::time::Duration::from_millis(5));
-    let mut clipboard_interval = tokio::time::interval(std::time::Duration::from_millis(250));
-    clipboard_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut offer_sent = false;
     let mut remote_description_set = false;
     let mut pending_candidates = Vec::new();
@@ -549,15 +550,6 @@ async fn run_connected_sender(
                     ControlCommand::MaintenanceError(reason) => {
                         send_control_message(&control_channel, SessionMessage::MaintenanceError { reason }).await?;
                     }
-                    ControlCommand::ChatAvailable => {
-                        input.start_chat()?;
-                        send_control_message(&control_channel, SessionMessage::ChatAvailable).await?;
-                    }
-                    ControlCommand::Chat(text) => {
-                        if let Err(error) = input.apply_chat(text) {
-                            tracing::warn!(%error, "could not display chat message");
-                        }
-                    }
                     ControlCommand::Stop => break Ok(()),
                     ControlCommand::ChannelClosed => {
                         // The viewer closes its old channels before resuming the
@@ -567,12 +559,6 @@ async fn run_connected_sender(
                         tracing::info!("viewer control channel closed; awaiting session resume");
                         break Ok(());
                     }
-                }
-            }
-            _ = clipboard_interval.tick(), if session_state == SessionState::Streaming
-                && control_channel.ready_state() == RTCDataChannelState::Open => {
-                if let Some(text) = input.poll_chat()? {
-                    send_control_message(&control_channel, SessionMessage::Chat { text }).await?;
                 }
             }
             Some(state) = state_rx.recv() => {
@@ -615,7 +601,6 @@ async fn run_connected_sender(
     control_start.abort();
     let _ = control_start.await;
     for worker in &mut cleanup.workers { worker.shutdown().await; }
-    input.stop_chat();
     if matches!(
         session_state,
         SessionState::Requested
@@ -642,6 +627,45 @@ async fn run_connected_sender(
         "remote sender session stopped"
     );
     result
+}
+
+fn spawn_chat_worker(
+    input: Arc<dyn super::platform::ScreenInput>,
+    channel: Arc<RTCDataChannel>,
+) -> anyhow::Result<(mpsc::Sender<SessionMessage>, super::native_task::NativeTask)> {
+    let (sender, mut commands) = mpsc::channel(64);
+    let task = super::native_task::NativeTask::spawn("meshrmm-chat", move |mut stop| async move {
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(50));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let result: anyhow::Result<()> = async {
+            loop {
+                if *stop.borrow() { break; }
+                tokio::select! {
+                    _ = stop.changed() => break,
+                    message = commands.recv() => {
+                        let Some(message) = message else { break; };
+                        match message {
+                            SessionMessage::ChatAvailable => {
+                                input.start_chat()?;
+                                send_control_message(&channel, SessionMessage::ChatAvailable).await?;
+                            }
+                            SessionMessage::Chat { text } => input.apply_chat(text)?,
+                            _ => {},
+                        }
+                    }
+                    _ = poll.tick(), if channel.ready_state() == RTCDataChannelState::Open => {
+                        if let Some(text) = input.poll_chat()? {
+                            send_control_message(&channel, SessionMessage::Chat { text }).await?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }.await;
+        input.stop_chat();
+        if let Err(error) = result { tracing::warn!(%error, "chat worker stopped"); }
+    })?;
+    Ok((sender, task))
 }
 
 fn spawn_clipboard_worker(

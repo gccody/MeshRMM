@@ -94,6 +94,7 @@ impl DesktopTarget {
 enum ParentCommand {
     StartFiles,
     StartClipboard,
+    StartChatHelper { viewer_name: String },
     Files(meshrmm_protocol::FileMessage),
     Start {
         viewer_name: String,
@@ -162,6 +163,8 @@ pub struct DesktopCaptureStreamer {
     input: Option<RunningInputHelper>,
     file_helper: Option<RunningInputHelper>,
     clipboard_helper: Option<RunningInputHelper>,
+    chat_helper: Option<RunningInputHelper>,
+    chat_route: InputRoute,
     clipboard_route: InputRoute,
     file_route: InputRoute,
     input_route: InputRoute,
@@ -183,6 +186,8 @@ impl DesktopCaptureStreamer {
             input: None,
             file_helper: None,
             clipboard_helper: None,
+            chat_helper: None,
+            chat_route: Arc::new(Mutex::new(None)),
             clipboard_route: Arc::new(Mutex::new(None)),
             file_route: Arc::new(Mutex::new(None)),
             input_route: Arc::new(Mutex::new(None)),
@@ -394,6 +399,7 @@ impl DesktopCaptureStreamer {
             route: Arc::clone(&self.input_route),
             file_route: Arc::clone(&self.file_route),
             clipboard_route: Arc::clone(&self.clipboard_route),
+            chat_route: Arc::clone(&self.chat_route),
             cursor: Arc::clone(&self.cursor),
             clipboard: Arc::clone(&self.clipboard),
             files: Arc::clone(&self.files),
@@ -477,6 +483,19 @@ impl DesktopCaptureStreamer {
                 }
             }
         }
+        if self.chat_helper.as_ref().is_none_or(|helper| helper.target != target || helper.status.lock().unwrap().is_some()) {
+            self.stop_chat_helper();
+            match start_input_helper(&self.viewer_name, target, display_id,
+                Arc::clone(&self.cursor), Arc::clone(&self.clipboard), Arc::clone(&self.files),
+                Arc::clone(&self.chat), Arc::clone(&self.maintenance), HelperKind::Chat) {
+                Ok(helper) => {
+                    if self.chat_enabled.load(Ordering::Acquire) { send_command(&helper.input, &ParentCommand::StartChat)?; }
+                    *self.chat_route.lock().unwrap() = Some(Arc::clone(&helper.input));
+                    self.chat_helper = Some(helper);
+                }
+                Err(error) => tracing::warn!(%error, "independent chat helper unavailable"),
+            }
+        }
         if self.clipboard_helper.as_ref().is_none_or(|helper| helper.target != target || helper.status.lock().unwrap().is_some()) {
             self.stop_clipboard_helper();
             match start_input_helper(&self.viewer_name, target, display_id,
@@ -531,11 +550,28 @@ impl DesktopCaptureStreamer {
             .input_route
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&helper.input));
-        if self.chat_enabled.load(Ordering::Acquire) {
-            send_command(&helper.input, &ParentCommand::StartChat)?;
-        }
         self.input = Some(helper);
         Ok(())
+    }
+
+    pub fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.stop_chat_helper();
+        self.stop_clipboard_helper();
+        self.stop_file_helper();
+        self.stop_input_helper();
+        self.stop()
+    }
+
+    fn stop_chat_helper(&mut self) {
+        *self.chat_route.lock().unwrap() = None;
+        if let Some(mut helper) = self.chat_helper.take() {
+            let _ = send_command(&helper.input, &ParentCommand::Stop);
+            if unsafe { WaitForSingleObject(helper.process.0, STOP_TIMEOUT_MS) } == WAIT_TIMEOUT {
+                terminate_and_wait(&helper.process);
+            }
+            helper.finish();
+        }
+        self.chat.lock().unwrap().clear();
     }
 
     fn stop_clipboard_helper(&mut self) {
@@ -590,14 +626,7 @@ impl Default for DesktopCaptureStreamer {
 }
 
 impl Drop for DesktopCaptureStreamer {
-    fn drop(&mut self) {
-        self.stop_clipboard_helper();
-        self.stop_file_helper();
-        if let Err(error) = self.stop() {
-            tracing::warn!(%error, "failed to stop desktop helper cleanly");
-        }
-        self.stop_input_helper();
-    }
+    fn drop(&mut self) { let _ = self.shutdown(); }
 }
 
 struct RunningHelper {
@@ -624,6 +653,7 @@ struct RunningInputHelper {
 }
 
 struct DesktopInputController {
+    chat_route: InputRoute,
     clipboard_route: InputRoute,
     blackout_message: String,
     file_route: InputRoute,
@@ -668,25 +698,16 @@ impl ScreenInput for DesktopInputController {
     }
 
     fn stop_chat(&self) {
-        if let Some(writer) = self
-            .file_route
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            let _ = send_command(&writer, &ParentCommand::Stop);
-        }
-
         self.chat_enabled.store(false, Ordering::Release);
         self.chat.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        if let Some(writer) = self.route.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        if let Some(writer) = self.chat_route.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             let _ = send_command(&writer, &ParentCommand::StopChat);
         }
     }
 
     fn start_chat(&self) -> anyhow::Result<()> {
         let writer = self
-            .route
+            .chat_route
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -698,7 +719,7 @@ impl ScreenInput for DesktopInputController {
 
     fn apply_chat(&self, text: String) -> anyhow::Result<()> {
         let writer = self
-            .route
+            .chat_route
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -942,7 +963,7 @@ fn launch_helper(target: DesktopTarget, as_user: bool) -> anyhow::Result<Launche
 // Parameters mirror the input/file helper startup IPC payload.
 #[allow(clippy::too_many_arguments)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum HelperKind { Input, Files, Clipboard }
+enum HelperKind { Input, Files, Clipboard, Chat }
 
 fn start_input_helper(
     viewer_name: &str,
@@ -984,6 +1005,7 @@ fn start_input_helper(
         &match kind {
             HelperKind::Files => ParentCommand::StartFiles,
             HelperKind::Clipboard => ParentCommand::StartClipboard,
+            HelperKind::Chat => ParentCommand::StartChatHelper { viewer_name: viewer_name.to_owned() },
             HelperKind::Input => ParentCommand::StartInput { display_id, viewer_name: viewer_name.to_owned() },
         },
     ) {
@@ -1309,6 +1331,7 @@ pub fn run_child() -> anyhow::Result<()> {
         ),
         ParentCommand::StartFiles => run_file_child(command_rx),
         ParentCommand::StartClipboard => run_clipboard_child(command_rx),
+        ParentCommand::StartChatHelper { viewer_name } => run_chat_child(command_rx, viewer_name),
         ParentCommand::StartInput {
             display_id,
             viewer_name,
@@ -1421,6 +1444,7 @@ fn run_capture_child(
                 Ok(Ok(
                     ParentCommand::StartFiles
                     | ParentCommand::StartClipboard
+                    | ParentCommand::StartChatHelper { .. }
                     | ParentCommand::StartInput { .. }
                     | ParentCommand::Input(_)
                     | ParentCommand::Blackout { .. }
@@ -1455,7 +1479,7 @@ fn run_capture_child(
 fn run_input_child(
     command_rx: mpsc::Receiver<io::Result<ParentCommand>>,
     display_id: DisplayId,
-    viewer_name: String,
+    _viewer_name: String,
 ) -> anyhow::Result<()> {
     let displays = enumerate_displays()?;
     let active_display = displays
@@ -1465,8 +1489,6 @@ fn run_input_child(
     let mut input = WindowsInputController::new();
     input.set_active_display(active_display)?;
     let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
-    let chat = meshrmm_chat::ChatSession::with_peer("Viewer");
-    let _indicator = super::indicator::SessionIndicator::show(&viewer_name, chat.clone())?;
     emit_child_event(&output, ChildEvent::InputStarted)?;
     emit_child_event(&output, ChildEvent::MaintenanceState { agent_input_blocked: false, blacked_out: false })?;
     let mut sent_cursor = None;
@@ -1517,18 +1539,6 @@ fn run_input_child(
                     tracing::warn!(%error, "desktop input helper could not release input");
                 }
             }
-            Ok(Ok(ParentCommand::StopChat)) => {
-                chat.set_available(false);
-            }
-            Ok(Ok(ParentCommand::StartChat)) => {
-                chat.set_available(true);
-            }
-
-            Ok(Ok(ParentCommand::Chat(text))) => {
-                if chat.available() {
-                    chat.receive(text);
-                }
-            }
             Ok(Ok(ParentCommand::Stop)) => break,
             Ok(Ok(_)) => {
                 terminal_error = Some("input helper received a video command".into());
@@ -1536,9 +1546,6 @@ fn run_input_child(
             }
             Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
-        if let Some(text) = chat.poll() {
-            emit_child_event(&output, ChildEvent::Chat(text))?;
         }
     }
     let _ = input.release_all();
@@ -1580,6 +1587,12 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
     match command {
         ParentCommand::StartFiles => writer.write_all(&[13]),
         ParentCommand::StartClipboard => writer.write_all(&[16]),
+        ParentCommand::StartChatHelper { viewer_name } => {
+            checked_len(viewer_name.len(), MAX_CONTROL_BYTES, "viewer name")?;
+            writer.write_all(&[17])?;
+            write_u32(&mut writer, viewer_name.len() as u32)?;
+            writer.write_all(viewer_name.as_bytes())
+        },
         ParentCommand::Files(message) => {
             writer.write_all(&[12])?;
             write_file_message(&mut writer, message)
@@ -1665,6 +1678,13 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
 fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
     match read_u8(&mut reader)? {
         16 => Ok(ParentCommand::StartClipboard),
+        17 => {
+            let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "viewer name")?;
+            let mut name = vec![0; length];
+            reader.read_exact(&mut name)?;
+            let viewer_name = String::from_utf8(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(ParentCommand::StartChatHelper { viewer_name })
+        },
         COMMAND_START => {
             let length = bounded_len(
                 read_u32(&mut reader)?,
@@ -2257,6 +2277,7 @@ mod tests {
                 pixel_format: VideoPixelFormat::Yuv444,
             },
             ParentCommand::StartClipboard,
+            ParentCommand::StartChatHelper { viewer_name: "Zoë 王".into() },
             ParentCommand::RequestKeyframe,
             ParentCommand::SetBitrate(4_000_000),
             ParentCommand::StartInput {
@@ -2398,6 +2419,7 @@ mod tests {
             ParentCommand::Clipboard(_) => COMMAND_CLIPBOARD,
             ParentCommand::StartFiles => 13,
             ParentCommand::StartClipboard => 16,
+            ParentCommand::StartChatHelper { .. } => 17,
             ParentCommand::Files(_) => 12,
             ParentCommand::Chat(_) => COMMAND_CHAT,
             ParentCommand::StartChat => COMMAND_START_CHAT,
@@ -2540,4 +2562,24 @@ mod isolation_tests {
         assert!(writer.send(vec![0; 2 * MAX_CLIPBOARD_WIRE_BYTES + MAX_CONTROL_BYTES + 1]).is_err());
         writer.send(vec![COMMAND_RELEASE_INPUT]).unwrap();
     }
+}
+
+fn run_chat_child(commands: mpsc::Receiver<io::Result<ParentCommand>>, viewer_name: String) -> anyhow::Result<()> {
+    let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+    let chat = meshrmm_chat::ChatSession::with_peer("Viewer");
+    let _indicator = super::indicator::SessionIndicator::show(&viewer_name, chat.clone())?;
+    emit_child_event(&output, ChildEvent::InputStarted)?;
+    loop {
+        match commands.recv_timeout(Duration::from_millis(16)) {
+            Ok(Ok(ParentCommand::StartChat)) => chat.set_available(true),
+            Ok(Ok(ParentCommand::StopChat)) => chat.set_available(false),
+            Ok(Ok(ParentCommand::Chat(text))) => { if chat.available() { chat.receive(text); } },
+            Ok(Ok(ParentCommand::Stop)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {},
+            _ => anyhow::bail!("chat helper received an unexpected command"),
+        }
+        if let Some(text) = chat.poll() { emit_child_event(&output, ChildEvent::Chat(text))?; }
+    }
+    emit_child_event(&output, ChildEvent::Stopped)?;
+    Ok(())
 }
