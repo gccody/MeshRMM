@@ -61,8 +61,7 @@ pub enum SessionMessage {
     CursorShape {
         shape: CursorShape,
     },
-    /// Replaces the peer's clipboard with UTF-8 plain text. Rich text, images,
-    /// and file lists are intentionally not carried by the control channel.
+    /// Replaces the peer's clipboard with UTF-8 plain text (legacy wire format).
     Clipboard {
         text: String,
     },
@@ -102,6 +101,12 @@ pub enum SessionMessage {
     /// Request the Windows secure attention sequence (Ctrl+Alt+Del).
     /// Keep appended so existing postcard message tags remain stable.
     SendSecureAttention,
+    /// Ordered, bounded parts of a rich clipboard payload.
+    ClipboardChunk {
+        offset: u32,
+        total: u32,
+        data: Vec<u8>,
+    },
 }
 
 impl SessionMessage {

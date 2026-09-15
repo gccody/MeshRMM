@@ -76,7 +76,7 @@ enum ControlCommand {
         reason: String,
     },
     SelectDisplay(DisplayId),
-    Clipboard(String),
+    Clipboard(SessionMessage),
     Chat(String),
     ChatAvailable,
     ChannelClosed,
@@ -376,11 +376,9 @@ async fn run_connected_sender(
                     Ok(SessionMessage::SelectDisplay { display_id }) => {
                         Some(ControlCommand::SelectDisplay(display_id))
                     }
-                    Ok(SessionMessage::SendSecureAttention) => {
-                        super::secure_attention::send()
-                            .err()
-                            .map(|error| ControlCommand::MaintenanceError(format!("{error:#}")))
-                    }
+                    Ok(SessionMessage::SendSecureAttention) => super::secure_attention::send()
+                        .err()
+                        .map(|error| ControlCommand::MaintenanceError(format!("{error:#}"))),
                     Ok(SessionMessage::SetBlackout { enabled }) => {
                         if let Err(error) = input.set_blackout(enabled) {
                             Some(ControlCommand::MaintenanceError(error.to_string()))
@@ -397,7 +395,10 @@ async fn run_connected_sender(
                         }
                         None
                     }
-                    Ok(SessionMessage::Clipboard { text }) => Some(ControlCommand::Clipboard(text)),
+                    Ok(
+                        message @ (SessionMessage::Clipboard { .. }
+                        | SessionMessage::ClipboardChunk { .. }),
+                    ) => Some(ControlCommand::Clipboard(message)),
                     Ok(SessionMessage::FileTransfer(message)) => {
                         Some(ControlCommand::Files(message))
                     }
@@ -471,6 +472,8 @@ async fn run_connected_sender(
     let mut cursor_interval = tokio::time::interval(std::time::Duration::from_millis(16));
     cursor_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut file_interval = tokio::time::interval(std::time::Duration::from_millis(5));
+    let mut clipboard_outgoing = std::collections::VecDeque::<SessionMessage>::new();
+    let mut clipboard_receiver = meshrmm_protocol::ClipboardReceiver::default();
     let mut clipboard_interval = tokio::time::interval(std::time::Duration::from_millis(250));
     clipboard_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut sent_cursor_shape = None::<CursorShape>;
@@ -545,6 +548,8 @@ async fn run_connected_sender(
             }
             _ = file_interval.tick(), if session_state == SessionState::Streaming && control_channel.ready_state() == RTCDataChannelState::Open => {
                 if let Some(message) = input.poll_files() { send_control_message(&control_channel, SessionMessage::FileTransfer(message)).await?; }
+                if control_channel.buffered_amount().await < 256 * 1024
+                    && let Some(message) = clipboard_outgoing.pop_front() { send_control_message(&control_channel, message).await?; }
             }
             Some(command) = control_rx.recv() => {
                 match command {
@@ -726,8 +731,13 @@ async fn run_connected_sender(
                             tracing::warn!(%error, "could not display chat message");
                         }
                     }
-                    ControlCommand::Clipboard(text) => {
-                        if let Err(error) = input.apply_clipboard(text) {
+                    ControlCommand::Clipboard(message) => {
+                        let content = match clipboard_receiver.receive(message) {
+                            Ok(Some(content)) => { clipboard_outgoing.clear(); content },
+                            Ok(None) => continue,
+                            Err(error) => { tracing::warn!(%error, "invalid clipboard payload"); continue; }
+                        };
+                        if let Err(error) = input.apply_clipboard(content) {
                             tracing::warn!(error = %error, "discarding viewer clipboard update");
                         }
                     }
@@ -810,10 +820,7 @@ async fn run_connected_sender(
                 }
                 match input.poll_clipboard() {
                     Ok(Some(text)) => {
-                        send_control_message(
-                            &control_channel,
-                            SessionMessage::Clipboard { text },
-                        ).await?;
+                        clipboard_outgoing = text.messages()?.into();
                     }
                     Ok(None) => {}
                     Err(error) => tracing::warn!(error = %error, "could not synchronize the Agent clipboard"),

@@ -1,0 +1,13 @@
+[package]
+name = "meshrmm-clipboard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+[lints]
+workspace = true
+[dependencies]
+anyhow.workspace = true
+arboard.workspace = true
+meshrmm-protocol.workspace = true
+meshrmm-file-transfer = { path = "../file-transfer" }

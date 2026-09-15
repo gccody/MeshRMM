@@ -341,6 +341,8 @@ pub async fn run_receiver(
         }
     };
     let mut file_interval = tokio::time::interval(std::time::Duration::from_millis(5));
+    let mut clipboard_outgoing = std::collections::VecDeque::<SessionMessage>::new();
+    let mut clipboard_receiver = meshrmm_protocol::ClipboardReceiver::default();
     let mut clipboard_interval = tokio::time::interval(CLIPBOARD_POLL_INTERVAL);
     clipboard_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut remote_description_set = false;
@@ -369,8 +371,12 @@ pub async fn run_receiver(
                     .context("failed to send viewer control message")?;
             }
             _ = file_interval.tick(), if session_state == SessionState::Streaming => {
-                let channel_open = control_channel.lock().ok().and_then(|c| c.clone()).is_some_and(|c| c.ready_state() == RTCDataChannelState::Open);
+                let channel = control_channel.lock().ok().and_then(|c| c.clone());
+                let channel_open = channel.as_ref().is_some_and(|c| c.ready_state() == RTCDataChannelState::Open);
                 if channel_open && let Some(message) = viewer_control.files.poll() { viewer_control.send(SessionMessage::FileTransfer(message)); }
+                if channel_open && let Some(channel) = channel
+                    && channel.buffered_amount().await < 256 * 1024
+                    && let Some(message) = clipboard_outgoing.pop_front() { viewer_control.send(message); }
             }
             Some(message) = remote_text_rx.recv() => {
                 if let SessionMessage::FileTransfer(message) = message { viewer_control.files.receive(message); continue; }
@@ -383,7 +389,11 @@ pub async fn run_receiver(
                     chat.receive(text);
                     continue;
                 }
-                let SessionMessage::Clipboard { text } = message else { continue; };
+                let text = match clipboard_receiver.receive(message) {
+                    Ok(Some(content)) => { clipboard_outgoing.clear(); content },
+                    Ok(None) => continue,
+                    Err(error) => { tracing::warn!(%error, "invalid clipboard payload"); continue; }
+                };
                 if let Some(clipboard) = clipboard.as_mut()
                     && let Err(error) = clipboard.apply(text)
                 {
@@ -407,7 +417,9 @@ pub async fn run_receiver(
                 }
                 if channel_open && let Some(clipboard) = clipboard.as_mut() {
                     match clipboard.poll() {
-                        Ok(Some(text)) => viewer_control.send(SessionMessage::Clipboard { text }),
+                        Ok(Some(content)) => {
+                            clipboard_outgoing = content.messages()?.into();
+                        },
                         Ok(None) => {}
                         Err(error) => tracing::warn!(error = %error, "could not synchronize the viewer clipboard"),
                     }
@@ -1060,7 +1072,7 @@ fn install_control_handler(
                         active.presenter.set_cursor_shape(shape);
                     }
                 }
-                Ok(message @ (SessionMessage::FileTransfer(_) | SessionMessage::Clipboard { .. } | SessionMessage::Chat { .. } | SessionMessage::ChatAvailable)) => {
+                Ok(message @ (SessionMessage::FileTransfer(_) | SessionMessage::Clipboard { .. } | SessionMessage::ClipboardChunk { .. } | SessionMessage::Chat { .. } | SessionMessage::ChatAvailable)) => {
                     let _ = remote_text.send(message).await;
                 }
                 Ok(_) => {}
