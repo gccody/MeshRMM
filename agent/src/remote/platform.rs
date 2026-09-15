@@ -44,6 +44,7 @@ pub trait ScreenStreamer: Send {
 }
 
 pub trait ScreenInput: Send + Sync {
+    fn set_blackout(&self, enabled: bool) -> anyhow::Result<()>;
     fn maintenance_state(&self) -> Option<meshrmm_protocol::SessionMessage>;
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()>;
     fn apply_files(&self, message: meshrmm_protocol::FileMessage) -> anyhow::Result<()>;
@@ -63,6 +64,7 @@ pub trait ScreenInput: Send + Sync {
 pub struct PlatformScreenStreamer {
     inner: CaptureBackend,
     viewer_name: String,
+    blackout_message: String,
     indicator: Option<super::indicator::SessionIndicator>,
     frames_per_second: u32,
     bitrate_bits_per_second: u32,
@@ -82,16 +84,18 @@ impl PlatformScreenStreamer {
         bitrate_bits_per_second: u32,
         capture_as_active_user: bool,
         viewer_name: String,
+    blackout_message: String,
     ) -> Self {
         Self {
             inner: if capture_as_active_user {
                 CaptureBackend::Desktop(Box::new(
-                    super::capture_helper::DesktopCaptureStreamer::new(viewer_name.clone()),
+                    super::capture_helper::DesktopCaptureStreamer::new(viewer_name.clone(), blackout_message.clone()),
                 ))
             } else {
                 CaptureBackend::Direct(meshrmm_remote_screen::WindowsScreenStreamer::new())
             },
             viewer_name,
+            blackout_message,
             indicator: None,
             frames_per_second,
             bitrate_bits_per_second,
@@ -259,6 +263,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
     fn input_controller(&self) -> Arc<dyn ScreenInput> {
         match &self.inner {
             CaptureBackend::Direct(_) => Arc::new(DirectInputController {
+                blackout_message: self.blackout_message.clone(),
                 controller: Arc::clone(&self.direct_input),
                 files: self
                     .direct_files
@@ -274,6 +279,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
 
 #[cfg(windows)]
 struct DirectInputController {
+    blackout_message: String,
     files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
     controller: Arc<Mutex<super::input::WindowsInputController>>,
@@ -282,9 +288,12 @@ struct DirectInputController {
 
 #[cfg(windows)]
 impl ScreenInput for DirectInputController {
+    fn set_blackout(&self, enabled: bool) -> anyhow::Result<()> {
+        self.controller.lock().map_err(|_| anyhow::anyhow!("input lock poisoned"))?.set_blackout(enabled, &self.blackout_message)
+    }
     fn maintenance_state(&self) -> Option<meshrmm_protocol::SessionMessage> {
         self.controller.lock().ok().map(|input| meshrmm_protocol::SessionMessage::MaintenanceState {
-            agent_input_blocked: input.blocked(), blacked_out: false,
+            agent_input_blocked: input.blocked(), blacked_out: input.blacked_out(),
         })
     }
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()> {

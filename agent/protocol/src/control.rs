@@ -97,6 +97,8 @@ pub enum SessionMessage {
     FileTransfer(crate::FileMessage),
     SetAgentInputBlocked { blocked: bool },
     MaintenanceState { agent_input_blocked: bool, blacked_out: bool },
+    SetBlackout { enabled: bool },
+    MaintenanceError { reason: String },
 }
 
 impl SessionMessage {

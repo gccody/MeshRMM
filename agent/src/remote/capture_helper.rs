@@ -47,6 +47,7 @@ const COMMAND_CHAT: u8 = 9;
 const COMMAND_START_CHAT: u8 = 10;
 const COMMAND_STOP_CHAT: u8 = 11;
 const COMMAND_BLOCK_INPUT: u8 = 14;
+const COMMAND_BLACKOUT: u8 = 15;
 const EVENT_STARTED: u8 = 1;
 const EVENT_FRAME: u8 = 2;
 const EVENT_ERROR: u8 = 3;
@@ -109,6 +110,7 @@ enum ParentCommand {
     Input(RemoteInput),
     ReleaseInput,
     BlockInput(bool),
+    Blackout { enabled: bool, text: String },
     Clipboard(String),
     Chat(String),
     StartChat,
@@ -127,6 +129,7 @@ enum ChildEvent {
     Started(StartedDesktop),
     InputStarted,
     MaintenanceState { agent_input_blocked: bool, blacked_out: bool },
+    MaintenanceError(String),
     Frame(EncodedAccessUnit),
     Cursor(CursorShape),
     Clipboard(String),
@@ -148,6 +151,7 @@ type InputRoute = Arc<Mutex<Option<InputWriter>>>;
 /// desktop. Only frames and remote-control events cross the inherited pipes;
 /// the Agent token, configuration, and network stack remain in Session 0.
 pub struct DesktopCaptureStreamer {
+    blackout_message: String,
     viewer_name: String,
     running: Option<RunningHelper>,
     input: Option<RunningInputHelper>,
@@ -164,9 +168,10 @@ pub struct DesktopCaptureStreamer {
 }
 
 impl DesktopCaptureStreamer {
-    pub fn new(viewer_name: String) -> Self {
+    pub fn new(viewer_name: String, blackout_message: String) -> Self {
         Self {
             viewer_name,
+            blackout_message,
             running: None,
             input: None,
             file_helper: None,
@@ -376,6 +381,7 @@ impl DesktopCaptureStreamer {
 
     pub fn input_controller(&self) -> Arc<dyn ScreenInput> {
         Arc::new(DesktopInputController {
+            blackout_message: self.blackout_message.clone(),
             route: Arc::clone(&self.input_route),
             file_route: Arc::clone(&self.file_route),
             cursor: Arc::clone(&self.cursor),
@@ -545,7 +551,7 @@ impl DesktopCaptureStreamer {
 
 impl Default for DesktopCaptureStreamer {
     fn default() -> Self {
-        Self::new(String::new())
+        Self::new(String::new(), meshrmm_protocol::render_blackout_message("", ""))
     }
 }
 
@@ -583,6 +589,7 @@ struct RunningInputHelper {
 }
 
 struct DesktopInputController {
+    blackout_message: String,
     file_route: InputRoute,
     route: InputRoute,
     cursor: HelperCursor,
@@ -594,6 +601,11 @@ struct DesktopInputController {
 }
 
 impl ScreenInput for DesktopInputController {
+    fn set_blackout(&self, enabled: bool) -> anyhow::Result<()> {
+        let writer = self.route.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            .context("desktop input helper is not running")?;
+        send_command(&writer, &ParentCommand::Blackout { enabled, text: self.blackout_message.clone() })
+    }
     fn maintenance_state(&self) -> Option<SessionMessage> {
         self.maintenance.lock().ok().and_then(|value| value.clone())
     }
@@ -1032,7 +1044,7 @@ fn dispatch_child_events(
             Ok(ChildEvent::Cursor(shape)) => {
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) = shape;
             }
-            Ok(ChildEvent::MaintenanceState { .. } | ChildEvent::Files(_) | ChildEvent::Clipboard(_) | ChildEvent::Chat(_)) => {
+            Ok(ChildEvent::MaintenanceError(_) | ChildEvent::MaintenanceState { .. } | ChildEvent::Files(_) | ChildEvent::Clipboard(_) | ChildEvent::Chat(_)) => {
                 set_status(
                     &status,
                     Err("capture helper reported an input-only clipboard event".into()),
@@ -1083,6 +1095,9 @@ fn dispatch_input_events(
                     );
                     break;
                 }
+            }
+            Ok(ChildEvent::MaintenanceError(reason)) => {
+                *maintenance.lock().unwrap_or_else(|e| e.into_inner()) = Some(SessionMessage::MaintenanceError { reason });
             }
             Ok(ChildEvent::MaintenanceState { agent_input_blocked, blacked_out }) => {
                 *maintenance.lock().unwrap_or_else(|e| e.into_inner()) = Some(SessionMessage::MaintenanceState { agent_input_blocked, blacked_out });
@@ -1336,6 +1351,7 @@ fn run_capture_child(
                     ParentCommand::StartFiles
                     | ParentCommand::StartInput { .. }
                     | ParentCommand::Input(_)
+                    | ParentCommand::Blackout { .. }
                     | ParentCommand::BlockInput(_)
                     | ParentCommand::ReleaseInput
                     | ParentCommand::Clipboard(_)
@@ -1418,12 +1434,19 @@ fn run_input_child(
                     tracing::warn!(%error, "desktop input helper discarded invalid input");
                 }
             }
+            Ok(Ok(ParentCommand::Blackout { enabled, text })) => {
+                if let Err(error) = input.set_blackout(enabled, &text) {
+                    emit_child_event(&output, ChildEvent::MaintenanceError(error.to_string()))?;
+                    continue;
+                }
+                emit_child_event(&output, ChildEvent::MaintenanceState { agent_input_blocked: input.blocked(), blacked_out: input.blacked_out() })?;
+            }
             Ok(Ok(ParentCommand::BlockInput(blocked))) => {
                 if let Err(error) = input.set_blocked(blocked) {
-                    terminal_error = Some(error.to_string());
-                    break;
+                    emit_child_event(&output, ChildEvent::MaintenanceError(error.to_string()))?;
+                    continue;
                 }
-                emit_child_event(&output, ChildEvent::MaintenanceState { agent_input_blocked: input.blocked(), blacked_out: false })?;
+                emit_child_event(&output, ChildEvent::MaintenanceState { agent_input_blocked: input.blocked(), blacked_out: input.blacked_out() })?;
             }
             Ok(Ok(ParentCommand::ReleaseInput)) => {
                 if let Err(error) = input.release_all() {
@@ -1564,6 +1587,12 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             write_u32(&mut writer, bytes.len() as u32)?;
             writer.write_all(&bytes)
         }
+        ParentCommand::Blackout { enabled, text } => {
+            checked_len(text.len(), MAX_CONTROL_BYTES, "blackout message")?;
+            writer.write_all(&[COMMAND_BLACKOUT, u8::from(*enabled)])?;
+            write_u32(&mut writer, text.len() as u32)?;
+            writer.write_all(text.as_bytes())
+        }
         ParentCommand::BlockInput(blocked) => writer.write_all(&[COMMAND_BLOCK_INPUT, u8::from(*blocked)]),
         ParentCommand::ReleaseInput => writer.write_all(&[COMMAND_RELEASE_INPUT]),
         ParentCommand::Clipboard(text) => {
@@ -1644,6 +1673,14 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
                 )),
                 Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
             }
+        }
+        COMMAND_BLACKOUT => {
+            let enabled = read_u8(&mut reader)?;
+            if enabled > 1 { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid blackout flag")); }
+            let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "blackout message")?;
+            let mut text = vec![0; length]; reader.read_exact(&mut text)?;
+            let text = String::from_utf8(text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(ParentCommand::Blackout { enabled: enabled == 1, text })
         }
         COMMAND_BLOCK_INPUT => {
             let mut value = [0]; reader.read_exact(&mut value)?;
@@ -1731,6 +1768,11 @@ fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
             }
             Ok(())
         }
+        ChildEvent::MaintenanceError(reason) => {
+            checked_len(reason.len(), MAX_ERROR_BYTES, "maintenance error")?;
+            writer.write_all(&[11])?; write_u32(&mut writer, reason.len() as u32)?;
+            writer.write_all(reason.as_bytes())
+        }
         ChildEvent::MaintenanceState { agent_input_blocked, blacked_out } => writer.write_all(&[10, u8::from(*agent_input_blocked), u8::from(*blacked_out)]),
         ChildEvent::InputStarted => writer.write_all(&[EVENT_INPUT_STARTED]),
         ChildEvent::Frame(frame) => {
@@ -1792,6 +1834,11 @@ fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
 
 fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
     match read_u8(&mut reader)? {
+        11 => {
+            let length = bounded_len(read_u32(&mut reader)?, MAX_ERROR_BYTES, "maintenance error")?;
+            let mut bytes = vec![0; length]; reader.read_exact(&mut bytes)?;
+            Ok(ChildEvent::MaintenanceError(String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?))
+        }
         10 => {
             let a = read_u8(&mut reader)?; let b = read_u8(&mut reader)?;
             if a > 1 || b > 1 { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid maintenance state")); }
@@ -2298,6 +2345,7 @@ mod tests {
             ParentCommand::Input(_) => COMMAND_INPUT,
             ParentCommand::ReleaseInput => COMMAND_RELEASE_INPUT,
             ParentCommand::BlockInput(_) => COMMAND_BLOCK_INPUT,
+            ParentCommand::Blackout { .. } => COMMAND_BLACKOUT,
             ParentCommand::Clipboard(_) => COMMAND_CLIPBOARD,
             ParentCommand::StartFiles => 13,
             ParentCommand::Files(_) => 12,

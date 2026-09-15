@@ -342,13 +342,14 @@ define_class!(
             for (title, action) in [
                 (if self.ivars().control.technician_blocked() { "Allow technician input" } else { "Block technician input" }, sel!(toggleTechnicianInput:)),
                 (if self.ivars().control.agent_blocked() { "Allow agent input" } else { "Block agent keyboard and mouse" }, sel!(toggleAgentInput:)),
+                (if self.ivars().control.maintenance_state().blacked_out { "Restore agent monitors" } else { "Black out all agent monitors" }, sel!(toggleBlackout:)),
                 ("Diagnostics", sel!(toggleDiagnostics:)),
             ] {
                 let item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(
                     NSMenuItem::alloc(self.mtm()), &NSString::from_str(title), Some(action), &NSString::from_str(""),
                 ) };
                 unsafe { item.setTarget(Some(self)); }
-                if action == sel!(toggleAgentInput:) { item.setEnabled(self.ivars().control.maintenance_state().available); }
+                if action == sel!(toggleAgentInput:) || action == sel!(toggleBlackout:) { item.setEnabled(self.ivars().control.maintenance_state().available); }
                 menu.addItem(&item);
             }
             menu.popUpMenuPositioningItem_atLocation_inView(None, NSPoint::new(0., 0.), Some(sender));
@@ -360,6 +361,12 @@ define_class!(
             let blocked = !self.ivars().control.technician_blocked();
             self.ivars().control.set_technician_blocked(blocked);
             self.ivars().control.set_input_enabled(true);
+        }
+
+        #[unsafe(method(toggleBlackout:))]
+        fn toggle_blackout(&self, _sender: &NSMenuItem) {
+            self.release_input();
+            self.ivars().control.toggle_blackout();
         }
 
         #[unsafe(method(toggleAgentInput:))]
@@ -798,6 +805,12 @@ impl RemoteView {
     }
 
     pub(super) fn refresh_debug(&self, force: bool) {
+        if let Some(error) = self.ivars().control.take_maintenance_error() {
+            let alert = NSAlert::new(self.mtm());
+            alert.setMessageText(&NSString::from_str("Maintenance control failed"));
+            alert.setInformativeText(&NSString::from_str(&error));
+            alert.runModal();
+        }
         if !*self.ivars().debug_visible.borrow()
             || (!force
                 && self.ivars().debug_refreshed.borrow().elapsed() < Duration::from_millis(250))

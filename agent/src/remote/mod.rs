@@ -10,6 +10,8 @@ mod input;
 #[cfg(windows)]
 mod input_block;
 #[cfg(windows)]
+mod blackout;
+#[cfg(windows)]
 mod platform;
 #[cfg(windows)]
 mod session;

@@ -7,9 +7,10 @@ mod macos;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 pub struct MaintenanceState {
     pub available: bool,
+    pub error: Option<String>,
     pub agent_input_blocked: bool,
     pub blacked_out: bool,
 }
@@ -82,7 +83,14 @@ impl ControlSink {
     }
 
     pub fn maintenance_state(&self) -> MaintenanceState {
-        self.maintenance.lock().map(|s| *s).unwrap_or_default()
+        self.maintenance.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+    pub fn take_maintenance_error(&self) -> Option<String> {
+        self.maintenance.lock().ok().and_then(|mut s| s.error.take())
+    }
+    pub fn toggle_blackout(&self) {
+        let state = self.maintenance_state();
+        if state.available { self.send(meshrmm_protocol::SessionMessage::SetBlackout { enabled: !state.blacked_out }); }
     }
     pub fn toggle_agent_input(&self) {
         let state = self.maintenance_state();

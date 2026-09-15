@@ -19,13 +19,7 @@ pub struct SessionIndicator {
 
 impl SessionIndicator {
     pub fn show(name: &str, chat: meshrmm_chat::ChatSession) -> anyhow::Result<Self> {
-        // Keep untrusted profile text on one line; GDI draws it literally.
-        let name: String = name.chars().filter(|c| !c.is_control()).take(256).collect();
-        let name = if name.trim().is_empty() {
-            "Remote user".to_owned()
-        } else {
-            name
-        };
+        let name = meshrmm_protocol::session_viewer_name(name);
         let (tx, rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("session-indicator".into())
