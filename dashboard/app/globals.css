@@ -173,7 +173,7 @@ button { color: inherit; }
 .management-heading p { margin: 5px 0 0; color: var(--muted); font-size: 10px; }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 20px; background: rgba(24,24,37,.48); backdrop-filter: blur(5px); animation: fade-in .18s ease; }
-.settings-modal { width: min(430px, 100%); position: relative; padding: 27px; border: 1px solid rgba(255,255,255,.55); border-radius: 15px; background: #fff; box-shadow: 0 24px 70px rgba(23,20,45,.25); animation: modal-in .22s ease; }
+.settings-modal { max-height: calc(100dvh - 40px); overflow-y: auto; width: min(430px, 100%); position: relative; padding: 27px; border: 1px solid rgba(255,255,255,.55); border-radius: 15px; background: #fff; box-shadow: 0 24px 70px rgba(23,20,45,.25); animation: modal-in .22s ease; }
 .modal-close { position: absolute; top: 15px; right: 15px; width: 31px; height: 31px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 8px; background: #fff; cursor: pointer; }
 .modal-icon { width: 42px; height: 42px; display: grid; place-items: center; margin-bottom: 16px; color: #fff; background: var(--purple); border-radius: 11px; box-shadow: 0 8px 18px rgba(108,85,225,.22); }
 .settings-modal h2 { margin: 0; font-size: 20px; letter-spacing: -.035em; }

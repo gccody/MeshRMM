@@ -607,7 +607,10 @@ impl ScreenInput for DesktopInputController {
         send_command(&writer, &ParentCommand::Blackout { enabled, text: self.blackout_message.clone() })
     }
     fn maintenance_state(&self) -> Option<SessionMessage> {
-        self.maintenance.lock().ok().and_then(|value| value.clone())
+        self.maintenance.lock().ok().and_then(|mut value| {
+            if matches!(&*value, Some(SessionMessage::MaintenanceError { .. })) { value.take() }
+            else { value.clone() }
+        })
     }
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()> {
         let writer = self.route.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -2202,6 +2205,27 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn maintenance_ipc_preserves_flags_and_unicode_and_rejects_bad_flags() {
+        for blocked in [false, true] {
+            let mut bytes = Vec::new();
+            write_command(&mut bytes, &ParentCommand::BlockInput(blocked)).unwrap();
+            assert!(matches!(read_command(bytes.as_slice()).unwrap(), ParentCommand::BlockInput(value) if value == blocked));
+        }
+        assert!(read_command([COMMAND_BLOCK_INPUT, 2].as_slice()).is_err());
+        assert!(read_command([COMMAND_BLACKOUT, 2].as_slice()).is_err());
+        let text = "Maintenance by Zoë 王\nPlease wait";
+        let mut bytes = Vec::new();
+        write_command(&mut bytes, &ParentCommand::Blackout { enabled: true, text: text.into() }).unwrap();
+        assert!(matches!(read_command(bytes.as_slice()).unwrap(), ParentCommand::Blackout { enabled: true, text: value } if value == text));
+        let mut bytes = Vec::new();
+        write_event(&mut bytes, &ChildEvent::MaintenanceState { agent_input_blocked: true, blacked_out: false }).unwrap();
+        assert!(matches!(read_event(bytes.as_slice()).unwrap(), ChildEvent::MaintenanceState { agent_input_blocked: true, blacked_out: false }));
+        let mut bytes = Vec::new();
+        write_event(&mut bytes, &ChildEvent::MaintenanceError("access denied".into())).unwrap();
+        assert!(matches!(read_event(bytes.as_slice()).unwrap(), ChildEvent::MaintenanceError(reason) if reason == "access denied"));
     }
 
     #[test]
