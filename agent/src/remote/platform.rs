@@ -33,6 +33,7 @@ pub trait ScreenStreamer: Send {
         self.start(Some(display_id), stream_id, slot)
     }
     fn stop(&mut self) -> anyhow::Result<()>;
+    fn shutdown(&mut self) -> anyhow::Result<()> { self.stop() }
     fn poll_ended(&mut self) -> Option<anyhow::Result<()>>;
     fn request_keyframe(&self) -> anyhow::Result<()>;
     fn set_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()>;
@@ -205,6 +206,14 @@ impl ScreenStreamer for PlatformScreenStreamer {
             CaptureBackend::Desktop(streamer) => streamer.stop(),
         }
         .context("Windows capture stop failed")
+    }
+
+    fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.indicator = None;
+        match &mut self.inner {
+            CaptureBackend::Direct(streamer) => streamer.stop().map_err(anyhow::Error::from),
+            CaptureBackend::Desktop(streamer) => streamer.shutdown(),
+        }
     }
 
     fn poll_ended(&mut self) -> Option<anyhow::Result<()>> {

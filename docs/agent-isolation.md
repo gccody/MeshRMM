@@ -52,3 +52,16 @@ Validation: 39 enabled Windows Agent tests pass. A real Windows anonymous pipe
 is filled without draining it; an independent input pipe still receives a release
 command within the test deadline. Tests also cover pipe byte-budget rejection,
 clipboard helper startup framing, and rich clipboard format/chunk round trips.
+
+## Chat
+
+Chat and the session banner now live in a separate desktop helper process with
+their own command pipe. Chat transport polling/sending has an independent native
+worker. The input helper performs no chat/UI or clipboard work. Full helper
+shutdown runs on the capture worker, so dropping session resources does not wait
+for native helper processes on an async runtime thread.
+
+Validation: all 39 enabled Windows Agent tests pass, including the new chat-helper
+startup framing, Unicode chat commands, banner message behavior and independent
+worker/pipe tests. Interactive installed-agent validation follows the remaining
+file/network isolation steps.
