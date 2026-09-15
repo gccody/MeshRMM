@@ -23,16 +23,104 @@ pub fn service_label(message: &SessionMessage) -> Option<&'static str> {
     }
 }
 
+/// One observer per physical channel, shared by legacy service routes too.
+/// Callbacks only wake consumers; no socket work runs in a callback.
+#[derive(Clone)]
+pub struct ServiceChannel {
+    channel: Arc<RTCDataChannel>,
+    changed: Arc<Notify>,
+}
+impl std::ops::Deref for ServiceChannel {
+    type Target = Arc<RTCDataChannel>;
+    fn deref(&self) -> &Self::Target {
+        &self.channel
+    }
+}
+impl ServiceChannel {
+    pub async fn new(channel: Arc<RTCDataChannel>) -> Self {
+        let result = Self {
+            channel,
+            changed: Arc::new(Notify::new()),
+        };
+        let changed = result.changed.clone();
+        result.channel.on_open(Box::new(move || {
+            changed.notify_waiters();
+            Box::pin(async {})
+        }));
+        let changed = result.changed.clone();
+        result.channel.on_close(Box::new(move || {
+            changed.notify_waiters();
+            Box::pin(async {})
+        }));
+        result
+            .channel
+            .set_buffered_amount_low_threshold(64 * 1024 - 1)
+            .await;
+        let changed = result.changed.clone();
+        result
+            .channel
+            .on_buffered_amount_low(Box::new(move || {
+                changed.notify_waiters();
+                Box::pin(async {})
+            }))
+            .await;
+        result
+    }
+
+    /// Application open/close handlers that replace ours must forward the wake.
+    pub fn notifier(&self) -> Arc<Notify> {
+        self.changed.clone()
+    }
+
+    pub async fn wait_open(&self) -> anyhow::Result<()> {
+        use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match self.ready_state() {
+                RTCDataChannelState::Open => return Ok(()),
+                RTCDataChannelState::Closing | RTCDataChannelState::Closed => {
+                    anyhow::bail!("session channel closed")
+                }
+                _ => changed.await,
+            }
+        }
+    }
+
+    pub async fn writable(&self) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                // Register before inspecting state/capacity to avoid a lost wake.
+                changed.as_mut().enable();
+                use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+                anyhow::ensure!(
+                    self.ready_state() == RTCDataChannelState::Open,
+                    "session channel is not open"
+                );
+                if self.buffered_amount().await < 64 * 1024 {
+                    return Ok(());
+                }
+                changed.await;
+            }
+        })
+        .await
+        .context("session channel buffer remained full for five seconds")?
+    }
+}
+
 #[derive(Default)]
 pub struct ServiceRoute {
-    dedicated: Mutex<Option<Arc<RTCDataChannel>>>,
+    dedicated: Mutex<Option<ServiceChannel>>,
     ready: AtomicBool,
     changed: Notify,
-    selected: OnceCell<Arc<RTCDataChannel>>,
+    selected: OnceCell<ServiceChannel>,
 }
 
 impl ServiceRoute {
-    pub fn attach(&self, channel: Arc<RTCDataChannel>) {
+    pub fn attach(&self, channel: ServiceChannel) {
         *self.dedicated.lock().unwrap() = Some(channel);
     }
 
@@ -41,23 +129,22 @@ impl ServiceRoute {
         self.changed.notify_one();
     }
 
-    pub async fn resolve(&self, fallback: Arc<RTCDataChannel>) -> Arc<RTCDataChannel> {
-        while !self.ready.load(Ordering::Acquire) {
-            use webrtc::data_channel::data_channel_state::RTCDataChannelState;
-            match fallback.ready_state() {
-                RTCDataChannelState::Open | RTCDataChannelState::Closed => break,
-                _ => tokio::time::sleep(Duration::from_millis(10)).await,
-            }
+    pub async fn resolve(&self, fallback: ServiceChannel) -> anyhow::Result<ServiceChannel> {
+        if !self.ready.load(Ordering::Acquire) {
+            fallback.wait_open().await?;
         }
-        self.resolve_with_timeout(fallback, Duration::from_secs(2))
-            .await
+        let selected = self
+            .resolve_with_timeout(fallback, Duration::from_secs(2))
+            .await;
+        selected.wait_open().await?;
+        Ok(selected)
     }
 
     async fn resolve_with_timeout(
         &self,
-        fallback: Arc<RTCDataChannel>,
+        fallback: ServiceChannel,
         deadline: Duration,
-    ) -> Arc<RTCDataChannel> {
+    ) -> ServiceChannel {
         self.selected
             .get_or_init(|| async {
                 if !self.ready.load(Ordering::Acquire) {
@@ -94,21 +181,12 @@ pub async fn send(channel: &RTCDataChannel, message: SessionMessage) -> anyhow::
 
 /// Both peers announce support on the dedicated stream. This is not an echo
 /// protocol: receiving Ready only marks the route; it never sends another Ready.
-pub fn announce(channel: Arc<RTCDataChannel>) {
-    if channel.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
-    {
-        tokio::spawn(async move {
+pub fn announce(channel: ServiceChannel) {
+    tokio::spawn(async move {
+        if channel.wait_open().await.is_ok() {
             let _ = send(&channel, SessionMessage::ServiceChannelReady).await;
-        });
-    } else {
-        let sender = channel.clone();
-        channel.on_open(Box::new(move || {
-            let sender = sender.clone();
-            Box::pin(async move {
-                let _ = send(&sender, SessionMessage::ServiceChannelReady).await;
-            })
-        }));
-    }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -118,25 +196,37 @@ mod tests {
     #[tokio::test]
     async fn legacy_route_never_switches_mid_transfer() {
         let route = ServiceRoute::default();
-        let legacy = Arc::new(RTCDataChannel::default());
-        let dedicated = Arc::new(RTCDataChannel::default());
+        let legacy = ServiceChannel::new(Arc::new(RTCDataChannel::default())).await;
+        let dedicated = ServiceChannel::new(Arc::new(RTCDataChannel::default())).await;
         route.attach(dedicated);
         let selected = route
             .resolve_with_timeout(legacy.clone(), Duration::from_millis(10))
             .await;
         assert!(Arc::ptr_eq(&selected, &legacy));
         route.peer_ready();
-        assert!(Arc::ptr_eq(&route.resolve(legacy.clone()).await, &legacy));
+        assert!(Arc::ptr_eq(
+            &route
+                .resolve_with_timeout(legacy.clone(), Duration::ZERO)
+                .await
+                .channel,
+            &legacy.channel
+        ));
     }
 
     #[tokio::test]
     async fn negotiated_route_uses_dedicated_stream() {
         let route = ServiceRoute::default();
-        let legacy = Arc::new(RTCDataChannel::default());
-        let dedicated = Arc::new(RTCDataChannel::default());
+        let legacy = ServiceChannel::new(Arc::new(RTCDataChannel::default())).await;
+        let dedicated = ServiceChannel::new(Arc::new(RTCDataChannel::default())).await;
         route.attach(dedicated.clone());
         route.peer_ready();
-        assert!(Arc::ptr_eq(&route.resolve(legacy).await, &dedicated));
+        assert!(Arc::ptr_eq(
+            &route
+                .resolve_with_timeout(legacy, Duration::ZERO)
+                .await
+                .channel,
+            &dedicated.channel
+        ));
     }
 }
 
@@ -145,7 +235,6 @@ mod network_tests {
     use super::*;
     use webrtc::api::APIBuilder;
     use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
-    use webrtc::data_channel::data_channel_state::RTCDataChannelState;
     use webrtc::peer_connection::configuration::RTCConfiguration;
 
     #[tokio::test]
@@ -162,10 +251,9 @@ mod network_tests {
             .await
             .unwrap();
         let entered = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
+        let (release, unblock) = tokio::sync::watch::channel(false);
         let (input, mut received) = tokio::sync::mpsc::channel(1);
         let blocked = entered.clone();
-        let unblock = release.clone();
         b.on_data_channel(Box::new(move |channel| {
             let entered = blocked.clone();
             let release = unblock.clone();
@@ -174,12 +262,12 @@ mod network_tests {
                 let bulk = channel.label() == FILE_CHANNEL;
                 channel.on_message(Box::new(move |message| {
                     let entered = entered.clone();
-                    let release = release.clone();
+                    let mut release = release.clone();
                     let input = input.clone();
                     Box::pin(async move {
                         if bulk {
                             entered.notify_one();
-                            release.notified().await;
+                            let _ = release.wait_for(|released| *released).await;
                         } else {
                             let _ = input.send(message.data).await;
                         }
@@ -201,6 +289,13 @@ mod network_tests {
             .create_data_channel(meshrmm_protocol::CONTROL_CHANNEL_LABEL, None)
             .await
             .unwrap();
+        let files = ServiceChannel::new(files).await;
+        let controls = ServiceChannel::new(controls).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), files.wait_open())
+                .await
+                .is_err()
+        );
         let mut gathered = a.gathering_complete_promise().await;
         a.set_local_description(a.create_offer(None).await.unwrap())
             .await
@@ -218,11 +313,9 @@ mod network_tests {
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
-            while files.ready_state() != RTCDataChannelState::Open
-                || controls.ready_state() != RTCDataChannelState::Open
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            let (files_open, controls_open) = tokio::join!(files.wait_open(), controls.wait_open());
+            files_open.unwrap();
+            controls_open.unwrap();
         })
         .await
         .unwrap();
@@ -233,6 +326,20 @@ mod network_tests {
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
             .unwrap();
+        // Queue a burst while the application receiver is held. SCTP can still
+        // acknowledge bytes, so capacity may recover before either waiter runs.
+        for _ in 0..128 {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                files.send(&bytes::Bytes::from(vec![0; 32 * 1024])),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if files.buffered_amount().await >= 64 * 1024 {
+                break;
+            }
+        }
         controls
             .send(&bytes::Bytes::from_static(b"input still works"))
             .await
@@ -245,7 +352,20 @@ mod network_tests {
                 .as_ref(),
             b"input still works"
         );
-        release.notify_one();
+        let first = files.clone();
+        let second = files.clone();
+        let waiting =
+            tokio::spawn(async move { tokio::join!(first.writable(), second.writable()) });
+        release.send_replace(true);
+        let (one, two) = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        one.unwrap();
+        two.unwrap();
+        files.close().await.unwrap();
+        assert!(files.wait_open().await.is_err());
+        assert!(files.writable().await.is_err());
         a.close().await.unwrap();
         b.close().await.unwrap();
     }

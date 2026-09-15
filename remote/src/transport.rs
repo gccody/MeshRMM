@@ -26,7 +26,7 @@ use crate::debug::DebugInfo;
 use crate::platform::{ControlSink, Presenter, monotonic_timestamp_us};
 use crate::signaling::{authenticated_websocket, session_signal_url};
 use meshrmm_session_transport::{
-    CHAT_CHANNEL, CLIPBOARD_CHANNEL, FILE_CHANNEL, SERVICE_CHANNELS, ServiceRoute,
+    CHAT_CHANNEL, CLIPBOARD_CHANNEL, FILE_CHANNEL, SERVICE_CHANNELS, ServiceChannel, ServiceRoute,
 };
 
 const SESSION_ACTIVITY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -313,7 +313,7 @@ pub async fn run_receiver(
     )
     .await?;
     let presenter = Arc::new(Mutex::new(None::<ActivePresenter>));
-    let control_channel = Arc::new(Mutex::new(None::<Arc<RTCDataChannel>>));
+    let control_channel = tokio::sync::watch::channel(None::<ServiceChannel>).0;
     let (viewer_control_tx, viewer_control_rx) = mpsc::unbounded_channel::<SessionMessage>();
     let viewer_control = ViewerControlQueue::new(viewer_control_tx, resume_state.clone());
     let (presentation_failure_tx, mut presentation_failure_rx) =
@@ -324,14 +324,14 @@ pub async fn run_receiver(
     };
     let (remote_text_tx, _services) = start_viewer_services(
         viewer_control.clone(),
-        Arc::clone(&control_channel),
+        control_channel.clone(),
         viewer_control_rx,
         lifecycle.clone(),
     )?;
     install_data_channel_handler(
         &peer,
         Arc::clone(&presenter),
-        Arc::clone(&control_channel),
+        control_channel.clone(),
         viewer_control.clone(),
         remote_text_tx,
         debug.clone(),
@@ -718,12 +718,14 @@ impl ServiceInbox {
     }
 }
 struct ViewerServices {
+    stop: tokio::sync::watch::Sender<bool>,
     stopping: Arc<AtomicBool>,
     tasks: Vec<tokio::task::AbortHandle>,
 }
 impl Drop for ViewerServices {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
+        self.stop.send_replace(true);
         for task in &self.tasks {
             task.abort();
         }
@@ -731,26 +733,32 @@ impl Drop for ViewerServices {
 }
 
 async fn wait_control_channel(
-    control: &Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
-) -> Arc<RTCDataChannel> {
+    control: &tokio::sync::watch::Sender<Option<ServiceChannel>>,
+) -> anyhow::Result<ServiceChannel> {
+    let mut receiver = control.subscribe();
     loop {
-        if let Some(channel) = control.lock().ok().and_then(|c| c.clone())
-            && channel.ready_state() == RTCDataChannelState::Open
-        {
-            return channel;
+        let current = receiver.borrow_and_update().clone();
+        if let Some(channel) = current {
+            channel.wait_open().await?;
+            return Ok(channel);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        receiver
+            .changed()
+            .await
+            .context("control channel subscription closed")?;
     }
 }
 
 type ViewerServiceSetup = (ServiceInbox, ViewerServices);
 fn start_viewer_services(
     viewer: ViewerControlQueue,
-    control: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    control: tokio::sync::watch::Sender<Option<ServiceChannel>>,
     mut controls: mpsc::UnboundedReceiver<SessionMessage>,
     lifecycle: ReceiverLifecycle,
 ) -> anyhow::Result<ViewerServiceSetup> {
+    let (stop, _) = tokio::sync::watch::channel(false);
     let mut owner = ViewerServices {
+        stop: stop.clone(),
         stopping: lifecycle.shutting_down.clone(),
         tasks: Vec::new(),
     };
@@ -758,7 +766,9 @@ fn start_viewer_services(
     let errors = lifecycle.presentation_failure.clone();
     let writer = tokio::spawn(async move {
         while let Some(message) = controls.recv().await {
-            let channel = wait_control_channel(&control_writer).await;
+            let Ok(channel) = wait_control_channel(&control_writer).await else {
+                break;
+            };
             if let Err(error) = meshrmm_session_transport::send(&channel, message).await {
                 let _ = errors.send(format!("input/control send failed: {error:#}"));
                 break;
@@ -780,15 +790,16 @@ fn start_viewer_services(
             .insert(label, outgoing);
         let fallback = control.clone();
         let writer = tokio::spawn(async move {
-            let fallback = wait_control_channel(&fallback).await;
-            let channel = route.resolve(fallback).await;
+            let Ok(fallback) = wait_control_channel(&fallback).await else {
+                return;
+            };
+            let Ok(channel) = route.resolve(fallback).await else {
+                return;
+            };
             while let Some(message) = pending.recv().await {
-                // Bound bulk SCTP backlog; each stream waits independently.
-                while channel.buffered_amount().await >= 64 * 1024 {
-                    if channel.ready_state() != RTCDataChannelState::Open {
-                        return;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                if let Err(error) = channel.writable().await {
+                    tracing::warn!(label, %error, "viewer service channel unavailable");
+                    break;
                 }
                 if let Err(error) = meshrmm_session_transport::send(&channel, message).await {
                     tracing::warn!(label, %error, "viewer service send failed");
@@ -803,6 +814,7 @@ fn start_viewer_services(
         let control = control.clone();
         let stopping = lifecycle.shutting_down.clone();
         let runtime = tokio::runtime::Handle::current();
+        let mut stop = stop.subscribe();
         std::thread::Builder::new().name(format!("viewer-{label}")).spawn(move || {
             runtime.block_on(async move {
                 let mut clipboard = if label == CLIPBOARD_CHANNEL { ClipboardSync::new(true).ok() } else { None };
@@ -810,7 +822,10 @@ fn start_viewer_services(
                 let mut outgoing = std::collections::VecDeque::new();
                 let chat_ready = viewer.chat.outgoing_ready();
                 if label == CHAT_CHANNEL {
-                    wait_control_channel(&control).await;
+                    tokio::select! {
+                        result = wait_control_channel(&control) => if result.is_err() { return; },
+                        _ = stop.wait_for(|stopped| *stopped) => return,
+                    }
                     viewer.send(SessionMessage::ChatAvailable);
                 }
                 let mut poll = tokio::time::interval(std::time::Duration::from_millis(5));
@@ -818,6 +833,7 @@ fn start_viewer_services(
                 let mut clipboard_poll = tokio::time::Instant::now();
                 while !stopping.load(Ordering::Acquire) {
                     tokio::select! {
+                        _ = stop.wait_for(|stopped| *stopped) => break,
                         message = messages.recv() => {
                             let Some(message) = message else { break; };
                             match message {
@@ -839,7 +855,7 @@ fn start_viewer_services(
                             while let Some(text) = viewer.chat.poll() { viewer.send(SessionMessage::Chat { text }); }
                         }
                         _ = poll.tick(), if label != CHAT_CHANNEL => {
-                            let open = control.lock().ok().and_then(|c| c.clone()).is_some_and(|c| c.ready_state() == RTCDataChannelState::Open);
+                            let open = control.borrow().as_ref().is_some_and(|c| c.ready_state() == RTCDataChannelState::Open);
                             if !open { continue; }
                             match label {
                                 FILE_CHANNEL => { if let Some(message) = viewer.files.poll() { viewer.send(SessionMessage::FileTransfer(message)); } }
@@ -877,7 +893,7 @@ fn start_viewer_services(
 fn install_data_channel_handler(
     peer: &Arc<RTCPeerConnection>,
     presenter: Arc<Mutex<Option<ActivePresenter>>>,
-    control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    control_channel: tokio::sync::watch::Sender<Option<ServiceChannel>>,
     viewer_control: ViewerControlQueue,
     remote_text: ServiceInbox,
     debug: DebugInfo,
@@ -885,7 +901,7 @@ fn install_data_channel_handler(
 ) {
     peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
         let presenter = Arc::clone(&presenter);
-        let control_channel = Arc::clone(&control_channel);
+        let control_channel = control_channel.clone();
         let viewer_control = viewer_control.clone();
         let remote_text = remote_text.clone();
         let service_routes = remote_text.routes.clone();
@@ -895,9 +911,8 @@ fn install_data_channel_handler(
             debug.set_data_channel(channel.label(), "open");
             match channel.label() {
                 CONTROL_CHANNEL_LABEL => {
-                    if let Ok(mut active) = control_channel.lock() {
-                        *active = Some(Arc::clone(&channel));
-                    }
+                    let channel = ServiceChannel::new(channel).await;
+                    control_channel.send_replace(Some(channel.clone()));
                     install_control_handler(
                         channel,
                         presenter,
@@ -910,6 +925,7 @@ fn install_data_channel_handler(
                 }
                 label if SERVICE_CHANNELS.contains(&label) => {
                     let route = service_routes.get(label).unwrap().clone();
+                    let channel = ServiceChannel::new(channel).await;
                     route.attach(channel.clone());
                     let label = channel.label().to_owned();
                     channel.on_message(Box::new(move |message| {
@@ -941,7 +957,7 @@ fn install_data_channel_handler(
 }
 
 fn install_control_handler(
-    channel: Arc<RTCDataChannel>,
+    channel: ServiceChannel,
     presenter: Arc<Mutex<Option<ActivePresenter>>>,
     viewer_control: ViewerControlQueue,
     remote_text: ServiceInbox,
@@ -953,7 +969,9 @@ fn install_control_handler(
         let presentation_failure = presentation_failure.clone();
         let debug = debug.clone();
         let shutting_down = Arc::clone(&shutting_down);
+        let closing = channel.notifier();
         channel.on_close(Box::new(move || {
+            closing.notify_waiters();
             let presentation_failure = presentation_failure.clone();
             let debug = debug.clone();
             let shutting_down = Arc::clone(&shutting_down);
