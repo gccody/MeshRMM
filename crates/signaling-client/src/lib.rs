@@ -170,3 +170,6 @@ pub fn signaling_close_error(
         anyhow::anyhow!("signaling connection closed: {frame:?}")
     }
 }
+
+mod connection;
+pub use connection::SignalingConnection;
