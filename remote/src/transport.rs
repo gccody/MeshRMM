@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Context;
-use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use meshrmm_protocol::{
     CONTROL_CHANNEL_LABEL, ChromaMode, Codec, CursorShape, EncodedFrame, FrameReassembler,
@@ -22,6 +21,7 @@ use webrtc::peer_connection::{
 use webrtc::stats::StatsReportType;
 
 use crate::clipboard::ClipboardSync;
+use meshrmm_session_transport::{ServiceRoute, SERVICE_CHANNELS, CLIPBOARD_CHANNEL, FILE_CHANNEL, CHAT_CHANNEL};
 use crate::config::Config;
 use crate::debug::DebugInfo;
 use crate::platform::{ControlSink, Presenter, monotonic_timestamp_us};
@@ -172,6 +172,7 @@ struct ViewerControlQueue {
     files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
     outgoing: mpsc::UnboundedSender<SessionMessage>,
+    service_senders: Arc<Mutex<HashMap<&'static str, mpsc::Sender<SessionMessage>>>>,
     input: Arc<Mutex<ViewerInputState>>,
     pointer_changed: Arc<Notify>,
     resume_state: ViewerResumeState,
@@ -192,6 +193,7 @@ impl ViewerControlQueue {
             files: meshrmm_file_transfer::TransferSession::new(),
             chat: meshrmm_chat::ChatSession::default(),
             outgoing,
+            service_senders: Arc::new(Mutex::new(HashMap::new())),
             input: Arc::new(Mutex::new(ViewerInputState {
                 enabled: false,
                 pending_pointer: None,
@@ -243,7 +245,12 @@ impl ViewerControlQueue {
         if let Some(pending_pointer) = pending_pointer {
             let _ = self.outgoing.send(pending_pointer);
         }
-        let _ = self.outgoing.send(message);
+        if let Some(label) = meshrmm_session_transport::service_label(&message)
+            && let Some(sender) = self.service_senders.lock().ok().and_then(|map| map.get(label).cloned()) {
+            if sender.try_send(message).is_err() { tracing::warn!(label, "viewer service queue full or closed"); }
+        } else {
+            let _ = self.outgoing.send(message);
+        }
     }
 
     fn flush_pointer(&self) {
@@ -296,21 +303,23 @@ pub async fn run_receiver(
     .await?;
     let presenter = Arc::new(Mutex::new(None::<ActivePresenter>));
     let control_channel = Arc::new(Mutex::new(None::<Arc<RTCDataChannel>>));
-    let (viewer_control_tx, mut viewer_control_rx) = mpsc::unbounded_channel::<SessionMessage>();
+    let (viewer_control_tx, viewer_control_rx) = mpsc::unbounded_channel::<SessionMessage>();
     let viewer_control = ViewerControlQueue::new(viewer_control_tx, resume_state.clone());
-    let (remote_text_tx, mut remote_text_rx) = mpsc::channel::<SessionMessage>(32);
     let (presentation_failure_tx, mut presentation_failure_rx) =
         mpsc::unbounded_channel::<String>();
     let lifecycle = ReceiverLifecycle {
         presentation_failure: presentation_failure_tx,
         shutting_down: Arc::new(AtomicBool::new(false)),
     };
+    let (remote_text_tx, service_routes, _services) = start_viewer_services(
+        viewer_control.clone(), Arc::clone(&control_channel), viewer_control_rx, lifecycle.clone())?;
     install_data_channel_handler(
         &peer,
         Arc::clone(&presenter),
         Arc::clone(&control_channel),
         viewer_control.clone(),
         remote_text_tx,
+        service_routes,
         debug.clone(),
         lifecycle.clone(),
     );
@@ -331,20 +340,6 @@ pub async fn run_receiver(
     let mut negotiation_interval = tokio::time::interval(NEGOTIATION_RETRY_INTERVAL);
     negotiation_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     negotiation_interval.tick().await;
-    let chat = viewer_control.chat.clone();
-    let mut chat_announced = false;
-    let mut clipboard = match ClipboardSync::new(true) {
-        Ok(clipboard) => Some(clipboard),
-        Err(error) => {
-            tracing::warn!(error = %error, "clipboard sync is unavailable for this viewer session");
-            None
-        }
-    };
-    let mut file_interval = tokio::time::interval(std::time::Duration::from_millis(5));
-    let mut clipboard_outgoing = std::collections::VecDeque::<SessionMessage>::new();
-    let mut clipboard_receiver = meshrmm_protocol::ClipboardReceiver::default();
-    let mut clipboard_interval = tokio::time::interval(CLIPBOARD_POLL_INTERVAL);
-    clipboard_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut remote_description_set = false;
     let mut pending_candidates = Vec::new();
     let mut disconnected_since = None::<tokio::time::Instant>;
@@ -359,71 +354,6 @@ pub async fn run_receiver(
             tokio::select! {
             Some(signal) = outgoing_rx.recv() => {
                 signal_writer.send(Message::Text(serde_json::to_string(&signal)?.into())).await?;
-            }
-            Some(message) = viewer_control_rx.recv() => {
-                let channel = control_channel
-                    .lock()
-                    .ok()
-                    .and_then(|channel| channel.clone())
-                    .context("control data channel is unavailable")?;
-                let bytes = message.encode().context("failed to encode viewer control message")?;
-                channel.send(&Bytes::from(bytes)).await
-                    .context("failed to send viewer control message")?;
-            }
-            _ = file_interval.tick(), if session_state == SessionState::Streaming => {
-                let channel = control_channel.lock().ok().and_then(|c| c.clone());
-                let channel_open = channel.as_ref().is_some_and(|c| c.ready_state() == RTCDataChannelState::Open);
-                if channel_open && let Some(message) = viewer_control.files.poll() { viewer_control.send(SessionMessage::FileTransfer(message)); }
-                if channel_open && let Some(channel) = channel
-                    && channel.buffered_amount().await < 256 * 1024
-                    && let Some(message) = clipboard_outgoing.pop_front() { viewer_control.send(message); }
-            }
-            Some(message) = remote_text_rx.recv() => {
-                if let SessionMessage::FileTransfer(message) = message { viewer_control.files.receive(message); continue; }
-                if message == SessionMessage::ChatAvailable {
-                    chat.set_available(true);
-                    continue;
-                }
-                if let SessionMessage::Chat { text } = message {
-                    chat.set_available(true);
-                    chat.receive(text);
-                    continue;
-                }
-                let text = match clipboard_receiver.receive(message) {
-                    Ok(Some(content)) => { clipboard_outgoing.clear(); content },
-                    Ok(None) => continue,
-                    Err(error) => { tracing::warn!(%error, "invalid clipboard payload"); continue; }
-                };
-                if let Some(clipboard) = clipboard.as_mut()
-                    && let Err(error) = clipboard.apply(text)
-                {
-                    tracing::warn!(error = %error, "discarding remote clipboard update");
-                }
-            }
-            _ = clipboard_interval.tick(), if session_state == SessionState::Streaming => {
-                let channel_open = control_channel
-                    .lock()
-                    .ok()
-                    .and_then(|channel| channel.clone())
-                    .is_some_and(|channel| channel.ready_state() == RTCDataChannelState::Open);
-                if channel_open {
-                    if !chat_announced {
-                        viewer_control.send(SessionMessage::ChatAvailable);
-                        chat_announced = true;
-                    }
-                    if let Some(text) = chat.poll() {
-                        viewer_control.send(SessionMessage::Chat { text });
-                    }
-                }
-                if channel_open && let Some(clipboard) = clipboard.as_mut() {
-                    match clipboard.poll() {
-                        Ok(Some(content)) => {
-                            clipboard_outgoing = content.messages()?.into();
-                        },
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(error = %error, "could not synchronize the viewer clipboard"),
-                    }
-                }
             }
             _ = activity_interval.tick() => {
                 outgoing_tx.send(SignalMessage::Activity)?;
@@ -593,8 +523,7 @@ pub async fn run_receiver(
     {
         active.presenter.stop();
     }
-    remote_text_rx.close();
-    chat.set_available(false);
+    viewer_control.chat.set_available(false);
     let mut result = result;
     if let Err(error) = peer.close().await {
         tracing::warn!(error = %error, "WebRTC peer did not close cleanly");
@@ -759,12 +688,155 @@ async fn create_peer(
     Ok(peer)
 }
 
+#[derive(Clone)]
+struct ServiceInbox(HashMap<&'static str, mpsc::Sender<SessionMessage>>);
+impl ServiceInbox {
+    fn send(&self, message: SessionMessage) {
+        if let Some(label) = meshrmm_session_transport::service_label(&message)
+            && let Some(sender) = self.0.get(label)
+            && sender.try_send(message).is_err() {
+                tracing::warn!(label, "viewer incoming service queue full or closed");
+            }
+    }
+}
+struct ViewerServices {
+    stopping: Arc<AtomicBool>,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+impl Drop for ViewerServices {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        for task in &self.tasks { task.abort(); }
+    }
+}
+
+async fn wait_control_channel(control: &Arc<Mutex<Option<Arc<RTCDataChannel>>>>) -> Arc<RTCDataChannel> {
+    loop {
+        if let Some(channel) = control.lock().ok().and_then(|c| c.clone())
+            && channel.ready_state() == RTCDataChannelState::Open { return channel; }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+type ViewerServiceSetup = (ServiceInbox, HashMap<&'static str, Arc<ServiceRoute>>, ViewerServices);
+fn start_viewer_services(
+    viewer: ViewerControlQueue,
+    control: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    mut controls: mpsc::UnboundedReceiver<SessionMessage>,
+    lifecycle: ReceiverLifecycle,
+) -> anyhow::Result<ViewerServiceSetup> {
+    let mut owner = ViewerServices { stopping: lifecycle.shutting_down.clone(), tasks: Vec::new() };
+    let control_writer = control.clone();
+    let errors = lifecycle.presentation_failure.clone();
+    let writer = tokio::spawn(async move {
+        while let Some(message) = controls.recv().await {
+            let channel = wait_control_channel(&control_writer).await;
+            if let Err(error) = meshrmm_session_transport::send(&channel, message).await {
+                let _ = errors.send(format!("input/control send failed: {error:#}"));
+                break;
+            }
+        }
+    });
+    owner.tasks.push(writer.abort_handle());
+    let mut inbox = HashMap::new();
+    let mut routes = HashMap::new();
+    for label in SERVICE_CHANNELS {
+        let route = Arc::new(ServiceRoute::default());
+        routes.insert(label, route.clone());
+        let (outgoing, mut pending) = mpsc::channel::<SessionMessage>(if label == CLIPBOARD_CHANNEL { 1024 } else { 64 });
+        viewer.service_senders.lock().unwrap().insert(label, outgoing);
+        let fallback = control.clone();
+        let writer = tokio::spawn(async move {
+            let fallback = wait_control_channel(&fallback).await;
+            let channel = route.resolve(fallback).await;
+            while let Some(message) = pending.recv().await {
+                // Bound bulk SCTP backlog; each stream waits independently.
+                while channel.buffered_amount().await >= 64 * 1024 {
+                    if channel.ready_state() != RTCDataChannelState::Open { return; }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                if let Err(error) = meshrmm_session_transport::send(&channel, message).await {
+                    tracing::warn!(label, %error, "viewer service send failed");
+                    break;
+                }
+            }
+        });
+        owner.tasks.push(writer.abort_handle());
+        let (incoming, mut messages) = mpsc::channel(1024);
+        inbox.insert(label, incoming);
+        let viewer = viewer.clone();
+        let control = control.clone();
+        let stopping = lifecycle.shutting_down.clone();
+        let runtime = tokio::runtime::Handle::current();
+        std::thread::Builder::new().name(format!("viewer-{label}")).spawn(move || {
+            runtime.block_on(async move {
+                let mut clipboard = if label == CLIPBOARD_CHANNEL { ClipboardSync::new(true).ok() } else { None };
+                let mut receiver = meshrmm_protocol::ClipboardReceiver::default();
+                let mut outgoing = std::collections::VecDeque::new();
+                let mut announced = false;
+                let mut poll = tokio::time::interval(std::time::Duration::from_millis(5));
+                poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut clipboard_poll = tokio::time::Instant::now();
+                while !stopping.load(Ordering::Acquire) {
+                    tokio::select! {
+                        message = messages.recv() => {
+                            let Some(message) = message else { break; };
+                            match message {
+                                SessionMessage::FileTransfer(message) => viewer.files.receive(message),
+                                SessionMessage::ChatAvailable => viewer.chat.set_available(true),
+                                SessionMessage::Chat { text } => { viewer.chat.set_available(true); viewer.chat.receive(text); },
+                                message => match receiver.receive(message) {
+                                    Ok(Some(content)) => {
+                                        outgoing.clear();
+                                        if let Some(clipboard) = clipboard.as_mut()
+                                            && let Err(error) = clipboard.apply(content) { tracing::warn!(%error, "viewer clipboard apply failed"); }
+                                    }
+                                    Ok(None) => {},
+                                    Err(error) => tracing::warn!(%error, "invalid viewer clipboard payload"),
+                                },
+                            }
+                        }
+                        _ = poll.tick() => {
+                            let open = control.lock().ok().and_then(|c| c.clone()).is_some_and(|c| c.ready_state() == RTCDataChannelState::Open);
+                            if !open { continue; }
+                            match label {
+                                FILE_CHANNEL => { if let Some(message) = viewer.files.poll() { viewer.send(SessionMessage::FileTransfer(message)); } }
+                                CHAT_CHANNEL => {
+                                    if !announced { viewer.send(SessionMessage::ChatAvailable); announced = true; }
+                                    if let Some(text) = viewer.chat.poll() { viewer.send(SessionMessage::Chat { text }); }
+                                }
+                                CLIPBOARD_CHANNEL => {
+                                    if clipboard_poll.elapsed() >= CLIPBOARD_POLL_INTERVAL {
+                                        clipboard_poll = tokio::time::Instant::now();
+                                        if let Some(clipboard) = clipboard.as_mut() {
+                                            match clipboard.poll().and_then(|c| Ok(c.map(|c| c.messages()).transpose()?)) {
+                                                Ok(Some(messages)) => outgoing = messages.into(),
+                                                Ok(None) => {},
+                                                Err(error) => tracing::warn!(%error, "viewer clipboard poll failed"),
+                                            }
+                                        }
+                                    }
+                                    if let Some(message) = outgoing.pop_front() { viewer.send(message); }
+                                }
+                                _ => {},
+                            }
+                        }
+                    }
+                }
+                if label == CHAT_CHANNEL { viewer.chat.set_available(false); }
+            });
+        })?;
+    }
+    Ok((ServiceInbox(inbox), routes, owner))
+}
+
 fn install_data_channel_handler(
     peer: &Arc<RTCPeerConnection>,
     presenter: Arc<Mutex<Option<ActivePresenter>>>,
     control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     viewer_control: ViewerControlQueue,
-    remote_text: mpsc::Sender<SessionMessage>,
+    remote_text: ServiceInbox,
+    service_routes: HashMap<&'static str, Arc<ServiceRoute>>,
     debug: DebugInfo,
     lifecycle: ReceiverLifecycle,
 ) {
@@ -773,6 +845,7 @@ fn install_data_channel_handler(
         let control_channel = Arc::clone(&control_channel);
         let viewer_control = viewer_control.clone();
         let remote_text = remote_text.clone();
+        let service_routes = service_routes.clone();
         let debug = debug.clone();
         let lifecycle = lifecycle.clone();
         Box::pin(async move {
@@ -792,6 +865,24 @@ fn install_data_channel_handler(
                         lifecycle.shutting_down,
                     )
                 }
+                label if SERVICE_CHANNELS.contains(&label) => {
+                    let route = service_routes.get(label).unwrap().clone();
+                    route.attach(channel.clone());
+                    let label = channel.label().to_owned();
+                    channel.on_message(Box::new(move |message| {
+                        let route = route.clone();
+                        let remote_text = remote_text.clone();
+                        let label = label.clone();
+                        Box::pin(async move {
+                            match SessionMessage::decode(&message.data) {
+                                Ok(SessionMessage::ServiceChannelReady) => route.peer_ready(),
+                                Ok(message) if meshrmm_session_transport::service_label(&message) == Some(label.as_str()) => remote_text.send(message),
+                                _ => tracing::warn!(label, "invalid service channel message"),
+                            }
+                        })
+                    }));
+                    meshrmm_session_transport::announce(channel);
+                }
                 "meshrmm-video-v1" => {
                     install_video_handler(channel, presenter, viewer_control, debug, lifecycle)
                 }
@@ -805,7 +896,7 @@ fn install_control_handler(
     channel: Arc<RTCDataChannel>,
     presenter: Arc<Mutex<Option<ActivePresenter>>>,
     viewer_control: ViewerControlQueue,
-    remote_text: mpsc::Sender<SessionMessage>,
+    remote_text: ServiceInbox,
     presentation_failure: mpsc::UnboundedSender<String>,
     debug: DebugInfo,
     shutting_down: Arc<AtomicBool>,
@@ -1073,7 +1164,7 @@ fn install_control_handler(
                     }
                 }
                 Ok(message @ (SessionMessage::FileTransfer(_) | SessionMessage::Clipboard { .. } | SessionMessage::ClipboardChunk { .. } | SessionMessage::Chat { .. } | SessionMessage::ChatAvailable)) => {
-                    let _ = remote_text.send(message).await;
+                    remote_text.send(message);
                 }
                 Ok(_) => {}
                 Err(error) => tracing::warn!(error = %error, "discarding invalid control message"),

@@ -107,6 +107,8 @@ pub enum SessionMessage {
         total: u32,
         data: Vec<u8>,
     },
+    /// Dedicated service-stream capability; appended to preserve existing tags.
+    ServiceChannelReady,
 }
 
 impl SessionMessage {

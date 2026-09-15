@@ -1754,6 +1754,7 @@ dependencies = [
  "meshrmm-protocol",
  "meshrmm-remote-screen",
  "meshrmm-self-update",
+ "meshrmm-session-transport",
  "meshrmm-signaling-client",
  "rustls",
  "serde",
@@ -1842,6 +1843,7 @@ dependencies = [
  "meshrmm-file-transfer",
  "meshrmm-protocol",
  "meshrmm-self-update",
+ "meshrmm-session-transport",
  "meshrmm-signaling-client",
  "objc2",
  "objc2-app-kit",
@@ -1901,6 +1903,19 @@ dependencies = [
  "uuid",
  "worker",
  "worker-macros",
+]
+
+[[package]]
+name = "meshrmm-session-transport"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "meshrmm-protocol",
+ "rustls",
+ "tokio",
+ "tracing",
+ "webrtc",
 ]
 
 [[package]]
