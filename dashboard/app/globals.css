@@ -342,3 +342,22 @@ button { color: inherit; }
 .close-session-button:hover { background: #fff0e7; border-color: #ba8063; }
 .close-session-button:disabled { opacity: .5; cursor: wait; }
 .session-notice { margin-top: 16px; padding: 12px 16px; border: 1px solid #bde5d1; border-radius: 8px; background: #f1fbf5; color: #236340; font-size: 13px; }
+
+.session-policy textarea {
+  width: 100%;
+  min-height: 7rem;
+  resize: vertical;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 8px;
+  padding: 10px;
+  font: inherit;
+}
+.blackout-preview {
+  padding: 24px 16px;
+  border-radius: 8px;
+  background: #000;
+  color: #fff;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-align: center;
+}

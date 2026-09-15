@@ -12,7 +12,7 @@ async fn account_for_identity(environment: &Env, identity: Identity) -> Result<R
     let db = environment.d1("DB")?;
     let company = query!(
         &db,
-        "SELECT id, name, dashboard_idle_timeout_minutes, slug, status FROM companies WHERE id = ?1",
+        "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, slug, status FROM companies WHERE id = ?1",
         identity.company_id
     )?
     .first::<Company>(None)
@@ -48,10 +48,13 @@ pub(crate) async fn update_company_settings(
             );
         }
     };
+    if body.blackout_message.as_deref().is_some_and(|text| !meshrmm_protocol_types::valid_blackout_message(text)) {
+        return api_error(400, "blackout message must be nonempty, at most 2048 UTF-8 bytes, and contain no control characters except newlines");
+    }
     let db = environment.d1("DB")?;
     let company_exists = query!(
         &db,
-        "SELECT id, name, dashboard_idle_timeout_minutes, slug, status FROM companies WHERE id = ?1",
+        "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, slug, status FROM companies WHERE id = ?1",
         identity.company_id
     )?
     .first::<Company>(None)
@@ -62,8 +65,9 @@ pub(crate) async fn update_company_settings(
     }
     query!(
         &db,
-        "UPDATE companies SET dashboard_idle_timeout_minutes = ?1 WHERE id = ?2",
+        "UPDATE companies SET dashboard_idle_timeout_minutes = ?1, blackout_message = COALESCE(?2, blackout_message) WHERE id = ?3",
         timeout,
+        body.blackout_message.clone(),
         identity.company_id
     )?
     .run()
@@ -74,7 +78,7 @@ pub(crate) async fn update_company_settings(
         "company.settings.update",
         "company",
         &identity.company_id,
-        &serde_json::json!({ "dashboard_idle_timeout_minutes": timeout }).to_string(),
+        &serde_json::json!({ "dashboard_idle_timeout_minutes": timeout, "blackout_message": body.blackout_message }).to_string(),
     )
     .await?;
     account_for_identity(environment, identity).await

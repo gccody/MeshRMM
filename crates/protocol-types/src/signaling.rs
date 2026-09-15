@@ -22,6 +22,8 @@ pub struct SessionBootstrap {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSessionRequest {
     #[serde(default)]
+    pub blackout_message: String,
+    #[serde(default)]
     pub viewer_name: String,
     pub session_id: RemoteSessionId,
     pub signaling_token: String,

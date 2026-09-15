@@ -135,6 +135,15 @@ pub(crate) async fn create_session_for_device(
     device_id: &str,
     viewer_name: &str,
 ) -> Result<Response> {
+    // Resolve policy from the enrolled device's company, never from viewer input.
+    let db = environment.d1("DB")?;
+    #[derive(Deserialize)]
+    struct MaintenancePolicy { blackout_message: String }
+    let policy = query!(&db,
+        "SELECT c.blackout_message FROM companies c JOIN agents a ON a.company_id = c.id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL",
+        device_id
+    )?.first::<MaintenancePolicy>(None).await?;
+    let Some(policy) = policy else { return api_error(404, "agent not found"); };
     let session_id = Uuid::new_v4().to_string();
     let client_token = random_token();
     let agent_token = random_token();
@@ -144,6 +153,7 @@ pub(crate) async fn create_session_for_device(
     let ice_servers = generate_ice_servers(environment, idle_timeout_seconds).await?;
 
     let init = SessionInit {
+        blackout_message: &policy.blackout_message,
         viewer_name,
         session_id: &session_id,
         device_id,
@@ -161,6 +171,7 @@ pub(crate) async fn create_session_for_device(
     .await?;
 
     let agent_request = AgentSessionRequest {
+        blackout_message: policy.blackout_message,
         viewer_name: viewer_name.to_owned(),
         session_id: RemoteSessionId::new(&session_id),
         signaling_token: agent_token,
