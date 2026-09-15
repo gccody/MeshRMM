@@ -94,7 +94,7 @@ impl ControlSink {
     }
     pub fn toggle_agent_input(&self) {
         let state = self.maintenance_state();
-        if state.available {
+        if state.available && !state.blacked_out {
             self.send(meshrmm_protocol::SessionMessage::SetAgentInputBlocked { blocked: !state.agent_input_blocked });
         }
     }
@@ -102,6 +102,10 @@ impl ControlSink {
 
     pub fn technician_blocked(&self) -> bool {
         self.technician_blocked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn effective_cursor_shape(&self, shape: meshrmm_protocol::CursorShape) -> meshrmm_protocol::CursorShape {
+        if self.technician_blocked() { meshrmm_protocol::CursorShape::Default } else { shape }
     }
 
     /// Call after releasing held keys/buttons, before changing the gate.

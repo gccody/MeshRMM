@@ -13,6 +13,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub struct WindowsInputController {
     block: Option<super::input_block::InputBlock>,
     blackout: Option<super::blackout::Blackout>,
+    manually_blocked: bool,
     active_display: Option<Display>,
     pressed_keys: HashSet<(u16, bool)>,
     pressed_buttons: HashSet<PointerButton>,
@@ -24,6 +25,7 @@ impl WindowsInputController {
         Self {
             block: None,
             blackout: None,
+            manually_blocked: false,
             active_display: None,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
@@ -33,14 +35,33 @@ impl WindowsInputController {
 
     pub fn blacked_out(&self) -> bool { self.blackout.is_some() }
     pub fn set_blackout(&mut self, enabled: bool, text: &str) -> anyhow::Result<()> {
-        if enabled && self.blackout.is_none() { self.blackout = Some(super::blackout::Blackout::show(text)?); }
-        else if !enabled { self.blackout = None; }
+        if enabled && self.blackout.is_none() {
+            // Install the input hooks before hiding the monitors. If creating
+            // the overlays fails, restore the previous input-blocking state.
+            self.update_input_block(true)?;
+            match super::blackout::Blackout::show(text) {
+                Ok(blackout) => self.blackout = Some(blackout),
+                Err(error) => {
+                    self.update_input_block(self.manually_blocked)?;
+                    return Err(error);
+                }
+            }
+        } else if !enabled {
+            self.blackout = None;
+            self.update_input_block(self.manually_blocked)?;
+        }
         Ok(())
     }
 
     pub fn blocked(&self) -> bool { self.block.is_some() }
 
     pub fn set_blocked(&mut self, blocked: bool) -> anyhow::Result<()> {
+        self.update_input_block(blocked || self.blacked_out())?;
+        self.manually_blocked = blocked;
+        Ok(())
+    }
+
+    fn update_input_block(&mut self, blocked: bool) -> anyhow::Result<()> {
         if blocked && self.block.is_none() {
             self.release_all()?;
             self.block = Some(super::input_block::InputBlock::start()?);
@@ -367,4 +388,31 @@ fn send(inputs: &[INPUT]) -> anyhow::Result<()> {
         return Err(windows::core::Error::from_thread()).context("Windows rejected remote input");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WindowsInputController;
+
+    #[test]
+    #[ignore = "requires interactive Windows desktop; blacks out monitors and blocks local input"]
+    fn blackout_enforces_input_block_and_restores_manual_setting() {
+        let mut input = WindowsInputController::new();
+        for manually_blocked in [false, true] {
+            input.set_blocked(manually_blocked).unwrap();
+            input.set_blackout(true, "MeshRMM input-block test").unwrap();
+            assert!(input.blacked_out());
+            assert!(input.blocked());
+            input.set_blackout(true, "MeshRMM input-block test").unwrap();
+            input.set_blackout(false, "").unwrap();
+            assert!(!input.blacked_out());
+            assert_eq!(input.blocked(), manually_blocked);
+        }
+
+        input.set_blackout(true, "MeshRMM input-block test").unwrap();
+        input.set_blocked(false).unwrap();
+        assert!(input.blocked(), "blackout must prevent unblocking local input");
+        input.set_blackout(false, "").unwrap();
+        assert!(!input.blocked());
+    }
 }

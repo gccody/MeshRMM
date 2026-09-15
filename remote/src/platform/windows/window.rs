@@ -227,7 +227,7 @@ impl WindowContext {
         for (id, checked, enabled) in [
             (SETTINGS_TECHNICIAN_INPUT_ID, self.control.technician_blocked(), true),
             (SETTINGS_BLACKOUT_ID, self.control.maintenance_state().blacked_out, self.control.maintenance_state().available),
-            (SETTINGS_AGENT_INPUT_ID, self.control.agent_blocked(), self.control.maintenance_state().available),
+            (SETTINGS_AGENT_INPUT_ID, self.control.agent_blocked(), self.control.maintenance_state().available && !self.control.maintenance_state().blacked_out),
         ] {
             if let Ok(button) = unsafe { GetDlgItem(Some(self.settings_window), id as i32) } {
                 unsafe {
@@ -479,6 +479,7 @@ unsafe extern "system" fn settings_window_proc(
                 if control_id == SETTINGS_TECHNICIAN_INPUT_ID {
                     context.release_input();
                     context.control.set_technician_blocked(!context.control.technician_blocked());
+                    unsafe { apply_cursor(context.control.effective_cursor_shape(context.cursor_shape)) };
                     return LRESULT(0);
                 }
                 if control_id == SETTINGS_DIAGNOSTICS_ID {
@@ -932,7 +933,7 @@ pub(super) unsafe fn create_window(
                 if let Some(context) = context
                     && (lparam.0 as u32 & 0xffff) == HTCLIENT
                 {
-                    unsafe { apply_cursor(context.cursor_shape) };
+                    unsafe { apply_cursor(context.control.effective_cursor_shape(context.cursor_shape)) };
                     return LRESULT(1);
                 }
                 unsafe { DefWindowProcW(window, message, wparam, lparam) }
@@ -1402,7 +1403,7 @@ pub(super) unsafe fn create_window(
 pub(super) unsafe fn set_window_cursor(window: HWND, shape: CursorShape) {
     if let Some(context) = unsafe { window_context(window) } {
         context.cursor_shape = shape;
-        unsafe { apply_cursor(shape) };
+        unsafe { apply_cursor(context.control.effective_cursor_shape(shape)) };
     }
 }
 
