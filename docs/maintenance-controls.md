@@ -13,7 +13,8 @@ in the toolbar. On Windows, open **Settings → Advanced**.
 - **Black out all agent monitors** places a black maintenance notice across the
   entire virtual desktop, with the message centered on every monitor. The notice
   is click-through and excluded from capture so the technician can still work.
-  Choose **Restore agent monitors** to remove it.
+  The endpoint's mouse pointer is hidden until blackout ends. Choose
+  **Restore agent monitors** to remove the notice and restore the pointer.
 
 Agent controls become available after the updated desktop helper announces support.
 The UI reflects acknowledged agent state. Failures show an error instead of silently
@@ -61,6 +62,9 @@ cargo test -p meshrmm-agent live_ -- --ignored --nocapture --test-threads=1
 They verify that tagged remote key events pass, untagged events are suppressed,
 held input is released, input recovers on teardown, blackout covers the full
 virtual desktop with capture exclusion, and its window is destroyed on teardown.
+Also check visually that the endpoint pointer stays hidden while moving the remote
+mouse across applications and monitors, then returns after restoring monitors or
+disconnecting. The technician's viewer should continue to show cursor shapes.
 
 ### Test-machine validation (2026-09-14)
 
