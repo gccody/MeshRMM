@@ -151,7 +151,12 @@ enum ChildEvent {
 
 type HelperStatus = Arc<Mutex<Option<Result<(), String>>>>;
 type HelperCursor = Arc<Mutex<CursorShape>>;
-type HelperFiles = Arc<Mutex<std::collections::VecDeque<meshrmm_protocol::FileMessage>>>;
+#[derive(Default)]
+struct FileEvents {
+    queue: Mutex<std::collections::VecDeque<meshrmm_protocol::FileMessage>>,
+    ready: Arc<tokio::sync::Notify>,
+}
+type HelperFiles = Arc<FileEvents>;
 type HelperMaintenance = Arc<Mutex<Option<SessionMessage>>>;
 #[derive(Default)]
 struct ChatEvents {
@@ -204,7 +209,7 @@ impl DesktopCaptureStreamer {
             preferred_desktop: None,
             cursor: Arc::new(Mutex::new(CursorShape::Default)),
             clipboard: Arc::new(Mutex::new(None)),
-            files: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            files: Arc::new(FileEvents::default()),
             chat: Arc::new(ChatEvents::default()),
             maintenance: Arc::new(Mutex::new(None)),
             chat_enabled: Arc::new(AtomicBool::new(false)),
@@ -631,7 +636,7 @@ impl DesktopCaptureStreamer {
             }
             helper.finish();
         }
-        self.files.lock().unwrap().clear();
+        self.files.queue.lock().unwrap().clear();
     }
 
     fn stop_input_helper(&mut self) {
@@ -751,8 +756,11 @@ impl ScreenInput for DesktopInputController {
         send_command(&writer, &ParentCommand::Files(message))?;
         Ok(())
     }
+    fn files_ready(&self) -> Arc<tokio::sync::Notify> {
+        self.files.ready.clone()
+    }
     fn poll_files(&self) -> Option<meshrmm_protocol::FileMessage> {
-        self.files.lock().ok()?.pop_front()
+        self.files.queue.lock().ok()?.pop_front()
     }
 
     fn stop_chat(&self) {
@@ -1269,9 +1277,10 @@ fn dispatch_input_events(
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) = shape;
             }
             Ok(ChildEvent::Files(message)) => {
-                let mut queue = files.lock().unwrap();
+                let mut queue = files.queue.lock().unwrap();
                 if queue.len() < 32 {
                     queue.push_back(message);
+                    files.ready.notify_one();
                 }
             }
             Ok(ChildEvent::Chat(text)) => {
@@ -2688,17 +2697,27 @@ fn run_file_child(commands: mpsc::Receiver<io::Result<ParentCommand>>) -> anyhow
     meshrmm_file_transfer::TransferSession::run_on_current_thread(move |files| {
         let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
         emit_child_event(&output, ChildEvent::InputStarted)?;
-        loop {
-            match commands.recv_timeout(Duration::from_millis(5)) {
-                Ok(Ok(ParentCommand::Files(message))) => files.receive(message),
-                Ok(Ok(ParentCommand::Stop)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                _ => anyhow::bail!("file helper received an unexpected command"),
-            }
-            if let Some(message) = files.poll() {
-                emit_child_event(&output, ChildEvent::Files(message))?;
-            }
-        }
+        let mut commands = async_helper_commands(commands)?;
+        let ready = files.outgoing_ready();
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(async {
+                loop {
+                    tokio::select! {
+                        command = commands.recv() => match command {
+                            Some(Ok(ParentCommand::Files(message))) => files.receive(message),
+                            Some(Ok(ParentCommand::Stop)) | None => break,
+                            _ => anyhow::bail!("file helper received an unexpected command"),
+                        },
+                        _ = ready.notified() => {
+                            while let Some(message) = files.poll() {
+                                emit_child_event(&output, ChildEvent::Files(message))?;
+                            }
+                        }
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
         emit_child_event(&output, ChildEvent::Stopped)?;
         Ok(())
     })

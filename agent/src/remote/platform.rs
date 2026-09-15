@@ -53,6 +53,7 @@ pub trait ScreenInput: Send + Sync {
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()>;
     fn apply_files(&self, message: meshrmm_protocol::FileMessage) -> anyhow::Result<()>;
     fn poll_files(&self) -> Option<meshrmm_protocol::FileMessage>;
+    fn files_ready(&self) -> Arc<tokio::sync::Notify>;
     fn apply(&self, input: RemoteInput) -> anyhow::Result<()>;
     fn release_all(&self) -> anyhow::Result<()>;
     fn cursor_shape(&self) -> CursorShape;
@@ -366,6 +367,9 @@ impl ScreenInput for DirectInputController {
     fn apply_files(&self, message: meshrmm_protocol::FileMessage) -> anyhow::Result<()> {
         self.files.receive(message);
         Ok(())
+    }
+    fn files_ready(&self) -> Arc<tokio::sync::Notify> {
+        self.files.outgoing_ready()
     }
     fn poll_files(&self) -> Option<meshrmm_protocol::FileMessage> {
         self.files.poll()
