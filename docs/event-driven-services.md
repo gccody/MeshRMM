@@ -59,3 +59,12 @@ passed. Windows agent 45, viewer 19, chat 7, clipboard 1, files 7 and transport 
 passed, with three existing invasive tests ignored. A real Windows pipe test
 verifies helper notifications for all three services, clipboard latest-value
 coalescing and consumption. macOS Clippy passed.
+
+## Helper executable startup
+
+The installed smoke test exposed a nested-runtime panic in the chat helper.
+The Agent executable now dispatches native helpers before entering its main
+Tokio runtime. A Windows integration test launches the real Agent executable,
+starts the chat helper, sends chat commands, and requires a clean Stopped event
+and successful process exit. It reproduced the panic before the fix and passed
+afterward. All targeted Windows suites and the macOS Agent suite passed again.

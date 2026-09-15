@@ -11,8 +11,7 @@ use anyhow::Context;
 use remote::config::{Config, ExecutionMode};
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     if std::env::args_os()
         .nth(1)
@@ -21,6 +20,15 @@ async fn main() -> anyhow::Result<()> {
         return remote::capture_helper::run_child();
     }
 
+    // Native helpers own their threads and optional service runtime. Dispatch
+    // them before entering Tokio so a helper never nests block_on inside it.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_agent())
+}
+
+async fn run_agent() -> anyhow::Result<()> {
     #[cfg(windows)]
     if std::env::args_os()
         .nth(1)
