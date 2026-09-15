@@ -192,7 +192,7 @@ define_class!(
 
         #[unsafe(method(resetCursorRects))]
         fn reset_cursor_rects(&self) {
-            let cursor = mac_cursor(*self.ivars().cursor_shape.borrow());
+            let cursor = mac_cursor(self.ivars().control.effective_cursor_shape(*self.ivars().cursor_shape.borrow()));
             let mut bounds = self.bounds();
             bounds.size.height = (bounds.size.height - VIEWER_TOOLBAR_HEIGHT).max(1.0);
             self.addCursorRect_cursor(bounds, &cursor);
@@ -350,6 +350,7 @@ define_class!(
                 ) };
                 unsafe { item.setTarget(Some(self)); }
                 if action == sel!(toggleAgentInput:) || action == sel!(toggleBlackout:) { item.setEnabled(self.ivars().control.maintenance_state().available); }
+                if action == sel!(toggleAgentInput:) && self.ivars().control.maintenance_state().blacked_out { item.setEnabled(false); }
                 menu.addItem(&item);
             }
             menu.popUpMenuPositioningItem_atLocation_inView(None, NSPoint::new(0., 0.), Some(sender));
@@ -360,6 +361,7 @@ define_class!(
             self.release_input();
             let blocked = !self.ivars().control.technician_blocked();
             self.ivars().control.set_technician_blocked(blocked);
+            self.refresh_cursor();
             self.ivars().control.set_input_enabled(true);
         }
 
@@ -674,10 +676,14 @@ impl RemoteView {
             return;
         }
         *self.ivars().cursor_shape.borrow_mut() = shape;
+        self.refresh_cursor();
+    }
+
+    fn refresh_cursor(&self) {
         if let Some(window) = self.window() {
             window.invalidateCursorRectsForView(self);
         }
-        mac_cursor(shape).set();
+        mac_cursor(self.ivars().control.effective_cursor_shape(*self.ivars().cursor_shape.borrow())).set();
     }
 
     fn send_pointer(&self, event: &NSEvent) {
