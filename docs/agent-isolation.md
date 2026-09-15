@@ -116,3 +116,43 @@ Helper startup logs identify each service role for fault-injection tests.
 
 Validation: 42 enabled Windows Agent tests plus a native clipboard test covering
 plain text, HTML, images and suppression of clipboard echo all pass.
+
+## Installed endpoint validation (2026-09-15)
+
+Tested on Windows endpoint `192.168.1.152` with the local macOS viewer. Each
+isolation change was tested and committed before starting the next change.
+Both final release builds were installed locally; no release was published.
+The installer verified the agent binary hash, preserved enrollment configuration,
+and confirmed signaling reconnected. Final agent SHA-256:
+`06dc5f2df262e73d803139e10cbeee1084ba6d6fed733cc81b92c6c30442973c`.
+
+Physical fault injection uses `scripts/test-helper-isolation.ps1`, which validates
+the selected helper process and resumes it in a `finally` block.
+
+| Paused helper | Duration | Observed independent behavior |
+| --- | --- | --- |
+| Clipboard | 90 seconds | Live keyboard/video, bidirectional chat, dashboard online |
+| Files | 90 seconds | Keyboard/video continued with an upload pending; upload completed after resume |
+| Chat | 60 seconds | Keyboard/video and Windows-to-Mac clipboard continued |
+| Capture | 90 seconds | Input and clipboard continued, dashboard reported online, video recovered automatically after resume |
+| Input | 30 seconds | Chat arrived on the endpoint and video displayed it during the pause |
+
+The transferred test file was 1,081,344 bytes; source and destination SHA-256:
+`82dc98f339452dd78912dfe6b873bc9c7034b539d707889abe564b8ed27f6e9b`.
+The corrected clipboard helper was also tested in both directions interactively.
+Switching between both physical monitors and returning to the original display
+worked with the final installed builds. The browser event stream briefly
+reconnected after being backgrounded; it returned to live/agent-online status
+while the capture helper was still suspended.
+
+Final automated suites: Windows agent 42 passed, protocol 25, clipboard 1,
+file transfer 6, viewer 19, session transport 3, signaling 5. Three existing
+Windows blackout/input-block tests remain explicitly ignored because they require
+their own interactive harness. macOS agent 10, viewer 27, protocol 25, transport 3
+and signaling 5 passed. Clippy passed for Windows agent/shared transport and
+macOS viewer/shared transport with the existing `too_many_arguments` lint allowed.
+
+All paused helpers resumed successfully. Closing the final viewer session removed
+every desktop helper; only the Windows service and its worker remained, and the
+dashboard showed the agent online. The temporary Notepad tab was discarded.
+The generated transfer file remains available as a checksum validation artifact.
