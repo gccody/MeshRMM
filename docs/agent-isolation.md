@@ -65,3 +65,14 @@ Validation: all 39 enabled Windows Agent tests pass, including the new chat-help
 startup framing, Unicode chat commands, banner message behavior and independent
 worker/pipe tests. Interactive installed-agent validation follows the remaining
 file/network isolation steps.
+
+## File transfer
+
+File dispatch, polling and network writes now have a separate worker and bounded
+inbound queue. File helper stalls never run inside the signaling/session loop.
+
+Validation: Windows Agent and file-transfer suites. A regression test blocks the
+actual file-worker dispatch path and confirms the input, chat and clipboard
+workers still process messages on a single-thread async runtime, then verifies
+input cleanup. File tests cover checksums, nested/Unicode/empty files, cancellation
+cleanup and preserving existing destination files.

@@ -52,7 +52,6 @@ impl Drop for SenderCleanup {
 
 enum ControlCommand {
     MaintenanceError(String),
-    Files(meshrmm_protocol::FileMessage),
     Keyframe,
     Bitrate(u32),
     ViewerCapabilities {
@@ -338,6 +337,8 @@ async fn run_connected_sender(
     cleanup.workers.push(clipboard_task);
     let (chat_tx, chat_task) = spawn_chat_worker(Arc::clone(&input), Arc::clone(&control_channel))?;
     cleanup.workers.push(chat_task);
+    let (files_tx, files_task) = spawn_file_worker(Arc::clone(&input), Arc::clone(&control_channel))?;
+    cleanup.workers.push(files_task);
     {
         let notify = Arc::clone(&control_open);
         let decoder_ready = Arc::clone(&decoder_ready);
@@ -354,6 +355,7 @@ async fn run_connected_sender(
         }));
         let control_messages_tx = control_tx.clone();
         let input_tx = input_tx.clone();
+        let files_tx = files_tx.clone();
         let chat_tx = chat_tx.clone();
         let clipboard_tx = clipboard_tx.clone();
         let maintenance_tx = maintenance_tx.clone();
@@ -361,6 +363,7 @@ async fn run_connected_sender(
             let tx = control_messages_tx.clone();
             let decoder_ready = Arc::clone(&decoder_ready);
             let input_tx = input_tx.clone();
+            let files_tx = files_tx.clone();
             let chat_tx = chat_tx.clone();
             let clipboard_tx = clipboard_tx.clone();
             let maintenance_tx = maintenance_tx.clone();
@@ -411,7 +414,7 @@ async fn run_connected_sender(
                         clipboard_tx.try_send(message).err().map(|_| ControlCommand::MaintenanceError("clipboard queue full or closed".into()))
                     },
                     Ok(SessionMessage::FileTransfer(message)) => {
-                        Some(ControlCommand::Files(message))
+                        files_tx.try_send(message).err().map(|_| ControlCommand::MaintenanceError("file-transfer queue full or closed".into()))
                     }
                     Ok(message @ (SessionMessage::ChatAvailable | SessionMessage::Chat { .. })) => {
                         chat_tx.try_send(message).err().map(|_| ControlCommand::MaintenanceError("chat queue full or closed".into()))
@@ -479,7 +482,6 @@ async fn run_connected_sender(
     session_state = session_state.transition(SessionState::Connecting)?;
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     stats_interval.tick().await;
-    let mut file_interval = tokio::time::interval(std::time::Duration::from_millis(5));
     let mut offer_sent = false;
     let mut remote_description_set = false;
     let mut pending_candidates = Vec::new();
@@ -535,9 +537,6 @@ async fn run_connected_sender(
                     _ => {}
                 }
             }
-            _ = file_interval.tick(), if session_state == SessionState::Streaming && control_channel.ready_state() == RTCDataChannelState::Open => {
-                if let Some(message) = input.poll_files() { send_control_message(&control_channel, SessionMessage::FileTransfer(message)).await?; }
-            }
             Some(command) = control_rx.recv() => {
                 match command {
                     command @ (ControlCommand::Keyframe | ControlCommand::Bitrate(_)
@@ -546,7 +545,6 @@ async fn run_connected_sender(
                         | ControlCommand::SelectDisplay(_)) => {
                         capture_tx.try_send(command).map_err(|_| anyhow::anyhow!("capture command queue full or closed"))?;
                     }
-                    ControlCommand::Files(message) => { if let Err(error) = input.apply_files(message) { tracing::warn!(%error, "file transfer helper unavailable"); } }
                     ControlCommand::MaintenanceError(reason) => {
                         send_control_message(&control_channel, SessionMessage::MaintenanceError { reason }).await?;
                     }
@@ -627,6 +625,36 @@ async fn run_connected_sender(
         "remote sender session stopped"
     );
     result
+}
+
+fn spawn_file_worker(
+    input: Arc<dyn super::platform::ScreenInput>,
+    channel: Arc<RTCDataChannel>,
+) -> anyhow::Result<(mpsc::Sender<meshrmm_protocol::FileMessage>, super::native_task::NativeTask)> {
+    let (sender, mut commands) = mpsc::channel(64);
+    let task = super::native_task::NativeTask::spawn("meshrmm-files", move |mut stop| async move {
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(5));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if *stop.borrow() { break; }
+            tokio::select! {
+                _ = stop.changed() => break,
+                message = commands.recv() => {
+                    let Some(message) = message else { break; };
+                    if let Err(error) = input.apply_files(message) { tracing::warn!(%error, "file helper unavailable"); }
+                }
+                _ = poll.tick(), if channel.ready_state() == RTCDataChannelState::Open => {
+                    if channel.buffered_amount().await < 64 * 1024
+                        && let Some(message) = input.poll_files()
+                        && let Err(error) = send_control_message(&channel, SessionMessage::FileTransfer(message)).await {
+                            tracing::warn!(%error, "file-transfer send failed");
+                            break;
+                        }
+                }
+            }
+        }
+    })?;
+    Ok((sender, task))
 }
 
 fn spawn_chat_worker(
@@ -1550,5 +1578,67 @@ mod tests {
             ),
             vec![h264_444, h264_420]
         );
+    }
+}
+
+#[cfg(test)]
+mod service_isolation_tests {
+    use super::*;
+    use super::super::platform::ScreenInput;
+    use meshrmm_protocol::{ClipboardContent, CursorShape, FileMessage, RemoteInput};
+
+    struct TestInput {
+        events: mpsc::UnboundedSender<&'static str>,
+        file_gate: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl ScreenInput for TestInput {
+        fn apply_files(&self, _: FileMessage) -> anyhow::Result<()> {
+            self.events.send("file blocked")?;
+            self.file_gate.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5))?;
+            Ok(())
+        }
+        fn apply(&self, _: RemoteInput) -> anyhow::Result<()> { self.events.send("input")?; Ok(()) }
+        fn apply_chat(&self, _: String) -> anyhow::Result<()> { self.events.send("chat")?; Ok(()) }
+        fn apply_clipboard(&self, _: ClipboardContent) -> anyhow::Result<()> { self.events.send("clipboard")?; Ok(()) }
+        fn release_all(&self) -> anyhow::Result<()> { self.events.send("released")?; Ok(()) }
+        fn set_blackout(&self, _: bool) -> anyhow::Result<()> { Ok(()) }
+        fn set_agent_input_blocked(&self, _: bool) -> anyhow::Result<()> { Ok(()) }
+        fn maintenance_state(&self) -> Option<SessionMessage> { None }
+        fn cursor_shape(&self) -> CursorShape { CursorShape::Default }
+        fn poll_files(&self) -> Option<FileMessage> { None }
+        fn poll_chat(&self) -> anyhow::Result<Option<String>> { Ok(None) }
+        fn poll_clipboard(&self) -> anyhow::Result<Option<ClipboardContent>> { Ok(None) }
+        fn start_chat(&self) -> anyhow::Result<()> { Ok(()) }
+        fn stop_chat(&self) {}
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_file_operation_does_not_delay_input_chat_or_clipboard() {
+        let (events, mut received) = mpsc::unbounded_channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let input: Arc<dyn ScreenInput> = Arc::new(TestInput { events, file_gate: Mutex::new(gate) });
+        let channel = Arc::new(RTCDataChannel::default());
+        let (errors, _) = mpsc::unbounded_channel();
+        let (files, mut file_task) = spawn_file_worker(input.clone(), channel.clone()).unwrap();
+        let (keys, mut input_task) = spawn_input_worker(input.clone(), channel.clone(), errors).unwrap();
+        let (chat, mut chat_task) = spawn_chat_worker(input.clone(), channel.clone()).unwrap();
+        let (clipboard, mut clipboard_task) = spawn_clipboard_worker(input, channel).unwrap();
+        files.try_send(FileMessage::Pick).unwrap();
+        assert_eq!(received.recv().await, Some("file blocked"));
+        keys.try_send(RemoteInput::PointerMove { display_id: DisplayId(1), x: 0, y: 0 }).unwrap();
+        chat.try_send(SessionMessage::Chat { text: "still responsive".into() }).unwrap();
+        for message in ClipboardContent::from("independent").messages().unwrap() { clipboard.try_send(message).unwrap(); }
+        let mut observed = Vec::new();
+        for _ in 0..3 {
+            observed.push(tokio::time::timeout(std::time::Duration::from_secs(1), received.recv()).await.unwrap().unwrap());
+        }
+        observed.sort();
+        assert_eq!(observed, ["chat", "clipboard", "input"]);
+        release.send(()).unwrap();
+        file_task.shutdown().await;
+        input_task.shutdown().await;
+        chat_task.shutdown().await;
+        clipboard_task.shutdown().await;
+        assert_eq!(received.recv().await, Some("released"));
     }
 }
