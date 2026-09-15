@@ -334,6 +334,15 @@ define_class!(
             }
         }
 
+        #[unsafe(method(toggleTechnicianInput:))]
+        fn toggle_technician_input(&self, sender: &NSButton) {
+            self.release_input();
+            let blocked = !self.ivars().control.technician_blocked();
+            self.ivars().control.set_technician_blocked(blocked);
+            sender.setTitle(&NSString::from_str(if blocked { "Allow technician input" } else { "Block technician input" }));
+            self.ivars().control.set_input_enabled(true);
+        }
+
         #[unsafe(method(selectQualityFromToolbar:))]
         fn select_quality_from_toolbar(&self, sender: &NSPopUpButton) {
             let preset = match sender.indexOfSelectedItem() {
@@ -591,6 +600,14 @@ impl RemoteView {
             },
         });
         toolbar.addSubview(&diagnostics);
+        let input_button = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Block technician input"), Some(self),
+                Some(sel!(toggleTechnicianInput:)), mtm,
+            )
+        };
+        input_button.setFrame(NSRect::new(NSPoint::new(604., 6.), NSSize::new(168., 24.)));
+        toolbar.addSubview(&input_button);
         self.registerForDraggedTypes(&NSArray::from_slice(&[unsafe { NSPasteboardTypeFileURL }]));
         let file_button = unsafe {
             NSButton::buttonWithTitle_target_action(
