@@ -15,7 +15,7 @@ mod blackout;
 mod platform;
 #[cfg(windows)]
 mod session;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod secure_attention;
 #[cfg(windows)]
 mod signaling;

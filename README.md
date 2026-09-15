@@ -466,9 +466,12 @@ Use **Ctrl+Alt+Del** in the Windows or macOS remote client's toolbar to send the
 secure attention sequence to the Windows agent. Update both the client and agent
 for this command. The agent must run through its installed Windows service.
 
-Windows must allow services to generate secure attention: in Group Policy, go to
-**Computer Configuration > Administrative Templates > Windows Components > Windows
-Logon Options > Disable or enable software Secure Attention Sequence**, enable it,
-and select **Services** (or **Services and Ease of Access applications**). MeshRMM
-reports blocked requests in the client and does not change this policy.
+When Windows policy blocks service-generated secure attention, the agent temporarily
+allows it locally, calls `SendSAS`, and restores the previous registry value (or
+removes it if it was absent). This also applies to settings delivered by domain GPO;
+the domain GPO itself is not changed. Already-permitted settings are left untouched.
+Registry access or restoration failures are reported in the client. A different
+value written by a concurrent policy refresh is preserved. Forced process termination
+or a machine crash during the override can prevent restoration; `SendSAS` itself
+returns no delivery status.
 See [Microsoft's SendSAS documentation](https://learn.microsoft.com/en-us/windows/win32/api/sas/nf-sas-sendsas).
