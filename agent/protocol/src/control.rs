@@ -95,6 +95,8 @@ pub enum SessionMessage {
     /// Announces support for session chat; both peers must opt in.
     ChatAvailable,
     FileTransfer(crate::FileMessage),
+    SetAgentInputBlocked { blocked: bool },
+    MaintenanceState { agent_input_blocked: bool, blacked_out: bool },
 }
 
 impl SessionMessage {

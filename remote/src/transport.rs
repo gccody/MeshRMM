@@ -168,6 +168,7 @@ impl VideoReceiveState {
 /// of stale pointer positions on the reliable control stream.
 #[derive(Clone)]
 struct ViewerControlQueue {
+    maintenance: Arc<Mutex<crate::platform::MaintenanceState>>,
     files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
     outgoing: mpsc::UnboundedSender<SessionMessage>,
@@ -187,6 +188,7 @@ impl ViewerControlQueue {
         resume_state: ViewerResumeState,
     ) -> Self {
         Self {
+            maintenance: Arc::new(Mutex::new(crate::platform::MaintenanceState::default())),
             files: meshrmm_file_transfer::TransferSession::new(),
             chat: meshrmm_chat::ChatSession::default(),
             outgoing,
@@ -898,6 +900,7 @@ fn install_control_handler(
                         move |enabled| input_gate.set_input_enabled(enabled),
                         viewer_control.chat.clone(),
                         Arc::clone(&viewer_control.resume_state.technician_blocked),
+                        Arc::clone(&viewer_control.maintenance),
                         Arc::clone(&quality_preset),
                         Arc::clone(&chroma_mode),
                         #[cfg(windows)]
@@ -1036,6 +1039,11 @@ fn install_control_handler(
                                 let _ = presentation_failure.send(message);
                             }
                         }
+                    }
+                }
+                Ok(SessionMessage::MaintenanceState { agent_input_blocked, blacked_out }) => {
+                    if let Ok(mut state) = viewer_control.maintenance.lock() {
+                        *state = crate::platform::MaintenanceState { available: true, agent_input_blocked, blacked_out };
                     }
                 }
                 Ok(SessionMessage::Stop { reason }) => tracing::info!(reason, "Agent stopped stream"),
@@ -1240,6 +1248,7 @@ mod tests {
         assert!(rx.try_recv().is_ok());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn monitor_resolution_changes_reuse_the_presenter_but_codec_changes_do_not() {
         let current = meshrmm_protocol::VideoFormat {

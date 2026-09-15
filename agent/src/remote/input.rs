@@ -11,6 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 pub struct WindowsInputController {
+    block: Option<super::input_block::InputBlock>,
     active_display: Option<Display>,
     pressed_keys: HashSet<(u16, bool)>,
     pressed_buttons: HashSet<PointerButton>,
@@ -20,11 +21,22 @@ pub struct WindowsInputController {
 impl WindowsInputController {
     pub fn new() -> Self {
         Self {
+            block: None,
             active_display: None,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
             system_cursors: system_cursor_handles(),
         }
+    }
+
+    pub fn blocked(&self) -> bool { self.block.is_some() }
+
+    pub fn set_blocked(&mut self, blocked: bool) -> anyhow::Result<()> {
+        if blocked && self.block.is_none() {
+            self.release_all()?;
+            self.block = Some(super::input_block::InputBlock::start()?);
+        } else if !blocked { self.block = None; }
+        Ok(())
     }
 
     pub fn cursor_shape(&self) -> CursorShape {
@@ -311,7 +323,7 @@ fn mouse_input(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> INPUT {
                 mouseData: data,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: super::input_block::INPUT_TAG,
             },
         },
     }
@@ -333,7 +345,7 @@ fn send_key(scan_code: u16, extended: bool, pressed: bool) -> anyhow::Result<()>
                 wScan: scan_code,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: super::input_block::INPUT_TAG,
             },
         },
     };

@@ -57,6 +57,7 @@ const SETTINGS_CHROMA_TITLE_ID: i32 = 4213;
 const SETTINGS_ADVANCED_TITLE_ID: i32 = 4221;
 const SETTINGS_DIAGNOSTICS_ID: usize = 4222;
 const SETTINGS_TECHNICIAN_INPUT_ID: usize = 4223;
+const SETTINGS_AGENT_INPUT_ID: usize = 4224;
 
 impl WindowContext {
     fn send(&self, message: SessionMessage) {
@@ -221,7 +222,21 @@ impl WindowContext {
         }
     }
 
+    fn refresh_maintenance_controls(&self) {
+        for (id, checked, enabled) in [
+            (SETTINGS_TECHNICIAN_INPUT_ID, self.control.technician_blocked(), true),
+            (SETTINGS_AGENT_INPUT_ID, self.control.agent_blocked(), self.control.maintenance_state().available),
+        ] {
+            if let Ok(button) = unsafe { GetDlgItem(Some(self.settings_window), id as i32) } {
+                unsafe {
+                    let _ = EnableWindow(button, enabled);
+                    SendMessageW(button, BM_SETCHECK, Some(WPARAM(usize::from(checked))), None);
+                }
+            }
+        }
+    }
     fn show_settings(&self) {
+        self.refresh_maintenance_controls();
         let _ = unsafe { ShowWindow(self.settings_window, SW_SHOW) };
         let _ = unsafe { SetForegroundWindow(self.settings_window) };
     }
@@ -385,7 +400,7 @@ unsafe fn show_settings_category(window: HWND, display: bool) {
             let _ = unsafe { ShowWindow(control, display_command) };
         }
     }
-    for id in [SETTINGS_ADVANCED_TITLE_ID, SETTINGS_DIAGNOSTICS_ID as i32, SETTINGS_TECHNICIAN_INPUT_ID as i32] {
+    for id in [SETTINGS_ADVANCED_TITLE_ID, SETTINGS_DIAGNOSTICS_ID as i32, SETTINGS_TECHNICIAN_INPUT_ID as i32, SETTINGS_AGENT_INPUT_ID as i32] {
         if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
             let _ = unsafe { ShowWindow(control, advanced_command) };
         }
@@ -447,6 +462,11 @@ unsafe extern "system" fn settings_window_proc(
                 };
                 if let Some(chroma) = chroma {
                     context.set_chroma(chroma);
+                    return LRESULT(0);
+                }
+                if control_id == SETTINGS_AGENT_INPUT_ID {
+                    context.release_input();
+                    context.control.toggle_agent_input();
                     return LRESULT(0);
                 }
                 if control_id == SETTINGS_TECHNICIAN_INPUT_ID {
@@ -674,6 +694,11 @@ unsafe fn create_settings_window(
         w!("BUTTON"), w!("Block technician input"),
         WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
         162, 110, 340, 28, SETTINGS_TECHNICIAN_INPUT_ID,
+    )?;
+    let _ = make_control(
+        w!("BUTTON"), w!("Block agent keyboard and mouse"),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
+        162, 150, 340, 28, SETTINGS_AGENT_INPUT_ID,
     )?;
     unsafe { show_settings_category(settings, true) };
     Ok(SettingsControls {

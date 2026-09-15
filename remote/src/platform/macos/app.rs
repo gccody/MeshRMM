@@ -334,13 +334,38 @@ define_class!(
             }
         }
 
+        #[unsafe(method(showSessionControls:))]
+        fn show_session_controls(&self, sender: &NSButton) {
+            self.release_input();
+            let menu = NSMenu::new(self.mtm());
+            menu.setAutoenablesItems(false);
+            for (title, action) in [
+                (if self.ivars().control.technician_blocked() { "Allow technician input" } else { "Block technician input" }, sel!(toggleTechnicianInput:)),
+                (if self.ivars().control.agent_blocked() { "Allow agent input" } else { "Block agent keyboard and mouse" }, sel!(toggleAgentInput:)),
+                ("Diagnostics", sel!(toggleDiagnostics:)),
+            ] {
+                let item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(self.mtm()), &NSString::from_str(title), Some(action), &NSString::from_str(""),
+                ) };
+                unsafe { item.setTarget(Some(self)); }
+                if action == sel!(toggleAgentInput:) { item.setEnabled(self.ivars().control.maintenance_state().available); }
+                menu.addItem(&item);
+            }
+            menu.popUpMenuPositioningItem_atLocation_inView(None, NSPoint::new(0., 0.), Some(sender));
+        }
+
         #[unsafe(method(toggleTechnicianInput:))]
-        fn toggle_technician_input(&self, sender: &NSButton) {
+        fn toggle_technician_input(&self, _sender: &NSMenuItem) {
             self.release_input();
             let blocked = !self.ivars().control.technician_blocked();
             self.ivars().control.set_technician_blocked(blocked);
-            sender.setTitle(&NSString::from_str(if blocked { "Allow technician input" } else { "Block technician input" }));
             self.ivars().control.set_input_enabled(true);
+        }
+
+        #[unsafe(method(toggleAgentInput:))]
+        fn toggle_agent_input(&self, _sender: &NSMenuItem) {
+            self.release_input();
+            self.ivars().control.toggle_agent_input();
         }
 
         #[unsafe(method(selectQualityFromToolbar:))]
@@ -586,9 +611,9 @@ impl RemoteView {
 
         let diagnostics = unsafe {
             NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("Diagnostics"),
+                &NSString::from_str("Session"),
                 Some(self),
-                Some(sel!(toggleDiagnostics:)),
+                Some(sel!(showSessionControls:)),
                 mtm,
             )
         };
@@ -600,14 +625,6 @@ impl RemoteView {
             },
         });
         toolbar.addSubview(&diagnostics);
-        let input_button = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("Block technician input"), Some(self),
-                Some(sel!(toggleTechnicianInput:)), mtm,
-            )
-        };
-        input_button.setFrame(NSRect::new(NSPoint::new(604., 6.), NSSize::new(168., 24.)));
-        toolbar.addSubview(&input_button);
         self.registerForDraggedTypes(&NSArray::from_slice(&[unsafe { NSPasteboardTypeFileURL }]));
         let file_button = unsafe {
             NSButton::buttonWithTitle_target_action(

@@ -8,6 +8,8 @@ mod indicator;
 #[cfg(windows)]
 mod input;
 #[cfg(windows)]
+mod input_block;
+#[cfg(windows)]
 mod platform;
 #[cfg(windows)]
 mod session;

@@ -45,6 +45,7 @@ impl Drop for SenderCleanup {
         if self.closed {
             return;
         }
+        let _ = self.input.set_agent_input_blocked(false);
         self.input.stop_chat();
         let _ = self.input.release_all();
         if let Ok(mut streamer) = self.streamer.lock() {
@@ -373,6 +374,12 @@ async fn run_connected_sender(
                     Ok(SessionMessage::SelectDisplay { display_id }) => {
                         Some(ControlCommand::SelectDisplay(display_id))
                     }
+                    Ok(SessionMessage::SetAgentInputBlocked { blocked }) => {
+                        if let Err(error) = input.set_agent_input_blocked(blocked) {
+                            tracing::error!(%error, "endpoint input block failed");
+                            Some(ControlCommand::Stop)
+                        } else { None }
+                    }
                     Ok(SessionMessage::Input(event)) => {
                         if let Err(error) = input.apply(event) {
                             tracing::warn!(error = %error, "discarding invalid remote input");
@@ -400,6 +407,7 @@ async fn run_connected_sender(
     }
 
     let slot = Arc::new(LatestFrameSlot::default());
+    let mut last_maintenance_state = None;
     let mut stream_id = VideoStreamId(1);
     let started = {
         let mut streamer = streamer
@@ -777,6 +785,12 @@ async fn run_connected_sender(
             }
             _ = clipboard_interval.tick(), if session_state == SessionState::Streaming
                 && control_channel.ready_state() == RTCDataChannelState::Open => {
+                if let Some(state) = input.maintenance_state() {
+                    if last_maintenance_state.as_ref() != Some(&state) {
+                        send_control_message(&control_channel, state.clone()).await?;
+                        last_maintenance_state = Some(state);
+                    }
+                }
                 if let Some(text) = input.poll_chat()? {
                     send_control_message(&control_channel, SessionMessage::Chat { text }).await?;
                 }
@@ -900,6 +914,7 @@ async fn run_connected_sender(
     let _ = video_sender.await;
     control_start.abort();
     let _ = control_start.await;
+    let _ = input.set_agent_input_blocked(false);
     input.stop_chat();
     if let Err(error) = input.release_all() {
         tracing::warn!(error = %error, "failed to release remote input during cleanup");
