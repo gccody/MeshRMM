@@ -42,7 +42,7 @@ cleanup.
 
 ## Clipboard and helper pipes
 
-Clipboard assembly, polling and outbound pacing have their own native worker.
+Clipboard assembly, helper notifications and capacity-driven sends have their own native worker.
 Service mode uses a separate clipboard helper process and separate pipes from
 keyboard/mouse input. Each parent-to-helper pipe has a dedicated writer thread,
 a bounded command queue and a byte budget. A full or stalled pipe cannot block
@@ -56,7 +56,7 @@ clipboard helper startup framing, and rich clipboard format/chunk round trips.
 ## Chat
 
 Chat and the session banner now live in a separate desktop helper process with
-their own command pipe. Chat transport polling/sending has an independent native
+their own command pipe. Chat transport notifications/sending have an independent native
 worker. The input helper performs no chat/UI or clipboard work. Full helper
 shutdown runs on the capture worker, so dropping session resources does not wait
 for native helper processes on an async runtime thread.
@@ -68,8 +68,8 @@ file/network isolation steps.
 
 ## File transfer
 
-File dispatch, polling and network writes now have a separate worker and bounded
-inbound queue. File helper stalls never run inside the signaling/session loop.
+File dispatch, output notifications and network writes have a separate worker and
+bounded inbound queue. File helper stalls never run inside the signaling/session loop.
 
 Validation: Windows Agent and file-transfer suites. A regression test blocks the
 actual file-worker dispatch path and confirms the input, chat and clipboard
@@ -156,3 +156,6 @@ All paused helpers resumed successfully. Closing the final viewer session remove
 every desktop helper; only the Windows service and its worker remained, and the
 dashboard showed the agent online. The temporary Notepad tab was discarded.
 The generated transfer file remains available as a checksum validation artifact.
+
+See [event-driven service transport](event-driven-services.md) for the subsequent
+polling removal, process-level regression test and installed validation.
