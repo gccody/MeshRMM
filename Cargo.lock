@@ -1790,6 +1790,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "clipboard-win",
  "meshrmm-file-transfer",
  "meshrmm-protocol",
 ]

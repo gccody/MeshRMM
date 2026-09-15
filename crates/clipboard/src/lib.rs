@@ -30,7 +30,7 @@ impl ClipboardSync {
             return Ok(None);
         }
         let text = optional(self.clipboard.get_text())?;
-        if let Some(html) = optional(self.clipboard.get().html())? {
+        if let Some(html) = self.read_html()? {
             return Ok(Some(ClipboardContent::Html {
                 html,
                 text: text.unwrap_or_default(),
@@ -45,6 +45,18 @@ impl ClipboardSync {
         }
         Ok(text.map(ClipboardContent::Text))
     }
+    fn read_html(&mut self) -> anyhow::Result<Option<String>> {
+        // arboard's Windows HTML reader reports Unknown (rather than
+        // ContentNotAvailable) when the registered HTML format is absent.
+        // Probe availability so ordinary text/image clipboards remain readable.
+        #[cfg(windows)]
+        if !clipboard_win::register_format("HTML Format")
+            .is_some_and(|format| clipboard_win::is_format_avail(format.get())) {
+            return Ok(None);
+        }
+        optional(self.clipboard.get().html())
+    }
+
     pub fn poll(&mut self) -> anyhow::Result<Option<ClipboardContent>> {
         let sequence = meshrmm_file_transfer::clipboard_sequence();
         if self.sequence == Some(sequence) {
@@ -103,5 +115,28 @@ fn optional<T>(result: Result<T, arboard::Error>) -> anyhow::Result<Option<T>> {
             Ok(None)
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_text_html_and_image_clipboards_round_trip_without_html_errors() {
+        let mut sender = ClipboardSync::new(false).unwrap();
+        let samples = [
+            ClipboardContent::Text("MeshRMM clipboard isolation test".into()),
+            ClipboardContent::Html { html: "<b>MeshRMM test</b>".into(), text: "MeshRMM test".into() },
+            ClipboardContent::Image { width: 1, height: 1, rgba: vec![10, 20, 30, 255] },
+        ];
+        for sample in samples {
+            sender.apply(sample.clone()).unwrap();
+            let mut receiver = ClipboardSync::new(true).unwrap();
+            let received = receiver.poll().unwrap().unwrap();
+            assert_eq!(std::mem::discriminant(&received), std::mem::discriminant(&sample));
+            if let ClipboardContent::Text(text) = received { assert_eq!(text, "MeshRMM clipboard isolation test"); }
+            assert!(sender.poll().unwrap().is_none(), "applying a remote clipboard must not echo it back");
+        }
     }
 }
