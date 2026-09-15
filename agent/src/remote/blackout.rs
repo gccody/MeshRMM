@@ -5,7 +5,7 @@ use windows::{
         Foundation::*,
         Graphics::Gdi::*,
         System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
-        UI::WindowsAndMessaging::*,
+        UI::{Magnification::*, WindowsAndMessaging::*},
     },
     core::{BOOL, PCWSTR, w},
 };
@@ -35,6 +35,13 @@ impl Blackout {
         let thread = thread::Builder::new()
             .name("maintenance-blackout".into())
             .spawn(move || unsafe {
+                let _cursor = match HiddenSystemCursor::hide() {
+                    Ok(cursor) => cursor,
+                    Err(error) => {
+                        let _ = tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
                 match create_window(text) {
                     Ok(window) => {
                         if tx.send(Ok(GetCurrentThreadId())).is_ok() {
@@ -70,6 +77,36 @@ impl Drop for Blackout {
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+    }
+}
+
+// The overlay is click-through, so ShowCursor/WM_SETCURSOR on its thread
+// cannot hide the cursor belonging to the application underneath it.
+// Keep the magnification runtime and cursor suppression on the overlay thread
+// so every exit path (including window creation failure) restores the cursor.
+struct HiddenSystemCursor;
+
+impl HiddenSystemCursor {
+    fn hide() -> windows::core::Result<Self> {
+        unsafe {
+            MagInitialize().ok()?;
+            let cursor = Self;
+            MagShowSystemCursor(false).ok()?;
+            Ok(cursor)
+        }
+    }
+}
+
+impl Drop for HiddenSystemCursor {
+    fn drop(&mut self) {
+        unsafe {
+            if !MagShowSystemCursor(true).as_bool() {
+                tracing::warn!("Could not restore the system cursor after monitor blackout");
+            }
+            if !MagUninitialize().as_bool() {
+                tracing::warn!("Could not release the monitor blackout magnification runtime");
+            }
         }
     }
 }

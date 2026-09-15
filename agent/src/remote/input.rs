@@ -74,7 +74,11 @@ impl WindowsInputController {
             cbSize: std::mem::size_of::<CURSORINFO>() as u32,
             ..Default::default()
         };
-        if unsafe { GetCursorInfo(&mut info) }.is_err() || info.flags.0 & CURSOR_SHOWING.0 == 0 {
+        // Blackout hides the endpoint's pointer, but the technician still needs
+        // the underlying application's cursor shape in the remote viewer.
+        if unsafe { GetCursorInfo(&mut info) }.is_err()
+            || (!self.blacked_out() && info.flags.0 & CURSOR_SHOWING.0 == 0)
+        {
             return CursorShape::Default;
         }
         let handle = info.hCursor.0 as usize;
