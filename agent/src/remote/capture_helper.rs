@@ -164,7 +164,12 @@ struct ChatEvents {
     ready: Arc<tokio::sync::Notify>,
 }
 type HelperChat = Arc<ChatEvents>;
-type HelperClipboard = Arc<Mutex<Option<ClipboardContent>>>;
+#[derive(Default)]
+struct ClipboardEvents {
+    latest: Mutex<Option<ClipboardContent>>,
+    ready: Arc<tokio::sync::Notify>,
+}
+type HelperClipboard = Arc<ClipboardEvents>;
 type InputWriter = Arc<CommandWriter>;
 type InputRoute = Arc<Mutex<Option<InputWriter>>>;
 
@@ -208,7 +213,7 @@ impl DesktopCaptureStreamer {
             input_route: Arc::new(Mutex::new(None)),
             preferred_desktop: None,
             cursor: Arc::new(Mutex::new(CursorShape::Default)),
-            clipboard: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(ClipboardEvents::default()),
             files: Arc::new(FileEvents::default()),
             chat: Arc::new(ChatEvents::default()),
             maintenance: Arc::new(Mutex::new(None)),
@@ -574,6 +579,7 @@ impl DesktopCaptureStreamer {
         self.stop_input_helper();
         *self
             .clipboard
+            .latest
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
         let helper = start_input_helper(
@@ -624,7 +630,7 @@ impl DesktopCaptureStreamer {
             }
             helper.finish();
         }
-        *self.clipboard.lock().unwrap() = None;
+        *self.clipboard.latest.lock().unwrap() = None;
     }
 
     fn stop_file_helper(&mut self) {
@@ -856,9 +862,13 @@ impl ScreenInput for DesktopInputController {
             .context("failed to send clipboard content to the active desktop")
     }
 
+    fn clipboard_ready(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(self.clipboard.ready.clone())
+    }
     fn poll_clipboard(&self) -> anyhow::Result<Option<ClipboardContent>> {
         Ok(self
             .clipboard
+            .latest
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take())
@@ -1291,7 +1301,11 @@ fn dispatch_input_events(
                 }
             }
             Ok(ChildEvent::Clipboard(text)) => {
-                *clipboard.lock().unwrap_or_else(|error| error.into_inner()) = Some(text);
+                *clipboard
+                    .latest
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(text);
+                clipboard.ready.notify_one();
             }
             Ok(ChildEvent::Error(message)) => {
                 if let Some(sender) = started_tx.take() {
@@ -2900,5 +2914,72 @@ mod service_command_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod service_event_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn helper_pipe_notifies_services_and_coalesces_clipboard_changes() {
+        let (read, write) = create_inherited_pipe(true).unwrap();
+        let (started, startup) = mpsc::sync_channel(1);
+        let clipboard = Arc::new(ClipboardEvents::default());
+        let files = Arc::new(FileEvents::default());
+        let chat = Arc::new(ChatEvents::default());
+        let reader_clipboard = clipboard.clone();
+        let reader_files = files.clone();
+        let reader_chat = chat.clone();
+        let (finished, done) = tokio::sync::oneshot::channel();
+        thread::spawn(move || {
+            dispatch_input_events(
+                read.into_file(),
+                started,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(CursorShape::Default)),
+                reader_clipboard,
+                reader_files,
+                reader_chat,
+                Arc::new(Mutex::new(None)),
+            );
+            let _ = finished.send(());
+        });
+        let mut writer = write.into_file();
+        for event in [
+            ChildEvent::InputStarted,
+            ChildEvent::Clipboard(ClipboardContent::Text("first".into())),
+            ChildEvent::Clipboard(ClipboardContent::Text("latest".into())),
+            ChildEvent::Chat("hello".into()),
+            ChildEvent::Files(meshrmm_protocol::FileMessage::Available),
+            ChildEvent::Stopped,
+        ] {
+            write_event(&mut writer, &event).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), done)
+            .await
+            .unwrap()
+            .unwrap();
+        startup.recv().unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            clipboard.ready.notified().await;
+            files.ready.notified().await;
+            chat.ready.notified().await;
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            clipboard.latest.lock().unwrap().take(),
+            Some(ClipboardContent::Text("latest".into()))
+        );
+        assert_eq!(
+            chat.queue.lock().unwrap().pop_front().as_deref(),
+            Some("hello")
+        );
+        assert!(matches!(
+            files.queue.lock().unwrap().pop_front(),
+            Some(meshrmm_protocol::FileMessage::Available)
+        ));
+        assert!(clipboard.latest.lock().unwrap().is_none());
     }
 }

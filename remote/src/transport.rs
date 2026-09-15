@@ -831,9 +831,8 @@ fn start_viewer_services(
                     }
                     viewer.send(SessionMessage::ChatAvailable);
                 }
-                let mut poll = tokio::time::interval(std::time::Duration::from_millis(5));
+                let mut poll = tokio::time::interval(CLIPBOARD_POLL_INTERVAL);
                 poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                let mut clipboard_poll = tokio::time::Instant::now();
                 while !stopping.load(Ordering::Acquire) {
                     tokio::select! {
                         _ = stop.wait_for(|stopped| *stopped) => break,
@@ -864,22 +863,20 @@ fn start_viewer_services(
                                 permit.send(SessionMessage::FileTransfer(message));
                             } else { files_pending = false; }
                         }
+                        permit = service_sender.reserve(), if label == CLIPBOARD_CHANNEL && !outgoing.is_empty() => {
+                            let Ok(permit) = permit else { break; };
+                            if let Some(message) = outgoing.pop_front() { permit.send(message); }
+                        }
                         _ = poll.tick(), if label == CLIPBOARD_CHANNEL => {
                             let open = control.borrow().as_ref().is_some_and(|c| c.ready_state() == RTCDataChannelState::Open);
                             if !open { continue; }
-                            {
-                                    if clipboard_poll.elapsed() >= CLIPBOARD_POLL_INTERVAL {
-                                        clipboard_poll = tokio::time::Instant::now();
-                                        if let Some(clipboard) = clipboard.as_mut() {
-                                            match clipboard.poll().and_then(|c| Ok(c.map(|c| c.messages()).transpose()?)) {
-                                                Ok(Some(messages)) => outgoing = messages.into(),
-                                                Ok(None) => {},
-                                                Err(error) => tracing::warn!(%error, "viewer clipboard poll failed"),
-                                            }
-                                        }
-                                    }
-                                    if let Some(message) = outgoing.pop_front() { viewer.send(message); }
+                            if let Some(clipboard) = clipboard.as_mut() {
+                                match clipboard.poll().and_then(|c| Ok(c.map(|c| c.messages()).transpose()?)) {
+                                    Ok(Some(messages)) => outgoing = messages.into(),
+                                    Ok(None) => {},
+                                    Err(error) => tracing::warn!(%error, "viewer clipboard poll failed"),
                                 }
+                            }
                         }
                     }
                 }
