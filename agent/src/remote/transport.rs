@@ -29,7 +29,7 @@ use super::video::LatestFrameSlot;
 // Cancellation and startup errors must release resources just like normal teardown.
 struct SenderCleanup {
     peer: Arc<RTCPeerConnection>,
-    streamer: Arc<Mutex<Box<dyn ScreenStreamer>>>,
+    capture: Option<super::native_task::NativeTask>,
     input: Arc<dyn super::platform::ScreenInput>,
     tasks: Vec<tokio::task::AbortHandle>,
     closed: bool,
@@ -47,9 +47,6 @@ impl Drop for SenderCleanup {
         let _ = self.input.set_agent_input_blocked(false);
         self.input.stop_chat();
         let _ = self.input.release_all();
-        if let Ok(mut streamer) = self.streamer.lock() {
-            let _ = streamer.stop();
-        }
         let peer = Arc::clone(&self.peer);
         tokio::spawn(async move {
             let _ = peer.close().await;
@@ -280,7 +277,7 @@ async fn run_connected_sender(
     let peer = create_peer(&ice_servers, outgoing_tx.clone(), state_tx).await?;
     let mut cleanup = SenderCleanup {
         peer: Arc::clone(&peer),
-        streamer: Arc::clone(&streamer),
+        capture: None,
         input: Arc::clone(&input),
         tasks: Vec::new(),
         closed: false,
@@ -414,23 +411,28 @@ async fn run_connected_sender(
 
     let slot = Arc::new(LatestFrameSlot::default());
     let mut last_maintenance_state = None;
-    let mut stream_id = VideoStreamId(1);
-    let started = {
-        let mut streamer = streamer
-            .lock()
-            .map_err(|_| anyhow::anyhow!("screen streamer lock is poisoned"))?;
-        streamer.start(None, stream_id, Arc::clone(&slot))?
-    };
-    let mut displays = started.displays;
-    let mut active_display = started.active_display;
+    let stream_id = VideoStreamId(1);
+    let quality_ceiling = Arc::new(AtomicU32::new(1));
+    let (capture_tx, capture_rx) = mpsc::channel(64);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let capture_streamer = Arc::clone(&streamer);
+    let capture_slot = Arc::clone(&slot);
+    let capture_channel = Arc::clone(&control_channel);
+    let capture_ceiling = Arc::clone(&quality_ceiling);
+    let capture_failure = video_failure_tx.clone();
+    let capture_task = super::native_task::NativeTask::spawn("meshrmm-capture-control", move |stop| async move {
+        let result = run_capture_control(capture_streamer.clone(), capture_slot, capture_channel,
+            capture_ceiling, capture_rx, started_tx, stop).await;
+        if let Err(error) = result { let _ = capture_failure.send(format!("capture worker: {error:#}")); }
+        if let Err(error) = lock_streamer(&capture_streamer).and_then(|mut s| s.stop()) {
+            tracing::warn!(%error, "capture worker cleanup failed");
+        }
+    })?;
+    cleanup.capture = Some(capture_task);
+    let started = started_rx.await.context("capture worker stopped before startup")??;
+    let displays = started.displays;
+    let active_display = started.active_display;
     let format = started.format;
-    let configured_maximum_bitrate = format.bitrate_bits_per_second;
-    let quality_ceiling = Arc::new(AtomicU32::new(configured_maximum_bitrate));
-    let mut active_profile = format.profile();
-    let mut viewer_profiles = vec![active_profile];
-    let mut requested_chroma = ChromaMode::Yuv420;
-    let mut rejected_profiles = Vec::new();
-    let mut capture_running = true;
     let video_sender = spawn_video_sender(
         Arc::clone(&video_channel),
         Arc::clone(&video_open),
@@ -457,9 +459,6 @@ async fn run_connected_sender(
     session_state = session_state.transition(SessionState::Connecting)?;
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     stats_interval.tick().await;
-    let mut desktop_interval = tokio::time::interval(DESKTOP_LIFECYCLE_INTERVAL);
-    desktop_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    desktop_interval.tick().await;
     let mut cursor_interval = tokio::time::interval(std::time::Duration::from_millis(16));
     cursor_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut file_interval = tokio::time::interval(std::time::Duration::from_millis(5));
@@ -471,8 +470,6 @@ async fn run_connected_sender(
     let mut offer_sent = false;
     let mut remote_description_set = false;
     let mut pending_candidates = Vec::new();
-    let mut capture_unavailable_since = None::<std::time::Instant>;
-    let mut capture_retry_after = std::time::Instant::now();
     let mut disconnected_since = None::<tokio::time::Instant>;
     let result: anyhow::Result<()> = async {
         loop {
@@ -532,170 +529,11 @@ async fn run_connected_sender(
             }
             Some(command) = control_rx.recv() => {
                 match command {
-                    ControlCommand::Keyframe => {
-                        if let Err(error) = lock_streamer(&streamer)?.request_keyframe() {
-                            tracing::warn!(error = %error, "could not request a keyframe while the desktop is changing");
-                        }
-                    }
-                    ControlCommand::Bitrate(value) => {
-                        // Several hardware HEVC MFTs accept the CodecAPI call and
-                        // then terminate asynchronously on the next frame. That
-                        // turns every AIMD adjustment into a capture restart and
-                        // bootstrap keyframe. Keep HEVC at the selected quality
-                        // preset; congestion handling can still drop frames and
-                        // request recovery without destabilizing the encoder.
-                        if let Err(error) = lock_streamer(&streamer)?.set_adaptive_bitrate(value) {
-                            tracing::warn!(error = %error, "could not set bitrate while the desktop is changing");
-                        }
-                    }
-                    ControlCommand::Quality(preset) => {
-                        let value = preset.bitrate(configured_maximum_bitrate);
-                        quality_ceiling.store(value, Ordering::Release);
-                        if let Err(error) = lock_streamer(&streamer)?.set_bitrate(value) {
-                            tracing::warn!(error = %error, "could not apply viewer quality preset");
-                        } else {
-                            tracing::info!(?preset, bits_per_second = value, "viewer quality preset applied");
-                        }
-                    }
-                    ControlCommand::ViewerCapabilities { profiles, quality, chroma } => {
-                        let value = quality.bitrate(configured_maximum_bitrate);
-                        quality_ceiling.store(value, Ordering::Release);
-                        if let Err(error) = lock_streamer(&streamer)?.set_bitrate(value) {
-                            tracing::warn!(error = %error, "could not apply initial viewer quality preset");
-                        }
-                        viewer_profiles = profiles;
-                        requested_chroma = chroma;
-                        rejected_profiles.clear();
-                        let candidates = profile_candidates(
-                            &viewer_profiles,
-                            requested_chroma,
-                            &rejected_profiles,
-                        );
-                        if candidates.first() == Some(&active_profile) {
-                            // Echo the settled configuration even when no
-                            // restart is needed. The viewer deliberately does
-                            // not paint the mandatory bootstrap profile until
-                            // capability negotiation has completed.
-                            send_control_message(
-                                &control_channel,
-                                SessionMessage::DisplayConfiguration {
-                                    displays: displays.clone(),
-                                    active_display_id: active_display.id,
-                                    stream_id,
-                                    format,
-                                },
-                            )
-                            .await?;
-                            tracing::info!(?active_profile, ?quality, ?requested_chroma, "video profile negotiation retained active profile");
-                            continue;
-                        }
-
-                        lock_streamer(&streamer)?.stop()?;
-                        capture_running = false;
-                        slot.clear();
-                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
-                        let started = start_first_profile(
-                            &streamer,
-                            active_display.id,
-                            stream_id,
-                            &slot,
-                            &candidates,
-                        )?;
-                        displays = started.displays;
-                        active_display = started.active_display;
-                        active_profile = started.format.profile();
-                        capture_running = true;
-                        capture_unavailable_since = None;
-                        sent_cursor_shape = None;
-                        send_control_message(
-                            &control_channel,
-                            SessionMessage::DisplayConfiguration {
-                                displays: displays.clone(),
-                                active_display_id: active_display.id,
-                                stream_id,
-                                format: started.format,
-                            },
-                        ).await?;
-                        tracing::info!(?active_profile, ?quality, bits_per_second = value, "video profile negotiation completed");
-                    }
-                    ControlCommand::Chroma(chroma) => {
-                        requested_chroma = chroma;
-                        rejected_profiles.clear();
-                        let candidates = profile_candidates(
-                            &viewer_profiles,
-                            requested_chroma,
-                            &rejected_profiles,
-                        );
-                        if candidates.first() == Some(&active_profile) {
-                            tracing::info!(?active_profile, ?requested_chroma, "chroma selection retained active profile");
-                            continue;
-                        }
-                        lock_streamer(&streamer)?.stop()?;
-                        capture_running = false;
-                        slot.clear();
-                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
-                        let started = start_first_profile(
-                            &streamer,
-                            active_display.id,
-                            stream_id,
-                            &slot,
-                            &candidates,
-                        )?;
-                        displays = started.displays;
-                        active_display = started.active_display;
-                        active_profile = started.format.profile();
-                        capture_running = true;
-                        capture_unavailable_since = None;
-                        sent_cursor_shape = None;
-                        send_control_message(
-                            &control_channel,
-                            SessionMessage::DisplayConfiguration {
-                                displays: displays.clone(),
-                                active_display_id: active_display.id,
-                                stream_id,
-                                format: started.format,
-                            },
-                        ).await?;
-                        tracing::info!(?active_profile, ?requested_chroma, "viewer chroma selection applied");
-                    }
-                    ControlCommand::VideoProfileRejected { profile, reason } => {
-                        if profile != active_profile {
-                            tracing::warn!(?profile, reason, "viewer rejected an inactive video profile");
-                            continue;
-                        }
-                        rejected_profiles.push(profile);
-                        tracing::warn!(?profile, reason, "viewer rejected hardware video profile; trying fallback");
-                        let candidates = profile_candidates(
-                            &viewer_profiles,
-                            requested_chroma,
-                            &rejected_profiles,
-                        );
-                        lock_streamer(&streamer)?.stop()?;
-                        capture_running = false;
-                        slot.clear();
-                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
-                        let started = start_first_profile(
-                            &streamer,
-                            active_display.id,
-                            stream_id,
-                            &slot,
-                            &candidates,
-                        )?;
-                        displays = started.displays;
-                        active_display = started.active_display;
-                        active_profile = started.format.profile();
-                        capture_running = true;
-                        capture_unavailable_since = None;
-                        sent_cursor_shape = None;
-                        send_control_message(
-                            &control_channel,
-                            SessionMessage::DisplayConfiguration {
-                                displays: displays.clone(),
-                                active_display_id: active_display.id,
-                                stream_id,
-                                format: started.format,
-                            },
-                        ).await?;
+                    command @ (ControlCommand::Keyframe | ControlCommand::Bitrate(_)
+                        | ControlCommand::Quality(_) | ControlCommand::ViewerCapabilities { .. }
+                        | ControlCommand::Chroma(_) | ControlCommand::VideoProfileRejected { .. }
+                        | ControlCommand::SelectDisplay(_)) => {
+                        capture_tx.try_send(command).map_err(|_| anyhow::anyhow!("capture command queue full or closed"))?;
                     }
                     ControlCommand::Files(message) => { if let Err(error) = input.apply_files(message) { tracing::warn!(%error, "file transfer helper unavailable"); } }
                     ControlCommand::MaintenanceError(reason) => {
@@ -718,61 +556,6 @@ async fn run_connected_sender(
                         };
                         if let Err(error) = input.apply_clipboard(content) {
                             tracing::warn!(error = %error, "discarding viewer clipboard update");
-                        }
-                    }
-                    ControlCommand::SelectDisplay(display_id) => {
-                        if display_id == active_display.id && capture_running {
-                            continue;
-                        }
-                        let Some(selected) = displays.iter().find(|display| display.id == display_id).cloned() else {
-                            tracing::warn!(display_id = display_id.0, "viewer requested an unavailable display");
-                            continue;
-                        };
-                        let switch_started = std::time::Instant::now();
-                        capture_running = false;
-                        capture_unavailable_since = Some(std::time::Instant::now());
-                        slot.clear();
-                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
-                        let candidates = profile_candidates(
-                            &viewer_profiles,
-                            requested_chroma,
-                            &rejected_profiles,
-                        );
-                        let restart = lock_streamer(&streamer)?.switch_display(
-                            selected.id, stream_id, Arc::clone(&slot),
-                        );
-                        let restart = match restart {
-                            Ok(started) => Ok(started),
-                            Err(error) => {
-                                tracing::warn!(?error, "fast display switch failed; retrying supported profiles");
-                                lock_streamer(&streamer)?.stop()?;
-                                start_first_profile(&streamer, selected.id, stream_id, &slot, &candidates)
-                            }
-                        };
-                        match restart {
-                            Ok(started) => {
-                                displays = started.displays;
-                                active_display = started.active_display;
-                                active_profile = started.format.profile();
-                                capture_running = true;
-                                capture_unavailable_since = None;
-                                sent_cursor_shape = None;
-                                send_control_message(
-                                    &control_channel,
-                                    SessionMessage::DisplayConfiguration {
-                                        displays: displays.clone(),
-                                        active_display_id: active_display.id,
-                                        stream_id,
-                                        format: started.format,
-                                    },
-                                ).await?;
-                                tracing::info!(switch_ms = switch_started.elapsed().as_millis(), display_id = active_display.id.0, display_name = %active_display.name, stream_id = stream_id.0, "remote display switched");
-                            }
-                            Err(error) => {
-                                active_display = selected;
-                                capture_retry_after = std::time::Instant::now() + DESKTOP_RETRY_INTERVAL;
-                                tracing::warn!(error = ?error, "display switch is waiting for an interactive desktop");
-                            }
                         }
                     }
                     ControlCommand::Stop => break Ok(()),
@@ -834,64 +617,6 @@ async fn run_connected_sender(
                 }
             }
             Some(error) = video_failure_rx.recv() => break Err(anyhow::anyhow!(error)),
-            _ = desktop_interval.tick() => {
-                if capture_running {
-                    let capture_ended = lock_streamer(&streamer)?.poll_ended();
-                    if let Some(capture_result) = capture_ended {
-                        if let Err(error) = capture_result {
-                            tracing::warn!(error = ?error, stream_id = stream_id.0, ?active_profile, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "visible Windows desktop changed; replacing capture helper");
-                        } else {
-                            tracing::warn!(stream_id = stream_id.0, ?active_profile, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "desktop capture helper stopped; replacing it");
-                        }
-                        capture_running = false;
-                        capture_unavailable_since = Some(std::time::Instant::now());
-                        capture_retry_after = std::time::Instant::now();
-                        slot.clear();
-                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
-                    }
-                }
-                if !capture_running && std::time::Instant::now() >= capture_retry_after {
-                    let candidates = profile_candidates(
-                        &viewer_profiles,
-                        requested_chroma,
-                        &rejected_profiles,
-                    );
-                    let restart = start_first_profile(
-                        &streamer,
-                        active_display.id,
-                        stream_id,
-                        &slot,
-                        &candidates,
-                    );
-                    match restart {
-                        Ok(started) => {
-                            displays = started.displays;
-                            active_display = started.active_display;
-                            active_profile = started.format.profile();
-                            capture_running = true;
-                            sent_cursor_shape = None;
-                            let recovery_ms = capture_unavailable_since
-                                .take()
-                                .map(|started| started.elapsed().as_millis())
-                                .unwrap_or_default();
-                            send_control_message(
-                                &control_channel,
-                                SessionMessage::DisplayConfiguration {
-                                    displays: displays.clone(),
-                                    active_display_id: active_display.id,
-                                    stream_id,
-                                    format: started.format,
-                                },
-                            ).await?;
-                            tracing::info!(stream_id = stream_id.0, display_id = active_display.id.0, recovery_ms, "remote session moved to the visible Windows desktop");
-                        }
-                        Err(error) => {
-                            capture_retry_after = std::time::Instant::now() + DESKTOP_RETRY_INTERVAL;
-                            tracing::warn!(error = ?error, "waiting for a Windows login or application desktop");
-                        }
-                    }
-                }
-            },
             _ = stats_interval.tick() => {
                 if disconnected_since.is_some_and(|since| since.elapsed() >= DISCONNECTED_GRACE_PERIOD) {
                     break Err(anyhow::anyhow!(
@@ -930,13 +655,7 @@ async fn run_connected_sender(
         session_state = session_state.transition(SessionState::Closing)?;
     }
     let mut result = result;
-    let stop_result = lock_streamer(&streamer).and_then(|mut streamer| streamer.stop());
-    if let Err(error) = stop_result {
-        tracing::warn!(error = %error, "screen streamer did not stop cleanly");
-        if result.is_ok() {
-            result = Err(error.context("screen streamer cleanup failed"));
-        }
-    }
+    if let Some(capture) = cleanup.capture.as_mut() { capture.shutdown().await; }
     if let Err(error) = peer.close().await {
         tracing::warn!(error = %error, "WebRTC peer did not close cleanly");
         if result.is_ok() {
@@ -952,6 +671,332 @@ async fn run_connected_sender(
         "remote sender session stopped"
     );
     result
+}
+
+async fn run_capture_control(
+    streamer: Arc<Mutex<Box<dyn ScreenStreamer>>>,
+    slot: Arc<LatestFrameSlot>,
+    control_channel: Arc<RTCDataChannel>,
+    quality_ceiling: Arc<AtomicU32>,
+    mut commands: mpsc::Receiver<ControlCommand>,
+    started_tx: tokio::sync::oneshot::Sender<anyhow::Result<StartedScreen>>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let mut stream_id = VideoStreamId(1);
+    let started = lock_streamer(&streamer)?.start(None, stream_id, Arc::clone(&slot));
+    let started = match started {
+        Ok(started) => started,
+        Err(error) => { let _ = started_tx.send(Err(error)); return Ok(()); }
+    };
+    let mut displays = started.displays.clone();
+    let mut active_display = started.active_display.clone();
+    let mut format = started.format;
+    let configured_maximum_bitrate = format.bitrate_bits_per_second;
+    quality_ceiling.store(configured_maximum_bitrate, Ordering::Release);
+    let mut active_profile = format.profile();
+    let mut viewer_profiles = vec![active_profile];
+    let mut requested_chroma = ChromaMode::Yuv420;
+    let mut rejected_profiles = Vec::new();
+    let mut capture_running = true;
+    let mut capture_unavailable_since = None::<std::time::Instant>;
+    let mut capture_retry_after = std::time::Instant::now();
+    let _ = started_tx.send(Ok(started));
+    let mut desktop_interval = tokio::time::interval(DESKTOP_LIFECYCLE_INTERVAL);
+    desktop_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if *stop.borrow() { return Ok(()); }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => return Ok(()),
+            command = commands.recv() => {
+                let Some(command) = command else { return Ok(()); };
+                match command {
+                    ControlCommand::Keyframe => {
+                        if let Err(error) = lock_streamer(&streamer)?.request_keyframe() {
+                            tracing::warn!(error = %error, "could not request a keyframe while the desktop is changing");
+                        }
+                    }
+                    ControlCommand::Bitrate(value) => {
+                        // Several hardware HEVC MFTs accept the CodecAPI call and
+                        // then terminate asynchronously on the next frame. That
+                        // turns every AIMD adjustment into a capture restart and
+                        // bootstrap keyframe. Keep HEVC at the selected quality
+                        // preset; congestion handling can still drop frames and
+                        // request recovery without destabilizing the encoder.
+                        if let Err(error) = lock_streamer(&streamer)?.set_adaptive_bitrate(value) {
+                            tracing::warn!(error = %error, "could not set bitrate while the desktop is changing");
+                        }
+                    }
+                    ControlCommand::Quality(preset) => {
+                        let value = preset.bitrate(configured_maximum_bitrate);
+                        quality_ceiling.store(value, Ordering::Release);
+                        if let Err(error) = lock_streamer(&streamer)?.set_bitrate(value) {
+                            tracing::warn!(error = %error, "could not apply viewer quality preset");
+                        } else {
+                            tracing::info!(?preset, bits_per_second = value, "viewer quality preset applied");
+                        }
+                    }
+                    ControlCommand::ViewerCapabilities { profiles, quality, chroma } => {
+                        let value = quality.bitrate(configured_maximum_bitrate);
+                        quality_ceiling.store(value, Ordering::Release);
+                        if let Err(error) = lock_streamer(&streamer)?.set_bitrate(value) {
+                            tracing::warn!(error = %error, "could not apply initial viewer quality preset");
+                        }
+                        viewer_profiles = profiles;
+                        requested_chroma = chroma;
+                        rejected_profiles.clear();
+                        let candidates = profile_candidates(
+                            &viewer_profiles,
+                            requested_chroma,
+                            &rejected_profiles,
+                        );
+                        if candidates.first() == Some(&active_profile) {
+                            // Echo the settled configuration even when no
+                            // restart is needed. The viewer deliberately does
+                            // not paint the mandatory bootstrap profile until
+                            // capability negotiation has completed.
+                            send_control_message(
+                                &control_channel,
+                                SessionMessage::DisplayConfiguration {
+                                    displays: displays.clone(),
+                                    active_display_id: active_display.id,
+                                    stream_id,
+                                    format,
+                                },
+                            )
+                            .await?;
+                            tracing::info!(?active_profile, ?quality, ?requested_chroma, "video profile negotiation retained active profile");
+                            continue;
+                        }
+
+                        lock_streamer(&streamer)?.stop()?;
+                        slot.clear();
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                        let started = start_first_profile(
+                            &streamer,
+                            active_display.id,
+                            stream_id,
+                            &slot,
+                            &candidates,
+                        )?;
+                        displays = started.displays;
+                        active_display = started.active_display;
+                        active_profile = started.format.profile();
+                        format = started.format;
+                        capture_running = true;
+                        capture_unavailable_since = None;
+
+                        send_control_message(
+                            &control_channel,
+                            SessionMessage::DisplayConfiguration {
+                                displays: displays.clone(),
+                                active_display_id: active_display.id,
+                                stream_id,
+                                format: started.format,
+                            },
+                        ).await?;
+                        tracing::info!(?active_profile, ?quality, bits_per_second = value, "video profile negotiation completed");
+                    }
+                    ControlCommand::Chroma(chroma) => {
+                        requested_chroma = chroma;
+                        rejected_profiles.clear();
+                        let candidates = profile_candidates(
+                            &viewer_profiles,
+                            requested_chroma,
+                            &rejected_profiles,
+                        );
+                        if candidates.first() == Some(&active_profile) {
+                            tracing::info!(?active_profile, ?requested_chroma, "chroma selection retained active profile");
+                            continue;
+                        }
+                        lock_streamer(&streamer)?.stop()?;
+                        slot.clear();
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                        let started = start_first_profile(
+                            &streamer,
+                            active_display.id,
+                            stream_id,
+                            &slot,
+                            &candidates,
+                        )?;
+                        displays = started.displays;
+                        active_display = started.active_display;
+                        active_profile = started.format.profile();
+                        format = started.format;
+                        capture_running = true;
+                        capture_unavailable_since = None;
+
+                        send_control_message(
+                            &control_channel,
+                            SessionMessage::DisplayConfiguration {
+                                displays: displays.clone(),
+                                active_display_id: active_display.id,
+                                stream_id,
+                                format: started.format,
+                            },
+                        ).await?;
+                        tracing::info!(?active_profile, ?requested_chroma, "viewer chroma selection applied");
+                    }
+                    ControlCommand::VideoProfileRejected { profile, reason } => {
+                        if profile != active_profile {
+                            tracing::warn!(?profile, reason, "viewer rejected an inactive video profile");
+                            continue;
+                        }
+                        rejected_profiles.push(profile);
+                        tracing::warn!(?profile, reason, "viewer rejected hardware video profile; trying fallback");
+                        let candidates = profile_candidates(
+                            &viewer_profiles,
+                            requested_chroma,
+                            &rejected_profiles,
+                        );
+                        lock_streamer(&streamer)?.stop()?;
+                        slot.clear();
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                        let started = start_first_profile(
+                            &streamer,
+                            active_display.id,
+                            stream_id,
+                            &slot,
+                            &candidates,
+                        )?;
+                        displays = started.displays;
+                        active_display = started.active_display;
+                        active_profile = started.format.profile();
+                        format = started.format;
+                        capture_running = true;
+                        capture_unavailable_since = None;
+
+                        send_control_message(
+                            &control_channel,
+                            SessionMessage::DisplayConfiguration {
+                                displays: displays.clone(),
+                                active_display_id: active_display.id,
+                                stream_id,
+                                format: started.format,
+                            },
+                        ).await?;
+                    }
+                    ControlCommand::SelectDisplay(display_id) => {
+                        if display_id == active_display.id && capture_running {
+                            continue;
+                        }
+                        let Some(selected) = displays.iter().find(|display| display.id == display_id).cloned() else {
+                            tracing::warn!(display_id = display_id.0, "viewer requested an unavailable display");
+                            continue;
+                        };
+                        let switch_started = std::time::Instant::now();
+                        capture_running = false;
+                        capture_unavailable_since = Some(std::time::Instant::now());
+                        slot.clear();
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                        let candidates = profile_candidates(
+                            &viewer_profiles,
+                            requested_chroma,
+                            &rejected_profiles,
+                        );
+                        let restart = lock_streamer(&streamer)?.switch_display(
+                            selected.id, stream_id, Arc::clone(&slot),
+                        );
+                        let restart = match restart {
+                            Ok(started) => Ok(started),
+                            Err(error) => {
+                                tracing::warn!(?error, "fast display switch failed; retrying supported profiles");
+                                lock_streamer(&streamer)?.stop()?;
+                                start_first_profile(&streamer, selected.id, stream_id, &slot, &candidates)
+                            }
+                        };
+                        match restart {
+                            Ok(started) => {
+                                displays = started.displays;
+                                active_display = started.active_display;
+                                active_profile = started.format.profile();
+                        format = started.format;
+                                capture_running = true;
+                                capture_unavailable_since = None;
+
+                                send_control_message(
+                                    &control_channel,
+                                    SessionMessage::DisplayConfiguration {
+                                        displays: displays.clone(),
+                                        active_display_id: active_display.id,
+                                        stream_id,
+                                        format: started.format,
+                                    },
+                                ).await?;
+                                tracing::info!(switch_ms = switch_started.elapsed().as_millis(), display_id = active_display.id.0, display_name = %active_display.name, stream_id = stream_id.0, "remote display switched");
+                            }
+                            Err(error) => {
+                                active_display = selected;
+                                capture_retry_after = std::time::Instant::now() + DESKTOP_RETRY_INTERVAL;
+                                tracing::warn!(error = ?error, "display switch is waiting for an interactive desktop");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ = desktop_interval.tick() => {
+                if capture_running {
+                    let capture_ended = lock_streamer(&streamer)?.poll_ended();
+                    if let Some(capture_result) = capture_ended {
+                        if let Err(error) = capture_result {
+                            tracing::warn!(error = ?error, stream_id = stream_id.0, ?active_profile, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "visible Windows desktop changed; replacing capture helper");
+                        } else {
+                            tracing::warn!(stream_id = stream_id.0, ?active_profile, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "desktop capture helper stopped; replacing it");
+                        }
+                        capture_running = false;
+                        capture_unavailable_since = Some(std::time::Instant::now());
+                        capture_retry_after = std::time::Instant::now();
+                        slot.clear();
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                    }
+                }
+                if !capture_running && std::time::Instant::now() >= capture_retry_after {
+                    let candidates = profile_candidates(
+                        &viewer_profiles,
+                        requested_chroma,
+                        &rejected_profiles,
+                    );
+                    let restart = start_first_profile(
+                        &streamer,
+                        active_display.id,
+                        stream_id,
+                        &slot,
+                        &candidates,
+                    );
+                    match restart {
+                        Ok(started) => {
+                            displays = started.displays;
+                            active_display = started.active_display;
+                            active_profile = started.format.profile();
+                        format = started.format;
+                            capture_running = true;
+
+                            let recovery_ms = capture_unavailable_since
+                                .take()
+                                .map(|started| started.elapsed().as_millis())
+                                .unwrap_or_default();
+                            send_control_message(
+                                &control_channel,
+                                SessionMessage::DisplayConfiguration {
+                                    displays: displays.clone(),
+                                    active_display_id: active_display.id,
+                                    stream_id,
+                                    format: started.format,
+                                },
+                            ).await?;
+                            tracing::info!(stream_id = stream_id.0, display_id = active_display.id.0, recovery_ms, "remote session moved to the visible Windows desktop");
+                        }
+                        Err(error) => {
+                            capture_retry_after = std::time::Instant::now() + DESKTOP_RETRY_INTERVAL;
+                            tracing::warn!(error = ?error, "waiting for a Windows login or application desktop");
+                        }
+                    }
+                }
+            },
+
+        }
+    }
 }
 
 async fn report_sender_failure(
