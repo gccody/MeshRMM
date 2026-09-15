@@ -16,6 +16,7 @@ use windows as native;
 struct State {
     transcript: VecDeque<String>,
     outgoing: VecDeque<String>,
+    outgoing_ready: Arc<tokio::sync::Notify>,
     revision: u64,
     available: bool,
     visible: bool,
@@ -36,6 +37,7 @@ impl State {
         }
         self.append("You", &text);
         self.outgoing.push_back(text);
+        self.outgoing_ready.notify_one();
         true
     }
     fn text(&self) -> String {
@@ -102,6 +104,14 @@ impl ChatSession {
         if !state.visible {
             state.unread = state.unread.saturating_add(1);
         }
+    }
+    /// One transport consumer drains the queue after each notification.
+    pub fn outgoing_ready(&self) -> Arc<tokio::sync::Notify> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .outgoing_ready
+            .clone()
     }
     pub fn poll(&self) -> Option<String> {
         self.state
@@ -240,5 +250,39 @@ mod popup_tests {
         replacement.set_visible(true);
         assert!(!replacement.visible());
         assert_eq!(replacement.unread(), 1);
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+    #[tokio::test]
+    async fn queued_and_later_messages_wake_the_consumer() {
+        let chat = ChatSession::default();
+        let ready = chat.outgoing_ready();
+        chat.state.lock().unwrap().send("before wait".into());
+        tokio::time::timeout(std::time::Duration::from_secs(1), ready.notified())
+            .await
+            .unwrap();
+        assert_eq!(chat.poll().as_deref(), Some("before wait"));
+        let waiting = ready.notified();
+        tokio::pin!(waiting);
+        waiting.as_mut().enable();
+        for text in ["first", "second"] {
+            chat.state.lock().unwrap().send(text.into());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .unwrap();
+        assert_eq!(chat.poll().as_deref(), Some("first"));
+        assert_eq!(chat.poll().as_deref(), Some("second"));
+        assert!(chat.poll().is_none());
+        // Multiple sends may leave one coalesced permit after the queue drains.
+        ready.notified().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), ready.notified())
+                .await
+                .is_err()
+        );
     }
 }

@@ -62,6 +62,7 @@ pub trait ScreenInput: Send + Sync {
     fn stop_chat(&self);
     fn apply_chat(&self, text: String) -> anyhow::Result<()>;
     fn poll_chat(&self) -> anyhow::Result<Option<String>>;
+    fn chat_ready(&self) -> Arc<tokio::sync::Notify>;
 }
 
 #[cfg(windows)]
@@ -335,6 +336,9 @@ impl ScreenInput for DirectInputController {
             self.chat.receive(text);
         }
         Ok(())
+    }
+    fn chat_ready(&self) -> Arc<tokio::sync::Notify> {
+        self.chat.outgoing_ready()
     }
     fn poll_chat(&self) -> anyhow::Result<Option<String>> {
         Ok(self.chat.poll())
