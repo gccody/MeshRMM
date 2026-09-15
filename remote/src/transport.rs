@@ -21,11 +21,13 @@ use webrtc::peer_connection::{
 use webrtc::stats::StatsReportType;
 
 use crate::clipboard::ClipboardSync;
-use meshrmm_session_transport::{ServiceRoute, SERVICE_CHANNELS, CLIPBOARD_CHANNEL, FILE_CHANNEL, CHAT_CHANNEL};
 use crate::config::Config;
 use crate::debug::DebugInfo;
 use crate::platform::{ControlSink, Presenter, monotonic_timestamp_us};
 use crate::signaling::{authenticated_websocket, session_signal_url};
+use meshrmm_session_transport::{
+    CHAT_CHANNEL, CLIPBOARD_CHANNEL, FILE_CHANNEL, SERVICE_CHANNELS, ServiceRoute,
+};
 
 const SESSION_ACTIVITY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const CLIPBOARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
@@ -213,7 +215,9 @@ impl ViewerControlQueue {
         let Ok(mut input) = self.input.lock() else {
             return;
         };
-        if is_input && (!input.enabled || self.resume_state.technician_blocked.load(Ordering::SeqCst)) {
+        if is_input
+            && (!input.enabled || self.resume_state.technician_blocked.load(Ordering::SeqCst))
+        {
             return;
         }
         if matches!(
@@ -246,8 +250,15 @@ impl ViewerControlQueue {
             let _ = self.outgoing.send(pending_pointer);
         }
         if let Some(label) = meshrmm_session_transport::service_label(&message)
-            && let Some(sender) = self.service_senders.lock().ok().and_then(|map| map.get(label).cloned()) {
-            if sender.try_send(message).is_err() { tracing::warn!(label, "viewer service queue full or closed"); }
+            && let Some(sender) = self
+                .service_senders
+                .lock()
+                .ok()
+                .and_then(|map| map.get(label).cloned())
+        {
+            if sender.try_send(message).is_err() {
+                tracing::warn!(label, "viewer service queue full or closed");
+            }
         } else {
             let _ = self.outgoing.send(message);
         }
@@ -311,15 +322,18 @@ pub async fn run_receiver(
         presentation_failure: presentation_failure_tx,
         shutting_down: Arc::new(AtomicBool::new(false)),
     };
-    let (remote_text_tx, service_routes, _services) = start_viewer_services(
-        viewer_control.clone(), Arc::clone(&control_channel), viewer_control_rx, lifecycle.clone())?;
+    let (remote_text_tx, _services) = start_viewer_services(
+        viewer_control.clone(),
+        Arc::clone(&control_channel),
+        viewer_control_rx,
+        lifecycle.clone(),
+    )?;
     install_data_channel_handler(
         &peer,
         Arc::clone(&presenter),
         Arc::clone(&control_channel),
         viewer_control.clone(),
         remote_text_tx,
-        service_routes,
         debug.clone(),
         lifecycle.clone(),
     );
@@ -689,14 +703,18 @@ async fn create_peer(
 }
 
 #[derive(Clone)]
-struct ServiceInbox(HashMap<&'static str, mpsc::Sender<SessionMessage>>);
+struct ServiceInbox {
+    senders: HashMap<&'static str, mpsc::Sender<SessionMessage>>,
+    routes: HashMap<&'static str, Arc<ServiceRoute>>,
+}
 impl ServiceInbox {
     fn send(&self, message: SessionMessage) {
         if let Some(label) = meshrmm_session_transport::service_label(&message)
-            && let Some(sender) = self.0.get(label)
-            && sender.try_send(message).is_err() {
-                tracing::warn!(label, "viewer incoming service queue full or closed");
-            }
+            && let Some(sender) = self.senders.get(label)
+            && sender.try_send(message).is_err()
+        {
+            tracing::warn!(label, "viewer incoming service queue full or closed");
+        }
     }
 }
 struct ViewerServices {
@@ -706,26 +724,36 @@ struct ViewerServices {
 impl Drop for ViewerServices {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
-        for task in &self.tasks { task.abort(); }
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 
-async fn wait_control_channel(control: &Arc<Mutex<Option<Arc<RTCDataChannel>>>>) -> Arc<RTCDataChannel> {
+async fn wait_control_channel(
+    control: &Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+) -> Arc<RTCDataChannel> {
     loop {
         if let Some(channel) = control.lock().ok().and_then(|c| c.clone())
-            && channel.ready_state() == RTCDataChannelState::Open { return channel; }
+            && channel.ready_state() == RTCDataChannelState::Open
+        {
+            return channel;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
-type ViewerServiceSetup = (ServiceInbox, HashMap<&'static str, Arc<ServiceRoute>>, ViewerServices);
+type ViewerServiceSetup = (ServiceInbox, ViewerServices);
 fn start_viewer_services(
     viewer: ViewerControlQueue,
     control: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     mut controls: mpsc::UnboundedReceiver<SessionMessage>,
     lifecycle: ReceiverLifecycle,
 ) -> anyhow::Result<ViewerServiceSetup> {
-    let mut owner = ViewerServices { stopping: lifecycle.shutting_down.clone(), tasks: Vec::new() };
+    let mut owner = ViewerServices {
+        stopping: lifecycle.shutting_down.clone(),
+        tasks: Vec::new(),
+    };
     let control_writer = control.clone();
     let errors = lifecycle.presentation_failure.clone();
     let writer = tokio::spawn(async move {
@@ -743,8 +771,13 @@ fn start_viewer_services(
     for label in SERVICE_CHANNELS {
         let route = Arc::new(ServiceRoute::default());
         routes.insert(label, route.clone());
-        let (outgoing, mut pending) = mpsc::channel::<SessionMessage>(if label == CLIPBOARD_CHANNEL { 1024 } else { 64 });
-        viewer.service_senders.lock().unwrap().insert(label, outgoing);
+        let (outgoing, mut pending) =
+            mpsc::channel::<SessionMessage>(if label == CLIPBOARD_CHANNEL { 1024 } else { 64 });
+        viewer
+            .service_senders
+            .lock()
+            .unwrap()
+            .insert(label, outgoing);
         let fallback = control.clone();
         let writer = tokio::spawn(async move {
             let fallback = wait_control_channel(&fallback).await;
@@ -752,7 +785,9 @@ fn start_viewer_services(
             while let Some(message) = pending.recv().await {
                 // Bound bulk SCTP backlog; each stream waits independently.
                 while channel.buffered_amount().await >= 64 * 1024 {
-                    if channel.ready_state() != RTCDataChannelState::Open { return; }
+                    if channel.ready_state() != RTCDataChannelState::Open {
+                        return;
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
                 if let Err(error) = meshrmm_session_transport::send(&channel, message).await {
@@ -827,7 +862,13 @@ fn start_viewer_services(
             });
         })?;
     }
-    Ok((ServiceInbox(inbox), routes, owner))
+    Ok((
+        ServiceInbox {
+            senders: inbox,
+            routes,
+        },
+        owner,
+    ))
 }
 
 fn install_data_channel_handler(
@@ -836,7 +877,6 @@ fn install_data_channel_handler(
     control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     viewer_control: ViewerControlQueue,
     remote_text: ServiceInbox,
-    service_routes: HashMap<&'static str, Arc<ServiceRoute>>,
     debug: DebugInfo,
     lifecycle: ReceiverLifecycle,
 ) {
@@ -845,7 +885,7 @@ fn install_data_channel_handler(
         let control_channel = Arc::clone(&control_channel);
         let viewer_control = viewer_control.clone();
         let remote_text = remote_text.clone();
-        let service_routes = service_routes.clone();
+        let service_routes = remote_text.routes.clone();
         let debug = debug.clone();
         let lifecycle = lifecycle.clone();
         Box::pin(async move {
@@ -876,7 +916,12 @@ fn install_data_channel_handler(
                         Box::pin(async move {
                             match SessionMessage::decode(&message.data) {
                                 Ok(SessionMessage::ServiceChannelReady) => route.peer_ready(),
-                                Ok(message) if meshrmm_session_transport::service_label(&message) == Some(label.as_str()) => remote_text.send(message),
+                                Ok(message)
+                                    if meshrmm_session_transport::service_label(&message)
+                                        == Some(label.as_str()) =>
+                                {
+                                    remote_text.send(message)
+                                }
                                 _ => tracing::warn!(label, "invalid service channel message"),
                             }
                         })
@@ -1344,12 +1389,18 @@ mod tests {
         let queue = ViewerControlQueue::new(tx, state.clone());
         queue.set_input_enabled(true);
         queue.send(SessionMessage::Input(RemoteInput::Key {
-            display_id: DisplayId(1), scan_code: 30, extended: false, pressed: true,
+            display_id: DisplayId(1),
+            scan_code: 30,
+            extended: false,
+            pressed: true,
         }));
         assert!(rx.try_recv().is_err());
         state.technician_blocked.store(false, Ordering::SeqCst);
         queue.send(SessionMessage::Input(RemoteInput::Key {
-            display_id: DisplayId(1), scan_code: 30, extended: false, pressed: true,
+            display_id: DisplayId(1),
+            scan_code: 30,
+            extended: false,
+            pressed: true,
         }));
         assert!(rx.try_recv().is_ok());
     }

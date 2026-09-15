@@ -51,7 +51,8 @@ impl ClipboardSync {
         // Probe availability so ordinary text/image clipboards remain readable.
         #[cfg(windows)]
         if !clipboard_win::register_format("HTML Format")
-            .is_some_and(|format| clipboard_win::is_format_avail(format.get())) {
+            .is_some_and(|format| clipboard_win::is_format_avail(format.get()))
+        {
             return Ok(None);
         }
         optional(self.clipboard.get().html())
@@ -127,16 +128,31 @@ mod tests {
         let mut sender = ClipboardSync::new(false).unwrap();
         let samples = [
             ClipboardContent::Text("MeshRMM clipboard isolation test".into()),
-            ClipboardContent::Html { html: "<b>MeshRMM test</b>".into(), text: "MeshRMM test".into() },
-            ClipboardContent::Image { width: 1, height: 1, rgba: vec![10, 20, 30, 255] },
+            ClipboardContent::Html {
+                html: "<b>MeshRMM test</b>".into(),
+                text: "MeshRMM test".into(),
+            },
+            ClipboardContent::Image {
+                width: 1,
+                height: 1,
+                rgba: vec![10, 20, 30, 255],
+            },
         ];
         for sample in samples {
             sender.apply(sample.clone()).unwrap();
             let mut receiver = ClipboardSync::new(true).unwrap();
             let received = receiver.poll().unwrap().unwrap();
-            assert_eq!(std::mem::discriminant(&received), std::mem::discriminant(&sample));
-            if let ClipboardContent::Text(text) = received { assert_eq!(text, "MeshRMM clipboard isolation test"); }
-            assert!(sender.poll().unwrap().is_none(), "applying a remote clipboard must not echo it back");
+            assert_eq!(
+                std::mem::discriminant(&received),
+                std::mem::discriminant(&sample)
+            );
+            if let ClipboardContent::Text(text) = received {
+                assert_eq!(text, "MeshRMM clipboard isolation test");
+            }
+            assert!(
+                sender.poll().unwrap().is_none(),
+                "applying a remote clipboard must not echo it back"
+            );
         }
     }
 }
