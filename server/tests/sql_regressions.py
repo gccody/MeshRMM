@@ -32,6 +32,20 @@ class EnrollmentTests(unittest.TestCase):
             self.db.execute("ROLLBACK")
             raise
 
+    def test_blackout_policy_is_company_scoped_and_preserved_by_legacy_updates(self):
+        self.redeem()
+        default = "This machine is under maintenance by {user_name}."
+        self.assertEqual(self.db.execute("SELECT blackout_message FROM companies WHERE id='co'").fetchone(), (default,))
+        update = sql("server/src/routes/account.rs", "UPDATE companies SET dashboard_idle_timeout_minutes")
+        self.db.execute("INSERT INTO companies (id,name,created_at,slug,status) VALUES ('other','Other',0,'other','active')")
+        self.db.execute(update, (60, "Maintenance by {user_name}\nPlease wait", "co"))
+        self.db.execute(update, (120, None, "co"))
+        self.assertEqual(self.db.execute("SELECT blackout_message FROM companies WHERE id='other'").fetchone(), (default,))
+        policy = sql("server/src/routes/handoffs.rs", "SELECT c.blackout_message")
+        self.assertEqual(self.db.execute(policy, ("device",)).fetchone(), ("Maintenance by {user_name}\nPlease wait",))
+        self.db.execute("UPDATE agents SET deletion_requested_at=1")
+        self.assertIsNone(self.db.execute(policy, ("device",)).fetchone())
+
     def test_lost_response_retry_keeps_one_identity(self):
         self.redeem()
         self.redeem(now=2)

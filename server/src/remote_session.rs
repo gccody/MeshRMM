@@ -18,6 +18,8 @@ fn default_idle_timeout_ms() -> u64 {
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionRecord {
     #[serde(default)]
+    blackout_message: String,
+    #[serde(default)]
     viewer_name: String,
     #[serde(default)]
     session_id: String,
@@ -283,6 +285,7 @@ impl RemoteSession {
             .await?;
 
         let agent_request = AgentSessionRequest {
+            blackout_message: record.blackout_message.clone(),
             viewer_name: record.viewer_name.clone(),
             session_id: RemoteSessionId::new(record.session_id.clone()),
             signaling_token: record.agent_token.clone(),
@@ -328,6 +331,7 @@ impl RemoteSession {
 
         record.expires_at_unix_ms = now.saturating_add(record.idle_timeout_ms);
         let lease = AgentSessionRequest {
+            blackout_message: record.blackout_message.clone(),
             viewer_name: record.viewer_name.clone(),
             session_id: RemoteSessionId::new(record.session_id.clone()),
             signaling_token: record.agent_token.clone(),
@@ -444,4 +448,23 @@ impl RemoteSession {
 fn token_eq(left: &[u8], right: &[u8]) -> bool {
     use sha2::{Digest, Sha256};
     bool::from(Sha256::digest(left).ct_eq(&Sha256::digest(right)))
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+    #[test]
+    fn session_records_preserve_policy_and_accept_legacy_records() {
+        let mut value = serde_json::json!({
+            "viewer_name": "Zoë 王", "session_id": "s", "device_id": "d",
+            "client_token": "client", "agent_token": "agent", "expires_at_unix_ms": 1000
+        });
+        let legacy: SessionRecord = serde_json::from_value(value.clone()).unwrap();
+        assert!(legacy.blackout_message.is_empty());
+        value["blackout_message"] = serde_json::json!("Maintenance by {user_name}");
+        let current: SessionRecord = serde_json::from_value(value).unwrap();
+        let restored: SessionRecord = serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
+        assert_eq!(restored.blackout_message, "Maintenance by {user_name}");
+        assert_eq!(restored.viewer_name, "Zoë 王");
+    }
 }

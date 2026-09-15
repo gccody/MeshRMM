@@ -31,6 +31,7 @@ struct Company {
     id: String,
     name: String,
     dashboard_idle_timeout_minutes: u32,
+    blackout_message: String,
     slug: Option<String>,
     status: String,
 }
@@ -132,6 +133,7 @@ struct AccountResponse {
 #[derive(Debug, Deserialize)]
 struct UpdateCompanySettingsRequest {
     dashboard_idle_timeout_minutes: u32,
+    blackout_message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,6 +187,7 @@ struct HandoffResponse {
 
 #[derive(Debug, Serialize)]
 struct SessionInit<'a> {
+    blackout_message: &'a str,
     viewer_name: &'a str,
     session_id: &'a str,
     device_id: &'a str,
@@ -502,7 +505,7 @@ async fn authorize_platform_owner(request: &Request, environment: &Env) -> Resul
 async fn ensure_company_exists(db: &D1Database, company_id: &str) -> Result<()> {
     if query!(
         db,
-        "SELECT id, name, dashboard_idle_timeout_minutes, slug, status FROM companies WHERE id = ?1",
+        "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, slug, status FROM companies WHERE id = ?1",
         company_id
     )?
     .first::<Company>(None)
