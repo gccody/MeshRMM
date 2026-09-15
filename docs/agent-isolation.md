@@ -39,3 +39,16 @@ Validation: Windows Agent tests and macOS native-worker tests. A blocked service
 with a full queue does not prevent a second worker from processing ordered
 commands; overflow is explicit and cancellation discards pending commands before
 cleanup.
+
+## Clipboard and helper pipes
+
+Clipboard assembly, polling and outbound pacing have their own native worker.
+Service mode uses a separate clipboard helper process and separate pipes from
+keyboard/mouse input. Each parent-to-helper pipe has a dedicated writer thread,
+a bounded command queue and a byte budget. A full or stalled pipe cannot block
+its caller. Clipboard output is paced with a 64 KiB transport backlog limit.
+
+Validation: 39 enabled Windows Agent tests pass. A real Windows anonymous pipe
+is filled without draining it; an independent input pipe still receives a release
+command within the test deadline. Tests also cover pipe byte-budget rejection,
+clipboard helper startup framing, and rich clipboard format/chunk round trips.

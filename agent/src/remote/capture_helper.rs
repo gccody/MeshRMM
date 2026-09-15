@@ -93,6 +93,7 @@ impl DesktopTarget {
 
 enum ParentCommand {
     StartFiles,
+    StartClipboard,
     Files(meshrmm_protocol::FileMessage),
     Start {
         viewer_name: String,
@@ -148,7 +149,7 @@ type HelperFiles = Arc<Mutex<std::collections::VecDeque<meshrmm_protocol::FileMe
 type HelperMaintenance = Arc<Mutex<Option<SessionMessage>>>;
 type HelperChat = Arc<Mutex<std::collections::VecDeque<String>>>;
 type HelperClipboard = Arc<Mutex<Option<ClipboardContent>>>;
-type InputWriter = Arc<Mutex<BufWriter<File>>>;
+type InputWriter = Arc<CommandWriter>;
 type InputRoute = Arc<Mutex<Option<InputWriter>>>;
 
 /// Brokers a credential-free LocalSystem helper on the visible Windows
@@ -160,6 +161,8 @@ pub struct DesktopCaptureStreamer {
     running: Option<RunningHelper>,
     input: Option<RunningInputHelper>,
     file_helper: Option<RunningInputHelper>,
+    clipboard_helper: Option<RunningInputHelper>,
+    clipboard_route: InputRoute,
     file_route: InputRoute,
     input_route: InputRoute,
     preferred_desktop: Option<DesktopTarget>,
@@ -179,6 +182,8 @@ impl DesktopCaptureStreamer {
             running: None,
             input: None,
             file_helper: None,
+            clipboard_helper: None,
+            clipboard_route: Arc::new(Mutex::new(None)),
             file_route: Arc::new(Mutex::new(None)),
             input_route: Arc::new(Mutex::new(None)),
             preferred_desktop: None,
@@ -308,7 +313,7 @@ impl DesktopCaptureStreamer {
             .name("meshrmm-desktop-stderr".into())
             .spawn(move || drain_child_stderr(launched.stderr))
             .context("failed to start desktop-helper error reader")?;
-        let input = Arc::new(Mutex::new(BufWriter::new(launched.input)));
+        let input = Arc::new(CommandWriter::new(launched.input)?);
         let start = ParentCommand::Start {
             viewer_name: self.viewer_name.clone(),
             display_id,
@@ -388,6 +393,7 @@ impl DesktopCaptureStreamer {
             blackout_message: self.blackout_message.clone(),
             route: Arc::clone(&self.input_route),
             file_route: Arc::clone(&self.file_route),
+            clipboard_route: Arc::clone(&self.clipboard_route),
             cursor: Arc::clone(&self.cursor),
             clipboard: Arc::clone(&self.clipboard),
             files: Arc::clone(&self.files),
@@ -460,7 +466,7 @@ impl DesktopCaptureStreamer {
                 Arc::clone(&self.files),
                 Arc::clone(&self.chat),
                 Arc::clone(&self.maintenance),
-                true,
+                HelperKind::Files,
             ) {
                 Ok(helper) => {
                     *self.file_route.lock().unwrap() = Some(Arc::clone(&helper.input));
@@ -469,6 +475,18 @@ impl DesktopCaptureStreamer {
                 Err(error) => {
                     tracing::warn!(%error, "file transfers require a signed-in interactive user")
                 }
+            }
+        }
+        if self.clipboard_helper.as_ref().is_none_or(|helper| helper.target != target || helper.status.lock().unwrap().is_some()) {
+            self.stop_clipboard_helper();
+            match start_input_helper(&self.viewer_name, target, display_id,
+                Arc::clone(&self.cursor), Arc::clone(&self.clipboard), Arc::clone(&self.files),
+                Arc::clone(&self.chat), Arc::clone(&self.maintenance), HelperKind::Clipboard) {
+                Ok(helper) => {
+                    *self.clipboard_route.lock().unwrap() = Some(Arc::clone(&helper.input));
+                    self.clipboard_helper = Some(helper);
+                }
+                Err(error) => tracing::warn!(%error, "independent clipboard helper unavailable"),
             }
         }
         if let Some(helper) = self.input.as_mut()
@@ -507,7 +525,7 @@ impl DesktopCaptureStreamer {
             Arc::clone(&self.files),
             Arc::clone(&self.chat),
             Arc::clone(&self.maintenance),
-            false,
+            HelperKind::Input,
         )?;
         *self
             .input_route
@@ -518,6 +536,18 @@ impl DesktopCaptureStreamer {
         }
         self.input = Some(helper);
         Ok(())
+    }
+
+    fn stop_clipboard_helper(&mut self) {
+        *self.clipboard_route.lock().unwrap() = None;
+        if let Some(mut helper) = self.clipboard_helper.take() {
+            let _ = send_command(&helper.input, &ParentCommand::Stop);
+            if unsafe { WaitForSingleObject(helper.process.0, STOP_TIMEOUT_MS) } == WAIT_TIMEOUT {
+                terminate_and_wait(&helper.process);
+            }
+            helper.finish();
+        }
+        *self.clipboard.lock().unwrap() = None;
     }
 
     fn stop_file_helper(&mut self) {
@@ -561,6 +591,7 @@ impl Default for DesktopCaptureStreamer {
 
 impl Drop for DesktopCaptureStreamer {
     fn drop(&mut self) {
+        self.stop_clipboard_helper();
         self.stop_file_helper();
         if let Err(error) = self.stop() {
             tracing::warn!(%error, "failed to stop desktop helper cleanly");
@@ -575,7 +606,7 @@ struct RunningHelper {
     process: OwnedHandle,
     process_id: u32,
     target: DesktopTarget,
-    input: Arc<Mutex<BufWriter<File>>>,
+    input: InputWriter,
     status: HelperStatus,
     reader: Option<JoinHandle<()>>,
     stderr: Option<JoinHandle<()>>,
@@ -586,13 +617,14 @@ struct RunningInputHelper {
     process_id: u32,
     target: DesktopTarget,
     display_id: DisplayId,
-    input: Arc<Mutex<BufWriter<File>>>,
+    input: InputWriter,
     status: HelperStatus,
     reader: Option<JoinHandle<()>>,
     stderr: Option<JoinHandle<()>>,
 }
 
 struct DesktopInputController {
+    clipboard_route: InputRoute,
     blackout_message: String,
     file_route: InputRoute,
     route: InputRoute,
@@ -715,7 +747,7 @@ impl ScreenInput for DesktopInputController {
 
     fn apply_clipboard(&self, text: ClipboardContent) -> anyhow::Result<()> {
         let writer = self
-            .route
+            .clipboard_route
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
@@ -909,6 +941,9 @@ fn launch_helper(target: DesktopTarget, as_user: bool) -> anyhow::Result<Launche
 
 // Parameters mirror the input/file helper startup IPC payload.
 #[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HelperKind { Input, Files, Clipboard }
+
 fn start_input_helper(
     viewer_name: &str,
     target: DesktopTarget,
@@ -918,9 +953,9 @@ fn start_input_helper(
     files: HelperFiles,
     chat: HelperChat,
     maintenance: HelperMaintenance,
-    files_only: bool,
+    kind: HelperKind,
 ) -> anyhow::Result<RunningInputHelper> {
-    let launched = launch_helper(target, files_only)?;
+    let launched = launch_helper(target, kind == HelperKind::Files)?;
     let status: HelperStatus = Arc::new(Mutex::new(None));
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let reader_status = Arc::clone(&status);
@@ -943,16 +978,13 @@ fn start_input_helper(
         .name("meshrmm-desktop-input-stderr".into())
         .spawn(move || drain_child_stderr(launched.stderr))
         .context("failed to start desktop input-helper error reader")?;
-    let input = Arc::new(Mutex::new(BufWriter::new(launched.input)));
+    let input = Arc::new(CommandWriter::new(launched.input)?);
     if let Err(error) = send_command(
         &input,
-        &if files_only {
-            ParentCommand::StartFiles
-        } else {
-            ParentCommand::StartInput {
-                display_id,
-                viewer_name: viewer_name.to_owned(),
-            }
+        &match kind {
+            HelperKind::Files => ParentCommand::StartFiles,
+            HelperKind::Clipboard => ParentCommand::StartClipboard,
+            HelperKind::Input => ParentCommand::StartInput { display_id, viewer_name: viewer_name.to_owned() },
         },
     ) {
         terminate_and_wait(&launched.process);
@@ -1185,14 +1217,45 @@ fn terminate_and_wait(process: &OwnedHandle) {
     let _ = unsafe { WaitForSingleObject(process.0, STOP_TIMEOUT_MS) };
 }
 
-fn send_command(
-    input: &Arc<Mutex<BufWriter<File>>>,
-    command: &ParentCommand,
-) -> anyhow::Result<()> {
-    let mut input = input.lock().unwrap_or_else(|error| error.into_inner());
-    write_command(&mut *input, command)?;
-    input.flush()?;
-    Ok(())
+struct CommandWriter {
+    sender: mpsc::SyncSender<Vec<u8>>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CommandWriter {
+    fn new(writer: impl Write + Send + 'static) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(64);
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pending = Arc::clone(&queued);
+        thread::Builder::new().name("meshrmm-helper-writer".into()).spawn(move || {
+            let mut writer = BufWriter::new(writer);
+            while let Ok(bytes) = receiver.recv() {
+                let result = writer.write_all(&bytes).and_then(|()| writer.flush());
+                pending.fetch_sub(bytes.len(), Ordering::AcqRel);
+                if result.is_err() { break; }
+            }
+        })?;
+        Ok(Self { sender, queued })
+    }
+
+    fn send(&self, bytes: Vec<u8>) -> anyhow::Result<()> {
+        let length = bytes.len();
+        let limit = 2 * MAX_CLIPBOARD_WIRE_BYTES + MAX_CONTROL_BYTES;
+        self.queued.fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+            queued.checked_add(length).filter(|next| *next <= limit)
+        }).map_err(|_| anyhow::anyhow!("helper pipe byte budget exhausted"))?;
+        if self.sender.try_send(bytes).is_err() {
+            self.queued.fetch_sub(length, Ordering::AcqRel);
+            anyhow::bail!("helper command queue full or closed");
+        }
+        Ok(())
+    }
+}
+
+fn send_command(input: &InputWriter, command: &ParentCommand) -> anyhow::Result<()> {
+    let mut bytes = Vec::new();
+    write_command(&mut bytes, command)?;
+    input.send(bytes)
 }
 
 /// Entry point for the isolated LocalSystem desktop helper. It loads no Agent
@@ -1245,6 +1308,7 @@ pub fn run_child() -> anyhow::Result<()> {
             pixel_format,
         ),
         ParentCommand::StartFiles => run_file_child(command_rx),
+        ParentCommand::StartClipboard => run_clipboard_child(command_rx),
         ParentCommand::StartInput {
             display_id,
             viewer_name,
@@ -1356,6 +1420,7 @@ fn run_capture_child(
                 }
                 Ok(Ok(
                     ParentCommand::StartFiles
+                    | ParentCommand::StartClipboard
                     | ParentCommand::StartInput { .. }
                     | ParentCommand::Input(_)
                     | ParentCommand::Blackout { .. }
@@ -1405,14 +1470,6 @@ fn run_input_child(
     emit_child_event(&output, ChildEvent::InputStarted)?;
     emit_child_event(&output, ChildEvent::MaintenanceState { agent_input_blocked: false, blacked_out: false })?;
     let mut sent_cursor = None;
-    let mut clipboard = match super::clipboard::ClipboardSync::new(false) {
-        Ok(clipboard) => Some(clipboard),
-        Err(error) => {
-            eprintln!("interactive Windows clipboard is unavailable: {error:#}");
-            None
-        }
-    };
-    let mut next_clipboard_poll = Instant::now();
     let mut terminal_error = None;
     loop {
         let cursor = input.cursor_shape();
@@ -1472,13 +1529,6 @@ fn run_input_child(
                     chat.receive(text);
                 }
             }
-            Ok(Ok(ParentCommand::Clipboard(text))) => {
-                if let Some(clipboard) = clipboard.as_mut()
-                    && let Err(error) = clipboard.apply(text)
-                {
-                    eprintln!("failed to apply viewer clipboard content: {error:#}");
-                }
-            }
             Ok(Ok(ParentCommand::Stop)) => break,
             Ok(Ok(_)) => {
                 terminal_error = Some("input helper received a video command".into());
@@ -1489,25 +1539,6 @@ fn run_input_child(
         }
         if let Some(text) = chat.poll() {
             emit_child_event(&output, ChildEvent::Chat(text))?;
-        }
-        if Instant::now() >= next_clipboard_poll {
-            next_clipboard_poll = Instant::now() + CLIPBOARD_POLL_INTERVAL;
-            if let Some(clipboard) = clipboard.as_mut() {
-                match clipboard.poll() {
-                    Ok(Some(text)) => {
-                        if let Err(error) = emit_child_event(&output, ChildEvent::Clipboard(text)) {
-                            terminal_error = Some(format!(
-                                "failed to send clipboard content to the Agent coordinator: {error}"
-                            ));
-                            break;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        eprintln!("failed to poll the interactive Windows clipboard: {error:#}");
-                    }
-                }
-            }
         }
     }
     let _ = input.release_all();
@@ -1548,6 +1579,7 @@ fn emit_child_event(
 fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<()> {
     match command {
         ParentCommand::StartFiles => writer.write_all(&[13]),
+        ParentCommand::StartClipboard => writer.write_all(&[16]),
         ParentCommand::Files(message) => {
             writer.write_all(&[12])?;
             write_file_message(&mut writer, message)
@@ -1632,6 +1664,7 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
 
 fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
     match read_u8(&mut reader)? {
+        16 => Ok(ParentCommand::StartClipboard),
         COMMAND_START => {
             let length = bounded_len(
                 read_u32(&mut reader)?,
@@ -2223,6 +2256,7 @@ mod tests {
                 codec: VideoCodec::H265,
                 pixel_format: VideoPixelFormat::Yuv444,
             },
+            ParentCommand::StartClipboard,
             ParentCommand::RequestKeyframe,
             ParentCommand::SetBitrate(4_000_000),
             ParentCommand::StartInput {
@@ -2363,6 +2397,7 @@ mod tests {
             ParentCommand::Blackout { .. } => COMMAND_BLACKOUT,
             ParentCommand::Clipboard(_) => COMMAND_CLIPBOARD,
             ParentCommand::StartFiles => 13,
+            ParentCommand::StartClipboard => 16,
             ParentCommand::Files(_) => 12,
             ParentCommand::Chat(_) => COMMAND_CHAT,
             ParentCommand::StartChat => COMMAND_START_CHAT,
@@ -2450,4 +2485,59 @@ fn run_file_child(commands: mpsc::Receiver<io::Result<ParentCommand>>) -> anyhow
         emit_child_event(&output, ChildEvent::Stopped)?;
         Ok(())
     })
+}
+
+fn run_clipboard_child(commands: mpsc::Receiver<io::Result<ParentCommand>>) -> anyhow::Result<()> {
+    let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+    let mut clipboard = super::clipboard::ClipboardSync::new(false)?;
+    emit_child_event(&output, ChildEvent::InputStarted)?;
+    loop {
+        match commands.recv_timeout(CLIPBOARD_POLL_INTERVAL) {
+            Ok(Ok(ParentCommand::Clipboard(content))) => {
+                if let Err(error) = clipboard.apply(content) { tracing::warn!(%error, "clipboard apply failed"); }
+            }
+            Ok(Ok(ParentCommand::Stop)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {},
+            _ => anyhow::bail!("clipboard helper received an unexpected command"),
+        }
+        match clipboard.poll() {
+            Ok(Some(content)) => emit_child_event(&output, ChildEvent::Clipboard(content))?,
+            Ok(None) => {},
+            Err(error) => tracing::warn!(%error, "clipboard poll failed"),
+        }
+    }
+    emit_child_event(&output, ChildEvent::Stopped)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+
+    #[test]
+    fn stalled_clipboard_pipe_does_not_block_input_pipe() {
+        let (blocked_read, blocked_write) = create_inherited_pipe(false).unwrap();
+        let clipboard = CommandWriter::new(blocked_write.into_file()).unwrap();
+        // Far larger than the anonymous pipe buffer; its writer must wait until
+        // the reader drains/closes it. The caller only enqueues these bytes.
+        clipboard.send(vec![0; 1024 * 1024]).unwrap();
+        let (input_read, input_write) = create_inherited_pipe(false).unwrap();
+        let input = Arc::new(CommandWriter::new(input_write.into_file()).unwrap());
+        let (received, result) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let command = read_command(input_read.into_file()).unwrap();
+            received.send(matches!(command, ParentCommand::ReleaseInput)).unwrap();
+        });
+        send_command(&input, &ParentCommand::ReleaseInput).unwrap();
+        assert!(result.recv_timeout(Duration::from_secs(2)).unwrap());
+        drop(blocked_read); // Unblock and close the clipboard writer too.
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn pipe_byte_budget_rejects_oversized_work_without_waiting() {
+        let writer = CommandWriter::new(io::sink()).unwrap();
+        assert!(writer.send(vec![0; 2 * MAX_CLIPBOARD_WIRE_BYTES + MAX_CONTROL_BYTES + 1]).is_err());
+        writer.send(vec![COMMAND_RELEASE_INPUT]).unwrap();
+    }
 }
