@@ -3,14 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use bytes::Bytes;
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
 use meshrmm_protocol::{
     CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, ChromaMode, Codec, CursorShape,
     DEFAULT_FRAGMENT_PAYLOAD, Display, DisplayId, IceServer, QualityPreset, RemoteSessionId,
     SessionMessage, SessionState, SignalMessage, VideoProfile, VideoStreamId, fragment_frame,
 };
-use meshrmm_signaling_client::Socket;
+use meshrmm_signaling_client::SignalingConnection;
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
@@ -92,8 +90,6 @@ const BITRATE_INCREASE_INTERVAL_US: u64 = 5_000_000;
 const DESKTOP_LIFECYCLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const DESKTOP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const DISCONNECTED_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
-const SIGNAL_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
-const SIGNAL_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Debug)]
 struct AdaptiveBitrate {
@@ -249,11 +245,10 @@ pub async fn run_sender(
     session_id: RemoteSessionId,
 ) -> anyhow::Result<()> {
     let (socket, _) = authenticated_websocket(signal_url, signaling_token).await?;
-    let (mut signal_writer, mut signal_reader) = socket.split();
+    let mut signal = SignalingConnection::new(socket);
     let mut failure_reported = false;
     let result = run_connected_sender(
-        &mut signal_writer,
-        &mut signal_reader,
+        &mut signal,
         ice_servers,
         streamer,
         session_id,
@@ -263,14 +258,13 @@ pub async fn run_sender(
     if let Err(error) = &result
         && !failure_reported
     {
-        report_sender_failure(&mut signal_writer, error).await;
+        report_sender_failure(&mut signal, error).await;
     }
     result
 }
 
 async fn run_connected_sender(
-    signal_writer: &mut SplitSink<Socket, Message>,
-    signal_reader: &mut SplitStream<Socket>,
+    signal: &mut SignalingConnection,
     ice_servers: Vec<IceServer>,
     streamer: Arc<Mutex<Box<dyn ScreenStreamer>>>,
     session_id: RemoteSessionId,
@@ -463,9 +457,6 @@ async fn run_connected_sender(
     session_state = session_state.transition(SessionState::Connecting)?;
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     stats_interval.tick().await;
-    let mut heartbeat_interval = tokio::time::interval(SIGNAL_HEARTBEAT_INTERVAL);
-    heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    heartbeat_interval.tick().await;
     let mut desktop_interval = tokio::time::interval(DESKTOP_LIFECYCLE_INTERVAL);
     desktop_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     desktop_interval.tick().await;
@@ -483,17 +474,15 @@ async fn run_connected_sender(
     let mut capture_unavailable_since = None::<std::time::Instant>;
     let mut capture_retry_after = std::time::Instant::now();
     let mut disconnected_since = None::<tokio::time::Instant>;
-    let mut last_signal_message = tokio::time::Instant::now();
     let result: anyhow::Result<()> = async {
         loop {
             tokio::select! {
-            Some(signal) = outgoing_rx.recv() => {
-                let json = serde_json::to_string(&signal)?;
-                signal_writer.send(Message::Text(json.into())).await?;
+            Some(outgoing) = outgoing_rx.recv() => {
+                let json = serde_json::to_string(&outgoing)?;
+                signal.send(Message::Text(json.into())).await?;
             }
-            incoming = signal_reader.next() => {
+            incoming = signal.next() => {
                 let Some(incoming) = incoming else { break Err(anyhow::anyhow!("signaling connection closed")); };
-                last_signal_message = tokio::time::Instant::now();
                 match incoming? {
                     Message::Text(text) => {
                         let signal: SignalMessage = serde_json::from_str(text.as_str())?;
@@ -529,22 +518,12 @@ async fn run_connected_sender(
                             _ => {}
                         }
                     }
-                    Message::Ping(payload) => signal_writer.send(Message::Pong(payload)).await?,
+                    Message::Ping(payload) => signal.send(Message::Pong(payload)).await?,
                     Message::Close(frame) => {
                         break Err(meshrmm_signaling_client::signaling_close_error(frame));
                     }
                     _ => {}
                 }
-            }
-            _ = heartbeat_interval.tick() => {
-                if last_signal_message.elapsed() >= SIGNAL_LIVENESS_TIMEOUT {
-                    break Err(anyhow::anyhow!(
-                        "signaling server did not respond for {} seconds",
-                        SIGNAL_LIVENESS_TIMEOUT.as_secs()
-                    ));
-                }
-                signal_writer.send(Message::Ping(Default::default())).await
-                    .context("failed to send signaling heartbeat")?;
             }
             _ = file_interval.tick(), if session_state == SessionState::Streaming && control_channel.ready_state() == RTCDataChannelState::Open => {
                 if let Some(message) = input.poll_files() { send_control_message(&control_channel, SessionMessage::FileTransfer(message)).await?; }
@@ -928,7 +907,7 @@ async fn run_connected_sender(
     .await;
 
     if let Err(error) = &result {
-        report_sender_failure(signal_writer, error).await;
+        report_sender_failure(signal, error).await;
         *failure_reported = true;
     }
     video_sender.abort();
@@ -976,7 +955,7 @@ async fn run_connected_sender(
 }
 
 async fn report_sender_failure(
-    signal_writer: &mut SplitSink<Socket, Message>,
+    connection: &mut SignalingConnection,
     error: &anyhow::Error,
 ) {
     let signal = SignalMessage::Error {
@@ -984,7 +963,7 @@ async fn report_sender_failure(
     };
     match serde_json::to_string(&signal) {
         Ok(message) => {
-            if let Err(send_error) = signal_writer.send(Message::Text(message.into())).await {
+            if let Err(send_error) = connection.send(Message::Text(message.into())).await {
                 tracing::warn!(error = %send_error, "failed to report sender failure to viewer");
             }
         }

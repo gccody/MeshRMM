@@ -30,11 +30,9 @@ use std::time::Duration;
 #[cfg(windows)]
 use anyhow::Context;
 #[cfg(windows)]
-use futures_util::{SinkExt, StreamExt};
-#[cfg(windows)]
 use meshrmm_protocol::{AgentCommand, AgentSessionRequest, AgentStatusMessage};
 #[cfg(windows)]
-use tokio::time::{Instant, sleep};
+use tokio::time::sleep;
 #[cfg(windows)]
 use tokio_tungstenite::tungstenite::Message;
 
@@ -48,11 +46,6 @@ struct ActiveSession {
     request: AgentSessionRequest,
     task: tokio::task::JoinHandle<()>,
 }
-
-#[cfg(windows)]
-const SIGNAL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
-#[cfg(windows)]
-const SIGNAL_LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[cfg_attr(not(windows), allow(unused_variables))]
 pub async fn run(
@@ -70,14 +63,11 @@ pub async fn run(
             let url = agent_connection_url(&config.server, &config.device_id)?;
             tracing::info!(device_id = %config.device_id, url = %url, "connecting Agent to Cloudflare signaling");
             match authenticated_websocket(url, &config.agent_token).await {
-                Ok((mut socket, _response)) => {
+                Ok((socket, _response)) => {
+                    let mut socket = meshrmm_signaling_client::SignalingConnection::new(socket);
                     retry_delay = Duration::from_secs(1);
                     tracing::info!(device_id = %config.device_id, "Agent signaling connected");
                     let connection_result: anyhow::Result<bool> = async {
-                        let mut heartbeat = tokio::time::interval(SIGNAL_HEARTBEAT_INTERVAL);
-                        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                        heartbeat.tick().await;
-                        let mut last_server_message = Instant::now();
                         loop {
                             if active_session
                                 .as_ref()
@@ -89,7 +79,6 @@ pub async fn run(
                             tokio::select! {
                                 message = socket.next() => {
                                     let Some(message) = message else { break Ok(false); };
-                                    last_server_message = Instant::now();
                                     match message.context("Agent signaling WebSocket read failed")? {
                                         Message::Text(text) => {
                                             if let Ok(command) = serde_json::from_str::<AgentCommand>(text.as_str()) {
@@ -115,9 +104,6 @@ pub async fn run(
                                                             ))
                                                             .await
                                                             .context("failed to acknowledge Agent self-uninstall")?;
-                                                        socket.flush().await.context(
-                                                            "failed to flush Agent self-uninstall acknowledgement",
-                                                        )?;
                                                         sleep(Duration::from_millis(250)).await;
                                                         break Ok(true);
                                                     }
@@ -186,18 +172,6 @@ pub async fn run(
                                         Message::Close(_) => break Ok(false),
                                         _ => {}
                                     }
-                                }
-                                _ = heartbeat.tick() => {
-                                    if last_server_message.elapsed() >= SIGNAL_LIVENESS_TIMEOUT {
-                                        break Err(anyhow::anyhow!(
-                                            "Agent signaling did not respond for {} seconds",
-                                            SIGNAL_LIVENESS_TIMEOUT.as_secs()
-                                        ));
-                                    }
-                                    socket
-                                        .send(Message::Ping(Default::default()))
-                                        .await
-                                        .context("failed to send Agent signaling heartbeat")?;
                                 }
                                 _ = tokio::signal::ctrl_c() => break Ok(true),
                             }

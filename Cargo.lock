@@ -1908,6 +1908,7 @@ name = "meshrmm-signaling-client"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "tokio",
  "tokio-tungstenite",
  "url",
