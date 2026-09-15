@@ -76,3 +76,22 @@ actual file-worker dispatch path and confirms the input, chat and clipboard
 workers still process messages on a single-thread async runtime, then verifies
 input cleanup. File tests cover checksums, nested/Unicode/empty files, cancellation
 cleanup and preserving existing destination files.
+
+## Independent network streams
+
+New agents/viewers negotiate separate reliable channels for chat, clipboard and
+files. Input/control and unordered video retain their existing channels. Each
+service chooses its outbound route once, after capability negotiation; older
+peers use the legacy control channel after a two-second negotiation window.
+Routes never switch mid-transfer. Full network isolation therefore requires both
+updated peers; legacy peers still benefit from independent native workers.
+The streams necessarily share the connection's available bandwidth.
+
+The viewer also has independent service workers and send queues, so local
+clipboard work cannot hold up keyboard/mouse sends or incoming chat.
+
+Validation: 40 Windows Agent tests, 19 Windows viewer tests, 27 macOS viewer tests,
+and three shared transport tests pass. The transport test establishes a real
+local WebRTC connection, blocks the file-stream receive callback, and confirms
+that input still arrives on the control stream. Route tests cover negotiation
+and a late capability announcement after choosing the legacy route.

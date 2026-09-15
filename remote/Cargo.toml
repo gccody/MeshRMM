@@ -10,6 +10,7 @@ description = "The native MeshRMM computer-remoting application"
 workspace = true
 
 [dependencies]
+meshrmm-session-transport = { path = "../crates/session-transport" }
 meshrmm-file-transfer = { path = "../crates/file-transfer" }
 meshrmm-chat = { path = "../crates/chat" }
 anyhow.workspace = true

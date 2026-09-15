@@ -10,6 +10,7 @@ members = [
     "crates/clipboard",
     "crates/file-transfer",
     "crates/signaling-client",
+    "crates/session-transport",
     "remote",
     "server",
 ]

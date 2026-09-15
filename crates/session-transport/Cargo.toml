@@ -1,0 +1,17 @@
+[package]
+name = "meshrmm-session-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+[lints]
+workspace = true
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+meshrmm-protocol.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+webrtc.workspace = true
+[dev-dependencies]
+rustls.workspace = true
