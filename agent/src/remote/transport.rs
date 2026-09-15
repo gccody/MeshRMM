@@ -867,6 +867,7 @@ fn spawn_clipboard_worker(
             } else {
                 channel
             };
+            let ready = input.clipboard_ready();
             let mut receiver = meshrmm_protocol::ClipboardReceiver::default();
             let mut outgoing = std::collections::VecDeque::new();
             let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -888,7 +889,10 @@ fn spawn_clipboard_worker(
                             Err(error) => tracing::warn!(%error, "invalid clipboard payload"),
                         }
                     }
-                    _ = poll.tick(), if channel.ready_state() == RTCDataChannelState::Open => {
+                    _ = async {
+                        if let Some(ready) = &ready { ready.notified().await; }
+                        else { poll.tick().await; }
+                    }, if channel.ready_state() == RTCDataChannelState::Open => {
                         match input.poll_clipboard().and_then(|content| Ok(content.map(|c| c.messages()).transpose()?)) {
                             Ok(Some(messages)) => outgoing = messages.into(),
                             Ok(None) => {},

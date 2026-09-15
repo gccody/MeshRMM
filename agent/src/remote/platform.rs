@@ -59,6 +59,10 @@ pub trait ScreenInput: Send + Sync {
     fn cursor_shape(&self) -> CursorShape;
     fn apply_clipboard(&self, text: ClipboardContent) -> anyhow::Result<()>;
     fn poll_clipboard(&self) -> anyhow::Result<Option<ClipboardContent>>;
+    /// Helpers already detect changes; direct native implementations may poll.
+    fn clipboard_ready(&self) -> Option<Arc<tokio::sync::Notify>> {
+        None
+    }
     fn start_chat(&self) -> anyhow::Result<()>;
     fn stop_chat(&self);
     fn apply_chat(&self, text: String) -> anyhow::Result<()>;

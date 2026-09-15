@@ -44,3 +44,18 @@ Validation: macOS file-transfer 6, agent 10, viewer 27, chat 7 and shared transp
 transport 3 passed (the same three invasive tests ignored). A new regression
 verifies a full output queue blocks its producer, freeing capacity preserves
 message order and the next message wakes its consumer. macOS Clippy passed.
+
+## Clipboard forwarding
+
+The Windows helper pipe reader wakes the clipboard transport immediately and
+keeps only the latest clipboard value, preserving coalescing. Direct native
+clipboard detection still runs every 250 ms. The viewer checks its native
+clipboard at that interval and drains serialized chunks by reserving sender
+capacity, without a separate 5 ms timer. Incoming clipboard content still clears
+superseded outgoing chunks and uses the existing echo suppression.
+
+Validation: macOS agent 10, viewer 27, chat 7, files 6 and shared transport 3 tests
+passed. Windows agent 45, viewer 19, chat 7, clipboard 1, files 7 and transport 3
+passed, with three existing invasive tests ignored. A real Windows pipe test
+verifies helper notifications for all three services, clipboard latest-value
+coalescing and consumption. macOS Clippy passed.
