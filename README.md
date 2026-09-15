@@ -323,6 +323,11 @@ development overrides. ICE
 candidate-pair logs identify a `direct` or `turn` connection; periodic WebRTC
 logs include measured RTT.
 
+The viewer also offers independent technician-input blocking, agent-input blocking,
+and all-monitor blackout. Company admins customize the blackout notice under
+**Profile & session**. See [maintenance controls](docs/maintenance-controls.md)
+for usage, Windows requirements, and cleanup behavior.
+
 The native viewer sends mouse, wheel, physical keyboard input, and bidirectional
 plain-text clipboard updates over the reliable control channel. The viewer's
 current text clipboard is copied to the Agent when the session connects; later

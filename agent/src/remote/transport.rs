@@ -795,7 +795,7 @@ async fn run_connected_sender(
             _ = clipboard_interval.tick(), if session_state == SessionState::Streaming
                 && control_channel.ready_state() == RTCDataChannelState::Open => {
                 if let Some(state) = input.maintenance_state() {
-                    if last_maintenance_state.as_ref() != Some(&state) {
+                    if matches!(&state, SessionMessage::MaintenanceError { .. }) || last_maintenance_state.as_ref() != Some(&state) {
                         send_control_message(&control_channel, state.clone()).await?;
                         last_maintenance_state = Some(state);
                     }
