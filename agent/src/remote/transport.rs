@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use bytes::Bytes;
 use meshrmm_protocol::{
-    CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, ChromaMode, Codec, CursorShape,
+    CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, ChromaMode, Codec,
     DEFAULT_FRAGMENT_PAYLOAD, Display, DisplayId, IceServer, QualityPreset, RemoteSessionId,
     SessionMessage, SessionState, SignalMessage, VideoProfile, VideoStreamId, fragment_frame,
 };
@@ -30,7 +30,7 @@ use super::video::LatestFrameSlot;
 struct SenderCleanup {
     peer: Arc<RTCPeerConnection>,
     capture: Option<super::native_task::NativeTask>,
-    input: Arc<dyn super::platform::ScreenInput>,
+    workers: Vec<super::native_task::NativeTask>,
     tasks: Vec<tokio::task::AbortHandle>,
     closed: bool,
 }
@@ -43,10 +43,6 @@ impl Drop for SenderCleanup {
         if self.closed {
             return;
         }
-        let _ = self.input.set_blackout(false);
-        let _ = self.input.set_agent_input_blocked(false);
-        self.input.stop_chat();
-        let _ = self.input.release_all();
         let peer = Arc::clone(&self.peer);
         tokio::spawn(async move {
             let _ = peer.close().await;
@@ -278,7 +274,7 @@ async fn run_connected_sender(
     let mut cleanup = SenderCleanup {
         peer: Arc::clone(&peer),
         capture: None,
-        input: Arc::clone(&input),
+        workers: Vec::new(),
         tasks: Vec::new(),
         closed: false,
     };
@@ -319,6 +315,28 @@ async fn run_connected_sender(
         )
         .await
         .context("failed to create reliable control data channel")?;
+    let (input_tx, input_task) = spawn_input_worker(Arc::clone(&input), Arc::clone(&control_channel), control_tx.clone())?;
+    cleanup.workers.push(input_task);
+    let maintenance_input = Arc::clone(&input);
+    let cleanup_input = Arc::clone(&input);
+    let maintenance_errors = control_tx.clone();
+    let (maintenance_tx, maintenance_task) = super::native_task::command_worker(
+        "meshrmm-maintenance", 32, std::time::Duration::from_secs(3600),
+        move |message| {
+            let result = match message {
+                Some(SessionMessage::SendSecureAttention) => super::secure_attention::send(),
+                Some(SessionMessage::SetBlackout { enabled }) => maintenance_input.set_blackout(enabled),
+                Some(SessionMessage::SetAgentInputBlocked { blocked }) => maintenance_input.set_agent_input_blocked(blocked),
+                _ => Ok(()),
+            };
+            if let Err(error) = result { let _ = maintenance_errors.send(ControlCommand::MaintenanceError(format!("{error:#}"))); }
+        },
+        move || {
+            let _ = cleanup_input.set_blackout(false);
+            let _ = cleanup_input.set_agent_input_blocked(false);
+        },
+    )?;
+    cleanup.workers.push(maintenance_task);
     {
         let notify = Arc::clone(&control_open);
         let decoder_ready = Arc::clone(&decoder_ready);
@@ -334,11 +352,13 @@ async fn run_connected_sender(
             })
         }));
         let control_messages_tx = control_tx.clone();
-        let control_input = Arc::clone(&input);
+        let input_tx = input_tx.clone();
+        let maintenance_tx = maintenance_tx.clone();
         control_channel.on_message(Box::new(move |message| {
             let tx = control_messages_tx.clone();
             let decoder_ready = Arc::clone(&decoder_ready);
-            let input = Arc::clone(&control_input);
+            let input_tx = input_tx.clone();
+            let maintenance_tx = maintenance_tx.clone();
             Box::pin(async move {
                 let command = match SessionMessage::decode(&message.data) {
                     Ok(SessionMessage::RequestKeyframe { .. }) => {
@@ -367,24 +387,17 @@ async fn run_connected_sender(
                     Ok(SessionMessage::SelectDisplay { display_id }) => {
                         Some(ControlCommand::SelectDisplay(display_id))
                     }
-                    Ok(SessionMessage::SendSecureAttention) => super::secure_attention::send()
-                        .err()
-                        .map(|error| ControlCommand::MaintenanceError(format!("{error:#}"))),
-                    Ok(SessionMessage::SetBlackout { enabled }) => {
-                        if let Err(error) = input.set_blackout(enabled) {
-                            Some(ControlCommand::MaintenanceError(error.to_string()))
-                        } else { None }
-                    }
-                    Ok(SessionMessage::SetAgentInputBlocked { blocked }) => {
-                        if let Err(error) = input.set_agent_input_blocked(blocked) {
-                            Some(ControlCommand::MaintenanceError(error.to_string()))
-                        } else { None }
+                    Ok(message @ (SessionMessage::SendSecureAttention
+                        | SessionMessage::SetBlackout { .. }
+                        | SessionMessage::SetAgentInputBlocked { .. })) => {
+                        maintenance_tx.try_send(message).err().map(|_| ControlCommand::MaintenanceError("maintenance command queue full or closed".into()))
                     }
                     Ok(SessionMessage::Input(event)) => {
-                        if let Err(error) = input.apply(event) {
-                            tracing::warn!(error = %error, "discarding invalid remote input");
-                        }
-                        None
+                        if input_tx.try_send(event).is_err() {
+                            // Never silently drop a key-up. End the session so
+                            // the input worker releases all pressed keys.
+                            Some(ControlCommand::Stop)
+                        } else { None }
                     }
                     Ok(
                         message @ (SessionMessage::Clipboard { .. }
@@ -410,7 +423,6 @@ async fn run_connected_sender(
     }
 
     let slot = Arc::new(LatestFrameSlot::default());
-    let mut last_maintenance_state = None;
     let stream_id = VideoStreamId(1);
     let quality_ceiling = Arc::new(AtomicU32::new(1));
     let (capture_tx, capture_rx) = mpsc::channel(64);
@@ -459,14 +471,11 @@ async fn run_connected_sender(
     session_state = session_state.transition(SessionState::Connecting)?;
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     stats_interval.tick().await;
-    let mut cursor_interval = tokio::time::interval(std::time::Duration::from_millis(16));
-    cursor_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut file_interval = tokio::time::interval(std::time::Duration::from_millis(5));
     let mut clipboard_outgoing = std::collections::VecDeque::<SessionMessage>::new();
     let mut clipboard_receiver = meshrmm_protocol::ClipboardReceiver::default();
     let mut clipboard_interval = tokio::time::interval(std::time::Duration::from_millis(250));
     clipboard_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut sent_cursor_shape = None::<CursorShape>;
     let mut offer_sent = false;
     let mut remote_description_set = false;
     let mut pending_candidates = Vec::new();
@@ -571,12 +580,6 @@ async fn run_connected_sender(
             }
             _ = clipboard_interval.tick(), if session_state == SessionState::Streaming
                 && control_channel.ready_state() == RTCDataChannelState::Open => {
-                if let Some(state) = input.maintenance_state() {
-                    if matches!(&state, SessionMessage::MaintenanceError { .. }) || last_maintenance_state.as_ref() != Some(&state) {
-                        send_control_message(&control_channel, state.clone()).await?;
-                        last_maintenance_state = Some(state);
-                    }
-                }
                 if let Some(text) = input.poll_chat()? {
                     send_control_message(&control_channel, SessionMessage::Chat { text }).await?;
                 }
@@ -586,18 +589,6 @@ async fn run_connected_sender(
                     }
                     Ok(None) => {}
                     Err(error) => tracing::warn!(error = %error, "could not synchronize the Agent clipboard"),
-                }
-            }
-            _ = cursor_interval.tick(), if session_state == SessionState::Streaming => {
-                let shape = input.cursor_shape();
-                if sent_cursor_shape != Some(shape)
-                    && control_channel.ready_state() == RTCDataChannelState::Open
-                {
-                    send_control_message(
-                        &control_channel,
-                        SessionMessage::CursorShape { shape },
-                    ).await?;
-                    sent_cursor_shape = Some(shape);
                 }
             }
             Some(state) = state_rx.recv() => {
@@ -639,12 +630,8 @@ async fn run_connected_sender(
     let _ = video_sender.await;
     control_start.abort();
     let _ = control_start.await;
-    let _ = input.set_blackout(false);
-    let _ = input.set_agent_input_blocked(false);
+    for worker in &mut cleanup.workers { worker.shutdown().await; }
     input.stop_chat();
-    if let Err(error) = input.release_all() {
-        tracing::warn!(error = %error, "failed to release remote input during cleanup");
-    }
     if matches!(
         session_state,
         SessionState::Requested
@@ -671,6 +658,40 @@ async fn run_connected_sender(
         "remote sender session stopped"
     );
     result
+}
+
+fn spawn_input_worker(
+    input: Arc<dyn super::platform::ScreenInput>,
+    channel: Arc<RTCDataChannel>,
+    errors: mpsc::UnboundedSender<ControlCommand>,
+) -> anyhow::Result<(mpsc::Sender<meshrmm_protocol::RemoteInput>, super::native_task::NativeTask)> {
+    let cleanup_input = Arc::clone(&input);
+    let status_channel = Arc::clone(&channel);
+    let (updates, mut pending) = mpsc::channel(8);
+    // This task owns no native resources; dropping the worker closes its queue.
+    tokio::spawn(async move {
+        while let Some(message) = pending.recv().await {
+            if channel.ready_state() != RTCDataChannelState::Open { continue; }
+            if let Err(error) = send_control_message(&channel, message).await {
+                let _ = errors.send(ControlCommand::MaintenanceError(format!("input status: {error:#}")));
+                break;
+            }
+        }
+    });
+    let mut cursor = None;
+    let mut state = None;
+    Ok(super::native_task::command_worker("meshrmm-input", 1024,
+        std::time::Duration::from_millis(16), move |event| {
+            if let Some(event) = event {
+                if let Err(error) = input.apply(event) { tracing::warn!(%error, "remote input failed"); }
+            } else if status_channel.ready_state() == RTCDataChannelState::Open {
+                let shape = input.cursor_shape();
+                if cursor != Some(shape) && updates.try_send(SessionMessage::CursorShape { shape }).is_ok() { cursor = Some(shape); }
+                if let Some(next) = input.maintenance_state()
+                    && (state.as_ref() != Some(&next) || matches!(next, SessionMessage::MaintenanceError { .. }))
+                    && updates.try_send(next.clone()).is_ok() { state = Some(next); }
+            }
+        }, move || { let _ = cleanup_input.release_all(); })?)
 }
 
 async fn run_capture_control(
@@ -1134,9 +1155,8 @@ async fn send_control_message(
     let bytes = message
         .encode()
         .context("failed to encode remote control message")?;
-    channel
-        .send(&Bytes::from(bytes))
-        .await
+    tokio::time::timeout(std::time::Duration::from_secs(5), channel.send(&Bytes::from(bytes)))
+        .await.context("remote control write timed out")?
         .context("failed to send remote control message")?;
     Ok(())
 }

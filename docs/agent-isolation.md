@@ -25,3 +25,17 @@ Existing encoder negotiation and frame ordering remain serialized within capture
 Validation: Windows Agent tests, including a deliberately blocked native worker
 on a single-thread Tokio runtime. The test verifies timers still run, dropping
 the worker does not join, and cleanup completes after releasing the operation.
+
+## Input and maintenance
+
+WebRTC input callbacks only enqueue keyboard/mouse commands. A dedicated input
+worker preserves their order and releases pressed keys when cancelled. Maintenance
+commands have another native worker. Cursor/state updates have a separate bounded
+outbound queue; native input never waits for a network write. Control writes have
+a five-second deadline. Input queue overflow ends the session to release keys
+rather than silently discarding a key-up event.
+
+Validation: Windows Agent tests and macOS native-worker tests. A blocked service
+with a full queue does not prevent a second worker from processing ordered
+commands; overflow is explicit and cancellation discards pending commands before
+cleanup.
