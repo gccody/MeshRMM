@@ -95,3 +95,13 @@ and three shared transport tests pass. The transport test establishes a real
 local WebRTC connection, blocks the file-stream receive callback, and confirms
 that input still arrives on the control stream. Route tests cover negotiation
 and a late capability announcement after choosing the legacy route.
+
+## Diagnostics and cancellation
+
+Agent file logging uses a bounded writer queue; a stalled disk drops log records
+instead of stalling service threads. Helper command-reader queues are bounded as
+well as parent pipe-writer queues. Failed capture startup awaits native cleanup
+before a reconnect can reuse the streamer.
+
+Validation: Windows Agent suite and a logger test that stalls its writer, fills
+the queue and confirms producers return with explicit dropped-record accounting.

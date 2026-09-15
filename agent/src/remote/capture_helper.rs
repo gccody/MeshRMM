@@ -1295,7 +1295,7 @@ pub fn run_child() -> anyhow::Result<()> {
         .with_thread_names(true)
         .try_init()
         .map_err(|error| anyhow::anyhow!("failed to initialize helper logging: {error}"))?;
-    let (command_tx, command_rx) = mpsc::channel();
+    let (command_tx, command_rx) = mpsc::sync_channel(64);
     thread::Builder::new()
         .name("meshrmm-desktop-commands".into())
         .spawn(move || {

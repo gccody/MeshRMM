@@ -1,3 +1,4 @@
+mod logging;
 #[cfg(windows)]
 mod installer;
 mod remote;
@@ -84,7 +85,7 @@ fn initialize_tracing(mode: ExecutionMode, config: &Config) -> anyhow::Result<()
             .map_err(|error| {
                 anyhow::anyhow!("failed to open Agent log {}: {error}", log_path.display())
             })?;
-        let writer = std::sync::Mutex::new(log);
+        let writer = logging::AsyncLog::new(log)?;
         if config.json_logs {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
