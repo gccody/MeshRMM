@@ -33,7 +33,9 @@ pub trait ScreenStreamer: Send {
         self.start(Some(display_id), stream_id, slot)
     }
     fn stop(&mut self) -> anyhow::Result<()>;
-    fn shutdown(&mut self) -> anyhow::Result<()> { self.stop() }
+    fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.stop()
+    }
     fn poll_ended(&mut self) -> Option<anyhow::Result<()>>;
     fn request_keyframe(&self) -> anyhow::Result<()>;
     fn set_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()>;
@@ -86,12 +88,15 @@ impl PlatformScreenStreamer {
         bitrate_bits_per_second: u32,
         capture_as_active_user: bool,
         viewer_name: String,
-    blackout_message: String,
+        blackout_message: String,
     ) -> Self {
         Self {
             inner: if capture_as_active_user {
                 CaptureBackend::Desktop(Box::new(
-                    super::capture_helper::DesktopCaptureStreamer::new(viewer_name.clone(), blackout_message.clone()),
+                    super::capture_helper::DesktopCaptureStreamer::new(
+                        viewer_name.clone(),
+                        blackout_message.clone(),
+                    ),
                 ))
             } else {
                 CaptureBackend::Direct(meshrmm_remote_screen::WindowsScreenStreamer::new())
@@ -299,7 +304,10 @@ struct DirectInputController {
 #[cfg(windows)]
 impl ScreenInput for DirectInputController {
     fn set_blackout(&self, enabled: bool) -> anyhow::Result<()> {
-        self.controller.lock().map_err(|_| anyhow::anyhow!("input lock poisoned"))?.set_blackout(enabled, &self.blackout_message)
+        self.controller
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input lock poisoned"))?
+            .set_blackout(enabled, &self.blackout_message)
     }
     fn maintenance_state(&self) -> Option<meshrmm_protocol::SessionMessage> {
         self.controller.lock().ok().map(|input| {
@@ -310,7 +318,10 @@ impl ScreenInput for DirectInputController {
         })
     }
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()> {
-        self.controller.lock().map_err(|_| anyhow::anyhow!("input lock poisoned"))?.set_blocked(blocked)
+        self.controller
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input lock poisoned"))?
+            .set_blocked(blocked)
     }
     fn stop_chat(&self) {
         self.chat.set_available(false);

@@ -1,7 +1,7 @@
 #[cfg(windows)]
+mod blackout;
+#[cfg(windows)]
 pub(crate) mod capture_helper;
-#[cfg(any(windows, test))]
-mod native_task;
 #[cfg(windows)]
 mod clipboard;
 pub mod config;
@@ -11,14 +11,14 @@ mod indicator;
 mod input;
 #[cfg(windows)]
 mod input_block;
-#[cfg(windows)]
-mod blackout;
+#[cfg(any(windows, test))]
+mod native_task;
 #[cfg(windows)]
 mod platform;
-#[cfg(windows)]
-mod session;
 #[cfg(any(windows, test))]
 mod secure_attention;
+#[cfg(windows)]
+mod session;
 #[cfg(windows)]
 mod signaling;
 #[cfg(windows)]

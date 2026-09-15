@@ -94,10 +94,19 @@ pub enum SessionMessage {
     /// Announces support for session chat; both peers must opt in.
     ChatAvailable,
     FileTransfer(crate::FileMessage),
-    SetAgentInputBlocked { blocked: bool },
-    MaintenanceState { agent_input_blocked: bool, blacked_out: bool },
-    SetBlackout { enabled: bool },
-    MaintenanceError { reason: String },
+    SetAgentInputBlocked {
+        blocked: bool,
+    },
+    MaintenanceState {
+        agent_input_blocked: bool,
+        blacked_out: bool,
+    },
+    SetBlackout {
+        enabled: bool,
+    },
+    MaintenanceError {
+        reason: String,
+    },
     /// Request the Windows secure attention sequence (Ctrl+Alt+Del).
     /// Keep appended so existing postcard message tags remain stable.
     SendSecureAttention,
@@ -254,7 +263,9 @@ mod tests {
         assert_eq!(message.encode().unwrap(), vec![24]);
         assert_eq!(SessionMessage::decode(&[24]).unwrap(), message);
         assert_eq!(
-            SessionMessage::SetBlackout { enabled: true }.encode().unwrap(),
+            SessionMessage::SetBlackout { enabled: true }
+                .encode()
+                .unwrap(),
             vec![22, 1]
         );
     }
