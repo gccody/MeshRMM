@@ -1,5 +1,7 @@
 #[cfg(windows)]
 pub(crate) mod capture_helper;
+#[cfg(any(windows, test))]
+mod native_task;
 #[cfg(windows)]
 mod clipboard;
 pub mod config;
