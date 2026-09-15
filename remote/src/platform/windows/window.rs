@@ -237,14 +237,32 @@ impl WindowContext {
 
     fn refresh_maintenance_controls(&self) {
         for (id, checked, enabled) in [
-            (SETTINGS_TECHNICIAN_INPUT_ID, self.control.technician_blocked(), true),
-            (SETTINGS_BLACKOUT_ID, self.control.maintenance_state().blacked_out, self.control.maintenance_state().available),
-            (SETTINGS_AGENT_INPUT_ID, self.control.agent_blocked(), self.control.maintenance_state().available && !self.control.maintenance_state().blacked_out),
+            (
+                SETTINGS_TECHNICIAN_INPUT_ID,
+                self.control.technician_blocked(),
+                true,
+            ),
+            (
+                SETTINGS_BLACKOUT_ID,
+                self.control.maintenance_state().blacked_out,
+                self.control.maintenance_state().available,
+            ),
+            (
+                SETTINGS_AGENT_INPUT_ID,
+                self.control.agent_blocked(),
+                self.control.maintenance_state().available
+                    && !self.control.maintenance_state().blacked_out,
+            ),
         ] {
             if let Ok(button) = unsafe { GetDlgItem(Some(self.settings_window), id as i32) } {
                 unsafe {
                     let _ = EnableWindow(button, enabled);
-                    SendMessageW(button, BM_SETCHECK, Some(WPARAM(usize::from(checked))), None);
+                    SendMessageW(
+                        button,
+                        BM_SETCHECK,
+                        Some(WPARAM(usize::from(checked))),
+                        None,
+                    );
                 }
             }
         }
@@ -414,7 +432,13 @@ unsafe fn show_settings_category(window: HWND, display: bool) {
             let _ = unsafe { ShowWindow(control, display_command) };
         }
     }
-    for id in [SETTINGS_ADVANCED_TITLE_ID, SETTINGS_DIAGNOSTICS_ID as i32, SETTINGS_TECHNICIAN_INPUT_ID as i32, SETTINGS_AGENT_INPUT_ID as i32, SETTINGS_BLACKOUT_ID as i32] {
+    for id in [
+        SETTINGS_ADVANCED_TITLE_ID,
+        SETTINGS_DIAGNOSTICS_ID as i32,
+        SETTINGS_TECHNICIAN_INPUT_ID as i32,
+        SETTINGS_AGENT_INPUT_ID as i32,
+        SETTINGS_BLACKOUT_ID as i32,
+    ] {
         if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
             let _ = unsafe { ShowWindow(control, advanced_command) };
         }
@@ -490,8 +514,12 @@ unsafe extern "system" fn settings_window_proc(
                 }
                 if control_id == SETTINGS_TECHNICIAN_INPUT_ID {
                     context.release_input();
-                    context.control.set_technician_blocked(!context.control.technician_blocked());
-                    unsafe { apply_cursor(context.control.effective_cursor_shape(context.cursor_shape)) };
+                    context
+                        .control
+                        .set_technician_blocked(!context.control.technician_blocked());
+                    unsafe {
+                        apply_cursor(context.control.effective_cursor_shape(context.cursor_shape))
+                    };
                     return LRESULT(0);
                 }
                 if control_id == SETTINGS_DIAGNOSTICS_ID {
@@ -711,19 +739,34 @@ unsafe fn create_settings_window(
         SETTINGS_DIAGNOSTICS_ID,
     )?;
     let _ = make_control(
-        w!("BUTTON"), w!("Block technician input"),
+        w!("BUTTON"),
+        w!("Block technician input"),
         WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
-        162, 110, 340, 28, SETTINGS_TECHNICIAN_INPUT_ID,
+        162,
+        110,
+        340,
+        28,
+        SETTINGS_TECHNICIAN_INPUT_ID,
     )?;
     let _ = make_control(
-        w!("BUTTON"), w!("Block agent keyboard and mouse"),
+        w!("BUTTON"),
+        w!("Block agent keyboard and mouse"),
         WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
-        162, 150, 340, 28, SETTINGS_AGENT_INPUT_ID,
+        162,
+        150,
+        340,
+        28,
+        SETTINGS_AGENT_INPUT_ID,
     )?;
     let _ = make_control(
-        w!("BUTTON"), w!("Black out all agent monitors"),
+        w!("BUTTON"),
+        w!("Black out all agent monitors"),
         WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
-        162, 190, 340, 28, SETTINGS_BLACKOUT_ID,
+        162,
+        190,
+        340,
+        28,
+        SETTINGS_BLACKOUT_ID,
     )?;
     unsafe { show_settings_category(settings, true) };
     Ok(SettingsControls {
@@ -958,7 +1001,9 @@ pub(super) unsafe fn create_window(
                 if let Some(context) = context
                     && (lparam.0 as u32 & 0xffff) == HTCLIENT
                 {
-                    unsafe { apply_cursor(context.control.effective_cursor_shape(context.cursor_shape)) };
+                    unsafe {
+                        apply_cursor(context.control.effective_cursor_shape(context.cursor_shape))
+                    };
                     return LRESULT(1);
                 }
                 unsafe { DefWindowProcW(window, message, wparam, lparam) }
@@ -1471,7 +1516,14 @@ pub(super) unsafe fn pump_window_messages(window: HWND) -> bool {
         context.refresh_maintenance_controls();
         if let Some(error) = context.control.take_maintenance_error() {
             let text: Vec<u16> = error.encode_utf16().chain(Some(0)).collect();
-            unsafe { MessageBoxW(Some(window), PCWSTR(text.as_ptr()), w!("Maintenance control failed"), MB_OK | MB_ICONERROR); }
+            unsafe {
+                MessageBoxW(
+                    Some(window),
+                    PCWSTR(text.as_ptr()),
+                    w!("Maintenance control failed"),
+                    MB_OK | MB_ICONERROR,
+                );
+            }
         }
         context.refresh_debug(false);
         if let Some(chat) = &context.chat_popup {

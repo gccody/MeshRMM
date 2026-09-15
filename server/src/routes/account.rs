@@ -48,8 +48,15 @@ pub(crate) async fn update_company_settings(
             );
         }
     };
-    if body.blackout_message.as_deref().is_some_and(|text| !meshrmm_protocol_types::valid_blackout_message(text)) {
-        return api_error(400, "blackout message must be nonempty, at most 2048 UTF-8 bytes, and contain no control characters except newlines");
+    if body
+        .blackout_message
+        .as_deref()
+        .is_some_and(|text| !meshrmm_protocol_types::valid_blackout_message(text))
+    {
+        return api_error(
+            400,
+            "blackout message must be nonempty, at most 2048 UTF-8 bytes, and contain no control characters except newlines",
+        );
     }
     let db = environment.d1("DB")?;
     let company_exists = query!(

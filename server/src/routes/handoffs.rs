@@ -138,12 +138,16 @@ pub(crate) async fn create_session_for_device(
     // Resolve policy from the enrolled device's company, never from viewer input.
     let db = environment.d1("DB")?;
     #[derive(Deserialize)]
-    struct MaintenancePolicy { blackout_message: String }
+    struct MaintenancePolicy {
+        blackout_message: String,
+    }
     let policy = query!(&db,
         "SELECT c.blackout_message FROM companies c JOIN agents a ON a.company_id = c.id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL",
         device_id
     )?.first::<MaintenancePolicy>(None).await?;
-    let Some(policy) = policy else { return api_error(404, "agent not found"); };
+    let Some(policy) = policy else {
+        return api_error(404, "agent not found");
+    };
     let session_id = Uuid::new_v4().to_string();
     let client_token = random_token();
     let agent_token = random_token();

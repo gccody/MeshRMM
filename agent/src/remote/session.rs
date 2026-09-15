@@ -23,7 +23,10 @@ pub async fn run(
             bitrate_bits_per_second,
             mode == ExecutionMode::Worker,
             request.viewer_name.clone(),
-            meshrmm_protocol::render_blackout_message(&request.blackout_message, &request.viewer_name),
+            meshrmm_protocol::render_blackout_message(
+                &request.blackout_message,
+                &request.viewer_name,
+            ),
         ))));
     tracing::info!(session_id = %session_id, "remote session requested");
     let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(15));

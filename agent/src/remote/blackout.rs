@@ -197,7 +197,12 @@ unsafe extern "system" fn paint_monitor(
         // DT_CALCRECT also changes the width. Keep the monitor's symmetric
         // bounds for drawing so every line remains centered on that monitor.
         let mut measured = bounds;
-        DrawTextW(paint.dc, &mut paint.text, &mut measured, flags | DT_CALCRECT);
+        DrawTextW(
+            paint.dc,
+            &mut paint.text,
+            &mut measured,
+            flags | DT_CALCRECT,
+        );
         let text_height = (measured.bottom - measured.top).min(height);
         bounds.top = monitor.top - paint.origin_y + (height - text_height) / 2;
         bounds.bottom = bounds.top + text_height;
