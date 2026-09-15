@@ -33,7 +33,9 @@ impl WindowsInputController {
         }
     }
 
-    pub fn blacked_out(&self) -> bool { self.blackout.is_some() }
+    pub fn blacked_out(&self) -> bool {
+        self.blackout.is_some()
+    }
     pub fn set_blackout(&mut self, enabled: bool, text: &str) -> anyhow::Result<()> {
         if enabled && self.blackout.is_none() {
             // Install the input hooks before hiding the monitors. If creating
@@ -53,7 +55,9 @@ impl WindowsInputController {
         Ok(())
     }
 
-    pub fn blocked(&self) -> bool { self.block.is_some() }
+    pub fn blocked(&self) -> bool {
+        self.block.is_some()
+    }
 
     pub fn set_blocked(&mut self, blocked: bool) -> anyhow::Result<()> {
         self.update_input_block(blocked || self.blacked_out())?;
@@ -65,7 +69,9 @@ impl WindowsInputController {
         if blocked && self.block.is_none() {
             self.release_all()?;
             self.block = Some(super::input_block::InputBlock::start()?);
-        } else if !blocked { self.block = None; }
+        } else if !blocked {
+            self.block = None;
+        }
         Ok(())
     }
 
@@ -404,18 +410,27 @@ mod tests {
         let mut input = WindowsInputController::new();
         for manually_blocked in [false, true] {
             input.set_blocked(manually_blocked).unwrap();
-            input.set_blackout(true, "MeshRMM input-block test").unwrap();
+            input
+                .set_blackout(true, "MeshRMM input-block test")
+                .unwrap();
             assert!(input.blacked_out());
             assert!(input.blocked());
-            input.set_blackout(true, "MeshRMM input-block test").unwrap();
+            input
+                .set_blackout(true, "MeshRMM input-block test")
+                .unwrap();
             input.set_blackout(false, "").unwrap();
             assert!(!input.blacked_out());
             assert_eq!(input.blocked(), manually_blocked);
         }
 
-        input.set_blackout(true, "MeshRMM input-block test").unwrap();
+        input
+            .set_blackout(true, "MeshRMM input-block test")
+            .unwrap();
         input.set_blocked(false).unwrap();
-        assert!(input.blocked(), "blackout must prevent unblocking local input");
+        assert!(
+            input.blocked(),
+            "blackout must prevent unblocking local input"
+        );
         input.set_blackout(false, "").unwrap();
         assert!(!input.blocked());
     }

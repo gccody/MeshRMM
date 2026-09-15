@@ -672,10 +672,8 @@ impl RemoteView {
                 mtm,
             )
         };
-        secure_attention_button.setFrame(NSRect::new(
-            NSPoint::new(558., 6.),
-            NSSize::new(110., 24.),
-        ));
+        secure_attention_button
+            .setFrame(NSRect::new(NSPoint::new(558., 6.), NSSize::new(110., 24.)));
         toolbar.addSubview(&secure_attention_button);
         let control = self.ivars().control.clone();
         *self.ivars().chat_popup.borrow_mut() = Some(meshrmm_chat::ChatPopup::new(
@@ -702,7 +700,12 @@ impl RemoteView {
         if let Some(window) = self.window() {
             window.invalidateCursorRectsForView(self);
         }
-        mac_cursor(self.ivars().control.effective_cursor_shape(*self.ivars().cursor_shape.borrow())).set();
+        mac_cursor(
+            self.ivars()
+                .control
+                .effective_cursor_shape(*self.ivars().cursor_shape.borrow()),
+        )
+        .set();
     }
 
     fn send_pointer(&self, event: &NSEvent) {

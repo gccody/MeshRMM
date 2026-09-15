@@ -32,6 +32,8 @@ pub struct ControlSink {
 }
 
 impl ControlSink {
+    // Keep the shared session handles and transport callbacks explicit at construction.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         files: meshrmm_file_transfer::TransferSession,
         send: impl Fn(meshrmm_protocol::SessionMessage) + Send + Sync + 'static,
@@ -93,35 +95,60 @@ impl ControlSink {
     }
 
     pub fn maintenance_state(&self) -> MaintenanceState {
-        self.maintenance.lock().map(|s| s.clone()).unwrap_or_default()
+        self.maintenance
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
     }
     pub fn take_maintenance_error(&self) -> Option<String> {
-        self.maintenance.lock().ok().and_then(|mut s| s.error.take())
+        self.maintenance
+            .lock()
+            .ok()
+            .and_then(|mut s| s.error.take())
     }
     pub fn toggle_blackout(&self) {
         let state = self.maintenance_state();
-        if state.available { self.send(meshrmm_protocol::SessionMessage::SetBlackout { enabled: !state.blacked_out }); }
+        if state.available {
+            self.send(meshrmm_protocol::SessionMessage::SetBlackout {
+                enabled: !state.blacked_out,
+            });
+        }
     }
     pub fn toggle_agent_input(&self) {
         let state = self.maintenance_state();
         if state.available && !state.blacked_out {
-            self.send(meshrmm_protocol::SessionMessage::SetAgentInputBlocked { blocked: !state.agent_input_blocked });
+            self.send(meshrmm_protocol::SessionMessage::SetAgentInputBlocked {
+                blocked: !state.agent_input_blocked,
+            });
         }
     }
-    pub fn agent_blocked(&self) -> bool { self.maintenance_state().agent_input_blocked }
-
-    pub fn technician_blocked(&self) -> bool {
-        self.technician_blocked.load(std::sync::atomic::Ordering::SeqCst)
+    pub fn agent_blocked(&self) -> bool {
+        self.maintenance_state().agent_input_blocked
     }
 
-    pub fn effective_cursor_shape(&self, shape: meshrmm_protocol::CursorShape) -> meshrmm_protocol::CursorShape {
-        if self.technician_blocked() { meshrmm_protocol::CursorShape::Default } else { shape }
+    pub fn technician_blocked(&self) -> bool {
+        self.technician_blocked
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn effective_cursor_shape(
+        &self,
+        shape: meshrmm_protocol::CursorShape,
+    ) -> meshrmm_protocol::CursorShape {
+        if self.technician_blocked() {
+            meshrmm_protocol::CursorShape::Default
+        } else {
+            shape
+        }
     }
 
     /// Call after releasing held keys/buttons, before changing the gate.
     pub fn set_technician_blocked(&self, blocked: bool) {
-        self.technician_blocked.store(blocked, std::sync::atomic::Ordering::SeqCst);
-        if blocked { (self.set_input_enabled)(false); }
+        self.technician_blocked
+            .store(blocked, std::sync::atomic::Ordering::SeqCst);
+        if blocked {
+            (self.set_input_enabled)(false);
+        }
     }
 
     pub fn set_input_enabled(&self, enabled: bool) {

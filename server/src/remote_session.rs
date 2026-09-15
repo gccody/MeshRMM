@@ -463,7 +463,8 @@ mod maintenance_tests {
         assert!(legacy.blackout_message.is_empty());
         value["blackout_message"] = serde_json::json!("Maintenance by {user_name}");
         let current: SessionRecord = serde_json::from_value(value).unwrap();
-        let restored: SessionRecord = serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
+        let restored: SessionRecord =
+            serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
         assert_eq!(restored.blackout_message, "Maintenance by {user_name}");
         assert_eq!(restored.viewer_name, "Zoë 王");
     }
