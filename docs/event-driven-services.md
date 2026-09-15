@@ -68,3 +68,33 @@ Tokio runtime. A Windows integration test launches the real Agent executable,
 starts the chat helper, sends chat commands, and requires a clean Stopped event
 and successful process exit. It reproduced the panic before the fix and passed
 afterward. All targeted Windows suites and the macOS Agent suite passed again.
+
+## Installed validation (2026-09-15)
+
+Installed the final local macOS viewer and Windows Agent on `192.168.1.152`.
+The installer preserved enrollment configuration, retained an executable backup,
+and verified the service reconnected. No release was published. Final Agent
+SHA-256: `cc79b4aea726568430c5ab63c0af2230d0c9488a3cf08cbe1732dcfd4912ce0f`.
+
+Verified through the installed UI:
+
+- Bidirectional chat, including the endpoint banner and viewer unread state.
+- Clipboard copying from macOS TextEdit into the Windows chat input and back
+  into TextEdit with a distinct endpoint-created marker.
+- Remote keyboard input and both monitor capture configurations.
+- Chat and keyboard input remained responsive during a 60-second file-helper
+  suspension. The helper resumed successfully through the harness's `finally`.
+- A selected file transfer waited during a second 30-second file-helper
+  suspension, then reached “Transfer complete” after resume. Its 417,792 bytes
+  matched SHA-256 `24acbe16c375e8c74731123cbf6e762148dd298b14fb67b0f8410f92bdaf321b`
+  on both machines. An earlier picker attempt selected a directory containing
+  non-regular files and was correctly rejected; the retry selected the exact
+  generated artifact.
+- Closing the viewer removed all desktop helpers. Only the Windows service and
+  its worker remained, and the dashboard continued to report the Agent online.
+
+The final full Windows test run passed: Agent 45 plus the executable integration
+regression 1, viewer 19, chat 7, clipboard 1, files 7 and shared transport 3.
+Three pre-existing blackout/input-block tests remain ignored because they require
+an invasive interactive harness. Clippy passed on macOS and Windows; the Windows
+final pass included all targets. No CPU or battery savings were benchmarked.
