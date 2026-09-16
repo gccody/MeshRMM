@@ -76,7 +76,9 @@ test("settings has a dedicated route and retains tenant isolation", async () => 
   const html = await response.text();
   assert.match(html, /<title>Settings \| MeshRMM<\/title>/);
   assert.match(html, /aria-current="page"/);
-  assert.match(html, /Settings categories/);
+  assert.match(html, /role="tablist" aria-label="Settings categories"/);
+  assert.match(html, /id="settings-tab-dashboard-security" aria-controls="dashboard-security" aria-selected="true"/);
+  assert.match(html, /id="settings-tab-remote-sessions" aria-controls="remote-sessions" aria-selected="false"/);
   assert.doesNotMatch(html, /id="idle-timeout"/); // No policy values before account authorization.
   const unknown = await render("/settings", "unknown.meshrmm.com");
   assert.equal(unknown.status, 404);

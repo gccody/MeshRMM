@@ -144,3 +144,15 @@ not manually exercised.
   viewport was reset and the preview server stopped afterward.
 - These are component/layout checks, not authenticated production save or
   enrollment tests. No dashboard/server deployment or push was performed.
+
+## Settings tabs follow-up
+
+Replaced category jump links with tabs: dashboard security, remote sessions, and
+blackout message. Only the selected panel is visible; draft values remain mounted
+and survive tab changes. Tabs support arrow keys, Home/End, selected state, and
+panel labels. Saving still applies all company settings, with a visible notice
+if a hidden blackout-message draft prevents saving.
+
+On macOS / Node 22.22.0, `npm run verify` passed TypeScript, ESLint, the production
+build, and all 10 tests (including tab semantics and initial selection in the
+settings route). `git diff --check` passed. This is a dashboard-only update.
