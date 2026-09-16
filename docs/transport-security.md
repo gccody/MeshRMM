@@ -65,3 +65,35 @@ Detailed local command output is retained under `dist/security-validation/`.
   not subjective sound quality.
 - Clean disconnect left the Windows service running. These live sessions used
   direct ICE; a forced TURN session was not separately exercised.
+
+## Public TLS policy — September 16, 2026
+
+The `meshrmm.com` Cloudflare zone uses these Edge Certificates settings:
+
+| Setting | Value |
+| --- | --- |
+| Minimum TLS Version | 1.2 |
+| TLS 1.3 | Enabled |
+| Always Use HTTPS | Enabled |
+
+These zone settings were applied directly; no Worker or native release was
+published. Before the change, live probes accepted TLS 1.0 and 1.1. Afterward,
+all six production hostnames rejected both with a protocol-version alert,
+accepted TLS 1.2/1.3 with valid certificates and AEAD ciphers, and redirected HTTP
+to HTTPS. The Windows service reconnected after restart, the authenticated
+dashboard reloaded, and a fresh remote handoff established an AES-GCM session.
+
+Repeat the read-only checks from a Python 3/OpenSSL host:
+
+```sh
+python3 scripts/check-transport-security.py \
+  meshrmm.com www.meshrmm.com admin.meshrmm.com auth.meshrmm.com \
+  api.meshrmm.com internal.meshrmm.com
+```
+
+The checker exits nonzero for accepted legacy TLS, invalid certificates,
+non-AEAD negotiated modern ciphers, missing HTTPS redirects, or inconclusive
+probes. An invalid-DNS negative check also verified failure rather than a false
+pass. This tests negotiated ciphers, not every cipher the edge might accept.
+Cloudflare's full TLS 1.2 cipher allowlist remains provider-managed; custom
+allowlists require Advanced Certificate Manager, which was not purchased.
