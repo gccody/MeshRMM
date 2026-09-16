@@ -28,7 +28,7 @@ pub enum CursorShape {
 /// Input coordinates are normalized to a display rather than the full virtual
 /// desktop. This keeps pointer input correctly bound to the displayed monitor,
 /// including monitors with negative desktop coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteInput {
     PointerMove {
         display_id: DisplayId,
@@ -74,17 +74,21 @@ pub enum RemoteInput {
         extended: bool,
         pressed: bool,
     },
+    /// Type literal text as Unicode keyboard events on the active desktop.
+    /// Appended to preserve existing postcard tags.
+    TypeText { display_id: DisplayId, text: String },
 }
 
 impl RemoteInput {
-    pub fn display_id(self) -> DisplayId {
+    pub fn display_id(&self) -> DisplayId {
         match self {
             Self::PointerMove { display_id, .. }
             | Self::PointerButton { display_id, .. }
             | Self::PointerButtonAt { display_id, .. }
             | Self::Wheel { display_id, .. }
             | Self::WheelAt { display_id, .. }
-            | Self::Key { display_id, .. } => display_id,
+            | Self::Key { display_id, .. }
+            | Self::TypeText { display_id, .. } => *display_id,
         }
     }
 }
@@ -103,6 +107,35 @@ mod tests {
     use crate::SessionMessage;
 
     use super::*;
+
+    #[test]
+    fn typed_text_is_bounded_and_preserves_unicode() {
+        let message = SessionMessage::Input(RemoteInput::TypeText {
+            display_id: DisplayId(2),
+            text: "päss🔑\r\nnext\tfield".into(),
+        });
+        assert_eq!(
+            SessionMessage::decode(&message.encode().unwrap()).unwrap(),
+            message
+        );
+        for text in [
+            "x".repeat(crate::MAX_CLIPBOARD_TEXT_BYTES + 1),
+            "bad\0text".into(),
+        ] {
+            let message = SessionMessage::Input(RemoteInput::TypeText {
+                display_id: DisplayId(2),
+                text,
+            });
+            assert!(SessionMessage::decode(&message.encode().unwrap()).is_err());
+        }
+        let message = SessionMessage::Input(RemoteInput::TypeText {
+            display_id: DisplayId(2),
+            text: "x".repeat(crate::MAX_CLIPBOARD_TEXT_BYTES),
+        });
+        let bytes = message.encode().unwrap();
+        assert!(bytes.len() < 65536);
+        assert_eq!(SessionMessage::decode(&bytes).unwrap(), message);
+    }
 
     #[test]
     fn input_round_trips_through_control_channel() {

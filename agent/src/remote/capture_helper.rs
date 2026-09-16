@@ -1821,7 +1821,7 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             writer.write_all(viewer_name.as_bytes())
         }
         ParentCommand::Input(input) => {
-            let bytes = SessionMessage::Input(*input)
+            let bytes = SessionMessage::Input(input.clone())
                 .encode()
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             checked_len(bytes.len(), MAX_CONTROL_BYTES, "desktop input")?;

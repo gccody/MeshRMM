@@ -136,6 +136,11 @@ impl SessionMessage {
         {
             return Err(postcard::Error::DeserializeBadEncoding);
         }
+        if let Self::Input(RemoteInput::TypeText { text, .. }) = &message
+            && (text.len() > MAX_CLIPBOARD_TEXT_BYTES || text.contains('\0'))
+        {
+            return Err(postcard::Error::DeserializeBadEncoding);
+        }
         Ok(message)
     }
 }

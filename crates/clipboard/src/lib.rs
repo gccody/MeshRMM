@@ -25,6 +25,13 @@ impl ClipboardSync {
             send_initial,
         })
     }
+    /// Read plain text explicitly, independently of clipboard synchronization.
+    pub fn text(&mut self) -> anyhow::Result<String> {
+        self.clipboard
+            .get_text()
+            .context("clipboard does not contain text")
+    }
+
     fn read(&mut self) -> anyhow::Result<Option<ClipboardContent>> {
         if meshrmm_file_transfer::clipboard_has_files() {
             return Ok(None);
