@@ -67,6 +67,7 @@ const SETTINGS_AGENT_INPUT_ID: usize = 4224;
 const SETTINGS_BLACKOUT_ID: usize = 4225;
 const SETTINGS_AUDIO_ID: usize = 4226;
 const SETTINGS_RECORDING_ID: usize = 4228;
+const SETTINGS_DISCONNECT_ID: usize = 4232;
 const SETTINGS_IDLE_ID: usize = 4231;
 const SETTINGS_DISPLAY_BORDER_ID: usize = 4230;
 const SETTINGS_WALLPAPER_ID: usize = 4229;
@@ -278,6 +279,11 @@ impl WindowContext {
             }
         }
         for (id, checked, enabled) in [
+            (
+                SETTINGS_DISCONNECT_ID,
+                self.control.disconnect_confirmation(),
+                true,
+            ),
             (
                 SETTINGS_IDLE_ID,
                 self.control.prevent_idle_lock(),
@@ -501,6 +507,7 @@ unsafe fn show_settings_category(window: HWND, display: bool) {
         SETTINGS_WALLPAPER_ID as i32,
         SETTINGS_DISPLAY_BORDER_ID as i32,
         SETTINGS_IDLE_ID as i32,
+        SETTINGS_DISCONNECT_ID as i32,
     ] {
         if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
             let _ = unsafe { ShowWindow(control, display_command) };
@@ -577,6 +584,11 @@ unsafe extern "system" fn settings_window_proc(
                 };
                 if let Some(chroma) = chroma {
                     context.set_chroma(chroma);
+                    return LRESULT(0);
+                }
+                if control_id == SETTINGS_DISCONNECT_ID {
+                    context.control.toggle_disconnect_confirmation();
+                    context.refresh_maintenance_controls();
                     return LRESULT(0);
                 }
                 if control_id == SETTINGS_IDLE_ID {
@@ -683,7 +695,7 @@ unsafe fn create_settings_window(
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             560,
-            590,
+            626,
             Some(owner),
             None,
             Some(instance),
@@ -946,6 +958,16 @@ unsafe fn create_settings_window(
         340,
         28,
         SETTINGS_IDLE_ID,
+    )?;
+    let _ = make_control(
+        w!("BUTTON"),
+        w!("Disconnect confirmation"),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
+        162,
+        522,
+        340,
+        28,
+        SETTINGS_DISCONNECT_ID,
     )?;
     unsafe { show_settings_category(settings, true) };
     Ok(SettingsControls {
@@ -1308,9 +1330,27 @@ pub(super) unsafe fn create_window(
                 LRESULT(0)
             }
             WM_CLOSE => {
-                if let Some(context) = context {
-                    context.release_input();
-                    context.control.set_input_enabled(false);
+                let confirm = context
+                    .map(|context| {
+                        context.release_input();
+                        context.control.set_input_enabled(false);
+                        context.control.disconnect_confirmation()
+                    })
+                    .unwrap_or(false);
+                if confirm
+                    && unsafe {
+                        MessageBoxW(
+                            Some(window),
+                            w!("Disconnect from this device?"),
+                            w!("End remote session"),
+                            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+                        )
+                    } != IDYES
+                {
+                    if let Some(context) = unsafe { window_context(window) } {
+                        context.control.set_input_enabled(true);
+                    }
+                    return LRESULT(0);
                 }
                 let _ = unsafe { DestroyWindow(window) };
                 LRESULT(0)

@@ -793,3 +793,27 @@ fn check_status(status: i32, context: &'static str) -> anyhow::Result<()> {
         bail!("{context}: OSStatus {status}")
     }
 }
+
+// Release the RefCell borrow before presenting a modal, which pumps AppKit events.
+fn active_window() -> Option<(Retained<NSWindow>, Retained<RemoteView>)> {
+    UI.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .filter(|ui| ui.window.isVisible())
+            .map(|ui| (ui.window.clone(), ui.input_view.clone()))
+    })
+}
+pub(super) fn confirm_session_replacement() -> bool {
+    active_window().is_none_or(|(_, view)| view.confirm_disconnect())
+}
+pub(super) fn request_user_disconnect() -> bool {
+    let Some((window, view)) = active_window() else {
+        return false;
+    };
+    if view.confirm_disconnect() {
+        window.close();
+    }
+    // Closing the window lets the transport finish recording and signal a clean stop.
+    true
+}
