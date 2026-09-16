@@ -146,7 +146,7 @@ export function PlatformDashboard() {
           <p className="eyebrow">MeshRMM administration</p>
           <h1>Platform owner sign-in</h1>
           <p>This area is restricted to the configured MeshRMM platform owner.</p>
-          <button className="primary-button" onClick={() => void signIn({ state: { returnTo: "/" } })}><ShieldCheck size={16} /> Continue with WorkOS</button>
+          <button className="primary-button" onClick={() => void signIn({ state: { returnTo: "/" } })}><ShieldCheck size={16} /> Sign in securely</button>
         </section>
       </main>
     );
@@ -163,7 +163,7 @@ export function PlatformDashboard() {
           <div className="modal-icon"><ShieldCheck size={22} /></div>
           <p className="eyebrow">Restricted</p>
           <h1>Platform owner access required</h1>
-          <p>{error ?? "This WorkOS user is not configured as a MeshRMM platform owner."}</p>
+          <p>{error ?? "This account does not have access to platform administration."}</p>
           <div className="login-actions">
             <button className="primary-button" onClick={() => { setHasOwnerAccess(null); void loadCompanies(); }}><RefreshCw size={16} /> Retry access check</button>
             <button className="secondary-button" onClick={() => void signOut({ returnTo: "https://meshrmm.com" })}><LogOut size={15} /> Sign out</button>
@@ -181,7 +181,7 @@ export function PlatformDashboard() {
       </header>
       <div className="platform-content">
         <section className="page-heading">
-          <div><p className="eyebrow">Private control plane</p><h1>Companies</h1><p>Create an isolated subdomain, WorkOS organization, and first company administrator invitation.</p></div>
+          <div><p className="eyebrow">Workspace management</p><h1>Companies</h1><p>Create company workspaces and invite their administrators.</p></div>
           <button className="secondary-button" onClick={() => void loadCompanies()} disabled={isLoading}><RefreshCw size={16} className={isLoading ? "spin" : ""} /> Refresh</button>
         </section>
 
