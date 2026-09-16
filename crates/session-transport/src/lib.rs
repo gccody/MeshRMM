@@ -1,4 +1,5 @@
 //! Independent reliable streams with a sticky, backwards-compatible route.
+pub mod identity;
 use anyhow::Context;
 use meshrmm_protocol::SessionMessage;
 use std::sync::atomic::{AtomicBool, Ordering};

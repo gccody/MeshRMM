@@ -315,6 +315,9 @@ pub async fn run_receiver(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .policy = bootstrap.idle_policy;
+    let identity = meshrmm_session_transport::identity::PeerIdentity::load(
+        &meshrmm_session_transport::identity::viewer_directory()?,
+    )?;
     let debug = DebugInfo::new(bootstrap.session_id.as_str());
     let url = session_signal_url(&config.server, bootstrap.session_id.as_str())?;
     let socket = authenticated_websocket(url, &bootstrap.signaling_token).await?;
@@ -326,6 +329,7 @@ pub async fn run_receiver(
         outgoing_tx.clone(),
         state_tx,
         debug.clone(),
+        identity.certificate.clone(),
     )
     .await?;
     let presenter = Arc::new(Mutex::new(None::<ActivePresenter>));
@@ -402,6 +406,7 @@ pub async fn run_receiver(
                         let signal: SignalMessage = serde_json::from_str(text.as_str())?;
                         match signal {
                             SignalMessage::Offer { sdp } => {
+                                debug.set_peer_fingerprint(identity.verify_sdp(&sdp)?);
                                 peer.set_remote_description(RTCSessionDescription::offer(sdp)?).await?;
                                 remote_description_set = true;
                                 for candidate in pending_candidates.drain(..) {
@@ -425,7 +430,12 @@ pub async fn run_receiver(
                             SignalMessage::PeerLeft => {
                                 break Err(anyhow::anyhow!("Agent disconnected from the remote session"));
                             }
-                            SignalMessage::Error { message } => break Err(anyhow::anyhow!(message)),
+                            SignalMessage::Error { message } => {
+                                if message.starts_with("Peer identity verification failed:") {
+                                    break Err(meshrmm_session_transport::identity::IdentityError(message).into());
+                                }
+                                break Err(anyhow::anyhow!(message));
+                            }
                             _ => {}
                         }
                     }
@@ -533,7 +543,13 @@ pub async fn run_receiver(
     pointer_flusher.abort();
     let _ = pointer_flusher.await;
 
-    if result.is_ok() {
+    if result.is_ok()
+        || result.as_ref().err().is_some_and(|error| {
+            error
+                .downcast_ref::<meshrmm_session_transport::identity::IdentityError>()
+                .is_some()
+        })
+    {
         let end_message = serde_json::to_string(&SignalMessage::EndSession)?;
         if let Err(error) = signal_writer.send(Message::Text(end_message.into())).await {
             tracing::warn!(error = %error, "failed to notify the server that the viewer ended the session");
@@ -656,11 +672,13 @@ async fn create_peer(
     outgoing: mpsc::UnboundedSender<SignalMessage>,
     state: mpsc::UnboundedSender<RTCPeerConnectionState>,
     debug: DebugInfo,
+    certificate: webrtc::peer_connection::certificate::RTCCertificate,
 ) -> anyhow::Result<Arc<RTCPeerConnection>> {
     let peer = Arc::new(
         APIBuilder::new()
             .build()
             .new_peer_connection(RTCConfiguration {
+                certificates: vec![certificate],
                 ice_servers: ice_servers
                     .iter()
                     .map(|server| RTCIceServer {

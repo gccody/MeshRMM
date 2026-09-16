@@ -296,7 +296,16 @@ async fn run_connected_sender(
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ControlCommand>();
     let (state_tx, mut state_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
     let (video_failure_tx, mut video_failure_rx) = mpsc::unbounded_channel::<String>();
-    let peer = create_peer(&ice_servers, outgoing_tx.clone(), state_tx).await?;
+    let identity = meshrmm_session_transport::identity::PeerIdentity::load(
+        &meshrmm_session_transport::identity::agent_directory()?,
+    )?;
+    let peer = create_peer(
+        &ice_servers,
+        outgoing_tx.clone(),
+        state_tx,
+        identity.certificate.clone(),
+    )
+    .await?;
     let mut cleanup = SenderCleanup {
         peer: Arc::clone(&peer),
         capture: None,
@@ -731,6 +740,7 @@ async fn run_connected_sender(
                                 offer_sent = true;
                             }
                             SignalMessage::Answer { sdp } => {
+                                identity.verify_sdp(&sdp)?;
                                 peer.set_remote_description(RTCSessionDescription::answer(sdp)?).await?;
                                 remote_description_set = true;
                                 for candidate in pending_candidates.drain(..) {
@@ -1509,9 +1519,11 @@ async fn create_peer(
     ice_servers: &[IceServer],
     outgoing: mpsc::UnboundedSender<SignalMessage>,
     state: mpsc::UnboundedSender<RTCPeerConnectionState>,
+    certificate: webrtc::peer_connection::certificate::RTCCertificate,
 ) -> anyhow::Result<Arc<RTCPeerConnection>> {
     let api = APIBuilder::new().build();
     let configuration = RTCConfiguration {
+        certificates: vec![certificate],
         ice_servers: ice_servers
             .iter()
             .map(|server| RTCIceServer {

@@ -12,6 +12,12 @@ use remote::config::{Config, ExecutionMode};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
+    if meshrmm_session_transport::identity::handle_command(
+        meshrmm_session_transport::identity::agent_directory,
+    )? {
+        return Ok(());
+    }
+
     #[cfg(windows)]
     if std::env::args_os()
         .nth(1)

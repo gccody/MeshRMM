@@ -42,7 +42,12 @@ pub async fn run(
         .await
         {
             Ok(()) => return Ok(()),
-            Err(error) if is_terminal_websocket_error(&error) => {
+            Err(error)
+                if is_terminal_websocket_error(&error)
+                    || error
+                        .downcast_ref::<meshrmm_session_transport::identity::IdentityError>()
+                        .is_some() =>
+            {
                 return Err(error);
             }
             Err(error) => {
