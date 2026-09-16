@@ -441,7 +441,7 @@ fn capture_loop_inner(
         if new_capture {
             frames_captured += 1;
         }
-        // Recompose the clean cached desktop when cursor visibility changes,
+        // Recompose the cached desktop when cursor visibility changes,
         // including keyboard-only handoffs with no DXGI damage. Retain pending
         // work until the encoder and frame pacer accept it.
         if desktop_texture.is_some()
@@ -454,7 +454,7 @@ fn capture_loop_inner(
                     None => cursor_compositor
                         .as_ref()
                         .ok_or(Error::InvalidDisplayDimensions)?
-                        .compose(&context, capture_cursor && separate_cursor_visible)?,
+                        .compose(&context, capture_cursor, separate_cursor_visible)?,
                 };
                 let yuv = converter.convert(texture)?;
                 cached_yuv = Some(yuv.clone());
