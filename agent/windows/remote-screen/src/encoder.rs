@@ -545,12 +545,6 @@ fn configure_codec(
             VARIANT::from(bitrate_bits_per_second),
         ),
         (&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0_u32)),
-        (
-            &CODECAPI_AVEncMPVGOPSize,
-            // Recovery requests are the fast path. A two-second fallback avoids
-            // the visible bitrate spike caused by forcing a full IDR each second.
-            VARIANT::from(frames_per_second.saturating_mul(2)),
-        ),
     ];
     for (key, value) in settings {
         // IsModifiable describes live changes, not whether an initial value can
@@ -565,6 +559,17 @@ fn configure_codec(
             }
         }
     }
+    // Periodic IDRs discard the sharp desktop reference and squeeze a full
+    // screen into one CBR frame, causing a visible blur pulse. Keep the chain
+    // for the session; startup and explicit recovery still produce keyframes.
+    // Some MFTs impose a smaller GOP range: retain their default if rejected
+    // rather than making remote capture unavailable on those adapters.
+    set_optional_initial_codec_value(
+        codec_api,
+        &CODECAPI_AVEncMPVGOPSize,
+        VARIANT::from(u32::MAX),
+        "request-driven keyframes",
+    )?;
     // Sunshine defaults to NVENC P1 with ultra-low-latency tuning and Parsec
     // prioritizes sub-frame encode latency. Media Foundation's portable
     // equivalent retains the fast path while allowing modestly better motion
@@ -700,6 +705,101 @@ fn _windows_result_type(_: WindowsResult<()>) {}
 mod tests {
     use super::contains_idr;
     use crate::VideoCodec;
+
+    #[test]
+    #[ignore = "requires Windows hardware H.264 and HEVC encoders"]
+    fn hardware_keeps_reference_until_explicit_recovery_request() {
+        use super::*;
+        use crate::converter::BgraToYuvConverter;
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Direct3D11::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        let (device, context) = windows_capture::d3d11::create_d3d_device().unwrap();
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 256,
+            Height: 256,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            ..Default::default()
+        };
+        // Dense, static desktop-like detail: an unsolicited IDR would discard
+        // its accumulated reference quality even though no pixels changed.
+        let pixels: Vec<u32> = (0..256 * 256)
+            .map(|i| {
+                if (i / 256 + i % 256) % 8 < 4 {
+                    0xffffffff
+                } else {
+                    0xff101010
+                }
+            })
+            .collect();
+        let data = D3D11_SUBRESOURCE_DATA {
+            pSysMem: pixels.as_ptr().cast(),
+            SysMemPitch: 256 * 4,
+            ..Default::default()
+        };
+        let mut texture = None;
+        unsafe {
+            device
+                .CreateTexture2D(&desc, Some(&data), Some(&mut texture))
+                .unwrap();
+        }
+        let texture = texture.unwrap();
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            let mut converter = BgraToYuvConverter::new(
+                &device,
+                &context,
+                256,
+                256,
+                60,
+                VideoPixelFormat::Yuv420,
+                false,
+            )
+            .unwrap();
+            let input = converter.convert(&texture).unwrap();
+            let mut encoder = MediaFoundationVideoEncoder::new(
+                &device,
+                256,
+                256,
+                60,
+                6_000_000,
+                codec,
+                VideoPixelFormat::Yuv420,
+            )
+            .unwrap();
+            for index in 0..300 {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !encoder.wants_input() {
+                    assert!(encoder.poll().unwrap().is_empty());
+                    assert!(Instant::now() < deadline, "{codec:?}: input stalled");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if index == 260 {
+                    encoder.request_keyframe().unwrap();
+                }
+                let mut output = encoder.submit(input, index * 16_667 + 1).unwrap();
+                while output.is_empty() {
+                    output.extend(encoder.poll().unwrap());
+                    assert!(Instant::now() < deadline, "{codec:?}: output stalled");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(output.len(), 1);
+                assert_eq!(
+                    output[0].keyframe,
+                    matches!(index, 0 | 260),
+                    "{codec:?} frame {index}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn detects_idr_in_annex_b_access_units() {

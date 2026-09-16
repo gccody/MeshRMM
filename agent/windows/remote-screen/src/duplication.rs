@@ -433,9 +433,21 @@ fn capture_loop_inner(
         if let Some(frame) = frame.as_ref()
             && let Some(cursor) = cursor_compositor.as_ref()
         {
-            cursor.update(&context, frame.texture());
-            desktop_cached = true;
-            desktop_pending = true;
+            let info = frame.frame_info();
+            let desktop_changed = !desktop_cached || info.LastPresentTime != 0;
+            if desktop_changed {
+                cursor.update(&context, frame.texture());
+                desktop_cached = true;
+            }
+            // AcquireNextFrame also wakes for pointer-only movement. Encoding
+            // those unchanged desktops advances the GOP and wastes bandwidth
+            // even though the viewer draws its own cursor. Keep real damage
+            // pending until the encoder accepts it, including visibility changes.
+            desktop_pending |= needs_pointer_frame(
+                desktop_changed,
+                info.LastMouseUpdateTime != 0,
+                capture_cursor,
+            );
         }
         let new_capture = frame.is_some() || desktop_texture.is_some();
         if new_capture {
@@ -530,4 +542,27 @@ fn capture_loop_inner(
 
 fn duplication_error(error: DuplicationError) -> Error {
     Error::DesktopDuplication(error.to_string())
+}
+
+// A hidden pointer cannot change the transmitted pixels. Embedded-pointer
+// changes still arrive as desktop damage and retain the cursor-free GDI path.
+fn needs_pointer_frame(desktop_changed: bool, pointer_changed: bool, capture_cursor: bool) -> bool {
+    desktop_changed || (pointer_changed && capture_cursor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_pointer_frame;
+
+    #[test]
+    fn hidden_pointer_motion_does_not_schedule_video_but_desktop_damage_does() {
+        assert!(!needs_pointer_frame(false, true, false));
+        assert!(!needs_pointer_frame(false, false, true));
+        assert!(needs_pointer_frame(false, true, true));
+        for capture_cursor in [false, true] {
+            for pointer_changed in [false, true] {
+                assert!(needs_pointer_frame(true, pointer_changed, capture_cursor));
+            }
+        }
+    }
 }
