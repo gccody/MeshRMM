@@ -16,6 +16,11 @@ members = [
     "server",
 ]
 default-members = ["agent", "remote"]
+exclude = ["vendor/dtls"]
+
+[patch.crates-io]
+# webrtc 0.14 has no cipher-policy setting; see vendor/dtls/MESHRMM.md.
+dtls = { path = "vendor/dtls" }
 
 [workspace.package]
 version = "0.2.0"

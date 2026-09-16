@@ -14,6 +14,13 @@ trusted for peer identity. These controls do not provide independent device
 identity verification against a compromised signaling service or establish
 FIPS certification.
 
+The pinned DTLS defaults allow only ECDHE with AES-128-GCM-SHA256 or
+ChaCha20-Poly1305-SHA256. CBC-only peers cannot establish a session. Existing
+MeshRMM clients already support AES-GCM, so mixed-version sessions remain
+compatible. The small dependency patch and upgrade requirements are documented
+in [the vendor note](../vendor/dtls/MESHRMM.md). Each completed handshake logs
+the negotiated DTLS cipher; it does not log keys, tokens, or session payloads.
+
 ## Secure URL validation — September 16, 2026
 
 - Regression tests cover plaintext rejection before a network connection,
@@ -33,3 +40,28 @@ FIPS certification.
   `0c5d760ee30b1ce431839139a364e109383c1613fa4a83160eb13a8bd479b419`.
 
 Detailed local command output is retained under `dist/security-validation/`.
+
+## DTLS policy validation — September 16, 2026
+
+- Real DTLS handshakes test GCM defaults, ChaCha20-only peers, older peers
+  preferring CBC but supporting GCM, and CBC-only rejection in both roles.
+  Successful handshakes verify the negotiated cipher and bidirectional payloads
+  with certificate verification enabled.
+- macOS viewer and session-transport tests and Clippy passed, including the
+  existing WebRTC test that stalls file consumption while input remains usable.
+- Windows workspace Clippy and tests passed against hash-verified source.
+- The updated macOS viewer connected to the previous Agent build, rendered the
+  screen, and delivered chat. The live handshake logged
+  `Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256`.
+- Installed the patched Agent using the supported local installer. SHA-256:
+  `b4c420c30774598ab513a07bdf0112a31d40b426d3680fe637e6756a2509bc62`.
+  Both endpoint logs confirmed AES-GCM negotiation. Configuration was preserved.
+- With both updated endpoints: screen rendering, all-monitor selection and
+  restoration, remote mouse/keyboard input, chat, and clipboard in both directions
+  passed. A 311,296-byte generated file transferred to Windows and back with
+  SHA-256 `aa43c7704a936a47a9d3dda43ce6203ecd8176a341786fdc9c1732f09a630b51`
+  matching on both machines. A generated five-second tone produced audio packets
+  and initialized macOS playback at 48 kHz stereo. This verifies the audio path,
+  not subjective sound quality.
+- Clean disconnect left the Windows service running. These live sessions used
+  direct ICE; a forced TURN session was not separately exercised.
