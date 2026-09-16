@@ -60,6 +60,7 @@ pub struct ViewerResumeState {
     quality: Arc<Mutex<QualityPreset>>,
     chroma: Arc<Mutex<ChromaMode>>,
     display_id: Arc<Mutex<Option<meshrmm_protocol::DisplayId>>>,
+    audio: meshrmm_audio::PlaybackState,
 }
 
 #[cfg(target_os = "macos")]
@@ -902,7 +903,9 @@ fn install_data_channel_handler(
     debug: DebugInfo,
     lifecycle: ReceiverLifecycle,
 ) {
+    let audio = meshrmm_audio::Player::new(viewer_control.resume_state.audio.clone());
     peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
+        let audio = audio.clone();
         let presenter = Arc::clone(&presenter);
         let control_channel = control_channel.clone();
         let viewer_control = viewer_control.clone();
@@ -913,6 +916,12 @@ fn install_data_channel_handler(
         Box::pin(async move {
             debug.set_data_channel(channel.label(), "open");
             match channel.label() {
+                meshrmm_audio::CHANNEL => {
+                    channel.on_message(Box::new(move |message| {
+                        audio.receive(&message.data);
+                        Box::pin(async {})
+                    }));
+                }
                 CONTROL_CHANNEL_LABEL => {
                     let channel = ServiceChannel::new(channel).await;
                     control_channel.send_replace(Some(channel.clone()));
@@ -1071,6 +1080,7 @@ fn install_control_handler(
                         move |message| message_queue.send(message),
                         move |enabled| input_gate.set_input_enabled(enabled),
                         viewer_control.chat.clone(),
+                        viewer_control.resume_state.audio.clone(),
                         Arc::clone(&viewer_control.resume_state.technician_blocked),
                         Arc::clone(&viewer_control.maintenance),
                         Arc::clone(&quality_preset),

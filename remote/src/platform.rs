@@ -21,6 +21,7 @@ pub struct MaintenanceState {
 pub struct ControlSink {
     files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
+    audio: meshrmm_audio::PlaybackState,
     send: Arc<dyn Fn(meshrmm_protocol::SessionMessage) + Send + Sync>,
     set_input_enabled: Arc<dyn Fn(bool) + Send + Sync>,
     maintenance: Arc<Mutex<MaintenanceState>>,
@@ -39,6 +40,7 @@ impl ControlSink {
         send: impl Fn(meshrmm_protocol::SessionMessage) + Send + Sync + 'static,
         set_input_enabled: impl Fn(bool) + Send + Sync + 'static,
         chat: meshrmm_chat::ChatSession,
+        audio: meshrmm_audio::PlaybackState,
         technician_blocked: Arc<std::sync::atomic::AtomicBool>,
         maintenance: Arc<Mutex<MaintenanceState>>,
         quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
@@ -48,6 +50,7 @@ impl ControlSink {
         Self {
             files,
             chat,
+            audio,
             technician_blocked,
             maintenance,
             send: Arc::new(send),
@@ -80,6 +83,14 @@ impl ControlSink {
             *chroma = *mode;
         }
         (self.send)(message);
+    }
+
+    pub fn audio_muted(&self) -> bool {
+        self.audio.muted()
+    }
+
+    pub fn toggle_audio(&self) {
+        self.audio.toggle();
     }
 
     pub fn send_secure_attention(&self) {

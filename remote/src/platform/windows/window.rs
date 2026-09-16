@@ -61,6 +61,7 @@ const SETTINGS_DIAGNOSTICS_ID: usize = 4222;
 const SETTINGS_TECHNICIAN_INPUT_ID: usize = 4223;
 const SETTINGS_AGENT_INPUT_ID: usize = 4224;
 const SETTINGS_BLACKOUT_ID: usize = 4225;
+const SETTINGS_AUDIO_ID: usize = 4226;
 
 impl WindowContext {
     fn send(&self, message: SessionMessage) {
@@ -237,6 +238,7 @@ impl WindowContext {
 
     fn refresh_maintenance_controls(&self) {
         for (id, checked, enabled) in [
+            (SETTINGS_AUDIO_ID, self.control.audio_muted(), true),
             (
                 SETTINGS_TECHNICIAN_INPUT_ID,
                 self.control.technician_blocked(),
@@ -438,6 +440,7 @@ unsafe fn show_settings_category(window: HWND, display: bool) {
         SETTINGS_TECHNICIAN_INPUT_ID as i32,
         SETTINGS_AGENT_INPUT_ID as i32,
         SETTINGS_BLACKOUT_ID as i32,
+        SETTINGS_AUDIO_ID as i32,
     ] {
         if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
             let _ = unsafe { ShowWindow(control, advanced_command) };
@@ -500,6 +503,11 @@ unsafe extern "system" fn settings_window_proc(
                 };
                 if let Some(chroma) = chroma {
                     context.set_chroma(chroma);
+                    return LRESULT(0);
+                }
+                if control_id == SETTINGS_AUDIO_ID {
+                    context.control.toggle_audio();
+                    context.refresh_maintenance_controls();
                     return LRESULT(0);
                 }
                 if control_id == SETTINGS_BLACKOUT_ID {
@@ -767,6 +775,16 @@ unsafe fn create_settings_window(
         340,
         28,
         SETTINGS_BLACKOUT_ID,
+    )?;
+    let _ = make_control(
+        w!("BUTTON"),
+        w!("Mute audio"),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
+        162,
+        230,
+        340,
+        28,
+        SETTINGS_AUDIO_ID,
     )?;
     unsafe { show_settings_category(settings, true) };
     Ok(SettingsControls {

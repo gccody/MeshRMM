@@ -328,6 +328,15 @@ and all-monitor blackout. Company admins customize the blackout notice under
 **Profile & session**. See [maintenance controls](docs/maintenance-controls.md)
 for usage, Windows requirements, and cleanup behavior.
 
+System audio from the Windows default playback device is forwarded to both native
+viewers over a separate, bounded WebRTC audio channel, including while muted.
+Each new session starts muted. On macOS, choose **Unmute audio** in the session
+controls menu; on Windows, clear **Mute audio** under **Settings → Troubleshooting**.
+The choice survives reconnects within the same session. Muting discards buffered
+sound. Capture includes the system output mix, not the microphone, and follows
+default playback-device changes. Audio uses PCM16 at the source sample rate
+(about 1.5 Mbps for 48 kHz stereo); congested queues drop audio to keep it live.
+
 The native viewer sends mouse, wheel, physical keyboard input, and bidirectional
 clipboard updates over the reliable control channel: plain text, HTML rich text
 with a plain-text alternative, and images. The viewer's current clipboard is
@@ -439,7 +448,7 @@ above; do not infer performance measurements from a successful build.
 
 The Agent/capture implementation remains Windows-only; the viewer supports
 Windows and macOS. The selected display and captured cursor are streamed.
-Clipboard synchronization supports plain text, HTML rich text, images, and files/folders; there is no audio,
+Clipboard synchronization supports plain text, HTML rich text, images, and files/folders; there is no
 recording, browser client, or concurrent
 viewer. Windows secure-attention sequences
 such as Ctrl+Alt+Delete cannot be synthesized by a normal user-mode Agent. H.265
