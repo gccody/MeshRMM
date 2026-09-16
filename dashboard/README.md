@@ -32,6 +32,29 @@ Application code is organized by responsibility:
 
 ## Session policy
 
+The dashboard Worker manages the public WorkOS PKCE flow and stores refresh
+tokens in an encrypted, host-only `Secure; HttpOnly; SameSite=Lax` cookie.
+Short-lived access tokens are held only in browser memory for API requests and
+WorkOS Widgets. No paid WorkOS custom domain is required. Reloading restores the
+session through a same-origin endpoint; sign-out clears the cookie and revokes
+the WorkOS session. Existing users must sign in once after this migration.
+
+Before deploying, configure `DASHBOARD_SESSION_KEY` as a dashboard Worker secret:
+
+```sh
+openssl rand -base64 32 | npx wrangler secret put DASHBOARD_SESSION_KEY
+```
+
+Keep this key stable across deployments. Rotating it invalidates all dashboard
+sessions. Never put it in `wrangler.jsonc` or browser environment variables. Local
+development can set it in an ignored `.dev.vars` file; use an HTTPS local origin
+for secure session cookies. The existing WorkOS root callback URLs, CORS origins,
+and `https://meshrmm.com` sign-out URL remain valid. The Worker uses WorkOS's
+public PKCE code and refresh grants without an API key. Session endpoints reject
+cross-origin requests, including other tenant subdomains; transient WorkOS
+failures preserve the cookie for retry. Browser Web Locks serialize refresh and
+sign-out across tabs where supported.
+
 MeshRMM enforces a per-organization dashboard inactivity timeout. New
 organizations default to four hours, and organization administrators can change
 the value under **Profile & session**. Expiry locks the dashboard and ends the
@@ -42,7 +65,7 @@ WorkOS also has an application-wide inactivity timeout based on token refreshes.
 Set it in the WorkOS Dashboard under **Applications → Sessions** to at least the
 largest MeshRMM organization timeout (24 hours). If it remains at five minutes,
 WorkOS can expire a suspended browser tab before MeshRMM's tenant policy does.
-MeshRMM permits AuthKit's automatic refresh while the page is in the background,
+MeshRMM automatically refreshes WorkOS tokens while the page is in the background,
 so an open dashboard remains active whenever the browser is still running it.
 
 See [company domains and provisioning](../docs/company-domains.md) for wildcard
@@ -52,7 +75,7 @@ DNS, WorkOS redirect/CORS configuration, owner identity, and deployment order.
 
 - `npm run typecheck`: validate browser and Cloudflare types.
 - `npm run lint`: run the TypeScript, React, accessibility, and Next rules.
-- `npm test`: build and run rendered-shell and Agent model tests.
+- `npm test`: build and run session-security, rendered-shell, and Agent model tests.
 - `npm run verify`: run the complete dashboard verification sequence.
 
 ## Learn More

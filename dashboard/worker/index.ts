@@ -1,4 +1,5 @@
 import handler from "vinext/server/fetch-handler";
+import { handleAuth } from "./auth";
 
 const ROOT_DOMAIN = "meshrmm.com";
 const RESERVED_HOSTS = new Set(["admin", "api", "auth", "downloads", "status", "support", "www"]);
@@ -29,6 +30,7 @@ const worker = {
   async fetch(request, env, ctx): Promise<Response> {
     const url = new URL(request.url);
     let appRequest: Request = request;
+    let organizationId: string | undefined;
     if (url.hostname === "www.meshrmm.com") {
       url.hostname = "meshrmm.com";
       return Response.redirect(url, 308);
@@ -58,10 +60,16 @@ const worker = {
           headers: { "Cache-Control": "no-store", "Retry-After": "30" },
         });
       }
+      organizationId = company.workos_organization_id;
       const headers = new Headers(request.headers);
       headers.set("X-Mesh-Tenant-Slug", slug);
       headers.set("X-Mesh-WorkOS-Organization-Id", company.workos_organization_id);
       appRequest = new Request(request, { headers });
+    }
+
+    if (url.pathname.startsWith("/auth/")) {
+      if (url.hostname === ROOT_DOMAIN) return notFound();
+      return handleAuth(appRequest, env, organizationId);
     }
 
     return handler.fetch(appRequest, env, ctx);

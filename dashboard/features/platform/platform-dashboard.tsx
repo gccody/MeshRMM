@@ -1,6 +1,6 @@
 "use client";
 
-import { LoginRequiredError, useAuth } from "@workos-inc/authkit-react";
+import { LoginRequiredError, useAuth } from "../auth/auth-provider";
 import { Building2, LoaderCircle, LogOut, Network, Plus, RefreshCw, ShieldCheck, X } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
