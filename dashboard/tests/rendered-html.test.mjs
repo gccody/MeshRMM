@@ -63,8 +63,9 @@ test("resolves a provisioned company before rendering its fixed workspace", asyn
   });
   assert.equal(response.status, 200);
   const html = await response.text();
-  assert.match(html, /Fixed company workspace/);
   assert.match(html, /Company workspace/);
+  assert.match(html, /<title>Devices \| MeshRMM<\/title>/);
+  assert.doesNotMatch(html, /Fixed company workspace|one-time remote handoffs|Cloudflare live inventory/);
 });
 
 test("settings has a dedicated route and retains tenant isolation", async () => {

@@ -122,3 +122,25 @@ not manually exercised.
 - No server deployment or Windows update is required for this dashboard-only
   change. Authenticated settings saves against a deployed new dashboard remain
   unexercised; the production dashboard was not replaced.
+
+## Dashboard presentation
+
+- Updated the workspace with a dark navigation sidebar, larger typography,
+  consistent spacing, accessible focus states, and responsive device rows.
+  Company settings use category links and clearly separated policy cards.
+- The device summary filters the list. Search has one location; device IDs are
+  available under each name. Offline Connect remains disabled. Administrative
+  close/delete actions retain their existing authorization and handlers.
+- Simplified sign-in, enrollment, status, and workspace copy. Replaced the
+  redundant inventory-status metric with an automatic-update indicator and
+  retained useful empty-state guidance. No fixture data ships in the dashboard.
+- Final `npm run verify` on macOS / Node 22.22.0 passed TypeScript, ESLint,
+  production build, and 10 tests. `git diff --check` passed.
+- Chrome layout checks used an isolated local fixture with the real device-list
+  component and settings markup/CSS. Verified summary filtering, search,
+  zero-result guidance, Clear filters, offline disabled Connect, desktop layout,
+  and a 390px mobile layout with visible statuses/actions. Category navigation
+  and remote-session checkbox layout were checked on mobile. The temporary
+  viewport was reset and the preview server stopped afterward.
+- These are component/layout checks, not authenticated production save or
+  enrollment tests. No dashboard/server deployment or push was performed.

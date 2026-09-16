@@ -17,7 +17,7 @@ export async function generateMetadata(): Promise<Metadata> {
     ? "MeshRMM | Secure remote monitoring"
     : hostname === "admin.meshrmm.com"
       ? "Platform Admin | MeshRMM"
-      : "Agents | MeshRMM";
+      : "Devices | MeshRMM";
   const description = hostname === "meshrmm.com"
     ? "Company-isolated remote monitoring and management with secure endpoint access."
     : "Monitor connected agents and launch secure remote desktop sessions from MeshRMM.";

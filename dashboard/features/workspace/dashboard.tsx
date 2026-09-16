@@ -17,7 +17,6 @@ import {
   Monitor,
   Plus,
   RefreshCw,
-  Search,
   Settings,
   ShieldCheck,
   Users,
@@ -146,7 +145,7 @@ function TenantDashboard({ view }: { view: View }) {
       }
       throw tokenError;
     }
-    if (!token) throw new Error("Your WorkOS session has expired. Please sign in again.");
+    if (!token) throw new Error("Your session has expired. Please sign in again.");
     const response = await fetch(`${normalizeServer(serverUrl)}${path}`, {
       ...init,
       headers: { ...init.headers, Authorization: `Bearer ${token}` },
@@ -274,7 +273,7 @@ function TenantDashboard({ view }: { view: View }) {
     try {
       await signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } });
     } catch (resumeError) {
-      setError(resumeError instanceof Error ? resumeError.message : "The WorkOS session could not be resumed.");
+      setError(resumeError instanceof Error ? resumeError.message : "Your session could not be resumed.");
       setIsResumingSession(false);
     }
   };
@@ -310,11 +309,11 @@ function TenantDashboard({ view }: { view: View }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ device_id: agent.id }),
       });
-      if (!response.ok) throw new Error(await errorMessage(response, "A secure remote handoff could not be created."));
+      if (!response.ok) throw new Error(await errorMessage(response, "The remote session could not be started."));
       const handoff = (await response.json()) as { handoff_token: string; api_url: string };
       window.location.assign(`meshrmm://connect?handoff=${encodeURIComponent(handoff.handoff_token)}&server=${encodeURIComponent(handoff.api_url)}`);
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "A secure remote handoff could not be created.");
+      setError(requestError instanceof Error ? requestError.message : "The remote session could not be started.");
     } finally {
       window.setTimeout(() => setConnectingId(null), 1200);
     }
@@ -422,14 +421,14 @@ function TenantDashboard({ view }: { view: View }) {
 
         <div className="workspace-switcher workspace-identity">
           <div className="workspace-avatar">{account?.company?.name.slice(0, 2).toUpperCase() ?? "CO"}</div>
-          <div><strong>{companyLabel}</strong><span>Fixed company workspace</span></div>
+          <div><strong>{companyLabel}</strong><span>Company workspace</span></div>
         </div>
 
         <nav aria-label="Primary navigation">
           <p className="nav-label">Company</p>
-          <button className={`nav-item ${view === "agents" ? "active" : ""}`} onClick={() => setActiveView("agents")} disabled={Boolean(sessionPauseReason)}><Monitor size={18} /><span>Agents</span>{isLive ? <em>{agents.length}</em> : null}</button>
-          {isAdmin && <button className={`nav-item ${view === "team" ? "active" : ""}`} onClick={() => setActiveView("team")} disabled={!hasTenantSession || Boolean(sessionPauseReason)}><Users size={18} /><span>Users</span></button>}
-          {isAdmin && <button className={`nav-item ${view === "sso" ? "active" : ""}`} onClick={() => setActiveView("sso")} disabled={!hasTenantSession || Boolean(sessionPauseReason)}><KeyRound size={18} /><span>Authentication</span></button>}
+          <button className={`nav-item ${view === "agents" ? "active" : ""}`} aria-current={view === "agents" ? "page" : undefined} onClick={() => setActiveView("agents")} disabled={Boolean(sessionPauseReason)}><Monitor size={18} /><span>Devices</span>{isLive ? <em>{agents.length}</em> : null}</button>
+          {isAdmin && <button className={`nav-item ${view === "team" ? "active" : ""}`} aria-current={view === "team" ? "page" : undefined} onClick={() => setActiveView("team")} disabled={!hasTenantSession || Boolean(sessionPauseReason)}><Users size={18} /><span>Users</span></button>}
+          {isAdmin && <button className={`nav-item ${view === "sso" ? "active" : ""}`} aria-current={view === "sso" ? "page" : undefined} onClick={() => setActiveView("sso")} disabled={!hasTenantSession || Boolean(sessionPauseReason)}><KeyRound size={18} /><span>Authentication</span></button>}
           <button className={`nav-item ${view === "settings" ? "active" : ""}`} onClick={() => setActiveView("settings")} disabled={!hasTenantSession || Boolean(sessionPauseReason)} aria-current={view === "settings" ? "page" : undefined}><Settings size={18} /><span>Settings</span></button>
           <p className="nav-label nav-label-spaced">Account</p>
           <button className="nav-item" onClick={() => setIsAuthOpen(true)} disabled={Boolean(sessionPauseReason)}><Settings size={18} /><span>Profile</span></button>
@@ -437,7 +436,7 @@ function TenantDashboard({ view }: { view: View }) {
 
         <button className="profile-row profile-button" onClick={() => setIsAuthOpen(true)} disabled={Boolean(sessionPauseReason)}>
           <div className="profile-avatar">{initials}</div>
-          <div><strong>{displayName}</strong><span>{user?.email ?? "WorkOS authentication"}</span></div>
+          <div><strong>{displayName}</strong><span>{user?.email ?? "Account"}</span></div>
         </button>
       </aside>
 
@@ -445,12 +444,12 @@ function TenantDashboard({ view }: { view: View }) {
 
       <main className="main-content">
         <header className="topbar">
-          <button className="mobile-menu" onClick={() => setIsSidebarOpen(true)} aria-label="Open navigation" disabled={Boolean(sessionPauseReason)}><Menu size={21} /></button>
-          {view === "agents" ? <label className="global-search"><Search size={18} /><input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="Search Agents" placeholder="Search Agents by name or device ID..." /></label> : <div />}
+          <button className="mobile-menu" onClick={() => setIsSidebarOpen(true)} aria-label="Open navigation" aria-expanded={isSidebarOpen} disabled={Boolean(sessionPauseReason)}><Menu size={21} /></button>
+          <div className="workspace-breadcrumb"><Building2 size={16} /><span>{companyLabel}</span></div>
           <div className="topbar-actions">
             <button className="connection-pill" onClick={() => setIsAuthOpen(true)} disabled={Boolean(sessionPauseReason)}>
               <span className={`status-dot ${isLive ? "live" : ""}`} />
-              {sessionPauseReason ? "Session paused" : isAuthLoading ? "Checking session" : isLive ? "Service live" : user ? "Signed in" : "Sign in"}
+              {sessionPauseReason ? "Session paused" : isAuthLoading ? "Checking session" : isLive ? "Connected" : user ? "Signed in" : "Sign in"}
             </button>
           </div>
         </header>
@@ -461,7 +460,7 @@ function TenantDashboard({ view }: { view: View }) {
               <div className="modal-icon"><Clock3 size={22} /></div>
               <p className="eyebrow">Session paused</p>
               <h1>{sessionPauseReason === "idle" ? "You’ve been signed out for inactivity" : "Your session needs to be renewed"}</h1>
-              <p>{sessionPauseReason === "idle" ? `Your organization pauses inactive dashboards after ${formatIdleTimeout(idleTimeoutMinutes)}.` : "MeshRMM could not renew your WorkOS session. Your dashboard stayed in place and no organization data will be requested until you continue."}</p>
+              <p>{sessionPauseReason === "idle" ? `Your organization pauses inactive dashboards after ${formatIdleTimeout(idleTimeoutMinutes)}.` : "Sign in again to continue managing your devices."}</p>
               <button className="primary-button" onClick={() => void resumeSession()} disabled={isResumingSession}>{isResumingSession ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />} Continue securely</button>
             </section>
           ) : !user && !isAuthLoading ? (
@@ -469,15 +468,15 @@ function TenantDashboard({ view }: { view: View }) {
               <div className="modal-icon"><ShieldCheck size={22} /></div>
               <p className="eyebrow">Secure company access</p>
               <h1>Sign in to MeshRMM</h1>
-              <p>WorkOS authenticates each user and selects the company boundary before any Agent data is requested.</p>
-              <button className="primary-button" onClick={() => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } })}><ShieldCheck size={16} /> Continue with WorkOS</button>
+              <p>Sign in with your company account to manage devices and start remote sessions.</p>
+              <button className="primary-button" onClick={() => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } })}><ShieldCheck size={16} /> Sign in securely</button>
             </section>
           ) : user && !hasTenantSession ? (
             <section className="signed-out-card organization-required">
               <div className="modal-icon"><Building2 size={22} /></div>
               <p className="eyebrow">Company-specific access</p>
               <h1>Continue to this company</h1>
-              <p>Your current WorkOS session belongs to a different company. Continue securely to authenticate for this URL. MeshRMM does not provide in-app company switching.</p>
+              <p>Sign in with an account that has access to this company’s workspace.</p>
               <button className="primary-button" onClick={() => void signOut({ navigate: false }).then(() => signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } }))}><ShieldCheck size={16} /> Continue to company</button>
             </section>
           ) : account && !account.company ? (
@@ -485,23 +484,23 @@ function TenantDashboard({ view }: { view: View }) {
               <div className="modal-icon"><Building2 size={22} /></div>
               <p className="eyebrow">Workspace unavailable</p>
               <h1>This company is not ready</h1>
-              <p>The workspace must be provisioned by the MeshRMM platform owner before it can be used.</p>
+              <p>Contact your administrator to finish setting up this workspace.</p>
             </section>
           ) : (
             <>
               <section className="page-heading">
                 <div>
                   <p className="eyebrow">{account?.company?.name ?? "Company"}</p>
-                  <h1>{view === "agents" ? "Agents" : view === "team" ? "Users" : view === "settings" ? "Settings" : "Authentication"}</h1>
-                  <p>{view === "agents" ? "Live company inventory with secure, one-time remote handoffs." : view === "team" ? "Invite users and manage company roles through WorkOS." : view === "settings" ? "Manage company security and remote session defaults." : "Manage this company’s verified domains and enterprise sign-in connection."}</p>
+                  <h1>{view === "agents" ? "Devices" : view === "team" ? "Users" : view === "settings" ? "Settings" : "Authentication"}</h1>
+                  <p>{view === "agents" ? "Connect to your devices and keep your team working." : view === "team" ? "Invite your team and manage their access." : view === "settings" ? "Manage company security and remote session defaults." : "Manage company domains and single sign-on."}</p>
                 </div>
                 {view === "agents" && <div className="heading-actions">
                   <button className="secondary-button" onClick={() => void loadAgents()}><RefreshCw size={16} className={isRefreshing ? "spin" : ""} /> Refresh</button>
-                  {isAdmin && <button className="primary-button" onClick={() => { setAgentPlatform("windows-x64"); setInstallerDownloaded(false); setInstallerError(null); setIsAgentOpen(true); }}><Plus size={16} /> Add Agent</button>}
+                  {isAdmin && <button className="primary-button" onClick={() => { setAgentPlatform("windows-x64"); setInstallerDownloaded(false); setInstallerError(null); setIsAgentOpen(true); }}><Plus size={16} /> Add device</button>}
                 </div>}
               </section>
 
-              {error && <div className="error-banner"><WifiOff size={17} /><span>{error}</span><button onClick={() => setError(null)} aria-label="Dismiss"><X size={16} /></button></div>}
+              {error && <div className="error-banner" role="alert"><WifiOff size={17} /><span>{error}</span><button onClick={() => setError(null)} aria-label="Dismiss"><X size={16} /></button></div>}
 
               {view === "settings" ? (<div className="settings-page">
                     <nav className="settings-categories" aria-label="Settings categories">
@@ -585,7 +584,7 @@ function TenantDashboard({ view }: { view: View }) {
         </div>
       </main>
 
-      {isAuthOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsAuthOpen(false)}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="account-title"><button className="modal-close" onClick={() => setIsAuthOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><ShieldCheck size={22} /></div><p className="eyebrow">Authenticated</p><h2 id="account-title">Your account</h2>{user ? <><div className="account-summary"><div className="profile-avatar">{initials}</div><div><strong>{displayName}</strong><span>{user.email}</span></div></div><button className="secondary-button modal-submit" onClick={handleSignOut}><LogOut size={16} /> Sign out</button></> : <button className="primary-button modal-submit" onClick={() => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } })}><ShieldCheck size={16} /> Continue with WorkOS</button>}</section></div>}
+      {isAuthOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsAuthOpen(false)}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="account-title"><button className="modal-close" onClick={() => setIsAuthOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><ShieldCheck size={22} /></div><p className="eyebrow">Authenticated</p><h2 id="account-title">Your account</h2>{user ? <><div className="account-summary"><div className="profile-avatar">{initials}</div><div><strong>{displayName}</strong><span>{user.email}</span></div></div><button className="secondary-button modal-submit" onClick={handleSignOut}><LogOut size={16} /> Sign out</button></> : <button className="primary-button modal-submit" onClick={() => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } })}><ShieldCheck size={16} /> Sign in securely</button>}</section></div>}
 
       {isAgentOpen && (
         <EnrollmentModal

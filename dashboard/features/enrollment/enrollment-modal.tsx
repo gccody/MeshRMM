@@ -32,13 +32,13 @@ export function EnrollmentModal({
         <button className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>
         <div className="modal-icon"><Monitor size={22} /></div>
         <p className="eyebrow">{companyName}</p>
-        <h2 id="agent-title">Download Agent installer</h2>
-        <p>Select the endpoint platform and download one installer. Setup will use the Windows computer name automatically, generate the device ID on the server, configure the Agent, and install the LocalSystem service.</p>
+        <h2 id="agent-title">Add a device</h2>
+        <p>Download the installer and run it on the device you want to manage. The device will appear in this workspace after setup.</p>
         <form onSubmit={onSubmit}>
-          <label>Installer platform<select required value={platform} onChange={(event) => onPlatformChange(event.target.value as AgentPlatform)}><option value="windows-x64">Windows 10/11 (x64)</option></select><small className="field-help">The Agent currently supports 64-bit Windows endpoints.</small></label>
+          <label>Operating system<select required value={platform} onChange={(event) => onPlatformChange(event.target.value as AgentPlatform)}><option value="windows-x64">Windows 10/11 (x64)</option></select><small className="field-help">Supports 64-bit Windows 10 and 11.</small></label>
           <div className="installer-summary">
-            <div><Monitor size={18} /><span><strong>Automatic machine identity</strong><small>Computer name from Windows · server-generated device ID</small></span></div>
-            <div><ShieldCheck size={18} /><span><strong>Administrator installation</strong><small>Automatic LocalSystem service with recovery</small></span></div>
+            <div><Monitor size={18} /><span><strong>Easy to find</strong><small>Appears using its Windows computer name</small></span></div>
+            <div><ShieldCheck size={18} /><span><strong>Administrator installation</strong><small>Runs automatically when the computer starts</small></span></div>
           </div>
           {error && <div className="installer-error" role="alert">{error}</div>}
           <button className="primary-button modal-submit" disabled={isDownloading}>
