@@ -1,6 +1,14 @@
-//! Session-scoped desktop hooks. Only MeshRMM's tagged SendInput events pass.
+//! Session-scoped desktop hooks for input blocking and cursor ownership.
 //! Windows removes hooks if the helper exits; Drop removes them on normal stop.
-use std::{sync::mpsc, thread};
+use std::{
+    cell::RefCell,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+};
 use windows::Win32::{
     Foundation::*,
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
@@ -9,6 +17,15 @@ use windows::Win32::{
 
 pub const INPUT_TAG: usize = 0x4d524d4d;
 
+enum HookMode {
+    Block,
+    Track(Arc<AtomicBool>),
+}
+
+thread_local! {
+    static HOOK_MODE: RefCell<HookMode> = const { RefCell::new(HookMode::Block) };
+}
+
 pub struct InputBlock {
     thread_id: u32,
     thread: Option<thread::JoinHandle<()>>,
@@ -16,10 +33,21 @@ pub struct InputBlock {
 
 impl InputBlock {
     pub fn start() -> anyhow::Result<Self> {
+        let guard = Self::start_hooks(HookMode::Block)?;
+        release_pressed_input()?;
+        Ok(guard)
+    }
+
+    pub fn track_ownership(viewer_controls_input: Arc<AtomicBool>) -> anyhow::Result<Self> {
+        Self::start_hooks(HookMode::Track(viewer_controls_input))
+    }
+
+    fn start_hooks(mode: HookMode) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
-            .name("local-input-block".into())
+            .name("desktop-input-hooks".into())
             .spawn(move || unsafe {
+                HOOK_MODE.with(|current| *current.borrow_mut() = mode);
                 // Force creation of the message queue before publishing the thread id.
                 let mut message = MSG::default();
                 let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
@@ -61,12 +89,11 @@ impl InputBlock {
                     thread_id,
                     thread: Some(thread),
                 };
-                release_pressed_input()?;
                 Ok(guard)
             }
             result => {
                 let _ = thread.join();
-                anyhow::bail!("Could not block endpoint input: {result:?}")
+                anyhow::bail!("Could not install endpoint input hooks: {result:?}")
             }
         }
     }
@@ -133,15 +160,47 @@ impl Drop for InputBlock {
         }
     }
 }
+// Releases must not hand control back to the viewer: focus loss and session
+// cleanup also inject tagged releases. Blocked local events never reach the
+// ownership hooks, which were installed before the blocking hooks.
+fn handle_input(mode: &HookMode, tag: usize, takes_control: bool) -> bool {
+    match mode {
+        HookMode::Block => tag != INPUT_TAG,
+        HookMode::Track(viewer_controls_input) => {
+            if tag != INPUT_TAG || takes_control {
+                viewer_controls_input.store(tag == INPUT_TAG, Ordering::SeqCst);
+            }
+            false
+        }
+    }
+}
+
 unsafe extern "system" fn keyboard_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if code >= 0 && unsafe { (*(l.0 as *const KBDLLHOOKSTRUCT)).dwExtraInfo } != INPUT_TAG {
-        return LRESULT(1);
+    if code >= 0 {
+        let tag = unsafe { (*(l.0 as *const KBDLLHOOKSTRUCT)).dwExtraInfo };
+        let pressed = matches!(w.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+        if HOOK_MODE.with(|mode| handle_input(&mode.borrow(), tag, pressed)) {
+            return LRESULT(1);
+        }
     }
     unsafe { CallNextHookEx(None, code, w, l) }
 }
 unsafe extern "system" fn mouse_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if code >= 0 && unsafe { (*(l.0 as *const MSLLHOOKSTRUCT)).dwExtraInfo } != INPUT_TAG {
-        return LRESULT(1);
+    if code >= 0 {
+        let tag = unsafe { (*(l.0 as *const MSLLHOOKSTRUCT)).dwExtraInfo };
+        let takes_control = matches!(
+            w.0 as u32,
+            WM_MOUSEMOVE
+                | WM_LBUTTONDOWN
+                | WM_RBUTTONDOWN
+                | WM_MBUTTONDOWN
+                | WM_XBUTTONDOWN
+                | WM_MOUSEWHEEL
+                | WM_MOUSEHWHEEL
+        );
+        if HOOK_MODE.with(|mode| handle_input(&mode.borrow(), tag, takes_control)) {
+            return LRESULT(1);
+        }
     }
     unsafe { CallNextHookEx(None, code, w, l) }
 }
@@ -149,6 +208,22 @@ unsafe extern "system" fn mouse_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ownership_follows_input_without_blocking_or_resuming_on_cleanup() {
+        let viewer = Arc::new(AtomicBool::new(false));
+        let mode = HookMode::Track(Arc::clone(&viewer));
+        assert!(!handle_input(&mode, INPUT_TAG, true));
+        assert!(viewer.load(Ordering::SeqCst));
+        assert!(!handle_input(&mode, 0, true));
+        assert!(!viewer.load(Ordering::SeqCst));
+        assert!(!handle_input(&mode, INPUT_TAG, false));
+        assert!(!viewer.load(Ordering::SeqCst));
+        assert!(!handle_input(&mode, INPUT_TAG, true));
+        assert!(viewer.load(Ordering::SeqCst));
+        assert!(!handle_input(&HookMode::Block, INPUT_TAG, true));
+        assert!(handle_input(&HookMode::Block, 0, true));
+    }
+
     #[test]
     fn untagged_keyboard_and_mouse_are_suppressed() {
         let keyboard = KBDLLHOOKSTRUCT::default();

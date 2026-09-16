@@ -1,4 +1,11 @@
-use std::collections::HashSet;
+use std::{
+    cell::Cell,
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::{Context, bail};
 use meshrmm_protocol::{CursorShape, Display, PointerButton, RemoteInput};
@@ -11,6 +18,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 pub struct WindowsInputController {
+    _ownership_hooks: Option<super::input_block::InputBlock>,
+    viewer_controls_input: Arc<AtomicBool>,
+    viewer_cursor: Cell<CursorShape>,
     block: Option<super::input_block::InputBlock>,
     blackout: Option<super::blackout::Blackout>,
     manually_blocked: bool,
@@ -22,7 +32,15 @@ pub struct WindowsInputController {
 
 impl WindowsInputController {
     pub fn new() -> Self {
+        let viewer_controls_input = Arc::new(AtomicBool::new(false));
+        let ownership_hooks =
+            super::input_block::InputBlock::track_ownership(Arc::clone(&viewer_controls_input))
+                .map_err(|error| tracing::warn!(%error, "Could not track cursor ownership"))
+                .ok();
         Self {
+            _ownership_hooks: ownership_hooks,
+            viewer_controls_input,
+            viewer_cursor: Cell::new(CursorShape::Default),
             block: None,
             blackout: None,
             manually_blocked: false,
@@ -76,6 +94,15 @@ impl WindowsInputController {
     }
 
     pub fn cursor_shape(&self) -> CursorShape {
+        if !self.viewer_controls_input.load(Ordering::SeqCst) {
+            return self.viewer_cursor.get();
+        }
+        let shape = self.current_cursor_shape();
+        self.viewer_cursor.set(shape);
+        shape
+    }
+
+    fn current_cursor_shape(&self) -> CursorShape {
         let mut info = CURSORINFO {
             cbSize: std::mem::size_of::<CURSORINFO>() as u32,
             ..Default::default()
@@ -402,7 +429,68 @@ fn send(inputs: &[INPUT]) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::WindowsInputController;
+    use super::*;
+
+    #[test]
+    #[ignore = "requires interactive Windows desktop; injects harmless pointer movement"]
+    fn live_cursor_shape_freezes_until_viewer_reclaims_input() {
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+        fn movement(tag: usize) {
+            send(&[INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dwFlags: MOUSEEVENTF_MOVE,
+                        dx: 1,
+                        dwExtraInfo: tag,
+                        ..Default::default()
+                    },
+                },
+            }])
+            .unwrap();
+        }
+        fn wait_for(input: &WindowsInputController, viewer: bool) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while input.viewer_controls_input.load(Ordering::SeqCst) != viewer {
+                assert!(
+                    Instant::now() < deadline,
+                    "input ownership did not change to viewer={viewer}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let mut input = WindowsInputController::new();
+        assert!(input._ownership_hooks.is_some());
+        movement(super::super::input_block::INPUT_TAG);
+        wait_for(&input, true);
+        assert_eq!(input.cursor_shape(), input.current_cursor_shape());
+        movement(0);
+        wait_for(&input, false);
+        // Use a cached shape different from the live desktop to prove polling
+        // retains it, rather than just observing an unchanged desktop cursor.
+        let frozen = if input.current_cursor_shape() == CursorShape::Text {
+            CursorShape::Pointer
+        } else {
+            CursorShape::Text
+        };
+        input.viewer_cursor.set(frozen);
+        assert_eq!(input.cursor_shape(), frozen);
+        input.release_all().unwrap();
+        assert_eq!(input.cursor_shape(), frozen);
+        movement(super::super::input_block::INPUT_TAG);
+        wait_for(&input, true);
+        assert_eq!(input.cursor_shape(), input.current_cursor_shape());
+        input.set_blocked(true).unwrap();
+        movement(0);
+        thread::sleep(Duration::from_millis(50));
+        assert!(input.viewer_controls_input.load(Ordering::SeqCst));
+        input.set_blocked(false).unwrap();
+        movement(0);
+        wait_for(&input, false);
+    }
 
     #[test]
     #[ignore = "requires interactive Windows desktop; blacks out monitors and blocks local input"]
