@@ -33,7 +33,8 @@ playback initialization fails. Windows viewers can select bandwidth-efficient
 4:2:0 or crisp-text 4:4:4 when the GPU driver exposes the required AYUV and
 High 4:4:4/RExt hardware path. Unsupported 4:4:4 controls are disabled and
 macOS currently advertises 4:2:0 only. Quality remains independently
-configurable as Data saver (3 Mbps), Balanced (6 Mbps), or Best quality (up to
+configurable as Ultra data saver (1 Mbps, grayscale, up to 24 FPS), Data saver
+(3 Mbps), Balanced (6 Mbps), or Best quality (up to
 12 Mbps).
 
 The hardware encoders use a streaming-oriented CBR configuration: real-time

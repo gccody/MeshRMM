@@ -349,6 +349,7 @@ fn capture_loop_inner(
         height,
         config.frames_per_second,
         config.pixel_format,
+        config.grayscale,
     )?;
     let mut encoder = MediaFoundationVideoEncoder::new(
         &device,

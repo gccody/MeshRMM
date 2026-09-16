@@ -15,6 +15,7 @@ fn hardware_encode_1440p60() {
             1440,
             60,
             VideoPixelFormat::Yuv420,
+            false,
         )
         .unwrap();
         let mut encoder = encoder::MediaFoundationVideoEncoder::new(
@@ -125,6 +126,7 @@ fn desktop_capture_throughput() {
                 codec: VideoCodec::H265,
                 pixel_format: VideoPixelFormat::Yuv420,
                 capture_cursor: true,
+                grayscale: false,
             },
             display,
             Arc::new(move |frame| {
@@ -192,6 +194,7 @@ fn hardware_bitrate_presets_under_high_motion() {
                 HEIGHT,
                 60,
                 VideoPixelFormat::Yuv420,
+                false,
             )
             .unwrap();
             let mut encoder = encoder::MediaFoundationVideoEncoder::new(

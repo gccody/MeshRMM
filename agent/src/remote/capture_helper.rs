@@ -106,6 +106,7 @@ enum ParentCommand {
         codec: VideoCodec,
         pixel_format: VideoPixelFormat,
         capture_cursor: bool,
+        grayscale: bool,
     },
     RequestKeyframe,
     SetBitrate(u32),
@@ -290,6 +291,7 @@ impl DesktopCaptureStreamer {
                 codec: config.codec,
                 pixel_format: config.pixel_format,
                 capture_cursor: config.capture_cursor,
+                grayscale: config.grayscale,
             },
         )?;
         let started = running
@@ -350,6 +352,7 @@ impl DesktopCaptureStreamer {
             codec: config.codec,
             pixel_format: config.pixel_format,
             capture_cursor: config.capture_cursor,
+            grayscale: config.grayscale,
         };
         if let Err(error) = send_command(&input, &start) {
             terminate_and_wait(&launched.process);
@@ -1482,14 +1485,18 @@ pub fn run_child() -> anyhow::Result<()> {
             codec,
             pixel_format,
             capture_cursor,
+            grayscale,
         } => run_capture_child(
             command_rx,
             display_id,
-            frames_per_second,
-            bitrate_bits_per_second,
-            codec,
-            pixel_format,
-            capture_cursor,
+            StreamConfig {
+                frames_per_second,
+                bitrate_bits_per_second,
+                codec,
+                pixel_format,
+                capture_cursor,
+                grayscale,
+            },
         ),
         ParentCommand::StartFiles => run_file_child(command_rx),
         ParentCommand::StartClipboard => run_clipboard_child(command_rx),
@@ -1505,14 +1512,10 @@ pub fn run_child() -> anyhow::Result<()> {
 fn run_capture_child(
     command_rx: mpsc::Receiver<io::Result<ParentCommand>>,
     mut display_id: Option<DisplayId>,
-    mut frames_per_second: u32,
-    mut bitrate_bits_per_second: u32,
-    mut codec: VideoCodec,
-    mut pixel_format: VideoPixelFormat,
-    mut capture_cursor: bool,
+    mut config: StreamConfig,
 ) -> anyhow::Result<()> {
     'capture: loop {
-        if frames_per_second == 0 || bitrate_bits_per_second == 0 {
+        if config.frames_per_second == 0 || config.bitrate_bits_per_second == 0 {
             anyhow::bail!("desktop-helper frame rate and bitrate must be positive");
         }
         let displays = enumerate_displays()?;
@@ -1538,17 +1541,7 @@ fn run_capture_child(
             }
         });
         let mut streamer = WindowsDesktopDuplicationStreamer::new();
-        let active = match streamer.start(
-            StreamConfig {
-                frames_per_second,
-                bitrate_bits_per_second,
-                codec,
-                pixel_format,
-                capture_cursor,
-            },
-            active_display.id.0,
-            sink,
-        ) {
+        let active = match streamer.start(config, active_display.id.0, sink) {
             Ok(active) => active,
             Err(error) => {
                 emit_child_event(&output, ChildEvent::Error(error.to_string()))?;
@@ -1600,14 +1593,16 @@ fn run_capture_child(
                     codec: next_codec,
                     pixel_format: next_pixel_format,
                     capture_cursor: next_capture_cursor,
+                    grayscale: next_grayscale,
                 })) => {
                     streamer.stop()?;
                     display_id = next_display;
-                    frames_per_second = next_fps;
-                    bitrate_bits_per_second = next_bitrate;
-                    codec = next_codec;
-                    pixel_format = next_pixel_format;
-                    capture_cursor = next_capture_cursor;
+                    config.frames_per_second = next_fps;
+                    config.bitrate_bits_per_second = next_bitrate;
+                    config.codec = next_codec;
+                    config.pixel_format = next_pixel_format;
+                    config.capture_cursor = next_capture_cursor;
+                    config.grayscale = next_grayscale;
                     continue 'capture;
                 }
                 Ok(Ok(
@@ -1792,6 +1787,7 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             codec,
             pixel_format,
             capture_cursor,
+            grayscale,
         } => {
             writer.write_all(&[COMMAND_START])?;
             checked_len(viewer_name.len(), MAX_DISPLAY_NAME_BYTES, "viewer name")?;
@@ -1803,6 +1799,7 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
                 .and_then(|()| writer.write_all(&[codec_byte(*codec)]))
                 .and_then(|()| writer.write_all(&[pixel_format_byte(*pixel_format)]))
                 .and_then(|()| writer.write_all(&[u8::from(*capture_cursor)]))
+                .and_then(|()| writer.write_all(&[u8::from(*grayscale)]))
         }
         ParentCommand::SetCursorCapture(enabled) => writer.write_all(&[18, u8::from(*enabled)]),
         ParentCommand::RequestKeyframe => writer.write_all(&[COMMAND_REQUEST_KEYFRAME]),
@@ -1895,6 +1892,7 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
                 codec: read_codec(&mut reader)?,
                 pixel_format: read_pixel_format(&mut reader)?,
                 capture_cursor: read_bool(&mut reader)?,
+                grayscale: read_bool(&mut reader)?,
             })
         }
         18 => Ok(ParentCommand::SetCursorCapture(read_bool(&mut reader)?)),
@@ -2571,26 +2569,29 @@ mod tests {
     }
 
     #[test]
-    fn cursor_capture_survives_helper_start_and_leaves_next_command_aligned() {
-        for enabled in [false, true] {
+    fn capture_flags_survive_helper_start_and_leave_next_command_aligned() {
+        for (cursor, monochrome) in [(false, false), (false, true), (true, false), (true, true)] {
             let mut bytes = Vec::new();
             write_command(
                 &mut bytes,
                 &ParentCommand::Start {
                     viewer_name: "Viewer".into(),
                     display_id: Some(DisplayId(1)),
-                    frames_per_second: 60,
-                    bitrate_bits_per_second: 6_000_000,
+                    frames_per_second: 24,
+                    bitrate_bits_per_second: 1_000_000,
                     codec: VideoCodec::H264,
                     pixel_format: VideoPixelFormat::Yuv420,
-                    capture_cursor: enabled,
+                    capture_cursor: cursor,
+                    grayscale: monochrome,
                 },
             )
             .unwrap();
             write_command(&mut bytes, &ParentCommand::RequestKeyframe).unwrap();
             let mut reader = bytes.as_slice();
             assert!(
-                matches!(read_command(&mut reader).unwrap(), ParentCommand::Start { capture_cursor, .. } if capture_cursor == enabled)
+                matches!(read_command(&mut reader).unwrap(), ParentCommand::Start {
+                    capture_cursor, grayscale, frames_per_second: 24, bitrate_bits_per_second: 1_000_000, ..
+                } if capture_cursor == cursor && grayscale == monochrome)
             );
             assert!(matches!(
                 read_command(&mut reader).unwrap(),
@@ -2611,6 +2612,7 @@ mod tests {
                 codec: VideoCodec::H265,
                 pixel_format: VideoPixelFormat::Yuv444,
                 capture_cursor: true,
+                grayscale: false,
             },
             ParentCommand::StartClipboard,
             ParentCommand::StartChatHelper {

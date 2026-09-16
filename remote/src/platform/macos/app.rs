@@ -393,8 +393,9 @@ define_class!(
         #[unsafe(method(selectQualityFromToolbar:))]
         fn select_quality_from_toolbar(&self, sender: &NSPopUpButton) {
             let preset = match sender.indexOfSelectedItem() {
-                0 => QualityPreset::DataSaver,
-                2 => QualityPreset::BestQuality,
+                0 => QualityPreset::UltraDataSaver,
+                1 => QualityPreset::DataSaver,
+                3 => QualityPreset::BestQuality,
                 _ => QualityPreset::Balanced,
             };
             self.send(SessionMessage::SetQuality { preset });
@@ -627,13 +628,13 @@ impl RemoteView {
             NSRect {
                 origin: NSPoint { x: 244.0, y: 6.0 },
                 size: NSSize {
-                    width: 124.0,
+                    width: 154.0,
                     height: 24.0,
                 },
             },
             false,
         );
-        for title in ["Data saver", "Balanced", "Best quality"] {
+        for title in ["Ultra data saver", "Data saver", "Balanced", "Best quality"] {
             quality_popup.addItemWithTitle(&NSString::from_str(title));
         }
         quality_popup.selectItemAtIndex(quality_index(self.ivars().control.quality_preset()));
@@ -652,7 +653,7 @@ impl RemoteView {
             )
         };
         diagnostics.setFrame(NSRect {
-            origin: NSPoint { x: 374.0, y: 6.0 },
+            origin: NSPoint { x: 404.0, y: 6.0 },
             size: NSSize {
                 width: 88.0,
                 height: 24.0,
@@ -668,7 +669,7 @@ impl RemoteView {
                 self.mtm(),
             )
         };
-        file_button.setFrame(NSRect::new(NSPoint::new(512., 6.), NSSize::new(40., 24.)));
+        file_button.setFrame(NSRect::new(NSPoint::new(542., 6.), NSSize::new(40., 24.)));
         file_button.setToolTip(Some(&NSString::from_str(
             "Send or receive files and folders",
         )));
@@ -681,7 +682,7 @@ impl RemoteView {
                 mtm,
             )
         };
-        chat_button.setFrame(NSRect::new(NSPoint::new(468., 6.), NSSize::new(40., 24.)));
+        chat_button.setFrame(NSRect::new(NSPoint::new(498., 6.), NSSize::new(40., 24.)));
         toolbar.addSubview(&chat_button);
         let secure_attention_button = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -692,7 +693,7 @@ impl RemoteView {
             )
         };
         secure_attention_button
-            .setFrame(NSRect::new(NSPoint::new(558., 6.), NSSize::new(110., 24.)));
+            .setFrame(NSRect::new(NSPoint::new(588., 6.), NSSize::new(110., 24.)));
         toolbar.addSubview(&secure_attention_button);
         let type_clipboard_button = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -702,7 +703,7 @@ impl RemoteView {
                 mtm,
             )
         };
-        type_clipboard_button.setFrame(NSRect::new(NSPoint::new(674., 6.), NSSize::new(120., 24.)));
+        type_clipboard_button.setFrame(NSRect::new(NSPoint::new(704., 6.), NSSize::new(120., 24.)));
         type_clipboard_button.setToolTip(Some(&NSString::from_str(
             "Type local clipboard text into the focused remote field",
         )));
@@ -936,9 +937,10 @@ impl RemoteView {
 
 fn quality_index(preset: QualityPreset) -> isize {
     match preset {
-        QualityPreset::DataSaver => 0,
-        QualityPreset::Balanced => 1,
-        QualityPreset::BestQuality => 2,
+        QualityPreset::UltraDataSaver => 0,
+        QualityPreset::DataSaver => 1,
+        QualityPreset::Balanced => 2,
+        QualityPreset::BestQuality => 3,
     }
 }
 
