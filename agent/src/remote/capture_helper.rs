@@ -1049,8 +1049,6 @@ fn launch_helper(target: DesktopTarget, as_user: bool) -> anyhow::Result<Launche
     })
 }
 
-// Parameters mirror the input/file helper startup IPC payload.
-#[allow(clippy::too_many_arguments)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HelperKind {
     Input,
@@ -1063,6 +1061,8 @@ fn helper_uses_user_token(kind: HelperKind, target: DesktopTarget) -> bool {
     kind == HelperKind::Files || (kind == HelperKind::Clipboard && target == DesktopTarget::Default)
 }
 
+// Keep the helper's startup options and independently shared event destinations explicit.
+#[allow(clippy::too_many_arguments)]
 fn start_input_helper(
     viewer_name: &str,
     target: DesktopTarget,
@@ -1244,6 +1244,8 @@ fn dispatch_child_events(
     }
 }
 
+// Each event destination is shared independently with the parent session.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_input_events(
     output: File,
     started_tx: mpsc::SyncSender<Result<(), String>>,
