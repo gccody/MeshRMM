@@ -15,7 +15,7 @@ fn default_idle_timeout_ms() -> u64 {
     DEFAULT_IDLE_TIMEOUT_MS
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionRecord {
     #[serde(default)]
     idle_policy: meshrmm_protocol_types::IdlePolicy,
@@ -84,6 +84,7 @@ impl DurableObject for RemoteSession {
                 self.expire("session cancelled").await?;
                 Response::ok("expired")
             }
+            (Method::Post, "/end") => self.end(&request).await,
             (Method::Post, "/resume") => self.resume(&request).await,
             (Method::Get, "/signal") => self.accept_peer(&request).await,
             _ => Response::error("not found", 404),
@@ -228,6 +229,23 @@ impl DurableObject for RemoteSession {
 }
 
 impl RemoteSession {
+    async fn end(&self, request: &Request) -> Result<Response> {
+        let Some(record) = self.state.storage().get::<SessionRecord>("session").await? else {
+            // Idempotent retry after a successful close; there is no state to mutate.
+            return Response::empty();
+        };
+        let supplied = request
+            .headers()
+            .get("Authorization")?
+            .and_then(|value| value.strip_prefix("Bearer ").map(str::to_owned))
+            .unwrap_or_default();
+        if !token_eq(supplied.as_bytes(), record.client_token.as_bytes()) {
+            return Response::error("unauthorized", 401);
+        }
+        self.expire("session ended by client").await?;
+        Response::empty()
+    }
+
     async fn advance_deadline(&self, proposed: &SessionRecord) -> Result<bool> {
         let Some(mut current) = self.state.storage().get::<SessionRecord>("session").await? else {
             return Ok(false);
@@ -429,10 +447,16 @@ impl RemoteSession {
 
     async fn expire(&self, reason: &str) -> Result<()> {
         let record = self.state.storage().get::<SessionRecord>("session").await?;
+        if let Some(mut terminal) = record.clone() {
+            terminal.expires_at_unix_ms = 0;
+            // Revoke signaling/resume before awaiting coordinator cleanup. Retain
+            // the record and a retry alarm until the lease release is acknowledged.
+            self.state.storage().put("session", &terminal).await?;
+            self.state.storage().set_alarm(1000_i64).await?;
+        }
         for socket in self.state.get_websockets() {
             let _ = socket.close(Some(4001), Some(reason));
         }
-        self.state.storage().delete_all().await?;
         if let Some(record) = record
             && !record.session_id.is_empty()
             && !record.device_id.is_empty()
@@ -440,14 +464,14 @@ impl RemoteSession {
             let ended = serde_json::json!({ "session_id": record.session_id });
             let request =
                 crate::internal_json_request("https://agent.internal/session-ended", &ended)?;
-            if let Err(error) =
+            let response =
                 crate::object_stub(&self.environment, "AGENT_COORDINATOR", &record.device_id)?
                     .fetch_with_request(request)
-                    .await
-            {
-                console_error!("event=agent_session_clear_failed error={}", error);
-            }
+                    .await?;
+            crate::ensure_success(response, "release Agent session lease").await?;
         }
+        self.state.storage().delete_all().await?;
+        self.state.storage().delete_alarm().await?;
         console_log!("event=remote_session_expired");
         Ok(())
     }

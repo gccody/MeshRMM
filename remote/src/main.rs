@@ -152,7 +152,10 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
     let resume_state = transport::ViewerResumeState::default();
     loop {
         match transport::run_receiver(&config, bootstrap.clone(), resume_state.clone()).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                signaling::end_session(&config, &bootstrap).await?;
+                return Ok(());
+            }
             Err(error) if signaling::is_terminal_session_error(&error) => {
                 return Err(error).context("remote viewer session can no longer be resumed");
             }

@@ -132,3 +132,27 @@ these outcomes and run in CI. Before the setting changed the new check exposed
 all eight weak alternatives; afterward all 78 probes across the six public
 hostnames passed. The probes cover the listed alternatives, not every possible
 cipher implementation.
+
+## Acknowledged session cleanup — September 16, 2026
+
+The viewer now follows an intentional disconnect with an HTTPS `POST` to the
+session's `/end` endpoint, authenticated with its session token. The operation
+is idempotent and retries transient failures three times with bounded timeouts.
+It works independently of the session WebSocket. Unauthorized tokens, including
+an Agent token, cannot release the lease. The server revokes the session before
+cleanup and retains a retry alarm until the coordinator acknowledges lease
+release, instead of discarding the only cleanup record on a failed request.
+
+Validation: macOS viewer Clippy/tests, server native tests, WASM check/build,
+SQL regressions, and Windows workspace Clippy/tests passed. A local workerd
+integration test on macOS/Node 22.23.2 verified close without a signaling socket,
+wrong-token rejection, repeated close, token revocation, fresh-session lease
+acquisition, and protection against cleanup from an older session. No Agent
+binary change or service reinstall was required for this feature.
+
+Deploy the server endpoint before distributing this viewer change. The new
+server has not been deployed to production; the production fault-injection
+retest therefore remains a release validation step. Full network loss can still
+prevent a close request from reaching the server; the existing idle lease
+provides eventual expiry in that case. A failed acknowledgment is reported,
+not treated as successful cleanup.
