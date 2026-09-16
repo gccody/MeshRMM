@@ -821,12 +821,18 @@ impl ScreenInput for DesktopInputController {
     }
 
     fn apply(&self, input: RemoteInput) -> anyhow::Result<()> {
-        let writer = self
+        let Some(writer) = self
             .route
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
-            .context("desktop input helper is not running")?;
+        else {
+            // Desktop switches temporarily unroute input while the old helper
+            // releases its pressed keys/buttons and its replacement starts.
+            // Discard events in this gap instead of ending the remote session
+            // or replaying stale input onto the new desktop.
+            return Ok(());
+        };
         send_command(&writer, &ParentCommand::Input(input))
             .context("failed to send input to the active desktop")
     }
@@ -2767,6 +2773,35 @@ fn run_clipboard_child(commands: mpsc::Receiver<io::Result<ParentCommand>>) -> a
 #[cfg(test)]
 mod isolation_tests {
     use super::*;
+    #[test]
+    fn desktop_switch_discards_unrouted_input_and_resumes_without_replay() {
+        let streamer = DesktopCaptureStreamer::default();
+        let controller = streamer.input_controller();
+        let event = |pressed| RemoteInput::PointerButton {
+            display_id: DisplayId(1),
+            button: meshrmm_protocol::PointerButton::Left,
+            pressed,
+        };
+        // A release arriving between helpers must not disconnect the viewer.
+        controller.apply(event(false)).unwrap();
+        controller.release_all().unwrap();
+
+        let (reader, writer) = create_inherited_pipe(false).unwrap();
+        *streamer.input_route.lock().unwrap() =
+            Some(Arc::new(CommandWriter::new(writer.into_file()).unwrap()));
+        controller.apply(event(true)).unwrap();
+        controller.release_all().unwrap();
+        let mut reader = reader.into_file();
+        assert!(matches!(
+            read_command(&mut reader).unwrap(),
+            ParentCommand::Input(RemoteInput::PointerButton { pressed: true, .. })
+        ));
+        assert!(matches!(
+            read_command(&mut reader).unwrap(),
+            ParentCommand::ReleaseInput
+        ));
+    }
+
     #[test]
     fn interactive_clipboard_uses_user_token_but_secure_input_does_not() {
         assert!(helper_uses_user_token(
