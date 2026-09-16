@@ -4,6 +4,7 @@ mod debug;
 #[cfg(any(target_os = "macos", test))]
 mod h264;
 mod platform;
+mod recording;
 mod signaling;
 mod transport;
 #[cfg(any(windows, target_os = "macos"))]

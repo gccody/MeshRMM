@@ -17,6 +17,7 @@ struct WindowContext {
     chroma_combo: HWND,
     diagnostics_button: HWND,
     settings_button: HWND,
+    recording_visible: std::cell::Cell<bool>,
     file_button: HWND,
     chat_button: HWND,
     secure_attention_button: HWND,
@@ -65,6 +66,7 @@ const SETTINGS_TECHNICIAN_INPUT_ID: usize = 4223;
 const SETTINGS_AGENT_INPUT_ID: usize = 4224;
 const SETTINGS_BLACKOUT_ID: usize = 4225;
 const SETTINGS_AUDIO_ID: usize = 4226;
+const SETTINGS_RECORDING_ID: usize = 4228;
 const SETTINGS_REMOTE_CURSOR_ID: usize = 4227;
 
 impl WindowContext {
@@ -251,6 +253,27 @@ impl WindowContext {
     }
 
     fn refresh_maintenance_controls(&self) {
+        let recording = self.control.recording().active();
+        if self.recording_visible.replace(recording) != recording {
+            unsafe {
+                let _ = SetWindowTextW(
+                    self.settings_button,
+                    if recording { w!("REC") } else { w!("⚙") },
+                );
+                if let Ok(button) =
+                    GetDlgItem(Some(self.settings_window), SETTINGS_RECORDING_ID as i32)
+                {
+                    let _ = SetWindowTextW(
+                        button,
+                        if recording {
+                            w!("Stop recording and save")
+                        } else {
+                            w!("Record video to Downloads")
+                        },
+                    );
+                }
+            }
+        }
         for (id, checked, enabled) in [
             (SETTINGS_AUDIO_ID, self.control.audio_muted(), true),
             (
@@ -463,6 +486,7 @@ unsafe fn show_settings_category(window: HWND, display: bool) {
         SETTINGS_AGENT_INPUT_ID as i32,
         SETTINGS_BLACKOUT_ID as i32,
         SETTINGS_AUDIO_ID as i32,
+        SETTINGS_RECORDING_ID as i32,
     ] {
         if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
             let _ = unsafe { ShowWindow(control, advanced_command) };
@@ -530,6 +554,11 @@ unsafe extern "system" fn settings_window_proc(
                 }
                 if control_id == SETTINGS_REMOTE_CURSOR_ID {
                     context.control.toggle_remote_cursor();
+                    context.refresh_maintenance_controls();
+                    return LRESULT(0);
+                }
+                if control_id == SETTINGS_RECORDING_ID {
+                    context.control.toggle_recording();
                     context.refresh_maintenance_controls();
                     return LRESULT(0);
                 }
@@ -835,6 +864,16 @@ unsafe fn create_settings_window(
         340,
         28,
         SETTINGS_REMOTE_CURSOR_ID,
+    )?;
+    let _ = make_control(
+        w!("BUTTON"),
+        w!("Record video to Downloads"),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        162,
+        270,
+        340,
+        28,
+        SETTINGS_RECORDING_ID,
     )?;
     unsafe { show_settings_category(settings, true) };
     Ok(SettingsControls {
@@ -1274,6 +1313,7 @@ pub(super) unsafe fn create_window(
         chroma_combo: HWND::default(),
         diagnostics_button: HWND::default(),
         settings_button: HWND::default(),
+        recording_visible: std::cell::Cell::new(false),
         file_button: HWND::default(),
         chat_button: HWND::default(),
         secure_attention_button: HWND::default(),
@@ -1604,6 +1644,17 @@ unsafe fn apply_cursor(shape: CursorShape) {
 pub(super) unsafe fn pump_window_messages(window: HWND) -> bool {
     if let Some(context) = unsafe { window_context(window) } {
         context.refresh_maintenance_controls();
+        if let Some(notice) = context.control.recording().take_notice() {
+            let text = HSTRING::from(notice);
+            unsafe {
+                MessageBoxW(
+                    Some(window),
+                    PCWSTR(text.as_ptr()),
+                    w!("Session recording"),
+                    MB_OK,
+                );
+            }
+        }
         if let Some(error) = context.control.take_maintenance_error() {
             let text: Vec<u16> = error.encode_utf16().chain(Some(0)).collect();
             unsafe {

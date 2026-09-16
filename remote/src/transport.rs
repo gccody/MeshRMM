@@ -172,6 +172,7 @@ impl VideoReceiveState {
 /// of stale pointer positions on the reliable control stream.
 #[derive(Clone)]
 struct ViewerControlQueue {
+    recording: crate::recording::Recorder,
     maintenance: Arc<Mutex<crate::platform::MaintenanceState>>,
     files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
@@ -193,6 +194,7 @@ impl ViewerControlQueue {
         resume_state: ViewerResumeState,
     ) -> Self {
         Self {
+            recording: crate::recording::Recorder::default(),
             maintenance: Arc::new(Mutex::new(crate::platform::MaintenanceState::default())),
             files: meshrmm_file_transfer::TransferSession::new(),
             chat: meshrmm_chat::ChatSession::default(),
@@ -318,6 +320,7 @@ pub async fn run_receiver(
     let control_channel = tokio::sync::watch::channel(None::<ServiceChannel>).0;
     let (viewer_control_tx, viewer_control_rx) = mpsc::unbounded_channel::<SessionMessage>();
     let viewer_control = ViewerControlQueue::new(viewer_control_tx, resume_state.clone());
+    let _recording = crate::recording::RecordingGuard(viewer_control.recording.clone());
     let (presentation_failure_tx, mut presentation_failure_rx) =
         mpsc::unbounded_channel::<String>();
     let lifecycle = ReceiverLifecycle {
@@ -1082,6 +1085,7 @@ fn install_control_handler(
                         move |enabled| input_gate.set_input_enabled(enabled),
                         viewer_control.chat.clone(),
                         viewer_control.resume_state.audio.clone(),
+                        viewer_control.recording.clone(),
                         Arc::clone(&viewer_control.resume_state.technician_blocked),
                         Arc::clone(&viewer_control.resume_state.remote_cursor_hidden),
                         Arc::clone(&viewer_control.maintenance),
@@ -1368,6 +1372,9 @@ fn install_video_handler(
                     && let Some(active) = guard.as_ref()
                     && active.stream_id == frame.stream_id
                 {
+                    viewer_control
+                        .recording
+                        .receive(&frame, active.profile.codec);
                     active.presenter.publish(frame, received_at_us);
                 }
                 tracing::trace!(encode_us, received_at_us, "encoded frame reassembled");
