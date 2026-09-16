@@ -343,6 +343,7 @@ define_class!(
                 (if self.ivars().control.technician_blocked() { "Allow technician input" } else { "Block technician input" }, sel!(toggleTechnicianInput:)),
                 (if self.ivars().control.agent_blocked() { "Allow agent input" } else { "Block agent keyboard and mouse" }, sel!(toggleAgentInput:)),
                 (if self.ivars().control.maintenance_state().blacked_out { "Restore agent monitors" } else { "Black out all agent monitors" }, sel!(toggleBlackout:)),
+                (if self.ivars().control.audio_muted() { "Unmute audio" } else { "Mute audio" }, sel!(toggleAudio:)),
                 ("Diagnostics", sel!(toggleDiagnostics:)),
             ] {
                 let item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -363,6 +364,11 @@ define_class!(
             self.ivars().control.set_technician_blocked(blocked);
             self.refresh_cursor();
             self.ivars().control.set_input_enabled(true);
+        }
+
+        #[unsafe(method(toggleAudio:))]
+        fn toggle_audio(&self, _sender: &NSMenuItem) {
+            self.ivars().control.toggle_audio();
         }
 
         #[unsafe(method(toggleBlackout:))]

@@ -278,6 +278,52 @@ async fn run_connected_sender(
         closed: false,
     };
 
+    let audio_channel = peer
+        .create_data_channel(
+            meshrmm_audio::CHANNEL,
+            Some(RTCDataChannelInit {
+                ordered: Some(true),
+                max_retransmits: Some(0),
+                protocol: Some(meshrmm_audio::PROTOCOL.into()),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(8);
+    let audio_capture = super::native_task::NativeTask::spawn(
+        "meshrmm-audio-capture",
+        move |mut stop| async move {
+            let mut stream = None;
+            let mut retry = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                tokio::select! {
+                    _ = stop.changed() => break,
+                    _ = retry.tick() => {
+                        if stream.as_ref().is_some_and(meshrmm_audio::Capture::healthy) { continue; }
+                        stream = None;
+                        let sender = audio_tx.clone();
+                        match meshrmm_audio::capture(move |packet| { let _ = sender.try_send(packet); }) {
+                            Ok(capture) => stream = Some(capture),
+                            Err(error) => tracing::debug!(%error, "system audio unavailable; retrying"),
+                        }
+                    }
+                }
+            }
+        },
+    )?;
+    cleanup.workers.push(audio_capture);
+    let audio_sender = tokio::spawn(async move {
+        while let Some(packet) = audio_rx.recv().await {
+            if audio_channel.ready_state() == RTCDataChannelState::Open
+                && audio_channel.buffered_amount().await < 32_000
+                && audio_channel.send(&Bytes::from(packet)).await.is_err()
+            {
+                break;
+            }
+        }
+    });
+    cleanup.tasks.push(audio_sender.abort_handle());
+
     let video_open = Arc::new(Notify::new());
     let control_open = Arc::new(Notify::new());
     let decoder_ready = Arc::new(Notify::new());
