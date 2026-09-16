@@ -361,3 +361,19 @@ button { color: inherit; }
   overflow-wrap: anywhere;
   text-align: center;
 }
+
+/* Company settings */
+.settings-page { max-width: 960px; }
+.settings-categories { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-bottom: 24px; }
+.settings-categories a { color: var(--purple-dark); font-size: 14px; text-underline-offset: 5px; }
+.company-settings-form fieldset { border: 0; margin: 0; padding: 0; min-width: 0; display: grid; gap: 20px; }
+.settings-section { padding: 26px; border: 1px solid var(--line); border-radius: 14px; background: white; scroll-margin-top: 24px; }
+.settings-section h2 { margin: 0 0 8px; font-size: 18px; }
+.settings-section p { color: var(--muted); font-size: 13px; line-height: 1.6; }
+.settings-section label { display: block; margin-top: 20px; font-size: 14px; line-height: 1.6; }
+.settings-section input[type=checkbox] { width: 17px; height: 17px; margin-right: 8px; accent-color: var(--purple); vertical-align: middle; }
+.settings-section select, .settings-section textarea { display: block; width: 100%; margin-top: 8px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--soft); font: inherit; }
+.settings-section select { max-width: 320px; }
+.settings-section textarea { resize: vertical; }
+.settings-section .blackout-preview { margin: 18px 0; }
+.settings-save { display: flex; justify-content: flex-end; padding: 20px 0; }

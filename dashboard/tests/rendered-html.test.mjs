@@ -67,6 +67,20 @@ test("resolves a provisioned company before rendering its fixed workspace", asyn
   assert.match(html, /Company workspace/);
 });
 
+test("settings has a dedicated route and retains tenant isolation", async () => {
+  const response = await render("/settings", "acme.meshrmm.com", {
+    workos_organization_id: "org_acme",
+  });
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /<title>Settings \| MeshRMM<\/title>/);
+  assert.match(html, /aria-current="page"/);
+  assert.match(html, /Settings categories/);
+  assert.doesNotMatch(html, /id="idle-timeout"/); // No policy values before account authorization.
+  const unknown = await render("/settings", "unknown.meshrmm.com");
+  assert.equal(unknown.status, 404);
+});
+
 test("rejects unknown tenant hostnames before rendering", async () => {
   const response = await render("/", "unknown.meshrmm.com");
   assert.equal(response.status, 404);
