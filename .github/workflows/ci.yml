@@ -34,6 +34,7 @@ jobs:
       - run: cargo check -p meshrmm-server --target wasm32-unknown-unknown
       - run: cargo test -p meshrmm-server
       - run: python3 server/tests/sql_regressions.py
+      - run: python3 -m unittest discover -s scripts/tests -v
 
   dashboard:
     runs-on: ubuntu-latest

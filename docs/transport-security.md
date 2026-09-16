@@ -114,3 +114,21 @@ The subsequent fresh session completed the forced-relay check successfully.
 The test rules had automatic cleanup and were also explicitly removed and
 verified absent. The viewer was disconnected and the Windows service remained
 running and online. No production code changed for this additional validation.
+
+## Strict public TLS follow-up — September 16, 2026
+
+The zone minimum is now **TLS 1.3**, superseding the TLS 1.2 minimum above.
+This removes CBC and static-RSA key exchange without purchasing ACM. TLS
+1.2-only clients are intentionally no longer supported on these public hosts.
+The installed Windows Agent uses rustls and reconnected after a service restart;
+the authenticated Chrome dashboard reloaded and the installed macOS viewer
+redeemed a new handoff and rendered the remote desktop successfully.
+
+The checker now defaults to requiring TLS 1.3, explicitly tests eight CBC and
+static-RSA alternatives, and requires forward secrecy as well as AEAD when
+checking an optional `--minimum-tls 1.2` policy. Its negative probes fail on
+inconclusive network, certificate, or local cipher errors. Six unit tests cover
+these outcomes and run in CI. Before the setting changed the new check exposed
+all eight weak alternatives; afterward all 78 probes across the six public
+hostnames passed. The probes cover the listed alternatives, not every possible
+cipher implementation.
