@@ -255,6 +255,7 @@ fn capture_loop_inner(
     stop: Arc<AtomicBool>,
     started: &mut Option<mpsc::SyncSender<Result<ActiveFormat, String>>>,
 ) -> Result<(), Error> {
+    let origin = crate::display_info(monitor)?;
     let mut duplication = if display_id == crate::ALL_MONITORS_ID {
         None
     } else {
@@ -313,6 +314,14 @@ fn capture_loop_inner(
     if width < 2 || height < 2 {
         return Err(Error::InvalidDisplayDimensions);
     }
+    let cursor_compositor = if config.capture_cursor && duplication.is_some() {
+        Some(crate::cursor::CursorCompositor::new(
+            &device, width, height, origin.x, origin.y,
+        )?)
+    } else {
+        None
+    };
+    let mut separate_cursor_visible = false;
     let format = ActiveFormat {
         width,
         height,
@@ -380,7 +389,7 @@ fn capture_loop_inner(
         }
 
         let desktop_texture = match desktop.as_mut() {
-            Some(desktop) => desktop.capture(&context)?,
+            Some(desktop) => desktop.capture(&context, config.capture_cursor)?,
             None => None,
         };
         let frame = if let Some(duplication) = duplication.as_mut() {
@@ -392,6 +401,11 @@ fn capture_loop_inner(
         } else {
             None
         };
+        if let Some(frame) = frame.as_ref()
+            && frame.frame_info().LastMouseUpdateTime != 0
+        {
+            separate_cursor_visible = frame.frame_info().PointerPosition.Visible.as_bool();
+        }
         let capture_idle = frame.is_none() && desktop_texture.is_none();
         let mut access_units = encoder.poll()?;
         if frame
@@ -409,6 +423,14 @@ fn capture_loop_inner(
             let capture_timestamp_us = monotonic_timestamp_us()?;
             frames_captured += 1;
             if encoder.wants_input() && frame_pacer.allow(capture_timestamp_us) {
+                let texture = if separate_cursor_visible {
+                    match cursor_compositor.as_ref() {
+                        Some(cursor) => cursor.compose(&context, texture)?,
+                        None => texture,
+                    }
+                } else {
+                    texture
+                };
                 let yuv = converter.convert(texture)?;
                 cached_yuv = Some(yuv.clone());
                 access_units.extend(encoder.submit(yuv, capture_timestamp_us)?);

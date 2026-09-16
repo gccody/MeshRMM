@@ -64,6 +64,7 @@ enum ControlCommand {
     },
     Quality(QualityPreset),
     Chroma(ChromaMode),
+    CursorCapture(bool),
     VideoProfileRejected {
         profile: VideoProfile,
         reason: String,
@@ -471,6 +472,9 @@ async fn run_connected_sender(
                         Some(ControlCommand::Quality(preset))
                     }
                     Ok(SessionMessage::SetChroma { mode }) => Some(ControlCommand::Chroma(mode)),
+                    Ok(SessionMessage::SetCursorCapture { enabled }) => {
+                        Some(ControlCommand::CursorCapture(enabled))
+                    }
                     Ok(SessionMessage::VideoProfileRejected { profile, reason }) => {
                         Some(ControlCommand::VideoProfileRejected { profile, reason })
                     }
@@ -717,7 +721,7 @@ async fn run_connected_sender(
                 match command {
                     command @ (ControlCommand::Keyframe | ControlCommand::Bitrate(_)
                         | ControlCommand::Quality(_) | ControlCommand::ViewerCapabilities { .. }
-                        | ControlCommand::Chroma(_) | ControlCommand::VideoProfileRejected { .. }
+                        | ControlCommand::Chroma(_) | ControlCommand::CursorCapture(_) | ControlCommand::VideoProfileRejected { .. }
                         | ControlCommand::SelectDisplay(_)) => {
                         capture_tx.try_send(command).map_err(|_| anyhow::anyhow!("capture command queue full or closed"))?;
                     }
@@ -1048,6 +1052,7 @@ async fn run_capture_control(
     let mut active_profile = format.profile();
     let mut viewer_profiles = vec![active_profile];
     let mut requested_chroma = ChromaMode::Yuv420;
+    let mut capture_cursor = true;
     let mut rejected_profiles = Vec::new();
     let mut capture_running = true;
     let mut capture_unavailable_since = None::<std::time::Instant>;
@@ -1150,6 +1155,32 @@ async fn run_capture_control(
                             },
                         ).await?;
                         tracing::info!(?active_profile, ?quality, bits_per_second = value, "video profile negotiation completed");
+                    }
+                    ControlCommand::CursorCapture(enabled) => {
+                        if capture_cursor == enabled {
+                            continue;
+                        }
+                        capture_cursor = enabled;
+                        lock_streamer(&streamer)?.set_cursor_capture(enabled);
+                        // Reconfigure capture without replacing the remote session or its services.
+                        lock_streamer(&streamer)?.stop()?;
+                        slot.clear();
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                        let candidates = profile_candidates(&viewer_profiles, requested_chroma, &rejected_profiles);
+                        let started = start_first_profile(&streamer, active_display.id, stream_id, &slot, &candidates)?;
+                        displays = started.displays;
+                        active_display = started.active_display;
+                        active_profile = started.format.profile();
+                        format = started.format;
+                        capture_running = true;
+                        capture_unavailable_since = None;
+                        send_control_message(&control_channel, SessionMessage::DisplayConfiguration {
+                            displays: displays.clone(),
+                            active_display_id: active_display.id,
+                            stream_id,
+                            format,
+                        }).await?;
+                        tracing::info!(enabled, "viewer cursor capture selection applied");
                     }
                     ControlCommand::Chroma(chroma) => {
                         requested_chroma = chroma;

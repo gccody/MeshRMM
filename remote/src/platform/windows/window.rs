@@ -62,6 +62,7 @@ const SETTINGS_TECHNICIAN_INPUT_ID: usize = 4223;
 const SETTINGS_AGENT_INPUT_ID: usize = 4224;
 const SETTINGS_BLACKOUT_ID: usize = 4225;
 const SETTINGS_AUDIO_ID: usize = 4226;
+const SETTINGS_REMOTE_CURSOR_ID: usize = 4227;
 
 impl WindowContext {
     fn send(&self, message: SessionMessage) {
@@ -239,6 +240,11 @@ impl WindowContext {
     fn refresh_maintenance_controls(&self) {
         for (id, checked, enabled) in [
             (SETTINGS_AUDIO_ID, self.control.audio_muted(), true),
+            (
+                SETTINGS_REMOTE_CURSOR_ID,
+                self.control.show_remote_cursor(),
+                true,
+            ),
             (
                 SETTINGS_TECHNICIAN_INPUT_ID,
                 self.control.technician_blocked(),
@@ -429,6 +435,7 @@ unsafe fn show_settings_category(window: HWND, display: bool) {
         QUALITY_BEST_ID as i32,
         CHROMA_420_ID as i32,
         CHROMA_444_ID as i32,
+        SETTINGS_REMOTE_CURSOR_ID as i32,
     ] {
         if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
             let _ = unsafe { ShowWindow(control, display_command) };
@@ -503,6 +510,11 @@ unsafe extern "system" fn settings_window_proc(
                 };
                 if let Some(chroma) = chroma {
                     context.set_chroma(chroma);
+                    return LRESULT(0);
+                }
+                if control_id == SETTINGS_REMOTE_CURSOR_ID {
+                    context.control.toggle_remote_cursor();
+                    context.refresh_maintenance_controls();
                     return LRESULT(0);
                 }
                 if control_id == SETTINGS_AUDIO_ID {
@@ -584,7 +596,7 @@ unsafe fn create_settings_window(
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             560,
-            390,
+            430,
             Some(owner),
             None,
             Some(instance),
@@ -785,6 +797,18 @@ unsafe fn create_settings_window(
         340,
         28,
         SETTINGS_AUDIO_ID,
+    )?;
+    let _ = make_control(
+        w!("BUTTON"),
+        w!("Show remote cursor"),
+        WINDOW_STYLE(
+            WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_GROUP.0 | BS_AUTOCHECKBOX as u32,
+        ),
+        162,
+        334,
+        340,
+        28,
+        SETTINGS_REMOTE_CURSOR_ID,
     )?;
     unsafe { show_settings_category(settings, true) };
     Ok(SettingsControls {

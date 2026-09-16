@@ -44,6 +44,7 @@ pub trait ScreenStreamer: Send {
     }
     fn set_codec(&mut self, codec: Codec);
     fn set_chroma(&mut self, chroma: ChromaMode);
+    fn set_cursor_capture(&mut self, enabled: bool);
     fn input_controller(&self) -> Arc<dyn ScreenInput>;
 }
 
@@ -80,6 +81,7 @@ pub struct PlatformScreenStreamer {
     bitrate_bits_per_second: u32,
     codec: Codec,
     chroma: ChromaMode,
+    capture_cursor: bool,
     next_frame_id: Arc<AtomicU64>,
     direct_files: Option<meshrmm_file_transfer::TransferSession>,
     direct_chat: meshrmm_chat::ChatSession,
@@ -114,6 +116,7 @@ impl PlatformScreenStreamer {
             bitrate_bits_per_second,
             codec: Codec::H264,
             chroma: ChromaMode::Yuv420,
+            capture_cursor: true,
             next_frame_id: Arc::new(AtomicU64::new(1)),
             direct_files: (!capture_as_active_user)
                 .then(meshrmm_file_transfer::TransferSession::new),
@@ -164,6 +167,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
             bitrate_bits_per_second: self.bitrate_bits_per_second,
             codec: remote_screen_codec(self.codec),
             pixel_format: remote_screen_pixel_format(self.chroma),
+            capture_cursor: self.capture_cursor,
         };
         match &mut self.inner {
             CaptureBackend::Direct(streamer) => {
@@ -279,6 +283,10 @@ impl ScreenStreamer for PlatformScreenStreamer {
 
     fn set_chroma(&mut self, chroma: ChromaMode) {
         self.chroma = chroma;
+    }
+
+    fn set_cursor_capture(&mut self, enabled: bool) {
+        self.capture_cursor = enabled;
     }
 
     fn input_controller(&self) -> Arc<dyn ScreenInput> {

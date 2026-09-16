@@ -26,6 +26,7 @@ pub struct ControlSink {
     set_input_enabled: Arc<dyn Fn(bool) + Send + Sync>,
     maintenance: Arc<Mutex<MaintenanceState>>,
     technician_blocked: Arc<std::sync::atomic::AtomicBool>,
+    remote_cursor_hidden: Arc<std::sync::atomic::AtomicBool>,
     quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
     chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
     #[cfg(windows)]
@@ -42,6 +43,7 @@ impl ControlSink {
         chat: meshrmm_chat::ChatSession,
         audio: meshrmm_audio::PlaybackState,
         technician_blocked: Arc<std::sync::atomic::AtomicBool>,
+        remote_cursor_hidden: Arc<std::sync::atomic::AtomicBool>,
         maintenance: Arc<Mutex<MaintenanceState>>,
         quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
         chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
@@ -52,6 +54,7 @@ impl ControlSink {
             chat,
             audio,
             technician_blocked,
+            remote_cursor_hidden,
             maintenance,
             send: Arc::new(send),
             set_input_enabled: Arc::new(set_input_enabled),
@@ -140,6 +143,21 @@ impl ControlSink {
     pub fn technician_blocked(&self) -> bool {
         self.technician_blocked
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn show_remote_cursor(&self) -> bool {
+        !self
+            .remote_cursor_hidden
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn toggle_remote_cursor(&self) {
+        let was_hidden = self
+            .remote_cursor_hidden
+            .fetch_xor(true, std::sync::atomic::Ordering::SeqCst);
+        self.send(meshrmm_protocol::SessionMessage::SetCursorCapture {
+            enabled: was_hidden,
+        });
     }
 
     pub fn effective_cursor_shape(

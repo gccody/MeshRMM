@@ -7,10 +7,6 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Gdi::*;
 
-use windows::Win32::UI::WindowsAndMessaging::{
-    CURSOR_SHOWING, CURSORINFO, DI_NORMAL, DrawIconEx, GetCursorInfo, GetIconInfo, HICON, ICONINFO,
-};
-
 use crate::{ALL_MONITORS_ID, DisplayInfo, Error, enumerate_displays};
 
 pub(crate) struct DesktopCapture {
@@ -131,6 +127,7 @@ impl DesktopCapture {
     pub fn capture(
         &mut self,
         context: &ID3D11DeviceContext,
+        capture_cursor: bool,
     ) -> Result<Option<ID3D11Texture2D>, Error> {
         let now = Instant::now();
         if now < self.next_frame {
@@ -173,32 +170,8 @@ impl DesktopCapture {
                     SRCCOPY | CAPTUREBLT,
                 )?;
             }
-            let mut cursor = CURSORINFO {
-                cbSize: std::mem::size_of::<CURSORINFO>() as u32,
-                ..Default::default()
-            };
-            if GetCursorInfo(&mut cursor).is_ok() && cursor.flags == CURSOR_SHOWING {
-                let mut icon = ICONINFO::default();
-                if GetIconInfo(HICON(cursor.hCursor.0), &mut icon).is_ok() {
-                    let result = DrawIconEx(
-                        self.memory,
-                        cursor.ptScreenPos.x - self.bounds.x - icon.xHotspot as i32,
-                        cursor.ptScreenPos.y - self.bounds.y - icon.yHotspot as i32,
-                        HICON(cursor.hCursor.0),
-                        0,
-                        0,
-                        0,
-                        None,
-                        DI_NORMAL,
-                    );
-                    if !icon.hbmMask.is_invalid() {
-                        let _ = DeleteObject(HGDIOBJ(icon.hbmMask.0));
-                    }
-                    if !icon.hbmColor.is_invalid() {
-                        let _ = DeleteObject(HGDIOBJ(icon.hbmColor.0));
-                    }
-                    result?;
-                }
+            if capture_cursor {
+                crate::cursor::draw_cursor(self.memory, self.bounds.x, self.bounds.y)?;
             }
             GdiFlush().ok()?;
             context.UpdateSubresource(&self.texture, 0, None, self.pixels, self.width() * 4, 0);

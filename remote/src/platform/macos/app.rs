@@ -344,6 +344,7 @@ define_class!(
                 (if self.ivars().control.agent_blocked() { "Allow agent input" } else { "Block agent keyboard and mouse" }, sel!(toggleAgentInput:)),
                 (if self.ivars().control.maintenance_state().blacked_out { "Restore agent monitors" } else { "Black out all agent monitors" }, sel!(toggleBlackout:)),
                 (if self.ivars().control.audio_muted() { "Unmute audio" } else { "Mute audio" }, sel!(toggleAudio:)),
+                ("Show remote cursor", sel!(toggleRemoteCursor:)),
                 ("Diagnostics", sel!(toggleDiagnostics:)),
             ] {
                 let item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -352,6 +353,7 @@ define_class!(
                 unsafe { item.setTarget(Some(self)); }
                 if action == sel!(toggleAgentInput:) || action == sel!(toggleBlackout:) { item.setEnabled(self.ivars().control.maintenance_state().available); }
                 if action == sel!(toggleAgentInput:) && self.ivars().control.maintenance_state().blacked_out { item.setEnabled(false); }
+                if action == sel!(toggleRemoteCursor:) { item.setState(isize::from(self.ivars().control.show_remote_cursor())); }
                 menu.addItem(&item);
             }
             menu.popUpMenuPositioningItem_atLocation_inView(None, NSPoint::new(0., 0.), Some(sender));
@@ -364,6 +366,11 @@ define_class!(
             self.ivars().control.set_technician_blocked(blocked);
             self.refresh_cursor();
             self.ivars().control.set_input_enabled(true);
+        }
+
+        #[unsafe(method(toggleRemoteCursor:))]
+        fn toggle_remote_cursor(&self, _sender: &NSMenuItem) {
+            self.ivars().control.toggle_remote_cursor();
         }
 
         #[unsafe(method(toggleAudio:))]

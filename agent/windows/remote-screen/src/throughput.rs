@@ -124,6 +124,7 @@ fn desktop_capture_throughput() {
                 bitrate_bits_per_second: 12_000_000,
                 codec: VideoCodec::H265,
                 pixel_format: VideoPixelFormat::Yuv420,
+                capture_cursor: true,
             },
             display,
             Arc::new(move |frame| {

@@ -118,6 +118,10 @@ pub enum SessionMessage {
     },
     /// Dedicated service-stream capability; appended to preserve existing tags.
     ServiceChannelReady,
+    /// Include the Agent's actual cursor in captured video. Appended for wire compatibility.
+    SetCursorCapture {
+        enabled: bool,
+    },
 }
 
 impl SessionMessage {
@@ -315,6 +319,26 @@ mod tests {
 
         let encoded = message.encode().unwrap();
         assert_eq!(SessionMessage::decode(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn cursor_capture_round_trips_without_changing_cursor_shape_messages() {
+        for enabled in [false, true] {
+            let message = SessionMessage::SetCursorCapture { enabled };
+            assert_eq!(
+                SessionMessage::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+        }
+        // The existing cursor-shape postcard discriminant must remain unchanged.
+        assert_eq!(
+            SessionMessage::CursorShape {
+                shape: CursorShape::Text
+            }
+            .encode()
+            .unwrap(),
+            vec![11, 1]
+        );
     }
 
     #[test]
