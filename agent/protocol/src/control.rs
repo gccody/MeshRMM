@@ -122,6 +122,10 @@ pub enum SessionMessage {
     SetCursorCapture {
         enabled: bool,
     },
+    /// Session wallpaper preference; appended to preserve postcard tags.
+    SetWallpaperHidden {
+        hidden: bool,
+    },
 }
 
 impl SessionMessage {
@@ -361,6 +365,23 @@ mod tests {
 
         let encoded = message.encode().unwrap();
         assert_eq!(SessionMessage::decode(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn wallpaper_preference_round_trips_and_keeps_existing_tags() {
+        for hidden in [false, true] {
+            let message = SessionMessage::SetWallpaperHidden { hidden };
+            assert_eq!(
+                SessionMessage::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+        }
+        assert_eq!(
+            SessionMessage::SetCursorCapture { enabled: true }
+                .encode()
+                .unwrap(),
+            vec![27, 1]
+        );
     }
 
     #[test]

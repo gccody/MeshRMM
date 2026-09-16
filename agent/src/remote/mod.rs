@@ -25,6 +25,8 @@ mod signaling;
 mod transport;
 #[cfg(windows)]
 mod video;
+#[cfg(windows)]
+mod wallpaper;
 
 #[cfg(windows)]
 use std::time::Duration;

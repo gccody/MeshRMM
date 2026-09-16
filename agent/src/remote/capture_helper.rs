@@ -111,6 +111,7 @@ enum ParentCommand {
     RequestKeyframe,
     SetBitrate(u32),
     SetCursorCapture(bool),
+    SetWallpaperHidden(bool),
     StartInput {
         viewer_name: String,
         display_id: DisplayId,
@@ -197,6 +198,7 @@ pub struct DesktopCaptureStreamer {
     files: HelperFiles,
     chat: HelperChat,
     maintenance: HelperMaintenance,
+    wallpaper_hidden: Arc<AtomicBool>,
     chat_enabled: Arc<AtomicBool>,
 }
 
@@ -220,6 +222,7 @@ impl DesktopCaptureStreamer {
             files: Arc::new(FileEvents::default()),
             chat: Arc::new(ChatEvents::default()),
             maintenance: Arc::new(Mutex::new(None)),
+            wallpaper_hidden: Arc::new(AtomicBool::new(false)),
             chat_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -439,6 +442,7 @@ impl DesktopCaptureStreamer {
             files: Arc::clone(&self.files),
             chat: Arc::clone(&self.chat),
             maintenance: Arc::clone(&self.maintenance),
+            wallpaper_hidden: Arc::clone(&self.wallpaper_hidden),
             chat_enabled: Arc::clone(&self.chat_enabled),
         })
     }
@@ -509,7 +513,14 @@ impl DesktopCaptureStreamer {
                 HelperKind::Files,
             ) {
                 Ok(helper) => {
-                    *self.file_route.lock().unwrap() = Some(Arc::clone(&helper.input));
+                    let mut route = self.file_route.lock().unwrap();
+                    send_command(
+                        &helper.input,
+                        &ParentCommand::SetWallpaperHidden(
+                            self.wallpaper_hidden.load(Ordering::Acquire),
+                        ),
+                    )?;
+                    *route = Some(Arc::clone(&helper.input));
                     self.file_helper = Some(helper);
                 }
                 Err(error) => {
@@ -729,10 +740,19 @@ struct DesktopInputController {
     files: HelperFiles,
     chat: HelperChat,
     maintenance: HelperMaintenance,
+    wallpaper_hidden: Arc<AtomicBool>,
     chat_enabled: Arc<AtomicBool>,
 }
 
 impl ScreenInput for DesktopInputController {
+    fn set_wallpaper_hidden(&self, hidden: bool) -> anyhow::Result<()> {
+        let route = self.file_route.lock().unwrap_or_else(|e| e.into_inner());
+        self.wallpaper_hidden.store(hidden, Ordering::Release);
+        if let Some(writer) = route.as_ref() {
+            send_command(writer, &ParentCommand::SetWallpaperHidden(hidden))?;
+        }
+        Ok(())
+    }
     fn set_blackout(&self, enabled: bool) -> anyhow::Result<()> {
         let writer = self
             .route
@@ -1611,6 +1631,7 @@ fn run_capture_child(
                     | ParentCommand::StartChatHelper { .. }
                     | ParentCommand::StartInput { .. }
                     | ParentCommand::Input(_)
+                    | ParentCommand::SetWallpaperHidden(_)
                     | ParentCommand::Blackout { .. }
                     | ParentCommand::BlockInput(_)
                     | ParentCommand::ReleaseInput
@@ -1801,6 +1822,7 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
                 .and_then(|()| writer.write_all(&[u8::from(*capture_cursor)]))
                 .and_then(|()| writer.write_all(&[u8::from(*grayscale)]))
         }
+        ParentCommand::SetWallpaperHidden(hidden) => writer.write_all(&[19, u8::from(*hidden)]),
         ParentCommand::SetCursorCapture(enabled) => writer.write_all(&[18, u8::from(*enabled)]),
         ParentCommand::RequestKeyframe => writer.write_all(&[COMMAND_REQUEST_KEYFRAME]),
         ParentCommand::SetBitrate(bits_per_second) => {
@@ -1895,6 +1917,7 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
                 grayscale: read_bool(&mut reader)?,
             })
         }
+        19 => Ok(ParentCommand::SetWallpaperHidden(read_bool(&mut reader)?)),
         18 => Ok(ParentCommand::SetCursorCapture(read_bool(&mut reader)?)),
         COMMAND_REQUEST_KEYFRAME => Ok(ParentCommand::RequestKeyframe),
         COMMAND_SET_BITRATE => Ok(ParentCommand::SetBitrate(read_u32(&mut reader)?)),
@@ -2536,6 +2559,25 @@ mod tests {
     }
 
     #[test]
+    fn wallpaper_commands_preserve_pipe_alignment_and_reject_invalid_flags() {
+        for hidden in [false, true] {
+            let mut bytes = Vec::new();
+            write_command(&mut bytes, &ParentCommand::SetWallpaperHidden(hidden)).unwrap();
+            write_command(&mut bytes, &ParentCommand::Stop).unwrap();
+            let mut reader = bytes.as_slice();
+            assert!(
+                matches!(read_command(&mut reader).unwrap(), ParentCommand::SetWallpaperHidden(value) if value == hidden)
+            );
+            assert!(matches!(
+                read_command(&mut reader).unwrap(),
+                ParentCommand::Stop
+            ));
+            assert!(reader.is_empty());
+        }
+        assert!(read_command([19, 2].as_slice()).is_err());
+    }
+
+    #[test]
     fn cursor_ownership_and_visibility_round_trip_without_desynchronizing_ipc() {
         for viewer in [false, true] {
             let mut bytes = Vec::new();
@@ -2749,6 +2791,7 @@ mod tests {
     fn command_name(command: &ParentCommand) -> u8 {
         match command {
             ParentCommand::Start { .. } => COMMAND_START,
+            ParentCommand::SetWallpaperHidden(_) => 19,
             ParentCommand::SetCursorCapture(_) => 18,
             ParentCommand::RequestKeyframe => COMMAND_REQUEST_KEYFRAME,
             ParentCommand::SetBitrate(_) => COMMAND_SET_BITRATE,
@@ -2830,6 +2873,7 @@ fn read_file_message(mut reader: impl Read) -> io::Result<meshrmm_protocol::File
 }
 
 fn run_file_child(commands: mpsc::Receiver<io::Result<ParentCommand>>) -> anyhow::Result<()> {
+    let mut wallpaper = None;
     meshrmm_file_transfer::windows::set_displays(enumerate_displays()?);
     meshrmm_file_transfer::TransferSession::run_on_current_thread(move |files| {
         let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
@@ -2842,6 +2886,12 @@ fn run_file_child(commands: mpsc::Receiver<io::Result<ParentCommand>>) -> anyhow
                 loop {
                     tokio::select! {
                         command = commands.recv() => match command {
+                            Some(Ok(ParentCommand::SetWallpaperHidden(hidden))) => {
+                                if let Err(error) = super::wallpaper::set_hidden(&mut wallpaper, hidden) {
+                                    tracing::warn!(%error, "wallpaper update failed");
+                                    emit_child_event(&output, ChildEvent::MaintenanceError(format!("Wallpaper: {error:#}")))?;
+                                }
+                            }
                             Some(Ok(ParentCommand::Files(message))) => files.receive(message),
                             Some(Ok(ParentCommand::Stop)) | None => break,
                             _ => anyhow::bail!("file helper received an unexpected command"),
