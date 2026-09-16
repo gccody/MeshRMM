@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::RemoteSessionId;
 
+pub fn default_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IceServer {
     pub urls: Vec<String>,
@@ -13,6 +17,8 @@ pub struct IceServer {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionBootstrap {
+    #[serde(default = "default_enabled")]
+    pub display_border: bool,
     pub session_id: RemoteSessionId,
     pub signaling_token: String,
     pub expires_at_unix_ms: u64,
@@ -88,6 +94,24 @@ pub struct ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn border_defaults_on_for_legacy_bootstraps_and_preserves_false() {
+        let mut value = serde_json::json!({"session_id":"s", "signaling_token":"t", "expires_at_unix_ms":1, "ice_servers":[]});
+        assert!(
+            serde_json::from_value::<SessionBootstrap>(value.clone())
+                .unwrap()
+                .display_border
+        );
+        value["display_border"] = serde_json::json!(false);
+        let bootstrap: SessionBootstrap = serde_json::from_value(value).unwrap();
+        assert!(!bootstrap.display_border);
+        assert_eq!(
+            serde_json::from_str::<SessionBootstrap>(&serde_json::to_string(&bootstrap).unwrap())
+                .unwrap(),
+            bootstrap
+        );
+    }
 
     #[test]
     fn session_names_survive_transport_and_legacy_requests_still_decode() {

@@ -32,6 +32,8 @@ struct Company {
     name: String,
     dashboard_idle_timeout_minutes: u32,
     blackout_message: String,
+    #[serde(deserialize_with = "deserialize_sql_bool")]
+    display_border: bool,
     slug: Option<String>,
     status: String,
 }
@@ -134,6 +136,7 @@ struct AccountResponse {
 struct UpdateCompanySettingsRequest {
     dashboard_idle_timeout_minutes: u32,
     blackout_message: Option<String>,
+    display_border: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +191,7 @@ struct HandoffResponse {
 #[derive(Debug, Serialize)]
 struct SessionInit<'a> {
     blackout_message: &'a str,
+    display_border: bool,
     viewer_name: &'a str,
     session_id: &'a str,
     device_id: &'a str,
@@ -505,7 +509,7 @@ async fn authorize_platform_owner(request: &Request, environment: &Env) -> Resul
 async fn ensure_company_exists(db: &D1Database, company_id: &str) -> Result<()> {
     if query!(
         db,
-        "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, slug, status FROM companies WHERE id = ?1",
+        "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, display_border, slug, status FROM companies WHERE id = ?1",
         company_id
     )?
     .first::<Company>(None)
@@ -604,5 +608,32 @@ mod tests {
         assert!(validate_dashboard_idle_timeout(1440).is_ok());
         assert!(validate_dashboard_idle_timeout(4).is_err());
         assert!(validate_dashboard_idle_timeout(1441).is_err());
+    }
+}
+
+// D1 returns SQLite booleans as integers; API responses remain JSON booleans.
+fn deserialize_sql_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error> {
+    match u8::deserialize(deserializer)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(serde::de::Error::custom("expected SQLite boolean 0 or 1")),
+    }
+}
+
+#[cfg(test)]
+mod company_policy_tests {
+    use super::*;
+    #[test]
+    fn sqlite_flags_are_exposed_as_json_booleans() {
+        for enabled in [0, 1] {
+            let row = serde_json::json!({"id":"c","name":"Company","dashboard_idle_timeout_minutes":60,"blackout_message":"Maintenance","display_border":enabled,"slug":"company","status":"active"});
+            let company: Company = serde_json::from_value(row).unwrap();
+            assert_eq!(
+                serde_json::to_value(company).unwrap()["display_border"],
+                enabled == 1
+            );
+        }
     }
 }

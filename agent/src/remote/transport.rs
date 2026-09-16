@@ -65,6 +65,7 @@ enum ControlCommand {
     Quality(QualityPreset),
     Chroma(ChromaMode),
     CursorCapture(bool),
+    DisplayBorder(bool),
     InputOwnership(bool),
     VideoProfileRejected {
         profile: VideoProfile,
@@ -498,6 +499,9 @@ async fn run_connected_sender(
                         Some(ControlCommand::Quality(preset))
                     }
                     Ok(SessionMessage::SetChroma { mode }) => Some(ControlCommand::Chroma(mode)),
+                    Ok(SessionMessage::SetDisplayBorder { enabled }) => {
+                        Some(ControlCommand::DisplayBorder(enabled))
+                    }
                     Ok(SessionMessage::SetCursorCapture { enabled }) => {
                         Some(ControlCommand::CursorCapture(enabled))
                     }
@@ -748,7 +752,7 @@ async fn run_connected_sender(
                 match command {
                     command @ (ControlCommand::Keyframe | ControlCommand::Bitrate(_)
                         | ControlCommand::Quality(_) | ControlCommand::ViewerCapabilities { .. }
-                        | ControlCommand::Chroma(_) | ControlCommand::CursorCapture(_) | ControlCommand::InputOwnership(_) | ControlCommand::VideoProfileRejected { .. }
+                        | ControlCommand::DisplayBorder(_) | ControlCommand::Chroma(_) | ControlCommand::CursorCapture(_) | ControlCommand::InputOwnership(_) | ControlCommand::VideoProfileRejected { .. }
                         | ControlCommand::SelectDisplay(_)) => {
                         capture_tx.try_send(command).map_err(|_| anyhow::anyhow!("capture command queue full or closed"))?;
                     }
@@ -1195,6 +1199,12 @@ async fn run_capture_control(
                             },
                         ).await?;
                         tracing::info!(?active_profile, ?quality, bits_per_second = value, "video quality/profile selection applied");
+                    }
+                    ControlCommand::DisplayBorder(enabled) => {
+                        let result = lock_streamer(&streamer)?.set_display_border(enabled);
+                        if let Err(error) = result {
+                            send_control_message(&control_channel, SessionMessage::MaintenanceError { reason: format!("Display border: {error:#}") }).await?;
+                        }
                     }
                     ControlCommand::CursorCapture(enabled) | ControlCommand::InputOwnership(enabled) => {
                         if matches!(command, ControlCommand::CursorCapture(_)) {

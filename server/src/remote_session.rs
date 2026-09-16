@@ -17,6 +17,8 @@ fn default_idle_timeout_ms() -> u64 {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionRecord {
+    #[serde(default = "meshrmm_protocol_types::default_enabled")]
+    display_border: bool,
     #[serde(default)]
     blackout_message: String,
     #[serde(default)]
@@ -310,6 +312,7 @@ impl RemoteSession {
             record.expires_at_unix_ms
         );
         Response::from_json(&SessionBootstrap {
+            display_border: record.display_border,
             session_id: RemoteSessionId::new(record.session_id),
             signaling_token: record.client_token,
             expires_at_unix_ms: record.expires_at_unix_ms,

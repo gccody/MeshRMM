@@ -41,7 +41,7 @@ import { PlatformDashboard } from "../features/platform/platform-dashboard";
 
 const DEFAULT_BLACKOUT_MESSAGE = "This machine is under maintenance by {user_name}.";
 
-type Company = { blackout_message: string; id: string; name: string; slug: string | null; status: string; dashboard_idle_timeout_minutes: number };
+type Company = { display_border: boolean; blackout_message: string; id: string; name: string; slug: string | null; status: string; dashboard_idle_timeout_minutes: number };
 type Account = {
   user_id: string;
   company: Company | null;
@@ -102,6 +102,7 @@ function TenantDashboard() {
   const [installerError, setInstallerError] = useState<string | null>(null);
   const [sessionPauseReason, setSessionPauseReason] = useState<SessionPauseReason | null>(null);
   const [isResumingSession, setIsResumingSession] = useState(false);
+  const [displayBorderDraft, setDisplayBorderDraft] = useState(true);
   const [blackoutMessageDraft, setBlackoutMessageDraft] = useState(DEFAULT_BLACKOUT_MESSAGE);
   const [idleTimeoutDraft, setIdleTimeoutDraft] = useState(DEFAULT_IDLE_TIMEOUT_MINUTES);
   const [isSavingSessionPolicy, setIsSavingSessionPolicy] = useState(false);
@@ -195,6 +196,7 @@ function TenantDashboard() {
     setAccount(data);
     setIdleTimeoutDraft(data.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES);
     setBlackoutMessageDraft(data.company?.blackout_message ?? DEFAULT_BLACKOUT_MESSAGE);
+    setDisplayBorderDraft(data.company?.display_border ?? true);
     return data;
   }, [authorizedFetch, hasTenantSession]);
 
@@ -236,7 +238,7 @@ function TenantDashboard() {
       const response = await authorizedFetch("/v1/company/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ dashboard_idle_timeout_minutes: idleTimeoutDraft, blackout_message: blackoutMessageDraft }),
+        body: JSON.stringify({ dashboard_idle_timeout_minutes: idleTimeoutDraft, blackout_message: blackoutMessageDraft, display_border: displayBorderDraft }),
       });
       if (!response.ok) {
         throw new Error(await errorMessage(response, "The session policy could not be saved."));
@@ -245,6 +247,7 @@ function TenantDashboard() {
       setAccount(data);
       setIdleTimeoutDraft(data.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES);
     setBlackoutMessageDraft(data.company?.blackout_message ?? DEFAULT_BLACKOUT_MESSAGE);
+    setDisplayBorderDraft(data.company?.display_border ?? true);
     } catch (requestError) {
       if (!(requestError instanceof AuthenticationRequired)) {
         setError(requestError instanceof Error ? requestError.message : "The session policy could not be saved.");
@@ -522,7 +525,7 @@ function TenantDashboard() {
         </div>
       </main>
 
-      {isAuthOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsAuthOpen(false)}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="account-title"><button className="modal-close" onClick={() => setIsAuthOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><ShieldCheck size={22} /></div><p className="eyebrow">Authenticated</p><h2 id="account-title">WorkOS account</h2><p>Your session is restricted to the company represented by this URL.</p>{user ? <><div className="account-summary"><div className="profile-avatar">{initials}</div><div><strong>{displayName}</strong><span>{user.email}</span></div></div>{account?.company && <div className="session-policy"><div className="session-policy-heading"><Clock3 size={16} /><div><strong>Company idle timeout</strong><span>Currently {formatIdleTimeout(idleTimeoutMinutes)}</span></div></div>{isAdmin ? <form onSubmit={saveSessionPolicy}><label htmlFor="idle-timeout">Sign out inactive dashboards after<select id="idle-timeout" value={idleTimeoutDraft} onChange={(event) => setIdleTimeoutDraft(Number(event.target.value))}><option value={5}>5 minutes</option><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={120}>2 hours</option><option value={240}>4 hours</option><option value={480}>8 hours</option><option value={720}>12 hours</option><option value={1440}>24 hours</option></select></label><label htmlFor="blackout-message">Agent blackout message<textarea id="blackout-message" rows={4} required maxLength={2048} value={blackoutMessageDraft} onChange={(event) => setBlackoutMessageDraft(event.target.value)} aria-describedby="blackout-message-help" /></label><p id="blackout-message-help">Use {"{user_name}"} for the technician’s banner name. Applies to new remote sessions. Maximum 2048 UTF-8 bytes.</p><div className="blackout-preview" aria-label="Blackout message preview">{blackoutMessageDraft.replaceAll("{user_name}", displayName)}</div><button type="button" className="secondary-button" onClick={() => setBlackoutMessageDraft(DEFAULT_BLACKOUT_MESSAGE)}>Restore default message</button><button className="primary-button" disabled={isSavingSessionPolicy || !blackoutMessageDraft.trim() || new TextEncoder().encode(blackoutMessageDraft).length > 2048 || (idleTimeoutDraft === idleTimeoutMinutes && blackoutMessageDraft === (account?.company?.blackout_message ?? DEFAULT_BLACKOUT_MESSAGE))}>{isSavingSessionPolicy ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save company settings</button></form> : <p>Only a company administrator can change this policy.</p>}</div>}<button className="secondary-button modal-submit" onClick={handleSignOut}><LogOut size={16} /> Sign out</button></> : <button className="primary-button modal-submit" onClick={() => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } })}><ShieldCheck size={16} /> Continue with WorkOS</button>}</section></div>}
+      {isAuthOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsAuthOpen(false)}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="account-title"><button className="modal-close" onClick={() => setIsAuthOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><ShieldCheck size={22} /></div><p className="eyebrow">Authenticated</p><h2 id="account-title">WorkOS account</h2><p>Your session is restricted to the company represented by this URL.</p>{user ? <><div className="account-summary"><div className="profile-avatar">{initials}</div><div><strong>{displayName}</strong><span>{user.email}</span></div></div>{account?.company && <div className="session-policy"><div className="session-policy-heading"><Clock3 size={16} /><div><strong>Company idle timeout</strong><span>Currently {formatIdleTimeout(idleTimeoutMinutes)}</span></div></div>{isAdmin ? <form onSubmit={saveSessionPolicy}><label htmlFor="idle-timeout">Sign out inactive dashboards after<select id="idle-timeout" value={idleTimeoutDraft} onChange={(event) => setIdleTimeoutDraft(Number(event.target.value))}><option value={5}>5 minutes</option><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={120}>2 hours</option><option value={240}>4 hours</option><option value={480}>8 hours</option><option value={720}>12 hours</option><option value={1440}>24 hours</option></select></label><label><input type="checkbox" checked={displayBorderDraft} onChange={(event) => setDisplayBorderDraft(event.target.checked)} /> Highlight the viewed monitor on the remote device by default</label><label htmlFor="blackout-message">Agent blackout message<textarea id="blackout-message" rows={4} required maxLength={2048} value={blackoutMessageDraft} onChange={(event) => setBlackoutMessageDraft(event.target.value)} aria-describedby="blackout-message-help" /></label><p id="blackout-message-help">Use {"{user_name}"} for the technician’s banner name. Applies to new remote sessions. Maximum 2048 UTF-8 bytes.</p><div className="blackout-preview" aria-label="Blackout message preview">{blackoutMessageDraft.replaceAll("{user_name}", displayName)}</div><button type="button" className="secondary-button" onClick={() => setBlackoutMessageDraft(DEFAULT_BLACKOUT_MESSAGE)}>Restore default message</button><button className="primary-button" disabled={isSavingSessionPolicy || !blackoutMessageDraft.trim() || new TextEncoder().encode(blackoutMessageDraft).length > 2048 || (displayBorderDraft === (account?.company?.display_border ?? true) && idleTimeoutDraft === idleTimeoutMinutes && blackoutMessageDraft === (account?.company?.blackout_message ?? DEFAULT_BLACKOUT_MESSAGE))}>{isSavingSessionPolicy ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save company settings</button></form> : <p>Only a company administrator can change this policy.</p>}</div>}<button className="secondary-button modal-submit" onClick={handleSignOut}><LogOut size={16} /> Sign out</button></> : <button className="primary-button modal-submit" onClick={() => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } })}><ShieldCheck size={16} /> Continue with WorkOS</button>}</section></div>}
 
       {isAgentOpen && (
         <EnrollmentModal
