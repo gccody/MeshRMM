@@ -56,6 +56,7 @@ struct ReceiverLifecycle {
 /// transports after a network change or remote reboot.
 #[derive(Clone, Default)]
 pub struct ViewerResumeState {
+    idle: Arc<Mutex<crate::platform::IdlePreference>>,
     display_border: Arc<Mutex<Option<bool>>>,
     technician_blocked: Arc<AtomicBool>,
     remote_cursor_hidden: Arc<AtomicBool>,
@@ -309,6 +310,11 @@ pub async fn run_receiver(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert(bootstrap.display_border);
+    resume_state
+        .idle
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .policy = bootstrap.idle_policy;
     let debug = DebugInfo::new(bootstrap.session_id.as_str());
     let url = session_signal_url(&config.server, bootstrap.session_id.as_str())?;
     let socket = authenticated_websocket(url, &bootstrap.signaling_token).await?;
@@ -1088,6 +1094,7 @@ fn install_control_handler(
                                 && displays.iter().any(|display| display.id == *selected)
                         });
                     let sink = ControlSink::new(
+                        Arc::clone(&viewer_control.resume_state.idle),
                         Arc::clone(&viewer_control.resume_state.display_border),
                         viewer_control.files.clone(),
                         move |message| message_queue.send(message),
@@ -1162,6 +1169,7 @@ fn install_control_handler(
                         // bootstrap profile. Negotiate the best common profile
                         // before creating a visible presenter; the Agent echoes a
                         // settled configuration even when that profile is retained.
+                        viewer_control.send(SessionMessage::SetPreventIdleLock { enabled: sink.prevent_idle_lock() });
                         viewer_control.send(SessionMessage::SetDisplayBorder { enabled: sink.display_border() });
                         viewer_control.send(SessionMessage::SetWallpaperHidden { hidden: sink.wallpaper_hidden() });
                         viewer_control.send(SessionMessage::SetCursorCapture {

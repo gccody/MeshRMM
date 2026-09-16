@@ -113,6 +113,7 @@ enum ParentCommand {
     SetCursorCapture(bool),
     SetDisplayBorder(bool),
     SetWallpaperHidden(bool),
+    SetPreventIdleLock(bool),
     StartInput {
         viewer_name: String,
         display_id: DisplayId,
@@ -200,6 +201,7 @@ pub struct DesktopCaptureStreamer {
     chat: HelperChat,
     maintenance: HelperMaintenance,
     wallpaper_hidden: Arc<AtomicBool>,
+    prevent_idle_lock: Arc<AtomicBool>,
     chat_enabled: Arc<AtomicBool>,
 }
 
@@ -224,6 +226,7 @@ impl DesktopCaptureStreamer {
             chat: Arc::new(ChatEvents::default()),
             maintenance: Arc::new(Mutex::new(None)),
             wallpaper_hidden: Arc::new(AtomicBool::new(false)),
+            prevent_idle_lock: Arc::new(AtomicBool::new(false)),
             chat_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -453,6 +456,7 @@ impl DesktopCaptureStreamer {
             chat: Arc::clone(&self.chat),
             maintenance: Arc::clone(&self.maintenance),
             wallpaper_hidden: Arc::clone(&self.wallpaper_hidden),
+            prevent_idle_lock: Arc::clone(&self.prevent_idle_lock),
             chat_enabled: Arc::clone(&self.chat_enabled),
         })
     }
@@ -628,10 +632,15 @@ impl DesktopCaptureStreamer {
             Arc::clone(&self.maintenance),
             HelperKind::Input,
         )?;
-        *self
+        let mut route = self
             .input_route
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&helper.input));
+            .unwrap_or_else(|error| error.into_inner());
+        send_command(
+            &helper.input,
+            &ParentCommand::SetPreventIdleLock(self.prevent_idle_lock.load(Ordering::Acquire)),
+        )?;
+        *route = Some(Arc::clone(&helper.input));
         self.input = Some(helper);
         Ok(())
     }
@@ -751,10 +760,19 @@ struct DesktopInputController {
     chat: HelperChat,
     maintenance: HelperMaintenance,
     wallpaper_hidden: Arc<AtomicBool>,
+    prevent_idle_lock: Arc<AtomicBool>,
     chat_enabled: Arc<AtomicBool>,
 }
 
 impl ScreenInput for DesktopInputController {
+    fn set_prevent_idle_lock(&self, enabled: bool) -> anyhow::Result<()> {
+        let route = self.route.lock().unwrap_or_else(|e| e.into_inner());
+        self.prevent_idle_lock.store(enabled, Ordering::Release);
+        if let Some(writer) = route.as_ref() {
+            send_command(writer, &ParentCommand::SetPreventIdleLock(enabled))?;
+        }
+        Ok(())
+    }
     fn set_wallpaper_hidden(&self, hidden: bool) -> anyhow::Result<()> {
         let route = self.file_route.lock().unwrap_or_else(|e| e.into_inner());
         self.wallpaper_hidden.store(hidden, Ordering::Release);
@@ -1670,6 +1688,7 @@ fn run_capture_child(
                     | ParentCommand::StartInput { .. }
                     | ParentCommand::Input(_)
                     | ParentCommand::SetWallpaperHidden(_)
+                    | ParentCommand::SetPreventIdleLock(_)
                     | ParentCommand::Blackout { .. }
                     | ParentCommand::BlockInput(_)
                     | ParentCommand::ReleaseInput
@@ -1709,6 +1728,7 @@ fn run_input_child(
         .into_iter()
         .find(|display| display.id == display_id)
         .context("input helper could not find the selected display")?;
+    let mut keep_awake = None;
     let mut input = WindowsInputController::new();
     input.set_active_display(active_display)?;
     let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
@@ -1736,6 +1756,14 @@ fn run_input_child(
             sent_cursor = Some(cursor);
         }
         match command_rx.recv_timeout(Duration::from_millis(16)) {
+            Ok(Ok(ParentCommand::SetPreventIdleLock(enabled))) => {
+                if let Err(error) = super::keep_awake::set_enabled(&mut keep_awake, enabled) {
+                    emit_child_event(
+                        &output,
+                        ChildEvent::MaintenanceError(format!("Prevent idle lock: {error:#}")),
+                    )?;
+                }
+            }
             Ok(Ok(ParentCommand::StartInput { display_id, .. })) => {
                 let result = enumerate_displays().and_then(|displays| {
                     let display = displays
@@ -1866,6 +1894,7 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
                 .and_then(|()| writer.write_all(&[u8::from(*grayscale)]))
         }
         ParentCommand::SetWallpaperHidden(hidden) => writer.write_all(&[19, u8::from(*hidden)]),
+        ParentCommand::SetPreventIdleLock(enabled) => writer.write_all(&[21, u8::from(*enabled)]),
         ParentCommand::SetCursorCapture(enabled) => writer.write_all(&[18, u8::from(*enabled)]),
         ParentCommand::SetDisplayBorder(enabled) => writer.write_all(&[20, u8::from(*enabled)]),
         ParentCommand::RequestKeyframe => writer.write_all(&[COMMAND_REQUEST_KEYFRAME]),
@@ -1962,6 +1991,7 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
             })
         }
         19 => Ok(ParentCommand::SetWallpaperHidden(read_bool(&mut reader)?)),
+        21 => Ok(ParentCommand::SetPreventIdleLock(read_bool(&mut reader)?)),
         18 => Ok(ParentCommand::SetCursorCapture(read_bool(&mut reader)?)),
         20 => Ok(ParentCommand::SetDisplayBorder(read_bool(&mut reader)?)),
         COMMAND_REQUEST_KEYFRAME => Ok(ParentCommand::RequestKeyframe),
@@ -2847,6 +2877,7 @@ mod tests {
         match command {
             ParentCommand::Start { .. } => COMMAND_START,
             ParentCommand::SetWallpaperHidden(_) => 19,
+            ParentCommand::SetPreventIdleLock(_) => 21,
             ParentCommand::SetCursorCapture(_) => 18,
             ParentCommand::SetDisplayBorder(_) => 20,
             ParentCommand::RequestKeyframe => COMMAND_REQUEST_KEYFRAME,

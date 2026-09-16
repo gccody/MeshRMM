@@ -17,6 +17,8 @@ fn default_idle_timeout_ms() -> u64 {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionRecord {
+    #[serde(default)]
+    idle_policy: meshrmm_protocol_types::IdlePolicy,
     #[serde(default = "meshrmm_protocol_types::default_enabled")]
     display_border: bool,
     #[serde(default)]
@@ -287,6 +289,7 @@ impl RemoteSession {
             .await?;
 
         let agent_request = AgentSessionRequest {
+            idle_policy: record.idle_policy,
             blackout_message: record.blackout_message.clone(),
             viewer_name: record.viewer_name.clone(),
             session_id: RemoteSessionId::new(record.session_id.clone()),
@@ -312,6 +315,7 @@ impl RemoteSession {
             record.expires_at_unix_ms
         );
         Response::from_json(&SessionBootstrap {
+            idle_policy: record.idle_policy,
             display_border: record.display_border,
             session_id: RemoteSessionId::new(record.session_id),
             signaling_token: record.client_token,
@@ -334,6 +338,7 @@ impl RemoteSession {
 
         record.expires_at_unix_ms = now.saturating_add(record.idle_timeout_ms);
         let lease = AgentSessionRequest {
+            idle_policy: record.idle_policy,
             blackout_message: record.blackout_message.clone(),
             viewer_name: record.viewer_name.clone(),
             session_id: RemoteSessionId::new(record.session_id.clone()),

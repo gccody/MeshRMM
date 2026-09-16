@@ -53,6 +53,7 @@ pub trait ScreenStreamer: Send {
 
 pub trait ScreenInput: Send + Sync {
     fn set_wallpaper_hidden(&self, hidden: bool) -> anyhow::Result<()>;
+    fn set_prevent_idle_lock(&self, enabled: bool) -> anyhow::Result<()>;
     fn set_blackout(&self, enabled: bool) -> anyhow::Result<()>;
     fn maintenance_state(&self) -> Option<meshrmm_protocol::SessionMessage>;
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()>;
@@ -355,6 +356,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
         match &self.inner {
             CaptureBackend::Direct(_) => Arc::new(DirectInputController {
                 wallpaper: Mutex::new(None),
+                keep_awake: Mutex::new(None),
                 blackout_message: self.blackout_message.clone(),
                 controller: Arc::clone(&self.direct_input),
                 files: self
@@ -371,6 +373,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
 
 #[cfg(windows)]
 struct DirectInputController {
+    keep_awake: Mutex<Option<super::keep_awake::KeepAwake>>,
     wallpaper: Mutex<Option<super::wallpaper::HiddenWallpaper>>,
     blackout_message: String,
     files: meshrmm_file_transfer::TransferSession,
@@ -381,6 +384,12 @@ struct DirectInputController {
 
 #[cfg(windows)]
 impl ScreenInput for DirectInputController {
+    fn set_prevent_idle_lock(&self, enabled: bool) -> anyhow::Result<()> {
+        super::keep_awake::set_enabled(
+            &mut self.keep_awake.lock().unwrap_or_else(|e| e.into_inner()),
+            enabled,
+        )
+    }
     fn set_wallpaper_hidden(&self, hidden: bool) -> anyhow::Result<()> {
         super::wallpaper::set_hidden(
             &mut *self

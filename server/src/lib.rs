@@ -34,6 +34,10 @@ struct Company {
     blackout_message: String,
     #[serde(deserialize_with = "deserialize_sql_bool")]
     display_border: bool,
+    #[serde(deserialize_with = "deserialize_sql_bool")]
+    prevent_idle_lock: bool,
+    #[serde(deserialize_with = "deserialize_sql_bool")]
+    allow_idle_override: bool,
     slug: Option<String>,
     status: String,
 }
@@ -137,6 +141,8 @@ struct UpdateCompanySettingsRequest {
     dashboard_idle_timeout_minutes: u32,
     blackout_message: Option<String>,
     display_border: Option<bool>,
+    prevent_idle_lock: Option<bool>,
+    allow_idle_override: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +196,7 @@ struct HandoffResponse {
 
 #[derive(Debug, Serialize)]
 struct SessionInit<'a> {
+    idle_policy: meshrmm_protocol_types::IdlePolicy,
     blackout_message: &'a str,
     display_border: bool,
     viewer_name: &'a str,
@@ -509,7 +516,7 @@ async fn authorize_platform_owner(request: &Request, environment: &Env) -> Resul
 async fn ensure_company_exists(db: &D1Database, company_id: &str) -> Result<()> {
     if query!(
         db,
-        "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, display_border, slug, status FROM companies WHERE id = ?1",
+        "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, display_border, prevent_idle_lock, allow_idle_override, slug, status FROM companies WHERE id = ?1",
         company_id
     )?
     .first::<Company>(None)
@@ -628,7 +635,7 @@ mod company_policy_tests {
     #[test]
     fn sqlite_flags_are_exposed_as_json_booleans() {
         for enabled in [0, 1] {
-            let row = serde_json::json!({"id":"c","name":"Company","dashboard_idle_timeout_minutes":60,"blackout_message":"Maintenance","display_border":enabled,"slug":"company","status":"active"});
+            let row = serde_json::json!({"id":"c","name":"Company","dashboard_idle_timeout_minutes":60,"blackout_message":"Maintenance","display_border":enabled,"prevent_idle_lock":1,"allow_idle_override":0,"slug":"company","status":"active"});
             let company: Company = serde_json::from_value(row).unwrap();
             assert_eq!(
                 serde_json::to_value(company).unwrap()["display_border"],

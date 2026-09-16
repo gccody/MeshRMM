@@ -56,3 +56,35 @@ viewer session displayed `➤ LG ULTRAGEAR` in the monitor list, then cleared th
 marker when the viewer clicked a harmless remote background area. Session close
 completed normally. Windows viewer behavior was compiled and unit-tested natively;
 its UI was not manually exercised.
+
+## Prevent idle lock
+
+Company settings independently control the default and whether session users may
+change it. Both default to on. The authenticated agent request carries the policy;
+the agent clamps every viewer request to the company default when overrides are
+forbidden. Preferences survive reconnects but reset for a new session. Deploy
+`0010_prevent_idle_lock.sql` with the server/dashboard changes.
+
+An elevated desktop helper owns a power request and periodically sends tagged
+zero-movement input. This resets Windows idle accounting without moving the mouse,
+claiming input ownership, changing configured timeouts, or unlocking a locked
+machine. Stop, pipe EOF, and helper exit release the request. Windows policies that
+reject simulated input remain authoritative.
+
+Validation: macOS viewer Clippy/tests, protocol/policy/server tests, WASM check,
+SQL regressions, and dashboard verification. Native Windows workspace Clippy/tests
+and release build passed. Policy tests exercise both locked default values and
+both override directions; input-hook tests verify keep-awake events preserve
+ownership. The interactive Windows test verifies idle resets, unchanged pointer
+coordinates, and cessation after dropping the guard.
+
+Installed build SHA-256:
+`FF1180BA5C7AF70F54351D3A54B1EE286C11FD401638323D9CAAA0F74FF6B723`.
+Live service measurements stayed below one second of idle time with prevention
+on, rose from 11.4 to 15.2 seconds after toggling off, and rose from 9.4 to 13.2
+seconds after disconnecting with prevention on. Service logs recorded enable and
+disable transitions; the service remained running and connected.
+
+The initial Windows test link exhausted C: disk space. The existing Rust cache
+was preserved and relocated to `D:\MeshRMM-qol-build-cache-20260916`, with a junction
+at its original path. This freed about 18 GB; the final checks passed afterward.

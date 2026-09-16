@@ -17,6 +17,8 @@ pub struct IceServer {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionBootstrap {
+    #[serde(default)]
+    pub idle_policy: IdlePolicy,
     #[serde(default = "default_enabled")]
     pub display_border: bool,
     pub session_id: RemoteSessionId,
@@ -27,6 +29,8 @@ pub struct SessionBootstrap {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSessionRequest {
+    #[serde(default)]
+    pub idle_policy: IdlePolicy,
     #[serde(default)]
     pub blackout_message: String,
     #[serde(default)]
@@ -143,6 +147,56 @@ mod tests {
             })
             .unwrap(),
             r#"{"type":"end_session","session_id":"session-123"}"#
+        );
+    }
+}
+
+/// Trusted company policy, supplied separately to both session peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdlePolicy {
+    #[serde(default = "default_enabled")]
+    pub prevent_idle_lock: bool,
+    #[serde(default = "default_enabled")]
+    pub allow_override: bool,
+}
+impl Default for IdlePolicy {
+    fn default() -> Self {
+        Self {
+            prevent_idle_lock: true,
+            allow_override: true,
+        }
+    }
+}
+impl IdlePolicy {
+    pub fn effective(self, choice: Option<bool>) -> bool {
+        if self.allow_override {
+            choice.unwrap_or(self.prevent_idle_lock)
+        } else {
+            self.prevent_idle_lock
+        }
+    }
+}
+#[cfg(test)]
+mod idle_policy_tests {
+    use super::*;
+    #[test]
+    fn locked_policies_ignore_both_override_directions() {
+        for default in [true, false] {
+            for allowed in [true, false] {
+                let policy = IdlePolicy {
+                    prevent_idle_lock: default,
+                    allow_override: allowed,
+                };
+                assert_eq!(policy.effective(None), default);
+                assert_eq!(
+                    policy.effective(Some(!default)),
+                    if allowed { !default } else { default }
+                );
+            }
+        }
+        assert_eq!(
+            serde_json::from_str::<IdlePolicy>("{}").unwrap(),
+            IdlePolicy::default()
         );
     }
 }

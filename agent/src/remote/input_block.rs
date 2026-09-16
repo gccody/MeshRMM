@@ -15,6 +15,7 @@ use windows::Win32::{
     UI::WindowsAndMessaging::*,
 };
 
+pub const KEEP_AWAKE_TAG: usize = 0x4d524d4b;
 pub const INPUT_TAG: usize = 0x4d524d4d;
 
 enum HookMode {
@@ -164,6 +165,9 @@ impl Drop for InputBlock {
 // cleanup also inject tagged releases. Blocked local events never reach the
 // ownership hooks, which were installed before the blocking hooks.
 fn handle_input(mode: &HookMode, tag: usize, takes_control: bool) -> bool {
+    if tag == KEEP_AWAKE_TAG {
+        return false;
+    }
     match mode {
         HookMode::Block => tag != INPUT_TAG,
         HookMode::Track(viewer_controls_input) => {
@@ -208,6 +212,20 @@ unsafe extern "system" fn mouse_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn keep_awake_does_not_claim_or_release_input_ownership() {
+        for initial in [false, true] {
+            let owner = Arc::new(AtomicBool::new(initial));
+            assert!(!handle_input(
+                &HookMode::Track(owner.clone()),
+                KEEP_AWAKE_TAG,
+                true
+            ));
+            assert_eq!(owner.load(Ordering::SeqCst), initial);
+        }
+        assert!(!handle_input(&HookMode::Block, KEEP_AWAKE_TAG, true));
+    }
+
     #[test]
     fn ownership_follows_input_without_blocking_or_resuming_on_cleanup() {
         let viewer = Arc::new(AtomicBool::new(false));
