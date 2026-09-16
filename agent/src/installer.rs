@@ -600,6 +600,7 @@ fn redeem_installer(
         bootstrap.server.trim_end_matches('/')
     );
     let http = ureq::Agent::config_builder()
+        .https_only(true)
         .timeout_global(Some(Duration::from_secs(30)))
         .http_status_as_error(false)
         .tls_config(

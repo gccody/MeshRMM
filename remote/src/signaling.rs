@@ -13,6 +13,7 @@ pub async fn create_session(config: &Config) -> anyhow::Result<SessionBootstrap>
         false,
     )?;
     let response = reqwest::Client::builder()
+        .https_only(true)
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(20))
         .build()?
@@ -49,6 +50,7 @@ pub async fn resume_session(
         false,
     )?;
     reqwest::Client::builder()
+        .https_only(true)
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .context("failed to build the session resume client")?

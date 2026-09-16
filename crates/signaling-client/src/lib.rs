@@ -61,14 +61,11 @@ pub fn endpoint_url(
             "https" => url
                 .set_scheme("wss")
                 .map_err(|_| anyhow::anyhow!("invalid HTTPS URL"))?,
-            "http" => url
-                .set_scheme("ws")
-                .map_err(|_| anyhow::anyhow!("invalid HTTP URL"))?,
-            "wss" | "ws" => {}
-            scheme => bail!("unsupported signaling URL scheme {scheme}"),
+            "wss" => {}
+            _ => bail!("MeshRMM signaling requires HTTPS or WSS"),
         }
-    } else if !matches!(url.scheme(), "https" | "http") {
-        bail!("MeshRMM API URL must use HTTP or HTTPS");
+    } else if url.scheme() != "https" {
+        bail!("MeshRMM API URL must use HTTPS");
     }
     url.set_query(None);
     url.set_fragment(None);
@@ -86,6 +83,9 @@ pub fn endpoint_url(
 }
 
 pub async fn authenticated_websocket(url: Url, token: &str) -> anyhow::Result<(Socket, Response)> {
+    if url.scheme() != "wss" {
+        bail!("MeshRMM authenticated signaling requires WSS");
+    }
     let mut request = url
         .as_str()
         .into_client_request()
@@ -123,6 +123,57 @@ pub fn is_terminal_websocket_error(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_urls_require_encryption_and_preserve_routing() {
+        for server in [
+            "http://example.com",
+            "ws://example.com",
+            "ftp://example.com",
+        ] {
+            for websocket in [false, true] {
+                assert!(endpoint_url(server, &["v1"], &[], websocket).is_err());
+            }
+        }
+        for server in [
+            "https://example.com/old?secret=unused#fragment",
+            "wss://example.com",
+        ] {
+            assert_eq!(
+                endpoint_url(
+                    server,
+                    &["v1", "sessions", "a/b"],
+                    &[("role", "client")],
+                    true
+                )
+                .unwrap()
+                .as_str(),
+                "wss://example.com/v1/sessions/a%2Fb?role=client"
+            );
+        }
+        assert_eq!(
+            endpoint_url("https://example.com", &["v1"], &[], false)
+                .unwrap()
+                .as_str(),
+            "https://example.com/v1"
+        );
+        assert!(endpoint_url("wss://example.com", &["v1"], &[], false).is_err());
+    }
+
+    #[tokio::test]
+    async fn plaintext_connector_rejects_before_connecting_or_sending_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+        let error = authenticated_websocket(url, "must-not-leave-this-process")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("requires WSS"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn revoked_sessions_stop_retrying_but_network_closures_do_not() {
