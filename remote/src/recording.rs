@@ -269,12 +269,24 @@ impl<W: Write> TransportStream<W> {
             (pts >> 7) as u8,
             ((pts << 1) as u8) | 1,
         ];
-        // Access-unit delimiters make frame boundaries explicit to TS players.
+        // Exactly one AUD must lead each PES access unit. Hardware encoders can
+        // already supply an AUD, sometimes after prepended parameter sets.
+        // Keeping that AUD as well would create an empty access unit in VLC,
+        // consume the PES timestamp and leave the actual frame without timing.
         match self.codec {
             Codec::H264 => pes.extend_from_slice(&[0, 0, 0, 1, 9, 0xf0]),
             Codec::H265 => pes.extend_from_slice(&[0, 0, 0, 1, 0x46, 1, 0x50]),
         }
-        pes.extend_from_slice(&frame.data);
+        for unit in crate::h264::annex_b_units(&frame.data) {
+            let is_delimiter = match self.codec {
+                Codec::H264 => unit[0] & 0x1f == 9,
+                Codec::H265 => (unit[0] >> 1) & 0x3f == 35,
+            };
+            if !is_delimiter {
+                pes.extend_from_slice(&[0, 0, 0, 1]);
+                pes.extend_from_slice(unit);
+            }
+        }
         let mut remaining = pes.as_slice();
         let mut first = true;
         while !remaining.is_empty() {
@@ -377,6 +389,65 @@ mod tests {
                     }
                 }
                 assert_eq!(crc, 0);
+            }
+        }
+    }
+
+    fn video_payloads(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        for packet in bytes.chunks_exact(188) {
+            let pid = (u16::from(packet[1] & 31) << 8) | u16::from(packet[2]);
+            if pid != 256 {
+                continue;
+            }
+            if packet[1] & 0x40 != 0 {
+                payloads.push(Vec::new());
+            }
+            let offset = if packet[3] & 0x20 != 0 {
+                5 + usize::from(packet[4])
+            } else {
+                4
+            };
+            payloads
+                .last_mut()
+                .unwrap()
+                .extend_from_slice(&packet[offset..]);
+        }
+        payloads
+    }
+
+    #[test]
+    fn hardware_delimiters_do_not_create_empty_access_units_or_lose_sparse_timestamps() {
+        for codec in [Codec::H264, Codec::H265] {
+            let (parameters, aud, slice): (&[u8], &[u8], &[u8]) = match codec {
+                Codec::H264 => (&[0x67, 0x64, 0x1f], &[9, 0xf0], &[0x65, 0x55]),
+                Codec::H265 => (&[0x40, 1, 0xaa], &[0x46, 1, 0x50], &[0x26, 1, 0x55]),
+            };
+            let mut writer = TransportStream::new(Vec::new(), codec, 1_000_000);
+            // Includes a static-screen pause: fixed-FPS decoding alone masked
+            // the lost timestamps in the original playback smoke test.
+            for (index, elapsed_us) in [0, 771_400, 788_800, 3_000_000].into_iter().enumerate() {
+                let mut frame = frame(1, index == 0);
+                frame.capture_timestamp_us += elapsed_us;
+                frame.data.clear();
+                // MFT keyframes prepend parameter sets before the encoder AUD.
+                for nal in [parameters, aud, parameters, slice] {
+                    frame.data.extend_from_slice(&[0, 0, 1]);
+                    frame.data.extend_from_slice(nal);
+                }
+                writer.frame(&frame).unwrap();
+            }
+            let payloads = video_payloads(&writer.output);
+            assert_eq!(payloads.len(), 4);
+            for (pes, elapsed_us) in payloads.iter().zip([0, 771_400, 788_800, 3_000_000]) {
+                let units = crate::h264::annex_b_units(&pes[9 + usize::from(pes[8])..]);
+                assert_eq!(units, [aud, parameters, parameters, slice]);
+                let pts = (u64::from(pes[9] & 14) << 29)
+                    | (u64::from(pes[10]) << 22)
+                    | (u64::from(pes[11] & 254) << 14)
+                    | (u64::from(pes[12]) << 7)
+                    | u64::from(pes[13] >> 1);
+                assert_eq!(pts, 90_000 + elapsed_us / 100 * 9);
             }
         }
     }
