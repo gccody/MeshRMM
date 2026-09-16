@@ -40,15 +40,11 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
     : hostname === "admin.meshrmm.com"
       ? "platform"
       : "tenant";
-  const clientId = process.env.WORKOS_CLIENT_ID ?? "client_01M0FT1AN01PAT37N98EMRSNVW";
-  const redirectUri = surface === "marketing" ? (process.env.WORKOS_REDIRECT_URI ?? origin) : origin;
   const serverUrl = process.env.MESHRMM_SERVER_URL || origin;
   return (
     <html lang="en">
       <body className={`${geistSans.variable} ${geistMono.variable}`}>
         <Providers
-          clientId={clientId}
-          redirectUri={redirectUri}
           serverUrl={serverUrl}
           surface={surface}
           hostname={hostname}

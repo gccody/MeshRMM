@@ -1,6 +1,6 @@
 "use client";
 
-import { useAuth } from "@workos-inc/authkit-react";
+import { useAuth } from "../../features/auth/auth-provider";
 import { LoaderCircle, ShieldCheck } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { LOGIN_ATTEMPT_KEY, useRuntimeConfig } from "../providers";

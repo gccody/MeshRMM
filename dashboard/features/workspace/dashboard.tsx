@@ -1,6 +1,6 @@
 "use client";
 
-import { LoginRequiredError, useAuth } from "@workos-inc/authkit-react";
+import { LoginRequiredError, useAuth } from "../auth/auth-provider";
 import {
   AdminPortalDomainVerification,
   AdminPortalSsoConnection,

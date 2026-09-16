@@ -13,17 +13,20 @@ import {
   timeoutMilliseconds,
 } from "../features/session/idle-session.ts";
 
-async function render(pathname = "/", hostname = "meshrmm.com", company = null) {
+async function render(pathname = "/", hostname = "meshrmm.com", company = null, init = {}) {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
 
   return worker.fetch(
     new Request(`https://${hostname}${pathname}`, {
-      headers: { accept: "text/html", host: hostname },
+      ...init,
+      headers: { accept: "text/html", host: hostname, ...init.headers },
     }),
     {
       ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) },
+      WORKOS_CLIENT_ID: "client_test",
+      DASHBOARD_SESSION_KEY: Buffer.alloc(32, 7).toString("base64"),
       DB: {
         prepare() {
           return { bind() { return { first: async () => company }; } };
@@ -34,6 +37,20 @@ async function render(pathname = "/", hostname = "meshrmm.com", company = null) 
     { waitUntil() {}, passThroughOnException() {} },
   );
 }
+
+test("tenant routing preserves the authentication POST body", async () => {
+  const response = await render("/auth/login", "acme.meshrmm.com", {
+    workos_organization_id: "org_acme",
+  }, {
+    method: "POST",
+    headers: { origin: "https://acme.meshrmm.com", "X-MeshRMM-Auth": "1" },
+    body: JSON.stringify({ returnTo: "/settings" }),
+  });
+  assert.equal(response.status, 200);
+  const url = new URL((await response.json()).url);
+  assert.equal(url.searchParams.get("organization_id"), "org_acme");
+  assert.match(response.headers.get("set-cookie"), /__Host-meshrmm-login=/);
+});
 
 test("server-renders the public marketing site at the root domain", async () => {
   const response = await render();
