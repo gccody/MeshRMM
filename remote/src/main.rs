@@ -3,6 +3,7 @@ mod config;
 mod debug;
 mod h264;
 mod platform;
+mod preferences;
 mod recording;
 mod signaling;
 mod transport;

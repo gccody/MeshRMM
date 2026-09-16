@@ -201,6 +201,18 @@ impl ControlSink {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub fn disconnect_confirmation(&self) -> bool {
+        crate::preferences::disconnect_confirmation()
+    }
+
+    pub fn toggle_disconnect_confirmation(&self) {
+        if let Err(error) = crate::preferences::toggle_disconnect_confirmation()
+            && let Ok(mut state) = self.maintenance.lock()
+        {
+            state.error = Some(error.to_string());
+        }
+    }
+
     pub fn prevent_idle_lock(&self) -> bool {
         let idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         idle.policy.effective(idle.choice)

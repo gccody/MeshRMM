@@ -6,6 +6,7 @@ use objc2_app_kit::{
 
 struct AppDelegateIvars {
     deep_link_tx: Sender<String>,
+    termination_confirmed: std::cell::Cell<bool>,
 }
 
 define_class!(
@@ -20,6 +21,19 @@ define_class!(
     unsafe impl NSObjectProtocol for AppDelegate {}
 
     unsafe impl NSApplicationDelegate for AppDelegate {
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn application_should_terminate(
+            &self,
+            _application: &NSApplication,
+        ) -> objc2_app_kit::NSApplicationTerminateReply {
+            if !self.ivars().termination_confirmed.get()
+                && super::presenter::request_user_disconnect()
+            {
+                objc2_app_kit::NSApplicationTerminateReply::TerminateCancel
+            } else {
+                objc2_app_kit::NSApplicationTerminateReply::TerminateNow
+            }
+        }
         #[unsafe(method(application:openURLs:))]
         fn application_open_urls(&self, application: &NSApplication, urls: &NSArray<NSURL>) {
             tracing::info!(
@@ -38,6 +52,9 @@ define_class!(
                 // session. A later dashboard handoff means the user is
                 // replacing a stale/broken session, so start a fresh process
                 // with that single-use URL before terminating this one.
+                if !super::presenter::confirm_session_replacement() {
+                    return;
+                }
                 let replacement = std::env::current_exe()
                     .context("could not locate the macOS viewer executable")
                     .and_then(|executable| {
@@ -53,6 +70,7 @@ define_class!(
                         tracing::warn!(
                             "replacing the macOS viewer process for a new dashboard handoff"
                         );
+                        self.ivars().termination_confirmed.set(true);
                         application.terminate(None);
                     }
                     Err(error) => {
@@ -66,7 +84,10 @@ define_class!(
 
 impl AppDelegate {
     fn new(mtm: MainThreadMarker, deep_link_tx: Sender<String>) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(AppDelegateIvars { deep_link_tx });
+        let this = Self::alloc(mtm).set_ivars(AppDelegateIvars {
+            deep_link_tx,
+            termination_confirmed: std::cell::Cell::new(false),
+        });
         // Safety: this invokes NSObject's parameterless initializer.
         unsafe { msg_send![super(this), init] }
     }
@@ -112,6 +133,7 @@ pub(super) struct RemoteViewIvars {
     video_height: std::cell::Cell<u32>,
     display_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     recording_visible: std::cell::Cell<bool>,
+    confirming_disconnect: std::cell::Cell<bool>,
     session_button: RefCell<Option<Retained<NSButton>>>,
     chat_popup: RefCell<Option<meshrmm_chat::ChatPopup>>,
     control: ControlSink,
@@ -166,6 +188,10 @@ define_class!(
     }
 
     unsafe impl NSWindowDelegate for RemoteView {
+        #[unsafe(method(windowShouldClose:))]
+        fn window_should_close(&self, _window: &NSWindow) -> bool {
+            self.confirm_disconnect()
+        }
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _notification: &NSNotification) {
             self.ivars().control.set_input_enabled(true);
@@ -348,6 +374,7 @@ define_class!(
                 (if self.ivars().control.maintenance_state().blacked_out { "Restore agent monitors" } else { "Black out all agent monitors" }, sel!(toggleBlackout:)),
                 (if self.ivars().control.audio_muted() { "Unmute audio" } else { "Mute audio" }, sel!(toggleAudio:)),
                 (if self.ivars().control.allow_idle_override() { "Prevent idle lock" } else { "Prevent idle lock (company managed)" }, sel!(togglePreventIdleLock:)),
+                ("Disconnect confirmation", sel!(toggleDisconnectConfirmation:)),
                 ("Highlight viewed monitor on agent", sel!(toggleDisplayBorder:)),
                 ("Hide remote wallpaper", sel!(toggleWallpaper:)),
                 ("Show remote cursor", sel!(toggleRemoteCursor:)),
@@ -361,6 +388,7 @@ define_class!(
                 if action == sel!(toggleAgentInput:) || action == sel!(toggleBlackout:) { item.setEnabled(self.ivars().control.maintenance_state().available); }
                 if action == sel!(toggleAgentInput:) && self.ivars().control.maintenance_state().blacked_out { item.setEnabled(false); }
                 if action == sel!(togglePreventIdleLock:) { item.setState(isize::from(self.ivars().control.prevent_idle_lock())); item.setEnabled(self.ivars().control.allow_idle_override()); }
+                if action == sel!(toggleDisconnectConfirmation:) { item.setState(isize::from(self.ivars().control.disconnect_confirmation())); }
                 if action == sel!(toggleDisplayBorder:) { item.setState(isize::from(self.ivars().control.display_border())); }
                 if action == sel!(toggleWallpaper:) { item.setState(isize::from(self.ivars().control.wallpaper_hidden())); }
                 if action == sel!(toggleRemoteCursor:) { item.setState(isize::from(self.ivars().control.show_remote_cursor())); }
@@ -381,6 +409,11 @@ define_class!(
         #[unsafe(method(togglePreventIdleLock:))]
         fn toggle_prevent_idle_lock(&self, _sender: &NSMenuItem) {
             self.ivars().control.toggle_prevent_idle_lock();
+        }
+
+        #[unsafe(method(toggleDisconnectConfirmation:))]
+        fn toggle_disconnect_confirmation(&self, _sender: &NSMenuItem) {
+            self.ivars().control.toggle_disconnect_confirmation();
         }
 
         #[unsafe(method(toggleDisplayBorder:))]
@@ -587,6 +620,7 @@ impl RemoteView {
             chat_popup: RefCell::new(None),
             session_button: RefCell::new(None),
             recording_visible: std::cell::Cell::new(false),
+            confirming_disconnect: std::cell::Cell::new(false),
             control,
             pressed_keys: RefCell::new(Vec::new()),
             pressed_buttons: RefCell::new(Vec::new()),
@@ -756,6 +790,27 @@ impl RemoteView {
 
     fn send(&self, message: SessionMessage) {
         self.ivars().control.send(message);
+    }
+
+    pub(super) fn confirm_disconnect(&self) -> bool {
+        self.disable_input();
+        if !self.ivars().control.disconnect_confirmation() {
+            return true;
+        }
+        if self.ivars().confirming_disconnect.replace(true) {
+            return false;
+        }
+        let alert = NSAlert::new(self.mtm());
+        alert.setMessageText(&NSString::from_str("Disconnect from this device?"));
+        alert.setInformativeText(&NSString::from_str("Your remote session will end."));
+        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+        alert.addButtonWithTitle(&NSString::from_str("Disconnect"));
+        let confirmed = alert.runModal() == 1001;
+        self.ivars().confirming_disconnect.set(false);
+        if !confirmed && self.window().is_some_and(|window| window.isKeyWindow()) {
+            self.ivars().control.set_input_enabled(true);
+        }
+        confirmed
     }
 
     pub(super) fn set_agent_pointer_display(
@@ -1292,6 +1347,24 @@ where
     let delegate = AppDelegate::new(mtm, deep_link_tx);
     application.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     application.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    let menu = NSMenu::new(mtm);
+    let item = NSMenuItem::new(mtm);
+    let submenu = NSMenu::new(mtm);
+    let quit = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Quit MeshRMM Remote"),
+            Some(sel!(terminate:)),
+            &NSString::from_str("q"),
+        )
+    };
+    unsafe {
+        quit.setTarget(Some(&application));
+    }
+    submenu.addItem(&quit);
+    item.setSubmenu(Some(&submenu));
+    menu.addItem(&item);
+    application.setMainMenu(Some(&menu));
     application.finishLaunching();
     show_connecting_window(mtm)?;
 

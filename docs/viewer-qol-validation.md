@@ -88,3 +88,21 @@ disable transitions; the service remained running and connected.
 The initial Windows test link exhausted C: disk space. The existing Rust cache
 was preserved and relocated to `D:\MeshRMM-qol-build-cache-20260916`, with a junction
 at its original path. This freed about 18 GB; the final checks passed afterward.
+
+## Disconnect confirmation
+
+**Disconnect confirmation** defaults to on and is stored per OS user in
+`MeshRMM/viewer-preferences.json` under Application Support (macOS) or APPDATA
+(Windows). The preference is independent of agent and session IDs. Writes replace
+the file atomically; missing or malformed preferences default to confirmation on.
+Window-close confirmation defaults to cancellation. macOS Quit also uses the
+confirmation and lets the transport finish cleanup before exiting.
+
+Validation: macOS and Windows viewer Clippy/tests, including preferences loaded
+from fresh instances, replacement of existing files, and malformed-file fallback;
+formatting and diff checks. Live macOS sessions verified window-close Cancel,
+Quit Cancel, immediate close when disabled, persistence after launching a new
+session, and confirmed Quit. Confirmation was restored to on after testing.
+The installed agent from the previous feature remained in use; no service update
+was needed for this viewer-only change. Windows UI was compiled/tested natively,
+not manually exercised.
