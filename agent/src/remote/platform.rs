@@ -38,10 +38,9 @@ pub trait ScreenStreamer: Send {
     }
     fn poll_ended(&mut self) -> Option<anyhow::Result<()>>;
     fn request_keyframe(&self) -> anyhow::Result<()>;
-    fn set_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()>;
-    fn set_adaptive_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()> {
-        self.set_bitrate(bits_per_second)
-    }
+    /// Configure the bitrate for the next start; preset changes restart capture.
+    fn set_bitrate(&mut self, bits_per_second: u32);
+    fn set_adaptive_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()>;
     fn set_codec(&mut self, codec: Codec);
     fn set_chroma(&mut self, chroma: ChromaMode);
     /// Returns true when the backend requires capture to be restarted.
@@ -253,19 +252,8 @@ impl ScreenStreamer for PlatformScreenStreamer {
         .context("hardware keyframe request failed")
     }
 
-    fn set_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()> {
-        let bits_per_second = bits_per_second.max(1);
-        if self.bitrate_bits_per_second == bits_per_second {
-            return Ok(());
-        }
-        self.bitrate_bits_per_second = bits_per_second;
-        match &self.inner {
-            CaptureBackend::Direct(streamer) => streamer
-                .set_bitrate(bits_per_second)
-                .map_err(anyhow::Error::from),
-            CaptureBackend::Desktop(streamer) => streamer.set_bitrate(bits_per_second),
-        }
-        .context("hardware encoder bitrate change failed")
+    fn set_bitrate(&mut self, bits_per_second: u32) {
+        self.bitrate_bits_per_second = bits_per_second.max(1);
     }
 
     fn set_adaptive_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()> {
@@ -276,7 +264,13 @@ impl ScreenStreamer for PlatformScreenStreamer {
             );
             return Ok(());
         }
-        self.set_bitrate(bits_per_second)
+        match &self.inner {
+            CaptureBackend::Direct(streamer) => streamer
+                .set_bitrate(bits_per_second.max(1))
+                .map_err(anyhow::Error::from),
+            CaptureBackend::Desktop(streamer) => streamer.set_bitrate(bits_per_second.max(1)),
+        }
+        .context("hardware encoder bitrate change failed")
     }
 
     fn set_codec(&mut self, codec: Codec) {
