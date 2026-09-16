@@ -134,6 +134,9 @@ pub enum SessionMessage {
     AgentPointerDisplay {
         display_id: Option<DisplayId>,
     },
+    SetPreventIdleLock {
+        enabled: bool,
+    },
 }
 
 impl SessionMessage {
@@ -293,6 +296,24 @@ pub enum ConnectionPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_preference_round_trips_without_changing_pointer_tag() {
+        for enabled in [true, false] {
+            let message = SessionMessage::SetPreventIdleLock { enabled };
+            assert_eq!(message.encode().unwrap(), vec![31, u8::from(enabled)]);
+            assert_eq!(
+                SessionMessage::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+        }
+        assert_eq!(
+            SessionMessage::AgentPointerDisplay { display_id: None }
+                .encode()
+                .unwrap(),
+            vec![30, 0]
+        );
+    }
 
     #[test]
     fn quality_presets_preserve_wire_tags_and_capture_limits() {

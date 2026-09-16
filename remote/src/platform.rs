@@ -7,6 +7,12 @@ mod macos;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+#[derive(Default)]
+pub struct IdlePreference {
+    pub policy: meshrmm_protocol::IdlePolicy,
+    pub choice: Option<bool>,
+}
+
 #[derive(Default, Clone)]
 pub struct MaintenanceState {
     pub available: bool,
@@ -19,6 +25,7 @@ pub struct MaintenanceState {
 /// with the native window's foreground state.
 #[derive(Clone)]
 pub struct ControlSink {
+    idle: Arc<Mutex<IdlePreference>>,
     display_border: Arc<Mutex<Option<bool>>>,
     files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
@@ -40,6 +47,7 @@ impl ControlSink {
     // Keep the shared session handles and transport callbacks explicit at construction.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        idle: Arc<Mutex<IdlePreference>>,
         display_border: Arc<Mutex<Option<bool>>>,
         files: meshrmm_file_transfer::TransferSession,
         send: impl Fn(meshrmm_protocol::SessionMessage) + Send + Sync + 'static,
@@ -55,6 +63,7 @@ impl ControlSink {
         #[cfg(windows)] profiles: Arc<Vec<meshrmm_protocol::VideoProfile>>,
     ) -> Self {
         Self {
+            idle,
             display_border,
             files,
             chat,
@@ -190,6 +199,32 @@ impl ControlSink {
     pub fn technician_blocked(&self) -> bool {
         self.technician_blocked
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn prevent_idle_lock(&self) -> bool {
+        let idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        idle.policy.effective(idle.choice)
+    }
+
+    pub fn allow_idle_override(&self) -> bool {
+        self.idle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .policy
+            .allow_override
+    }
+
+    pub fn toggle_prevent_idle_lock(&self) {
+        let enabled = {
+            let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+            if !idle.policy.allow_override {
+                return;
+            }
+            let enabled = !idle.policy.effective(idle.choice);
+            idle.choice = Some(enabled);
+            enabled
+        };
+        self.send(meshrmm_protocol::SessionMessage::SetPreventIdleLock { enabled });
     }
 
     pub fn display_border(&self) -> bool {

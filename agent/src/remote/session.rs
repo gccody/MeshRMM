@@ -37,6 +37,7 @@ pub async fn run(
             request.ice_servers.clone(),
             Arc::clone(&streamer),
             session_id.clone(),
+            request.idle_policy,
         )
         .await
         {

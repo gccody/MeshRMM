@@ -259,6 +259,7 @@ pub async fn run_sender(
     ice_servers: Vec<IceServer>,
     streamer: Arc<Mutex<Box<dyn ScreenStreamer>>>,
     session_id: RemoteSessionId,
+    idle_policy: meshrmm_protocol::IdlePolicy,
 ) -> anyhow::Result<()> {
     let (socket, _) = authenticated_websocket(signal_url, signaling_token).await?;
     let mut signal = SignalingConnection::new(socket);
@@ -269,6 +270,7 @@ pub async fn run_sender(
         streamer,
         session_id,
         &mut failure_reported,
+        idle_policy,
     )
     .await;
     if let Err(error) = &result
@@ -285,6 +287,7 @@ async fn run_connected_sender(
     streamer: Arc<Mutex<Box<dyn ScreenStreamer>>>,
     session_id: RemoteSessionId,
     failure_reported: &mut bool,
+    idle_policy: meshrmm_protocol::IdlePolicy,
 ) -> anyhow::Result<()> {
     // Input has its own synchronized controller so capture startup, encoder
     // recovery, and video teardown never hold the path used by control events.
@@ -400,6 +403,9 @@ async fn run_connected_sender(
         move |message| {
             let result = match message {
                 Some(SessionMessage::SendSecureAttention) => super::secure_attention::send(),
+                Some(SessionMessage::SetPreventIdleLock { enabled }) => {
+                    maintenance_input.set_prevent_idle_lock(idle_policy.effective(Some(enabled)))
+                }
                 Some(SessionMessage::SetWallpaperHidden { hidden }) => {
                     maintenance_input.set_wallpaper_hidden(hidden)
                 }
@@ -417,6 +423,7 @@ async fn run_connected_sender(
             }
         },
         move || {
+            let _ = cleanup_input.set_prevent_idle_lock(false);
             let _ = cleanup_input.set_wallpaper_hidden(false);
             let _ = cleanup_input.set_blackout(false);
             let _ = cleanup_input.set_agent_input_blocked(false);
@@ -451,7 +458,11 @@ async fn run_connected_sender(
         let closed_tx = control_tx.clone();
         let opening = control_service.notifier();
         let closing = control_service.notifier();
+        let initial_idle = maintenance_tx.clone();
         control_channel.on_open(Box::new(move || {
+            let _ = initial_idle.try_send(SessionMessage::SetPreventIdleLock {
+                enabled: idle_policy.prevent_idle_lock,
+            });
             opening.notify_waiters();
             let notify = Arc::clone(&notify);
             Box::pin(async move { notify.notify_one() })
@@ -514,6 +525,7 @@ async fn run_connected_sender(
                     Ok(
                         message @ (SessionMessage::SendSecureAttention
                         | SessionMessage::SetWallpaperHidden { .. }
+                        | SessionMessage::SetPreventIdleLock { .. }
                         | SessionMessage::SetBlackout { .. }
                         | SessionMessage::SetAgentInputBlocked { .. }),
                     ) => maintenance_tx.try_send(message).err().map(|_| {
@@ -1972,6 +1984,10 @@ mod service_isolation_tests {
         file_gate: Mutex<std::sync::mpsc::Receiver<()>>,
     }
     impl ScreenInput for TestInput {
+        fn set_prevent_idle_lock(&self, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+
         fn set_wallpaper_hidden(&self, _: bool) -> anyhow::Result<()> {
             Ok(())
         }

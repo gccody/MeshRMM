@@ -15,6 +15,8 @@ mod indicator;
 mod input;
 #[cfg(windows)]
 mod input_block;
+#[cfg(windows)]
+mod keep_awake;
 #[cfg(any(windows, test))]
 mod native_task;
 #[cfg(windows)]

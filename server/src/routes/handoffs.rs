@@ -142,13 +142,21 @@ pub(crate) async fn create_session_for_device(
         blackout_message: String,
         #[serde(deserialize_with = "deserialize_sql_bool")]
         display_border: bool,
+        #[serde(deserialize_with = "deserialize_sql_bool")]
+        prevent_idle_lock: bool,
+        #[serde(deserialize_with = "deserialize_sql_bool")]
+        allow_idle_override: bool,
     }
     let policy = query!(&db,
-        "SELECT c.blackout_message, c.display_border FROM companies c JOIN agents a ON a.company_id = c.id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL",
+        "SELECT c.blackout_message, c.display_border, c.prevent_idle_lock, c.allow_idle_override FROM companies c JOIN agents a ON a.company_id = c.id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL",
         device_id
     )?.first::<MaintenancePolicy>(None).await?;
     let Some(policy) = policy else {
         return api_error(404, "agent not found");
+    };
+    let idle_policy = meshrmm_protocol_types::IdlePolicy {
+        prevent_idle_lock: policy.prevent_idle_lock,
+        allow_override: policy.allow_idle_override,
     };
     let session_id = Uuid::new_v4().to_string();
     let client_token = random_token();
@@ -159,6 +167,7 @@ pub(crate) async fn create_session_for_device(
     let ice_servers = generate_ice_servers(environment, idle_timeout_seconds).await?;
 
     let init = SessionInit {
+        idle_policy,
         display_border: policy.display_border,
         blackout_message: &policy.blackout_message,
         viewer_name,
@@ -178,6 +187,7 @@ pub(crate) async fn create_session_for_device(
     .await?;
 
     let agent_request = AgentSessionRequest {
+        idle_policy,
         blackout_message: policy.blackout_message,
         viewer_name: viewer_name.to_owned(),
         session_id: RemoteSessionId::new(&session_id),
@@ -205,6 +215,7 @@ pub(crate) async fn create_session_for_device(
         expires_at_unix_ms
     );
     Response::from_json(&SessionBootstrap {
+        idle_policy,
         display_border: policy.display_border,
         session_id: RemoteSessionId::new(session_id),
         signaling_token: client_token,
