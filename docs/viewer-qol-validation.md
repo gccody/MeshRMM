@@ -106,3 +106,19 @@ session, and confirmed Quit. Confirmation was restored to on after testing.
 The installed agent from the previous feature remained in use; no service update
 was needed for this viewer-only change. Windows UI was compiled/tested natively,
 not manually exercised.
+
+## Dedicated settings page
+
+- Company settings now live at `/settings`, categorized as dashboard security,
+  remote sessions, and blackout message. Account details remain separate. Users
+  and authentication also have addressable routes; non-admin visits retain a
+  permission gate. Company policy controls are read-only for non-admins.
+- Preserved company PUT payload, byte-length/empty-message validation, default
+  values, session pause behavior, and tenant resolution. Saves provide feedback.
+- On macOS with Node 22.22.0, `npm run verify` passed TypeScript, ESLint,
+  production build, and all 10 tests. The new route regression checks title,
+  navigation, absence of policy values before authorization, and rejection of
+  unknown tenants. `git diff --check` passed.
+- No server deployment or Windows update is required for this dashboard-only
+  change. Authenticated settings saves against a deployed new dashboard remain
+  unexercised; the production dashboard was not replaced.
