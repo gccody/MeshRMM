@@ -55,6 +55,9 @@ impl WindowsDesktopDuplicationStreamer {
         }
         // The static media type already contains this start's bitrate. Do not
         // replay a runtime request left behind by the previous encoder.
+        self.controls
+            .capture_cursor
+            .store(config.capture_cursor, Ordering::Release);
         self.controls.requested_bitrate.store(0, Ordering::Release);
         self.controls
             .runtime_bitrate_disabled
@@ -127,6 +130,12 @@ impl WindowsDesktopDuplicationStreamer {
             worker: Some(worker),
         });
         Ok(format)
+    }
+
+    pub fn set_cursor_capture(&self, enabled: bool) {
+        self.controls
+            .capture_cursor
+            .store(enabled, Ordering::Release);
     }
 
     pub fn request_keyframe(&self) -> Result<(), Error> {
@@ -314,7 +323,7 @@ fn capture_loop_inner(
     if width < 2 || height < 2 {
         return Err(Error::InvalidDisplayDimensions);
     }
-    let cursor_compositor = if config.capture_cursor && duplication.is_some() {
+    let cursor_compositor = if duplication.is_some() {
         Some(crate::cursor::CursorCompositor::new(
             &device, width, height, origin.x, origin.y,
         )?)
@@ -322,6 +331,9 @@ fn capture_loop_inner(
         None
     };
     let mut separate_cursor_visible = false;
+    let mut desktop_cached = false;
+    let mut desktop_pending = false;
+    let mut encoded_cursor = None;
     let format = ActiveFormat {
         width,
         height,
@@ -388,8 +400,9 @@ fn capture_loop_inner(
                 .store(true, Ordering::Release);
         }
 
+        let capture_cursor = controls.capture_cursor.load(Ordering::Acquire);
         let desktop_texture = match desktop.as_mut() {
-            Some(desktop) => desktop.capture(&context, config.capture_cursor)?,
+            Some(desktop) => desktop.capture(&context, capture_cursor)?,
             None => None,
         };
         let frame = if let Some(duplication) = duplication.as_mut() {
@@ -416,29 +429,44 @@ fn capture_loop_inner(
                 "captured display dimensions changed".into(),
             ));
         }
-        if let Some(texture) = desktop_texture
-            .as_ref()
-            .or_else(|| frame.as_ref().map(|frame| frame.texture()))
+        if let Some(frame) = frame.as_ref()
+            && let Some(cursor) = cursor_compositor.as_ref()
+        {
+            cursor.update(&context, frame.texture());
+            desktop_cached = true;
+            desktop_pending = true;
+        }
+        let new_capture = frame.is_some() || desktop_texture.is_some();
+        if new_capture {
+            frames_captured += 1;
+        }
+        // Recompose the clean cached desktop when cursor visibility changes,
+        // including keyboard-only handoffs with no DXGI damage. Retain pending
+        // work until the encoder and frame pacer accept it.
+        if desktop_texture.is_some()
+            || (desktop_cached && (desktop_pending || encoded_cursor != Some(capture_cursor)))
         {
             let capture_timestamp_us = monotonic_timestamp_us()?;
-            frames_captured += 1;
             if encoder.wants_input() && frame_pacer.allow(capture_timestamp_us) {
-                let texture = if separate_cursor_visible {
-                    match cursor_compositor.as_ref() {
-                        Some(cursor) => cursor.compose(&context, texture)?,
-                        None => texture,
-                    }
-                } else {
-                    texture
+                let texture = match desktop_texture.as_ref() {
+                    Some(texture) => texture,
+                    None => cursor_compositor
+                        .as_ref()
+                        .ok_or(Error::InvalidDisplayDimensions)?
+                        .compose(&context, capture_cursor && separate_cursor_visible)?,
                 };
                 let yuv = converter.convert(texture)?;
                 cached_yuv = Some(yuv.clone());
                 access_units.extend(encoder.submit(yuv, capture_timestamp_us)?);
                 keyframe_input_pending = false;
-            } else if encoder.wants_input() {
-                frames_rate_limited += 1;
-            } else {
-                frames_encoder_busy += 1;
+                desktop_pending = false;
+                encoded_cursor = Some(capture_cursor);
+            } else if new_capture {
+                if encoder.wants_input() {
+                    frames_rate_limited += 1;
+                } else {
+                    frames_encoder_busy += 1;
+                }
             }
         } else if keyframe_input_pending
             && encoder.wants_input()

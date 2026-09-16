@@ -65,6 +65,7 @@ enum ControlCommand {
     Quality(QualityPreset),
     Chroma(ChromaMode),
     CursorCapture(bool),
+    InputOwnership(bool),
     VideoProfileRejected {
         profile: VideoProfile,
         reason: String,
@@ -721,7 +722,7 @@ async fn run_connected_sender(
                 match command {
                     command @ (ControlCommand::Keyframe | ControlCommand::Bitrate(_)
                         | ControlCommand::Quality(_) | ControlCommand::ViewerCapabilities { .. }
-                        | ControlCommand::Chroma(_) | ControlCommand::CursorCapture(_) | ControlCommand::VideoProfileRejected { .. }
+                        | ControlCommand::Chroma(_) | ControlCommand::CursorCapture(_) | ControlCommand::InputOwnership(_) | ControlCommand::VideoProfileRejected { .. }
                         | ControlCommand::SelectDisplay(_)) => {
                         capture_tx.try_send(command).map_err(|_| anyhow::anyhow!("capture command queue full or closed"))?;
                     }
@@ -991,6 +992,7 @@ fn spawn_input_worker(
         }
     });
     let mut cursor = None;
+    let mut ownership = None;
     let mut state = None;
     Ok(super::native_task::command_worker(
         "meshrmm-input",
@@ -1003,6 +1005,14 @@ fn spawn_input_worker(
                     let _ = input_errors.send(ControlCommand::Stop);
                 }
             } else if status_channel.ready_state() == RTCDataChannelState::Open {
+                let viewer_controls_input = input.viewer_controls_input();
+                if ownership != Some(viewer_controls_input)
+                    && input_errors
+                        .send(ControlCommand::InputOwnership(viewer_controls_input))
+                        .is_ok()
+                {
+                    ownership = Some(viewer_controls_input);
+                }
                 let shape = input.cursor_shape();
                 if cursor != Some(shape)
                     && updates
@@ -1053,6 +1063,7 @@ async fn run_capture_control(
     let mut viewer_profiles = vec![active_profile];
     let mut requested_chroma = ChromaMode::Yuv420;
     let mut capture_cursor = true;
+    let mut viewer_controls_input = false;
     let mut rejected_profiles = Vec::new();
     let mut capture_running = true;
     let mut capture_unavailable_since = None::<std::time::Instant>;
@@ -1156,31 +1167,39 @@ async fn run_capture_control(
                         ).await?;
                         tracing::info!(?active_profile, ?quality, bits_per_second = value, "video profile negotiation completed");
                     }
-                    ControlCommand::CursorCapture(enabled) => {
-                        if capture_cursor == enabled {
-                            continue;
+                    ControlCommand::CursorCapture(enabled) | ControlCommand::InputOwnership(enabled) => {
+                        if matches!(command, ControlCommand::CursorCapture(_)) {
+                            capture_cursor = enabled;
+                            tracing::info!(enabled, "viewer cursor capture selection applied");
+                        } else {
+                            viewer_controls_input = enabled;
                         }
-                        capture_cursor = enabled;
-                        lock_streamer(&streamer)?.set_cursor_capture(enabled);
-                        // Reconfigure capture without replacing the remote session or its services.
-                        lock_streamer(&streamer)?.stop()?;
-                        slot.clear();
-                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
-                        let candidates = profile_candidates(&viewer_profiles, requested_chroma, &rejected_profiles);
-                        let started = start_first_profile(&streamer, active_display.id, stream_id, &slot, &candidates)?;
-                        displays = started.displays;
-                        active_display = started.active_display;
-                        active_profile = started.format.profile();
-                        format = started.format;
-                        capture_running = true;
-                        capture_unavailable_since = None;
-                        send_control_message(&control_channel, SessionMessage::DisplayConfiguration {
-                            displays: displays.clone(),
-                            active_display_id: active_display.id,
-                            stream_id,
-                            format,
-                        }).await?;
-                        tracing::info!(enabled, "viewer cursor capture selection applied");
+                        let update = lock_streamer(&streamer)?.set_cursor_capture(capture_cursor && !viewer_controls_input);
+                        match update {
+                            Ok(false) => {}
+                            Err(error) => tracing::warn!(%error, "could not update cursor capture while the desktop is changing"),
+                            Ok(true) => {
+                                // The console-mode WGC backend needs its existing
+                                // reconfiguration path; service capture updates in place.
+                                lock_streamer(&streamer)?.stop()?;
+                                slot.clear();
+                                stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                                let candidates = profile_candidates(&viewer_profiles, requested_chroma, &rejected_profiles);
+                                let started = start_first_profile(&streamer, active_display.id, stream_id, &slot, &candidates)?;
+                                displays = started.displays;
+                                active_display = started.active_display;
+                                active_profile = started.format.profile();
+                                format = started.format;
+                                capture_running = true;
+                                capture_unavailable_since = None;
+                                send_control_message(&control_channel, SessionMessage::DisplayConfiguration {
+                                    displays: displays.clone(),
+                                    active_display_id: active_display.id,
+                                    stream_id,
+                                    format,
+                                }).await?;
+                            }
+                        }
                     }
                     ControlCommand::Chroma(chroma) => {
                         requested_chroma = chroma;
@@ -1902,6 +1921,10 @@ mod service_isolation_tests {
         fn maintenance_state(&self) -> Option<SessionMessage> {
             None
         }
+        fn viewer_controls_input(&self) -> bool {
+            false
+        }
+
         fn cursor_shape(&self) -> CursorShape {
             CursorShape::Default
         }

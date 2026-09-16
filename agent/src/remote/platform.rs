@@ -44,7 +44,8 @@ pub trait ScreenStreamer: Send {
     }
     fn set_codec(&mut self, codec: Codec);
     fn set_chroma(&mut self, chroma: ChromaMode);
-    fn set_cursor_capture(&mut self, enabled: bool);
+    /// Returns true when the backend requires capture to be restarted.
+    fn set_cursor_capture(&mut self, enabled: bool) -> anyhow::Result<bool>;
     fn input_controller(&self) -> Arc<dyn ScreenInput>;
 }
 
@@ -58,6 +59,7 @@ pub trait ScreenInput: Send + Sync {
     fn apply(&self, input: RemoteInput) -> anyhow::Result<()>;
     fn release_all(&self) -> anyhow::Result<()>;
     fn cursor_shape(&self) -> CursorShape;
+    fn viewer_controls_input(&self) -> bool;
     fn apply_clipboard(&self, text: ClipboardContent) -> anyhow::Result<()>;
     fn poll_clipboard(&self) -> anyhow::Result<Option<ClipboardContent>>;
     /// Helpers already detect changes; direct native implementations may poll.
@@ -285,8 +287,17 @@ impl ScreenStreamer for PlatformScreenStreamer {
         self.chroma = chroma;
     }
 
-    fn set_cursor_capture(&mut self, enabled: bool) {
+    fn set_cursor_capture(&mut self, enabled: bool) -> anyhow::Result<bool> {
+        let changed = self.capture_cursor != enabled;
         self.capture_cursor = enabled;
+        match &self.inner {
+            // windows-capture does not expose runtime WGC cursor settings.
+            CaptureBackend::Direct(_) => Ok(changed),
+            CaptureBackend::Desktop(streamer) => {
+                streamer.set_cursor_capture(enabled)?;
+                Ok(false)
+            }
+        }
     }
 
     fn input_controller(&self) -> Arc<dyn ScreenInput> {
@@ -368,6 +379,12 @@ impl ScreenInput for DirectInputController {
             .lock()
             .map_err(|_| anyhow::anyhow!("direct input controller lock was poisoned"))?
             .release_all()
+    }
+
+    fn viewer_controls_input(&self) -> bool {
+        self.controller
+            .lock()
+            .is_ok_and(|input| input.viewer_controls_input())
     }
 
     fn cursor_shape(&self) -> CursorShape {

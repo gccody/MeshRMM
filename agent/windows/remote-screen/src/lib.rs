@@ -241,6 +241,7 @@ struct CaptureFlags {
 #[derive(Default)]
 struct ControlState {
     request_keyframe: AtomicBool,
+    capture_cursor: AtomicBool,
     requested_bitrate: AtomicU32,
     runtime_bitrate_disabled: AtomicBool,
 }
@@ -759,6 +760,52 @@ mod tests {
             assert!(streamer.poll_ended().is_none());
             streamer.stop().unwrap();
             assert!(streamer.active_format().is_none());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop and hardware video encoder"]
+    fn live_cursor_visibility_updates_without_restarting_capture() {
+        use super::*;
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+        let displays = enumerate_displays().unwrap();
+        for display in displays
+            .iter()
+            .filter(|display| display.primary || display.id == ALL_MONITORS_ID)
+        {
+            let (tx, rx) = mpsc::channel();
+            let mut streamer = WindowsDesktopDuplicationStreamer::new();
+            streamer
+                .start(
+                    StreamConfig::default(),
+                    display.id,
+                    Arc::new(move |frame| {
+                        let _ = tx.send(frame);
+                    }),
+                )
+                .unwrap();
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            for visible in [false, true, false, true] {
+                std::thread::sleep(Duration::from_millis(200));
+                while rx.try_recv().is_ok() {}
+                let changed_at = monotonic_timestamp_us().unwrap();
+                streamer.set_cursor_capture(visible);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let frame = rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .unwrap();
+                    if frame.capture_timestamp_us >= changed_at {
+                        assert!(!frame.data.is_empty());
+                        break;
+                    }
+                }
+                assert!(streamer.poll_ended().is_none());
+            }
+            streamer.stop().unwrap();
         }
     }
 

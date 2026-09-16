@@ -93,8 +93,12 @@ impl WindowsInputController {
         Ok(())
     }
 
+    pub fn viewer_controls_input(&self) -> bool {
+        self.viewer_controls_input.load(Ordering::SeqCst)
+    }
+
     pub fn cursor_shape(&self) -> CursorShape {
-        if !self.viewer_controls_input.load(Ordering::SeqCst) {
+        if !self.viewer_controls_input() {
             return self.viewer_cursor.get();
         }
         let shape = self.current_cursor_shape();

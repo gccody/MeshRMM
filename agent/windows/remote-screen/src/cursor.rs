@@ -49,6 +49,7 @@ pub(crate) fn draw_cursor(dc: HDC, origin_x: i32, origin_y: i32) -> Result<(), E
 
 pub(crate) struct CursorCompositor {
     texture: ID3D11Texture2D,
+    desktop: ID3D11Texture2D,
     surface: IDXGISurface1,
     region: D3D11_BOX,
     origin: (i32, i32),
@@ -83,8 +84,18 @@ impl CursorCompositor {
         }
         let texture = texture.ok_or(Error::InvalidDisplayDimensions)?;
         let surface = texture.cast()?;
+        let mut desktop = None;
+        let desktop_desc = D3D11_TEXTURE2D_DESC {
+            MiscFlags: 0,
+            ..desc
+        };
+        unsafe {
+            device.CreateTexture2D(&desktop_desc, None, Some(&mut desktop))?;
+        }
+        let desktop = desktop.ok_or(Error::InvalidDisplayDimensions)?;
         Ok(Self {
             texture,
+            desktop,
             surface,
             region: D3D11_BOX {
                 right: width,
@@ -96,15 +107,24 @@ impl CursorCompositor {
         })
     }
 
+    pub fn update(&self, context: &ID3D11DeviceContext, source: &ID3D11Texture2D) {
+        // Keep a clean, owned frame after DXGI releases its borrowed surface.
+        // Ownership may change on a static desktop without any new damage.
+        unsafe {
+            context.CopySubresourceRegion(&self.desktop, 0, 0, 0, 0, source, 0, Some(&self.region));
+        }
+    }
+
     pub fn compose(
         &self,
         context: &ID3D11DeviceContext,
-        source: &ID3D11Texture2D,
+        visible: bool,
     ) -> Result<&ID3D11Texture2D, Error> {
-        // Never paint into DXGI's borrowed texture: every frame starts with a clean
-        // desktop, so moving or hiding the cursor cannot leave trails behind.
+        if !visible {
+            return Ok(&self.desktop);
+        }
         unsafe {
-            context.CopySubresourceRegion(&self.texture, 0, 0, 0, 0, source, 0, Some(&self.region));
+            context.CopyResource(&self.texture, &self.desktop);
             let dc = self.surface.GetDC(false)?;
             let drawn = draw_cursor(dc, self.origin.0, self.origin.1);
             // Release even when drawing failed, before any further D3D work.
