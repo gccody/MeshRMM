@@ -89,3 +89,50 @@ pub async fn authenticated_websocket(url: Url, token: &str) -> anyhow::Result<So
     let (socket, _) = meshrmm_signaling_client::authenticated_websocket(url, token).await?;
     Ok(socket)
 }
+
+/// End via a separate authenticated request even if the signaling socket died.
+/// The server acknowledges only after releasing the device lease.
+pub async fn end_session(config: &Config, bootstrap: &SessionBootstrap) -> anyhow::Result<()> {
+    let url = endpoint_url(
+        config.server.as_str(),
+        &[
+            "v1",
+            "remote",
+            "sessions",
+            bootstrap.session_id.as_str(),
+            "end",
+        ],
+        &[],
+        false,
+    )?;
+    let client = reqwest::Client::builder()
+        .https_only(true)
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match client
+            .post(url.clone())
+            .bearer_auth(&bootstrap.signaling_token)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                let terminal = error.status().is_some_and(|status| {
+                    status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                });
+                last_error = Some(error);
+                if terminal {
+                    break;
+                }
+            }
+        }
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+    Err(last_error.expect("at least one close attempt"))
+        .context("server did not acknowledge session cleanup")
+}

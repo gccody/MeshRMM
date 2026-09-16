@@ -306,6 +306,20 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
         (Method::Post, ["v1", "remote", "handoffs", "redeem"]) => {
             redeem_handoff(&request, &environment).await
         }
+        (Method::Post, ["v1", "remote", "sessions", session_id, "end"]) => {
+            if Uuid::parse_str(session_id).is_err() {
+                return cors(api_error(400, "invalid session ID")?, &environment);
+            }
+            forward_to_object(
+                &environment,
+                "REMOTE_SESSION",
+                session_id,
+                request,
+                "https://session.internal/end",
+                &[],
+            )
+            .await
+        }
         (Method::Post, ["v1", "remote", "sessions", session_id, "resume"]) => {
             if Uuid::parse_str(session_id).is_err() {
                 return cors(api_error(400, "invalid session ID")?, &environment);

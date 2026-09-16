@@ -45,7 +45,14 @@ try {
   assert.equal((await post(first, '/init', { ...request('session-first'), device_id: 'device-test', client_token: 'client-token', agent_token: 'agent-token', idle_timeout_ms: 900_000 })).status, 200);
   assert.equal((await post(agent, '/request', request('session-first'))).status, 200);
   assert.equal((await post(agent, '/request', request('blocked'))).status, 409);
-  assert.deepEqual(await (await post(agent, '/close-session')).json(), { closed: true });
+  // Cleanup is independently authenticated and works without a signaling socket.
+  assert.equal((await post(first, '/end')).status, 401);
+  assert.equal((await first.fetch('https://session.internal/end', { method: 'POST', headers: { Authorization: 'Bearer agent-token' } })).status, 401);
+  assert.equal((await post(agent, '/request', request('unauthorized-close-did-not-release'))).status, 409);
+  const end = () => first.fetch('https://session.internal/end', { method: 'POST', headers: { Authorization: 'Bearer client-token' } });
+  assert.equal((await end()).status, 200);
+  assert.equal((await end()).status, 200);
+  assert.deepEqual(await (await post(agent, '/close-session')).json(), { closed: false });
   assert.equal((await first.fetch('https://session.internal/resume', { method: 'POST', headers: { Authorization: 'Bearer client-token' } })).status, 410);
   assert.deepEqual(await (await agent.fetch('https://agent.internal/status')).json(), { connected: true });
   // A stale lease with no RemoteSession record must also be recoverable.
