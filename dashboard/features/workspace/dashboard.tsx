@@ -56,6 +56,12 @@ type AgentInstallerBootstrap = {
 };
 type View = "agents" | "team" | "sso" | "settings";
 const VIEW_PATHS: Record<View, string> = { agents: "/", team: "/users", sso: "/authentication", settings: "/settings" };
+const SETTINGS_TABS = [
+  { id: "dashboard-security", label: "Dashboard security" },
+  { id: "remote-sessions", label: "Remote sessions" },
+  { id: "blackout", label: "Blackout message" },
+] as const;
+type SettingsTab = (typeof SETTINGS_TABS)[number]["id"];
 type SessionPauseReason = "idle" | "expired";
 
 const INSTALLER_ASSETS: Record<AgentPlatform, { label: string; binary: string; checksum: string }> = {
@@ -87,6 +93,7 @@ function TenantDashboard({ view }: { view: View }) {
     roles,
   } = useAuth();
   const [account, setAccount] = useState<Account | null>(null);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("dashboard-security");
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<AgentStatusFilter>("all");
   const [isAuthOpen, setIsAuthOpen] = useState(false);
@@ -503,13 +510,33 @@ function TenantDashboard({ view }: { view: View }) {
               {error && <div className="error-banner" role="alert"><WifiOff size={17} /><span>{error}</span><button onClick={() => setError(null)} aria-label="Dismiss"><X size={16} /></button></div>}
 
               {view === "settings" ? (<div className="settings-page">
-                    <nav className="settings-categories" aria-label="Settings categories">
-                    <a href="#dashboard-security">Dashboard security</a>
-                    <a href="#remote-sessions">Remote sessions</a>
-                    <a href="#blackout">Blackout message</a>
-                    </nav>{!account?.company ? <p role="status">Loading company settings…</p> : <>{!isAdmin && <p className="session-notice">Company settings are managed by your administrator.</p>}<form className="company-settings-form" onSubmit={saveSessionPolicy}>
+                    <div className="settings-categories" role="tablist" aria-label="Settings categories">
+                      {SETTINGS_TABS.map((tab, index) => (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          role="tab"
+                          id={`settings-tab-${tab.id}`}
+                          aria-controls={tab.id}
+                          aria-selected={settingsTab === tab.id}
+                          tabIndex={settingsTab === tab.id ? 0 : -1}
+                          onClick={() => setSettingsTab(tab.id)}
+                          onKeyDown={(event) => {
+                            let next: number;
+                            if (event.key === "ArrowRight") next = (index + 1) % SETTINGS_TABS.length;
+                            else if (event.key === "ArrowLeft") next = (index + SETTINGS_TABS.length - 1) % SETTINGS_TABS.length;
+                            else if (event.key === "Home") next = 0;
+                            else if (event.key === "End") next = SETTINGS_TABS.length - 1;
+                            else return;
+                            event.preventDefault();
+                            setSettingsTab(SETTINGS_TABS[next].id);
+                            document.getElementById(`settings-tab-${SETTINGS_TABS[next].id}`)?.focus();
+                          }}
+                        >{tab.label}</button>
+                      ))}
+                    </div>{!account?.company ? <p role="status">Loading company settings…</p> : <>{!isAdmin && <p className="session-notice">Company settings are managed by your administrator.</p>}<form className="company-settings-form" onSubmit={saveSessionPolicy}>
                     <fieldset disabled={!isAdmin || isSavingSessionPolicy}>
-                    <section className="settings-section" id="dashboard-security">
+                    <section className="settings-section" id="dashboard-security" role="tabpanel" aria-labelledby="settings-tab-dashboard-security" hidden={settingsTab !== "dashboard-security"} tabIndex={0}>
                     <h2>Dashboard security</h2>
                     <p>Choose when an inactive dashboard session is paused.</p>
                     <label htmlFor="idle-timeout">Sign out inactive dashboards after<select id="idle-timeout" value={idleTimeoutDraft} onChange={(event) => setIdleTimeoutDraft(Number(event.target.value))}>
@@ -525,7 +552,7 @@ function TenantDashboard({ view }: { view: View }) {
                     </select>
                     </label>
                     </section>
-                    <section className="settings-section" id="remote-sessions">
+                    <section className="settings-section" id="remote-sessions" role="tabpanel" aria-labelledby="settings-tab-remote-sessions" hidden={settingsTab !== "remote-sessions"} tabIndex={0}>
                     <h2>Remote sessions</h2>
                     <p>Defaults for new connections. Monitor highlighting can be changed in the viewer.</p>
                     <label>
@@ -536,7 +563,7 @@ function TenantDashboard({ view }: { view: View }) {
                     <input type="checkbox" checked={allowIdleOverrideDraft} onChange={(event) => setAllowIdleOverrideDraft(event.target.checked)} /> Allow users to change idle-lock prevention per session</label>
                     <p>The per-session permission above applies only to idle-lock prevention.</p>
                     </section>
-                    <section className="settings-section" id="blackout">
+                    <section className="settings-section" id="blackout" role="tabpanel" aria-labelledby="settings-tab-blackout" hidden={settingsTab !== "blackout"} tabIndex={0}>
                     <h2>Blackout message</h2>
                     <p>Shown on the remote device when a technician enables screen blackout.</p>
                     <label htmlFor="blackout-message">Agent blackout message<textarea id="blackout-message" rows={4} required maxLength={2048} value={blackoutMessageDraft} onChange={(event) => setBlackoutMessageDraft(event.target.value)} aria-describedby="blackout-message-help" />
@@ -545,7 +572,9 @@ function TenantDashboard({ view }: { view: View }) {
                     <div className="blackout-preview" aria-label="Blackout message preview">{blackoutMessageDraft.replaceAll("{user_name}", displayName)}</div>
                     <button type="button" className="secondary-button" onClick={() => setBlackoutMessageDraft(DEFAULT_BLACKOUT_MESSAGE)}>Restore default message</button>
                     </section>
-                    </fieldset>{isAdmin && <div className="settings-save">
+                    </fieldset>
+                    {settingsTab !== "blackout" && (!blackoutMessageDraft.trim() || new TextEncoder().encode(blackoutMessageDraft).length > 2048) && <p role="alert">Check the blackout message before saving: it must contain text and be no larger than 2 KB.</p>}
+                    {isAdmin && <div className="settings-save">
                     <button className="primary-button" disabled={isSavingSessionPolicy || !blackoutMessageDraft.trim() || new TextEncoder().encode(blackoutMessageDraft).length > 2048 || (preventIdleDraft === (account?.company?.prevent_idle_lock ?? true) && allowIdleOverrideDraft === (account?.company?.allow_idle_override ?? true) && displayBorderDraft === (account?.company?.display_border ?? true) && idleTimeoutDraft === idleTimeoutMinutes && blackoutMessageDraft === (account?.company?.blackout_message ?? DEFAULT_BLACKOUT_MESSAGE))}>{isSavingSessionPolicy ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save company settings</button>
                     </div>}{settingsNotice && <p role="status" className="session-notice">{settingsNotice}</p>}</form>
                     </>}</div>) : view === "agents" ? (
