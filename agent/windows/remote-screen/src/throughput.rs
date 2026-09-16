@@ -153,3 +153,131 @@ fn desktop_capture_throughput() {
         "animated desktop cannot sustain 30 FPS: {fps:.2}"
     );
 }
+
+#[test]
+#[ignore = "requires hardware H.264/HEVC encoders; exercises all bitrates with 1440p noise"]
+fn hardware_bitrate_presets_under_high_motion() {
+    const WIDTH: u32 = 2560;
+    const HEIGHT: u32 = 1440;
+    // Independent 32x32 noise blocks defeat temporal prediction and expose
+    // quality constraints that override CBR on complex video. Pixel-level white
+    // noise can exceed 3 Mbps even at the codec's maximum quantizer; transport
+    // pacing covers that case separately.
+    let mut seed = 1_u32;
+    let pictures: Vec<Vec<u32>> = (0..8)
+        .map(|_| {
+            let blocks: Vec<u32> = (0..(WIDTH / 32) * HEIGHT.div_ceil(32))
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed | 0xff00_0000
+                })
+                .collect();
+            (0..WIDTH * HEIGHT)
+                .map(|pixel| {
+                    blocks[((pixel / WIDTH / 32) * (WIDTH / 32) + pixel % WIDTH / 32) as usize]
+                })
+                .collect()
+        })
+        .collect();
+    for codec in [VideoCodec::H264, VideoCodec::H265] {
+        let mut measured_rates = Vec::new();
+        for bitrate in [3_000_000, 6_000_000, 12_000_000] {
+            let (device, context) = windows_capture::d3d11::create_d3d_device().unwrap();
+            let mut converter = converter::BgraToYuvConverter::new(
+                &device,
+                &context,
+                WIDTH,
+                HEIGHT,
+                60,
+                VideoPixelFormat::Yuv420,
+            )
+            .unwrap();
+            let mut encoder = encoder::MediaFoundationVideoEncoder::new(
+                &device,
+                WIDTH,
+                HEIGHT,
+                60,
+                bitrate,
+                codec,
+                VideoPixelFormat::Yuv420,
+            )
+            .unwrap();
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: WIDTH,
+                Height: HEIGHT,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                ..Default::default()
+            };
+            let mut texture = None;
+            // Safety: the texture belongs to the converter's device.
+            unsafe {
+                device
+                    .CreateTexture2D(&desc, None, Some(&mut texture))
+                    .unwrap();
+            }
+            let texture = texture.unwrap();
+            let started = Instant::now();
+            let mut next = started;
+            let mut submitted = 0;
+            let mut completed = 0;
+            let mut bytes = 0;
+            while started.elapsed() < Duration::from_secs(6) {
+                let mut output = encoder.poll().unwrap();
+                if Instant::now() >= next && encoder.wants_input() {
+                    // Safety: each picture contains HEIGHT rows of WIDTH BGRA pixels.
+                    unsafe {
+                        context.UpdateSubresource(
+                            &texture,
+                            0,
+                            None,
+                            pictures[submitted % pictures.len()].as_ptr().cast(),
+                            WIDTH * 4,
+                            0,
+                        );
+                    }
+                    output.extend(
+                        encoder
+                            .submit(
+                                converter.convert(&texture).unwrap(),
+                                crate::monotonic_timestamp_us().unwrap(),
+                            )
+                            .unwrap(),
+                    );
+                    submitted += 1;
+                    next = Instant::now() + Duration::from_nanos(1_000_000_000 / 60);
+                }
+                for frame in output {
+                    completed += 1;
+                    bytes += frame.data.len();
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            let measured = bytes as f64 * 8.0 / elapsed;
+            let fps = completed as f64 / elapsed;
+            eprintln!("{codec:?}: target={bitrate} measured={measured:.0} fps={fps:.1}");
+            assert!(
+                fps >= 30.0,
+                "bitrate must not be achieved by stalling capture"
+            );
+            measured_rates.push(measured);
+        }
+        // Hardware CBR cannot guarantee a wire-rate ceiling on arbitrary input
+        // (the sender's pacing tests cover that). It must still respond to the
+        // preset: Data Saver should compress this identical scene more strongly.
+        assert!(
+            measured_rates[0] < measured_rates[2],
+            "{codec:?} ignored the quality presets: {measured_rates:?}"
+        );
+    }
+}

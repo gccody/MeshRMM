@@ -85,6 +85,27 @@ const DESKTOP_LIFECYCLE_INTERVAL: std::time::Duration = std::time::Duration::fro
 const DESKTOP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const DISCONNECTED_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
 
+// Encoder CBR is a target, not a transport limit. Pace video fragments even
+// when the network is fast enough to hide encoder overshoot from congestion
+// control. Allow a small burst, but never accumulate credit while idle.
+const VIDEO_PACING_BURST_US: u64 = 20_000;
+
+#[derive(Default)]
+struct VideoPacer {
+    next_send_us: u64,
+}
+
+impl VideoPacer {
+    fn reserve(&mut self, now_us: u64, bytes: usize, bits_per_second: u32) -> u64 {
+        let duration_us = (bytes as u64)
+            .saturating_mul(8_000_000)
+            .div_ceil(u64::from(bits_per_second.max(1)));
+        self.next_send_us = self.next_send_us.max(now_us).saturating_add(duration_us);
+        self.next_send_us
+            .saturating_sub(now_us.saturating_add(VIDEO_PACING_BURST_US))
+    }
+}
+
 #[derive(Debug)]
 struct AdaptiveBitrate {
     minimum: u32,
@@ -1093,34 +1114,35 @@ async fn run_capture_control(
                         // bootstrap keyframe. Keep HEVC at the selected quality
                         // preset; congestion handling can still drop frames and
                         // request recovery without destabilizing the encoder.
+                        // A queued adjustment from before a preset change must
+                        // never raise the encoder above the new quality ceiling.
+                        let value = value.min(quality_ceiling.load(Ordering::Acquire));
                         if let Err(error) = lock_streamer(&streamer)?.set_adaptive_bitrate(value) {
                             tracing::warn!(error = %error, "could not set bitrate while the desktop is changing");
                         }
                     }
-                    ControlCommand::Quality(preset) => {
-                        let value = preset.bitrate(configured_maximum_bitrate);
-                        quality_ceiling.store(value, Ordering::Release);
-                        if let Err(error) = lock_streamer(&streamer)?.set_bitrate(value) {
-                            tracing::warn!(error = %error, "could not apply viewer quality preset");
-                        } else {
-                            tracing::info!(?preset, bits_per_second = value, "viewer quality preset applied");
-                        }
-                    }
-                    ControlCommand::ViewerCapabilities { profiles, quality, chroma } => {
+                    ControlCommand::Quality(quality)
+                    | ControlCommand::ViewerCapabilities { quality, .. } => {
                         let value = quality.bitrate(configured_maximum_bitrate);
-                        quality_ceiling.store(value, Ordering::Release);
-                        if let Err(error) = lock_streamer(&streamer)?.set_bitrate(value) {
-                            tracing::warn!(error = %error, "could not apply initial viewer quality preset");
+                        if let ControlCommand::ViewerCapabilities { profiles, chroma, .. } = command {
+                            viewer_profiles = profiles;
+                            requested_chroma = chroma;
+                            rejected_profiles.clear();
                         }
-                        viewer_profiles = profiles;
-                        requested_chroma = chroma;
-                        rejected_profiles.clear();
+                        quality_ceiling.store(value, Ordering::Release);
+                        // Recreate the encoder with its static bitrate settings.
+                        // Live CodecAPI updates may be ignored, rejected, or even
+                        // terminate HEVC encoders after the call reports success.
+                        lock_streamer(&streamer)?.set_bitrate(value);
                         let candidates = profile_candidates(
                             &viewer_profiles,
                             requested_chroma,
                             &rejected_profiles,
                         );
-                        if candidates.first() == Some(&active_profile) {
+                        if capture_running
+                            && candidates.first() == Some(&active_profile)
+                            && format.bitrate_bits_per_second == value
+                        {
                             // Echo the settled configuration even when no
                             // restart is needed. The viewer deliberately does
                             // not paint the mandatory bootstrap profile until
@@ -1135,7 +1157,7 @@ async fn run_capture_control(
                                 },
                             )
                             .await?;
-                            tracing::info!(?active_profile, ?quality, ?requested_chroma, "video profile negotiation retained active profile");
+                            tracing::info!(?active_profile, ?quality, ?requested_chroma, "video quality/profile selection retained active configuration");
                             continue;
                         }
 
@@ -1165,7 +1187,7 @@ async fn run_capture_control(
                                 format: started.format,
                             },
                         ).await?;
-                        tracing::info!(?active_profile, ?quality, bits_per_second = value, "video profile negotiation completed");
+                        tracing::info!(?active_profile, ?quality, bits_per_second = value, "video quality/profile selection applied");
                     }
                     ControlCommand::CursorCapture(enabled) | ControlCommand::InputOwnership(enabled) => {
                         if matches!(command, ControlCommand::CursorCapture(_)) {
@@ -1588,6 +1610,7 @@ fn spawn_video_sender(
         let mut recovering = false;
         let mut last_keyframe_request_us = 0_u64;
         let mut bitrate = AdaptiveBitrate::new(quality_ceiling.load(Ordering::Acquire).max(1));
+        let mut pacer = VideoPacer::default();
         loop {
             let source = if let Some(frame) = bootstrap_keyframe.take() {
                 frame
@@ -1699,6 +1722,14 @@ fn spawn_video_sender(
                         break;
                     }
                 };
+                let delay_us = pacer.reserve(
+                    monotonic_timestamp_us(),
+                    bytes.len(),
+                    quality_ceiling.load(Ordering::Acquire),
+                );
+                if delay_us != 0 {
+                    tokio::time::sleep(std::time::Duration::from_micros(delay_us)).await;
+                }
                 bytes_sent = bytes_sent.saturating_add(bytes.len() as u64);
                 if let Err(error) = channel.send(&Bytes::from(bytes)).await {
                     tracing::warn!(error = %error, "video data channel send failed");
@@ -1746,6 +1777,31 @@ fn spawn_video_sender(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_pacing_bounds_sustained_overshoot_and_idle_bursts() {
+        let mut pacer = VideoPacer::default();
+        let mut now = 1_000_000;
+        let started = now;
+        let mut bytes = 0;
+        // Model an encoder producing far more than Data Saver's 3 Mbps.
+        for _ in 0..1000 {
+            now += pacer.reserve(now, 12_000, 3_000_000);
+            bytes += 12_000_u64;
+            assert!(bytes * 8_000_000 <= (now - started + VIDEO_PACING_BURST_US) * 3_000_000);
+        }
+        now += 60_000_000;
+        assert_eq!(pacer.reserve(now, 12_000, 3_000_000), 12_000);
+    }
+
+    #[test]
+    fn video_pacing_applies_quality_changes_to_the_next_fragment() {
+        let mut pacer = VideoPacer::default();
+        assert_eq!(pacer.reserve(1_000_000, 12_000, 12_000_000), 0);
+        assert_eq!(pacer.reserve(1_008_000, 12_000, 3_000_000), 12_000);
+        assert_eq!(pacer.reserve(2_000_000, 12_000, 6_000_000), 0);
+        assert_eq!(pacer.reserve(2_000_000, 12_000, 6_000_000), 12_000);
+    }
 
     #[test]
     fn adaptive_bitrate_uses_aimd_without_oscillating() {

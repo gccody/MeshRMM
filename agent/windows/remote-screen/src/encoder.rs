@@ -583,14 +583,9 @@ fn configure_codec(
         VARIANT::from(0_u32),
         "desktop content type",
     )?;
-    // Bound destructive quantization during complex desktop updates. Drivers
-    // may ignore this optional hint to preserve their CBR guarantees.
-    set_optional_initial_codec_value(
-        codec_api,
-        &CODECAPI_AVEncVideoMaxQP,
-        VARIANT::from(36_u32),
-        "maximum quantizer",
-    )?;
+    // Leave the quantizer range unrestricted so CBR can meet the selected
+    // bitrate even on high-entropy video. A MaxQP quality floor overrides that
+    // budget on some hardware encoders (including NVIDIA's HEVC MFT).
     set_optional_initial_codec_value(
         codec_api,
         &CODECAPI_AVEncCommonBufferSize,
