@@ -105,6 +105,7 @@ enum ParentCommand {
         bitrate_bits_per_second: u32,
         codec: VideoCodec,
         pixel_format: VideoPixelFormat,
+        capture_cursor: bool,
     },
     RequestKeyframe,
     SetBitrate(u32),
@@ -287,6 +288,7 @@ impl DesktopCaptureStreamer {
                 bitrate_bits_per_second: config.bitrate_bits_per_second,
                 codec: config.codec,
                 pixel_format: config.pixel_format,
+                capture_cursor: config.capture_cursor,
             },
         )?;
         let started = running
@@ -346,6 +348,7 @@ impl DesktopCaptureStreamer {
             bitrate_bits_per_second: config.bitrate_bits_per_second,
             codec: config.codec,
             pixel_format: config.pixel_format,
+            capture_cursor: config.capture_cursor,
         };
         if let Err(error) = send_command(&input, &start) {
             terminate_and_wait(&launched.process);
@@ -1461,6 +1464,7 @@ pub fn run_child() -> anyhow::Result<()> {
             bitrate_bits_per_second,
             codec,
             pixel_format,
+            capture_cursor,
         } => run_capture_child(
             command_rx,
             display_id,
@@ -1468,6 +1472,7 @@ pub fn run_child() -> anyhow::Result<()> {
             bitrate_bits_per_second,
             codec,
             pixel_format,
+            capture_cursor,
         ),
         ParentCommand::StartFiles => run_file_child(command_rx),
         ParentCommand::StartClipboard => run_clipboard_child(command_rx),
@@ -1487,6 +1492,7 @@ fn run_capture_child(
     mut bitrate_bits_per_second: u32,
     mut codec: VideoCodec,
     mut pixel_format: VideoPixelFormat,
+    mut capture_cursor: bool,
 ) -> anyhow::Result<()> {
     'capture: loop {
         if frames_per_second == 0 || bitrate_bits_per_second == 0 {
@@ -1521,6 +1527,7 @@ fn run_capture_child(
                 bitrate_bits_per_second,
                 codec,
                 pixel_format,
+                capture_cursor,
             },
             active_display.id.0,
             sink,
@@ -1572,6 +1579,7 @@ fn run_capture_child(
                     bitrate_bits_per_second: next_bitrate,
                     codec: next_codec,
                     pixel_format: next_pixel_format,
+                    capture_cursor: next_capture_cursor,
                 })) => {
                     streamer.stop()?;
                     display_id = next_display;
@@ -1579,6 +1587,7 @@ fn run_capture_child(
                     bitrate_bits_per_second = next_bitrate;
                     codec = next_codec;
                     pixel_format = next_pixel_format;
+                    capture_cursor = next_capture_cursor;
                     continue 'capture;
                 }
                 Ok(Ok(
@@ -1762,6 +1771,7 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             bitrate_bits_per_second,
             codec,
             pixel_format,
+            capture_cursor,
         } => {
             writer.write_all(&[COMMAND_START])?;
             checked_len(viewer_name.len(), MAX_DISPLAY_NAME_BYTES, "viewer name")?;
@@ -1772,6 +1782,7 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
             write_u32(&mut writer, *bitrate_bits_per_second)
                 .and_then(|()| writer.write_all(&[codec_byte(*codec)]))
                 .and_then(|()| writer.write_all(&[pixel_format_byte(*pixel_format)]))
+                .and_then(|()| writer.write_all(&[u8::from(*capture_cursor)]))
         }
         ParentCommand::RequestKeyframe => writer.write_all(&[COMMAND_REQUEST_KEYFRAME]),
         ParentCommand::SetBitrate(bits_per_second) => {
@@ -1862,6 +1873,7 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
                 bitrate_bits_per_second: read_u32(&mut reader)?,
                 codec: read_codec(&mut reader)?,
                 pixel_format: read_pixel_format(&mut reader)?,
+                capture_cursor: read_bool(&mut reader)?,
             })
         }
         COMMAND_REQUEST_KEYFRAME => Ok(ParentCommand::RequestKeyframe),
@@ -2281,6 +2293,17 @@ fn write_u32(writer: &mut impl Write, value: u32) -> io::Result<()> {
 fn write_u64(writer: &mut impl Write, value: u64) -> io::Result<()> {
     writer.write_all(&value.to_le_bytes())
 }
+fn read_bool(reader: &mut impl Read) -> io::Result<bool> {
+    match read_u8(reader)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid boolean",
+        )),
+    }
+}
+
 fn read_u8(reader: &mut impl Read) -> io::Result<u8> {
     let mut value = [0; 1];
     reader.read_exact(&mut value)?;
@@ -2490,6 +2513,36 @@ mod tests {
     }
 
     #[test]
+    fn cursor_capture_survives_helper_start_and_leaves_next_command_aligned() {
+        for enabled in [false, true] {
+            let mut bytes = Vec::new();
+            write_command(
+                &mut bytes,
+                &ParentCommand::Start {
+                    viewer_name: "Viewer".into(),
+                    display_id: Some(DisplayId(1)),
+                    frames_per_second: 60,
+                    bitrate_bits_per_second: 6_000_000,
+                    codec: VideoCodec::H264,
+                    pixel_format: VideoPixelFormat::Yuv420,
+                    capture_cursor: enabled,
+                },
+            )
+            .unwrap();
+            write_command(&mut bytes, &ParentCommand::RequestKeyframe).unwrap();
+            let mut reader = bytes.as_slice();
+            assert!(
+                matches!(read_command(&mut reader).unwrap(), ParentCommand::Start { capture_cursor, .. } if capture_cursor == enabled)
+            );
+            assert!(matches!(
+                read_command(&mut reader).unwrap(),
+                ParentCommand::RequestKeyframe
+            ));
+            assert!(reader.is_empty());
+        }
+    }
+
+    #[test]
     fn command_protocol_round_trips_desktop_input() {
         let commands = [
             ParentCommand::Start {
@@ -2499,6 +2552,7 @@ mod tests {
                 bitrate_bits_per_second: 12_000_000,
                 codec: VideoCodec::H265,
                 pixel_format: VideoPixelFormat::Yuv444,
+                capture_cursor: true,
             },
             ParentCommand::StartClipboard,
             ParentCommand::StartChatHelper {

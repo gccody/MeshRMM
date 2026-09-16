@@ -6,6 +6,7 @@
 //! encoded access units cross the callback boundary.
 
 mod converter;
+mod cursor;
 mod desktop;
 mod duplication;
 mod encoder;
@@ -44,6 +45,7 @@ pub struct StreamConfig {
     pub bitrate_bits_per_second: u32,
     pub codec: VideoCodec,
     pub pixel_format: VideoPixelFormat,
+    pub capture_cursor: bool,
 }
 
 impl Default for StreamConfig {
@@ -53,6 +55,7 @@ impl Default for StreamConfig {
             bitrate_bits_per_second: 12_000_000,
             codec: VideoCodec::H264,
             pixel_format: VideoPixelFormat::Yuv420,
+            capture_cursor: true,
         }
     }
 }
@@ -533,7 +536,11 @@ impl WindowsScreenStreamer {
         };
         let settings = Settings::new(
             monitor,
-            CursorCaptureSettings::WithCursor,
+            if config.capture_cursor {
+                CursorCaptureSettings::WithCursor
+            } else {
+                CursorCaptureSettings::WithoutCursor
+            },
             DrawBorderSettings::Default,
             SecondaryWindowSettings::Default,
             MinimumUpdateIntervalSettings::Custom(std::time::Duration::from_secs_f64(
@@ -773,6 +780,7 @@ mod tests {
                     bitrate_bits_per_second: 6_000_000,
                     codec: VideoCodec::H265,
                     pixel_format: VideoPixelFormat::Yuv420,
+                    capture_cursor: true,
                 },
                 display_id,
                 Arc::new(move |_| {

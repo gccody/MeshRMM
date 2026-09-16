@@ -57,6 +57,7 @@ struct ReceiverLifecycle {
 #[derive(Clone, Default)]
 pub struct ViewerResumeState {
     technician_blocked: Arc<AtomicBool>,
+    remote_cursor_hidden: Arc<AtomicBool>,
     quality: Arc<Mutex<QualityPreset>>,
     chroma: Arc<Mutex<ChromaMode>>,
     display_id: Arc<Mutex<Option<meshrmm_protocol::DisplayId>>>,
@@ -1082,6 +1083,7 @@ fn install_control_handler(
                         viewer_control.chat.clone(),
                         viewer_control.resume_state.audio.clone(),
                         Arc::clone(&viewer_control.resume_state.technician_blocked),
+                        Arc::clone(&viewer_control.resume_state.remote_cursor_hidden),
                         Arc::clone(&viewer_control.maintenance),
                         Arc::clone(&quality_preset),
                         Arc::clone(&chroma_mode),
@@ -1147,6 +1149,9 @@ fn install_control_handler(
                         // bootstrap profile. Negotiate the best common profile
                         // before creating a visible presenter; the Agent echoes a
                         // settled configuration even when that profile is retained.
+                        viewer_control.send(SessionMessage::SetCursorCapture {
+                            enabled: sink.show_remote_cursor(),
+                        });
                         viewer_control.send(SessionMessage::ViewerCapabilities {
                             profiles: profiles.as_ref().clone(),
                             quality: sink.quality_preset(),
