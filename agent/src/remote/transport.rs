@@ -399,6 +399,9 @@ async fn run_connected_sender(
         move |message| {
             let result = match message {
                 Some(SessionMessage::SendSecureAttention) => super::secure_attention::send(),
+                Some(SessionMessage::SetWallpaperHidden { hidden }) => {
+                    maintenance_input.set_wallpaper_hidden(hidden)
+                }
                 Some(SessionMessage::SetBlackout { enabled }) => {
                     maintenance_input.set_blackout(enabled)
                 }
@@ -413,6 +416,7 @@ async fn run_connected_sender(
             }
         },
         move || {
+            let _ = cleanup_input.set_wallpaper_hidden(false);
             let _ = cleanup_input.set_blackout(false);
             let _ = cleanup_input.set_agent_input_blocked(false);
         },
@@ -505,6 +509,7 @@ async fn run_connected_sender(
                     }
                     Ok(
                         message @ (SessionMessage::SendSecureAttention
+                        | SessionMessage::SetWallpaperHidden { .. }
                         | SessionMessage::SetBlackout { .. }
                         | SessionMessage::SetAgentInputBlocked { .. }),
                     ) => maintenance_tx.try_send(message).err().map(|_| {
@@ -1946,6 +1951,9 @@ mod service_isolation_tests {
         file_gate: Mutex<std::sync::mpsc::Receiver<()>>,
     }
     impl ScreenInput for TestInput {
+        fn set_wallpaper_hidden(&self, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn apply_files(&self, _: FileMessage) -> anyhow::Result<()> {
             self.events.send("file blocked")?;
             self.file_gate

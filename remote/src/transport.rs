@@ -1153,6 +1153,7 @@ fn install_control_handler(
                         // bootstrap profile. Negotiate the best common profile
                         // before creating a visible presenter; the Agent echoes a
                         // settled configuration even when that profile is retained.
+                        viewer_control.send(SessionMessage::SetWallpaperHidden { hidden: sink.wallpaper_hidden() });
                         viewer_control.send(SessionMessage::SetCursorCapture {
                             enabled: sink.show_remote_cursor(),
                         });

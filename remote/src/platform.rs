@@ -27,6 +27,7 @@ pub struct ControlSink {
     set_input_enabled: Arc<dyn Fn(bool) + Send + Sync>,
     maintenance: Arc<Mutex<MaintenanceState>>,
     technician_blocked: Arc<std::sync::atomic::AtomicBool>,
+    wallpaper_hidden: Arc<std::sync::atomic::AtomicBool>,
     remote_cursor_hidden: Arc<std::sync::atomic::AtomicBool>,
     quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
     chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
@@ -58,6 +59,7 @@ impl ControlSink {
             recording,
             technician_blocked,
             remote_cursor_hidden,
+            wallpaper_hidden: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             maintenance,
             send: Arc::new(send),
             set_input_enabled: Arc::new(set_input_enabled),
@@ -185,6 +187,18 @@ impl ControlSink {
     pub fn technician_blocked(&self) -> bool {
         self.technician_blocked
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn wallpaper_hidden(&self) -> bool {
+        self.wallpaper_hidden
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn toggle_wallpaper(&self) {
+        let hidden = !self
+            .wallpaper_hidden
+            .fetch_xor(true, std::sync::atomic::Ordering::SeqCst);
+        self.send(meshrmm_protocol::SessionMessage::SetWallpaperHidden { hidden });
     }
 
     pub fn show_remote_cursor(&self) -> bool {

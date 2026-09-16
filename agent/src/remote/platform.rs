@@ -51,6 +51,7 @@ pub trait ScreenStreamer: Send {
 }
 
 pub trait ScreenInput: Send + Sync {
+    fn set_wallpaper_hidden(&self, hidden: bool) -> anyhow::Result<()>;
     fn set_blackout(&self, enabled: bool) -> anyhow::Result<()>;
     fn maintenance_state(&self) -> Option<meshrmm_protocol::SessionMessage>;
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()>;
@@ -310,6 +311,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
     fn input_controller(&self) -> Arc<dyn ScreenInput> {
         match &self.inner {
             CaptureBackend::Direct(_) => Arc::new(DirectInputController {
+                wallpaper: Mutex::new(None),
                 blackout_message: self.blackout_message.clone(),
                 controller: Arc::clone(&self.direct_input),
                 files: self
@@ -326,6 +328,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
 
 #[cfg(windows)]
 struct DirectInputController {
+    wallpaper: Mutex<Option<super::wallpaper::HiddenWallpaper>>,
     blackout_message: String,
     files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
@@ -335,6 +338,15 @@ struct DirectInputController {
 
 #[cfg(windows)]
 impl ScreenInput for DirectInputController {
+    fn set_wallpaper_hidden(&self, hidden: bool) -> anyhow::Result<()> {
+        super::wallpaper::set_hidden(
+            &mut *self
+                .wallpaper
+                .lock()
+                .map_err(|_| anyhow::anyhow!("wallpaper lock poisoned"))?,
+            hidden,
+        )
+    }
     fn set_blackout(&self, enabled: bool) -> anyhow::Result<()> {
         self.controller
             .lock()

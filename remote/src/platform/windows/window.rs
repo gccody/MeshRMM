@@ -67,6 +67,7 @@ const SETTINGS_AGENT_INPUT_ID: usize = 4224;
 const SETTINGS_BLACKOUT_ID: usize = 4225;
 const SETTINGS_AUDIO_ID: usize = 4226;
 const SETTINGS_RECORDING_ID: usize = 4228;
+const SETTINGS_WALLPAPER_ID: usize = 4229;
 const SETTINGS_REMOTE_CURSOR_ID: usize = 4227;
 
 impl WindowContext {
@@ -275,6 +276,7 @@ impl WindowContext {
             }
         }
         for (id, checked, enabled) in [
+            (SETTINGS_WALLPAPER_ID, self.control.wallpaper_hidden(), true),
             (SETTINGS_AUDIO_ID, self.control.audio_muted(), true),
             (
                 SETTINGS_REMOTE_CURSOR_ID,
@@ -474,6 +476,7 @@ unsafe fn show_settings_category(window: HWND, display: bool) {
         CHROMA_420_ID as i32,
         CHROMA_444_ID as i32,
         SETTINGS_REMOTE_CURSOR_ID as i32,
+        SETTINGS_WALLPAPER_ID as i32,
     ] {
         if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
             let _ = unsafe { ShowWindow(control, display_command) };
@@ -550,6 +553,11 @@ unsafe extern "system" fn settings_window_proc(
                 };
                 if let Some(chroma) = chroma {
                     context.set_chroma(chroma);
+                    return LRESULT(0);
+                }
+                if control_id == SETTINGS_WALLPAPER_ID {
+                    context.control.toggle_wallpaper();
+                    context.refresh_maintenance_controls();
                     return LRESULT(0);
                 }
                 if control_id == SETTINGS_REMOTE_CURSOR_ID {
@@ -641,7 +649,7 @@ unsafe fn create_settings_window(
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             560,
-            470,
+            510,
             Some(owner),
             None,
             Some(instance),
@@ -874,6 +882,16 @@ unsafe fn create_settings_window(
         340,
         28,
         SETTINGS_RECORDING_ID,
+    )?;
+    let _ = make_control(
+        w!("BUTTON"),
+        w!("Hide remote wallpaper"),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
+        162,
+        414,
+        340,
+        28,
+        SETTINGS_WALLPAPER_ID,
     )?;
     unsafe { show_settings_category(settings, true) };
     Ok(SettingsControls {
