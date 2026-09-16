@@ -248,7 +248,7 @@ impl DebugInfo {
             "MeshRMM diagnostics  [F12 to close]\n\
              Session: {}  Uptime: {}\n\
              State: {}  Route: {}\n\
-             Pinned peer SHA-256: {}\n\
+             Session peer SHA-256: {}\n\
              Local: {}\n\
              Remote: {}\n\
              ICE pair: {}\n\
