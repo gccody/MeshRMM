@@ -63,8 +63,8 @@ Detailed local command output is retained under `dist/security-validation/`.
   matching on both machines. A generated five-second tone produced audio packets
   and initialized macOS playback at 48 kHz stereo. This verifies the audio path,
   not subjective sound quality.
-- Clean disconnect left the Windows service running. These live sessions used
-  direct ICE; a forced TURN session was not separately exercised.
+- Clean disconnect left the Windows service running. These initial live sessions
+  used direct ICE; forced TURN was subsequently verified below.
 
 ## Public TLS policy — September 16, 2026
 
@@ -97,3 +97,20 @@ probes. An invalid-DNS negative check also verified failure rather than a false
 pass. This tests negotiated ciphers, not every cipher the edge might accept.
 Cloudflare's full TLS 1.2 cipher allowlist remains provider-managed; custom
 allowlists require Advanced Certificate Manager, which was not purchased.
+
+## Forced TURN validation — September 16, 2026
+
+Temporary Windows firewall rules blocked only the Agent executable's direct UDP
+paths to the Mac's LAN, VPN, and public addresses. A fresh installed-service
+session selected a Cloudflare TURN relay and negotiated
+`Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256`. Screen presentation, remote mouse and
+keyboard input, and chat in both directions passed over this relayed connection.
+
+The first attempt discovered the additional VPN path. Blocking that already-live
+path interrupted teardown, and immediate retries received HTTP 409 until the
+test session was explicitly closed using the dashboard's Close session action.
+The subsequent fresh session completed the forced-relay check successfully.
+
+The test rules had automatic cleanup and were also explicitly removed and
+verified absent. The viewer was disconnected and the Windows service remained
+running and online. No production code changed for this additional validation.
