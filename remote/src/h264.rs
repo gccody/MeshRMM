@@ -1,6 +1,9 @@
+#[cfg(any(target_os = "macos", test))]
 use anyhow::{Context, bail};
+#[cfg(any(target_os = "macos", test))]
 use meshrmm_protocol::Codec;
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
 pub struct AvccAccessUnit {
     pub data: Vec<u8>,
@@ -11,6 +14,7 @@ pub struct AvccAccessUnit {
 
 /// Converts the Agent's Annex-B access unit into the four-byte length-prefixed
 /// representation required by Apple's CoreMedia H.264 format description.
+#[cfg(any(target_os = "macos", test))]
 pub fn annex_b_to_length_prefixed(data: &[u8], codec: Codec) -> anyhow::Result<AvccAccessUnit> {
     let units = annex_b_units(data);
     if units.is_empty() {
@@ -45,7 +49,7 @@ pub fn annex_b_to_length_prefixed(data: &[u8], codec: Codec) -> anyhow::Result<A
     })
 }
 
-fn annex_b_units(data: &[u8]) -> Vec<&[u8]> {
+pub(crate) fn annex_b_units(data: &[u8]) -> Vec<&[u8]> {
     let mut starts = Vec::new();
     let mut index = 0;
     while index + 3 <= data.len() {

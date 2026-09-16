@@ -1,7 +1,6 @@
 mod clipboard;
 mod config;
 mod debug;
-#[cfg(any(target_os = "macos", test))]
 mod h264;
 mod platform;
 mod recording;
