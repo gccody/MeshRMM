@@ -130,6 +130,10 @@ pub enum SessionMessage {
     SetDisplayBorder {
         enabled: bool,
     },
+    /// Physical monitor containing the agent-side pointer; None while the viewer owns input.
+    AgentPointerDisplay {
+        display_id: Option<DisplayId>,
+    },
 }
 
 impl SessionMessage {
@@ -369,6 +373,24 @@ mod tests {
 
         let encoded = message.encode().unwrap();
         assert_eq!(SessionMessage::decode(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn pointer_monitor_round_trip_preserves_existing_tags() {
+        for display_id in [None, Some(DisplayId(2))] {
+            let message = SessionMessage::AgentPointerDisplay { display_id };
+            assert_eq!(
+                SessionMessage::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+            assert_eq!(message.encode().unwrap()[0], 30);
+        }
+        assert_eq!(
+            SessionMessage::SetDisplayBorder { enabled: true }
+                .encode()
+                .unwrap(),
+            vec![29, 1]
+        );
     }
 
     #[test]

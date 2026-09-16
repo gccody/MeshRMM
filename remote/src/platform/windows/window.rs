@@ -1727,3 +1727,34 @@ pub(super) unsafe fn pump_window_messages(window: HWND) -> bool {
     }
     false
 }
+
+// Only monitor/ownership transitions reach this path, never individual mouse moves.
+pub(super) unsafe fn set_agent_pointer_display(
+    window: HWND,
+    display_id: Option<meshrmm_protocol::DisplayId>,
+) {
+    if let Some(context) = unsafe { window_context(window) } {
+        unsafe {
+            let combo = GetDlgItem(Some(window), DISPLAY_COMBO_ID as i32);
+            if let Ok(combo) = combo {
+                let selected = SendMessageW(combo, CB_GETCURSEL, None, None);
+                SendMessageW(combo, CB_RESETCONTENT, None, None);
+                for display in &context.displays {
+                    let title = if display_id == Some(display.id) {
+                        format!("➤ {}", display.name)
+                    } else {
+                        display.name.clone()
+                    };
+                    let title = HSTRING::from(title);
+                    SendMessageW(
+                        combo,
+                        CB_ADDSTRING,
+                        None,
+                        Some(LPARAM(title.as_ptr() as isize)),
+                    );
+                }
+                SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(selected.0 as usize)), None);
+            }
+        }
+    }
+}

@@ -119,6 +119,7 @@ pub(super) struct RemoteViewIvars {
     pressed_buttons: RefCell<Vec<PointerButton>>,
     wheel_normalizer: RefCell<WheelNormalizer>,
     cursor_shape: RefCell<CursorShape>,
+    agent_pointer_display: std::cell::Cell<Option<meshrmm_protocol::DisplayId>>,
     debug: DebugInfo,
     debug_label: Retained<NSTextField>,
     debug_visible: RefCell<bool>,
@@ -584,6 +585,7 @@ impl RemoteView {
             pressed_buttons: RefCell::new(Vec::new()),
             wheel_normalizer: RefCell::new(WheelNormalizer::default()),
             cursor_shape: RefCell::new(CursorShape::Default),
+            agent_pointer_display: std::cell::Cell::new(None),
             debug,
             debug_label,
             debug_visible: RefCell::new(false),
@@ -644,6 +646,9 @@ impl RemoteView {
             display_popup.setTarget(Some(self));
             display_popup.setAction(Some(sel!(selectDisplayFromToolbar:)));
         }
+        display_popup.setToolTip(Some(&NSString::from_str(
+            "➤ marks the monitor with the agent-side mouse when the local user controls input.",
+        )));
         toolbar.addSubview(&display_popup);
         *self.ivars().display_popup.borrow_mut() = Some(display_popup);
 
@@ -744,6 +749,25 @@ impl RemoteView {
 
     fn send(&self, message: SessionMessage) {
         self.ivars().control.send(message);
+    }
+
+    pub(super) fn set_agent_pointer_display(
+        &self,
+        display_id: Option<meshrmm_protocol::DisplayId>,
+    ) {
+        self.ivars().agent_pointer_display.set(display_id);
+        if let Some(popup) = self.ivars().display_popup.borrow().as_ref() {
+            for (index, display) in self.ivars().displays.borrow().iter().enumerate() {
+                if let Some(item) = popup.itemAtIndex(index as isize) {
+                    let title = if display_id == Some(display.id) {
+                        format!("➤ {}", display.name)
+                    } else {
+                        display.name.clone()
+                    };
+                    item.setTitle(&NSString::from_str(&title));
+                }
+            }
+        }
     }
 
     pub(super) fn set_cursor_shape(&self, shape: CursorShape) {
@@ -948,6 +972,7 @@ impl RemoteView {
         }
         *self.ivars().active_display.borrow_mut() = display;
         *self.ivars().displays.borrow_mut() = displays;
+        self.set_agent_pointer_display(self.ivars().agent_pointer_display.get());
         self.ivars().video_width.set(width);
         self.ivars().video_height.set(height);
     }

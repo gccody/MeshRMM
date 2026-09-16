@@ -147,7 +147,7 @@ enum ChildEvent {
     },
     MaintenanceError(String),
     Frame(EncodedAccessUnit),
-    Cursor(CursorShape, bool),
+    Cursor(CursorShape, bool, Option<DisplayId>),
     Clipboard(ClipboardContent),
     Chat(String),
     Error(String),
@@ -155,7 +155,7 @@ enum ChildEvent {
 }
 
 type HelperStatus = Arc<Mutex<Option<Result<(), String>>>>;
-type HelperCursor = Arc<Mutex<(CursorShape, bool)>>;
+type HelperCursor = Arc<Mutex<(CursorShape, bool, Option<DisplayId>)>>;
 #[derive(Default)]
 struct FileEvents {
     queue: Mutex<std::collections::VecDeque<meshrmm_protocol::FileMessage>>,
@@ -218,7 +218,7 @@ impl DesktopCaptureStreamer {
             file_route: Arc::new(Mutex::new(None)),
             input_route: Arc::new(Mutex::new(None)),
             preferred_desktop: None,
-            cursor: Arc::new(Mutex::new((CursorShape::Default, false))),
+            cursor: Arc::new(Mutex::new((CursorShape::Default, false, None))),
             clipboard: Arc::new(ClipboardEvents::default()),
             files: Arc::new(FileEvents::default()),
             chat: Arc::new(ChatEvents::default()),
@@ -894,6 +894,10 @@ impl ScreenInput for DesktopInputController {
             .context("failed to release input on the active desktop")
     }
 
+    fn agent_pointer_display(&self) -> Option<DisplayId> {
+        self.cursor.lock().unwrap_or_else(|e| e.into_inner()).2
+    }
+
     fn cursor_shape(&self) -> CursorShape {
         self.cursor
             .lock()
@@ -1266,9 +1270,9 @@ fn dispatch_child_events(
                     (sink)(frame);
                 }
             }
-            Ok(ChildEvent::Cursor(shape, viewer_controls_input)) => {
+            Ok(ChildEvent::Cursor(shape, viewer_controls_input, pointer_display)) => {
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) =
-                    (shape, viewer_controls_input);
+                    (shape, viewer_controls_input, pointer_display);
             }
             Ok(ChildEvent::MaintenanceError(reason)) => {
                 *maintenance.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -1347,9 +1351,9 @@ fn dispatch_input_events(
                         blacked_out,
                     });
             }
-            Ok(ChildEvent::Cursor(shape, viewer_controls_input)) => {
+            Ok(ChildEvent::Cursor(shape, viewer_controls_input, pointer_display)) => {
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) =
-                    (shape, viewer_controls_input);
+                    (shape, viewer_controls_input, pointer_display);
             }
             Ok(ChildEvent::Files(message)) => {
                 let mut queue = files.queue.lock().unwrap();
@@ -1719,9 +1723,14 @@ fn run_input_child(
     let mut sent_cursor = None;
     let mut terminal_error = None;
     loop {
-        let cursor = (input.cursor_shape(), input.viewer_controls_input());
+        let cursor = (
+            input.cursor_shape(),
+            input.viewer_controls_input(),
+            input.agent_pointer_display(),
+        );
         if sent_cursor != Some(cursor) {
-            if emit_child_event(&output, ChildEvent::Cursor(cursor.0, cursor.1)).is_err() {
+            if emit_child_event(&output, ChildEvent::Cursor(cursor.0, cursor.1, cursor.2)).is_err()
+            {
                 break;
             }
             sent_cursor = Some(cursor);
@@ -2113,12 +2122,13 @@ fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
             writer.write_all(codec_config)?;
             writer.write_all(&frame.data)
         }
-        ChildEvent::Cursor(shape, viewer_controls_input) => {
+        ChildEvent::Cursor(shape, viewer_controls_input, pointer_display) => {
             let bytes = SessionMessage::CursorShape { shape: *shape }
                 .encode()
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             checked_len(bytes.len(), MAX_CONTROL_BYTES, "cursor shape")?;
             writer.write_all(&[EVENT_CURSOR, u8::from(*viewer_controls_input)])?;
+            write_u32(&mut writer, pointer_display.map_or(u32::MAX, |id| id.0))?;
             write_u32(&mut writer, bytes.len() as u32)?;
             writer.write_all(&bytes)
         }
@@ -2243,13 +2253,17 @@ fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
         }
         EVENT_CURSOR => {
             let viewer_controls_input = read_bool(&mut reader)?;
+            let pointer_id = read_u32(&mut reader)?;
+            let pointer_display = (pointer_id != u32::MAX).then_some(DisplayId(pointer_id));
             let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "cursor shape")?;
             let mut bytes = vec![0; length];
             reader.read_exact(&mut bytes)?;
             match SessionMessage::decode(&bytes) {
-                Ok(SessionMessage::CursorShape { shape }) => {
-                    Ok(ChildEvent::Cursor(shape, viewer_controls_input))
-                }
+                Ok(SessionMessage::CursorShape { shape }) => Ok(ChildEvent::Cursor(
+                    shape,
+                    viewer_controls_input,
+                    pointer_display,
+                )),
                 Ok(_) => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "cursor event contained an unexpected message",
@@ -2521,7 +2535,7 @@ mod tests {
                 Arc::new(Mutex::new(enabled.then_some(sink))),
                 started_tx,
                 Arc::clone(&status),
-                Arc::new(Mutex::new((CursorShape::Default, false))),
+                Arc::new(Mutex::new((CursorShape::Default, false, None))),
                 Arc::new(Mutex::new(None)),
             );
             assert_eq!(
@@ -2618,11 +2632,15 @@ mod tests {
     fn cursor_ownership_and_visibility_round_trip_without_desynchronizing_ipc() {
         for viewer in [false, true] {
             let mut bytes = Vec::new();
-            write_event(&mut bytes, &ChildEvent::Cursor(CursorShape::Text, viewer)).unwrap();
+            write_event(
+                &mut bytes,
+                &ChildEvent::Cursor(CursorShape::Text, viewer, Some(DisplayId(2))),
+            )
+            .unwrap();
             write_event(&mut bytes, &ChildEvent::Stopped).unwrap();
             let mut reader = bytes.as_slice();
             assert!(
-                matches!(read_event(&mut reader).unwrap(), ChildEvent::Cursor(CursorShape::Text, owner) if owner == viewer)
+                matches!(read_event(&mut reader).unwrap(), ChildEvent::Cursor(CursorShape::Text, owner, Some(DisplayId(2))) if owner == viewer)
             );
             assert!(matches!(
                 read_event(&mut reader).unwrap(),
@@ -3184,7 +3202,7 @@ mod service_event_tests {
                 read.into_file(),
                 started,
                 Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new((CursorShape::Default, false))),
+                Arc::new(Mutex::new((CursorShape::Default, false, None))),
                 reader_clipboard,
                 reader_files,
                 reader_chat,

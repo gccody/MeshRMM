@@ -189,6 +189,17 @@ impl Presenter {
         result
     }
 
+    pub fn set_agent_pointer_display(&self, display_id: Option<meshrmm_protocol::DisplayId>) {
+        let id = self.shared.id;
+        DispatchQueue::main().exec_async(move || {
+            UI.with(|state| {
+                if let Some(ui) = state.borrow().as_ref().filter(|ui| ui.id == id) {
+                    ui.input_view.set_agent_pointer_display(display_id);
+                }
+            });
+        });
+    }
+
     pub fn set_cursor_shape(&self, shape: CursorShape) {
         let id = self.shared.id;
         DispatchQueue::main().exec_async(move || {
