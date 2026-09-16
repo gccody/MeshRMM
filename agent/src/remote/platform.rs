@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use meshrmm_protocol::{
-    ChromaMode, Codec, CursorShape, Display, DisplayId, EncodedFrame, PixelFormat, RemoteInput,
-    VideoFormat, VideoStreamId,
+    ChromaMode, Codec, CursorShape, Display, DisplayId, EncodedFrame, PixelFormat, QualityPreset,
+    RemoteInput, VideoFormat, VideoStreamId,
 };
 
 use super::video::LatestFrameSlot;
@@ -40,6 +40,8 @@ pub trait ScreenStreamer: Send {
     fn request_keyframe(&self) -> anyhow::Result<()>;
     /// Configure the bitrate for the next start; preset changes restart capture.
     fn set_bitrate(&mut self, bits_per_second: u32);
+    /// Configure capture color/rate; return whether a restart is required.
+    fn set_quality(&mut self, quality: QualityPreset) -> bool;
     fn set_adaptive_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()>;
     fn set_codec(&mut self, codec: Codec);
     fn set_chroma(&mut self, chroma: ChromaMode);
@@ -79,6 +81,7 @@ pub struct PlatformScreenStreamer {
     blackout_message: String,
     indicator: Option<super::indicator::SessionIndicator>,
     frames_per_second: u32,
+    quality: QualityPreset,
     bitrate_bits_per_second: u32,
     codec: Codec,
     chroma: ChromaMode,
@@ -114,6 +117,7 @@ impl PlatformScreenStreamer {
             blackout_message,
             indicator: None,
             frames_per_second,
+            quality: QualityPreset::BestQuality,
             bitrate_bits_per_second,
             codec: Codec::H264,
             chroma: ChromaMode::Yuv420,
@@ -164,7 +168,8 @@ impl ScreenStreamer for PlatformScreenStreamer {
             },
         );
         let config = meshrmm_remote_screen::StreamConfig {
-            frames_per_second: self.frames_per_second,
+            frames_per_second: self.quality.frames_per_second(self.frames_per_second),
+            grayscale: self.quality.grayscale(),
             bitrate_bits_per_second: self.bitrate_bits_per_second,
             codec: remote_screen_codec(self.codec),
             pixel_format: remote_screen_pixel_format(self.chroma),
@@ -254,6 +259,14 @@ impl ScreenStreamer for PlatformScreenStreamer {
 
     fn set_bitrate(&mut self, bits_per_second: u32) {
         self.bitrate_bits_per_second = bits_per_second.max(1);
+    }
+
+    fn set_quality(&mut self, quality: QualityPreset) -> bool {
+        let changed = self.quality.grayscale() != quality.grayscale()
+            || self.quality.frames_per_second(self.frames_per_second)
+                != quality.frames_per_second(self.frames_per_second);
+        self.quality = quality;
+        changed
     }
 
     fn set_adaptive_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()> {

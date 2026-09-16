@@ -5,8 +5,8 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-    DXGI_FORMAT_AYUV, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL,
-    DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_AYUV, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_R8G8B8A8_UNORM,
+    DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::core::Interface;
 
@@ -18,12 +18,14 @@ pub(crate) const SURFACE_COUNT: usize = 3;
 pub enum Error {
     #[error("D3D11 video processor creation failed: {0}")]
     Processor(#[source] windows::core::Error),
-    #[error("GPU does not support BGRA input and {0} output video processing")]
+    #[error("GPU does not support the selected RGB input and {0} output video processing")]
     UnsupportedFormatConversion(VideoPixelFormat),
     #[error("D3D11 YUV texture allocation returned no texture")]
     MissingTexture,
     #[error("D3D11 video processor view creation returned no view")]
     MissingView,
+    #[error("D3D11 returned no grayscale shader or surface")]
+    MissingGrayscaleResource,
 }
 
 pub struct BgraToYuvConverter {
@@ -33,6 +35,7 @@ pub struct BgraToYuvConverter {
     processor: ID3D11VideoProcessor,
     surfaces: Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
     next_surface: usize,
+    grayscale: Option<crate::grayscale::GrayscalePass>,
 }
 
 impl BgraToYuvConverter {
@@ -43,6 +46,7 @@ impl BgraToYuvConverter {
         height: u32,
         frames_per_second: u32,
         pixel_format: VideoPixelFormat,
+        grayscale: bool,
     ) -> Result<Self, Error> {
         // Safety: all COM interfaces originate from one D3D11 device and remain
         // owned by this converter on the capture worker thread.
@@ -69,7 +73,11 @@ impl BgraToYuvConverter {
                 .CreateVideoProcessorEnumerator(&content)
                 .map_err(Error::Processor)?;
             let bgra_support = enumerator
-                .CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM)
+                .CheckVideoProcessorFormat(if grayscale {
+                    DXGI_FORMAT_R8G8B8A8_UNORM
+                } else {
+                    DXGI_FORMAT_B8G8R8A8_UNORM
+                })
                 .map_err(Error::Processor)?;
             let output_format = match pixel_format {
                 VideoPixelFormat::Yuv420 => DXGI_FORMAT_NV12,
@@ -161,11 +169,18 @@ impl BgraToYuvConverter {
                 processor,
                 surfaces,
                 next_surface: 0,
+                grayscale: grayscale
+                    .then(|| crate::grayscale::GrayscalePass::new(device, context, width, height))
+                    .transpose()?,
             })
         }
     }
 
     pub fn convert(&mut self, bgra: &ID3D11Texture2D) -> Result<&ID3D11Texture2D, Error> {
+        let bgra = self
+            .grayscale
+            .as_ref()
+            .map_or(bgra, |pass| pass.convert(bgra));
         // Safety: the input texture belongs to the same device and the returned
         // YUV texture stays alive in the converter's fixed three-surface pool.
         unsafe {

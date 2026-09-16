@@ -1134,12 +1134,14 @@ async fn run_capture_control(
                         // Live CodecAPI updates may be ignored, rejected, or even
                         // terminate HEVC encoders after the call reports success.
                         lock_streamer(&streamer)?.set_bitrate(value);
+                        let capture_changed = lock_streamer(&streamer)?.set_quality(quality);
                         let candidates = profile_candidates(
                             &viewer_profiles,
                             requested_chroma,
                             &rejected_profiles,
                         );
                         if capture_running
+                            && !capture_changed
                             && candidates.first() == Some(&active_profile)
                             && format.bitrate_bits_per_second == value
                         {

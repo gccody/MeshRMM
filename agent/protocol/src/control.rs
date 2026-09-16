@@ -183,15 +183,31 @@ pub enum QualityPreset {
     #[default]
     Balanced,
     BestQuality,
+    // Append to preserve the existing postcard discriminants.
+    UltraDataSaver,
 }
 
 pub const MAX_QUALITY_BITRATE_BITS_PER_SECOND: u32 = 12_000_000;
 
 impl QualityPreset {
+    pub fn grayscale(self) -> bool {
+        self == Self::UltraDataSaver
+    }
+
+    /// Never raise a lower administrator-configured capture rate.
+    pub fn frames_per_second(self, configured: u32) -> u32 {
+        if self.grayscale() {
+            configured.min(24)
+        } else {
+            configured
+        }
+    }
+
     /// Applies the preset without exceeding the 12 Mbps application cap or the
     /// lower administrator-configured cap.
     pub fn bitrate(self, configured_maximum: u32) -> u32 {
         let preferred = match self {
+            Self::UltraDataSaver => 1_000_000,
             Self::DataSaver => 3_000_000,
             Self::Balanced => 6_000_000,
             Self::BestQuality => MAX_QUALITY_BITRATE_BITS_PER_SECOND,
@@ -265,6 +281,27 @@ pub enum ConnectionPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quality_presets_preserve_wire_tags_and_capture_limits() {
+        for (preset, tag) in [
+            (QualityPreset::DataSaver, 0),
+            (QualityPreset::Balanced, 1),
+            (QualityPreset::BestQuality, 2),
+            (QualityPreset::UltraDataSaver, 3),
+        ] {
+            assert_eq!(postcard::to_stdvec(&preset).unwrap(), vec![tag]);
+            assert_eq!(
+                postcard::from_bytes::<QualityPreset>(&[tag]).unwrap(),
+                preset
+            );
+            assert_eq!(preset.frames_per_second(15), 15);
+            assert_eq!(preset.bitrate(500_000), 500_000);
+            assert_eq!(preset.grayscale(), tag == 3);
+            assert_eq!(preset.frames_per_second(60), if tag == 3 { 24 } else { 60 });
+        }
+        assert_eq!(QualityPreset::UltraDataSaver.bitrate(12_000_000), 1_000_000);
+    }
 
     #[test]
     fn secure_attention_appends_a_stable_control_message() {

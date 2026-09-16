@@ -26,13 +26,13 @@ struct WindowContext {
     maximize_button: HWND,
     close_button: HWND,
     settings_window: HWND,
-    quality_buttons: [(HWND, QualityPreset); 3],
+    quality_buttons: [(HWND, QualityPreset); 4],
     chroma_buttons: [(HWND, ChromaMode); 2],
 }
 
 struct SettingsControls {
     window: HWND,
-    quality_buttons: [(HWND, QualityPreset); 3],
+    quality_buttons: [(HWND, QualityPreset); 4],
     chroma_buttons: [(HWND, ChromaMode); 2],
 }
 
@@ -48,6 +48,7 @@ const TYPE_CLIPBOARD_BUTTON_ID: usize = 4012;
 const MINIMIZE_BUTTON_ID: usize = 4005;
 const MAXIMIZE_BUTTON_ID: usize = 4006;
 const CLOSE_BUTTON_ID: usize = 4007;
+const QUALITY_ULTRA_DATA_SAVER_ID: usize = 4104;
 const QUALITY_DATA_SAVER_ID: usize = 4101;
 const QUALITY_BALANCED_ID: usize = 4102;
 const QUALITY_BEST_ID: usize = 4103;
@@ -162,8 +163,8 @@ impl WindowContext {
             )
         };
         let _ = unsafe { MoveWindow(self.display_combo, 8, 5, 158, 300, true) };
-        let _ = unsafe { MoveWindow(self.quality_combo, 172, 5, 124, 300, true) };
-        let _ = unsafe { MoveWindow(self.chroma_combo, 302, 5, 124, 300, true) };
+        let _ = unsafe { MoveWindow(self.quality_combo, 172, 5, 154, 300, true) };
+        let _ = unsafe { MoveWindow(self.chroma_combo, 332, 5, 124, 300, true) };
         let caption_x = width.saturating_sub(138);
         let _ = unsafe { MoveWindow(self.minimize_button, caption_x, 0, 46, 34, true) };
         let _ = unsafe { MoveWindow(self.maximize_button, caption_x + 46, 0, 46, 34, true) };
@@ -422,9 +423,10 @@ fn signed_high_word(value: isize) -> i32 {
 
 fn quality_index(preset: QualityPreset) -> usize {
     match preset {
-        QualityPreset::DataSaver => 0,
-        QualityPreset::Balanced => 1,
-        QualityPreset::BestQuality => 2,
+        QualityPreset::UltraDataSaver => 0,
+        QualityPreset::DataSaver => 1,
+        QualityPreset::Balanced => 2,
+        QualityPreset::BestQuality => 3,
     }
 }
 
@@ -442,6 +444,7 @@ unsafe fn show_settings_category(window: HWND, display: bool) {
         SETTINGS_DISPLAY_TITLE_ID,
         SETTINGS_QUALITY_TITLE_ID,
         SETTINGS_CHROMA_TITLE_ID,
+        QUALITY_ULTRA_DATA_SAVER_ID as i32,
         QUALITY_DATA_SAVER_ID as i32,
         QUALITY_BALANCED_ID as i32,
         QUALITY_BEST_ID as i32,
@@ -506,6 +509,7 @@ unsafe extern "system" fn settings_window_proc(
             }
             if let Some(context) = unsafe { window_context(owner) } {
                 let preset = match control_id {
+                    QUALITY_ULTRA_DATA_SAVER_ID => Some(QualityPreset::UltraDataSaver),
                     QUALITY_DATA_SAVER_ID => Some(QualityPreset::DataSaver),
                     QUALITY_BALANCED_ID => Some(QualityPreset::Balanced),
                     QUALITY_BEST_ID => Some(QualityPreset::BestQuality),
@@ -608,7 +612,7 @@ unsafe fn create_settings_window(
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             560,
-            430,
+            470,
             Some(owner),
             None,
             Some(instance),
@@ -690,12 +694,22 @@ unsafe fn create_settings_window(
     )?;
     let radio_style =
         WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTORADIOBUTTON as u32);
-    let data_saver = make_control(
+    let ultra_data_saver = make_control(
         w!("BUTTON"),
-        w!("Data saver · 3 Mbps"),
+        w!("Ultra data saver · 1 Mbps · grayscale · 24 FPS"),
         WINDOW_STYLE(radio_style.0 | WS_GROUP.0),
         162,
         104,
+        370,
+        28,
+        QUALITY_ULTRA_DATA_SAVER_ID,
+    )?;
+    let data_saver = make_control(
+        w!("BUTTON"),
+        w!("Data saver · 3 Mbps"),
+        radio_style,
+        162,
+        144,
         340,
         28,
         QUALITY_DATA_SAVER_ID,
@@ -705,7 +719,7 @@ unsafe fn create_settings_window(
         w!("Balanced · 6 Mbps"),
         radio_style,
         162,
-        144,
+        184,
         340,
         28,
         QUALITY_BALANCED_ID,
@@ -715,7 +729,7 @@ unsafe fn create_settings_window(
         w!("Best quality · 12 Mbps maximum"),
         radio_style,
         162,
-        184,
+        224,
         340,
         28,
         QUALITY_BEST_ID,
@@ -725,7 +739,7 @@ unsafe fn create_settings_window(
         w!("Color detail"),
         static_style,
         162,
-        224,
+        264,
         340,
         24,
         SETTINGS_CHROMA_TITLE_ID as usize,
@@ -735,7 +749,7 @@ unsafe fn create_settings_window(
         w!("4:2:0 · bandwidth efficient"),
         WINDOW_STYLE(radio_style.0 | WS_GROUP.0),
         162,
-        254,
+        294,
         340,
         28,
         CHROMA_420_ID,
@@ -745,7 +759,7 @@ unsafe fn create_settings_window(
         w!("4:4:4 · crisp text and color"),
         radio_style,
         162,
-        294,
+        334,
         340,
         28,
         CHROMA_444_ID,
@@ -817,7 +831,7 @@ unsafe fn create_settings_window(
             WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_GROUP.0 | BS_AUTOCHECKBOX as u32,
         ),
         162,
-        334,
+        374,
         340,
         28,
         SETTINGS_REMOTE_CURSOR_ID,
@@ -826,6 +840,7 @@ unsafe fn create_settings_window(
     Ok(SettingsControls {
         window: settings,
         quality_buttons: [
+            (ultra_data_saver, QualityPreset::UltraDataSaver),
             (data_saver, QualityPreset::DataSaver),
             (balanced, QualityPreset::Balanced),
             (best, QualityPreset::BestQuality),
@@ -861,7 +876,7 @@ pub(super) unsafe fn create_window(
             WM_GETMINMAXINFO => {
                 let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
                 // Leave room for display/quality controls, session actions and caption buttons.
-                info.ptMinTrackSize.x = 1030;
+                info.ptMinTrackSize.x = 1060;
                 info.ptMinTrackSize.y = 300;
                 LRESULT(0)
             }
@@ -943,8 +958,9 @@ pub(super) unsafe fn create_window(
                             SendMessageW(context.quality_combo, CB_GETCURSEL, None, None).0
                         };
                         let preset = match selected {
-                            0 => QualityPreset::DataSaver,
-                            2 => QualityPreset::BestQuality,
+                            0 => QualityPreset::UltraDataSaver,
+                            1 => QualityPreset::DataSaver,
+                            3 => QualityPreset::BestQuality,
                             _ => QualityPreset::Balanced,
                         };
                         context.set_quality(preset);
@@ -1268,6 +1284,7 @@ pub(super) unsafe fn create_window(
         close_button: HWND::default(),
         settings_window: HWND::default(),
         quality_buttons: [
+            (HWND::default(), QualityPreset::UltraDataSaver),
             (HWND::default(), QualityPreset::DataSaver),
             (HWND::default(), QualityPreset::Balanced),
             (HWND::default(), QualityPreset::BestQuality),
@@ -1403,7 +1420,12 @@ pub(super) unsafe fn create_window(
         )
     }
     .context("quality dropdown creation failed")?;
-    for title in [w!("Data saver"), w!("Balanced"), w!("Best quality")] {
+    for title in [
+        w!("Ultra data saver"),
+        w!("Data saver"),
+        w!("Balanced"),
+        w!("Best quality"),
+    ] {
         unsafe {
             SendMessageW(
                 quality_combo,

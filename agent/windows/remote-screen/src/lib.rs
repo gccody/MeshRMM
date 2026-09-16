@@ -10,6 +10,7 @@ mod cursor;
 mod desktop;
 mod duplication;
 mod encoder;
+mod grayscale;
 mod layout;
 
 pub use duplication::WindowsDesktopDuplicationStreamer;
@@ -46,6 +47,7 @@ pub struct StreamConfig {
     pub codec: VideoCodec,
     pub pixel_format: VideoPixelFormat,
     pub capture_cursor: bool,
+    pub grayscale: bool,
 }
 
 impl Default for StreamConfig {
@@ -56,6 +58,7 @@ impl Default for StreamConfig {
             codec: VideoCodec::H264,
             pixel_format: VideoPixelFormat::Yuv420,
             capture_cursor: true,
+            grayscale: false,
         }
     }
 }
@@ -325,6 +328,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             format.height,
             format.frames_per_second,
             config.pixel_format,
+            config.grayscale,
         )?;
         let encoder = MediaFoundationVideoEncoder::new(
             &context.device,
@@ -828,6 +832,7 @@ mod tests {
                     codec: VideoCodec::H265,
                     pixel_format: VideoPixelFormat::Yuv420,
                     capture_cursor: true,
+                    grayscale: false,
                 },
                 display_id,
                 Arc::new(move |_| {
