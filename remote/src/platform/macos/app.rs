@@ -111,6 +111,8 @@ pub(super) struct RemoteViewIvars {
     video_width: std::cell::Cell<u32>,
     video_height: std::cell::Cell<u32>,
     display_popup: RefCell<Option<Retained<NSPopUpButton>>>,
+    recording_visible: std::cell::Cell<bool>,
+    session_button: RefCell<Option<Retained<NSButton>>>,
     chat_popup: RefCell<Option<meshrmm_chat::ChatPopup>>,
     control: ControlSink,
     pressed_keys: RefCell<Vec<(u16, bool)>>,
@@ -346,6 +348,7 @@ define_class!(
                 (if self.ivars().control.audio_muted() { "Unmute audio" } else { "Mute audio" }, sel!(toggleAudio:)),
                 ("Show remote cursor", sel!(toggleRemoteCursor:)),
                 ("Diagnostics", sel!(toggleDiagnostics:)),
+                (if self.ivars().control.recording().active() { "Stop recording and save" } else { "Record video to Downloads" }, sel!(toggleRecording:)),
             ] {
                 let item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(
                     NSMenuItem::alloc(self.mtm()), &NSString::from_str(title), Some(action), &NSString::from_str(""),
@@ -371,6 +374,11 @@ define_class!(
         #[unsafe(method(toggleRemoteCursor:))]
         fn toggle_remote_cursor(&self, _sender: &NSMenuItem) {
             self.ivars().control.toggle_remote_cursor();
+        }
+
+        #[unsafe(method(toggleRecording:))]
+        fn toggle_recording(&self, _sender: &NSMenuItem) {
+            self.ivars().control.toggle_recording();
         }
 
         #[unsafe(method(toggleAudio:))]
@@ -555,6 +563,8 @@ impl RemoteView {
             video_height: std::cell::Cell::new(video_height),
             display_popup: RefCell::new(None),
             chat_popup: RefCell::new(None),
+            session_button: RefCell::new(None),
+            recording_visible: std::cell::Cell::new(false),
             control,
             pressed_keys: RefCell::new(Vec::new()),
             pressed_buttons: RefCell::new(Vec::new()),
@@ -660,6 +670,7 @@ impl RemoteView {
             },
         });
         toolbar.addSubview(&diagnostics);
+        *self.ivars().session_button.borrow_mut() = Some(diagnostics);
         self.registerForDraggedTypes(&NSArray::from_slice(&[unsafe { NSPasteboardTypeFileURL }]));
         let file_button = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -866,6 +877,22 @@ impl RemoteView {
     }
 
     pub(super) fn refresh_debug(&self, force: bool) {
+        if let Some(notice) = self.ivars().control.recording().take_notice() {
+            let alert = NSAlert::new(self.mtm());
+            alert.setMessageText(&NSString::from_str("Session recording"));
+            alert.setInformativeText(&NSString::from_str(&notice));
+            alert.runModal();
+        }
+        let recording = self.ivars().control.recording().active();
+        if self.ivars().recording_visible.replace(recording) != recording
+            && let Some(button) = self.ivars().session_button.borrow().as_ref()
+        {
+            button.setTitle(&NSString::from_str(if recording {
+                "● REC"
+            } else {
+                "Controls"
+            }));
+        }
         if let Some(error) = self.ivars().control.take_maintenance_error() {
             let alert = NSAlert::new(self.mtm());
             alert.setMessageText(&NSString::from_str("Maintenance control failed"));

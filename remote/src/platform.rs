@@ -22,6 +22,7 @@ pub struct ControlSink {
     files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
     audio: meshrmm_audio::PlaybackState,
+    recording: crate::recording::Recorder,
     send: Arc<dyn Fn(meshrmm_protocol::SessionMessage) + Send + Sync>,
     set_input_enabled: Arc<dyn Fn(bool) + Send + Sync>,
     maintenance: Arc<Mutex<MaintenanceState>>,
@@ -42,6 +43,7 @@ impl ControlSink {
         set_input_enabled: impl Fn(bool) + Send + Sync + 'static,
         chat: meshrmm_chat::ChatSession,
         audio: meshrmm_audio::PlaybackState,
+        recording: crate::recording::Recorder,
         technician_blocked: Arc<std::sync::atomic::AtomicBool>,
         remote_cursor_hidden: Arc<std::sync::atomic::AtomicBool>,
         maintenance: Arc<Mutex<MaintenanceState>>,
@@ -53,6 +55,7 @@ impl ControlSink {
             files,
             chat,
             audio,
+            recording,
             technician_blocked,
             remote_cursor_hidden,
             maintenance,
@@ -86,6 +89,16 @@ impl ControlSink {
             *chroma = *mode;
         }
         (self.send)(message);
+    }
+
+    pub fn recording(&self) -> &crate::recording::Recorder {
+        &self.recording
+    }
+
+    pub fn toggle_recording(&self) {
+        if let Some(stream_id) = self.recording.toggle() {
+            self.send(meshrmm_protocol::SessionMessage::RequestKeyframe { stream_id });
+        }
     }
 
     pub fn audio_muted(&self) -> bool {
