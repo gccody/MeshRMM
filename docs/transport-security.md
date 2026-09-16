@@ -1,5 +1,23 @@
 # Remote transport security
 
+## Current peer acceptance policy
+
+Authenticated sessions automatically accept peer certificate fingerprints supplied
+by signaling. No administrator verification, fingerprint prompts, or local
+pre-enrollment is required on either endpoint, including new viewers and replaced
+peer keys. Persistent local certificates, SHA-256 SDP validation, DTLS certificate
+matching/private-key proof, ECDHE/AEAD encryption, and TLS 1.3 remain enforced.
+Peer identity trusts the authenticated signaling service; this is not independent
+identity verification against a compromised control plane or trust-on-first-use
+key-change detection. The earlier manual enrollment requirement has been removed. Existing `trusted-peers` entries are not used for admission.
+
+`--revoke-peer <fingerprint>` optionally blocks that exact certificate locally;
+`--trust-peer <fingerprint>` removes such a block. Normal connections need neither
+command. Close an active session when applying a local block. Certificate blocking
+does not revoke an account or device's server authorization; revoke that access
+through the normal administration controls when appropriate.
+
+
 MeshRMM's authenticated API and signaling clients require HTTPS and WSS.
 The shared URL builder rejects HTTP/WS, and the authenticated WebSocket
 connector also rejects non-WSS URLs before opening a connection or attaching
@@ -159,63 +177,25 @@ the legacy WebSocket close behavior with a warning, so rolling upgrades do not
 turn an otherwise successful disconnect into an application error. This fallback
 does not claim acknowledged cleanup; deploy the server first to obtain it.
 
-## Independent peer enrollment
+## Persistent endpoint certificates
 
-Both native endpoints now use persistent local DTLS certificates and require an
-administrator-enrolled SHA-256 fingerprint for the other peer. Every advertised
-SDP fingerprint must match the same enrolled identity, and WebRTC must then
-verify that the actual DTLS peer possesses its private key. Unknown, malformed,
-conflicting, missing, changed, or revoked identities fail closed. There is no
-trust-on-first-use, dashboard enrollment, or compatibility bypass for old peers
-that generate a new certificate on every session.
-
-The trust store is an allowlist of permitted peer identities. It does not bind a
-browser's displayed device name to a fingerprint; a compromised dashboard can
-still mislabel or redirect a request to another already-trusted device. Only
-enroll endpoints that should be permitted to connect. This protects remote
-channel peer authentication; it does not remove control-plane authority over
-other Agent administration operations or make a compromised endpoint safe.
-
-Before distributing the updated native binaries, provision both identities and
-exchange their public fingerprints through a separately authenticated channel
-(for example, an administrator's established SSH connection or physical access).
-Do not copy private identity files between endpoints or obtain the fingerprint
-solely from the signaling error or dashboard.
-
-Run the appropriate binary locally (an elevated shell for the Agent):
-
-```text
-meshrmm-agent.exe --identity-fingerprint
-meshrmm-remote --identity-fingerprint
-
-meshrmm-agent.exe --trust-peer <verified-viewer-SHA256-fingerprint>
-meshrmm-remote --trust-peer <verified-agent-SHA256-fingerprint>
-```
-
-On macOS, the installed executable is
-`~/Applications/MeshRMM Remote.app/Contents/MacOS/meshrmm-remote`. The commands
-operate without a handoff token or server connection. Fingerprints accept
-colon-separated or contiguous hexadecimal digits. Existing trust entries are
-never overwritten implicitly. Use `--revoke-peer <fingerprint>` to remove a
-pin; close active sessions to apply a revocation immediately. A new identity
-requires independent verification and explicit enrollment again.
-
-The Agent stores its key and pins under `%ProgramData%\MeshRMM\Agent\identity`,
-inheriting the installer's SYSTEM/Administrators-only ACL. The viewer uses
+Local certificates survive restarts and upgrades. The Agent uses
+`%ProgramData%\MeshRMM\Agent\identity`, protected by the installer's
+SYSTEM/Administrators-only ACL. The viewer uses
 `%APPDATA%\MeshRMM\viewer-identity` on Windows and
 `~/Library/Application Support/MeshRMM/viewer-identity` on macOS. Unix directories
 are owner-only and private-key files are mode 0600; Windows viewer files inherit
 the current user's profile permissions. Corrupt or expired identity files are
-not replaced automatically. Identities expire after five years and require
-administrator rotation. Protect these directories in backups and keep them
-outside release artifacts. `--identity-directory <path>` is available on the
-administrative commands for provisioning/testing; normal sessions use the
-standard locations above.
+not replaced silently. Keys expire after five years. Keep private identity files
+out of release artifacts and do not copy them between endpoints.
 
-Release order: deploy the acknowledged-close server first; provision local
-identities and mutual pins; then distribute both native endpoint updates.
-Unenrolled viewers and older ephemeral-certificate peers will be blocked by
-updated endpoints. Do not enable fleet auto-update until enrollment is complete.
+The optional `--identity-fingerprint` command prints the local public certificate
+fingerprint without contacting a server. It is a diagnostic, not a connection
+prerequisite. Deploy the acknowledged-close server endpoint before the native
+release to enable acknowledged cleanup; no fingerprint provisioning is needed.
+
+The following records describe the earlier manual-enrollment validation. That
+admission policy has been replaced by automatic authenticated-session acceptance.
 
 ### Identity validation — September 16, 2026
 
@@ -246,3 +226,22 @@ updated endpoints. Do not enable fleet auto-update until enrollment is complete.
   using the explicitly logged legacy-close fallback. The new acknowledged-close
   endpoint passed local workerd integration tests; its production fault-recovery
   check is still required after the server deployment and before fleet rollout.
+
+### Automatic acceptance validation — September 16, 2026
+
+Supersedes the manual enrollment policy above. macOS viewer/session-transport
+Clippy and tests passed; hash-verified Windows workspace Clippy/tests and Agent
+release build passed. Tests cover new/replacement peers without enrollment,
+explicit local certificate blocks, malformed SDP, real WebRTC data exchange
+without trust entries, and rejection when the actual DTLS certificate differs
+from signaling. Existing AEAD/cipher and independent-channel tests still pass.
+
+Installed the updated Mac viewer and Windows service through the supported
+installers. Windows configuration was preserved and signaling reconnected.
+Installed Agent SHA-256:
+`aa111449e52f03655508e105e814008c4913004839422fc183e49981e6d92a96`.
+Both prior enrollment directories were moved to local backups. With no enrollment
+list on either endpoint, a fresh dashboard connection opened without a fingerprint
+prompt and passed desktop rendering, remote mouse/keyboard input, bidirectional
+chat, and clean disconnect. The Windows service was left online. No release was
+published and no Cloudflare setting changed for this revision.

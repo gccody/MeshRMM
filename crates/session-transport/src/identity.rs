@@ -1,4 +1,4 @@
-//! Local, administrator-provisioned peer identities. Signaling never enrolls keys.
+//! Persistent local certificates; peers are authorized by authenticated signaling.
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -155,7 +155,7 @@ impl PeerIdentity {
     }
 
     /// Check every SDP fingerprint before handing SDP to WebRTC. WebRTC then
-    /// verifies the actual DTLS certificate against that pinned fingerprint.
+    /// verifies the actual DTLS certificate against that signaled fingerprint. Local pre-enrollment is not required.
     pub fn verify_sdp(&self, sdp: &str) -> anyhow::Result<String> {
         let result = (|| -> anyhow::Result<String> {
             let mut fingerprint = None;
@@ -175,14 +175,15 @@ impl PeerIdentity {
             }
             let fingerprint =
                 fingerprint.context("peer did not supply a certificate fingerprint")?;
-            let path = self.directory.join("trusted-peers").join(&fingerprint);
-            let contents = fs::read_to_string(&path).with_context(|| format!(
-                "unrecognized peer fingerprint {fingerprint}. Verify it directly with the administrator of the other endpoint, then enroll it locally with --trust-peer. Never trust a fingerprint supplied only by the dashboard or signaling service"))?;
             ensure!(
-                normalize_fingerprint(contents.trim())? == fingerprint,
-                "invalid local trust entry"
+                !self
+                    .directory
+                    .join("revoked-peers")
+                    .join(&fingerprint)
+                    .try_exists()?,
+                "peer certificate has been explicitly revoked locally"
             );
-            tracing::info!(peer_fingerprint = %fingerprint, "peer SDP matches locally enrolled identity");
+            tracing::info!(peer_fingerprint = %fingerprint, "accepted peer fingerprint from authenticated signaling");
             Ok(fingerprint)
         })();
         result.map_err(|error| IdentityError(format!("{error:#}")).into())
@@ -190,7 +191,7 @@ impl PeerIdentity {
 }
 
 /// Explicit local administration only. These commands never contact a server.
-/// Trust changes require an independently verified public fingerprint.
+/// Optional local certificate blocking; normal connections require no enrollment.
 pub fn handle_command(
     default_directory: impl FnOnce() -> anyhow::Result<PathBuf>,
 ) -> anyhow::Result<bool> {
@@ -225,19 +226,20 @@ pub fn handle_command(
         ensure!(values.is_empty(), "unexpected fingerprint command argument");
         println!("{}", PeerIdentity::load(&directory)?.fingerprint());
     } else {
-        ensure!(
-            values.len() == 1,
-            "supply exactly one independently verified SHA-256 fingerprint"
-        );
+        ensure!(values.len() == 1, "supply exactly one SHA-256 fingerprint");
         let fingerprint = normalize_fingerprint(values[0])?;
-        let path = directory.join("trusted-peers").join(&fingerprint);
+        let path = directory.join("revoked-peers").join(&fingerprint);
         if command == "--trust-peer" {
-            publish_new(&path, fingerprint.as_bytes()).context(
-                "could not add trust entry (already enrolled entries are not overwritten)",
-            )?;
-            println!("Enrolled peer {fingerprint}");
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("could not remove peer block"),
+            }
+            println!("Peer {fingerprint} will be accepted through authenticated signaling");
         } else {
-            fs::remove_file(&path).context("could not revoke peer")?;
+            if !path.try_exists()? {
+                publish_new(&path, fingerprint.as_bytes())?;
+            }
             println!("Revoked peer {fingerprint}. Close any active session to apply immediately.");
         }
     }
@@ -264,14 +266,6 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
-    fn enroll(identity: &PeerIdentity, fingerprint: &str) {
-        let fingerprint = normalize_fingerprint(fingerprint).unwrap();
-        publish_new(
-            &identity.directory.join("trusted-peers").join(&fingerprint),
-            fingerprint.as_bytes(),
-        )
-        .unwrap();
-    }
     fn sdp(fingerprint: &str) -> String {
         format!("v=0\r\na=fingerprint:sha-256 {fingerprint}\r\n")
     }
@@ -289,16 +283,20 @@ mod tests {
     }
 
     #[test]
-    fn trust_requires_explicit_enrollment_and_revocation_blocks_reconnect() {
+    fn new_and_replacement_peers_are_accepted_without_enrollment_but_explicit_blocks_apply() {
         let directory = TestDirectory::new();
         let identity = PeerIdentity::load(&directory.0).unwrap();
         let fingerprint = "12".repeat(32);
-        assert!(identity.verify_sdp(&sdp(&fingerprint)).is_err());
-        enroll(&identity, &fingerprint);
         identity.verify_sdp(&sdp(&fingerprint)).unwrap();
-        assert!(identity.verify_sdp(&sdp(&"34".repeat(32))).is_err());
-        fs::remove_file(directory.0.join("trusted-peers").join(fingerprint)).unwrap();
-        assert!(identity.verify_sdp(&sdp(&"12".repeat(32))).is_err());
+        identity.verify_sdp(&sdp(&"34".repeat(32))).unwrap();
+        assert!(!directory.0.join("trusted-peers").exists());
+        publish_new(
+            &directory.0.join("revoked-peers").join(&fingerprint),
+            b"revoked",
+        )
+        .unwrap();
+        assert!(identity.verify_sdp(&sdp(&fingerprint)).is_err());
+        identity.verify_sdp(&sdp(&"34".repeat(32))).unwrap();
     }
 
     #[test]
@@ -306,7 +304,6 @@ mod tests {
         let directory = TestDirectory::new();
         let identity = PeerIdentity::load(&directory.0).unwrap();
         let fingerprint = identity.fingerprint();
-        enroll(&identity, &fingerprint);
         for value in [
             "v=0".into(),
             "a=fingerprint:sha-256 ../path".into(),
@@ -326,17 +323,9 @@ mod tests {
     }
 
     #[test]
-    fn expired_keys_and_malformed_trust_entries_are_rejected() {
+    fn expired_keys_are_rejected() {
         let directory = TestDirectory::new();
-        let identity = PeerIdentity::load(&directory.0).unwrap();
-        let fingerprint = normalize_fingerprint(&identity.fingerprint()).unwrap();
-        enroll(&identity, &fingerprint);
-        fs::write(
-            directory.0.join("trusted-peers").join(&fingerprint),
-            "corrupt",
-        )
-        .unwrap();
-        assert!(identity.verify_sdp(&sdp(&fingerprint)).is_err());
+        PeerIdentity::load(&directory.0).unwrap();
         let path = directory.0.join("identity.json");
         let mut stored: StoredIdentity = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         stored.expires_at = 1;
@@ -345,7 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinned_webrtc_peers_exchange_data_and_substituted_identity_is_rejected() {
+    async fn fresh_webrtc_peers_exchange_data_without_any_enrollment() {
         use crate::ServiceChannel;
         use std::sync::Arc;
         use webrtc::{api::APIBuilder, peer_connection::configuration::RTCConfiguration};
@@ -353,8 +342,6 @@ mod tests {
         let b_directory = TestDirectory::new();
         let a_identity = PeerIdentity::load(&a_directory.0).unwrap();
         let b_identity = PeerIdentity::load(&b_directory.0).unwrap();
-        enroll(&a_identity, &b_identity.fingerprint());
-        enroll(&b_identity, &a_identity.fingerprint());
         let a = APIBuilder::new()
             .build()
             .new_peer_connection(RTCConfiguration {
@@ -392,11 +379,6 @@ mod tests {
         gathered.recv().await;
         let offer = a.local_description().await.unwrap();
         b_identity.verify_sdp(&offer.sdp).unwrap();
-        let substituted = offer.sdp.replace(
-            &a_identity.fingerprint().to_uppercase(),
-            "34:".repeat(32).trim_end_matches(':'),
-        );
-        assert!(b_identity.verify_sdp(&substituted).is_err());
         b.set_remote_description(offer).await.unwrap();
         let mut gathered = b.gathering_complete_promise().await;
         b.set_local_description(b.create_answer(None).await.unwrap())
@@ -411,7 +393,7 @@ mod tests {
             .unwrap()
             .unwrap();
         channel
-            .send(&bytes::Bytes::from_static(b"pinned payload"))
+            .send(&bytes::Bytes::from_static(b"automatic peer payload"))
             .await
             .unwrap();
         assert_eq!(
@@ -420,13 +402,13 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .as_ref(),
-            b"pinned payload"
+            b"automatic peer payload"
         );
         a.close().await.unwrap();
         b.close().await.unwrap();
     }
     #[tokio::test]
-    async fn copied_pinned_fingerprint_without_private_key_cannot_connect() {
+    async fn signaled_fingerprint_without_matching_private_key_cannot_connect() {
         use webrtc::{
             api::APIBuilder,
             peer_connection::{
@@ -435,7 +417,6 @@ mod tests {
         };
         let directory = TestDirectory::new();
         let identity = PeerIdentity::load(&directory.0).unwrap();
-        enroll(&identity, &identity.fingerprint());
         let attacker = APIBuilder::new()
             .build()
             .new_peer_connection(RTCConfiguration::default())
