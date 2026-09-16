@@ -47,6 +47,7 @@ pub trait ScreenStreamer: Send {
     fn set_chroma(&mut self, chroma: ChromaMode);
     /// Returns true when the backend requires capture to be restarted.
     fn set_cursor_capture(&mut self, enabled: bool) -> anyhow::Result<bool>;
+    fn set_display_border(&mut self, enabled: bool) -> anyhow::Result<()>;
     fn input_controller(&self) -> Arc<dyn ScreenInput>;
 }
 
@@ -80,6 +81,9 @@ pub struct PlatformScreenStreamer {
     inner: CaptureBackend,
     viewer_name: String,
     blackout_message: String,
+    border_enabled: bool,
+    border: Option<super::display_border::DisplayBorder>,
+    border_display: Option<Display>,
     indicator: Option<super::indicator::SessionIndicator>,
     outline_dragging: Option<super::drag_windows::ConsoleOutlineDragging>,
     frames_per_second: u32,
@@ -117,6 +121,9 @@ impl PlatformScreenStreamer {
             },
             viewer_name,
             blackout_message,
+            border_enabled: false,
+            border: None,
+            border_display: None,
             indicator: None,
             outline_dragging: None,
             frames_per_second,
@@ -195,6 +202,12 @@ impl ScreenStreamer for PlatformScreenStreamer {
                     .map_err(|_| anyhow::anyhow!("direct input controller lock was poisoned"))?
                     .set_active_display(active_display.clone())?;
                 let active = streamer.start(config, active_display.id.0, sink)?;
+                self.border = None;
+                self.border_display = Some(active_display.clone());
+                if self.border_enabled {
+                    self.border =
+                        Some(super::display_border::DisplayBorder::show(&active_display)?);
+                }
                 if self.indicator.is_none() {
                     self.indicator = Some(super::indicator::SessionIndicator::show(
                         &self.viewer_name,
@@ -209,6 +222,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
             }
             CaptureBackend::Desktop(streamer) => {
                 let started = streamer.start(config, requested_display_id, sink)?;
+                streamer.set_display_border(self.border_enabled)?;
                 Ok(StartedScreen {
                     displays: started.displays,
                     active_display: started.active_display,
@@ -232,6 +246,8 @@ impl ScreenStreamer for PlatformScreenStreamer {
 
     fn stop(&mut self) -> anyhow::Result<()> {
         self.indicator = None;
+        self.border = None;
+        self.border_display = None;
         match &mut self.inner {
             CaptureBackend::Direct(streamer) => streamer.stop().map_err(anyhow::Error::from),
             CaptureBackend::Desktop(streamer) => streamer.stop(),
@@ -241,6 +257,8 @@ impl ScreenStreamer for PlatformScreenStreamer {
 
     fn shutdown(&mut self) -> anyhow::Result<()> {
         self.indicator = None;
+        self.border = None;
+        self.border_display = None;
         self.outline_dragging = None;
         match &mut self.inner {
             CaptureBackend::Direct(streamer) => streamer.stop().map_err(anyhow::Error::from),
@@ -314,6 +332,20 @@ impl ScreenStreamer for PlatformScreenStreamer {
             CaptureBackend::Desktop(streamer) => {
                 streamer.set_cursor_capture(enabled)?;
                 Ok(false)
+            }
+        }
+    }
+
+    fn set_display_border(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.border_enabled = enabled;
+        match &self.inner {
+            CaptureBackend::Desktop(streamer) => streamer.set_display_border(enabled),
+            CaptureBackend::Direct(_) => {
+                self.border = None;
+                if enabled && let Some(display) = &self.border_display {
+                    self.border = Some(super::display_border::DisplayBorder::show(display)?);
+                }
+                Ok(())
             }
         }
     }
@@ -492,7 +524,7 @@ fn remote_screen_pixel_format(chroma: ChromaMode) -> meshrmm_remote_screen::Vide
 }
 
 #[cfg(windows)]
-fn enumerate_displays() -> anyhow::Result<Vec<Display>> {
+pub(super) fn enumerate_displays() -> anyhow::Result<Vec<Display>> {
     meshrmm_remote_screen::enumerate_displays()
         .context("failed to enumerate Windows displays")?
         .into_iter()

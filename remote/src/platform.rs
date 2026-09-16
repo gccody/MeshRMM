@@ -19,6 +19,7 @@ pub struct MaintenanceState {
 /// with the native window's foreground state.
 #[derive(Clone)]
 pub struct ControlSink {
+    display_border: Arc<Mutex<Option<bool>>>,
     files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
     audio: meshrmm_audio::PlaybackState,
@@ -39,6 +40,7 @@ impl ControlSink {
     // Keep the shared session handles and transport callbacks explicit at construction.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        display_border: Arc<Mutex<Option<bool>>>,
         files: meshrmm_file_transfer::TransferSession,
         send: impl Fn(meshrmm_protocol::SessionMessage) + Send + Sync + 'static,
         set_input_enabled: impl Fn(bool) + Send + Sync + 'static,
@@ -53,6 +55,7 @@ impl ControlSink {
         #[cfg(windows)] profiles: Arc<Vec<meshrmm_protocol::VideoProfile>>,
     ) -> Self {
         Self {
+            display_border,
             files,
             chat,
             audio,
@@ -187,6 +190,26 @@ impl ControlSink {
     pub fn technician_blocked(&self) -> bool {
         self.technician_blocked
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn display_border(&self) -> bool {
+        self.display_border
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or(true)
+    }
+
+    pub fn toggle_display_border(&self) {
+        let enabled = {
+            let mut choice = self
+                .display_border
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let enabled = !choice.unwrap_or(true);
+            *choice = Some(enabled);
+            enabled
+        };
+        self.send(meshrmm_protocol::SessionMessage::SetDisplayBorder { enabled });
     }
 
     pub fn wallpaper_hidden(&self) -> bool {

@@ -346,6 +346,7 @@ define_class!(
                 (if self.ivars().control.agent_blocked() { "Allow agent input" } else { "Block agent keyboard and mouse" }, sel!(toggleAgentInput:)),
                 (if self.ivars().control.maintenance_state().blacked_out { "Restore agent monitors" } else { "Black out all agent monitors" }, sel!(toggleBlackout:)),
                 (if self.ivars().control.audio_muted() { "Unmute audio" } else { "Mute audio" }, sel!(toggleAudio:)),
+                ("Highlight viewed monitor on agent", sel!(toggleDisplayBorder:)),
                 ("Hide remote wallpaper", sel!(toggleWallpaper:)),
                 ("Show remote cursor", sel!(toggleRemoteCursor:)),
                 ("Diagnostics", sel!(toggleDiagnostics:)),
@@ -357,6 +358,7 @@ define_class!(
                 unsafe { item.setTarget(Some(self)); }
                 if action == sel!(toggleAgentInput:) || action == sel!(toggleBlackout:) { item.setEnabled(self.ivars().control.maintenance_state().available); }
                 if action == sel!(toggleAgentInput:) && self.ivars().control.maintenance_state().blacked_out { item.setEnabled(false); }
+                if action == sel!(toggleDisplayBorder:) { item.setState(isize::from(self.ivars().control.display_border())); }
                 if action == sel!(toggleWallpaper:) { item.setState(isize::from(self.ivars().control.wallpaper_hidden())); }
                 if action == sel!(toggleRemoteCursor:) { item.setState(isize::from(self.ivars().control.show_remote_cursor())); }
                 menu.addItem(&item);
@@ -371,6 +373,11 @@ define_class!(
             self.ivars().control.set_technician_blocked(blocked);
             self.refresh_cursor();
             self.ivars().control.set_input_enabled(true);
+        }
+
+        #[unsafe(method(toggleDisplayBorder:))]
+        fn toggle_display_border(&self, _sender: &NSMenuItem) {
+            self.ivars().control.toggle_display_border();
         }
 
         #[unsafe(method(toggleWallpaper:))]

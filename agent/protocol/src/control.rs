@@ -126,6 +126,10 @@ pub enum SessionMessage {
     SetWallpaperHidden {
         hidden: bool,
     },
+    /// Agent-only monitor outline, excluded from captured video.
+    SetDisplayBorder {
+        enabled: bool,
+    },
 }
 
 impl SessionMessage {
@@ -365,6 +369,24 @@ mod tests {
 
         let encoded = message.encode().unwrap();
         assert_eq!(SessionMessage::decode(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn display_border_preserves_wire_tags() {
+        for enabled in [true, false] {
+            let message = SessionMessage::SetDisplayBorder { enabled };
+            assert_eq!(message.encode().unwrap(), vec![29, u8::from(enabled)]);
+            assert_eq!(
+                SessionMessage::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+        }
+        assert_eq!(
+            SessionMessage::SetWallpaperHidden { hidden: true }
+                .encode()
+                .unwrap(),
+            vec![28, 1]
+        );
     }
 
     #[test]

@@ -111,6 +111,7 @@ enum ParentCommand {
     RequestKeyframe,
     SetBitrate(u32),
     SetCursorCapture(bool),
+    SetDisplayBorder(bool),
     SetWallpaperHidden(bool),
     StartInput {
         viewer_name: String,
@@ -330,6 +331,7 @@ impl DesktopCaptureStreamer {
         let reader_sink = Arc::clone(&sink);
         let reader_status = Arc::clone(&status);
         let reader_cursor = Arc::clone(&self.cursor);
+        let reader_maintenance = Arc::clone(&self.maintenance);
         let reader = thread::Builder::new()
             .name("meshrmm-desktop-ipc".into())
             .spawn(move || {
@@ -339,6 +341,7 @@ impl DesktopCaptureStreamer {
                     started_tx,
                     reader_status,
                     reader_cursor,
+                    reader_maintenance,
                 )
             })
             .context("failed to start desktop-helper IPC reader")?;
@@ -411,6 +414,13 @@ impl DesktopCaptureStreamer {
             stderr: Some(stderr),
         });
         Ok(started)
+    }
+
+    pub fn set_display_border(&self, enabled: bool) -> anyhow::Result<()> {
+        if self.running.is_some() {
+            self.send(ParentCommand::SetDisplayBorder(enabled))?;
+        }
+        Ok(())
     }
 
     pub fn set_cursor_capture(&self, enabled: bool) -> anyhow::Result<()> {
@@ -1231,6 +1241,7 @@ fn dispatch_child_events(
     started_tx: mpsc::Sender<Result<StartedDesktop, String>>,
     status: HelperStatus,
     cursor: HelperCursor,
+    maintenance: HelperMaintenance,
 ) {
     let mut output = BufReader::new(output);
     loop {
@@ -1259,9 +1270,12 @@ fn dispatch_child_events(
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) =
                     (shape, viewer_controls_input);
             }
+            Ok(ChildEvent::MaintenanceError(reason)) => {
+                *maintenance.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(SessionMessage::MaintenanceError { reason });
+            }
             Ok(
-                ChildEvent::MaintenanceError(_)
-                | ChildEvent::MaintenanceState { .. }
+                ChildEvent::MaintenanceState { .. }
                 | ChildEvent::Files(_)
                 | ChildEvent::Clipboard(_)
                 | ChildEvent::Chat(_),
@@ -1534,6 +1548,7 @@ fn run_capture_child(
     mut display_id: Option<DisplayId>,
     mut config: StreamConfig,
 ) -> anyhow::Result<()> {
+    let mut border_enabled = false;
     'capture: loop {
         if config.frames_per_second == 0 || config.bitrate_bits_per_second == 0 {
             anyhow::bail!("desktop-helper frame rate and bitrate must be positive");
@@ -1545,6 +1560,11 @@ fn run_capture_child(
             .or_else(|| displays.first())
             .cloned()
             .context("Windows reported no displays on the active desktop")?;
+        let mut border = if border_enabled {
+            Some(super::display_border::DisplayBorder::show(&active_display)?)
+        } else {
+            None
+        };
         let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
         let ipc_failed = Arc::new(AtomicBool::new(false));
         let sink_output = Arc::clone(&output);
@@ -1573,12 +1593,13 @@ fn run_capture_child(
             ChildEvent::Started(StartedDesktop {
                 format: active,
                 displays,
-                active_display,
+                active_display: active_display.clone(),
             }),
         )?;
 
         let mut terminal_error = None;
         loop {
+            let _keep_border_alive = &border;
             if ipc_failed.load(Ordering::Acquire) {
                 break;
             }
@@ -1589,6 +1610,19 @@ fn run_capture_child(
                 break;
             }
             match command_rx.recv_timeout(Duration::from_millis(16)) {
+                Ok(Ok(ParentCommand::SetDisplayBorder(enabled))) => {
+                    border = None;
+                    border_enabled = enabled;
+                    if enabled {
+                        match super::display_border::DisplayBorder::show(&active_display) {
+                            Ok(value) => border = Some(value),
+                            Err(error) => emit_child_event(
+                                &output,
+                                ChildEvent::MaintenanceError(format!("Display border: {error:#}")),
+                            )?,
+                        }
+                    }
+                }
                 Ok(Ok(ParentCommand::SetCursorCapture(enabled))) => {
                     streamer.set_cursor_capture(enabled);
                 }
@@ -1824,6 +1858,7 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
         }
         ParentCommand::SetWallpaperHidden(hidden) => writer.write_all(&[19, u8::from(*hidden)]),
         ParentCommand::SetCursorCapture(enabled) => writer.write_all(&[18, u8::from(*enabled)]),
+        ParentCommand::SetDisplayBorder(enabled) => writer.write_all(&[20, u8::from(*enabled)]),
         ParentCommand::RequestKeyframe => writer.write_all(&[COMMAND_REQUEST_KEYFRAME]),
         ParentCommand::SetBitrate(bits_per_second) => {
             writer.write_all(&[COMMAND_SET_BITRATE])?;
@@ -1919,6 +1954,7 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
         }
         19 => Ok(ParentCommand::SetWallpaperHidden(read_bool(&mut reader)?)),
         18 => Ok(ParentCommand::SetCursorCapture(read_bool(&mut reader)?)),
+        20 => Ok(ParentCommand::SetDisplayBorder(read_bool(&mut reader)?)),
         COMMAND_REQUEST_KEYFRAME => Ok(ParentCommand::RequestKeyframe),
         COMMAND_SET_BITRATE => Ok(ParentCommand::SetBitrate(read_u32(&mut reader)?)),
         COMMAND_START_INPUT => {
@@ -2486,6 +2522,7 @@ mod tests {
                 started_tx,
                 Arc::clone(&status),
                 Arc::new(Mutex::new((CursorShape::Default, false))),
+                Arc::new(Mutex::new(None)),
             );
             assert_eq!(
                 started_rx.recv().unwrap().unwrap().active_display.id,
@@ -2793,6 +2830,7 @@ mod tests {
             ParentCommand::Start { .. } => COMMAND_START,
             ParentCommand::SetWallpaperHidden(_) => 19,
             ParentCommand::SetCursorCapture(_) => 18,
+            ParentCommand::SetDisplayBorder(_) => 20,
             ParentCommand::RequestKeyframe => COMMAND_REQUEST_KEYFRAME,
             ParentCommand::SetBitrate(_) => COMMAND_SET_BITRATE,
             ParentCommand::StartInput { .. } => COMMAND_START_INPUT,
