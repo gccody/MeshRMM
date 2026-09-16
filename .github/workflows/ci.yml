@@ -23,8 +23,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p meshrmm-remote --all-targets -- -D warnings
-      - run: cargo test -p meshrmm-remote
+      - run: cargo clippy -p meshrmm-remote -p meshrmm-session-transport --all-targets -- -D warnings
+      - run: cargo test -p meshrmm-remote -p meshrmm-session-transport
 
   server-wasm:
     runs-on: ubuntu-latest

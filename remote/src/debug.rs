@@ -10,6 +10,7 @@ pub struct DebugInfo {
 
 struct DebugState {
     session_id: String,
+    peer_fingerprint: String,
     started: Instant,
     connection_state: String,
     connection_path: String,
@@ -50,6 +51,7 @@ impl DebugInfo {
         Self {
             state: Arc::new(Mutex::new(DebugState {
                 session_id: session_id.into(),
+                peer_fingerprint: "not verified".into(),
                 started: now,
                 connection_state: "signaling".into(),
                 connection_path: "selecting ICE route".into(),
@@ -83,6 +85,12 @@ impl DebugInfo {
                 received_window_frames: 0,
                 network_sample: None,
             })),
+        }
+    }
+
+    pub fn set_peer_fingerprint(&self, fingerprint: String) {
+        if let Ok(mut debug) = self.state.lock() {
+            debug.peer_fingerprint = fingerprint;
         }
     }
 
@@ -240,6 +248,7 @@ impl DebugInfo {
             "MeshRMM diagnostics  [F12 to close]\n\
              Session: {}  Uptime: {}\n\
              State: {}  Route: {}\n\
+             Pinned peer SHA-256: {}\n\
              Local: {}\n\
              Remote: {}\n\
              ICE pair: {}\n\
@@ -257,6 +266,7 @@ impl DebugInfo {
             format_duration(debug.started.elapsed()),
             debug.connection_state,
             debug.connection_path,
+            debug.peer_fingerprint,
             debug.local_candidate,
             debug.remote_candidate,
             debug.selected_pair,

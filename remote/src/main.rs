@@ -157,6 +157,9 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
                 return Ok(());
             }
             Err(error) if signaling::is_terminal_session_error(&error) => {
+                if let Err(cleanup) = signaling::end_session(&config, &bootstrap).await {
+                    tracing::warn!(%cleanup, "could not acknowledge terminal session cleanup");
+                }
                 return Err(error).context("remote viewer session can no longer be resumed");
             }
             Err(error) => {
@@ -197,6 +200,11 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
 #[cfg(windows)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if meshrmm_session_transport::identity::handle_command(
+        meshrmm_session_transport::identity::viewer_directory,
+    )? {
+        return Ok(());
+    }
     if updater::is_helper_invocation() {
         return updater::apply_scheduled_update();
     }
@@ -216,6 +224,11 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
+    if meshrmm_session_transport::identity::handle_command(
+        meshrmm_session_transport::identity::viewer_directory,
+    )? {
+        return Ok(());
+    }
     if updater::is_helper_invocation() {
         return updater::apply_scheduled_update();
     }

@@ -67,7 +67,10 @@ pub async fn resume_session(
 }
 
 pub fn is_terminal_session_error(error: &anyhow::Error) -> bool {
-    meshrmm_signaling_client::is_terminal_websocket_error(error)
+    error
+        .downcast_ref::<meshrmm_session_transport::identity::IdentityError>()
+        .is_some()
+        || meshrmm_signaling_client::is_terminal_websocket_error(error)
         || error.chain().any(|cause| {
             cause
                 .downcast_ref::<reqwest::Error>()
@@ -119,6 +122,15 @@ pub async fn end_session(config: &Config, bootstrap: &SessionBootstrap) -> anyho
             .and_then(reqwest::Response::error_for_status)
         {
             Ok(_) => return Ok(()),
+            Err(error) if error.status() == Some(reqwest::StatusCode::NOT_FOUND) => {
+                // Rolling upgrades: older servers only understand the EndSession
+                // WebSocket message already sent by the transport. Keep their
+                // existing close behavior while making the missing guarantee visible.
+                tracing::warn!(
+                    "server lacks acknowledged close; used legacy WebSocket session end"
+                );
+                return Ok(());
+            }
             Err(error) => {
                 let terminal = error.status().is_some_and(|status| {
                     status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS

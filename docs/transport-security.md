@@ -154,5 +154,95 @@ Deploy the server endpoint before distributing this viewer change. The new
 server has not been deployed to production; the production fault-injection
 retest therefore remains a release validation step. Full network loss can still
 prevent a close request from reaching the server; the existing idle lease
-provides eventual expiry in that case. A failed acknowledgment is reported,
-not treated as successful cleanup.
+provides eventual expiry in that case. A failed acknowledgment is reported. An older server returning HTTP 404 retains
+the legacy WebSocket close behavior with a warning, so rolling upgrades do not
+turn an otherwise successful disconnect into an application error. This fallback
+does not claim acknowledged cleanup; deploy the server first to obtain it.
+
+## Independent peer enrollment
+
+Both native endpoints now use persistent local DTLS certificates and require an
+administrator-enrolled SHA-256 fingerprint for the other peer. Every advertised
+SDP fingerprint must match the same enrolled identity, and WebRTC must then
+verify that the actual DTLS peer possesses its private key. Unknown, malformed,
+conflicting, missing, changed, or revoked identities fail closed. There is no
+trust-on-first-use, dashboard enrollment, or compatibility bypass for old peers
+that generate a new certificate on every session.
+
+The trust store is an allowlist of permitted peer identities. It does not bind a
+browser's displayed device name to a fingerprint; a compromised dashboard can
+still mislabel or redirect a request to another already-trusted device. Only
+enroll endpoints that should be permitted to connect. This protects remote
+channel peer authentication; it does not remove control-plane authority over
+other Agent administration operations or make a compromised endpoint safe.
+
+Before distributing the updated native binaries, provision both identities and
+exchange their public fingerprints through a separately authenticated channel
+(for example, an administrator's established SSH connection or physical access).
+Do not copy private identity files between endpoints or obtain the fingerprint
+solely from the signaling error or dashboard.
+
+Run the appropriate binary locally (an elevated shell for the Agent):
+
+```text
+meshrmm-agent.exe --identity-fingerprint
+meshrmm-remote --identity-fingerprint
+
+meshrmm-agent.exe --trust-peer <verified-viewer-SHA256-fingerprint>
+meshrmm-remote --trust-peer <verified-agent-SHA256-fingerprint>
+```
+
+On macOS, the installed executable is
+`~/Applications/MeshRMM Remote.app/Contents/MacOS/meshrmm-remote`. The commands
+operate without a handoff token or server connection. Fingerprints accept
+colon-separated or contiguous hexadecimal digits. Existing trust entries are
+never overwritten implicitly. Use `--revoke-peer <fingerprint>` to remove a
+pin; close active sessions to apply a revocation immediately. A new identity
+requires independent verification and explicit enrollment again.
+
+The Agent stores its key and pins under `%ProgramData%\MeshRMM\Agent\identity`,
+inheriting the installer's SYSTEM/Administrators-only ACL. The viewer uses
+`%APPDATA%\MeshRMM\viewer-identity` on Windows and
+`~/Library/Application Support/MeshRMM/viewer-identity` on macOS. Unix directories
+are owner-only and private-key files are mode 0600; Windows viewer files inherit
+the current user's profile permissions. Corrupt or expired identity files are
+not replaced automatically. Identities expire after five years and require
+administrator rotation. Protect these directories in backups and keep them
+outside release artifacts. `--identity-directory <path>` is available on the
+administrative commands for provisioning/testing; normal sessions use the
+standard locations above.
+
+Release order: deploy the acknowledged-close server first; provision local
+identities and mutual pins; then distribute both native endpoint updates.
+Unenrolled viewers and older ephemeral-certificate peers will be blocked by
+updated endpoints. Do not enable fleet auto-update until enrollment is complete.
+
+### Identity validation — September 16, 2026
+
+- Six new identity tests cover persisted certificates, corrupt/expired key
+  rejection, explicit enrollment and revocation, malformed/conflicting SDP,
+  mutually pinned real WebRTC payload exchange, and a real attacker presenting
+  a copied trusted fingerprint without its private key. The latter reached a
+  failed DTLS connection, rather than merely timing out.
+- macOS viewer/session-transport Clippy and tests passed. Windows workspace
+  Clippy, tests, and release build passed against hash-verified source. CI now
+  exercises the shared transport security tests on macOS as well as Windows.
+- An installed viewer rejected an unenrolled peer and displayed the verification
+  error without opening remote channels. Both test endpoint fingerprints were
+  subsequently obtained through local execution and authenticated SSH and
+  enrolled explicitly. The Windows private-key ACL was verified as SYSTEM and
+  Administrators only.
+- The final installed Agent SHA-256 is
+  `896ca944f4d3b9da3d5c5066873774809e2113dd703a32140c6ecb11cd272ca4`.
+  The supported installer preserved configuration and confirmed reconnection.
+  The identity persisted across the subsequent build installation and restart.
+- Installed endpoints passed screen/input, bidirectional chat, a 311,296-byte
+  file delivery verified by the receiver, and generated audio delivery. Forced
+  Cloudflare TURN passed screen/input, bidirectional chat and clipboard, with
+  the expected fingerprint visible in diagnostics and ECDHE-ECDSA AES-GCM in
+  both endpoint logs. Temporary firewall rules were removed and the service
+  was left online.
+- The final viewer disconnected cleanly against the existing production server
+  using the explicitly logged legacy-close fallback. The new acknowledged-close
+  endpoint passed local workerd integration tests; its production fault-recovery
+  check is still required after the server deployment and before fleet rollout.
