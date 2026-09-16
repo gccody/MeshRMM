@@ -429,6 +429,12 @@ define_class!(
         #[unsafe(method(receiveFiles:))]
         fn receive_files(&self, _: &NSMenuItem) { self.send(SessionMessage::FileTransfer(meshrmm_protocol::FileMessage::Pick)); }
 
+        #[unsafe(method(typeClipboard:))]
+        fn type_clipboard(&self, _sender: &NSButton) {
+            self.release_input();
+            self.ivars().control.type_clipboard(self.ivars().active_display.borrow().id);
+        }
+
         #[unsafe(method(sendSecureAttention:))]
         fn send_secure_attention(&self, _sender: &NSButton) {
             self.release_input();
@@ -688,6 +694,19 @@ impl RemoteView {
         secure_attention_button
             .setFrame(NSRect::new(NSPoint::new(558., 6.), NSSize::new(110., 24.)));
         toolbar.addSubview(&secure_attention_button);
+        let type_clipboard_button = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Type clipboard"),
+                Some(self),
+                Some(sel!(typeClipboard:)),
+                mtm,
+            )
+        };
+        type_clipboard_button.setFrame(NSRect::new(NSPoint::new(674., 6.), NSSize::new(120., 24.)));
+        type_clipboard_button.setToolTip(Some(&NSString::from_str(
+            "Type local clipboard text into the focused remote field",
+        )));
+        toolbar.addSubview(&type_clipboard_button);
         let control = self.ivars().control.clone();
         *self.ivars().chat_popup.borrow_mut() = Some(meshrmm_chat::ChatPopup::new(
             control.chat(),

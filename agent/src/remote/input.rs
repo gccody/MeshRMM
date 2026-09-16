@@ -153,6 +153,22 @@ impl WindowsInputController {
             );
         }
         match input {
+            RemoteInput::TypeText { text, .. } => {
+                anyhow::ensure!(
+                    text.len() <= meshrmm_protocol::MAX_CLIPBOARD_TEXT_BYTES
+                        && !text.contains('\0'),
+                    "invalid text input"
+                );
+                self.release_all()?;
+                let inputs = text_inputs(&text);
+                // Send bounded batches locally without network round trips or
+                // artificial per-character delays.
+                for batch in inputs.chunks(128) {
+                    send(batch)?;
+                }
+                Ok(())
+            }
+
             RemoteInput::PointerMove { x, y, .. } => move_pointer(display, x, y),
             RemoteInput::PointerButton {
                 button, pressed, ..
@@ -423,6 +439,57 @@ fn send_key(scan_code: u16, extended: bool, pressed: bool) -> anyhow::Result<()>
     send(&[input])
 }
 
+fn text_inputs(text: &str) -> Vec<INPUT> {
+    let mut inputs = Vec::with_capacity(text.len() * 2);
+    // Treat CRLF as one Enter; do not append an Enter to the clipboard.
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' && chars.peek() == Some(&'\n') {
+            chars.next();
+        }
+        let vk = match ch {
+            '\r' | '\n' => VK_RETURN,
+            '\t' => VK_TAB,
+            _ => VIRTUAL_KEY(0),
+        };
+        let mut units = [0; 2];
+        let codes: &[u16] = if vk.0 != 0 {
+            &[0]
+        } else {
+            ch.encode_utf16(&mut units)
+        };
+        for &unit in codes {
+            for release in [false, true] {
+                inputs.push(text_key(vk, unit, release));
+            }
+        }
+    }
+    inputs
+}
+
+fn text_key(vk: VIRTUAL_KEY, unit: u16, release: bool) -> INPUT {
+    let mut flags = if vk.0 == 0 {
+        KEYEVENTF_UNICODE
+    } else {
+        KEYBD_EVENT_FLAGS(0)
+    };
+    if release {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: unit,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: super::input_block::INPUT_TAG,
+            },
+        },
+    }
+}
+
 fn send(inputs: &[INPUT]) -> anyhow::Result<()> {
     let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent != inputs.len() as u32 {
@@ -434,6 +501,32 @@ fn send(inputs: &[INPUT]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_text_emits_unicode_pairs_and_normalizes_line_endings() {
+        let inputs = text_inputs("Aé🔑\r\n\t");
+        let keys: Vec<_> = inputs
+            .iter()
+            .map(|input| unsafe { input.Anonymous.ki })
+            .collect();
+        assert_eq!(keys.len(), 12);
+        assert_eq!(
+            keys.iter().step_by(2).map(|k| k.wScan).collect::<Vec<_>>(),
+            vec![65, 233, 0xd83d, 0xdd11, 0, 0]
+        );
+        for pair in keys.chunks_exact(2) {
+            assert_eq!(pair[0].wScan, pair[1].wScan);
+            assert_eq!(pair[0].wVk, pair[1].wVk);
+            assert!(!pair[0].dwFlags.contains(KEYEVENTF_KEYUP));
+            assert!(pair[1].dwFlags.contains(KEYEVENTF_KEYUP));
+            assert_eq!(pair[0].dwExtraInfo, super::super::input_block::INPUT_TAG);
+        }
+        assert!(keys[0].dwFlags.contains(KEYEVENTF_UNICODE));
+        assert_eq!(keys[8].wVk, VK_RETURN);
+        assert_eq!(keys[10].wVk, VK_TAB);
+        assert!(text_inputs("").is_empty());
+        assert_eq!(text_inputs("\r\n\n\r").len(), 6);
+    }
 
     #[test]
     #[ignore = "requires interactive Windows desktop; injects harmless pointer movement"]

@@ -96,6 +96,35 @@ impl ControlSink {
         self.audio.toggle();
     }
 
+    pub fn type_clipboard(&self, display_id: meshrmm_protocol::DisplayId) {
+        if self.technician_blocked() {
+            return;
+        }
+        let result = (|| -> anyhow::Result<()> {
+            let text = crate::clipboard::ClipboardSync::new(false)?.text()?;
+            anyhow::ensure!(
+                text.len() <= meshrmm_protocol::MAX_CLIPBOARD_TEXT_BYTES,
+                "Clipboard text is too large to type (maximum 60 KiB)"
+            );
+            anyhow::ensure!(
+                !text.contains('\0'),
+                "Clipboard text contains a null character"
+            );
+            if !text.is_empty() {
+                self.set_input_enabled(true);
+                self.send(meshrmm_protocol::SessionMessage::Input(
+                    meshrmm_protocol::RemoteInput::TypeText { display_id, text },
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = result
+            && let Ok(mut state) = self.maintenance.lock()
+        {
+            state.error = Some(format!("Type clipboard: {error}"));
+        }
+    }
+
     pub fn send_secure_attention(&self) {
         self.send(meshrmm_protocol::SessionMessage::SendSecureAttention);
     }

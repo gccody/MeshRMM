@@ -20,6 +20,7 @@ struct WindowContext {
     file_button: HWND,
     chat_button: HWND,
     secure_attention_button: HWND,
+    type_clipboard_button: HWND,
     chat_popup: Option<meshrmm_chat::ChatPopup>,
     minimize_button: HWND,
     maximize_button: HWND,
@@ -43,6 +44,7 @@ const SETTINGS_BUTTON_ID: usize = 4004;
 const FILE_BUTTON_ID: usize = 4010;
 const CHAT_BUTTON_ID: usize = 4009;
 const SECURE_ATTENTION_BUTTON_ID: usize = 4011;
+const TYPE_CLIPBOARD_BUTTON_ID: usize = 4012;
 const MINIMIZE_BUTTON_ID: usize = 4005;
 const MAXIMIZE_BUTTON_ID: usize = 4006;
 const CLOSE_BUTTON_ID: usize = 4007;
@@ -212,6 +214,16 @@ impl WindowContext {
                 caption_x.saturating_sub(296),
                 5,
                 110,
+                24,
+                true,
+            )
+        };
+        let _ = unsafe {
+            MoveWindow(
+                self.type_clipboard_button,
+                caption_x.saturating_sub(422),
+                5,
+                120,
                 24,
                 true,
             )
@@ -849,7 +861,7 @@ pub(super) unsafe fn create_window(
             WM_GETMINMAXINFO => {
                 let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
                 // Leave room for display/quality controls, session actions and caption buttons.
-                info.ptMinTrackSize.x = 900;
+                info.ptMinTrackSize.x = 1030;
                 info.ptMinTrackSize.y = 300;
                 LRESULT(0)
             }
@@ -954,6 +966,12 @@ pub(super) unsafe fn create_window(
                     }
                     if control_id == DIAGNOSTICS_BUTTON_ID {
                         context.toggle_debug();
+                        let _ = unsafe { SetFocus(Some(window)) };
+                        return LRESULT(0);
+                    }
+                    if control_id == TYPE_CLIPBOARD_BUTTON_ID {
+                        context.release_input();
+                        context.control.type_clipboard(context.active_display.id);
                         let _ = unsafe { SetFocus(Some(window)) };
                         return LRESULT(0);
                     }
@@ -1243,6 +1261,7 @@ pub(super) unsafe fn create_window(
         file_button: HWND::default(),
         chat_button: HWND::default(),
         secure_attention_button: HWND::default(),
+        type_clipboard_button: HWND::default(),
         chat_popup: None,
         minimize_button: HWND::default(),
         maximize_button: HWND::default(),
@@ -1455,6 +1474,11 @@ pub(super) unsafe fn create_window(
     }
     let file_button = make_toolbar_button(FILE_BUTTON_ID, w!("📁"), toolbar_button_style)?;
     let chat_button = make_toolbar_button(CHAT_BUTTON_ID, w!("💬"), toolbar_button_style)?;
+    let type_clipboard_button = make_toolbar_button(
+        TYPE_CLIPBOARD_BUTTON_ID,
+        w!("Type clipboard"),
+        toolbar_button_style,
+    )?;
     let secure_attention_button = make_toolbar_button(
         SECURE_ATTENTION_BUTTON_ID,
         w!("Ctrl+Alt+Del"),
@@ -1475,6 +1499,7 @@ pub(super) unsafe fn create_window(
         file_button,
         chat_button,
         secure_attention_button,
+        type_clipboard_button,
         minimize_button,
         maximize_button,
         close_button,
@@ -1500,6 +1525,7 @@ pub(super) unsafe fn create_window(
         context.file_button = file_button;
         context.chat_button = chat_button;
         context.secure_attention_button = secure_attention_button;
+        context.type_clipboard_button = type_clipboard_button;
         context.chat_popup = Some(unsafe {
             meshrmm_chat::ChatPopup::new(window, chat_button, context.control.chat())
         }?);
