@@ -36,3 +36,23 @@ Final installed border-build SHA-256:
 `8B521281D7DCAFFD3359A547BB05A5FF22ACF2F25729D8A3FE59109DADA9825D`.
 The all-monitor service test produced eight excluded border windows (four per
 physical monitor), with no outline visible in the combined captured video.
+
+## Agent pointer monitor indicator
+
+The display selector marks the physical monitor containing the agent-side mouse
+with `➤` while the local user owns input. The marker clears when the technician
+controls input. Status messages are sent on monitor/ownership changes, without
+sending every mouse position or changing the selected video display.
+
+Validation: macOS viewer Clippy/tests and protocol tests; Windows workspace
+Clippy/tests and release build; formatting and diff checks. Geometry tests cover
+negative origins, exact shared edges, gaps, and exclusion of the synthetic
+all-monitor entry. IPC round trips include pointer monitor identity.
+
+Installed Windows build SHA-256:
+`2670718902E23E9E0036BC566320B29564998DBB30C9C99F5D5FF157F56652F2`.
+The service started and connected with its configuration preserved. A live macOS
+viewer session displayed `➤ LG ULTRAGEAR` in the monitor list, then cleared the
+marker when the viewer clicked a harmless remote background area. Session close
+completed normally. Windows viewer behavior was compiled and unit-tested natively;
+its UI was not manually exercised.

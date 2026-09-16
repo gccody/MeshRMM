@@ -1023,6 +1023,7 @@ fn spawn_input_worker(
     });
     let mut cursor = None;
     let mut ownership = None;
+    let mut pointer_display = None;
     let mut state = None;
     Ok(super::native_task::command_worker(
         "meshrmm-input",
@@ -1042,6 +1043,16 @@ fn spawn_input_worker(
                         .is_ok()
                 {
                     ownership = Some(viewer_controls_input);
+                }
+                let next_pointer = input.agent_pointer_display();
+                if pointer_display != Some(next_pointer)
+                    && updates
+                        .try_send(SessionMessage::AgentPointerDisplay {
+                            display_id: next_pointer,
+                        })
+                        .is_ok()
+                {
+                    pointer_display = Some(next_pointer);
                 }
                 let shape = input.cursor_shape();
                 if cursor != Some(shape)
@@ -1999,6 +2010,10 @@ mod service_isolation_tests {
         }
         fn viewer_controls_input(&self) -> bool {
             false
+        }
+
+        fn agent_pointer_display(&self) -> Option<DisplayId> {
+            None
         }
 
         fn cursor_shape(&self) -> CursorShape {

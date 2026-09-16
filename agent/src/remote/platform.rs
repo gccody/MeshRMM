@@ -62,6 +62,7 @@ pub trait ScreenInput: Send + Sync {
     fn apply(&self, input: RemoteInput) -> anyhow::Result<()>;
     fn release_all(&self) -> anyhow::Result<()>;
     fn cursor_shape(&self) -> CursorShape;
+    fn agent_pointer_display(&self) -> Option<DisplayId>;
     fn viewer_controls_input(&self) -> bool;
     fn apply_clipboard(&self, text: ClipboardContent) -> anyhow::Result<()>;
     fn poll_clipboard(&self) -> anyhow::Result<Option<ClipboardContent>>;
@@ -446,6 +447,13 @@ impl ScreenInput for DirectInputController {
         self.controller
             .lock()
             .is_ok_and(|input| input.viewer_controls_input())
+    }
+
+    fn agent_pointer_display(&self) -> Option<DisplayId> {
+        self.controller
+            .lock()
+            .ok()
+            .and_then(|input| input.agent_pointer_display())
     }
 
     fn cursor_shape(&self) -> CursorShape {

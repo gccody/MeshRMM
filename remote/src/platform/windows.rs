@@ -61,6 +61,7 @@ struct QueuedFrame {
 struct Shared {
     queued: Mutex<VecDeque<QueuedFrame>>,
     cursor_shape: Mutex<Option<CursorShape>>,
+    agent_pointer_display: Mutex<Option<Option<meshrmm_protocol::DisplayId>>>,
     ready: Condvar,
     stopping: AtomicBool,
     running: AtomicBool,
@@ -87,6 +88,7 @@ impl Presenter {
         let shared = Arc::new(Shared {
             queued: Mutex::new(VecDeque::with_capacity(MAX_PRESENTER_QUEUE_FRAMES)),
             cursor_shape: Mutex::new(None),
+            agent_pointer_display: Mutex::new(None),
             ready: Condvar::new(),
             stopping: AtomicBool::new(false),
             running: AtomicBool::new(false),
@@ -167,6 +169,13 @@ impl Presenter {
         true
     }
 
+    pub fn set_agent_pointer_display(&self, display_id: Option<meshrmm_protocol::DisplayId>) {
+        if let Ok(mut pending) = self.shared.agent_pointer_display.lock() {
+            *pending = Some(display_id);
+        }
+        self.shared.ready.notify_one();
+    }
+
     pub fn set_cursor_shape(&self, shape: CursorShape) {
         if let Ok(mut pending) = self.shared.cursor_shape.lock() {
             *pending = Some(shape);
@@ -234,6 +243,16 @@ fn run_worker(
     while !shared.stopping.load(Ordering::Acquire) {
         if unsafe { pump_window_messages(pipeline.window()) } {
             break;
+        }
+        if let Some(display_id) = shared
+            .agent_pointer_display
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
+        {
+            unsafe {
+                window::set_agent_pointer_display(pipeline.window(), display_id);
+            }
         }
         if let Some(shape) = shared
             .cursor_shape

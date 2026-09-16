@@ -25,6 +25,7 @@ pub struct WindowsInputController {
     blackout: Option<super::blackout::Blackout>,
     manually_blocked: bool,
     active_display: Option<Display>,
+    displays: Vec<Display>,
     pressed_keys: HashSet<(u16, bool)>,
     pressed_buttons: HashSet<PointerButton>,
     system_cursors: Vec<(usize, CursorShape)>,
@@ -45,6 +46,7 @@ impl WindowsInputController {
             blackout: None,
             manually_blocked: false,
             active_display: None,
+            displays: Vec::new(),
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
             system_cursors: system_cursor_handles(),
@@ -97,6 +99,17 @@ impl WindowsInputController {
         self.viewer_controls_input.load(Ordering::SeqCst)
     }
 
+    pub fn agent_pointer_display(&self) -> Option<meshrmm_protocol::DisplayId> {
+        if self.viewer_controls_input() {
+            return None;
+        }
+        let mut point = windows::Win32::Foundation::POINT::default();
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut point).ok()?;
+        }
+        pointer_display_at(&self.displays, point.x, point.y)
+    }
+
     pub fn cursor_shape(&self) -> CursorShape {
         if !self.viewer_controls_input() {
             return self.viewer_cursor.get();
@@ -136,6 +149,7 @@ impl WindowsInputController {
         {
             self.release_all()?;
         }
+        self.displays = super::platform::enumerate_displays()?;
         self.active_display = Some(display);
         Ok(())
     }
@@ -618,5 +632,68 @@ mod tests {
         );
         input.set_blackout(false, "").unwrap();
         assert!(!input.blocked());
+    }
+}
+
+fn pointer_display_at(displays: &[Display], x: i32, y: i32) -> Option<meshrmm_protocol::DisplayId> {
+    displays
+        .iter()
+        .find(|d| {
+            d.id.0 != meshrmm_remote_screen::ALL_MONITORS_ID
+                && i64::from(x) >= i64::from(d.x)
+                && i64::from(x) < i64::from(d.x) + i64::from(d.width)
+                && i64::from(y) >= i64::from(d.y)
+                && i64::from(y) < i64::from(d.y) + i64::from(d.height)
+        })
+        .map(|d| d.id)
+}
+
+#[cfg(test)]
+mod pointer_monitor_tests {
+    use super::*;
+    #[test]
+    fn pointer_monitor_excludes_virtual_display_and_handles_edges_and_gaps() {
+        let mut displays = vec![
+            Display {
+                id: meshrmm_protocol::DisplayId(1),
+                name: "Left".into(),
+                x: -100,
+                y: -20,
+                width: 100,
+                height: 100,
+                primary: false,
+            },
+            Display {
+                id: meshrmm_protocol::DisplayId(2),
+                name: "Right".into(),
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                primary: true,
+            },
+        ];
+        displays.insert(
+            0,
+            Display {
+                id: meshrmm_protocol::DisplayId(meshrmm_remote_screen::ALL_MONITORS_ID),
+                name: "All".into(),
+                x: -100,
+                y: -20,
+                width: 200,
+                height: 120,
+                primary: false,
+            },
+        );
+        assert_eq!(
+            pointer_display_at(&displays, -1, 0),
+            Some(meshrmm_protocol::DisplayId(1))
+        );
+        assert_eq!(
+            pointer_display_at(&displays, 0, 0),
+            Some(meshrmm_protocol::DisplayId(2))
+        );
+        assert_eq!(pointer_display_at(&displays, 0, -1), None);
+        assert_eq!(pointer_display_at(&displays, 100, 0), None);
     }
 }

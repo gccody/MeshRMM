@@ -1011,6 +1011,7 @@ fn install_control_handler(
         }));
     }
     let cursor_shape = Arc::new(Mutex::new(CursorShape::Default));
+    let pointer_display = Arc::new(Mutex::new(None));
     let capabilities_sent = Arc::new(AtomicBool::new(false));
     let supported_profiles = Arc::new(OnceLock::<Arc<Vec<VideoProfile>>>::new());
     let configurations_seen = Arc::new(AtomicU64::new(0));
@@ -1021,6 +1022,7 @@ fn install_control_handler(
     channel.on_message(Box::new(move |message| {
         let presenter = Arc::clone(&presenter);
         let cursor_shape = Arc::clone(&cursor_shape);
+        let pointer_display = Arc::clone(&pointer_display);
         let capabilities_sent = Arc::clone(&capabilities_sent);
         let supported_profiles = Arc::clone(&supported_profiles);
         let configurations_seen = Arc::clone(&configurations_seen);
@@ -1185,6 +1187,7 @@ fn install_control_handler(
                         debug.clone(),
                     ) {
                         Ok(new_presenter) => {
+                            if let Ok(display) = pointer_display.lock() { new_presenter.set_agent_pointer_display(*display); }
                             if let Ok(shape) = cursor_shape.lock() {
                                 new_presenter.set_cursor_shape(*shape);
                             }
@@ -1250,6 +1253,10 @@ fn install_control_handler(
                     }
                 }
                 Ok(SessionMessage::Stop { reason }) => tracing::info!(reason, "Agent stopped stream"),
+                Ok(SessionMessage::AgentPointerDisplay { display_id }) => {
+                    if let Ok(mut current) = pointer_display.lock() { *current = display_id; }
+                    if let Ok(guard) = presenter.lock() && let Some(active) = guard.as_ref() { active.presenter.set_agent_pointer_display(display_id); }
+                }
                 Ok(SessionMessage::CursorShape { shape }) => {
                     if let Ok(mut current) = cursor_shape.lock() {
                         *current = shape;
