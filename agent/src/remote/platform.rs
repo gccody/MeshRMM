@@ -81,6 +81,7 @@ pub struct PlatformScreenStreamer {
     viewer_name: String,
     blackout_message: String,
     indicator: Option<super::indicator::SessionIndicator>,
+    outline_dragging: Option<super::drag_windows::ConsoleOutlineDragging>,
     frames_per_second: u32,
     quality: QualityPreset,
     bitrate_bits_per_second: u32,
@@ -117,6 +118,7 @@ impl PlatformScreenStreamer {
             viewer_name,
             blackout_message,
             indicator: None,
+            outline_dragging: None,
             frames_per_second,
             quality: QualityPreset::BestQuality,
             bitrate_bits_per_second,
@@ -178,6 +180,13 @@ impl ScreenStreamer for PlatformScreenStreamer {
         };
         match &mut self.inner {
             CaptureBackend::Direct(streamer) => {
+                if self.outline_dragging.is_none() {
+                    self.outline_dragging = super::drag_windows::ConsoleOutlineDragging::new()
+                        .inspect_err(|error| {
+                            tracing::warn!(%error, "could not disable window contents while dragging");
+                        })
+                        .ok();
+                }
                 let displays = enumerate_displays()?;
                 meshrmm_file_transfer::windows::set_displays(displays.clone());
                 let active_display = choose_display(&displays, requested_display_id)?;
@@ -232,6 +241,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
 
     fn shutdown(&mut self) -> anyhow::Result<()> {
         self.indicator = None;
+        self.outline_dragging = None;
         match &mut self.inner {
             CaptureBackend::Direct(streamer) => streamer.stop().map_err(anyhow::Error::from),
             CaptureBackend::Desktop(streamer) => streamer.shutdown(),

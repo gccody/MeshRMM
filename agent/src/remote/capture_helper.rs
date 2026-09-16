@@ -2873,6 +2873,13 @@ fn read_file_message(mut reader: impl Read) -> io::Result<meshrmm_protocol::File
 }
 
 fn run_file_child(commands: mpsc::Receiver<io::Result<ParentCommand>>) -> anyhow::Result<()> {
+    // This helper runs as the interactive user and survives capture/desktop switches.
+    // Keep the guard until Stop, pipe EOF, or an error unwinds this session.
+    let _drag_windows = super::drag_windows::OutlineDragging::new()
+        .inspect_err(|error| {
+            tracing::warn!(%error, "could not disable window contents while dragging");
+        })
+        .ok();
     let mut wallpaper = None;
     meshrmm_file_transfer::windows::set_displays(enumerate_displays()?);
     meshrmm_file_transfer::TransferSession::run_on_current_thread(move |files| {
