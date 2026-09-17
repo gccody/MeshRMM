@@ -2,6 +2,10 @@
 
 ## Task Manager
 
+The Windows 10-style replacement and its current validation are documented in
+[Background Task Manager](background-task-manager.md). The notes below record
+the earlier implementation and the native Task Manager compatibility investigation.
+
 The background taskbar's Task Manager button launches MeshRMM Task Manager,
 a native Win32 process manager inside the existing isolated Session 0 desktop.
 It lists processes across sessions with PID, session ID, and working-set memory,
