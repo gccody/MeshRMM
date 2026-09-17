@@ -189,7 +189,11 @@ pub fn paint(dc: HDC) -> windows::core::Result<()> {
             let _ = SetViewportOrgEx(dc, rect.left, rect.top, None);
             IntersectClipRect(dc, 0, 0, rect.right - rect.left, rect.bottom - rect.top);
             if !IsHungAppWindow(hwnd).as_bool() {
-                let _ = PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(0));
+                // Full-content capture also supports some DirectComposition windows.
+                // Keep the legacy path for applications that reject this flag.
+                if !PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(2)).as_bool() {
+                    let _ = PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(0));
+                }
             }
             let _ = RestoreDC(dc, saved);
         }
