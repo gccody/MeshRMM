@@ -42,6 +42,14 @@ fn main() -> anyhow::Result<()> {
         return remote::background_tasks::run();
     }
 
+    #[cfg(windows)]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--background-file-browser")
+    {
+        return remote::background_files::run();
+    }
+
     // Native helpers own their threads and optional service runtime. Dispatch
     // them before entering Tokio so a helper never nests block_on inside it.
     tokio::runtime::Builder::new_multi_thread()
