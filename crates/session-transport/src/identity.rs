@@ -335,6 +335,9 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_webrtc_peers_exchange_data_without_any_enrollment() {
+        // Match the executables' TLS setup; each test must also work in isolation
+        // when dependency features enable more than one Rustls provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         use crate::ServiceChannel;
         use std::sync::Arc;
         use webrtc::{api::APIBuilder, peer_connection::configuration::RTCConfiguration};
@@ -409,6 +412,9 @@ mod tests {
     }
     #[tokio::test]
     async fn signaled_fingerprint_without_matching_private_key_cannot_connect() {
+        // Match the executables' TLS setup; each test must also work in isolation
+        // when dependency features enable more than one Rustls provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         use webrtc::{
             api::APIBuilder,
             peer_connection::{
