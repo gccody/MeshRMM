@@ -52,6 +52,9 @@ pub trait ScreenStreamer: Send {
 }
 
 pub trait ScreenInput: Send + Sync {
+    fn is_background(&self) -> bool {
+        false
+    }
     fn set_wallpaper_hidden(&self, hidden: bool) -> anyhow::Result<()>;
     fn set_prevent_idle_lock(&self, enabled: bool) -> anyhow::Result<()>;
     fn set_blackout(&self, enabled: bool) -> anyhow::Result<()>;

@@ -65,16 +65,22 @@ impl WindowsDesktopDuplicationStreamer {
         self.controls
             .request_keyframe
             .store(false, Ordering::Release);
-        let monitor = Monitor::enumerate()
-            .map_err(|error| Error::DesktopDuplication(error.to_string()))?
-            .into_iter()
-            .find(|monitor| {
-                display_id == crate::ALL_MONITORS_ID
-                    || monitor.index().is_ok_and(|id| id == display_id as usize)
-            })
-            .ok_or_else(|| {
-                Error::DesktopDuplication(format!("display {display_id} is unavailable"))
-            })?;
+        let monitor = if display_id == crate::background::DISPLAY_ID {
+            None
+        } else {
+            Some(
+                Monitor::enumerate()
+                    .map_err(|error| Error::DesktopDuplication(error.to_string()))?
+                    .into_iter()
+                    .find(|monitor| {
+                        display_id == crate::ALL_MONITORS_ID
+                            || monitor.index().is_ok_and(|id| id == display_id as usize)
+                    })
+                    .ok_or_else(|| {
+                        Error::DesktopDuplication(format!("display {display_id} is unavailable"))
+                    })?,
+            )
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let status: CaptureStatus = Arc::new(Mutex::new(None));
         let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -228,7 +234,7 @@ impl RunningCapture {
 }
 
 fn capture_loop(
-    monitor: Monitor,
+    monitor: Option<Monitor>,
     display_id: u32,
     config: StreamConfig,
     sink: EncodedFrameSink,
@@ -256,7 +262,7 @@ fn capture_loop(
 }
 
 fn capture_loop_inner(
-    monitor: Monitor,
+    monitor: Option<Monitor>,
     display_id: u32,
     config: StreamConfig,
     sink: EncodedFrameSink,
@@ -264,15 +270,22 @@ fn capture_loop_inner(
     stop: Arc<AtomicBool>,
     started: &mut Option<mpsc::SyncSender<Result<ActiveFormat, String>>>,
 ) -> Result<(), Error> {
-    let origin = crate::display_info(monitor)?;
-    let mut duplication = if display_id == crate::ALL_MONITORS_ID {
-        None
-    } else {
-        Some(
-            DxgiDuplicationApi::new_options(monitor, &[DxgiDuplicationFormat::Bgra8])
-                .map_err(duplication_error)?,
-        )
+    let origin = match monitor {
+        Some(monitor) => crate::display_info(monitor)?,
+        None => crate::background::display(),
     };
+    let mut duplication =
+        if display_id == crate::ALL_MONITORS_ID || display_id == crate::background::DISPLAY_ID {
+            None
+        } else {
+            Some(
+                DxgiDuplicationApi::new_options(
+                    monitor.ok_or(Error::InvalidDisplayDimensions)?,
+                    &[DxgiDuplicationFormat::Bgra8],
+                )
+                .map_err(duplication_error)?,
+            )
+        };
     let (device, context) = if let Some(duplication) = duplication.as_ref() {
         (
             duplication.device().clone(),

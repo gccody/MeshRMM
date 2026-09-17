@@ -9,6 +9,7 @@ import {
 import {
   Network,
   Building2,
+  ChevronRight,
   Clock3,
   KeyRound,
   LoaderCircle,
@@ -437,13 +438,12 @@ function TenantDashboard({ view }: { view: View }) {
           {isAdmin && <button className={`nav-item ${view === "team" ? "active" : ""}`} aria-current={view === "team" ? "page" : undefined} onClick={() => setActiveView("team")} disabled={!hasTenantSession || Boolean(sessionPauseReason)}><Users size={18} /><span>Users</span></button>}
           {isAdmin && <button className={`nav-item ${view === "sso" ? "active" : ""}`} aria-current={view === "sso" ? "page" : undefined} onClick={() => setActiveView("sso")} disabled={!hasTenantSession || Boolean(sessionPauseReason)}><KeyRound size={18} /><span>Authentication</span></button>}
           <button className={`nav-item ${view === "settings" ? "active" : ""}`} onClick={() => setActiveView("settings")} disabled={!hasTenantSession || Boolean(sessionPauseReason)} aria-current={view === "settings" ? "page" : undefined}><Settings size={18} /><span>Settings</span></button>
-          <p className="nav-label nav-label-spaced">Account</p>
-          <button className="nav-item" onClick={() => setIsAuthOpen(true)} disabled={Boolean(sessionPauseReason)}><Settings size={18} /><span>Profile</span></button>
         </nav>
 
-        <button className="profile-row profile-button" onClick={() => setIsAuthOpen(true)} disabled={Boolean(sessionPauseReason)}>
+        <button className="profile-row profile-button" onClick={() => { setIsSidebarOpen(false); setIsAuthOpen(true); }} disabled={Boolean(sessionPauseReason)} aria-haspopup="dialog">
           <div className="profile-avatar">{initials}</div>
-          <div><strong>{displayName}</strong><span>{user?.email ?? "Account"}</span></div>
+          <div className="profile-details"><strong>Your account</strong><span>{displayName}</span></div>
+          <ChevronRight size={16} aria-hidden="true" />
         </button>
       </aside>
 
@@ -454,10 +454,10 @@ function TenantDashboard({ view }: { view: View }) {
           <button className="mobile-menu" onClick={() => setIsSidebarOpen(true)} aria-label="Open navigation" aria-expanded={isSidebarOpen} disabled={Boolean(sessionPauseReason)}><Menu size={21} /></button>
           <div className="workspace-breadcrumb"><Building2 size={16} /><span>{companyLabel}</span></div>
           <div className="topbar-actions">
-            <button className="connection-pill" onClick={() => setIsAuthOpen(true)} disabled={Boolean(sessionPauseReason)}>
+            <div className="connection-pill" role="status">
               <span className={`status-dot ${isLive ? "live" : ""}`} />
-              {sessionPauseReason ? "Session paused" : isAuthLoading ? "Checking session" : isLive ? "Connected" : user ? "Signed in" : "Sign in"}
-            </button>
+              {sessionPauseReason ? "Session paused" : isAuthLoading ? "Checking session" : isLive ? "Connected" : user ? "Signed in" : "Signed out"}
+            </div>
           </div>
         </header>
 

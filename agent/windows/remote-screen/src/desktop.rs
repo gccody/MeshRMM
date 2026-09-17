@@ -10,6 +10,7 @@ use windows::Win32::Graphics::Gdi::*;
 use crate::{ALL_MONITORS_ID, DisplayInfo, Error, enumerate_displays};
 
 pub(crate) struct DesktopCapture {
+    background: Option<crate::background::Desktop>,
     displays: Vec<DisplayInfo>,
     bounds: DisplayInfo,
     screen: HDC,
@@ -25,7 +26,14 @@ pub(crate) struct DesktopCapture {
 
 impl DesktopCapture {
     pub fn new(device: &ID3D11Device, fps: u32, display_id: u32) -> Result<Self, Error> {
-        let displays = enumerate_displays()?;
+        let background = (display_id == crate::background::DISPLAY_ID)
+            .then(crate::background::Desktop::bind)
+            .transpose()?;
+        let displays = if background.is_some() {
+            vec![crate::background::display()]
+        } else {
+            enumerate_displays()?
+        };
         let mut bounds = displays
             .iter()
             .find(|d| d.id == display_id)
@@ -68,6 +76,7 @@ impl DesktopCapture {
         // Construct the owner before allocating GDI resources so every failure
         // releases the resources already acquired, on this same capture thread.
         let mut capture = Self {
+            background,
             displays,
             bounds,
             screen: HDC::default(),
@@ -134,7 +143,7 @@ impl DesktopCapture {
             return Ok(None);
         }
         self.next_frame = now + self.interval;
-        if now >= self.next_layout_check {
+        if self.background.is_none() && now >= self.next_layout_check {
             if enumerate_displays()? != self.displays {
                 return Err(Error::DesktopDuplication(
                     "desktop monitor layout changed".into(),
@@ -154,8 +163,12 @@ impl DesktopCapture {
                 BLACKNESS,
             )
             .ok()?;
+            if self.background.is_some() {
+                crate::background::paint(self.memory)?;
+            }
             for display in self.displays.iter().filter(|d| {
-                d.id != ALL_MONITORS_ID
+                self.background.is_none()
+                    && d.id != ALL_MONITORS_ID
                     && (self.bounds.id == ALL_MONITORS_ID || d.id == self.bounds.id)
             }) {
                 BitBlt(
@@ -170,7 +183,7 @@ impl DesktopCapture {
                     SRCCOPY | CAPTUREBLT,
                 )?;
             }
-            if capture_cursor {
+            if capture_cursor && self.background.is_none() {
                 crate::cursor::draw_cursor(self.memory, self.bounds.x, self.bounds.y)?;
             }
             GdiFlush().ok()?;

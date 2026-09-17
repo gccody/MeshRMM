@@ -1,4 +1,8 @@
 #[cfg(windows)]
+mod background;
+#[cfg(windows)]
+pub(crate) mod background_console;
+#[cfg(windows)]
 mod blackout;
 #[cfg(windows)]
 pub(crate) mod capture_helper;
