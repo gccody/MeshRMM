@@ -493,7 +493,10 @@ With an updated Windows agent installed, connect normally and select
 The black workspace has a charcoal, icon-only bottom taskbar with hover labels.
 It pins Command Prompt, PowerShell, Registry Editor, Services,
 Event Viewer, Resource Monitor, Task Manager, Computer Management, Device Manager,
-and Windows Firewall. It opens administrative applications in a private Windows desktop in
+Windows Firewall, and File Explorer. Task Manager and File Explorer launch built-in
+MeshRMM tools. The process manager lists processes and supports confirmed End Task;
+the file browser navigates folders, previews text, creates folders, renames entries,
+and copies individual files without overwriting existing destinations. It opens administrative applications in a private Windows desktop in
 Session 0 under SYSTEM. Select a physical monitor to return to the console.
 Leaving background mode or closing the session terminates applications launched
 in that workspace; save any work first. Changing video quality keeps the workspace
@@ -515,9 +518,10 @@ This is a prototype for traditional Win32 administration tools, not a complete
 Explorer login session. Applications that depend on the user's shell, modern
 GPU-composited UI, or physical keyboard/mouse input may not render or respond
 correctly. Full-content window capture is attempted before the legacy capture path to improve
-compatibility with some composited windows. Task Manager is available to try, but
-modern versions may still fail to start or render in Session 0; Resource Monitor
-remains pinned as an alternative. Background mode is currently entered after a normal connection; it
+compatibility with some composited windows. The built-in tools avoid the shell
+dependencies of Windows Task Manager and Explorer. Text previews are read-only
+and limited to 1 MiB; recursive folder copying and shell file associations are not
+supported. Background mode is currently entered after a normal connection; it
 does not yet provide a separate background-only connection from the dashboard.
 
 The ignored native test `remote::background::tests::session_zero_gui` exercises

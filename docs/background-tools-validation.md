@@ -54,3 +54,34 @@ shutdown warnings remain outside this change. Standard Windows message boxes
 were unsuitable because their text was missing in background capture; this tool
 uses an inline confirmation instead. It does not guarantee artifact-free capture
 of every Windows control.
+
+## File Explorer
+
+The File Explorer pin launches MeshRMM File Browser on the same private desktop.
+Native Explorer with `/separate,C:\` failed to create a folder window on the
+validation endpoint. The built-in browser uses asynchronous directory enumeration
+and file operations, supports absolute paths, parent navigation, folder creation,
+rename, individual file copy/paste, and read-only UTF-8/UTF-16 text previews.
+Existing destinations are never overwritten. Unsafe child names and device paths
+are rejected. Previews are limited to 1 MiB and listings to 20,000 entries.
+Shell associations, recursive copying, and deletion are not implemented.
+
+Native Windows Clippy, 71 tests, and a locked release build passed against the
+SHA-256-verified final source (23 platform-specific tests ignored in the default
+suites). Three ignored tests were then explicitly executed as SYSTEM in Session 0:
+Task Manager launch/cleanup, File Browser launch/cleanup, and `session_zero_gui`.
+The last also verifies ordered address editing, Registry Editor capture, H.264,
+and mixed-case PowerShell input. Printable window input now uses the same queue
+as navigation keys so it cannot overtake Home/Delete or disappear on a 20 ms
+synchronous-send timeout.
+
+Installed agent SHA-256:
+`F111EE03CFF56E4CC808DCA51E84CC900D8A69FF26F2B9BA79DD0D3AC3E36A07`.
+The supported installer preserved configuration and confirmed service startup
+and signaling. Through the installed macOS viewer, validation exercised Ctrl+A,
+a full typed path, folder navigation, a visible text preview, folder creation,
+rename, file copy/paste, and the visible duplicate-destination error. Only fixtures
+inside the dedicated checkout were changed. Remote hashes confirmed identical
+source/destination files. Disconnect removed the browser helper, left the service
+running, and logged zero dropped encoded frames; existing WebRTC shutdown warnings
+were observed. Formatting and diff whitespace checks passed on macOS.

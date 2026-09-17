@@ -35,6 +35,11 @@ const PINS: &[(&str, &str, &str)] = &[
     ("Computer Mgmt", "mmc.exe", "compmgmt.msc"),
     ("Device Manager", "mmc.exe", "devmgmt.msc"),
     ("Firewall", "mmc.exe", "wf.msc"),
+    (
+        "File Explorer",
+        "..\\explorer.exe",
+        "--background-file-browser",
+    ),
 ];
 
 pub struct Workspace {
@@ -176,7 +181,10 @@ impl Workspace {
             .get(index.wrapping_sub(1))
             .context("unknown background application")?;
         let root = std::env::var("SystemRoot").context("SystemRoot is unavailable")?;
-        let built_in = *arguments == "--background-task-manager";
+        let built_in = matches!(
+            *arguments,
+            "--background-task-manager" | "--background-file-browser"
+        );
         let path = if built_in {
             #[cfg(test)]
             let executable = std::path::PathBuf::from(
@@ -593,15 +601,10 @@ impl Workspace {
                         // Explicit characters preserve the remote modifier state without
                         // depending on the time an application's message loop runs.
                         for character in characters.iter().take(count.max(0) as usize) {
-                            SendMessageTimeoutW(
-                                target,
-                                WM_CHAR,
-                                WPARAM(*character as usize),
-                                LPARAM(bits),
-                                SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                                20,
-                                None,
-                            );
+                            // Keep text in FIFO order with queued Home/Delete,
+                            // shortcuts, and key releases. A synchronous send can
+                            // overtake them or time out while the app is painting.
+                            self.post(target, WM_CHAR, *character as usize, bits)?;
                         }
                     } else {
                         // Accelerators and dialog navigation are interpreted by the
@@ -829,7 +832,21 @@ mod tests {
     #[test]
     #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
     fn task_manager_opens_in_background() -> anyhow::Result<()> {
-        std::thread::spawn(|| -> anyhow::Result<()> {
+        tool_opens_in_background(7, "MeshRMM Task Manager", "background-task-manager.bmp")
+    }
+
+    #[test]
+    #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
+    fn file_browser_opens_in_background() -> anyhow::Result<()> {
+        tool_opens_in_background(11, "MeshRMM File Browser", "background-file-browser.bmp")
+    }
+
+    fn tool_opens_in_background(
+        index: usize,
+        expected_title: &'static str,
+        screenshot: &'static str,
+    ) -> anyhow::Result<()> {
+        std::thread::spawn(move || -> anyhow::Result<()> {
             unsafe {
                 use windows::Win32::System::StationsAndDesktops::*;
                 let station = OpenWindowStationW(w!("WinSta0"), false, 0x000f037f)?;
@@ -838,15 +855,14 @@ mod tests {
             let _owner = background::Desktop::create()?;
             let _binding = background::Desktop::bind()?;
             let mut workspace = Workspace::new()?;
-            workspace.launch(7)?;
+            workspace.launch(index)?;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
                 workspace.pump();
                 for window in background::windows()? {
                     let mut title = [0_u16; 256];
                     let count = unsafe { GetWindowTextW(window, &mut title) };
-                    if String::from_utf16_lossy(&title[..count as usize]) == "MeshRMM Task Manager"
-                    {
+                    if String::from_utf16_lossy(&title[..count as usize]) == expected_title {
                         let list = unsafe { GetDlgItem(Some(window), 101)? };
                         let mut rows = 0;
                         unsafe {
@@ -880,7 +896,7 @@ mod tests {
                         }
                         assert!(in_job.as_bool(), "process manager escaped session cleanup");
                         std::fs::write(
-                            std::env::temp_dir().join("background-task-manager.bmp"),
+                            std::env::temp_dir().join(screenshot),
                             background::snapshot_bmp()?,
                         )?;
                         drop(workspace);
@@ -895,7 +911,7 @@ mod tests {
                 }
                 anyhow::ensure!(
                     std::time::Instant::now() < deadline,
-                    "Task Manager did not open on the background desktop"
+                    "{expected_title} did not open on the background desktop"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -1096,6 +1112,43 @@ mod tests {
             assert_eq!(
                 String::from_utf16_lossy(&text[..count as usize]),
                 "Session 0 GUI input verified"
+            );
+            // This EDIT belongs to this thread, so it deliberately cannot pump
+            // queued navigation until after every printable key was submitted.
+            // Synchronous WM_CHAR used to overtake Home/Delete and corrupt text.
+            unsafe {
+                SetWindowTextW(edit, w!("C:\\"))?;
+            }
+            for scan in [0x47, 0x53, 0x53, 0x53] {
+                for pressed in [true, false] {
+                    workspace.apply(RemoteInput::Key {
+                        display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+                        scan_code: scan,
+                        extended: true,
+                        pressed,
+                    })?;
+                }
+            }
+            let expected = "C:\\Windows\\System32";
+            for character in expected.encode_utf16() {
+                let key = unsafe { VkKeyScanW(character) };
+                assert!(key >= 0);
+                if key & 0x100 != 0 {
+                    send_key(&mut workspace, 0x2a, true)?;
+                }
+                let scan = unsafe { MapVirtualKeyW((key & 0xff) as u32, MAPVK_VK_TO_VSC) } as u16;
+                send_key(&mut workspace, scan, true)?;
+                send_key(&mut workspace, scan, false)?;
+                if key & 0x100 != 0 {
+                    send_key(&mut workspace, 0x2a, false)?;
+                }
+            }
+            workspace.pump();
+            let count = unsafe { GetWindowTextW(edit, &mut text) };
+            assert_eq!(
+                String::from_utf16_lossy(&text[..count as usize]),
+                expected,
+                "queued navigation and literal text must stay ordered"
             );
             let before = background::snapshot_bmp()?;
             assert!(before[54..].chunks_exact(4).any(|p| p[..3] != [0, 0, 0]));

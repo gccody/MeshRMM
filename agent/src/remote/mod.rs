@@ -3,6 +3,8 @@ mod background;
 #[cfg(windows)]
 pub(crate) mod background_console;
 #[cfg(windows)]
+pub(crate) mod background_files;
+#[cfg(windows)]
 pub(crate) mod background_tasks;
 #[cfg(windows)]
 mod blackout;
