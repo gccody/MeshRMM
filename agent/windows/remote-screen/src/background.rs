@@ -295,6 +295,8 @@ impl Renderer {
                     if PrintWindow(image.hwnd, scratch.dc, PRINT_WINDOW_FLAGS(2)).as_bool()
                         || PrintWindow(image.hwnd, scratch.dc, PRINT_WINDOW_FLAGS(0)).as_bool()
                     {
+                        // A failed toolbar overlay must not discard the window.
+                        let _ = paint_mmc_toolbars(image.hwnd, scratch.dc);
                         GdiFlush().ok()?;
                         BitBlt(
                             image.dc,
@@ -335,9 +337,10 @@ impl Renderer {
                         let _ = SetViewportOrgEx(dc, rect.left, rect.top, None);
                         IntersectClipRect(dc, 0, 0, rect.right - rect.left, rect.bottom - rect.top);
                         if !IsHungAppWindow(hwnd).as_bool()
-                            && !PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(2)).as_bool()
+                            && (PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(2)).as_bool()
+                                || PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(0)).as_bool())
                         {
-                            let _ = PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(0));
+                            let _ = paint_mmc_toolbars(hwnd, dc);
                         }
                         let _ = RestoreDC(dc, saved);
                     }
@@ -346,6 +349,76 @@ impl Renderer {
         }
         Ok(())
     }
+}
+
+/// MMC's menu labels are custom-drawn toolbar buttons. Printing the whole frame
+/// can omit them after a move, even when PrintWindow reports success. Printing
+/// those controls directly preserves their normal, disabled and hot states
+/// without activating the window or synthesizing input.
+fn paint_mmc_toolbars(hwnd: HWND, dc: HDC) -> windows::core::Result<()> {
+    unsafe extern "system" fn collect(hwnd: HWND, parameter: LPARAM) -> BOOL {
+        unsafe {
+            let mut class = [0_u16; 64];
+            let count = GetClassNameW(hwnd, &mut class);
+            if String::from_utf16_lossy(&class[..count as usize]) == "ToolbarWindow32"
+                && IsWindowVisible(hwnd).as_bool()
+            {
+                let toolbars = &mut *(parameter.0 as *mut Vec<HWND>);
+                if toolbars.len() < 16 {
+                    toolbars.push(hwnd);
+                }
+            }
+        }
+        BOOL(1)
+    }
+    unsafe {
+        let mut class = [0_u16; 64];
+        let count = GetClassNameW(hwnd, &mut class);
+        if String::from_utf16_lossy(&class[..count as usize]) != "MMCMainFrame" {
+            return Ok(());
+        }
+        let mut parent = RECT::default();
+        GetWindowRect(hwnd, &mut parent)?;
+        let mut toolbars = Vec::<HWND>::new();
+        let _ = EnumChildWindows(
+            Some(hwnd),
+            Some(collect),
+            LPARAM((&mut toolbars as *mut Vec<HWND>) as isize),
+        );
+        for toolbar in toolbars {
+            let mut rect = RECT::default();
+            if GetWindowRect(toolbar, &mut rect).is_err()
+                || rect.right <= rect.left
+                || rect.bottom <= rect.top
+                || rect.left < parent.left
+                || rect.top < parent.top
+                || rect.right > parent.right
+                || rect.bottom > parent.bottom
+                || rect.right - rect.left > 8192
+                || rect.bottom - rect.top > 256
+            {
+                continue;
+            }
+            let image =
+                WindowImage::new(toolbar, rect.right - rect.left, rect.bottom - rect.top, dc)?;
+            GdiFlush().ok()?;
+            if PrintWindow(toolbar, image.dc, PRINT_WINDOW_FLAGS(0)).as_bool() {
+                GdiFlush().ok()?;
+                BitBlt(
+                    dc,
+                    rect.left - parent.left,
+                    rect.top - parent.top,
+                    image.width,
+                    image.height,
+                    Some(image.dc),
+                    0,
+                    0,
+                    SRCCOPY,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Capture diagnostic evidence using the same renderer as the video backend.

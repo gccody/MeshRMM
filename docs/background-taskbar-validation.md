@@ -1,5 +1,43 @@
 # Background taskbar validation
 
+## MMC menu labels follow-up
+
+Validated September 16, 2026 on `DESKTOP-85R6S28`. The installed service reproduced
+missing File/Action/View/Help labels after dragging Computer Management, without
+interacting with its menu. MMC exposes these labels as `ToolbarWindow32` children
+of `MMCMainFrame`. Capturing those controls separately and compositing them over
+the normal window capture fixes the reproduced omission. Other applications keep
+their existing capture path. Retained images, refresh budgets, full-content
+capture with fallback, and desktop isolation are preserved. Toolbar enumeration
+and temporary bitmap sizes are bounded; a failed overlay retains the ordinary
+window capture.
+
+Final code was synchronized to a dedicated Windows test directory and verified
+against a SHA-256 source manifest. Checks passed:
+
+- Windows Clippy: `cargo clippy -p meshrmm-agent -p meshrmm-remote-screen --all-targets -- -D warnings`.
+- Windows tests: `cargo test -p meshrmm-agent -p meshrmm-remote-screen` (65 passed, 21 ignored).
+- Explicit SYSTEM Session 0 tests: retained-window budget/close regression and
+  `stable_taskbar_and_management_caption`. The latter now requires visible menu
+  text in its baseline and compares menu pixels across four moves and ten
+  cross-thread captures per move, without menu interaction.
+- Windows release build: `cargo build --locked --release -p meshrmm-agent`.
+- macOS: `cargo fmt --all -- --check` and `git diff --check`.
+
+The supported local installer installed working-tree release 0.2.7, SHA-256
+`2E6FFC93120AEDEC29EE1F1575642E969185FE0E5D03C58B871290BB67F53A3D`.
+The service started and reconnected with its configuration unchanged. In the
+installed macOS viewer, Computer Management retained all four menu labels through
+the previously failing drags, including a move partly off canvas. Its Action menu
+opened normally. Services also retained its labels after dragging over Computer
+Management; closing Services left the underlying menu labels visible.
+
+After disconnect, logs confirmed session cleanup with zero dropped encoded frames,
+no Session 0 MMC process remained, and the service was still running with the
+installed hash above. Existing WebRTC shutdown warnings were present. This fixes
+the tested MMC menu-label omission, not every application-rendering artifact.
+No changes were pushed and no release was published.
+
 ## Compact taskbar and capture stability follow-up
 
 Validated September 16, 2026 on `DESKTOP-85R6S28`, using the installed macOS
@@ -41,7 +79,7 @@ still running with the installed hash above. Existing WebRTC shutdown warnings
 were logged on disconnect. The automated caption comparisons passed; these checks
 do not establish flicker-free rendering for every application or GPU surface.
 Some MMC menu text was absent while inactive and reappeared after interaction;
-that pre-existing application-rendering limitation remains.
+that observation prompted the MMC menu-label follow-up above.
 
 ## Earlier validation (before the compact taskbar follow-up)
 
