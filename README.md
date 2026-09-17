@@ -490,7 +490,8 @@ live coordinator/session/inventory connections and blocks token redemption.
 
 With an updated Windows agent installed, connect normally and select
 **Background (Session 0 · experimental)** in the viewer's display selector.
-The bottom taskbar pins Command Prompt, PowerShell, Registry Editor, Services,
+The black workspace has a charcoal, icon-only bottom taskbar with hover labels.
+It pins Command Prompt, PowerShell, Registry Editor, Services,
 Event Viewer, Resource Monitor, Task Manager, Computer Management, Device Manager,
 and Windows Firewall. It opens administrative applications in a private Windows desktop in
 Session 0 under SYSTEM. Select a physical monitor to return to the console.
@@ -500,7 +501,10 @@ open. The existing Windows and macOS viewers can use this mode without a protoco
 update.
 
 The workspace uses a fixed 1280×800 canvas, up to 20 FPS, window capture, and
-separate window-message input. Command Prompt and PowerShell receive console input
+separate window-message input. Window images are retained between captures so
+slow or failed repaints do not make already-captured windows disappear when
+the refresh budget expires. Application-specific rendering limitations can still
+cause flicker. Command Prompt and PowerShell receive console input
 records through disposable helpers. It does not switch the console desktop or move the
 console pointer. Console audio, clipboard synchronization, file-transfer UI, chat,
 blackout, input blocking, and Ctrl+Alt+Del are unavailable in background mode.

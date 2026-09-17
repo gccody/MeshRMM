@@ -11,6 +11,7 @@ use crate::{ALL_MONITORS_ID, DisplayInfo, Error, enumerate_displays};
 
 pub(crate) struct DesktopCapture {
     background: Option<crate::background::Desktop>,
+    renderer: crate::background::Renderer,
     displays: Vec<DisplayInfo>,
     bounds: DisplayInfo,
     screen: HDC,
@@ -77,6 +78,7 @@ impl DesktopCapture {
         // releases the resources already acquired, on this same capture thread.
         let mut capture = Self {
             background,
+            renderer: crate::background::Renderer::default(),
             displays,
             bounds,
             screen: HDC::default(),
@@ -164,7 +166,7 @@ impl DesktopCapture {
             )
             .ok()?;
             if self.background.is_some() {
-                crate::background::paint(self.memory)?;
+                self.renderer.paint(self.memory)?;
             }
             for display in self.displays.iter().filter(|d| {
                 self.background.is_none()
