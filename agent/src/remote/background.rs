@@ -897,6 +897,54 @@ mod tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
+            // MMC's File/Action/View/Help toolbar can print only its background
+            // after a move on this off-screen desktop. Compare the actual menu
+            // pixels after dragging, without hovering or activating the menu.
+            let menu_pixels = |frame: &[u8], rect: RECT| -> Vec<u8> {
+                let mut pixels = Vec::new();
+                for y in rect.top + 30..rect.top + 50 {
+                    let start = 54 + (y as usize * WIDTH as usize + rect.left as usize + 8) * 4;
+                    pixels.extend_from_slice(&frame[start..start + 170 * 4]);
+                }
+                pixels
+            };
+            let expected_menu = menu_pixels(&baseline, rect);
+            anyhow::ensure!(
+                expected_menu
+                    .chunks_exact(4)
+                    .filter(|pixel| pixel[..3].iter().all(|value| *value < 100))
+                    .count()
+                    > 40,
+                "baseline MMC menu must contain visible text"
+            );
+            for (dx, dy) in [(150, 80), (60, 20), (200, 60), (0, 0)] {
+                workspace.pointer = POINT {
+                    x: rect.left + 300,
+                    y: rect.top + 12,
+                };
+                workspace.drag = Some((management, workspace.pointer, rect));
+                workspace.move_pointer(
+                    ((rect.left + 300 + dx) as u32 * 65535 / (WIDTH - 1)) as u16,
+                    ((rect.top + 12 + dy) as u32 * 65535 / (HEIGHT - 1)) as u16,
+                );
+                workspace.drag = None;
+                let mut moved = RECT::default();
+                unsafe { GetWindowRect(management, &mut moved)? };
+                for _ in 0..10 {
+                    let frame = capture(&mut workspace)?;
+                    if menu_pixels(&frame, moved) != expected_menu {
+                        std::fs::write(
+                            std::env::temp_dir().join("mmc-menu-before.bmp"),
+                            &baseline,
+                        )?;
+                        std::fs::write(std::env::temp_dir().join("mmc-menu-after.bmp"), &frame)?;
+                    }
+                    anyhow::ensure!(
+                        menu_pixels(&frame, moved) == expected_menu,
+                        "MMC menu labels changed after moving from {rect:?} to {moved:?}"
+                    );
+                }
+            }
             Ok(())
         })
         .join()
