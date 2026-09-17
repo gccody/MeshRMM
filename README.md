@@ -490,7 +490,9 @@ live coordinator/session/inventory connections and blocks token redemption.
 
 With an updated Windows agent installed, connect normally and select
 **Background (Session 0 · experimental)** in the viewer's display selector.
-The launcher opens administrative applications in a private Windows desktop in
+The bottom taskbar pins Command Prompt, PowerShell, Registry Editor, Services,
+Event Viewer, Resource Monitor, Task Manager, Computer Management, Device Manager,
+and Windows Firewall. It opens administrative applications in a private Windows desktop in
 Session 0 under SYSTEM. Select a physical monitor to return to the console.
 Leaving background mode or closing the session terminates applications launched
 in that workspace; save any work first. Changing video quality keeps the workspace
@@ -508,8 +510,10 @@ SYSTEM has a different profile and network credentials from the signed-in user.
 This is a prototype for traditional Win32 administration tools, not a complete
 Explorer login session. Applications that depend on the user's shell, modern
 GPU-composited UI, or physical keyboard/mouse input may not render or respond
-correctly. The launcher includes Resource Monitor because modern Task Manager
-did not start on the validated Windows endpoint. Background mode is currently entered after a normal connection; it
+correctly. Full-content window capture is attempted before the legacy capture path to improve
+compatibility with some composited windows. Task Manager is available to try, but
+modern versions may still fail to start or render in Session 0; Resource Monitor
+remains pinned as an alternative. Background mode is currently entered after a normal connection; it
 does not yet provide a separate background-only connection from the dashboard.
 
 The ignored native test `remote::background::tests::session_zero_gui` exercises

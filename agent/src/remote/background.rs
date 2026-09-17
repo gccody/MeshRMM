@@ -4,14 +4,40 @@ use anyhow::Context;
 use meshrmm_protocol::{PointerButton, RemoteInput};
 use meshrmm_remote_screen::background::{self, HEIGHT, WIDTH};
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, GetSysColorBrush, ScreenToClient};
+use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::JobObjects::*;
 use windows::Win32::System::Threading::*;
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
 
+const TASKBAR_HEIGHT: i32 = 72;
+const PIN_WIDTH: i32 = 116;
+const PINS: &[(&str, &str, &str)] = &[
+    (
+        "Command Prompt",
+        "cmd.exe",
+        "/k title MeshRMM Background Command Prompt",
+    ),
+    (
+        "PowerShell",
+        "WindowsPowerShell\\v1.0\\powershell.exe",
+        "-NoLogo -NoProfile -NoExit",
+    ),
+    ("Registry Editor", "..\\regedit.exe", "/m"),
+    ("Services", "mmc.exe", "services.msc"),
+    ("Event Viewer", "mmc.exe", "eventvwr.msc"),
+    ("Resource Monitor", "resmon.exe", ""),
+    ("Task Manager", "taskmgr.exe", ""),
+    ("Computer Mgmt", "mmc.exe", "compmgmt.msc"),
+    ("Device Manager", "mmc.exe", "devmgmt.msc"),
+    ("Firewall", "mmc.exe", "wf.msc"),
+];
+
 pub struct Workspace {
+    icons: Vec<HICON>,
     shell: HWND,
     job: HANDLE,
     focus: HWND,
@@ -45,6 +71,7 @@ impl Workspace {
                 return Err(error.into());
             }
             let mut workspace = Self {
+                icons: Vec::new(),
                 shell: HWND::default(),
                 job,
                 focus: HWND::default(),
@@ -58,70 +85,59 @@ impl Workspace {
             let class = WNDCLASSW {
                 lpfnWndProc: Some(launcher_proc),
                 lpszClassName: w!("MeshRMMBackgroundLauncher"),
-                hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
+                hbrBackground: HBRUSH(GetStockObject(DKGRAY_BRUSH).0),
                 ..Default::default()
             };
             if RegisterClassW(&class) == 0 {
                 return Err(windows::core::Error::from_thread().into());
             }
             workspace.shell = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 w!("MeshRMMBackgroundLauncher"),
                 w!("MeshRMM Background — Session 0 (SYSTEM)"),
-                WS_OVERLAPPED | WS_CAPTION | WS_VISIBLE,
-                12,
-                12,
-                1000,
-                100,
+                WS_POPUP | WS_VISIBLE,
+                0,
+                HEIGHT as i32 - TASKBAR_HEIGHT,
+                WIDTH as i32,
+                TASKBAR_HEIGHT,
                 None,
                 None,
                 None,
                 None,
             )?;
-            for (index, label) in [
-                "Command Prompt",
-                "PowerShell",
-                "Registry Editor",
-                "Services",
-                "Event Viewer",
-                "Resource Monitor",
-            ]
-            .iter()
-            .enumerate()
-            {
+            let root = std::env::var("SystemRoot").context("SystemRoot is unavailable")?;
+            for (index, (label, program, _)) in PINS.iter().enumerate() {
                 let label = wide(label);
-                CreateWindowExW(
+                let button = CreateWindowExW(
                     WINDOW_EX_STYLE(0),
                     w!("BUTTON"),
                     PCWSTR(label.as_ptr()),
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                    8 + index as i32 * 163,
-                    12,
-                    156,
-                    36,
+                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    8 + index as i32 * PIN_WIDTH,
+                    4,
+                    PIN_WIDTH - 4,
+                    TASKBAR_HEIGHT - 8,
                     Some(workspace.shell),
                     Some(HMENU((index + 1) as *mut _)),
                     None,
                     None,
                 )?;
+                let path = wide(&format!("{root}\\System32\\{program}"));
+                let mut icon = HICON::default();
+                ExtractIconExW(PCWSTR(path.as_ptr()), 0, Some(&mut icon), None, 1);
+                if !icon.is_invalid() {
+                    SetWindowLongPtrW(button, GWLP_USERDATA, icon.0 as isize);
+                    workspace.icons.push(icon);
+                }
             }
             Ok(workspace)
         }
     }
 
     fn launch(&mut self, index: usize) -> anyhow::Result<()> {
-        let (program, arguments) = match index {
-            1 => ("cmd.exe", "/k title MeshRMM Background Command Prompt"),
-            2 => (
-                "WindowsPowerShell\\v1.0\\powershell.exe",
-                "-NoLogo -NoProfile -NoExit",
-            ),
-            3 => ("..\\regedit.exe", "/m"),
-            4 => ("mmc.exe", "services.msc"),
-            5 => ("mmc.exe", "eventvwr.msc"),
-            6 => ("resmon.exe", ""),
-            _ => anyhow::bail!("unknown background application"),
-        };
+        let (_, program, arguments) = PINS
+            .get(index.wrapping_sub(1))
+            .context("unknown background application")?;
         let root = std::env::var("SystemRoot").context("SystemRoot is unavailable")?;
         let executable = wide(&format!("{root}\\System32\\{program}"));
         let mut command = wide(&format!("\"{root}\\System32\\{program}\" {arguments}"));
@@ -131,9 +147,9 @@ impl Workspace {
             lpDesktop: PWSTR(desktop.as_mut_ptr()),
             dwFlags: STARTF_USEPOSITION | STARTF_USESIZE,
             dwX: 40,
-            dwY: 140,
+            dwY: 24,
             dwXSize: 1100,
-            dwYSize: 580,
+            dwYSize: (HEIGHT as i32 - TASKBAR_HEIGHT - 48) as u32,
             ..Default::default()
         };
         unsafe {
@@ -581,6 +597,9 @@ impl Drop for Workspace {
             if !self.shell.is_invalid() {
                 let _ = DestroyWindow(self.shell);
             }
+            for icon in self.icons.drain(..) {
+                let _ = DestroyIcon(icon);
+            }
         }
     }
 }
@@ -598,7 +617,48 @@ unsafe extern "system" fn launcher_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    unsafe {
+        if message == WM_DRAWITEM && lparam.0 != 0 {
+            let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
+            let brush = CreateSolidBrush(COLORREF(if item.itemState.0 & ODS_SELECTED.0 != 0 {
+                0x665544
+            } else {
+                0x383838
+            }));
+            FillRect(item.hDC, &item.rcItem, brush);
+            let _ = DeleteObject(brush.into());
+            let icon = HICON(GetWindowLongPtrW(item.hwndItem, GWLP_USERDATA) as *mut _);
+            if !icon.is_invalid() {
+                let _ = DrawIconEx(
+                    item.hDC,
+                    (PIN_WIDTH - 36) / 2,
+                    3,
+                    icon,
+                    32,
+                    32,
+                    0,
+                    None,
+                    DI_NORMAL,
+                );
+            }
+            SetBkMode(item.hDC, TRANSPARENT);
+            SetTextColor(item.hDC, COLORREF(0xffffff));
+            let font = SelectObject(item.hDC, GetStockObject(DEFAULT_GUI_FONT));
+            let mut label = [0_u16; 64];
+            let length = GetWindowTextW(item.hwndItem, &mut label) as usize;
+            let mut rect = item.rcItem;
+            rect.top += 39;
+            DrawTextW(
+                item.hDC,
+                &mut label[..length],
+                &mut rect,
+                DT_CENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(item.hDC, font);
+            return LRESULT(1);
+        }
+        DefWindowProcW(hwnd, message, wparam, lparam)
+    }
 }
 
 #[cfg(test)]
@@ -669,8 +729,8 @@ mod tests {
             let baseline = background::snapshot_bmp()?;
             workspace.apply(RemoteInput::PointerButtonAt {
                 display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
-                x: (430 * 65535 / (WIDTH - 1)) as u16,
-                y: (72 * 65535 / (HEIGHT - 1)) as u16,
+                x: ((8 + 2 * PIN_WIDTH as u32 + 30) * 65535 / (WIDTH - 1)) as u16,
+                y: ((HEIGHT - TASKBAR_HEIGHT as u32 + 30) * 65535 / (HEIGHT - 1)) as u16,
                 button: PointerButton::Left,
                 pressed: true,
             })?;
