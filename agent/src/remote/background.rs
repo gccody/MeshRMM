@@ -45,6 +45,7 @@ const PINS: &[(&str, &str, &str)] = &[
 pub struct Workspace {
     icons: Vec<HICON>,
     task_managers: Vec<(u32, HANDLE)>,
+    file_browsers: Vec<(u32, HANDLE)>,
     shell: HWND,
     tooltip: HWND,
     hovered: Option<usize>,
@@ -82,6 +83,7 @@ impl Workspace {
             let mut workspace = Self {
                 icons: Vec::new(),
                 task_managers: Vec::new(),
+                file_browsers: Vec::new(),
                 shell: HWND::default(),
                 tooltip: HWND::default(),
                 hovered: None,
@@ -178,16 +180,40 @@ impl Workspace {
         }
     }
 
+    fn owns_window(&self, window: HWND) -> bool {
+        unsafe {
+            let mut pid = 0;
+            GetWindowThreadProcessId(window, Some(&mut pid));
+            let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+                return false;
+            };
+            let mut owned = windows::core::BOOL(0);
+            let result = IsProcessInJob(process, Some(self.job), &mut owned);
+            let _ = CloseHandle(process);
+            result.is_ok() && owned.as_bool()
+        }
+    }
+
     fn launch(&mut self, index: usize) -> anyhow::Result<()> {
         let (_, program, arguments) = PINS
             .get(index.wrapping_sub(1))
             .context("unknown background application")?;
-        if *arguments == "--background-task-manager" {
+        if matches!(
+            *arguments,
+            "--background-task-manager" | "--background-file-browser"
+        ) {
             unsafe {
-                if let Ok(window) = FindWindowW(w!("MeshRMMBackgroundTasks"), None) {
+                let (class, owned) = if *arguments == "--background-task-manager" {
+                    (w!("MeshRMMBackgroundTasks"), &self.task_managers)
+                } else {
+                    (w!("MeshRMMBackgroundFiles"), &self.file_browsers)
+                };
+                if let Ok(window) = FindWindowW(class, None) {
                     let mut pid = 0;
                     GetWindowThreadProcessId(window, Some(&mut pid));
-                    if self.task_managers.iter().any(|(owned, _)| *owned == pid) {
+                    if owned.iter().any(|(owned, _)| *owned == pid)
+                        || (*arguments == "--background-file-browser" && self.owns_window(window))
+                    {
                         let _ = ShowWindowAsync(
                             window,
                             if IsIconic(window).as_bool() {
@@ -274,6 +300,8 @@ impl Workspace {
                 // Retain the process handle so its PID cannot be recycled before
                 // cleaning its private telemetry session on forced job shutdown.
                 self.task_managers.push((info.dwProcessId, info.hProcess));
+            } else if *arguments == "--background-file-browser" {
+                self.file_browsers.push((info.dwProcessId, info.hProcess));
             } else {
                 let _ = CloseHandle(info.hProcess);
             }
@@ -465,7 +493,17 @@ impl Workspace {
                         | HTBOTTOMLEFT | HTBOTTOMRIGHT => {
                             let mut pid = 0;
                             GetWindowThreadProcessId(top, Some(&mut pid));
-                            if self.task_managers.iter().any(|(owned, _)| *owned == pid) {
+                            let mut class = [0u16; 64];
+                            let length = GetClassNameW(top, &mut class);
+                            let browser = String::from_utf16_lossy(&class[..length as usize])
+                                == "MeshRMMBackgroundFiles";
+                            if (browser && self.owns_window(top))
+                                || self
+                                    .task_managers
+                                    .iter()
+                                    .chain(&self.file_browsers)
+                                    .any(|(owned, _)| *owned == pid)
+                            {
                                 // Task Manager owns its resize adapter. Send its
                                 // border clicks to the frame rather than an
                                 // overlapping list child; leave other apps alone.
@@ -743,6 +781,10 @@ impl Drop for Workspace {
                 super::background_tasks::stop_telemetry(pid);
                 let _ = CloseHandle(process);
             }
+            for (_, process) in self.file_browsers.drain(..) {
+                WaitForSingleObject(process, 5000);
+                let _ = CloseHandle(process);
+            }
             if !self.tooltip.is_invalid() {
                 let _ = DestroyWindow(self.tooltip);
             }
@@ -893,7 +935,417 @@ mod tests {
     #[test]
     #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
     fn file_browser_opens_in_background() -> anyhow::Result<()> {
-        tool_opens_in_background(11, "MeshRMM File Browser", "background-file-browser.bmp")
+        tool_opens_in_background(11, "File Explorer", "background-file-browser.bmp")
+    }
+
+    fn file_browser_interactions(workspace: &mut Workspace, window: HWND) -> anyhow::Result<()> {
+        use windows::Win32::UI::Controls::*;
+        fn settle(workspace: &Workspace, millis: u64) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
+            while std::time::Instant::now() < deadline {
+                workspace.pump();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        fn text(window: HWND) -> String {
+            let mut value = [0u16; 8192];
+            let length = unsafe {
+                SendMessageW(
+                    window,
+                    WM_GETTEXT,
+                    Some(WPARAM(value.len())),
+                    Some(LPARAM(value.as_mut_ptr() as isize)),
+                )
+                .0
+            };
+            String::from_utf16_lossy(&value[..length as usize])
+        }
+        fn command(window: HWND, id: usize) -> anyhow::Result<()> {
+            unsafe {
+                PostMessageW(Some(window), WM_COMMAND, WPARAM(id), LPARAM(0))?;
+            }
+            Ok(())
+        }
+        fn wait(workspace: &Workspace, status: HWND) -> anyhow::Result<()> {
+            settle(workspace, 300);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "Browser operation timed out: {}",
+                    text(status)
+                );
+                let before = text(status);
+                settle(workspace, 200);
+                let after = text(status);
+                if before == after
+                    && !after.starts_with("Working")
+                    && !after.starts_with("Cancelling")
+                {
+                    println!("Browser status: {after}");
+                    return Ok(());
+                }
+            }
+        }
+        fn select(list: HWND, name: &str) {
+            unsafe {
+                SendMessageW(list, WM_KEYDOWN, Some(WPARAM(0x24)), None);
+            }
+            for c in name.encode_utf16() {
+                unsafe {
+                    SendMessageW(list, WM_CHAR, Some(WPARAM(c as usize)), None);
+                }
+            }
+        }
+        let root = std::env::var_os("MESHRMM_BACKGROUND_PROOF_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let fixture = root.join(format!("explorer-fixture-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(fixture.join("Folder"))?;
+        std::fs::write(fixture.join("alpha.txt"), b"Explorer fixture\r\n")?;
+        std::fs::write(fixture.join("beta.txt"), b"Second fixture\r\n")?;
+        std::fs::write(
+            fixture.join("Folder").join("nested.txt"),
+            b"Recursive copy fixture",
+        )?;
+        let location = unsafe { GetDlgItem(Some(window), 201)? };
+        let list = unsafe { GetDlgItem(Some(window), 101)? };
+        let status = unsafe { GetDlgItem(Some(window), 231)? };
+        let search = unsafe { GetDlgItem(Some(window), 227)? };
+        let navigate = |path: &std::path::Path| -> anyhow::Result<()> {
+            unsafe {
+                SendMessageW(
+                    location,
+                    WM_SETTEXT,
+                    None,
+                    Some(LPARAM(wide(&path.to_string_lossy()).as_ptr() as isize)),
+                );
+            }
+            command(window, 202)
+        };
+        navigate(&fixture)?;
+        wait(workspace, status)?;
+        std::fs::write(
+            root.join("explorer-initial.bmp"),
+            background::snapshot_bmp()?,
+        )?;
+        assert_eq!(
+            unsafe { SendMessageW(list, LVM_GETITEMCOUNT, None, None).0 },
+            3
+        );
+        // Exercise toolbar commands and verify their effects only inside this fixture.
+        select(list, "alpha");
+        command(window, 209)?;
+        settle(workspace, 100);
+        command(window, 210)?;
+        wait(workspace, status)?;
+        assert_eq!(
+            std::fs::read(fixture.join("alpha - Copy.txt"))?,
+            b"Explorer fixture\r\n"
+        );
+        command(window, 207)?;
+        wait(workspace, status)?;
+        let edit = HWND(unsafe { SendMessageW(list, LVM_GETEDITCONTROL, None, None).0 } as *mut _);
+        anyhow::ensure!(!edit.is_invalid(), "New folder did not begin inline rename");
+        unsafe {
+            SendMessageW(
+                edit,
+                WM_SETTEXT,
+                None,
+                Some(LPARAM(w!("Renamed folder").as_ptr() as isize)),
+            );
+            PostMessageW(Some(edit), WM_KEYDOWN, WPARAM(13), LPARAM(0))?;
+        }
+        wait(workspace, status)?;
+        anyhow::ensure!(
+            fixture.join("Renamed folder").is_dir(),
+            "Inline rename failed"
+        );
+        select(list, "Folder");
+        command(window, 209)?;
+        settle(workspace, 100);
+        navigate(&fixture.join("Renamed folder"))?;
+        wait(workspace, status)?;
+        command(window, 210)?;
+        wait(workspace, status)?;
+        assert_eq!(
+            std::fs::read(fixture.join("Renamed folder/Folder/nested.txt"))?,
+            b"Recursive copy fixture"
+        );
+        command(window, 212)?;
+        wait(workspace, status)?;
+        assert_eq!(text(location), fixture.to_string_lossy());
+        command(window, 213)?;
+        wait(workspace, status)?;
+        assert_eq!(
+            text(location),
+            fixture.join("Renamed folder").to_string_lossy()
+        );
+        command(window, 203)?;
+        wait(workspace, status)?;
+        select(list, "beta");
+        command(window, 214)?;
+        settle(workspace, 100);
+        navigate(&fixture.join("Renamed folder"))?;
+        wait(workspace, status)?;
+        command(window, 210)?;
+        wait(workspace, status)?;
+        anyhow::ensure!(
+            !fixture.join("beta.txt").exists() && fixture.join("Renamed folder/beta.txt").exists(),
+            "Cut/paste failed"
+        );
+        // Cancel and confirm must act on the captured selection, not another row.
+        select(list, "beta");
+        command(window, 215)?;
+        settle(workspace, 150);
+        anyhow::ensure!(
+            fixture.join("Renamed folder/beta.txt").exists(),
+            "Delete skipped confirmation"
+        );
+        std::fs::write(
+            root.join("explorer-delete.bmp"),
+            background::snapshot_bmp()?,
+        )?;
+        command(window, 230)?;
+        settle(workspace, 100);
+        anyhow::ensure!(
+            fixture.join("Renamed folder/beta.txt").exists(),
+            "Cancel deleted the fixture"
+        );
+        command(window, 215)?;
+        settle(workspace, 100);
+        command(window, 229)?;
+        wait(workspace, status)?;
+        anyhow::ensure!(
+            !fixture.join("Renamed folder/beta.txt").exists(),
+            "Confirmed delete failed"
+        );
+        navigate(&fixture)?;
+        wait(workspace, status)?;
+        unsafe {
+            SendMessageW(
+                search,
+                WM_SETTEXT,
+                None,
+                Some(LPARAM(w!("nested").as_ptr() as isize)),
+            );
+        }
+        command(window, 232)?;
+        wait(workspace, status)?;
+        assert_eq!(
+            unsafe { SendMessageW(list, LVM_GETITEMCOUNT, None, None).0 },
+            2
+        );
+        unsafe {
+            SendMessageW(
+                search,
+                WM_SETTEXT,
+                None,
+                Some(LPARAM(w!("").as_ptr() as isize)),
+            );
+        }
+        command(window, 232)?;
+        wait(workspace, status)?;
+        command(window, 217)?;
+        wait(workspace, status)?;
+        assert_eq!(
+            unsafe { SendMessageW(list, LVM_GETSELECTEDCOUNT, None, None).0 },
+            4
+        );
+        command(window, 219)?;
+        wait(workspace, status)?;
+        assert_eq!(
+            unsafe { SendMessageW(list, LVM_GETSELECTEDCOUNT, None, None).0 },
+            0
+        );
+        for (command_id, mode) in [
+            (224, LV_VIEW_ICON),
+            (223, LV_VIEW_SMALLICON),
+            (222, LV_VIEW_DETAILS),
+        ] {
+            command(window, command_id)?;
+            wait(workspace, status)?;
+            assert_eq!(
+                unsafe { SendMessageW(list, LVM_GETVIEW, None, None).0 },
+                mode as isize
+            );
+        }
+        // Exercise real list-view drag notifications through remote pointer input.
+        let drag_folder = fixture.join("Drag test");
+        std::fs::create_dir_all(drag_folder.join("Target"))?;
+        std::fs::write(drag_folder.join("drag.txt"), b"drag fixture")?;
+        navigate(&drag_folder)?;
+        wait(workspace, status)?;
+        let drag_item = |workspace: &mut Workspace| -> anyhow::Result<()> {
+            let header = HWND(unsafe { SendMessageW(list, LVM_GETHEADER, None, None).0 } as *mut _);
+            let mut bounds = RECT::default();
+            let mut heading = RECT::default();
+            unsafe {
+                GetWindowRect(list, &mut bounds)?;
+                GetWindowRect(header, &mut heading)?;
+            }
+            let x = bounds.left + 80;
+            let from_y = heading.bottom + 27;
+            let to_y = heading.bottom + 9;
+            workspace.move_pointer(
+                (x as u32 * 65535 / (WIDTH - 1)) as u16,
+                (from_y as u32 * 65535 / (HEIGHT - 1)) as u16,
+            );
+            workspace.button(PointerButton::Left, true)?;
+            settle(workspace, 100);
+            for (px, py) in [(x + 18, from_y), (x + 18, to_y)] {
+                workspace.apply(RemoteInput::PointerMove {
+                    display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+                    x: (px as u32 * 65535 / (WIDTH - 1)) as u16,
+                    y: (py as u32 * 65535 / (HEIGHT - 1)) as u16,
+                })?;
+                settle(workspace, 100);
+            }
+            workspace.button(PointerButton::Left, false)?;
+            wait(workspace, status)
+        };
+        drag_item(workspace)?;
+        anyhow::ensure!(
+            !drag_folder.join("drag.txt").exists() && drag_folder.join("Target/drag.txt").exists(),
+            "Dragging into a folder did not move the file"
+        );
+        assert_eq!(
+            text(location),
+            drag_folder.to_string_lossy(),
+            "Drop unexpectedly navigated away from the source"
+        );
+        std::fs::write(drag_folder.join("copy.txt"), b"ctrl drag fixture")?;
+        command(window, 204)?;
+        wait(workspace, status)?;
+        workspace.apply(RemoteInput::Key {
+            display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+            scan_code: 0x1d,
+            extended: false,
+            pressed: true,
+        })?;
+        settle(workspace, 100);
+        drag_item(workspace)?;
+        workspace.apply(RemoteInput::Key {
+            display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+            scan_code: 0x1d,
+            extended: false,
+            pressed: false,
+        })?;
+        anyhow::ensure!(
+            drag_folder.join("copy.txt").exists() && drag_folder.join("Target/copy.txt").exists(),
+            "Ctrl-drag did not preserve and copy the source"
+        );
+        command(window, 236)?;
+        wait(workspace, status)?;
+        anyhow::ensure!(
+            drag_folder.join("copy.txt").exists() && !drag_folder.join("Target/copy.txt").exists(),
+            "Undo copy did not preserve the original and remove its unchanged copy"
+        );
+        command(window, 236)?;
+        wait(workspace, status)?;
+        anyhow::ensure!(
+            drag_folder.join("drag.txt").exists() && !drag_folder.join("Target/drag.txt").exists(),
+            "Undo move did not restore the original location"
+        );
+        navigate(&fixture)?;
+        wait(workspace, status)?;
+        // Posted background input must resize and minimize the custom frame.
+        let mut original = RECT::default();
+        unsafe {
+            GetWindowRect(window, &mut original)?;
+        }
+        let x = original.right - 2;
+        let y = original.top + 220;
+        workspace.move_pointer(
+            (x as u32 * 65535 / (WIDTH - 1)) as u16,
+            (y as u32 * 65535 / (HEIGHT - 1)) as u16,
+        );
+        workspace.button(PointerButton::Left, true)?;
+        settle(workspace, 100);
+        workspace.apply(RemoteInput::PointerMove {
+            display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+            x: ((x - 60) as u32 * 65535 / (WIDTH - 1)) as u16,
+            y: (y as u32 * 65535 / (HEIGHT - 1)) as u16,
+        })?;
+        settle(workspace, 100);
+        workspace.button(PointerButton::Left, false)?;
+        settle(workspace, 100);
+        let mut resized = RECT::default();
+        unsafe {
+            GetWindowRect(window, &mut resized)?;
+        }
+        anyhow::ensure!(
+            resized.right - resized.left < original.right - original.left,
+            "Explorer border did not resize with background pointer input"
+        );
+        unsafe {
+            PostMessageW(
+                Some(window),
+                WM_SYSCOMMAND,
+                WPARAM(SC_MAXIMIZE as usize),
+                LPARAM(0),
+            )?;
+        }
+        settle(workspace, 200);
+        let mut maximized = RECT::default();
+        unsafe {
+            GetWindowRect(window, &mut maximized)?;
+        }
+        assert_eq!(maximized.right - maximized.left, WIDTH as i32);
+        assert_eq!(
+            maximized.bottom - maximized.top,
+            HEIGHT as i32 - TASKBAR_HEIGHT
+        );
+        unsafe {
+            PostMessageW(
+                Some(window),
+                WM_SYSCOMMAND,
+                WPARAM(SC_RESTORE as usize),
+                LPARAM(0),
+            )?;
+        }
+        settle(workspace, 200);
+        let helpers = workspace.file_browsers.len();
+        unsafe {
+            GetWindowRect(window, &mut resized)?;
+        }
+        let x = resized.right - 115;
+        let y = resized.top + 16;
+        workspace.move_pointer(
+            (x as u32 * 65535 / (WIDTH - 1)) as u16,
+            (y as u32 * 65535 / (HEIGHT - 1)) as u16,
+        );
+        workspace.button(PointerButton::Left, true)?;
+        workspace.button(PointerButton::Left, false)?;
+        settle(workspace, 200);
+        anyhow::ensure!(
+            unsafe { IsIconic(window) }.as_bool(),
+            "Explorer minimize button did not respond"
+        );
+        workspace.launch(11)?;
+        settle(workspace, 200);
+        anyhow::ensure!(
+            !unsafe { IsIconic(window) }.as_bool(),
+            "Explorer taskbar pin did not restore the window"
+        );
+        assert_eq!(
+            workspace.file_browsers.len(),
+            helpers,
+            "Restoring Explorer launched a duplicate"
+        );
+        command(window, 221)?;
+        settle(workspace, 150);
+        std::fs::write(root.join("explorer-view.bmp"), background::snapshot_bmp()?)?;
+        command(window, 220)?;
+        settle(workspace, 150);
+        std::fs::write(root.join("explorer-home.bmp"), background::snapshot_bmp()?)?;
+        navigate(&root)?;
+        wait(workspace, status)?;
+        std::fs::remove_dir_all(fixture)?;
+        println!(
+            "Explorer navigation, inline rename, file/folder copy, move, deletion confirmation, search, selection and view modes passed"
+        );
+        Ok(())
     }
 
     fn task_manager_interactions(workspace: &mut Workspace, window: HWND) -> anyhow::Result<()> {
@@ -1271,8 +1723,14 @@ mod tests {
                         if index == 7 {
                             task_manager_interactions(&mut workspace, window)?;
                         }
+                        if index == 11 {
+                            file_browser_interactions(&mut workspace, window)?;
+                        }
                         std::fs::write(
-                            std::env::temp_dir().join(screenshot),
+                            std::env::var_os("MESHRMM_BACKGROUND_PROOF_DIR")
+                                .map(std::path::PathBuf::from)
+                                .unwrap_or_else(std::env::temp_dir)
+                                .join(screenshot),
                             background::snapshot_bmp()?,
                         )?;
                         drop(workspace);
@@ -1294,10 +1752,14 @@ mod tests {
                             String::from_utf16_lossy(&title[..count as usize])
                         );
                     }
-                    for (pid, process) in &workspace.task_managers {
+                    for (pid, process) in workspace
+                        .task_managers
+                        .iter()
+                        .chain(&workspace.file_browsers)
+                    {
                         let mut code = 0;
                         let _ = unsafe { GetExitCodeProcess(*process, &mut code) };
-                        eprintln!("Task manager {pid} exit={code}");
+                        eprintln!("Background tool {pid} exit={code}");
                     }
                     std::fs::write(
                         std::env::temp_dir().join("task-manager-failure.bmp"),

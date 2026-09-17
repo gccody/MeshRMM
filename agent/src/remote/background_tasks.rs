@@ -1914,6 +1914,17 @@ unsafe fn scroll_command(hwnd: HWND, vertical: bool, command: SCROLLBAR_COMMAND,
         );
     }
 }
+pub(super) fn install_list_scrollbars(list: HWND) -> anyhow::Result<()> {
+    unsafe {
+        let scroll_input = Box::into_raw(Box::new(Cell::new(None::<ScrollInput>)));
+        if !SetWindowSubclass(list, Some(list_paint), 1, scroll_input as usize).as_bool() {
+            drop(Box::from_raw(scroll_input));
+            anyhow::bail!("Could not initialize captured list scrollbars");
+        }
+    }
+    Ok(())
+}
+
 unsafe extern "system" fn list_paint(
     hwnd: HWND,
     message: u32,
@@ -3064,11 +3075,7 @@ fn create_window() -> anyhow::Result<Box<RefCell<State>>> {
                 Some(LPARAM((&item as *const TCITEMW) as isize)),
             );
         }
-        let scroll_input = Box::into_raw(Box::new(Cell::new(None::<ScrollInput>)));
-        if !SetWindowSubclass(list, Some(list_paint), 1, scroll_input as usize).as_bool() {
-            drop(Box::from_raw(scroll_input));
-            anyhow::bail!("Could not initialize captured list scrollbars");
-        }
+        install_list_scrollbars(list)?;
         let status = control(
             hwnd,
             w!("STATIC"),
