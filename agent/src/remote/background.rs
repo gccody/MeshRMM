@@ -13,7 +13,7 @@ use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
 
-const TASKBAR_HEIGHT: i32 = 48;
+pub(super) const TASKBAR_HEIGHT: i32 = 48;
 const PIN_WIDTH: i32 = 48;
 const ICON_SIZE: i32 = 32;
 const PINS: &[(&str, &str, &str)] = &[
@@ -44,6 +44,7 @@ const PINS: &[(&str, &str, &str)] = &[
 
 pub struct Workspace {
     icons: Vec<HICON>,
+    task_managers: Vec<(u32, HANDLE)>,
     shell: HWND,
     tooltip: HWND,
     hovered: Option<usize>,
@@ -80,6 +81,7 @@ impl Workspace {
             }
             let mut workspace = Self {
                 icons: Vec::new(),
+                task_managers: Vec::new(),
                 shell: HWND::default(),
                 tooltip: HWND::default(),
                 hovered: None,
@@ -180,6 +182,35 @@ impl Workspace {
         let (_, program, arguments) = PINS
             .get(index.wrapping_sub(1))
             .context("unknown background application")?;
+        if *arguments == "--background-task-manager" {
+            unsafe {
+                if let Ok(window) = FindWindowW(w!("MeshRMMBackgroundTasks"), None) {
+                    let mut pid = 0;
+                    GetWindowThreadProcessId(window, Some(&mut pid));
+                    if self.task_managers.iter().any(|(owned, _)| *owned == pid) {
+                        let _ = ShowWindowAsync(
+                            window,
+                            if IsIconic(window).as_bool() {
+                                SW_RESTORE
+                            } else {
+                                SW_SHOW
+                            },
+                        );
+                        let _ = SetWindowPos(
+                            window,
+                            Some(HWND_TOP),
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                        self.focus = window;
+                        return Ok(());
+                    }
+                }
+            }
+        }
         let root = std::env::var("SystemRoot").context("SystemRoot is unavailable")?;
         let built_in = matches!(
             *arguments,
@@ -239,7 +270,13 @@ impl Workspace {
                 anyhow::bail!("could not resume background application");
             }
             let _ = CloseHandle(info.hThread);
-            let _ = CloseHandle(info.hProcess);
+            if *arguments == "--background-task-manager" {
+                // Retain the process handle so its PID cannot be recycled before
+                // cleaning its private telemetry session on forced job shutdown.
+                self.task_managers.push((info.dwProcessId, info.hProcess));
+            } else {
+                let _ = CloseHandle(info.hProcess);
+            }
             if index == 1 || index == 2 {
                 self.console_inputs
                     .push(super::background_console::ConsoleInput::start(
@@ -424,6 +461,19 @@ impl Workspace {
                 );
                 if button == PointerButton::Left {
                     match hit as u32 {
+                        HTLEFT | HTRIGHT | HTTOP | HTTOPLEFT | HTTOPRIGHT | HTBOTTOM
+                        | HTBOTTOMLEFT | HTBOTTOMRIGHT => {
+                            let mut pid = 0;
+                            GetWindowThreadProcessId(top, Some(&mut pid));
+                            if self.task_managers.iter().any(|(owned, _)| *owned == pid) {
+                                // Task Manager owns its resize adapter. Send its
+                                // border clicks to the frame rather than an
+                                // overlapping list child; leave other apps alone.
+                                self.pressed = Some(top);
+                                self.focus = top;
+                                return self.post(top, WM_LBUTTONDOWN, 1, self.client_point(top));
+                            }
+                        }
                         HTCAPTION => {
                             let mut rect = RECT::default();
                             GetWindowRect(top, &mut rect)?;
@@ -688,6 +738,11 @@ impl Drop for Workspace {
         self.console_inputs.clear();
         unsafe {
             let _ = CloseHandle(self.job);
+            for (pid, process) in self.task_managers.drain(..) {
+                WaitForSingleObject(process, 5000);
+                super::background_tasks::stop_telemetry(pid);
+                let _ = CloseHandle(process);
+            }
             if !self.tooltip.is_invalid() {
                 let _ = DestroyWindow(self.tooltip);
             }
@@ -832,13 +887,331 @@ mod tests {
     #[test]
     #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
     fn task_manager_opens_in_background() -> anyhow::Result<()> {
-        tool_opens_in_background(7, "MeshRMM Task Manager", "background-task-manager.bmp")
+        tool_opens_in_background(7, "Task Manager", "background-task-manager.bmp")
     }
 
     #[test]
     #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
     fn file_browser_opens_in_background() -> anyhow::Result<()> {
         tool_opens_in_background(11, "MeshRMM File Browser", "background-file-browser.bmp")
+    }
+
+    fn task_manager_interactions(workspace: &mut Workspace, window: HWND) -> anyhow::Result<()> {
+        use windows::Win32::UI::Controls::*;
+        fn settle(workspace: &Workspace, millis: u64) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
+            while std::time::Instant::now() < deadline {
+                workspace.pump();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        fn click(workspace: &mut Workspace, x: i32, y: i32) -> anyhow::Result<()> {
+            workspace.move_pointer(
+                (x as u32 * 65535 / (WIDTH - 1)) as u16,
+                (y as u32 * 65535 / (HEIGHT - 1)) as u16,
+            );
+            workspace.button(PointerButton::Left, true)?;
+            workspace.button(PointerButton::Left, false)?;
+            settle(workspace, 60);
+            Ok(())
+        }
+        fn command(window: HWND, id: usize) -> anyhow::Result<()> {
+            unsafe {
+                PostMessageW(Some(window), WM_COMMAND, WPARAM(id), LPARAM(0))?;
+            }
+            Ok(())
+        }
+        fn select_tab(workspace: &mut Workspace, tabs: HWND, index: usize) -> anyhow::Result<()> {
+            let mut rect = RECT::default();
+            unsafe {
+                GetWindowRect(tabs, &mut rect)?;
+            }
+            // Exercise actual routed mouse input. The native tab widths depend on
+            // the Windows font/theme, so scan instead of guessing fixed widths.
+            for x in (rect.left + 5..rect.right).step_by(6) {
+                click(workspace, x, rect.top + 10)?;
+                if unsafe { SendMessageW(tabs, TCM_GETCURSEL, None, None).0 } == index as isize {
+                    return Ok(());
+                }
+            }
+            anyhow::bail!("Tab {index} did not respond to background mouse input")
+        }
+        let proof = std::env::var_os("MESHRMM_BACKGROUND_PROOF_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        std::fs::create_dir_all(&proof)?;
+        let tabs = unsafe { GetDlgItem(Some(window), 104)? };
+        assert_eq!(
+            unsafe { SendMessageW(tabs, TCM_GETITEMCOUNT, None, None).0 },
+            7
+        );
+        settle(workspace, 2400);
+        std::fs::write(
+            proof.join("task-manager-processes.bmp"),
+            background::snapshot_bmp()?,
+        )?;
+        for (index, name) in [
+            "processes",
+            "performance",
+            "history",
+            "startup",
+            "users",
+            "details",
+            "services",
+        ]
+        .iter()
+        .enumerate()
+        {
+            select_tab(workspace, tabs, index)?;
+            settle(workspace, 250);
+            if index == 6 {
+                let list = unsafe { GetDlgItem(Some(window), 101)? };
+                for (id, bar) in [(OBJID_VSCROLL, SB_VERT), (OBJID_HSCROLL, SB_HORZ)] {
+                    let mut info = SCROLLBARINFO {
+                        cbSize: std::mem::size_of::<SCROLLBARINFO>() as u32,
+                        ..Default::default()
+                    };
+                    unsafe { GetScrollBarInfo(list, id, &mut info)? };
+                    assert_eq!(info.rgstate[0] & 0x8000, 0, "Scrollbar must be visible");
+                    let before = unsafe { GetScrollPos(list, bar) };
+                    let x = if bar == SB_VERT {
+                        (info.rcScrollBar.left + info.rcScrollBar.right) / 2
+                    } else {
+                        info.rcScrollBar.right - info.dxyLineButton / 2
+                    };
+                    let y = if bar == SB_VERT {
+                        info.rcScrollBar.bottom - info.dxyLineButton / 2
+                    } else {
+                        (info.rcScrollBar.top + info.rcScrollBar.bottom) / 2
+                    };
+                    click(workspace, x, y)?;
+                    assert!(
+                        unsafe { GetScrollPos(list, bar) } > before,
+                        "Scrollbar arrow did not scroll"
+                    );
+                    unsafe { GetScrollBarInfo(list, id, &mut info)? };
+                    let before_drag = unsafe { GetScrollPos(list, bar) };
+                    let thumb = (info.xyThumbTop + info.xyThumbBottom) / 2;
+                    let (x, y) = if bar == SB_VERT {
+                        (x, info.rcScrollBar.top + thumb)
+                    } else {
+                        (info.rcScrollBar.left + thumb, y)
+                    };
+                    workspace.move_pointer(
+                        (x as u32 * 65535 / (WIDTH - 1)) as u16,
+                        (y as u32 * 65535 / (HEIGHT - 1)) as u16,
+                    );
+                    workspace.button(PointerButton::Left, true)?;
+                    settle(workspace, 60);
+                    let (x, y) = if bar == SB_VERT {
+                        (x, y + 30)
+                    } else {
+                        (x + 30, y)
+                    };
+                    workspace.apply(RemoteInput::PointerMove {
+                        display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+                        x: (x as u32 * 65535 / (WIDTH - 1)) as u16,
+                        y: (y as u32 * 65535 / (HEIGHT - 1)) as u16,
+                    })?;
+                    settle(workspace, 60);
+                    workspace.button(PointerButton::Left, false)?;
+                    settle(workspace, 60);
+                    assert!(
+                        unsafe { GetScrollPos(list, bar) } > before_drag,
+                        "Scrollbar {bar:?} thumb did not drag from {before_drag} (now {})",
+                        unsafe { GetScrollPos(list, bar) }
+                    );
+                    unsafe {
+                        SendMessageW(
+                            list,
+                            if bar == SB_VERT {
+                                WM_VSCROLL
+                            } else {
+                                WM_HSCROLL
+                            },
+                            Some(WPARAM(SB_TOP.0 as usize)),
+                            None,
+                        );
+                    }
+                }
+                settle(workspace, 100);
+            }
+            std::fs::write(
+                proof.join(format!("task-manager-{name}.bmp")),
+                background::snapshot_bmp()?,
+            )?;
+        }
+        let mut bounds = RECT::default();
+        unsafe { GetWindowRect(window, &mut bounds)? };
+        click(workspace, bounds.right - 116, bounds.top + 15)?;
+        settle(workspace, 200);
+        assert!(
+            unsafe { IsIconic(window) }.as_bool(),
+            "Minimize button did not minimize"
+        );
+        let helpers = workspace.task_managers.len();
+        workspace.launch(7)?;
+        settle(workspace, 200);
+        assert!(
+            !unsafe { IsIconic(window) }.as_bool(),
+            "Taskbar pin did not restore Task Manager"
+        );
+        assert_eq!(
+            workspace.task_managers.len(),
+            helpers,
+            "Restoring created a duplicate helper"
+        );
+        unsafe { GetWindowRect(window, &mut bounds)? };
+        click(workspace, bounds.right - 70, bounds.top + 15)?;
+        settle(workspace, 200);
+        assert!(
+            unsafe { IsZoomed(window) }.as_bool(),
+            "Maximize button did not maximize"
+        );
+        unsafe { GetWindowRect(window, &mut bounds)? };
+        assert!(
+            bounds.left == 0
+                && bounds.top == 0
+                && bounds.right == WIDTH as i32
+                && bounds.bottom == HEIGHT as i32 - TASKBAR_HEIGHT,
+            "Maximized Task Manager must fill the background work area: {bounds:?}"
+        );
+        click(workspace, bounds.right - 70, bounds.top + 15)?;
+        settle(workspace, 200);
+        assert!(!unsafe { IsZoomed(window) }.as_bool());
+        unsafe { GetWindowRect(window, &mut bounds)? };
+        let original = bounds;
+        workspace.move_pointer(
+            ((bounds.right - 1) as u32 * 65535 / (WIDTH - 1)) as u16,
+            ((bounds.bottom - 1) as u32 * 65535 / (HEIGHT - 1)) as u16,
+        );
+        workspace.button(PointerButton::Left, true)?;
+        settle(workspace, 60);
+        workspace.apply(RemoteInput::PointerMove {
+            display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+            x: ((bounds.right + 89) as u32 * 65535 / (WIDTH - 1)) as u16,
+            y: ((bounds.bottom + 59) as u32 * 65535 / (HEIGHT - 1)) as u16,
+        })?;
+        settle(workspace, 60);
+        workspace.button(PointerButton::Left, false)?;
+        settle(workspace, 100);
+        unsafe { GetWindowRect(window, &mut bounds)? };
+        assert!(
+            bounds.right > original.right + 50 && bounds.bottom > original.bottom + 30,
+            "Window border did not resize: {bounds:?}"
+        );
+        unsafe {
+            SetWindowPos(
+                window,
+                None,
+                original.left,
+                original.top,
+                original.right - original.left,
+                original.bottom - original.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )?;
+        }
+        settle(workspace, 100);
+        select_tab(workspace, tabs, 0)?;
+        command(window, 213)?; // pause; manual refresh must still work
+        command(window, 102)?;
+        settle(workspace, 200);
+        command(window, 105)?;
+        settle(workspace, 100);
+        assert!(!unsafe { IsWindowVisible(tabs) }.as_bool());
+        std::fs::write(
+            proof.join("task-manager-compact.bmp"),
+            background::snapshot_bmp()?,
+        )?;
+        command(window, 105)?;
+        command(window, 211)?;
+        settle(workspace, 100);
+        assert!(unsafe { IsWindowVisible(tabs) }.as_bool());
+        // Run a benign command through the actual new-task form on this desktop.
+        let output = proof.join("task-manager-run.txt");
+        let _ = std::fs::remove_file(&output);
+        command(window, 201)?;
+        settle(workspace, 100);
+        let edit = unsafe { GetDlgItem(Some(window), 107)? };
+        let text = wide(&format!(
+            "cmd.exe /c echo MeshRMMTaskManagerFixture>\"{}\"",
+            output.display()
+        ));
+        unsafe {
+            SendMessageW(edit, WM_SETTEXT, None, Some(LPARAM(text.as_ptr() as isize)));
+        }
+        command(window, 108)?;
+        settle(workspace, 600);
+        anyhow::ensure!(
+            std::fs::read_to_string(&output)?.contains("MeshRMMTaskManagerFixture"),
+            "Run new task did not execute"
+        );
+        // Termination is tested only against an executable copied into this test's
+        // directory. Verify the selected PID before issuing any End Task command.
+        let exe = proof.join("MeshRMMTaskFixture.exe");
+        std::fs::copy(
+            std::path::PathBuf::from(std::env::var("SystemRoot")?).join("System32\\cmd.exe"),
+            &exe,
+        )?;
+        let mut child = std::process::Command::new(&exe)
+            .args(["/c", "pause"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        let result = (|| -> anyhow::Result<()> {
+            select_tab(workspace, tabs, 5)?;
+            command(window, 102)?;
+            settle(workspace, 1800);
+            let list = unsafe { GetDlgItem(Some(window), 101)? };
+            unsafe {
+                SendMessageW(list, WM_KEYDOWN, Some(WPARAM(0x24)), None);
+            }
+            for c in "MeshRMMTaskFixture.exe".encode_utf16() {
+                unsafe {
+                    SendMessageW(list, WM_CHAR, Some(WPARAM(c as usize)), None);
+                }
+            }
+            command(window, 222)?;
+            settle(workspace, 100);
+            let status = unsafe { GetDlgItem(Some(window), 109)? };
+            let mut text = [0u16; 4096];
+            let len = unsafe { GetWindowTextW(status, &mut text) };
+            let text = String::from_utf16_lossy(&text[..len as usize]);
+            anyhow::ensure!(
+                text.split("  |  ").nth(1) == Some(child.id().to_string().as_str()),
+                "Refusing to end unexpected selection: {text}"
+            );
+            command(window, 103)?;
+            settle(workspace, 100);
+            anyhow::ensure!(child.try_wait()?.is_none(), "End task skipped confirmation");
+            std::fs::write(
+                proof.join("task-manager-confirmation.bmp"),
+                background::snapshot_bmp()?,
+            )?;
+            command(window, 106)?;
+            settle(workspace, 100);
+            anyhow::ensure!(child.try_wait()?.is_none(), "Cancel terminated the process");
+            command(window, 103)?;
+            settle(workspace, 100);
+            command(window, 103)?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while child.try_wait()?.is_none() {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "Confirmed End Task did not terminate fixture"
+                );
+                settle(workspace, 50);
+            }
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(exe);
+        result?;
+        select_tab(workspace, tabs, 0)?;
+        command(window, 106)?;
+        settle(workspace, 300);
+        Ok(())
     }
 
     fn tool_opens_in_background(
@@ -895,6 +1268,9 @@ mod tests {
                             IsProcessInJob(process, Some(workspace.job), &mut in_job)?;
                         }
                         assert!(in_job.as_bool(), "process manager escaped session cleanup");
+                        if index == 7 {
+                            task_manager_interactions(&mut workspace, window)?;
+                        }
                         std::fs::write(
                             std::env::temp_dir().join(screenshot),
                             background::snapshot_bmp()?,
@@ -909,10 +1285,26 @@ mod tests {
                         return Ok(());
                     }
                 }
-                anyhow::ensure!(
-                    std::time::Instant::now() < deadline,
-                    "{expected_title} did not open on the background desktop"
-                );
+                if std::time::Instant::now() >= deadline {
+                    for window in background::windows()? {
+                        let mut title = [0u16; 512];
+                        let count = unsafe { GetWindowTextW(window, &mut title) };
+                        eprintln!(
+                            "Window: {}",
+                            String::from_utf16_lossy(&title[..count as usize])
+                        );
+                    }
+                    for (pid, process) in &workspace.task_managers {
+                        let mut code = 0;
+                        let _ = unsafe { GetExitCodeProcess(*process, &mut code) };
+                        eprintln!("Task manager {pid} exit={code}");
+                    }
+                    std::fs::write(
+                        std::env::temp_dir().join("task-manager-failure.bmp"),
+                        background::snapshot_bmp()?,
+                    )?;
+                    anyhow::bail!("{expected_title} did not open on the background desktop");
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         })
