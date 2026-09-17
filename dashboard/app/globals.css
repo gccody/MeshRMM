@@ -60,8 +60,7 @@ button { color: inherit; }
 .mobile-menu { display: none; }
 .mobile-menu:disabled { cursor: default; opacity: .65; }
 .topbar-divider { width: 1px; height: 25px; background: var(--line); }
-.connection-pill { height: 33px; padding: 0 11px; display: flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 8px; background: #fff; font-size: 13px; font-weight: 650; cursor: pointer; }
-.connection-pill:disabled { cursor: default; }
+.connection-pill { height: 33px; padding: 0 11px; display: flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 8px; background: #fff; font-size: 13px; font-weight: 650; }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #a6a8b1; }
 .status-dot.live { background: #27a874; box-shadow: 0 0 0 4px #e9f8f1; }
 
@@ -396,7 +395,8 @@ button { color: inherit; }
 .nav-item.active::before { display: none; }
 .nav-item em { background: #495a7e; color: white; box-shadow: none; font-size: 11px; }
 .profile-row { margin-top: auto; padding-top: 20px; border-color: #2b374d; min-width: 0; }
-.profile-row > div:last-child { min-width: 0; }
+.profile-details { min-width: 0; }
+.profile-button > svg { color: #b0bbce; }
 .profile-row strong, .profile-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .profile-row strong { color: #f1f5f9; font-size: 13px; }
 .profile-row span { color: #b0bbce; font-size: 11px; margin-top: 4px; }

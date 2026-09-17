@@ -326,6 +326,7 @@ async fn run_connected_sender(
         )
         .await?;
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(8);
+    let audio_input = Arc::clone(&input);
     let audio_capture = super::native_task::NativeTask::spawn(
         "meshrmm-audio-capture",
         move |mut stop| async move {
@@ -335,6 +336,7 @@ async fn run_connected_sender(
                 tokio::select! {
                     _ = stop.changed() => break,
                     _ = retry.tick() => {
+                        if audio_input.is_background() { stream = None; continue; }
                         if stream.as_ref().is_some_and(meshrmm_audio::Capture::healthy) { continue; }
                         stream = None;
                         let sender = audio_tx.clone();
@@ -348,9 +350,11 @@ async fn run_connected_sender(
         },
     )?;
     cleanup.workers.push(audio_capture);
+    let audio_input = Arc::clone(&input);
     let audio_sender = tokio::spawn(async move {
         while let Some(packet) = audio_rx.recv().await {
-            if audio_channel.ready_state() == RTCDataChannelState::Open
+            if !audio_input.is_background()
+                && audio_channel.ready_state() == RTCDataChannelState::Open
                 && audio_channel.buffered_amount().await < 32_000
                 && audio_channel.send(&Bytes::from(packet)).await.is_err()
             {
@@ -411,7 +415,15 @@ async fn run_connected_sender(
         std::time::Duration::from_secs(3600),
         move |message| {
             let result = match message {
-                Some(SessionMessage::SendSecureAttention) => super::secure_attention::send(),
+                Some(SessionMessage::SendSecureAttention) => {
+                    if maintenance_input.is_background() {
+                        Err(anyhow::anyhow!(
+                            "Ctrl+Alt+Del is unavailable in background mode"
+                        ))
+                    } else {
+                        super::secure_attention::send()
+                    }
+                }
                 Some(SessionMessage::SetPreventIdleLock { enabled }) => {
                     maintenance_input.set_prevent_idle_lock(idle_policy.effective(Some(enabled)))
                 }
@@ -1402,9 +1414,30 @@ async fn run_capture_control(
                                 tracing::info!(switch_ms = switch_started.elapsed().as_millis(), display_id = active_display.id.0, display_name = %active_display.name, stream_id = stream_id.0, "remote display switched");
                             }
                             Err(error) => {
-                                active_display = selected;
-                                capture_retry_after = std::time::Instant::now() + DESKTOP_RETRY_INTERVAL;
-                                tracing::warn!(error = ?error, "display switch is waiting for an interactive desktop");
+                                if selected.id.0 == meshrmm_remote_screen::background::DISPLAY_ID
+                                    && active_display.id != selected.id
+                                {
+                                    send_control_message(&control_channel, SessionMessage::MaintenanceError {
+                                        reason: format!("Background mode could not start: {error:#}"),
+                                    }).await?;
+                                    // A failed experimental backend must not strand the viewer
+                                    // on a blank desktop or silently inject console input.
+                                    let restored = start_first_profile(&streamer, active_display.id, stream_id, &slot, &candidates)?;
+                                    displays = restored.displays;
+                                    active_display = restored.active_display;
+                                    active_profile = restored.format.profile();
+                                    format = restored.format;
+                                    capture_running = true;
+                                    capture_unavailable_since = None;
+                                    send_control_message(&control_channel, SessionMessage::DisplayConfiguration {
+                                        displays: displays.clone(), active_display_id: active_display.id,
+                                        stream_id, format,
+                                    }).await?;
+                                } else {
+                                    active_display = selected;
+                                    capture_retry_after = std::time::Instant::now() + DESKTOP_RETRY_INTERVAL;
+                                    tracing::warn!(error = ?error, "display switch is waiting for an interactive desktop");
+                                }
                             }
                         }
                     }

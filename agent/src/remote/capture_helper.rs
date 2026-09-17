@@ -73,6 +73,7 @@ const NO_ACTIVE_SESSION: u32 = u32::MAX;
 enum DesktopTarget {
     Default,
     Winlogon,
+    Background,
 }
 
 impl DesktopTarget {
@@ -80,6 +81,7 @@ impl DesktopTarget {
         match self {
             Self::Default => "default",
             Self::Winlogon => "Winlogon",
+            Self::Background => "MeshRMMBackground",
         }
     }
 
@@ -87,6 +89,7 @@ impl DesktopTarget {
         match self {
             Self::Default => Self::Winlogon,
             Self::Winlogon => Self::Default,
+            Self::Background => Self::Background,
         }
     }
 }
@@ -183,6 +186,8 @@ type InputRoute = Arc<Mutex<Option<InputWriter>>>;
 /// desktop. Only frames and remote-control events cross the inherited pipes;
 /// the Agent token, configuration, and network stack remain in Session 0.
 pub struct DesktopCaptureStreamer {
+    background_active: Arc<AtomicBool>,
+    console_displays: Vec<Display>,
     blackout_message: String,
     viewer_name: String,
     running: Option<RunningHelper>,
@@ -208,6 +213,8 @@ pub struct DesktopCaptureStreamer {
 impl DesktopCaptureStreamer {
     pub fn new(viewer_name: String, blackout_message: String) -> Self {
         Self {
+            background_active: Arc::new(AtomicBool::new(false)),
+            console_displays: Vec::new(),
             viewer_name,
             blackout_message,
             running: None,
@@ -237,6 +244,24 @@ impl DesktopCaptureStreamer {
         display_id: Option<DisplayId>,
         sink: EncodedFrameSink,
     ) -> anyhow::Result<StartedDesktop> {
+        let background =
+            display_id.is_some_and(|id| id.0 == meshrmm_remote_screen::background::DISPLAY_ID);
+        let config = if background {
+            StreamConfig {
+                frames_per_second: config.frames_per_second.min(20),
+                ..config
+            }
+        } else {
+            config
+        };
+        if background != self.background_active.load(Ordering::Acquire) {
+            self.shutdown()?;
+            self.background_active.store(background, Ordering::Release);
+            self.preferred_desktop = None;
+        }
+        if background {
+            meshrmm_remote_screen::background::require_session_zero()?;
+        }
         if self.running.is_some() {
             let result = self.reconfigure(config, display_id, Arc::clone(&sink));
             if result.is_ok() {
@@ -245,9 +270,16 @@ impl DesktopCaptureStreamer {
             tracing::warn!(error = ?result.err(), "could not reuse capture helper; starting a replacement");
             let _ = self.stop();
         }
-        let preferred = self.preferred_desktop.unwrap_or_else(preferred_desktop);
+        let preferred = if background {
+            DesktopTarget::Background
+        } else {
+            self.preferred_desktop.unwrap_or_else(preferred_desktop)
+        };
         let mut last_error = None;
-        for target in [preferred, preferred.alternate()] {
+        for target in [preferred, preferred.alternate()]
+            .into_iter()
+            .take(if background { 1 } else { 2 })
+        {
             let attempt_started = Instant::now();
             match self.start_on_desktop(target, config, display_id, Arc::clone(&sink)) {
                 Ok(started) => {
@@ -317,7 +349,17 @@ impl DesktopCaptureStreamer {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(sink);
         self.request_keyframe()?;
-        Ok(started)
+        Ok(self.with_background_display(started))
+    }
+
+    fn with_background_display(&mut self, mut started: StartedDesktop) -> StartedDesktop {
+        if self.background_active.load(Ordering::Acquire) {
+            started.displays = self.console_displays.clone();
+        } else {
+            self.console_displays = started.displays.clone();
+        }
+        started.displays.push(background_display());
+        started
     }
 
     fn start_on_desktop(
@@ -335,6 +377,8 @@ impl DesktopCaptureStreamer {
         let reader_status = Arc::clone(&status);
         let reader_cursor = Arc::clone(&self.cursor);
         let reader_maintenance = Arc::clone(&self.maintenance);
+        let last_frame = Arc::new(Mutex::new(Instant::now()));
+        let reader_progress = Arc::clone(&last_frame);
         let reader = thread::Builder::new()
             .name("meshrmm-desktop-ipc".into())
             .spawn(move || {
@@ -345,6 +389,7 @@ impl DesktopCaptureStreamer {
                     reader_status,
                     reader_cursor,
                     reader_maintenance,
+                    reader_progress,
                 )
             })
             .context("failed to start desktop-helper IPC reader")?;
@@ -408,6 +453,7 @@ impl DesktopCaptureStreamer {
         self.running = Some(RunningHelper {
             sink,
             started: started_rx,
+            last_frame,
             process: launched.process,
             process_id: launched.process_id,
             target,
@@ -416,7 +462,7 @@ impl DesktopCaptureStreamer {
             reader: Some(reader),
             stderr: Some(stderr),
         });
-        Ok(started)
+        Ok(self.with_background_display(started))
     }
 
     pub fn set_display_border(&self, enabled: bool) -> anyhow::Result<()> {
@@ -445,6 +491,7 @@ impl DesktopCaptureStreamer {
 
     pub fn input_controller(&self) -> Arc<dyn ScreenInput> {
         Arc::new(DesktopInputController {
+            background_active: Arc::clone(&self.background_active),
             blackout_message: self.blackout_message.clone(),
             route: Arc::clone(&self.input_route),
             file_route: Arc::clone(&self.file_route),
@@ -471,6 +518,20 @@ impl DesktopCaptureStreamer {
 
     pub fn poll_ended(&mut self) -> Option<anyhow::Result<()>> {
         let running = self.running.as_ref()?;
+        if running.target == DesktopTarget::Background
+            && running
+                .last_frame
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .elapsed()
+                > Duration::from_secs(10)
+        {
+            terminate_and_wait(&running.process);
+            set_status(
+                &running.status,
+                Err("Background rendering stalled; capture helper was terminated".into()),
+            );
+        }
         let status = running
             .status
             .lock()
@@ -508,89 +569,89 @@ impl DesktopCaptureStreamer {
         target: DesktopTarget,
         display_id: DisplayId,
     ) -> anyhow::Result<()> {
-        if self
-            .file_helper
-            .as_ref()
-            .is_none_or(|h| h.status.lock().unwrap().is_some())
-            || self.file_route.lock().unwrap().is_none()
-        {
-            self.stop_file_helper();
-            match start_input_helper(
-                &self.viewer_name,
-                DesktopTarget::Default,
-                display_id,
-                Arc::clone(&self.cursor),
-                Arc::clone(&self.clipboard),
-                Arc::clone(&self.files),
-                Arc::clone(&self.chat),
-                Arc::clone(&self.maintenance),
-                HelperKind::Files,
-            ) {
-                Ok(helper) => {
-                    let mut route = self.file_route.lock().unwrap();
-                    send_command(
-                        &helper.input,
-                        &ParentCommand::SetWallpaperHidden(
-                            self.wallpaper_hidden.load(Ordering::Acquire),
-                        ),
-                    )?;
-                    *route = Some(Arc::clone(&helper.input));
-                    self.file_helper = Some(helper);
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "file transfers require a signed-in interactive user")
-                }
-            }
-        }
-        if self
-            .chat_helper
-            .as_ref()
-            .is_none_or(|helper| helper.target != target || helper.status.lock().unwrap().is_some())
-        {
-            self.stop_chat_helper();
-            match start_input_helper(
-                &self.viewer_name,
-                target,
-                display_id,
-                Arc::clone(&self.cursor),
-                Arc::clone(&self.clipboard),
-                Arc::clone(&self.files),
-                Arc::clone(&self.chat),
-                Arc::clone(&self.maintenance),
-                HelperKind::Chat,
-            ) {
-                Ok(helper) => {
-                    if self.chat_enabled.load(Ordering::Acquire) {
-                        send_command(&helper.input, &ParentCommand::StartChat)?;
+        if target != DesktopTarget::Background {
+            if self
+                .file_helper
+                .as_ref()
+                .is_none_or(|h| h.status.lock().unwrap().is_some())
+                || self.file_route.lock().unwrap().is_none()
+            {
+                self.stop_file_helper();
+                match start_input_helper(
+                    &self.viewer_name,
+                    DesktopTarget::Default,
+                    display_id,
+                    Arc::clone(&self.cursor),
+                    Arc::clone(&self.clipboard),
+                    Arc::clone(&self.files),
+                    Arc::clone(&self.chat),
+                    Arc::clone(&self.maintenance),
+                    HelperKind::Files,
+                ) {
+                    Ok(helper) => {
+                        let mut route = self.file_route.lock().unwrap();
+                        send_command(
+                            &helper.input,
+                            &ParentCommand::SetWallpaperHidden(
+                                self.wallpaper_hidden.load(Ordering::Acquire),
+                            ),
+                        )?;
+                        *route = Some(Arc::clone(&helper.input));
+                        self.file_helper = Some(helper);
                     }
-                    *self.chat_route.lock().unwrap() = Some(Arc::clone(&helper.input));
-                    self.chat_helper = Some(helper);
+                    Err(error) => {
+                        tracing::warn!(%error, "file transfers require a signed-in interactive user")
+                    }
                 }
-                Err(error) => tracing::warn!(%error, "independent chat helper unavailable"),
             }
-        }
-        if self
-            .clipboard_helper
-            .as_ref()
-            .is_none_or(|helper| helper.target != target || helper.status.lock().unwrap().is_some())
-        {
-            self.stop_clipboard_helper();
-            match start_input_helper(
-                &self.viewer_name,
-                target,
-                display_id,
-                Arc::clone(&self.cursor),
-                Arc::clone(&self.clipboard),
-                Arc::clone(&self.files),
-                Arc::clone(&self.chat),
-                Arc::clone(&self.maintenance),
-                HelperKind::Clipboard,
-            ) {
-                Ok(helper) => {
-                    *self.clipboard_route.lock().unwrap() = Some(Arc::clone(&helper.input));
-                    self.clipboard_helper = Some(helper);
+            if self.chat_helper.as_ref().is_none_or(|helper| {
+                helper.target != target || helper.status.lock().unwrap().is_some()
+            }) {
+                self.stop_chat_helper();
+                match start_input_helper(
+                    &self.viewer_name,
+                    target,
+                    display_id,
+                    Arc::clone(&self.cursor),
+                    Arc::clone(&self.clipboard),
+                    Arc::clone(&self.files),
+                    Arc::clone(&self.chat),
+                    Arc::clone(&self.maintenance),
+                    HelperKind::Chat,
+                ) {
+                    Ok(helper) => {
+                        if self.chat_enabled.load(Ordering::Acquire) {
+                            send_command(&helper.input, &ParentCommand::StartChat)?;
+                        }
+                        *self.chat_route.lock().unwrap() = Some(Arc::clone(&helper.input));
+                        self.chat_helper = Some(helper);
+                    }
+                    Err(error) => tracing::warn!(%error, "independent chat helper unavailable"),
                 }
-                Err(error) => tracing::warn!(%error, "independent clipboard helper unavailable"),
+            }
+            if self.clipboard_helper.as_ref().is_none_or(|helper| {
+                helper.target != target || helper.status.lock().unwrap().is_some()
+            }) {
+                self.stop_clipboard_helper();
+                match start_input_helper(
+                    &self.viewer_name,
+                    target,
+                    display_id,
+                    Arc::clone(&self.cursor),
+                    Arc::clone(&self.clipboard),
+                    Arc::clone(&self.files),
+                    Arc::clone(&self.chat),
+                    Arc::clone(&self.maintenance),
+                    HelperKind::Clipboard,
+                ) {
+                    Ok(helper) => {
+                        *self.clipboard_route.lock().unwrap() = Some(Arc::clone(&helper.input));
+                        self.clipboard_helper = Some(helper);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "independent clipboard helper unavailable")
+                    }
+                }
             }
         }
         if let Some(helper) = self.input.as_mut()
@@ -726,6 +787,7 @@ impl Drop for DesktopCaptureStreamer {
 }
 
 struct RunningHelper {
+    last_frame: Arc<Mutex<Instant>>,
     sink: Arc<Mutex<Option<EncodedFrameSink>>>,
     started: mpsc::Receiver<Result<StartedDesktop, String>>,
     process: OwnedHandle,
@@ -749,6 +811,7 @@ struct RunningInputHelper {
 }
 
 struct DesktopInputController {
+    background_active: Arc<AtomicBool>,
     chat_route: InputRoute,
     clipboard_route: InputRoute,
     blackout_message: String,
@@ -765,6 +828,9 @@ struct DesktopInputController {
 }
 
 impl ScreenInput for DesktopInputController {
+    fn is_background(&self) -> bool {
+        self.background_active.load(Ordering::Acquire)
+    }
     fn set_prevent_idle_lock(&self, enabled: bool) -> anyhow::Result<()> {
         let route = self.route.lock().unwrap_or_else(|e| e.into_inner());
         self.prevent_idle_lock.store(enabled, Ordering::Release);
@@ -1020,7 +1086,12 @@ fn launch_helper(target: DesktopTarget, as_user: bool) -> anyhow::Result<Launche
     let working_directory = executable
         .parent()
         .context("Agent executable has no parent directory")?;
-    let session_id = unsafe { WTSGetActiveConsoleSessionId() };
+    let session_id = if target == DesktopTarget::Background {
+        meshrmm_remote_screen::background::require_session_zero()?;
+        0
+    } else {
+        unsafe { WTSGetActiveConsoleSessionId() }
+    };
     if session_id == NO_ACTIVE_SESSION {
         anyhow::bail!("Windows reported no active console session");
     }
@@ -1065,10 +1136,22 @@ fn launch_helper(target: DesktopTarget, as_user: bool) -> anyhow::Result<Launche
     let executable_wide = wide(executable.as_os_str());
     let working_directory_wide = wide(working_directory.as_os_str());
     let mut command_line = wide(OsStr::new(&format!(
-        "\"{}\" --capture-helper",
-        executable.display()
+        "\"{}\" {}",
+        executable.display(),
+        if target == DesktopTarget::Background {
+            "--background-helper"
+        } else {
+            "--capture-helper"
+        }
     )));
-    let mut desktop = wide(OsStr::new(&format!("winsta0\\{}", target.name())));
+    let desktop_path = if target == DesktopTarget::Background {
+        // Launch in Session 0's window station, then bind the helper to its
+        // private desktop before starting any GUI or capture threads.
+        "winsta0\\default".to_owned()
+    } else {
+        format!("winsta0\\{}", target.name())
+    };
+    let mut desktop = wide(OsStr::new(&desktop_path));
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         lpDesktop: PWSTR(desktop.as_mut_ptr()),
@@ -1137,7 +1220,9 @@ enum HelperKind {
 }
 
 fn helper_uses_user_token(kind: HelperKind, target: DesktopTarget) -> bool {
-    kind == HelperKind::Files || (kind == HelperKind::Clipboard && target == DesktopTarget::Default)
+    target != DesktopTarget::Background
+        && (kind == HelperKind::Files
+            || (kind == HelperKind::Clipboard && target == DesktopTarget::Default))
 }
 
 // Keep the helper's startup options and independently shared event destinations explicit.
@@ -1264,11 +1349,13 @@ fn dispatch_child_events(
     status: HelperStatus,
     cursor: HelperCursor,
     maintenance: HelperMaintenance,
+    last_frame: Arc<Mutex<Instant>>,
 ) {
     let mut output = BufReader::new(output);
     loop {
         match read_event(&mut output) {
             Ok(ChildEvent::Started(started)) => {
+                *last_frame.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
                 if started_tx.send(Ok(started)).is_err() {
                     break;
                 }
@@ -1280,6 +1367,7 @@ fn dispatch_child_events(
                 break;
             }
             Ok(ChildEvent::Frame(frame)) => {
+                *last_frame.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
                 if let Some(sink) = sink
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -1502,6 +1590,13 @@ fn send_command(input: &InputWriter, command: &ParentCommand) -> anyhow::Result<
 /// Entry point for the isolated LocalSystem desktop helper. It loads no Agent
 /// configuration, opens no network sockets, and receives no Agent credential.
 pub fn run_child() -> anyhow::Result<()> {
+    let _background_desktop = if is_background_child() {
+        let owner = meshrmm_remote_screen::background::Desktop::create()?;
+        let binding = meshrmm_remote_screen::background::Desktop::bind()?;
+        Some((binding, owner))
+    } else {
+        None
+    };
     // stdout is the binary frame/control protocol. Forward diagnostics through
     // stderr, which the parent already drains into the protected Agent log.
     tracing_subscriber::fmt()
@@ -1570,6 +1665,7 @@ fn run_capture_child(
     mut display_id: Option<DisplayId>,
     mut config: StreamConfig,
 ) -> anyhow::Result<()> {
+    let background = is_background_child();
     let mut border_enabled = false;
     'capture: loop {
         if config.frames_per_second == 0 || config.bitrate_bits_per_second == 0 {
@@ -1582,7 +1678,7 @@ fn run_capture_child(
             .or_else(|| displays.first())
             .cloned()
             .context("Windows reported no displays on the active desktop")?;
-        let mut border = if border_enabled {
+        let mut border = if border_enabled && !background {
             Some(super::display_border::DisplayBorder::show(&active_display)?)
         } else {
             None
@@ -1634,8 +1730,8 @@ fn run_capture_child(
             match command_rx.recv_timeout(Duration::from_millis(16)) {
                 Ok(Ok(ParentCommand::SetDisplayBorder(enabled))) => {
                     border = None;
-                    border_enabled = enabled;
-                    if enabled {
+                    border_enabled = enabled && !background;
+                    if border_enabled {
                         match super::display_border::DisplayBorder::show(&active_display) {
                             Ok(value) => border = Some(value),
                             Err(error) => emit_child_event(
@@ -1723,6 +1819,9 @@ fn run_input_child(
     display_id: DisplayId,
     _viewer_name: String,
 ) -> anyhow::Result<()> {
+    if is_background_child() {
+        return run_background_input_child(command_rx);
+    }
     let displays = enumerate_displays()?;
     let active_display = displays
         .into_iter()
@@ -1830,7 +1929,75 @@ fn run_input_child(
     Ok(())
 }
 
+fn is_background_child() -> bool {
+    std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--background-helper")
+}
+
+fn background_display() -> Display {
+    let info = meshrmm_remote_screen::background::display();
+    Display {
+        id: DisplayId(info.id),
+        name: info.name,
+        x: info.x,
+        y: info.y,
+        width: info.width,
+        height: info.height,
+        primary: false,
+    }
+}
+
+fn run_background_input_child(
+    command_rx: mpsc::Receiver<io::Result<ParentCommand>>,
+) -> anyhow::Result<()> {
+    let mut workspace = super::background::Workspace::new()?;
+    let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+    emit_child_event(&output, ChildEvent::InputStarted)?;
+    emit_child_event(
+        &output,
+        ChildEvent::MaintenanceState {
+            agent_input_blocked: false,
+            blacked_out: false,
+        },
+    )?;
+    loop {
+        workspace.pump();
+        let result = match command_rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(Ok(ParentCommand::Input(input))) => workspace.apply(input),
+            Ok(Ok(ParentCommand::ReleaseInput)) => {
+                workspace.release();
+                Ok(())
+            }
+            Ok(Ok(ParentCommand::Stop))
+            | Ok(Err(_))
+            | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(Ok(
+                ParentCommand::Blackout { enabled: true, .. } | ParentCommand::BlockInput(true),
+            )) => Err(anyhow::anyhow!(
+                "Console blackout and input blocking are unavailable in background mode"
+            )),
+            Ok(Ok(
+                ParentCommand::StartInput { .. }
+                | ParentCommand::SetPreventIdleLock(_)
+                | ParentCommand::Blackout { enabled: false, .. }
+                | ParentCommand::BlockInput(false),
+            ))
+            | Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
+            Ok(Ok(_)) => Err(anyhow::anyhow!("Unsupported background input command")),
+        };
+        if let Err(error) = result {
+            emit_child_event(&output, ChildEvent::MaintenanceError(error.to_string()))?;
+        }
+    }
+    drop(workspace);
+    emit_child_event(&output, ChildEvent::Stopped).map_err(Into::into)
+}
+
 fn enumerate_displays() -> anyhow::Result<Vec<Display>> {
+    if is_background_child() {
+        return Ok(vec![background_display()]);
+    }
     meshrmm_remote_screen::enumerate_displays()
         .context("failed to enumerate displays on the active desktop")?
         .into_iter()
@@ -2567,6 +2734,7 @@ mod tests {
                 Arc::clone(&status),
                 Arc::new(Mutex::new((CursorShape::Default, false, None))),
                 Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(Instant::now())),
             );
             assert_eq!(
                 started_rx.recv().unwrap().unwrap().active_display.id,

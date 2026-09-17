@@ -5,6 +5,7 @@
 //! COM and GPU objects remain on the capture worker thread. Only compressed
 //! encoded access units cross the callback boundary.
 
+pub mod background;
 mod converter;
 mod cursor;
 mod desktop;

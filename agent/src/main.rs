@@ -21,7 +21,15 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     if std::env::args_os()
         .nth(1)
-        .is_some_and(|argument| argument == "--capture-helper")
+        .is_some_and(|argument| argument == "--background-console-input")
+    {
+        return remote::background_console::run_child();
+    }
+
+    #[cfg(windows)]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--capture-helper" || argument == "--background-helper")
     {
         return remote::capture_helper::run_child();
     }

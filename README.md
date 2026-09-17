@@ -486,6 +486,40 @@ An agent accepts one active remote session. A second viewer receives a busy resp
 closing the current viewer releases the session. Suspending a company revokes its
 live coordinator/session/inventory connections and blocks token redemption.
 
+### Experimental Session 0 background GUI
+
+With an updated Windows agent installed, connect normally and select
+**Background (Session 0 · experimental)** in the viewer's display selector.
+The launcher opens administrative applications in a private Windows desktop in
+Session 0 under SYSTEM. Select a physical monitor to return to the console.
+Leaving background mode or closing the session terminates applications launched
+in that workspace; save any work first. Changing video quality keeps the workspace
+open. The existing Windows and macOS viewers can use this mode without a protocol
+update.
+
+The workspace uses a fixed 1280×800 canvas, up to 20 FPS, window capture, and
+separate window-message input. Command Prompt and PowerShell receive console input
+records through disposable helpers. It does not switch the console desktop or move the
+console pointer. Console audio, clipboard synchronization, file-transfer UI, chat,
+blackout, input blocking, and Ctrl+Alt+Del are unavailable in background mode.
+Operations performed inside the workspace still affect the same machine, and
+SYSTEM has a different profile and network credentials from the signed-in user.
+
+This is a prototype for traditional Win32 administration tools, not a complete
+Explorer login session. Applications that depend on the user's shell, modern
+GPU-composited UI, or physical keyboard/mouse input may not render or respond
+correctly. The launcher includes Resource Monitor because modern Task Manager
+did not start on the validated Windows endpoint. Background mode is currently entered after a normal connection; it
+does not yet provide a separate background-only connection from the dashboard.
+
+The ignored native test `remote::background::tests::session_zero_gui` exercises
+the launcher, text input, PowerShell keyboard input, Registry Editor rendering, H.264 output, Session 0
+placement, and application cleanup. Run it in a dedicated SYSTEM process in
+Session 0 with no active background workspace. It writes
+`meshrmm-background-gui.bmp` to that process's temporary directory. The capture
+helper is disposable: a ten-second frame watchdog restarts it if a window stalls
+Windows' synchronous capture API, while input remains in a separate helper.
+
 ### Sending Ctrl+Alt+Del
 
 Use **Ctrl+Alt+Del** in the Windows or macOS remote client's toolbar to send the
