@@ -61,6 +61,10 @@ of every Windows control.
 
 ## File Explorer
 
+The current Windows 10-style replacement and its validation are documented in
+[Background File Explorer](background-file-explorer.md). The notes below describe
+the original minimal browser and its earlier validation.
+
 The File Explorer pin launches MeshRMM File Browser on the same private desktop.
 Native Explorer with `/separate,C:\` failed to create a folder window on the
 validation endpoint. The built-in browser uses asynchronous directory enumeration
