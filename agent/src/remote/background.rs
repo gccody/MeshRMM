@@ -13,8 +13,9 @@ use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
 
-const TASKBAR_HEIGHT: i32 = 72;
-const PIN_WIDTH: i32 = 116;
+const TASKBAR_HEIGHT: i32 = 48;
+const PIN_WIDTH: i32 = 48;
+const ICON_SIZE: i32 = 32;
 const PINS: &[(&str, &str, &str)] = &[
     (
         "Command Prompt",
@@ -39,6 +40,8 @@ const PINS: &[(&str, &str, &str)] = &[
 pub struct Workspace {
     icons: Vec<HICON>,
     shell: HWND,
+    tooltip: HWND,
+    hovered: Option<usize>,
     job: HANDLE,
     focus: HWND,
     pointer: POINT,
@@ -73,6 +76,8 @@ impl Workspace {
             let mut workspace = Self {
                 icons: Vec::new(),
                 shell: HWND::default(),
+                tooltip: HWND::default(),
+                hovered: None,
                 job,
                 focus: HWND::default(),
                 pointer: POINT::default(),
@@ -85,14 +90,16 @@ impl Workspace {
             let class = WNDCLASSW {
                 lpfnWndProc: Some(launcher_proc),
                 lpszClassName: w!("MeshRMMBackgroundLauncher"),
-                hbrBackground: HBRUSH(GetStockObject(DKGRAY_BRUSH).0),
+                hbrBackground: HBRUSH::default(),
                 ..Default::default()
             };
             if RegisterClassW(&class) == 0 {
                 return Err(windows::core::Error::from_thread().into());
             }
+            // PrintWindow can capture ordinary child repaints partway through.
+            // Composite the launcher and its buttons before exposing their pixels.
             workspace.shell = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_COMPOSITED,
                 w!("MeshRMMBackgroundLauncher"),
                 w!("MeshRMM Background — Session 0 (SYSTEM)"),
                 WS_POPUP | WS_VISIBLE,
@@ -105,8 +112,30 @@ impl Workspace {
                 None,
                 None,
             )?;
+            let tooltip_class = WNDCLASSW {
+                lpfnWndProc: Some(tooltip_proc),
+                lpszClassName: w!("MeshRMMBackgroundTooltip"),
+                ..Default::default()
+            };
+            if RegisterClassW(&tooltip_class) == 0 {
+                return Err(windows::core::Error::from_thread().into());
+            }
+            workspace.tooltip = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                tooltip_class.lpszClassName,
+                w!(""),
+                WS_POPUP | WS_BORDER,
+                0,
+                0,
+                240,
+                24,
+                Some(workspace.shell),
+                None,
+                None,
+                None,
+            )?;
             let root = std::env::var("SystemRoot").context("SystemRoot is unavailable")?;
-            for (index, (label, program, _)) in PINS.iter().enumerate() {
+            for (index, (label, program, arguments)) in PINS.iter().enumerate() {
                 let label = wide(label);
                 let button = CreateWindowExW(
                     WINDOW_EX_STYLE(0),
@@ -115,16 +144,24 @@ impl Workspace {
                     WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
                     8 + index as i32 * PIN_WIDTH,
                     4,
-                    PIN_WIDTH - 4,
+                    PIN_WIDTH,
                     TASKBAR_HEIGHT - 8,
                     Some(workspace.shell),
                     Some(HMENU((index + 1) as *mut _)),
                     None,
                     None,
                 )?;
-                let path = wide(&format!("{root}\\System32\\{program}"));
+                let (icon_file, icon_index) = match *arguments {
+                    "services.msc" => ("filemgmt.dll", 0),
+                    "eventvwr.msc" => ("miguiresource.dll", 0),
+                    "compmgmt.msc" => ("mycomput.dll", 2),
+                    "devmgmt.msc" => ("devmgr.dll", 4),
+                    "wf.msc" => ("authfwgp.dll", 0),
+                    _ => (*program, 0),
+                };
+                let path = wide(&format!("{root}\\System32\\{icon_file}"));
                 let mut icon = HICON::default();
-                ExtractIconExW(PCWSTR(path.as_ptr()), 0, Some(&mut icon), None, 1);
+                ExtractIconExW(PCWSTR(path.as_ptr()), icon_index, Some(&mut icon), None, 1);
                 if !icon.is_invalid() {
                     SetWindowLongPtrW(button, GWLP_USERDATA, icon.0 as isize);
                     workspace.icons.push(icon);
@@ -208,6 +245,41 @@ impl Workspace {
             x: i32::from(x) * (WIDTH as i32 - 1) / 65535,
             y: i32::from(y) * (HEIGHT as i32 - 1) / 65535,
         };
+        let hovered = (self.pointer.y >= HEIGHT as i32 - TASKBAR_HEIGHT + 4
+            && self.pointer.y < HEIGHT as i32 - 4
+            && self.pointer.x >= 8)
+            .then(|| ((self.pointer.x - 8) / PIN_WIDTH) as usize)
+            .filter(|index| *index < PINS.len());
+        if self.hovered != hovered {
+            unsafe {
+                for index in [self.hovered, hovered].into_iter().flatten() {
+                    if let Ok(button) = GetDlgItem(Some(self.shell), index as i32 + 1) {
+                        SendMessageW(
+                            button,
+                            BM_SETSTATE,
+                            Some(WPARAM(usize::from(hovered == Some(index)))),
+                            None,
+                        );
+                    }
+                }
+                if let Some(index) = hovered {
+                    let label = wide(PINS[index].0);
+                    let _ = SetWindowTextW(self.tooltip, PCWSTR(label.as_ptr()));
+                    let _ = SetWindowPos(
+                        self.tooltip,
+                        Some(HWND_TOPMOST),
+                        8 + index as i32 * PIN_WIDTH,
+                        HEIGHT as i32 - TASKBAR_HEIGHT - 26,
+                        200,
+                        24,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                } else {
+                    let _ = ShowWindow(self.tooltip, SW_HIDE);
+                }
+            }
+            self.hovered = hovered;
+        }
         if let Some((hwnd, origin, rect)) = self.drag {
             unsafe {
                 let _ = SetWindowPos(
@@ -594,6 +666,9 @@ impl Drop for Workspace {
         self.console_inputs.clear();
         unsafe {
             let _ = CloseHandle(self.job);
+            if !self.tooltip.is_invalid() {
+                let _ = DestroyWindow(self.tooltip);
+            }
             if !self.shell.is_invalid() {
                 let _ = DestroyWindow(self.shell);
             }
@@ -611,6 +686,45 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
+unsafe extern "system" fn tooltip_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        if matches!(message, WM_PAINT | WM_PRINT | WM_PRINTCLIENT) {
+            let mut paint = PAINTSTRUCT::default();
+            let dc = if message == WM_PAINT {
+                BeginPaint(hwnd, &mut paint)
+            } else {
+                HDC(wparam.0 as *mut _)
+            };
+            let mut rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rect);
+            FillRect(dc, &rect, HBRUSH(GetStockObject(WHITE_BRUSH).0));
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, COLORREF(0));
+            let font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+            let mut label = [0_u16; 64];
+            let length = GetWindowTextW(hwnd, &mut label) as usize;
+            rect.left += 5;
+            DrawTextW(
+                dc,
+                &mut label[..length],
+                &mut rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(dc, font);
+            if message == WM_PAINT {
+                let _ = EndPaint(hwnd, &paint);
+            }
+            return LRESULT(0);
+        }
+        DefWindowProcW(hwnd, message, wparam, lparam)
+    }
+}
+
 unsafe extern "system" fn launcher_proc(
     hwnd: HWND,
     message: u32,
@@ -618,12 +732,38 @@ unsafe extern "system" fn launcher_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     unsafe {
+        if message == WM_ERASEBKGND {
+            let dc = HDC(wparam.0 as *mut _);
+            let mut rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rect);
+            let brush = CreateSolidBrush(COLORREF(0x3f3933));
+            FillRect(dc, &rect, brush);
+            let _ = DeleteObject(brush.into());
+            return LRESULT(1);
+        }
+        if matches!(message, WM_PAINT | WM_PRINTCLIENT) {
+            let mut paint = PAINTSTRUCT::default();
+            let dc = if message == WM_PAINT {
+                BeginPaint(hwnd, &mut paint)
+            } else {
+                HDC(wparam.0 as *mut _)
+            };
+            let mut rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rect);
+            let brush = CreateSolidBrush(COLORREF(0x3f3933));
+            FillRect(dc, &rect, brush);
+            let _ = DeleteObject(brush.into());
+            if message == WM_PAINT {
+                let _ = EndPaint(hwnd, &paint);
+            }
+            return LRESULT(0);
+        }
         if message == WM_DRAWITEM && lparam.0 != 0 {
             let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
             let brush = CreateSolidBrush(COLORREF(if item.itemState.0 & ODS_SELECTED.0 != 0 {
-                0x665544
+                0x655c53
             } else {
-                0x383838
+                0x3f3933
             }));
             FillRect(item.hDC, &item.rcItem, brush);
             let _ = DeleteObject(brush.into());
@@ -631,30 +771,23 @@ unsafe extern "system" fn launcher_proc(
             if !icon.is_invalid() {
                 let _ = DrawIconEx(
                     item.hDC,
-                    (PIN_WIDTH - 36) / 2,
-                    3,
+                    (PIN_WIDTH - ICON_SIZE) / 2,
+                    (TASKBAR_HEIGHT - 8 - ICON_SIZE) / 2,
                     icon,
-                    32,
-                    32,
+                    ICON_SIZE,
+                    ICON_SIZE,
                     0,
                     None,
                     DI_NORMAL,
                 );
             }
-            SetBkMode(item.hDC, TRANSPARENT);
-            SetTextColor(item.hDC, COLORREF(0xffffff));
-            let font = SelectObject(item.hDC, GetStockObject(DEFAULT_GUI_FONT));
-            let mut label = [0_u16; 64];
-            let length = GetWindowTextW(item.hwndItem, &mut label) as usize;
-            let mut rect = item.rcItem;
-            rect.top += 39;
-            DrawTextW(
-                item.hDC,
-                &mut label[..length],
-                &mut rect,
-                DT_CENTER | DT_SINGLELINE | DT_NOPREFIX,
-            );
-            SelectObject(item.hDC, font);
+            if item.itemState.0 & ODS_SELECTED.0 != 0 {
+                let brush = CreateSolidBrush(COLORREF(0xcbb54c));
+                let mut line = item.rcItem;
+                line.top = line.bottom - 3;
+                FillRect(item.hDC, &line, brush);
+                let _ = DeleteObject(brush.into());
+            }
             return LRESULT(1);
         }
         DefWindowProcW(hwnd, message, wparam, lparam)
@@ -676,6 +809,102 @@ mod tests {
 
     #[test]
     #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
+    fn stable_taskbar_and_management_caption() -> anyhow::Result<()> {
+        fn capture(workspace: &mut Workspace) -> anyhow::Result<Vec<u8>> {
+            let worker = std::thread::spawn(|| -> anyhow::Result<Vec<u8>> {
+                let _binding = background::Desktop::bind()?;
+                Ok(background::snapshot_bmp()?)
+            });
+            while !worker.is_finished() {
+                workspace.pump();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            worker.join().expect("capture worker panicked")
+        }
+        std::thread::spawn(|| -> anyhow::Result<()> {
+            unsafe {
+                use windows::Win32::System::StationsAndDesktops::*;
+                let station = OpenWindowStationW(w!("WinSta0"), false, 0x000f037f)?;
+                SetProcessWindowStation(station)?;
+            }
+            let _owner = background::Desktop::create()?;
+            let _binding = background::Desktop::bind()?;
+            let mut workspace = Workspace::new()?;
+            workspace.pump();
+            let baseline = background::snapshot_bmp()?;
+            let taskbar_start = 54 + (WIDTH * (HEIGHT - TASKBAR_HEIGHT as u32) * 4) as usize;
+            for _ in 0..60 {
+                workspace.pump();
+                let frame = capture(&mut workspace)?;
+                if frame[taskbar_start..] != baseline[taskbar_start..] {
+                    std::fs::write(std::env::temp_dir().join("taskbar-baseline.bmp"), &baseline)?;
+                    std::fs::write(std::env::temp_dir().join("taskbar-worker.bmp"), &frame)?;
+                    anyhow::bail!("idle taskbar changed");
+                }
+            }
+            workspace.launch(8)?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let management = loop {
+                workspace.pump();
+                let window = background::windows()?.into_iter().find(|hwnd| {
+                    let mut title = [0_u16; 256];
+                    let count = unsafe { GetWindowTextW(*hwnd, &mut title) };
+                    String::from_utf16_lossy(&title[..count as usize]) == "Computer Management"
+                });
+                if let Some(window) = window {
+                    break window;
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "Computer Management did not open"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            let ready = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < ready {
+                workspace.pump();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let mut rect = RECT::default();
+            unsafe {
+                GetWindowRect(management, &mut rect)?;
+            }
+            let caption = |frame: &[u8]| -> Vec<u8> {
+                let mut pixels = Vec::new();
+                for y in rect.top.max(0)..(rect.top + 28).min(HEIGHT as i32) {
+                    let start = 54 + (y as usize * WIDTH as usize + rect.left.max(0) as usize) * 4;
+                    let end = 54
+                        + (y as usize * WIDTH as usize + rect.right.min(WIDTH as i32) as usize) * 4;
+                    pixels.extend_from_slice(&frame[start..end]);
+                }
+                pixels
+            };
+            let baseline = background::snapshot_bmp()?;
+            std::fs::write(
+                std::env::temp_dir().join("meshrmm-compact-taskbar.bmp"),
+                &baseline,
+            )?;
+            for _ in 0..60 {
+                workspace.pump();
+                let frame = capture(&mut workspace)?;
+                anyhow::ensure!(
+                    caption(&frame) == caption(&baseline),
+                    "idle management caption changed"
+                );
+                anyhow::ensure!(
+                    frame[taskbar_start..] == baseline[taskbar_start..],
+                    "taskbar changed with management open"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(())
+        })
+        .join()
+        .expect("capture stability test thread panicked")
+    }
+
+    #[test]
+    #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
     fn session_zero_gui() -> anyhow::Result<()> {
         // A dedicated thread can bind before any HWNDs or hooks are created.
         std::thread::spawn(|| -> anyhow::Result<()> {
@@ -687,7 +916,13 @@ mod tests {
             let _owner = background::Desktop::create().context("create background desktop")?;
             let _binding = background::Desktop::bind().context("bind background desktop")?;
             background::windows().context("enumerate empty background desktop")?;
-            background::snapshot_bmp().context("render empty background desktop")?;
+            let empty = background::snapshot_bmp().context("render empty background desktop")?;
+            assert!(
+                empty[54..]
+                    .chunks_exact(4)
+                    .all(|pixel| pixel[..3] == [0, 0, 0]),
+                "background must be black"
+            );
             let mut workspace = Workspace::new().context("create background workspace")?;
             let edit = unsafe {
                 CreateWindowExW(
@@ -718,11 +953,7 @@ mod tests {
                 "Session 0 GUI input verified"
             );
             let before = background::snapshot_bmp()?;
-            assert!(
-                before[54..]
-                    .chunks_exact(4)
-                    .any(|p| p[..3] != [0x30, 0x20, 0x18])
-            );
+            assert!(before[54..].chunks_exact(4).any(|p| p[..3] != [0, 0, 0]));
             unsafe {
                 DestroyWindow(edit)?;
             }
@@ -745,7 +976,7 @@ mod tests {
                 workspace.pump();
                 applications = background::windows()?
                     .into_iter()
-                    .filter(|hwnd| *hwnd != workspace.shell)
+                    .filter(|hwnd| *hwnd != workspace.shell && *hwnd != workspace.tooltip)
                     .collect();
                 if !applications.is_empty() {
                     break;
