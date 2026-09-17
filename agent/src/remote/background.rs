@@ -31,7 +31,7 @@ const PINS: &[(&str, &str, &str)] = &[
     ("Services", "mmc.exe", "services.msc"),
     ("Event Viewer", "mmc.exe", "eventvwr.msc"),
     ("Resource Monitor", "resmon.exe", ""),
-    ("Task Manager", "taskmgr.exe", ""),
+    ("Task Manager", "taskmgr.exe", "--background-task-manager"),
     ("Computer Mgmt", "mmc.exe", "compmgmt.msc"),
     ("Device Manager", "mmc.exe", "devmgmt.msc"),
     ("Firewall", "mmc.exe", "wf.msc"),
@@ -176,8 +176,22 @@ impl Workspace {
             .get(index.wrapping_sub(1))
             .context("unknown background application")?;
         let root = std::env::var("SystemRoot").context("SystemRoot is unavailable")?;
-        let executable = wide(&format!("{root}\\System32\\{program}"));
-        let mut command = wide(&format!("\"{root}\\System32\\{program}\" {arguments}"));
+        let built_in = *arguments == "--background-task-manager";
+        let path = if built_in {
+            #[cfg(test)]
+            let executable = std::path::PathBuf::from(
+                std::env::var_os("MESHRMM_BACKGROUND_TEST_AGENT").context(
+                    "set MESHRMM_BACKGROUND_TEST_AGENT to the built Agent for GUI tests",
+                )?,
+            );
+            #[cfg(not(test))]
+            let executable = std::env::current_exe()?;
+            executable
+        } else {
+            std::path::PathBuf::from(format!("{root}\\System32\\{program}"))
+        };
+        let executable = wide(&path.to_string_lossy());
+        let mut command = wide(&format!("\"{}\" {arguments}", path.display()));
         let mut desktop = wide(&background::desktop_path()?);
         let startup = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
@@ -197,7 +211,12 @@ impl Workspace {
                 None,
                 None,
                 false,
-                CREATE_SUSPENDED | CREATE_NEW_CONSOLE,
+                CREATE_SUSPENDED
+                    | if built_in {
+                        CREATE_NO_WINDOW
+                    } else {
+                        CREATE_NEW_CONSOLE
+                    },
                 None,
                 PCWSTR::null(),
                 &startup,
@@ -805,6 +824,84 @@ mod tests {
             extended: false,
             pressed,
         })
+    }
+
+    #[test]
+    #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
+    fn task_manager_opens_in_background() -> anyhow::Result<()> {
+        std::thread::spawn(|| -> anyhow::Result<()> {
+            unsafe {
+                use windows::Win32::System::StationsAndDesktops::*;
+                let station = OpenWindowStationW(w!("WinSta0"), false, 0x000f037f)?;
+                SetProcessWindowStation(station)?;
+            }
+            let _owner = background::Desktop::create()?;
+            let _binding = background::Desktop::bind()?;
+            let mut workspace = Workspace::new()?;
+            workspace.launch(7)?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                workspace.pump();
+                for window in background::windows()? {
+                    let mut title = [0_u16; 256];
+                    let count = unsafe { GetWindowTextW(window, &mut title) };
+                    if String::from_utf16_lossy(&title[..count as usize]) == "MeshRMM Task Manager"
+                    {
+                        let list = unsafe { GetDlgItem(Some(window), 101)? };
+                        let mut rows = 0;
+                        unsafe {
+                            SendMessageTimeoutW(
+                                list,
+                                windows::Win32::UI::Controls::LVM_GETITEMCOUNT,
+                                WPARAM(0),
+                                LPARAM(0),
+                                SMTO_ABORTIFHUNG,
+                                100,
+                                Some(&mut rows),
+                            );
+                        }
+                        if rows == 0 {
+                            continue;
+                        }
+                        let mut pid = 0;
+                        unsafe {
+                            GetWindowThreadProcessId(window, Some(&mut pid));
+                        }
+                        let process = unsafe {
+                            OpenProcess(
+                                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                                false,
+                                pid,
+                            )?
+                        };
+                        let mut in_job = windows::core::BOOL(0);
+                        unsafe {
+                            IsProcessInJob(process, Some(workspace.job), &mut in_job)?;
+                        }
+                        assert!(in_job.as_bool(), "process manager escaped session cleanup");
+                        std::fs::write(
+                            std::env::temp_dir().join("background-task-manager.bmp"),
+                            background::snapshot_bmp()?,
+                        )?;
+                        drop(workspace);
+                        let exited = unsafe { WaitForSingleObject(process, 5000) };
+                        let _ = unsafe { CloseHandle(process) };
+                        assert_eq!(
+                            exited, WAIT_OBJECT_0,
+                            "background tool survived workspace close"
+                        );
+                        return Ok(());
+                    }
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "Task Manager did not open on the background desktop"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+        .join()
+        .expect("background test panicked")
     }
 
     #[test]
