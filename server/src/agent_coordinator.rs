@@ -1,3 +1,4 @@
+use futures_util::lock::Mutex;
 use meshrmm_protocol_types::{AgentCommand, AgentSessionRequest, AgentStatusMessage};
 use serde::{Deserialize, Serialize};
 use worker::*;
@@ -9,6 +10,7 @@ const COMPANY_HEADER: &str = "X-Mesh-Company-Id";
 const DEVICE_HEADER: &str = "X-Mesh-Device-Id";
 const UNINSTALL_HEADER: &str = "X-Mesh-Uninstall-Requested";
 const IDENTITY_KEY: &str = "agent_identity";
+const PRESENCE_DELIVERY_KEY: &str = "presence_delivery";
 const ACTIVE_SESSION_KEY: &str = "active_session";
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -16,6 +18,18 @@ struct AgentIdentity {
     company_id: String,
     device_id: String,
     connection_id: String,
+    #[serde(default)]
+    uninstall_requested: bool,
+}
+
+// Persisted outbox: retries survive eviction/deployment and carry a monotonic
+// generation so a delayed delivery cannot undo a replacement connection.
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct PresenceDelivery {
+    generation: u64,
+    connection_id: String,
+    connected: bool,
+    acknowledged: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,27 +41,36 @@ struct SessionEnded {
 pub struct AgentCoordinator {
     state: State,
     environment: Env,
+    presence_lock: Mutex<()>,
 }
 
 impl DurableObject for AgentCoordinator {
     fn new(state: State, environment: Env) -> Self {
-        Self { state, environment }
+        Self {
+            state,
+            environment,
+            presence_lock: Mutex::new(()),
+        }
     }
 
     async fn fetch(&self, mut request: Request) -> Result<Response> {
         match (request.method(), request.path().as_str()) {
             (Method::Get, "/connect") => {
+                let _guard = self.presence_lock.lock().await;
                 let uninstall_requested = required_header(&request, UNINSTALL_HEADER)? == "true";
                 let identity = AgentIdentity {
                     company_id: required_header(&request, COMPANY_HEADER)?,
                     device_id: required_header(&request, DEVICE_HEADER)?,
                     connection_id: crate::random_token(),
+                    uninstall_requested,
                 };
                 crate::validate_identifier(&identity.company_id, "company ID")?;
                 crate::validate_identifier(&identity.device_id, "device ID")?;
                 for socket in self.state.get_websockets_with_tag(AGENT_TAG) {
                     let _ = socket.close(Some(4000), Some("superseded Agent connection"));
                 }
+                // Arm recovery before changing the durable identity or accepting a socket.
+                self.state.storage().set_alarm(30_000_i64).await?;
                 self.state.storage().put(IDENTITY_KEY, &identity).await?;
                 let pair = WebSocketPair::new()?;
                 pair.server
@@ -86,7 +109,6 @@ impl DurableObject for AgentCoordinator {
                     pair.server
                         .send_with_str(serde_json::to_string(&command)?)?;
                 }
-                self.state.storage().set_alarm(30_000_i64).await?;
                 console_log!("event=agent_signaling_connected");
                 Response::from_websocket(pair.client)
             }
@@ -277,21 +299,28 @@ impl DurableObject for AgentCoordinator {
     }
 
     async fn alarm(&self) -> Result<Response> {
+        let _guard = self.presence_lock.lock().await;
         if let Some(identity) = self
             .state
             .storage()
             .get::<AgentIdentity>(IDENTITY_KEY)
             .await?
         {
-            let connected = !self.state.get_websockets_with_tag(AGENT_TAG).is_empty();
-            if let Err(error) = self.publish_presence(&identity, connected).await {
-                console_error!("presence reconciliation failed: {}", error);
-                self.state.storage().set_alarm(30_000_i64).await?;
-            } else if connected {
-                self.state.storage().set_alarm(30_000_i64).await?;
-            }
+            let connected = !identity.uninstall_requested
+                && self
+                    .state
+                    .get_websockets_with_tag(AGENT_TAG)
+                    .iter()
+                    .any(|socket| {
+                        socket
+                            .deserialize_attachment::<String>()
+                            .ok()
+                            .flatten()
+                            .is_some_and(|id| id == identity.connection_id)
+                    });
+            self.publish_presence(&identity, connected).await?;
         }
-        Response::ok("presence reconciled")
+        Response::ok("presence delivered")
     }
 
     async fn websocket_message(
@@ -327,6 +356,9 @@ impl DurableObject for AgentCoordinator {
         _reason: String,
         was_clean: bool,
     ) -> Result<()> {
+        // Complete the close handshake so a retry cannot mistake this socket
+        // for an established connection.
+        let _ = socket.close(Some(1000), Some("Agent disconnected"));
         self.publish_disconnected_if_current(&socket).await;
         console_log!(
             "event=agent_signaling_closed code={} clean={}",
@@ -337,6 +369,7 @@ impl DurableObject for AgentCoordinator {
     }
 
     async fn websocket_error(&self, socket: WebSocket, error: Error) -> Result<()> {
+        let _ = socket.close(Some(1011), Some("Agent signaling failed"));
         self.publish_disconnected_if_current(&socket).await;
         console_error!("event=agent_signaling_error error={}", error);
         Ok(())
@@ -402,6 +435,11 @@ impl AgentCoordinator {
     }
 
     async fn publish_disconnected_if_current(&self, socket: &WebSocket) {
+        let _guard = self.presence_lock.lock().await;
+        if let Err(error) = self.state.storage().set_alarm(30_000_i64).await {
+            console_error!("event=agent_presence_retry_schedule_failed error={}", error);
+            return;
+        }
         let connection_id = match socket.deserialize_attachment::<String>() {
             Ok(Some(connection_id)) => connection_id,
             Ok(None) => return,
@@ -431,12 +469,43 @@ impl AgentCoordinator {
     }
 
     async fn publish_presence(&self, identity: &AgentIdentity, connected: bool) -> Result<()> {
-        let mutation = PresenceMutation::Upsert {
-            agent_id: identity.device_id.clone(),
-            name: None,
-            connected: Some(connected),
-        };
-        company_presence::publish(&self.environment, &identity.company_id, &mutation).await
+        let mut delivery = self
+            .state
+            .storage()
+            .get::<PresenceDelivery>(PRESENCE_DELIVERY_KEY)
+            .await?
+            .unwrap_or_default();
+        if delivery.connection_id != identity.connection_id || delivery.connected != connected {
+            delivery.generation = delivery
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| Error::RustError("presence generation exhausted".into()))?;
+            delivery.connection_id = identity.connection_id.clone();
+            delivery.connected = connected;
+            delivery.acknowledged = false;
+        }
+        if !delivery.acknowledged {
+            // Write the retry alarm before the outbox; neither a failed RPC nor
+            // termination between awaits can silently discard a transition.
+            self.state.storage().set_alarm(30_000_i64).await?;
+            self.state
+                .storage()
+                .put(PRESENCE_DELIVERY_KEY, &delivery)
+                .await?;
+            let mutation = PresenceMutation::Connection {
+                agent_id: identity.device_id.clone(),
+                connected,
+                generation: delivery.generation,
+            };
+            company_presence::publish(&self.environment, &identity.company_id, &mutation).await?;
+            delivery.acknowledged = true;
+            self.state
+                .storage()
+                .put(PRESENCE_DELIVERY_KEY, &delivery)
+                .await?;
+        }
+        self.state.storage().delete_alarm().await?;
+        Ok(())
     }
 }
 

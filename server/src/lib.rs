@@ -80,6 +80,7 @@ struct AgentInstallTokenRow {
 #[derive(Debug, Deserialize)]
 struct AgentEventSubscriptionRow {
     company_id: String,
+    user_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,6 +254,9 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
         (Method::Get, ["v1", "agents"]) => list_agents(&request, &environment).await,
         (Method::Post, ["v1", "agents", "events", "subscriptions"]) => {
             create_agent_event_subscription(&request, &environment).await
+        }
+        (Method::Post, ["v1", "agents", "events", "subscriptions", "renew"]) => {
+            renew_agent_event_subscription(&mut request, &environment).await
         }
         (Method::Get, ["v1", "agents", "events"]) => {
             subscribe_agent_events(request, &environment).await

@@ -32,6 +32,40 @@ class EnrollmentTests(unittest.TestCase):
             self.db.execute("ROLLBACK")
             raise
 
+    def test_catalog_outbox_commits_with_changes_and_coalesces_without_losing_newer_edits(self):
+        self.redeem()
+        event = self.db.execute("SELECT event_id FROM presence_catalog_outbox WHERE agent_id='device'").fetchone()[0]
+        # Auth/lease metadata must not cause inventory broadcasts.
+        self.db.execute("UPDATE agents SET updated_at=50 WHERE id='device'")
+        self.assertEqual(self.db.execute("SELECT event_id FROM presence_catalog_outbox").fetchone()[0], event)
+        self.db.execute("UPDATE agents SET name='Renamed' WHERE id='device'")
+        newer = self.db.execute("SELECT event_id FROM presence_catalog_outbox").fetchone()[0]
+        self.assertNotEqual(event, newer)
+        acknowledge = sql("server/src/company_presence.rs", "DELETE FROM presence_catalog_outbox")
+        self.db.execute(acknowledge, ('device', 'co', event))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM presence_catalog_outbox").fetchone()[0], 1)
+        self.db.execute(acknowledge, ('device', 'another-company', newer))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM presence_catalog_outbox").fetchone()[0], 1)
+        self.db.execute(acknowledge, ('device', 'co', newer))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM presence_catalog_outbox").fetchone()[0], 0)
+
+    def test_catalog_outbox_rolls_back_and_recovers_soft_and_hard_deletion(self):
+        self.redeem()
+        self.db.execute("DELETE FROM presence_catalog_outbox")
+        self.db.execute("BEGIN")
+        self.db.execute("UPDATE agents SET deletion_requested_at=100 WHERE id='device'")
+        self.db.execute("ROLLBACK")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM presence_catalog_outbox").fetchone()[0], 0)
+        self.db.execute("UPDATE agents SET deletion_requested_at=100 WHERE id='device'")
+        pending = sql("server/src/company_presence.rs", "SELECT o.agent_id, o.event_id, a.name")
+        row = self.db.execute(pending, ('co',)).fetchone()
+        self.assertEqual(row[0], 'device')
+        self.assertIsNone(row[2])
+        self.assertEqual(self.db.execute(pending, ('other',)).fetchall(), [])
+        self.db.execute("DELETE FROM presence_catalog_outbox")
+        self.db.execute("DELETE FROM agents WHERE id='device'")
+        self.assertIsNone(self.db.execute(pending, ('co',)).fetchone()[2])
+
     def test_blackout_policy_is_company_scoped_and_preserved_by_legacy_updates(self):
         self.redeem()
         default = "This machine is under maintenance by {user_name}."

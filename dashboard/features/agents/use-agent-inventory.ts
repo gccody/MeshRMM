@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { errorMessage } from "../../lib/http";
 import { AuthenticationRequired } from "../../lib/http";
 import { applyAgentDelta, parseAgentEvent, parseAgentList, sortAgents } from "./model";
+import { subscriptionRenewal } from "./subscription-renewal";
 import type { Agent, AgentDelta, AgentEventSubscription } from "./types";
 
 const MAX_EVENT_RECONNECT_DELAY_MS = 30_000;
@@ -52,7 +53,6 @@ export function useAgentInventory({
         if (data.revision < revision.current) return true;
         revision.current = data.revision;
         setAgents(sortAgents(data.agents));
-        setIsLive(true);
         setLastUpdated(new Date());
         return true;
       } catch (requestError) {
@@ -77,6 +77,7 @@ export function useAgentInventory({
     revision.current = -1;
     let disposed = false;
     let socket: WebSocket | null = null;
+    let stopRenewal: (() => void) | undefined;
     let reconnectTimer: number | undefined;
     let reconnectDelay = 1_000;
     let awaitingSnapshot = true;
@@ -105,8 +106,11 @@ export function useAgentInventory({
         if (disposed) return;
         const websocketUrl = new URL(subscription.websocket_url);
         websocketUrl.searchParams.set("token", subscription.subscription_token);
+        websocketUrl.searchParams.set("protocol", "2");
         const nextSocket = new WebSocket(websocketUrl);
         socket = nextSocket;
+        const renewal = subscriptionRenewal(authorizedFetch, () => nextSocket.close(4001, "fresh authorization required"));
+        stopRenewal = renewal.stop;
         awaitingSnapshot = true;
         pendingEvents = [];
 
@@ -117,13 +121,14 @@ export function useAgentInventory({
         nextSocket.addEventListener("open", () => {
           if (disposed || socket !== nextSocket) return;
           reconnectDelay = 1_000;
-          setIsLive(true);
           reportError(null);
         });
         nextSocket.addEventListener("message", (message) => {
           if (disposed || socket !== nextSocket || typeof message.data !== "string") return;
           try {
-            const event = parseAgentEvent(JSON.parse(message.data));
+            const value: unknown = JSON.parse(message.data);
+            if (renewal.accept(value)) return;
+            const event = parseAgentEvent(value);
             if (!event) {
               requestSnapshot();
               return;
@@ -178,6 +183,7 @@ export function useAgentInventory({
         });
         nextSocket.addEventListener("error", () => nextSocket.close());
         nextSocket.addEventListener("close", () => {
+          renewal.stop();
           if (disposed || socket !== nextSocket) return;
           socket = null;
           setIsLive(false);
@@ -198,6 +204,7 @@ export function useAgentInventory({
     void connect();
     return () => {
       disposed = true;
+      stopRenewal?.();
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
       socket?.close(1000, "dashboard subscription ended");
     };

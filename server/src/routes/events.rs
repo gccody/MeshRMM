@@ -78,7 +78,7 @@ pub(crate) async fn subscribe_agent_events(
     let db = environment.d1("DB")?;
     let subscription = query!(
         &db,
-        "UPDATE agent_event_subscriptions SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = agent_event_subscriptions.company_id AND companies.status = 'active') RETURNING company_id",
+        "UPDATE agent_event_subscriptions SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = agent_event_subscriptions.company_id AND companies.status = 'active') RETURNING company_id, user_id",
         now,
         token_hash
     )?
@@ -95,13 +95,63 @@ pub(crate) async fn subscribe_agent_events(
     {
         return api_error(403, "subscription does not match company hostname");
     }
+    let protocol = if request
+        .url()?
+        .query_pairs()
+        .any(|(key, value)| key == "protocol" && value == "2")
+    {
+        "2"
+    } else {
+        "1"
+    };
     forward_to_object(
         environment,
         "COMPANY_PRESENCE",
         &subscription.company_id,
         request,
         "https://presence.internal/subscribe",
-        &[("X-Mesh-Company-Id", subscription.company_id.as_str())],
+        &[
+            ("X-Mesh-Company-Id", subscription.company_id.as_str()),
+            ("X-Mesh-User-Id", subscription.user_id.as_str()),
+            ("X-Mesh-Presence-Protocol", protocol),
+        ],
     )
     .await
+}
+
+// Authorization renews only the matching user's existing connection. No new
+// token, snapshot, or Agent lookup is needed, and expired sockets cannot revive.
+pub(crate) async fn renew_agent_event_subscription(
+    request: &mut Request,
+    environment: &Env,
+) -> Result<Response> {
+    let identity = match authorize_workos_user(request, environment).await {
+        Ok(identity) => identity,
+        Err(error) => return workos_auth_error(error),
+    };
+    #[derive(Deserialize)]
+    struct Renewal {
+        connection_id: String,
+    }
+    let renewal: Renewal = request.json().await?;
+    if renewal.connection_id.len() != 64
+        || !renewal
+            .connection_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return api_error(400, "invalid subscription connection ID");
+    }
+    let mut internal = internal_json_request(
+        "https://presence.internal/renew",
+        &serde_json::json!({
+            "connection_id": renewal.connection_id, "user_id": identity.user_id,
+        }),
+    )?;
+    internal
+        .headers_mut()?
+        .set("X-Mesh-Company-Id", &identity.company_id)?;
+    object_stub(environment, "COMPANY_PRESENCE", &identity.company_id)?
+        .fetch_with_request(internal)
+        .await
 }

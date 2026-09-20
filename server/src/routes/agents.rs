@@ -154,14 +154,9 @@ pub(crate) async fn redeem_agent_installer(
         &serde_json::json!({ "installer_id": ticket.id }).to_string(),
     )
     .await?;
-    let created = company_presence::PresenceMutation::Upsert {
-        agent_id: device_id.clone(),
-        name: Some(name.clone()),
-        connected: Some(false),
-    };
-    if let Err(error) = company_presence::publish(environment, &identity.company_id, &created).await
-    {
-        console_error!("event=agent_created_publish_failed error={}", error);
+    if let Err(error) = company_presence::flush_catalog(environment, &identity.company_id).await {
+        // The D1 trigger committed the notification with the catalog change.
+        console_error!("event=agent_created_publish_deferred error={}", error);
     }
     Response::from_json(&AgentConfig {
         server: canonical_company_url(&db, environment, &identity.company_id).await?,
@@ -205,12 +200,8 @@ pub(crate) async fn delete_agent(
         return api_error(404, "Agent not found");
     }
     audit(&db, &identity, "agent.delete", "agent", device_id, "{}").await?;
-    let deleted = company_presence::PresenceMutation::Delete {
-        agent_id: device_id.to_owned(),
-    };
-    if let Err(error) = company_presence::publish(environment, &identity.company_id, &deleted).await
-    {
-        console_error!("event=agent_deleted_publish_failed error={}", error);
+    if let Err(error) = company_presence::flush_catalog(environment, &identity.company_id).await {
+        console_error!("event=agent_deleted_publish_deferred error={}", error);
     }
     if let Err(error) = crate::agent_coordinator::request_uninstall(environment, device_id).await {
         console_error!("event=agent_uninstall_notify_failed error={}", error);

@@ -378,10 +378,8 @@ impl RemoteSession {
         if !self.advance_deadline(&record).await? {
             return Ok(());
         }
-        self.state
-            .storage()
-            .set_alarm(record.idle_timeout_ms as i64)
-            .await?;
+        // Keep the existing alarm. It checks the durable deadline and reschedules
+        // itself if activity advanced it, preserving exact expiry after eviction.
         Ok(())
     }
 
