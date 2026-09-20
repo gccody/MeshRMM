@@ -219,8 +219,7 @@ function TenantDashboard({ view }: { view: View }) {
     let cancelled = false;
     const start = async () => {
       try {
-        const loaded = await loadAccount();
-        if (!cancelled && loaded?.company) await loadAgents();
+        await loadAccount(); // The event subscription supplies the initial inventory.
       } catch (requestError) {
         if (!cancelled && !(requestError instanceof AuthenticationRequired)) {
           setError(requestError instanceof Error ? requestError.message : "The company account could not be loaded.");
@@ -229,7 +228,7 @@ function TenantDashboard({ view }: { view: View }) {
     };
     void start();
     return () => { cancelled = true; };
-  }, [hasTenantSession, isAuthLoading, loadAccount, loadAgents]);
+  }, [hasTenantSession, isAuthLoading, loadAccount]);
 
   const filteredAgents = useMemo(() => {
     const search = query.trim().toLowerCase();
@@ -341,7 +340,7 @@ function TenantDashboard({ view }: { view: View }) {
       if (!response.ok) {
         throw new Error(await errorMessage(response, "The Agent could not be deleted."));
       }
-      await loadAgents(true);
+      // The backend publishes agent_deleted to the existing subscription.
     } catch (requestError) {
       if (!(requestError instanceof AuthenticationRequired)) {
         setError(requestError instanceof Error ? requestError.message : "The Agent could not be deleted.");

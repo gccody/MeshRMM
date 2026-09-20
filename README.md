@@ -223,9 +223,23 @@ The responsive dashboard at `https://<company>.meshrmm.com` lists only Agents
 owned by the organization bound to that hostname and the current WorkOS token. It receives inventory
 and connection changes from a company-scoped, hibernating WebSocket event
 stream instead of polling. The browser obtains a 60-second, one-use
-subscription token and reconnects automatically. Each inventory connection must
-reauthorize at least every five minutes; **Refresh** requests a single
-authoritative snapshot when needed. **Remote** requests a one-time server
+subscription token and reconnects automatically after failure. Authorization is
+renewed on the existing connection before its five-minute deadline, without
+issuing another subscription token or loading the inventory again. **Refresh**
+requests a single backend snapshot when needed; snapshots never contact Agents
+or their coordinators. Online/offline transitions are published by the backend
+coordinator with durable, ordered retries, and healthy idle Agents have no
+recurring presence alarm. The company-level 30-second authorization check remains
+in place. Device creation/deletion notifications are committed with their D1
+catalog changes and delivered immediately; that existing check also retries any
+undelivered catalog notifications while a dashboard is subscribed.
+
+Apply `0011_presence_catalog_outbox.sql` with the other D1 migrations **before**
+deploying this server, then deploy the dashboard. Existing Agents and native
+viewers remain wire-compatible and do not need reinstalling. Older dashboard
+connections continue to expire and reconnect until their page is refreshed.
+
+**Remote** requests a one-time server
 handoff, then opens the native viewer with a
 `meshrmm://connect?handoff=...&server=...` deep link. No service credential is
 entered into or retained by the browser.
