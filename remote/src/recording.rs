@@ -20,6 +20,7 @@ struct State {
     stream: Option<VideoStreamId>,
     notice: Option<String>,
     finishing: Vec<Session>,
+    on_active: Option<Arc<dyn Fn(bool) + Send + Sync>>,
 }
 
 struct Session {
@@ -38,6 +39,13 @@ impl Drop for RecordingGuard {
 }
 
 impl Recorder {
+    pub fn with_activity_callback(callback: impl Fn(bool) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(Mutex::new(State {
+            on_active: Some(Arc::new(callback)),
+            ..State::default()
+        })))
+    }
+
     pub fn active(&self) -> bool {
         self.0.lock().unwrap().session.is_some()
     }
@@ -109,7 +117,11 @@ impl Recorder {
             .name("session-recording".into())
             .spawn(move || write_recording(receiver, output))
             .context("Cannot start recording writer")?;
-        self.0.lock().unwrap().session = Some(Session {
+        let mut state = self.0.lock().unwrap();
+        if let Some(callback) = &state.on_active {
+            callback(true);
+        }
+        state.session = Some(Session {
             sender: Some(sender),
             overloaded: false,
             worker,
@@ -121,6 +133,9 @@ impl Recorder {
     pub fn stop(&self) {
         let mut state = self.0.lock().unwrap();
         if let Some(mut session) = state.session.take() {
+            if let Some(callback) = &state.on_active {
+                callback(false);
+            }
             // Never wait for a slow disk on the UI or video thread.
             session.sender = None;
             state.finishing.push(session);
@@ -218,7 +233,10 @@ mod tests {
 
     #[test]
     fn stop_and_full_queue_never_wait_for_a_stalled_writer() {
-        let recorder = Recorder::default();
+        let (activity, changes) = mpsc::channel();
+        let recorder = Recorder::with_activity_callback(move |active| {
+            activity.send(active).unwrap();
+        });
         let (sender, receiver) = mpsc::sync_channel(1);
         let (release, wait) = mpsc::channel();
         recorder.0.lock().unwrap().session = Some(Session {
@@ -257,6 +275,9 @@ mod tests {
         stopper.join().unwrap();
         result.expect("Stop blocked on the recording writer");
         assert!(!recorder.active());
+        assert_eq!(changes.try_recv(), Ok(false));
+        recorder.stop();
+        assert!(changes.try_recv().is_err());
         let session = recorder.0.lock().unwrap().finishing.pop().unwrap();
         recorder.collect(session);
         assert!(

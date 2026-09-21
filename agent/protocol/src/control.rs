@@ -137,6 +137,10 @@ pub enum SessionMessage {
     SetPreventIdleLock {
         enabled: bool,
     },
+    /// Keep the cursor in encoded video while a viewer records.
+    SetRecording {
+        enabled: bool,
+    },
 }
 
 impl SessionMessage {
@@ -295,6 +299,23 @@ pub enum ConnectionPath {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recording_override_round_trips_and_preserves_idle_tag() {
+        for enabled in [false, true] {
+            let message = super::SessionMessage::SetRecording { enabled };
+            assert_eq!(
+                super::SessionMessage::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+        }
+        assert_eq!(
+            super::SessionMessage::SetPreventIdleLock { enabled: true }
+                .encode()
+                .unwrap(),
+            vec![31, 1]
+        );
+    }
+
     use super::*;
 
     #[test]
