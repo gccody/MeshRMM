@@ -53,6 +53,15 @@ impl Drop for SenderCleanup {
     }
 }
 
+// Recordings persist encoded frames, so their pointer must be composed by capture.
+fn capture_cursor_for_session(
+    show_cursor: bool,
+    viewer_controls_input: bool,
+    recording: bool,
+) -> bool {
+    recording || (show_cursor && !viewer_controls_input)
+}
+
 enum ControlCommand {
     MaintenanceError(String),
     Keyframe,
@@ -65,6 +74,7 @@ enum ControlCommand {
     Quality(QualityPreset),
     Chroma(ChromaMode),
     CursorCapture(bool),
+    Recording(bool),
     DisplayBorder(bool),
     InputOwnership(bool),
     VideoProfileRejected {
@@ -534,6 +544,9 @@ async fn run_connected_sender(
                     Ok(SessionMessage::SetDisplayBorder { enabled }) => {
                         Some(ControlCommand::DisplayBorder(enabled))
                     }
+                    Ok(SessionMessage::SetRecording { enabled }) => {
+                        Some(ControlCommand::Recording(enabled))
+                    }
                     Ok(SessionMessage::SetCursorCapture { enabled }) => {
                         Some(ControlCommand::CursorCapture(enabled))
                     }
@@ -786,7 +799,7 @@ async fn run_connected_sender(
                 match command {
                     command @ (ControlCommand::Keyframe | ControlCommand::Bitrate(_)
                         | ControlCommand::Quality(_) | ControlCommand::ViewerCapabilities { .. }
-                        | ControlCommand::DisplayBorder(_) | ControlCommand::Chroma(_) | ControlCommand::CursorCapture(_) | ControlCommand::InputOwnership(_) | ControlCommand::VideoProfileRejected { .. }
+                        | ControlCommand::DisplayBorder(_) | ControlCommand::Chroma(_) | ControlCommand::CursorCapture(_) | ControlCommand::InputOwnership(_) | ControlCommand::Recording(_) | ControlCommand::VideoProfileRejected { .. }
                         | ControlCommand::SelectDisplay(_)) => {
                         capture_tx.try_send(command).map_err(|_| anyhow::anyhow!("capture command queue full or closed"))?;
                     }
@@ -1138,6 +1151,7 @@ async fn run_capture_control(
     let mut viewer_profiles = vec![active_profile];
     let mut requested_chroma = ChromaMode::Yuv420;
     let mut capture_cursor = true;
+    let mut recording = false;
     let mut viewer_controls_input = false;
     let mut rejected_profiles = Vec::new();
     let mut capture_running = true;
@@ -1251,14 +1265,16 @@ async fn run_capture_control(
                             send_control_message(&control_channel, SessionMessage::MaintenanceError { reason: format!("Display border: {error:#}") }).await?;
                         }
                     }
-                    ControlCommand::CursorCapture(enabled) | ControlCommand::InputOwnership(enabled) => {
+                    ControlCommand::CursorCapture(enabled) | ControlCommand::InputOwnership(enabled) | ControlCommand::Recording(enabled) => {
                         if matches!(command, ControlCommand::CursorCapture(_)) {
                             capture_cursor = enabled;
                             tracing::info!(enabled, "viewer cursor capture selection applied");
+                        } else if matches!(command, ControlCommand::Recording(_)) {
+                            recording = enabled;
                         } else {
                             viewer_controls_input = enabled;
                         }
-                        let update = lock_streamer(&streamer)?.set_cursor_capture(capture_cursor && !viewer_controls_input);
+                        let update = lock_streamer(&streamer)?.set_cursor_capture(capture_cursor_for_session(capture_cursor, viewer_controls_input, recording));
                         match update {
                             Ok(false) => {}
                             Err(error) => tracing::warn!(%error, "could not update cursor capture while the desktop is changing"),
@@ -2022,6 +2038,23 @@ mod tests {
 mod service_isolation_tests {
     use super::super::platform::ScreenInput;
     use super::*;
+    #[test]
+    fn recording_keeps_cursor_for_both_input_owners_and_restores_preference() {
+        for show_cursor in [false, true] {
+            for viewer_controls_input in [false, true] {
+                assert!(super::capture_cursor_for_session(
+                    show_cursor,
+                    viewer_controls_input,
+                    true
+                ));
+                assert_eq!(
+                    super::capture_cursor_for_session(show_cursor, viewer_controls_input, false),
+                    show_cursor && !viewer_controls_input
+                );
+            }
+        }
+    }
+
     use meshrmm_protocol::{ClipboardContent, CursorShape, FileMessage, RemoteInput};
 
     struct TestInput {

@@ -194,8 +194,11 @@ impl ViewerControlQueue {
         outgoing: mpsc::UnboundedSender<SessionMessage>,
         resume_state: ViewerResumeState,
     ) -> Self {
+        let recording_outgoing = outgoing.clone();
         Self {
-            recording: crate::recording::Recorder::default(),
+            recording: crate::recording::Recorder::with_activity_callback(move |enabled| {
+                let _ = recording_outgoing.send(SessionMessage::SetRecording { enabled });
+            }),
             maintenance: Arc::new(Mutex::new(crate::platform::MaintenanceState::default())),
             files: meshrmm_file_transfer::TransferSession::new(),
             chat: meshrmm_chat::ChatSession::default(),
@@ -1189,6 +1192,9 @@ fn install_control_handler(
                         viewer_control.send(SessionMessage::SetPreventIdleLock { enabled: sink.prevent_idle_lock() });
                         viewer_control.send(SessionMessage::SetDisplayBorder { enabled: sink.display_border() });
                         viewer_control.send(SessionMessage::SetWallpaperHidden { hidden: sink.wallpaper_hidden() });
+                        viewer_control.send(SessionMessage::SetRecording {
+                            enabled: viewer_control.recording.active(),
+                        });
                         viewer_control.send(SessionMessage::SetCursorCapture {
                             enabled: sink.show_remote_cursor(),
                         });
