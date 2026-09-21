@@ -2,6 +2,7 @@ mod clipboard;
 mod config;
 mod debug;
 mod h264;
+mod matroska;
 mod platform;
 mod preferences;
 mod recording;

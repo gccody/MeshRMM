@@ -356,14 +356,16 @@ default playback-device changes. Audio uses PCM16 at the source sample rate
 To record the remote display locally, choose **Record video to Downloads** in
 macOS **Controls** or Windows **Settings → Troubleshooting**. **REC** stays
 visible while recording; choose **Stop recording and save** to finish. Video-only
-MPEG-TS (`.ts`) files are saved under `Downloads/MeshRMM Recordings/session-…`
+Matroska (`.mkv`) files are saved under `Downloads/MeshRMM Recordings/session-…`
 on the viewer's computer, and the saved location is shown when stopped. Open
-these files in a player supporting H.264/HEVC transport streams, such as VLC.
+these files in a player supporting H.264/HEVC in MKV, such as VLC.
 Recording begins at the next keyframe and creates a new part when the stream
 changes (for example, selecting another display or quality). Disconnecting saves
 captured video and stops recording; start it again after reconnecting. Audio,
 chat, and the viewer's own controls are not recorded. Recording writes to disk
-as video arrives; a disk error or full recording queue stops recording and shows
+as video arrives on a bounded background writer; stopping releases the recording
+control immediately while the writer finishes its remaining queued frames. No
+whole-session buffer or final conversion is needed. A disk error or full recording queue stops recording and shows
 an error without ending the remote session.
 
 The native viewer sends mouse, wheel, physical keyboard input, and bidirectional

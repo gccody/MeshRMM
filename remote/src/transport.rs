@@ -40,7 +40,6 @@ const SIGNAL_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 struct ActivePresenter {
     stream_id: VideoStreamId,
-    #[cfg(target_os = "macos")]
     format: meshrmm_protocol::VideoFormat,
     profile: VideoProfile,
     presenter: Presenter,
@@ -1222,7 +1221,6 @@ fn install_control_handler(
                                 .ok()
                                 .and_then(|mut guard| guard.replace(ActivePresenter {
                                     stream_id,
-                                    #[cfg(target_os = "macos")]
                                     format,
                                     profile: format.profile(),
                                     presenter: new_presenter,
@@ -1414,9 +1412,7 @@ fn install_video_handler(
                     && let Some(active) = guard.as_ref()
                     && active.stream_id == frame.stream_id
                 {
-                    viewer_control
-                        .recording
-                        .receive(&frame, active.profile.codec);
+                    viewer_control.recording.receive(&frame, active.format);
                     active.presenter.publish(frame, received_at_us);
                 }
                 tracing::trace!(encode_us, received_at_us, "encoded frame reassembled");
