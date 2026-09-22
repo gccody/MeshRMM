@@ -3,6 +3,7 @@
 use anyhow::Context;
 use meshrmm_protocol::{PointerButton, RemoteInput};
 use meshrmm_remote_screen::background::{self, HEIGHT, WIDTH};
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::JobObjects::*;
@@ -16,6 +17,8 @@ use windows::core::{PCWSTR, PWSTR, w};
 pub(super) const TASKBAR_HEIGHT: i32 = 48;
 const PIN_WIDTH: i32 = 48;
 const ICON_SIZE: i32 = 32;
+const TASKS_LEFT: i32 = 8 + PINS.len() as i32 * PIN_WIDTH + 12;
+const TASK_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const PINS: &[(&str, &str, &str)] = &[
     (
         "Command Prompt",
@@ -49,6 +52,8 @@ pub struct Workspace {
     shell: HWND,
     tooltip: HWND,
     hovered: Option<usize>,
+    tasks: Vec<TaskButton>,
+    last_task_refresh: Instant,
     job: HANDLE,
     focus: HWND,
     pointer: POINT,
@@ -57,6 +62,19 @@ pub struct Workspace {
     keys: [u8; 256],
     attached_thread: Option<u32>,
     console_inputs: Vec<super::background_console::ConsoleInput>,
+}
+
+struct TaskButton {
+    window: HWND,
+    process: u32,
+    button: HWND,
+    title: String,
+}
+
+struct TaskWindow {
+    window: HWND,
+    process: u32,
+    title: String,
 }
 
 impl Workspace {
@@ -87,6 +105,8 @@ impl Workspace {
                 shell: HWND::default(),
                 tooltip: HWND::default(),
                 hovered: None,
+                tasks: Vec::new(),
+                last_task_refresh: Instant::now(),
                 job,
                 focus: HWND::default(),
                 pointer: POINT::default(),
@@ -191,6 +211,112 @@ impl Workspace {
             let result = IsProcessInJob(process, Some(self.job), &mut owned);
             let _ = CloseHandle(process);
             result.is_ok() && owned.as_bool()
+        }
+    }
+
+    fn refresh_tasks(&mut self) -> anyhow::Result<()> {
+        let visible = task_windows(self.shell, self.tooltip)?;
+        unsafe {
+            self.tasks.retain(|task| {
+                let exists = visible
+                    .iter()
+                    .any(|window| window.window == task.window && window.process == task.process);
+                if !exists {
+                    let _ = DestroyWindow(task.button);
+                }
+                exists
+            });
+            for window in visible {
+                if let Some(task) = self
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.window == window.window && task.process == window.process)
+                {
+                    if task.title != window.title {
+                        task.title = window.title;
+                        SetWindowTextW(task.button, PCWSTR(wide(&task.title).as_ptr()))?;
+                    }
+                    continue;
+                }
+                let button = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("BUTTON"),
+                    PCWSTR(wide(&window.title).as_ptr()),
+                    WS_CHILD | WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    0,
+                    4,
+                    1,
+                    TASKBAR_HEIGHT - 8,
+                    Some(self.shell),
+                    None,
+                    None,
+                    None,
+                )?;
+                self.tasks.push(TaskButton {
+                    window: window.window,
+                    process: window.process,
+                    button,
+                    title: window.title,
+                });
+            }
+            let width = ((WIDTH as i32 - TASKS_LEFT - 8) / self.tasks.len().max(1) as i32).min(160);
+            for (index, task) in self.tasks.iter().enumerate() {
+                let id = (PINS.len() + index + 1) as i32;
+                if GetDlgCtrlID(task.button) != id {
+                    SetWindowLongPtrW(task.button, GWLP_ID, id as isize);
+                }
+                let x = TASKS_LEFT + index as i32 * width;
+                let mut rect = RECT::default();
+                if GetWindowRect(task.button, &mut rect).is_err()
+                    || rect.left != x
+                    || rect.top != HEIGHT as i32 - TASKBAR_HEIGHT + 4
+                    || rect.right - rect.left != width
+                    || rect.bottom - rect.top != TASKBAR_HEIGHT - 8
+                    || !IsWindowVisible(task.button).as_bool()
+                {
+                    let _ = SetWindowPos(
+                        task.button,
+                        None,
+                        x,
+                        4,
+                        width,
+                        TASKBAR_HEIGHT - 8,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_task(&mut self, index: usize) {
+        let Some(task) = self.tasks.get(index) else {
+            return;
+        };
+        unsafe {
+            let mut process = 0;
+            GetWindowThreadProcessId(task.window, Some(&mut process));
+            if process != task.process || !IsWindow(Some(task.window)).as_bool() {
+                return;
+            }
+            let _ = ShowWindowAsync(
+                task.window,
+                if IsIconic(task.window).as_bool() {
+                    SW_RESTORE
+                } else {
+                    SW_SHOW
+                },
+            );
+            let _ = SetWindowPos(
+                task.window,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            self.focus = task.window;
         }
     }
 
@@ -322,13 +448,19 @@ impl Workspace {
         Ok(())
     }
 
-    pub fn pump(&self) {
+    pub fn pump(&mut self) {
         unsafe {
             let mut message = MSG::default();
             while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
+        }
+        if self.last_task_refresh.elapsed() >= TASK_REFRESH_INTERVAL {
+            if let Err(error) = self.refresh_tasks() {
+                tracing::warn!(%error, "could not refresh background taskbar");
+            }
+            self.last_task_refresh = Instant::now();
         }
     }
 
@@ -342,6 +474,19 @@ impl Workspace {
             && self.pointer.x >= 8)
             .then(|| ((self.pointer.x - 8) / PIN_WIDTH) as usize)
             .filter(|index| *index < PINS.len());
+        let hovered = hovered.or_else(|| {
+            self.tasks
+                .iter()
+                .position(|task| unsafe {
+                    let mut rect = RECT::default();
+                    GetWindowRect(task.button, &mut rect).is_ok()
+                        && self.pointer.x >= rect.left
+                        && self.pointer.x < rect.right
+                        && self.pointer.y >= rect.top
+                        && self.pointer.y < rect.bottom
+                })
+                .map(|index| PINS.len() + index)
+        });
         if self.hovered != hovered {
             unsafe {
                 for index in [self.hovered, hovered].into_iter().flatten() {
@@ -355,12 +500,23 @@ impl Workspace {
                     }
                 }
                 if let Some(index) = hovered {
-                    let label = wide(PINS[index].0);
+                    let label = wide(if index < PINS.len() {
+                        PINS[index].0
+                    } else {
+                        &self.tasks[index - PINS.len()].title
+                    });
                     let _ = SetWindowTextW(self.tooltip, PCWSTR(label.as_ptr()));
+                    let x = if index < PINS.len() {
+                        8 + index as i32 * PIN_WIDTH
+                    } else {
+                        let mut rect = RECT::default();
+                        let _ = GetWindowRect(self.tasks[index - PINS.len()].button, &mut rect);
+                        rect.left
+                    };
                     let _ = SetWindowPos(
                         self.tooltip,
                         Some(HWND_TOPMOST),
-                        8 + index as i32 * PIN_WIDTH,
+                        x.min(WIDTH as i32 - 200),
                         HEIGHT as i32 - TASKBAR_HEIGHT - 26,
                         200,
                         24,
@@ -460,7 +616,12 @@ impl Workspace {
         unsafe {
             if GetParent(hwnd).ok() == Some(self.shell) {
                 if down && button == PointerButton::Left {
-                    self.launch(GetDlgCtrlID(hwnd) as usize)?;
+                    let id = GetDlgCtrlID(hwnd) as usize;
+                    if id <= PINS.len() {
+                        self.launch(id)?;
+                    } else {
+                        self.restore_task(id - PINS.len() - 1);
+                    }
                 }
                 return Ok(());
             }
@@ -805,6 +966,55 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
+fn task_windows(shell: HWND, tooltip: HWND) -> windows::core::Result<Vec<TaskWindow>> {
+    unsafe extern "system" fn collect(hwnd: HWND, parameter: LPARAM) -> windows::core::BOOL {
+        unsafe {
+            let windows = &mut *(parameter.0 as *mut Vec<HWND>);
+            if windows.len() < 128 {
+                windows.push(hwnd);
+            }
+        }
+        windows::core::BOOL(1)
+    }
+    unsafe {
+        let desktop =
+            windows::Win32::System::StationsAndDesktops::GetThreadDesktop(GetCurrentThreadId())?;
+        let mut handles = Vec::new();
+        windows::Win32::System::StationsAndDesktops::EnumDesktopWindows(
+            Some(desktop),
+            Some(collect),
+            LPARAM((&mut handles as *mut Vec<HWND>) as isize),
+        )?;
+        let mut windows = Vec::new();
+        for window in handles {
+            if window == shell || window == tooltip {
+                continue;
+            }
+            let style = GetWindowLongPtrW(window, GWL_STYLE) as u32;
+            let ex_style = GetWindowLongPtrW(window, GWL_EXSTYLE) as u32;
+            if (style & WS_VISIBLE.0 == 0 && !IsIconic(window).as_bool())
+                || ex_style & WS_EX_TOOLWINDOW.0 != 0
+                || GetWindow(window, GW_OWNER).is_ok()
+            {
+                continue;
+            }
+            let mut title = [0_u16; 256];
+            let count = GetWindowTextW(window, &mut title);
+            if count == 0 {
+                continue;
+            }
+            let mut process = 0;
+            GetWindowThreadProcessId(window, Some(&mut process));
+            windows.push(TaskWindow {
+                window,
+                process,
+                title: String::from_utf16_lossy(&title[..count as usize]),
+            });
+        }
+        Ok(windows)
+    }
+}
+
 unsafe extern "system" fn tooltip_proc(
     hwnd: HWND,
     message: u32,
@@ -886,19 +1096,37 @@ unsafe extern "system" fn launcher_proc(
             }));
             FillRect(item.hDC, &item.rcItem, brush);
             let _ = DeleteObject(brush.into());
-            let icon = HICON(GetWindowLongPtrW(item.hwndItem, GWLP_USERDATA) as *mut _);
-            if !icon.is_invalid() {
-                let _ = DrawIconEx(
+            if (item.CtlID as usize) <= PINS.len() {
+                let icon = HICON(GetWindowLongPtrW(item.hwndItem, GWLP_USERDATA) as *mut _);
+                if !icon.is_invalid() {
+                    let _ = DrawIconEx(
+                        item.hDC,
+                        (PIN_WIDTH - ICON_SIZE) / 2,
+                        (TASKBAR_HEIGHT - 8 - ICON_SIZE) / 2,
+                        icon,
+                        ICON_SIZE,
+                        ICON_SIZE,
+                        0,
+                        None,
+                        DI_NORMAL,
+                    );
+                }
+            } else {
+                let mut title = [0_u16; 256];
+                let count = GetWindowTextW(item.hwndItem, &mut title) as usize;
+                let mut rect = item.rcItem;
+                rect.left += 8;
+                rect.right -= 8;
+                SetBkMode(item.hDC, TRANSPARENT);
+                SetTextColor(item.hDC, COLORREF(0xffffff));
+                let font = SelectObject(item.hDC, GetStockObject(DEFAULT_GUI_FONT));
+                DrawTextW(
                     item.hDC,
-                    (PIN_WIDTH - ICON_SIZE) / 2,
-                    (TASKBAR_HEIGHT - 8 - ICON_SIZE) / 2,
-                    icon,
-                    ICON_SIZE,
-                    ICON_SIZE,
-                    0,
-                    None,
-                    DI_NORMAL,
+                    &mut title[..count],
+                    &mut rect,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
                 );
+                SelectObject(item.hDC, font);
             }
             if item.itemState.0 & ODS_SELECTED.0 != 0 {
                 let brush = CreateSolidBrush(COLORREF(0xcbb54c));
@@ -916,6 +1144,93 @@ unsafe extern "system" fn launcher_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
+    fn running_window_taskbar_restores_minimized_window() -> anyhow::Result<()> {
+        unsafe extern "system" fn test_window_proc(
+            window: HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            unsafe { DefWindowProcW(window, message, wparam, lparam) }
+        }
+        std::thread::spawn(|| -> anyhow::Result<()> {
+            unsafe {
+                use windows::Win32::System::StationsAndDesktops::*;
+                let station = OpenWindowStationW(w!("WinSta0"), false, 0x000f037f)?;
+                SetProcessWindowStation(station)?;
+            }
+            let _owner = background::Desktop::create()?;
+            let _binding = background::Desktop::bind()?;
+            let mut workspace = Workspace::new()?;
+            let window = unsafe {
+                RegisterClassW(&WNDCLASSW {
+                    lpfnWndProc: Some(test_window_proc),
+                    lpszClassName: w!("MeshRMMTaskbarTest"),
+                    ..Default::default()
+                });
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("MeshRMMTaskbarTest"),
+                    w!("Taskbar restore test"),
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    40,
+                    50,
+                    400,
+                    250,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?
+            };
+            workspace.refresh_tasks()?;
+            let task = workspace
+                .tasks
+                .iter()
+                .find(|task| task.window == window)
+                .context("running window is missing from taskbar")?;
+            let button = task.button;
+            unsafe {
+                let _ = ShowWindow(window, SW_MINIMIZE);
+            }
+            workspace.refresh_tasks()?;
+            anyhow::ensure!(
+                unsafe { IsIconic(window) }.as_bool(),
+                "window did not minimize"
+            );
+            anyhow::ensure!(
+                workspace.tasks.iter().any(|task| task.window == window),
+                "minimized window disappeared from taskbar"
+            );
+            let mut rect = RECT::default();
+            unsafe { GetWindowRect(button, &mut rect)? };
+            let x = (rect.left + rect.right) / 2;
+            let y = (rect.top + rect.bottom) / 2;
+            workspace.move_pointer(
+                (x as u32 * 65535 / (WIDTH - 1)) as u16,
+                (y as u32 * 65535 / (HEIGHT - 1)) as u16,
+            );
+            workspace.button(PointerButton::Left, true)?;
+            workspace.button(PointerButton::Left, false)?;
+            workspace.pump();
+            anyhow::ensure!(
+                !unsafe { IsIconic(window) }.as_bool(),
+                "taskbar button did not restore the minimized window"
+            );
+            unsafe { DestroyWindow(window)? };
+            workspace.refresh_tasks()?;
+            anyhow::ensure!(
+                !workspace.tasks.iter().any(|task| task.window == window),
+                "closed window remained on taskbar"
+            );
+            Ok(())
+        })
+        .join()
+        .expect("background taskbar test panicked")
+    }
 
     fn send_key(workspace: &mut Workspace, scan_code: u16, pressed: bool) -> anyhow::Result<()> {
         workspace.apply(RemoteInput::Key {
@@ -940,7 +1255,7 @@ mod tests {
 
     fn file_browser_interactions(workspace: &mut Workspace, window: HWND) -> anyhow::Result<()> {
         use windows::Win32::UI::Controls::*;
-        fn settle(workspace: &Workspace, millis: u64) {
+        fn settle(workspace: &mut Workspace, millis: u64) {
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
             while std::time::Instant::now() < deadline {
                 workspace.pump();
@@ -966,7 +1281,7 @@ mod tests {
             }
             Ok(())
         }
-        fn wait(workspace: &Workspace, status: HWND) -> anyhow::Result<()> {
+        fn wait(workspace: &mut Workspace, status: HWND) -> anyhow::Result<()> {
             settle(workspace, 300);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
@@ -1350,7 +1665,7 @@ mod tests {
 
     fn task_manager_interactions(workspace: &mut Workspace, window: HWND) -> anyhow::Result<()> {
         use windows::Win32::UI::Controls::*;
-        fn settle(workspace: &Workspace, millis: u64) {
+        fn settle(workspace: &mut Workspace, millis: u64) {
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
             while std::time::Instant::now() < deadline {
                 workspace.pump();
