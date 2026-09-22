@@ -506,7 +506,10 @@ live coordinator/session/inventory connections and blocks token redemption.
 
 With an updated Windows agent installed, connect normally and select
 **Background (Session 0 · experimental)** in the viewer's display selector.
-The black workspace has a charcoal, icon-only bottom taskbar with hover labels.
+The black workspace has a charcoal bottom taskbar with icon launchers and hover labels.
+Open application windows appear as labeled buttons beside the launchers. Minimized
+windows remain listed; select their button to restore them. Closing a window removes
+its button.
 It pins Command Prompt, PowerShell, Registry Editor, Services,
 Event Viewer, Resource Monitor, Task Manager, Computer Management, Device Manager,
 Windows Firewall, and File Explorer. Task Manager and File Explorer launch built-in
