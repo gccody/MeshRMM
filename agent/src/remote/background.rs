@@ -68,6 +68,7 @@ struct TaskButton {
     window: HWND,
     process: u32,
     button: HWND,
+    icon: HICON,
     title: String,
 }
 
@@ -223,6 +224,9 @@ impl Workspace {
                     .any(|window| window.window == task.window && window.process == task.process);
                 if !exists {
                     let _ = DestroyWindow(task.button);
+                    if !task.icon.is_invalid() {
+                        let _ = DestroyIcon(task.icon);
+                    }
                 }
                 exists
             });
@@ -252,14 +256,18 @@ impl Workspace {
                     None,
                     None,
                 )?;
+                let icon = task_icon(window.window, window.process, self.shell);
+                SetWindowLongPtrW(button, GWLP_USERDATA, icon.0 as isize);
                 self.tasks.push(TaskButton {
                     window: window.window,
                     process: window.process,
                     button,
+                    icon,
                     title: window.title,
                 });
             }
-            let width = ((WIDTH as i32 - TASKS_LEFT - 8) / self.tasks.len().max(1) as i32).min(160);
+            let width =
+                ((WIDTH as i32 - TASKS_LEFT - 8) / self.tasks.len().max(1) as i32).min(PIN_WIDTH);
             for (index, task) in self.tasks.iter().enumerate() {
                 let id = (PINS.len() + index + 1) as i32;
                 if GetDlgCtrlID(task.button) != id {
@@ -680,6 +688,9 @@ impl Workspace {
                             return Ok(());
                         }
                         HTCLOSE => return self.post(top, WM_CLOSE, 0, 0),
+                        HTMINBUTTON => {
+                            return self.post(top, WM_SYSCOMMAND, SC_MINIMIZE as usize, 0);
+                        }
                         HTMAXBUTTON => {
                             return self.post(
                                 top,
@@ -952,6 +963,11 @@ impl Drop for Workspace {
             if !self.shell.is_invalid() {
                 let _ = DestroyWindow(self.shell);
             }
+            for task in self.tasks.drain(..) {
+                if !task.icon.is_invalid() {
+                    let _ = DestroyIcon(task.icon);
+                }
+            }
             for icon in self.icons.drain(..) {
                 let _ = DestroyIcon(icon);
             }
@@ -1012,6 +1028,75 @@ fn task_windows(shell: HWND, tooltip: HWND) -> windows::core::Result<Vec<TaskWin
             });
         }
         Ok(windows)
+    }
+}
+
+fn task_icon(window: HWND, process_id: u32, shell: HWND) -> HICON {
+    unsafe {
+        let mut class = [0_u16; 64];
+        let length = GetClassNameW(window, &mut class) as usize;
+        let pinned = match String::from_utf16_lossy(&class[..length]).as_str() {
+            "MeshRMMBackgroundTasks" => Some(7),
+            "MeshRMMBackgroundFiles" => Some(11),
+            _ => None,
+        };
+        if let Some(index) = pinned
+            && let Ok(button) = GetDlgItem(Some(shell), index)
+        {
+            let source = HICON(GetWindowLongPtrW(button, GWLP_USERDATA) as *mut _);
+            if !source.is_invalid()
+                && let Ok(icon) = CopyIcon(source)
+            {
+                return icon;
+            }
+        }
+        for size in [ICON_SMALL2, ICON_SMALL, ICON_BIG] {
+            let mut result = 0;
+            SendMessageTimeoutW(
+                window,
+                WM_GETICON,
+                WPARAM(size as usize),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG,
+                20,
+                Some(&mut result),
+            );
+            if result != 0
+                && let Ok(icon) = CopyIcon(HICON(result as *mut _))
+            {
+                return icon;
+            }
+        }
+        for index in [GCLP_HICONSM, GCLP_HICON] {
+            let source = GetClassLongPtrW(window, index);
+            if source != 0
+                && let Ok(icon) = CopyIcon(HICON(source as *mut _))
+            {
+                return icon;
+            }
+        }
+        if let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) {
+            let mut path = vec![0_u16; 32768];
+            let mut length = path.len() as u32;
+            let found = QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_WIN32,
+                PWSTR(path.as_mut_ptr()),
+                &mut length,
+            )
+            .is_ok();
+            let _ = CloseHandle(process);
+            if found {
+                let mut icon = HICON::default();
+                ExtractIconExW(PCWSTR(path.as_ptr()), 0, Some(&mut icon), None, 1);
+                if !icon.is_invalid() {
+                    return icon;
+                }
+            }
+        }
+        LoadIconW(None, IDI_APPLICATION)
+            .and_then(|icon| CopyIcon(icon))
+            .unwrap_or_default()
     }
 }
 
@@ -1096,39 +1181,26 @@ unsafe extern "system" fn launcher_proc(
             }));
             FillRect(item.hDC, &item.rcItem, brush);
             let _ = DeleteObject(brush.into());
-            if (item.CtlID as usize) <= PINS.len() {
-                let icon = HICON(GetWindowLongPtrW(item.hwndItem, GWLP_USERDATA) as *mut _);
-                if !icon.is_invalid() {
-                    let _ = DrawIconEx(
-                        item.hDC,
-                        (PIN_WIDTH - ICON_SIZE) / 2,
-                        (TASKBAR_HEIGHT - 8 - ICON_SIZE) / 2,
-                        icon,
-                        ICON_SIZE,
-                        ICON_SIZE,
-                        0,
-                        None,
-                        DI_NORMAL,
-                    );
-                }
-            } else {
-                let mut title = [0_u16; 256];
-                let count = GetWindowTextW(item.hwndItem, &mut title) as usize;
-                let mut rect = item.rcItem;
-                rect.left += 8;
-                rect.right -= 8;
-                SetBkMode(item.hDC, TRANSPARENT);
-                SetTextColor(item.hDC, COLORREF(0xffffff));
-                let font = SelectObject(item.hDC, GetStockObject(DEFAULT_GUI_FONT));
-                DrawTextW(
+            let icon = HICON(GetWindowLongPtrW(item.hwndItem, GWLP_USERDATA) as *mut _);
+            if !icon.is_invalid() {
+                let x = if (item.CtlID as usize) <= PINS.len() {
+                    (PIN_WIDTH - ICON_SIZE) / 2
+                } else {
+                    (item.rcItem.right - item.rcItem.left - ICON_SIZE) / 2
+                };
+                let _ = DrawIconEx(
                     item.hDC,
-                    &mut title[..count],
-                    &mut rect,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    x,
+                    (TASKBAR_HEIGHT - 8 - ICON_SIZE) / 2,
+                    icon,
+                    ICON_SIZE,
+                    ICON_SIZE,
+                    0,
+                    None,
+                    DI_NORMAL,
                 );
-                SelectObject(item.hDC, font);
             }
-            if item.itemState.0 & ODS_SELECTED.0 != 0 {
+            if (item.CtlID as usize) > PINS.len() || item.itemState.0 & ODS_SELECTED.0 != 0 {
                 let brush = CreateSolidBrush(COLORREF(0xcbb54c));
                 let mut line = item.rcItem;
                 line.top = line.bottom - 3;
@@ -1169,6 +1241,7 @@ mod tests {
                 RegisterClassW(&WNDCLASSW {
                     lpfnWndProc: Some(test_window_proc),
                     lpszClassName: w!("MeshRMMTaskbarTest"),
+                    hIcon: LoadIconW(None, IDI_WARNING)?,
                     ..Default::default()
                 });
                 CreateWindowExW(
@@ -1192,10 +1265,55 @@ mod tests {
                 .iter()
                 .find(|task| task.window == window)
                 .context("running window is missing from taskbar")?;
+            anyhow::ensure!(
+                !task.icon.is_invalid(),
+                "running window has no taskbar icon"
+            );
             let button = task.button;
-            unsafe {
-                let _ = ShowWindow(window, SW_MINIMIZE);
-            }
+            workspace.pump();
+            let mut rect = RECT::default();
+            unsafe { GetWindowRect(button, &mut rect)? };
+            let frame = background::snapshot_bmp()?;
+            let pixel = |x: i32, y: i32| -> &[u8] {
+                let start = 54 + (y as usize * WIDTH as usize + x as usize) * 4;
+                &frame[start..start + 3]
+            };
+            let background = pixel(rect.left + 1, rect.top + 1);
+            anyhow::ensure!(
+                (rect.top + 5..rect.bottom - 5).any(|y| {
+                    (rect.left + 8..rect.right - 8).any(|x| pixel(x, y) != background)
+                }),
+                "running-window icon did not render"
+            );
+            anyhow::ensure!(
+                pixel((rect.left + rect.right) / 2, rect.bottom - 2) != background,
+                "running-window indicator did not render"
+            );
+            let mut window_rect = RECT::default();
+            unsafe { GetWindowRect(window, &mut window_rect)? };
+            let minimize = (window_rect.left..window_rect.right)
+                .rev()
+                .find(|x| unsafe {
+                    SendMessageW(
+                        window,
+                        WM_NCHITTEST,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(pack(POINT {
+                            x: *x,
+                            y: window_rect.top + 15,
+                        }))),
+                    )
+                    .0 as u32
+                        == HTMINBUTTON
+                })
+                .context("standard minimize button was not found")?;
+            workspace.move_pointer(
+                (minimize as u32 * 65535 / (WIDTH - 1)) as u16,
+                ((window_rect.top + 15) as u32 * 65535 / (HEIGHT - 1)) as u16,
+            );
+            workspace.button(PointerButton::Left, true)?;
+            workspace.button(PointerButton::Left, false)?;
+            workspace.pump();
             workspace.refresh_tasks()?;
             anyhow::ensure!(
                 unsafe { IsIconic(window) }.as_bool(),
@@ -1205,7 +1323,6 @@ mod tests {
                 workspace.tasks.iter().any(|task| task.window == window),
                 "minimized window disappeared from taskbar"
             );
-            let mut rect = RECT::default();
             unsafe { GetWindowRect(button, &mut rect)? };
             let x = (rect.left + rect.right) / 2;
             let y = (rect.top + rect.bottom) / 2;
@@ -2173,10 +2290,17 @@ mod tests {
                     caption(&frame) == caption(&baseline),
                     "idle management caption changed"
                 );
-                anyhow::ensure!(
-                    frame[taskbar_start..] == baseline[taskbar_start..],
-                    "taskbar changed with management open"
-                );
+                if frame[taskbar_start..] != baseline[taskbar_start..] {
+                    std::fs::write(
+                        std::env::temp_dir().join("management-taskbar-baseline.bmp"),
+                        &baseline,
+                    )?;
+                    std::fs::write(
+                        std::env::temp_dir().join("management-taskbar-worker.bmp"),
+                        &frame,
+                    )?;
+                    anyhow::bail!("taskbar changed with management open");
+                }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             // MMC's File/Action/View/Help toolbar can print only its background
