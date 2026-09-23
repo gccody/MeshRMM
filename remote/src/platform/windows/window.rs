@@ -70,6 +70,7 @@ const SETTINGS_BLACKOUT_ID: usize = 4225;
 const SETTINGS_AUDIO_ID: usize = 4226;
 const SETTINGS_RECORDING_ID: usize = 4228;
 const SETTINGS_DISCONNECT_ID: usize = 4232;
+const SETTINGS_CLIPBOARD_ID: usize = 4233;
 const SETTINGS_IDLE_ID: usize = 4231;
 const SETTINGS_DISPLAY_BORDER_ID: usize = 4230;
 const SETTINGS_WALLPAPER_ID: usize = 4229;
@@ -325,6 +326,7 @@ impl WindowContext {
             ),
             (SETTINGS_WALLPAPER_ID, self.control.wallpaper_hidden(), true),
             (SETTINGS_AUDIO_ID, self.control.audio_muted(), true),
+            (SETTINGS_CLIPBOARD_ID, self.control.clipboard_sync(), true),
             (
                 SETTINGS_REMOTE_CURSOR_ID,
                 self.control.show_remote_cursor(),
@@ -551,6 +553,7 @@ unsafe fn show_settings_category(window: HWND, display: bool) {
         SETTINGS_BLACKOUT_ID as i32,
         SETTINGS_AUDIO_ID as i32,
         SETTINGS_RECORDING_ID as i32,
+        SETTINGS_CLIPBOARD_ID as i32,
     ] {
         if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
             let _ = unsafe { ShowWindow(control, advanced_command) };
@@ -648,6 +651,11 @@ unsafe extern "system" fn settings_window_proc(
                 }
                 if control_id == SETTINGS_AUDIO_ID {
                     context.control.toggle_audio();
+                    context.refresh_maintenance_controls();
+                    return LRESULT(0);
+                }
+                if control_id == SETTINGS_CLIPBOARD_ID {
+                    context.control.toggle_clipboard_sync();
                     context.refresh_maintenance_controls();
                     return LRESULT(0);
                 }
@@ -958,6 +966,16 @@ unsafe fn create_settings_window(
         340,
         28,
         SETTINGS_RECORDING_ID,
+    )?;
+    let _ = make_control(
+        w!("BUTTON"),
+        w!("Sync clipboard"),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
+        162,
+        310,
+        340,
+        28,
+        SETTINGS_CLIPBOARD_ID,
     )?;
     let _ = make_control(
         w!("BUTTON"),

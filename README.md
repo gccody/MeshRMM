@@ -376,6 +376,11 @@ are detected every 250 ms. Rich text and images require updated peers on both
 ends. Payloads are capped at 32 MiB (uncompressed RGBA pixels for images) and
 sent in paced 60 KiB chunks; larger copies take longer to arrive. File lists
 continue to use the file-transfer path. RTF-only formatting is not synchronized.
+Turn off **Sync clipboard** (session menu on macOS; Troubleshooting settings on
+Windows) to stop this exchange in both directions. The choice is saved for the
+current viewer user and defaults to on. When it is turned back on, only later copies are
+sent; content copied while sync was off stays local. **Type clipboard** and file
+clipboard transfers are unaffected.
 
 The **folder icon** offers **Send** and **Receive** using native multi-file/folder
 pickers on the source computer. Transfers preserve nested and empty folders and

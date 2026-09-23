@@ -213,6 +213,18 @@ impl ControlSink {
         }
     }
 
+    pub fn clipboard_sync(&self) -> bool {
+        crate::preferences::clipboard_sync()
+    }
+
+    pub fn toggle_clipboard_sync(&self) {
+        if let Err(error) = crate::preferences::toggle_clipboard_sync()
+            && let Ok(mut state) = self.maintenance.lock()
+        {
+            state.error = Some(error.to_string());
+        }
+    }
+
     pub fn prevent_idle_lock(&self) -> bool {
         let idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         idle.policy.effective(idle.choice)

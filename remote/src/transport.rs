@@ -865,7 +865,8 @@ fn start_viewer_services(
         let service_sender = outgoing;
         std::thread::Builder::new().name(format!("viewer-{label}")).spawn(move || {
             runtime.block_on(async move {
-                let mut clipboard = if label == CLIPBOARD_CHANNEL { ClipboardSync::new(true).ok() } else { None };
+                let mut clipboard_enabled = label == CLIPBOARD_CHANNEL && crate::preferences::clipboard_sync();
+                let mut clipboard = if clipboard_enabled { ClipboardSync::new(true).ok() } else { None };
                 let mut receiver = meshrmm_protocol::ClipboardReceiver::default();
                 let mut outgoing = std::collections::VecDeque::new();
                 let chat_ready = viewer.chat.outgoing_ready();
@@ -892,7 +893,8 @@ fn start_viewer_services(
                                 message => match receiver.receive(message) {
                                     Ok(Some(content)) => {
                                         outgoing.clear();
-                                        if let Some(clipboard) = clipboard.as_mut()
+                                        if crate::preferences::clipboard_sync()
+                                            && let Some(clipboard) = clipboard.as_mut()
                                             && let Err(error) = clipboard.apply(content) { tracing::warn!(%error, "viewer clipboard apply failed"); }
                                     }
                                     Ok(None) => {},
@@ -915,6 +917,13 @@ fn start_viewer_services(
                             if let Some(message) = outgoing.pop_front() { permit.send(message); }
                         }
                         _ = poll.tick(), if label == CLIPBOARD_CHANNEL => {
+                            let enabled = crate::preferences::clipboard_sync();
+                            if enabled != clipboard_enabled {
+                                clipboard_enabled = enabled;
+                                outgoing.clear();
+                                // Re-enabling syncs later copies only; content copied while off stays local.
+                                clipboard = if enabled { ClipboardSync::new(false).ok() } else { None };
+                            }
                             let open = control.borrow().as_ref().is_some_and(|c| c.ready_state() == RTCDataChannelState::Open);
                             if !open { continue; }
                             if let Some(clipboard) = clipboard.as_mut() {

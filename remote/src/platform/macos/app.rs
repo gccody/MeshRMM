@@ -391,6 +391,7 @@ define_class!(
                 (if self.ivars().control.audio_muted() { "Unmute audio" } else { "Mute audio" }, sel!(toggleAudio:)),
                 (if self.ivars().control.allow_idle_override() { "Prevent idle lock" } else { "Prevent idle lock (company managed)" }, sel!(togglePreventIdleLock:)),
                 ("Disconnect confirmation", sel!(toggleDisconnectConfirmation:)),
+                ("Sync clipboard", sel!(toggleClipboardSync:)),
                 ("Highlight viewed monitor on agent", sel!(toggleDisplayBorder:)),
                 ("Hide remote wallpaper", sel!(toggleWallpaper:)),
                 ("Show remote cursor", sel!(toggleRemoteCursor:)),
@@ -405,6 +406,7 @@ define_class!(
                 if action == sel!(toggleAgentInput:) && self.ivars().control.maintenance_state().blacked_out { item.setEnabled(false); }
                 if action == sel!(togglePreventIdleLock:) { item.setState(isize::from(self.ivars().control.prevent_idle_lock())); item.setEnabled(self.ivars().control.allow_idle_override()); }
                 if action == sel!(toggleDisconnectConfirmation:) { item.setState(isize::from(self.ivars().control.disconnect_confirmation())); }
+                if action == sel!(toggleClipboardSync:) { item.setState(isize::from(self.ivars().control.clipboard_sync())); }
                 if action == sel!(toggleDisplayBorder:) { item.setState(isize::from(self.ivars().control.display_border())); }
                 if action == sel!(toggleWallpaper:) { item.setState(isize::from(self.ivars().control.wallpaper_hidden())); }
                 if action == sel!(toggleRemoteCursor:) { item.setState(isize::from(self.ivars().control.show_remote_cursor())); }
@@ -430,6 +432,11 @@ define_class!(
         #[unsafe(method(toggleDisconnectConfirmation:))]
         fn toggle_disconnect_confirmation(&self, _sender: &NSMenuItem) {
             self.ivars().control.toggle_disconnect_confirmation();
+        }
+
+        #[unsafe(method(toggleClipboardSync:))]
+        fn toggle_clipboard_sync(&self, _sender: &NSMenuItem) {
+            self.ivars().control.toggle_clipboard_sync();
         }
 
         #[unsafe(method(toggleDisplayBorder:))]
