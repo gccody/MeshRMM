@@ -377,10 +377,10 @@ ends. Payloads are capped at 32 MiB (uncompressed RGBA pixels for images) and
 sent in paced 60 KiB chunks; larger copies take longer to arrive. File lists
 continue to use the file-transfer path. RTF-only formatting is not synchronized.
 Turn off **Sync clipboard** (session menu on macOS; Troubleshooting settings on
-Windows) to stop this exchange in both directions. The choice is saved for the
-current viewer user and defaults to on. When it is turned back on, only later copies are
-sent; content copied while sync was off stays local. **Type clipboard** and file
-clipboard transfers are unaffected.
+Windows) to stop this exchange, including copied files, in both directions. The
+choice is saved for the current viewer user and defaults to on. When it is turned
+back on, only later copies are sent; content copied while sync was off stays local.
+**Type clipboard**, **Send**/**Receive**, and drag-and-drop are unaffected.
 
 The **folder icon** offers **Send** and **Receive** using native multi-file/folder
 pickers on the source computer. Transfers preserve nested and empty folders and
@@ -389,8 +389,9 @@ Existing names are preserved by assigning a unique name to incoming duplicates.
 Drag files from Finder or Explorer onto the remote view to deliver a native
 Windows drop at that position (Explorer, desktop, or a browser drop target);
 if the target declines the drop, files go to the same Documents folder.
-File clipboard changes also synchronize in both directions. Copy files/folders
-in Finder or Explorer, then paste into the destination folder or desktop.
+File clipboard changes also synchronize in both directions while **Sync
+clipboard** is on. Copy files/folders in Finder or Explorer, then paste into the
+destination folder or desktop.
 The receiver publishes files after all chunks and SHA-256 checks complete;
 a remote paste shortcut waits for the transfer before pasting.
 A native progress window appears on the receiving computer: on the Agent for

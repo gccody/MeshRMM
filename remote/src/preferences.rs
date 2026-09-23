@@ -70,7 +70,7 @@ pub fn disconnect_confirmation() -> bool {
 pub fn toggle_disconnect_confirmation() -> anyhow::Result<()> {
     toggle(|p| &mut p.disconnect_confirmation)
 }
-/// Automatic text/rich-text/image clipboard exchange with the Agent.
+/// Automatic text/rich-text/image and file clipboard exchange with the Agent.
 pub fn clipboard_sync() -> bool {
     get(|p| p.clipboard_sync)
 }
