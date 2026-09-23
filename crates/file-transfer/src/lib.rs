@@ -51,6 +51,7 @@ pub struct TransferSession {
     rx: Arc<Mutex<mpsc::Receiver<FileMessage>>>,
     status: Arc<Mutex<String>>,
     ready: Arc<tokio::sync::Notify>,
+    clipboard_enabled: fn() -> bool,
 }
 impl Default for TransferSession {
     fn default() -> Self {
@@ -59,6 +60,11 @@ impl Default for TransferSession {
 }
 impl TransferSession {
     pub fn new() -> Self {
+        Self::with_clipboard_policy(|| true)
+    }
+    /// Clipboard file copies are skipped, not sent, and rejected on receipt
+    /// while `clipboard_enabled` returns false; other transfers are unaffected.
+    pub fn with_clipboard_policy(clipboard_enabled: fn() -> bool) -> Self {
         let (tx, commands) = mpsc::sync_channel(32);
         let (sender, rx) = mpsc::sync_channel(8);
         let ready = Arc::new(tokio::sync::Notify::new());
@@ -68,12 +74,13 @@ impl TransferSession {
         };
         let status = Arc::new(Mutex::new("Waiting for file-transfer support…".into()));
         let worker_status = status.clone();
-        std::thread::spawn(move || worker(commands, out, worker_status));
+        std::thread::spawn(move || worker(commands, out, worker_status, clipboard_enabled));
         Self {
             tx,
             rx: Arc::new(Mutex::new(rx)),
             ready,
             status,
+            clipboard_enabled,
         }
     }
     /// Run native OLE operations on a dedicated helper's main thread while its
@@ -94,9 +101,10 @@ impl TransferSession {
             rx: Arc::new(Mutex::new(rx)),
             status: status.clone(),
             ready,
+            clipboard_enabled: || true,
         };
         let transport = std::thread::spawn(move || client(session));
-        worker(commands, out, status);
+        worker(commands, out, status, || true);
         transport.join().expect("file transport thread panicked")
     }
     pub fn command(&self, command: Command) {
@@ -111,6 +119,9 @@ impl TransferSession {
         self.command(Command::Send(paths, destination));
     }
     pub fn paste_files(&self, display_id: meshrmm_protocol::DisplayId) -> bool {
+        if !(self.clipboard_enabled)() {
+            return false;
+        }
         let paths = native::clipboard_files().unwrap_or_default();
         if paths.is_empty() {
             return false;
@@ -149,7 +160,12 @@ fn id() -> u64 {
     now.max(previous + 1)
 }
 
-fn worker(commands: mpsc::Receiver<Command>, out: OutgoingFiles, status: Arc<Mutex<String>>) {
+fn worker(
+    commands: mpsc::Receiver<Command>,
+    out: OutgoingFiles,
+    status: Arc<Mutex<String>>,
+    clipboard_enabled: fn() -> bool,
+) {
     let _native = match native::initialize() {
         Ok(v) => v,
         Err(e) => {
@@ -214,7 +230,12 @@ fn worker(commands: mpsc::Receiver<Command>, out: OutgoingFiles, status: Arc<Mut
                 }
             }
             Some(Command::Peer(FileMessage::Error { id, reason })) => {
-                *status.lock().unwrap() = format!("Transfer failed: {reason}");
+                // Errors for transfers rejected before they began here are not ours to report.
+                if sender.as_ref().is_some_and(|(active, _)| *active == id)
+                    || incoming.as_ref().is_some_and(|i| i.id == id)
+                {
+                    *status.lock().unwrap() = format!("Transfer failed: {reason}");
+                }
                 if let Some((active, tx)) = &sender
                     && *active == id
                 {
@@ -223,6 +244,16 @@ fn worker(commands: mpsc::Receiver<Command>, out: OutgoingFiles, status: Arc<Mut
                 if incoming.as_ref().is_some_and(|i| i.id == id) {
                     incoming = None;
                     progress = None;
+                }
+            }
+            Some(Command::Peer(FileMessage::Begin {
+                id,
+                destination: FileDestination::Clipboard | FileDestination::ClipboardPaste { .. },
+            })) if !clipboard_enabled() => {
+                tracing::info!(id, "clipboard sync is off; rejected file transfer");
+                let reason = "Clipboard file transfers are disabled".into();
+                if out.send(FileMessage::Error { id, reason }).is_err() {
+                    break;
                 }
             }
             Some(Command::Peer(message)) => {
@@ -317,7 +348,10 @@ fn worker(commands: mpsc::Receiver<Command>, out: OutgoingFiles, status: Arc<Mut
         if send.is_none() && available && poll.elapsed() >= Duration::from_millis(250) {
             poll = Instant::now();
             let sequence = native::clipboard_sequence();
-            if sequence != last_clipboard_sequence
+            if sequence != last_clipboard_sequence && !clipboard_enabled() {
+                // Copies made while clipboard sync is off stay local after re-enabling.
+                last_clipboard_sequence = sequence;
+            } else if sequence != last_clipboard_sequence
                 && let Ok(paths) = native::clipboard_files()
             {
                 tracing::info!(files = paths.len(), "native file clipboard changed");

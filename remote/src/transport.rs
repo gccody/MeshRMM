@@ -210,7 +210,9 @@ impl ViewerControlQueue {
                 let _ = recording_outgoing.send(SessionMessage::SetRecording { enabled });
             }),
             maintenance: Arc::new(Mutex::new(crate::platform::MaintenanceState::default())),
-            files: meshrmm_file_transfer::TransferSession::new(),
+            files: meshrmm_file_transfer::TransferSession::with_clipboard_policy(
+                crate::preferences::clipboard_sync,
+            ),
             chat: meshrmm_chat::ChatSession::default(),
             outgoing,
             service_senders: Arc::new(Mutex::new(HashMap::new())),
