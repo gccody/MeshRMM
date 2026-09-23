@@ -75,6 +75,12 @@ const SETTINGS_IDLE_ID: usize = 4231;
 const SETTINGS_DISPLAY_BORDER_ID: usize = 4230;
 const SETTINGS_WALLPAPER_ID: usize = 4229;
 const SETTINGS_REMOTE_CURSOR_ID: usize = 4227;
+const SETTINGS_CLOSE_TITLE_ID: i32 = 4234;
+const SETTINGS_CLOSE_ACTION_IDS: [(usize, SessionCloseAction); 3] = [
+    (4235, SessionCloseAction::NoAction),
+    (4236, SessionCloseAction::Lock),
+    (4237, SessionCloseAction::Logout),
+];
 
 impl WindowContext {
     fn send(&self, message: SessionMessage) {
@@ -287,6 +293,7 @@ impl WindowContext {
     }
 
     fn refresh_maintenance_controls(&self) {
+        let close_action = self.control.session_close_action();
         let recording = self.control.recording().active();
         if self.recording_visible.replace(recording) != recording {
             unsafe {
@@ -348,7 +355,10 @@ impl WindowContext {
                 self.control.maintenance_state().available
                     && !self.control.maintenance_state().blacked_out,
             ),
-        ] {
+        ]
+        .into_iter()
+        .chain(SETTINGS_CLOSE_ACTION_IDS.map(|(id, action)| (id, action == close_action, true)))
+        {
             if let Ok(button) = unsafe { GetDlgItem(Some(self.settings_window), id as i32) } {
                 unsafe {
                     if id == SETTINGS_IDLE_ID {
@@ -554,7 +564,11 @@ unsafe fn show_settings_category(window: HWND, display: bool) {
         SETTINGS_AUDIO_ID as i32,
         SETTINGS_RECORDING_ID as i32,
         SETTINGS_CLIPBOARD_ID as i32,
-    ] {
+        SETTINGS_CLOSE_TITLE_ID,
+    ]
+    .into_iter()
+    .chain(SETTINGS_CLOSE_ACTION_IDS.map(|(id, _)| id as i32))
+    {
         if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
             let _ = unsafe { ShowWindow(control, advanced_command) };
         }
@@ -656,6 +670,14 @@ unsafe extern "system" fn settings_window_proc(
                 }
                 if control_id == SETTINGS_CLIPBOARD_ID {
                     context.control.toggle_clipboard_sync();
+                    context.refresh_maintenance_controls();
+                    return LRESULT(0);
+                }
+                if let Some((_, action)) = SETTINGS_CLOSE_ACTION_IDS
+                    .iter()
+                    .find(|(id, _)| *id == control_id)
+                {
+                    context.control.set_session_close_action(*action);
                     context.refresh_maintenance_controls();
                     return LRESULT(0);
                 }
@@ -977,6 +999,33 @@ unsafe fn create_settings_window(
         28,
         SETTINGS_CLIPBOARD_ID,
     )?;
+    let _ = make_control(
+        w!("STATIC"),
+        w!("On session close"),
+        static_style,
+        162,
+        358,
+        340,
+        24,
+        SETTINGS_CLOSE_TITLE_ID as usize,
+    )?;
+    for (index, (id, action)) in SETTINGS_CLOSE_ACTION_IDS.into_iter().enumerate() {
+        let label = HSTRING::from(action.label());
+        let _ = make_control(
+            w!("BUTTON"),
+            PCWSTR(label.as_ptr()),
+            WINDOW_STYLE(if index == 0 {
+                radio_style.0 | WS_GROUP.0
+            } else {
+                radio_style.0
+            }),
+            162,
+            388 + 36 * index as i32,
+            340,
+            28,
+            id,
+        )?;
+    }
     let _ = make_control(
         w!("BUTTON"),
         w!("Hide remote wallpaper"),

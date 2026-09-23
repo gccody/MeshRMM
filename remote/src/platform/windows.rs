@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use meshrmm_protocol::{
     ChromaMode, Codec, CursorShape, Display, EncodedFrame, PointerButton, QualityPreset,
-    RemoteInput, SessionMessage, VideoFormat, VideoProfile,
+    RemoteInput, SessionCloseAction, SessionMessage, VideoFormat, VideoProfile,
 };
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,

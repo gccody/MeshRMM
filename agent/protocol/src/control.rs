@@ -141,6 +141,32 @@ pub enum SessionMessage {
     SetRecording {
         enabled: bool,
     },
+    /// Action the Agent runs on the viewed Windows session when the remote
+    /// session ends. Appended to preserve postcard tags.
+    SetSessionCloseAction {
+        action: SessionCloseAction,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCloseAction {
+    #[default]
+    NoAction,
+    Lock,
+    Logout,
+}
+
+impl SessionCloseAction {
+    pub const ALL: [Self; 3] = [Self::NoAction, Self::Lock, Self::Logout];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoAction => "No action",
+            Self::Lock => "Lock",
+            Self::Logout => "Logout",
+        }
+    }
 }
 
 impl SessionMessage {
@@ -362,6 +388,18 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn session_close_action_is_appended_and_round_trips() {
+        for (index, action) in SessionCloseAction::ALL.into_iter().enumerate() {
+            let message = SessionMessage::SetSessionCloseAction { action };
+            assert_eq!(message.encode().unwrap(), vec![33, index as u8]);
+            assert_eq!(
+                SessionMessage::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+        }
+    }
 
     #[test]
     fn idle_preference_round_trips_without_changing_pointer_tag() {

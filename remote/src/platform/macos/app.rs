@@ -1,4 +1,5 @@
 use super::*;
+use meshrmm_protocol::SessionCloseAction;
 use objc2_app_kit::{
     NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSMenu, NSMenuItem,
     NSPasteboardTypeFileURL,
@@ -411,6 +412,23 @@ define_class!(
                 if action == sel!(toggleWallpaper:) { item.setState(isize::from(self.ivars().control.wallpaper_hidden())); }
                 if action == sel!(toggleRemoteCursor:) { item.setState(isize::from(self.ivars().control.show_remote_cursor())); }
                 menu.addItem(&item);
+                if action == sel!(toggleDisconnectConfirmation:) {
+                    let close = NSMenuItem::new(self.mtm());
+                    close.setTitle(&NSString::from_str("On session close"));
+                    let choices = NSMenu::new(self.mtm());
+                    let selected = self.ivars().control.session_close_action();
+                    for (index, choice) in SessionCloseAction::ALL.into_iter().enumerate() {
+                        let choice_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(
+                            NSMenuItem::alloc(self.mtm()), &NSString::from_str(choice.label()), Some(sel!(selectSessionCloseAction:)), &NSString::new(),
+                        ) };
+                        unsafe { choice_item.setTarget(Some(self)); }
+                        choice_item.setTag(index as isize);
+                        choice_item.setState(isize::from(choice == selected));
+                        choices.addItem(&choice_item);
+                    }
+                    close.setSubmenu(Some(&choices));
+                    menu.addItem(&close);
+                }
             }
             menu.popUpMenuPositioningItem_atLocation_inView(None, NSPoint::new(0., 0.), Some(sender));
         }
@@ -432,6 +450,13 @@ define_class!(
         #[unsafe(method(toggleDisconnectConfirmation:))]
         fn toggle_disconnect_confirmation(&self, _sender: &NSMenuItem) {
             self.ivars().control.toggle_disconnect_confirmation();
+        }
+
+        #[unsafe(method(selectSessionCloseAction:))]
+        fn select_session_close_action(&self, sender: &NSMenuItem) {
+            if let Some(action) = usize::try_from(sender.tag()).ok().and_then(|index| SessionCloseAction::ALL.get(index)) {
+                self.ivars().control.set_session_close_action(*action);
+            }
         }
 
         #[unsafe(method(toggleClipboardSync:))]

@@ -6,12 +6,14 @@ use meshrmm_signaling_client::{ReconnectBackoff, is_terminal_websocket_error};
 
 use super::config::{Config, ExecutionMode};
 use super::platform::{PlatformScreenStreamer, ScreenStreamer};
+use super::session_close::SessionClose;
 use super::signaling::session_signal_url;
 
 pub async fn run(
     config: &Config,
     request: AgentSessionRequest,
     mode: ExecutionMode,
+    session_close: Arc<SessionClose>,
 ) -> anyhow::Result<()> {
     let session_id = request.session_id.clone();
     let signal_url = session_signal_url(config.server.as_str(), session_id.as_str(), "agent")?;
@@ -39,15 +41,20 @@ pub async fn run(
             session_id.clone(),
             request.idle_policy,
             request.start_in_background,
+            Arc::clone(&session_close),
         )
         .await
         {
             Ok(()) => return Ok(()),
+            Err(error) if is_terminal_websocket_error(&error) => {
+                // The server revoked or expired the session, so it cannot resume.
+                session_close.run(&session_id);
+                return Err(error);
+            }
             Err(error)
-                if is_terminal_websocket_error(&error)
-                    || error
-                        .downcast_ref::<meshrmm_session_transport::identity::IdentityError>()
-                        .is_some() =>
+                if error
+                    .downcast_ref::<meshrmm_session_transport::identity::IdentityError>()
+                    .is_some() =>
             {
                 return Err(error);
             }

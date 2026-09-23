@@ -344,6 +344,17 @@ and all-monitor blackout. Company admins customize the blackout notice under
 **Profile & session**. See [maintenance controls](docs/maintenance-controls.md)
 for usage, Windows requirements, and cleanup behavior.
 
+**On session close** (session menu on macOS; Troubleshooting settings on Windows)
+chooses what the Agent does to the Windows session being viewed when the remote
+session ends: **No action** (default), **Lock**, or **Logout**. The choice is saved
+for the current viewer user and sent to the Agent when each connection starts.
+The action runs when the server ends the session: when the viewer closes it, when
+it is closed from the dashboard, or when an unreachable viewer reaches the session
+idle timeout. It does not run while the viewer is reconnecting to the same session. The action applies to the console or RDP user session viewed last.
+If no user is signed in, or the session was in background mode, nothing happens.
+Logout does not save open work. Updating or restarting the Agent service skips
+the action.
+
 System audio from the Windows default playback device is forwarded to both native
 viewers over a separate, bounded WebRTC audio channel, including while muted.
 Each new session starts muted. On macOS, choose **Unmute audio** in the session

@@ -225,6 +225,21 @@ impl ControlSink {
         }
     }
 
+    pub fn session_close_action(&self) -> meshrmm_protocol::SessionCloseAction {
+        crate::preferences::session_close_action()
+    }
+
+    pub fn set_session_close_action(&self, action: meshrmm_protocol::SessionCloseAction) {
+        match crate::preferences::set_session_close_action(action) {
+            Ok(()) => self.send(meshrmm_protocol::SessionMessage::SetSessionCloseAction { action }),
+            Err(error) => {
+                if let Ok(mut state) = self.maintenance.lock() {
+                    state.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
     pub fn prevent_idle_lock(&self) -> bool {
         let idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         idle.policy.effective(idle.choice)

@@ -107,6 +107,30 @@ The installed agent from the previous feature remained in use; no service update
 was needed for this viewer-only change. Windows UI was compiled/tested natively,
 not manually exercised.
 
+## On session close
+
+**On session close** (No action by default, Lock, or Logout) is a per-OS-user viewer
+preference stored with **Disconnect confirmation**. The viewer sends it to the Agent
+on each connection. The Agent keeps it per remote session, across resumes, and
+tracks the viewed console or RDP session. It runs the action once, when the server
+ends the session (end-session command, a replacing session, or terminal signaling
+rejection). A closed control channel alone does not trigger it. Lock launches a
+`--lock-session` helper as the signed-in user on `winsta0\default`, which calls
+`LockWorkStation`. Logout calls `WTSLogoffSession`. Sessions with no user, and the
+background desktop, are skipped.
+
+Validation: macOS and native Windows workspace Clippy, protocol/agent/viewer tests,
+and formatting. The Windows test source was verified against the working tree by
+SHA-256. Installed build SHA-256:
+`6A418BED032CEA41CD451705CEB3E3705512BE8C9BA8CD17C2ED0F3D0A716F65`.
+The service started and connected with its configuration preserved. Two live macOS
+viewer sessions were run against the console. With Lock, closing the viewer logged
+`action=Lock session=Console` 28 ms after the server ended the session, and
+LogonUI appeared in session 1. With Logout, the action ran 2 ms after the session
+ended and `query user` reported no signed-in users. The service stayed running and
+connected. The Windows viewer's radio buttons were compiled and unit-tested
+natively; that UI was not manually exercised.
+
 ## Dedicated settings page
 
 - Company settings now live at `/settings`, categorized as dashboard security,
