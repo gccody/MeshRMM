@@ -33,6 +33,8 @@ mod platform;
 mod secure_attention;
 #[cfg(windows)]
 mod session;
+#[cfg(any(windows, test))]
+pub(crate) mod session_close;
 #[cfg(windows)]
 mod signaling;
 #[cfg(windows)]
@@ -77,6 +79,12 @@ pub async fn run(
     {
         let mut retry_delay = Duration::from_secs(1);
         let mut active_session = None::<ActiveSession>;
+        // Outlives session tasks, which end whenever the viewer drops its
+        // connection, so the close action runs only once the session ends.
+        let mut session_close = None::<(
+            meshrmm_protocol::RemoteSessionId,
+            std::sync::Arc<session_close::SessionClose>,
+        )>;
         loop {
             let url = agent_connection_url(&config.server, &config.device_id)?;
             tracing::info!(device_id = %config.device_id, url = %url, "connecting Agent to Cloudflare signaling");
@@ -134,6 +142,11 @@ pub async fn run(
                                                             let _ = active.task.await;
                                                             tracing::info!(%session_id, "stopped expired remote session");
                                                         }
+                                                        if session_close.as_ref().is_some_and(|(id, _)| *id == session_id)
+                                                            && let Some((id, close)) = session_close.take()
+                                                        {
+                                                            close.run(&id);
+                                                        }
                                                         continue;
                                                     }
                                                     AgentCommand::StartBackgroundSession { request } => Some(request),
@@ -166,11 +179,21 @@ pub async fn run(
                                                 let _ = active.task.await;
                                             }
                                             let session_id = request.session_id.clone();
+                                            if session_close.as_ref().is_some_and(|(id, _)| *id != session_id)
+                                                && let Some((id, close)) = session_close.take()
+                                            {
+                                                close.run(&id);
+                                            }
+                                            let close = std::sync::Arc::clone(
+                                                &session_close
+                                                    .get_or_insert_with(|| (session_id.clone(), Default::default()))
+                                                    .1,
+                                            );
                                             let active_request = request.clone();
                                             let session_config = config.clone();
                                             let task_session_id = session_id.clone();
                                             let task = tokio::spawn(async move {
-                                                if let Err(error) = session::run(&session_config, request, mode).await {
+                                                if let Err(error) = session::run(&session_config, request, mode, close).await {
                                                     tracing::error!(
                                                         error = ?error,
                                                         session_id = %task_session_id,

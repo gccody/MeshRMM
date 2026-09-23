@@ -47,6 +47,14 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     if std::env::args_os()
         .nth(1)
+        .is_some_and(|argument| argument == "--lock-session")
+    {
+        return remote::session_close::run_lock_helper();
+    }
+
+    #[cfg(windows)]
+    if std::env::args_os()
+        .nth(1)
         .is_some_and(|argument| argument == "--background-task-manager")
     {
         return remote::background_tasks::run();

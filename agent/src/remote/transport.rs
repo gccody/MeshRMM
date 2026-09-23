@@ -26,6 +26,7 @@ use webrtc::peer_connection::{
 use webrtc::stats::StatsReportType;
 
 use super::platform::{ScreenStreamer, StartedScreen, monotonic_timestamp_us};
+use super::session_close::SessionClose;
 use super::signaling::authenticated_websocket;
 use super::video::LatestFrameSlot;
 
@@ -89,6 +90,7 @@ enum ControlCommand {
 struct CaptureStartup {
     quality_ceiling: Arc<AtomicU32>,
     initial_display: Option<DisplayId>,
+    session_close: Arc<SessionClose>,
 }
 
 const VIDEO_BUFFER_DRAIN_MS: u32 = 50;
@@ -268,6 +270,8 @@ fn start_first_profile(
     )
 }
 
+// Session-scoped state is owned by the caller so it survives sender reconnects.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_sender(
     signal_url: Url,
     signaling_token: &str,
@@ -276,6 +280,7 @@ pub async fn run_sender(
     session_id: RemoteSessionId,
     idle_policy: meshrmm_protocol::IdlePolicy,
     start_in_background: bool,
+    session_close: Arc<SessionClose>,
 ) -> anyhow::Result<()> {
     let (socket, _) = authenticated_websocket(signal_url, signaling_token).await?;
     let mut signal = SignalingConnection::new(socket);
@@ -288,6 +293,7 @@ pub async fn run_sender(
         &mut failure_reported,
         idle_policy,
         start_in_background,
+        session_close,
     )
     .await;
     if let Err(error) = &result
@@ -298,6 +304,7 @@ pub async fn run_sender(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_connected_sender(
     signal: &mut SignalingConnection,
     ice_servers: Vec<IceServer>,
@@ -306,6 +313,7 @@ async fn run_connected_sender(
     failure_reported: &mut bool,
     idle_policy: meshrmm_protocol::IdlePolicy,
     start_in_background: bool,
+    session_close: Arc<SessionClose>,
 ) -> anyhow::Result<()> {
     // Input has its own synchronized controller so capture startup, encoder
     // recovery, and video teardown never hold the path used by control events.
@@ -519,7 +527,9 @@ async fn run_connected_sender(
         let chat_tx = chat_tx.clone();
         let clipboard_tx = clipboard_tx.clone();
         let maintenance_tx = maintenance_tx.clone();
+        let message_session_close = Arc::clone(&session_close);
         control_channel.on_message(Box::new(move |message| {
+            let session_close = Arc::clone(&message_session_close);
             let tx = control_messages_tx.clone();
             let decoder_ready = Arc::clone(&decoder_ready);
             let input_tx = input_tx.clone();
@@ -601,6 +611,10 @@ async fn run_connected_sender(
                         chat_tx.try_send(message).err().map(|_| {
                             ControlCommand::MaintenanceError("chat queue full or closed".into())
                         })
+                    }
+                    Ok(SessionMessage::SetSessionCloseAction { action }) => {
+                        session_close.set_action(action);
+                        None
                     }
                     Ok(SessionMessage::Stop { .. }) => Some(ControlCommand::Stop),
                     Ok(_) => None,
@@ -690,6 +704,7 @@ async fn run_connected_sender(
                     quality_ceiling: capture_ceiling,
                     initial_display: start_in_background
                         .then_some(DisplayId(meshrmm_remote_screen::background::DISPLAY_ID)),
+                    session_close,
                 },
                 capture_rx,
                 started_tx,
@@ -1149,6 +1164,7 @@ async fn run_capture_control(
     let CaptureStartup {
         quality_ceiling,
         initial_display,
+        session_close,
     } = startup;
     let started = lock_streamer(&streamer)?.start(initial_display, stream_id, Arc::clone(&slot));
     let started = match started {
@@ -1180,6 +1196,7 @@ async fn run_capture_control(
         if *stop.borrow() {
             return Ok(());
         }
+        session_close.set_target(&active_display.session);
         tokio::select! {
             biased;
             _ = stop.changed() => return Ok(()),
