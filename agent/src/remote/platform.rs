@@ -52,6 +52,13 @@ pub trait ScreenStreamer: Send {
 }
 
 pub trait ScreenInput: Send + Sync {
+    fn credential_command(&self, _message: meshrmm_protocol::SessionMessage) -> anyhow::Result<()> {
+        anyhow::bail!("Credentials require the installed Windows service")
+    }
+    fn credential_state(&self) -> Option<meshrmm_protocol::CredentialState> {
+        None
+    }
+
     /// Session 0 audio capture and service SendSAS target only the console.
     fn is_console_session(&self) -> bool {
         !self.is_background()

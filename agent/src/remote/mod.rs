@@ -14,6 +14,8 @@ pub(crate) mod capture_helper;
 mod clipboard;
 pub mod config;
 #[cfg(windows)]
+mod credentials;
+#[cfg(windows)]
 mod display_border;
 #[cfg(windows)]
 mod drag_windows;

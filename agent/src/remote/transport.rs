@@ -441,6 +441,11 @@ async fn run_connected_sender(
         std::time::Duration::from_secs(3600),
         move |message| {
             let result = match message {
+                Some(
+                    message @ (SessionMessage::PromptForCredentials
+                    | SessionMessage::AutofillCredentials
+                    | SessionMessage::ForgetCredentials),
+                ) => maintenance_input.credential_command(message),
                 Some(SessionMessage::SendSecureAttention) => {
                     if !maintenance_input.is_console_session() {
                         Err(anyhow::anyhow!(
@@ -576,6 +581,9 @@ async fn run_connected_sender(
                     }
                     Ok(
                         message @ (SessionMessage::SendSecureAttention
+                        | SessionMessage::PromptForCredentials
+                        | SessionMessage::AutofillCredentials
+                        | SessionMessage::ForgetCredentials
                         | SessionMessage::SetWallpaperHidden { .. }
                         | SessionMessage::SetPreventIdleLock { .. }
                         | SessionMessage::SetBlackout { .. }
@@ -1103,6 +1111,7 @@ fn spawn_input_worker(
     let mut ownership = None;
     let mut pointer_display = None;
     let mut state = None;
+    let mut credentials = None;
     Ok(super::native_task::command_worker(
         "meshrmm-input",
         1024,
@@ -1121,6 +1130,14 @@ fn spawn_input_worker(
                         .is_ok()
                 {
                     ownership = Some(viewer_controls_input);
+                }
+                if let Some(next) = input.credential_state()
+                    && credentials.as_ref() != Some(&next)
+                    && updates
+                        .try_send(SessionMessage::CredentialState(next.clone()))
+                        .is_ok()
+                {
+                    credentials = Some(next);
                 }
                 let next_pointer = input.agent_pointer_display();
                 if pointer_display != Some(next_pointer)

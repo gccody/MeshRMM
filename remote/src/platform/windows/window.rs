@@ -23,6 +23,8 @@ struct WindowContext {
     chat_button: HWND,
     secure_attention_button: HWND,
     type_clipboard_button: HWND,
+    credential_buttons: [HWND; 3],
+    credential_label: HWND,
     chat_popup: Option<meshrmm_chat::ChatPopup>,
     minimize_button: HWND,
     maximize_button: HWND,
@@ -48,6 +50,7 @@ const FILE_BUTTON_ID: usize = 4010;
 const CHAT_BUTTON_ID: usize = 4009;
 const SECURE_ATTENTION_BUTTON_ID: usize = 4011;
 const TYPE_CLIPBOARD_BUTTON_ID: usize = 4012;
+const CREDENTIAL_BUTTON_ID: usize = 4020;
 const MINIMIZE_BUTTON_ID: usize = 4005;
 const MAXIMIZE_BUTTON_ID: usize = 4006;
 const CLOSE_BUTTON_ID: usize = 4007;
@@ -182,6 +185,19 @@ impl WindowContext {
         let _ = unsafe { MoveWindow(self.display_combo, 172, 5, 110, 300, true) };
         let _ = unsafe { MoveWindow(self.quality_combo, 288, 5, 154, 300, true) };
         let _ = unsafe { MoveWindow(self.chroma_combo, 448, 5, 124, 300, true) };
+        for (i, button) in self.credential_buttons.iter().enumerate() {
+            let _ = unsafe { MoveWindow(*button, 8 + i as i32 * 184, 38, 180, 24, true) };
+        }
+        let _ = unsafe {
+            MoveWindow(
+                self.credential_label,
+                566,
+                42,
+                (width - 574).max(1),
+                20,
+                true,
+            )
+        };
         let caption_x = width.saturating_sub(138);
         let _ = unsafe { MoveWindow(self.minimize_button, caption_x, 0, 46, 34, true) };
         let _ = unsafe { MoveWindow(self.maximize_button, caption_x + 46, 0, 46, 34, true) };
@@ -294,6 +310,25 @@ impl WindowContext {
     }
 
     fn refresh_maintenance_controls(&self) {
+        let state = self.control.credential_state();
+        for (i, button) in self.credential_buttons.iter().enumerate() {
+            unsafe {
+                let _ = EnableWindow(
+                    *button,
+                    !self.control.technician_blocked()
+                        && match i {
+                            0 => state.available && !state.prompt_active,
+                            1 => state.can_autofill,
+                            _ => state.saved && !state.prompt_active,
+                        },
+                );
+                if i == 1 {
+                    let _ = ShowWindow(*button, if state.can_autofill { SW_SHOW } else { SW_HIDE });
+                }
+            }
+        }
+        let text: Vec<u16> = state.message.encode_utf16().chain(Some(0)).collect();
+        let _ = unsafe { SetWindowTextW(self.credential_label, PCWSTR(text.as_ptr())) };
         let close_action = self.control.session_close_action();
         let recording = self.control.recording().active();
         if self.recording_visible.replace(recording) != recording {
@@ -1247,6 +1282,17 @@ pub(super) unsafe fn create_window(
                         let _ = unsafe { SetFocus(Some(window)) };
                         return LRESULT(0);
                     }
+                    if (CREDENTIAL_BUTTON_ID..CREDENTIAL_BUTTON_ID + 3).contains(&control_id) {
+                        context.release_input();
+                        context
+                            .control
+                            .send(match control_id - CREDENTIAL_BUTTON_ID {
+                                0 => SessionMessage::PromptForCredentials,
+                                1 => SessionMessage::AutofillCredentials,
+                                _ => SessionMessage::ForgetCredentials,
+                            });
+                        return LRESULT(0);
+                    }
                     if control_id == TYPE_CLIPBOARD_BUTTON_ID {
                         context.release_input();
                         context.control.type_clipboard(context.active_display.id);
@@ -1560,6 +1606,8 @@ pub(super) unsafe fn create_window(
         chat_button: HWND::default(),
         secure_attention_button: HWND::default(),
         type_clipboard_button: HWND::default(),
+        credential_buttons: [HWND::default(); 3],
+        credential_label: HWND::default(),
         chat_popup: None,
         minimize_button: HWND::default(),
         maximize_button: HWND::default(),
@@ -1817,6 +1865,40 @@ pub(super) unsafe fn create_window(
         w!("Type clipboard"),
         toolbar_button_style,
     )?;
+    let credential_buttons = [
+        make_toolbar_button(
+            CREDENTIAL_BUTTON_ID,
+            w!("Prompt for credentials"),
+            toolbar_button_style,
+        )?,
+        make_toolbar_button(
+            CREDENTIAL_BUTTON_ID + 1,
+            w!("Autofill credentials?"),
+            toolbar_button_style,
+        )?,
+        make_toolbar_button(
+            CREDENTIAL_BUTTON_ID + 2,
+            w!("Forget credentials"),
+            toolbar_button_style,
+        )?,
+    ];
+    let credential_label = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!(""),
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+            1,
+            1,
+            Some(window),
+            None,
+            Some(instance),
+            None,
+        )
+    }
+    .context("credential status label creation failed")?;
     let secure_attention_button = make_toolbar_button(
         SECURE_ATTENTION_BUTTON_ID,
         w!("Ctrl+Alt+Del"),
@@ -1839,6 +1921,10 @@ pub(super) unsafe fn create_window(
         chat_button,
         secure_attention_button,
         type_clipboard_button,
+        credential_buttons[0],
+        credential_buttons[1],
+        credential_buttons[2],
+        credential_label,
         minimize_button,
         maximize_button,
         close_button,
@@ -1866,6 +1952,8 @@ pub(super) unsafe fn create_window(
         context.chat_button = chat_button;
         context.secure_attention_button = secure_attention_button;
         context.type_clipboard_button = type_clipboard_button;
+        context.credential_buttons = credential_buttons;
+        context.credential_label = credential_label;
         context.chat_popup = Some(unsafe {
             meshrmm_chat::ChatPopup::new(window, chat_button, context.control.chat())
         }?);

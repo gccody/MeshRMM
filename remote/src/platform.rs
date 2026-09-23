@@ -34,6 +34,7 @@ pub struct ControlSink {
     send: Arc<dyn Fn(meshrmm_protocol::SessionMessage) + Send + Sync>,
     set_input_enabled: Arc<dyn Fn(bool) + Send + Sync>,
     maintenance: Arc<Mutex<MaintenanceState>>,
+    credentials: Arc<Mutex<meshrmm_protocol::CredentialState>>,
     technician_blocked: Arc<std::sync::atomic::AtomicBool>,
     wallpaper_hidden: Arc<std::sync::atomic::AtomicBool>,
     remote_cursor_hidden: Arc<std::sync::atomic::AtomicBool>,
@@ -76,6 +77,7 @@ impl ControlSink {
             session_close_action,
             wallpaper_hidden: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             maintenance,
+            credentials: Arc::new(Mutex::new(Default::default())),
             send: Arc::new(send),
             set_input_enabled: Arc::new(set_input_enabled),
             quality,
@@ -85,12 +87,28 @@ impl ControlSink {
         }
     }
 
+    pub fn credential_state(&self) -> meshrmm_protocol::CredentialState {
+        self.credentials
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+    pub fn with_credentials(
+        mut self,
+        state: Arc<Mutex<meshrmm_protocol::CredentialState>>,
+    ) -> Self {
+        self.credentials = state;
+        self
+    }
+
     pub fn send(&self, message: meshrmm_protocol::SessionMessage) {
         if self.technician_blocked()
             && matches!(
                 &message,
                 meshrmm_protocol::SessionMessage::Input(_)
                     | meshrmm_protocol::SessionMessage::SendSecureAttention
+                    | meshrmm_protocol::SessionMessage::PromptForCredentials
+                    | meshrmm_protocol::SessionMessage::AutofillCredentials
             )
         {
             return;

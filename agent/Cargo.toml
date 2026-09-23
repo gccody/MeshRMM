@@ -14,6 +14,7 @@ meshrmm-audio = { path = "../crates/audio" }
 meshrmm-session-transport = { path = "../crates/session-transport" }
 meshrmm-file-transfer = { path = "../crates/file-transfer" }
 meshrmm-chat = { path = "../crates/chat" }
+zeroize = "1.8"
 anyhow.workspace = true
 meshrmm-clipboard = { path = "../crates/clipboard" }
 bytes.workspace = true
@@ -59,6 +60,9 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Console",
     "Win32_Storage_FileSystem",
     "Win32_Security",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+    "Win32_UI_Accessibility",
     "Win32_Security_Authentication_Identity",
     "Win32_System_Registry",
     "Win32_System_Environment",

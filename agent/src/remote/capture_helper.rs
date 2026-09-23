@@ -98,6 +98,8 @@ impl DesktopTarget {
 }
 
 enum ParentCommand {
+    PromptCredentials,
+    AutofillCredentials(Vec<u8>),
     EnumerateDisplays,
     StartFiles,
     StartClipboard,
@@ -146,6 +148,8 @@ pub struct StartedDesktop {
 }
 
 enum ChildEvent {
+    Credentials(CredentialResult),
+    CredentialPrompt(bool),
     Files(meshrmm_protocol::FileMessage),
     Started(StartedDesktop),
     InputStarted,
@@ -161,6 +165,18 @@ enum ChildEvent {
     Error(String),
     Stopped,
 }
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CredentialResult {
+    encrypted: Option<Vec<u8>>,
+    message: String,
+}
+#[derive(Default)]
+struct Credentials {
+    encrypted: Vec<u8>,
+    state: meshrmm_protocol::CredentialState,
+}
+type HelperCredentials = Arc<Mutex<Credentials>>;
 
 type HelperStatus = Arc<Mutex<Option<Result<(), String>>>>;
 type HelperCursor = Arc<Mutex<(CursorShape, bool, Option<DisplayId>)>>;
@@ -214,6 +230,7 @@ pub struct DesktopCaptureStreamer {
     files: HelperFiles,
     chat: HelperChat,
     maintenance: HelperMaintenance,
+    credentials: HelperCredentials,
     wallpaper_hidden: Arc<AtomicBool>,
     prevent_idle_lock: Arc<AtomicBool>,
     chat_enabled: Arc<AtomicBool>,
@@ -246,6 +263,7 @@ impl DesktopCaptureStreamer {
             files: Arc::new(FileEvents::default()),
             chat: Arc::new(ChatEvents::default()),
             maintenance: Arc::new(Mutex::new(None)),
+            credentials: Arc::new(Mutex::new(Credentials::default())),
             wallpaper_hidden: Arc::new(AtomicBool::new(false)),
             prevent_idle_lock: Arc::new(AtomicBool::new(false)),
             chat_enabled: Arc::new(AtomicBool::new(false)),
@@ -627,6 +645,7 @@ impl DesktopCaptureStreamer {
             files: Arc::clone(&self.files),
             chat: Arc::clone(&self.chat),
             maintenance: Arc::clone(&self.maintenance),
+            credentials: Arc::clone(&self.credentials),
             wallpaper_hidden: Arc::clone(&self.wallpaper_hidden),
             prevent_idle_lock: Arc::clone(&self.prevent_idle_lock),
             chat_enabled: Arc::clone(&self.chat_enabled),
@@ -726,6 +745,7 @@ impl DesktopCaptureStreamer {
                     Arc::clone(&self.files),
                     Arc::clone(&self.chat),
                     Arc::clone(&self.maintenance),
+                    Arc::clone(&self.credentials),
                     HelperKind::Files,
                 ) {
                     Ok(helper) => {
@@ -757,6 +777,7 @@ impl DesktopCaptureStreamer {
                     Arc::clone(&self.files),
                     Arc::clone(&self.chat),
                     Arc::clone(&self.maintenance),
+                    Arc::clone(&self.credentials),
                     HelperKind::Chat,
                 ) {
                     Ok(helper) => {
@@ -782,6 +803,7 @@ impl DesktopCaptureStreamer {
                     Arc::clone(&self.files),
                     Arc::clone(&self.chat),
                     Arc::clone(&self.maintenance),
+                    Arc::clone(&self.credentials),
                     HelperKind::Clipboard,
                 ) {
                     Ok(helper) => {
@@ -831,6 +853,7 @@ impl DesktopCaptureStreamer {
             Arc::clone(&self.files),
             Arc::clone(&self.chat),
             Arc::clone(&self.maintenance),
+            Arc::clone(&self.credentials),
             HelperKind::Input,
         )?;
         let mut route = self
@@ -851,10 +874,12 @@ impl DesktopCaptureStreamer {
         self.stop_clipboard_helper();
         self.stop_file_helper();
         self.stop_input_helper();
+        *self.credentials.lock().unwrap() = Credentials::default();
         self.stop()
     }
 
     fn stop_chat_helper(&mut self) {
+        self.credentials.lock().unwrap().state.prompt_active = false;
         *self.chat_route.lock().unwrap() = None;
         if let Some(mut helper) = self.chat_helper.take() {
             let _ = send_command(&helper.input, &ParentCommand::Stop);
@@ -891,6 +916,7 @@ impl DesktopCaptureStreamer {
     }
 
     fn stop_input_helper(&mut self) {
+        self.credentials.lock().unwrap().state.can_autofill = false;
         let Some(mut helper) = self.input.take() else {
             return;
         };
@@ -963,12 +989,79 @@ struct DesktopInputController {
     files: HelperFiles,
     chat: HelperChat,
     maintenance: HelperMaintenance,
+    credentials: HelperCredentials,
     wallpaper_hidden: Arc<AtomicBool>,
     prevent_idle_lock: Arc<AtomicBool>,
     chat_enabled: Arc<AtomicBool>,
 }
 
 impl ScreenInput for DesktopInputController {
+    fn credential_state(&self) -> Option<meshrmm_protocol::CredentialState> {
+        let mut state = self.credentials.lock().ok()?.state.clone();
+        state.available = !self.is_background();
+        state.can_autofill &= state.available && state.saved && !state.prompt_active;
+        Some(state)
+    }
+    fn credential_command(&self, message: SessionMessage) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.is_background(),
+            "Credentials are unavailable in background sessions"
+        );
+        match message {
+            SessionMessage::PromptForCredentials => {
+                let writer = self
+                    .chat_route
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .context("Unlock Windows before requesting credentials")?;
+                let mut credentials = self.credentials.lock().unwrap();
+                anyhow::ensure!(
+                    !credentials.state.prompt_active,
+                    "A credential request is already open"
+                );
+                credentials.state.prompt_active = true;
+                credentials.state.message = "Waiting for the remote user…".into();
+                if let Err(error) = send_command(&writer, &ParentCommand::PromptCredentials) {
+                    credentials.state.prompt_active = false;
+                    return Err(error);
+                }
+                Ok(())
+            }
+            SessionMessage::AutofillCredentials => {
+                let credentials = self.credentials.lock().unwrap();
+                anyhow::ensure!(
+                    credentials.state.saved
+                        && credentials.state.can_autofill
+                        && !credentials.state.prompt_active,
+                    "No saved credentials or Windows password prompt"
+                );
+                let writer = self
+                    .route
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .context("Windows desktop is switching; try again")?;
+                send_command(
+                    &writer,
+                    &ParentCommand::AutofillCredentials(credentials.encrypted.clone()),
+                )
+            }
+            SessionMessage::ForgetCredentials => {
+                let mut credentials = self.credentials.lock().unwrap();
+                anyhow::ensure!(
+                    !credentials.state.prompt_active,
+                    "Close the credential dialog before forgetting credentials"
+                );
+                credentials.encrypted.clear();
+                credentials.state.saved = false;
+                credentials.state.message = "Saved credentials cleared".into();
+                Ok(())
+            }
+            _ => anyhow::bail!("Invalid credential command"),
+        }
+    }
+
     fn is_console_session(&self) -> bool {
         !self.is_background() && self.display_routes.lock().unwrap().is_empty()
     }
@@ -1509,6 +1602,7 @@ fn start_input_helper(
     files: HelperFiles,
     chat: HelperChat,
     maintenance: HelperMaintenance,
+    credentials: HelperCredentials,
     kind: HelperKind,
 ) -> anyhow::Result<RunningInputHelper> {
     // Clipboard data can be owned/delayed-rendered by an interactive user app.
@@ -1529,6 +1623,8 @@ fn start_input_helper(
                 files,
                 chat,
                 maintenance,
+                credentials,
+                kind,
             )
         })
         .context("failed to start desktop input-helper IPC reader")?;
@@ -1658,7 +1754,9 @@ fn dispatch_child_events(
                     Some(SessionMessage::MaintenanceError { reason });
             }
             Ok(
-                ChildEvent::MaintenanceState { .. }
+                ChildEvent::Credentials(_)
+                | ChildEvent::CredentialPrompt(_)
+                | ChildEvent::MaintenanceState { .. }
                 | ChildEvent::Files(_)
                 | ChildEvent::Clipboard(_)
                 | ChildEvent::Chat(_),
@@ -1700,6 +1798,8 @@ fn dispatch_input_events(
     files: HelperFiles,
     chat: HelperChat,
     maintenance: HelperMaintenance,
+    credentials: HelperCredentials,
+    kind: HelperKind,
 ) {
     let mut output = BufReader::new(output);
     let mut started_tx = Some(started_tx);
@@ -1715,6 +1815,31 @@ fn dispatch_input_events(
                     );
                     break;
                 }
+            }
+            Ok(ChildEvent::Credentials(result)) => {
+                let mut current = credentials.lock().unwrap();
+                if !matches!(kind, HelperKind::Chat | HelperKind::Input)
+                    || (result.encrypted.is_some()
+                        && (kind != HelperKind::Chat || !current.state.prompt_active))
+                {
+                    set_status(&status, Err("unexpected credential result".into()));
+                    break;
+                }
+                if let Some(encrypted) = result.encrypted {
+                    current.encrypted = encrypted;
+                    current.state.saved = true;
+                }
+                if kind == HelperKind::Chat {
+                    current.state.prompt_active = false;
+                }
+                current.state.message = result.message;
+            }
+            Ok(ChildEvent::CredentialPrompt(ready)) => {
+                if kind != HelperKind::Input {
+                    set_status(&status, Err("unexpected credential detection event".into()));
+                    break;
+                }
+                credentials.lock().unwrap().state.can_autofill = ready;
             }
             Ok(ChildEvent::MaintenanceError(reason)) => {
                 *maintenance.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -2073,6 +2198,8 @@ fn run_capture_child(
                     | ParentCommand::Blackout { .. }
                     | ParentCommand::BlockInput(_)
                     | ParentCommand::ReleaseInput
+                    | ParentCommand::PromptCredentials
+                    | ParentCommand::AutofillCredentials(_)
                     | ParentCommand::Clipboard(_)
                     | ParentCommand::Files(_)
                     | ParentCommand::Chat(_)
@@ -2124,6 +2251,55 @@ fn run_input_child(
             blacked_out: false,
         },
     )?;
+    // UI Automation providers may block; keep discovery and fills off the
+    // desktop input loop so pointer/key release remains responsive.
+    let (credential_tx, credential_rx) = mpsc::sync_channel::<Vec<u8>>(1);
+    let credential_output = output.clone();
+    thread::Builder::new()
+        .name("meshrmm-credential-fields".into())
+        .spawn(move || {
+            let detector = super::credentials::Detector::new().ok();
+            let mut last_ready = None;
+            loop {
+                let ready = detector.as_ref().is_some_and(|d| d.ready());
+                if last_ready != Some(ready) {
+                    if emit_child_event(&credential_output, ChildEvent::CredentialPrompt(ready))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    last_ready = Some(ready);
+                }
+                match credential_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(mut encrypted) => {
+                        let result = detector
+                            .as_ref()
+                            .context("Windows credential detection unavailable")
+                            .and_then(|d| d.fill(&mut encrypted));
+                        let message = match result {
+                            Ok(()) => {
+                                "Credentials filled. Review the account and submit when ready."
+                                    .into()
+                            }
+                            Err(error) => format!("Autofill: {error:#}"),
+                        };
+                        if emit_child_event(
+                            &credential_output,
+                            ChildEvent::Credentials(CredentialResult {
+                                encrypted: None,
+                                message,
+                            }),
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })?;
     let mut sent_cursor = None;
     let mut terminal_error = None;
     loop {
@@ -2140,6 +2316,16 @@ fn run_input_child(
             sent_cursor = Some(cursor);
         }
         match command_rx.recv_timeout(Duration::from_millis(16)) {
+            Ok(Ok(ParentCommand::AutofillCredentials(encrypted))) => {
+                if credential_tx.try_send(encrypted).is_err() {
+                    emit_child_event(
+                        &output,
+                        ChildEvent::MaintenanceError(
+                            "Credential autofill is busy; try again".into(),
+                        ),
+                    )?;
+                }
+            }
             Ok(Ok(ParentCommand::SetPreventIdleLock(enabled))) => {
                 if let Err(error) = super::keep_awake::set_enabled(&mut keep_awake, enabled) {
                     emit_child_event(
@@ -2313,6 +2499,13 @@ fn emit_child_event(
 
 fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<()> {
     match command {
+        ParentCommand::PromptCredentials => writer.write_all(&[23]),
+        ParentCommand::AutofillCredentials(bytes) => {
+            checked_len(bytes.len(), 8192, "protected credentials")?;
+            writer.write_all(&[24])?;
+            write_u32(&mut writer, bytes.len() as u32)?;
+            writer.write_all(bytes)
+        }
         ParentCommand::EnumerateDisplays => writer.write_all(&[COMMAND_ENUMERATE_DISPLAYS]),
         ParentCommand::StartFiles => writer.write_all(&[13]),
         ParentCommand::StartClipboard => writer.write_all(&[16]),
@@ -2414,6 +2607,13 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
 
 fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
     match read_u8(&mut reader)? {
+        23 => Ok(ParentCommand::PromptCredentials),
+        24 => {
+            let length = bounded_len(read_u32(&mut reader)?, 8192, "protected credentials")?;
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes)?;
+            Ok(ParentCommand::AutofillCredentials(bytes))
+        }
         COMMAND_ENUMERATE_DISPLAYS => Ok(ParentCommand::EnumerateDisplays),
         16 => Ok(ParentCommand::StartClipboard),
         17 => {
@@ -2560,6 +2760,14 @@ fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
 
 fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
     match event {
+        ChildEvent::CredentialPrompt(ready) => writer.write_all(&[13, u8::from(*ready)]),
+        ChildEvent::Credentials(result) => {
+            let bytes = serde_json::to_vec(result).map_err(io::Error::other)?;
+            checked_len(bytes.len(), 32768, "credential result")?;
+            writer.write_all(&[12])?;
+            write_u32(&mut writer, bytes.len() as u32)?;
+            writer.write_all(&bytes)
+        }
         ChildEvent::Files(message) => {
             writer.write_all(&[9])?;
             write_file_message(&mut writer, message)
@@ -2651,6 +2859,19 @@ fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
 
 fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
     match read_u8(&mut reader)? {
+        12 => {
+            let length = bounded_len(read_u32(&mut reader)?, 32768, "credential result")?;
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes)?;
+            Ok(ChildEvent::Credentials(
+                serde_json::from_slice(&bytes).map_err(io::Error::other)?,
+            ))
+        }
+        13 => match read_u8(&mut reader)? {
+            0 => Ok(ChildEvent::CredentialPrompt(false)),
+            1 => Ok(ChildEvent::CredentialPrompt(true)),
+            _ => Err(io::Error::other("invalid credential prompt state")),
+        },
         11 => {
             let length = bounded_len(read_u32(&mut reader)?, MAX_ERROR_BYTES, "maintenance error")?;
             let mut bytes = vec![0; length];
@@ -3525,6 +3746,8 @@ mod tests {
             ParentCommand::StartFiles => 13,
             ParentCommand::StartClipboard => 16,
             ParentCommand::StartChatHelper { .. } => 17,
+            ParentCommand::PromptCredentials => 23,
+            ParentCommand::AutofillCredentials(_) => 24,
             ParentCommand::Files(_) => 12,
             ParentCommand::Chat(_) => COMMAND_CHAT,
             ParentCommand::StartChat => COMMAND_START_CHAT,
@@ -3766,12 +3989,28 @@ fn run_chat_child(
     emit_child_event(&output, ChildEvent::InputStarted)?;
     let mut commands = async_helper_commands(commands)?;
     let ready = chat.outgoing_ready();
+    let prompt_open = Arc::new(AtomicBool::new(false));
     tokio::runtime::Builder::new_current_thread()
         .build()?
         .block_on(async {
             loop {
                 tokio::select! {
                     command = commands.recv() => match command {
+                        Some(Ok(ParentCommand::PromptCredentials)) => {
+                            if !prompt_open.swap(true, Ordering::AcqRel) {
+                                let output = output.clone();
+                                let prompt_open = prompt_open.clone();
+                                thread::Builder::new().name("meshrmm-credential-prompt".into()).spawn(move || {
+                                    let result = match super::credentials::prompt() {
+                                        Ok(Some((encrypted, username))) => CredentialResult { encrypted: Some(encrypted), message: format!("Validated {username}; saved for this session") },
+                                        Ok(None) => CredentialResult { encrypted: None, message: "Credential request cancelled".into() },
+                                        Err(error) => CredentialResult { encrypted: None, message: format!("{error:#}") },
+                                    };
+                                    let _ = emit_child_event(&output, ChildEvent::Credentials(result));
+                                    prompt_open.store(false, Ordering::Release);
+                                })?;
+                            }
+                        }
                         Some(Ok(ParentCommand::StartChat)) => chat.set_available(true),
                         Some(Ok(ParentCommand::StopChat)) => chat.set_available(false),
                         Some(Ok(ParentCommand::Chat(text))) => {
@@ -3872,6 +4111,8 @@ mod service_event_tests {
                 reader_files,
                 reader_chat,
                 Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(Credentials::default())),
+                HelperKind::Clipboard,
             );
             let _ = finished.send(());
         });
@@ -3911,5 +4152,39 @@ mod service_event_tests {
             Some(meshrmm_protocol::FileMessage::Available)
         ));
         assert!(clipboard.latest.lock().unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn credential_ipc_round_trips_and_bounds_payloads() {
+        let encrypted = vec![17, 42, 0, 255];
+        let mut bytes = Vec::new();
+        write_command(
+            &mut bytes,
+            &ParentCommand::AutofillCredentials(encrypted.clone()),
+        )
+        .unwrap();
+        assert!(
+            matches!(read_command(&bytes[..]).unwrap(), ParentCommand::AutofillCredentials(value) if value == encrypted)
+        );
+        bytes.clear();
+        write_event(
+            &mut bytes,
+            &ChildEvent::Credentials(CredentialResult {
+                encrypted: Some(encrypted.clone()),
+                message: "Saved".into(),
+            }),
+        )
+        .unwrap();
+        assert!(
+            matches!(read_event(&bytes[..]).unwrap(), ChildEvent::Credentials(value) if value.encrypted == Some(encrypted))
+        );
+        assert!(read_command(&[24, 1, 32, 0, 0][..]).is_err());
+        assert!(read_event(&[12, 1, 128, 0, 0][..]).is_err());
+        assert!(read_event(&[13, 2][..]).is_err());
     }
 }

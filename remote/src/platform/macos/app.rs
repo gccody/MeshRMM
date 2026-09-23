@@ -137,6 +137,8 @@ pub(super) struct RemoteViewIvars {
     recording_visible: std::cell::Cell<bool>,
     confirming_disconnect: std::cell::Cell<bool>,
     session_button: RefCell<Option<Retained<NSButton>>>,
+    credential_buttons: RefCell<Vec<Retained<NSButton>>>,
+    credential_label: RefCell<Option<Retained<NSTextField>>>,
     chat_popup: RefCell<Option<meshrmm_chat::ChatPopup>>,
     control: ControlSink,
     pressed_keys: RefCell<Vec<(u16, bool)>>,
@@ -548,6 +550,13 @@ define_class!(
         #[unsafe(method(receiveFiles:))]
         fn receive_files(&self, _: &NSMenuItem) { self.send(SessionMessage::FileTransfer(meshrmm_protocol::FileMessage::Pick)); }
 
+        #[unsafe(method(promptCredentials:))]
+        fn prompt_credentials(&self, _: &NSButton) { self.release_input(); self.send(SessionMessage::PromptForCredentials); }
+        #[unsafe(method(autofillCredentials:))]
+        fn autofill_credentials(&self, _: &NSButton) { self.release_input(); self.send(SessionMessage::AutofillCredentials); }
+        #[unsafe(method(forgetCredentials:))]
+        fn forget_credentials(&self, _: &NSButton) { self.send(SessionMessage::ForgetCredentials); }
+
         #[unsafe(method(typeClipboard:))]
         fn type_clipboard(&self, _sender: &NSButton) {
             self.release_input();
@@ -675,6 +684,8 @@ impl RemoteView {
             display_popup: RefCell::new(None),
             chat_popup: RefCell::new(None),
             session_button: RefCell::new(None),
+            credential_buttons: RefCell::new(Vec::new()),
+            credential_label: RefCell::new(None),
             recording_visible: std::cell::Cell::new(false),
             confirming_disconnect: std::cell::Cell::new(false),
             control,
@@ -838,6 +849,38 @@ impl RemoteView {
             "Type local clipboard text into the focused remote field",
         )));
         toolbar.addSubview(&type_clipboard_button);
+        for (i, (title, action)) in [
+            ("Prompt for credentials", sel!(promptCredentials:)),
+            ("Autofill credentials?", sel!(autofillCredentials:)),
+            ("Forget credentials", sel!(forgetCredentials:)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str(title),
+                    Some(self),
+                    Some(action),
+                    mtm,
+                )
+            };
+            button.setFrame(NSRect::new(
+                NSPoint::new(80. + i as f64 * 184., 40.),
+                NSSize::new(180., 24.),
+            ));
+            button.setEnabled(false);
+            toolbar.addSubview(&button);
+            self.ivars().credential_buttons.borrow_mut().push(button);
+        }
+        let label = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+        label.setFrame(NSRect::new(
+            NSPoint::new(638., 42.),
+            NSSize::new((frame.size.width - 646.).max(100.), 20.),
+        ));
+        label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+        toolbar.addSubview(&label);
+        *self.ivars().credential_label.borrow_mut() = Some(label);
         let control = self.ivars().control.clone();
         *self.ivars().chat_popup.borrow_mut() = Some(meshrmm_chat::ChatPopup::new(
             control.chat(),
@@ -1045,6 +1088,24 @@ impl RemoteView {
     }
 
     pub(super) fn refresh_debug(&self, force: bool) {
+        let state = self.ivars().control.credential_state();
+        for (i, button) in self.ivars().credential_buttons.borrow().iter().enumerate() {
+            button.setEnabled(
+                !self.ivars().control.technician_blocked()
+                    && match i {
+                        0 => state.available && !state.prompt_active,
+                        1 => state.can_autofill,
+                        _ => state.saved && !state.prompt_active,
+                    },
+            );
+            if i == 1 {
+                button.setHidden(!state.can_autofill);
+            }
+        }
+        if let Some(label) = self.ivars().credential_label.borrow().as_ref() {
+            label.setStringValue(&NSString::from_str(&state.message));
+            label.setToolTip(Some(&NSString::from_str(&state.message)));
+        }
         if let Some(notice) = self.ivars().control.recording().take_notice() {
             let alert = NSAlert::new(self.mtm());
             alert.setMessageText(&NSString::from_str("Session recording"));
