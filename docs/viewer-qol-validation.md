@@ -109,9 +109,9 @@ not manually exercised.
 
 ## On session close
 
-**On session close** (No action by default, Lock, or Logout) is a per-OS-user viewer
-preference stored with **Disconnect confirmation**. The viewer sends it to the Agent
-on each connection. The Agent keeps it per remote session, across resumes, and
+**On session close** (No action by default, Lock, or Logout) is chosen per remote
+session and is not saved; each new session starts with No action. The viewer keeps
+the choice across reconnects and sends it to the Agent on each connection. The Agent keeps it per remote session, across resumes, and
 tracks the viewed console or RDP session. It runs the action once, when the server
 ends the session (end-session command, a replacing session, or terminal signaling
 rejection). A closed control channel alone does not trigger it. Lock launches a
@@ -134,7 +134,8 @@ natively; that UI was not manually exercised.
 ## Clear clipboard on session close
 
 **Clear clipboard on session close** is a per-OS-user viewer preference, on by
-default, stored with **On session close** and sent to the Agent on each connection.
+default, stored with **Disconnect confirmation** and sent to the Agent on each
+connection.
 The Agent keeps it with the session close action and runs it at the same points,
 once, before Lock. It launches a `--clear-clipboard` helper as the signed-in user on
 `winsta0\default`, which calls `EmptyClipboard` and retries briefly while another
