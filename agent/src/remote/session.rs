@@ -29,6 +29,9 @@ pub async fn run(
                 &request.blackout_message,
                 &request.viewer_name,
             ),
+            config
+                .config_path
+                .with_file_name("autofill-credentials.dat"),
         ))));
     tracing::info!(session_id = %session_id, "remote session requested");
     let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(15));

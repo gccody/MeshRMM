@@ -1309,9 +1309,13 @@ fn install_control_handler(
                         }
                     }
                 }
-                Ok(SessionMessage::CredentialState(state)) => { if let Ok(mut current) = viewer_control.credentials.lock() { *current = state; } },
+                Ok(SessionMessage::CredentialState(state)) => {
+                    if let Ok(mut current) = viewer_control.credentials.lock() { *current = state; }
+                    if let Ok(guard) = presenter.lock() && let Some(active) = guard.as_ref() { active.presenter.refresh_controls(); }
+                }
                 Ok(SessionMessage::MaintenanceError { reason }) => {
                     if let Ok(mut state) = viewer_control.maintenance.lock() { state.error = Some(reason); }
+                    if let Ok(guard) = presenter.lock() && let Some(active) = guard.as_ref() { active.presenter.refresh_controls(); }
                 }
                 Ok(SessionMessage::MaintenanceState { agent_input_blocked, blacked_out }) => {
                     if let Ok(mut state) = viewer_control.maintenance.lock() {

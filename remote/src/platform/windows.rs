@@ -176,6 +176,9 @@ impl Presenter {
         self.shared.ready.notify_one();
     }
 
+    /// The window pump already refreshes controls without waiting for frames.
+    pub fn refresh_controls(&self) {}
+
     pub fn set_cursor_shape(&self, shape: CursorShape) {
         if let Ok(mut pending) = self.shared.cursor_shape.lock() {
             *pending = Some(shape);

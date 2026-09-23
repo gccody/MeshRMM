@@ -13,12 +13,17 @@ policies, account restrictions, and domain availability still apply.
 
 After successful validation, the endpoint encrypts the credential using
 user-scoped Windows DPAPI under the LocalSystem helper identity. The service
-retains only ciphertext in session memory. Plaintext buffers, including BSTR
+saves only ciphertext to `autofill-credentials.dat` beside `agent.json`
+(`%ProgramData%\MeshRMM\Agent`, restricted to SYSTEM and Administrators), and
+only the LocalSystem DPAPI key can decrypt it. Plaintext buffers, including BSTR
 copies used by UI Automation, are wiped on release. Neither plaintext nor
-ciphertext is sent to the viewer/server, persisted to disk, placed on a clipboard,
-or logged. Closing the session, switching Windows users/background sessions, or
-choosing **Forget credentials** clears the retained ciphertext. A reconnect that
-creates a new agent session requires a new prompt.
+ciphertext is sent to the viewer/server, placed on a clipboard, or logged.
+
+Saved credentials persist across remote sessions, reconnects, Windows user
+switches, background sessions, agent updates, and reboots. There is one saved
+credential per endpoint; a new successful prompt replaces it. Only **Forget
+credentials** (available in any session mode) or uninstalling the agent deletes
+it.
 
 When a supported Windows login or UAC password field is visible, **Autofill
 credentials?** appears. Each fill requires a click and rechecks the foreground

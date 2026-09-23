@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -173,8 +174,20 @@ struct CredentialResult {
 }
 #[derive(Default)]
 struct Credentials {
-    encrypted: Vec<u8>,
+    /// DPAPI ciphertext file; persists until ForgetCredentials.
+    store: PathBuf,
     state: meshrmm_protocol::CredentialState,
+}
+impl Credentials {
+    fn new(store: PathBuf) -> Self {
+        Self {
+            state: meshrmm_protocol::CredentialState {
+                saved: super::credentials::saved(&store),
+                ..Default::default()
+            },
+            store,
+        }
+    }
 }
 type HelperCredentials = Arc<Mutex<Credentials>>;
 
@@ -237,7 +250,7 @@ pub struct DesktopCaptureStreamer {
 }
 
 impl DesktopCaptureStreamer {
-    pub fn new(viewer_name: String, blackout_message: String) -> Self {
+    pub fn new(viewer_name: String, blackout_message: String, credential_store: PathBuf) -> Self {
         Self {
             background_active: Arc::new(AtomicBool::new(false)),
             console_displays: Vec::new(),
@@ -263,7 +276,7 @@ impl DesktopCaptureStreamer {
             files: Arc::new(FileEvents::default()),
             chat: Arc::new(ChatEvents::default()),
             maintenance: Arc::new(Mutex::new(None)),
-            credentials: Arc::new(Mutex::new(Credentials::default())),
+            credentials: Arc::new(Mutex::new(Credentials::new(credential_store))),
             wallpaper_hidden: Arc::new(AtomicBool::new(false)),
             prevent_idle_lock: Arc::new(AtomicBool::new(false)),
             chat_enabled: Arc::new(AtomicBool::new(false)),
@@ -874,7 +887,9 @@ impl DesktopCaptureStreamer {
         self.stop_clipboard_helper();
         self.stop_file_helper();
         self.stop_input_helper();
-        *self.credentials.lock().unwrap() = Credentials::default();
+        let mut credentials = self.credentials.lock().unwrap();
+        *credentials = Credentials::new(std::mem::take(&mut credentials.store));
+        drop(credentials);
         self.stop()
     }
 
@@ -942,6 +957,7 @@ impl Default for DesktopCaptureStreamer {
         Self::new(
             String::new(),
             meshrmm_protocol::render_blackout_message("", ""),
+            PathBuf::new(),
         )
     }
 }
@@ -1003,8 +1019,9 @@ impl ScreenInput for DesktopInputController {
         Some(state)
     }
     fn credential_command(&self, message: SessionMessage) -> anyhow::Result<()> {
+        // Forgetting only deletes the saved file, so it works in any mode.
         anyhow::ensure!(
-            !self.is_background(),
+            matches!(message, SessionMessage::ForgetCredentials) || !self.is_background(),
             "Credentials are unavailable in background sessions"
         );
         match message {
@@ -1029,7 +1046,7 @@ impl ScreenInput for DesktopInputController {
                 Ok(())
             }
             SessionMessage::AutofillCredentials => {
-                let credentials = self.credentials.lock().unwrap();
+                let mut credentials = self.credentials.lock().unwrap();
                 anyhow::ensure!(
                     credentials.state.saved
                         && credentials.state.can_autofill
@@ -1042,10 +1059,12 @@ impl ScreenInput for DesktopInputController {
                     .unwrap()
                     .clone()
                     .context("Windows desktop is switching; try again")?;
-                send_command(
-                    &writer,
-                    &ParentCommand::AutofillCredentials(credentials.encrypted.clone()),
-                )
+                // Another session may have forgotten or replaced the saved credential.
+                let Some(encrypted) = super::credentials::load(&credentials.store)? else {
+                    credentials.state.saved = false;
+                    anyhow::bail!("No saved credentials");
+                };
+                send_command(&writer, &ParentCommand::AutofillCredentials(encrypted))
             }
             SessionMessage::ForgetCredentials => {
                 let mut credentials = self.credentials.lock().unwrap();
@@ -1053,7 +1072,7 @@ impl ScreenInput for DesktopInputController {
                     !credentials.state.prompt_active,
                     "Close the credential dialog before forgetting credentials"
                 );
-                credentials.encrypted.clear();
+                super::credentials::forget(&credentials.store)?;
                 credentials.state.saved = false;
                 credentials.state.message = "Saved credentials cleared".into();
                 Ok(())
@@ -1825,14 +1844,19 @@ fn dispatch_input_events(
                     set_status(&status, Err("unexpected credential result".into()));
                     break;
                 }
+                current.state.message = result.message;
                 if let Some(encrypted) = result.encrypted {
-                    current.encrypted = encrypted;
-                    current.state.saved = true;
+                    match super::credentials::save(&current.store, &encrypted) {
+                        Ok(()) => current.state.saved = true,
+                        Err(error) => {
+                            current.state.message =
+                                format!("Validated, but could not save credentials: {error:#}")
+                        }
+                    }
                 }
                 if kind == HelperKind::Chat {
                     current.state.prompt_active = false;
                 }
-                current.state.message = result.message;
             }
             Ok(ChildEvent::CredentialPrompt(ready)) => {
                 if kind != HelperKind::Input {
@@ -3237,7 +3261,8 @@ mod tests {
             height: 1080,
             primary: true,
         };
-        let mut streamer = DesktopCaptureStreamer::new(String::new(), String::new());
+        let mut streamer =
+            DesktopCaptureStreamer::new(String::new(), String::new(), PathBuf::new());
         streamer.console_displays = vec![console.clone()];
         streamer.selected_session = Some(3);
         streamer.session_displays = vec![(
@@ -3312,7 +3337,8 @@ mod tests {
                 primary: id == 1,
             })
             .collect();
-        let mut streamer = DesktopCaptureStreamer::new(String::new(), String::new());
+        let mut streamer =
+            DesktopCaptureStreamer::new(String::new(), String::new(), PathBuf::new());
         streamer.console_displays = console.clone();
         let format = ActiveFormat {
             width: 1920,
@@ -4002,7 +4028,7 @@ fn run_chat_child(
                                 let prompt_open = prompt_open.clone();
                                 thread::Builder::new().name("meshrmm-credential-prompt".into()).spawn(move || {
                                     let result = match super::credentials::prompt() {
-                                        Ok(Some((encrypted, username))) => CredentialResult { encrypted: Some(encrypted), message: format!("Validated {username}; saved for this session") },
+                                        Ok(Some((encrypted, username))) => CredentialResult { encrypted: Some(encrypted), message: format!("Validated {username}; saved on this computer until forgotten") },
                                         Ok(None) => CredentialResult { encrypted: None, message: "Credential request cancelled".into() },
                                         Err(error) => CredentialResult { encrypted: None, message: format!("{error:#}") },
                                     };

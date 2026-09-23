@@ -1,5 +1,8 @@
 //! Credentials stay on the endpoint. Only DPAPI ciphertext crosses inherited
-//! helper pipes; only status crosses the authenticated remote control channel.
+//! helper pipes or reaches disk; only status crosses the authenticated remote
+//! control channel.
+use std::path::Path;
+
 use anyhow::{Context, ensure};
 use windows::{
     Win32::{
@@ -48,7 +51,7 @@ fn protect(data: &mut [u8], decrypt: bool) -> anyhow::Result<Zeroizing<Vec<u8>>>
         } else {
             CryptProtectData(
                 &input,
-                w!("MeshRMM session credentials"),
+                w!("MeshRMM saved credentials"),
                 None,
                 None,
                 None,
@@ -64,6 +67,43 @@ fn protect(data: &mut [u8], decrypt: bool) -> anyhow::Result<Zeroizing<Vec<u8>>>
     }
 }
 
+const MAX_PROTECTED_BYTES: u64 = 8192;
+
+/// Ciphertext lives beside agent.json, whose directory only SYSTEM and
+/// Administrators can access, and survives sessions, updates, and reboots until
+/// explicitly forgotten. Only the LocalSystem DPAPI key can decrypt it.
+pub fn saved(store: &Path) -> bool {
+    store.is_file()
+}
+pub fn load(store: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    match std::fs::metadata(store) {
+        Ok(metadata) => ensure!(
+            metadata.len() <= MAX_PROTECTED_BYTES,
+            "Saved credentials are invalid; forget them and prompt again"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Could not read saved credentials"),
+    }
+    Ok(Some(
+        std::fs::read(store).context("Could not read saved credentials")?,
+    ))
+}
+pub fn save(store: &Path, encrypted: &[u8]) -> anyhow::Result<()> {
+    ensure!(
+        encrypted.len() as u64 <= MAX_PROTECTED_BYTES,
+        "Invalid protected credential data"
+    );
+    crate::installer::replace_file(store, encrypted)
+}
+pub fn forget(store: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(store) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error).context("Could not delete saved credentials")
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Cancel and failed validation preserve any previously validated credentials.
 /// One logon attempt per explicit dialog submission; never retry automatically.
 pub fn prompt() -> anyhow::Result<Option<(Vec<u8>, String)>> {
@@ -71,9 +111,9 @@ pub fn prompt() -> anyhow::Result<Option<(Vec<u8>, String)>> {
     let mut password = Zeroizing::new(vec![0u16; 257]);
     let info = CREDUI_INFOW {
         cbSize: std::mem::size_of::<CREDUI_INFOW>() as u32,
-        pszCaptionText: w!("MeshRMM — share credentials for this remote session"),
+        pszCaptionText: w!("MeshRMM — share credentials with your technician"),
         pszMessageText: w!(
-            "Your technician requested Windows credentials. Windows will test them once and keep them encrypted on this computer until this remote session ends. The technician can then fill Windows password prompts. Use DOMAIN\\user, user@domain, or .\\localuser. Enter your password, not your PIN."
+            "Your technician requested Windows credentials. Windows will test them once and keep them encrypted on this computer, including after restarts, until the technician chooses Forget credentials. The technician can then fill Windows password prompts. Use DOMAIN\\user, user@domain, or .\\localuser. Enter your password, not your PIN."
         ),
         ..Default::default()
     };
@@ -350,6 +390,26 @@ mod tests {
         ] {
             assert!(!supported_password_id(id));
         }
+    }
+    #[test]
+    fn saved_credentials_persist_until_forgotten() {
+        let directory =
+            std::env::temp_dir().join(format!("meshrmm-credentials-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = directory.join("autofill-credentials.dat");
+        assert!(!saved(&store));
+        assert!(load(&store).unwrap().is_none());
+        save(&store, &[1, 2, 3]).unwrap();
+        save(&store, &[4, 5]).unwrap();
+        assert!(saved(&store));
+        assert_eq!(load(&store).unwrap().unwrap(), [4, 5]);
+        assert!(save(&store, &[0; 8193]).is_err());
+        std::fs::write(&store, [0; 8193]).unwrap();
+        assert!(load(&store).is_err());
+        forget(&store).unwrap();
+        forget(&store).unwrap();
+        assert!(!saved(&store));
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn dpapi_round_trip_and_tamper_rejection() {
