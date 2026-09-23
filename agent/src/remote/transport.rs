@@ -616,6 +616,10 @@ async fn run_connected_sender(
                         session_close.set_action(action);
                         None
                     }
+                    Ok(SessionMessage::SetClearClipboardOnClose { enabled }) => {
+                        session_close.set_clear_clipboard(enabled);
+                        None
+                    }
                     Ok(SessionMessage::Stop { .. }) => Some(ControlCommand::Stop),
                     Ok(_) => None,
                     Err(error) => {

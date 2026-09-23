@@ -76,6 +76,7 @@ const SETTINGS_DISPLAY_BORDER_ID: usize = 4230;
 const SETTINGS_WALLPAPER_ID: usize = 4229;
 const SETTINGS_REMOTE_CURSOR_ID: usize = 4227;
 const SETTINGS_CLOSE_TITLE_ID: i32 = 4234;
+const SETTINGS_CLEAR_CLIPBOARD_ID: usize = 4238;
 const SETTINGS_CLOSE_ACTION_IDS: [(usize, SessionCloseAction); 3] = [
     (4235, SessionCloseAction::NoAction),
     (4236, SessionCloseAction::Lock),
@@ -335,6 +336,11 @@ impl WindowContext {
             (SETTINGS_AUDIO_ID, self.control.audio_muted(), true),
             (SETTINGS_CLIPBOARD_ID, self.control.clipboard_sync(), true),
             (
+                SETTINGS_CLEAR_CLIPBOARD_ID,
+                self.control.clear_clipboard_on_close(),
+                true,
+            ),
+            (
                 SETTINGS_REMOTE_CURSOR_ID,
                 self.control.show_remote_cursor(),
                 true,
@@ -564,6 +570,7 @@ unsafe fn show_settings_category(window: HWND, display: bool) {
         SETTINGS_AUDIO_ID as i32,
         SETTINGS_RECORDING_ID as i32,
         SETTINGS_CLIPBOARD_ID as i32,
+        SETTINGS_CLEAR_CLIPBOARD_ID as i32,
         SETTINGS_CLOSE_TITLE_ID,
     ]
     .into_iter()
@@ -670,6 +677,11 @@ unsafe extern "system" fn settings_window_proc(
                 }
                 if control_id == SETTINGS_CLIPBOARD_ID {
                     context.control.toggle_clipboard_sync();
+                    context.refresh_maintenance_controls();
+                    return LRESULT(0);
+                }
+                if control_id == SETTINGS_CLEAR_CLIPBOARD_ID {
+                    context.control.toggle_clear_clipboard_on_close();
                     context.refresh_maintenance_controls();
                     return LRESULT(0);
                 }
@@ -1000,11 +1012,21 @@ unsafe fn create_settings_window(
         SETTINGS_CLIPBOARD_ID,
     )?;
     let _ = make_control(
+        w!("BUTTON"),
+        w!("Clear clipboard on session close"),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
+        162,
+        350,
+        340,
+        28,
+        SETTINGS_CLEAR_CLIPBOARD_ID,
+    )?;
+    let _ = make_control(
         w!("STATIC"),
         w!("On session close"),
         static_style,
         162,
-        358,
+        398,
         340,
         24,
         SETTINGS_CLOSE_TITLE_ID as usize,
@@ -1020,7 +1042,7 @@ unsafe fn create_settings_window(
                 radio_style.0
             }),
             162,
-            388 + 36 * index as i32,
+            428 + 36 * index as i32,
             340,
             28,
             id,

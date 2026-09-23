@@ -393,6 +393,7 @@ define_class!(
                 (if self.ivars().control.allow_idle_override() { "Prevent idle lock" } else { "Prevent idle lock (company managed)" }, sel!(togglePreventIdleLock:)),
                 ("Disconnect confirmation", sel!(toggleDisconnectConfirmation:)),
                 ("Sync clipboard", sel!(toggleClipboardSync:)),
+                ("Clear clipboard on session close", sel!(toggleClearClipboardOnClose:)),
                 ("Highlight viewed monitor on agent", sel!(toggleDisplayBorder:)),
                 ("Hide remote wallpaper", sel!(toggleWallpaper:)),
                 ("Show remote cursor", sel!(toggleRemoteCursor:)),
@@ -408,6 +409,7 @@ define_class!(
                 if action == sel!(togglePreventIdleLock:) { item.setState(isize::from(self.ivars().control.prevent_idle_lock())); item.setEnabled(self.ivars().control.allow_idle_override()); }
                 if action == sel!(toggleDisconnectConfirmation:) { item.setState(isize::from(self.ivars().control.disconnect_confirmation())); }
                 if action == sel!(toggleClipboardSync:) { item.setState(isize::from(self.ivars().control.clipboard_sync())); }
+                if action == sel!(toggleClearClipboardOnClose:) { item.setState(isize::from(self.ivars().control.clear_clipboard_on_close())); }
                 if action == sel!(toggleDisplayBorder:) { item.setState(isize::from(self.ivars().control.display_border())); }
                 if action == sel!(toggleWallpaper:) { item.setState(isize::from(self.ivars().control.wallpaper_hidden())); }
                 if action == sel!(toggleRemoteCursor:) { item.setState(isize::from(self.ivars().control.show_remote_cursor())); }
@@ -462,6 +464,11 @@ define_class!(
         #[unsafe(method(toggleClipboardSync:))]
         fn toggle_clipboard_sync(&self, _sender: &NSMenuItem) {
             self.ivars().control.toggle_clipboard_sync();
+        }
+
+        #[unsafe(method(toggleClearClipboardOnClose:))]
+        fn toggle_clear_clipboard_on_close(&self, _sender: &NSMenuItem) {
+            self.ivars().control.toggle_clear_clipboard_on_close();
         }
 
         #[unsafe(method(toggleDisplayBorder:))]

@@ -355,6 +355,13 @@ If no user is signed in, or the session was in background mode, nothing happens.
 Logout does not save open work. Updating or restarting the Agent service skips
 the action.
 
+**Clear clipboard on session close** (session menu on macOS; Troubleshooting
+settings on Windows) empties the clipboard of that same Windows session when the
+remote session ends, at the same points as **On session close** and before any
+Lock. It is on by default, saved for the current viewer user, and sent to the Agent
+when each connection starts. Logout skips it because signing out discards the
+clipboard. Windows clipboard history (Win+V) is left unchanged.
+
 System audio from the Windows default playback device is forwarded to both native
 viewers over a separate, bounded WebRTC audio channel, including while muted.
 Each new session starts muted. On macOS, choose **Unmute audio** in the session

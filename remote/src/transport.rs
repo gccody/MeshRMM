@@ -1220,6 +1220,7 @@ fn install_control_handler(
                         // settled configuration even when that profile is retained.
                         viewer_control.send(SessionMessage::SetPreventIdleLock { enabled: sink.prevent_idle_lock() });
                         viewer_control.send(SessionMessage::SetSessionCloseAction { action: sink.session_close_action() });
+                        viewer_control.send(SessionMessage::SetClearClipboardOnClose { enabled: sink.clear_clipboard_on_close() });
                         viewer_control.send(SessionMessage::SetDisplayBorder { enabled: sink.display_border() });
                         viewer_control.send(SessionMessage::SetWallpaperHidden { hidden: sink.wallpaper_hidden() });
                         viewer_control.send(SessionMessage::SetRecording {

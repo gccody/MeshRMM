@@ -55,6 +55,14 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     if std::env::args_os()
         .nth(1)
+        .is_some_and(|argument| argument == "--clear-clipboard")
+    {
+        return remote::session_close::run_clear_clipboard_helper();
+    }
+
+    #[cfg(windows)]
+    if std::env::args_os()
+        .nth(1)
         .is_some_and(|argument| argument == "--background-task-manager")
     {
         return remote::background_tasks::run();

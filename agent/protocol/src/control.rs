@@ -146,6 +146,11 @@ pub enum SessionMessage {
     SetSessionCloseAction {
         action: SessionCloseAction,
     },
+    /// Empty the viewed Windows session's clipboard when the remote session
+    /// ends. Appended to preserve postcard tags.
+    SetClearClipboardOnClose {
+        enabled: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +399,18 @@ mod tests {
         for (index, action) in SessionCloseAction::ALL.into_iter().enumerate() {
             let message = SessionMessage::SetSessionCloseAction { action };
             assert_eq!(message.encode().unwrap(), vec![33, index as u8]);
+            assert_eq!(
+                SessionMessage::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn clear_clipboard_on_close_is_appended_and_round_trips() {
+        for enabled in [false, true] {
+            let message = SessionMessage::SetClearClipboardOnClose { enabled };
+            assert_eq!(message.encode().unwrap(), vec![34, u8::from(enabled)]);
             assert_eq!(
                 SessionMessage::decode(&message.encode().unwrap()).unwrap(),
                 message

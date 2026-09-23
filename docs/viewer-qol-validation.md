@@ -131,6 +131,24 @@ ended and `query user` reported no signed-in users. The service stayed running a
 connected. The Windows viewer's radio buttons were compiled and unit-tested
 natively; that UI was not manually exercised.
 
+## Clear clipboard on session close
+
+**Clear clipboard on session close** is a per-OS-user viewer preference, on by
+default, stored with **On session close** and sent to the Agent on each connection.
+The Agent keeps it with the session close action and runs it at the same points,
+once, before Lock. It launches a `--clear-clipboard` helper as the signed-in user on
+`winsta0\default`, which calls `EmptyClipboard` and retries briefly while another
+application holds the clipboard. Logout, the background desktop, and sessions with
+no signed-in user are skipped. Windows clipboard history is not cleared.
+
+Validation: macOS and native Windows workspace Clippy, protocol/agent/viewer tests,
+and formatting. The Windows test source was verified against the working tree by
+SHA-256. Installed build SHA-256:
+`2BAFC0ED9D957B76181A748CD3268716F34E196680D4E38606AAF03386344E3F`.
+The service started and connected with its configuration preserved. Running the
+installed helper in console session 2 emptied text placed there by the signed-in
+user. A live viewer session closing with the toggle on has not been exercised yet.
+
 ## Dedicated settings page
 
 - Company settings now live at `/settings`, categorized as dashboard security,
