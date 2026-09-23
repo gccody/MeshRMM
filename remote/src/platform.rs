@@ -37,6 +37,7 @@ pub struct ControlSink {
     technician_blocked: Arc<std::sync::atomic::AtomicBool>,
     wallpaper_hidden: Arc<std::sync::atomic::AtomicBool>,
     remote_cursor_hidden: Arc<std::sync::atomic::AtomicBool>,
+    session_close_action: Arc<Mutex<meshrmm_protocol::SessionCloseAction>>,
     quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
     chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
     #[cfg(windows)]
@@ -57,6 +58,7 @@ impl ControlSink {
         recording: crate::recording::Recorder,
         technician_blocked: Arc<std::sync::atomic::AtomicBool>,
         remote_cursor_hidden: Arc<std::sync::atomic::AtomicBool>,
+        session_close_action: Arc<Mutex<meshrmm_protocol::SessionCloseAction>>,
         maintenance: Arc<Mutex<MaintenanceState>>,
         quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
         chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
@@ -71,6 +73,7 @@ impl ControlSink {
             recording,
             technician_blocked,
             remote_cursor_hidden,
+            session_close_action,
             wallpaper_hidden: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             maintenance,
             send: Arc::new(send),
@@ -242,19 +245,20 @@ impl ControlSink {
         }
     }
 
+    /// Chosen per remote session; every new session starts with No action.
     pub fn session_close_action(&self) -> meshrmm_protocol::SessionCloseAction {
-        crate::preferences::session_close_action()
+        *self
+            .session_close_action
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn set_session_close_action(&self, action: meshrmm_protocol::SessionCloseAction) {
-        match crate::preferences::set_session_close_action(action) {
-            Ok(()) => self.send(meshrmm_protocol::SessionMessage::SetSessionCloseAction { action }),
-            Err(error) => {
-                if let Ok(mut state) = self.maintenance.lock() {
-                    state.error = Some(error.to_string());
-                }
-            }
-        }
+        *self
+            .session_close_action
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = action;
+        self.send(meshrmm_protocol::SessionMessage::SetSessionCloseAction { action });
     }
 
     pub fn prevent_idle_lock(&self) -> bool {

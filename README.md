@@ -346,8 +346,9 @@ for usage, Windows requirements, and cleanup behavior.
 
 **On session close** (session menu on macOS; Troubleshooting settings on Windows)
 chooses what the Agent does to the Windows session being viewed when the remote
-session ends: **No action** (default), **Lock**, or **Logout**. The choice is saved
-for the current viewer user and sent to the Agent when each connection starts.
+session ends: **No action** (default), **Lock**, or **Logout**. The choice is not
+saved: every new remote session starts with **No action**, so choose it again each
+session. It is kept across reconnects of the same session.
 The action runs when the server ends the session: when the viewer closes it, when
 it is closed from the dashboard, or when an unreachable viewer reaches the session
 idle timeout. It does not run while the viewer is reconnecting to the same session. The action applies to the console or RDP user session viewed last.

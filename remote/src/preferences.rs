@@ -1,6 +1,5 @@
 //! Viewer-wide preferences for the current OS user, independent of agent/session IDs.
 use anyhow::Context;
-use meshrmm_protocol::SessionCloseAction;
 use serde::{Deserialize, Serialize};
 use std::{
     io::Write,
@@ -17,7 +16,6 @@ struct Preferences {
     disconnect_confirmation: bool,
     clipboard_sync: bool,
     clear_clipboard_on_close: bool,
-    session_close_action: SessionCloseAction,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -25,7 +23,6 @@ impl Default for Preferences {
             disconnect_confirmation: true,
             clipboard_sync: true,
             clear_clipboard_on_close: true,
-            session_close_action: SessionCloseAction::NoAction,
         }
     }
 }
@@ -94,13 +91,6 @@ pub fn clear_clipboard_on_close() -> bool {
 pub fn toggle_clear_clipboard_on_close() -> anyhow::Result<()> {
     toggle(|p| &mut p.clear_clipboard_on_close)
 }
-/// Lock or log out the viewed Windows session when the remote session ends.
-pub fn session_close_action() -> SessionCloseAction {
-    get(|p| p.session_close_action)
-}
-pub fn set_session_close_action(action: SessionCloseAction) -> anyhow::Result<()> {
-    update(|p| p.session_close_action = action)
-}
 fn save(path: &Path, preferences: &Preferences) -> anyhow::Result<()> {
     let directory = path.parent().context("preferences path has no parent")?;
     std::fs::create_dir_all(directory)?;
@@ -145,41 +135,32 @@ mod tests {
                 disconnect_confirmation: false,
                 clipboard_sync: false,
                 clear_clipboard_on_close: false,
-                session_close_action: SessionCloseAction::Logout,
             },
         )
         .unwrap();
         assert!(!load(&path).disconnect_confirmation);
         assert!(!load(&path).clipboard_sync);
         assert!(!load(&path).clear_clipboard_on_close);
-        assert_eq!(load(&path).session_close_action, SessionCloseAction::Logout);
         save(&path, &Preferences::default()).unwrap();
         assert!(load(&path).disconnect_confirmation);
         assert!(load(&path).clipboard_sync);
         assert!(load(&path).clear_clipboard_on_close);
-        assert_eq!(
-            load(&path).session_close_action,
-            SessionCloseAction::NoAction
-        );
         // Files written before these preferences existed keep their defaults.
         std::fs::write(&path, r#"{"disconnect_confirmation":false}"#).unwrap();
         assert!(!load(&path).disconnect_confirmation);
         assert!(load(&path).clipboard_sync);
         assert!(load(&path).clear_clipboard_on_close);
-        assert_eq!(
-            load(&path).session_close_action,
-            SessionCloseAction::NoAction
-        );
-        std::fs::write(&path, r#"{"session_close_action":"lock"}"#).unwrap();
-        assert_eq!(load(&path).session_close_action, SessionCloseAction::Lock);
+        // The session close action used to be saved here; it is now per session.
+        std::fs::write(
+            &path,
+            r#"{"disconnect_confirmation":false,"session_close_action":"lock"}"#,
+        )
+        .unwrap();
+        assert!(!load(&path).disconnect_confirmation);
         std::fs::write(&path, "broken json").unwrap();
         assert!(load(&path).disconnect_confirmation);
         assert!(load(&path).clipboard_sync);
         assert!(load(&path).clear_clipboard_on_close);
-        assert_eq!(
-            load(&path).session_close_action,
-            SessionCloseAction::NoAction
-        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
