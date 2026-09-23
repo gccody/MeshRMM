@@ -1,9 +1,11 @@
 "use client";
 
+import { useEffect, useId, useRef, useState } from "react";
 import {
   ArrowUpRight,
   ChevronDown,
   Filter,
+  Layers,
   LoaderCircle,
   Monitor,
   Square,
@@ -35,6 +37,66 @@ type Props = {
   onCloseSession: (agent: Agent) => void;
   onDelete: (agent: Agent) => void;
 };
+
+function ConnectMenu({ agent, disabled, connecting, background, onRemote, onRemoteBackground }: {
+  agent: Agent;
+  disabled: boolean;
+  connecting: boolean;
+  background: boolean;
+  onRemote: (agent: Agent) => void;
+  onRemoteBackground: (agent: Agent) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuId = useId();
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setOpen(false);
+      triggerRef.current?.focus();
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  const choose = (action: (agent: Agent) => void) => {
+    setOpen(false);
+    action(agent);
+  };
+
+  return (
+    <div className={`connect-menu${open ? " open" : ""}`} ref={containerRef}>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="remote-button connect-trigger"
+        disabled={disabled}
+        aria-label={`Connect to ${agent.name}`}
+        aria-expanded={open}
+        aria-controls={open ? menuId : undefined}
+        onClick={() => setOpen((current) => !current)}
+      >
+        {connecting ? <LoaderCircle size={16} className="spin" /> : <Monitor size={16} />}
+        {connecting ? (background ? "Opening…" : "Connecting…") : "Connect"}
+        {!connecting && <ChevronDown size={14} aria-hidden="true" />}
+      </button>
+      {open && <div id={menuId} className="connect-options" role="group" aria-label={`Connection options for ${agent.name}`}>
+        <button type="button" onClick={() => choose(onRemote)}><Monitor size={16} aria-hidden="true" />Connect</button>
+        <button type="button" onClick={() => choose(onRemoteBackground)} title="Open the private background workspace without changing the user's desktop"><Layers size={16} aria-hidden="true" />Connect to background</button>
+      </div>}
+    </div>
+  );
+}
 
 export function AgentOverview({
   agents,
@@ -92,8 +154,7 @@ export function AgentOverview({
                 </td>
                 <td className="device-status"><span className={`status-badge ${agent.connected ? "online" : "offline"}`}><i />{agent.connected ? "Online" : "Offline"}</span></td>
                 <td className="row-actions">
-                  <button className="remote-button" disabled={!agent.connected || connectingId === agent.id || deletingId === agent.id || closingId === agent.id} onClick={() => onRemote(agent)} aria-label={`Connect to ${agent.name}`}>{connectingId === agent.id && connectingBackgroundId !== agent.id ? <LoaderCircle size={16} className="spin" /> : <Monitor size={16} />}{connectingId === agent.id && connectingBackgroundId !== agent.id ? "Connecting…" : "Connect"}</button>
-                  <button className="remote-button background-remote-button" disabled={!agent.connected || connectingId === agent.id || deletingId === agent.id || closingId === agent.id} onClick={() => onRemoteBackground(agent)} aria-label={`Connect to ${agent.name} in background mode`} title="Open the private background workspace without changing the user's desktop">{connectingBackgroundId === agent.id ? <LoaderCircle size={16} className="spin" /> : null}{connectingBackgroundId === agent.id ? "Opening…" : "Background"}</button>
+                  <ConnectMenu agent={agent} disabled={!agent.connected || connectingId === agent.id || deletingId === agent.id || closingId === agent.id} connecting={connectingId === agent.id} background={connectingBackgroundId === agent.id} onRemote={onRemote} onRemoteBackground={onRemoteBackground} />
                   {canDelete && <button className="close-session-button" disabled={closingId !== null || connectingId === agent.id || deletingId === agent.id} onClick={() => onCloseSession(agent)} aria-label={`Close active session for ${agent.name}`} title="Close active session">{closingId === agent.id ? <LoaderCircle size={16} className="spin" /> : <Square size={16} />}<span className="sr-only">Close session</span></button>}
                   {canDelete && <button className="agent-delete-button" disabled={deletingId === agent.id || closingId === agent.id} onClick={() => onDelete(agent)} aria-label={`Delete ${agent.name}`} title="Delete device">{deletingId === agent.id ? <LoaderCircle size={16} className="spin" /> : <Trash2 size={16} />}</button>}
                 </td>

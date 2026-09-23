@@ -452,8 +452,13 @@ button { color: inherit; }
 .agent-row .row-actions { display: table-cell; text-align: right; white-space: nowrap; }
 .row-actions button { display: inline-flex; vertical-align: middle; align-items: center; justify-content: center; height: 38px; margin-left: 5px; border-radius: 8px; }
 .remote-button { min-width: 100px; font-size: 12px; color: #4338ca; background: #eef2ff; }
-.background-remote-button { background: #f1f5f9; color: #334155; }
-.background-remote-button:hover { background: #e2e8f0; }
+.connect-menu { position: relative; display: inline-block; vertical-align: middle; }
+.connect-menu.open { z-index: 2; }
+.connect-trigger { min-width: 100px; padding: 0 8px; gap: 4px; white-space: nowrap; }
+.connect-trigger:disabled { opacity: .55; cursor: not-allowed; transform: none; }
+.connect-options { position: absolute; right: 0; bottom: calc(100% + 8px); width: 215px; padding: 5px; border: 1px solid #dce2ec; border-radius: 10px; background: #fff; box-shadow: 0 12px 30px rgba(24, 33, 55, .16); text-align: left; white-space: normal; }
+.connect-menu .connect-options button { width: 100%; min-height: 38px; height: auto; margin: 0; padding: 9px 10px; display: flex; align-items: center; justify-content: flex-start; gap: 9px; border: 0; border-radius: 6px; background: transparent; color: #334155; cursor: pointer; font: inherit; font-size: 12px; font-weight: 600; text-align: left; white-space: nowrap; }
+.connect-menu .connect-options button:hover, .connect-menu .connect-options button:focus-visible { background: #eef2ff; color: #4338ca; outline: none; }
 .close-session-button, .agent-delete-button { width: 34px; padding: 0; background: white; color: #647084; border-color: var(--line); }
 .agent-delete-button:hover { color: #b42318; background: #fff5f5; }
 .close-session-button:hover { color: #925338; }
@@ -520,6 +525,7 @@ button { color: inherit; }
   .agent-row .row-actions { grid-column: 1 / -1; text-align: left; }
   .row-actions button { margin: 0 6px 0 0; height: 40px; }
   .remote-button { width: auto; min-width: 110px; padding: 0 12px; font-size: 13px; }
+  .connect-options { right: auto; left: 0; }
   .device-cell strong { font-size: 13px; }
   .status-badge { font-size: 11px; }
   .panel-footer { padding: 16px; justify-content: space-between; gap: 12px; font-size: 10px; }
