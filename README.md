@@ -504,7 +504,9 @@ live coordinator/session/inventory connections and blocks token redemption.
 
 ### Experimental Session 0 background GUI
 
-With an updated Windows agent installed, connect normally and select
+With an updated Windows agent installed, choose **Background** on the dashboard
+to open the private workspace directly, without first capturing or changing the
+user's desktop. You can also connect normally and select
 **Background (Session 0 · experimental)** in the viewer's display selector.
 The black workspace has a charcoal bottom taskbar with icon launchers and hover labels.
 Open windows appear as icons after a gap, each with a persistent underline and

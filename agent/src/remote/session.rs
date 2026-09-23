@@ -38,6 +38,7 @@ pub async fn run(
             Arc::clone(&streamer),
             session_id.clone(),
             request.idle_policy,
+            request.start_in_background,
         )
         .await
         {

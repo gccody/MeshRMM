@@ -92,8 +92,7 @@ impl DurableObject for AgentCoordinator {
                     .await?
                     && session.expires_at_unix_ms > Date::now().as_millis()
                 {
-                    pair.server
-                        .send_with_str(serde_json::to_string(&session)?)?;
+                    pair.server.send_with_str(session_payload(&session)?)?;
                     console_log!(
                         "event=agent_session_resumed session_id={}",
                         session.session_id
@@ -153,7 +152,7 @@ impl DurableObject for AgentCoordinator {
                     .storage()
                     .put(ACTIVE_SESSION_KEY, &session)
                     .await?;
-                let payload = serde_json::to_string(&session)?;
+                let payload = session_payload(&session)?;
                 let mut delivered = false;
                 for agent in agents {
                     match agent.send_with_str(&payload) {
@@ -186,7 +185,7 @@ impl DurableObject for AgentCoordinator {
                     .storage()
                     .put(ACTIVE_SESSION_KEY, &session)
                     .await?;
-                let payload = serde_json::to_string(&session)?;
+                let payload = session_payload(&session)?;
                 let mut delivered = false;
                 for agent in self.state.get_websockets_with_tag(AGENT_TAG) {
                     match agent.send_with_str(&payload) {
@@ -528,12 +527,25 @@ fn lease_matches(active: &AgentSessionRequest, requested: &AgentSessionRequest, 
     active.session_id == requested.session_id && active.expires_at_unix_ms > now
 }
 
+fn session_payload(session: &AgentSessionRequest) -> Result<String> {
+    if session.start_in_background {
+        Ok(serde_json::to_string(
+            &AgentCommand::StartBackgroundSession {
+                request: session.clone(),
+            },
+        )?)
+    } else {
+        Ok(serde_json::to_string(session)?)
+    }
+}
+
 #[cfg(test)]
 mod lease_tests {
     use super::*;
     #[test]
     fn resume_cannot_take_over_another_or_expired_session() {
         let active = AgentSessionRequest {
+            start_in_background: false,
             idle_policy: Default::default(),
             blackout_message: String::new(),
             viewer_name: "Ada Lovelace".into(),
@@ -547,5 +559,18 @@ mod lease_tests {
         let mut other = active.clone();
         other.session_id = meshrmm_protocol_types::RemoteSessionId::new("two");
         assert!(!lease_matches(&active, &other, 1));
+        let mut background = active.clone();
+        background.start_in_background = true;
+        let payload = session_payload(&background).unwrap();
+        assert!(serde_json::from_str::<AgentSessionRequest>(&payload).is_err());
+        assert!(matches!(
+            serde_json::from_str::<AgentCommand>(&payload).unwrap(),
+            AgentCommand::StartBackgroundSession { request } if request == background
+        ));
+        assert_eq!(
+            serde_json::from_str::<AgentSessionRequest>(&session_payload(&active).unwrap())
+                .unwrap(),
+            active
+        );
     }
 }

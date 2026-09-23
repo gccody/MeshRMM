@@ -24,12 +24,14 @@ type Props = {
   query: string;
   status: AgentStatusFilter;
   connectingId: string | null;
+  connectingBackgroundId: string | null;
   deletingId: string | null;
   closingId: string | null;
   canDelete: boolean;
   onQueryChange: (query: string) => void;
   onStatusChange: (status: AgentStatusFilter) => void;
   onRemote: (agent: Agent) => void;
+  onRemoteBackground: (agent: Agent) => void;
   onCloseSession: (agent: Agent) => void;
   onDelete: (agent: Agent) => void;
 };
@@ -42,12 +44,14 @@ export function AgentOverview({
   query,
   status,
   connectingId,
+  connectingBackgroundId,
   deletingId,
   closingId,
   canDelete,
   onQueryChange,
   onStatusChange,
   onRemote,
+  onRemoteBackground,
   onCloseSession,
   onDelete,
 }: Props) {
@@ -88,7 +92,8 @@ export function AgentOverview({
                 </td>
                 <td className="device-status"><span className={`status-badge ${agent.connected ? "online" : "offline"}`}><i />{agent.connected ? "Online" : "Offline"}</span></td>
                 <td className="row-actions">
-                  <button className="remote-button" disabled={!agent.connected || connectingId === agent.id || deletingId === agent.id || closingId === agent.id} onClick={() => onRemote(agent)} aria-label={`Connect to ${agent.name}`}>{connectingId === agent.id ? <LoaderCircle size={16} className="spin" /> : <Monitor size={16} />}{connectingId === agent.id ? "Connecting…" : "Connect"}</button>
+                  <button className="remote-button" disabled={!agent.connected || connectingId === agent.id || deletingId === agent.id || closingId === agent.id} onClick={() => onRemote(agent)} aria-label={`Connect to ${agent.name}`}>{connectingId === agent.id && connectingBackgroundId !== agent.id ? <LoaderCircle size={16} className="spin" /> : <Monitor size={16} />}{connectingId === agent.id && connectingBackgroundId !== agent.id ? "Connecting…" : "Connect"}</button>
+                  <button className="remote-button background-remote-button" disabled={!agent.connected || connectingId === agent.id || deletingId === agent.id || closingId === agent.id} onClick={() => onRemoteBackground(agent)} aria-label={`Connect to ${agent.name} in background mode`} title="Open the private background workspace without changing the user's desktop">{connectingBackgroundId === agent.id ? <LoaderCircle size={16} className="spin" /> : null}{connectingBackgroundId === agent.id ? "Opening…" : "Background"}</button>
                   {canDelete && <button className="close-session-button" disabled={closingId !== null || connectingId === agent.id || deletingId === agent.id} onClick={() => onCloseSession(agent)} aria-label={`Close active session for ${agent.name}`} title="Close active session">{closingId === agent.id ? <LoaderCircle size={16} className="spin" /> : <Square size={16} />}<span className="sr-only">Close session</span></button>}
                   {canDelete && <button className="agent-delete-button" disabled={deletingId === agent.id || closingId === agent.id} onClick={() => onDelete(agent)} aria-label={`Delete ${agent.name}`} title="Delete device">{deletingId === agent.id ? <LoaderCircle size={16} className="spin" /> : <Trash2 size={16} />}</button>}
                 </td>

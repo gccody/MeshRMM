@@ -99,7 +99,7 @@ pub async fn run(
                                     let Some(message) = message else { break Ok(false); };
                                     match message.context("Agent signaling WebSocket read failed")? {
                                         Message::Text(text) => {
-                                            if let Ok(command) = serde_json::from_str::<AgentCommand>(text.as_str()) {
+                                            let background_request = if let Ok(command) = serde_json::from_str::<AgentCommand>(text.as_str()) {
                                                 match command {
                                                     AgentCommand::RotateToken { token } => {
                                                         if token == config.agent_token { continue; }
@@ -136,9 +136,10 @@ pub async fn run(
                                                         }
                                                         continue;
                                                     }
+                                                    AgentCommand::StartBackgroundSession { request } => Some(request),
                                                 }
-                                            }
-                                            let request: AgentSessionRequest = match serde_json::from_str(text.as_str()) {
+                                            } else { None };
+                                            let request: AgentSessionRequest = match background_request.map(Ok).unwrap_or_else(|| serde_json::from_str(text.as_str())) {
                                                 Ok(request) => request,
                                                 Err(error) => {
                                                     tracing::warn!(error = %error, "discarding invalid remote-session request");

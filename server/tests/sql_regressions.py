@@ -134,6 +134,15 @@ class EnrollmentTests(unittest.TestCase):
         query = sql("server/src/routes/handoffs.rs", "UPDATE remote_handoffs SET")
         self.assertIsNone(self.db.execute(query, (1, "c" * 64, "co")).fetchone())
 
+    def test_background_handoff_mode_survives_redemption(self):
+        self.redeem()
+        insert = sql("server/src/routes/handoffs.rs", "INSERT INTO remote_handoffs")
+        redeem = sql("server/src/routes/handoffs.rs", "UPDATE remote_handoffs SET")
+        for mode, token in ((False, "c" * 64), (True, "d" * 64)):
+            self.db.execute(insert, (token, "co", "device", "user", 0, 1000, mode))
+            row = self.db.execute(redeem, (1, token, "co")).fetchone()
+            self.assertEqual(row[3], int(mode))
+
     def test_rotation_stages_without_disabling_current_credential(self):
         self.redeem()
         query = sql("server/src/routes/agents.rs", "UPDATE agents SET pending_auth_token_hash")

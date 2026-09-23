@@ -101,6 +101,7 @@ function TenantDashboard({ view }: { view: View }) {
   const [isAgentOpen, setIsAgentOpen] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [connectingId, setConnectingId] = useState<string | null>(null);
+  const [connectingBackgroundId, setConnectingBackgroundId] = useState<string | null>(null);
   const [closingId, setClosingId] = useState<string | null>(null);
   const [sessionNotice, setSessionNotice] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -305,24 +306,31 @@ function TenantDashboard({ view }: { view: View }) {
     }
   };
 
-  const remoteInto = async (agent: Agent) => {
+  const remoteInto = async (agent: Agent, startInBackground = false) => {
     setSessionNotice(null);
     if (!agent.connected) return;
     setConnectingId(agent.id);
+    setConnectingBackgroundId(startInBackground ? agent.id : null);
     setError(null);
     try {
       const response = await authorizedFetch("/v1/remote/handoffs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ device_id: agent.id }),
+        body: JSON.stringify({ device_id: agent.id, start_in_background: startInBackground }),
       });
       if (!response.ok) throw new Error(await errorMessage(response, "The remote session could not be started."));
-      const handoff = (await response.json()) as { handoff_token: string; api_url: string };
+      const handoff = (await response.json()) as { handoff_token: string; api_url: string; start_in_background?: boolean };
+      if (startInBackground && handoff.start_in_background !== true) {
+        throw new Error("Background launch requires an updated server. Try again after the server is updated.");
+      }
       window.location.assign(`meshrmm://connect?handoff=${encodeURIComponent(handoff.handoff_token)}&server=${encodeURIComponent(handoff.api_url)}`);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "The remote session could not be started.");
     } finally {
-      window.setTimeout(() => setConnectingId(null), 1200);
+      window.setTimeout(() => {
+        setConnectingId(null);
+        setConnectingBackgroundId(null);
+      }, 1200);
     }
   };
 
@@ -587,12 +595,14 @@ function TenantDashboard({ view }: { view: View }) {
                     query={query}
                     status={status}
                     connectingId={connectingId}
+                    connectingBackgroundId={connectingBackgroundId}
                     deletingId={deletingId}
                     closingId={closingId}
                     canDelete={isAdmin}
                     onQueryChange={setQuery}
                     onStatusChange={setStatus}
                     onRemote={(agent) => void remoteInto(agent)}
+                    onRemoteBackground={(agent) => void remoteInto(agent, true)}
                     onCloseSession={(agent) => void closeAgentSession(agent)}
                     onDelete={(agent) => void deleteAgent(agent)}
                   />

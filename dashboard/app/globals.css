@@ -452,6 +452,8 @@ button { color: inherit; }
 .agent-row .row-actions { display: table-cell; text-align: right; white-space: nowrap; }
 .row-actions button { display: inline-flex; vertical-align: middle; align-items: center; justify-content: center; height: 38px; margin-left: 5px; border-radius: 8px; }
 .remote-button { min-width: 100px; font-size: 12px; color: #4338ca; background: #eef2ff; }
+.background-remote-button { background: #f1f5f9; color: #334155; }
+.background-remote-button:hover { background: #e2e8f0; }
 .close-session-button, .agent-delete-button { width: 34px; padding: 0; background: white; color: #647084; border-color: var(--line); }
 .agent-delete-button:hover { color: #b42318; background: #fff5f5; }
 .close-session-button:hover { color: #925338; }

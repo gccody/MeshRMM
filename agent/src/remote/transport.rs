@@ -86,6 +86,11 @@ enum ControlCommand {
     Stop,
 }
 
+struct CaptureStartup {
+    quality_ceiling: Arc<AtomicU32>,
+    initial_display: Option<DisplayId>,
+}
+
 const VIDEO_BUFFER_DRAIN_MS: u32 = 50;
 const VIDEO_BUFFER_CONGESTED_MS: u32 = 150;
 const VIDEO_BUFFER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(80);
@@ -270,6 +275,7 @@ pub async fn run_sender(
     streamer: Arc<Mutex<Box<dyn ScreenStreamer>>>,
     session_id: RemoteSessionId,
     idle_policy: meshrmm_protocol::IdlePolicy,
+    start_in_background: bool,
 ) -> anyhow::Result<()> {
     let (socket, _) = authenticated_websocket(signal_url, signaling_token).await?;
     let mut signal = SignalingConnection::new(socket);
@@ -281,6 +287,7 @@ pub async fn run_sender(
         session_id,
         &mut failure_reported,
         idle_policy,
+        start_in_background,
     )
     .await;
     if let Err(error) = &result
@@ -298,6 +305,7 @@ async fn run_connected_sender(
     session_id: RemoteSessionId,
     failure_reported: &mut bool,
     idle_policy: meshrmm_protocol::IdlePolicy,
+    start_in_background: bool,
 ) -> anyhow::Result<()> {
     // Input has its own synchronized controller so capture startup, encoder
     // recovery, and video teardown never hold the path used by control events.
@@ -678,7 +686,11 @@ async fn run_connected_sender(
                 capture_streamer.clone(),
                 capture_slot,
                 capture_channel,
-                capture_ceiling,
+                CaptureStartup {
+                    quality_ceiling: capture_ceiling,
+                    initial_display: start_in_background
+                        .then_some(DisplayId(meshrmm_remote_screen::background::DISPLAY_ID)),
+                },
                 capture_rx,
                 started_tx,
                 stop,
@@ -1128,13 +1140,17 @@ async fn run_capture_control(
     streamer: Arc<Mutex<Box<dyn ScreenStreamer>>>,
     slot: Arc<LatestFrameSlot>,
     control_channel: Arc<RTCDataChannel>,
-    quality_ceiling: Arc<AtomicU32>,
+    startup: CaptureStartup,
     mut commands: mpsc::Receiver<ControlCommand>,
     started_tx: tokio::sync::oneshot::Sender<anyhow::Result<StartedScreen>>,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut stream_id = VideoStreamId(1);
-    let started = lock_streamer(&streamer)?.start(None, stream_id, Arc::clone(&slot));
+    let CaptureStartup {
+        quality_ceiling,
+        initial_display,
+    } = startup;
+    let started = lock_streamer(&streamer)?.start(initial_display, stream_id, Arc::clone(&slot));
     let started = match started {
         Ok(started) => started,
         Err(error) => {
