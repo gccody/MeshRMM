@@ -225,6 +225,23 @@ impl ControlSink {
         }
     }
 
+    pub fn clear_clipboard_on_close(&self) -> bool {
+        crate::preferences::clear_clipboard_on_close()
+    }
+
+    pub fn toggle_clear_clipboard_on_close(&self) {
+        match crate::preferences::toggle_clear_clipboard_on_close() {
+            Ok(()) => self.send(meshrmm_protocol::SessionMessage::SetClearClipboardOnClose {
+                enabled: self.clear_clipboard_on_close(),
+            }),
+            Err(error) => {
+                if let Ok(mut state) = self.maintenance.lock() {
+                    state.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
     pub fn session_close_action(&self) -> meshrmm_protocol::SessionCloseAction {
         crate::preferences::session_close_action()
     }

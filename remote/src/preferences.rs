@@ -16,6 +16,7 @@ use std::{
 struct Preferences {
     disconnect_confirmation: bool,
     clipboard_sync: bool,
+    clear_clipboard_on_close: bool,
     session_close_action: SessionCloseAction,
 }
 impl Default for Preferences {
@@ -23,6 +24,7 @@ impl Default for Preferences {
         Self {
             disconnect_confirmation: true,
             clipboard_sync: true,
+            clear_clipboard_on_close: true,
             session_close_action: SessionCloseAction::NoAction,
         }
     }
@@ -85,6 +87,13 @@ pub fn clipboard_sync() -> bool {
 pub fn toggle_clipboard_sync() -> anyhow::Result<()> {
     toggle(|p| &mut p.clipboard_sync)
 }
+/// Empty the viewed Windows session's clipboard when the remote session ends.
+pub fn clear_clipboard_on_close() -> bool {
+    get(|p| p.clear_clipboard_on_close)
+}
+pub fn toggle_clear_clipboard_on_close() -> anyhow::Result<()> {
+    toggle(|p| &mut p.clear_clipboard_on_close)
+}
 /// Lock or log out the viewed Windows session when the remote session ends.
 pub fn session_close_action() -> SessionCloseAction {
     get(|p| p.session_close_action)
@@ -135,16 +144,19 @@ mod tests {
             &Preferences {
                 disconnect_confirmation: false,
                 clipboard_sync: false,
+                clear_clipboard_on_close: false,
                 session_close_action: SessionCloseAction::Logout,
             },
         )
         .unwrap();
         assert!(!load(&path).disconnect_confirmation);
         assert!(!load(&path).clipboard_sync);
+        assert!(!load(&path).clear_clipboard_on_close);
         assert_eq!(load(&path).session_close_action, SessionCloseAction::Logout);
         save(&path, &Preferences::default()).unwrap();
         assert!(load(&path).disconnect_confirmation);
         assert!(load(&path).clipboard_sync);
+        assert!(load(&path).clear_clipboard_on_close);
         assert_eq!(
             load(&path).session_close_action,
             SessionCloseAction::NoAction
@@ -153,6 +165,7 @@ mod tests {
         std::fs::write(&path, r#"{"disconnect_confirmation":false}"#).unwrap();
         assert!(!load(&path).disconnect_confirmation);
         assert!(load(&path).clipboard_sync);
+        assert!(load(&path).clear_clipboard_on_close);
         assert_eq!(
             load(&path).session_close_action,
             SessionCloseAction::NoAction
@@ -162,6 +175,7 @@ mod tests {
         std::fs::write(&path, "broken json").unwrap();
         assert!(load(&path).disconnect_confirmation);
         assert!(load(&path).clipboard_sync);
+        assert!(load(&path).clear_clipboard_on_close);
         assert_eq!(
             load(&path).session_close_action,
             SessionCloseAction::NoAction
