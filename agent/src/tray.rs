@@ -21,6 +21,16 @@ pub fn run() -> anyhow::Result<()> {
         .nth(3)
         .ok_or_else(|| anyhow::anyhow!("missing service PID"))?
         .parse()?;
+    // A remote session ended by sign-out or restart cannot restore the wallpaper
+    // it hid. Retry while Explorer's shell is still starting after sign-in.
+    std::thread::spawn(|| {
+        for _ in 0..60 {
+            if crate::remote::wallpaper::restore_interrupted().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    });
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let class = w!("MeshRMMAgentTray");
