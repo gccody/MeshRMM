@@ -151,6 +151,9 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
     );
     let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(15));
     let resume_state = transport::ViewerResumeState::default();
+    if bootstrap.start_in_background {
+        resume_state.select_background_display();
+    }
     loop {
         match transport::run_receiver(&config, bootstrap.clone(), resume_state.clone()).await {
             Ok(()) => {

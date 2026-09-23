@@ -261,6 +261,14 @@ impl DesktopCaptureStreamer {
         }
         if background {
             meshrmm_remote_screen::background::require_session_zero()?;
+            if self.console_displays.is_empty() {
+                match super::platform::enumerate_displays() {
+                    Ok(displays) => self.console_displays = displays,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not list console monitors before background launch")
+                    }
+                }
+            }
         }
         if self.running.is_some() {
             let result = self.reconfigure(config, display_id, Arc::clone(&sink));

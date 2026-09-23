@@ -67,6 +67,8 @@ struct HandoffRow {
     company_id: String,
     device_id: String,
     user_id: String,
+    #[serde(deserialize_with = "deserialize_sql_bool")]
+    start_in_background: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,6 +188,8 @@ struct AgentConfig {
 #[derive(Debug, Deserialize)]
 struct HandoffRequest {
     device_id: String,
+    #[serde(default)]
+    start_in_background: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -193,10 +197,12 @@ struct HandoffResponse {
     handoff_token: String,
     api_url: String,
     expires_at_unix_ms: u64,
+    start_in_background: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct SessionInit<'a> {
+    start_in_background: bool,
     idle_policy: meshrmm_protocol_types::IdlePolicy,
     blackout_message: &'a str,
     display_border: bool,

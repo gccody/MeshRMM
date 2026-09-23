@@ -27,3 +27,6 @@ pub struct VideoStreamId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DisplayId(pub u32);
+
+/// The private Session 0 workspace advertised by the Windows Agent.
+pub const BACKGROUND_DISPLAY_ID: DisplayId = DisplayId(u32::MAX - 2);

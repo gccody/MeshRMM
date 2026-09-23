@@ -36,13 +36,14 @@ pub(crate) async fn create_handoff(request: &mut Request, environment: &Env) -> 
     .await?;
     query!(
         &db,
-        "INSERT INTO remote_handoffs (token_hash, company_id, device_id, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO remote_handoffs (token_hash, company_id, device_id, user_id, created_at, expires_at, start_in_background) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         token_hash,
         identity.company_id,
         body.device_id,
         identity.user_id,
         i64::try_from(created_at).map_err(|_| Error::RustError("clock overflow".into()))?,
-        i64::try_from(expires_at).map_err(|_| Error::RustError("clock overflow".into()))?
+        i64::try_from(expires_at).map_err(|_| Error::RustError("clock overflow".into()))?,
+        body.start_in_background
     )?
     .run()
     .await?;
@@ -59,6 +60,7 @@ pub(crate) async fn create_handoff(request: &mut Request, environment: &Env) -> 
         handoff_token,
         api_url: canonical_company_url(&db, environment, &identity.company_id).await?,
         expires_at_unix_ms: expires_at,
+        start_in_background: body.start_in_background,
     })
 }
 
@@ -77,7 +79,7 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
     let handoff = if let Some(tenant) = request_tenant.as_ref() {
         query!(
             &db,
-            "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND company_id = ?3 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = remote_handoffs.company_id AND companies.status IN ('active', 'awaiting_admin')) AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id",
+            "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND company_id = ?3 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = remote_handoffs.company_id AND companies.status IN ('active', 'awaiting_admin')) AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id, start_in_background",
             now,
             token_hash,
             tenant.id
@@ -87,7 +89,7 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
     } else {
         query!(
             &db,
-            "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = remote_handoffs.company_id AND companies.status IN ('active', 'awaiting_admin')) AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id",
+            "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = remote_handoffs.company_id AND companies.status IN ('active', 'awaiting_admin')) AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id, start_in_background",
             now,
             token_hash
         )?
@@ -110,7 +112,13 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
     }
     let profile: serde_json::Value = profile_response.json().await?;
     let viewer_name = dashboard_user_name(&profile);
-    let response = create_session_for_device(environment, &handoff.device_id, &viewer_name).await?;
+    let response = create_session_for_device(
+        environment,
+        &handoff.device_id,
+        &viewer_name,
+        handoff.start_in_background,
+    )
+    .await?;
     let identity = Identity {
         user_id: handoff.user_id,
         company_id: handoff.company_id,
@@ -134,6 +142,7 @@ pub(crate) async fn create_session_for_device(
     environment: &Env,
     device_id: &str,
     viewer_name: &str,
+    start_in_background: bool,
 ) -> Result<Response> {
     // Resolve policy from the enrolled device's company, never from viewer input.
     let db = environment.d1("DB")?;
@@ -167,6 +176,7 @@ pub(crate) async fn create_session_for_device(
     let ice_servers = generate_ice_servers(environment, idle_timeout_seconds).await?;
 
     let init = SessionInit {
+        start_in_background,
         idle_policy,
         display_border: policy.display_border,
         blackout_message: &policy.blackout_message,
@@ -187,6 +197,7 @@ pub(crate) async fn create_session_for_device(
     .await?;
 
     let agent_request = AgentSessionRequest {
+        start_in_background,
         idle_policy,
         blackout_message: policy.blackout_message,
         viewer_name: viewer_name.to_owned(),
@@ -215,6 +226,7 @@ pub(crate) async fn create_session_for_device(
         expires_at_unix_ms
     );
     Response::from_json(&SessionBootstrap {
+        start_in_background,
         idle_policy,
         display_border: policy.display_border,
         session_id: RemoteSessionId::new(session_id),

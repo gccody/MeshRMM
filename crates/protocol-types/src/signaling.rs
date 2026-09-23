@@ -18,6 +18,8 @@ pub struct IceServer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionBootstrap {
     #[serde(default)]
+    pub start_in_background: bool,
+    #[serde(default)]
     pub idle_policy: IdlePolicy,
     #[serde(default = "default_enabled")]
     pub display_border: bool,
@@ -29,6 +31,8 @@ pub struct SessionBootstrap {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSessionRequest {
+    #[serde(default)]
+    pub start_in_background: bool,
     #[serde(default)]
     pub idle_policy: IdlePolicy,
     #[serde(default)]
@@ -48,6 +52,7 @@ pub enum AgentCommand {
     Uninstall,
     RotateToken { token: String },
     EndSession { session_id: RemoteSessionId },
+    StartBackgroundSession { request: AgentSessionRequest },
 }
 
 /// Agent-to-coordinator lifecycle notifications.
@@ -124,6 +129,7 @@ mod tests {
             "expires_at_unix_ms": 123, "ice_servers": []
         });
         let mut request: AgentSessionRequest = serde_json::from_value(legacy).unwrap();
+        assert!(!request.start_in_background);
         assert!(request.viewer_name.is_empty());
         request.viewer_name = "Zoë 王".into();
         let decoded: AgentSessionRequest =

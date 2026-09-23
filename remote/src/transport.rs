@@ -65,6 +65,16 @@ pub struct ViewerResumeState {
     audio: meshrmm_audio::PlaybackState,
 }
 
+impl ViewerResumeState {
+    pub fn select_background_display(&self) {
+        *self
+            .display_id
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(meshrmm_protocol::BACKGROUND_DISPLAY_ID);
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn can_reset_presenter_in_place(
     current: meshrmm_protocol::VideoFormat,
