@@ -49,6 +49,7 @@ const COMMAND_START_CHAT: u8 = 10;
 const COMMAND_STOP_CHAT: u8 = 11;
 const COMMAND_BLOCK_INPUT: u8 = 14;
 const COMMAND_BLACKOUT: u8 = 15;
+const COMMAND_ENUMERATE_DISPLAYS: u8 = 22;
 const EVENT_STARTED: u8 = 1;
 const EVENT_FRAME: u8 = 2;
 const EVENT_ERROR: u8 = 3;
@@ -95,6 +96,7 @@ impl DesktopTarget {
 }
 
 enum ParentCommand {
+    EnumerateDisplays,
     StartFiles,
     StartClipboard,
     StartChatHelper {
@@ -262,7 +264,7 @@ impl DesktopCaptureStreamer {
         if background {
             meshrmm_remote_screen::background::require_session_zero()?;
             if self.console_displays.is_empty() {
-                match super::platform::enumerate_displays() {
+                match enumerate_console_displays() {
                     Ok(displays) => self.console_displays = displays,
                     Err(error) => {
                         tracing::warn!(%error, "could not list console monitors before background launch")
@@ -1086,6 +1088,48 @@ fn preferred_desktop() -> DesktopTarget {
     }
 }
 
+// Session 0 cannot see the console's complete monitor topology. Query the same
+// desktop helper used by regular connections, without starting capture or input.
+fn enumerate_console_displays() -> anyhow::Result<Vec<Display>> {
+    let preferred = preferred_desktop();
+    let mut last_error = None;
+    for target in [preferred, preferred.alternate()] {
+        match enumerate_desktop_displays(target) {
+            Ok(displays) => return Ok(displays),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no console desktop is available")))
+}
+
+fn enumerate_desktop_displays(target: DesktopTarget) -> anyhow::Result<Vec<Display>> {
+    let mut launched = launch_system_helper(target)?;
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut output = launched.output;
+        let result = (|| {
+            let count = bounded_len(read_u32(&mut output)?, MAX_DISPLAYS, "display count")?;
+            (0..count)
+                .map(|_| read_display(&mut output))
+                .collect::<io::Result<Vec<_>>>()
+        })();
+        let _ = sender.send(result);
+    });
+    let stderr = thread::spawn(move || drain_child_stderr(launched.stderr));
+    let result = (|| {
+        write_command(&mut launched.input, &ParentCommand::EnumerateDisplays)?;
+        let displays = receiver
+            .recv_timeout(START_TIMEOUT)
+            .context("console display enumeration timed out")??;
+        anyhow::ensure!(!displays.is_empty(), "console desktop reported no displays");
+        Ok(displays)
+    })();
+    terminate_and_wait(&launched.process);
+    let _ = reader.join();
+    let _ = stderr.join();
+    result
+}
+
 fn launch_system_helper(target: DesktopTarget) -> anyhow::Result<LaunchedHelper> {
     launch_helper(target, false)
 }
@@ -1657,6 +1701,17 @@ pub fn run_child() -> anyhow::Result<()> {
                 grayscale,
             },
         ),
+        ParentCommand::EnumerateDisplays => {
+            let displays = enumerate_displays()?;
+            checked_len(displays.len(), MAX_DISPLAYS, "display count")?;
+            let mut output = io::stdout().lock();
+            write_u32(&mut output, displays.len() as u32)?;
+            for display in &displays {
+                write_display(&mut output, display)?;
+            }
+            output.flush()?;
+            Ok(())
+        }
         ParentCommand::StartFiles => run_file_child(command_rx),
         ParentCommand::StartClipboard => run_clipboard_child(command_rx),
         ParentCommand::StartChatHelper { viewer_name } => run_chat_child(command_rx, viewer_name),
@@ -1786,7 +1841,8 @@ fn run_capture_child(
                     continue 'capture;
                 }
                 Ok(Ok(
-                    ParentCommand::StartFiles
+                    ParentCommand::EnumerateDisplays
+                    | ParentCommand::StartFiles
                     | ParentCommand::StartClipboard
                     | ParentCommand::StartChatHelper { .. }
                     | ParentCommand::StartInput { .. }
@@ -2034,6 +2090,7 @@ fn emit_child_event(
 
 fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<()> {
     match command {
+        ParentCommand::EnumerateDisplays => writer.write_all(&[COMMAND_ENUMERATE_DISPLAYS]),
         ParentCommand::StartFiles => writer.write_all(&[13]),
         ParentCommand::StartClipboard => writer.write_all(&[16]),
         ParentCommand::StartChatHelper { viewer_name } => {
@@ -2134,6 +2191,7 @@ fn write_command(mut writer: impl Write, command: &ParentCommand) -> io::Result<
 
 fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
     match read_u8(&mut reader)? {
+        COMMAND_ENUMERATE_DISPLAYS => Ok(ParentCommand::EnumerateDisplays),
         16 => Ok(ParentCommand::StartClipboard),
         17 => {
             let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "viewer name")?;
@@ -2682,6 +2740,63 @@ mod tests {
     use meshrmm_protocol::PointerButton;
 
     #[test]
+    fn background_start_preserves_all_console_displays_when_switching() {
+        let console: Vec<_> = (1..=3)
+            .map(|id| Display {
+                id: DisplayId(id),
+                name: format!("Display {id}"),
+                x: (id as i32 - 1) * 1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                primary: id == 1,
+            })
+            .collect();
+        let mut streamer = DesktopCaptureStreamer::new(String::new(), String::new());
+        streamer.console_displays = console.clone();
+        let format = ActiveFormat {
+            width: 1920,
+            height: 1080,
+            frames_per_second: 20,
+            bitrate_bits_per_second: 12_000_000,
+            codec: VideoCodec::H264,
+            pixel_format: VideoPixelFormat::Yuv420,
+        };
+        for background in [true, false, true] {
+            streamer
+                .background_active
+                .store(background, Ordering::Release);
+            let active = if background {
+                background_display()
+            } else {
+                console[2].clone()
+            };
+            let started = streamer.with_background_display(StartedDesktop {
+                format,
+                displays: if background {
+                    vec![active.clone()]
+                } else {
+                    console.clone()
+                },
+                active_display: active.clone(),
+            });
+            assert_eq!(started.displays.len(), 4);
+            assert_eq!(started.active_display.id, active.id);
+            for (actual, expected) in started.displays.iter().zip(&console) {
+                assert_eq!(actual.id, expected.id);
+                assert_eq!(actual.x, expected.x);
+            }
+            assert_eq!(started.displays[3].id, background_display().id);
+        }
+        let mut bytes = Vec::new();
+        write_command(&mut bytes, &ParentCommand::EnumerateDisplays).unwrap();
+        assert!(matches!(
+            read_command(bytes.as_slice()).unwrap(),
+            ParentCommand::EnumerateDisplays
+        ));
+    }
+
+    #[test]
     fn capture_reader_accepts_reconfiguration_and_discards_frames_while_unrouted() {
         let display = Display {
             id: DisplayId(1),
@@ -3051,6 +3166,7 @@ mod tests {
 
     fn command_name(command: &ParentCommand) -> u8 {
         match command {
+            ParentCommand::EnumerateDisplays => COMMAND_ENUMERATE_DISPLAYS,
             ParentCommand::Start { .. } => COMMAND_START,
             ParentCommand::SetWallpaperHidden(_) => 19,
             ParentCommand::SetPreventIdleLock(_) => 21,
