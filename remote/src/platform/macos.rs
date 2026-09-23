@@ -76,7 +76,7 @@ pub fn supported_video_profiles(_format: VideoFormat) -> Vec<VideoProfile> {
 }
 
 static NEXT_PRESENTER_ID: AtomicU64 = AtomicU64::new(1);
-const VIEWER_TOOLBAR_HEIGHT: f64 = 36.0;
+const VIEWER_TOOLBAR_HEIGHT: f64 = 70.0;
 
 #[cfg(test)]
 mod tests {

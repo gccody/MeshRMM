@@ -1877,6 +1877,7 @@ dependencies = [
  "webrtc",
  "windows 0.62.2",
  "windows-service",
+ "zeroize",
 ]
 
 [[package]]

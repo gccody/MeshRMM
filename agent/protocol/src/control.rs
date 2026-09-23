@@ -151,6 +151,21 @@ pub enum SessionMessage {
     SetClearClipboardOnClose {
         enabled: bool,
     },
+    /// Request a local Windows credential dialog. No secrets cross the network.
+    PromptForCredentials,
+    AutofillCredentials,
+    ForgetCredentials,
+    CredentialState(CredentialState),
+}
+
+/// Session-scoped status only; never contains a password or protected credential blob.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialState {
+    pub available: bool,
+    pub saved: bool,
+    pub prompt_active: bool,
+    pub can_autofill: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -771,5 +786,36 @@ mod desktop_session_tests {
             SessionMessage::decode(&message.encode().unwrap()).unwrap(),
             message
         );
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+    #[test]
+    fn credential_messages_append_after_existing_tags() {
+        let old = SessionMessage::SetClearClipboardOnClose { enabled: true }
+            .encode()
+            .unwrap()[0];
+        assert_eq!(
+            SessionMessage::PromptForCredentials.encode().unwrap()[0],
+            old + 1
+        );
+        for message in [
+            SessionMessage::PromptForCredentials,
+            SessionMessage::AutofillCredentials,
+            SessionMessage::ForgetCredentials,
+            SessionMessage::CredentialState(CredentialState {
+                available: true,
+                saved: true,
+                can_autofill: true,
+                ..Default::default()
+            }),
+        ] {
+            assert_eq!(
+                SessionMessage::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+        }
     }
 }

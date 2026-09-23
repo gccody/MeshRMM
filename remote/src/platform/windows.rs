@@ -51,7 +51,7 @@ const MAX_DECODER_PENDING_FRAMES: usize = 16;
 // reference loss; the worker still presents only the newest decoded surface.
 const MAX_PRESENTER_QUEUE_FRAMES: usize = 15;
 const DECODER_INPUT_STALL_TIMEOUT: Duration = Duration::from_secs(3);
-const VIEWER_TOOLBAR_HEIGHT: u32 = 34;
+const VIEWER_TOOLBAR_HEIGHT: u32 = 68;
 
 struct QueuedFrame {
     frame: EncodedFrame,

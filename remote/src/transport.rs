@@ -186,6 +186,7 @@ impl VideoReceiveState {
 struct ViewerControlQueue {
     recording: crate::recording::Recorder,
     maintenance: Arc<Mutex<crate::platform::MaintenanceState>>,
+    credentials: Arc<Mutex<meshrmm_protocol::CredentialState>>,
     files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
     outgoing: mpsc::UnboundedSender<SessionMessage>,
@@ -211,6 +212,7 @@ impl ViewerControlQueue {
                 let _ = recording_outgoing.send(SessionMessage::SetRecording { enabled });
             }),
             maintenance: Arc::new(Mutex::new(crate::platform::MaintenanceState::default())),
+            credentials: Arc::new(Mutex::new(Default::default())),
             files: meshrmm_file_transfer::TransferSession::with_clipboard_policy(
                 crate::preferences::clipboard_sync,
             ),
@@ -1160,7 +1162,7 @@ fn install_control_handler(
                         Arc::clone(&chroma_mode),
                         #[cfg(windows)]
                         Arc::clone(&profiles),
-                    );
+                    ).with_credentials(Arc::clone(&viewer_control.credentials));
                     debug.configure_stream(
                         active_display.name.clone(),
                         format.width,
@@ -1307,6 +1309,7 @@ fn install_control_handler(
                         }
                     }
                 }
+                Ok(SessionMessage::CredentialState(state)) => { if let Ok(mut current) = viewer_control.credentials.lock() { *current = state; } },
                 Ok(SessionMessage::MaintenanceError { reason }) => {
                     if let Ok(mut state) = viewer_control.maintenance.lock() { state.error = Some(reason); }
                 }
