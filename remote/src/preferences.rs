@@ -10,15 +10,17 @@ use std::{
     },
 };
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct Preferences {
     disconnect_confirmation: bool,
+    clipboard_sync: bool,
 }
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             disconnect_confirmation: true,
+            clipboard_sync: true,
         }
     }
 }
@@ -50,20 +52,30 @@ fn load(path: &Path) -> Preferences {
 fn current() -> &'static Mutex<Preferences> {
     PREFERENCES.get_or_init(|| Mutex::new(path().map(|p| load(&p)).unwrap_or_default()))
 }
-pub fn disconnect_confirmation() -> bool {
-    current()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .disconnect_confirmation
+fn get(field: fn(&Preferences) -> bool) -> bool {
+    field(&current().lock().unwrap_or_else(|e| e.into_inner()))
 }
-pub fn toggle_disconnect_confirmation() -> anyhow::Result<()> {
+fn toggle(field: fn(&mut Preferences) -> &mut bool) -> anyhow::Result<()> {
     let mut current = current().lock().unwrap_or_else(|e| e.into_inner());
-    let next = Preferences {
-        disconnect_confirmation: !current.disconnect_confirmation,
-    };
+    let mut next = current.clone();
+    let value = field(&mut next);
+    *value = !*value;
     save(&path()?, &next)?;
     *current = next;
     Ok(())
+}
+pub fn disconnect_confirmation() -> bool {
+    get(|p| p.disconnect_confirmation)
+}
+pub fn toggle_disconnect_confirmation() -> anyhow::Result<()> {
+    toggle(|p| &mut p.disconnect_confirmation)
+}
+/// Automatic text/rich-text/image clipboard exchange with the Agent.
+pub fn clipboard_sync() -> bool {
+    get(|p| p.clipboard_sync)
+}
+pub fn toggle_clipboard_sync() -> anyhow::Result<()> {
+    toggle(|p| &mut p.clipboard_sync)
 }
 fn save(path: &Path, preferences: &Preferences) -> anyhow::Result<()> {
     let directory = path.parent().context("preferences path has no parent")?;
@@ -102,18 +114,27 @@ mod tests {
         ));
         let path = dir.join("preferences.json");
         assert!(load(&path).disconnect_confirmation);
+        assert!(load(&path).clipboard_sync);
         save(
             &path,
             &Preferences {
                 disconnect_confirmation: false,
+                clipboard_sync: false,
             },
         )
         .unwrap();
         assert!(!load(&path).disconnect_confirmation);
+        assert!(!load(&path).clipboard_sync);
         save(&path, &Preferences::default()).unwrap();
         assert!(load(&path).disconnect_confirmation);
+        assert!(load(&path).clipboard_sync);
+        // Files written before clipboard sync was configurable keep it enabled.
+        std::fs::write(&path, r#"{"disconnect_confirmation":false}"#).unwrap();
+        assert!(!load(&path).disconnect_confirmation);
+        assert!(load(&path).clipboard_sync);
         std::fs::write(&path, "broken json").unwrap();
         assert!(load(&path).disconnect_confirmation);
+        assert!(load(&path).clipboard_sync);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
