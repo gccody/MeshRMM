@@ -21,7 +21,7 @@ use windows::Win32::Security::{
     TOKEN_ALL_ACCESS, TokenPrimary, TokenSessionId,
 };
 use windows::Win32::System::Pipes::CreatePipe;
-use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+use windows::Win32::System::RemoteDesktop::*;
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken,
     PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
@@ -75,13 +75,14 @@ enum DesktopTarget {
     Default,
     Winlogon,
     Background,
+    Rdp(u32, bool),
 }
 
 impl DesktopTarget {
     fn name(self) -> &'static str {
         match self {
-            Self::Default => "default",
-            Self::Winlogon => "Winlogon",
+            Self::Default | Self::Rdp(_, false) => "default",
+            Self::Winlogon | Self::Rdp(_, true) => "Winlogon",
             Self::Background => "MeshRMMBackground",
         }
     }
@@ -91,6 +92,7 @@ impl DesktopTarget {
             Self::Default => Self::Winlogon,
             Self::Winlogon => Self::Default,
             Self::Background => Self::Background,
+            Self::Rdp(id, secure) => Self::Rdp(id, !secure),
         }
     }
 }
@@ -190,6 +192,11 @@ type InputRoute = Arc<Mutex<Option<InputWriter>>>;
 pub struct DesktopCaptureStreamer {
     background_active: Arc<AtomicBool>,
     console_displays: Vec<Display>,
+    session_displays: Vec<(Display, DisplayId)>,
+    selected_session: Option<u32>,
+    known_sessions: Vec<(u32, String)>,
+    sessions_checked: Instant,
+    display_routes: Arc<Mutex<Vec<(DisplayId, DisplayId)>>>,
     blackout_message: String,
     viewer_name: String,
     running: Option<RunningHelper>,
@@ -217,6 +224,11 @@ impl DesktopCaptureStreamer {
         Self {
             background_active: Arc::new(AtomicBool::new(false)),
             console_displays: Vec::new(),
+            session_displays: Vec::new(),
+            selected_session: None,
+            known_sessions: Vec::new(),
+            sessions_checked: Instant::now(),
+            display_routes: Arc::new(Mutex::new(Vec::new())),
             viewer_name,
             blackout_message,
             running: None,
@@ -246,6 +258,24 @@ impl DesktopCaptureStreamer {
         display_id: Option<DisplayId>,
         sink: EncodedFrameSink,
     ) -> anyhow::Result<StartedDesktop> {
+        self.refresh_sessions();
+        let selected =
+            display_id.and_then(|id| self.session_displays.iter().find(|(d, _)| d.id == id));
+        anyhow::ensure!(
+            display_id
+                .is_none_or(|id| id.0 < 0x8000_0000 || id.0 >= u32::MAX - 2 || selected.is_some()),
+            "selected RDP display is no longer available"
+        );
+        let session = selected.and_then(|(d, _)| match d.session {
+            meshrmm_protocol::DesktopSession::Rdp { id, .. } => Some(id),
+            _ => None,
+        });
+        let display_id = selected.map(|(_, local)| *local).or(display_id);
+        if session != self.selected_session {
+            self.shutdown()?;
+            self.selected_session = session;
+            self.preferred_desktop = None;
+        }
         let background =
             display_id.is_some_and(|id| id.0 == meshrmm_remote_screen::background::DISPLAY_ID);
         let config = if background {
@@ -283,7 +313,10 @@ impl DesktopCaptureStreamer {
         let preferred = if background {
             DesktopTarget::Background
         } else {
-            self.preferred_desktop.unwrap_or_else(preferred_desktop)
+            self.preferred_desktop.unwrap_or_else(|| {
+                self.selected_session
+                    .map_or_else(preferred_desktop, |id| DesktopTarget::Rdp(id, false))
+            })
         };
         let mut last_error = None;
         for target in [preferred, preferred.alternate()]
@@ -310,6 +343,17 @@ impl DesktopCaptureStreamer {
                     last_error = Some(error);
                 }
             }
+        }
+        if display_id.is_none()
+            && !background
+            && self.selected_session.is_none()
+            && let Some((display, _)) = self
+                .session_displays
+                .iter()
+                .find(|(d, _)| d.primary)
+                .or(self.session_displays.first())
+        {
+            return self.start(config, Some(display.id), sink);
         }
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no interactive desktop is available")))
     }
@@ -362,13 +406,83 @@ impl DesktopCaptureStreamer {
         Ok(self.with_background_display(started))
     }
 
+    fn refresh_sessions(&mut self) {
+        // Keep IDs stable for the life of this remote connection, including reconnects
+        // of a previously discovered RDP session. Only advertise currently active users.
+        let sessions = match active_rdp_sessions() {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(%error, "could not enumerate RDP sessions");
+                return;
+            }
+        };
+        self.known_sessions = sessions.clone();
+        self.sessions_checked = Instant::now();
+        self.session_displays.retain(|(d, _)| matches!(&d.session,
+            meshrmm_protocol::DesktopSession::Rdp { id, .. } if sessions.iter().any(|(candidate, _)| candidate == id)));
+        for (id, user) in sessions {
+            match enumerate_desktop_displays(DesktopTarget::Rdp(id, false)) {
+                Ok(displays) => {
+                    self.session_displays.retain(|(d, _)| !matches!(d.session, meshrmm_protocol::DesktopSession::Rdp { id: candidate, .. } if candidate == id));
+                    for mut display in displays {
+                        // WTS session IDs and monitor counts are bounded before encoding.
+                        if id >= 0x7fff || (display.id.0 >= 255 && display.id.0 != u32::MAX - 1) {
+                            continue;
+                        }
+                        let local = display.id;
+                        display.id = rdp_display_id(id, local);
+                        display.session = meshrmm_protocol::DesktopSession::Rdp {
+                            id,
+                            user: user.clone(),
+                        };
+                        self.session_displays.push((display, local));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, session_id = id, "could not enumerate RDP monitors")
+                }
+            }
+        }
+    }
+
     fn with_background_display(&mut self, mut started: StartedDesktop) -> StartedDesktop {
-        if self.background_active.load(Ordering::Acquire) {
-            started.displays = self.console_displays.clone();
-        } else {
+        let mut routes = Vec::new();
+        if let Some(session_id) = self.selected_session {
+            // Use the topology returned by the capture helper for the selected session.
+            let session = self
+                .session_displays
+                .iter()
+                .find_map(|(d, _)| match &d.session {
+                    meshrmm_protocol::DesktopSession::Rdp { id, .. } if *id == session_id => {
+                        Some(d.session.clone())
+                    }
+                    _ => None,
+                });
+            if let Some(session) = session {
+                self.session_displays.retain(|(d, _)| d.session != session);
+                for mut display in started.displays.iter().cloned() {
+                    let local = display.id;
+                    display.id = rdp_display_id(session_id, local);
+                    display.session = session.clone();
+                    routes.push((display.id, local));
+                    if local == started.active_display.id {
+                        started.active_display = display.clone();
+                    }
+                    self.session_displays.push((display, local));
+                }
+            }
+        } else if !self.background_active.load(Ordering::Acquire) {
             self.console_displays = started.displays.clone();
         }
+        if self.console_displays.is_empty() {
+            self.console_displays = enumerate_console_displays().unwrap_or_default();
+        }
+        *self.display_routes.lock().unwrap() = routes;
+        started.displays = self.console_displays.clone();
         started.displays.push(background_display());
+        started
+            .displays
+            .extend(self.session_displays.iter().map(|(d, _)| d.clone()));
         started
     }
 
@@ -502,6 +616,7 @@ impl DesktopCaptureStreamer {
     pub fn input_controller(&self) -> Arc<dyn ScreenInput> {
         Arc::new(DesktopInputController {
             background_active: Arc::clone(&self.background_active),
+            display_routes: Arc::clone(&self.display_routes),
             blackout_message: self.blackout_message.clone(),
             route: Arc::clone(&self.input_route),
             file_route: Arc::clone(&self.file_route),
@@ -527,6 +642,18 @@ impl DesktopCaptureStreamer {
     }
 
     pub fn poll_ended(&mut self) -> Option<anyhow::Result<()>> {
+        if self.sessions_checked.elapsed() >= Duration::from_secs(5) {
+            self.sessions_checked = Instant::now();
+            if let Ok(sessions) = active_rdp_sessions()
+                && sessions != self.known_sessions
+            {
+                self.known_sessions = sessions;
+                // Restart capture to publish the changed session catalog using the
+                // existing ordered DisplayConfiguration/stream boundary.
+                let result = self.stop();
+                return Some(result);
+            }
+        }
         let running = self.running.as_ref()?;
         if running.target == DesktopTarget::Background
             && running
@@ -589,7 +716,10 @@ impl DesktopCaptureStreamer {
                 self.stop_file_helper();
                 match start_input_helper(
                     &self.viewer_name,
-                    DesktopTarget::Default,
+                    match target {
+                        DesktopTarget::Rdp(id, _) => DesktopTarget::Rdp(id, false),
+                        _ => DesktopTarget::Default,
+                    },
                     display_id,
                     Arc::clone(&self.cursor),
                     Arc::clone(&self.clipboard),
@@ -821,6 +951,7 @@ struct RunningInputHelper {
 }
 
 struct DesktopInputController {
+    display_routes: Arc<Mutex<Vec<(DisplayId, DisplayId)>>>,
     background_active: Arc<AtomicBool>,
     chat_route: InputRoute,
     clipboard_route: InputRoute,
@@ -838,6 +969,10 @@ struct DesktopInputController {
 }
 
 impl ScreenInput for DesktopInputController {
+    fn is_console_session(&self) -> bool {
+        !self.is_background() && self.display_routes.lock().unwrap().is_empty()
+    }
+
     fn is_background(&self) -> bool {
         self.background_active.load(Ordering::Acquire)
     }
@@ -890,7 +1025,19 @@ impl ScreenInput for DesktopInputController {
             .context("desktop input helper is not running")?;
         send_command(&writer, &ParentCommand::BlockInput(blocked))
     }
-    fn apply_files(&self, message: meshrmm_protocol::FileMessage) -> anyhow::Result<()> {
+    fn apply_files(&self, mut message: meshrmm_protocol::FileMessage) -> anyhow::Result<()> {
+        if let meshrmm_protocol::FileMessage::Begin {
+            destination:
+                meshrmm_protocol::FileDestination::Drop { display_id, .. }
+                | meshrmm_protocol::FileDestination::ClipboardPaste { display_id },
+            ..
+        } = &mut message
+        {
+            let routes = self.display_routes.lock().unwrap();
+            if let Some((_, local)) = routes.iter().find(|(wire, _)| wire == display_id) {
+                *display_id = *local;
+            }
+        }
         let writer = self
             .file_route
             .lock()
@@ -958,7 +1105,16 @@ impl ScreenInput for DesktopInputController {
             .pop_front())
     }
 
-    fn apply(&self, input: RemoteInput) -> anyhow::Result<()> {
+    fn apply(&self, mut input: RemoteInput) -> anyhow::Result<()> {
+        let routes = self.display_routes.lock().unwrap();
+        if !routes.is_empty() {
+            let Some((_, local)) = routes.iter().find(|(wire, _)| *wire == input.display_id())
+            else {
+                return Ok(());
+            };
+            input.set_display_id(*local);
+        }
+        drop(routes);
         let Some(writer) = self
             .route
             .lock()
@@ -989,7 +1145,16 @@ impl ScreenInput for DesktopInputController {
     }
 
     fn agent_pointer_display(&self) -> Option<DisplayId> {
-        self.cursor.lock().unwrap_or_else(|e| e.into_inner()).2
+        let local = self.cursor.lock().unwrap_or_else(|e| e.into_inner()).2?;
+        let routes = self.display_routes.lock().unwrap();
+        if routes.is_empty() {
+            Some(local)
+        } else {
+            routes
+                .iter()
+                .find(|(_, id)| *id == local)
+                .map(|(wire, _)| *wire)
+        }
     }
 
     fn cursor_shape(&self) -> CursorShape {
@@ -1090,6 +1255,56 @@ fn preferred_desktop() -> DesktopTarget {
 
 // Session 0 cannot see the console's complete monitor topology. Query the same
 // desktop helper used by regular connections, without starting capture or input.
+fn rdp_display_id(session: u32, local: DisplayId) -> DisplayId {
+    DisplayId(
+        0x8000_0000
+            | (session << 8)
+            | if local.0 == u32::MAX - 1 {
+                255
+            } else {
+                local.0
+            },
+    )
+}
+
+fn active_rdp_sessions() -> anyhow::Result<Vec<(u32, String)>> {
+    let mut buffer = std::ptr::null_mut();
+    let mut count = 0;
+    unsafe { WTSEnumerateSessionsW(None, 0, 1, &mut buffer, &mut count) }?;
+    let mut result = Vec::new();
+    if !buffer.is_null() {
+        for session in unsafe { std::slice::from_raw_parts(buffer, count as usize) } {
+            if session.State != WTSActive
+                || session.SessionId == unsafe { WTSGetActiveConsoleSessionId() }
+            {
+                continue;
+            }
+            let mut name = PWSTR::null();
+            let mut bytes = 0;
+            if unsafe {
+                WTSQuerySessionInformationW(
+                    None,
+                    session.SessionId,
+                    WTSUserName,
+                    &mut name,
+                    &mut bytes,
+                )
+            }
+            .is_ok()
+                && !name.is_null()
+            {
+                let user = unsafe { name.to_string() }.unwrap_or_default();
+                unsafe { WTSFreeMemory(name.0.cast()) };
+                if !user.is_empty() {
+                    result.push((session.SessionId, user));
+                }
+            }
+        }
+        unsafe { WTSFreeMemory(buffer.cast()) };
+    }
+    Ok(result)
+}
+
 fn enumerate_console_displays() -> anyhow::Result<Vec<Display>> {
     let preferred = preferred_desktop();
     let mut last_error = None;
@@ -1141,6 +1356,8 @@ fn launch_helper(target: DesktopTarget, as_user: bool) -> anyhow::Result<Launche
     let session_id = if target == DesktopTarget::Background {
         meshrmm_remote_screen::background::require_session_zero()?;
         0
+    } else if let DesktopTarget::Rdp(id, _) = target {
+        id
     } else {
         unsafe { WTSGetActiveConsoleSessionId() }
     };
@@ -1274,7 +1491,11 @@ enum HelperKind {
 fn helper_uses_user_token(kind: HelperKind, target: DesktopTarget) -> bool {
     target != DesktopTarget::Background
         && (kind == HelperKind::Files
-            || (kind == HelperKind::Clipboard && target == DesktopTarget::Default))
+            || (kind == HelperKind::Clipboard
+                && matches!(
+                    target,
+                    DesktopTarget::Default | DesktopTarget::Rdp(_, false)
+                )))
 }
 
 // Keep the helper's startup options and independently shared event destinations explicit.
@@ -2002,6 +2223,7 @@ fn is_background_child() -> bool {
 fn background_display() -> Display {
     let info = meshrmm_remote_screen::background::display();
     Display {
+        session: meshrmm_protocol::DesktopSession::Background,
         id: DisplayId(info.id),
         name: info.name,
         x: info.x,
@@ -2067,6 +2289,7 @@ fn enumerate_displays() -> anyhow::Result<Vec<Display>> {
         .into_iter()
         .map(|display| {
             Ok(Display {
+                session: meshrmm_protocol::DesktopSession::Console,
                 id: DisplayId(display.id),
                 name: display.name,
                 x: display.x,
@@ -2620,6 +2843,11 @@ fn read_display(reader: &mut impl Read) -> io::Result<Display> {
     let name = String::from_utf8(name)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     Ok(Display {
+        session: if id == meshrmm_protocol::BACKGROUND_DISPLAY_ID {
+            meshrmm_protocol::DesktopSession::Background
+        } else {
+            meshrmm_protocol::DesktopSession::Console
+        },
         id,
         name,
         x,
@@ -2740,9 +2968,120 @@ mod tests {
     use meshrmm_protocol::PointerButton;
 
     #[test]
+    fn rdp_monitor_ids_are_stable_and_do_not_alias_console_or_other_users() {
+        assert_ne!(rdp_display_id(3, DisplayId(1)), DisplayId(1));
+        assert_ne!(
+            rdp_display_id(3, DisplayId(1)),
+            rdp_display_id(4, DisplayId(1))
+        );
+        assert_ne!(
+            rdp_display_id(3, DisplayId(1)),
+            rdp_display_id(3, DisplayId(2))
+        );
+        assert_ne!(
+            rdp_display_id(3, DisplayId(u32::MAX - 1)),
+            meshrmm_protocol::BACKGROUND_DISPLAY_ID
+        );
+        assert_eq!(
+            DesktopTarget::Rdp(3, false).alternate(),
+            DesktopTarget::Rdp(3, true)
+        );
+        assert!(helper_uses_user_token(
+            HelperKind::Files,
+            DesktopTarget::Rdp(3, true)
+        ));
+        assert!(helper_uses_user_token(
+            HelperKind::Clipboard,
+            DesktopTarget::Rdp(3, false)
+        ));
+        assert!(!helper_uses_user_token(
+            HelperKind::Clipboard,
+            DesktopTarget::Rdp(3, true)
+        ));
+    }
+
+    #[test]
+    fn rdp_catalog_preserves_all_monitors_and_maps_the_active_monitor() {
+        let session = meshrmm_protocol::DesktopSession::Rdp {
+            id: 3,
+            user: "Alice".into(),
+        };
+        let console = Display {
+            session: meshrmm_protocol::DesktopSession::Console,
+            id: DisplayId(1),
+            name: "Console".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+        };
+        let mut streamer = DesktopCaptureStreamer::new(String::new(), String::new());
+        streamer.console_displays = vec![console.clone()];
+        streamer.selected_session = Some(3);
+        streamer.session_displays = vec![(
+            Display {
+                session: session.clone(),
+                id: rdp_display_id(3, console.id),
+                ..console.clone()
+            },
+            console.id,
+        )];
+        let monitors: Vec<_> = (1..=3)
+            .map(|id| Display {
+                id: DisplayId(id),
+                x: (id as i32 - 1) * 1920,
+                ..console.clone()
+            })
+            .collect();
+        let started = streamer.with_background_display(StartedDesktop {
+            active_display: monitors[1].clone(),
+            displays: monitors,
+            format: ActiveFormat {
+                width: 1920,
+                height: 1080,
+                frames_per_second: 30,
+                bitrate_bits_per_second: 8_000_000,
+                codec: VideoCodec::H264,
+                pixel_format: VideoPixelFormat::Yuv420,
+            },
+        });
+        assert_eq!(started.active_display.id, rdp_display_id(3, DisplayId(2)));
+        assert_eq!(started.active_display.session, session);
+        assert_eq!(
+            started
+                .active_display
+                .session_displays(&started.displays)
+                .len(),
+            3
+        );
+        assert_eq!(started.displays.len(), 5);
+        let input = streamer.input_controller();
+        assert!(!input.is_console_session());
+        *streamer.cursor.lock().unwrap() = (CursorShape::Default, false, Some(DisplayId(3)));
+        assert_eq!(
+            input.agent_pointer_display(),
+            Some(rdp_display_id(3, DisplayId(3)))
+        );
+        streamer.selected_session = None;
+        let console_started = streamer.with_background_display(StartedDesktop {
+            active_display: console.clone(),
+            displays: vec![console],
+            format: started.format,
+        });
+        assert_eq!(
+            console_started.active_display.session,
+            meshrmm_protocol::DesktopSession::Console
+        );
+        assert!(streamer.display_routes.lock().unwrap().is_empty());
+        assert!(input.is_console_session());
+    }
+
+    #[test]
     fn background_start_preserves_all_console_displays_when_switching() {
         let console: Vec<_> = (1..=3)
             .map(|id| Display {
+                session: meshrmm_protocol::DesktopSession::Console,
                 id: DisplayId(id),
                 name: format!("Display {id}"),
                 x: (id as i32 - 1) * 1920,
@@ -2799,6 +3138,7 @@ mod tests {
     #[test]
     fn capture_reader_accepts_reconfiguration_and_discards_frames_while_unrouted() {
         let display = Display {
+            session: meshrmm_protocol::DesktopSession::Console,
             id: DisplayId(1),
             name: "Display".into(),
             x: 0,
@@ -2810,6 +3150,7 @@ mod tests {
         let mut bytes = Vec::new();
         for id in [1, 2] {
             let selected = Display {
+                session: meshrmm_protocol::DesktopSession::Console,
                 id: DisplayId(id),
                 ..display.clone()
             };
@@ -3069,6 +3410,7 @@ mod tests {
     #[test]
     fn started_event_round_trips_display_metadata() {
         let display = Display {
+            session: meshrmm_protocol::DesktopSession::Console,
             id: DisplayId(2),
             name: "Secure display".into(),
             x: -1920,

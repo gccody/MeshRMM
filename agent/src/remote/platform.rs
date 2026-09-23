@@ -52,6 +52,11 @@ pub trait ScreenStreamer: Send {
 }
 
 pub trait ScreenInput: Send + Sync {
+    /// Session 0 audio capture and service SendSAS target only the console.
+    fn is_console_session(&self) -> bool {
+        !self.is_background()
+    }
+
     fn is_background(&self) -> bool {
         false
     }
@@ -550,6 +555,7 @@ pub(super) fn enumerate_displays() -> anyhow::Result<Vec<Display>> {
         .into_iter()
         .map(|display| {
             Ok(Display {
+                session: meshrmm_protocol::DesktopSession::Console,
                 id: DisplayId(display.id),
                 name: display.name,
                 x: display.x,

@@ -5,6 +5,8 @@ mod remote;
 #[cfg(windows)]
 mod service;
 #[cfg(windows)]
+mod tray;
+#[cfg(windows)]
 mod updater;
 
 use anyhow::Context;
@@ -12,6 +14,14 @@ use remote::config::{Config, ExecutionMode};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--tray")
+    {
+        return tray::run();
+    }
+
     if meshrmm_session_transport::identity::handle_command(
         meshrmm_session_transport::identity::agent_directory,
     )? {

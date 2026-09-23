@@ -80,6 +80,18 @@ pub enum RemoteInput {
 }
 
 impl RemoteInput {
+    pub fn set_display_id(&mut self, id: DisplayId) {
+        match self {
+            Self::PointerMove { display_id, .. }
+            | Self::PointerButton { display_id, .. }
+            | Self::PointerButtonAt { display_id, .. }
+            | Self::Wheel { display_id, .. }
+            | Self::WheelAt { display_id, .. }
+            | Self::Key { display_id, .. }
+            | Self::TypeText { display_id, .. } => *display_id = id,
+        }
+    }
+
     pub fn display_id(&self) -> DisplayId {
         match self {
             Self::PointerMove { display_id, .. }

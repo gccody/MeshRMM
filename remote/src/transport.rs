@@ -1120,9 +1120,17 @@ fn install_control_handler(
                         .ok()
                         .and_then(|selected| *selected)
                         .filter(|selected| {
-                            *selected != active_display_id
+                            configuration_sequence == 1
+                                && *selected != active_display_id
                                 && displays.iter().any(|display| display.id == *selected)
                         });
+                    // Replay a remembered choice only on transport reconnect. Later
+                    // configurations acknowledge selection or recovery; replaying a
+                    // failed choice there would cause an endless switch/restore loop.
+                    if resumed_display.is_none()
+                        && let Ok(mut selected) = selected_display_id.lock() {
+                        *selected = Some(active_display_id);
+                    }
                     let sink = ControlSink::new(
                         Arc::clone(&viewer_control.resume_state.idle),
                         Arc::clone(&viewer_control.resume_state.display_border),

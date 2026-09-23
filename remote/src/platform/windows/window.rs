@@ -12,6 +12,7 @@ struct WindowContext {
     debug_visible: bool,
     debug_refreshed: std::time::Instant,
     toolbar: HWND,
+    user_combo: HWND,
     display_combo: HWND,
     quality_combo: HWND,
     chroma_combo: HWND,
@@ -37,6 +38,7 @@ struct SettingsControls {
     chroma_buttons: [(HWND, ChromaMode); 2],
 }
 
+const USER_COMBO_ID: usize = 4013;
 const DISPLAY_COMBO_ID: usize = 4001;
 const QUALITY_COMBO_ID: usize = 4002;
 const CHROMA_COMBO_ID: usize = 4008;
@@ -168,9 +170,10 @@ impl WindowContext {
                 true,
             )
         };
-        let _ = unsafe { MoveWindow(self.display_combo, 8, 5, 158, 300, true) };
-        let _ = unsafe { MoveWindow(self.quality_combo, 172, 5, 154, 300, true) };
-        let _ = unsafe { MoveWindow(self.chroma_combo, 332, 5, 124, 300, true) };
+        let _ = unsafe { MoveWindow(self.user_combo, 8, 5, 158, 300, true) };
+        let _ = unsafe { MoveWindow(self.display_combo, 172, 5, 110, 300, true) };
+        let _ = unsafe { MoveWindow(self.quality_combo, 288, 5, 154, 300, true) };
+        let _ = unsafe { MoveWindow(self.chroma_combo, 448, 5, 124, 300, true) };
         let caption_x = width.saturating_sub(138);
         let _ = unsafe { MoveWindow(self.minimize_button, caption_x, 0, 46, 34, true) };
         let _ = unsafe { MoveWindow(self.maximize_button, caption_x + 46, 0, 46, 34, true) };
@@ -247,12 +250,38 @@ impl WindowContext {
     }
 
     fn select_display(&self, index: usize) {
-        if let Some(display) = self.displays.get(index)
+        if let Some(display) = self
+            .active_display
+            .session_displays(&self.displays)
+            .get(index)
             && display.id != self.active_display.id
         {
             self.send(SessionMessage::SelectDisplay {
                 display_id: display.id,
             });
+        }
+    }
+
+    fn select_user(&self, index: usize) {
+        let sessions = Display::sessions(&self.displays);
+        if let Some(session) = sessions.get(index)
+            && *session != self.active_display.session
+            && let Some(display) = self
+                .displays
+                .iter()
+                .find(|d| &d.session == session && d.primary)
+                .or_else(|| self.displays.iter().find(|d| &d.session == session))
+        {
+            self.send(SessionMessage::SelectDisplay {
+                display_id: display.id,
+            });
+        }
+        let current = sessions
+            .iter()
+            .position(|s| *s == self.active_display.session)
+            .unwrap_or(0);
+        unsafe {
+            SendMessageW(self.user_combo, CB_SETCURSEL, Some(WPARAM(current)), None);
         }
     }
 
@@ -408,16 +437,17 @@ impl WindowContext {
     }
 
     fn select_next_display(&self) {
-        if self.displays.len() < 2 {
+        let displays = self.active_display.session_displays(&self.displays);
+        if displays.len() < 2 {
             return;
         }
-        let current = self
-            .displays
+        let current = displays
             .iter()
-            .position(|display| display.id == self.active_display.id)
+            .position(|d| d.id == self.active_display.id)
             .unwrap_or(0);
-        let next = self.displays[(current + 1) % self.displays.len()].id;
-        self.send(SessionMessage::SelectDisplay { display_id: next });
+        self.send(SessionMessage::SelectDisplay {
+            display_id: displays[(current + 1) % displays.len()].id,
+        });
     }
 
     fn toggle_debug(&mut self) {
@@ -1009,7 +1039,7 @@ pub(super) unsafe fn create_window(
             WM_GETMINMAXINFO => {
                 let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
                 // Leave room for display/quality controls, session actions and caption buttons.
-                info.ptMinTrackSize.x = 1060;
+                info.ptMinTrackSize.x = 1176;
                 info.ptMinTrackSize.y = 300;
                 LRESULT(0)
             }
@@ -1076,6 +1106,16 @@ pub(super) unsafe fn create_window(
                 if let Some(context) = context {
                     let control_id = wparam.0 & 0xffff;
                     let notification = (wparam.0 >> 16) & 0xffff;
+                    if control_id == USER_COMBO_ID && notification == CBN_SELCHANGE as usize {
+                        let selected =
+                            unsafe { SendMessageW(context.user_combo, CB_GETCURSEL, None, None).0 };
+                        if selected >= 0 {
+                            context.release_input();
+                            context.select_user(selected as usize);
+                        }
+                        let _ = unsafe { SetFocus(Some(window)) };
+                        return LRESULT(0);
+                    }
                     if control_id == DISPLAY_COMBO_ID && notification == CBN_SELCHANGE as usize {
                         let selected = unsafe {
                             SendMessageW(context.display_combo, CB_GETCURSEL, None, None).0
@@ -1420,6 +1460,7 @@ pub(super) unsafe fn create_window(
         debug_visible: false,
         debug_refreshed: std::time::Instant::now(),
         toolbar: HWND::default(),
+        user_combo: HWND::default(),
         display_combo: HWND::default(),
         quality_combo: HWND::default(),
         chroma_combo: HWND::default(),
@@ -1523,27 +1564,60 @@ pub(super) unsafe fn create_window(
         )
     }
     .context("display dropdown creation failed")?;
-    for display in &unsafe { window_context(window) }
-        .context("viewer context unavailable while building toolbar")?
-        .displays
-    {
-        let title = HSTRING::from(display.name.as_str());
+    let user_combo = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("COMBOBOX"),
+            w!(""),
+            WINDOW_STYLE(
+                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
+            ),
+            8,
+            5,
+            158,
+            300,
+            Some(window),
+            Some(HMENU(USER_COMBO_ID as *mut c_void)),
+            Some(instance),
+            None,
+        )
+    }
+    .context("user dropdown creation failed")?;
+    let context = unsafe { window_context(window) }.context("viewer context unavailable")?;
+    let sessions = Display::sessions(&context.displays);
+    for session in &sessions {
+        let title = HSTRING::from(session.label());
+        unsafe {
+            SendMessageW(
+                user_combo,
+                CB_ADDSTRING,
+                None,
+                Some(LPARAM(title.as_ptr() as isize)),
+            );
+        }
+    }
+    let active_session = sessions
+        .iter()
+        .position(|s| *s == context.active_display.session)
+        .unwrap_or(0);
+    unsafe {
+        SendMessageW(user_combo, CB_SETCURSEL, Some(WPARAM(active_session)), None);
+    }
+    let visible = context.active_display.session_displays(&context.displays);
+    for (index, display) in visible.iter().enumerate() {
+        let title = HSTRING::from(display.selection_label(index));
         unsafe {
             SendMessageW(
                 display_combo,
                 CB_ADDSTRING,
                 None,
                 Some(LPARAM(title.as_ptr() as isize)),
-            )
-        };
+            );
+        }
     }
-    let active_index = unsafe { window_context(window) }
-        .and_then(|context| {
-            context
-                .displays
-                .iter()
-                .position(|display| display.id == context.active_display.id)
-        })
+    let active_index = visible
+        .iter()
+        .position(|d| d.id == context.active_display.id)
         .unwrap_or(0);
     unsafe {
         SendMessageW(
@@ -1551,8 +1625,9 @@ pub(super) unsafe fn create_window(
             CB_SETCURSEL,
             Some(WPARAM(active_index)),
             None,
-        )
-    };
+        );
+        let _ = EnableWindow(display_combo, visible.len() > 1);
+    }
     let quality_combo = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -1665,6 +1740,7 @@ pub(super) unsafe fn create_window(
     let close_button = make_toolbar_button(CLOSE_BUTTON_ID, w!("×"), caption_button_style)?;
     let header_font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
     for control in [
+        user_combo,
         display_combo,
         quality_combo,
         chroma_combo,
@@ -1691,6 +1767,7 @@ pub(super) unsafe fn create_window(
     if let Some(context) = unsafe { window_context(window) } {
         context.debug_overlay = overlay;
         context.toolbar = toolbar;
+        context.user_combo = user_combo;
         context.display_combo = display_combo;
         context.quality_combo = quality_combo;
         context.chroma_combo = chroma_combo;
@@ -1811,11 +1888,16 @@ pub(super) unsafe fn set_agent_pointer_display(
             if let Ok(combo) = combo {
                 let selected = SendMessageW(combo, CB_GETCURSEL, None, None);
                 SendMessageW(combo, CB_RESETCONTENT, None, None);
-                for display in &context.displays {
+                for (index, display) in context
+                    .active_display
+                    .session_displays(&context.displays)
+                    .iter()
+                    .enumerate()
+                {
                     let title = if display_id == Some(display.id) {
-                        format!("➤ {}", display.name)
+                        format!("➤ {}", display.selection_label(index))
                     } else {
-                        display.name.clone()
+                        display.selection_label(index)
                     };
                     let title = HSTRING::from(title);
                     SendMessageW(
