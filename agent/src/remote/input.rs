@@ -655,6 +655,7 @@ mod pointer_monitor_tests {
     fn pointer_monitor_excludes_virtual_display_and_handles_edges_and_gaps() {
         let mut displays = vec![
             Display {
+                session: meshrmm_protocol::DesktopSession::Console,
                 id: meshrmm_protocol::DisplayId(1),
                 name: "Left".into(),
                 x: -100,
@@ -664,6 +665,7 @@ mod pointer_monitor_tests {
                 primary: false,
             },
             Display {
+                session: meshrmm_protocol::DesktopSession::Console,
                 id: meshrmm_protocol::DisplayId(2),
                 name: "Right".into(),
                 x: 0,
@@ -676,6 +678,7 @@ mod pointer_monitor_tests {
         displays.insert(
             0,
             Display {
+                session: meshrmm_protocol::DesktopSession::Console,
                 id: meshrmm_protocol::DisplayId(meshrmm_remote_screen::ALL_MONITORS_ID),
                 name: "All".into(),
                 x: -100,

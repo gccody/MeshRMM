@@ -170,6 +170,7 @@ mod tests {
     #[ignore = "requires an interactive Windows desktop with DWM"]
     fn native_border_is_excluded_click_through_and_destroyed_on_drop() {
         let d = Display {
+            session: meshrmm_protocol::DesktopSession::Console,
             id: meshrmm_protocol::DisplayId(1),
             name: "Test".into(),
             x: 0,
@@ -212,6 +213,7 @@ mod tests {
     #[test]
     fn border_follows_negative_monitor_coordinates() {
         let d = Display {
+            session: meshrmm_protocol::DesktopSession::Console,
             id: meshrmm_protocol::DisplayId(2),
             name: "Left".into(),
             x: -1920,

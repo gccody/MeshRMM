@@ -354,7 +354,7 @@ async fn run_connected_sender(
                 tokio::select! {
                     _ = stop.changed() => break,
                     _ = retry.tick() => {
-                        if audio_input.is_background() { stream = None; continue; }
+                        if !audio_input.is_console_session() { stream = None; continue; }
                         if stream.as_ref().is_some_and(meshrmm_audio::Capture::healthy) { continue; }
                         stream = None;
                         let sender = audio_tx.clone();
@@ -371,7 +371,7 @@ async fn run_connected_sender(
     let audio_input = Arc::clone(&input);
     let audio_sender = tokio::spawn(async move {
         while let Some(packet) = audio_rx.recv().await {
-            if !audio_input.is_background()
+            if audio_input.is_console_session()
                 && audio_channel.ready_state() == RTCDataChannelState::Open
                 && audio_channel.buffered_amount().await < 32_000
                 && audio_channel.send(&Bytes::from(packet)).await.is_err()
@@ -434,9 +434,9 @@ async fn run_connected_sender(
         move |message| {
             let result = match message {
                 Some(SessionMessage::SendSecureAttention) => {
-                    if maintenance_input.is_background() {
+                    if !maintenance_input.is_console_session() {
                         Err(anyhow::anyhow!(
-                            "Ctrl+Alt+Del is unavailable in background mode"
+                            "Ctrl+Alt+Del is only available for the console session"
                         ))
                     } else {
                         super::secure_attention::send()
@@ -1446,13 +1446,12 @@ async fn run_capture_control(
                                 tracing::info!(switch_ms = switch_started.elapsed().as_millis(), display_id = active_display.id.0, display_name = %active_display.name, stream_id = stream_id.0, "remote display switched");
                             }
                             Err(error) => {
-                                if selected.id.0 == meshrmm_remote_screen::background::DISPLAY_ID
-                                    && active_display.id != selected.id
+                                if selected.session != active_display.session
                                 {
                                     send_control_message(&control_channel, SessionMessage::MaintenanceError {
-                                        reason: format!("Background mode could not start: {error:#}"),
+                                        reason: format!("{} session could not start: {error:#}", selected.session.label()),
                                     }).await?;
-                                    // A failed experimental backend must not strand the viewer
+                                    // A failed session switch must not strand the viewer
                                     // on a blank desktop or silently inject console input.
                                     let restored = start_first_profile(&streamer, active_display.id, stream_id, &slot, &candidates)?;
                                     displays = restored.displays;

@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CursorShape, DisplayId, RemoteInput, RemoteSessionId, VideoStreamId};
 
-pub const CONTROL_CHANNEL_LABEL: &str = "meshrmm-control-v4";
-pub const CONTROL_CHANNEL_PROTOCOL: &str = "meshrmm.control.v4";
+pub const CONTROL_CHANNEL_LABEL: &str = "meshrmm-control-v5";
+pub const CONTROL_CHANNEL_PROTOCOL: &str = "meshrmm.control.v5";
 /// Maximum UTF-8 payload for a single session chat message.
 pub const MAX_CHAT_TEXT_BYTES: usize = 4 * 1024;
 
@@ -165,7 +165,25 @@ impl SessionMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DesktopSession {
+    Console,
+    Background,
+    Rdp { id: u32, user: String },
+}
+
+impl DesktopSession {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Console => "Console".into(),
+            Self::Background => "Background".into(),
+            Self::Rdp { id, user } => format!("{user} (RDP {id})"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Display {
+    pub session: DesktopSession,
     pub id: DisplayId,
     pub name: String,
     /// Desktop-space coordinates. These may be negative when a display is to
@@ -175,6 +193,33 @@ pub struct Display {
     pub width: u32,
     pub height: u32,
     pub primary: bool,
+}
+
+impl Display {
+    pub fn session_displays<'a>(&self, displays: &'a [Self]) -> Vec<&'a Self> {
+        displays
+            .iter()
+            .filter(|d| d.session == self.session)
+            .collect()
+    }
+
+    pub fn sessions(displays: &[Self]) -> Vec<DesktopSession> {
+        let mut sessions = Vec::new();
+        for display in displays {
+            if !sessions.contains(&display.session) {
+                sessions.push(display.session.clone());
+            }
+        }
+        sessions
+    }
+
+    pub fn selection_label(&self, index: usize) -> String {
+        if self.id.0 == u32::MAX - 1 || self.name == "All monitors" {
+            "All displays".into()
+        } else {
+            format!("Display {}", index + 1)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +445,7 @@ mod tests {
         };
         let message = SessionMessage::DisplayConfiguration {
             displays: vec![Display {
+                session: DesktopSession::Console,
                 id: DisplayId(2),
                 name: "Left display".into(),
                 x: -2_560,
@@ -588,5 +634,87 @@ mod chat_tests {
             vec![17, 1, b'x']
         );
         assert_eq!(SessionMessage::ChatAvailable.encode().unwrap(), vec![18]);
+    }
+}
+
+#[cfg(test)]
+mod desktop_session_tests {
+    use super::*;
+
+    fn display(id: u32, session: DesktopSession) -> Display {
+        Display {
+            id: DisplayId(id),
+            session,
+            name: "Monitor".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: false,
+        }
+    }
+
+    #[test]
+    fn selectors_keep_console_background_and_each_rdp_user_separate() {
+        let alice = DesktopSession::Rdp {
+            id: 3,
+            user: "Alice".into(),
+        };
+        let bob = DesktopSession::Rdp {
+            id: 4,
+            user: "Alice".into(),
+        };
+        let displays = vec![
+            display(1, DesktopSession::Console),
+            display(2, DesktopSession::Console),
+            display(crate::BACKGROUND_DISPLAY_ID.0, DesktopSession::Background),
+            display(101, alice.clone()),
+            display(102, alice.clone()),
+            display(103, alice.clone()),
+            display(201, bob.clone()),
+        ];
+        assert_eq!(
+            Display::sessions(&displays),
+            vec![
+                DesktopSession::Console,
+                DesktopSession::Background,
+                alice,
+                bob
+            ]
+        );
+        assert_eq!(displays[0].session_displays(&displays).len(), 2);
+        assert_eq!(displays[2].session_displays(&displays).len(), 1);
+        assert_eq!(
+            displays[3]
+                .session_displays(&displays)
+                .iter()
+                .map(|d| d.id.0)
+                .collect::<Vec<_>>(),
+            vec![101, 102, 103]
+        );
+        assert_eq!(displays[6].session_displays(&displays).len(), 1);
+        for (index, display) in displays[3].session_displays(&displays).iter().enumerate() {
+            assert_eq!(
+                display.selection_label(index),
+                format!("Display {}", index + 1)
+            );
+        }
+        let message = SessionMessage::DisplayConfiguration {
+            displays,
+            active_display_id: DisplayId(102),
+            stream_id: VideoStreamId(1),
+            format: VideoFormat {
+                width: 1920,
+                height: 1080,
+                frames_per_second: 30,
+                bitrate_bits_per_second: 8_000_000,
+                codec: Codec::H264,
+                pixel_format: PixelFormat::Nv12,
+            },
+        };
+        assert_eq!(
+            SessionMessage::decode(&message.encode().unwrap()).unwrap(),
+            message
+        );
     }
 }

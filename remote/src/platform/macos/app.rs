@@ -131,6 +131,7 @@ pub(super) struct RemoteViewIvars {
     displays: RefCell<Vec<Display>>,
     video_width: std::cell::Cell<u32>,
     video_height: std::cell::Cell<u32>,
+    user_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     display_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     recording_visible: std::cell::Cell<bool>,
     confirming_disconnect: std::cell::Cell<bool>,
@@ -354,13 +355,28 @@ define_class!(
         fn select_display_from_toolbar(&self, sender: &NSPopUpButton) {
             let index = sender.indexOfSelectedItem();
             if index >= 0
-                && let Some(display) = self.ivars().displays.borrow().get(index as usize)
+                && let Some(display) = self.ivars().active_display.borrow().session_displays(&self.ivars().displays.borrow()).get(index as usize)
                 && display.id != self.ivars().active_display.borrow().id
             {
                 self.send(SessionMessage::SelectDisplay {
                     display_id: display.id,
                 });
             }
+        }
+
+        #[unsafe(method(selectUserFromToolbar:))]
+        fn select_user_from_toolbar(&self, sender: &NSPopUpButton) {
+            let displays = self.ivars().displays.borrow();
+            let sessions = Display::sessions(&displays);
+            if let Some(session) = sessions.get(sender.indexOfSelectedItem() as usize)
+                && *session != self.ivars().active_display.borrow().session
+                && let Some(display) = displays.iter().find(|d| &d.session == session && d.primary)
+                    .or_else(|| displays.iter().find(|d| &d.session == session)) {
+                self.release_input();
+                self.send(SessionMessage::SelectDisplay { display_id: display.id });
+            }
+            // Selection is committed only once the agent confirms its stream.
+            self.refresh_display_selectors();
         }
 
         #[unsafe(method(showSessionControls:))]
@@ -616,6 +632,7 @@ impl RemoteView {
             displays: RefCell::new(displays),
             video_width: std::cell::Cell::new(video_width),
             video_height: std::cell::Cell::new(video_height),
+            user_popup: RefCell::new(None),
             display_popup: RefCell::new(None),
             chat_popup: RefCell::new(None),
             session_button: RefCell::new(None),
@@ -664,25 +681,14 @@ impl RemoteView {
         let display_popup = NSPopUpButton::initWithFrame_pullsDown(
             NSPopUpButton::alloc(mtm),
             NSRect {
-                origin: NSPoint { x: 78.0, y: 6.0 },
+                origin: NSPoint { x: 234.0, y: 6.0 },
                 size: NSSize {
-                    width: 160.0,
+                    width: 110.0,
                     height: 24.0,
                 },
             },
             false,
         );
-        for display in self.ivars().displays.borrow().iter() {
-            display_popup.addItemWithTitle(&NSString::from_str(&display.name));
-        }
-        let active_index = self
-            .ivars()
-            .displays
-            .borrow()
-            .iter()
-            .position(|display| display.id == self.ivars().active_display.borrow().id)
-            .unwrap_or(0);
-        display_popup.selectItemAtIndex(active_index as isize);
         unsafe {
             display_popup.setTarget(Some(self));
             display_popup.setAction(Some(sel!(selectDisplayFromToolbar:)));
@@ -693,10 +699,24 @@ impl RemoteView {
         toolbar.addSubview(&display_popup);
         *self.ivars().display_popup.borrow_mut() = Some(display_popup);
 
+        let user_popup = NSPopUpButton::initWithFrame_pullsDown(
+            NSPopUpButton::alloc(mtm),
+            NSRect::new(NSPoint::new(78., 6.), NSSize::new(150., 24.)),
+            false,
+        );
+        user_popup.setToolTip(Some(&NSString::from_str("User session")));
+        unsafe {
+            user_popup.setTarget(Some(self));
+            user_popup.setAction(Some(sel!(selectUserFromToolbar:)));
+        }
+        toolbar.addSubview(&user_popup);
+        *self.ivars().user_popup.borrow_mut() = Some(user_popup);
+        self.refresh_display_selectors();
+
         let quality_popup = NSPopUpButton::initWithFrame_pullsDown(
             NSPopUpButton::alloc(mtm),
             NSRect {
-                origin: NSPoint { x: 244.0, y: 6.0 },
+                origin: NSPoint { x: 356.0, y: 6.0 },
                 size: NSSize {
                     width: 154.0,
                     height: 24.0,
@@ -723,7 +743,7 @@ impl RemoteView {
             )
         };
         diagnostics.setFrame(NSRect {
-            origin: NSPoint { x: 404.0, y: 6.0 },
+            origin: NSPoint { x: 516.0, y: 6.0 },
             size: NSSize {
                 width: 88.0,
                 height: 24.0,
@@ -740,7 +760,7 @@ impl RemoteView {
                 self.mtm(),
             )
         };
-        file_button.setFrame(NSRect::new(NSPoint::new(542., 6.), NSSize::new(40., 24.)));
+        file_button.setFrame(NSRect::new(NSPoint::new(654., 6.), NSSize::new(40., 24.)));
         file_button.setToolTip(Some(&NSString::from_str(
             "Send or receive files and folders",
         )));
@@ -753,7 +773,7 @@ impl RemoteView {
                 mtm,
             )
         };
-        chat_button.setFrame(NSRect::new(NSPoint::new(498., 6.), NSSize::new(40., 24.)));
+        chat_button.setFrame(NSRect::new(NSPoint::new(610., 6.), NSSize::new(40., 24.)));
         toolbar.addSubview(&chat_button);
         let secure_attention_button = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -764,7 +784,7 @@ impl RemoteView {
             )
         };
         secure_attention_button
-            .setFrame(NSRect::new(NSPoint::new(588., 6.), NSSize::new(110., 24.)));
+            .setFrame(NSRect::new(NSPoint::new(700., 6.), NSSize::new(110., 24.)));
         toolbar.addSubview(&secure_attention_button);
         let type_clipboard_button = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -774,7 +794,7 @@ impl RemoteView {
                 mtm,
             )
         };
-        type_clipboard_button.setFrame(NSRect::new(NSPoint::new(704., 6.), NSSize::new(120., 24.)));
+        type_clipboard_button.setFrame(NSRect::new(NSPoint::new(816., 6.), NSSize::new(120., 24.)));
         type_clipboard_button.setToolTip(Some(&NSString::from_str(
             "Type local clipboard text into the focused remote field",
         )));
@@ -819,12 +839,19 @@ impl RemoteView {
     ) {
         self.ivars().agent_pointer_display.set(display_id);
         if let Some(popup) = self.ivars().display_popup.borrow().as_ref() {
-            for (index, display) in self.ivars().displays.borrow().iter().enumerate() {
+            for (index, display) in self
+                .ivars()
+                .active_display
+                .borrow()
+                .session_displays(&self.ivars().displays.borrow())
+                .iter()
+                .enumerate()
+            {
                 if let Some(item) = popup.itemAtIndex(index as isize) {
                     let title = if display_id == Some(display.id) {
-                        format!("➤ {}", display.name)
+                        format!("➤ {}", display.selection_label(index))
                     } else {
-                        display.name.clone()
+                        display.selection_label(index)
                     };
                     item.setTitle(&NSString::from_str(&title));
                 }
@@ -949,7 +976,9 @@ impl RemoteView {
     }
 
     fn select_adjacent(&self, next: bool) {
-        let displays = self.ivars().displays.borrow();
+        let all_displays = self.ivars().displays.borrow();
+        let active = self.ivars().active_display.borrow();
+        let displays = active.session_displays(&all_displays);
         if displays.len() < 2 {
             return;
         }
@@ -1011,6 +1040,35 @@ impl RemoteView {
             .setStringValue(&NSString::from_str(&self.ivars().debug.render()));
     }
 
+    fn refresh_display_selectors(&self) {
+        let displays = self.ivars().displays.borrow();
+        let active = self.ivars().active_display.borrow();
+        if let Some(popup) = self.ivars().user_popup.borrow().as_ref() {
+            popup.removeAllItems();
+            let sessions = Display::sessions(&displays);
+            for session in &sessions {
+                popup.addItemWithTitle(&NSString::from_str(&session.label()));
+            }
+            popup.selectItemAtIndex(
+                sessions
+                    .iter()
+                    .position(|s| *s == active.session)
+                    .unwrap_or(0) as isize,
+            );
+        }
+        if let Some(popup) = self.ivars().display_popup.borrow().as_ref() {
+            popup.removeAllItems();
+            let visible = active.session_displays(&displays);
+            for (index, display) in visible.iter().enumerate() {
+                popup.addItemWithTitle(&NSString::from_str(&display.selection_label(index)));
+            }
+            popup.selectItemAtIndex(
+                visible.iter().position(|d| d.id == active.id).unwrap_or(0) as isize
+            );
+            popup.setEnabled(visible.len() > 1);
+        }
+    }
+
     pub(super) fn configure_display(
         &self,
         display: Display,
@@ -1021,19 +1079,9 @@ impl RemoteView {
         if self.ivars().active_display.borrow().id != display.id {
             self.release_input();
         }
-        if let Some(popup) = self.ivars().display_popup.borrow().as_ref() {
-            popup.removeAllItems();
-            for display in &displays {
-                popup.addItemWithTitle(&NSString::from_str(&display.name));
-            }
-            let index = displays
-                .iter()
-                .position(|candidate| candidate.id == display.id)
-                .unwrap_or(0);
-            popup.selectItemAtIndex(index as isize);
-        }
         *self.ivars().active_display.borrow_mut() = display;
         *self.ivars().displays.borrow_mut() = displays;
+        self.refresh_display_selectors();
         self.set_agent_pointer_display(self.ivars().agent_pointer_display.get());
         self.ivars().video_width.set(width);
         self.ivars().video_height.set(height);

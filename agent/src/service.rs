@@ -1,3 +1,6 @@
+#[path = "service_tray.rs"]
+mod trays;
+
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
@@ -94,6 +97,7 @@ fn run_service() -> anyhow::Result<()> {
     ))?;
 
     let mut worker: Option<WorkerProcess> = None;
+    let mut trays = trays::Trays::default();
     let mut next_update_check = Instant::now();
     let result = loop {
         // The authenticated coordinator deliberately remains in the service's
@@ -115,6 +119,10 @@ fn run_service() -> anyhow::Result<()> {
                     tracing::warn!(error = ?error, "could not start persistent Agent coordinator");
                 }
             }
+        }
+
+        if let Err(error) = trays.refresh() {
+            tracing::warn!(?error, "could not refresh Agent tray sessions");
         }
 
         if Instant::now() >= next_update_check {
@@ -146,6 +154,7 @@ fn run_service() -> anyhow::Result<()> {
         wait_hint: Duration::from_secs(10),
         process_id: None,
     })?;
+    drop(trays);
     if let Some(mut process) = worker {
         process.stop();
     }
