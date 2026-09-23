@@ -124,6 +124,7 @@ impl PlatformScreenStreamer {
         capture_as_active_user: bool,
         viewer_name: String,
         blackout_message: String,
+        credential_store: std::path::PathBuf,
     ) -> Self {
         Self {
             inner: if capture_as_active_user {
@@ -131,6 +132,7 @@ impl PlatformScreenStreamer {
                     super::capture_helper::DesktopCaptureStreamer::new(
                         viewer_name.clone(),
                         blackout_message.clone(),
+                        credential_store,
                     ),
                 ))
             } else {
