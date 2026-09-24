@@ -39,6 +39,15 @@ pub const TRANSFER_LIMIT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const FREE_SPACE_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 /// A peer's files are accepted into Documents this long after asking for them.
 const PEER_PICK_WINDOW: Duration = Duration::from_secs(15 * 60);
+/// Transfer messages, mostly [`FILE_CHUNK_BYTES`] chunks, a sender keeps
+/// unacknowledged. The file channel holds at most 64 KiB unacknowledged by
+/// SCTP (see `meshrmm_session_transport::ServiceChannel::writable`), so this
+/// covers that plus the receiver's queues. Earlier receivers queue 32
+/// commands, which leaves room for their acknowledgements and local requests.
+const SEND_WINDOW: usize = 16;
+/// Commands a worker queues: a window of the peer's transfer, the
+/// acknowledgements for its own, and local requests.
+pub const COMMAND_QUEUE: usize = 64;
 /// Interrupted transfers leave `.partial-*` folders; untouched ones are removed.
 const STALE_PARTIAL_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Clipboard and drop copies live in the cache while an app may still read them.
@@ -95,7 +104,7 @@ impl TransferSession {
         Self::spawn(Role::Viewer, clipboard_enabled)
     }
     fn spawn(role: Role, clipboard_enabled: fn() -> bool) -> Self {
-        let (tx, commands) = mpsc::sync_channel(32);
+        let (tx, commands) = mpsc::sync_channel(COMMAND_QUEUE);
         let (sender, rx) = mpsc::sync_channel(8);
         let ready = Arc::new(tokio::sync::Notify::new());
         let out = OutgoingFiles {
@@ -119,7 +128,7 @@ impl TransferSession {
     pub fn run_on_current_thread<T: Send + 'static>(
         client: impl FnOnce(Self) -> T + Send + 'static,
     ) -> T {
-        let (tx, commands) = mpsc::sync_channel(32);
+        let (tx, commands) = mpsc::sync_channel(COMMAND_QUEUE);
         let (sender, rx) = mpsc::sync_channel(8);
         let ready = Arc::new(tokio::sync::Notify::new());
         let out = OutgoingFiles {
@@ -268,6 +277,8 @@ fn worker(
     let _ = out.send(FileMessage::Available);
     let mut admission = Admission::new(role);
     let mut incoming: Option<Incoming> = None;
+    // Transfers rejected or failed here, whose in-flight messages are dropped.
+    let mut ended = VecDeque::new();
     let mut progress: Option<native::Progress> = None;
     let mut progress_updated = Instant::now();
     let mut sender: Option<(u64, mpsc::SyncSender<bool>)> = None;
@@ -294,6 +305,7 @@ fn worker(
                     Ok(()) => Some(Command::Peer(FileMessage::Begin { id, destination })),
                     Err(reason) => {
                         tracing::info!(id, ?destination, reason, "rejected file transfer");
+                        end_transfer(&mut ended, id);
                         if role == Role::Viewer && destination != FileDestination::Clipboard {
                             *status.lock().unwrap() = reason.into();
                         }
@@ -377,6 +389,9 @@ fn worker(
                     progress = None;
                 }
             }
+            // A sender has a window of messages in flight when it learns its
+            // transfer failed; answering each would only repeat the error.
+            Some(Command::Peer(message)) if ended.contains(&message_id(&message)) => {}
             Some(Command::Peer(message)) => {
                 let packet_id = message_id(&message);
                 let result = (|| -> anyhow::Result<()> {
@@ -455,6 +470,7 @@ fn worker(
                     Err(e) => {
                         incoming = None;
                         progress = None;
+                        end_transfer(&mut ended, packet_id);
                         let reason = format!("{e:#}");
                         tracing::warn!(id = packet_id, %reason, "file transfer failed");
                         *status.lock().unwrap() = reason.clone();
@@ -502,22 +518,18 @@ fn worker(
             && let Some((paths, destination)) = pending.pop_front()
         {
             let transfer_id = id();
-            let (ack, acknowledgements) = mpsc::sync_channel(1);
+            let (ack, acknowledgements) = mpsc::sync_channel(SEND_WINDOW + 1);
             sender = Some((transfer_id, ack));
             let out = out.clone();
             let status = status.clone();
             sender_thread = Some(std::thread::spawn(move || {
                 let _native = native::initialize();
                 *status.lock().unwrap() = "Transferring files…".into();
+                let mut window = AckWindow::new(&acknowledgements, SEND_WINDOW);
                 let result = send_paths(transfer_id, paths, destination, |message| {
+                    let settle = window.settles(&message);
                     out.send(message).context("session closed")?;
-                    ensure!(
-                        acknowledgements
-                            .recv_timeout(Duration::from_secs(120))
-                            .context("transfer acknowledgement timed out")?,
-                        "peer rejected transfer"
-                    );
-                    Ok(())
+                    window.sent(settle)
                 });
                 *status.lock().unwrap() = match &result {
                     Ok(()) => "Transfer complete".into(),
@@ -532,6 +544,54 @@ fn worker(
                 }
             }));
         }
+    }
+}
+
+fn end_transfer(ended: &mut VecDeque<u64>, id: u64) {
+    if ended.len() == 8 {
+        ended.pop_front();
+    }
+    ended.push_back(id);
+}
+
+/// Keeps up to `limit` transfer messages unacknowledged. The receiver
+/// acknowledges each message in order or answers with an error.
+struct AckWindow<'a> {
+    acknowledgements: &'a mpsc::Receiver<bool>,
+    limit: usize,
+    unacknowledged: usize,
+}
+impl<'a> AckWindow<'a> {
+    fn new(acknowledgements: &'a mpsc::Receiver<bool>, limit: usize) -> Self {
+        Self {
+            acknowledgements,
+            limit,
+            unacknowledged: 0,
+        }
+    }
+    /// A receiver rejects a transfer when it begins or learns its totals, so
+    /// nothing follows those until they are accepted. A transfer is complete
+    /// once its finish is acknowledged.
+    fn settles(&self, message: &FileMessage) -> bool {
+        matches!(
+            message,
+            FileMessage::Begin { .. } | FileMessage::Totals { .. } | FileMessage::Finish { .. }
+        )
+    }
+    /// Records one sent message, then waits until another may be sent.
+    fn sent(&mut self, settle: bool) -> anyhow::Result<()> {
+        self.unacknowledged += 1;
+        let limit = if settle { 1 } else { self.limit };
+        while self.unacknowledged >= limit {
+            ensure!(
+                self.acknowledgements
+                    .recv_timeout(Duration::from_secs(120))
+                    .context("transfer acknowledgement timed out")?,
+                "peer rejected transfer"
+            );
+            self.unacknowledged -= 1;
+        }
+        Ok(())
     }
 }
 
@@ -1440,6 +1500,97 @@ mod tests {
         fs::write(other.join("a.txt"), "a").unwrap();
         remove_batch(&[other.join("a.txt")]);
         assert!(other.exists());
+    }
+    #[test]
+    fn ack_window_pipelines_chunks_and_settles_the_rest() {
+        let (acks, acknowledgements) = mpsc::sync_channel(SEND_WINDOW + 1);
+        let mut window = AckWindow::new(&acknowledgements, 3);
+        let chunk = FileMessage::Chunk {
+            id: 1,
+            data: vec![0],
+        };
+        assert!(!window.settles(&chunk));
+        for message in [
+            FileMessage::Begin {
+                id: 1,
+                destination: FileDestination::Documents,
+            },
+            totals(1, 1),
+            FileMessage::Finish { id: 1 },
+        ] {
+            assert!(window.settles(&message));
+        }
+        // Two chunks go out without waiting; the third waits for one ack.
+        window.sent(false).unwrap();
+        window.sent(false).unwrap();
+        acks.send(true).unwrap();
+        window.sent(false).unwrap();
+        assert_eq!(window.unacknowledged, 2);
+        // A settling message waits for every earlier one too.
+        for _ in 0..3 {
+            acks.send(true).unwrap();
+        }
+        window.sent(true).unwrap();
+        assert_eq!(window.unacknowledged, 0);
+        window.sent(false).unwrap();
+        window.sent(false).unwrap();
+        acks.send(false).unwrap();
+        let error = window.sent(false).unwrap_err();
+        assert!(format!("{error:#}").contains("rejected"), "{error:#}");
+    }
+    #[test]
+    fn windowed_transfer_keeps_a_window_in_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let source = Sandbox::new();
+        let target = Sandbox::new();
+        let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 253) as u8).collect();
+        let file = source.0.join("large.bin");
+        fs::write(&file, &data).unwrap();
+        let (wire, packets) = mpsc::sync_channel::<FileMessage>(SEND_WINDOW + 1);
+        let (acks, acknowledgements) = mpsc::sync_channel(SEND_WINDOW + 1);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let receiver_in_flight = in_flight.clone();
+        let documents = target.0.clone();
+        let receiver = std::thread::spawn(move || {
+            let mut incoming = Incoming::new(1, FileDestination::Documents, documents).unwrap();
+            let mut received = Vec::new();
+            for packet in packets {
+                // A slow receiver lets the sender fill its window.
+                std::thread::sleep(Duration::from_millis(3));
+                let finished = matches!(packet, FileMessage::Finish { .. });
+                match packet {
+                    FileMessage::Begin { .. } => {}
+                    FileMessage::Finish { .. } => received = incoming.finish().unwrap(),
+                    packet => incoming.accept(packet).unwrap(),
+                }
+                receiver_in_flight.fetch_sub(1, Ordering::SeqCst);
+                acks.send(true).unwrap();
+                if finished {
+                    break;
+                }
+            }
+            received
+        });
+        let mut window = AckWindow::new(&acknowledgements, SEND_WINDOW);
+        let mut peak = 0;
+        send_paths(1, vec![file], FileDestination::Documents, |message| {
+            let settle = window.settles(&message);
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            if matches!(
+                message,
+                FileMessage::Begin { .. } | FileMessage::Totals { .. }
+            ) {
+                assert_eq!(now, 1, "nothing follows a transfer until it is accepted");
+            }
+            peak = peak.max(now);
+            wire.send(message).unwrap();
+            window.sent(settle)
+        })
+        .unwrap();
+        let received = receiver.join().unwrap();
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(peak, SEND_WINDOW);
+        assert_eq!(fs::read(&received[0]).unwrap(), data);
     }
     #[test]
     fn viewer_accepts_only_requested_documents_and_clipboard_copies() {

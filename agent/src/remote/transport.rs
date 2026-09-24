@@ -936,7 +936,7 @@ fn spawn_file_worker(
     mpsc::Sender<meshrmm_protocol::FileMessage>,
     super::native_task::NativeTask,
 )> {
-    let (sender, mut commands) = mpsc::channel(64);
+    let (sender, mut commands) = mpsc::channel(meshrmm_file_transfer::COMMAND_QUEUE);
     let task = super::native_task::NativeTask::spawn(
         "meshrmm-files",
         move |mut stop| async move {
