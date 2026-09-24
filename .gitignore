@@ -31,6 +31,12 @@ dashboard/public/downloads/update-manifest.json
 *.p12
 *.pfx
 
+# Site archives packed from dashboard builds
+*-site.tar.gz
+
+# Python bytecode caches
+__pycache__/
+
 # Logs and transient files
 *.log
 *.swp
