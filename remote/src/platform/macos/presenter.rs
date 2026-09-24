@@ -87,8 +87,16 @@ impl Presenter {
         });
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         DispatchQueue::main().exec_async(move || {
-            let result =
-                MacUi::new(id, format, active_display, displays, control, debug).and_then(|ui| {
+            // A replacement window opens where the one it replaces was.
+            let frame = UI.with(|state| {
+                state
+                    .try_borrow()
+                    .ok()?
+                    .as_ref()
+                    .map(|ui| ui.window.frame())
+            });
+            let result = MacUi::new(id, format, active_display, displays, control, debug, frame)
+                .and_then(|ui| {
                     UI.with(|state| {
                         let Ok(mut state) = state.try_borrow_mut() else {
                             ui.close();
@@ -211,6 +219,13 @@ impl Presenter {
     /// Agent status can change on a static desktop that sends no frames.
     pub fn refresh_controls(&self) {
         exec_with_ui(self.shared.id, |ui| ui.input_view.refresh_debug(false));
+    }
+
+    /// Marks the window as waiting for the connection to be restored.
+    pub fn set_reconnecting(&self, reconnecting: bool) {
+        exec_with_ui(self.shared.id, move |ui| {
+            ui.input_view.set_reconnecting(reconnecting)
+        });
     }
 
     pub fn set_cursor_shape(&self, shape: CursorShape) {
@@ -416,6 +431,7 @@ impl MacUi {
         displays: Vec<Display>,
         control: ControlSink,
         debug: DebugInfo,
+        frame: Option<NSRect>,
     ) -> anyhow::Result<Self> {
         let mtm =
             MainThreadMarker::new().context("AppKit must be initialized on the main thread")?;
@@ -498,7 +514,10 @@ impl MacUi {
         video_host.setWantsLayer(true);
         view.addSubview_positioned_relativeTo(&video_host, NSWindowOrderingMode::Below, None);
         window.setAcceptsMouseMovedEvents(true);
-        window.center();
+        match frame {
+            Some(frame) => window.setFrame_display(frame, false),
+            None => window.center(),
+        }
         close_connecting_window();
         activate_application(mtm);
         window.makeKeyAndOrderFront(None);

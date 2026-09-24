@@ -59,6 +59,7 @@ impl ControlSink {
         recording: crate::recording::Recorder,
         technician_blocked: Arc<std::sync::atomic::AtomicBool>,
         remote_cursor_hidden: Arc<std::sync::atomic::AtomicBool>,
+        wallpaper_hidden: Arc<std::sync::atomic::AtomicBool>,
         session_close_action: Arc<Mutex<meshrmm_protocol::SessionCloseAction>>,
         maintenance: Arc<Mutex<MaintenanceState>>,
         quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
@@ -75,7 +76,7 @@ impl ControlSink {
             technician_blocked,
             remote_cursor_hidden,
             session_close_action,
-            wallpaper_hidden: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            wallpaper_hidden,
             maintenance,
             credentials: Arc::new(Mutex::new(Default::default())),
             send: Arc::new(send),
@@ -413,8 +414,10 @@ impl ControlSink {
 #[cfg(windows)]
 pub use windows::{
     Presenter, attach_parent_console, enable_dpi_awareness, monotonic_timestamp_us,
-    show_fatal_error, supported_video_profiles,
+    show_fatal_error, show_notice, supported_video_profiles,
 };
 
 #[cfg(target_os = "macos")]
-pub use macos::{Presenter, monotonic_timestamp_us, run_application, supported_video_profiles};
+pub use macos::{
+    Presenter, monotonic_timestamp_us, run_application, show_notice, supported_video_profiles,
+};
