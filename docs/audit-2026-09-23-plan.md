@@ -22,12 +22,12 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 | T09 Capture-helper IPC hardening | Medium | Done | `30e0836` |
 | T10 Agent logging flush + write-error recovery | Medium | Done | `de94bca` |
 | T11 Background console `exit` cleanup | Medium | Done | `6178050` |
-| T12 Windows viewer pointer mapping / DPI / letterbox | Medium | **Next** | |
-| T13 Relaunch replaces viewer without ending old session | Medium | Todo | |
-| T14 macOS viewer keyboard (Cmd→Win, ISO/JIS, stuck Shift) | Medium | Todo | |
-| T15 Windows viewer GUI subsystem + friendly errors (+ deep-link registration) | Medium | Todo | |
-| T16 Reconnect UX + recordings + wallpaper setting persistence | Medium | Todo | |
-| T17 File transfer roles, limits, cache cleanup | Medium | Todo | |
+| T12 Windows viewer pointer mapping / DPI / letterbox | Medium | Done | `2bd0db6`, `8e95162` |
+| T13 Relaunch replaces viewer without ending old session | Medium | Done | `233a875` |
+| T14 macOS viewer keyboard (Cmd→Win, ISO/JIS, stuck Shift) | Medium | Done | `871e913` |
+| T15 Windows viewer GUI subsystem + friendly errors (+ deep-link registration) | Medium | Done | `f8cb85d` |
+| T16 Reconnect UX + recordings + wallpaper setting persistence | Medium | Done | `5a9b6bf` |
+| T17 File transfer roles, limits, cache cleanup | Medium | **Next** | |
 | T18 Quarantine / Mark-of-the-Web on received files | Medium | Todo | |
 | T19 Server auth error mapping + JWKS cache | Medium | Todo | |
 | T20 Company status transition guards | Medium | Todo | |
@@ -73,7 +73,9 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 ## Endpoint state
 
 After T11, DESKTOP-85R6S28 runs a release build of `6178050` (SHA-256 `466070DE…4B04`). The
-service is running and connected. Earlier builds are kept as
+service is running and connected. T12–T16 changed only the viewer, the dashboard link and shared
+crates in ways that leave the Agent's behavior unchanged (the chat banner path is the same), so the
+installed Agent was not replaced. Earlier builds are kept as
 `C:\Program Files\MeshRMM\Agent\meshrmm-agent.exe.before-local-*`. T01 removed the explicit
 `gccody` permission on `ProgramData\MeshRMM\Agent`, so a non-elevated `gccody` process can no longer
 read that folder. `updates\local-3273ef617bd940a68963ee6b2d11b6ad` came from an earlier session and was
@@ -103,71 +105,33 @@ These need a live dashboard → viewer → agent session, which the agent-driven
 - T11: `exit` in a live background session. The ignored `console_exit_closes_window_task_and_input_helper`
   test, run as SYSTEM in Session 0 on the endpoint, passes, and fails when the helper's watcher is
   removed. Not tested: a program started from the console that outlives it keeps the console open.
+- T12: a live session. The endpoint has no hardware H.264 decoder, so temporary probes drove the
+  real window and D3D11 renderer with a synthetic NV12 frame in the interactive session: resize,
+  minimize/restore and a simulated 144-DPI change resized the swap chain without errors, and posted
+  mouse moves mapped the letterboxed corners to 0 and 65535 and ignored the bars and the toolbar.
+  A real monitor with another DPI was not available. The probes also showed that, before
+  `8e95162`, the first presented frame hid every toolbar control, the chat panel and the
+  diagnostics overlay; after it, `PrintWindow` captures show all of them.
+- T13: a real replaced session. On Windows, two real viewer processes for one device (with an
+  unreachable server) showed the second signaling the first and waiting for it to exit; unit
+  tests cover takeover, an abandoned mutex and a timeout. The dashboard adds the device ID to the
+  link, so Windows links from an undeployed dashboard keep the old behavior. macOS replacement
+  was not exercised. A server-side "takeover by the same user" was not added.
+- T14: real key events. Unit tests cover the Command state machine, per-side modifiers, ISO and
+  JIS mapping; the key-up monitor for Command combinations was not observed with a keyboard.
+- T15: a real 401/403/404/409 from the server (unit tests cover the messages). On the endpoint,
+  the build is a GUI-subsystem executable, an unreachable server and an injected option each showed
+  their message box, `--identity-fingerprint` still printed through a pipe, and the handler was
+  registered as `"exe" -- "%1"`; the previous handler value was restored afterwards.
+- T16: a live reconnect on either platform, and a recording across one. On Windows, a probe showed
+  the "Reconnecting…" popup centered over the video, the title suffix, and new windows taking the
+  previous window's position, size and maximized state. The macOS label, Quit handling and frame
+  reuse are untested beyond compiling and the unit tests.
 
 ## Remaining tasks
 
 ---------------------------------------------------------------------------------------------------
 ## MEDIUM — Viewer
-
-### T12 — Windows viewer: pointer mapping when not 1:1, DPI awareness, letterboxing
-remote/src/platform/windows/renderer.rs:30-45, :105-128; window.rs:102-121. Swap chain is fixed-size
-(video w × video h + 68px toolbar) and stretched to the window; pointer code assumes video starts at a
-fixed 68 px and maps unscaled → wrong pointer positions when window is resized/maximized/DPI-scaled;
-viewer not DPI aware. Fix: declare PerMonitorV2 DPI awareness (manifest or SetProcessDpiAwarenessContext
-early), ResizeBuffers on WM_SIZE, render video into a letterboxed destination rect (preserve aspect),
-use the same rect for pointer mapping (clamp to video), handle WM_DPICHANGED. Toolbar layout must scale
-with DPI. Validate on the endpoint (build + native checks; run the viewer interactively via the
-scheduled-task runner if a session can be established, otherwise unit-test the mapping math).
-
-### T13 — Relaunching a session replaces the viewer without ending the old session (409 for 15 min)
-remote/src/platform/macos/app.rs:56-76: on a second dashboard link, the viewer spawns a new process and
-terminates without sending EndSession/end_session; server treats socket close as advisory
-(server/src/remote_session.rs:~207); the new handoff is consumed (handoffs.rs:~84) then /request returns
-409 while the old lease is unexpired (agent_coordinator.rs:~137-145). Windows: a second link starts a
-second process that also gets 409. Fix: before terminating/replacing, end the old session with a bounded
-wait (macOS). Windows: make the existing viewer process notice a new launch for the same device (single
-instance per device via named mutex/pipe/window message) and end its session before the new one
-proceeds, or have the new process ask the old to end. Optionally add a server-side "takeover by same
-user" path — only if clean; keep lease semantics safe (never let a different user hijack silently).
-Test both platforms as far as possible.
-
-### T14 — macOS viewer keyboard: Cmd→Win taps, ISO/JIS keys, stuck Shift
-remote/src/platform/macos/app.rs:339-355, :1330-1331, :209-212, :1276-1381, :347-354.
-(a) Cmd is sent as Win immediately; Cmd+Tab/Space/Q → lone Win tap on focus loss → remote Start menu.
-Fix: defer Win-down until a non-modifier key arrives while Cmd is held; drop a Cmd press never combined.
-Add a persisted preference (menu toggle) to map Cmd→Ctrl (so Cmd+C/V copy/paste on remote).
-(b) kVK_ISO_Section (10) unmapped and 50 always → 0x29: map both per ISO layout (KBGetLayoutType or
-equivalent, as Chromium does); add JIS keys 93, 94, 102, 104.
-(c) flagsChanged uses shared Shift/Cmd flags, not left/right device bits → releasing Right Shift while
-Left held is sent as a press → stuck shift. Use NX_DEVICELSHIFTKEYMASK etc.
-(d) Also check: AppKit usually doesn't deliver keyUp while Cmd is held (Cmd+L leaves L down remotely);
-fix with a local keyUp event monitor if confirmed. Add unit tests for the mapping tables/state machine.
-
-### T15 — Windows viewer: GUI subsystem and visible, friendly errors
-remote/src/main.rs lacks `#![windows_subsystem = "windows"]`; errors print to a console that vanishes
-(:204-227). Error text is raw server JSON (remote/src/signaling.rs:~28). Fix: GUI subsystem on Windows
-(keep a debug/console option if logging relies on stdout — check remote/src/debug.rs), show a
-MessageBoxW on fatal errors like macOS does, and translate HTTP statuses/API errors (401/403/404/409/410,
-network timeouts) into plain messages on both platforms. Also: don't show an error dialog after a clean
-user-initiated disconnect when only the final cleanup request fails (main.rs:~160).
-Additional T15 scope: the Windows viewer runs reg.exe three times per launch to register the deep-link
-handler (prints "The operation completed successfully." x3 on the console) — use the registry API, write
-only when values differ, and register the handler as `"exe" -- "%1"` style so link args can't inject
-flags; when launched from a deep link, reject extra flags like --update-manifest-url (check main.rs ~:116).
-Also remote/src/updater/mod.rs `launch_verified` checks child exit before the ready file, so a viewer
-that writes ready and exits within 100 ms is reported as a failed update — check ready file first.
-
-### T16 — Reconnect UX: keep the window, show "Reconnecting…", don't silently lose recordings
-remote/src/transport.rs:356, :585-589; main.rs:169-199; recording.rs:33-39. On any drop the window
-closes; no reconnecting state; the recording is stopped by its guard and its notice goes nowhere; it
-doesn't resume. On macOS, Quit while no window exists exits without session cleanup
-(presenter.rs:822-825). Fix: keep window (or at least keep state) across reconnects with a visible
-"Reconnecting…" indicator on both platforms; keep the recorder in the resume state so recording
-continues (new cluster/segment) or at minimum finalize + surface the saved-file notice to the user; make
-Quit during reconnect perform session cleanup. Also carry the wallpaper-hidden setting across
-reconnects/display switches (platform.rs:78; transport.rs:1148-1165, :1229: new control object per
-display config defaults hidden=true; Windows checkbox state wrong after display switch). Validate macOS
-here and Windows on the endpoint.
 
 ---------------------------------------------------------------------------------------------------
 ## MEDIUM — Shared crates
