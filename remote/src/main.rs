@@ -10,6 +10,7 @@ mod deep_link;
 mod errors;
 mod h264;
 mod http;
+mod input;
 mod matroska;
 mod platform;
 mod preferences;
