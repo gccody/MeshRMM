@@ -352,6 +352,28 @@ pub(crate) async fn retry_platform_company(
     let Some(operation_id) = operation_id else {
         return api_error(404, "company provisioning operation was not found");
     };
+    // Only unfinished provisioning is retried. Retrying an active or suspended
+    // company would reactivate it, or mark it failed and lock out its users
+    // and Agents when WorkOS returns an error.
+    let claimed = query!(
+        &db,
+        "UPDATE companies SET status = 'provisioning', provisioning_error = NULL, updated_at = ?1 WHERE id = ?2 AND status IN ('provisioning', 'failed')",
+        now_ms_i64()?,
+        company_id
+    )?
+    .run()
+    .await?;
+    if claimed
+        .meta()?
+        .and_then(|meta| meta.changes)
+        .unwrap_or_default()
+        == 0
+    {
+        return api_error(
+            409,
+            "only a company that is still provisioning or failed provisioning can be retried",
+        );
+    }
     query!(
         &db,
         "INSERT INTO platform_audit_events (id, actor_user_id, action, company_id, created_at) VALUES (?1, ?2, 'company.provisioning_retry', ?3, ?4)",
@@ -585,9 +607,10 @@ async fn provision_company(
             now,
             operation_id
         )?,
+        // A company suspended while provisioning stays suspended.
         query!(
             &db,
-            "UPDATE companies SET status = ?1, provisioning_error = NULL, updated_at = ?2 WHERE id = ?3",
+            "UPDATE companies SET status = ?1, provisioning_error = NULL, updated_at = ?2 WHERE id = ?3 AND status IN ('provisioning', 'failed')",
             status,
             now,
             company.id
@@ -849,9 +872,10 @@ async fn mark_provisioning_failed(
     let detail = error.chars().take(1_000).collect::<String>();
     let now = now_ms_i64()?;
     db.batch(vec![
+        // Only unfinished provisioning can fail; other statuses are kept.
         query!(
             db,
-            "UPDATE companies SET status = 'failed', provisioning_error = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE companies SET status = 'failed', provisioning_error = ?1, updated_at = ?2 WHERE id = ?3 AND status IN ('provisioning', 'failed')",
             detail,
             now,
             company_id

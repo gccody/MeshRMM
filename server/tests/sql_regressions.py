@@ -12,6 +12,47 @@ def sql(file, prefix):
     return next(query for query in re.findall(r'"([^"\n]+)"', source) if query.startswith(prefix))
 
 
+class CompanyProvisioningTests(unittest.TestCase):
+    def setUp(self):
+        self.db = sqlite3.connect(":memory:", isolation_level=None)
+        for migration in sorted((ROOT / "server/migrations").glob("*.sql")):
+            self.db.executescript(migration.read_text())
+        platform = "server/src/routes/platform.rs"
+        self.retry = sql(platform, "UPDATE companies SET status = 'provisioning'")
+        self.complete = sql(platform, "UPDATE companies SET status = ?1, provisioning_error = NULL")
+        self.fail = sql(platform, "UPDATE companies SET status = 'failed'")
+
+    def company(self, status):
+        self.db.execute("DELETE FROM companies")
+        self.db.execute("INSERT INTO companies (id,name,created_at,slug,status) VALUES ('co','Company',0,'acme',?)", (status,))
+
+    def status(self):
+        return self.db.execute("SELECT status FROM companies WHERE id='co'").fetchone()[0]
+
+    def test_retry_is_limited_to_unfinished_provisioning(self):
+        for status, claimed in [("provisioning", 1), ("failed", 1), ("active", 0), ("awaiting_admin", 0), ("suspended", 0)]:
+            self.company(status)
+            self.assertEqual(self.db.execute(self.retry, (5, "co")).rowcount, claimed, status)
+            self.assertEqual(self.status(), "provisioning" if claimed else status)
+
+    def test_provisioning_outcomes_keep_a_status_set_meanwhile(self):
+        for status in ["suspended", "active", "awaiting_admin"]:
+            self.company(status)
+            self.db.execute(self.complete, ("active" if status != "active" else "awaiting_admin", 5, "co"))
+            self.assertEqual(self.status(), status)
+            self.db.execute(self.fail, ("WorkOS error", 5, "co"))
+            self.assertEqual(self.status(), status)
+
+    def test_provisioning_outcomes_apply_to_unfinished_companies(self):
+        for status in ["provisioning", "failed"]:
+            self.company(status)
+            self.db.execute(self.complete, ("awaiting_admin", 5, "co"))
+            self.assertEqual(self.status(), "awaiting_admin")
+            self.company(status)
+            self.db.execute(self.fail, ("WorkOS error", 5, "co"))
+            self.assertEqual(self.db.execute("SELECT status, provisioning_error FROM companies").fetchone(), ("failed", "WorkOS error"))
+
+
 class EnrollmentTests(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(":memory:", isolation_level=None)
