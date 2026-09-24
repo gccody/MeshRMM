@@ -31,6 +31,17 @@ struct State {
     action: SessionCloseAction,
     clear_clipboard: bool,
     target: Option<Target>,
+    /// A blocking task is resolving the logon of the recorded session again.
+    refreshing: bool,
+}
+
+/// How to bring the recorded target up to date with the viewed session.
+#[derive(Debug, PartialEq, Eq)]
+enum Refresh {
+    /// The viewer switched sessions, so resolve before a close could use the old one.
+    Now,
+    /// Look for a user switch in the same session without holding up the caller.
+    Background,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -61,33 +72,83 @@ impl SessionClose {
     }
 
     /// Records the Windows session currently shown to the viewer and the user
-    /// signed in to it.
+    /// signed in to it. Resolving the user queries Terminal Services, which can
+    /// stall during a sign-in, so the periodic check of an unchanged session runs
+    /// on a blocking thread instead of the caller's runtime worker.
     #[cfg(windows)]
-    pub fn set_target(&self, session: &DesktopSession) {
-        self.set_target_with(session, Instant::now(), resolve_logon);
+    pub fn set_target(self: &std::sync::Arc<Self>, session: &DesktopSession) {
+        let now = Instant::now();
+        match self.refresh(session, now) {
+            None => {}
+            Some(Refresh::Now) => {
+                let logon = resolve(session, resolve_logon);
+                self.record(session, logon, now, false);
+            }
+            Some(Refresh::Background) => {
+                let close = std::sync::Arc::clone(self);
+                let session = session.clone();
+                tokio::task::spawn_blocking(move || {
+                    let logon = resolve(&session, resolve_logon);
+                    close.record(&session, logon, Instant::now(), true);
+                });
+            }
+        }
     }
 
+    /// Resolves the target on the calling thread, as [`Self::set_target`] does after a switch.
+    #[cfg(test)]
     fn set_target_with(
         &self,
         session: &DesktopSession,
         now: Instant,
-        resolve: impl FnOnce(&DesktopSession) -> anyhow::Result<Logon>,
+        resolver: impl FnOnce(&DesktopSession) -> anyhow::Result<Logon>,
     ) {
+        if let Some(refresh) = self.refresh(session, now) {
+            let refreshed = refresh == Refresh::Background;
+            self.record(session, resolve(session, resolver), now, refreshed);
+        }
+    }
+
+    fn refresh(&self, session: &DesktopSession, now: Instant) -> Option<Refresh> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(target) = state
+            .target
+            .as_ref()
+            .filter(|target| target.session == *session)
+        else {
+            return Some(Refresh::Now);
+        };
+        // The background desktop never has a user to look for.
+        if state.refreshing
+            || *session == DesktopSession::Background
+            || now.saturating_duration_since(target.resolved_at) < LOGON_REFRESH
         {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.target.as_ref().is_some_and(|target| {
-                target.session == *session
-                    && now.saturating_duration_since(target.resolved_at) < LOGON_REFRESH
-            }) {
+            return None;
+        }
+        state.refreshing = true;
+        Some(Refresh::Background)
+    }
+
+    /// `refreshed` marks the result of a background refresh, which a switch to
+    /// another session since it started makes obsolete.
+    fn record(
+        &self,
+        session: &DesktopSession,
+        logon: Option<Logon>,
+        now: Instant,
+        refreshed: bool,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if refreshed {
+            state.refreshing = false;
+            if state
+                .target
+                .as_ref()
+                .is_none_or(|target| target.session != *session)
+            {
                 return;
             }
         }
-        // The console may be at the sign-in screen with no user, which leaves
-        // nothing to act on.
-        let logon = (*session != DesktopSession::Background)
-            .then(|| resolve(session).ok())
-            .flatten();
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.target.as_ref().map(|target| &target.logon) != Some(&logon) {
             match &logon {
                 Some(logon) => {
@@ -372,6 +433,18 @@ pub fn run_clear_clipboard_helper() -> anyhow::Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     anyhow::bail!("the clipboard stayed open by another application")
+}
+
+/// The user signed in to `session`. The console may be at the sign-in screen
+/// with no user, and the background desktop never has one, which leaves nothing
+/// to act on.
+fn resolve(
+    session: &DesktopSession,
+    resolver: impl FnOnce(&DesktopSession) -> anyhow::Result<Logon>,
+) -> Option<Logon> {
+    (*session != DesktopSession::Background)
+        .then(|| resolver(session).ok())
+        .flatten()
 }
 
 #[cfg(test)]
