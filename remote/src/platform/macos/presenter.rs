@@ -418,6 +418,7 @@ struct MacUi {
     frames_submitted: u64,
     total_frames_submitted: u64,
     stats_started: Instant,
+    statistics_log: crate::debug::StatisticsLog,
     debug: DebugInfo,
     codec: Codec,
     layer_backpressured: bool,
@@ -542,6 +543,7 @@ impl MacUi {
             frames_submitted: 0,
             total_frames_submitted: 0,
             stats_started: Instant::now(),
+            statistics_log: Default::default(),
             debug,
             codec: format.codec,
             layer_backpressured: false,
@@ -659,15 +661,17 @@ impl MacUi {
             let present_fps = self.frames_submitted as f64 / elapsed.as_secs_f64();
             self.debug
                 .update_presentation(None, present_fps, self.total_frames_submitted, None, 0);
-            tracing::info!(
-                submit_fps = present_fps,
-                frames_submitted = self.frames_submitted,
-                receive_to_submit_us =
-                    monotonic_timestamp_us().saturating_sub(queued.received_at_us),
-                ready_for_display = unsafe { self.layer.isReadyForDisplay() },
-                codec = ?self.codec,
-                "macOS hardware decode/presentation statistics"
-            );
+            if self.statistics_log.due() {
+                tracing::info!(
+                    submit_fps = present_fps,
+                    frames_submitted = self.frames_submitted,
+                    receive_to_submit_us =
+                        monotonic_timestamp_us().saturating_sub(queued.received_at_us),
+                    ready_for_display = unsafe { self.layer.isReadyForDisplay() },
+                    codec = ?self.codec,
+                    "macOS hardware decode/presentation statistics"
+                );
+            }
             self.frames_submitted = 0;
             self.stats_started = Instant::now();
         }

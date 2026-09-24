@@ -151,15 +151,11 @@ fn initialize_tracing(mode: ExecutionMode, config: &Config) -> anyhow::Result<()
     if mode != ExecutionMode::Console {
         let log_path = config.config_path.with_file_name("agent.log");
         let open_path = log_path.clone();
-        let writer = logging::AsyncLog::new(move || {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&open_path)
-        })
-        .map_err(|error| {
-            anyhow::anyhow!("failed to open Agent log {}: {error}", log_path.display())
-        })?;
+        let writer =
+            logging::AsyncLog::new(move || meshrmm_log_file::RotatingFile::open(&open_path))
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to open Agent log {}: {error}", log_path.display())
+                })?;
         logging::set_process_log(writer.clone());
         if config.json_logs {
             tracing_subscriber::fmt()

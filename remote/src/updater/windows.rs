@@ -141,22 +141,33 @@ pub fn apply_scheduled_update() -> anyhow::Result<()> {
         .parent()
         .context("client update helper has no parent directory")?
         .to_owned();
+    tracing::info!(
+        target = %target.display(),
+        staged = %staged.display(),
+        viewer_process_id = ?process_id,
+        "client update helper started"
+    );
 
     let mut result = process_id
         .to_str()
         .and_then(|value| value.parse::<u32>().ok())
         .context("the client update helper received an invalid viewer process ID")
         .and_then(|process_id| install_update(&target, &staged, process_id, launch_arguments));
-    if result.is_err()
+    if let Err(error) = &result
         && target.exists()
-        && let Err(relaunch_error) = launch(&target, launch_arguments)
     {
-        result = result.with_context(|| {
-            format!("the restored viewer could not be relaunched either: {relaunch_error:#}")
-        });
+        tracing::warn!(error = ?error, "client update failed; relaunching the installed viewer");
+        if let Err(relaunch_error) = launch(&target, launch_arguments) {
+            result = result.with_context(|| {
+                format!("the restored viewer could not be relaunched either: {relaunch_error:#}")
+            });
+        }
     }
     remove_if_present(&staged);
     let cleanup = schedule_cleanup(&helper, &helper_directory);
+    if let Err(error) = &cleanup {
+        tracing::warn!(error = ?error, "could not schedule removal of the client update helper");
+    }
     result.and(cleanup)
 }
 
@@ -178,6 +189,7 @@ fn install_update(
         VIEWER_EXIT_TIMEOUT,
         TERMINATED_VIEWER_TIMEOUT,
     )?;
+    tracing::info!("the previous viewer exited; replacing it");
 
     let backup = target.with_extension("exe.previous");
     remove_if_present(&backup);
@@ -185,6 +197,7 @@ fn install_update(
         .with_context(|| format!("failed to back up client {}", target.display()))?;
     if let Err(error) = std::fs::rename(staged, target) {
         std::fs::rename(&backup, target).context("could not restore the previous viewer")?;
+        tracing::warn!("restored the previous viewer after the update could not be installed");
         return Err(error)
             .with_context(|| format!("failed to install client update {}", target.display()));
     }
@@ -194,10 +207,12 @@ fn install_update(
         std::fs::rename(&backup, target).context(
             "the client update failed and the previous executable could not be restored",
         )?;
+        tracing::warn!("restored the previous viewer after the update could not be launched");
         return Err(update_error).context("the updated client could not be launched");
     }
 
     remove_if_present(&backup);
+    tracing::info!(target = %target.display(), "installed and launched the client update");
     Ok(())
 }
 

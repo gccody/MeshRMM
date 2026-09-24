@@ -63,30 +63,7 @@ fn initialize_tracing(config: &config::Config) -> anyhow::Result<()> {
 
     #[cfg(any(windows, target_os = "macos"))]
     let log_path = {
-        #[cfg(windows)]
-        let path = std::env::var_os("LOCALAPPDATA")
-            .map(std::path::PathBuf::from)
-            .context("Windows did not provide LOCALAPPDATA for viewer logging")?
-            .join("MeshRMM")
-            .join("remote.log");
-        #[cfg(target_os = "macos")]
-        let path = std::path::PathBuf::from(objc2_foundation::NSHomeDirectory().to_string())
-            .join("Library")
-            .join("Logs")
-            .join("MeshRMM")
-            .join("remote.log");
-        let parent = path
-            .parent()
-            .context("macOS viewer log has no parent directory")?;
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create viewer log directory {}", parent.display())
-        })?;
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("failed to open viewer log {}", path.display()))?;
-        let writer = std::sync::Mutex::new(log);
+        let (path, writer) = open_log()?;
         if config.json_logs {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
@@ -125,6 +102,53 @@ fn initialize_tracing(config: &config::Config) -> anyhow::Result<()> {
         "viewer logging initialized"
     );
     Ok(())
+}
+
+/// Opens the viewer's log, which rotates at 10 MiB and keeps three older files.
+#[cfg(any(windows, target_os = "macos"))]
+fn open_log() -> anyhow::Result<(
+    std::path::PathBuf,
+    std::sync::Mutex<meshrmm_log_file::RotatingFile>,
+)> {
+    #[cfg(windows)]
+    let path = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .context("Windows did not provide LOCALAPPDATA for viewer logging")?
+        .join("MeshRMM")
+        .join("remote.log");
+    #[cfg(target_os = "macos")]
+    let path = std::path::PathBuf::from(objc2_foundation::NSHomeDirectory().to_string())
+        .join("Library")
+        .join("Logs")
+        .join("MeshRMM")
+        .join("remote.log");
+    let parent = path
+        .parent()
+        .context("viewer log has no parent directory")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create viewer log directory {}", parent.display()))?;
+    let log = meshrmm_log_file::RotatingFile::open(&path)
+        .with_context(|| format!("failed to open viewer log {}", path.display()))?;
+    Ok((path, std::sync::Mutex::new(log)))
+}
+
+/// The update helper runs detached, with no window to report a failure in,
+/// so it logs its steps to the viewer's log. It runs before any configuration
+/// is loaded and always writes text.
+#[cfg(any(windows, target_os = "macos"))]
+fn initialize_update_helper_tracing() {
+    let Ok((_, writer)) = open_log() else {
+        return;
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_ansi(false)
+        .try_init();
 }
 
 /// Runs the session until it ends. A recording still running is saved, and
@@ -254,9 +278,13 @@ fn main() -> std::process::ExitCode {
     }
     if updater::is_helper_invocation() {
         // The detached helper has no window; it relaunches the viewer either way.
+        initialize_update_helper_tracing();
         return match updater::apply_scheduled_update() {
             Ok(()) => ExitCode::SUCCESS,
-            Err(_) => ExitCode::FAILURE,
+            Err(error) => {
+                tracing::error!(error = ?error, "client update helper failed");
+                ExitCode::FAILURE
+            }
         };
     }
     let mut recording_notice = None;
@@ -317,7 +345,17 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if updater::is_helper_invocation() {
-        return updater::apply_scheduled_update();
+        initialize_update_helper_tracing();
+        tracing::info!(
+            process_id = std::process::id(),
+            "client update helper started"
+        );
+        let result = updater::apply_scheduled_update();
+        match &result {
+            Ok(()) => tracing::info!("client update installed"),
+            Err(error) => tracing::error!(error = ?error, "client update helper failed"),
+        }
+        return result;
     }
     platform::run_application(move |deep_link| {
         let mut config = initialize(deep_link.as_deref())?;

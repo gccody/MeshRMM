@@ -524,11 +524,7 @@ fn initialize_helper_log(helper_directory: &Path, json: bool) {
     let Some(config_directory) = helper_directory.parent() else {
         return;
     };
-    let Ok(log) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(config_directory.join("agent.log"))
-    else {
+    let Ok(log) = meshrmm_log_file::RotatingFile::open(config_directory.join("agent.log")) else {
         return;
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
