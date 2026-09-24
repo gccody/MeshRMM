@@ -1920,6 +1920,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "dispatch2",
+ "libc",
  "meshrmm-protocol",
  "objc2",
  "objc2-app-kit",

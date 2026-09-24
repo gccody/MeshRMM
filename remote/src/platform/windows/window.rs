@@ -1765,9 +1765,7 @@ pub(super) unsafe fn create_window(
                                     context.control.files().pick();
                                 }
                                 if chosen == 2 {
-                                    context.control.send(SessionMessage::FileTransfer(
-                                        meshrmm_protocol::FileMessage::Pick,
-                                    ));
+                                    context.control.files().request_peer_pick();
                                 }
                             }
                         }

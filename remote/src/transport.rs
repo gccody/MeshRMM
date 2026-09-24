@@ -285,7 +285,7 @@ impl ViewerControlQueue {
             recording: resume_state.recording.clone(),
             maintenance: Arc::new(Mutex::new(crate::platform::MaintenanceState::default())),
             credentials: Arc::new(Mutex::new(Default::default())),
-            files: meshrmm_file_transfer::TransferSession::with_clipboard_policy(
+            files: meshrmm_file_transfer::TransferSession::viewer(
                 crate::preferences::clipboard_sync,
             ),
             chat: meshrmm_chat::ChatSession::default(),
