@@ -9,9 +9,9 @@ import { Miniflare, convertV4MiniflareOptions } from '../../dashboard/node_modul
 const root = fileURLToPath(new URL('../build/', import.meta.url));
 const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'test-key', alg: 'RS256', use: 'sig' };
-const token = (user = 'user-test', organization = 'org-test') => {
+const token = (user = 'user-test', organization = 'org-test', kid = 'test-key') => {
   const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url');
-  const data = `${encode({ alg: 'RS256', kid: 'test-key' })}.${encode({ sub: user, org_id: organization, client_id: 'client-test', iss: 'https://api.workos.com', exp: Math.floor(Date.now() / 1000) + 300 })}`;
+  const data = `${encode({ alg: 'RS256', kid })}.${encode({ sub: user, org_id: organization, client_id: 'client-test', iss: 'https://api.workos.com', exp: Math.floor(Date.now() / 1000) + 300 })}`;
   return `${data}.${sign('RSA-SHA256', Buffer.from(data), privateKey).toString('base64url')}`;
 };
 const wrapper = `
@@ -73,7 +73,10 @@ const runtime = new Miniflare(convertV4MiniflareOptions({ workers: [{
   outboundService: 'jwks',
 }, {
   name: 'jwks', modules: true,
-  script: `export default { fetch(request) { if (request.url !== 'https://api.workos.com/sso/jwks/client-test') throw new Error('Unexpected external request'); return Response.json(${JSON.stringify({ keys: [jwk] })}); } };`,
+  script: `let calls = 0; export default { fetch(request) {
+    if (request.url === 'https://api.workos.com/__test/calls') return Response.json({ calls });
+    if (request.url !== 'https://api.workos.com/sso/jwks/client-test') throw new Error('Unexpected external request');
+    calls++; return Response.json(${JSON.stringify({ keys: [jwk] })}); } };`,
 }] }));
 const company = 'company-test';
 const headers = { 'X-Mesh-Company-Id': company };
@@ -125,6 +128,20 @@ try {
   assert.equal((await apiRenew()).status, 401);
   assert.equal((await apiRenew(token('another-user'))).status, 410, 'body cannot spoof original user');
   assert.equal((await apiRenew(token(), 'other.meshrmm.com')).status, 403, 'JWT cannot renew another tenant');
+  assert.equal((await apiRenew(token())).status, 200);
+  // WorkOS keys are cached per isolate, and unknown key IDs cannot force refetches.
+  const jwksCalls = async () => (await (await (await runtime.getWorker('jwks')).fetch('https://api.workos.com/__test/calls')).json()).calls;
+  assert.equal(await jwksCalls(), 1, 'signing keys are fetched once');
+  assert.equal((await apiRenew(token('user-test', 'org-test', 'rotated-key'))).status, 401);
+  assert.equal((await apiRenew(token('user-test', 'org-test', 'rotated-key'))).status, 401);
+  assert.equal(await jwksCalls(), 1, 'unknown key IDs are rate limited');
+  // A database outage is retryable and must not sign the dashboard out.
+  await db.exec('ALTER TABLE companies RENAME TO companies_offline');
+  const outage = await apiRenew(token());
+  await db.exec('ALTER TABLE companies_offline RENAME TO companies');
+  assert.equal(outage.status, 503);
+  assert.equal(outage.headers.get('Retry-After'), '5');
+  assert.doesNotMatch((await outage.json()).error, /sign in/);
   assert.equal((await apiRenew(token())).status, 200);
   // The initial upgrade still consumes a one-use token and overwrites identity headers.
   await db.exec("CREATE TABLE agent_event_subscriptions (token_hash TEXT PRIMARY KEY, company_id TEXT, user_id TEXT, expires_at INTEGER, used_at INTEGER);");
@@ -210,7 +227,7 @@ try {
   assert.equal((await state(session)).alarm, before.alarm, 'activity does not rewrite alarm');
   await post(session, '/__test/alarm');
   assert.ok((await state(session)).alarm > Date.now(), 'early alarm reschedules to durable deadline');
-  console.log('Presence integration passed: event-only snapshots, durable retry, replacement ordering, renewal isolation/expiry/revocation, deletion, and session alarm preservation.');
+  console.log('Presence integration passed: event-only snapshots, durable retry, replacement ordering, renewal isolation/expiry/revocation, signing-key caching, retryable auth outages, deletion, and session alarm preservation.');
 } finally {
   for (const socket of sockets) { try { socket.close(); } catch {} }
   await runtime.dispose();
