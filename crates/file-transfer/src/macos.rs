@@ -124,6 +124,33 @@ pub fn rename_no_replace(from: &std::path::Path, to: &std::path::Path) -> std::i
     }
 }
 
+/// Quarantines a received file or folder as a download from MeshRMM, so
+/// Gatekeeper checks it before it first opens, as it does for browser
+/// downloads. Folders are marked too because apps are folders.
+pub fn mark_received(path: &std::path::Path) -> std::io::Result<()> {
+    use objc2_foundation::{NSDictionary, NSURLQuarantinePropertiesKey};
+    objc2::rc::autoreleasepool(|_| {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        // The values of kLSQuarantineAgentNameKey, kLSQuarantineTypeKey and
+        // kLSQuarantineTypeOtherDownload.
+        let keys = [
+            NSString::from_str("LSQuarantineAgentName"),
+            NSString::from_str("LSQuarantineType"),
+        ];
+        let values = [
+            NSString::from_str("MeshRMM"),
+            NSString::from_str("LSQuarantineTypeOtherDownload"),
+        ];
+        let properties =
+            NSDictionary::from_slices(&[&*keys[0], &*keys[1]], &[&*values[0], &*values[1]]);
+        // SAFETY: NSURLQuarantinePropertiesKey takes a dictionary of these keys.
+        unsafe {
+            url.setResourceValue_forKey_error(Some(&properties), NSURLQuarantinePropertiesKey)
+        }
+        .map_err(|error| std::io::Error::other(error.localizedDescription().to_string()))
+    })
+}
+
 /// Bytes available to this user on the volume holding `path`.
 pub fn available_space(path: &std::path::Path) -> std::io::Result<u64> {
     let path = c_path(path)?;

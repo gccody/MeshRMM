@@ -412,6 +412,11 @@ accepts pasted or dropped files. Clipboard file copies are limited to 512 MiB
 computer must have enough free disk space. Interrupted transfers are removed
 after 24 hours, and cached clipboard/drop copies after an hour once they are no
 longer on the clipboard.
+Received files are tagged like browser downloads on both computers: the macOS
+quarantine attribute (with MeshRMM as the downloading app) on files and folders,
+and the Internet zone's Mark of the Web on Windows files. Opening a received app
+or installer therefore gets the Gatekeeper or SmartScreen check; use **Open
+Anyway** (macOS) or **Unblock** in the file's properties (Windows) to trust it.
 Drag files from Finder or Explorer onto the remote view to deliver a native
 Windows drop at that position (Explorer, desktop, or a browser drop target);
 if the target declines the drop, files go to the same Documents folder.

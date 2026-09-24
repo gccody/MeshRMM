@@ -580,6 +580,18 @@ pub fn rename_no_replace(from: &std::path::Path, to: &std::path::Path) -> std::i
     .map_err(io_error)
 }
 
+/// Adds the Internet zone's Mark of the Web to a received file, so
+/// SmartScreen and Office check it as they do a download. Folders carry no
+/// mark; the files inside them do.
+pub fn mark_received(path: &std::path::Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        return Ok(());
+    }
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    std::fs::write(stream, "[ZoneTransfer]\r\nZoneId=3\r\n")
+}
+
 /// Bytes available to this user on the volume holding `path`.
 pub fn available_space(path: &std::path::Path) -> std::io::Result<u64> {
     let path = wide(path);
