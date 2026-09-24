@@ -17,6 +17,9 @@ use windows::Win32::Foundation::{
     GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, LUID, LocalFree,
 };
 use windows::Win32::Security::Authorization::{
+    AUTHZ_CLIENT_CONTEXT_HANDLE, AUTHZ_RESOURCE_MANAGER_HANDLE, AUTHZ_RM_FLAG_NO_AUDIT,
+    AuthzContextInfoGroupsSids, AuthzFreeContext, AuthzFreeResourceManager,
+    AuthzGetInformationFromContext, AuthzInitializeContextFromSid, AuthzInitializeResourceManager,
     ConvertSecurityDescriptorToStringSecurityDescriptorW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
     SE_FILE_OBJECT, SetNamedSecurityInfoW,
@@ -27,9 +30,9 @@ use windows::Win32::Security::{
     InitializeAcl, IsWellKnownSid, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
     OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_BACKUP_NAME, SE_PRIVILEGE_ENABLED,
     SE_RESTORE_NAME, SECURITY_ATTRIBUTES, SetKernelObjectSecurity, TOKEN_ADJUST_PRIVILEGES,
-    TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION,
-    WinAuthenticatedUserSid, WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinLocalSystemSid,
-    WinWorldSid,
+    TOKEN_GROUPS, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    UNPROTECTED_DACL_SECURITY_INFORMATION, WinAuthenticatedUserSid, WinBuiltinAdministratorsSid,
+    WinBuiltinUsersSid, WinLocalSystemSid, WinWorldSid,
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, DELETE, FILE_ACCESS_RIGHTS,
@@ -506,8 +509,79 @@ fn is_trusted_account(sid: PSID) -> anyhow::Result<bool> {
             || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool()
     };
     // With the "object creator" default-owner policy, directories created by an elevated
-    // administrator are owned by that user rather than by Administrators.
-    Ok(trusted || is_current_user(sid)?)
+    // administrator are owned by that user rather than by Administrators. The SYSTEM service and
+    // a different administrator must accept them too, or updates stop and a repair discards the
+    // Agent identity.
+    Ok(trusted || is_current_user(sid)? || is_administrator(sid))
+}
+
+/// Whether the account belongs to Administrators, directly or through nested and domain groups.
+/// An account Windows cannot resolve, such as a domain user while the controller is unreachable,
+/// is treated as untrusted.
+fn is_administrator(sid: PSID) -> bool {
+    let mut manager = AUTHZ_RESOURCE_MANAGER_HANDLE::default();
+    if unsafe {
+        AuthzInitializeResourceManager(
+            AUTHZ_RM_FLAG_NO_AUDIT.0,
+            None,
+            None,
+            None,
+            PCWSTR::null(),
+            &mut manager,
+        )
+    }
+    .is_err()
+    {
+        return false;
+    }
+    let mut context = AUTHZ_CLIENT_CONTEXT_HANDLE::default();
+    let initialized = unsafe {
+        AuthzInitializeContextFromSid(0, sid, manager, None, LUID::default(), None, &mut context)
+    };
+    let member = initialized.is_ok() && context_has_administrators(context);
+    unsafe {
+        if initialized.is_ok() {
+            let _ = AuthzFreeContext(context);
+        }
+        let _ = AuthzFreeResourceManager(manager);
+    }
+    member
+}
+
+fn context_has_administrators(context: AUTHZ_CLIENT_CONTEXT_HANDLE) -> bool {
+    let mut length = 0;
+    let _ = unsafe {
+        AuthzGetInformationFromContext(
+            context,
+            AuthzContextInfoGroupsSids,
+            0,
+            &mut length,
+            std::ptr::null_mut(),
+        )
+    };
+    if length == 0 {
+        return false;
+    }
+    let mut buffer = vec![0_u64; (length as usize).div_ceil(8)];
+    if unsafe {
+        AuthzGetInformationFromContext(
+            context,
+            AuthzContextInfoGroupsSids,
+            length,
+            &mut length,
+            buffer.as_mut_ptr().cast(),
+        )
+    }
+    .is_err()
+    {
+        return false;
+    }
+    let groups = unsafe { &*buffer.as_ptr().cast::<TOKEN_GROUPS>() };
+    let groups =
+        unsafe { std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize) };
+    groups
+        .iter()
+        .any(|group| unsafe { IsWellKnownSid(group.Sid, WinBuiltinAdministratorsSid) }.as_bool())
 }
 
 fn is_current_user(sid: PSID) -> anyhow::Result<bool> {
@@ -758,6 +832,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+    use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
 
     const FOREIGN_OWNER: &str = "O:BUD:(A;OICI;FA;;;BU)(A;OICI;FA;;;BA)";
 
@@ -792,6 +867,60 @@ mod tests {
         // Securing an already private directory is idempotent.
         secure(&updates).unwrap();
         assert_eq!(sddl_of(&updates), PRIVATE_DIRECTORY_SDDL);
+        remove(&root);
+    }
+
+    fn is_administrator_sid(sid: &str) -> bool {
+        let sid = wide(OsStr::new(sid));
+        let mut parsed = PSID::default();
+        unsafe { ConvertStringSidToSidW(PCWSTR(sid.as_ptr()), &mut parsed) }.unwrap();
+        let member = is_administrator(parsed);
+        unsafe {
+            LocalFree(Some(HLOCAL(parsed.0)));
+        }
+        member
+    }
+
+    #[test]
+    fn recognizes_administrators_through_group_membership() {
+        // Everyone, Users, and an account no domain issued.
+        assert!(!is_administrator_sid("S-1-1-0"));
+        assert!(!is_administrator_sid("S-1-5-32-545"));
+        assert!(!is_administrator_sid("S-1-5-21-1-2-3-4242"));
+        if !elevated() {
+            return;
+        }
+        let token = process_token(TOKEN_QUERY).unwrap();
+        let mut length = 0;
+        let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut length) };
+        let mut buffer = vec![0_u64; (length as usize).div_ceil(8)];
+        unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                Some(buffer.as_mut_ptr().cast()),
+                length,
+                &mut length,
+            )
+        }
+        .unwrap();
+        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        assert!(is_administrator(user.User.Sid));
+    }
+
+    /// The SYSTEM service securing a directory an administrator created under the "object creator"
+    /// owner policy. Run elevated as another account, such as SYSTEM, with
+    /// `MESHRMM_TEST_ADMINISTRATOR_SID` naming an administrator account.
+    #[test]
+    #[ignore = "needs a second administrator account"]
+    fn takes_over_a_directory_another_administrator_owns() {
+        let administrator = std::env::var("MESHRMM_TEST_ADMINISTRATOR_SID").unwrap();
+        assert!(elevated());
+        let root = scratch("administrator-owned");
+        set_sddl(&root, &format!("O:{administrator}D:(A;OICI;FA;;;BA)"));
+        assert!(sddl_of(&root).starts_with(&format!("O:{administrator}")));
+        secure(&root).unwrap();
+        assert_eq!(sddl_of(&root), PRIVATE_DIRECTORY_SDDL);
         remove(&root);
     }
 
