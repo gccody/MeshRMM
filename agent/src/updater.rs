@@ -571,15 +571,20 @@ fn prepare_update_directory(config_directory: &Path) -> anyhow::Result<PathBuf> 
     Ok(update_directory)
 }
 
+/// Verifies certificates with the operating system and offers only TLS 1.3,
+/// which every MeshRMM host requires. Used for updates and enrollment.
+pub(crate) fn https_tls_config() -> ureq::tls::TlsConfig {
+    ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .unversioned_rustls_crypto_provider(meshrmm_signaling_client::tls::tls13_crypto_provider())
+        .build()
+}
+
 fn http_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(30)))
         .http_status_as_error(true)
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
+        .tls_config(https_tls_config())
         .build()
         .new_agent()
 }
@@ -637,8 +642,30 @@ fn unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meshrmm_signaling_client::test_support::TlsServer;
+    use rustls::version::{TLS12, TLS13};
 
     const DAY: u64 = 24 * 60 * 60;
+
+    #[test]
+    fn downloads_offer_only_tls_13() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (tls12, tls13) = runtime.block_on(async {
+            (
+                TlsServer::start(&TLS12).await,
+                TlsServer::start(&TLS13).await,
+            )
+        });
+        let http = http_agent();
+        let url = |server: &TlsServer| format!("https://127.0.0.1:{}/", server.address.port());
+
+        let refused = format!("{:?}", http.get(url(&tls12)).call().unwrap_err());
+        assert!(refused.contains("ProtocolVersion"), "{refused}");
+        // TLS 1.3 gets as far as certificate verification, which rejects the
+        // test server's self-signed certificate.
+        let untrusted = format!("{:?}", http.get(url(&tls13)).call().unwrap_err());
+        assert!(untrusted.contains("InvalidCertificate"), "{untrusted}");
+    }
 
     #[test]
     fn limits_attempts_for_the_same_release() {

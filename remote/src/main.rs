@@ -9,6 +9,7 @@ mod debug;
 mod deep_link;
 mod errors;
 mod h264;
+mod http;
 mod matroska;
 mod platform;
 mod preferences;

@@ -57,16 +57,17 @@ and are used by ICE only when a direct candidate pair cannot connect.
 - Windows 10 version 1903 or newer for the Agent and Windows viewer.
 - Local administrator approval to install the Agent as a Windows service.
 - macOS 12 or newer for the macOS viewer.
-- A current stable Rust MSVC toolchain.
+- rustup. The first `cargo` command in the repository installs the toolchain
+  pinned in `rust-toolchain.toml` (the MSVC host toolchain on Windows) with
+  Clippy, rustfmt and the `wasm32-unknown-unknown` target.
 - A GPU/driver exposing Media Foundation hardware H.264 encode and decode
   transforms plus D3D11 NV12 video processing. Hardware H.265/HEVC and AYUV
   4:4:4 support are optional and negotiated only when available at both ends.
 - Node.js/npm and a Cloudflare account for the one-time server deployment.
-- The `wasm32-unknown-unknown` Rust target.
 
-```powershell
-rustup target add wasm32-unknown-unknown
-```
+A `cargo` that rustup does not manage, such as Homebrew's, ignores
+`rust-toolchain.toml` and has no wasm32 target. Put rustup's `cargo` first in
+`PATH`.
 
 There is deliberately no software codec fallback. Startup fails with a
 contextual error if the required hardware path is unavailable.
