@@ -412,7 +412,8 @@ impl ControlSink {
 
 #[cfg(windows)]
 pub use windows::{
-    Presenter, enable_dpi_awareness, monotonic_timestamp_us, supported_video_profiles,
+    Presenter, attach_parent_console, enable_dpi_awareness, monotonic_timestamp_us,
+    show_fatal_error, supported_video_profiles,
 };
 
 #[cfg(target_os = "macos")]

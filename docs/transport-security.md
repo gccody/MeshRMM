@@ -191,7 +191,9 @@ out of release artifacts and do not copy them between endpoints.
 
 The optional `--identity-fingerprint` command prints the local public certificate
 fingerprint without contacting a server. It is a diagnostic, not a connection
-prerequisite. Deploy the acknowledged-close server endpoint before the native
+prerequisite. The Windows viewer is a GUI application, so Command Prompt returns
+before its output appears; pipe the command, for example
+`meshrmm-remote.exe --identity-fingerprint | more`, or run it from PowerShell. Deploy the acknowledged-close server endpoint before the native
 release to enable acknowledged cleanup; no fingerprint provisioning is needed.
 
 The following records describe the earlier manual-enrollment validation. That

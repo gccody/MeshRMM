@@ -1,6 +1,13 @@
+// The Windows viewer is a GUI app: no console window flashes up or lingers.
+// Fatal errors are shown in a message box, and the log is a file.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod clipboard;
 mod config;
 mod debug;
+#[cfg(windows)]
+mod deep_link;
+mod errors;
 mod h264;
 mod matroska;
 mod platform;
@@ -27,7 +34,7 @@ const VIEWER_REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn initialize(launch_deep_link: Option<&str>) -> anyhow::Result<config::Config> {
     #[cfg(windows)]
-    register_windows_deep_link_handler();
+    let registration = deep_link::register();
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install the Rustls ring crypto provider"))?;
@@ -39,6 +46,10 @@ fn initialize(launch_deep_link: Option<&str>) -> anyhow::Result<config::Config> 
         config::Config::load()?
     };
     initialize_tracing(&config)?;
+    #[cfg(windows)]
+    if let Err(error) = registration {
+        tracing::warn!(error = ?error, "could not register the meshrmm: link handler");
+    }
     if let Some(ready) = std::env::var_os("MESHRMM_UPDATE_READY_FILE") {
         std::fs::write(ready, b"ready").context("could not acknowledge viewer initialization")?;
     }
@@ -115,38 +126,6 @@ fn initialize_tracing(config: &config::Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn register_windows_deep_link_handler() {
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let Ok(executable) = std::env::current_exe() else {
-        return;
-    };
-    let command = format!("\"{}\" \"%1\"", executable.display());
-    let entries = [
-        (
-            r"HKCU\Software\Classes\meshrmm",
-            "URL:MeshRMM Remote Protocol",
-        ),
-        (r"HKCU\Software\Classes\meshrmm", ""),
-        (
-            r"HKCU\Software\Classes\meshrmm\shell\open\command",
-            command.as_str(),
-        ),
-    ];
-    for (index, (key, value)) in entries.iter().enumerate() {
-        let mut arguments = vec!["add", key, "/ve", "/d", value, "/f"];
-        if index == 1 {
-            arguments = vec!["add", key, "/v", "URL Protocol", "/d", value, "/f"];
-        }
-        let _ = std::process::Command::new("reg.exe")
-            .args(arguments)
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
-    }
-}
-
 async fn run_session(config: config::Config) -> anyhow::Result<()> {
     let mut bootstrap = match config.bootstrap.clone() {
         Some(bootstrap) => bootstrap,
@@ -167,7 +146,7 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
     loop {
         match transport::run_receiver(&config, bootstrap.clone(), resume_state.clone()).await {
             Ok(()) => {
-                signaling::end_session(&config, &bootstrap).await?;
+                end_session_after_disconnect(&config, &bootstrap).await;
                 return Ok(());
             }
             Err(error) if signaling::is_terminal_session_error(&error) => {
@@ -179,7 +158,8 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
             Err(error) => {
                 let delay = backoff.next_delay();
                 if shutdown::requested() {
-                    return signaling::end_session(&config, &bootstrap).await;
+                    end_session_after_disconnect(&config, &bootstrap).await;
+                    return Ok(());
                 }
                 tracing::warn!(
                     error = ?error,
@@ -211,7 +191,8 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
                 tokio::select! {
                     () = tokio::time::sleep(delay) => {}
                     () = shutdown::wait() => {
-                        return signaling::end_session(&config, &bootstrap).await;
+                        end_session_after_disconnect(&config, &bootstrap).await;
+                        return Ok(());
                     }
                 }
             }
@@ -219,18 +200,64 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
     }
 }
 
+/// Releases the device lease after the session ended by choice. A failure
+/// is logged rather than reported: the disconnect itself succeeded, and the
+/// server expires the lease on its own.
+async fn end_session_after_disconnect(
+    config: &config::Config,
+    bootstrap: &meshrmm_protocol::SessionBootstrap,
+) {
+    if let Err(error) = signaling::end_session(config, bootstrap).await {
+        tracing::warn!(
+            error = ?error,
+            session_id = %bootstrap.session_id,
+            "could not confirm session cleanup after the viewer disconnected"
+        );
+    }
+}
+
 #[cfg(windows)]
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
+    use std::process::ExitCode;
+    // Lets the identity commands print when run from a terminal.
+    platform::attach_parent_console();
     platform::enable_dpi_awareness();
-    if meshrmm_session_transport::identity::handle_command(
+    match meshrmm_session_transport::identity::handle_command(
         meshrmm_session_transport::identity::viewer_directory,
-    )? {
-        return Ok(());
+    ) {
+        Ok(true) => return ExitCode::SUCCESS,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("{error:#}");
+            return ExitCode::FAILURE;
+        }
     }
     if updater::is_helper_invocation() {
-        return updater::apply_scheduled_update();
+        // The detached helper has no window; it relaunches the viewer either way.
+        return match updater::apply_scheduled_update() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
     }
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to create the viewer network runtime")
+        .and_then(|runtime| runtime.block_on(run_windows_viewer()));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(error = ?error, "remote viewer stopped with an error");
+            // The instance mutex was released with the session, so a new link
+            // does not wait on this dialog.
+            platform::show_fatal_error(&errors::user_message(&error));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn run_windows_viewer() -> anyhow::Result<()> {
     let mut config = initialize(None)?;
     // Held on the main thread until the process exits.
     let _instance = match config.device_id.as_deref() {
@@ -242,7 +269,11 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
     if config.bootstrap.is_none() {
-        config.bootstrap = Some(signaling::create_session(&config).await?);
+        config.bootstrap = Some(
+            signaling::create_session(&config)
+                .await
+                .context("remote session request failed")?,
+        );
     }
     match updater::check_and_schedule(&config).await {
         Ok(true) => Ok(()),
@@ -271,7 +302,11 @@ fn main() -> anyhow::Result<()> {
             .build()
             .context("failed to create the macOS network runtime")?;
         if config.bootstrap.is_none() {
-            config.bootstrap = Some(runtime.block_on(signaling::create_session(&config))?);
+            config.bootstrap = Some(
+                runtime
+                    .block_on(signaling::create_session(&config))
+                    .context("remote session request failed")?,
+            );
         }
         match runtime.block_on(updater::check_and_schedule(&config, deep_link.as_deref())) {
             Ok(true) => Ok(()),

@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use clap::{ArgAction, Parser};
+use clap::parser::ValueSource;
+use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -76,7 +77,7 @@ impl Config {
     }
 
     fn load_inner(launch_deep_link: Option<&str>) -> anyhow::Result<Self> {
-        let arguments = Arguments::parse();
+        let arguments = parse_arguments(std::env::args_os())?;
         let file = load_file(arguments.config.as_deref(), "remote.json")?;
         let linked = launch_deep_link
             .or(arguments.deep_link.as_deref())
@@ -120,6 +121,52 @@ impl Config {
             device_id,
         })
     }
+}
+
+/// Options a dashboard link must not be combined with. A crafted link that
+/// smuggles, say, `--update-manifest-url` into the command line is rejected.
+const LOCAL_OPTIONS: [&str; 5] = [
+    "config",
+    "server",
+    "handoff_token",
+    "update_manifest_url",
+    "json_logs",
+];
+
+fn parse_arguments(
+    arguments: impl IntoIterator<Item = std::ffi::OsString>,
+) -> anyhow::Result<Arguments> {
+    let matches = match Arguments::command().try_get_matches_from(arguments) {
+        Ok(matches) => matches,
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            error.exit()
+        }
+        Err(error) => {
+            let rendered = error.render().to_string();
+            let reason = rendered.lines().next().unwrap_or_default();
+            return Err(crate::errors::UserFacing(format!(
+                "The viewer was started with a link or options it does not accept.\n\n{reason}"
+            ))
+            .into());
+        }
+    };
+    let arguments = Arguments::from_arg_matches(&matches)?;
+    if arguments.deep_link.is_some()
+        && LOCAL_OPTIONS
+            .iter()
+            .any(|id| matches.value_source(id) == Some(ValueSource::CommandLine))
+    {
+        return Err(crate::errors::UserFacing(
+            "A MeshRMM dashboard link cannot be combined with other command-line options.".into(),
+        )
+        .into());
+    }
+    Ok(arguments)
 }
 
 fn session_from_deep_link(value: &str) -> anyhow::Result<LinkedSession> {
@@ -228,6 +275,50 @@ mod tests {
         assert_eq!(link("..%5CGlobal%5Cx"), None);
         assert_eq!(link(""), None);
         assert_eq!(link(&"a".repeat(129)), None);
+    }
+
+    fn arguments(values: &[&str]) -> anyhow::Result<Arguments> {
+        parse_arguments(
+            std::iter::once("meshrmm-remote")
+                .chain(values.iter().copied())
+                .map(std::ffi::OsString::from),
+        )
+    }
+
+    #[test]
+    fn a_link_is_accepted_alone_or_after_the_option_terminator() {
+        let link = "meshrmm://connect?handoff=abc&server=https%3A%2F%2Fapi.example.com";
+        for values in [vec![link], vec!["--", link]] {
+            assert_eq!(arguments(&values).unwrap().deep_link.as_deref(), Some(link));
+        }
+    }
+
+    #[test]
+    fn a_link_cannot_carry_other_options() {
+        let link = "meshrmm://connect?handoff=abc";
+        for values in [
+            vec![
+                link,
+                "--update-manifest-url",
+                "https://evil.example/manifest.json",
+            ],
+            vec!["--server", "https://evil.example", link],
+            vec![link, "--json-logs"],
+        ] {
+            let error = arguments(&values).unwrap_err();
+            assert!(
+                error.to_string().contains("cannot be combined"),
+                "{values:?}: {error}"
+            );
+        }
+        // After the terminator, an injected option is only an extra value.
+        let error =
+            arguments(&["--", link, "--update-manifest-url=https://evil.example"]).unwrap_err();
+        assert!(
+            crate::errors::user_message(&error).starts_with("The viewer was started with a link")
+        );
+        // Without a link, local options still work.
+        assert!(arguments(&["--server", "https://api.example.com"]).is_ok());
     }
 
     #[test]
