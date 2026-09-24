@@ -15,6 +15,16 @@ const IDENTITY_KEY: &str = "agent_identity";
 const PRESENCE_DELIVERY_KEY: &str = "presence_delivery";
 const ACTIVE_SESSION_KEY: &str = "active_session";
 const ACTIVE_SESSION_LEASE_KEY: &str = "active_session_lease";
+/// The rotated credential last sent to the Agent, in plaintext, kept only
+/// while D1 still holds its hash as the pending credential.
+const PENDING_ROTATION_KEY: &str = "pending_rotation";
+const OFFLINE_FOR_ROTATION: &str =
+    "Agent must be online to receive its new credential; current credential remains valid";
+
+#[derive(Debug, Deserialize)]
+struct CredentialState {
+    pending_auth_token_hash: Option<String>,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct AgentIdentity {
@@ -53,6 +63,7 @@ struct SessionEnded {
 pub struct AgentCoordinator {
     state: State,
     environment: Env,
+    /// Serializes connections, presence publication and credential rotation.
     presence_lock: Mutex<()>,
 }
 
@@ -111,29 +122,26 @@ impl DurableObject for AgentCoordinator {
                         );
                     }
                 }
-                if !uninstall_requested
-                    && let Some(command) = self
-                        .state
-                        .storage()
-                        .get::<AgentCommand>("pending_rotation")
-                        .await?
-                {
-                    pair.server
-                        .send_with_str(serde_json::to_string(&command)?)?;
+                if !uninstall_requested {
+                    match self.pending_rotation(&identity).await {
+                        Ok(Some(command)) => pair
+                            .server
+                            .send_with_str(serde_json::to_string(&command)?)?,
+                        Ok(None) => {}
+                        // Rotating again resends the credential, so accept the Agent.
+                        Err(error) => {
+                            console_error!("event=agent_rotation_check_failed error={}", error)
+                        }
+                    }
                 }
                 console_log!("event=agent_signaling_connected");
                 Response::from_websocket(pair.client)
             }
             (Method::Post, "/rotate-token") => {
-                let command: AgentCommand = request.json().await?;
-                self.state
-                    .storage()
-                    .put("pending_rotation", &command)
-                    .await?;
-                for socket in self.state.get_websockets_with_tag(AGENT_TAG) {
-                    let _ = socket.send_with_str(serde_json::to_string(&command)?);
-                }
-                Response::ok("rotation delivered")
+                let _guard = self.presence_lock.lock().await;
+                let company_id = required_header(&request, COMPANY_HEADER)?;
+                let device_id = required_header(&request, DEVICE_HEADER)?;
+                self.rotate_token(&company_id, &device_id).await
             }
             (Method::Post, "/uninstall") => {
                 if let Some(agent) = self
@@ -397,6 +405,103 @@ impl AgentCoordinator {
         Ok(())
     }
 
+    /// Sends the connected Agent a new credential, or again the one already
+    /// staged, so a rotation the Agent never completed can be retried without
+    /// locking it out. D1 accepts the current credential until the Agent
+    /// authenticates with the new one, which promotes it.
+    async fn rotate_token(&self, company_id: &str, device_id: &str) -> Result<Response> {
+        let db = self.environment.d1("DB")?;
+        let Some(credential) = credential_state(&db, company_id, device_id).await? else {
+            return Response::error("Agent not found", 404);
+        };
+        let agents = self.state.get_websockets_with_tag(AGENT_TAG);
+        if agents.is_empty() {
+            return Response::error(OFFLINE_FOR_ROTATION, 409);
+        }
+        let storage = self.state.storage();
+        let staged = storage
+            .get::<AgentCommand>(PENDING_ROTATION_KEY)
+            .await?
+            .filter(|command| {
+                rotation_matches(command, credential.pending_auth_token_hash.as_deref())
+            });
+        let (command, created_hash) = match staged {
+            Some(command) => (command, None),
+            None => {
+                // No staged credential matches the pending hash, so the Agent
+                // was never sent it and replacing it cannot lock the Agent out.
+                let token = crate::random_token();
+                let hash = crate::sha256_hex(&token);
+                let changes = query!(
+                    &db,
+                    "UPDATE agents SET pending_auth_token_hash = ?1, updated_at = ?2 WHERE id = ?3 AND company_id = ?4 AND deletion_requested_at IS NULL AND pending_auth_token_hash IS ?5",
+                    hash,
+                    crate::now_ms_i64()?,
+                    device_id,
+                    company_id,
+                    credential.pending_auth_token_hash
+                )?
+                .run()
+                .await?
+                .meta()?
+                .and_then(|meta| meta.changes)
+                .unwrap_or_default();
+                if changes == 0 {
+                    return Response::error(
+                        "the Agent's credential changed during the rotation; try again",
+                        409,
+                    );
+                }
+                let command = AgentCommand::RotateToken { token };
+                storage.put(PENDING_ROTATION_KEY, &command).await?;
+                (command, Some(hash))
+            }
+        };
+        let payload = serde_json::to_string(&command)?;
+        let redelivered = created_hash.is_none();
+        if agents
+            .iter()
+            .any(|agent| agent.send_with_str(&payload).is_ok())
+        {
+            console_log!("event=agent_rotation_sent redelivered={}", redelivered);
+            return Response::from_json(&serde_json::json!({ "redelivered": redelivered }));
+        }
+        // Nothing was sent, so withdraw a credential this request staged.
+        if let Some(hash) = created_hash {
+            query!(
+                &db,
+                "UPDATE agents SET pending_auth_token_hash = NULL WHERE id = ?1 AND pending_auth_token_hash = ?2",
+                device_id,
+                hash
+            )?
+            .run()
+            .await?;
+            storage.delete(PENDING_ROTATION_KEY).await?;
+        }
+        Response::error(OFFLINE_FOR_ROTATION, 409)
+    }
+
+    /// The staged rotation to resend to a connecting Agent. One that D1 no
+    /// longer expects was promoted or abandoned: it is deleted, because the
+    /// plaintext credential must not outlive its use and an Agent that
+    /// adopted a credential D1 does not accept would be locked out.
+    async fn pending_rotation(&self, identity: &AgentIdentity) -> Result<Option<AgentCommand>> {
+        let storage = self.state.storage();
+        let Some(command) = storage.get::<AgentCommand>(PENDING_ROTATION_KEY).await? else {
+            return Ok(None);
+        };
+        let db = self.environment.d1("DB")?;
+        let pending = credential_state(&db, &identity.company_id, &identity.device_id)
+            .await?
+            .and_then(|credential| credential.pending_auth_token_hash);
+        if rotation_matches(&command, pending.as_deref()) {
+            return Ok(Some(command));
+        }
+        storage.delete(PENDING_ROTATION_KEY).await?;
+        console_log!("event=agent_rotation_cleared");
+        Ok(None)
+    }
+
     /// Revokes the Agent when its company is no longer active, so a suspension
     /// whose revocation did not reach this coordinator still takes effect at
     /// the next session request or alarm. A failed lookup revokes nothing.
@@ -614,6 +719,31 @@ impl AgentCoordinator {
     }
 }
 
+async fn credential_state(
+    db: &D1Database,
+    company_id: &str,
+    device_id: &str,
+) -> Result<Option<CredentialState>> {
+    query!(
+        db,
+        "SELECT pending_auth_token_hash FROM agents WHERE id = ?1 AND company_id = ?2 AND deletion_requested_at IS NULL",
+        device_id,
+        company_id
+    )?
+    .first::<CredentialState>(None)
+    .await
+}
+
+/// Whether `command` carries the credential whose hash D1 holds as pending.
+fn rotation_matches(command: &AgentCommand, pending_hash: Option<&str>) -> bool {
+    match (command, pending_hash) {
+        (AgentCommand::RotateToken { token }, Some(pending)) => {
+            crate::constant_time_eq(crate::sha256_hex(token).as_bytes(), pending.as_bytes())
+        }
+        _ => false,
+    }
+}
+
 fn required_header(request: &Request, name: &str) -> Result<String> {
     request
         .headers()
@@ -703,5 +833,27 @@ mod lease_tests {
                 .unwrap(),
             active
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_credential_pending_in_d1_is_resent() {
+        let token = "a".repeat(64);
+        let rotation = AgentCommand::RotateToken {
+            token: token.clone(),
+        };
+        let pending = crate::sha256_hex(&token);
+        assert!(rotation_matches(&rotation, Some(&pending)));
+        // Promoted or withdrawn in D1, or replaced by another rotation.
+        assert!(!rotation_matches(&rotation, None));
+        assert!(!rotation_matches(
+            &rotation,
+            Some(&crate::sha256_hex(&"b".repeat(64)))
+        ));
+        assert!(!rotation_matches(&AgentCommand::Uninstall, Some(&pending)));
     }
 }

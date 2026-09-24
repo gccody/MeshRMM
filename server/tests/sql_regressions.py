@@ -184,14 +184,47 @@ class EnrollmentTests(unittest.TestCase):
             row = self.db.execute(redeem, (1, token, "co")).fetchone()
             self.assertEqual(row[3], int(mode))
 
+    def rotation_sql(self):
+        coordinator = "server/src/agent_coordinator.rs"
+        return (
+            sql(coordinator, "SELECT pending_auth_token_hash FROM agents"),
+            sql(coordinator, "UPDATE agents SET pending_auth_token_hash = ?1"),
+            sql(coordinator, "UPDATE agents SET pending_auth_token_hash = NULL"),
+            sql("server/src/lib.rs", "UPDATE agents SET auth_token_hash = ?1, pending_auth_token_hash = NULL"),
+        )
+
+    def credentials(self):
+        return self.db.execute("SELECT auth_token_hash,pending_auth_token_hash FROM agents").fetchone()
+
     def test_rotation_stages_without_disabling_current_credential(self):
         self.redeem()
-        query = sql("server/src/routes/agents.rs", "UPDATE agents SET pending_auth_token_hash")
-        self.db.execute(query, ("c" * 64, 2, "device", "co"))
-        self.assertEqual(self.db.execute("SELECT auth_token_hash,pending_auth_token_hash FROM agents").fetchone(), ("b" * 64, "c" * 64))
-        self.db.execute(query, ("d" * 64, 3, "device", "co"))
-        self.assertEqual(self.db.execute("SELECT pending_auth_token_hash FROM agents").fetchone(), ("c" * 64,))
+        state, stage, _, _ = self.rotation_sql()
+        self.assertEqual(self.db.execute(state, ("device", "co")).fetchone(), (None,))
+        self.assertEqual(self.db.execute(stage, ("c" * 64, 2, "device", "co", None)).rowcount, 1)
+        self.assertEqual(self.credentials(), ("b" * 64, "c" * 64))
+        # Staging expects the pending hash it read, so a concurrent change wins.
+        self.assertEqual(self.db.execute(stage, ("d" * 64, 3, "device", "co", None)).rowcount, 0)
+        self.assertEqual(self.db.execute(stage, ("d" * 64, 3, "device", "other", "c" * 64)).rowcount, 0)
+        self.assertEqual(self.credentials(), ("b" * 64, "c" * 64))
+        # A pending hash that was never sent can be replaced.
+        self.assertEqual(self.db.execute(stage, ("d" * 64, 3, "device", "co", "c" * 64)).rowcount, 1)
+        self.assertEqual(self.credentials(), ("b" * 64, "d" * 64))
+        self.db.execute("UPDATE agents SET deletion_requested_at=1")
+        self.assertIsNone(self.db.execute(state, ("device", "co")).fetchone())
+        self.assertEqual(self.db.execute(stage, ("e" * 64, 4, "device", "co", "d" * 64)).rowcount, 0)
 
+    def test_undelivered_rotation_is_withdrawn_only_while_still_pending(self):
+        self.redeem()
+        _, stage, withdraw, promote = self.rotation_sql()
+        self.db.execute(stage, ("c" * 64, 2, "device", "co", None))
+        self.assertEqual(self.db.execute(withdraw, ("device", "d" * 64)).rowcount, 0)
+        self.assertEqual(self.db.execute(withdraw, ("device", "c" * 64)).rowcount, 1)
+        self.assertEqual(self.credentials(), ("b" * 64, None))
+        # After promotion there is nothing left to withdraw.
+        self.db.execute(stage, ("c" * 64, 3, "device", "co", None))
+        self.assertEqual(self.db.execute(promote, ("c" * 64, "device")).rowcount, 1)
+        self.assertEqual(self.db.execute(withdraw, ("device", "c" * 64)).rowcount, 0)
+        self.assertEqual(self.credentials(), ("c" * 64, None))
 
 if __name__ == "__main__":
     unittest.main()
