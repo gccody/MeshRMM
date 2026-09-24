@@ -8,38 +8,47 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same ref supersedes the run in progress. The group names
+# the workflow because a reusable call runs under its caller's name: the
+# release workflow's checks must not share, and be cancelled with, the
+# push-triggered CI run for the same commit on main.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
 
   remote-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p meshrmm-remote -p meshrmm-session-transport --all-targets -- -D warnings
-      - run: cargo test -p meshrmm-remote -p meshrmm-session-transport
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo clippy --locked -p meshrmm-remote -p meshrmm-session-transport --all-targets -- -D warnings
+      - run: cargo test --locked -p meshrmm-remote -p meshrmm-session-transport
 
   server-wasm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p meshrmm-server --target wasm32-unknown-unknown
-      - run: cargo test -p meshrmm-server
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo check --locked -p meshrmm-server --target wasm32-unknown-unknown
+      - run: cargo test --locked -p meshrmm-server
       - run: python3 server/tests/sql_regressions.py
       - run: python3 -m unittest discover -s scripts/tests -v
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
+      - run: node --test scripts/*.test.mjs
       - run: npm ci
         working-directory: dashboard
       - run: cargo install worker-build --version 0.8.5 --locked
@@ -54,8 +63,8 @@ jobs:
       run:
         working-directory: dashboard
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm

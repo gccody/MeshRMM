@@ -25,10 +25,10 @@ jobs:
     outputs:
       version: ${{ steps.release.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
       - id: release
@@ -67,13 +67,13 @@ jobs:
     needs: validate
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
       - name: Restore Windows Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: native-windows-x64
           workspaces: ". -> target"
@@ -91,7 +91,7 @@ jobs:
           New-Item -ItemType Directory -Path release-output -Force | Out-Null
           Copy-Item dashboard\public\downloads\*.exe release-output\
           Copy-Item dashboard\public\downloads\*.sha256 release-output\
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-windows-${{ needs.validate.outputs.version }}
           path: release-output/
@@ -103,13 +103,13 @@ jobs:
     needs: validate
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
       - name: Restore Apple Silicon Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: native-macos-arm64
           workspaces: ". -> target"
@@ -178,7 +178,7 @@ jobs:
         run: |
           mkdir -p release-output
           cp "$ARCHIVE" release-output/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-macos-arm64-${{ needs.validate.outputs.version }}
           path: release-output/
@@ -194,17 +194,17 @@ jobs:
     env:
       CLOUDFLARE_ACCOUNT_ID: "023f5fc9ffca88a15dac8e9f27b8d21f"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: native-windows-${{ needs.validate.outputs.version }}
           path: dashboard/public/downloads
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: native-macos-arm64-${{ needs.validate.outputs.version }}
           path: dashboard/public/downloads
@@ -220,7 +220,7 @@ jobs:
           node scripts/update-release-manifest.mjs "$manifest" client-macos-arm64 "$version" "$origin/downloads/meshrmm-remote-macos-arm64.zip" dashboard/public/downloads/meshrmm-remote-macos-arm64.zip
           node scripts/verify-release-assets.mjs "$manifest"
       - name: Upload assembled release for recovery
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-release-${{ needs.validate.outputs.version }}
           path: dashboard/public/downloads/
