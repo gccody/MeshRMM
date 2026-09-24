@@ -71,6 +71,22 @@ struct ActiveSession {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Whether `request` repeats the session the Agent is running, as the coordinator does when the
+/// Agent reconnects. Servers that renew the session's lease rewrite the expiry of the request they
+/// replay, so the expiry is ignored. A resume carries new TURN credentials, so it still restarts
+/// the session.
+#[cfg(any(windows, test))]
+fn replays_session(
+    active: &meshrmm_protocol::AgentSessionRequest,
+    request: &meshrmm_protocol::AgentSessionRequest,
+) -> bool {
+    *active
+        == meshrmm_protocol::AgentSessionRequest {
+            expires_at_unix_ms: active.expires_at_unix_ms,
+            ..request.clone()
+        }
+}
+
 /// Ends the remote session and runs its close actions before the coordinator exits, since the
 /// session cannot outlive it and nothing else would run them.
 #[cfg(windows)]
@@ -185,7 +201,7 @@ pub async fn run(
                                                 }
                                             };
                                             if active_session.as_ref().is_some_and(|active| {
-                                                active.request == request
+                                                replays_session(&active.request, &request)
                                                     && !active.task.is_finished()
                                             }) {
                                                 tracing::info!(
@@ -269,6 +285,55 @@ pub async fn run(
                 },
             }
             retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use meshrmm_protocol::{AgentSessionRequest, IceServer, RemoteSessionId};
+
+    use super::replays_session;
+
+    fn request() -> AgentSessionRequest {
+        AgentSessionRequest {
+            start_in_background: false,
+            idle_policy: Default::default(),
+            blackout_message: String::new(),
+            viewer_name: "Ada Lovelace".into(),
+            session_id: RemoteSessionId::new("session"),
+            signaling_token: "token".into(),
+            expires_at_unix_ms: 1_000,
+            ice_servers: vec![IceServer {
+                urls: vec!["turn:turn.cloudflare.com:3478?transport=udp".into()],
+                username: Some("first".into()),
+                credential: Some("secret".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn renewed_lease_replay_keeps_the_running_session() {
+        let active = request();
+        let mut replayed = active.clone();
+        replayed.expires_at_unix_ms = 31_000;
+        assert!(replays_session(&active, &active));
+        assert!(replays_session(&active, &replayed));
+    }
+
+    #[test]
+    fn other_or_resumed_sessions_restart() {
+        let active = request();
+        let mut other = active.clone();
+        other.session_id = RemoteSessionId::new("other");
+        let mut token = active.clone();
+        token.signaling_token = "other".into();
+        let mut resumed = active.clone();
+        resumed.ice_servers[0].username = Some("second".into());
+        let mut background = active.clone();
+        background.start_in_background = true;
+        for request in [other, token, resumed, background] {
+            assert!(!replays_session(&active, &request));
         }
     }
 }

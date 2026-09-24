@@ -215,7 +215,7 @@ try {
 
   // Activity persists exact deadlines but leaves the existing alarm in place.
   await db.exec("UPDATE companies SET status = 'active'; UPDATE agents SET deletion_requested_at = NULL;");
-  collect(await connectAgent());
+  const running = collect(await connectAgent());
   const session = sessions.get(sessions.idFromName('session-test'));
   const lease = { session_id: 'session-test', device_id: 'device-test', viewer_name: 'Test', signaling_token: 'agent-token', expires_at_unix_ms: Date.now() + 900_000, ice_servers: [] };
   assert.equal((await post(agent, '/request', lease)).status, 200);
@@ -228,11 +228,17 @@ try {
   await post(session, '/__test/alarm');
   assert.ok((await state(session)).alarm > Date.now(), 'early alarm reschedules to durable deadline');
 
+  // Lease renewals leave the request the Agent received unchanged, so the
+  // replay after the Agent reconnects matches the session it is running.
+  const delivered = running.messages.find(m => m.session_id === 'session-test');
+  assert.ok(delivered, 'session delivered to the Agent');
+  assert.equal((await post(agent, '/lease', { ...lease, expires_at_unix_ms: Date.now() + 1_800_000 })).status, 200);
   // A failed online publication does not refuse a reconnecting Agent: the
   // live session is still resumed on the new socket and the alarm retries.
   await post(presence, '/__test/fail', true);
   const unpublished = collect(await connectAgent());
   await until(() => unpublished.messages.some(m => m.session_id === 'session-test'), 'session resumed despite presence failure');
+  assert.deepEqual(unpublished.messages.find(m => m.session_id === 'session-test'), delivered, 'replay repeats the delivered request');
   const queued = await state(agent);
   assert.equal(queued.delivery.connected, true);
   assert.equal(queued.delivery.acknowledged, false, 'online publication stays in the outbox');
@@ -277,7 +283,7 @@ try {
   assert.equal((await post(failing, '/lease', lease)).status, 403);
   assert.equal(await failingClosed, 4001, 'the missed Agent is revoked at its next request');
   await db.exec("UPDATE companies SET status = 'active'");
-  console.log('Presence integration passed: event-only snapshots, durable retry, replacement ordering, renewal isolation/expiry/revocation, signing-key caching, retryable auth outages, deletion, session alarm preservation, Agent connect past a presence failure, suspension fan-out past failures, and revocation after a missed suspension.');
+  console.log('Presence integration passed: event-only snapshots, durable retry, replacement ordering, renewal isolation/expiry/revocation, signing-key caching, retryable auth outages, deletion, session alarm preservation, unchanged replays after lease renewal, Agent connect past a presence failure, suspension fan-out past failures, and revocation after a missed suspension.');
 } finally {
   for (const socket of sockets) { try { socket.close(); } catch {} }
   await runtime.dispose();
