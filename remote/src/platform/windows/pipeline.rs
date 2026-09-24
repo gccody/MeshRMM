@@ -11,6 +11,7 @@ pub(super) struct WorkerPipeline {
     interval_decoded: u64,
     interval_presented: u64,
     stats_started_us: u64,
+    statistics_log: crate::debug::StatisticsLog,
     debug: DebugInfo,
 }
 
@@ -56,6 +57,7 @@ impl WorkerPipeline {
             interval_decoded: 0,
             interval_presented: 0,
             stats_started_us: monotonic_timestamp_us(),
+            statistics_log: Default::default(),
             debug,
         })
     }
@@ -129,14 +131,16 @@ impl WorkerPipeline {
                 Some(presenter_frames_dropped),
                 self.decoded_frames_dropped,
             );
-            tracing::info!(
-                decode_fps,
-                present_fps,
-                frames_decoded = self.decoded,
-                frames_presented = self.presented,
-                decoded_frames_dropped = self.decoded_frames_dropped,
-                "decoder/presentation statistics"
-            );
+            if self.statistics_log.due() {
+                tracing::info!(
+                    decode_fps,
+                    present_fps,
+                    frames_decoded = self.decoded,
+                    frames_presented = self.presented,
+                    decoded_frames_dropped = self.decoded_frames_dropped,
+                    "decoder/presentation statistics"
+                );
+            }
             self.interval_decoded = 0;
             self.interval_presented = 0;
             self.stats_started_us = now_us;

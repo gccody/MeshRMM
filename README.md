@@ -451,7 +451,11 @@ example, a UAC prompt) recreates the endpoint chat popup and clears its local
 history. Older peers can still connect, but chat requires updated builds.
 
 Viewer diagnostics are written to `%LOCALAPPDATA%\MeshRMM\remote.log` on
-Windows and `~/Library/Logs/MeshRMM/remote.log` on macOS.
+Windows and `~/Library/Logs/MeshRMM/remote.log` on macOS, and the Agent's to
+`%ProgramData%\MeshRMM\Agent\agent.log`. A log is rotated at 10 MiB, keeping
+the three previous files (`remote.1.log`, newest, to `remote.3.log`). Periodic
+connection and video statistics are logged every 30 seconds; the diagnostics
+overlay updates every two.
 Pointer coordinates are normalized to the display
 currently being streamed and every event carries that display ID, so the Agent
 rejects input left over from a previous display after a switch. On Windows,

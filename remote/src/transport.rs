@@ -163,6 +163,7 @@ struct VideoReceiveState {
     last_accepted_frame_id: Option<u64>,
     waiting_for_keyframe: bool,
     last_keyframe_request_us: u64,
+    statistics_log: crate::debug::StatisticsLog,
 }
 
 impl VideoReceiveState {
@@ -173,6 +174,7 @@ impl VideoReceiveState {
             last_accepted_frame_id: None,
             waiting_for_keyframe: true,
             last_keyframe_request_us: 0,
+            statistics_log: Default::default(),
         }
     }
 
@@ -453,6 +455,7 @@ pub async fn run_receiver(
     session_state = session_state.transition(SessionState::Connecting)?;
     let mut presenter_missing_since = Some(tokio::time::Instant::now());
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut statistics_log = crate::debug::StatisticsLog::default();
     stats_interval.tick().await;
     let mut heartbeat_interval = tokio::time::interval(SIGNAL_HEARTBEAT_INTERVAL);
     heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -585,7 +588,7 @@ pub async fn run_receiver(
                 } else {
                     presenter_missing_since = None;
                 }
-                update_network_stats(&peer, &debug).await;
+                update_network_stats(&peer, &debug, statistics_log.due()).await;
                 let ended = presenter
                     .lock()
                     .ok()
@@ -680,11 +683,14 @@ pub async fn run_receiver(
     result
 }
 
-async fn update_network_stats(peer: &RTCPeerConnection, debug: &DebugInfo) {
+/// Refreshes the diagnostics overlay, and logs the statistics when `log` is set.
+async fn update_network_stats(peer: &RTCPeerConnection, debug: &DebugInfo, log: bool) {
     let reports = peer.get_stats().await.reports;
     let mut candidates = HashMap::new();
     for report in reports.values() {
-        if let StatsReportType::DataChannel(channel) = report {
+        if let StatsReportType::DataChannel(channel) = report
+            && log
+        {
             // ICE candidate-pair counters are not populated by webrtc-ice.
             // Data-channel counters measure the actual video/control traffic.
             tracing::info!(
@@ -748,6 +754,9 @@ async fn update_network_stats(peer: &RTCPeerConnection, debug: &DebugInfo) {
                 remote.0,
                 path,
             );
+            if !log {
+                continue;
+            }
             tracing::info!(
                 rtt_ms = pair.current_round_trip_time * 1_000.0,
                 available_incoming_bitrate = pair.available_incoming_bitrate,
@@ -1510,6 +1519,7 @@ fn install_video_handler(
             } else {
                 None
             };
+            let log_statistics = completed.is_some() && receive_state.statistics_log.due();
             drop(receive_state);
             if request_keyframe {
                 viewer_control.send(SessionMessage::RequestKeyframe {
@@ -1540,7 +1550,7 @@ fn install_video_handler(
                     active.presenter.publish(frame, received_at_us);
                 }
                 tracing::trace!(encode_us, received_at_us, "encoded frame reassembled");
-                if stats.completed_frames.is_multiple_of(120) {
+                if log_statistics {
                     tracing::info!(
                         frames_received = stats.completed_frames,
                         incomplete_frames_dropped = stats.incomplete_frames_dropped,

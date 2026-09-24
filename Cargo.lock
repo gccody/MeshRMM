@@ -1859,6 +1859,7 @@ dependencies = [
  "meshrmm-chat",
  "meshrmm-clipboard",
  "meshrmm-file-transfer",
+ "meshrmm-log-file",
  "meshrmm-protocol",
  "meshrmm-remote-screen",
  "meshrmm-self-update",
@@ -1933,6 +1934,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "meshrmm-log-file"
+version = "0.2.0"
+
+[[package]]
 name = "meshrmm-protocol"
 version = "0.2.0"
 dependencies = [
@@ -1965,6 +1970,7 @@ dependencies = [
  "meshrmm-chat",
  "meshrmm-clipboard",
  "meshrmm-file-transfer",
+ "meshrmm-log-file",
  "meshrmm-protocol",
  "meshrmm-self-update",
  "meshrmm-session-transport",

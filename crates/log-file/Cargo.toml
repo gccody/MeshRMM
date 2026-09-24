@@ -1,0 +1,10 @@
+[package]
+name = "meshrmm-log-file"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Size-limited, rotating log files shared by MeshRMM's native processes"
+
+[lints]
+workspace = true
