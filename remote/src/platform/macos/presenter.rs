@@ -406,7 +406,7 @@ impl MacUi {
         };
         // NSWindow releases itself when the user closes it by default. Keep the
         // window alive until MacUi is dropped so queued frames can safely detect
-        // that it is no longer visible and end the remote session.
+        // that it was closed and end the remote session.
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
         window.setTitlebarAppearsTransparent(true);
@@ -513,7 +513,7 @@ impl MacUi {
 
     #[allow(deprecated)]
     fn enqueue(&mut self, queued: QueuedFrame) -> anyhow::Result<bool> {
-        if !self.window.isVisible() {
+        if self.input_view.window_closed() {
             bail!("macOS viewer window was closed");
         }
         if unsafe { self.layer.requiresFlushToResumeDecoding() } {
@@ -626,7 +626,7 @@ impl MacUi {
     }
 
     fn presentation_failure(&self) -> Option<String> {
-        if !self.window.isVisible() {
+        if self.input_view.window_closed() {
             return Some("macOS viewer window was closed".into());
         }
         self.decoder_failure()
@@ -812,7 +812,7 @@ fn active_window() -> Option<(Retained<NSWindow>, Retained<RemoteView>)> {
         state
             .borrow()
             .as_ref()
-            .filter(|ui| ui.window.isVisible())
+            .filter(|ui| !ui.input_view.window_closed())
             .map(|ui| (ui.window.clone(), ui.input_view.clone()))
     })
 }
