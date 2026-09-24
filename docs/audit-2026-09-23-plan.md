@@ -17,9 +17,9 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 | T05 Updater failure paths / restart loop / exe ACL | Medium | Done | `eb52c2c` |
 | T05b Uninstall helper self-delete + viewer updater race | Medium | Done | `a5d39e4`, `1265e1c` |
 | T06 Defer updates during sessions; graceful worker stop | Medium | Done | `662ecb1` |
-| T07 Session-close actions bound to viewed user/session | Medium | **Next** | |
-| T08 Task Manager protection names / own processes | Medium | Todo | |
-| T09 Capture-helper IPC hardening | Medium | Todo | |
+| T07 Session-close actions bound to viewed user/session | Medium | Done | `c926dd9` |
+| T08 Task Manager protection names / own processes | Medium | Done | `0159bd8` |
+| T09 Capture-helper IPC hardening | Medium | **Next** | |
 | T10 Agent logging flush + write-error recovery | Medium | Todo | |
 | T11 Background console `exit` cleanup | Medium | Todo | |
 | T12 Windows viewer pointer mapping / DPI / letterbox | Medium | Todo | |
@@ -72,7 +72,7 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 
 ## Endpoint state
 
-After T06, DESKTOP-85R6S28 runs a release build of `662ecb1` (SHA-256 `628EE7E1…F7E3`). The
+After T08, DESKTOP-85R6S28 runs a release build of `0159bd8` (SHA-256 `5E33FA09…DB5A`). The
 service is running and connected. Earlier builds are kept as
 `C:\Program Files\MeshRMM\Agent\meshrmm-agent.exe.before-local-*`. T01 removed the explicit
 `gccody` permission on `ProgramData\MeshRMM\Agent`, so a non-elevated `gccody` process can no longer
@@ -90,28 +90,12 @@ These need a live dashboard → viewer → agent session, which the agent-driven
 - T05b: a real uninstall (re-enrolling afterwards needs a dashboard token), and a real viewer self-update from a published manifest.
 - T06: update deferral while a session is live, lock or clear-clipboard on service stop, stopping
   with a staged update, and system shutdown.
+- T07: a close action in a live session, and a user switch after the viewer leaves. A temporary
+  test run as SYSTEM on the endpoint resolved the console's session, logon ID and user.
+- T08: ending Agent processes from the Task Manager on the background desktop. Unit tests on the
+  endpoint cover the ancestor chain, Agent copies, and the legacy service name.
 
 ## Remaining tasks
-
-### T07 — Session-close actions not bound to the viewed user/session
-Note: T06 split session_close.rs into spawn / `run` / `finish`; build on that structure.
-agent/src/remote/session_close.rs:40-45, 129-141, 152. Target stored as DesktopSession::Console or
-Rdp{id,user}; at close, console session ID is looked up fresh and RDP `user` is never checked. Close may
-run minutes after viewer drop → a different user who signed in gets locked/force-logged-off
-(WTSLogoffSession) or has their clipboard cleared. Fix: record resolved session ID + user identity
-(SID and/or logon ID / logon time) in set_target; before Lock/Logoff/ClearClipboard verify the session
-still belongs to the same user logon; skip with a log line otherwise. Add session ID/user to close logs.
-Installed-agent validation (at least lock-on-close with a matching session if a viewer session can be
-driven; otherwise unit tests of the matching logic + service start/connect).
-
-### T08 — Background Task Manager protection uses wrong names; own processes killable
-agent/src/remote/background_tasks/data.rs:394, background_tasks.rs:1212, :1419 hardcode "MeshRMMAgent";
-service.rs has SERVICE_NAME + LEGACY_SERVICE_NAME ("PulseRMMAgent") and active_service_name().
-data.rs:101-113 termination_handle only refuses the Task Manager's own PID. Nothing stops ending the
-service/--worker/--background-helper processes or "End process tree" on an ancestor (kills the input
-helper, whose kill-on-close job then kills all background apps). Fix: protect both service names; refuse
-terminating processes whose image path is the Agent's own executable (and helper copies), and the Task
-Manager's own ancestors; give a clear error message in the UI. Update tests (data.rs:~1149).
 
 ### T09 — Capture-helper IPC hardening: bounded stderr + per-helper event validation (+ handle inheritance)
 (a) agent/src/remote/capture_helper.rs:~1948 drain_child_stderr uses BufReader::lines() with no cap;
