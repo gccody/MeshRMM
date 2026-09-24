@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
 
+#[cfg(windows)]
+pub mod windows;
+
 use anyhow::{Context, bail};
 use semver::Version;
 use serde::{Deserialize, Serialize};
