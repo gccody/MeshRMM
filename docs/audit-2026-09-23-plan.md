@@ -46,8 +46,8 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 | T39 Native log rotation (+ viewer update helper logging) | Low | Done | `797f7a5` |
 | T33 Local dashboard dev loop | QoL | Done | `c67249f` |
 | T34 Server deploy script + schema version in /healthz | QoL | Done | `534ee4d` |
-| T35 Viewer input QoL (Win/Alt+Tab hook, rebindable keys) | QoL | **Next** | |
-| T36 Agent refactor: split large files, dedupe launch code | QoL | Todo | |
+| T35 Viewer input QoL (Win/Alt+Tab hook, rebindable keys) | QoL | Done | `2ddef48` |
+| T36 Agent refactor: split large files, dedupe launch code | QoL | **Next** | |
 | T37 Viewer refactor: split window.rs / transport.rs | QoL | Todo | |
 | T38 Dashboard refactor: split dashboard.tsx, modal a11y | QoL | Todo | |
 
@@ -223,6 +223,14 @@ These need a live dashboard → viewer → agent session, which the agent-driven
   `npm run dev`, `/healthz` on the seeded local D1 answered 200 `ok` and, with the newest row
   removed from `d1_migrations`, 503 `schema_behind`. The Miniflare suites pass with the new build.
   `/healthz` used to return the text `ok`; nothing in the repository read it.
+- T35: a live session, real hardware keys and the macOS menu. A temporary probe on the endpoint
+  drove the real viewer window in the interactive session with `SendInput`: the Windows key,
+  Alt+Tab, Ctrl+Esc and Windows+R reached the device as key events and the viewer stayed in the
+  foreground; A and Tab were unaffected; F12 toggled diagnostics while F11 was sent, and the
+  reverse after rebinding diagnostics to F11; F8 was sent with the display key off; with the
+  setting off, Alt+Tab switched windows locally. The title named the keys. The probe restored the
+  preferences file it changed, apart from one failed first run that saved the default values.
+  Rebinding offers F8–F12 or off rather than any key, which covers sending F12 itself.
 
 ## Remaining tasks
 
