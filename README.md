@@ -405,6 +405,13 @@ The **folder icon** offers **Send** and **Receive** using native multi-file/fold
 pickers on the source computer. Transfers preserve nested and empty folders and
 land in the signed-in user’s `Documents/MeshRMM Transferred Files` folder.
 Existing names are preserved by assigning a unique name to incoming duplicates.
+The viewer saves files from the device only after **Receive**, one transfer per
+request within 15 minutes; it ignores the device's own pick requests and never
+accepts pasted or dropped files. Clipboard file copies are limited to 512 MiB
+(use **Send** for larger files) and other transfers to 64 GiB, and the receiving
+computer must have enough free disk space. Interrupted transfers are removed
+after 24 hours, and cached clipboard/drop copies after an hour once they are no
+longer on the clipboard.
 Drag files from Finder or Explorer onto the remote view to deliver a native
 Windows drop at that position (Explorer, desktop, or a browser drop target);
 if the target declines the drop, files go to the same Documents folder.
