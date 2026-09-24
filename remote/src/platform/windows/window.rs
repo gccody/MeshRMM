@@ -1,4 +1,6 @@
+use super::keyboard_hook;
 use super::*;
+use crate::shortcuts::{ShortcutKey, ViewerShortcut};
 use crate::video_layout::{self, VideoRect};
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CreateFontIndirectW, DeleteObject, GetMonitorInfoW, HFONT, HGDIOBJ,
@@ -110,6 +112,14 @@ const CHROMA_420_ID: usize = 4111;
 const CHROMA_444_ID: usize = 4112;
 const SETTINGS_DISPLAY_TAB_ID: usize = 4201;
 const SETTINGS_ADVANCED_TAB_ID: usize = 4202;
+const SETTINGS_KEYBOARD_TAB_ID: usize = 4203;
+const SETTINGS_KEYBOARD_TITLE_ID: i32 = 4241;
+const SETTINGS_WINDOWS_SHORTCUTS_ID: usize = 4242;
+const SETTINGS_DIAGNOSTICS_KEY_TITLE_ID: i32 = 4243;
+const SETTINGS_DIAGNOSTICS_KEY_ID: usize = 4244;
+const SETTINGS_DISPLAY_KEY_TITLE_ID: i32 = 4245;
+const SETTINGS_DISPLAY_KEY_ID: usize = 4246;
+const SETTINGS_KEYBOARD_NOTE_ID: i32 = 4247;
 const SETTINGS_DISPLAY_TITLE_ID: i32 = 4211;
 const SETTINGS_QUALITY_TITLE_ID: i32 = 4212;
 const SETTINGS_CHROMA_TITLE_ID: i32 = 4213;
@@ -456,6 +466,7 @@ impl WindowContext {
     }
 
     fn refresh_maintenance_controls(&self) {
+        self.refresh_shortcut_keys();
         let state = self.control.credential_state();
         for (i, button) in self.credential_buttons.iter().enumerate() {
             unsafe {
@@ -532,6 +543,11 @@ impl WindowContext {
                 true,
             ),
             (
+                SETTINGS_WINDOWS_SHORTCUTS_ID,
+                self.control.send_windows_shortcuts(),
+                true,
+            ),
+            (
                 SETTINGS_BLACKOUT_ID,
                 self.control.maintenance_state().blacked_out,
                 self.control.maintenance_state().available,
@@ -566,6 +582,21 @@ impl WindowContext {
                         None,
                     );
                 }
+            }
+        }
+    }
+    fn refresh_shortcut_keys(&self) {
+        for (id, shortcut) in [
+            (SETTINGS_DIAGNOSTICS_KEY_ID, ViewerShortcut::Diagnostics),
+            (SETTINGS_DISPLAY_KEY_ID, ViewerShortcut::NextDisplay),
+        ] {
+            let key = self.control.shortcut_key(shortcut);
+            let index = ShortcutKey::ALL.iter().position(|choice| *choice == key);
+            if let (Ok(combo), Some(index)) = (
+                unsafe { GetDlgItem(Some(self.settings_window), id as i32) },
+                index,
+            ) {
+                unsafe { SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(index)), None) };
             }
         }
     }
@@ -627,6 +658,23 @@ impl WindowContext {
             if self.pressed_buttons.is_empty() {
                 let _ = unsafe { ReleaseCapture() };
             }
+        }
+    }
+
+    fn send_key(&mut self, scan_code: u16, extended: bool, pressed: bool) {
+        if scan_code == 0 {
+            return;
+        }
+        self.send(SessionMessage::Input(RemoteInput::Key {
+            display_id: self.active_display.id,
+            scan_code,
+            extended,
+            pressed,
+        }));
+        if pressed {
+            self.pressed_keys.insert((scan_code, extended));
+        } else {
+            self.pressed_keys.remove(&(scan_code, extended));
         }
     }
 
@@ -713,6 +761,30 @@ unsafe fn window_context(window: HWND) -> Option<&'static mut WindowContext> {
 }
 
 /// Scales a 96-DPI length to `dpi`, rounding to the nearest pixel.
+/// The window title: the display, and the viewer's shortcut keys.
+fn window_title(display: &Display) -> HSTRING {
+    let next_display = crate::preferences::shortcut_key(ViewerShortcut::NextDisplay);
+    let diagnostics = crate::preferences::shortcut_key(ViewerShortcut::Diagnostics);
+    let hint = crate::shortcuts::hint(
+        (next_display != ShortcutKey::Off).then(|| next_display.label()),
+        diagnostics,
+    );
+    let mut title = format!(
+        "MeshRMM Remote Desktop — {} ({})",
+        display.name,
+        if display.primary {
+            "primary"
+        } else {
+            "secondary"
+        }
+    );
+    if !hint.is_empty() {
+        title.push_str(" — ");
+        title.push_str(&hint);
+    }
+    HSTRING::from(title)
+}
+
 fn scale(value: i32, dpi: u32) -> i32 {
     ((i64::from(value) * i64::from(dpi) + 48).div_euclid(96)) as i32
 }
@@ -940,10 +1012,15 @@ fn chroma_index(mode: ChromaMode) -> usize {
     }
 }
 
-unsafe fn show_settings_category(window: HWND, display: bool) {
-    let display_command = if display { SW_SHOW } else { SW_HIDE };
-    let advanced_command = if display { SW_HIDE } else { SW_SHOW };
-    for id in [
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsCategory {
+    Display,
+    Advanced,
+    Keyboard,
+}
+
+unsafe fn show_settings_category(window: HWND, category: SettingsCategory) {
+    let display: &[i32] = &[
         SETTINGS_DISPLAY_TITLE_ID,
         SETTINGS_QUALITY_TITLE_ID,
         SETTINGS_CHROMA_TITLE_ID,
@@ -958,12 +1035,8 @@ unsafe fn show_settings_category(window: HWND, display: bool) {
         SETTINGS_DISPLAY_BORDER_ID as i32,
         SETTINGS_IDLE_ID as i32,
         SETTINGS_DISCONNECT_ID as i32,
-    ] {
-        if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
-            let _ = unsafe { ShowWindow(control, display_command) };
-        }
-    }
-    for id in [
+    ];
+    let advanced: Vec<i32> = [
         SETTINGS_ADVANCED_TITLE_ID,
         SETTINGS_DIAGNOSTICS_ID as i32,
         SETTINGS_TECHNICIAN_INPUT_ID as i32,
@@ -977,14 +1050,40 @@ unsafe fn show_settings_category(window: HWND, display: bool) {
     ]
     .into_iter()
     .chain(SETTINGS_CLOSE_ACTION_IDS.map(|(id, _)| id as i32))
-    {
-        if let Ok(control) = unsafe { GetDlgItem(Some(window), id) } {
-            let _ = unsafe { ShowWindow(control, advanced_command) };
+    .collect();
+    let keyboard: &[i32] = &[
+        SETTINGS_KEYBOARD_TITLE_ID,
+        SETTINGS_WINDOWS_SHORTCUTS_ID as i32,
+        SETTINGS_DIAGNOSTICS_KEY_TITLE_ID,
+        SETTINGS_DIAGNOSTICS_KEY_ID as i32,
+        SETTINGS_DISPLAY_KEY_TITLE_ID,
+        SETTINGS_DISPLAY_KEY_ID as i32,
+        SETTINGS_KEYBOARD_NOTE_ID,
+    ];
+    for (ids, shown) in [
+        (display, category == SettingsCategory::Display),
+        (advanced.as_slice(), category == SettingsCategory::Advanced),
+        (keyboard, category == SettingsCategory::Keyboard),
+    ] {
+        for id in ids {
+            if let Ok(control) = unsafe { GetDlgItem(Some(window), *id) } {
+                let _ = unsafe { ShowWindow(control, if shown { SW_SHOW } else { SW_HIDE }) };
+            }
         }
     }
     for (id, selected) in [
-        (SETTINGS_DISPLAY_TAB_ID, display),
-        (SETTINGS_ADVANCED_TAB_ID, !display),
+        (
+            SETTINGS_DISPLAY_TAB_ID,
+            category == SettingsCategory::Display,
+        ),
+        (
+            SETTINGS_ADVANCED_TAB_ID,
+            category == SettingsCategory::Advanced,
+        ),
+        (
+            SETTINGS_KEYBOARD_TAB_ID,
+            category == SettingsCategory::Keyboard,
+        ),
     ] {
         if let Ok(control) = unsafe { GetDlgItem(Some(window), id as i32) } {
             unsafe {
@@ -1013,13 +1112,16 @@ unsafe extern "system" fn settings_window_proc(
     match message {
         WM_COMMAND => {
             let control_id = wparam.0 & 0xffff;
-            if control_id == SETTINGS_DISPLAY_TAB_ID {
-                unsafe { show_settings_category(window, true) };
-                return LRESULT(0);
-            }
-            if control_id == SETTINGS_ADVANCED_TAB_ID {
-                unsafe { show_settings_category(window, false) };
-                return LRESULT(0);
+            let notification = (wparam.0 >> 16) & 0xffff;
+            for (tab, category) in [
+                (SETTINGS_DISPLAY_TAB_ID, SettingsCategory::Display),
+                (SETTINGS_ADVANCED_TAB_ID, SettingsCategory::Advanced),
+                (SETTINGS_KEYBOARD_TAB_ID, SettingsCategory::Keyboard),
+            ] {
+                if control_id == tab {
+                    unsafe { show_settings_category(window, category) };
+                    return LRESULT(0);
+                }
             }
             if let Some(context) = unsafe { window_context(owner) } {
                 let preset = match control_id {
@@ -1117,6 +1219,33 @@ unsafe extern "system" fn settings_window_proc(
                 }
                 if control_id == SETTINGS_DIAGNOSTICS_ID {
                     context.toggle_debug();
+                    return LRESULT(0);
+                }
+                if control_id == SETTINGS_WINDOWS_SHORTCUTS_ID {
+                    context.control.toggle_send_windows_shortcuts();
+                    context.refresh_maintenance_controls();
+                    return LRESULT(0);
+                }
+                let shortcut = match control_id {
+                    SETTINGS_DIAGNOSTICS_KEY_ID => Some(ViewerShortcut::Diagnostics),
+                    SETTINGS_DISPLAY_KEY_ID => Some(ViewerShortcut::NextDisplay),
+                    _ => None,
+                };
+                if let Some(shortcut) = shortcut
+                    && notification == CBN_SELCHANGE as usize
+                {
+                    let selected = unsafe {
+                        SendMessageW(HWND(lparam.0 as *mut c_void), CB_GETCURSEL, None, None).0
+                    };
+                    if let Some(key) = usize::try_from(selected)
+                        .ok()
+                        .and_then(|index| ShortcutKey::ALL.get(index))
+                    {
+                        context.control.set_shortcut_key(shortcut, *key);
+                        context.title = window_title(&context.active_display);
+                        let _ = unsafe { SetWindowTextW(owner, PCWSTR(context.title.as_ptr())) };
+                    }
+                    context.refresh_maintenance_controls();
                     return LRESULT(0);
                 }
             }
@@ -1252,6 +1381,16 @@ unsafe fn create_settings_window(
         118,
         34,
         SETTINGS_ADVANCED_TAB_ID,
+    )?;
+    let _ = make_control(
+        w!("BUTTON"),
+        w!("Keyboard"),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTORADIOBUTTON as u32),
+        16,
+        100,
+        118,
+        34,
+        SETTINGS_KEYBOARD_TAB_ID,
     )?;
     let static_style = WS_CHILD | WS_VISIBLE;
     let _ = make_control(
@@ -1515,7 +1654,89 @@ unsafe fn create_settings_window(
         28,
         SETTINGS_DISCONNECT_ID,
     )?;
-    unsafe { show_settings_category(settings, true) };
+    let _ = make_control(
+        w!("STATIC"),
+        w!("Keyboard"),
+        static_style,
+        162,
+        24,
+        340,
+        28,
+        SETTINGS_KEYBOARD_TITLE_ID as usize,
+    )?;
+    let _ = make_control(
+        w!("BUTTON"),
+        w!("Send Windows shortcuts to the device (Windows key, Alt+Tab, Alt+Esc, Ctrl+Esc)"),
+        WINDOW_STYLE(
+            WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32 | BS_MULTILINE as u32,
+        ),
+        162,
+        66,
+        370,
+        48,
+        SETTINGS_WINDOWS_SHORTCUTS_ID,
+    )?;
+    for (title_id, title, combo_id, y) in [
+        (
+            SETTINGS_DIAGNOSTICS_KEY_TITLE_ID,
+            w!("Diagnostics overlay key"),
+            SETTINGS_DIAGNOSTICS_KEY_ID,
+            130,
+        ),
+        (
+            SETTINGS_DISPLAY_KEY_TITLE_ID,
+            w!("Next display key"),
+            SETTINGS_DISPLAY_KEY_ID,
+            204,
+        ),
+    ] {
+        let _ = make_control(
+            w!("STATIC"),
+            title,
+            static_style,
+            162,
+            y,
+            340,
+            24,
+            title_id as usize,
+        )?;
+        let combo = make_control(
+            w!("COMBOBOX"),
+            w!(""),
+            WINDOW_STYLE(
+                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
+            ),
+            162,
+            y + 28,
+            280,
+            240,
+            combo_id,
+        )?;
+        for key in ShortcutKey::ALL {
+            let label = HSTRING::from(key.label());
+            unsafe {
+                SendMessageW(
+                    combo,
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(label.as_ptr() as isize)),
+                );
+            }
+        }
+    }
+    let _ = make_control(
+        w!("STATIC"),
+        w!(
+            "A key that is off goes to the device. Ctrl+Alt+Del and Windows+L always stay with this computer."
+        ),
+        static_style,
+        162,
+        280,
+        370,
+        48,
+        SETTINGS_KEYBOARD_NOTE_ID as usize,
+    )?;
+    unsafe { show_settings_category(settings, SettingsCategory::Display) };
     Ok(SettingsControls {
         window: settings,
         dpi: 96,
@@ -1859,18 +2080,16 @@ pub(super) unsafe fn create_window(
             WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
                 if let Some(context) = context {
                     let pressed = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
-                    if wparam.0 as u16 == VK_F8.0 && pressed {
-                        if lparam.0 & (1 << 30) == 0 {
-                            context.select_next_display();
-                        }
-                        return LRESULT(0);
-                    }
-                    if wparam.0 as u16 == VK_F8.0 {
-                        return LRESULT(0);
-                    }
-                    if wparam.0 as u16 == VK_F12.0 {
+                    if let Some(shortcut) = crate::shortcuts::windows_shortcut(
+                        wparam.0 as u16,
+                        context.control.shortcut_key(ViewerShortcut::Diagnostics),
+                        context.control.shortcut_key(ViewerShortcut::NextDisplay),
+                    ) {
                         if pressed && lparam.0 & (1 << 30) == 0 {
-                            context.toggle_debug();
+                            match shortcut {
+                                ViewerShortcut::NextDisplay => context.select_next_display(),
+                                ViewerShortcut::Diagnostics => context.toggle_debug(),
+                            }
                         }
                         return LRESULT(0);
                     }
@@ -1888,25 +2107,23 @@ pub(super) unsafe fn create_window(
                     }
                     let scan_code = ((lparam.0 >> 16) & 0xff) as u16;
                     let extended = lparam.0 & (1 << 24) != 0;
-                    if scan_code != 0 {
-                        context.send(SessionMessage::Input(RemoteInput::Key {
-                            display_id: context.active_display.id,
-                            scan_code,
-                            extended,
-                            pressed,
-                        }));
-                        if pressed {
-                            context.pressed_keys.insert((scan_code, extended));
-                        } else {
-                            context.pressed_keys.remove(&(scan_code, extended));
-                        }
-                    }
+                    context.send_key(scan_code, extended, pressed);
+                }
+                LRESULT(0)
+            }
+            keyboard_hook::WM_SYSTEM_SHORTCUT_KEY => {
+                if let Some(context) = context {
+                    let (scan_code, extended, pressed) = keyboard_hook::unpack(wparam);
+                    context.send_key(scan_code, extended, pressed);
                 }
                 LRESULT(0)
             }
             WM_SETFOCUS => {
                 if let Some(context) = context {
                     context.control.set_input_enabled(true);
+                    if context.control.send_windows_shortcuts() {
+                        keyboard_hook::install(window);
+                    }
                 }
                 LRESULT(0)
             }
@@ -1922,6 +2139,7 @@ pub(super) unsafe fn create_window(
                 LRESULT(GetStockObject(BLACK_BRUSH).0 as isize)
             },
             WM_KILLFOCUS => {
+                keyboard_hook::remove();
                 if let Some(context) = context {
                     context.release_input();
                     context.control.set_input_enabled(false);
@@ -1958,6 +2176,7 @@ pub(super) unsafe fn create_window(
                 LRESULT(0)
             }
             WM_DESTROY => {
+                keyboard_hook::remove();
                 unsafe { PostQuitMessage(0) };
                 LRESULT(0)
             }
@@ -2022,15 +2241,7 @@ pub(super) unsafe fn create_window(
     let placement = *LAST_PLACEMENT
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let title = HSTRING::from(format!(
-        "MeshRMM Remote Desktop — {} ({}) — F8 display · F12 diagnostics",
-        active_display.name,
-        if active_display.primary {
-            "primary"
-        } else {
-            "secondary"
-        }
-    ));
+    let title = window_title(&active_display);
     let context = Box::new(WindowContext {
         video_width: format.width,
         video_height: format.height,

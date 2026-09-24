@@ -364,7 +364,7 @@ define_class!(
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             self.sync_modifiers(event.modifierFlags());
-            if event.keyCode() == 111 {
+            if self.is_diagnostics_key(event) {
                 if !event.isARepeat() {
                     self.toggle_debug();
                 }
@@ -465,6 +465,23 @@ define_class!(
                 if action == sel!(toggleWallpaper:) { item.setState(isize::from(self.ivars().control.wallpaper_hidden())); }
                 if action == sel!(toggleRemoteCursor:) { item.setState(isize::from(self.ivars().control.show_remote_cursor())); }
                 menu.addItem(&item);
+                if action == sel!(toggleDiagnostics:) {
+                    let shortcut = NSMenuItem::new(self.mtm());
+                    shortcut.setTitle(&NSString::from_str("Diagnostics key"));
+                    let choices = NSMenu::new(self.mtm());
+                    let selected = self.ivars().control.shortcut_key(crate::shortcuts::ViewerShortcut::Diagnostics);
+                    for (index, key) in crate::shortcuts::ShortcutKey::ALL.into_iter().enumerate() {
+                        let choice_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(
+                            NSMenuItem::alloc(self.mtm()), &NSString::from_str(key.label()), Some(sel!(selectDiagnosticsKey:)), &NSString::new(),
+                        ) };
+                        unsafe { choice_item.setTarget(Some(self)); }
+                        choice_item.setTag(index as isize);
+                        choice_item.setState(isize::from(key == selected));
+                        choices.addItem(&choice_item);
+                    }
+                    shortcut.setSubmenu(Some(&choices));
+                    menu.addItem(&shortcut);
+                }
                 if action == sel!(toggleDisconnectConfirmation:) {
                     let close = NSMenuItem::new(self.mtm());
                     close.setTitle(&NSString::from_str("On session close"));
@@ -520,6 +537,16 @@ define_class!(
         fn select_session_close_action(&self, sender: &NSMenuItem) {
             if let Some(action) = usize::try_from(sender.tag()).ok().and_then(|index| SessionCloseAction::ALL.get(index)) {
                 self.ivars().control.set_session_close_action(*action);
+            }
+        }
+
+        #[unsafe(method(selectDiagnosticsKey:))]
+        fn select_diagnostics_key(&self, sender: &NSMenuItem) {
+            if let Some(key) = usize::try_from(sender.tag()).ok().and_then(|index| crate::shortcuts::ShortcutKey::ALL.get(index)) {
+                self.ivars().control.set_shortcut_key(crate::shortcuts::ViewerShortcut::Diagnostics, *key);
+                if let Some(window) = self.window() {
+                    window.setTitle(&NSString::from_str(&super::presenter::window_title(&self.ivars().active_display.borrow().name)));
+                }
             }
         }
 
@@ -850,7 +877,7 @@ impl RemoteView {
 
     fn handle_key_up(&self, event: &NSEvent) {
         self.sync_modifiers(event.modifierFlags());
-        if event.keyCode() == 111 {
+        if self.is_diagnostics_key(event) {
             return;
         }
         self.send_key(event.keyCode(), false);
@@ -1241,6 +1268,15 @@ impl RemoteView {
         self.send(SessionMessage::SelectDisplay {
             display_id: displays[selected].id,
         });
+    }
+
+    fn is_diagnostics_key(&self, event: &NSEvent) -> bool {
+        crate::shortcuts::macos_toggles_diagnostics(
+            event.keyCode(),
+            self.ivars()
+                .control
+                .shortcut_key(crate::shortcuts::ViewerShortcut::Diagnostics),
+        )
     }
 
     fn toggle_debug(&self) {

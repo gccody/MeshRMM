@@ -29,7 +29,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, ReleaseCapture, SetCapture, SetFocus, VK_F8, VK_F12,
+    EnableWindow, ReleaseCapture, SetCapture, SetFocus,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, Interface, PCWSTR, w};
@@ -37,6 +37,7 @@ use windows::core::{HSTRING, Interface, PCWSTR, w};
 use super::ControlSink;
 use crate::debug::DebugInfo;
 
+mod keyboard_hook;
 mod pipeline;
 mod renderer;
 mod window;

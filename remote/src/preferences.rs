@@ -1,4 +1,5 @@
 //! Viewer-wide preferences for the current OS user, independent of agent/session IDs.
+use crate::shortcuts::{ShortcutKey, ViewerShortcut};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -18,6 +19,11 @@ struct Preferences {
     clear_clipboard_on_close: bool,
     /// macOS: the Command key sends Ctrl instead of the Windows key.
     command_as_control: bool,
+    /// Windows: the Windows key, Alt+Tab, Alt+Esc and Ctrl+Esc go to the device.
+    send_windows_shortcuts: bool,
+    diagnostics_key: ShortcutKey,
+    /// Windows: cycles the viewed display.
+    next_display_key: ShortcutKey,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -26,6 +32,9 @@ impl Default for Preferences {
             clipboard_sync: true,
             clear_clipboard_on_close: true,
             command_as_control: false,
+            send_windows_shortcuts: true,
+            diagnostics_key: ShortcutKey::F12,
+            next_display_key: ShortcutKey::F8,
         }
     }
 }
@@ -102,6 +111,41 @@ pub fn command_as_control() -> bool {
 pub fn toggle_command_as_control() -> anyhow::Result<()> {
     toggle(|p| &mut p.command_as_control)
 }
+#[cfg(windows)]
+pub fn send_windows_shortcuts() -> bool {
+    get(|p| p.send_windows_shortcuts)
+}
+#[cfg(windows)]
+pub fn toggle_send_windows_shortcuts() -> anyhow::Result<()> {
+    toggle(|p| &mut p.send_windows_shortcuts)
+}
+pub fn shortcut_key(shortcut: ViewerShortcut) -> ShortcutKey {
+    let (diagnostics, next_display) = get(|p| (p.diagnostics_key, p.next_display_key));
+    match shortcut {
+        ViewerShortcut::Diagnostics => diagnostics,
+        ViewerShortcut::NextDisplay => next_display,
+    }
+}
+pub fn set_shortcut_key(shortcut: ViewerShortcut, key: ShortcutKey) -> anyhow::Result<()> {
+    update(|p| assign_shortcut(p, shortcut, key))
+}
+/// A key serves one shortcut: giving it to one turns the other off.
+fn assign_shortcut(preferences: &mut Preferences, shortcut: ViewerShortcut, key: ShortcutKey) {
+    let (assigned, other) = match shortcut {
+        ViewerShortcut::Diagnostics => (
+            &mut preferences.diagnostics_key,
+            &mut preferences.next_display_key,
+        ),
+        ViewerShortcut::NextDisplay => (
+            &mut preferences.next_display_key,
+            &mut preferences.diagnostics_key,
+        ),
+    };
+    *assigned = key;
+    if *other == key {
+        *other = ShortcutKey::Off;
+    }
+}
 fn save(path: &Path, preferences: &Preferences) -> anyhow::Result<()> {
     let directory = path.parent().context("preferences path has no parent")?;
     std::fs::create_dir_all(directory)?;
@@ -147,6 +191,7 @@ mod tests {
                 clipboard_sync: false,
                 clear_clipboard_on_close: false,
                 command_as_control: true,
+                ..Preferences::default()
             },
         )
         .unwrap();
@@ -164,6 +209,9 @@ mod tests {
         assert!(load(&path).clipboard_sync);
         assert!(load(&path).clear_clipboard_on_close);
         assert!(!load(&path).command_as_control);
+        assert!(load(&path).send_windows_shortcuts);
+        assert_eq!(load(&path).diagnostics_key, ShortcutKey::F12);
+        assert_eq!(load(&path).next_display_key, ShortcutKey::F8);
         // The session close action used to be saved here; it is now per session.
         std::fs::write(
             &path,
@@ -176,5 +224,53 @@ mod tests {
         assert!(load(&path).clipboard_sync);
         assert!(load(&path).clear_clipboard_on_close);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn shortcut_keys_persist_and_never_share_a_key() {
+        let mut preferences = Preferences::default();
+        assign_shortcut(
+            &mut preferences,
+            ViewerShortcut::Diagnostics,
+            ShortcutKey::F11,
+        );
+        assert_eq!(
+            (preferences.diagnostics_key, preferences.next_display_key),
+            (ShortcutKey::F11, ShortcutKey::F8)
+        );
+        assign_shortcut(
+            &mut preferences,
+            ViewerShortcut::NextDisplay,
+            ShortcutKey::F11,
+        );
+        assert_eq!(
+            (preferences.diagnostics_key, preferences.next_display_key),
+            (ShortcutKey::Off, ShortcutKey::F11)
+        );
+        assign_shortcut(
+            &mut preferences,
+            ViewerShortcut::Diagnostics,
+            ShortcutKey::Off,
+        );
+        assign_shortcut(
+            &mut preferences,
+            ViewerShortcut::NextDisplay,
+            ShortcutKey::Off,
+        );
+        assert_eq!(
+            (preferences.diagnostics_key, preferences.next_display_key),
+            (ShortcutKey::Off, ShortcutKey::Off)
+        );
+        let json = serde_json::to_string(&Preferences {
+            diagnostics_key: ShortcutKey::F10,
+            send_windows_shortcuts: false,
+            ..Preferences::default()
+        })
+        .unwrap();
+        let loaded: Preferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.diagnostics_key, ShortcutKey::F10);
+        assert!(!loaded.send_windows_shortcuts);
+        // An unknown key makes the file invalid, so the defaults apply.
+        let invalid: Result<Preferences, _> = serde_json::from_str(r#"{"diagnostics_key":"F1"}"#);
+        assert!(invalid.is_err());
     }
 }
