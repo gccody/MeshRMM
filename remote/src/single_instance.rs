@@ -71,10 +71,11 @@ pub fn claim(
                 unsafe {
                     let _ = CloseHandle(event.0);
                 }
-                bail!(
+                return Err(crate::errors::UserFacing(format!(
                     "The remote viewer that is already open for this device did not close within {} seconds. Close it and try again.",
                     timeout.as_secs()
-                );
+                ))
+                .into());
             }
             other => {
                 unsafe {

@@ -1594,7 +1594,7 @@ where
                     tracing::error!(error = ?error, "macOS viewer network session failed")
                 }
             }
-            let error = result.as_ref().err().map(|error| format!("{error:#}"));
+            let error = result.as_ref().err().map(crate::errors::user_message);
             let _ = result_tx.send(result);
             DispatchQueue::main().exec_async(move || {
                 if let Some(mtm) = MainThreadMarker::new() {

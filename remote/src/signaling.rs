@@ -1,4 +1,4 @@
-use anyhow::{Context, bail};
+use anyhow::Context;
 use meshrmm_protocol::SessionBootstrap;
 use meshrmm_signaling_client::{Socket, endpoint_url};
 use url::Url;
@@ -22,10 +22,10 @@ pub async fn create_session(config: &Config) -> anyhow::Result<SessionBootstrap>
         .send()
         .await
         .context("Cloudflare session API request failed")?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        bail!("session API returned HTTP {status}: {body}");
+    if !response.status().is_success() {
+        return Err(crate::errors::ApiError::from_response(response)
+            .await
+            .into());
     }
     response
         .json()
@@ -76,6 +76,11 @@ pub fn is_terminal_session_error(error: &anyhow::Error) -> bool {
                 .downcast_ref::<reqwest::Error>()
                 .and_then(reqwest::Error::status)
                 .is_some_and(|status| matches!(status.as_u16(), 400 | 401 | 403 | 404 | 410))
+        })
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<crate::errors::ApiError>()
+                .is_some_and(|api| matches!(api.status, 400 | 401 | 403 | 404 | 410))
         })
 }
 

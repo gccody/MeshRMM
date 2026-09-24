@@ -200,8 +200,9 @@ mod tests {
     }
 }
 
+/// The server closed signaling because the session was ended or revoked.
 #[derive(Debug)]
-struct TerminalClose;
+pub struct TerminalClose;
 impl std::fmt::Display for TerminalClose {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "remote session was ended or revoked")

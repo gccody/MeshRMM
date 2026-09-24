@@ -364,6 +364,28 @@ pub fn enable_dpi_awareness() {
     }
 }
 
+/// Attaches to the console of the process that started the viewer, if any,
+/// so command-line output reaches a terminal despite the GUI subsystem.
+pub fn attach_parent_console() {
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // Fails when started from Explorer or a browser, which have no console.
+    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+/// Shows why the viewer stopped. Without a console, this is the only place
+/// a fatal error appears apart from the log.
+pub fn show_fatal_error(message: &str) {
+    let text = HSTRING::from(message);
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            w!("MeshRMM Remote"),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        )
+    };
+}
+
 pub fn monotonic_timestamp_us() -> u64 {
     unsafe {
         let mut counter = 0_i64;
