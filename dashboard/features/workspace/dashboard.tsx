@@ -25,7 +25,7 @@ import {
   X,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AUTH_REFRESH_FAILED_EVENT, useRuntimeConfig } from "../../app/providers";
 import { AgentOverview, type AgentStatusFilter } from "../agents/agent-overview";
 import { useAgentInventory } from "../agents/use-agent-inventory";
@@ -37,6 +37,7 @@ import {
   formatIdleTimeout,
 } from "../session/idle-session";
 import { remoteViewerLink } from "../session/remote-link";
+import { AccountLoadError, accountLoader } from "./account-load";
 import { useIdleSession } from "../session/use-idle-session";
 import { MarketingPage } from "../marketing/marketing-page";
 import { PlatformDashboard } from "../platform/platform-dashboard";
@@ -95,6 +96,9 @@ function TenantDashboard({ view }: { view: View }) {
     roles,
   } = useAuth();
   const [account, setAccount] = useState<Account | null>(null);
+  const [accountError, setAccountError] = useState<{ message: string; retrying: boolean } | null>(null);
+  const accountLoad = useRef<{ retry: () => void } | null>(null);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("dashboard-security");
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<AgentStatusFilter>("all");
@@ -132,6 +136,7 @@ function TenantDashboard({ view }: { view: View }) {
     account?.permissions.includes("company:settings:manage"),
   );
   const companyId = account?.company?.id;
+  const accountPending = hasTenantSession && !account;
   const idleTimeoutMinutes = account?.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES;
 
   const lockSession = useCallback((reason: SessionPauseReason) => {
@@ -199,38 +204,47 @@ function TenantDashboard({ view }: { view: View }) {
     return () => window.removeEventListener(AUTH_REFRESH_FAILED_EVENT, handleRefreshFailure);
   }, [lockSession, resetInventory]);
 
-  const loadAccount = useCallback(async () => {
-    if (!hasTenantSession) {
-      setAccount(null);
-      return null;
-    }
-    const response = await authorizedFetch("/v1/account");
-    if (!response.ok) throw new Error(await errorMessage(response, "The company account could not be loaded."));
-    const data = (await response.json()) as Account;
+  const applyAccount = useCallback((data: Account) => {
     setAccount(data);
     setIdleTimeoutDraft(data.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES);
     setBlackoutMessageDraft(data.company?.blackout_message ?? DEFAULT_BLACKOUT_MESSAGE);
     setDisplayBorderDraft(data.company?.display_border ?? true);
     setPreventIdleDraft(data.company?.prevent_idle_lock ?? true);
     setAllowIdleOverrideDraft(data.company?.allow_idle_override ?? true);
-    return data;
-  }, [authorizedFetch, hasTenantSession]);
+  }, []);
 
+  const fetchAccount = useCallback(async () => {
+    const response = await authorizedFetch("/v1/account");
+    if (!response.ok) {
+      throw new AccountLoadError(await errorMessage(response, "The company account could not be loaded."), response.status);
+    }
+    return (await response.json()) as Account;
+  }, [authorizedFetch]);
+
+  // The account carries the idle policy, so the workspace stays hidden until it
+  // loads. The event subscription supplies the initial inventory.
   useEffect(() => {
-    if (isAuthLoading || !hasTenantSession) return;
-    let cancelled = false;
-    const start = async () => {
-      try {
-        await loadAccount(); // The event subscription supplies the initial inventory.
-      } catch (requestError) {
-        if (!cancelled && !(requestError instanceof AuthenticationRequired)) {
-          setError(requestError instanceof Error ? requestError.message : "The company account could not be loaded.");
-        }
-      }
+    if (isAuthLoading || !hasTenantSession || sessionPauseReason) return;
+    const loader = accountLoader({
+      load: fetchAccount,
+      onLoaded: (data) => {
+        setAccountError(null);
+        applyAccount(data);
+      },
+      onError: (requestError, retryInMs) => {
+        if (requestError instanceof AuthenticationRequired) return;
+        setAccountError({
+          message: requestError instanceof Error ? requestError.message : "The company account could not be loaded.",
+          retrying: retryInMs !== null,
+        });
+      },
+    });
+    accountLoad.current = loader;
+    return () => {
+      loader.stop();
+      accountLoad.current = null;
     };
-    void start();
-    return () => { cancelled = true; };
-  }, [hasTenantSession, isAuthLoading, loadAccount]);
+  }, [applyAccount, fetchAccount, hasTenantSession, isAuthLoading, sessionPauseReason]);
 
   const filteredAgents = useMemo(() => {
     const search = query.trim().toLowerCase();
@@ -259,14 +273,8 @@ function TenantDashboard({ view }: { view: View }) {
       if (!response.ok) {
         throw new Error(await errorMessage(response, "The session policy could not be saved."));
       }
-      const data = (await response.json()) as Account;
-      setAccount(data);
+      applyAccount((await response.json()) as Account);
       setSettingsNotice("Company settings saved. Remote defaults apply to new sessions.");
-      setIdleTimeoutDraft(data.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES);
-    setBlackoutMessageDraft(data.company?.blackout_message ?? DEFAULT_BLACKOUT_MESSAGE);
-    setDisplayBorderDraft(data.company?.display_border ?? true);
-    setPreventIdleDraft(data.company?.prevent_idle_lock ?? true);
-    setAllowIdleOverrideDraft(data.company?.allow_idle_override ?? true);
     } catch (requestError) {
       if (!(requestError instanceof AuthenticationRequired)) {
         setError(requestError instanceof Error ? requestError.message : "The session policy could not be saved.");
@@ -414,11 +422,17 @@ function TenantDashboard({ view }: { view: View }) {
     }
   };
 
-  const handleSignOut = () => {
+  const handleSignOut = async () => {
     resetInventory();
     setAccount(null);
     setIsAuthOpen(false);
-    signOut({ returnTo: "https://meshrmm.com" });
+    setSignOutError(null);
+    try {
+      await signOut({ returnTo: "https://meshrmm.com" });
+    } catch {
+      // The browser session is already cleared, but the WorkOS session may remain.
+      setSignOutError("Sign-out could not be completed. Sign in and sign out again, or close your browser, to end your session.");
+    }
   };
 
   const setActiveView = (next: View) => {
@@ -484,6 +498,7 @@ function TenantDashboard({ view }: { view: View }) {
               <p className="eyebrow">Secure company access</p>
               <h1>Sign in to MeshRMM</h1>
               <p>Sign in with your company account to manage devices and start remote sessions.</p>
+              {signOutError && <p role="alert">{signOutError}</p>}
               <button className="primary-button" onClick={() => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } })}><ShieldCheck size={16} /> Sign in securely</button>
             </section>
           ) : user && !hasTenantSession ? (
@@ -492,7 +507,10 @@ function TenantDashboard({ view }: { view: View }) {
               <p className="eyebrow">Company-specific access</p>
               <h1>Continue to this company</h1>
               <p>Sign in with an account that has access to this company’s workspace.</p>
-              <button className="primary-button" onClick={() => void signOut({ navigate: false }).then(() => signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } }))}><ShieldCheck size={16} /> Continue to company</button>
+              {signOutError && <p role="alert">{signOutError}</p>}
+              <button className="primary-button" onClick={() => void signOut({ navigate: false })
+                .then(() => signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } }))
+                .catch(() => setSignOutError("Your session could not be switched. Please retry."))}><ShieldCheck size={16} /> Continue to company</button>
             </section>
           ) : account && !account.company ? (
             <section className="signed-out-card organization-required">
@@ -509,7 +527,7 @@ function TenantDashboard({ view }: { view: View }) {
                   <h1>{view === "agents" ? "Devices" : view === "team" ? "Users" : view === "settings" ? "Settings" : "Authentication"}</h1>
                   <p>{view === "agents" ? "Connect to your devices and keep your team working." : view === "team" ? "Invite your team and manage their access." : view === "settings" ? "Manage company security and remote session defaults." : "Manage company domains and single sign-on."}</p>
                 </div>
-                {view === "agents" && <div className="heading-actions">
+                {view === "agents" && !accountPending && <div className="heading-actions">
                   <button className="secondary-button" onClick={() => void loadAgents()}><RefreshCw size={16} className={isRefreshing ? "spin" : ""} /> Refresh</button>
                   {isAdmin && <button className="primary-button" onClick={() => { setAgentPlatform("windows-x64"); setInstallerDownloaded(false); setInstallerError(null); setIsAgentOpen(true); }}><Plus size={16} /> Add device</button>}
                 </div>}
@@ -517,7 +535,20 @@ function TenantDashboard({ view }: { view: View }) {
 
               {error && <div className="error-banner" role="alert"><WifiOff size={17} /><span>{error}</span><button onClick={() => setError(null)} aria-label="Dismiss"><X size={16} /></button></div>}
 
-              {view === "settings" ? (<div className="settings-page">
+              {accountPending ? (
+                <section className="management-panel account-status">
+                  {accountError ? (
+                    <>
+                      <h2>Your company workspace could not be loaded</h2>
+                      <p role="alert">{accountError.message}</p>
+                      <p>{accountError.retrying ? "MeshRMM will keep retrying." : "Resolve the problem, then try again."}</p>
+                      <button className="secondary-button" onClick={() => accountLoad.current?.retry()}><RefreshCw size={16} /> Retry now</button>
+                    </>
+                  ) : (
+                    <p role="status"><LoaderCircle size={16} className="spin" /> Loading your company workspace…</p>
+                  )}
+                </section>
+              ) : view === "settings" ? (<div className="settings-page">
                     <div className="settings-categories" role="tablist" aria-label="Settings categories">
                       {SETTINGS_TABS.map((tab, index) => (
                         <button
@@ -623,7 +654,7 @@ function TenantDashboard({ view }: { view: View }) {
         </div>
       </main>
 
-      {isAuthOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsAuthOpen(false)}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="account-title"><button className="modal-close" onClick={() => setIsAuthOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><ShieldCheck size={22} /></div><p className="eyebrow">Authenticated</p><h2 id="account-title">Your account</h2>{user ? <><div className="account-summary"><div className="profile-avatar">{initials}</div><div><strong>{displayName}</strong><span>{user.email}</span></div></div><button className="secondary-button modal-submit" onClick={handleSignOut}><LogOut size={16} /> Sign out</button></> : <button className="primary-button modal-submit" onClick={() => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } })}><ShieldCheck size={16} /> Sign in securely</button>}</section></div>}
+      {isAuthOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsAuthOpen(false)}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="account-title"><button className="modal-close" onClick={() => setIsAuthOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><ShieldCheck size={22} /></div><p className="eyebrow">Authenticated</p><h2 id="account-title">Your account</h2>{user ? <><div className="account-summary"><div className="profile-avatar">{initials}</div><div><strong>{displayName}</strong><span>{user.email}</span></div></div><button className="secondary-button modal-submit" onClick={() => void handleSignOut()}><LogOut size={16} /> Sign out</button></> : <button className="primary-button modal-submit" onClick={() => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } })}><ShieldCheck size={16} /> Sign in securely</button>}</section></div>}
 
       {isAgentOpen && (
         <EnrollmentModal
