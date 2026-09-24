@@ -34,6 +34,8 @@ mod platform;
 #[cfg(any(windows, test))]
 mod secure_attention;
 #[cfg(windows)]
+pub(crate) mod service_link;
+#[cfg(windows)]
 mod session;
 #[cfg(any(windows, test))]
 pub(crate) mod session_close;
@@ -69,6 +71,26 @@ struct ActiveSession {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Ends the remote session and runs its close actions before the coordinator exits, since the
+/// session cannot outlive it and nothing else would run them.
+#[cfg(windows)]
+async fn end_sessions(
+    active_session: &mut Option<ActiveSession>,
+    session_close: &mut Option<(
+        meshrmm_protocol::RemoteSessionId,
+        std::sync::Arc<session_close::SessionClose>,
+    )>,
+) {
+    if let Some(active) = active_session.take() {
+        active.task.abort();
+        let _ = active.task.await;
+        tracing::info!(session_id = %active.session_id, "stopped remote session because the Agent is stopping");
+    }
+    if let Some((id, close)) = session_close.take() {
+        close.finish(&id).await;
+    }
+}
+
 #[cfg_attr(not(windows), allow(unused_variables))]
 pub async fn run(
     #[allow(unused_mut)] mut config: Config,
@@ -79,6 +101,7 @@ pub async fn run(
 
     #[cfg(windows)]
     {
+        let link = service_link::ServiceLink::new(mode == ExecutionMode::Worker);
         let mut retry_delay = Duration::from_secs(1);
         let mut active_session = None::<ActiveSession>;
         // Outlives session tasks, which end whenever the viewer drops its
@@ -194,7 +217,9 @@ pub async fn run(
                                             let active_request = request.clone();
                                             let session_config = config.clone();
                                             let task_session_id = session_id.clone();
+                                            let activity = link.session_started();
                                             let task = tokio::spawn(async move {
+                                                let _activity = activity;
                                                 if let Err(error) = session::run(&session_config, request, mode, close).await {
                                                     tracing::error!(
                                                         error = ?error,
@@ -217,16 +242,13 @@ pub async fn run(
                                         _ => {}
                                     }
                                 }
-                                _ = tokio::signal::ctrl_c() => break Ok(true),
+                                () = link.stopped() => break Ok(true),
                             }
                         }
                     }.await;
                     match connection_result {
                         Ok(true) => {
-                            if let Some(active) = active_session.take() {
-                                active.task.abort();
-                                let _ = active.task.await;
-                            }
+                            end_sessions(&mut active_session, &mut session_close).await;
                             return Ok(());
                         }
                         Ok(false) => tracing::warn!("Agent signaling disconnected"),
@@ -241,11 +263,8 @@ pub async fn run(
             }
             tokio::select! {
                 _ = sleep(retry_delay) => {},
-                _ = tokio::signal::ctrl_c() => {
-                    if let Some(active) = active_session.take() {
-                        active.task.abort();
-                        let _ = active.task.await;
-                    }
+                () = link.stopped() => {
+                    end_sessions(&mut active_session, &mut session_close).await;
                     return Ok(());
                 },
             }

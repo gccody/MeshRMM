@@ -64,11 +64,26 @@ impl SessionClose {
 
     #[cfg(windows)]
     pub fn run(&self, session_id: &meshrmm_protocol::RemoteSessionId) {
-        let Some(pending) = self.take() else {
-            return;
-        };
+        self.spawn(session_id);
+    }
+
+    /// Runs the pending work like [`Self::run`] and waits for it, for a coordinator that is
+    /// about to exit.
+    #[cfg(windows)]
+    pub async fn finish(&self, session_id: &meshrmm_protocol::RemoteSessionId) {
+        if let Some(task) = self.spawn(session_id) {
+            let _ = task.await;
+        }
+    }
+
+    #[cfg(windows)]
+    fn spawn(
+        &self,
+        session_id: &meshrmm_protocol::RemoteSessionId,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let pending = self.take()?;
         let session_id = session_id.clone();
-        tokio::task::spawn_blocking(move || {
+        Some(tokio::task::spawn_blocking(move || {
             let Pending {
                 action,
                 clear_clipboard,
@@ -103,7 +118,7 @@ impl SessionClose {
                     tracing::warn!(%session_id, ?action, session = %target.label(), error = ?error, "session close action failed")
                 }
             }
-        });
+        }))
     }
 }
 
