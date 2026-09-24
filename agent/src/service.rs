@@ -96,6 +96,10 @@ fn run_service() -> anyhow::Result<()> {
             | ServiceControlAccept::SESSION_CHANGE,
     ))?;
 
+    if let Some(config_directory) = config.config_path.parent() {
+        crate::updater::remove_stale_files(config_directory);
+    }
+
     let mut worker: Option<WorkerProcess> = None;
     let mut trays = trays::Trays::default();
     let mut next_update_check = Instant::now();
@@ -129,6 +133,9 @@ fn run_service() -> anyhow::Result<()> {
             next_update_check = Instant::now() + Duration::from_secs(6 * 60 * 60);
             match crate::updater::check_and_schedule(config) {
                 Ok(true) => {
+                    // Stop cleanly: the helper restarts the service on every path, while a
+                    // failure exit would let SCM recovery start this executable again while
+                    // the helper is replacing it.
                     tracing::info!("staged an Agent update; stopping the service for replacement");
                     break Ok(());
                 }
