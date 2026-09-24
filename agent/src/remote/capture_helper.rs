@@ -2013,10 +2013,14 @@ fn dispatch_input_events(
                     (shape, viewer_controls_input, pointer_display);
             }
             ChildEvent::Files(message) => {
+                // A window of the helper's transfer plus its acknowledgements
+                // of the viewer's fits; the windows keep it from growing further.
                 let mut queue = files.queue.lock().unwrap();
-                if queue.len() < 32 {
+                if queue.len() < meshrmm_file_transfer::COMMAND_QUEUE {
                     queue.push_back(message);
                     files.ready.notify_one();
+                } else {
+                    tracing::warn!("dropped a file-transfer message from the desktop helper");
                 }
             }
             ChildEvent::Chat(text) => {
