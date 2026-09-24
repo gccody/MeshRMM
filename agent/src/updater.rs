@@ -609,18 +609,7 @@ fn schedule_cleanup(helper: &Path, helper_directory: &Path) -> anyhow::Result<()
     let working_directory = helper_directory
         .parent()
         .context("Agent update directory has no parent directory")?;
-    let cleanup = format!(
-        "ping.exe 127.0.0.1 -n 3 >NUL & del /f /q \"{}\" & rmdir /q \"{}\"",
-        helper.display(),
-        helper_directory.display()
-    );
-    Command::new("cmd.exe")
-        .args(["/D", "/S", "/C"])
-        // `arg` would escape the inner quotes as \", which cmd does not understand. With /S, cmd
-        // removes only the outer pair of quotes.
-        .raw_arg(format!("\"{cleanup}\""))
-        .current_dir(working_directory)
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+    crate::installer::helper_cleanup_command(helper, helper_directory, working_directory)
         .spawn()
         .context("failed to schedule Agent update cleanup")?;
     Ok(())

@@ -159,6 +159,13 @@ fn stage_uninstall_helper(program_data: &Path, source: &Path) -> anyhow::Result<
 }
 
 pub fn uninstall() -> anyhow::Result<()> {
+    let result = remove_agent();
+    // The helper is not rerun after a failure, so it removes itself either way.
+    let cleanup = schedule_helper_cleanup();
+    result.and(cleanup)
+}
+
+fn remove_agent() -> anyhow::Result<()> {
     // Give the worker enough time to flush its coordinator acknowledgement before stopping the
     // service terminates that worker process.
     sleep(Duration::from_secs(1));
@@ -181,9 +188,7 @@ pub fn uninstall() -> anyhow::Result<()> {
     remove_directory_if_present(&install_directory)?;
     remove_empty_parent(&config_directory);
     remove_empty_parent(&install_directory);
-    remove_legacy_directories()?;
-    schedule_helper_cleanup()?;
-    Ok(())
+    remove_legacy_directories()
 }
 
 /// Installs or repairs the Agent, returning a notice for the user when legacy state was skipped.
@@ -467,20 +472,34 @@ fn schedule_helper_cleanup() -> anyhow::Result<()> {
     let cleanup_working_directory = helper_directory
         .parent()
         .context("the uninstall helper directory has no parent directory")?;
+    // The cleanup process must not keep the helper directory open while removing it.
+    helper_cleanup_command(&helper, helper_directory, cleanup_working_directory)
+        .spawn()
+        .context("failed to schedule uninstall helper cleanup")?;
+    Ok(())
+}
+
+/// Builds a detached `cmd.exe` that waits about two seconds for `helper` to exit, then deletes it
+/// and its now-empty directory. `working_directory` must be outside `helper_directory`.
+pub(crate) fn helper_cleanup_command(
+    helper: &Path,
+    helper_directory: &Path,
+    working_directory: &Path,
+) -> Command {
     let cleanup = format!(
         "ping.exe 127.0.0.1 -n 3 >NUL & del /f /q \"{}\" & rmdir /q \"{}\"",
         helper.display(),
         helper_directory.display()
     );
-    Command::new("cmd.exe")
+    let mut command = Command::new("cmd.exe");
+    command
         .args(["/D", "/S", "/C"])
-        .arg(cleanup)
-        // The cleanup process must not keep the helper directory open while removing it.
-        .current_dir(cleanup_working_directory)
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-        .spawn()
-        .context("failed to schedule uninstall helper cleanup")?;
-    Ok(())
+        // `arg` would escape the inner quotes as \", which cmd does not understand. With /S, cmd
+        // removes only the outer pair of quotes.
+        .raw_arg(format!("\"{cleanup}\""))
+        .current_dir(working_directory)
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    command
 }
 
 fn wait_for_state(
@@ -906,6 +925,32 @@ mod tests {
         assert!(is_managed_config_directory(&legacy).unwrap());
         assert!(!is_managed_config_directory(&managed.join("updates")).unwrap());
         assert!(!is_managed_config_directory(Path::new(r"C:\MeshRMM\Agent")).unwrap());
+    }
+
+    #[test]
+    fn helper_cleanup_deletes_the_helper_and_its_directory() {
+        let parent =
+            std::env::temp_dir().join(format!("meshrmm cleanup {}", uuid::Uuid::new_v4().simple()));
+        let helper_directory = parent.join("helper dir");
+        std::fs::create_dir_all(&helper_directory).unwrap();
+        let helper = helper_directory.join("meshrmm-agent-uninstall.exe");
+        std::fs::write(&helper, b"MZ helper").unwrap();
+
+        let mut command = helper_cleanup_command(&helper, &helper_directory, &parent);
+        // cmd receives the quoted paths unescaped inside one outer pair of quotes.
+        let cleanup = format!(
+            "\"ping.exe 127.0.0.1 -n 3 >NUL & del /f /q \"{}\" & rmdir /q \"{}\"\"",
+            helper.display(),
+            helper_directory.display()
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["/D", "/S", "/C", cleanup.as_str()].map(OsStr::new)
+        );
+        let status = command.spawn().unwrap().wait().unwrap();
+        assert!(status.success());
+        assert!(!helper_directory.exists());
+        std::fs::remove_dir(&parent).unwrap();
     }
 
     #[test]
