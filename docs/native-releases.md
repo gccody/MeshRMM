@@ -90,7 +90,10 @@ discover it the next time a dashboard remote session launches.
 
 If a transient failure occurs, open the failed workflow and use **Re-run all
 jobs**. The `workflow_dispatch` trigger can also republish the current version
-without another version bump.
+without another version bump. A manual run publishes only from `main`, and only
+when `release.json`'s version is not older than any release in the published
+`update-manifest.json`; if that manifest cannot be read, the run fails. Runs on
+other branches still run the checks but build and publish nothing.
 
 Each run retains the platform artifacts for 14 days and the assembled release
 for 30 days. The deploy job is the only job that writes to Cloudflare, so a

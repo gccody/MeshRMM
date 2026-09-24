@@ -19,6 +19,8 @@ jobs:
 
   validate:
     name: Validate release version
+    # Manual runs can target any branch; only main may publish.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.release.outputs.version }}
@@ -48,6 +50,17 @@ jobs:
             echo "::error::Could not read previous release configuration; refusing to skip validation."
             exit 1
           fi
+      - name: Require a version no older than the published release
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          origin=$(node scripts/release-config.mjs download-origin)
+          if ! curl --fail --silent --show-error --location --retry 3 \
+            "$origin/downloads/update-manifest.json" -o "$RUNNER_TEMP/published-manifest.json"; then
+            echo "::error::Could not read the published update manifest; refusing to republish."
+            exit 1
+          fi
+          node scripts/release-config.mjs assert-not-older "$RUNNER_TEMP/published-manifest.json"
 
   windows:
     name: Build Windows Agent and viewer
@@ -175,6 +188,7 @@ jobs:
   deploy:
     name: Publish downloads to Cloudflare
     needs: [checks, validate, windows, macos]
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: production
     env:
