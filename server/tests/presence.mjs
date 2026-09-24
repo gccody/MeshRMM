@@ -41,7 +41,7 @@ function instrument(Inner) {
         await this.ctx.storage.put('session', { ...record, expires_at_unix_ms: Date.now() + 900000 });
         return new Response('ok');
       }
-      if (path === '/presence' && await this.ctx.storage.get('test_failure')) return new Response('injected failure', { status: 503 });
+      if ((path === '/presence' || path === '/revoke') && await this.ctx.storage.get('test_failure')) return new Response('injected failure', { status: 503 });
       if (path === '/status') this.statusCalls++;
       return this.inner.fetch(request);
     }
@@ -69,7 +69,7 @@ const runtime = new Miniflare(convertV4MiniflareOptions({ workers: [{
     COMPANY_PRESENCE: { className: 'CompanyPresence', useSQLite: true },
     REMOTE_SESSION: { className: 'RemoteSession', useSQLite: true },
   }, d1Databases: ['DB'],
-  bindings: { WORKOS_CLIENT_ID: 'client-test', WORKOS_ISSUER: 'https://api.workos.com', TENANT_ROOT_DOMAIN: 'meshrmm.com', PUBLIC_API_URL: 'https://api.meshrmm.com', DASHBOARD_ORIGIN: 'https://meshrmm.com' },
+  bindings: { PLATFORM_OWNER_USER_IDS: 'owner-test', WORKOS_CLIENT_ID: 'client-test', WORKOS_ISSUER: 'https://api.workos.com', TENANT_ROOT_DOMAIN: 'meshrmm.com', PUBLIC_API_URL: 'https://api.meshrmm.com', DASHBOARD_ORIGIN: 'https://meshrmm.com' },
   outboundService: 'jwks',
 }, {
   name: 'jwks', modules: true,
@@ -227,7 +227,43 @@ try {
   assert.equal((await state(session)).alarm, before.alarm, 'activity does not rewrite alarm');
   await post(session, '/__test/alarm');
   assert.ok((await state(session)).alarm > Date.now(), 'early alarm reschedules to durable deadline');
-  console.log('Presence integration passed: event-only snapshots, durable retry, replacement ordering, renewal isolation/expiry/revocation, signing-key caching, retryable auth outages, deletion, and session alarm preservation.');
+
+  // A suspension whose revocation never reached the coordinator still takes
+  // effect at its next session request: the Agent is disconnected and the
+  // live session ends.
+  const unrevoked = collect(await connectAgent());
+  const closeCode = new Promise(resolve => unrevoked.socket.addEventListener('close', event => resolve(event.code)));
+  const peerClosed = new Promise(resolve => peer.socket.addEventListener('close', event => resolve(event.code)));
+  await db.exec("UPDATE companies SET status = 'suspended'");
+  assert.equal((await post(agent, '/lease', lease)).status, 403);
+  assert.equal(await closeCode, 4001);
+  assert.equal(await peerClosed, 4001);
+  await until(async () => (await state(session)).session === undefined, 'suspended session expired');
+  assert.equal((await post(agent, '/request', { ...lease, session_id: 'session-after-suspension' })).status, 403);
+  await db.exec("UPDATE companies SET status = 'active'");
+
+  // Suspending keeps revoking past a coordinator that fails.
+  await db.exec("ALTER TABLE companies ADD COLUMN updated_at INTEGER; CREATE TABLE platform_audit_events (id TEXT PRIMARY KEY, actor_user_id TEXT, action TEXT, company_id TEXT, metadata_json TEXT, created_at INTEGER); INSERT INTO agents VALUES ('device-failing','company-test','Failing PC',NULL);");
+  const connectDevice = (stub, device) => stub.fetch('https://agent.internal/connect', { headers: {
+    ...headers, Upgrade: 'websocket', 'X-Mesh-Device-Id': device, 'X-Mesh-Uninstall-Requested': 'false',
+  }});
+  const failing = agents.get(agents.idFromName('device-failing'));
+  const failingAgent = collect(await connectDevice(failing, 'device-failing'));
+  await post(failing, '/__test/fail', true);
+  const healthy = collect(await connectAgent());
+  const healthyClosed = new Promise(resolve => healthy.socket.addEventListener('close', event => resolve(event.code)));
+  const suspend = await runtime.dispatchFetch('https://admin.meshrmm.com/v1/platform/companies/company-test/suspend', {
+    method: 'POST', headers: { Authorization: `Bearer ${token('owner-test')}` },
+  });
+  assert.equal(suspend.status, 204, 'one failed coordinator does not fail the suspension');
+  assert.equal(await healthyClosed, 4001, 'the other Agents are still revoked');
+  assert.equal((await db.prepare("SELECT status FROM companies WHERE id = 'company-test'").first()).status, 'suspended');
+  await post(failing, '/__test/fail', false);
+  const failingClosed = new Promise(resolve => failingAgent.socket.addEventListener('close', event => resolve(event.code)));
+  assert.equal((await post(failing, '/lease', lease)).status, 403);
+  assert.equal(await failingClosed, 4001, 'the missed Agent is revoked at its next request');
+  await db.exec("UPDATE companies SET status = 'active'");
+  console.log('Presence integration passed: event-only snapshots, durable retry, replacement ordering, renewal isolation/expiry/revocation, signing-key caching, retryable auth outages, deletion, session alarm preservation, suspension fan-out past failures, and revocation after a missed suspension.');
 } finally {
   for (const socket of sockets) { try { socket.close(); } catch {} }
   await runtime.dispose();
