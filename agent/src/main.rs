@@ -1,6 +1,8 @@
 #[cfg(windows)]
 mod installer;
 mod logging;
+#[cfg(windows)]
+mod private_directory;
 mod remote;
 #[cfg(windows)]
 mod service;
