@@ -8,6 +8,14 @@ use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi,
 };
 
+/// Where the last session window was. A window opened for another display,
+/// codec or connection takes its place instead of jumping to a new one.
+static LAST_PLACEMENT: std::sync::Mutex<Option<WINDOWPLACEMENT>> = std::sync::Mutex::new(None);
+
+/// SS_CENTER and SS_CENTERIMAGE, which live in an otherwise unused Windows feature.
+const STATIC_CENTER: u32 = 0x0001;
+const STATIC_CENTER_VERTICALLY: u32 = 0x0200;
+
 /// The minimum outer window size, in 96-DPI pixels, that fits the toolbar.
 const MINIMUM_WINDOW_WIDTH: i32 = 1176;
 const MINIMUM_WINDOW_HEIGHT: i32 = 300;
@@ -44,6 +52,9 @@ struct WindowContext {
     video_window: HWND,
     /// Owned popup: a child window over the video would be hidden by it.
     debug_overlay: HWND,
+    /// Owned popup shown while the connection is being restored.
+    reconnecting_label: HWND,
+    title: HSTRING,
     debug_visible: bool,
     debug_refreshed: std::time::Instant,
     toolbar: HWND,
@@ -368,9 +379,44 @@ impl WindowContext {
                 )
             };
         }
+        let (width, height) = unsafe { client_size(window) }.unwrap_or_default();
+        let video = self.video_rect_for(width, height);
+        let (label_width, label_height) = (self.px(360), self.px(48));
+        let mut center = windows::Win32::Foundation::POINT {
+            x: video.left + (video.width - label_width) / 2,
+            y: video.top + (video.height - label_height) / 2,
+        };
+        if unsafe { ClientToScreen(window, &mut center) }.as_bool() {
+            let _ = unsafe {
+                SetWindowPos(
+                    self.reconnecting_label,
+                    None,
+                    center.x,
+                    center.y,
+                    label_width,
+                    label_height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            };
+        }
         if let Some(chat) = &self.chat_popup {
             chat.layout();
         }
+    }
+
+    fn set_reconnecting(&self, window: HWND, reconnecting: bool) {
+        let command = if reconnecting {
+            SW_SHOWNOACTIVATE
+        } else {
+            SW_HIDE
+        };
+        let _ = unsafe { ShowWindow(self.reconnecting_label, command) };
+        let title = if reconnecting {
+            HSTRING::from(format!("{} — Reconnecting…", self.title))
+        } else {
+            self.title.clone()
+        };
+        let _ = unsafe { SetWindowTextW(window, PCWSTR(title.as_ptr())) };
     }
 
     fn select_display(&self, index: usize) {
@@ -1591,6 +1637,7 @@ pub(super) unsafe fn create_window(
                 if let Some(context) = context {
                     context.place_popups(window);
                 }
+                unsafe { remember_placement(window) };
                 LRESULT(0)
             }
             WM_SIZE => {
@@ -1602,6 +1649,7 @@ pub(super) unsafe fn create_window(
                     }
                     context.layout_toolbar(window);
                 }
+                unsafe { remember_placement(window) };
                 LRESULT(0)
             }
             WM_COMMAND => {
@@ -1905,6 +1953,9 @@ pub(super) unsafe fn create_window(
                     }
                     return LRESULT(0);
                 }
+                // Ends the session even while it is reconnecting and no
+                // transport is watching this window.
+                crate::shutdown::request("the viewer window was closed");
                 let _ = unsafe { DestroyWindow(window) };
                 LRESULT(0)
             }
@@ -1969,6 +2020,10 @@ pub(super) unsafe fn create_window(
         }
     }
     let window_style = WINDOW_STYLE((WS_OVERLAPPEDWINDOW.0 & !WS_CAPTION.0) | WS_CLIPCHILDREN.0);
+    // Read before creating: the new window's own size messages update it.
+    let placement = *LAST_PLACEMENT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let title = HSTRING::from(format!(
         "MeshRMM Remote Desktop — {} ({}) — F8 display · F12 diagnostics",
         active_display.name,
@@ -1987,6 +2042,8 @@ pub(super) unsafe fn create_window(
         settings_dpi: 96,
         settings_font: HFONT::default(),
         resize_pending: false,
+        reconnecting_label: HWND::default(),
+        title: title.clone(),
         active_display,
         displays,
         control,
@@ -2057,7 +2114,18 @@ pub(super) unsafe fn create_window(
         context.dpi = dpi;
         context.font = font;
     }
-    unsafe { place_initial_window(window, window_style, format, dpi) };
+    match placement {
+        Some(mut placement) => {
+            if placement.showCmd == SW_SHOWMINIMIZED.0 as u32 {
+                placement.showCmd = SW_SHOWMINNOACTIVE.0 as u32;
+            } else if placement.showCmd != SW_SHOWMAXIMIZED.0 as u32 {
+                // Stay hidden until the controls exist; shown at the end.
+                placement.showCmd = SW_HIDE.0 as u32;
+            }
+            let _ = unsafe { SetWindowPlacement(window, &placement) };
+        }
+        None => unsafe { place_initial_window(window, window_style, format, dpi) },
+    }
     let video_window = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -2095,6 +2163,23 @@ pub(super) unsafe fn create_window(
         )
     }
     .context("debug overlay creation failed")?;
+    let reconnecting_label = unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            w!("STATIC"),
+            w!("Reconnecting to the remote computer…"),
+            WINDOW_STYLE(WS_POPUP.0 | WS_BORDER.0 | STATIC_CENTER | STATIC_CENTER_VERTICALLY),
+            0,
+            0,
+            1,
+            1,
+            Some(window),
+            None,
+            Some(instance),
+            None,
+        )
+    }
+    .context("reconnecting label creation failed")?;
     let toolbar = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -2341,6 +2426,7 @@ pub(super) unsafe fn create_window(
     let close_button = make_toolbar_button(CLOSE_BUTTON_ID, w!("×"), caption_button_style)?;
     for control in [
         overlay,
+        reconnecting_label,
         user_combo,
         display_combo,
         quality_combo,
@@ -2378,6 +2464,7 @@ pub(super) unsafe fn create_window(
     };
     if let Some(context) = unsafe { window_context(window) } {
         context.debug_overlay = overlay;
+        context.reconnecting_label = reconnecting_label;
         context.toolbar = toolbar;
         context.user_combo = user_combo;
         context.display_combo = display_combo;
@@ -2424,6 +2511,27 @@ pub(super) unsafe fn create_window(
     };
     let _ = unsafe { ShowWindow(window, SW_SHOW) };
     Ok(window)
+}
+
+unsafe fn remember_placement(window: HWND) {
+    if !unsafe { IsWindowVisible(window) }.as_bool() {
+        return;
+    }
+    let mut placement = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetWindowPlacement(window, &mut placement) }.is_ok() {
+        *LAST_PLACEMENT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(placement);
+    }
+}
+
+pub(super) unsafe fn set_reconnecting(window: HWND, reconnecting: bool) {
+    if let Some(context) = unsafe { window_context(window) } {
+        context.set_reconnecting(window, reconnecting);
+    }
 }
 
 pub(super) unsafe fn set_window_cursor(window: HWND, shape: CursorShape) {

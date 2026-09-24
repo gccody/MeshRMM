@@ -126,10 +126,30 @@ fn initialize_tracing(config: &config::Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_session(config: config::Config) -> anyhow::Result<()> {
+/// Runs the session until it ends. A recording still running is saved, and
+/// its notice goes to `recording_notice` for the caller to show once any
+/// session-wide lock is released.
+async fn run_session(
+    config: config::Config,
+    recording_notice: &mut Option<String>,
+) -> anyhow::Result<()> {
+    let resume_state = transport::ViewerResumeState::default();
+    let result = run_resumable_session(&config, &resume_state).await;
+    resume_state.close_reconnecting_window();
+    let recording = resume_state.clone();
+    *recording_notice = tokio::task::spawn_blocking(move || recording.finish_recording())
+        .await
+        .unwrap_or_default();
+    result
+}
+
+async fn run_resumable_session(
+    config: &config::Config,
+    resume_state: &transport::ViewerResumeState,
+) -> anyhow::Result<()> {
     let mut bootstrap = match config.bootstrap.clone() {
         Some(bootstrap) => bootstrap,
-        None => signaling::create_session(&config)
+        None => signaling::create_session(config)
             .await
             .context("remote session request failed")?,
     };
@@ -139,18 +159,17 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
         "remote session authorized"
     );
     let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(15));
-    let resume_state = transport::ViewerResumeState::default();
     if bootstrap.start_in_background {
         resume_state.select_background_display();
     }
     loop {
-        match transport::run_receiver(&config, bootstrap.clone(), resume_state.clone()).await {
+        match transport::run_receiver(config, bootstrap.clone(), resume_state.clone()).await {
             Ok(()) => {
-                end_session_after_disconnect(&config, &bootstrap).await;
+                end_session_after_disconnect(config, &bootstrap).await;
                 return Ok(());
             }
             Err(error) if signaling::is_terminal_session_error(&error) => {
-                if let Err(cleanup) = signaling::end_session(&config, &bootstrap).await {
+                if let Err(cleanup) = signaling::end_session(config, &bootstrap).await {
                     tracing::warn!(%cleanup, "could not acknowledge terminal session cleanup");
                 }
                 return Err(error).context("remote viewer session can no longer be resumed");
@@ -158,7 +177,7 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
             Err(error) => {
                 let delay = backoff.next_delay();
                 if shutdown::requested() {
-                    end_session_after_disconnect(&config, &bootstrap).await;
+                    end_session_after_disconnect(config, &bootstrap).await;
                     return Ok(());
                 }
                 tracing::warn!(
@@ -167,7 +186,7 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
                     retry_seconds = delay.as_secs(),
                     "remote viewer disconnected; waiting to resume"
                 );
-                match signaling::resume_session(&config, &bootstrap).await {
+                match signaling::resume_session(config, &bootstrap).await {
                     Ok(refreshed) => {
                         bootstrap = refreshed;
                         tracing::info!(
@@ -191,7 +210,7 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
                 tokio::select! {
                     () = tokio::time::sleep(delay) => {}
                     () = shutdown::wait() => {
-                        end_session_after_disconnect(&config, &bootstrap).await;
+                        end_session_after_disconnect(config, &bootstrap).await;
                         return Ok(());
                     }
                 }
@@ -239,17 +258,21 @@ fn main() -> std::process::ExitCode {
             Err(_) => ExitCode::FAILURE,
         };
     }
+    let mut recording_notice = None;
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to create the viewer network runtime")
-        .and_then(|runtime| runtime.block_on(run_windows_viewer()));
+        .and_then(|runtime| runtime.block_on(run_windows_viewer(&mut recording_notice)));
+    // The instance mutex was released with the session, so a new link does
+    // not wait on these dialogs.
+    if let Some(notice) = recording_notice {
+        platform::show_notice("Session recording", &notice);
+    }
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(error = ?error, "remote viewer stopped with an error");
-            // The instance mutex was released with the session, so a new link
-            // does not wait on this dialog.
             platform::show_fatal_error(&errors::user_message(&error));
             ExitCode::FAILURE
         }
@@ -257,7 +280,7 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(windows)]
-async fn run_windows_viewer() -> anyhow::Result<()> {
+async fn run_windows_viewer(recording_notice: &mut Option<String>) -> anyhow::Result<()> {
     let mut config = initialize(None)?;
     // Held on the main thread until the process exits.
     let _instance = match config.device_id.as_deref() {
@@ -277,10 +300,10 @@ async fn run_windows_viewer() -> anyhow::Result<()> {
     }
     match updater::check_and_schedule(&config).await {
         Ok(true) => Ok(()),
-        Ok(false) => run_session(config).await,
+        Ok(false) => run_session(config, recording_notice).await,
         Err(error) => {
             tracing::warn!(error = ?error, "client update check failed; continuing with this launch");
-            run_session(config).await
+            run_session(config, recording_notice).await
         }
     }
 }
@@ -308,14 +331,21 @@ fn main() -> anyhow::Result<()> {
                     .context("remote session request failed")?,
             );
         }
-        match runtime.block_on(updater::check_and_schedule(&config, deep_link.as_deref())) {
+        let mut recording_notice = None;
+        let result = match runtime
+            .block_on(updater::check_and_schedule(&config, deep_link.as_deref()))
+        {
             Ok(true) => Ok(()),
-            Ok(false) => runtime.block_on(run_session(config)),
+            Ok(false) => runtime.block_on(run_session(config, &mut recording_notice)),
             Err(error) => {
                 tracing::warn!(error = ?error, "client update check failed; continuing with this launch");
-                runtime.block_on(run_session(config))
+                runtime.block_on(run_session(config, &mut recording_notice))
             }
+        };
+        if let Some(notice) = recording_notice {
+            platform::show_notice("Session recording", &notice);
         }
+        result
     })
 }
 

@@ -49,7 +49,7 @@ mod presenter;
 use app::close_connecting_window;
 #[cfg(test)]
 use app::{WheelNormalizer, normalized_video_position};
-pub use app::{monotonic_timestamp_us, run_application};
+pub use app::{monotonic_timestamp_us, run_application, show_notice};
 pub use presenter::Presenter;
 
 #[link(name = "VideoToolbox", kind = "framework")]

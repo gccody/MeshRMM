@@ -64,6 +64,7 @@ struct Shared {
     agent_pointer_display: Mutex<Option<Option<meshrmm_protocol::DisplayId>>>,
     ready: Condvar,
     stopping: AtomicBool,
+    reconnecting: AtomicBool,
     running: AtomicBool,
     failure: Mutex<Option<String>>,
     replaced_frames: AtomicU64,
@@ -91,6 +92,7 @@ impl Presenter {
             agent_pointer_display: Mutex::new(None),
             ready: Condvar::new(),
             stopping: AtomicBool::new(false),
+            reconnecting: AtomicBool::new(false),
             running: AtomicBool::new(false),
             failure: Mutex::new(None),
             replaced_frames: AtomicU64::new(0),
@@ -179,6 +181,13 @@ impl Presenter {
     /// The window pump already refreshes controls without waiting for frames.
     pub fn refresh_controls(&self) {}
 
+    /// Marks the window as waiting for the connection to be restored.
+    pub fn set_reconnecting(&self, reconnecting: bool) {
+        self.shared
+            .reconnecting
+            .store(reconnecting, Ordering::Release);
+    }
+
     pub fn set_cursor_shape(&self, shape: CursorShape) {
         if let Ok(mut pending) = self.shared.cursor_shape.lock() {
             *pending = Some(shape);
@@ -243,9 +252,15 @@ fn run_worker(
     };
 
     let mut decoder_blocked_since = None::<std::time::Instant>;
+    let mut reconnecting = false;
     while !shared.stopping.load(Ordering::Acquire) {
         if unsafe { pump_window_messages(pipeline.window()) } {
             break;
+        }
+        let wanted = shared.reconnecting.load(Ordering::Acquire);
+        if wanted != reconnecting {
+            reconnecting = wanted;
+            unsafe { window::set_reconnecting(pipeline.window(), reconnecting) };
         }
         if let Some(layout) = unsafe { window::take_resize(pipeline.window()) }
             && let Err(error) = unsafe { pipeline.resize(&layout) }
@@ -370,6 +385,20 @@ pub fn attach_parent_console() {
     use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
     // Fails when started from Explorer or a browser, which have no console.
     let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+/// Shows a notice after the session, such as where a recording was saved.
+pub fn show_notice(title: &str, message: &str) {
+    let title = HSTRING::from(title);
+    let text = HSTRING::from(message);
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+        )
+    };
 }
 
 /// Shows why the viewer stopped. Without a console, this is the only place

@@ -37,6 +37,8 @@ const NEGOTIATION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::fro
 const DISCONNECTED_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
 const SIGNAL_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 const SIGNAL_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long the end of a session waits for a recording to be saved.
+const RECORDING_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 struct ActivePresenter {
     stream_id: VideoStreamId,
@@ -53,20 +55,89 @@ struct ReceiverLifecycle {
 
 /// Viewer choices that should survive rebuilding the signaling and WebRTC
 /// transports after a network change or remote reboot.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ViewerResumeState {
     idle: Arc<Mutex<crate::platform::IdlePreference>>,
     display_border: Arc<Mutex<Option<bool>>>,
     technician_blocked: Arc<AtomicBool>,
     remote_cursor_hidden: Arc<AtomicBool>,
+    wallpaper_hidden: Arc<AtomicBool>,
     session_close_action: Arc<Mutex<meshrmm_protocol::SessionCloseAction>>,
     quality: Arc<Mutex<QualityPreset>>,
     chroma: Arc<Mutex<ChromaMode>>,
     display_id: Arc<Mutex<Option<meshrmm_protocol::DisplayId>>>,
     audio: meshrmm_audio::PlaybackState,
+    /// Keeps recording across reconnects; each new stream starts a new part.
+    recording: crate::recording::Recorder,
+    /// The current connection's control queue, for recording state changes.
+    recording_outgoing: Arc<Mutex<Option<mpsc::UnboundedSender<SessionMessage>>>>,
+    /// The window of a lost connection, shown as reconnecting until the next
+    /// connection opens its own.
+    reconnecting: Arc<Mutex<Option<ActivePresenter>>>,
+}
+
+impl Default for ViewerResumeState {
+    fn default() -> Self {
+        let recording_outgoing =
+            Arc::new(Mutex::new(None::<mpsc::UnboundedSender<SessionMessage>>));
+        let activity = Arc::clone(&recording_outgoing);
+        Self {
+            idle: Default::default(),
+            display_border: Default::default(),
+            technician_blocked: Default::default(),
+            remote_cursor_hidden: Default::default(),
+            wallpaper_hidden: Arc::new(AtomicBool::new(true)),
+            session_close_action: Default::default(),
+            quality: Default::default(),
+            chroma: Default::default(),
+            display_id: Default::default(),
+            audio: Default::default(),
+            recording: crate::recording::Recorder::with_activity_callback(move |enabled| {
+                if let Some(outgoing) = activity
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                {
+                    let _ = outgoing.send(SessionMessage::SetRecording { enabled });
+                }
+            }),
+            recording_outgoing,
+            reconnecting: Default::default(),
+        }
+    }
 }
 
 impl ViewerResumeState {
+    fn keep_while_reconnecting(&self, active: ActivePresenter) {
+        active.presenter.set_reconnecting(true);
+        let previous = self
+            .reconnecting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(active);
+        if let Some(mut previous) = previous {
+            previous.presenter.stop();
+        }
+    }
+
+    /// Closes the window kept from a lost connection.
+    pub fn close_reconnecting_window(&self) {
+        let kept = self
+            .reconnecting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(mut kept) = kept {
+            kept.presenter.stop();
+        }
+    }
+
+    /// Ends a recording that is still running once the session is over, and
+    /// waits for it to be saved. Returns the notice to show the user.
+    pub fn finish_recording(&self) -> Option<String> {
+        self.recording.finish(RECORDING_FINISH_TIMEOUT)
+    }
+
     pub fn select_background_display(&self) {
         *self
             .display_id
@@ -206,11 +277,12 @@ impl ViewerControlQueue {
         outgoing: mpsc::UnboundedSender<SessionMessage>,
         resume_state: ViewerResumeState,
     ) -> Self {
-        let recording_outgoing = outgoing.clone();
+        *resume_state
+            .recording_outgoing
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(outgoing.clone());
         Self {
-            recording: crate::recording::Recorder::with_activity_callback(move |enabled| {
-                let _ = recording_outgoing.send(SessionMessage::SetRecording { enabled });
-            }),
+            recording: resume_state.recording.clone(),
             maintenance: Arc::new(Mutex::new(crate::platform::MaintenanceState::default())),
             credentials: Arc::new(Mutex::new(Default::default())),
             files: meshrmm_file_transfer::TransferSession::with_clipboard_policy(
@@ -353,7 +425,6 @@ pub async fn run_receiver(
     let control_channel = tokio::sync::watch::channel(None::<ServiceChannel>).0;
     let (viewer_control_tx, viewer_control_rx) = mpsc::unbounded_channel::<SessionMessage>();
     let viewer_control = ViewerControlQueue::new(viewer_control_tx, resume_state.clone());
-    let _recording = crate::recording::RecordingGuard(viewer_control.recording.clone());
     let (presentation_failure_tx, mut presentation_failure_rx) =
         mpsc::unbounded_channel::<String>();
     let lifecycle = ReceiverLifecycle {
@@ -583,10 +654,13 @@ pub async fn run_receiver(
     ) {
         session_state = session_state.transition(SessionState::Closing)?;
     }
-    if let Ok(mut guard) = presenter.lock()
-        && let Some(mut active) = guard.take()
-    {
-        active.presenter.stop();
+    if let Some(mut active) = presenter.lock().ok().and_then(|mut guard| guard.take()) {
+        if result.is_ok() {
+            active.presenter.stop();
+        } else {
+            // The session may resume; keep its window up until then.
+            resume_state.keep_while_reconnecting(active);
+        }
     }
     viewer_control.chat.set_available(false);
     let mut result = result;
@@ -1157,6 +1231,7 @@ fn install_control_handler(
                         viewer_control.recording.clone(),
                         Arc::clone(&viewer_control.resume_state.technician_blocked),
                         Arc::clone(&viewer_control.resume_state.remote_cursor_hidden),
+                        Arc::clone(&viewer_control.resume_state.wallpaper_hidden),
                         Arc::clone(&viewer_control.resume_state.session_close_action),
                         Arc::clone(&viewer_control.maintenance),
                         Arc::clone(&quality_preset),
@@ -1274,10 +1349,12 @@ fn install_control_handler(
                                     previous_profile = ?old.profile,
                                     stream_id = stream_id.0,
                                     codec = ?format.codec,
-                                    "replacing the active macOS presenter after display configuration"
+                                    "replacing the active presenter after display configuration"
                                 );
                                 old.presenter.stop();
                             }
+                            // The new window is up; retire the one kept while reconnecting.
+                            viewer_control.resume_state.close_reconnecting_window();
                             let request = SessionMessage::RequestKeyframe { stream_id };
                             viewer_control.send(request);
                             if let Some(display_id) = resumed_display {
@@ -1776,6 +1853,35 @@ mod tests {
                 display_id: DisplayId(42)
             }
         );
+    }
+
+    #[test]
+    fn resumed_connections_keep_viewer_choices_and_recording() {
+        let state = ViewerResumeState::default();
+        // Hidden is the default until the technician shows the wallpaper.
+        assert!(state.wallpaper_hidden.load(Ordering::SeqCst));
+        state.wallpaper_hidden.store(false, Ordering::SeqCst);
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let first = ViewerControlQueue::new(first_tx, state.clone());
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let second = ViewerControlQueue::new(second_tx, state.clone());
+        assert!(!state.wallpaper_hidden.load(Ordering::SeqCst));
+        // Both connections record into the same recorder...
+        assert!(first.recording.is_same(&second.recording));
+        // ...and its state changes go to the newest connection.
+        state
+            .recording_outgoing
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .send(SessionMessage::SetRecording { enabled: true })
+            .unwrap();
+        assert_eq!(
+            second_rx.try_recv().unwrap(),
+            SessionMessage::SetRecording { enabled: true }
+        );
+        assert!(first_rx.try_recv().is_err());
     }
 
     #[tokio::test]

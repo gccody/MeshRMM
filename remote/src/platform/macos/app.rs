@@ -18,6 +18,9 @@ const REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(20);
 /// A later dashboard link, started once this viewer's session has ended.
 static REPLACEMENT: Mutex<Option<String>> = Mutex::new(None);
 
+/// Whether the network session is still running, so quitting must end it.
+static SESSION_RUNNING: AtomicBool = AtomicBool::new(false);
+
 /// Starts the viewer for a pending replacement link. Returns whether one was
 /// pending; each link is launched at most once.
 fn launch_replacement() -> bool {
@@ -63,6 +66,16 @@ define_class!(
             _application: &NSApplication,
         ) -> objc2_app_kit::NSApplicationTerminateReply {
             if super::presenter::request_user_disconnect() {
+                objc2_app_kit::NSApplicationTerminateReply::TerminateCancel
+            } else if SESSION_RUNNING.load(Ordering::Acquire) {
+                // No window, for example while reconnecting or connecting:
+                // end the session so the server releases the device, and
+                // stop once the network thread is done.
+                crate::shutdown::request("the user quit the viewer");
+                end_after(
+                    REPLACEMENT_TIMEOUT,
+                    "the session did not end in time after Quit",
+                );
                 objc2_app_kit::NSApplicationTerminateReply::TerminateCancel
             } else {
                 objc2_app_kit::NSApplicationTerminateReply::TerminateNow
@@ -183,6 +196,7 @@ pub(super) struct RemoteViewIvars {
     agent_pointer_display: std::cell::Cell<Option<meshrmm_protocol::DisplayId>>,
     debug: DebugInfo,
     debug_label: Retained<NSTextField>,
+    reconnecting_label: Retained<NSTextField>,
     debug_visible: RefCell<bool>,
     debug_refreshed: RefCell<Instant>,
 }
@@ -234,6 +248,9 @@ define_class!(
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
             self.ivars().window_closed.set(true);
+            // Ends the session even while it is reconnecting and no transport
+            // is watching this window.
+            crate::shutdown::request("the viewer window was closed");
         }
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _notification: &NSNotification) {
@@ -718,6 +735,30 @@ impl RemoteView {
             unsafe { NSFontWeightRegular },
         )));
         debug_label.setHidden(true);
+        let reconnecting_label = NSTextField::labelWithString(
+            &NSString::from_str("Reconnecting to the remote computer…"),
+            mtm,
+        );
+        reconnecting_label.setAlignment(NSTextAlignment::Center);
+        reconnecting_label.setDrawsBackground(true);
+        reconnecting_label.setBackgroundColor(Some(&NSColor::colorWithWhite_alpha(0.04, 0.88)));
+        reconnecting_label.setTextColor(Some(&NSColor::whiteColor()));
+        reconnecting_label.setFont(Some(&NSFont::systemFontOfSize(16.0)));
+        let label_size = NSSize::new(360.0, 32.0);
+        reconnecting_label.setFrame(NSRect::new(
+            NSPoint::new(
+                ((frame.size.width - label_size.width) / 2.0).max(0.0),
+                ((frame.size.height - VIEWER_TOOLBAR_HEIGHT - label_size.height) / 2.0).max(0.0),
+            ),
+            label_size,
+        ));
+        reconnecting_label.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMinXMargin
+                | NSAutoresizingMaskOptions::ViewMaxXMargin
+                | NSAutoresizingMaskOptions::ViewMinYMargin
+                | NSAutoresizingMaskOptions::ViewMaxYMargin,
+        );
+        reconnecting_label.setHidden(true);
         let command = command_key(&control);
         let this = Self::alloc(mtm).set_ivars(RemoteViewIvars {
             active_display: RefCell::new(active_display),
@@ -743,11 +784,13 @@ impl RemoteView {
             agent_pointer_display: std::cell::Cell::new(None),
             debug,
             debug_label,
+            reconnecting_label,
             debug_visible: RefCell::new(false),
             debug_refreshed: RefCell::new(Instant::now()),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         this.addSubview(&this.ivars().debug_label);
+        this.addSubview(&this.ivars().reconnecting_label);
         this.install_toolbar(mtm, frame);
         this.install_key_up_monitor();
         this
@@ -1000,6 +1043,11 @@ impl RemoteView {
 
     fn send(&self, message: SessionMessage) {
         self.ivars().control.send(message);
+    }
+
+    /// Shows that the connection is being restored; input waits until then.
+    pub(super) fn set_reconnecting(&self, reconnecting: bool) {
+        self.ivars().reconnecting_label.setHidden(!reconnecting);
     }
 
     pub(super) fn window_closed(&self) -> bool {
@@ -1527,6 +1575,35 @@ pub(super) fn close_connecting_window() {
     });
 }
 
+/// Exits after `timeout` if the network session is still running then.
+fn end_after(timeout: Duration, reason: &'static str) {
+    let when = dispatch2::DispatchTime::try_from(timeout).unwrap_or(dispatch2::DispatchTime::NOW);
+    let scheduled = DispatchQueue::main().after(when, move || {
+        if SESSION_RUNNING.load(Ordering::Acquire) {
+            tracing::warn!(reason, "exiting without the session's cleanup");
+            std::process::exit(0);
+        }
+    });
+    if scheduled.is_err() {
+        tracing::warn!("could not schedule the viewer exit deadline");
+    }
+}
+
+/// Shows a notice from the network thread, such as where a recording was
+/// saved, and waits until the user dismisses it.
+pub fn show_notice(title: &'static str, message: &str) {
+    let message = message.to_owned();
+    DispatchQueue::main().exec_sync(move || {
+        if let Some(mtm) = MainThreadMarker::new() {
+            activate_application(mtm);
+            let alert = NSAlert::new(mtm);
+            alert.setMessageText(&NSString::from_str(title));
+            alert.setInformativeText(&NSString::from_str(&message));
+            alert.runModal();
+        }
+    });
+}
+
 fn show_connection_error(mtm: MainThreadMarker, error: &str) {
     tracing::error!(%error, "showing macOS viewer connection error");
     close_connecting_window();
@@ -1583,6 +1660,7 @@ where
         .skip(1)
         .any(|argument| !argument.to_string_lossy().starts_with("-psn_"))
         || std::env::var_os("MESHRMM_HANDOFF_TOKEN").is_some();
+    SESSION_RUNNING.store(true, Ordering::Release);
     std::thread::Builder::new()
         .name("meshrmm-network".into())
         .spawn(move || {
@@ -1597,6 +1675,7 @@ where
             let error = result.as_ref().err().map(crate::errors::user_message);
             let _ = result_tx.send(result);
             DispatchQueue::main().exec_async(move || {
+                SESSION_RUNNING.store(false, Ordering::Release);
                 if let Some(mtm) = MainThreadMarker::new() {
                     // A replaced session starts its successor instead of
                     // reporting how its own cleanup went.
