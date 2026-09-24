@@ -43,8 +43,8 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 | T30 Documentation accuracy / TLS 1.3 | Low | Done | `1297f0f` |
 | T31 Token rotation edge cases | Low | Done | `f95d930` |
 | T32 File transfer sliding window | Low | Done | `21316da` |
-| T39 Native log rotation (+ viewer update helper logging) | Low | **Next** | |
-| T33 Local dashboard dev loop | QoL | Todo | |
+| T39 Native log rotation (+ viewer update helper logging) | Low | Done | `797f7a5` |
+| T33 Local dashboard dev loop | QoL | **Next** | |
 | T34 Server deploy script + schema version in /healthz | QoL | Todo | |
 | T35 Viewer input QoL (Win/Alt+Tab hook, rebindable keys) | QoL | Todo | |
 | T36 Agent refactor: split large files, dedupe launch code | QoL | Todo | |
@@ -72,9 +72,11 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 
 ## Endpoint state
 
-After T32, DESKTOP-85R6S28 runs a release build of `21316da` (SHA-256 `75508B37…ECD0`), which
-includes T17, T18, T23, T30 and T32. The service is running and connected; the build it replaced
-(`1297f0f`, SHA-256 `5DACF2F3…71D0`) is kept as `meshrmm-agent.exe.before-local-20260924-164046`.
+After T39, DESKTOP-85R6S28 runs a release build of `797f7a5` (SHA-256 `EF774B2A…77ED`), which
+includes T17, T18, T23, T30, T32 and T39. The service is running and connected; the build it
+replaced (`21316da`, SHA-256 `75508B37…ECD0`) is kept as
+`meshrmm-agent.exe.before-local-20260924-164940`. Its first start rotated the 72.6 MB Agent log to
+`agent.1.log`, which will age out after three more rotations.
 T19–T22, T24–T29 and T31 did not change the Agent. Earlier builds are kept as
 `C:\Program Files\MeshRMM\Agent\meshrmm-agent.exe.before-local-*`. T01 removed the explicit
 `gccody` permission on `ProgramData\MeshRMM\Agent`, so a non-elevated `gccody` process can no longer
@@ -199,6 +201,13 @@ These need a live dashboard → viewer → agent session, which the agent-driven
   queue is FIFO and capped at 128 KiB, so more buffered file data would queue input behind it.
   The protocol is unchanged; a window of 16 fits the 32-command queue of deployed receivers. The
   installed service started and connected with the new build.
+- T39: a log rotating in production after weeks of uptime, and a real viewer self-update on either
+  platform. On the endpoint, the installed service's first start rotated its 72.6 MB log, and both
+  files kept the inherited SYSTEM and Administrators ACL; the unit test that rotates a log another
+  handle holds open passes there too. The viewer's Windows update helper, run by hand with
+  stand-in executables, logged its start, the install and launch, and, when the update was
+  missing or never reported ready, the restore, the relaunch and the final error. The macOS
+  helper's logging and the Mac viewer's 90 MB log (rotated at the next launch) were not exercised.
 
 ## Remaining tasks
 
