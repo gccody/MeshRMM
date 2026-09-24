@@ -4,15 +4,19 @@
 //! rewrite the DACL at any time. These helpers only reuse directories owned by SYSTEM or an
 //! administrator, replace the owner and DACL through a handle that never follows reparse points,
 //! and verify the stored security descriptor before callers write credentials or executables.
+//! State left by an older installation is only read when the same accounts control it.
 
 use std::ffi::OsStr;
+use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context, bail};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LUID, LocalFree,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_ALL,
+    GENERIC_WRITE, HANDLE, HLOCAL, LUID, LocalFree,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW,
@@ -20,16 +24,18 @@ use windows::Win32::Security::Authorization::{
     SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, DACL_SECURITY_INFORMATION, EqualSid, GetTokenInformation,
-    IsWellKnownSid, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SE_BACKUP_NAME, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME,
-    SECURITY_ATTRIBUTES, SetKernelObjectSecurity, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
-    TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, AdjustTokenPrivileges, DACL_SECURITY_INFORMATION,
+    EqualSid, GetAce, GetTokenInformation, INHERIT_ONLY_ACE, IsWellKnownSid, LUID_AND_ATTRIBUTES,
+    LookupPrivilegeValueW, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_BACKUP_NAME,
+    SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME, SECURITY_ATTRIBUTES, SetKernelObjectSecurity,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, DELETE, FILE_ACCESS_RIGHTS,
+    FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
     GetFileInformationByHandle, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -115,6 +121,189 @@ pub fn secure_contents(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reads `file` only if no account other than SYSTEM or an administrator could have written it or
+/// swapped it into place, for state left by an older installation that is not re-secured before
+/// it is read. The file and its directory must be owned by those accounts and grant nobody else
+/// write access, and the directory's parent (the product folder under ProgramData) must not let
+/// anyone else rename or replace the directory. None of them may be a reparse point. Returns
+/// `Ok(None)` when any of them is missing and fails with [`UntrustedPath`] when one is untrusted.
+pub fn read_protected_file(file: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    let directory = file
+        .parent()
+        .with_context(|| format!("{} has no parent directory", file.display()))?;
+    let product = directory
+        .parent()
+        .with_context(|| format!("{} has no parent directory", directory.display()))?;
+    let _privileges = Privileges::enable()?;
+    let entries = [
+        (product, true, REPLACE_RIGHTS),
+        (directory, true, MODIFY_RIGHTS),
+        (file, false, MODIFY_RIGHTS),
+    ];
+    let mut opened = None;
+    for (path, is_directory, forbidden) in entries {
+        let access = if is_directory {
+            READ_CONTROL
+        } else {
+            READ_CONTROL | FILE_READ_DATA
+        };
+        let Some((handle, information)) = inspect(path, access)? else {
+            return Ok(None);
+        };
+        let untrusted = |reason| UntrustedPath {
+            path: path.to_owned(),
+            reason,
+        };
+        // Report planted links as untrusted rather than failing, since a standard user can
+        // create entries in a product folder that inherited the ProgramData ACL.
+        if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err(untrusted("is a junction, symbolic link, or other reparse point").into());
+        }
+        if (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0) != is_directory {
+            return Err(untrusted(if is_directory {
+                "is not a directory"
+            } else {
+                "is a directory"
+            })
+            .into());
+        }
+        ensure_protected(&handle, path, forbidden)?;
+        opened = Some(handle);
+    }
+    let handle = opened.context("no file was opened")?;
+    // Read through the verified handle so the file cannot be exchanged after the check.
+    let mut contents = Vec::new();
+    handle
+        .into_file()
+        .read_to_end(&mut contents)
+        .with_context(|| format!("failed to read {}", file.display()))?;
+    Ok(Some(contents))
+}
+
+/// Why a file from an older installation cannot be trusted.
+#[derive(Debug)]
+pub struct UntrustedPath {
+    path: PathBuf,
+    reason: &'static str,
+}
+
+impl std::fmt::Display for UntrustedPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} {}", self.path.display(), self.reason)
+    }
+}
+
+impl std::error::Error for UntrustedPath {}
+
+/// Rights that let an account change a file or a directory's entries, or take over its security.
+const MODIFY_RIGHTS: u32 = FILE_WRITE_DATA.0
+    | FILE_APPEND_DATA.0
+    | FILE_DELETE_CHILD.0
+    | DELETE.0
+    | WRITE_DAC.0
+    | WRITE_OWNER.0
+    | GENERIC_WRITE.0
+    | GENERIC_ALL.0;
+/// Rights that let an account rename or replace a directory's existing entries. ProgramData
+/// passes its "create files and folders" grant for Users down to product folders, which alone
+/// cannot move an entry that is already there.
+const REPLACE_RIGHTS: u32 =
+    FILE_DELETE_CHILD.0 | DELETE.0 | WRITE_DAC.0 | WRITE_OWNER.0 | GENERIC_ALL.0;
+
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const ACCESS_ALLOWED_COMPOUND_ACE_TYPE: u8 = 4;
+const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 5;
+const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
+const ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: u8 = 11;
+
+/// Opens `path` without following reparse points, or returns `None` if it does not exist.
+fn inspect(
+    path: &Path,
+    access: FILE_ACCESS_RIGHTS,
+) -> anyhow::Result<Option<(Handle, BY_HANDLE_FILE_INFORMATION)>> {
+    match open_handle(path, access | FILE_READ_ATTRIBUTES) {
+        Ok(opened) => Ok(Some(opened)),
+        Err(error)
+            if error
+                .downcast_ref::<windows::core::Error>()
+                .is_some_and(|error| {
+                    error.code() == ERROR_FILE_NOT_FOUND.to_hresult()
+                        || error.code() == ERROR_PATH_NOT_FOUND.to_hresult()
+                }) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Fails with [`UntrustedPath`] unless SYSTEM or an administrator owns the object and no ACE that
+/// applies to it grants any `forbidden` right to another account.
+fn ensure_protected(handle: &Handle, path: &Path, forbidden: u32) -> anyhow::Result<()> {
+    let untrusted = |reason| UntrustedPath {
+        path: path.to_owned(),
+        reason,
+    };
+    let mut owner = PSID::default();
+    let mut dacl = std::ptr::null_mut::<ACL>();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        GetSecurityInfo(
+            handle.0,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            Some(&mut dacl),
+            None,
+            Some(&mut descriptor),
+        )
+    }
+    .ok()
+    .with_context(|| format!("failed to read the security of {}", path.display()))?;
+    let _descriptor = LocalDescriptor(descriptor);
+    if !is_trusted_account(owner)? {
+        return Err(
+            untrusted("is owned by an account other than SYSTEM or an administrator").into(),
+        );
+    }
+    if dacl.is_null() {
+        return Err(untrusted("has no DACL, so every account can modify it").into());
+    }
+    for index in 0..unsafe { (*dacl).AceCount } {
+        let mut ace = std::ptr::null_mut();
+        unsafe { GetAce(dacl, index.into(), &mut ace) }
+            .with_context(|| format!("failed to read the DACL of {}", path.display()))?;
+        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        if u32::from(header.AceFlags) & INHERIT_ONLY_ACE.0 != 0 {
+            continue;
+        }
+        let trusted = match header.AceType {
+            ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => {
+                // Callback ACEs only append condition data after the SID.
+                let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+                allowed.Mask & forbidden == 0
+                    || is_trusted_account(PSID((&raw const allowed.SidStart).cast_mut().cast()))?
+            }
+            // Object and compound ACEs place the SID elsewhere; Agent files never carry them.
+            ACCESS_ALLOWED_COMPOUND_ACE_TYPE
+            | ACCESS_ALLOWED_OBJECT_ACE_TYPE
+            | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => {
+                unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() }.Mask & forbidden == 0
+            }
+            // Deny, audit, and label ACEs grant nothing.
+            _ => true,
+        };
+        if !trusted {
+            return Err(untrusted(
+                "lets an account other than SYSTEM or an administrator modify it",
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn create(path: &Path) -> windows::core::Result<()> {
     let descriptor = LocalDescriptor::parse(PRIVATE_DIRECTORY_SDDL)?;
     let attributes = SECURITY_ATTRIBUTES {
@@ -127,13 +316,23 @@ fn create(path: &Path) -> windows::core::Result<()> {
 }
 
 fn open_without_following(path: &Path) -> anyhow::Result<(Handle, BY_HANDLE_FILE_INFORMATION)> {
+    open_handle(
+        path,
+        READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+    )
+}
+
+fn open_handle(
+    path: &Path,
+    access: FILE_ACCESS_RIGHTS,
+) -> anyhow::Result<(Handle, BY_HANDLE_FILE_INFORMATION)> {
     let wide_path = wide(path.as_os_str());
     // Backup semantics open directories, and with the backup and restore privileges they also
     // bypass a squatter's DACL so its owner can be inspected and replaced.
     let handle = unsafe {
         CreateFileW(
             PCWSTR(wide_path.as_ptr()),
-            (READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES).0,
+            access.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,
@@ -191,16 +390,20 @@ fn owner_is_trusted(handle: &Handle, path: &Path) -> anyhow::Result<bool> {
     .ok()
     .with_context(|| format!("failed to read the owner of {}", path.display()))?;
     let _descriptor = LocalDescriptor(descriptor);
+    is_trusted_account(owner)
+}
+
+fn is_trusted_account(sid: PSID) -> anyhow::Result<bool> {
     let trusted = unsafe {
-        IsWellKnownSid(owner, WinLocalSystemSid).as_bool()
-            || IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool()
+        IsWellKnownSid(sid, WinLocalSystemSid).as_bool()
+            || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool()
     };
     // With the "object creator" default-owner policy, directories created by an elevated
     // administrator are owned by that user rather than by Administrators.
-    Ok(trusted || current_user_owns(owner)?)
+    Ok(trusted || is_current_user(sid)?)
 }
 
-fn current_user_owns(owner: PSID) -> anyhow::Result<bool> {
+fn is_current_user(sid: PSID) -> anyhow::Result<bool> {
     let token = process_token(TOKEN_QUERY)?;
     let mut length = 0;
     let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut length) };
@@ -216,7 +419,7 @@ fn current_user_owns(owner: PSID) -> anyhow::Result<bool> {
     }
     .context("failed to read the Agent process user")?;
     let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
-    Ok(unsafe { EqualSid(owner, user.User.Sid) }.is_ok())
+    Ok(unsafe { EqualSid(sid, user.User.Sid) }.is_ok())
 }
 
 fn apply(handle: &Handle, path: &Path, sddl: &str) -> anyhow::Result<()> {
@@ -356,6 +559,13 @@ impl Drop for Privileges {
 }
 
 struct Handle(HANDLE);
+
+impl Handle {
+    fn into_file(self) -> std::fs::File {
+        let handle = std::mem::ManuallyDrop::new(self);
+        unsafe { std::fs::File::from_raw_handle(handle.0.0) }
+    }
+}
 
 impl Drop for Handle {
     fn drop(&mut self) {
@@ -527,6 +737,84 @@ mod tests {
         let fresh = root.join("staging");
         create_new(&fresh).unwrap();
         assert_eq!(sddl_of(&fresh), PRIVATE_DIRECTORY_SDDL);
+        remove(&root);
+    }
+
+    #[test]
+    fn reads_legacy_files_only_when_administrators_control_them() {
+        if !elevated() {
+            return;
+        }
+        let root = scratch("legacy");
+        let product = root.join("PulseRMM");
+        let directory = product.join("Agent");
+        let file = directory.join("agent.json");
+        assert!(read_protected_file(&file).unwrap().is_none());
+        std::fs::create_dir_all(&directory).unwrap();
+        assert!(read_protected_file(&file).unwrap().is_none());
+        std::fs::write(&file, b"{}").unwrap();
+        // As a legacy installation leaves them: the product folder keeps what ProgramData passes
+        // down, including the Users grant to create entries, and icacls protected the Agent folder.
+        const PRODUCT: &str =
+            "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;CI;0x116;;;BU)(A;OICIIO;FA;;;CO)";
+        const DIRECTORY: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+        const FILE: &str = "O:BAD:(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;;FR;;;BU)";
+        set_sddl(&product, PRODUCT);
+        set_sddl(&directory, DIRECTORY);
+        set_sddl(&file, FILE);
+        assert_eq!(read_protected_file(&file).unwrap().unwrap(), b"{}");
+
+        let untrusted = |path: &Path, descriptor: &str, original: &str| {
+            set_sddl(path, descriptor);
+            let error = read_protected_file(&file).unwrap_err();
+            let reason = error
+                .downcast_ref::<UntrustedPath>()
+                .unwrap_or_else(|| panic!("{error:#}"));
+            assert_eq!(reason.path, path);
+            set_sddl(path, original);
+        };
+        untrusted(&file, "O:BUD:(A;;FA;;;SY)(A;;FA;;;BA)", FILE);
+        untrusted(
+            &file,
+            "O:BAD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x12019f;;;BU)",
+            FILE,
+        );
+        untrusted(&file, "O:BAD:NO_ACCESS_CONTROL", FILE);
+        untrusted(
+            &directory,
+            "O:BUD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+            DIRECTORY,
+        );
+        untrusted(
+            &directory,
+            "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;CI;0x116;;;BU)",
+            DIRECTORY,
+        );
+        untrusted(&product, "O:BUD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", PRODUCT);
+        untrusted(
+            &product,
+            "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x40;;;BU)",
+            PRODUCT,
+        );
+        assert_eq!(read_protected_file(&file).unwrap().unwrap(), b"{}");
+
+        // A planted junction is reported as untrusted without reading through it.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("agent.json"), b"{}").unwrap();
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&directory)
+            .arg(&target)
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success());
+        let error = read_protected_file(&file).unwrap_err();
+        let reason = error.downcast_ref::<UntrustedPath>().unwrap();
+        assert_eq!(reason.path, directory);
         remove(&root);
     }
 

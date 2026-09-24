@@ -24,9 +24,8 @@ fn main() -> anyhow::Result<()> {
         return tray::run();
     }
 
-    if meshrmm_session_transport::identity::handle_command(
-        meshrmm_session_transport::identity::agent_directory,
-    )? {
+    #[cfg(windows)]
+    if meshrmm_session_transport::identity::handle_command(installer::identity_directory)? {
         return Ok(());
     }
 
