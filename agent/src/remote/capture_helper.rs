@@ -15,19 +15,22 @@ use meshrmm_protocol::{
     CursorShape, Display, DisplayId, MAX_CLIPBOARD_WIRE_BYTES, RemoteInput, SessionMessage,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_TIMEOUT,
+    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::{
-    DuplicateTokenEx, SECURITY_ATTRIBUTES, SecurityImpersonation, SetTokenInformation,
-    TOKEN_ALL_ACCESS, TokenPrimary, TokenSessionId,
+    DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TokenPrimary,
+    TokenSessionId,
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::RemoteDesktop::*;
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, CreateProcessAsUserW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
-use windows::core::{BOOL, PCWSTR, PWSTR};
+use windows::core::{PCWSTR, PWSTR};
 
 use meshrmm_remote_screen::{
     ActiveFormat, EncodedAccessUnit, EncodedFrameSink, StreamConfig, VideoCodec, VideoPixelFormat,
@@ -68,6 +71,9 @@ const MAX_DISPLAYS: usize = 64;
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const STOP_TIMEOUT_MS: u32 = 5_000;
+const MAX_STDERR_LINE_BYTES: usize = 4 * 1024;
+const STDERR_LINES_PER_WINDOW: u32 = 120;
+const STDERR_WINDOW: Duration = Duration::from_secs(60);
 const NO_DISPLAY: u32 = u32::MAX;
 const NO_ACTIVE_SESSION: u32 = u32::MAX;
 
@@ -1511,9 +1517,14 @@ fn launch_helper(target: DesktopTarget, as_user: bool) -> anyhow::Result<Launche
 
         session_token
     };
-    let (child_input, parent_input) = create_inherited_pipe(false)?;
-    let (parent_output, child_output) = create_inherited_pipe(true)?;
-    let (parent_stderr, child_stderr) = create_inherited_pipe(true)?;
+    // Pipes start non-inheritable. Only this child's ends become inheritable,
+    // just before the launch, and the explicit handle list keeps a concurrent
+    // launch from passing them to another helper, which may run as the user.
+    let (child_input, parent_input) = create_pipe()?;
+    let (parent_output, child_output) = create_pipe()?;
+    let (parent_stderr, child_stderr) = create_pipe()?;
+    let child_handles = [child_input.0, child_output.0, child_stderr.0];
+    let handle_list = HandleListAttribute::new(&child_handles)?;
     let executable_wide = wide(executable.as_os_str());
     let working_directory_wide = wide(working_directory.as_os_str());
     let mut command_line = wide(OsStr::new(&format!(
@@ -1533,14 +1544,17 @@ fn launch_helper(target: DesktopTarget, as_user: bool) -> anyhow::Result<Launche
         format!("winsta0\\{}", target.name())
     };
     let mut desktop = wide(OsStr::new(&desktop_path));
-    let startup = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        lpDesktop: PWSTR(desktop.as_mut_ptr()),
-        dwFlags: STARTF_USESTDHANDLES,
-        hStdInput: child_input.0,
-        hStdOutput: child_output.0,
-        hStdError: child_stderr.0,
-        ..Default::default()
+    let startup = STARTUPINFOEXW {
+        StartupInfo: STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
+            lpDesktop: PWSTR(desktop.as_mut_ptr()),
+            dwFlags: STARTF_USESTDHANDLES,
+            hStdInput: child_input.0,
+            hStdOutput: child_output.0,
+            hStdError: child_stderr.0,
+            ..Default::default()
+        },
+        lpAttributeList: handle_list.list(),
     };
     let mut environment = std::ptr::null_mut();
     if as_user {
@@ -1553,21 +1567,37 @@ fn launch_helper(target: DesktopTarget, as_user: bool) -> anyhow::Result<Launche
         }?;
     }
     let mut process_info = PROCESS_INFORMATION::default();
-    let launched = unsafe {
-        CreateProcessAsUserW(
-            Some(session_token.0),
-            PCWSTR(executable_wide.as_ptr()),
-            Some(PWSTR(command_line.as_mut_ptr())),
-            None,
-            None,
-            true,
-            CREATE_NO_WINDOW | windows::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT,
-            (!environment.is_null()).then_some(environment.cast_const()),
-            PCWSTR(working_directory_wide.as_ptr()),
-            &startup,
-            &mut process_info,
-        )
-    };
+    let launched = child_handles
+        .iter()
+        .try_for_each(|&handle| unsafe {
+            SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT)
+        })
+        .context("failed to prepare the desktop-helper pipe handles")
+        .and_then(|()| {
+            unsafe {
+                CreateProcessAsUserW(
+                    Some(session_token.0),
+                    PCWSTR(executable_wide.as_ptr()),
+                    Some(PWSTR(command_line.as_mut_ptr())),
+                    None,
+                    None,
+                    true,
+                    CREATE_NO_WINDOW
+                        | EXTENDED_STARTUPINFO_PRESENT
+                        | windows::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT,
+                    (!environment.is_null()).then_some(environment.cast_const()),
+                    PCWSTR(working_directory_wide.as_ptr()),
+                    &startup.StartupInfo,
+                    &mut process_info,
+                )
+            }
+            .map_err(anyhow::Error::from)
+        });
+    // The child holds its own copies now; close ours whether or not it started.
+    drop(child_input);
+    drop(child_output);
+    drop(child_stderr);
+    drop(handle_list);
     if !environment.is_null() {
         let _ =
             unsafe { windows::Win32::System::Environment::DestroyEnvironmentBlock(environment) };
@@ -1579,9 +1609,6 @@ fn launch_helper(target: DesktopTarget, as_user: bool) -> anyhow::Result<Launche
         )
     })?;
     let _thread = OwnedHandle(process_info.hThread);
-    drop(child_input);
-    drop(child_output);
-    drop(child_stderr);
     Ok(LaunchedHelper {
         process: OwnedHandle(process_info.hProcess),
         process_id: process_info.dwProcessId,
@@ -1598,6 +1625,43 @@ enum HelperKind {
     Files,
     Clipboard,
     Chat,
+}
+
+/// Whether a helper of `kind` sends `event`, matching the child run loops. The
+/// Files and Clipboard helpers run with the user's token, so the parent treats
+/// any other event as a protocol error instead of trusting it.
+fn helper_sends(kind: HelperKind, event: &ChildEvent) -> bool {
+    match event {
+        ChildEvent::InputStarted | ChildEvent::Error(_) | ChildEvent::Stopped => true,
+        ChildEvent::Cursor(..)
+        | ChildEvent::MaintenanceState { .. }
+        | ChildEvent::CredentialPrompt(_) => kind == HelperKind::Input,
+        // The file helper reports wallpaper failures.
+        ChildEvent::MaintenanceError(_) => matches!(kind, HelperKind::Input | HelperKind::Files),
+        ChildEvent::Credentials(_) => matches!(kind, HelperKind::Input | HelperKind::Chat),
+        ChildEvent::Files(_) => kind == HelperKind::Files,
+        ChildEvent::Clipboard(_) => kind == HelperKind::Clipboard,
+        ChildEvent::Chat(_) => kind == HelperKind::Chat,
+        ChildEvent::Started(_) | ChildEvent::Frame(_) => false,
+    }
+}
+
+fn child_event_name(event: &ChildEvent) -> &'static str {
+    match event {
+        ChildEvent::Credentials(_) => "credential result",
+        ChildEvent::CredentialPrompt(_) => "credential detection",
+        ChildEvent::Files(_) => "file transfer",
+        ChildEvent::Started(_) => "video start",
+        ChildEvent::InputStarted => "start",
+        ChildEvent::MaintenanceState { .. } => "maintenance state",
+        ChildEvent::MaintenanceError(_) => "maintenance error",
+        ChildEvent::Frame(_) => "video frame",
+        ChildEvent::Cursor(..) => "cursor",
+        ChildEvent::Clipboard(_) => "clipboard",
+        ChildEvent::Chat(_) => "chat",
+        ChildEvent::Error(_) => "error",
+        ChildEvent::Stopped => "stop",
+    }
 }
 
 fn helper_uses_user_token(kind: HelperKind, target: DesktopTarget) -> bool {
@@ -1712,22 +1776,61 @@ fn start_input_helper(
     })
 }
 
-fn create_inherited_pipe(parent_reads: bool) -> anyhow::Result<(OwnedHandle, OwnedHandle)> {
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        bInheritHandle: BOOL(1),
-        ..Default::default()
-    };
+/// Creates a non-inheritable pipe and returns its (read, write) ends.
+fn create_pipe() -> anyhow::Result<(OwnedHandle, OwnedHandle)> {
     let mut read = HANDLE::default();
     let mut write = HANDLE::default();
-    unsafe { CreatePipe(&mut read, &mut write, Some(&attributes), 0) }
+    unsafe { CreatePipe(&mut read, &mut write, None, 0) }
         .context("failed to create desktop-helper IPC pipe")?;
-    let read = OwnedHandle(read);
-    let write = OwnedHandle(write);
-    let parent = if parent_reads { &read } else { &write };
-    unsafe { SetHandleInformation(parent.0, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) }
-        .context("failed to protect the parent desktop-helper pipe handle")?;
-    Ok((read, write))
+    Ok((OwnedHandle(read), OwnedHandle(write)))
+}
+
+/// A PROC_THREAD_ATTRIBUTE_HANDLE_LIST that limits what a child inherits to
+/// the listed handles. The handle array must outlive the process launch.
+struct HandleListAttribute<'a> {
+    // u64 storage keeps the opaque attribute list pointer-aligned.
+    buffer: Vec<u64>,
+    _handles: std::marker::PhantomData<&'a [HANDLE]>,
+}
+
+impl<'a> HandleListAttribute<'a> {
+    fn new(handles: &'a [HANDLE]) -> anyhow::Result<Self> {
+        let mut size = 0;
+        // The sizing call reports ERROR_INSUFFICIENT_BUFFER by design.
+        let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
+        anyhow::ensure!(size > 0, "Windows reported no process attribute list size");
+        let mut buffer = vec![0u64; size.div_ceil(std::mem::size_of::<u64>())];
+        let list = LPPROC_THREAD_ATTRIBUTE_LIST(buffer.as_mut_ptr().cast());
+        unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut size) }
+            .context("failed to create the desktop-helper process attribute list")?;
+        let attribute = Self {
+            buffer,
+            _handles: std::marker::PhantomData,
+        };
+        unsafe {
+            UpdateProcThreadAttribute(
+                attribute.list(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                Some(handles.as_ptr().cast()),
+                std::mem::size_of_val(handles),
+                None,
+                None,
+            )
+        }
+        .context("failed to limit the handles a desktop helper inherits")?;
+        Ok(attribute)
+    }
+
+    fn list(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        LPPROC_THREAD_ATTRIBUTE_LIST(self.buffer.as_ptr().cast_mut().cast())
+    }
+}
+
+impl Drop for HandleListAttribute<'_> {
+    fn drop(&mut self) {
+        unsafe { DeleteProcThreadAttributeList(self.list()) };
+    }
 }
 
 fn dispatch_child_events(
@@ -1822,9 +1925,40 @@ fn dispatch_input_events(
 ) {
     let mut output = BufReader::new(output);
     let mut started_tx = Some(started_tx);
+    let fail = |started_tx: &mut Option<mpsc::SyncSender<Result<(), String>>>, message: String| {
+        if let Some(sender) = started_tx.take() {
+            let _ = sender.send(Err(message.clone()));
+        }
+        set_status(&status, Err(message));
+    };
     loop {
-        match read_event(&mut output) {
-            Ok(ChildEvent::InputStarted) => {
+        let event = match read_event(&mut output) {
+            Ok(event) if helper_sends(kind, &event) => event,
+            Ok(event) => {
+                tracing::warn!(
+                    helper_kind = ?kind,
+                    event = child_event_name(&event),
+                    "desktop helper sent an event it never sends; stopping it"
+                );
+                fail(
+                    &mut started_tx,
+                    format!(
+                        "desktop {kind:?} helper sent an unexpected {} event",
+                        child_event_name(&event)
+                    ),
+                );
+                break;
+            }
+            Err(error) => {
+                fail(
+                    &mut started_tx,
+                    format!("desktop input-helper IPC failed: {error}"),
+                );
+                break;
+            }
+        };
+        match event {
+            ChildEvent::InputStarted => {
                 if let Some(sender) = started_tx.take() {
                     let _ = sender.send(Ok(()));
                 } else {
@@ -1835,11 +1969,10 @@ fn dispatch_input_events(
                     break;
                 }
             }
-            Ok(ChildEvent::Credentials(result)) => {
+            ChildEvent::Credentials(result) => {
                 let mut current = credentials.lock().unwrap();
-                if !matches!(kind, HelperKind::Chat | HelperKind::Input)
-                    || (result.encrypted.is_some()
-                        && (kind != HelperKind::Chat || !current.state.prompt_active))
+                if result.encrypted.is_some()
+                    && (kind != HelperKind::Chat || !current.state.prompt_active)
                 {
                     set_status(&status, Err("unexpected credential result".into()));
                     break;
@@ -1858,80 +1991,65 @@ fn dispatch_input_events(
                     current.state.prompt_active = false;
                 }
             }
-            Ok(ChildEvent::CredentialPrompt(ready)) => {
-                if kind != HelperKind::Input {
-                    set_status(&status, Err("unexpected credential detection event".into()));
-                    break;
-                }
+            ChildEvent::CredentialPrompt(ready) => {
                 credentials.lock().unwrap().state.can_autofill = ready;
             }
-            Ok(ChildEvent::MaintenanceError(reason)) => {
+            ChildEvent::MaintenanceError(reason) => {
                 *maintenance.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(SessionMessage::MaintenanceError { reason });
             }
-            Ok(ChildEvent::MaintenanceState {
+            ChildEvent::MaintenanceState {
                 agent_input_blocked,
                 blacked_out,
-            }) => {
+            } => {
                 *maintenance.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(SessionMessage::MaintenanceState {
                         agent_input_blocked,
                         blacked_out,
                     });
             }
-            Ok(ChildEvent::Cursor(shape, viewer_controls_input, pointer_display)) => {
+            ChildEvent::Cursor(shape, viewer_controls_input, pointer_display) => {
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) =
                     (shape, viewer_controls_input, pointer_display);
             }
-            Ok(ChildEvent::Files(message)) => {
+            ChildEvent::Files(message) => {
                 let mut queue = files.queue.lock().unwrap();
                 if queue.len() < 32 {
                     queue.push_back(message);
                     files.ready.notify_one();
                 }
             }
-            Ok(ChildEvent::Chat(text)) => {
+            ChildEvent::Chat(text) => {
                 let mut queue = chat.queue.lock().unwrap_or_else(|e| e.into_inner());
                 if queue.len() < 32 {
                     queue.push_back(text);
                     chat.ready.notify_one();
                 }
             }
-            Ok(ChildEvent::Clipboard(text)) => {
+            ChildEvent::Clipboard(text) => {
                 *clipboard
                     .latest
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = Some(text);
                 clipboard.ready.notify_one();
             }
-            Ok(ChildEvent::Error(message)) => {
-                if let Some(sender) = started_tx.take() {
-                    let _ = sender.send(Err(message.clone()));
-                }
-                set_status(&status, Err(message));
+            ChildEvent::Error(message) => {
+                fail(&mut started_tx, message);
                 break;
             }
-            Ok(ChildEvent::Stopped) => {
+            ChildEvent::Stopped => {
                 if let Some(sender) = started_tx.take() {
                     let _ = sender.send(Err("desktop input helper stopped before startup".into()));
                 }
                 set_status(&status, Ok(()));
                 break;
             }
-            Ok(ChildEvent::Started(_) | ChildEvent::Frame(_)) => {
-                let message = "desktop input helper reported a video event".to_string();
-                if let Some(sender) = started_tx.take() {
-                    let _ = sender.send(Err(message.clone()));
-                }
-                set_status(&status, Err(message));
-                break;
-            }
-            Err(error) => {
-                let message = format!("desktop input-helper IPC failed: {error}");
-                if let Some(sender) = started_tx.take() {
-                    let _ = sender.send(Err(message.clone()));
-                }
-                set_status(&status, Err(message));
+            // helper_sends rejects video events before this match.
+            ChildEvent::Started(_) | ChildEvent::Frame(_) => {
+                fail(
+                    &mut started_tx,
+                    "desktop input helper reported a video event".into(),
+                );
                 break;
             }
         }
@@ -1945,15 +2063,115 @@ fn set_status(status: &HelperStatus, value: Result<(), String>) {
     }
 }
 
+/// Forwards a helper's stderr to the Agent log. Some helpers run with the
+/// user's token, so lines are capped in length and rate and the rest is
+/// drained without being kept, to keep the pipe from blocking the helper.
 fn drain_child_stderr(stderr: File) {
-    for line in BufReader::new(stderr).lines() {
-        match line {
-            Ok(line) => tracing::warn!(message = %line, "desktop helper wrote to stderr"),
+    let mut reader = BufReader::new(stderr);
+    let mut line = Vec::new();
+    let mut budget = LineBudget::new(STDERR_LINES_PER_WINDOW, STDERR_WINDOW, Instant::now());
+    loop {
+        match read_bounded_line(&mut reader, &mut line, MAX_STDERR_LINE_BYTES) {
+            Ok(Some(truncated)) => {
+                let (admitted, suppressed) = budget.admit(Instant::now());
+                if suppressed > 0 {
+                    tracing::warn!(suppressed, "suppressed desktop-helper stderr lines");
+                }
+                if admitted {
+                    let message = String::from_utf8_lossy(&line);
+                    tracing::warn!(%message, truncated, "desktop helper wrote to stderr");
+                }
+            }
+            Ok(None) => break,
             Err(error) => {
                 tracing::warn!(%error, "failed to read desktop-helper stderr");
                 break;
             }
         }
+    }
+    let suppressed = budget.take_suppressed();
+    if suppressed > 0 {
+        tracing::warn!(suppressed, "suppressed desktop-helper stderr lines");
+    }
+}
+
+/// Reads one line into `line`, keeping at most `limit` bytes and discarding
+/// the rest up to the newline. Returns whether the line was cut short, or
+/// `None` at end of input.
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<Option<bool>> {
+    line.clear();
+    let mut truncated = false;
+    let mut read_any = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            return Ok(read_any.then_some(truncated));
+        }
+        read_any = true;
+        let newline = available.iter().position(|&byte| byte == b'\n');
+        let content = &available[..newline.unwrap_or(available.len())];
+        let room = limit.saturating_sub(line.len());
+        truncated |= content.len() > room;
+        line.extend_from_slice(&content[..content.len().min(room)]);
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        reader.consume(consumed);
+        if newline.is_some() {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(Some(truncated));
+        }
+    }
+}
+
+/// Allows `limit` lines per window and counts the lines it refuses.
+struct LineBudget {
+    limit: u32,
+    window: Duration,
+    window_start: Instant,
+    used: u32,
+    suppressed: u64,
+}
+
+impl LineBudget {
+    fn new(limit: u32, window: Duration, now: Instant) -> Self {
+        Self {
+            limit,
+            window,
+            window_start: now,
+            used: 0,
+            suppressed: 0,
+        }
+    }
+
+    /// Returns whether to log this line, and how many lines the window that
+    /// just ended suppressed.
+    fn admit(&mut self, now: Instant) -> (bool, u64) {
+        let mut ended = 0;
+        if now.duration_since(self.window_start) >= self.window {
+            ended = self.take_suppressed();
+            self.window_start = now;
+            self.used = 0;
+        }
+        if self.used < self.limit {
+            self.used += 1;
+            (true, ended)
+        } else {
+            self.suppressed += 1;
+            (false, ended)
+        }
+    }
+
+    fn take_suppressed(&mut self) -> u64 {
+        std::mem::take(&mut self.suppressed)
     }
 }
 
@@ -3928,7 +4146,7 @@ mod isolation_tests {
         controller.apply(event(false)).unwrap();
         controller.release_all().unwrap();
 
-        let (reader, writer) = create_inherited_pipe(false).unwrap();
+        let (reader, writer) = create_pipe().unwrap();
         *streamer.input_route.lock().unwrap() =
             Some(Arc::new(CommandWriter::new(writer.into_file()).unwrap()));
         controller.apply(event(true)).unwrap();
@@ -3969,13 +4187,31 @@ mod isolation_tests {
     }
 
     #[test]
+    fn helper_pipes_start_non_inheritable() {
+        let (read, write) = create_pipe().unwrap();
+        for handle in [&read, &write] {
+            let mut flags = 0;
+            unsafe { windows::Win32::Foundation::GetHandleInformation(handle.0, &mut flags) }
+                .unwrap();
+            assert_eq!(flags & HANDLE_FLAG_INHERIT.0, 0);
+        }
+        let handles = [read.0, write.0];
+        // The attribute list accepts the pipe ends once a launch marks them inheritable.
+        for handle in handles {
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
+                .unwrap();
+        }
+        HandleListAttribute::new(&handles).unwrap();
+    }
+
+    #[test]
     fn stalled_clipboard_pipe_does_not_block_input_pipe() {
-        let (blocked_read, blocked_write) = create_inherited_pipe(false).unwrap();
+        let (blocked_read, blocked_write) = create_pipe().unwrap();
         let clipboard = CommandWriter::new(blocked_write.into_file()).unwrap();
         // Far larger than the anonymous pipe buffer; its writer must wait until
         // the reader drains/closes it. The caller only enqueues these bytes.
         clipboard.send(vec![0; 1024 * 1024]).unwrap();
-        let (input_read, input_write) = create_inherited_pipe(false).unwrap();
+        let (input_read, input_write) = create_pipe().unwrap();
         let input = Arc::new(CommandWriter::new(input_write.into_file()).unwrap());
         let (received, result) = mpsc::channel();
         let reader = thread::spawn(move || {
@@ -4116,68 +4352,289 @@ mod service_command_tests {
 mod service_event_tests {
     use super::*;
 
-    #[tokio::test]
-    async fn helper_pipe_notifies_services_and_coalesces_clipboard_changes() {
-        let (read, write) = create_inherited_pipe(true).unwrap();
+    struct Dispatched {
+        startup: Result<(), String>,
+        status: Option<Result<(), String>>,
+        cursor: HelperCursor,
+        clipboard: HelperClipboard,
+        files: HelperFiles,
+        chat: HelperChat,
+        maintenance: HelperMaintenance,
+        credentials: HelperCredentials,
+    }
+
+    fn dispatch(kind: HelperKind, events: &[ChildEvent]) -> Dispatched {
+        let (read, write) = create_pipe().unwrap();
         let (started, startup) = mpsc::sync_channel(1);
+        let status: HelperStatus = Arc::new(Mutex::new(None));
+        let cursor: HelperCursor = Arc::new(Mutex::new((CursorShape::Default, false, None)));
         let clipboard = Arc::new(ClipboardEvents::default());
         let files = Arc::new(FileEvents::default());
         let chat = Arc::new(ChatEvents::default());
-        let reader_clipboard = clipboard.clone();
-        let reader_files = files.clone();
-        let reader_chat = chat.clone();
-        let (finished, done) = tokio::sync::oneshot::channel();
-        thread::spawn(move || {
-            dispatch_input_events(
-                read.into_file(),
-                started,
-                Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new((CursorShape::Default, false, None))),
-                reader_clipboard,
-                reader_files,
-                reader_chat,
-                Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new(Credentials::default())),
-                HelperKind::Clipboard,
+        let maintenance: HelperMaintenance = Arc::new(Mutex::new(None));
+        let credentials = Arc::new(Mutex::new(Credentials::default()));
+        let reader = {
+            let (status, cursor, clipboard, files, chat, maintenance, credentials) = (
+                status.clone(),
+                cursor.clone(),
+                clipboard.clone(),
+                files.clone(),
+                chat.clone(),
+                maintenance.clone(),
+                credentials.clone(),
             );
-            let _ = finished.send(());
-        });
+            thread::spawn(move || {
+                dispatch_input_events(
+                    read.into_file(),
+                    started,
+                    status,
+                    cursor,
+                    clipboard,
+                    files,
+                    chat,
+                    maintenance,
+                    credentials,
+                    kind,
+                )
+            })
+        };
         let mut writer = write.into_file();
-        for event in [
-            ChildEvent::InputStarted,
-            ChildEvent::Clipboard(ClipboardContent::Text("first".into())),
-            ChildEvent::Clipboard(ClipboardContent::Text("latest".into())),
-            ChildEvent::Chat("hello".into()),
-            ChildEvent::Files(meshrmm_protocol::FileMessage::Available),
-            ChildEvent::Stopped,
-        ] {
-            write_event(&mut writer, &event).unwrap();
+        for event in events {
+            // The reader may already have stopped after a rejected event.
+            if write_event(&mut writer, event).is_err() {
+                break;
+            }
         }
-        tokio::time::timeout(Duration::from_secs(2), done)
-            .await
-            .unwrap()
-            .unwrap();
-        startup.recv().unwrap().unwrap();
+        drop(writer);
+        reader.join().unwrap();
+        let status = status.lock().unwrap().take();
+        Dispatched {
+            startup: startup.recv().unwrap(),
+            status,
+            cursor,
+            clipboard,
+            files,
+            chat,
+            maintenance,
+            credentials,
+        }
+    }
+
+    #[tokio::test]
+    async fn helper_pipe_notifies_services_and_coalesces_clipboard_changes() {
+        let clipboard = dispatch(
+            HelperKind::Clipboard,
+            &[
+                ChildEvent::InputStarted,
+                ChildEvent::Clipboard(ClipboardContent::Text("first".into())),
+                ChildEvent::Clipboard(ClipboardContent::Text("latest".into())),
+                ChildEvent::Stopped,
+            ],
+        );
+        let chat = dispatch(
+            HelperKind::Chat,
+            &[
+                ChildEvent::InputStarted,
+                ChildEvent::Chat("hello".into()),
+                ChildEvent::Stopped,
+            ],
+        );
+        let files = dispatch(
+            HelperKind::Files,
+            &[
+                ChildEvent::InputStarted,
+                ChildEvent::Files(meshrmm_protocol::FileMessage::Available),
+                ChildEvent::Stopped,
+            ],
+        );
+        for helper in [&clipboard, &chat, &files] {
+            assert_eq!(helper.startup, Ok(()));
+            assert_eq!(helper.status, Some(Ok(())));
+        }
         tokio::time::timeout(Duration::from_secs(2), async {
-            clipboard.ready.notified().await;
-            files.ready.notified().await;
-            chat.ready.notified().await;
+            clipboard.clipboard.ready.notified().await;
+            files.files.ready.notified().await;
+            chat.chat.ready.notified().await;
         })
         .await
         .unwrap();
         assert_eq!(
-            clipboard.latest.lock().unwrap().take(),
+            clipboard.clipboard.latest.lock().unwrap().take(),
             Some(ClipboardContent::Text("latest".into()))
         );
         assert_eq!(
-            chat.queue.lock().unwrap().pop_front().as_deref(),
+            chat.chat.queue.lock().unwrap().pop_front().as_deref(),
             Some("hello")
         );
         assert!(matches!(
-            files.queue.lock().unwrap().pop_front(),
+            files.files.queue.lock().unwrap().pop_front(),
             Some(meshrmm_protocol::FileMessage::Available)
         ));
-        assert!(clipboard.latest.lock().unwrap().is_none());
+        assert!(clipboard.clipboard.latest.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn helpers_are_trusted_only_for_events_their_run_loops_send() {
+        use HelperKind::*;
+        let events = [
+            ChildEvent::InputStarted,
+            ChildEvent::Error("failed".into()),
+            ChildEvent::Stopped,
+            ChildEvent::Cursor(CursorShape::Default, true, None),
+            ChildEvent::MaintenanceState {
+                agent_input_blocked: false,
+                blacked_out: false,
+            },
+            ChildEvent::CredentialPrompt(true),
+            ChildEvent::MaintenanceError("wallpaper".into()),
+            ChildEvent::Credentials(CredentialResult {
+                encrypted: None,
+                message: "done".into(),
+            }),
+            ChildEvent::Files(meshrmm_protocol::FileMessage::Available),
+            ChildEvent::Clipboard(ClipboardContent::Text("copied".into())),
+            ChildEvent::Chat("hello".into()),
+        ];
+        let expected: [&[HelperKind]; 11] = [
+            &[Input, Files, Clipboard, Chat],
+            &[Input, Files, Clipboard, Chat],
+            &[Input, Files, Clipboard, Chat],
+            &[Input],
+            &[Input],
+            &[Input],
+            &[Input, Files],
+            &[Input, Chat],
+            &[Files],
+            &[Clipboard],
+            &[Chat],
+        ];
+        for (event, senders) in events.iter().zip(expected) {
+            for kind in [Input, Files, Clipboard, Chat] {
+                assert_eq!(
+                    helper_sends(kind, event),
+                    senders.contains(&kind),
+                    "{kind:?} helper, {} event",
+                    child_event_name(event)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn user_token_helpers_cannot_forge_other_helpers_events() {
+        let forged = [
+            (
+                HelperKind::Clipboard,
+                ChildEvent::Chat("forged chat".into()),
+            ),
+            (
+                HelperKind::Clipboard,
+                ChildEvent::MaintenanceError("forged".into()),
+            ),
+            (
+                HelperKind::Files,
+                ChildEvent::Cursor(CursorShape::Text, true, None),
+            ),
+            (
+                HelperKind::Files,
+                ChildEvent::MaintenanceState {
+                    agent_input_blocked: true,
+                    blacked_out: true,
+                },
+            ),
+            (
+                HelperKind::Files,
+                ChildEvent::Clipboard(ClipboardContent::Text("forged".into())),
+            ),
+            (HelperKind::Files, ChildEvent::CredentialPrompt(true)),
+            (
+                HelperKind::Clipboard,
+                ChildEvent::Files(meshrmm_protocol::FileMessage::Available),
+            ),
+            (
+                HelperKind::Chat,
+                ChildEvent::Clipboard(ClipboardContent::Text("forged".into())),
+            ),
+            (HelperKind::Input, ChildEvent::Chat("forged chat".into())),
+        ];
+        for (kind, event) in forged {
+            let name = child_event_name(&event);
+            let result = dispatch(
+                kind,
+                &[
+                    ChildEvent::InputStarted,
+                    event,
+                    ChildEvent::Chat("after".into()),
+                    ChildEvent::Stopped,
+                ],
+            );
+            assert_eq!(result.startup, Ok(()));
+            let Some(Err(message)) = result.status else {
+                panic!("{kind:?} helper's {name} event was accepted");
+            };
+            assert!(message.contains("unexpected"), "{message}");
+            assert_eq!(
+                *result.cursor.lock().unwrap(),
+                (CursorShape::Default, false, None)
+            );
+            assert!(result.clipboard.latest.lock().unwrap().is_none());
+            assert!(result.files.queue.lock().unwrap().is_empty());
+            assert!(result.chat.queue.lock().unwrap().is_empty());
+            assert!(result.maintenance.lock().unwrap().is_none());
+            assert!(!result.credentials.lock().unwrap().state.can_autofill);
+        }
+    }
+
+    #[test]
+    fn stderr_lines_are_bounded_without_losing_the_next_line() {
+        let mut input = Vec::new();
+        input.extend(std::iter::repeat_n(b'x', 10_000));
+        input.extend_from_slice(b"\r\nnext\npartial");
+        // A small buffer exercises lines that span several reads.
+        let mut reader = BufReader::with_capacity(7, &input[..]);
+        let mut line = Vec::new();
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line, 16).unwrap(),
+            Some(true)
+        );
+        assert_eq!(line, vec![b'x'; 16]);
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line, 16).unwrap(),
+            Some(false)
+        );
+        assert_eq!(line, b"next");
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line, 16).unwrap(),
+            Some(false)
+        );
+        assert_eq!(line, b"partial");
+        assert_eq!(read_bounded_line(&mut reader, &mut line, 16).unwrap(), None);
+    }
+
+    #[test]
+    fn stderr_budget_suppresses_floods_and_reports_them_per_window() {
+        let start = Instant::now();
+        let window = Duration::from_secs(60);
+        let mut budget = LineBudget::new(2, window, start);
+        assert_eq!(budget.admit(start), (true, 0));
+        assert_eq!(budget.admit(start), (true, 0));
+        assert_eq!(budget.admit(start), (false, 0));
+        assert_eq!(budget.admit(start + Duration::from_secs(59)), (false, 0));
+        assert_eq!(budget.admit(start + window), (true, 2));
+        assert_eq!(budget.admit(start + window), (true, 0));
+        assert_eq!(budget.admit(start + window), (false, 0));
+        assert_eq!(budget.take_suppressed(), 1);
+        assert_eq!(budget.take_suppressed(), 0);
+    }
+
+    #[test]
+    fn forged_event_before_start_fails_startup() {
+        let result = dispatch(
+            HelperKind::Clipboard,
+            &[ChildEvent::Files(meshrmm_protocol::FileMessage::Available)],
+        );
+        assert!(result.startup.is_err());
+        assert!(matches!(result.status, Some(Err(_))));
     }
 }
 
