@@ -2,7 +2,7 @@
 //! has a viewer asks that viewer to end its session and waits for it to exit.
 //! Otherwise the new handoff is redeemed while the old lease is still active,
 //! and the server refuses it for up to 15 minutes.
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use windows::Win32::Foundation::{
@@ -13,6 +13,9 @@ use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, INFINITE, ReleaseMutex, ResetEvent, SetEvent, WaitForSingleObject,
 };
 use windows::core::HSTRING;
+
+/// How often a viewer waiting to take over repeats its request.
+const RESIGNAL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Holds this device's viewer mutex until dropped or the process exits.
 pub struct InstanceGuard {
@@ -63,9 +66,21 @@ pub fn claim(
             device_id,
             "asking the open viewer for this device to end its session"
         );
-        unsafe { SetEvent(event.0) }.context("could not signal the open viewer")?;
-        let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
-        match unsafe { WaitForSingleObject(mutex, milliseconds) } {
+        let deadline = Instant::now() + timeout;
+        let waited = loop {
+            // Signal again after each slice. When several viewers start at once, the one that
+            // takes over resets the event, and that would otherwise erase this viewer's request.
+            unsafe { SetEvent(event.0) }.context("could not signal the open viewer")?;
+            let slice = deadline
+                .saturating_duration_since(Instant::now())
+                .min(RESIGNAL_INTERVAL);
+            let milliseconds = u32::try_from(slice.as_millis()).unwrap_or(u32::MAX - 1);
+            match unsafe { WaitForSingleObject(mutex, milliseconds) } {
+                WAIT_TIMEOUT if Instant::now() < deadline => {}
+                other => break other,
+            }
+        };
+        match waited {
             WAIT_OBJECT_0 | WAIT_ABANDONED => {}
             WAIT_TIMEOUT => {
                 unsafe {
@@ -140,6 +155,47 @@ mod tests {
                 .is_err()
         );
         drop(second);
+    }
+
+    #[test]
+    fn viewers_opened_together_both_get_their_turn() {
+        let device = device("together");
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let (replaced_tx, replaced_rx) = std::sync::mpsc::channel();
+        let first_device = device.clone();
+        let first = std::thread::spawn(move || {
+            let guard = claim(&first_device, Duration::from_secs(5), move || {
+                let _ = replaced_tx.send(());
+            })
+            .unwrap();
+            claimed_tx.send(()).unwrap();
+            replaced_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(guard);
+        });
+        claimed_rx.recv().unwrap();
+        // Each later viewer ends its session when replaced, so whichever claims
+        // first gives way to the other instead of leaving it to time out.
+        let later: Vec<_> = (0..2)
+            .map(|_| {
+                let device = device.clone();
+                std::thread::spawn(move || {
+                    let (replaced_tx, replaced_rx) = std::sync::mpsc::channel();
+                    let guard = claim(&device, Duration::from_secs(5), move || {
+                        let _ = replaced_tx.send(());
+                    })?;
+                    let _ = replaced_rx.recv_timeout(Duration::from_millis(1_500));
+                    drop(guard);
+                    anyhow::Ok(())
+                })
+            })
+            .collect();
+        first.join().unwrap();
+        for viewer in later {
+            viewer
+                .join()
+                .unwrap()
+                .expect("each viewer claimed the device");
+        }
     }
 
     #[test]
