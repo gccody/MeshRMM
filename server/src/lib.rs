@@ -401,7 +401,9 @@ async fn authorize_agent(
         return Err(Error::RustError("invalid Agent token".into()));
     }
     if let Some(tenant) = request_tenant_company(&db, request, environment).await? {
-        if tenant.id != credential.company_id || tenant.status != "active" {
+        if tenant.id != credential.company_id
+            || !matches!(tenant.status.as_str(), "active" | "awaiting_admin")
+        {
             return Err(Error::RustError(
                 "Agent credential does not match the company hostname".into(),
             ));
@@ -411,7 +413,7 @@ async fn authorize_agent(
     }
     let active = query!(
         &db,
-        "SELECT 1 AS allowed FROM companies WHERE id = ?1 AND status = 'active'",
+        "SELECT 1 AS allowed FROM companies WHERE id = ?1 AND status IN ('active', 'awaiting_admin')",
         credential.company_id
     )?
     .first::<i64>(Some("allowed"))

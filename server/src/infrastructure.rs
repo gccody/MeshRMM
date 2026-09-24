@@ -364,7 +364,7 @@ pub(crate) fn api_error(status: u16, message: &str) -> Result<Response> {
 pub(crate) async fn device_is_active(environment: &Env, device_id: &str) -> Result<bool> {
     let db = environment.d1("DB")?;
     Ok(query!(&db,
-        "SELECT 1 AS allowed FROM agents a JOIN companies c ON c.id = a.company_id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL AND c.status = 'active'",
+        "SELECT 1 AS allowed FROM agents a JOIN companies c ON c.id = a.company_id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL AND c.status IN ('active', 'awaiting_admin')",
         device_id
     )?.first::<i64>(Some("allowed")).await?.is_some())
 }

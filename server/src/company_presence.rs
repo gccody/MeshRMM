@@ -165,7 +165,7 @@ impl DurableObject for CompanyPresence {
         let db = self.environment.d1("DB")?;
         let active = query!(
             &db,
-            "SELECT 1 AS allowed FROM companies WHERE id = ?1 AND status = 'active'",
+            "SELECT 1 AS allowed FROM companies WHERE id = ?1 AND status IN ('active', 'awaiting_admin')",
             company
         )?
         .first::<i64>(Some("allowed"))
@@ -323,7 +323,7 @@ impl CompanyPresence {
         let db = self.environment.d1("DB")?;
         let active = query!(
             &db,
-            "SELECT 1 AS allowed FROM companies WHERE id = ?1 AND status = 'active'",
+            "SELECT 1 AS allowed FROM companies WHERE id = ?1 AND status IN ('active', 'awaiting_admin')",
             company_id
         )?
         .first::<i64>(Some("allowed"))
