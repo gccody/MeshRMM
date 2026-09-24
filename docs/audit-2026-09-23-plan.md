@@ -37,12 +37,12 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 | T24 `npm run deploy` wipes production downloads | Medium | Done | `b84c249` |
 | T25 Release workflow branch restriction | Medium | Done | `f9e4582` |
 | T26 Dashboard account-load retry + sign-out handling | Medium | Done | `094a4e9` |
-| T27 Platform console error handling | Medium | **Next** | |
-| T28 Remove `dashboard/pulsermm-site.tar.gz` | Low | Todo | |
-| T29 CI hardening | Low | Todo | |
-| T30 Documentation accuracy / TLS 1.3 | Low | Todo | |
-| T31 Token rotation edge cases | Low | Todo | |
-| T32 File transfer sliding window | Low | Todo | |
+| T27 Platform console error handling | Medium | Done | `0546992` |
+| T28 Remove `dashboard/pulsermm-site.tar.gz` | Low | Done | `00d43c3` |
+| T29 CI hardening | Low | Done | `d8307fa` |
+| T30 Documentation accuracy / TLS 1.3 | Low | Done | `1297f0f` |
+| T31 Token rotation edge cases | Low | Done | `f95d930` |
+| T32 File transfer sliding window | Low | **Next** | |
 | T39 Native log rotation (+ viewer update helper logging) | Low | Todo | |
 | T33 Local dashboard dev loop | QoL | Todo | |
 | T34 Server deploy script + schema version in /healthz | QoL | Todo | |
@@ -72,10 +72,10 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 
 ## Endpoint state
 
-After T23, DESKTOP-85R6S28 runs a release build of `e5a50b2` (SHA-256 `C0B701A7…E8E7`), which
-includes T17, T18 and T23. The service is running and connected; the build it replaced (`a048609`,
-SHA-256 `591FD24D…9154`) is kept as `meshrmm-agent.exe.before-local-20260924-151551`. T19–T22 and
-T24–T26 did not change the Agent. Earlier builds are kept as
+After T30, DESKTOP-85R6S28 runs a release build of `1297f0f` (SHA-256 `5DACF2F3…71D0`), which
+includes T17, T18, T23 and T30. The service is running and connected; the build it replaced
+(`e5a50b2`, SHA-256 `C0B701A7…E8E7`) is kept as `meshrmm-agent.exe.before-local-20260924-160459`.
+T19–T22, T24–T29 and T31 did not change the Agent. Earlier builds are kept as
 `C:\Program Files\MeshRMM\Agent\meshrmm-agent.exe.before-local-*`. T01 removed the explicit
 `gccody` permission on `ProgramData\MeshRMM\Agent`, so a non-elevated `gccody` process can no longer
 read that folder. `updates\local-3273ef617bd940a68963ee6b2d11b6ad` came from an earlier session and was
@@ -167,6 +167,28 @@ These need a live dashboard → viewer → agent session, which the agent-driven
   Mac against the live manifest (0.2.8, passed).
 - T26: a live dashboard. The local dev loop cannot create a company session yet (T33); unit tests
   cover the retry policy and `npm run verify` passes.
+- T27: a live platform console (the same T33 limit). Unit tests cover which failures refuse owner
+  access and which error a reload keeps; `npm run verify` passes.
+- T28: nothing left. `git check-ignore` confirmed the new patterns match a `*-site.tar.gz` archive
+  at the root and in the dashboard, and a `__pycache__` directory.
+- T29: a real CI run. Both workflows parse with js-yaml and Ruby, every action is pinned to a
+  SHA resolved with `git ls-remote`, `cargo metadata --locked` passes, and
+  `node --test scripts/*.test.mjs` passes locally. The concurrency group includes the workflow
+  name so the release workflow's reusable CI call never shares a group with, and is cancelled
+  alongside, the push-triggered CI run for the same commit on main.
+- T30: the Agent's enrollment request (needs an installer token) and the viewers' update checks
+  against production. Handshake tests against local TLS 1.2-only and 1.3-only servers pass on
+  the Mac and the endpoint for the WebSocket, ureq and reqwest clients; the probe script showed
+  all public hosts reject TLS 1.2; temporary Mac probes completed TLS 1.3 handshakes with
+  `api.meshrmm.com` (WSS) and `meshrmm.com` (HTTPS). The installed service connected its
+  signaling WebSocket and ran its startup update check without an error. The unused
+  `WORKOS_REDIRECT_URI` was removed from `wrangler.jsonc` and edited out of the generated
+  `worker-configuration.d.ts` by hand, because `wrangler types` also rewrote the runtime types
+  for a newer workerd.
+- T31: a real rotation. The Miniflare suite (run on the Mac) covers offline refusal, resending
+  a pending credential, promotion deleting the plaintext copy, replacing a pending hash that was
+  never sent, and not sending one D1 withdrew; it fails against the previous code. A failed
+  send cannot be simulated there, so its withdrawal is covered by the SQL regressions only.
 
 ## Remaining tasks
 
