@@ -80,23 +80,28 @@ impl DurableObject for AgentCoordinator {
                 if uninstall_requested {
                     pair.server
                         .send_with_str(serde_json::to_string(&AgentCommand::Uninstall)?)?;
-                } else if let Err(error) = self.publish_presence(&identity, true).await {
-                    let _ = pair
-                        .server
-                        .close(Some(1011), Some("Agent presence could not be registered"));
-                    return Err(error);
-                } else if let Some(session) = self
-                    .state
-                    .storage()
-                    .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
-                    .await?
-                    && session.expires_at_unix_ms > Date::now().as_millis()
-                {
-                    pair.server.send_with_str(session_payload(&session)?)?;
-                    console_log!(
-                        "event=agent_session_resumed session_id={}",
-                        session.session_id
-                    );
+                } else {
+                    // A failed publication stays in the outbox, and the alarm armed
+                    // above retries it, so the Agent is accepted either way.
+                    if let Err(error) = self.publish_presence(&identity, true).await {
+                        console_error!(
+                            "event=agent_presence_publish_failed connected=true error={}",
+                            error
+                        );
+                    }
+                    if let Some(session) = self
+                        .state
+                        .storage()
+                        .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
+                        .await?
+                        && session.expires_at_unix_ms > Date::now().as_millis()
+                    {
+                        pair.server.send_with_str(session_payload(&session)?)?;
+                        console_log!(
+                            "event=agent_session_resumed session_id={}",
+                            session.session_id
+                        );
+                    }
                 }
                 if !uninstall_requested
                     && let Some(command) = self

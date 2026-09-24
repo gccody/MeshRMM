@@ -228,6 +228,20 @@ try {
   await post(session, '/__test/alarm');
   assert.ok((await state(session)).alarm > Date.now(), 'early alarm reschedules to durable deadline');
 
+  // A failed online publication does not refuse a reconnecting Agent: the
+  // live session is still resumed on the new socket and the alarm retries.
+  await post(presence, '/__test/fail', true);
+  const unpublished = collect(await connectAgent());
+  await until(() => unpublished.messages.some(m => m.session_id === 'session-test'), 'session resumed despite presence failure');
+  const queued = await state(agent);
+  assert.equal(queued.delivery.connected, true);
+  assert.equal(queued.delivery.acknowledged, false, 'online publication stays in the outbox');
+  assert.notEqual(queued.alarm, null);
+  await post(presence, '/__test/fail', false);
+  assert.equal((await post(agent, '/__test/alarm')).status, 200);
+  assert.equal((await state(agent)).delivery.acknowledged, true, 'alarm delivered the online publication');
+  assert.equal((await snapshot()).agents[0].connected, true);
+
   // A suspension whose revocation never reached the coordinator still takes
   // effect at its next session request: the Agent is disconnected and the
   // live session ends.
@@ -263,7 +277,7 @@ try {
   assert.equal((await post(failing, '/lease', lease)).status, 403);
   assert.equal(await failingClosed, 4001, 'the missed Agent is revoked at its next request');
   await db.exec("UPDATE companies SET status = 'active'");
-  console.log('Presence integration passed: event-only snapshots, durable retry, replacement ordering, renewal isolation/expiry/revocation, signing-key caching, retryable auth outages, deletion, session alarm preservation, suspension fan-out past failures, and revocation after a missed suspension.');
+  console.log('Presence integration passed: event-only snapshots, durable retry, replacement ordering, renewal isolation/expiry/revocation, signing-key caching, retryable auth outages, deletion, session alarm preservation, Agent connect past a presence failure, suspension fan-out past failures, and revocation after a missed suspension.');
 } finally {
   for (const socket of sockets) { try { socket.close(); } catch {} }
   await runtime.dispose();
