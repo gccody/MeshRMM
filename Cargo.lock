@@ -1954,6 +1954,7 @@ name = "meshrmm-remote"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "block2",
  "bytes",
  "clap",
  "dispatch2",

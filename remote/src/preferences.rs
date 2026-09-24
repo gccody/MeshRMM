@@ -16,6 +16,8 @@ struct Preferences {
     disconnect_confirmation: bool,
     clipboard_sync: bool,
     clear_clipboard_on_close: bool,
+    /// macOS: the Command key sends Ctrl instead of the Windows key.
+    command_as_control: bool,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -23,6 +25,7 @@ impl Default for Preferences {
             disconnect_confirmation: true,
             clipboard_sync: true,
             clear_clipboard_on_close: true,
+            command_as_control: false,
         }
     }
 }
@@ -91,6 +94,14 @@ pub fn clear_clipboard_on_close() -> bool {
 pub fn toggle_clear_clipboard_on_close() -> anyhow::Result<()> {
     toggle(|p| &mut p.clear_clipboard_on_close)
 }
+#[cfg(target_os = "macos")]
+pub fn command_as_control() -> bool {
+    get(|p| p.command_as_control)
+}
+#[cfg(target_os = "macos")]
+pub fn toggle_command_as_control() -> anyhow::Result<()> {
+    toggle(|p| &mut p.command_as_control)
+}
 fn save(path: &Path, preferences: &Preferences) -> anyhow::Result<()> {
     let directory = path.parent().context("preferences path has no parent")?;
     std::fs::create_dir_all(directory)?;
@@ -135,12 +146,14 @@ mod tests {
                 disconnect_confirmation: false,
                 clipboard_sync: false,
                 clear_clipboard_on_close: false,
+                command_as_control: true,
             },
         )
         .unwrap();
         assert!(!load(&path).disconnect_confirmation);
         assert!(!load(&path).clipboard_sync);
         assert!(!load(&path).clear_clipboard_on_close);
+        assert!(load(&path).command_as_control);
         save(&path, &Preferences::default()).unwrap();
         assert!(load(&path).disconnect_confirmation);
         assert!(load(&path).clipboard_sync);
@@ -150,6 +163,7 @@ mod tests {
         assert!(!load(&path).disconnect_confirmation);
         assert!(load(&path).clipboard_sync);
         assert!(load(&path).clear_clipboard_on_close);
+        assert!(!load(&path).command_as_control);
         // The session close action used to be saved here; it is now per session.
         std::fs::write(
             &path,

@@ -43,6 +43,7 @@ use crate::debug::DebugInfo;
 use crate::h264::annex_b_to_length_prefixed;
 
 mod app;
+mod keyboard;
 mod presenter;
 
 use app::close_connecting_window;

@@ -234,6 +234,20 @@ impl ControlSink {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn command_as_control(&self) -> bool {
+        crate::preferences::command_as_control()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn toggle_command_as_control(&self) {
+        if let Err(error) = crate::preferences::toggle_command_as_control()
+            && let Ok(mut state) = self.maintenance.lock()
+        {
+            state.error = Some(error.to_string());
+        }
+    }
+
     pub fn clipboard_sync(&self) -> bool {
         crate::preferences::clipboard_sync()
     }

@@ -695,6 +695,7 @@ impl MacUi {
             // that shares the same transport gate.
             self.input_view.release_input();
         }
+        self.input_view.remove_key_up_monitor();
         unsafe { self.layer.flushAndRemoveImage() };
         self.window.orderOut(None);
     }
