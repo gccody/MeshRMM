@@ -16,8 +16,19 @@ on immutable `<slug>.meshrmm.com` hostnames.
 npm install
 npm run dev
 npm run build
-npm run deploy
 ```
+
+## Deployment
+
+Deploy the dashboard only through the **Publish native release** GitHub Actions
+workflow. A deployment replaces every published Agent and viewer download, and
+`public/downloads/` is not committed, so a deployment from a normal checkout
+would remove them or publish local builds. `npm run deploy` refuses to run unless
+the workflow set `MESHRMM_RELEASE_DEPLOY=1` and `public/downloads/` holds the
+complete release for `release.json`'s version. To publish a dashboard change
+without a new native version, run the workflow manually. Use
+`npm run deploy:dry-run` to check a build without deploying. See
+[automated native releases](../docs/native-releases.md).
 
 Application code is organized by responsibility:
 
