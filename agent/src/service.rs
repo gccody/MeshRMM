@@ -82,6 +82,7 @@ fn service_main(_arguments: Vec<OsString>) {
     if let Err(error) = run_service() {
         tracing::error!(error = ?error, "MeshRMM Agent service stopped with an error");
     }
+    crate::logging::flush();
 }
 
 enum Control {
@@ -208,6 +209,9 @@ fn run_service() -> anyhow::Result<()> {
             drop(process);
         }
     }
+    tracing::info!(graceful, "the Agent service stopped");
+    // Windows may end the process once it reports Stopped.
+    crate::logging::flush();
     status.set_service_status(service_status(
         ServiceState::Stopped,
         ServiceControlAccept::empty(),
