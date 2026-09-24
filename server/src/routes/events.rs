@@ -78,7 +78,7 @@ pub(crate) async fn subscribe_agent_events(
     let db = environment.d1("DB")?;
     let subscription = query!(
         &db,
-        "UPDATE agent_event_subscriptions SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = agent_event_subscriptions.company_id AND companies.status = 'active') RETURNING company_id, user_id",
+        "UPDATE agent_event_subscriptions SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = agent_event_subscriptions.company_id AND companies.status IN ('active', 'awaiting_admin')) RETURNING company_id, user_id",
         now,
         token_hash
     )?

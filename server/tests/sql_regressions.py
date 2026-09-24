@@ -121,6 +121,17 @@ class EnrollmentTests(unittest.TestCase):
             self.db.execute("ROLLBACK")
             raise
 
+    def test_agents_a_company_can_enroll_stay_connected(self):
+        self.db.execute("UPDATE companies SET status='awaiting_admin'")
+        self.redeem()
+        revoke = sql("server/src/agent_coordinator.rs", "SELECT 1 AS active FROM companies")
+        connect = sql("server/src/lib.rs", "SELECT 1 AS allowed FROM companies")
+        device = sql("server/src/infrastructure.rs", "SELECT 1 AS allowed FROM agents a JOIN companies")
+        for status, allowed in [("awaiting_admin", True), ("active", True), ("suspended", False)]:
+            self.db.execute("UPDATE companies SET status=?", (status,))
+            for query, argument in [(revoke, "co"), (connect, "co"), (device, "device")]:
+                self.assertEqual(self.db.execute(query, (argument,)).fetchone() is not None, allowed, (status, query))
+
     def test_catalog_outbox_commits_with_changes_and_coalesces_without_losing_newer_edits(self):
         self.redeem()
         event = self.db.execute("SELECT event_id FROM presence_catalog_outbox WHERE agent_id='device'").fetchone()[0]

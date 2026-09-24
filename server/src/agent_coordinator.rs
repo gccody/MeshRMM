@@ -504,7 +504,9 @@ impl AgentCoordinator {
 
     /// Revokes the Agent when its company is no longer active, so a suspension
     /// whose revocation did not reach this coordinator still takes effect at
-    /// the next session request or alarm. A failed lookup revokes nothing.
+    /// the next session request or alarm. A company awaiting its first
+    /// administrator counts as active, as it does for enrollment. A failed
+    /// lookup revokes nothing.
     async fn revoke_if_company_inactive(&self) -> Result<bool> {
         let Some(identity) = self
             .state
@@ -518,7 +520,7 @@ impl AgentCoordinator {
             let db = self.environment.d1("DB")?;
             query!(
                 &db,
-                "SELECT 1 AS active FROM companies WHERE id = ?1 AND status = 'active'",
+                "SELECT 1 AS active FROM companies WHERE id = ?1 AND status IN ('active', 'awaiting_admin')",
                 identity.company_id
             )?
             .first::<i64>(Some("active"))
