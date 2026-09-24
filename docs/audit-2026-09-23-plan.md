@@ -19,10 +19,10 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 | T06 Defer updates during sessions; graceful worker stop | Medium | Done | `662ecb1` |
 | T07 Session-close actions bound to viewed user/session | Medium | Done | `c926dd9` |
 | T08 Task Manager protection names / own processes | Medium | Done | `0159bd8` |
-| T09 Capture-helper IPC hardening | Medium | **Next** | |
-| T10 Agent logging flush + write-error recovery | Medium | Todo | |
-| T11 Background console `exit` cleanup | Medium | Todo | |
-| T12 Windows viewer pointer mapping / DPI / letterbox | Medium | Todo | |
+| T09 Capture-helper IPC hardening | Medium | Done | `30e0836` |
+| T10 Agent logging flush + write-error recovery | Medium | Done | `de94bca` |
+| T11 Background console `exit` cleanup | Medium | Done | `6178050` |
+| T12 Windows viewer pointer mapping / DPI / letterbox | Medium | **Next** | |
 | T13 Relaunch replaces viewer without ending old session | Medium | Todo | |
 | T14 macOS viewer keyboard (Cmd→Win, ISO/JIS, stuck Shift) | Medium | Todo | |
 | T15 Windows viewer GUI subsystem + friendly errors (+ deep-link registration) | Medium | Todo | |
@@ -72,7 +72,7 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 
 ## Endpoint state
 
-After T08, DESKTOP-85R6S28 runs a release build of `0159bd8` (SHA-256 `5E33FA09…DB5A`). The
+After T11, DESKTOP-85R6S28 runs a release build of `6178050` (SHA-256 `466070DE…4B04`). The
 service is running and connected. Earlier builds are kept as
 `C:\Program Files\MeshRMM\Agent\meshrmm-agent.exe.before-local-*`. T01 removed the explicit
 `gccody` permission on `ProgramData\MeshRMM\Agent`, so a non-elevated `gccody` process can no longer
@@ -94,39 +94,17 @@ These need a live dashboard → viewer → agent session, which the agent-driven
   test run as SYSTEM on the endpoint resolved the console's session, logon ID and user.
 - T08: ending Agent processes from the Task Manager on the background desktop. Unit tests on the
   endpoint cover the ancestor chain, Agent copies, and the legacy service name.
+- T09: helpers started by the installed service during a live session. A temporary probe run as
+  SYSTEM on the endpoint started all four helper kinds and shut them down through the new launch
+  path. It confirmed that an unrelated inheritable handle reached neither a SYSTEM nor a user-token
+  helper, while a `std::process::Command` child did inherit it.
+- T10: recovery from a real disk-full or lost log file. Unit tests cover reopening with a backoff;
+  stopping the installed service now logs "the Agent service stopped".
+- T11: `exit` in a live background session. The ignored `console_exit_closes_window_task_and_input_helper`
+  test, run as SYSTEM in Session 0 on the endpoint, passes, and fails when the helper's watcher is
+  removed. Not tested: a program started from the console that outlives it keeps the console open.
 
 ## Remaining tasks
-
-### T09 — Capture-helper IPC hardening: bounded stderr + per-helper event validation (+ handle inheritance)
-(a) agent/src/remote/capture_helper.rs:~1948 drain_child_stderr uses BufReader::lines() with no cap;
-Files/Clipboard helpers run with the user's token so a local user can write unbounded data without a
-newline → SYSTEM worker OOM. Fix: bounded line reads (e.g. 4 KiB, truncate), rate-limit logging.
-(b) capture_helper.rs:~1868-1906: only Credentials/CredentialPrompt events are checked against helper
-kind. Enforce: Maintenance*/Cursor only from Input helper, Chat only from Chat, Files only from Files,
-Clipboard only from Clipboard/Input (verify real senders in code first); treat others as protocol error.
-(c) capture_helper.rs:~1557-1563 CreateProcess with bInheritHandles=TRUE and no
-PROC_THREAD_ATTRIBUTE_HANDLE_LIST; create_inherited_pipe (~1715-1731) leaves parent ends inheritable until
-SetHandleInformation. A concurrent launch (old session's capture thread still starting while new
-session starts helpers) can leak another helper's pipe ends into a user-token process. Fix: use
-STARTUPINFOEXW with an explicit handle list of that child's handles, and/or serialize helper launches
-with a process-wide lock. Native Windows checks + installed-agent validation (helpers still launch;
-background session / chat / files still work as far as can be exercised).
-
-### T10 — Agent logging: flush on exit, recover from write errors
-Note: T06 added a graceful worker stop path (stdin close → close actions → exit); make sure the flush guard covers it.
-agent/src/logging.rs:13-38, main.rs:60-63. Detached writer thread + queue; nothing flushes at exit so
-the final "service stopped with an error"/worker fatal lines usually never reach agent.log. Writer thread
-stops permanently after first write error. Fix: return a guard that closes the sender and joins the
-writer with a short timeout on shutdown/error paths (service_main, worker main, helpers); on write
-errors, retry/reopen instead of breaking (with backoff; don't spin). Add a test if practical.
-
-### T11 — Background console: `exit` leaves a dead console window + helper
-agent/src/remote/background.rs:~442-448 pushes a ConsoleInput per console launch and never prunes;
-background_console.rs:164-228 attaches the input helper to the app's console and loops until stdin EOF,
-never watching the target process. After `exit`, the blank console and its taskbar button remain and a
-helper process leaks. Fix: helper waits on the target process handle and FreeConsole/exit when it exits;
-prune console_inputs in refresh_tasks; replace hardcoded `index == 1 || index == 2` console pin
-detection with a flag on each pin. Native checks + installed validation as far as possible.
 
 ---------------------------------------------------------------------------------------------------
 ## MEDIUM — Viewer
