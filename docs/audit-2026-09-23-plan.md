@@ -1,0 +1,410 @@
+# Audit fix plan — 2026-09-23
+
+Tracks the fixes from the 2026-09-23 audit, which was made after the fixes in
+[audit-fixes.md](audit-fixes.md). Work happens on branch `audit-fixes-2026-09-23`, cut from
+`main` at `a237bb5`. Tasks go in priority order, and each one is committed before the next
+starts. Line numbers in the task descriptions come from the audit and may have drifted.
+
+## Status
+
+| Task | Priority | Status | Commit(s) |
+| --- | --- | --- | --- |
+| T01 Installer: secure ProgramData dirs + uninstall-helper staging (LPE) | High | Done | `5618b00` |
+| T02 macOS viewer: minimize ends session | High | Done | `2eb9bde` |
+| T03 macOS viewer: modal alert while UI borrowed → abort | High | Done | `b7ba5bd` |
+| T04 Windows QPC → µs overflow after ~21 days | High | Done | `bfb6f3c` |
+| T04b Installer: legacy config trust + non-environment system paths | High | Done | `4debd96` |
+| T05 Updater failure paths / restart loop / exe ACL | Medium | Done | `eb52c2c` |
+| T05b Uninstall helper self-delete + viewer updater race | Medium | Done | `a5d39e4`, `1265e1c` |
+| T06 Defer updates during sessions; graceful worker stop | Medium | Done | `662ecb1` |
+| T07 Session-close actions bound to viewed user/session | Medium | **Next** | |
+| T08 Task Manager protection names / own processes | Medium | Todo | |
+| T09 Capture-helper IPC hardening | Medium | Todo | |
+| T10 Agent logging flush + write-error recovery | Medium | Todo | |
+| T11 Background console `exit` cleanup | Medium | Todo | |
+| T12 Windows viewer pointer mapping / DPI / letterbox | Medium | Todo | |
+| T13 Relaunch replaces viewer without ending old session | Medium | Todo | |
+| T14 macOS viewer keyboard (Cmd→Win, ISO/JIS, stuck Shift) | Medium | Todo | |
+| T15 Windows viewer GUI subsystem + friendly errors (+ deep-link registration) | Medium | Todo | |
+| T16 Reconnect UX + recordings + wallpaper setting persistence | Medium | Todo | |
+| T17 File transfer roles, limits, cache cleanup | Medium | Todo | |
+| T18 Quarantine / Mark-of-the-Web on received files | Medium | Todo | |
+| T19 Server auth error mapping + JWKS cache | Medium | Todo | |
+| T20 Company status transition guards | Medium | Todo | |
+| T21 Suspension fan-out resilience | Medium | Todo | |
+| T22 Presence failure must not block agent connect | Medium | Todo | |
+| T23 Coordinator reconnect restarts healthy session | Medium | Todo | |
+| T24 `npm run deploy` wipes production downloads | Medium | Todo | |
+| T25 Release workflow branch restriction | Medium | Todo | |
+| T26 Dashboard account-load retry + sign-out handling | Medium | Todo | |
+| T27 Platform console error handling | Medium | Todo | |
+| T28 Remove `dashboard/pulsermm-site.tar.gz` | Low | Todo | |
+| T29 CI hardening | Low | Todo | |
+| T30 Documentation accuracy / TLS 1.3 | Low | Todo | |
+| T31 Token rotation edge cases | Low | Todo | |
+| T32 File transfer sliding window | Low | Todo | |
+| T39 Native log rotation (+ viewer update helper logging) | Low | Todo | |
+| T33 Local dashboard dev loop | QoL | Todo | |
+| T34 Server deploy script + schema version in /healthz | QoL | Todo | |
+| T35 Viewer input QoL (Win/Alt+Tab hook, rebindable keys) | QoL | Todo | |
+| T36 Agent refactor: split large files, dedupe launch code | QoL | Todo | |
+| T37 Viewer refactor: split window.rs / transport.rs | QoL | Todo | |
+| T38 Dashboard refactor: split dashboard.tsx, modal a11y | QoL | Todo | |
+
+## Working rules
+
+- Stay on `audit-fixes-2026-09-23`. Don't deploy, publish releases, bump versions, run
+  remote D1 migrations, or rewrite history.
+- Before changing code, read the code paths involved. If a finding turns out to be wrong,
+  record why in this file instead of changing code.
+- Match the surrounding style. Add tests for the behavior you change.
+- Mac checks: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace`. For server changes, also run
+  `cargo check -p meshrmm-server --target wasm32-unknown-unknown` and
+  `python3 server/tests/sql_regressions.py`. For dashboard changes, run `cd dashboard && npm run verify`.
+- Windows-only code does not compile under macOS clippy. Follow [AGENTS.md](../AGENTS.md):
+  1. Sync the tree to `~\audit-fixes-2026-09-23` on DESKTOP-85R6S28 and verify it with a SHA-256 manifest.
+  2. Run native fmt, clippy and tests there, checking `$LASTEXITCODE` after each.
+  3. When installed-agent behavior changes, back up the exe, install, confirm the service starts
+     and connects, exercise the change, and check the logs. Leave a working service.
+- Commit each task (conventional-commit subject) before starting the next, then update the status
+  table and notes here.
+
+## Endpoint state
+
+After T06, DESKTOP-85R6S28 runs a release build of `662ecb1` (SHA-256 `628EE7E1…F7E3`). The
+service is running and connected. Earlier builds are kept as
+`C:\Program Files\MeshRMM\Agent\meshrmm-agent.exe.before-local-*`. T01 removed the explicit
+`gccody` permission on `ProgramData\MeshRMM\Agent`, so a non-elevated `gccody` process can no longer
+read that folder. `updates\local-3273ef617bd940a68963ee6b2d11b6ad` came from an earlier session and was
+left untouched.
+
+## Validation gaps in completed tasks
+
+These need a live dashboard → viewer → agent session, which the agent-driven runs could not create:
+
+- T02 and T03: minimize/restore/close, and the "Recording saved" and maintenance-error alerts in a live macOS session.
+- T04: actual behavior after more than 21 days of uptime. Unit tests cover the conversion.
+- T04b: the updater's directory check during a real update, and a real PulseRMM legacy install.
+- T05: the forced-termination path for an old instance that hangs.
+- T05b: a real uninstall (re-enrolling afterwards needs a dashboard token), and a real viewer self-update from a published manifest.
+- T06: update deferral while a session is live, lock or clear-clipboard on service stop, stopping
+  with a staged update, and system shutdown.
+
+## Remaining tasks
+
+### T07 — Session-close actions not bound to the viewed user/session
+Note: T06 split session_close.rs into spawn / `run` / `finish`; build on that structure.
+agent/src/remote/session_close.rs:40-45, 129-141, 152. Target stored as DesktopSession::Console or
+Rdp{id,user}; at close, console session ID is looked up fresh and RDP `user` is never checked. Close may
+run minutes after viewer drop → a different user who signed in gets locked/force-logged-off
+(WTSLogoffSession) or has their clipboard cleared. Fix: record resolved session ID + user identity
+(SID and/or logon ID / logon time) in set_target; before Lock/Logoff/ClearClipboard verify the session
+still belongs to the same user logon; skip with a log line otherwise. Add session ID/user to close logs.
+Installed-agent validation (at least lock-on-close with a matching session if a viewer session can be
+driven; otherwise unit tests of the matching logic + service start/connect).
+
+### T08 — Background Task Manager protection uses wrong names; own processes killable
+agent/src/remote/background_tasks/data.rs:394, background_tasks.rs:1212, :1419 hardcode "MeshRMMAgent";
+service.rs has SERVICE_NAME + LEGACY_SERVICE_NAME ("PulseRMMAgent") and active_service_name().
+data.rs:101-113 termination_handle only refuses the Task Manager's own PID. Nothing stops ending the
+service/--worker/--background-helper processes or "End process tree" on an ancestor (kills the input
+helper, whose kill-on-close job then kills all background apps). Fix: protect both service names; refuse
+terminating processes whose image path is the Agent's own executable (and helper copies), and the Task
+Manager's own ancestors; give a clear error message in the UI. Update tests (data.rs:~1149).
+
+### T09 — Capture-helper IPC hardening: bounded stderr + per-helper event validation (+ handle inheritance)
+(a) agent/src/remote/capture_helper.rs:~1948 drain_child_stderr uses BufReader::lines() with no cap;
+Files/Clipboard helpers run with the user's token so a local user can write unbounded data without a
+newline → SYSTEM worker OOM. Fix: bounded line reads (e.g. 4 KiB, truncate), rate-limit logging.
+(b) capture_helper.rs:~1868-1906: only Credentials/CredentialPrompt events are checked against helper
+kind. Enforce: Maintenance*/Cursor only from Input helper, Chat only from Chat, Files only from Files,
+Clipboard only from Clipboard/Input (verify real senders in code first); treat others as protocol error.
+(c) capture_helper.rs:~1557-1563 CreateProcess with bInheritHandles=TRUE and no
+PROC_THREAD_ATTRIBUTE_HANDLE_LIST; create_inherited_pipe (~1715-1731) leaves parent ends inheritable until
+SetHandleInformation. A concurrent launch (old session's capture thread still starting while new
+session starts helpers) can leak another helper's pipe ends into a user-token process. Fix: use
+STARTUPINFOEXW with an explicit handle list of that child's handles, and/or serialize helper launches
+with a process-wide lock. Native Windows checks + installed-agent validation (helpers still launch;
+background session / chat / files still work as far as can be exercised).
+
+### T10 — Agent logging: flush on exit, recover from write errors
+Note: T06 added a graceful worker stop path (stdin close → close actions → exit); make sure the flush guard covers it.
+agent/src/logging.rs:13-38, main.rs:60-63. Detached writer thread + queue; nothing flushes at exit so
+the final "service stopped with an error"/worker fatal lines usually never reach agent.log. Writer thread
+stops permanently after first write error. Fix: return a guard that closes the sender and joins the
+writer with a short timeout on shutdown/error paths (service_main, worker main, helpers); on write
+errors, retry/reopen instead of breaking (with backoff; don't spin). Add a test if practical.
+
+### T11 — Background console: `exit` leaves a dead console window + helper
+agent/src/remote/background.rs:~442-448 pushes a ConsoleInput per console launch and never prunes;
+background_console.rs:164-228 attaches the input helper to the app's console and loops until stdin EOF,
+never watching the target process. After `exit`, the blank console and its taskbar button remain and a
+helper process leaks. Fix: helper waits on the target process handle and FreeConsole/exit when it exits;
+prune console_inputs in refresh_tasks; replace hardcoded `index == 1 || index == 2` console pin
+detection with a flag on each pin. Native checks + installed validation as far as possible.
+
+---------------------------------------------------------------------------------------------------
+## MEDIUM — Viewer
+
+### T12 — Windows viewer: pointer mapping when not 1:1, DPI awareness, letterboxing
+remote/src/platform/windows/renderer.rs:30-45, :105-128; window.rs:102-121. Swap chain is fixed-size
+(video w × video h + 68px toolbar) and stretched to the window; pointer code assumes video starts at a
+fixed 68 px and maps unscaled → wrong pointer positions when window is resized/maximized/DPI-scaled;
+viewer not DPI aware. Fix: declare PerMonitorV2 DPI awareness (manifest or SetProcessDpiAwarenessContext
+early), ResizeBuffers on WM_SIZE, render video into a letterboxed destination rect (preserve aspect),
+use the same rect for pointer mapping (clamp to video), handle WM_DPICHANGED. Toolbar layout must scale
+with DPI. Validate on the endpoint (build + native checks; run the viewer interactively via the
+scheduled-task runner if a session can be established, otherwise unit-test the mapping math).
+
+### T13 — Relaunching a session replaces the viewer without ending the old session (409 for 15 min)
+remote/src/platform/macos/app.rs:56-76: on a second dashboard link, the viewer spawns a new process and
+terminates without sending EndSession/end_session; server treats socket close as advisory
+(server/src/remote_session.rs:~207); the new handoff is consumed (handoffs.rs:~84) then /request returns
+409 while the old lease is unexpired (agent_coordinator.rs:~137-145). Windows: a second link starts a
+second process that also gets 409. Fix: before terminating/replacing, end the old session with a bounded
+wait (macOS). Windows: make the existing viewer process notice a new launch for the same device (single
+instance per device via named mutex/pipe/window message) and end its session before the new one
+proceeds, or have the new process ask the old to end. Optionally add a server-side "takeover by same
+user" path — only if clean; keep lease semantics safe (never let a different user hijack silently).
+Test both platforms as far as possible.
+
+### T14 — macOS viewer keyboard: Cmd→Win taps, ISO/JIS keys, stuck Shift
+remote/src/platform/macos/app.rs:339-355, :1330-1331, :209-212, :1276-1381, :347-354.
+(a) Cmd is sent as Win immediately; Cmd+Tab/Space/Q → lone Win tap on focus loss → remote Start menu.
+Fix: defer Win-down until a non-modifier key arrives while Cmd is held; drop a Cmd press never combined.
+Add a persisted preference (menu toggle) to map Cmd→Ctrl (so Cmd+C/V copy/paste on remote).
+(b) kVK_ISO_Section (10) unmapped and 50 always → 0x29: map both per ISO layout (KBGetLayoutType or
+equivalent, as Chromium does); add JIS keys 93, 94, 102, 104.
+(c) flagsChanged uses shared Shift/Cmd flags, not left/right device bits → releasing Right Shift while
+Left held is sent as a press → stuck shift. Use NX_DEVICELSHIFTKEYMASK etc.
+(d) Also check: AppKit usually doesn't deliver keyUp while Cmd is held (Cmd+L leaves L down remotely);
+fix with a local keyUp event monitor if confirmed. Add unit tests for the mapping tables/state machine.
+
+### T15 — Windows viewer: GUI subsystem and visible, friendly errors
+remote/src/main.rs lacks `#![windows_subsystem = "windows"]`; errors print to a console that vanishes
+(:204-227). Error text is raw server JSON (remote/src/signaling.rs:~28). Fix: GUI subsystem on Windows
+(keep a debug/console option if logging relies on stdout — check remote/src/debug.rs), show a
+MessageBoxW on fatal errors like macOS does, and translate HTTP statuses/API errors (401/403/404/409/410,
+network timeouts) into plain messages on both platforms. Also: don't show an error dialog after a clean
+user-initiated disconnect when only the final cleanup request fails (main.rs:~160).
+Additional T15 scope: the Windows viewer runs reg.exe three times per launch to register the deep-link
+handler (prints "The operation completed successfully." x3 on the console) — use the registry API, write
+only when values differ, and register the handler as `"exe" -- "%1"` style so link args can't inject
+flags; when launched from a deep link, reject extra flags like --update-manifest-url (check main.rs ~:116).
+Also remote/src/updater/mod.rs `launch_verified` checks child exit before the ready file, so a viewer
+that writes ready and exits within 100 ms is reported as a failed update — check ready file first.
+
+### T16 — Reconnect UX: keep the window, show "Reconnecting…", don't silently lose recordings
+remote/src/transport.rs:356, :585-589; main.rs:169-199; recording.rs:33-39. On any drop the window
+closes; no reconnecting state; the recording is stopped by its guard and its notice goes nowhere; it
+doesn't resume. On macOS, Quit while no window exists exits without session cleanup
+(presenter.rs:822-825). Fix: keep window (or at least keep state) across reconnects with a visible
+"Reconnecting…" indicator on both platforms; keep the recorder in the resume state so recording
+continues (new cluster/segment) or at minimum finalize + surface the saved-file notice to the user; make
+Quit during reconnect perform session cleanup. Also carry the wallpaper-hidden setting across
+reconnects/display switches (platform.rs:78; transport.rs:1148-1165, :1229: new control object per
+display config defaults hidden=true; Windows checkbox state wrong after display switch). Validate macOS
+here and Windows on the endpoint.
+
+---------------------------------------------------------------------------------------------------
+## MEDIUM — Shared crates
+
+### T17 — File transfer: roles, size limits, cache cleanup
+crates/file-transfer/src/lib.rs. (a) Same symmetric worker on both sides: viewer handles peer `Pick`
+(:214-224 → native file picker pops on technician's Mac, chosen file uploaded) and any `Begin`
+(:249-270) incl. Documents/Drop into ~/Documents/MeshRMM Transferred Files; remote/src/transport.rs:~895
+passes every agent FileMessage. Fix: add a Role (Viewer/Agent) to the worker; viewer ignores Pick and
+only accepts Documents transfers after its own Pick request; keep agent behavior intact.
+(b) No byte/disk limits (:506-513, :528-558): Entry.size any u64, Totals.bytes informational. Fix:
+require Totals first and enforce against actual bytes; per-transfer caps (clipboard smaller than
+documents); check free space; auto clipboard file sync (:348-362) only below a size threshold (above:
+skip with a user-visible notice/log rather than silently streaming GBs).
+(c) Cache never deleted (:577-579, :302, windows.rs:559-565, macos.rs:112): sweep stale `.partial-*`
+and old cache batches at startup (not currently on clipboard / older than N hours); delete cache batch
+after successful commit_documents.
+(d) While here: race in exists-check-then-rename (:584-588) can overwrite — use no-replace rename
+(renamex_np RENAME_EXCL on macOS, MoveFileExW without REPLACE_EXISTING on Windows) with retry on
+collision; complete reserved Windows names (COM0, LPT0, CONIN$, CONOUT$, superscript digits, trimmed
+stem) and reject Windows-invalid chars (:453-461); sender reads exactly declared size with take()
+(:618-631, :675-688). Add hostile-input tests. Native Windows checks on endpoint.
+
+### T18 — Tag received files with quarantine / Mark-of-the-Web
+crates/file-transfer/src/lib.rs:530-538, 577-590. Received files get no com.apple.quarantine xattr (macOS)
+or Zone.Identifier ADS (Windows), so a pasted setup.exe/.app skips Gatekeeper/SmartScreen. Fix: tag
+files on the receiving side where they land on the technician's machine (viewer) — macOS quarantine
+xattr (with agent name "MeshRMM"), Windows Zone.Identifier ZoneId=3. Decide deliberately whether the
+agent side (endpoint receiving files from the technician) should also tag (probably yes for consistency;
+document the choice). Tests on both platforms (endpoint for Windows).
+
+---------------------------------------------------------------------------------------------------
+## MEDIUM — Server (Cloudflare Worker)
+
+### T19 — Auth: outages returned as 401 (locks dashboards); JWKS fetched every request
+server/src/infrastructure.rs:363-432, server/src/lib.rs:436-457, 482-489. Any error in
+authorize_workos_user maps via workos_auth_error to 401 "sign out and sign in again" — incl. D1 errors,
+JWKS network failures, non-2xx. Dashboard locks on any 401 (dashboard/features/workspace/dashboard.tsx:~162).
+Fix: typed auth error enum (replace string-matching `detail.contains`), 503 for upstream/D1 failures,
+401 only for token failures; cache JWKS (isolate memory with TTL, refetch on unknown kid, bounded).
+Check dashboard handles 503 gracefully (retry, no lock). Tests.
+
+### T20 — Company status transitions not guarded (provisioning/retry)
+server/src/routes/platform.rs:334-372, 580-596, 851-866. provision_company's final write and
+mark_provisioning_failed are unconditional; retry_platform_company accepts any status. Suspended-while-
+provisioning → becomes active; Retry on suspended → reactivated; Retry on active hitting WorkOS error →
+`failed` (locks users + agents). Fix: retry only when status IN ('provisioning','failed') (409 otherwise);
+conditional writes `AND status IN ('provisioning','failed')`. Add SQL regression tests.
+
+### T21 — Suspension revocation fan-out stops at first error
+server/src/routes/platform.rs:413-445. Company marked suspended, then each agent coordinator revoked
+sequentially with `?`; one failure returns 500 and skips the rest + presence revoke; big companies may hit
+subrequest limits. Fix: revoke presence first; continue past errors (collect/log failures); bound
+concurrency or use wait_until/batching; have the coordinator re-check company status (e.g. on its alarm
+or on next request) so missed revocations self-heal. Tests.
+
+### T22 — Presence publish failure blocks agent connect
+server/src/agent_coordinator.rs:83-87. /connect closes the socket 1011 and errors if the CompanyPresence
+publish fails, although an outbox + 30s alarm retry exists. Fix: accept the socket, persist the delivery
+record, let the alarm retry. Update server/tests/presence.mjs etc. if relevant.
+
+### T23 — Coordinator reconnect restarts a healthy session
+server/src/agent_coordinator.rs:88-95, 219-230 vs agent/src/remote/mod.rs:171-180. /lease (viewer every
+30s) rewrites expires_at_unix_ms in the stored session request; on agent coordinator reconnect /connect
+replays it; the agent compares full-struct equality → mismatch → aborts and restarts the live session.
+Fix: agent compares session identity (session_id + signaling_token) instead of whole struct (update the
+lease expiry in place), and/or server sends lease expiry separately. Keep backward compat with deployed
+server/agents. Tests. Installed-agent validation if agent code changes.
+
+---------------------------------------------------------------------------------------------------
+## MEDIUM — Dashboard & release
+
+### T24 — `npm run deploy` from a normal checkout wipes production downloads
+docs/company-domains.md:48-57, dashboard/README.md (local dev lists npm run deploy),
+dashboard/wrangler.jsonc:8-12, root .gitignore:16-19. public/downloads is gitignored → deploy ships no
+installers/update-manifest.json (or local unsigned builds). Fix: `predeploy` guard running
+scripts/verify-release-assets.mjs (check its interface) that refuses to deploy without the full asset
+set matching release.json; remove `npm run deploy` from the local-dev docs; document the release
+workflow as the deploy path. Test the guard (node test). Do NOT run deploy.
+
+### T25 — Release workflow can deploy from any branch via workflow_dispatch
+.github/workflows/native-release-build.yml:7, 39-40, 175-179. Add `if: github.ref == 'refs/heads/main'`
+(or equivalent) to validate/deploy jobs; for dispatch runs, require version ≥ live/previous manifest
+version (fail closed). Keep YAML valid (use a YAML parser to check, e.g. python yaml or node).
+
+### T26 — Dashboard: failed /v1/account load never retried; idle enforcement off
+dashboard/features/workspace/dashboard.tsx:186, 218-232, 544. One attempt; on failure Settings shows
+"Loading…" forever, inventory never subscribes, idle lock disabled while admin widgets still usable.
+Fix: retry with backoff + a visible error + Retry button; don't render management views until policy
+loaded (show error state instead). Treat 503 (after T19) as retryable, 401 as lock. Also:
+handleSignOut (:~420) doesn't await/catch logout → unhandled rejection, no navigation on 5xx: fix.
+Add tests (dashboard/tests).
+
+### T27 — Platform console hides errors and misreads transient failures
+dashboard/features/platform/platform-dashboard.tsx:54, 58, 65, 93-95. createCompany's error handler sets
+error then calls loadCompanies() which does setError(null) → duplicate-slug error invisible; any
+loadCompanies failure sets hasOwnerAccess=false → a 503 shows "Platform owner access required". Fix:
+don't clear errors on the follow-up reload; only 401/403 mean no owner access; add role="alert" to the
+error banner. Tests where practical.
+
+---------------------------------------------------------------------------------------------------
+## LOW
+
+### T28 — Remove stale committed artifact dashboard/pulsermm-site.tar.gz
+7.8 MB pre-rename dist build incl. unsigned pulsermm-agent-windows-x64.exe and .openai/hosting.json.
+Unreferenced. `git rm` it (do NOT rewrite history). Broaden .gitignore to cover `*-site.tar.gz` (check
+existing `/meshrmm-site.tar.gz` pattern and any script that produces it). Add `__pycache__/` to root
+.gitignore.
+
+### T29 — CI hardening
+.github/workflows/ci.yml (and native-release-build.yml where applicable): cargo commands with `--locked`;
+run `node --test scripts/release-config.test.mjs` (and any other scripts/*.test.mjs) in CI; pin actions
+to full commit SHAs with a `# vX` comment (resolve SHAs with `git ls-remote https://github.com/<owner>/<repo> refs/tags/<tag>`
+— read-only; dereference annotated tags with ^{}); add `concurrency: {group: ci-${{ github.ref }},
+cancel-in-progress: true}` for CI (NOT for release deploy unless cancel-in-progress false). Validate YAML.
+
+### T30 — Documentation accuracy
+docs/transport-security.md:~8 claims "TLS 1.3 remain enforced" but rustls configs (tokio-tungstenite,
+reqwest, ureq) allow TLS 1.2 and WebRTC uses DTLS 1.2. Decide: enforce TLS 1.3 for HTTPS/WSS clients
+(with_protocol_versions(&[&TLS13])) if all endpoints (Cloudflare) support it — they do — or correct the
+doc. Prefer enforcing for the HTTPS/WSS clients and correcting the DTLS wording. docs/audit-fixes.md
+item 12 no longer matches presence design (snapshots no longer query coordinators; see
+server/tests/presence.mjs asserting statusCalls == 0) — update. Also fix stale docs: dashboard/README.md
+idle timeout location (now Settings → Dashboard security); root README "current stable Rust" vs pinned
+rust-toolchain.toml; unused WORKOS_REDIRECT_URI in dashboard/wrangler.jsonc (verify unused first);
+scripts/provision-cloudflare.ps1 closing message URL (companies are created at admin.meshrmm.com).
+If you change TLS config, run native Windows checks too.
+
+### T31 — Token rotation edge cases
+server/src/routes/agents.rs:227-267, agent_coordinator.rs:101-123, lib.rs:420-422. Pending hash written
+to D1 before coordinator call; if that errors, pending_auth_token_hash stays set → every later rotation
+409 "already pending", no way to clear. Coordinator /rotate-token always 200 → "Agent must be online"
+409 branch dead. Plaintext pending_rotation token stays in DO storage forever after promotion. Fix:
+deliver first or roll back on failure (or allow re-rotation to replace a stale pending hash after a
+timeout); make coordinator return a status reflecting delivery (offline → 409); delete pending_rotation
+after promotion. SQL regressions + tests.
+
+### T32 — File transfer throughput: stop-and-wait per 32 KiB chunk
+crates/file-transfer/src/lib.rs:387-395, :330. Each chunk waits for an ack → ~320 KB/s at 100ms RTT.
+Fix: sliding window (e.g. 1–4 MiB in flight), ack per window/entry; keep backpressure; stay compatible
+with the peer protocol version where feasible (if protocol change required, version-gate or make
+receiver tolerant). Tests. Native Windows checks.
+
+---------------------------------------------------------------------------------------------------
+## QUALITY-OF-LIFE / DX
+
+### T33 — Local dashboard dev loop
+dashboard/worker/index.ts returns "Company not found" for localhost; __Host-/Secure cookies need HTTPS.
+Add a dev-only hostname mapping (e.g. `*.localhost` → fixture org via env var, never active in
+production), `.dev.vars.example` with needed vars (DASHBOARD_SESSION_KEY etc.; no real secrets), a local
+D1 seed script for a fixture company, and a documented `npm run dev` flow in dashboard/README.md. Make
+sure production behavior is unchanged (tests).
+
+### T34 — Deploy script applying D1 migrations + schema version in /healthz
+Add a server deploy script (e.g. scripts/deploy-server.mjs or npm script) that applies pending D1
+migrations (`wrangler d1 migrations apply --remote`) before `wrangler deploy`, with a dry-run/--list
+mode. Add a schema-version check to /healthz (report latest applied migration vs expected; e.g. compare
+d1_migrations table to the embedded latest migration name) and fail/flag on mismatch. Don't run it
+against production. Also extend server/tests/sql_regressions.py to prepare every SQL string in server/src
+against the migrated schema (catches column mismatches) if feasible.
+
+### T35 — Viewer input QoL: capture Win/Alt+Tab on Windows; rebindable reserved keys
+Windows viewer: low-level keyboard hook (WH_KEYBOARD_LL) active only while the viewer window is focused
+and input-enabled, forwarding Win, Alt+Tab, etc. to the remote (with a way to release — e.g. the
+existing reserved key). Reserved local keys: F12 (both platforms) and F8 (Windows) cannot be sent to the
+remote — make them configurable (preference) with a sensible default, and allow sending the key itself
+(e.g. via menu/toolbar "Send F12"). Validate on endpoint as far as possible.
+
+### T36 — Refactor: split giant files and dedupe background launch code (agent)
+agent/src/remote/capture_helper.rs (4.2k lines): split into parent orchestration, child run loops, wire
+protocol (tests start ~:3210). background_tasks.rs / background_files.rs: separate window-proc and state
+modules; background.rs: move the ~1,450 lines of tests to a tests submodule file. Deduplicate the three
+"launch on background desktop" implementations (background.rs:379-431, background_files/launch.rs:85-136,
+background_tasks.rs:1555-1580), the multiple `wide()` helpers and Handle/OwnedHandle types. Pure
+refactor: no behavior change. Native Windows fmt/clippy/tests + installed-agent smoke validation.
+
+### T37 — Refactor: split viewer window.rs / transport.rs; share input state; ControlSink struct
+remote/src/platform/windows/window.rs (2.1k lines) → window proc, toolbar, settings, input modules.
+remote/src/transport.rs → signaling loop, services, video. Move shared key/modifier state, release-all
+input and pointer mapping into a shared module used by both platforms. Replace 15-arg ControlSink::new
+with a struct. Fix window_context handing out overlapping `&'static mut` (UB on message-box re-entry).
+Behavior-preserving. Checks on Mac + endpoint.
+
+### T38 — Refactor: split dashboard.tsx
+dashboard/features/workspace/dashboard.tsx (~641 lines): extract SettingsPage, useInstallerDownload,
+useRemoteHandoff (and modal a11y: Escape handling, focus trap/return for enrollment and account modals;
+nav items as links so open-in-new-tab works). Behavior-preserving otherwise. npm run verify.
+
+---------------------------------------------------------------------------------------------------
+## LOW (added during implementation)
+
+### T39 — Native log retention/rotation (viewer + agent)
+Viewer log `~/Library/Logs/MeshRMM/remote.log` observed at ~90 MB with no rotation (Windows viewer and
+agent logs likely similar; see agent/src/logging.rs and remote/src/debug.rs or wherever the viewer log is
+opened). Add size-based rotation (e.g. rotate at 10 MB, keep 3–5 files) for viewer and agent logs, and
+consider reducing per-frame "presentation statistics" log frequency. Keep log files' existing ACLs/paths.
+Native Windows checks + installed-agent smoke validation.
+Also: the viewer's Windows update helper runs detached and has no logging — log its steps to the viewer log.
+
+Note for T36: while refactoring, replace remaining `SystemRoot` environment reads in
+agent/src/remote/background.rs, credentials.rs, background_tasks.rs with GetSystemWindowsDirectoryW (or the
+helper added in T04b in agent/src/installer.rs / private_directory.rs).
