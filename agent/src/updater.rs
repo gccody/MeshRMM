@@ -1,5 +1,4 @@
-use std::ffi::{OsStr, OsString};
-use std::os::windows::ffi::OsStringExt;
+use std::ffi::OsStr;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -7,17 +6,13 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
+use meshrmm_self_update::windows::{
+    PreviousProcess, current_process_created, helper_cleanup_command,
+};
 use meshrmm_self_update::{AGENT_WINDOWS_X64, CURRENT_VERSION, UpdateManifest};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
-use windows::Win32::Foundation::{
-    CloseHandle, ERROR_SERVICE_ALREADY_RUNNING, HANDLE, WAIT_OBJECT_0,
-};
-use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
-};
-use windows::core::PWSTR;
+use windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
 use windows_service::service::{Service, ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -343,9 +338,16 @@ fn stop_instance(service_name: &str, image: &Path, process_id: Option<u32>) -> a
         service_name,
         ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
     )?;
+    let queried_at = meshrmm_self_update::windows::now();
     let status = service.query_status()?;
-    let process_id = process_id.or(status.process_id).filter(|&id| id != 0);
-    let process = process_id.and_then(|id| InstanceProcess::open(id, image));
+    // The instance that scheduled the update started this helper, so it was created first. One
+    // the SCM reports now was created before the query. Either way a recycled ID is skipped.
+    let (process_id, created_before) = match process_id {
+        Some(id) => (Some(id), current_process_created()?),
+        None => (status.process_id, queried_at),
+    };
+    let process_id = process_id.filter(|&id| id != 0);
+    let process = process_id.and_then(|id| PreviousProcess::open(id, image, created_before));
     if !matches!(
         status.current_state,
         ServiceState::Stopped | ServiceState::StopPending
@@ -373,13 +375,13 @@ fn stop_instance(service_name: &str, image: &Path, process_id: Option<u32>) -> a
 
 fn wait_for_exit(
     service: &Service,
-    process: Option<&InstanceProcess>,
+    process: Option<&PreviousProcess>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         let state = service.query_status()?.current_state;
-        let exited = process.is_none_or(InstanceProcess::has_exited);
+        let exited = process.is_none_or(PreviousProcess::has_exited);
         if state == ServiceState::Stopped && exited {
             return Ok(());
         }
@@ -429,55 +431,6 @@ fn start_and_confirm(service_name: &str, grace: Duration) -> anyhow::Result<()> 
         }
     }
     Ok(())
-}
-
-/// The process that ran an Agent service instance.
-struct InstanceProcess(HANDLE);
-
-impl InstanceProcess {
-    /// Opens the process only while it runs `image`, so a recycled process ID is never waited
-    /// on or terminated.
-    fn open(process_id: u32, image: &Path) -> Option<Self> {
-        let handle = unsafe {
-            OpenProcess(
-                PROCESS_SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-                false,
-                process_id,
-            )
-        }
-        .ok()?;
-        let process = Self(handle);
-        let mut name = vec![0_u16; 32_768];
-        let mut length = name.len() as u32;
-        unsafe {
-            QueryFullProcessImageNameW(
-                process.0,
-                PROCESS_NAME_WIN32,
-                PWSTR(name.as_mut_ptr()),
-                &mut length,
-            )
-        }
-        .ok()?;
-        let name = PathBuf::from(OsString::from_wide(&name[..length as usize]));
-        name.as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&image.as_os_str().to_string_lossy())
-            .then_some(process)
-    }
-
-    fn has_exited(&self) -> bool {
-        (unsafe { WaitForSingleObject(self.0, 0) }) == WAIT_OBJECT_0
-    }
-
-    fn terminate(&self) -> windows::core::Result<()> {
-        unsafe { TerminateProcess(self.0, 1) }
-    }
-}
-
-impl Drop for InstanceProcess {
-    fn drop(&mut self) {
-        let _ = unsafe { CloseHandle(self.0) };
-    }
 }
 
 /// Update attempts for the release most recently offered, kept in the private update directory.
@@ -611,7 +564,7 @@ fn schedule_cleanup(helper: &Path, helper_directory: &Path) -> anyhow::Result<()
     let working_directory = helper_directory
         .parent()
         .context("Agent update directory has no parent directory")?;
-    crate::installer::helper_cleanup_command(helper, helper_directory, working_directory)
+    helper_cleanup_command(helper, helper_directory, working_directory)
         .spawn()
         .context("failed to schedule Agent update cleanup")?;
     Ok(())

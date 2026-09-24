@@ -1,19 +1,14 @@
 use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use meshrmm_self_update::{CLIENT_WINDOWS_X64, CURRENT_VERSION, UpdateManifest};
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+use meshrmm_self_update::windows::{
+    PreviousProcess, current_process_created, helper_cleanup_command,
 };
-use windows::core::PWSTR;
+use meshrmm_self_update::{CLIENT_WINDOWS_X64, CURRENT_VERSION, UpdateManifest};
 
 use crate::config::Config;
 
@@ -180,8 +175,8 @@ fn install_update(
     launch_arguments: &[OsString],
 ) -> anyhow::Result<()> {
     // The helper was started by that viewer, so the viewer was created before it.
-    let created_before = ViewerProcess::creation_time(unsafe { GetCurrentProcess() })
-        .context("could not read the client update helper start time")?;
+    let created_before =
+        current_process_created().context("could not read the client update helper start time")?;
     wait_for_viewer_exit(
         process_id,
         target,
@@ -257,7 +252,7 @@ fn wait_for_viewer_exit(
     timeout: Duration,
     terminated_timeout: Duration,
 ) -> anyhow::Result<()> {
-    let Some(process) = ViewerProcess::open(process_id, image, created_before) else {
+    let Some(process) = PreviousProcess::open(process_id, image, created_before) else {
         return Ok(());
     };
     if process.wait(timeout) {
@@ -274,68 +269,6 @@ fn wait_for_viewer_exit(
         bail!("the previous viewer is still running after it was terminated");
     }
     Ok(())
-}
-
-/// The viewer process that scheduled an update.
-struct ViewerProcess(HANDLE);
-
-impl ViewerProcess {
-    /// Opens the process only while it runs `image` and was created before `created_before`, so
-    /// a recycled process ID, including one reused by a newer viewer, is never waited on or
-    /// terminated. `None` means the viewer has exited.
-    fn open(process_id: u32, image: &Path, created_before: u64) -> Option<Self> {
-        let handle = unsafe {
-            OpenProcess(
-                PROCESS_SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-                false,
-                process_id,
-            )
-        }
-        .ok()?;
-        let process = Self(handle);
-        let mut name = vec![0_u16; 32_768];
-        let mut length = name.len() as u32;
-        unsafe {
-            QueryFullProcessImageNameW(
-                process.0,
-                PROCESS_NAME_WIN32,
-                PWSTR(name.as_mut_ptr()),
-                &mut length,
-            )
-        }
-        .ok()?;
-        let name = OsString::from_wide(&name[..length as usize]);
-        let same_image = name
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&image.as_os_str().to_string_lossy());
-        let created = Self::creation_time(process.0).ok()?;
-        (same_image && created < created_before).then_some(process)
-    }
-
-    fn creation_time(process: HANDLE) -> windows::core::Result<u64> {
-        let mut created = FILETIME::default();
-        let mut exited = FILETIME::default();
-        let mut kernel = FILETIME::default();
-        let mut user = FILETIME::default();
-        unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) }?;
-        Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
-    }
-
-    /// Returns whether the process exited within `timeout`.
-    fn wait(&self, timeout: Duration) -> bool {
-        let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
-        (unsafe { WaitForSingleObject(self.0, milliseconds) }) == WAIT_OBJECT_0
-    }
-
-    fn terminate(&self) -> windows::core::Result<()> {
-        unsafe { TerminateProcess(self.0, 1) }
-    }
-}
-
-impl Drop for ViewerProcess {
-    fn drop(&mut self) {
-        let _ = unsafe { CloseHandle(self.0) };
-    }
 }
 
 fn remove_if_present(path: &Path) {
@@ -356,29 +289,10 @@ fn schedule_cleanup(helper: &Path, helper_directory: &Path) -> anyhow::Result<()
     let working_directory = helper_directory
         .parent()
         .context("client update helper directory has no parent directory")?;
-    cleanup_command(helper, helper_directory, working_directory)
+    helper_cleanup_command(helper, helper_directory, working_directory)
         .spawn()
         .context("failed to schedule client update cleanup")?;
     Ok(())
-}
-
-/// Builds a detached `cmd.exe` that waits about two seconds for `helper` to exit, then deletes it
-/// and its now-empty directory. `working_directory` must be outside `helper_directory`.
-fn cleanup_command(helper: &Path, helper_directory: &Path, working_directory: &Path) -> Command {
-    let cleanup = format!(
-        "ping.exe 127.0.0.1 -n 3 >NUL & del /f /q \"{}\" & rmdir /q \"{}\"",
-        helper.display(),
-        helper_directory.display()
-    );
-    let mut command = Command::new("cmd.exe");
-    command
-        .args(["/D", "/S", "/C"])
-        // `arg` would escape the inner quotes as \", which cmd does not understand. With /S, cmd
-        // removes only the outer pair of quotes.
-        .raw_arg(format!("\"{cleanup}\""))
-        .current_dir(working_directory)
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
-    command
 }
 
 fn unique_suffix() -> String {
@@ -443,7 +357,7 @@ mod tests {
     fn ignores_a_recycled_process_id() {
         let (image, mut child) = ping(60);
         let other_image = image.with_file_name("meshrmm-remote.exe");
-        let helper_started = ViewerProcess::creation_time(unsafe { GetCurrentProcess() }).unwrap();
+        let helper_started = current_process_created().unwrap();
         for (image, created_before) in [(&other_image, u64::MAX), (&image, helper_started)] {
             let started = std::time::Instant::now();
             wait_for_viewer_exit(
@@ -459,30 +373,5 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
         child.kill().unwrap();
         child.wait().unwrap();
-    }
-
-    #[test]
-    fn cleanup_deletes_the_helper_and_its_directory() {
-        let parent = std::env::temp_dir().join(format!("meshrmm cleanup {}", unique_suffix()));
-        let helper_directory = parent.join("client-update test");
-        std::fs::create_dir_all(&helper_directory).unwrap();
-        let helper = helper_directory.join("update-helper.exe");
-        std::fs::write(&helper, b"MZ helper").unwrap();
-
-        let mut command = cleanup_command(&helper, &helper_directory, &parent);
-        // cmd receives the quoted paths unescaped inside one outer pair of quotes.
-        let cleanup = format!(
-            "\"ping.exe 127.0.0.1 -n 3 >NUL & del /f /q \"{}\" & rmdir /q \"{}\"\"",
-            helper.display(),
-            helper_directory.display()
-        );
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            ["/D", "/S", "/C", cleanup.as_str()].map(std::ffi::OsStr::new)
-        );
-        let status = command.spawn().unwrap().wait().unwrap();
-        assert!(status.success());
-        assert!(!helper_directory.exists());
-        std::fs::remove_dir(&parent).unwrap();
     }
 }

@@ -17,6 +17,9 @@ serde_json.workspace = true
 sha2.workspace = true
 url.workspace = true
 
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
 [build-dependencies]
 semver = "1.0.27"
 serde.workspace = true
