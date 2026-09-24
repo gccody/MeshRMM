@@ -48,6 +48,13 @@ pub fn run(config: Config) -> anyhow::Result<()> {
         .context("failed to connect the Agent to the Windows Service Control Manager")
 }
 
+/// Whether `name` is the Agent's Windows service, under its current or legacy name.
+pub fn is_agent_service(name: &str) -> bool {
+    [SERVICE_NAME, LEGACY_SERVICE_NAME]
+        .iter()
+        .any(|service| name.eq_ignore_ascii_case(service))
+}
+
 pub fn active_service_name() -> &'static str {
     std::env::current_exe()
         .ok()
