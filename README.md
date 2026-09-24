@@ -207,14 +207,11 @@ interval. TURN credentials use the same configured lifetime when issued.
 For local Worker development, bind a local D1 database, put the two TURN values
 in an ignored `server/.dev.vars` file, and use `npx wrangler dev`. Cloudflare
 TURN credential generation still needs real credentials and outbound access.
-Apply the D1 migrations before deploying a Worker that exposes the installer
-endpoints:
-
-```powershell
-Push-Location server
-npx wrangler d1 migrations apply DB --remote
-Pop-Location
-```
+Deploy the server with `node scripts/deploy-server.mjs` (add `--dry-run` to
+list pending migrations and build without deploying). It applies the D1
+migrations before deploying the Worker and then checks `/healthz`, which
+reports the newest applied migration and answers 503 when D1 is older than the
+Worker expects. See [company domains](docs/company-domains.md).
 
 ## Run
 

@@ -12,6 +12,54 @@ def sql(file, prefix):
     return next(query for query in re.findall(r'"([^"\n]+)"', source) if query.startswith(prefix))
 
 
+SQL_START = re.compile(r"\s*(SELECT|INSERT|UPDATE|DELETE|WITH|REPLACE)\b")
+
+
+def shipped_sql():
+    """Every SQL string literal in the Worker's source, with where it appears."""
+    for path in sorted((ROOT / "server/src").rglob("*.rs")):
+        source = path.read_text()
+        for match in re.finditer(r'"((?:[^"\\\n]|\\.)*)"', source):
+            if SQL_START.match(match.group(1)):
+                line = source.count("\n", 0, match.start()) + 1
+                yield f"{path.relative_to(ROOT)}:{line}", match.group(1)
+
+
+def migrated_database():
+    db = sqlite3.connect(":memory:", isolation_level=None)
+    for migration in sorted((ROOT / "server/migrations").glob("*.sql")):
+        db.executescript(migration.read_text())
+    # Wrangler creates this table when it applies migrations; /healthz reads it.
+    db.execute("CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL)")
+    return db
+
+
+class ShippedSqlTests(unittest.TestCase):
+    """Compiles each query against the migrated schema, so a query naming a column or table a
+    migration never created fails here instead of in production."""
+
+    def compile(self, db, query):
+        numbered = [int(number) for number in re.findall(r"\?(\d+)", query)]
+        count = max(numbered) if numbered else len(re.findall(r"\?(?!\d)", query))
+        db.execute(f"EXPLAIN {query}", (None,) * count)
+
+    def test_every_query_compiles_against_the_migrated_schema(self):
+        db = migrated_database()
+        queries = list(shipped_sql())
+        self.assertGreater(len(queries), 50)
+        for location, query in queries:
+            with self.subTest(location=location):
+                try:
+                    self.compile(db, query)
+                except sqlite3.Error as error:
+                    self.fail(f"{location}: {error}\n{query}")
+
+    def test_a_query_naming_a_missing_column_fails(self):
+        db = migrated_database()
+        with self.assertRaises(sqlite3.OperationalError):
+            self.compile(db, "SELECT no_such_column FROM companies WHERE id = ?1")
+
+
 class CompanyProvisioningTests(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(":memory:", isolation_level=None)
