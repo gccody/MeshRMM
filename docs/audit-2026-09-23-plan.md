@@ -47,8 +47,8 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 | T33 Local dashboard dev loop | QoL | Done | `c67249f` |
 | T34 Server deploy script + schema version in /healthz | QoL | Done | `534ee4d` |
 | T35 Viewer input QoL (Win/Alt+Tab hook, rebindable keys) | QoL | Done | `2ddef48` |
-| T36 Agent refactor: split large files, dedupe launch code | QoL | **Next** | |
-| T37 Viewer refactor: split window.rs / transport.rs | QoL | Todo | |
+| T36 Agent refactor: split large files, dedupe launch code | QoL | Done | `def5e93`, `2d691a9` |
+| T37 Viewer refactor: split window.rs / transport.rs | QoL | **Next** | |
 | T38 Dashboard refactor: split dashboard.tsx, modal a11y | QoL | Todo | |
 
 ## Working rules
@@ -72,11 +72,11 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 
 ## Endpoint state
 
-After T39, DESKTOP-85R6S28 runs a release build of `797f7a5` (SHA-256 `EF774B2A…77ED`), which
-includes T17, T18, T23, T30, T32 and T39. The service is running and connected; the build it
-replaced (`21316da`, SHA-256 `75508B37…ECD0`) is kept as
-`meshrmm-agent.exe.before-local-20260924-164940`. Its first start rotated the 72.6 MB Agent log to
-`agent.1.log`, which will age out after three more rotations.
+After T36, DESKTOP-85R6S28 runs a release build of `2d691a9` (SHA-256 `481985D9…0D76`), which
+includes T17, T18, T23, T30, T32, T39 and T36. The service is running and connected; the build it
+replaced (`797f7a5`, SHA-256 `EF774B2A…77ED`) is kept as
+`meshrmm-agent.exe.before-local-20260924-173653`. T39's first start rotated the 72.6 MB Agent log
+to `agent.1.log`, which will age out after three more rotations.
 T19–T22, T24–T29 and T31 did not change the Agent. Earlier builds are kept as
 `C:\Program Files\MeshRMM\Agent\meshrmm-agent.exe.before-local-*`. T01 removed the explicit
 `gccody` permission on `ProgramData\MeshRMM\Agent`, so a non-elevated `gccody` process can no longer
@@ -231,6 +231,13 @@ These need a live dashboard → viewer → agent session, which the agent-driven
   setting off, Alt+Tab switched windows locally. The title named the keys. The probe restored the
   preferences file it changed, apart from one failed first run that saved the default values.
   Rebinding offers F8–F12 or off rather than any key, which covers sending F12 itself.
+- T36: a live session. The split only moves code (a token comparison against the previous files
+  shows only added `pub(super)`, `use` lines, module declarations and docs). On the endpoint,
+  native fmt, clippy and the 127 Agent tests pass, and the six ignored Session 0 GUI tests, run
+  as SYSTEM, pass: the workspace, pinned applications, Task Manager and file browser (which use
+  the shared launch helper), the caption and taskbar, and console exit. The installed service
+  stopped gracefully, restarted and connected. The only behavior change is that the Windows
+  directory comes from `GetSystemWindowsDirectoryW` instead of `SystemRoot`.
 
 ## Remaining tasks
 
