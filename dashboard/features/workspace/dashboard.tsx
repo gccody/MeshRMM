@@ -36,6 +36,7 @@ import {
   DEFAULT_IDLE_TIMEOUT_MINUTES,
   formatIdleTimeout,
 } from "../session/idle-session";
+import { remoteViewerLink } from "../session/remote-link";
 import { useIdleSession } from "../session/use-idle-session";
 import { MarketingPage } from "../marketing/marketing-page";
 import { PlatformDashboard } from "../platform/platform-dashboard";
@@ -323,7 +324,7 @@ function TenantDashboard({ view }: { view: View }) {
       if (startInBackground && handoff.start_in_background !== true) {
         throw new Error("Background launch requires an updated server. Try again after the server is updated.");
       }
-      window.location.assign(`meshrmm://connect?handoff=${encodeURIComponent(handoff.handoff_token)}&server=${encodeURIComponent(handoff.api_url)}`);
+      window.location.assign(remoteViewerLink(handoff.handoff_token, handoff.api_url, agent.id));
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "The remote session could not be started.");
     } finally {

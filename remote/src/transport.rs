@@ -552,6 +552,7 @@ pub async fn run_receiver(
                 }
             },
             _ = tokio::signal::ctrl_c() => break Ok(()),
+            () = crate::shutdown::wait() => break Ok(()),
             }
         }
     }
