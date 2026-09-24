@@ -2,8 +2,6 @@ use meshrmm_protocol::ClipboardContent;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::FromRawHandle;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -14,9 +12,7 @@ use anyhow::Context;
 use meshrmm_protocol::{
     CursorShape, Display, DisplayId, MAX_CLIPBOARD_WIRE_BYTES, RemoteInput, SessionMessage,
 };
-use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_TIMEOUT,
-};
+use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_TIMEOUT};
 use windows::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TokenPrimary,
     TokenSessionId,
@@ -39,6 +35,7 @@ use meshrmm_remote_screen::{
 
 use super::input::WindowsInputController;
 use super::platform::ScreenInput;
+use crate::win32::{OwnedHandle, wide};
 
 const COMMAND_START: u8 = 1;
 const COMMAND_REQUEST_KEYFRAME: u8 = 2;
@@ -3404,29 +3401,6 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
     let mut value = [0; 8];
     reader.read_exact(&mut value)?;
     Ok(u64::from_le_bytes(value))
-}
-
-struct OwnedHandle(HANDLE);
-unsafe impl Send for OwnedHandle {}
-
-impl OwnedHandle {
-    fn into_file(self) -> File {
-        let raw = self.0.0;
-        std::mem::forget(self);
-        unsafe { File::from_raw_handle(raw) }
-    }
-}
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            let _ = unsafe { CloseHandle(self.0) };
-        }
-    }
-}
-
-fn wide(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(Some(0)).collect()
 }
 
 #[cfg(test)]

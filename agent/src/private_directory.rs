@@ -8,15 +8,13 @@
 
 use std::ffi::OsStr;
 use std::io::Read;
-use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context, bail};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_ALL,
-    GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, LUID, LocalFree,
+    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_ALL, GENERIC_EXECUTE,
+    GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, LUID, LocalFree,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW,
@@ -43,6 +41,8 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{PCWSTR, PWSTR};
+
+use crate::win32::{OwnedHandle, wide};
 
 /// Owned by Administrators, full control for SYSTEM and Administrators only, and protected from
 /// the ProgramData ACEs that let standard users create and own subfolders.
@@ -159,7 +159,7 @@ pub fn inherit_parent_security(file: &Path) -> anyhow::Result<()> {
 
 /// Whether an ACE for Users, Authenticated Users, or Everyone grants reading and executing the
 /// object, and none of them denies it.
-fn users_can_read_and_execute(handle: &Handle, path: &Path) -> anyhow::Result<bool> {
+fn users_can_read_and_execute(handle: &OwnedHandle, path: &Path) -> anyhow::Result<bool> {
     const READ_EXECUTE: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
     let mut dacl = std::ptr::null_mut::<ACL>();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
@@ -325,7 +325,7 @@ const ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: u8 = 11;
 fn inspect(
     path: &Path,
     access: FILE_ACCESS_RIGHTS,
-) -> anyhow::Result<Option<(Handle, BY_HANDLE_FILE_INFORMATION)>> {
+) -> anyhow::Result<Option<(OwnedHandle, BY_HANDLE_FILE_INFORMATION)>> {
     match open_handle(path, access | FILE_READ_ATTRIBUTES) {
         Ok(opened) => Ok(Some(opened)),
         Err(error)
@@ -344,7 +344,7 @@ fn inspect(
 
 /// Fails with [`UntrustedPath`] unless SYSTEM or an administrator owns the object and no ACE that
 /// applies to it grants any `forbidden` right to another account.
-fn ensure_protected(handle: &Handle, path: &Path, forbidden: u32) -> anyhow::Result<()> {
+fn ensure_protected(handle: &OwnedHandle, path: &Path, forbidden: u32) -> anyhow::Result<()> {
     let untrusted = |reason| UntrustedPath {
         path: path.to_owned(),
         reason,
@@ -420,7 +420,9 @@ fn create(path: &Path) -> windows::core::Result<()> {
     unsafe { CreateDirectoryW(PCWSTR(path.as_ptr()), Some(&attributes)) }
 }
 
-fn open_without_following(path: &Path) -> anyhow::Result<(Handle, BY_HANDLE_FILE_INFORMATION)> {
+fn open_without_following(
+    path: &Path,
+) -> anyhow::Result<(OwnedHandle, BY_HANDLE_FILE_INFORMATION)> {
     open_handle(
         path,
         READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
@@ -430,7 +432,7 @@ fn open_without_following(path: &Path) -> anyhow::Result<(Handle, BY_HANDLE_FILE
 fn open_handle(
     path: &Path,
     access: FILE_ACCESS_RIGHTS,
-) -> anyhow::Result<(Handle, BY_HANDLE_FILE_INFORMATION)> {
+) -> anyhow::Result<(OwnedHandle, BY_HANDLE_FILE_INFORMATION)> {
     let wide_path = wide(path.as_os_str());
     // Backup semantics open directories, and with the backup and restore privileges they also
     // bypass a squatter's DACL so its owner can be inspected and replaced.
@@ -445,7 +447,7 @@ fn open_handle(
             None,
         )
     }
-    .map(Handle)
+    .map(OwnedHandle)
     .with_context(|| format!("failed to open {}", path.display()))?;
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
     unsafe { GetFileInformationByHandle(handle.0, &mut information) }
@@ -477,7 +479,7 @@ fn ensure_plain_directory(
     Ok(())
 }
 
-fn owner_is_trusted(handle: &Handle, path: &Path) -> anyhow::Result<bool> {
+fn owner_is_trusted(handle: &OwnedHandle, path: &Path) -> anyhow::Result<bool> {
     let mut owner = PSID::default();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     unsafe {
@@ -527,7 +529,7 @@ fn is_current_user(sid: PSID) -> anyhow::Result<bool> {
     Ok(unsafe { EqualSid(sid, user.User.Sid) }.is_ok())
 }
 
-fn apply(handle: &Handle, path: &Path, sddl: &str) -> anyhow::Result<()> {
+fn apply(handle: &OwnedHandle, path: &Path, sddl: &str) -> anyhow::Result<()> {
     store(handle, sddl).with_context(|| format!("failed to secure {}", path.display()))?;
     verify(handle, path, sddl)
 }
@@ -535,7 +537,7 @@ fn apply(handle: &Handle, path: &Path, sddl: &str) -> anyhow::Result<()> {
 /// Stores exactly this owner and DACL, including the descriptor's protection bit. Unlike
 /// SetSecurityInfo, the kernel call does not propagate into existing children, which could
 /// otherwise follow a planted junction.
-fn store(handle: &Handle, sddl: &str) -> windows::core::Result<()> {
+fn store(handle: &OwnedHandle, sddl: &str) -> windows::core::Result<()> {
     let descriptor = LocalDescriptor::parse(sddl)?;
     unsafe {
         SetKernelObjectSecurity(
@@ -546,7 +548,7 @@ fn store(handle: &Handle, sddl: &str) -> windows::core::Result<()> {
     }
 }
 
-fn verify(handle: &Handle, path: &Path, expected: &str) -> anyhow::Result<()> {
+fn verify(handle: &OwnedHandle, path: &Path, expected: &str) -> anyhow::Result<()> {
     let actual = sddl(handle).with_context(|| format!("failed to verify {}", path.display()))?;
     if actual != expected {
         bail!(
@@ -557,7 +559,7 @@ fn verify(handle: &Handle, path: &Path, expected: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn sddl(handle: &Handle) -> anyhow::Result<String> {
+fn sddl(handle: &OwnedHandle) -> anyhow::Result<String> {
     let information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     unsafe {
@@ -591,11 +593,13 @@ fn sddl(handle: &Handle) -> anyhow::Result<String> {
     Ok(text?)
 }
 
-fn process_token(access: windows::Win32::Security::TOKEN_ACCESS_MASK) -> anyhow::Result<Handle> {
+fn process_token(
+    access: windows::Win32::Security::TOKEN_ACCESS_MASK,
+) -> anyhow::Result<OwnedHandle> {
     let mut token = HANDLE::default();
     unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut token) }
         .context("failed to open the Agent process token")?;
-    Ok(Handle(token))
+    Ok(OwnedHandle(token))
 }
 
 /// Temporarily enables the backup and restore privileges that elevated administrators and
@@ -603,7 +607,7 @@ fn process_token(access: windows::Win32::Security::TOKEN_ACCESS_MASK) -> anyhow:
 /// hostile DACL can make the later open fail. Privileges belong to the whole process token, so
 /// guards are serialized to keep one caller from disabling them while another still needs them.
 struct Privileges {
-    token: Handle,
+    token: OwnedHandle,
     previous: Vec<TOKEN_PRIVILEGES>,
     _serialized: MutexGuard<'static, ()>,
 }
@@ -663,21 +667,6 @@ impl Drop for Privileges {
     }
 }
 
-struct Handle(HANDLE);
-
-impl Handle {
-    fn into_file(self) -> std::fs::File {
-        let handle = std::mem::ManuallyDrop::new(self);
-        unsafe { std::fs::File::from_raw_handle(handle.0.0) }
-    }
-}
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        let _ = unsafe { CloseHandle(self.0) };
-    }
-}
-
 /// A descriptor allocated by the security APIs with LocalAlloc.
 struct LocalDescriptor(PSECURITY_DESCRIPTOR);
 
@@ -705,10 +694,6 @@ impl LocalDescriptor {
         }?;
         Ok(Self(descriptor))
     }
-}
-
-fn wide(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(Some(0)).collect()
 }
 
 #[cfg(test)]

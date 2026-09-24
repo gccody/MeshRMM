@@ -4,6 +4,9 @@ use std::time::{Duration, Instant};
 
 use meshrmm_protocol::{DesktopSession, SessionCloseAction};
 
+#[cfg(windows)]
+use crate::win32::OwnedHandle;
+
 /// How long a resolved logon is reused while the viewer keeps showing the same session.
 const LOGON_REFRESH: Duration = Duration::from_secs(1);
 
@@ -205,21 +208,9 @@ fn resolve_logon(target: &DesktopSession) -> anyhow::Result<Logon> {
     user_session(target).map(|(logon, _)| logon)
 }
 
-#[cfg(windows)]
-struct Handle(windows::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-impl Drop for Handle {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
-        }
-    }
-}
-
 /// Current sign-in and user token of the viewed session.
 #[cfg(windows)]
-fn user_session(target: &DesktopSession) -> anyhow::Result<(Logon, Handle)> {
+fn user_session(target: &DesktopSession) -> anyhow::Result<(Logon, OwnedHandle)> {
     use anyhow::Context;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Security::{GetTokenInformation, TOKEN_STATISTICS, TokenStatistics};
@@ -239,7 +230,7 @@ fn user_session(target: &DesktopSession) -> anyhow::Result<(Logon, Handle)> {
     let mut token = HANDLE::default();
     unsafe { WTSQueryUserToken(session, &mut token) }
         .with_context(|| format!("no signed-in user in Windows session {session}"))?;
-    let token = Handle(token);
+    let token = OwnedHandle(token);
     let mut statistics = TOKEN_STATISTICS::default();
     let mut length = 0;
     unsafe {
@@ -291,7 +282,7 @@ fn session_text(
 }
 
 #[cfg(windows)]
-fn apply(action: SessionCloseAction, (logon, token): (Logon, Handle)) -> anyhow::Result<()> {
+fn apply(action: SessionCloseAction, (logon, token): (Logon, OwnedHandle)) -> anyhow::Result<()> {
     use anyhow::Context;
     use windows::Win32::System::RemoteDesktop::WTSLogoffSession;
 
@@ -306,7 +297,7 @@ fn apply(action: SessionCloseAction, (logon, token): (Logon, Handle)) -> anyhow:
 /// LockWorkStation and the clipboard only affect the caller's session, so
 /// helpers run as the signed-in user on that session's interactive desktop.
 #[cfg(windows)]
-fn run_helper(token: &Handle, argument: &str) -> anyhow::Result<()> {
+fn run_helper(token: &OwnedHandle, argument: &str) -> anyhow::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     use anyhow::Context;
@@ -347,8 +338,8 @@ fn run_helper(token: &Handle, argument: &str) -> anyhow::Result<()> {
         )
     }
     .with_context(|| format!("could not start the {argument} helper as the signed-in user"))?;
-    let _thread = Handle(information.hThread);
-    let process = Handle(information.hProcess);
+    let _thread = OwnedHandle(information.hThread);
+    let process = OwnedHandle(information.hProcess);
     anyhow::ensure!(
         unsafe { WaitForSingleObject(process.0, 10_000) } == WAIT_OBJECT_0,
         "{argument} helper did not finish"
