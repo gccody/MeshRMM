@@ -10,6 +10,8 @@ mod service;
 mod tray;
 #[cfg(windows)]
 mod updater;
+#[cfg(windows)]
+mod win32;
 
 use anyhow::Context;
 use remote::config::{Config, ExecutionMode};

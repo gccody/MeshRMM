@@ -1,5 +1,5 @@
 use std::ffi::{OsStr, OsString};
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -12,9 +12,7 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Registry::{
     HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
 };
-use windows::Win32::System::SystemInformation::{
-    ComputerNameDnsHostname, GetComputerNameExW, GetSystemWindowsDirectoryW,
-};
+use windows::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 use windows::Win32::UI::Shell::{
     FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellExecuteW,
 };
@@ -30,6 +28,7 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use crate::private_directory;
 use crate::service::{LEGACY_SERVICE_NAME, SERVICE_NAME};
+use crate::win32::wide;
 
 const ENROLLMENT_MAGIC: &[u8] = b"MESHRMM-BOOTSTRAP-V1";
 const CONFIG_LENGTH_BYTES: usize = 8;
@@ -611,12 +610,7 @@ pub(crate) fn is_managed_config_directory(path: &Path) -> anyhow::Result<bool> {
 /// drive is taken from the Windows directory the kernel reports instead.
 pub(crate) fn program_data() -> anyhow::Result<PathBuf> {
     let registered = registered_program_data()?;
-    let mut windows = vec![0_u16; 260];
-    let length = unsafe { GetSystemWindowsDirectoryW(Some(&mut windows)) } as usize;
-    if length == 0 || length >= windows.len() {
-        bail!("Windows did not provide its system directory");
-    }
-    let windows = PathBuf::from(OsString::from_wide(&windows[..length]));
+    let windows = crate::win32::windows_directory()?;
     let Some(Component::Prefix(drive)) = windows.components().next() else {
         bail!("the Windows directory {} has no drive", windows.display());
     };
@@ -828,10 +822,6 @@ fn message(text: &str, error: bool) {
     unsafe {
         MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), style);
     }
-}
-
-fn wide(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(Some(0)).collect()
 }
 
 #[cfg(test)]

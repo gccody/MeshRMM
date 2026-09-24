@@ -22,6 +22,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
+use crate::win32::{OwnedHandle, wide};
+
 #[derive(Debug)]
 pub struct Icon(pub usize);
 impl Drop for Icon {
@@ -30,17 +32,8 @@ impl Drop for Icon {
     }
 }
 
-pub fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
 fn time(t: FILETIME) -> u64 {
     (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)
-}
-pub struct Handle(pub HANDLE);
-impl Drop for Handle {
-    fn drop(&mut self) {
-        let _ = unsafe { CloseHandle(self.0) };
-    }
 }
 struct ServiceHandle(SC_HANDLE);
 impl Drop for ServiceHandle {
@@ -87,12 +80,16 @@ pub fn creation(process: HANDLE) -> anyhow::Result<u64> {
     Ok(time(created))
 }
 
-pub fn identified_handle(row: &Process, access: PROCESS_ACCESS_RIGHTS) -> anyhow::Result<Handle> {
+pub fn identified_handle(
+    row: &Process,
+    access: PROCESS_ACCESS_RIGHTS,
+) -> anyhow::Result<OwnedHandle> {
     let expected = row
         .created
         .context("This process cannot be safely identified. Refresh the list.")?;
-    let handle =
-        Handle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | access, false, row.pid)? });
+    let handle = OwnedHandle(unsafe {
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | access, false, row.pid)?
+    });
     ensure!(
         creation(handle.0)? == expected,
         "The process has exited. Refresh the list."
@@ -151,7 +148,7 @@ fn same_contents(first: &Path, second: &Path) -> std::io::Result<bool> {
 
 /// Opens `row` for ending it, unless it is this Task Manager, one of the `protected` processes
 /// that run it, an Agent process, or a process Windows needs.
-pub fn termination_handle(row: &Process, protected: &HashSet<u32>) -> anyhow::Result<Handle> {
+pub fn termination_handle(row: &Process, protected: &HashSet<u32>) -> anyhow::Result<OwnedHandle> {
     ensure!(
         row.pid != std::process::id(),
         "The process manager cannot end itself."
@@ -175,7 +172,7 @@ fn owner(process: HANDLE) -> anyhow::Result<String> {
     unsafe {
         let mut token = HANDLE::default();
         OpenProcessToken(process, TOKEN_QUERY, &mut token)?;
-        let token = Handle(token);
+        let token = OwnedHandle(token);
         let mut size = 0;
         let _ = GetTokenInformation(token.0, TokenUser, None, 0, &mut size);
         ensure!(size > 0 && size < 65536, "Invalid token size");
@@ -227,7 +224,7 @@ fn description(path: &str) -> Option<String> {
             return None;
         }
         let lang = std::slice::from_raw_parts(translations.cast::<u16>(), 2);
-        let query = wide(&format!(
+        let query = wide(format!(
             "\\StringFileInfo\\{:04x}{:04x}\\FileDescription",
             lang[0], lang[1]
         ));
@@ -269,7 +266,7 @@ pub fn processes(previous: &[Process]) -> anyhow::Result<Vec<Process>> {
             LPARAM((&mut hung as *mut std::collections::HashSet<u32>) as isize),
         )
     };
-    let snapshot = Handle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)? });
+    let snapshot = OwnedHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)? });
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
@@ -296,7 +293,7 @@ pub fn processes(previous: &[Process]) -> anyhow::Result<Vec<Process>> {
         if let Ok(handle) =
             unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, row.pid) }
         {
-            let handle = Handle(handle);
+            let handle = OwnedHandle(handle);
             let (mut created, mut exit, mut kernel, mut user) = Default::default();
             if unsafe { GetProcessTimes(handle.0, &mut created, &mut exit, &mut kernel, &mut user) }
                 .is_ok()

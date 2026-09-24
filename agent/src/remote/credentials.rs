@@ -254,7 +254,9 @@ impl Detector {
             let _ = CloseHandle(process);
             result?;
             let path = String::from_utf16(&path[..length as usize])?.to_lowercase();
-            let system = std::env::var("SystemRoot")?.to_lowercase();
+            let system = crate::win32::windows_directory()?
+                .to_string_lossy()
+                .to_lowercase();
             ensure!(
                 trusted_prompt_process(&path, &system),
                 "The foreground window is not a Windows credential prompt"

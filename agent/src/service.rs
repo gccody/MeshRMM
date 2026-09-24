@@ -3,7 +3,6 @@ mod trays;
 
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader};
-use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::IntoRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
@@ -13,7 +12,7 @@ use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
@@ -26,6 +25,7 @@ use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::remote::config::Config;
 use crate::remote::service_link::{SESSION_ACTIVE, SESSION_IDLE};
+use crate::win32::{OwnedHandle, wide};
 
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// An update check that falls due during a remote session is retried this often until the
@@ -276,16 +276,6 @@ fn service_status(state: ServiceState, accepted: ServiceControlAccept) -> Servic
     }
 }
 
-struct OwnedHandle(HANDLE);
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            let _ = unsafe { CloseHandle(self.0) };
-        }
-    }
-}
-
 /// The persistent coordinator and the pipes it reports on. Closing its stdin asks it to stop;
 /// its stdout reports whether a remote session is live.
 struct Coordinator {
@@ -414,10 +404,6 @@ impl Drop for WorkerProcess {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-fn wide(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(Some(0)).collect()
 }
 
 #[cfg(test)]

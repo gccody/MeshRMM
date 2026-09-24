@@ -11,8 +11,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
 
+use crate::win32::{OwnedHandle, wide};
 use anyhow::{Context, ensure};
-use data::{Handle, Process, Snapshot, wide};
+use data::{Process, Snapshot};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::RemoteDesktop::WTSDisconnectSession;
@@ -224,7 +225,7 @@ fn priority(value: u32) -> &'static str {
 // The action captures identities/handles before confirmation. Refreshing or
 // selecting another row cannot redirect it to a different process or service.
 enum Pending {
-    End(Vec<Handle>),
+    End(Vec<OwnedHandle>),
     Service(String, data::ServiceAction),
     Startup(data::Startup),
     Disconnect(u32),
@@ -443,7 +444,8 @@ impl State {
                     }
                 }
                 let mut groups: BTreeMap<(u8, String), Vec<usize>> = BTreeMap::new();
-                let system = std::env::var("SystemRoot")
+                let system = crate::win32::windows_directory()
+                    .map(|directory| directory.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| "C:\\Windows".into())
                     .to_lowercase();
                 for (index, p) in self.snapshot.processes.iter().enumerate() {
@@ -1082,7 +1084,7 @@ impl State {
                 Box::new(move || {
                     let handles: Vec<_> = handles
                         .into_iter()
-                        .map(|h| Handle(HANDLE(h as *mut _)))
+                        .map(|h| OwnedHandle(HANDLE(h as *mut _)))
                         .collect();
                     for handle in &handles {
                         unsafe {
@@ -1558,30 +1560,11 @@ fn visible_processes() -> HashSet<u32> {
     pids
 }
 fn launch(command: &str) -> anyhow::Result<()> {
-    let mut command = wide(command);
-    let mut desktop = wide(&meshrmm_remote_screen::background::desktop_path()?);
-    let startup = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        lpDesktop: PWSTR(desktop.as_mut_ptr()),
+    super::background::launch::launch(super::background::launch::Launch {
+        command,
+        flags: CREATE_NEW_CONSOLE,
         ..Default::default()
-    };
-    let mut process = PROCESS_INFORMATION::default();
-    unsafe {
-        CreateProcessW(
-            PCWSTR::null(),
-            Some(PWSTR(command.as_mut_ptr())),
-            None,
-            None,
-            false,
-            CREATE_NEW_CONSOLE,
-            None,
-            PCWSTR::null(),
-            &startup,
-            &mut process,
-        )?;
-        let _thread = Handle(process.hThread);
-        let _process = Handle(process.hProcess);
-    }
+    })?;
     Ok(())
 }
 

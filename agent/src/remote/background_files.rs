@@ -4,6 +4,7 @@ mod controls;
 mod frame;
 mod launch;
 mod model;
+use crate::win32::wide;
 use anyhow::{Context, ensure};
 use model::*;
 use std::cell::RefCell;
@@ -73,13 +74,6 @@ const UPDATE_SELECTION: u32 = WM_APP + 1;
 const NAVIGATE: u32 = WM_APP + 2;
 const DROP_FILES: u32 = WM_APP + 3;
 
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(Some(0)).collect()
-}
-fn path_wide(path: &Path) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    path.as_os_str().encode_wide().chain(Some(0)).collect()
-}
 fn window_text(hwnd: HWND) -> String {
     unsafe {
         let length = GetWindowTextLengthW(hwnd).clamp(0, 32767) as usize;
@@ -2159,7 +2153,7 @@ unsafe extern "system" fn preview_proc(
 }
 fn show_preview(path: &Path, text: &str) -> anyhow::Result<()> {
     unsafe {
-        let title = wide(&format!("{} — read-only", path.display()));
+        let title = wide(format!("{} — read-only", path.display()));
         let hwnd = CreateWindowExW(
             WS_EX_COMPOSITED,
             w!("MeshRMMBackgroundPreview"),
