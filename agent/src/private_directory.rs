@@ -16,25 +16,28 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use anyhow::{Context, bail};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_ALL,
-    GENERIC_WRITE, HANDLE, HLOCAL, LUID, LocalFree,
+    GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, LUID, LocalFree,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
-    SE_FILE_OBJECT,
+    SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, AdjustTokenPrivileges, DACL_SECURITY_INFORMATION,
-    EqualSid, GetAce, GetTokenInformation, INHERIT_ONLY_ACE, IsWellKnownSid, LUID_AND_ATTRIBUTES,
-    LookupPrivilegeValueW, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_BACKUP_NAME,
-    SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME, SECURITY_ATTRIBUTES, SetKernelObjectSecurity,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenUser,
-    WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, AdjustTokenPrivileges,
+    DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetTokenInformation, INHERIT_ONLY_ACE,
+    InitializeAcl, IsWellKnownSid, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_BACKUP_NAME, SE_PRIVILEGE_ENABLED,
+    SE_RESTORE_NAME, SECURITY_ATTRIBUTES, SetKernelObjectSecurity, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    WinAuthenticatedUserSid, WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinLocalSystemSid,
+    WinWorldSid,
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, DELETE, FILE_ACCESS_RIGHTS,
-    FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+    FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
     GetFileInformationByHandle, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
@@ -119,6 +122,107 @@ pub fn secure_contents(path: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Gives a file moved out of a private directory the ACEs its new parent passes down, as if it had
+/// been created there. A rename keeps the private DACL, so an updated Agent staged under
+/// ProgramData would stay unreadable to the signed-in users who start its tray. Fails unless
+/// Users can then read and execute the file.
+pub fn inherit_parent_security(file: &Path) -> anyhow::Result<()> {
+    let (handle, information) = open_handle(file, READ_CONTROL | FILE_READ_ATTRIBUTES)?;
+    ensure_not_reparse_point(file, &information)?;
+    let mut empty = ACL::default();
+    unsafe { InitializeAcl(&mut empty, std::mem::size_of::<ACL>() as u32, ACL_REVISION) }?;
+    let wide_path = wide(file.as_os_str());
+    // Unlike the handle-based calls, the named call merges in what the parent passes down.
+    unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(wide_path.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&empty),
+            None,
+        )
+    }
+    .ok()
+    .with_context(|| format!("failed to reset the security of {}", file.display()))?;
+    if !users_can_read_and_execute(&handle, file)? {
+        bail!(
+            "{} does not let Users read and execute it after inheriting its directory's security",
+            file.display()
+        );
+    }
+    Ok(())
+}
+
+/// Whether an ACE for Users, Authenticated Users, or Everyone grants reading and executing the
+/// object, and none of them denies it.
+fn users_can_read_and_execute(handle: &Handle, path: &Path) -> anyhow::Result<bool> {
+    const READ_EXECUTE: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
+    let mut dacl = std::ptr::null_mut::<ACL>();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        GetSecurityInfo(
+            handle.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            Some(&mut descriptor),
+        )
+    }
+    .ok()
+    .with_context(|| format!("failed to read the security of {}", path.display()))?;
+    let _descriptor = LocalDescriptor(descriptor);
+    if dacl.is_null() {
+        return Ok(true);
+    }
+    let (mut allowed, mut denied) = (0, 0);
+    for index in 0..unsafe { (*dacl).AceCount } {
+        let mut ace = std::ptr::null_mut();
+        unsafe { GetAce(dacl, index.into(), &mut ace) }
+            .with_context(|| format!("failed to read the DACL of {}", path.display()))?;
+        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        if u32::from(header.AceFlags) & INHERIT_ONLY_ACE.0 != 0
+            || !matches!(
+                header.AceType,
+                ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE
+            )
+        {
+            continue;
+        }
+        // Denied ACEs share the layout of allowed ones.
+        let entry = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        let sid = PSID((&raw const entry.SidStart).cast_mut().cast());
+        let applies = unsafe {
+            IsWellKnownSid(sid, WinBuiltinUsersSid).as_bool()
+                || IsWellKnownSid(sid, WinAuthenticatedUserSid).as_bool()
+                || IsWellKnownSid(sid, WinWorldSid).as_bool()
+        };
+        if !applies {
+            continue;
+        }
+        let mut rights = entry.Mask;
+        if rights & GENERIC_ALL.0 != 0 {
+            rights |= FILE_ALL_ACCESS.0;
+        }
+        if rights & GENERIC_READ.0 != 0 {
+            rights |= FILE_GENERIC_READ.0;
+        }
+        if rights & GENERIC_EXECUTE.0 != 0 {
+            rights |= FILE_GENERIC_EXECUTE.0;
+        }
+        if header.AceType == ACCESS_ALLOWED_ACE_TYPE {
+            allowed |= rights;
+        } else {
+            denied |= rights;
+        }
+    }
+    Ok(allowed & READ_EXECUTE == READ_EXECUTE && denied & READ_EXECUTE == 0)
 }
 
 /// Reads `file` only if no account other than SYSTEM or an administrator could have written it or
@@ -211,6 +315,7 @@ const REPLACE_RIGHTS: u32 =
     FILE_DELETE_CHILD.0 | DELETE.0 | WRITE_DAC.0 | WRITE_OWNER.0 | GENERIC_ALL.0;
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 const ACCESS_ALLOWED_COMPOUND_ACE_TYPE: u8 = 4;
 const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 5;
 const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
@@ -850,5 +955,35 @@ mod tests {
         assert!(format!("{error:#}").contains("reparse point"), "{error:#}");
         assert_eq!(sddl_of(&target), original);
         remove(&root);
+    }
+
+    #[test]
+    fn installed_files_inherit_their_new_directory_security() {
+        if !elevated() {
+            return;
+        }
+        // Like Program Files, the install directory lets Users read and execute its files.
+        let install = scratch("install");
+        set_sddl(
+            &install,
+            "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
+        );
+        let agent = install.join("meshrmm-agent.exe");
+        std::fs::write(&agent, b"MZ").unwrap();
+        // A file renamed out of the private update directory keeps what it inherited there.
+        set_sddl(&agent, INHERITED_FILE_SDDL);
+        inherit_parent_security(&agent).unwrap();
+        let installed = sddl_of(&agent);
+        assert!(installed.contains("(A;ID;0x1200a9;;;BU)"), "{installed}");
+        assert!(!installed.contains("D:P"), "{installed}");
+
+        let private = scratch("private-install");
+        set_sddl(&private, PRIVATE_DIRECTORY_SDDL);
+        let hidden = private.join("meshrmm-agent.exe");
+        std::fs::write(&hidden, b"MZ").unwrap();
+        let error = inherit_parent_security(&hidden).unwrap_err();
+        assert!(format!("{error:#}").contains("Users read"), "{error:#}");
+        remove(&install);
+        remove(&private);
     }
 }
