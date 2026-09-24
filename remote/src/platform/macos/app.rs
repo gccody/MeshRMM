@@ -1119,10 +1119,7 @@ impl RemoteView {
             label.setToolTip(Some(&NSString::from_str(&state.message)));
         }
         if let Some(notice) = self.ivars().control.recording().take_notice() {
-            let alert = NSAlert::new(self.mtm());
-            alert.setMessageText(&NSString::from_str("Session recording"));
-            alert.setInformativeText(&NSString::from_str(&notice));
-            alert.runModal();
+            queue_alert("Session recording", notice);
         }
         let recording = self.ivars().control.recording().active();
         if self.ivars().recording_visible.replace(recording) != recording
@@ -1135,10 +1132,7 @@ impl RemoteView {
             }));
         }
         if let Some(error) = self.ivars().control.take_maintenance_error() {
-            let alert = NSAlert::new(self.mtm());
-            alert.setMessageText(&NSString::from_str("Maintenance control failed"));
-            alert.setInformativeText(&NSString::from_str(&error));
-            alert.runModal();
+            queue_alert("Maintenance control failed", error);
         }
         if !*self.ivars().debug_visible.borrow()
             || (!force
@@ -1394,6 +1388,55 @@ fn mac_key_to_windows_scan_code(code: u16) -> Option<(u16, bool)> {
 
 thread_local! {
     static CONNECTING_WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
+    static PENDING_ALERTS: RefCell<AlertQueue> = const { RefCell::new(AlertQueue::new()) };
+}
+
+/// Informational alerts raised while presenter state is borrowed. `runModal`
+/// pumps the main queue, whose blocks borrow that state, so alerts are shown
+/// one at a time from a separate main-queue block instead.
+struct AlertQueue {
+    pending: VecDeque<(&'static str, String)>,
+    scheduled: bool,
+}
+
+impl AlertQueue {
+    const fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            scheduled: false,
+        }
+    }
+
+    /// Returns whether the caller must schedule a presentation block.
+    fn push(&mut self, title: &'static str, message: String) -> bool {
+        self.pending.push_back((title, message));
+        !std::mem::replace(&mut self.scheduled, true)
+    }
+
+    /// Alerts raised while one is open are shown after it by the same block.
+    fn next(&mut self) -> Option<(&'static str, String)> {
+        let next = self.pending.pop_front();
+        self.scheduled = next.is_some();
+        next
+    }
+}
+
+fn queue_alert(title: &'static str, message: String) {
+    if PENDING_ALERTS.with(|alerts| alerts.borrow_mut().push(title, message)) {
+        DispatchQueue::main().exec_async(present_queued_alerts);
+    }
+}
+
+fn present_queued_alerts() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    while let Some((title, message)) = PENDING_ALERTS.with(|alerts| alerts.borrow_mut().next()) {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(title));
+        alert.setInformativeText(&NSString::from_str(&message));
+        alert.runModal();
+    }
 }
 
 pub(super) fn activate_application(mtm: MainThreadMarker) {
@@ -1608,5 +1651,24 @@ mod launch_tests {
             assert_eq!(link.is_some(), !command_line);
             assert!(sender.send("second".to_owned()).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod alert_tests {
+    use super::*;
+
+    #[test]
+    fn alerts_raised_while_one_is_pending_share_one_presentation_block() {
+        let mut alerts = AlertQueue::new();
+        assert!(alerts.push("first", "one".into()));
+        assert!(!alerts.push("second", "two".into()));
+        assert_eq!(alerts.next(), Some(("first", "one".into())));
+        // Raised while the first modal pumps the main queue.
+        assert!(!alerts.push("third", "three".into()));
+        assert_eq!(alerts.next(), Some(("second", "two".into())));
+        assert_eq!(alerts.next(), Some(("third", "three".into())));
+        assert_eq!(alerts.next(), None);
+        assert!(alerts.push("fourth", "four".into()));
     }
 }
