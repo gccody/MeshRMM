@@ -69,11 +69,15 @@ Application code is organized by responsibility:
 
 - `app/` contains route composition and providers.
 - `features/agents/` owns Agent models, event-stream synchronization, and UI.
-- `features/enrollment/` owns installer enrollment UI.
-- `features/session/` owns organization-scoped dashboard inactivity handling.
+- `features/enrollment/` owns installer enrollment UI and the enrolled installer download.
+- `features/session/` owns organization-scoped dashboard inactivity handling and
+  remote viewer handoffs.
+- `features/settings/` owns the company settings page.
+- `features/workspace/` owns the company dashboard shell, account loading, and the account dialog.
 - `features/platform/` owns invite-only company provisioning for the platform owner.
 - `features/marketing/` owns the public root-domain experience.
-- `lib/` contains shared browser HTTP behavior.
+- `lib/` contains shared browser behavior: HTTP helpers, host classification, and
+  the accessible modal dialog.
 - `wrangler.jsonc` owns the production Worker, domain, and runtime settings.
 
 ## Session policy

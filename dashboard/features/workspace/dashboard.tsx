@@ -13,7 +13,6 @@ import {
   Clock3,
   KeyRound,
   LoaderCircle,
-  LogOut,
   Menu,
   Monitor,
   Plus,
@@ -24,57 +23,32 @@ import {
   WifiOff,
   X,
 } from "lucide-react";
-import { useRouter } from "next/navigation";
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AUTH_REFRESH_FAILED_EVENT, useRuntimeConfig } from "../../app/providers";
 import { AgentOverview, type AgentStatusFilter } from "../agents/agent-overview";
 import { useAgentInventory } from "../agents/use-agent-inventory";
 import type { Agent } from "../agents/types";
-import { EnrollmentModal, type AgentPlatform } from "../enrollment/enrollment-modal";
+import { EnrollmentModal } from "../enrollment/enrollment-modal";
+import { useInstallerDownload } from "../enrollment/use-installer-download";
 import { AuthenticationRequired, errorMessage, normalizeServer } from "../../lib/http";
 import {
   DEFAULT_IDLE_TIMEOUT_MINUTES,
   formatIdleTimeout,
 } from "../session/idle-session";
-import { remoteViewerLink } from "../session/remote-link";
+import { useRemoteHandoff } from "../session/use-remote-handoff";
+import { SettingsPage } from "../settings/settings-page";
 import { AccountLoadError, accountLoader } from "./account-load";
+import { AccountModal } from "./account-modal";
+import type { Account } from "./types";
 import { useIdleSession } from "../session/use-idle-session";
 import { MarketingPage } from "../marketing/marketing-page";
 import { PlatformDashboard } from "../platform/platform-dashboard";
 
-const DEFAULT_BLACKOUT_MESSAGE = "This machine is under maintenance by {user_name}.";
-
-type Company = { prevent_idle_lock: boolean; allow_idle_override: boolean; display_border: boolean; blackout_message: string; id: string; name: string; slug: string | null; status: string; dashboard_idle_timeout_minutes: number };
-type Account = {
-  user_id: string;
-  company: Company | null;
-  role: string | null;
-  roles: string[];
-  permissions: string[];
-};
-type AgentInstallerBootstrap = {
-  server: string;
-  install_token: string;
-  expires_at_unix_ms: number;
-};
 type View = "agents" | "team" | "sso" | "settings";
 const VIEW_PATHS: Record<View, string> = { agents: "/", team: "/users", sso: "/authentication", settings: "/settings" };
-const SETTINGS_TABS = [
-  { id: "dashboard-security", label: "Dashboard security" },
-  { id: "remote-sessions", label: "Remote sessions" },
-  { id: "blackout", label: "Blackout message" },
-] as const;
-type SettingsTab = (typeof SETTINGS_TABS)[number]["id"];
 type SessionPauseReason = "idle" | "expired";
 
-const INSTALLER_ASSETS: Record<AgentPlatform, { label: string; binary: string; checksum: string }> = {
-  "windows-x64": {
-    label: "Windows 10/11 (x64)",
-    binary: "/downloads/meshrmm-agent-windows-x64.exe",
-    checksum: "/downloads/meshrmm-agent-windows-x64.exe.sha256",
-  },
-};
-const ENROLLMENT_MAGIC = "MESHRMM-BOOTSTRAP-V1";
 export default function Dashboard({ view = "agents" }: { view?: View }) {
   const { surface } = useRuntimeConfig();
   if (surface === "marketing") return <MarketingPage />;
@@ -83,7 +57,6 @@ export default function Dashboard({ view = "agents" }: { view?: View }) {
 }
 
 function TenantDashboard({ view }: { view: View }) {
-  const router = useRouter();
   const { serverUrl, workosOrganizationId } = useRuntimeConfig();
   const {
     isLoading: isAuthLoading,
@@ -99,31 +72,17 @@ function TenantDashboard({ view }: { view: View }) {
   const [accountError, setAccountError] = useState<{ message: string; retrying: boolean } | null>(null);
   const accountLoad = useRef<{ retry: () => void } | null>(null);
   const [signOutError, setSignOutError] = useState<string | null>(null);
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>("dashboard-security");
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<AgentStatusFilter>("all");
   const [isAuthOpen, setIsAuthOpen] = useState(false);
   const [isAgentOpen, setIsAgentOpen] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const [connectingId, setConnectingId] = useState<string | null>(null);
-  const [connectingBackgroundId, setConnectingBackgroundId] = useState<string | null>(null);
-  const [closingId, setClosingId] = useState<string | null>(null);
-  const [sessionNotice, setSessionNotice] = useState<string | null>(null);
+  // The control that opened the account or enrollment dialog gets focus back.
+  const dialogOpener = useRef<HTMLElement | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [agentPlatform, setAgentPlatform] = useState<AgentPlatform>("windows-x64");
-  const [isDownloadingInstaller, setIsDownloadingInstaller] = useState(false);
-  const [installerDownloaded, setInstallerDownloaded] = useState(false);
-  const [installerError, setInstallerError] = useState<string | null>(null);
   const [sessionPauseReason, setSessionPauseReason] = useState<SessionPauseReason | null>(null);
   const [isResumingSession, setIsResumingSession] = useState(false);
-  const [preventIdleDraft, setPreventIdleDraft] = useState(true);
-  const [allowIdleOverrideDraft, setAllowIdleOverrideDraft] = useState(true);
-  const [displayBorderDraft, setDisplayBorderDraft] = useState(true);
-  const [blackoutMessageDraft, setBlackoutMessageDraft] = useState(DEFAULT_BLACKOUT_MESSAGE);
-  const [idleTimeoutDraft, setIdleTimeoutDraft] = useState(DEFAULT_IDLE_TIMEOUT_MINUTES);
-  const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
-  const [isSavingSessionPolicy, setIsSavingSessionPolicy] = useState(false);
 
   const hasTenantSession = Boolean(user && workosOrganizationId && organizationId === workosOrganizationId);
   const isAdmin = Boolean(
@@ -204,14 +163,8 @@ function TenantDashboard({ view }: { view: View }) {
     return () => window.removeEventListener(AUTH_REFRESH_FAILED_EVENT, handleRefreshFailure);
   }, [lockSession, resetInventory]);
 
-  const applyAccount = useCallback((data: Account) => {
-    setAccount(data);
-    setIdleTimeoutDraft(data.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES);
-    setBlackoutMessageDraft(data.company?.blackout_message ?? DEFAULT_BLACKOUT_MESSAGE);
-    setDisplayBorderDraft(data.company?.display_border ?? true);
-    setPreventIdleDraft(data.company?.prevent_idle_lock ?? true);
-    setAllowIdleOverrideDraft(data.company?.allow_idle_override ?? true);
-  }, []);
+  const installer = useInstallerDownload(authorizedFetch);
+  const remote = useRemoteHandoff({ authorizedFetch, reportError: setError });
 
   const fetchAccount = useCallback(async () => {
     const response = await authorizedFetch("/v1/account");
@@ -229,7 +182,7 @@ function TenantDashboard({ view }: { view: View }) {
       load: fetchAccount,
       onLoaded: (data) => {
         setAccountError(null);
-        applyAccount(data);
+        setAccount(data);
       },
       onError: (requestError, retryInMs) => {
         if (requestError instanceof AuthenticationRequired) return;
@@ -244,7 +197,7 @@ function TenantDashboard({ view }: { view: View }) {
       loader.stop();
       accountLoad.current = null;
     };
-  }, [applyAccount, fetchAccount, hasTenantSession, isAuthLoading, sessionPauseReason]);
+  }, [fetchAccount, hasTenantSession, isAuthLoading, sessionPauseReason]);
 
   const filteredAgents = useMemo(() => {
     const search = query.trim().toLowerCase();
@@ -259,31 +212,6 @@ function TenantDashboard({ view }: { view: View }) {
   const initials = user ? `${user.firstName?.[0] ?? user.email[0] ?? ""}${user.lastName?.[0] ?? ""}`.toUpperCase() : "--";
   const companyLabel = account?.company?.name ?? "Company workspace";
 
-  const saveSessionPolicy = async (event: FormEvent) => {
-    event.preventDefault();
-    setIsSavingSessionPolicy(true);
-    setSettingsNotice(null);
-    setError(null);
-    try {
-      const response = await authorizedFetch("/v1/company/settings", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ dashboard_idle_timeout_minutes: idleTimeoutDraft, blackout_message: blackoutMessageDraft, display_border: displayBorderDraft, prevent_idle_lock: preventIdleDraft, allow_idle_override: allowIdleOverrideDraft }),
-      });
-      if (!response.ok) {
-        throw new Error(await errorMessage(response, "The session policy could not be saved."));
-      }
-      applyAccount((await response.json()) as Account);
-      setSettingsNotice("Company settings saved. Remote defaults apply to new sessions.");
-    } catch (requestError) {
-      if (!(requestError instanceof AuthenticationRequired)) {
-        setError(requestError instanceof Error ? requestError.message : "The session policy could not be saved.");
-      }
-    } finally {
-      setIsSavingSessionPolicy(false);
-    }
-  };
-
   const resumeSession = async () => {
     setIsResumingSession(true);
     setError(null);
@@ -292,54 +220,6 @@ function TenantDashboard({ view }: { view: View }) {
     } catch (resumeError) {
       setError(resumeError instanceof Error ? resumeError.message : "Your session could not be resumed.");
       setIsResumingSession(false);
-    }
-  };
-
-  const closeAgentSession = async (agent: Agent) => {
-    setClosingId(agent.id);
-    setError(null);
-    setSessionNotice(null);
-    try {
-      const response = await authorizedFetch(`/v1/agents/${encodeURIComponent(agent.id)}/close-session`, { method: "POST" });
-      if (!response.ok) throw new Error(await errorMessage(response, "The remote session could not be closed."));
-      const result = (await response.json()) as { closed: boolean };
-      setSessionNotice(result.closed
-        ? `Closed the remote session for ${agent.name}. You can connect again.`
-        : `${agent.name} has no active remote session. You can connect now.`);
-    } catch (requestError) {
-      if (!(requestError instanceof AuthenticationRequired)) {
-        setError(requestError instanceof Error ? requestError.message : "The remote session could not be closed.");
-      }
-    } finally {
-      setClosingId(null);
-    }
-  };
-
-  const remoteInto = async (agent: Agent, startInBackground = false) => {
-    setSessionNotice(null);
-    if (!agent.connected) return;
-    setConnectingId(agent.id);
-    setConnectingBackgroundId(startInBackground ? agent.id : null);
-    setError(null);
-    try {
-      const response = await authorizedFetch("/v1/remote/handoffs", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ device_id: agent.id, start_in_background: startInBackground }),
-      });
-      if (!response.ok) throw new Error(await errorMessage(response, "The remote session could not be started."));
-      const handoff = (await response.json()) as { handoff_token: string; api_url: string; start_in_background?: boolean };
-      if (startInBackground && handoff.start_in_background !== true) {
-        throw new Error("Background launch requires an updated server. Try again after the server is updated.");
-      }
-      window.location.assign(remoteViewerLink(handoff.handoff_token, handoff.api_url, agent.id));
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "The remote session could not be started.");
-    } finally {
-      window.setTimeout(() => {
-        setConnectingId(null);
-        setConnectingBackgroundId(null);
-      }, 1200);
     }
   };
 
@@ -367,61 +247,6 @@ function TenantDashboard({ view }: { view: View }) {
     }
   };
 
-  const downloadInstaller = async (event: FormEvent) => {
-    event.preventDefault();
-    setIsDownloadingInstaller(true);
-    setInstallerError(null);
-    try {
-      const bootstrapResponse = await authorizedFetch("/v1/agent-installers", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ platform: agentPlatform }),
-      });
-      if (!bootstrapResponse.ok) {
-        throw new Error(await errorMessage(bootstrapResponse, "The Agent installer could not be authorized."));
-      }
-      const bootstrap = (await bootstrapResponse.json()) as AgentInstallerBootstrap;
-      const asset = INSTALLER_ASSETS[agentPlatform];
-      const [binaryResponse, checksumResponse] = await Promise.all([
-        fetch(asset.binary, { cache: "no-store" }),
-        fetch(asset.checksum, { cache: "no-store" }),
-      ]);
-      if (!binaryResponse.ok || !checksumResponse.ok) {
-        throw new Error("The selected Agent installer has not been published yet.");
-      }
-      const binary = await binaryResponse.arrayBuffer();
-      const expectedChecksum = (await checksumResponse.text()).trim().split(/\s+/)[0]?.toLowerCase();
-      if (!expectedChecksum?.match(/^[a-f0-9]{64}$/)) {
-        throw new Error("The published Agent installer checksum is invalid.");
-      }
-      const digest = await crypto.subtle.digest("SHA-256", binary);
-      const actualChecksum = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-      if (actualChecksum !== expectedChecksum) {
-        throw new Error("The Agent installer failed its SHA-256 integrity check.");
-      }
-
-      const config = new TextEncoder().encode(JSON.stringify(bootstrap));
-      const magic = new TextEncoder().encode(ENROLLMENT_MAGIC);
-      const trailer = new Uint8Array(8 + magic.length);
-      new DataView(trailer.buffer).setBigUint64(0, BigInt(config.length), true);
-      trailer.set(magic, 8);
-      const installer = new Blob([binary, config, trailer], { type: "application/vnd.microsoft.portable-executable" });
-      const downloadUrl = URL.createObjectURL(installer);
-      const link = document.createElement("a");
-      link.href = downloadUrl;
-      link.download = "MeshRMM-Agent-Setup-Windows-x64.exe";
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1_000);
-      setInstallerDownloaded(true);
-    } catch (downloadError) {
-      setInstallerError(downloadError instanceof Error ? downloadError.message : "The Agent installer could not be created.");
-    } finally {
-      setIsDownloadingInstaller(false);
-    }
-  };
-
   const handleSignOut = async () => {
     resetInventory();
     setAccount(null);
@@ -435,10 +260,8 @@ function TenantDashboard({ view }: { view: View }) {
     }
   };
 
-  const setActiveView = (next: View) => {
-    router.push(VIEW_PATHS[next]);
-    setIsSidebarOpen(false);
-  };
+  const closeSidebar = () => setIsSidebarOpen(false);
+  const signInToCompany = () => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } });
 
   return (
     <div className="app-shell">
@@ -456,13 +279,13 @@ function TenantDashboard({ view }: { view: View }) {
 
         <nav aria-label="Primary navigation">
           <p className="nav-label">Company</p>
-          <button className={`nav-item ${view === "agents" ? "active" : ""}`} aria-current={view === "agents" ? "page" : undefined} onClick={() => setActiveView("agents")} disabled={Boolean(sessionPauseReason)}><Monitor size={18} /><span>Devices</span>{isLive ? <em>{agents.length}</em> : null}</button>
-          {isAdmin && <button className={`nav-item ${view === "team" ? "active" : ""}`} aria-current={view === "team" ? "page" : undefined} onClick={() => setActiveView("team")} disabled={!hasTenantSession || Boolean(sessionPauseReason)}><Users size={18} /><span>Users</span></button>}
-          {isAdmin && <button className={`nav-item ${view === "sso" ? "active" : ""}`} aria-current={view === "sso" ? "page" : undefined} onClick={() => setActiveView("sso")} disabled={!hasTenantSession || Boolean(sessionPauseReason)}><KeyRound size={18} /><span>Authentication</span></button>}
-          <button className={`nav-item ${view === "settings" ? "active" : ""}`} onClick={() => setActiveView("settings")} disabled={!hasTenantSession || Boolean(sessionPauseReason)} aria-current={view === "settings" ? "page" : undefined}><Settings size={18} /><span>Settings</span></button>
+          <NavItem view="agents" current={view} disabled={Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Monitor size={18} /><span>Devices</span>{isLive ? <em>{agents.length}</em> : null}</NavItem>
+          {isAdmin && <NavItem view="team" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Users size={18} /><span>Users</span></NavItem>}
+          {isAdmin && <NavItem view="sso" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><KeyRound size={18} /><span>Authentication</span></NavItem>}
+          <NavItem view="settings" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Settings size={18} /><span>Settings</span></NavItem>
         </nav>
 
-        <button className="profile-row profile-button" onClick={() => { setIsSidebarOpen(false); setIsAuthOpen(true); }} disabled={Boolean(sessionPauseReason)} aria-haspopup="dialog">
+        <button className="profile-row profile-button" onClick={(event) => { dialogOpener.current = event.currentTarget; setIsSidebarOpen(false); setIsAuthOpen(true); }} disabled={Boolean(sessionPauseReason)} aria-haspopup="dialog">
           <div className="profile-avatar">{initials}</div>
           <div className="profile-details"><strong>Your account</strong><span>{displayName}</span></div>
           <ChevronRight size={16} aria-hidden="true" />
@@ -499,7 +322,7 @@ function TenantDashboard({ view }: { view: View }) {
               <h1>Sign in to MeshRMM</h1>
               <p>Sign in with your company account to manage devices and start remote sessions.</p>
               {signOutError && <p role="alert">{signOutError}</p>}
-              <button className="primary-button" onClick={() => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } })}><ShieldCheck size={16} /> Sign in securely</button>
+              <button className="primary-button" onClick={signInToCompany}><ShieldCheck size={16} /> Sign in securely</button>
             </section>
           ) : user && !hasTenantSession ? (
             <section className="signed-out-card organization-required">
@@ -529,7 +352,7 @@ function TenantDashboard({ view }: { view: View }) {
                 </div>
                 {view === "agents" && !accountPending && <div className="heading-actions">
                   <button className="secondary-button" onClick={() => void loadAgents()}><RefreshCw size={16} className={isRefreshing ? "spin" : ""} /> Refresh</button>
-                  {isAdmin && <button className="primary-button" onClick={() => { setAgentPlatform("windows-x64"); setInstallerDownloaded(false); setInstallerError(null); setIsAgentOpen(true); }}><Plus size={16} /> Add device</button>}
+                  {isAdmin && <button className="primary-button" onClick={(event) => { dialogOpener.current = event.currentTarget; installer.reset(); setIsAgentOpen(true); }} aria-haspopup="dialog"><Plus size={16} /> Add device</button>}
                 </div>}
               </section>
 
@@ -548,77 +371,18 @@ function TenantDashboard({ view }: { view: View }) {
                     <p role="status"><LoaderCircle size={16} className="spin" /> Loading your company workspace…</p>
                   )}
                 </section>
-              ) : view === "settings" ? (<div className="settings-page">
-                    <div className="settings-categories" role="tablist" aria-label="Settings categories">
-                      {SETTINGS_TABS.map((tab, index) => (
-                        <button
-                          key={tab.id}
-                          type="button"
-                          role="tab"
-                          id={`settings-tab-${tab.id}`}
-                          aria-controls={tab.id}
-                          aria-selected={settingsTab === tab.id}
-                          tabIndex={settingsTab === tab.id ? 0 : -1}
-                          onClick={() => setSettingsTab(tab.id)}
-                          onKeyDown={(event) => {
-                            let next: number;
-                            if (event.key === "ArrowRight") next = (index + 1) % SETTINGS_TABS.length;
-                            else if (event.key === "ArrowLeft") next = (index + SETTINGS_TABS.length - 1) % SETTINGS_TABS.length;
-                            else if (event.key === "Home") next = 0;
-                            else if (event.key === "End") next = SETTINGS_TABS.length - 1;
-                            else return;
-                            event.preventDefault();
-                            setSettingsTab(SETTINGS_TABS[next].id);
-                            document.getElementById(`settings-tab-${SETTINGS_TABS[next].id}`)?.focus();
-                          }}
-                        >{tab.label}</button>
-                      ))}
-                    </div>{!account?.company ? <p role="status">Loading company settings…</p> : <>{!isAdmin && <p className="session-notice">Company settings are managed by your administrator.</p>}<form className="company-settings-form" onSubmit={saveSessionPolicy}>
-                    <fieldset disabled={!isAdmin || isSavingSessionPolicy}>
-                    <section className="settings-section" id="dashboard-security" role="tabpanel" aria-labelledby="settings-tab-dashboard-security" hidden={settingsTab !== "dashboard-security"} tabIndex={0}>
-                    <h2>Dashboard security</h2>
-                    <p>Choose when an inactive dashboard session is paused.</p>
-                    <label htmlFor="idle-timeout">Sign out inactive dashboards after<select id="idle-timeout" value={idleTimeoutDraft} onChange={(event) => setIdleTimeoutDraft(Number(event.target.value))}>
-                    <option value={5}>5 minutes</option>
-                    <option value={15}>15 minutes</option>
-                    <option value={30}>30 minutes</option>
-                    <option value={60}>1 hour</option>
-                    <option value={120}>2 hours</option>
-                    <option value={240}>4 hours</option>
-                    <option value={480}>8 hours</option>
-                    <option value={720}>12 hours</option>
-                    <option value={1440}>24 hours</option>
-                    </select>
-                    </label>
-                    </section>
-                    <section className="settings-section" id="remote-sessions" role="tabpanel" aria-labelledby="settings-tab-remote-sessions" hidden={settingsTab !== "remote-sessions"} tabIndex={0}>
-                    <h2>Remote sessions</h2>
-                    <p>Defaults for new connections. Monitor highlighting can be changed in the viewer.</p>
-                    <label>
-                    <input type="checkbox" checked={displayBorderDraft} onChange={(event) => setDisplayBorderDraft(event.target.checked)} /> Highlight the viewed monitor on the agent’s physical display by default</label>
-                    <label>
-                    <input type="checkbox" checked={preventIdleDraft} onChange={(event) => setPreventIdleDraft(event.target.checked)} /> Prevent remote devices from locking while idle by default</label>
-                    <label>
-                    <input type="checkbox" checked={allowIdleOverrideDraft} onChange={(event) => setAllowIdleOverrideDraft(event.target.checked)} /> Allow users to change idle-lock prevention per session</label>
-                    <p>The per-session permission above applies only to idle-lock prevention.</p>
-                    </section>
-                    <section className="settings-section" id="blackout" role="tabpanel" aria-labelledby="settings-tab-blackout" hidden={settingsTab !== "blackout"} tabIndex={0}>
-                    <h2>Blackout message</h2>
-                    <p>Shown on the remote device when a technician enables screen blackout.</p>
-                    <label htmlFor="blackout-message">Agent blackout message<textarea id="blackout-message" rows={4} required maxLength={2048} value={blackoutMessageDraft} onChange={(event) => setBlackoutMessageDraft(event.target.value)} aria-describedby="blackout-message-help" />
-                    </label>
-                    <p id="blackout-message-help">Use {"{user_name}"} for the technician’s banner name. Applies to new remote sessions. Keep the message short (up to 2 KB).</p>
-                    <div className="blackout-preview" aria-label="Blackout message preview">{blackoutMessageDraft.replaceAll("{user_name}", displayName)}</div>
-                    <button type="button" className="secondary-button" onClick={() => setBlackoutMessageDraft(DEFAULT_BLACKOUT_MESSAGE)}>Restore default message</button>
-                    </section>
-                    </fieldset>
-                    {settingsTab !== "blackout" && (!blackoutMessageDraft.trim() || new TextEncoder().encode(blackoutMessageDraft).length > 2048) && <p role="alert">Check the blackout message before saving: it must contain text and be no larger than 2 KB.</p>}
-                    {isAdmin && <div className="settings-save">
-                    <button className="primary-button" disabled={isSavingSessionPolicy || !blackoutMessageDraft.trim() || new TextEncoder().encode(blackoutMessageDraft).length > 2048 || (preventIdleDraft === (account?.company?.prevent_idle_lock ?? true) && allowIdleOverrideDraft === (account?.company?.allow_idle_override ?? true) && displayBorderDraft === (account?.company?.display_border ?? true) && idleTimeoutDraft === idleTimeoutMinutes && blackoutMessageDraft === (account?.company?.blackout_message ?? DEFAULT_BLACKOUT_MESSAGE))}>{isSavingSessionPolicy ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save company settings</button>
-                    </div>}{settingsNotice && <p role="status" className="session-notice">{settingsNotice}</p>}</form>
-                    </>}</div>) : view === "agents" ? (
+              ) : view === "settings" ? (
+                <SettingsPage
+                  company={account?.company}
+                  isAdmin={isAdmin}
+                  displayName={displayName}
+                  authorizedFetch={authorizedFetch}
+                  onSaved={setAccount}
+                  reportError={setError}
+                />
+              ) : view === "agents" ? (
                 <>
-                {sessionNotice && <div className="session-notice" role="status">{sessionNotice}</div>}
+                {remote.sessionNotice && <div className="session-notice" role="status">{remote.sessionNotice}</div>}
                 <AgentOverview
                     agents={agents}
                     filteredAgents={filteredAgents}
@@ -626,16 +390,16 @@ function TenantDashboard({ view }: { view: View }) {
                     lastUpdated={lastUpdated}
                     query={query}
                     status={status}
-                    connectingId={connectingId}
-                    connectingBackgroundId={connectingBackgroundId}
+                    connectingId={remote.connectingId}
+                    connectingBackgroundId={remote.connectingBackgroundId}
                     deletingId={deletingId}
-                    closingId={closingId}
+                    closingId={remote.closingId}
                     canDelete={isAdmin}
                     onQueryChange={setQuery}
                     onStatusChange={setStatus}
-                    onRemote={(agent) => void remoteInto(agent)}
-                    onRemoteBackground={(agent) => void remoteInto(agent, true)}
-                    onCloseSession={(agent) => void closeAgentSession(agent)}
+                    onRemote={(agent) => void remote.connect(agent)}
+                    onRemoteBackground={(agent) => void remote.connect(agent, true)}
+                    onCloseSession={(agent) => void remote.closeSession(agent)}
                     onDelete={(agent) => void deleteAgent(agent)}
                   />
                 </>
@@ -654,20 +418,49 @@ function TenantDashboard({ view }: { view: View }) {
         </div>
       </main>
 
-      {isAuthOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setIsAuthOpen(false)}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="account-title"><button className="modal-close" onClick={() => setIsAuthOpen(false)} aria-label="Close"><X size={19} /></button><div className="modal-icon"><ShieldCheck size={22} /></div><p className="eyebrow">Authenticated</p><h2 id="account-title">Your account</h2>{user ? <><div className="account-summary"><div className="profile-avatar">{initials}</div><div><strong>{displayName}</strong><span>{user.email}</span></div></div><button className="secondary-button modal-submit" onClick={() => void handleSignOut()}><LogOut size={16} /> Sign out</button></> : <button className="primary-button modal-submit" onClick={() => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } })}><ShieldCheck size={16} /> Sign in securely</button>}</section></div>}
+      {isAuthOpen && (
+        <AccountModal
+          email={user?.email ?? null}
+          displayName={displayName}
+          initials={initials}
+          onClose={() => setIsAuthOpen(false)}
+          onSignIn={signInToCompany}
+          onSignOut={() => void handleSignOut()}
+          returnFocus={dialogOpener}
+        />
+      )}
 
       {isAgentOpen && (
         <EnrollmentModal
           companyName={account?.company?.name}
-          platform={agentPlatform}
-          error={installerError}
-          isDownloading={isDownloadingInstaller}
-          downloaded={installerDownloaded}
+          platform={installer.platform}
+          error={installer.error}
+          isDownloading={installer.isDownloading}
+          downloaded={installer.downloaded}
           onClose={() => setIsAgentOpen(false)}
-          onPlatformChange={setAgentPlatform}
-          onSubmit={downloadInstaller}
+          onPlatformChange={installer.setPlatform}
+          onSubmit={(event) => void installer.download(event)}
+          returnFocus={dialogOpener}
         />
       )}
     </div>
   );
+}
+
+// Sidebar entries are links so they can open in a new tab. A plain click
+// navigates in place and closes the mobile sidebar. Unavailable entries stay
+// disabled buttons.
+function NavItem({ view, current, disabled, onNavigate, children }: {
+  view: View;
+  current: View;
+  disabled: boolean;
+  onNavigate: () => void;
+  children: ReactNode;
+}) {
+  const className = `nav-item ${view === current ? "active" : ""}`;
+  const ariaCurrent = view === current ? "page" : undefined;
+  if (disabled) {
+    return <button type="button" className={className} aria-current={ariaCurrent} disabled>{children}</button>;
+  }
+  return <Link href={VIEW_PATHS[view]} prefetch={false} className={className} aria-current={ariaCurrent} onNavigate={onNavigate}>{children}</Link>;
 }
