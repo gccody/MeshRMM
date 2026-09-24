@@ -136,6 +136,9 @@ pub(super) struct RemoteViewIvars {
     display_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     recording_visible: std::cell::Cell<bool>,
     confirming_disconnect: std::cell::Cell<bool>,
+    // A miniaturized window or hidden application also reports
+    // `isVisible == false`, so only this flag means the session window closed.
+    window_closed: std::cell::Cell<bool>,
     session_button: RefCell<Option<Retained<NSButton>>>,
     credential_buttons: RefCell<Vec<Retained<NSButton>>>,
     credential_label: RefCell<Option<Retained<NSTextField>>>,
@@ -195,6 +198,10 @@ define_class!(
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, _window: &NSWindow) -> bool {
             self.confirm_disconnect()
+        }
+        #[unsafe(method(windowWillClose:))]
+        fn window_will_close(&self, _notification: &NSNotification) {
+            self.ivars().window_closed.set(true);
         }
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _notification: &NSNotification) {
@@ -688,6 +695,7 @@ impl RemoteView {
             credential_label: RefCell::new(None),
             recording_visible: std::cell::Cell::new(false),
             confirming_disconnect: std::cell::Cell::new(false),
+            window_closed: std::cell::Cell::new(false),
             control,
             pressed_keys: RefCell::new(Vec::new()),
             pressed_buttons: RefCell::new(Vec::new()),
@@ -892,6 +900,10 @@ impl RemoteView {
 
     fn send(&self, message: SessionMessage) {
         self.ivars().control.send(message);
+    }
+
+    pub(super) fn window_closed(&self) -> bool {
+        self.ivars().window_closed.get()
     }
 
     pub(super) fn confirm_disconnect(&self) -> bool {
