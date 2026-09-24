@@ -39,6 +39,10 @@ pub const TRANSFER_LIMIT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const FREE_SPACE_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 /// A peer's files are accepted into Documents this long after asking for them.
 const PEER_PICK_WINDOW: Duration = Duration::from_secs(15 * 60);
+/// The ID of the agent's [`FileMessage::Error`] saying a requested pick sent nothing, which closes
+/// the viewer's request. Transfer IDs are timestamps, so none is 0, and earlier viewers ignore
+/// errors for transfers they do not know.
+const PEER_PICK_ID: u64 = 0;
 /// Transfer messages, mostly [`FILE_CHUNK_BYTES`] chunks, a sender keeps
 /// unacknowledged. The file channel holds at most 64 KiB unacknowledged by
 /// SCTP (see `meshrmm_session_transport::ServiceChannel::writable`), so this
@@ -52,6 +56,9 @@ pub const COMMAND_QUEUE: usize = 64;
 const STALE_PARTIAL_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Clipboard and drop copies live in the cache while an app may still read them.
 const CACHE_BATCH_AGE: Duration = Duration::from_secs(60 * 60);
+/// Receipts sweep the cache at most this often, since walking it can take a while and batches
+/// only expire after [`CACHE_BATCH_AGE`].
+const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Which end of a session a worker serves. The agent follows the viewer's
 /// requests. The viewer never opens its own picker for the peer and saves only
@@ -222,6 +229,11 @@ impl Admission {
         }
         self.peer_picks.push_back(now);
     }
+    /// The peer answered the oldest request without sending files, or with files this side
+    /// rejected, so that request no longer admits a transfer.
+    fn close_peer_pick(&mut self) {
+        self.peer_picks.pop_front();
+    }
     /// Only the agent opens a file picker for its peer.
     fn allows_peer_pick(&self) -> bool {
         self.role == Role::Agent
@@ -286,6 +298,8 @@ fn worker(
     let mut pending = VecDeque::new();
     let mut available = false;
     let mut last_clipboard_sequence = native::clipboard_sequence();
+    // The sweep at startup covered the cache.
+    let mut last_cache_sweep = Instant::now();
     let mut poll = Instant::now();
     loop {
         let command = match commands.recv_timeout(Duration::from_millis(20)) {
@@ -297,6 +311,9 @@ fn worker(
             Some(Command::Peer(FileMessage::Begin { id, destination })) => {
                 // Rejecting a new transfer leaves the one in progress intact.
                 let admitted = if incoming.is_some() {
+                    if destination == FileDestination::Documents {
+                        admission.close_peer_pick();
+                    }
                     Err("Another transfer is in progress")
                 } else {
                     admission.admit(&destination, clipboard_enabled(), Instant::now())
@@ -355,15 +372,37 @@ fn worker(
                 tracing::warn!("ignored a request to pick local files for the remote device");
             }
             Some(Command::Peer(FileMessage::Pick)) => {
-                if available {
+                let picked = if !available {
+                    Err("File transfers are not ready".to_owned())
+                } else {
                     match native::pick() {
-                        Ok(paths) => send = Some((paths, FileDestination::Documents)),
+                        Ok(paths) if paths.is_empty() => Err("No files were chosen".to_owned()),
+                        Ok(paths) => Ok(paths),
                         Err(error) => {
                             tracing::warn!(%error, "file picker failed");
                             *status.lock().unwrap() = format!("File picker failed: {error:#}");
+                            Err(format!("File picker failed: {error:#}"))
+                        }
+                    }
+                };
+                match picked {
+                    Ok(paths) => send = Some((paths, FileDestination::Documents)),
+                    Err(reason) => {
+                        let reply = FileMessage::Error {
+                            id: PEER_PICK_ID,
+                            reason,
+                        };
+                        if out.send(reply).is_err() {
+                            break;
                         }
                     }
                 }
+            }
+            Some(Command::Peer(FileMessage::Error { id, reason }))
+                if id == PEER_PICK_ID && role == Role::Viewer =>
+            {
+                admission.close_peer_pick();
+                *status.lock().unwrap() = format!("No files received: {reason}");
             }
             Some(Command::Peer(FileMessage::Ack { id })) => {
                 if let Some((active, tx)) = &sender
@@ -440,8 +479,14 @@ fn worker(
                                 }
                                 FileDestination::Documents => {}
                             }
-                            if state.destination != FileDestination::Documents {
-                                sweep_cache(&state.base);
+                            if state.destination != FileDestination::Documents
+                                && last_cache_sweep.elapsed() >= CACHE_SWEEP_INTERVAL
+                            {
+                                last_cache_sweep = Instant::now();
+                                // Off this thread, which acknowledges the peer's transfers.
+                                let base = state.base.clone();
+                                let keep = native::clipboard_files().unwrap_or_default();
+                                std::thread::spawn(move || sweep_cache(&base, &keep));
                             }
                             tracing::info!(id = packet_id, "file transfer received and verified");
                             *status.lock().unwrap() = "Transfer complete".into();
@@ -510,6 +555,16 @@ fn worker(
             } else {
                 *status.lock().unwrap() =
                     "Transfer queue is full; try again after completion".into();
+                if answers_peer_pick(role, &job.1) {
+                    let reason = "The remote transfer queue is full".into();
+                    let reply = FileMessage::Error {
+                        id: PEER_PICK_ID,
+                        reason,
+                    };
+                    if out.send(reply).is_err() {
+                        break;
+                    }
+                }
             }
         }
         if sender_thread
@@ -522,11 +577,14 @@ fn worker(
             sender = Some((transfer_id, ack));
             let out = out.clone();
             let status = status.clone();
+            let answers_pick = answers_peer_pick(role, &destination);
             sender_thread = Some(std::thread::spawn(move || {
                 let _native = native::initialize();
                 *status.lock().unwrap() = "Transferring files…".into();
                 let mut window = AckWindow::new(&acknowledgements, SEND_WINDOW);
+                let mut began = false;
                 let result = send_paths(transfer_id, paths, destination, |message| {
+                    began |= matches!(message, FileMessage::Begin { .. });
                     let settle = window.settles(&message);
                     out.send(message).context("session closed")?;
                     window.sent(settle)
@@ -537,14 +595,26 @@ fn worker(
                 };
                 if let Err(e) = result {
                     tracing::warn!(error = %format!("{e:#}"), "file transfer not sent");
+                    // A pick that failed before its transfer began still has to answer the request.
+                    let id = if answers_pick && !began {
+                        PEER_PICK_ID
+                    } else {
+                        transfer_id
+                    };
                     let _ = out.send(FileMessage::Error {
-                        id: transfer_id,
+                        id,
                         reason: format!("{e:#}"),
                     });
                 }
             }));
         }
     }
+}
+
+/// Whether this job is the agent's answer to a viewer's request to pick files, the only way the
+/// agent sends files to the viewer's Documents folder.
+fn answers_peer_pick(role: Role, destination: &FileDestination) -> bool {
+    role == Role::Agent && *destination == FileDestination::Documents
 }
 
 fn end_transfer(ended: &mut VecDeque<u64>, id: u64) {
@@ -602,14 +672,15 @@ fn sweep_transfer_folders() {
         sweep_partials(&documents.join(TRANSFER_FOLDER), SystemTime::now());
     }
     if let Ok(cache) = native::cache() {
-        sweep_cache(&cache.join(TRANSFER_FOLDER));
+        let keep = native::clipboard_files().unwrap_or_default();
+        sweep_cache(&cache.join(TRANSFER_FOLDER), &keep);
     }
 }
 
-fn sweep_cache(base: &Path) {
-    let keep = native::clipboard_files().unwrap_or_default();
+/// `keep` lists the files on the clipboard, whose batches stay.
+fn sweep_cache(base: &Path, keep: &[PathBuf]) {
     sweep_partials(base, SystemTime::now());
-    sweep_batches(base, &keep, SystemTime::now());
+    sweep_batches(base, keep, SystemTime::now());
 }
 
 /// Deletes `.partial-*` folders nothing has written to for [`STALE_PARTIAL_AGE`].
@@ -1640,6 +1711,14 @@ mod tests {
                 .admit(&FileDestination::Documents, true, start + PEER_PICK_WINDOW)
                 .is_err(),
             "requests expire"
+        );
+        viewer.request_peer_pick(start);
+        viewer.close_peer_pick();
+        assert!(
+            viewer
+                .admit(&FileDestination::Documents, true, start)
+                .is_err(),
+            "a request the peer answered without files admits nothing"
         );
 
         let mut agent = Admission::new(Role::Agent);
