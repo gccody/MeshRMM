@@ -1,5 +1,7 @@
 use futures_util::lock::Mutex;
-use meshrmm_protocol_types::{AgentCommand, AgentSessionRequest, AgentStatusMessage};
+use meshrmm_protocol_types::{
+    AgentCommand, AgentSessionRequest, AgentStatusMessage, RemoteSessionId,
+};
 use serde::{Deserialize, Serialize};
 use worker::{query, *};
 
@@ -12,6 +14,7 @@ const UNINSTALL_HEADER: &str = "X-Mesh-Uninstall-Requested";
 const IDENTITY_KEY: &str = "agent_identity";
 const PRESENCE_DELIVERY_KEY: &str = "presence_delivery";
 const ACTIVE_SESSION_KEY: &str = "active_session";
+const ACTIVE_SESSION_LEASE_KEY: &str = "active_session_lease";
 
 #[derive(Debug, Deserialize, Serialize)]
 struct AgentIdentity {
@@ -30,6 +33,15 @@ struct PresenceDelivery {
     connection_id: String,
     connected: bool,
     acknowledged: bool,
+}
+
+// Lease renewals are stored apart from the active session request, which must
+// stay exactly as the Agent received it: the Agent restarts a live session when
+// a replay after reconnecting differs from the request it is running.
+#[derive(Debug, Deserialize, Serialize)]
+struct SessionLease {
+    session_id: RemoteSessionId,
+    expires_at_unix_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,12 +101,8 @@ impl DurableObject for AgentCoordinator {
                             error
                         );
                     }
-                    if let Some(session) = self
-                        .state
-                        .storage()
-                        .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
-                        .await?
-                        && session.expires_at_unix_ms > Date::now().as_millis()
+                    if let Some((session, expires_at_unix_ms)) = self.active_session().await?
+                        && expires_at_unix_ms > Date::now().as_millis()
                     {
                         pair.server.send_with_str(session_payload(&session)?)?;
                         console_log!(
@@ -144,11 +152,11 @@ impl DurableObject for AgentCoordinator {
                     return Response::error("company is not active", 403);
                 }
                 if self
-                    .state
-                    .storage()
-                    .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
+                    .active_session()
                     .await?
-                    .is_some_and(|active| active.expires_at_unix_ms > Date::now().as_millis())
+                    .is_some_and(|(_, expires_at_unix_ms)| {
+                        expires_at_unix_ms > Date::now().as_millis()
+                    })
                 {
                     return Response::error("Agent already has an active remote session", 409);
                 }
@@ -156,10 +164,7 @@ impl DurableObject for AgentCoordinator {
                 if agents.is_empty() {
                     return Response::error("Agent is offline", 409);
                 }
-                self.state
-                    .storage()
-                    .put(ACTIVE_SESSION_KEY, &session)
-                    .await?;
+                self.store_session(&session).await?;
                 let payload = session_payload(&session)?;
                 let mut delivered = false;
                 for agent in agents {
@@ -175,7 +180,7 @@ impl DurableObject for AgentCoordinator {
                     }
                 }
                 if !delivered {
-                    self.state.storage().delete(ACTIVE_SESSION_KEY).await?;
+                    self.forget_session().await?;
                     return Response::error("Agent is offline", 409);
                 }
                 console_log!(
@@ -192,10 +197,7 @@ impl DurableObject for AgentCoordinator {
                 if !self.owns_session(&session).await? {
                     return Response::error("remote session no longer owns this Agent", 410);
                 }
-                self.state
-                    .storage()
-                    .put(ACTIVE_SESSION_KEY, &session)
-                    .await?;
+                self.store_session(&session).await?;
                 let payload = session_payload(&session)?;
                 let mut delivered = false;
                 for agent in self.state.get_websockets_with_tag(AGENT_TAG) {
@@ -230,18 +232,16 @@ impl DurableObject for AgentCoordinator {
                 if !self.owns_session(&session).await? {
                     return Response::error("remote session no longer owns this Agent", 410);
                 }
-                if let Some(mut active) = self
-                    .state
+                self.state
                     .storage()
-                    .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
-                    .await?
-                {
-                    active.expires_at_unix_ms = session.expires_at_unix_ms;
-                    self.state
-                        .storage()
-                        .put(ACTIVE_SESSION_KEY, &active)
-                        .await?;
-                }
+                    .put(
+                        ACTIVE_SESSION_LEASE_KEY,
+                        &SessionLease {
+                            session_id: session.session_id,
+                            expires_at_unix_ms: session.expires_at_unix_ms,
+                        },
+                    )
+                    .await?;
                 Response::ok("renewed")
             }
             (Method::Post, "/revoke") => {
@@ -375,7 +375,7 @@ impl AgentCoordinator {
             .storage()
             .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
             .await?;
-        self.state.storage().delete(ACTIVE_SESSION_KEY).await?;
+        self.forget_session().await?;
         for socket in self.state.get_websockets_with_tag(AGENT_TAG) {
             if let Some(active) = &session {
                 let _ = socket.send_with_str(serde_json::to_string(&AgentCommand::EndSession {
@@ -442,7 +442,7 @@ impl AgentCoordinator {
             .await?
             .is_some_and(|active| active.session_id.as_str() == session_id)
         {
-            self.state.storage().delete(ACTIVE_SESSION_KEY).await?;
+            self.forget_session().await?;
             if let Some(agent) = self
                 .state
                 .get_websockets_with_tag(AGENT_TAG)
@@ -458,13 +458,61 @@ impl AgentCoordinator {
         Ok(())
     }
 
-    async fn owns_session(&self, requested: &AgentSessionRequest) -> Result<bool> {
-        Ok(self
+    /// Returns the active session as it was last delivered to the Agent, and
+    /// its expiry including lease renewals.
+    async fn active_session(&self) -> Result<Option<(AgentSessionRequest, u64)>> {
+        let Some(session) = self
             .state
             .storage()
             .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
             .await?
-            .is_some_and(|active| lease_matches(&active, requested, Date::now().as_millis())))
+        else {
+            return Ok(None);
+        };
+        let lease = self
+            .state
+            .storage()
+            .get::<SessionLease>(ACTIVE_SESSION_LEASE_KEY)
+            .await?;
+        let expires_at_unix_ms = session_expiry(&session, lease.as_ref());
+        Ok(Some((session, expires_at_unix_ms)))
+    }
+
+    /// Records a session delivered to the Agent. Its request carries its own
+    /// expiry, which replaces any earlier renewal.
+    async fn store_session(&self, session: &AgentSessionRequest) -> Result<()> {
+        self.state
+            .storage()
+            .put(ACTIVE_SESSION_KEY, session)
+            .await?;
+        self.state
+            .storage()
+            .delete(ACTIVE_SESSION_LEASE_KEY)
+            .await?;
+        Ok(())
+    }
+
+    async fn forget_session(&self) -> Result<()> {
+        self.state.storage().delete(ACTIVE_SESSION_KEY).await?;
+        self.state
+            .storage()
+            .delete(ACTIVE_SESSION_LEASE_KEY)
+            .await?;
+        Ok(())
+    }
+
+    async fn owns_session(&self, requested: &AgentSessionRequest) -> Result<bool> {
+        Ok(self
+            .active_session()
+            .await?
+            .is_some_and(|(active, expires_at_unix_ms)| {
+                lease_matches(
+                    &active,
+                    expires_at_unix_ms,
+                    requested,
+                    Date::now().as_millis(),
+                )
+            }))
     }
 
     async fn acknowledge_uninstall(&self, socket: &WebSocket) -> Result<()> {
@@ -581,8 +629,22 @@ pub async fn request_uninstall(environment: &Env, device_id: &str) -> Result<()>
     crate::ensure_success(response, "notify Agent uninstall").await
 }
 
-fn lease_matches(active: &AgentSessionRequest, requested: &AgentSessionRequest, now: u64) -> bool {
-    active.session_id == requested.session_id && active.expires_at_unix_ms > now
+fn lease_matches(
+    active: &AgentSessionRequest,
+    expires_at_unix_ms: u64,
+    requested: &AgentSessionRequest,
+    now: u64,
+) -> bool {
+    active.session_id == requested.session_id && expires_at_unix_ms > now
+}
+
+/// Coordinators written before leases were stored separately advanced the
+/// request's own expiry, so a request without a matching lease keeps it.
+fn session_expiry(session: &AgentSessionRequest, lease: Option<&SessionLease>) -> u64 {
+    match lease {
+        Some(lease) if lease.session_id == session.session_id => lease.expires_at_unix_ms,
+        _ => session.expires_at_unix_ms,
+    }
 }
 
 fn session_payload(session: &AgentSessionRequest) -> Result<String> {
@@ -612,11 +674,11 @@ mod lease_tests {
             expires_at_unix_ms: 100,
             ice_servers: vec![],
         };
-        assert!(lease_matches(&active, &active, 99));
-        assert!(!lease_matches(&active, &active, 100));
+        assert!(lease_matches(&active, 100, &active, 99));
+        assert!(!lease_matches(&active, 100, &active, 100));
         let mut other = active.clone();
         other.session_id = meshrmm_protocol_types::RemoteSessionId::new("two");
-        assert!(!lease_matches(&active, &other, 1));
+        assert!(!lease_matches(&active, 100, &other, 1));
         let mut background = active.clone();
         background.start_in_background = true;
         let payload = session_payload(&background).unwrap();
@@ -625,6 +687,17 @@ mod lease_tests {
             serde_json::from_str::<AgentCommand>(&payload).unwrap(),
             AgentCommand::StartBackgroundSession { request } if request == background
         ));
+        assert_eq!(session_expiry(&active, None), 100);
+        let renewed = SessionLease {
+            session_id: active.session_id.clone(),
+            expires_at_unix_ms: 200,
+        };
+        assert_eq!(session_expiry(&active, Some(&renewed)), 200);
+        let stale = SessionLease {
+            session_id: other.session_id.clone(),
+            expires_at_unix_ms: 300,
+        };
+        assert_eq!(session_expiry(&active, Some(&stale)), 100);
         assert_eq!(
             serde_json::from_str::<AgentSessionRequest>(&session_payload(&active).unwrap())
                 .unwrap(),
