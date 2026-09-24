@@ -47,9 +47,9 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 | T33 Local dashboard dev loop | QoL | Done | `c67249f` |
 | T34 Server deploy script + schema version in /healthz | QoL | Done | `534ee4d` |
 | T35 Viewer input QoL (Win/Alt+Tab hook, rebindable keys) | QoL | Done | `2ddef48` |
-| T36 Agent refactor: split large files, dedupe launch code | QoL | Done | `def5e93`, `2d691a9` |
-| T37 Viewer refactor: split window.rs / transport.rs | QoL | **Next** | |
-| T38 Dashboard refactor: split dashboard.tsx, modal a11y | QoL | Todo | |
+| T36 Agent refactor: split large files, dedupe launch code | QoL | Done | `685371e`, `2d691a9` |
+| T37 Viewer refactor: split window.rs / transport.rs | QoL | Done | `cf0a159` |
+| T38 Dashboard refactor: split dashboard.tsx, modal a11y | QoL | Done | `c3b2c8c` |
 
 ## Working rules
 
@@ -238,6 +238,28 @@ These need a live dashboard → viewer → agent session, which the agent-driven
   the shared launch helper), the caption and taskbar, and console exit. The installed service
   stopped gracefully, restarted and connected. The only behavior change is that the Windows
   directory comes from `GetSystemWindowsDirectoryW` instead of `SystemRoot`.
+- T37: a live session and the macOS GUI. `window_context` handed out overlapping `&'static mut`
+  references whenever a message box, popup menu, `SetFocus` or `SendMessageW` re-entered the
+  window procedure, and a close confirmed during the recording or maintenance message box freed
+  the context under `pump_window_messages`. The context is now an `Rc` with `Cell`/`RefCell`
+  state, and no borrow is held across a call that can re-enter. On the endpoint (in a separate
+  `~\audit-t37` checkout), native fmt, clippy and 59 viewer tests pass, and a probe of the real
+  window repeated the T35 key checks, released held keys and buttons on focus loss, drove the
+  settings window (including rebinding diagnostics to F11) and resized it, and clicked and resized
+  the window while the disconnect confirmation was open, answering No and then Yes without a
+  crash. Held keys are now released in the order they were pressed. Pointer mapping and macOS
+  modifier state stayed per platform.
+- T38: the enrollment dialog in a browser (it needs a signed-in administrator), Safari, and the
+  mobile sidebar. Through the T33 dev loop, headless Chrome checked the account dialog's focus,
+  Tab wrapping, Escape, backdrop and Close returning focus to its button, and Cmd+click on a
+  sidebar link opening a new tab; `npm run verify` passes 53 tests. Closing the account dialog
+  opened from the mobile sidebar leaves focus on the page, because its button is hidden.
+- T37 and T38 were done in parallel worktrees and applied in plan order after T36. The combined
+  branch passes the Mac checks, `npm run verify`, and native fmt, clippy and the viewer, Agent,
+  file-transfer and log-file tests on the endpoint. The endpoint sync restores the Mac's
+  modification times, so a file changed on the endpoint after a build (such as a probe) must be
+  touched after it is restored, or Cargo reuses the stale build: the final run first reported the
+  T32 probe's file-transfer test binary until `lib.rs` was touched.
 
 ## Remaining tasks
 
