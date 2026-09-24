@@ -45,14 +45,19 @@ switcher.
    npx wrangler secret put WORKOS_API_KEY
    ```
 
-7. Apply D1 migrations before deploying either Worker, then deploy the server
-   before the dashboard:
+7. Deploy the server before the dashboard. From the repository root, after
+   `npm ci` in `dashboard/`:
 
    ```sh
-   cd server
-   npx wrangler d1 migrations apply DB --remote
-   npx wrangler deploy
+   node scripts/deploy-server.mjs --dry-run   # pending migrations and a build; changes nothing
+   node scripts/deploy-server.mjs
    ```
+
+   The script applies pending D1 migrations (Wrangler asks to confirm), then
+   deploys the Worker, then waits for `https://api.meshrmm.com/healthz` to
+   report `"status": "ok"`. `/healthz` compares the newest migration recorded
+   in D1 with the one the Worker expects and answers 503 `schema_behind` when
+   D1 is older, so a deployment that skipped migrations shows up at once.
 
    Then deploy the dashboard by running the **Publish native release**
    workflow; see [automated native releases](native-releases.md). Do not run

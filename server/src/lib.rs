@@ -11,6 +11,7 @@ use worker::{query, *};
 mod agent_coordinator;
 mod auth;
 mod company_presence;
+mod health;
 mod infrastructure;
 mod remote_session;
 mod routes;
@@ -233,7 +234,7 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
     let path = request.path();
     let segments: Vec<_> = path.trim_matches('/').split('/').collect();
     let response = match (method, segments.as_slice()) {
-        (Method::Get, ["healthz"]) => Response::ok("ok"),
+        (Method::Get, ["healthz"]) => health::health(&environment).await,
         (Method::Get, ["v1", "auth", "invitations", "resolve"]) => {
             resolve_workos_invitation(&request, &environment).await
         }
