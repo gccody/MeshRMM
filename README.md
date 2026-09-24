@@ -535,6 +535,10 @@ acknowledged credential rotation, and cancellation cleanup on endpoints. Older
 installers retain one-shot enrollment, and older agents retain their current token
 when they do not understand the staged rotation command. Rotation returns HTTP 202
 with `rotation_pending`; the agent commits the credential by reconnecting with it.
+The Agent must be online: an offline Agent gets HTTP 409 and nothing is staged.
+Rotating again before the Agent reconnects resends the same pending credential,
+and the coordinator deletes its copy of the credential once the Agent has
+authenticated with it.
 
 An agent accepts one active remote session. A second viewer receives a busy response;
 closing the current viewer releases the session. Suspending a company revokes its
