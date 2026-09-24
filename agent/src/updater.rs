@@ -34,7 +34,8 @@ const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ATTEMPTS_PER_VERSION: u32 = 3;
 const ATTEMPT_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 const ATTEMPTS_FILE: &str = "update-attempts.json";
-/// The stopping service waits up to 5 seconds for each tray and for its coordinator.
+/// The stopping service waits up to 5 seconds for each tray and 25 seconds for its coordinator to
+/// end remote sessions and run their close actions.
 const PREVIOUS_INSTANCE_TIMEOUT: Duration = Duration::from_secs(60);
 const TERMINATED_INSTANCE_TIMEOUT: Duration = Duration::from_secs(15);
 const START_TIMEOUT: Duration = Duration::from_secs(30);
