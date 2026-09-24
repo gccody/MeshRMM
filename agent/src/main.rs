@@ -79,10 +79,17 @@ fn main() -> anyhow::Result<()> {
 
     // Native helpers own their threads and optional service runtime. Dispatch
     // them before entering Tokio so a helper never nests block_on inside it.
-    tokio::runtime::Builder::new_multi_thread()
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run_agent())
+        .block_on(run_agent());
+    if let Err(error) = &result
+        && logging::has_process_log()
+    {
+        tracing::error!(error = ?error, "MeshRMM Agent process stopped with an error");
+    }
+    logging::flush();
+    result
 }
 
 async fn run_agent() -> anyhow::Result<()> {
@@ -143,14 +150,17 @@ fn initialize_tracing(mode: ExecutionMode, config: &Config) -> anyhow::Result<()
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     if mode != ExecutionMode::Console {
         let log_path = config.config_path.with_file_name("agent.log");
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(|error| {
-                anyhow::anyhow!("failed to open Agent log {}: {error}", log_path.display())
-            })?;
-        let writer = logging::AsyncLog::new(log)?;
+        let open_path = log_path.clone();
+        let writer = logging::AsyncLog::new(move || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&open_path)
+        })
+        .map_err(|error| {
+            anyhow::anyhow!("failed to open Agent log {}: {error}", log_path.display())
+        })?;
+        logging::set_process_log(writer.clone());
         if config.json_logs {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
