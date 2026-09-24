@@ -121,6 +121,9 @@ struct CachedJwks {
 
 /// One key set per isolate. Never hold the lock across an await.
 static JWKS_CACHE: Mutex<Option<CachedJwks>> = Mutex::new(None);
+/// The client whose keys last failed to fetch, and when. Requests in the following
+/// [`JWKS_REFRESH_INTERVAL_MS`] use what is cached instead of waiting on WorkOS again.
+static JWKS_FAILED_AT: Mutex<Option<(String, f64)>> = Mutex::new(None);
 
 #[derive(Debug, PartialEq)]
 enum CachedKey {
@@ -163,6 +166,13 @@ fn stale_keys(
         .map(|cache| cache.keys.clone())
 }
 
+fn failed_recently(failure: Option<&(String, f64)>, client_id: &str, now_ms: f64) -> bool {
+    failure.is_some_and(|(failed_client, failed_at_ms)| {
+        failed_client == client_id
+            && (0.0..JWKS_REFRESH_INTERVAL_MS).contains(&(now_ms - failed_at_ms))
+    })
+}
+
 fn read_jwks_cache() -> Option<CachedJwks> {
     JWKS_CACHE
         .lock()
@@ -198,29 +208,47 @@ async fn workos_signing_key(
     let keys = match cached_key(cache.as_ref(), client_id, key_id, now_ms) {
         CachedKey::Found => cache.map(|cache| cache.keys).unwrap_or_default(),
         CachedKey::Unknown => return Err(AuthError::InvalidToken("signing_key_not_found")),
-        CachedKey::Refresh => match fetch_jwks(client_id).await {
-            Ok(keys) => {
-                *JWKS_CACHE.lock().unwrap_or_else(|error| error.into_inner()) = Some(CachedJwks {
-                    client_id: client_id.to_owned(),
-                    keys: keys.clone(),
-                    fetched_at_ms: Date::now().as_millis() as f64,
-                });
-                keys
-            }
-            Err(error) => {
-                let Some(keys) = stale_keys(cache.as_ref(), client_id, key_id, now_ms) else {
-                    return Err(error);
+        CachedKey::Refresh => {
+            let failure = JWKS_FAILED_AT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            let fetched = if failed_recently(failure.as_ref(), client_id, now_ms) {
+                Err(AuthError::Unavailable(
+                    "WorkOS signing keys are temporarily unavailable".into(),
+                ))
+            } else {
+                let fetched = fetch_jwks(client_id).await;
+                *JWKS_FAILED_AT
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = match &fetched {
+                    Ok(_) => None,
+                    Err(error) => {
+                        console_warn!(
+                            "{}",
+                            serde_json::json!({
+                                "event": "workos_jwks_unavailable",
+                                "detail": format!("{error:?}"),
+                            })
+                        );
+                        Some((client_id.to_owned(), Date::now().as_millis() as f64))
+                    }
                 };
-                console_warn!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "workos_jwks_stale",
-                        "detail": format!("{error:?}"),
-                    })
-                );
-                keys
+                fetched
+            };
+            match fetched {
+                Ok(keys) => {
+                    *JWKS_CACHE.lock().unwrap_or_else(|error| error.into_inner()) =
+                        Some(CachedJwks {
+                            client_id: client_id.to_owned(),
+                            keys: keys.clone(),
+                            fetched_at_ms: Date::now().as_millis() as f64,
+                        });
+                    keys
+                }
+                Err(error) => stale_keys(cache.as_ref(), client_id, key_id, now_ms).ok_or(error)?,
             }
-        },
+        }
     };
     let jwk = keys
         .find(key_id)
@@ -425,6 +453,17 @@ mod tests {
             cached_key(Some(&older), "client", "rotated", now),
             CachedKey::Refresh
         );
+    }
+
+    #[test]
+    fn a_failed_fetch_is_not_retried_within_the_interval() {
+        let now = 1_000_000.0;
+        let failure = ("client".to_owned(), now - 1_000.0);
+        assert!(failed_recently(Some(&failure), "client", now));
+        assert!(!failed_recently(Some(&failure), "other-client", now));
+        assert!(!failed_recently(None, "client", now));
+        let older = ("client".to_owned(), now - JWKS_REFRESH_INTERVAL_MS);
+        assert!(!failed_recently(Some(&older), "client", now));
     }
 
     #[test]
