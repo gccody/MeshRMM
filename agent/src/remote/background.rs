@@ -19,30 +19,82 @@ const PIN_WIDTH: i32 = 48;
 const ICON_SIZE: i32 = 32;
 const TASKS_LEFT: i32 = 8 + PINS.len() as i32 * PIN_WIDTH + 12;
 const TASK_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
-const PINS: &[(&str, &str, &str)] = &[
-    (
-        "Command Prompt",
-        "cmd.exe",
-        "/k title MeshRMM Background Command Prompt",
-    ),
-    (
-        "PowerShell",
-        "WindowsPowerShell\\v1.0\\powershell.exe",
-        "-NoLogo -NoProfile -NoExit",
-    ),
-    ("Registry Editor", "..\\regedit.exe", "/m"),
-    ("Services", "mmc.exe", "services.msc"),
-    ("Event Viewer", "mmc.exe", "eventvwr.msc"),
-    ("Resource Monitor", "resmon.exe", ""),
-    ("Task Manager", "taskmgr.exe", "--background-task-manager"),
-    ("Computer Mgmt", "mmc.exe", "compmgmt.msc"),
-    ("Device Manager", "mmc.exe", "devmgmt.msc"),
-    ("Firewall", "mmc.exe", "wf.msc"),
-    (
-        "File Explorer",
-        "..\\explorer.exe",
-        "--background-file-browser",
-    ),
+/// An application on the background taskbar.
+struct Pin {
+    label: &'static str,
+    program: &'static str,
+    arguments: &'static str,
+    /// Runs in its own console, which takes keyboard input through a console input helper.
+    console: bool,
+}
+
+const PINS: &[Pin] = &[
+    Pin {
+        label: "Command Prompt",
+        program: "cmd.exe",
+        arguments: "/k title MeshRMM Background Command Prompt",
+        console: true,
+    },
+    Pin {
+        label: "PowerShell",
+        program: "WindowsPowerShell\\v1.0\\powershell.exe",
+        arguments: "-NoLogo -NoProfile -NoExit",
+        console: true,
+    },
+    Pin {
+        label: "Registry Editor",
+        program: "..\\regedit.exe",
+        arguments: "/m",
+        console: false,
+    },
+    Pin {
+        label: "Services",
+        program: "mmc.exe",
+        arguments: "services.msc",
+        console: false,
+    },
+    Pin {
+        label: "Event Viewer",
+        program: "mmc.exe",
+        arguments: "eventvwr.msc",
+        console: false,
+    },
+    Pin {
+        label: "Resource Monitor",
+        program: "resmon.exe",
+        arguments: "",
+        console: false,
+    },
+    Pin {
+        label: "Task Manager",
+        program: "taskmgr.exe",
+        arguments: "--background-task-manager",
+        console: false,
+    },
+    Pin {
+        label: "Computer Mgmt",
+        program: "mmc.exe",
+        arguments: "compmgmt.msc",
+        console: false,
+    },
+    Pin {
+        label: "Device Manager",
+        program: "mmc.exe",
+        arguments: "devmgmt.msc",
+        console: false,
+    },
+    Pin {
+        label: "Firewall",
+        program: "mmc.exe",
+        arguments: "wf.msc",
+        console: false,
+    },
+    Pin {
+        label: "File Explorer",
+        program: "..\\explorer.exe",
+        arguments: "--background-file-browser",
+        console: false,
+    },
 ];
 
 pub struct Workspace {
@@ -165,8 +217,8 @@ impl Workspace {
                 None,
             )?;
             let root = std::env::var("SystemRoot").context("SystemRoot is unavailable")?;
-            for (index, (label, program, arguments)) in PINS.iter().enumerate() {
-                let label = wide(label);
+            for (index, pin) in PINS.iter().enumerate() {
+                let label = wide(pin.label);
                 let button = CreateWindowExW(
                     WINDOW_EX_STYLE(0),
                     w!("BUTTON"),
@@ -181,13 +233,13 @@ impl Workspace {
                     None,
                     None,
                 )?;
-                let (icon_file, icon_index) = match *arguments {
+                let (icon_file, icon_index) = match pin.arguments {
                     "services.msc" => ("filemgmt.dll", 0),
                     "eventvwr.msc" => ("miguiresource.dll", 0),
                     "compmgmt.msc" => ("mycomput.dll", 2),
                     "devmgmt.msc" => ("devmgr.dll", 4),
                     "wf.msc" => ("authfwgp.dll", 0),
-                    _ => (*program, 0),
+                    _ => (pin.program, 0),
                 };
                 let path = wide(&format!("{root}\\System32\\{icon_file}"));
                 let mut icon = HICON::default();
@@ -216,6 +268,9 @@ impl Workspace {
     }
 
     fn refresh_tasks(&mut self) -> anyhow::Result<()> {
+        // A console's input helper leaves once its programs exit and the console closes.
+        self.console_inputs
+            .retain_mut(|console| !console.finished());
         let visible = task_windows(self.shell, self.tooltip)?;
         unsafe {
             self.tasks.retain(|task| {
@@ -329,9 +384,10 @@ impl Workspace {
     }
 
     fn launch(&mut self, index: usize) -> anyhow::Result<()> {
-        let (_, program, arguments) = PINS
+        let pin = PINS
             .get(index.wrapping_sub(1))
             .context("unknown background application")?;
+        let (program, arguments) = (&pin.program, &pin.arguments);
         if matches!(
             *arguments,
             "--background-task-manager" | "--background-file-browser"
@@ -439,7 +495,7 @@ impl Workspace {
             } else {
                 let _ = CloseHandle(info.hProcess);
             }
-            if index == 1 || index == 2 {
+            if pin.console {
                 self.console_inputs
                     .push(super::background_console::ConsoleInput::start(
                         info.dwProcessId,
@@ -509,7 +565,7 @@ impl Workspace {
                 }
                 if let Some(index) = hovered {
                     let label = wide(if index < PINS.len() {
-                        PINS[index].0
+                        PINS[index].label
                     } else {
                         &self.tasks[index - PINS.len()].title
                     });
@@ -2355,6 +2411,76 @@ mod tests {
         })
         .join()
         .expect("capture stability test thread panicked")
+    }
+
+    #[test]
+    #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
+    fn console_exit_closes_window_task_and_input_helper() -> anyhow::Result<()> {
+        std::thread::spawn(|| -> anyhow::Result<()> {
+            unsafe {
+                use windows::Win32::System::StationsAndDesktops::*;
+                let station = OpenWindowStationW(w!("WinSta0"), false, 0x000f037f)?;
+                SetProcessWindowStation(station)?;
+            }
+            let _owner = background::Desktop::create()?;
+            let _binding = background::Desktop::bind()?;
+            let mut workspace = Workspace::new()?;
+            let pin = PINS
+                .iter()
+                .position(|pin| pin.program == "cmd.exe")
+                .unwrap()
+                + 1;
+            assert!(PINS[pin - 1].console);
+            workspace.launch(pin)?;
+            assert_eq!(workspace.console_inputs.len(), 1);
+            let helper = workspace.console_inputs[0].helper_process_id();
+            let console = workspace.console_inputs[0].window;
+            let helper = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, helper)? };
+            let wait_for =
+                |workspace: &mut Workspace, what: &str, done: &dyn Fn(&Workspace) -> bool| {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !done(workspace) {
+                        anyhow::ensure!(Instant::now() < deadline, "timed out waiting for {what}");
+                        workspace.pump();
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Ok(())
+                };
+            wait_for(&mut workspace, "the console task", &|workspace| {
+                workspace.tasks.iter().any(|task| task.window == console)
+            })?;
+            // Let cmd reach its prompt before typing.
+            let ready = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < ready {
+                workspace.pump();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            workspace.focus = console;
+            workspace.apply(RemoteInput::TypeText {
+                display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+                text: "exit".into(),
+            })?;
+            send_key(&mut workspace, 0x1c, true)?;
+            send_key(&mut workspace, 0x1c, false)?;
+            wait_for(&mut workspace, "the console window to close", &|_| {
+                !unsafe { IsWindow(Some(console)) }.as_bool()
+            })?;
+            wait_for(
+                &mut workspace,
+                "the console task and input to go",
+                &|workspace| {
+                    workspace.console_inputs.is_empty()
+                        && !workspace.tasks.iter().any(|task| task.window == console)
+                },
+            )?;
+            let exited = unsafe { WaitForSingleObject(helper, 5000) };
+            unsafe { CloseHandle(helper)? };
+            assert_eq!(exited, WAIT_OBJECT_0, "console input helper kept running");
+            println!("Session 0 console exit closed its window, task and input helper");
+            Ok(())
+        })
+        .join()
+        .expect("console exit test thread panicked")
     }
 
     #[test]
