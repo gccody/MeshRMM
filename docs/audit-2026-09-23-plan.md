@@ -44,8 +44,8 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 | T31 Token rotation edge cases | Low | Done | `f95d930` |
 | T32 File transfer sliding window | Low | Done | `21316da` |
 | T39 Native log rotation (+ viewer update helper logging) | Low | Done | `797f7a5` |
-| T33 Local dashboard dev loop | QoL | **Next** | |
-| T34 Server deploy script + schema version in /healthz | QoL | Todo | |
+| T33 Local dashboard dev loop | QoL | Done | `c67249f` |
+| T34 Server deploy script + schema version in /healthz | QoL | **Next** | |
 | T35 Viewer input QoL (Win/Alt+Tab hook, rebindable keys) | QoL | Todo | |
 | T36 Agent refactor: split large files, dedupe launch code | QoL | Todo | |
 | T37 Viewer refactor: split window.rs / transport.rs | QoL | Todo | |
@@ -208,6 +208,15 @@ These need a live dashboard → viewer → agent session, which the agent-driven
   stand-in executables, logged its start, the install and launch, and, when the update was
   missing or never reported ready, the restore, the relaunch and the final error. The macOS
   helper's logging and the Mac viewer's 90 MB log (rotated at the next launch) were not exercised.
+- T33: a full sign-in, which needs a WorkOS staging environment with `*.localhost` redirect URIs.
+  On the Mac, after `npm run dev:seed -- acme`, `npm run dev` served the marketing site, owner
+  console and company dashboard at `localhost`, `admin.localhost` and `acme.localhost:3000`
+  (`other.localhost` returned 404 and `www.localhost` redirected), and `/v1/account` reached the
+  local control plane (401 without a token). Headless Chrome treated `http://acme.localhost` as a
+  secure context and kept the `__Host-` sign-in cookie: `/auth/callback` with the issued state got
+  as far as WorkOS, which rejected the fake code. The production build contains only the
+  dashboard Worker and none of the development settings. The Agent list does not load locally,
+  as documented, so T26 and T27 still lack a live check.
 
 ## Remaining tasks
 
