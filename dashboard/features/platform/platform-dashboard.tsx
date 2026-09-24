@@ -6,6 +6,7 @@ import { FormEvent, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { errorMessage, normalizeServer } from "../../lib/http";
 import { useRuntimeConfig } from "../../app/providers";
+import { errorAfterFailure, ownerAccessAfterFailure, PlatformRequestError, type OwnerAccess } from "./platform-access";
 
 type PlatformCompany = {
   id: string;
@@ -23,7 +24,7 @@ export function PlatformDashboard() {
   const { serverUrl } = useRuntimeConfig();
   const { isLoading: isAuthLoading, user, signIn, signOut, getAccessToken } = useAuth();
   const [companies, setCompanies] = useState<PlatformCompany[]>([]);
-  const [hasOwnerAccess, setHasOwnerAccess] = useState<boolean | null>(null);
+  const [hasOwnerAccess, setHasOwnerAccess] = useState<OwnerAccess>(null);
   const [name, setName] = useState("");
   const [slug, setSlug] = useState("");
   const [adminEmail, setAdminEmail] = useState("");
@@ -38,32 +39,33 @@ export function PlatformDashboard() {
     try {
       token = await getAccessToken();
     } catch (tokenError) {
-      if (tokenError instanceof LoginRequiredError) throw new Error("Your administrator session has expired.");
+      if (tokenError instanceof LoginRequiredError) throw new PlatformRequestError("Your administrator session has expired.", 401);
       throw tokenError;
     }
-    if (!token) throw new Error("Your administrator session has expired.");
+    if (!token) throw new PlatformRequestError("Your administrator session has expired.", 401);
     return fetch(`${normalizeServer(serverUrl)}${path}`, {
       ...init,
       headers: { ...init.headers, Authorization: `Bearer ${token}` },
     });
   }, [getAccessToken, serverUrl]);
 
+  // Leaves any current error in place: callers that start a fresh attempt
+  // clear it first, and a reload after a failed action must keep its error.
   const loadCompanies = useCallback(async () => {
     if (!user) return;
     setIsLoading(true);
-    setError(null);
     try {
       const response = await authorizedFetch("/v1/platform/companies");
       if (!response.ok) {
-        setHasOwnerAccess(false);
-        throw new Error(await errorMessage(response, "Platform owner access could not be verified."));
+        throw new PlatformRequestError(await errorMessage(response, "Companies could not be loaded."), response.status);
       }
       const data = (await response.json()) as { companies: PlatformCompany[] };
       setHasOwnerAccess(true);
       setCompanies(data.companies);
     } catch (requestError) {
-      setHasOwnerAccess(false);
-      setError(requestError instanceof Error ? requestError.message : "Companies could not be loaded.");
+      setHasOwnerAccess((current) => ownerAccessAfterFailure(current, requestError));
+      const message = requestError instanceof Error ? requestError.message : "Companies could not be loaded.";
+      setError((current) => errorAfterFailure(current, requestError, message));
     } finally {
       setIsLoading(false);
     }
@@ -152,6 +154,29 @@ export function PlatformDashboard() {
     );
   }
 
+  const retryAccessCheck = () => {
+    setHasOwnerAccess(null);
+    setError(null);
+    void loadCompanies();
+  };
+
+  if (hasOwnerAccess === null && error) {
+    return (
+      <main className="platform-auth">
+        <section className="signed-out-card">
+          <div className="modal-icon"><ShieldCheck size={22} /></div>
+          <p className="eyebrow">Unavailable</p>
+          <h1>Platform administration could not load</h1>
+          <p role="alert">{error}</p>
+          <div className="login-actions">
+            <button className="primary-button" onClick={retryAccessCheck} disabled={isLoading}><RefreshCw size={16} className={isLoading ? "spin" : ""} /> Try again</button>
+            <button className="secondary-button" onClick={() => void signOut({ returnTo: "https://meshrmm.com" })}><LogOut size={15} /> Sign out</button>
+          </div>
+        </section>
+      </main>
+    );
+  }
+
   if (hasOwnerAccess === null) {
     return <main className="platform-auth"><LoaderCircle className="spin" /><span>Verifying platform owner access</span></main>;
   }
@@ -163,9 +188,9 @@ export function PlatformDashboard() {
           <div className="modal-icon"><ShieldCheck size={22} /></div>
           <p className="eyebrow">Restricted</p>
           <h1>Platform owner access required</h1>
-          <p>{error ?? "This account does not have access to platform administration."}</p>
+          <p role="alert">{error ?? "This account does not have access to platform administration."}</p>
           <div className="login-actions">
-            <button className="primary-button" onClick={() => { setHasOwnerAccess(null); void loadCompanies(); }}><RefreshCw size={16} /> Retry access check</button>
+            <button className="primary-button" onClick={retryAccessCheck}><RefreshCw size={16} /> Retry access check</button>
             <button className="secondary-button" onClick={() => void signOut({ returnTo: "https://meshrmm.com" })}><LogOut size={15} /> Sign out</button>
           </div>
         </section>
@@ -182,10 +207,10 @@ export function PlatformDashboard() {
       <div className="platform-content">
         <section className="page-heading">
           <div><p className="eyebrow">Workspace management</p><h1>Companies</h1><p>Create company workspaces and invite their administrators.</p></div>
-          <button className="secondary-button" onClick={() => void loadCompanies()} disabled={isLoading}><RefreshCw size={16} className={isLoading ? "spin" : ""} /> Refresh</button>
+          <button className="secondary-button" onClick={() => { setError(null); void loadCompanies(); }} disabled={isLoading}><RefreshCw size={16} className={isLoading ? "spin" : ""} /> Refresh</button>
         </section>
 
-        {error && <div className="error-banner"><X size={17} /><span>{error}</span><button onClick={() => setError(null)} aria-label="Dismiss"><X size={16} /></button></div>}
+        {error && <div className="error-banner" role="alert"><X size={17} /><span>{error}</span><button onClick={() => setError(null)} aria-label="Dismiss"><X size={16} /></button></div>}
 
         <section className="platform-grid">
           <form className="platform-create-card" onSubmit={createCompany}>
