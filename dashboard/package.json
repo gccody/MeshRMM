@@ -7,6 +7,7 @@
   },
   "scripts": {
     "dev": "vinext dev",
+    "dev:seed": "node scripts/seed-local.mjs",
     "build": "vinext build",
     "start": "vinext start",
     "predeploy": "node ../scripts/verify-dashboard-deploy.mjs",
