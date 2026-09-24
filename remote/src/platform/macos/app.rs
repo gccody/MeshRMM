@@ -608,7 +608,7 @@ define_class!(
         #[unsafe(method(sendFiles:))]
         fn send_files(&self, _: &NSMenuItem) { self.ivars().control.files().pick(); }
         #[unsafe(method(receiveFiles:))]
-        fn receive_files(&self, _: &NSMenuItem) { self.send(SessionMessage::FileTransfer(meshrmm_protocol::FileMessage::Pick)); }
+        fn receive_files(&self, _: &NSMenuItem) { self.ivars().control.files().request_peer_pick(); }
 
         #[unsafe(method(promptCredentials:))]
         fn prompt_credentials(&self, _: &NSButton) { self.release_input(); self.send(SessionMessage::PromptForCredentials); }

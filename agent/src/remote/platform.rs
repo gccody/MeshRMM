@@ -153,7 +153,7 @@ impl PlatformScreenStreamer {
             capture_cursor: true,
             next_frame_id: Arc::new(AtomicU64::new(1)),
             direct_files: (!capture_as_active_user)
-                .then(meshrmm_file_transfer::TransferSession::new),
+                .then(meshrmm_file_transfer::TransferSession::agent),
             direct_chat: meshrmm_chat::ChatSession::with_peer("Viewer"),
             direct_input: Arc::new(Mutex::new(super::input::WindowsInputController::new())),
             // Service workers live in non-interactive Session 0. Their clipboard
