@@ -740,6 +740,17 @@ fn valid_path(path: &str) -> anyhow::Result<PathBuf> {
     Ok(result)
 }
 
+/// Tags a received file or folder the way browsers tag downloads (the
+/// quarantine attribute on macOS, Mark of the Web on Windows), so opening a
+/// received app or installer gets the same checks. Both the viewer and the
+/// agent tag what they receive. A volume without extended attributes or
+/// alternate streams keeps the file untagged.
+fn mark_received(path: &Path) {
+    if let Err(error) = native::mark_received(path) {
+        tracing::warn!(%error, path = %path.display(), "could not mark a received file as downloaded");
+    }
+}
+
 /// Moves `from` to `to`, failing with [`io::ErrorKind::AlreadyExists`]
 /// instead of replacing an existing file or folder.
 fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
@@ -863,16 +874,15 @@ impl Incoming {
                     ensure!(parent.is_dir(), "parent directory missing");
                 }
                 if let Some(size) = size {
-                    self.file = Some((
-                        OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(target)?,
-                        size,
-                        Sha256::new(),
-                    ));
+                    let file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&target)?;
+                    mark_received(&target);
+                    self.file = Some((file, size, Sha256::new()));
                 } else {
-                    fs::create_dir(target)?;
+                    fs::create_dir(&target)?;
+                    mark_received(&target);
                 }
             }
             FileMessage::Chunk { data, .. } => {
@@ -1492,6 +1502,65 @@ mod tests {
             assert!(agent.admit(&destination, true, start).is_ok());
         }
         assert!(agent.admit(&paste, false, start).is_err());
+    }
+    /// Reads the tag `mark_received` leaves, if any.
+    #[cfg(target_os = "macos")]
+    fn received_mark(path: &Path) -> Option<String> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = c"com.apple.quarantine";
+        let mut value = [0u8; 256];
+        // SAFETY: both strings are NUL-terminated and `value` is writable.
+        let length = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            )
+        };
+        (length >= 0).then(|| String::from_utf8_lossy(&value[..length as usize]).into_owned())
+    }
+    #[cfg(windows)]
+    fn received_mark(path: &Path) -> Option<String> {
+        let mut stream = path.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        fs::read_to_string(stream).ok()
+    }
+    #[test]
+    fn received_files_are_marked_as_downloaded() {
+        let source = Sandbox::new();
+        let target = Sandbox::new();
+        let folder = source.0.join("Tool.app");
+        fs::create_dir_all(folder.join("Contents")).unwrap();
+        fs::write(folder.join("Contents").join("setup.exe"), "MZ").unwrap();
+        assert!(received_mark(&folder.join("Contents").join("setup.exe")).is_none());
+        for destination in [FileDestination::Documents, FileDestination::Clipboard] {
+            let mut receiver = Incoming::new(1, destination.clone(), target.0.clone()).unwrap();
+            let mut received = Vec::new();
+            send_paths(1, vec![folder.clone()], destination, |message| {
+                match message {
+                    FileMessage::Begin { .. } => {}
+                    FileMessage::Finish { .. } => received = receiver.finish()?,
+                    message => receiver.accept(message)?,
+                }
+                Ok(())
+            })
+            .unwrap();
+            let file = received[0].join("Contents").join("setup.exe");
+            let mark = received_mark(&file).expect("received file is marked");
+            #[cfg(target_os = "macos")]
+            {
+                assert!(mark.contains(";MeshRMM;"), "{mark}");
+                let folder_mark = received_mark(&received[0]).expect("received folder is marked");
+                assert!(folder_mark.contains(";MeshRMM;"), "{folder_mark}");
+            }
+            #[cfg(windows)]
+            assert!(mark.contains("ZoneId=3"), "{mark}");
+        }
+        assert!(received_mark(&folder.join("Contents").join("setup.exe")).is_none());
     }
     #[test]
     fn clipboard_batches_preserve_names_across_repeated_copies() {
