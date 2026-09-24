@@ -753,11 +753,7 @@ fn redeem_installer(
         .https_only(true)
         .timeout_global(Some(Duration::from_secs(30)))
         .http_status_as_error(false)
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
+        .tls_config(crate::updater::https_tls_config())
         .build()
         .new_agent();
     let mut response = http

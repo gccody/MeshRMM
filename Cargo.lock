@@ -2052,8 +2052,13 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "rcgen",
+ "rustls",
+ "rustls-native-certs",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
+ "tracing",
  "url",
 ]
 

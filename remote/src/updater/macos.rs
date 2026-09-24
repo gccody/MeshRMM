@@ -30,7 +30,7 @@ pub async fn check_and_schedule(
     if std::env::var_os("MESHRMM_UPDATE_READY_FILE").is_some() {
         return Ok(false);
     }
-    let http = reqwest::Client::builder()
+    let http = crate::http::client_builder()
         .timeout(Duration::from_secs(60))
         .build()
         .context("failed to create client update HTTP client")?;

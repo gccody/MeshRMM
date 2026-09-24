@@ -12,7 +12,7 @@ pub async fn create_session(config: &Config) -> anyhow::Result<SessionBootstrap>
         &[],
         false,
     )?;
-    let response = reqwest::Client::builder()
+    let response = crate::http::client_builder()
         .https_only(true)
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(20))
@@ -49,7 +49,7 @@ pub async fn resume_session(
         &[],
         false,
     )?;
-    reqwest::Client::builder()
+    crate::http::client_builder()
         .https_only(true)
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -113,7 +113,7 @@ pub async fn end_session(config: &Config, bootstrap: &SessionBootstrap) -> anyho
         &[],
         false,
     )?;
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .https_only(true)
         .timeout(std::time::Duration::from_secs(5))
         .build()?;

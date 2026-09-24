@@ -80,3 +80,6 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Controls",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+meshrmm-signaling-client = { workspace = true, features = ["test-support"] }

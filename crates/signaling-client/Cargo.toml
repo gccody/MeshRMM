@@ -9,10 +9,23 @@ description = "Shared MeshRMM HTTP/WebSocket endpoint and authentication client"
 [lints]
 workspace = true
 
+[features]
+# A local TLS server for handshake tests in other workspace crates.
+test-support = ["dep:rcgen", "dep:tokio-rustls"]
+
 [dependencies]
 anyhow.workspace = true
 futures-util.workspace = true
+rcgen = { version = "0.13.2", optional = true }
+rustls.workspace = true
+rustls-native-certs = "0.8.4"
 tokio.workspace = true
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"], optional = true }
 tokio-tungstenite.workspace = true
+tracing.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13.2"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 

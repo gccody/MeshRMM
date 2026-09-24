@@ -68,7 +68,7 @@ sign-out across tabs where supported.
 
 MeshRMM enforces a per-organization dashboard inactivity timeout. New
 organizations default to four hours, and organization administrators can change
-the value under **Profile & session**. Expiry locks the dashboard and ends the
+the value under **Settings → Dashboard security**. Expiry locks the dashboard and ends the
 WorkOS session without navigating away; the user deliberately resumes through
 WorkOS when they return.
 
