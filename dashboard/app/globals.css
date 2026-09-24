@@ -32,7 +32,7 @@ button { color: inherit; }
 .workspace-switcher span, .profile-row span { display: block; margin-top: 1px; font-size: 13px; color: #9294a1; }
 .nav-label { margin: 0 9px 8px; color: #a2a4af; font-size: 12px; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
 .nav-label-spaced { margin-top: 24px; }
-.nav-item { position: relative; width: 100%; height: 40px; margin: 1px 0; padding: 0 10px; display: flex; align-items: center; gap: 11px; border: 0; border-radius: 9px; background: transparent; color: #656878; cursor: pointer; font-size: 12px; font-weight: 540; text-align: left; }
+.nav-item { position: relative; width: 100%; height: 40px; margin: 1px 0; padding: 0 10px; display: flex; align-items: center; gap: 11px; border: 0; border-radius: 9px; background: transparent; color: #656878; cursor: pointer; font-size: 12px; font-weight: 540; text-align: left; text-decoration: none; }
 .nav-item:hover { color: var(--ink); background: #f7f7fa; }
 .nav-item:disabled { cursor: not-allowed; opacity: .45; }
 .nav-item.active { color: var(--purple); background: var(--purple-soft); font-weight: 650; }
@@ -173,6 +173,8 @@ button { color: inherit; }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 20px; background: rgba(24,24,37,.48); backdrop-filter: blur(5px); animation: fade-in .18s ease; }
 .settings-modal { max-height: calc(100dvh - 40px); overflow-y: auto; width: min(430px, 100%); position: relative; padding: 27px; border: 1px solid rgba(255,255,255,.55); border-radius: 15px; background: #fff; box-shadow: 0 24px 70px rgba(23,20,45,.25); animation: modal-in .22s ease; }
+/* Dialogs take focus themselves when they open; their controls show the focus ring. */
+.settings-modal[tabindex="-1"]:focus { outline: none; }
 .modal-close { position: absolute; top: 15px; right: 15px; width: 31px; height: 31px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 8px; background: #fff; cursor: pointer; }
 .modal-icon { width: 42px; height: 42px; display: grid; place-items: center; margin-bottom: 16px; color: #fff; background: var(--purple); border-radius: 11px; box-shadow: 0 8px 18px rgba(108,85,225,.22); }
 .settings-modal h2 { margin: 0; font-size: 20px; letter-spacing: -.035em; }

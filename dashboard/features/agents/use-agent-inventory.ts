@@ -2,14 +2,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { errorMessage } from "../../lib/http";
-import { AuthenticationRequired } from "../../lib/http";
+import { AuthenticationRequired, type AuthorizedFetch } from "../../lib/http";
 import { applyAgentDelta, parseAgentEvent, parseAgentList, sortAgents } from "./model";
 import { subscriptionRenewal } from "./subscription-renewal";
 import type { Agent, AgentDelta, AgentEventSubscription } from "./types";
 
 const MAX_EVENT_RECONNECT_DELAY_MS = 30_000;
-
-type AuthorizedFetch = (path: string, init?: RequestInit) => Promise<Response>;
 
 type Options = {
   enabled: boolean;
