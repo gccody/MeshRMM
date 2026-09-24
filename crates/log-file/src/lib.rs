@@ -9,17 +9,23 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// A log is rotated once it reaches this size.
 pub const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 /// Rotated logs kept beside the current one: `agent.1.log` (newest) to `agent.3.log`.
 pub const KEEP_ROTATED: usize = 3;
+/// How long a writer waits before retrying a rotation that failed, for example
+/// because another program holds the log open without sharing it for deletion.
+const RETRY_ROTATION_AFTER: Duration = Duration::from_secs(60);
 
 pub struct RotatingFile {
     path: PathBuf,
     file: File,
     limit: u64,
     keep: usize,
+    retry_rotation_at: Option<Instant>,
 }
 
 impl RotatingFile {
@@ -29,30 +35,37 @@ impl RotatingFile {
     }
 
     fn with_limits(path: PathBuf, limit: u64, keep: usize) -> io::Result<Self> {
-        if length(&path) >= limit {
-            rotate(&path, keep);
+        let mut retry_rotation_at = None;
+        if length(&path) >= limit && rotate(&path, keep).is_err() {
+            retry_rotation_at = Some(Instant::now() + RETRY_ROTATION_AFTER);
         }
         Ok(Self {
             file: append(&path)?,
             path,
             limit,
             keep,
+            retry_rotation_at,
         })
     }
 
     /// Moves to a new log when the one held is full, rotating it unless
-    /// another writer already has. Failures keep the current file, and the
-    /// next write tries again.
+    /// another writer already has. Failures keep the current file, and a write
+    /// after [`RETRY_ROTATION_AFTER`] tries again.
     fn rotate_if_full(&mut self) {
         if self
-            .file
-            .metadata()
-            .is_ok_and(|metadata| metadata.len() < self.limit)
+            .retry_rotation_at
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+            || self
+                .file
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() < self.limit)
         {
             return;
         }
-        if length(&self.path) >= self.limit {
-            rotate(&self.path, self.keep);
+        self.retry_rotation_at = None;
+        if length(&self.path) >= self.limit && rotate(&self.path, self.keep).is_err() {
+            self.retry_rotation_at = Some(Instant::now() + RETRY_ROTATION_AFTER);
+            return;
         }
         if let Ok(file) = append(&self.path) {
             self.file = file;
@@ -91,17 +104,37 @@ pub fn rotated_path(path: &Path, number: usize) -> PathBuf {
 
 /// Shifts `path.1` … `path.{keep - 1}` up by one, dropping `path.{keep}`, and
 /// moves `path` to `path.1`. Windows can rename a log other processes hold
-/// open because the standard library shares files for deletion.
-fn rotate(path: &Path, keep: usize) {
+/// open because the standard library shares files for deletion, but not one a
+/// program opened without that sharing. The log is moved aside before anything
+/// else, so when it cannot be, the rotated logs stay as they were.
+fn rotate(path: &Path, keep: usize) -> io::Result<()> {
     if keep == 0 {
-        let _ = fs::remove_file(path);
-        return;
+        return match fs::remove_file(path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+    }
+    // A name no other writer uses, so writers rotating at once cannot replace
+    // each other's full log.
+    static ROTATION: AtomicU64 = AtomicU64::new(0);
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(
+        ".{}-{}.rotating",
+        std::process::id(),
+        ROTATION.fetch_add(1, Ordering::Relaxed)
+    ));
+    let aside = PathBuf::from(aside);
+    match fs::rename(path, &aside) {
+        Ok(()) => {}
+        // Another writer rotated it first.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
     }
     let _ = fs::remove_file(rotated_path(path, keep));
     for number in (1..keep).rev() {
         let _ = fs::rename(rotated_path(path, number), rotated_path(path, number + 1));
     }
-    let _ = fs::rename(path, rotated_path(path, 1));
+    fs::rename(&aside, rotated_path(path, 1))
 }
 
 #[cfg(test)]
@@ -169,6 +202,44 @@ mod tests {
         log.write_all(b"new\n").unwrap();
         assert_eq!(sandbox.read("remote.log").unwrap(), "new\n");
         assert_eq!(sandbox.read("remote.1.log").unwrap().len(), 64);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_log_held_open_without_delete_sharing_keeps_its_history() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+
+        let sandbox = Sandbox::new("locked");
+        let path = sandbox.0.join("agent.log");
+        fs::write(rotated_path(&path, 1), "one").unwrap();
+        fs::write(rotated_path(&path, 2), "two").unwrap();
+        let mut log = RotatingFile::with_limits(path.clone(), 8, 2).unwrap();
+        log.write_all(b"full log\n").unwrap();
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .open(&path)
+            .unwrap();
+        log.write_all(b"more\n").unwrap();
+        log.write_all(b"again\n").unwrap();
+        assert_eq!(sandbox.read("agent.1.log").unwrap(), "one");
+        assert_eq!(sandbox.read("agent.2.log").unwrap(), "two");
+        assert_eq!(
+            sandbox.read("agent.log").unwrap(),
+            "full log\nmore\nagain\n"
+        );
+
+        // Once the program lets go, the next retry rotates normally.
+        drop(reader);
+        log.retry_rotation_at = None;
+        log.write_all(b"new\n").unwrap();
+        assert_eq!(sandbox.read("agent.log").unwrap(), "new\n");
+        assert_eq!(
+            sandbox.read("agent.1.log").unwrap(),
+            "full log\nmore\nagain\n"
+        );
+        assert_eq!(sandbox.read("agent.2.log").unwrap(), "one");
     }
 
     #[test]
