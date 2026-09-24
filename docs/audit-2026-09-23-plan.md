@@ -45,8 +45,8 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 | T32 File transfer sliding window | Low | Done | `21316da` |
 | T39 Native log rotation (+ viewer update helper logging) | Low | Done | `797f7a5` |
 | T33 Local dashboard dev loop | QoL | Done | `c67249f` |
-| T34 Server deploy script + schema version in /healthz | QoL | **Next** | |
-| T35 Viewer input QoL (Win/Alt+Tab hook, rebindable keys) | QoL | Todo | |
+| T34 Server deploy script + schema version in /healthz | QoL | Done | `534ee4d` |
+| T35 Viewer input QoL (Win/Alt+Tab hook, rebindable keys) | QoL | **Next** | |
 | T36 Agent refactor: split large files, dedupe launch code | QoL | Todo | |
 | T37 Viewer refactor: split window.rs / transport.rs | QoL | Todo | |
 | T38 Dashboard refactor: split dashboard.tsx, modal a11y | QoL | Todo | |
@@ -217,6 +217,12 @@ These need a live dashboard → viewer → agent session, which the agent-driven
   as far as WorkOS, which rejected the fake code. The production build contains only the
   dashboard Worker and none of the development settings. The Agent list does not load locally,
   as documented, so T26 and T27 still lack a live check.
+- T34: the script against production, which the working rules forbid, including its read-only
+  `--dry-run` (it lists remote migrations). Its unit tests cover the step order, the dry run, the
+  health URL and the health wait; `wrangler deploy --dry-run` built the Worker on the Mac. Through
+  `npm run dev`, `/healthz` on the seeded local D1 answered 200 `ok` and, with the newest row
+  removed from `d1_migrations`, 503 `schema_behind`. The Miniflare suites pass with the new build.
+  `/healthz` used to return the text `ok`; nothing in the repository read it.
 
 ## Remaining tasks
 
