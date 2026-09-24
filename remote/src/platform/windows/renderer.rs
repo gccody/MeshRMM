@@ -32,11 +32,13 @@ impl D3d11Renderer {
         debug: DebugInfo,
     ) -> anyhow::Result<Self> {
         let window = unsafe { create_window(format, active_display, displays, control, debug)? };
+        let video_window = unsafe { window::video_window(window) }
+            .context("remote video window is unavailable")?;
         let layout = unsafe { window::client_layout(window) }
             .context("remote window client area is unavailable")?;
         let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
             .context("DXGI factory creation failed")?;
-        // The buffers track the client area; the video is letterboxed inside
+        // The buffers track the video window; the video is letterboxed inside
         // them. Stretch scaling only shows while the user drags the border.
         let swap_desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: layout.width.max(1),
@@ -55,7 +57,7 @@ impl D3d11Renderer {
             Flags: SWAP_CHAIN_FLAGS.0 as u32,
         };
         let swap_chain: IDXGISwapChain2 =
-            unsafe { factory.CreateSwapChainForHwnd(device, window, &swap_desc, None, None) }
+            unsafe { factory.CreateSwapChainForHwnd(device, video_window, &swap_desc, None, None) }
                 .context("low-latency DXGI swap chain creation failed")?
                 .cast()?;
         unsafe { swap_chain.SetMaximumFrameLatency(1) }
@@ -111,7 +113,7 @@ impl D3d11Renderer {
         unsafe {
             video_context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&source_rect))
         };
-        // Letterbox bars and the area under the toolbar stay black.
+        // Letterbox bars stay black.
         let black = D3D11_VIDEO_COLOR {
             Anonymous: D3D11_VIDEO_COLOR_0 {
                 RGBA: D3D11_VIDEO_COLOR_RGBA {
@@ -198,7 +200,7 @@ impl D3d11Renderer {
         Ok(())
     }
 
-    /// Resizes the swap chain to the client area and redraws the last frame.
+    /// Resizes the swap chain to the video window and redraws the last frame.
     pub(super) unsafe fn resize(&mut self, layout: &ClientLayout) -> anyhow::Result<()> {
         if layout.width == 0 || layout.height == 0 {
             // Minimized; keep the current buffers until the window returns.

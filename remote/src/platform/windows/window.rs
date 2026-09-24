@@ -1,8 +1,8 @@
 use super::*;
 use crate::video_layout::{self, VideoRect};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, DeleteObject, GetMonitorInfoW, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST,
-    MONITORINFO, MapWindowPoints, MonitorFromWindow,
+    ClientToScreen, CreateFontIndirectW, DeleteObject, GetMonitorInfoW, HFONT, HGDIOBJ,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints, MonitorFromWindow,
 };
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi,
@@ -15,7 +15,7 @@ const MINIMUM_WINDOW_HEIGHT: i32 = 300;
 const SETTINGS_WINDOW_WIDTH: i32 = 560;
 const SETTINGS_WINDOW_HEIGHT: i32 = 626;
 
-/// The client area and the letterboxed video inside it, in physical pixels.
+/// The video window's size and the letterboxed video inside it, in physical pixels.
 pub(super) struct ClientLayout {
     pub(super) width: u32,
     pub(super) height: u32,
@@ -37,6 +37,12 @@ struct WindowContext {
     pressed_buttons: HashSet<PointerButton>,
     cursor_shape: CursorShape,
     debug: DebugInfo,
+    /// Hosts the swap chain below the toolbar. A flip-model swap chain covers
+    /// every GDI child of its own window, so the video cannot be drawn on the
+    /// top-level window without hiding the toolbar. The child is disabled, so
+    /// mouse input and dropped files go to the top-level window.
+    video_window: HWND,
+    /// Owned popup: a child window over the video would be hidden by it.
     debug_overlay: HWND,
     debug_visible: bool,
     debug_refreshed: std::time::Instant,
@@ -328,21 +334,43 @@ impl WindowContext {
             px(24),
         );
         place(
-            self.debug_overlay,
-            px(12),
-            toolbar_height(self.dpi) + px(12),
-            px(640),
-            px(300),
+            self.video_window,
+            0,
+            toolbar_height(self.dpi),
+            width,
+            (rect.bottom - rect.top - toolbar_height(self.dpi)).max(0),
         );
-        if let Some(chat) = &self.chat_popup {
-            chat.layout();
-        }
+        self.place_popups(window);
         let maximize_title = if unsafe { IsZoomed(window) }.as_bool() {
             w!("❐")
         } else {
             w!("□")
         };
         let _ = unsafe { SetWindowTextW(self.maximize_button, maximize_title) };
+    }
+
+    /// Keeps the owned popups over the video when the window moves or resizes.
+    fn place_popups(&self, window: HWND) {
+        let mut origin = windows::Win32::Foundation::POINT {
+            x: self.px(12),
+            y: toolbar_height(self.dpi) + self.px(12),
+        };
+        if unsafe { ClientToScreen(window, &mut origin) }.as_bool() {
+            let _ = unsafe {
+                SetWindowPos(
+                    self.debug_overlay,
+                    None,
+                    origin.x,
+                    origin.y,
+                    self.px(640),
+                    self.px(300),
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            };
+        }
+        if let Some(chat) = &self.chat_popup {
+            chat.layout();
+        }
     }
 
     fn select_display(&self, index: usize) {
@@ -590,7 +618,11 @@ impl WindowContext {
 
     fn toggle_debug(&mut self) {
         self.debug_visible = !self.debug_visible;
-        let command = if self.debug_visible { SW_SHOW } else { SW_HIDE };
+        let command = if self.debug_visible {
+            SW_SHOWNOACTIVATE
+        } else {
+            SW_HIDE
+        };
         let _ = unsafe { ShowWindow(self.debug_overlay, command) };
         unsafe {
             SendMessageW(
@@ -808,14 +840,23 @@ unsafe fn place_initial_window(window: HWND, style: WINDOW_STYLE, format: VideoF
     };
 }
 
-/// The current client layout, for creating the swap chain.
+/// The window that hosts the swap chain.
+pub(super) unsafe fn video_window(window: HWND) -> Option<HWND> {
+    let context = unsafe { window_context(window) }?;
+    (!context.video_window.is_invalid()).then_some(context.video_window)
+}
+
+/// The video window's size and the video's place in it, for the swap chain.
 pub(super) unsafe fn client_layout(window: HWND) -> Option<ClientLayout> {
     let context = unsafe { window_context(window) }?;
     let (width, height) = unsafe { client_size(window) }?;
+    let toolbar = toolbar_height(context.dpi);
+    let mut video = context.video_rect_for(width, height);
+    video.top -= toolbar;
     Some(ClientLayout {
         width,
-        height,
-        video: context.video_rect_for(width, height),
+        height: height.saturating_sub(u32::try_from(toolbar).unwrap_or(0)),
+        video,
     })
 }
 
@@ -1546,6 +1587,12 @@ pub(super) unsafe fn create_window(
                 }
                 LRESULT(0)
             }
+            WM_MOVE => {
+                if let Some(context) = context {
+                    context.place_popups(window);
+                }
+                LRESULT(0)
+            }
             WM_SIZE => {
                 if let Some(context) = context {
                     // The worker resizes the swap chain after the message pump
@@ -1896,7 +1943,32 @@ pub(super) unsafe fn create_window(
             return Err(error).context("remote desktop window class registration failed");
         }
     }
-    let window_style = WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 & !WS_CAPTION.0);
+    unsafe extern "system" fn video_proc(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            // The swap chain paints every pixel; skip the GDI erase.
+            WM_ERASEBKGND => LRESULT(1),
+            _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+        }
+    }
+    let video_class = w!("MeshRmmRemoteVideo");
+    let video_window_class = WNDCLASSW {
+        lpfnWndProc: Some(video_proc),
+        hInstance: instance,
+        lpszClassName: video_class,
+        ..Default::default()
+    };
+    if unsafe { RegisterClassW(&video_window_class) } == 0 {
+        let error = windows::core::Error::from_thread();
+        if error.code() != windows::core::HRESULT::from_win32(ERROR_CLASS_ALREADY_EXISTS.0) {
+            return Err(error).context("remote video window class registration failed");
+        }
+    }
+    let window_style = WINDOW_STYLE((WS_OVERLAPPEDWINDOW.0 & !WS_CAPTION.0) | WS_CLIPCHILDREN.0);
     let title = HSTRING::from(format!(
         "MeshRMM Remote Desktop — {} ({}) — F8 display · F12 diagnostics",
         active_display.name,
@@ -1911,6 +1983,7 @@ pub(super) unsafe fn create_window(
         video_height: format.height,
         dpi: 96,
         font: HFONT::default(),
+        video_window: HWND::default(),
         settings_dpi: 96,
         settings_font: HFONT::default(),
         resize_pending: false,
@@ -1985,12 +2058,32 @@ pub(super) unsafe fn create_window(
         context.font = font;
     }
     unsafe { place_initial_window(window, window_style, format, dpi) };
-    let overlay = unsafe {
+    let video_window = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
+            video_class,
+            w!(""),
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | WS_CLIPSIBLINGS,
+            0,
+            0,
+            1,
+            1,
+            Some(window),
+            None,
+            Some(instance),
+            None,
+        )
+    }
+    .context("remote video window creation failed")?;
+    if let Some(context) = unsafe { window_context(window) } {
+        context.video_window = video_window;
+    }
+    let overlay = unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             w!("STATIC"),
             w!(""),
-            WS_CHILD | WS_BORDER,
+            WS_POPUP | WS_BORDER,
             0,
             0,
             1,
@@ -2007,7 +2100,7 @@ pub(super) unsafe fn create_window(
             WINDOW_EX_STYLE::default(),
             w!("STATIC"),
             w!(""),
-            WS_CHILD | WS_VISIBLE | WS_BORDER,
+            WS_CHILD | WS_VISIBLE | WS_BORDER | WS_CLIPSIBLINGS,
             0,
             0,
             1,
@@ -2316,6 +2409,19 @@ pub(super) unsafe fn create_window(
         context.set_quality(context.control.quality_preset());
         context.set_chroma(context.control.chroma_mode());
     }
+    // New children are added below their siblings. Put the strip under
+    // every control created after it, or its background paints over them.
+    let _ = unsafe {
+        SetWindowPos(
+            toolbar,
+            Some(HWND_BOTTOM),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    };
     let _ = unsafe { ShowWindow(window, SW_SHOW) };
     Ok(window)
 }
