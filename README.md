@@ -457,7 +457,13 @@ Pointer coordinates are normalized to the display
 currently being streamed and every event carries that display ID, so the Agent
 rejects input left over from a previous display after a switch. On Windows,
 press **F8** in the viewer to cycle displays. On macOS, use
-**Control-Option-Left/Right Arrow**. On endpoints with multiple monitors,
+**Control-Option-Left/Right Arrow**. **F12** shows the diagnostics overlay.
+Either shortcut can use F8–F12 or be turned off, which sends the key to the
+device: on Windows under **Settings → Keyboard**, on macOS (diagnostics only)
+under the session menu's **Diagnostics key**. While the Windows viewer has
+keyboard focus it also sends the Windows key, Alt+Tab, Alt+Esc and Ctrl+Esc to
+the device instead of acting on them locally; turn this off under
+**Settings → Keyboard**. Ctrl+Alt+Del and Windows+L always stay local. On endpoints with multiple monitors,
 select **All monitors** from the viewer's display dropdown (also included in
 keyboard cycling) to view and control the complete desktop in one window.
 The combined view preserves monitor positions, including negative coordinates,

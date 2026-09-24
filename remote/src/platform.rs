@@ -249,6 +249,39 @@ impl ControlSink {
         }
     }
 
+    pub fn shortcut_key(
+        &self,
+        shortcut: crate::shortcuts::ViewerShortcut,
+    ) -> crate::shortcuts::ShortcutKey {
+        crate::preferences::shortcut_key(shortcut)
+    }
+
+    pub fn set_shortcut_key(
+        &self,
+        shortcut: crate::shortcuts::ViewerShortcut,
+        key: crate::shortcuts::ShortcutKey,
+    ) {
+        if let Err(error) = crate::preferences::set_shortcut_key(shortcut, key)
+            && let Ok(mut state) = self.maintenance.lock()
+        {
+            state.error = Some(error.to_string());
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn send_windows_shortcuts(&self) -> bool {
+        crate::preferences::send_windows_shortcuts()
+    }
+
+    #[cfg(windows)]
+    pub fn toggle_send_windows_shortcuts(&self) {
+        if let Err(error) = crate::preferences::toggle_send_windows_shortcuts()
+            && let Ok(mut state) = self.maintenance.lock()
+        {
+            state.error = Some(error.to_string());
+        }
+    }
+
     pub fn clipboard_sync(&self) -> bool {
         crate::preferences::clipboard_sync()
     }

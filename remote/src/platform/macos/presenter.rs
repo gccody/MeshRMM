@@ -192,10 +192,8 @@ impl Presenter {
                     .filter(|ui| ui.id == id)
                     .context("macOS viewer window is no longer available")?;
                 ui.reset_stream(format)?;
-                ui.window.setTitle(&NSString::from_str(&format!(
-                    "MeshRMM Remote Desktop — {} — Control-Option-Arrow display · F12 diagnostics",
-                    display.name
-                )));
+                ui.window
+                    .setTitle(&NSString::from_str(&window_title(&display.name)));
                 ui.input_view
                     .configure_display(display, displays, format.width, format.height);
                 Ok(())
@@ -478,10 +476,7 @@ impl MacUi {
         // that view into local window moves instead of remote pointer drags.
         // The native title bar remains draggable without this setting.
         window.setMovableByWindowBackground(false);
-        window.setTitle(&NSString::from_str(&format!(
-            "MeshRMM Remote Desktop — {} — Control-Option-Arrow display · F12 diagnostics",
-            active_display.name
-        )));
+        window.setTitle(&NSString::from_str(&window_title(&active_display.name)));
         let view = RemoteView::new(
             mtm,
             rect,
@@ -906,4 +901,14 @@ pub(super) fn request_user_disconnect() -> bool {
     }
     // Closing the window lets the transport finish recording and signal a clean stop.
     true
+}
+
+/// The window title, naming the display and the viewer's shortcuts.
+pub(crate) fn window_title(display: &str) -> String {
+    let diagnostics =
+        crate::preferences::shortcut_key(crate::shortcuts::ViewerShortcut::Diagnostics);
+    format!(
+        "MeshRMM Remote Desktop — {display} — {}",
+        crate::shortcuts::hint(Some("Control-Option-Arrow"), diagnostics)
+    )
 }

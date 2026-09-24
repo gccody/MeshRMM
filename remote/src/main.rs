@@ -14,6 +14,7 @@ mod matroska;
 mod platform;
 mod preferences;
 mod recording;
+mod shortcuts;
 mod shutdown;
 mod signaling;
 #[cfg(windows)]
