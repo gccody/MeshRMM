@@ -694,8 +694,14 @@ pub(crate) fn performance_counter_us() -> Result<u64, Error> {
         if counter < 0 || frequency <= 0 {
             return Err(Error::PerformanceCounter);
         }
-        Ok((counter as u64).saturating_mul(1_000_000) / frequency as u64)
+        Ok(counter_to_us(counter as u64, frequency as u64))
     }
+}
+
+/// Converts QPC ticks to microseconds without overflowing the intermediate
+/// product, which a u64 would after ~21 days of uptime at 10 MHz.
+fn counter_to_us(counter: u64, frequency: u64) -> u64 {
+    u64::try_from(u128::from(counter) * 1_000_000 / u128::from(frequency)).unwrap_or(u64::MAX)
 }
 
 #[allow(dead_code)]
@@ -703,7 +709,7 @@ fn _windows_result_type(_: WindowsResult<()>) {}
 
 #[cfg(test)]
 mod tests {
-    use super::contains_idr;
+    use super::{contains_idr, counter_to_us};
     use crate::VideoCodec;
 
     #[test]
@@ -809,5 +815,21 @@ mod tests {
         ));
         assert!(!contains_idr(VideoCodec::H264, &[0, 0, 1, 0x41, 1, 2, 3]));
         assert!(contains_idr(VideoCodec::H265, &[0, 0, 0, 1, 19 << 1, 1]));
+    }
+
+    #[test]
+    fn converts_performance_counter_past_u64_product_range() {
+        const FREQUENCY: u64 = 10_000_000;
+        // 30 days of uptime: counter * 1_000_000 no longer fits in a u64.
+        let counter = 30 * 24 * 60 * 60 * FREQUENCY + 12_345;
+        assert!(counter.checked_mul(1_000_000).is_none());
+        assert_eq!(counter_to_us(counter, FREQUENCY), 2_592_000_001_234);
+        assert_eq!(
+            counter_to_us(counter + FREQUENCY, FREQUENCY) - counter_to_us(counter, FREQUENCY),
+            1_000_000
+        );
+        assert_eq!(counter_to_us(u64::MAX, FREQUENCY), u64::MAX / 10);
+        assert_eq!(counter_to_us(u64::MAX, 1), u64::MAX);
+        assert_eq!(counter_to_us(3, 3_000_000), 1);
     }
 }
