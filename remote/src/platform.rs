@@ -397,7 +397,9 @@ impl ControlSink {
 }
 
 #[cfg(windows)]
-pub use windows::{Presenter, monotonic_timestamp_us, supported_video_profiles};
+pub use windows::{
+    Presenter, enable_dpi_awareness, monotonic_timestamp_us, supported_video_profiles,
+};
 
 #[cfg(target_os = "macos")]
 pub use macos::{Presenter, monotonic_timestamp_us, run_application, supported_video_profiles};

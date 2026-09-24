@@ -247,6 +247,15 @@ fn run_worker(
         if unsafe { pump_window_messages(pipeline.window()) } {
             break;
         }
+        if let Some(layout) = unsafe { window::take_resize(pipeline.window()) }
+            && let Err(error) = unsafe { pipeline.resize(&layout) }
+        {
+            tracing::error!(error = %error, "viewer swap chain resize failed");
+            if let Ok(mut failure) = shared.failure.lock() {
+                *failure = Some(error.to_string());
+            }
+            break;
+        }
         if let Some(display_id) = shared
             .agent_pointer_display
             .lock()
@@ -338,6 +347,21 @@ fn run_worker(
         }
     }
     shared.running.store(false, Ordering::Release);
+}
+
+/// Opts the viewer into per-monitor DPI awareness so Windows does not
+/// bitmap-stretch its window, and pointer coordinates are physical pixels.
+/// Must run before the first window is created.
+pub fn enable_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    };
+    if let Err(error) =
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+    {
+        // Access denied means a manifest or an earlier call already set it.
+        tracing::debug!(%error, "could not set per-monitor DPI awareness");
+    }
 }
 
 pub fn monotonic_timestamp_us() -> u64 {
