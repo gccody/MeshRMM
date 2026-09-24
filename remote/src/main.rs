@@ -10,6 +10,8 @@ mod signaling;
 mod transport;
 #[cfg(any(windows, target_os = "macos"))]
 mod updater;
+#[cfg(any(windows, test))]
+mod video_layout;
 
 use anyhow::Context;
 use meshrmm_signaling_client::ReconnectBackoff;
@@ -204,6 +206,7 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
 #[cfg(windows)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    platform::enable_dpi_awareness();
     if meshrmm_session_transport::identity::handle_command(
         meshrmm_session_transport::identity::viewer_directory,
     )? {

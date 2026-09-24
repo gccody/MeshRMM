@@ -60,6 +60,10 @@ impl WorkerPipeline {
         })
     }
 
+    pub(super) unsafe fn resize(&mut self, layout: &window::ClientLayout) -> anyhow::Result<()> {
+        unsafe { self.renderer.resize(layout) }
+    }
+
     pub(super) fn wants_input(&self) -> bool {
         self.decoder.wants_input()
     }

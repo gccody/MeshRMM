@@ -4,11 +4,22 @@ use ::windows::Win32::Graphics::Gdi::{COLOR_WINDOW, GetSysColorBrush, ScreenToCl
 use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use ::windows::Win32::System::Threading::GetCurrentThreadId;
 use ::windows::Win32::UI::Controls::{EM_SCROLLCARET, EM_SETLIMITTEXT, EM_SETSEL};
+use ::windows::Win32::UI::HiDpi::GetDpiForWindow;
 use ::windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use ::windows::Win32::UI::WindowsAndMessaging::*;
 use ::windows::core::{PCWSTR, w};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+
+/// Scales a 96-DPI length to the DPI of `window`. Windows of processes that
+/// are not DPI aware always report 96.
+fn scaled(window: HWND, value: i32) -> i32 {
+    let dpi = match unsafe { GetDpiForWindow(window) } {
+        0 => 96,
+        dpi => dpi,
+    };
+    ((i64::from(value) * i64::from(dpi) + 48) / 96) as i32
+}
 
 pub(super) struct Window {
     thread: Option<JoinHandle<()>>,
@@ -214,11 +225,33 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 WM_SIZE => {
                     let mut rect = RECT::default();
                     let _ = GetClientRect(hwnd, &mut rect);
-                    let width = rect.right.max(240);
-                    let height = rect.bottom.max(160);
-                    let _ = MoveWindow(ui.history, 12, 12, width - 24, height - 66, true);
-                    let _ = MoveWindow(ui.entry, 12, height - 42, width - 110, 30, true);
-                    let _ = MoveWindow(ui.send, width - 90, height - 42, 78, 30, true);
+                    let px = |value| scaled(hwnd, value);
+                    let width = rect.right.max(px(240));
+                    let height = rect.bottom.max(px(160));
+                    let _ = MoveWindow(
+                        ui.history,
+                        px(12),
+                        px(12),
+                        width - px(24),
+                        height - px(66),
+                        true,
+                    );
+                    let _ = MoveWindow(
+                        ui.entry,
+                        px(12),
+                        height - px(42),
+                        width - px(110),
+                        px(30),
+                        true,
+                    );
+                    let _ = MoveWindow(
+                        ui.send,
+                        width - px(90),
+                        height - px(42),
+                        px(78),
+                        px(30),
+                        true,
+                    );
                     return LRESULT(0);
                 }
                 WM_COMMAND
@@ -407,10 +440,10 @@ impl Popup {
                     return;
                 }
                 let work = info.rcWork;
-                let width = 480.min(work.right - work.left);
-                let height = 400.min(work.bottom - work.top);
+                let width = scaled(self.parent, 480).min(work.right - work.left);
+                let height = scaled(self.parent, 400).min(work.bottom - work.top);
                 let x = (point.x - width).clamp(work.left, work.right - width);
-                let y = (point.y + 5).clamp(work.top, work.bottom - height);
+                let y = (point.y + scaled(self.parent, 5)).clamp(work.top, work.bottom - height);
                 let _ = SetWindowPos(
                     self.window,
                     Some(HWND_TOPMOST),
@@ -423,13 +456,14 @@ impl Popup {
                 return;
             }
             let _ = ScreenToClient(self.parent, &mut point);
-            let width = 480.min((bounds.right - 16).max(240));
-            let height = 400.min((bounds.bottom - point.y - 16).max(160));
+            let px = |value| scaled(self.parent, value);
+            let width = px(480).min((bounds.right - px(16)).max(px(240)));
+            let height = px(400).min((bounds.bottom - point.y - px(16)).max(px(160)));
             let _ = SetWindowPos(
                 self.window,
                 Some(HWND_TOP),
-                (point.x - width).max(8),
-                point.y + 5,
+                (point.x - width).max(px(8)),
+                point.y + px(5),
                 width,
                 height,
                 SWP_NOACTIVATE,

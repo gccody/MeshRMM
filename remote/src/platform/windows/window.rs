@@ -1,6 +1,35 @@
 use super::*;
+use crate::video_layout::{self, VideoRect};
+use windows::Win32::Graphics::Gdi::{
+    CreateFontIndirectW, DeleteObject, GetMonitorInfoW, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MapWindowPoints, MonitorFromWindow,
+};
+use windows::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi,
+};
+
+/// The minimum outer window size, in 96-DPI pixels, that fits the toolbar.
+const MINIMUM_WINDOW_WIDTH: i32 = 1176;
+const MINIMUM_WINDOW_HEIGHT: i32 = 300;
+/// The settings window's outer size, in 96-DPI pixels.
+const SETTINGS_WINDOW_WIDTH: i32 = 560;
+const SETTINGS_WINDOW_HEIGHT: i32 = 626;
+
+/// The client area and the letterboxed video inside it, in physical pixels.
+pub(super) struct ClientLayout {
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) video: VideoRect,
+}
 
 struct WindowContext {
+    video_width: u32,
+    video_height: u32,
+    dpi: u32,
+    font: HFONT,
+    settings_dpi: u32,
+    settings_font: HFONT,
+    resize_pending: bool,
     active_display: Display,
     displays: Vec<Display>,
     control: ControlSink,
@@ -34,8 +63,10 @@ struct WindowContext {
     chroma_buttons: [(HWND, ChromaMode); 2],
 }
 
+/// Settings controls are created at 96 DPI; the caller scales them.
 struct SettingsControls {
     window: HWND,
+    dpi: u32,
     quality_buttons: [(HWND, QualityPreset); 4],
     chroma_buttons: [(HWND, ChromaMode); 2],
 }
@@ -86,9 +117,45 @@ const SETTINGS_CLOSE_ACTION_IDS: [(usize, SessionCloseAction); 3] = [
     (4237, SessionCloseAction::Logout),
 ];
 
+impl Drop for WindowContext {
+    fn drop(&mut self) {
+        for font in [self.font, self.settings_font] {
+            if !font.is_invalid() {
+                let _ = unsafe { DeleteObject(HGDIOBJ(font.0)) };
+            }
+        }
+    }
+}
+
 impl WindowContext {
     fn send(&self, message: SessionMessage) {
         self.control.send(message);
+    }
+
+    /// Converts 96-DPI layout pixels to this window's physical pixels.
+    fn px(&self, value: i32) -> i32 {
+        scale(value, self.dpi)
+    }
+
+    fn video_rect_for(&self, width: u32, height: u32) -> VideoRect {
+        let toolbar = toolbar_height(self.dpi);
+        let width = i32::try_from(width).unwrap_or(i32::MAX);
+        let height = i32::try_from(height).unwrap_or(i32::MAX);
+        video_layout::letterbox(
+            VideoRect {
+                left: 0,
+                top: toolbar,
+                width,
+                height: height.saturating_sub(toolbar),
+            },
+            self.video_width,
+            self.video_height,
+        )
+    }
+
+    fn video_rect(&self, window: HWND) -> Option<VideoRect> {
+        let (width, height) = unsafe { client_size(window) }?;
+        Some(self.video_rect_for(width, height))
     }
 
     fn pointer_position(&self, window: HWND, lparam: LPARAM) -> Option<(u16, u16)> {
@@ -100,24 +167,48 @@ impl WindowContext {
     }
 
     fn normalized_client_position(&self, window: HWND, x: i32, y: i32) -> Option<(u16, u16)> {
-        let mut rect = RECT::default();
-        if unsafe { GetClientRect(window, &mut rect) }.is_err() {
-            return None;
+        video_layout::normalize(self.video_rect(window)?, x, y)
+    }
+
+    /// Applies a new monitor DPI: fonts, toolbar layout and video placement.
+    fn set_dpi(&mut self, window: HWND, dpi: u32) {
+        if dpi == self.dpi {
+            return;
         }
-        let width = rect.right.saturating_sub(rect.left).max(1);
-        let height = rect
-            .bottom
-            .saturating_sub(rect.top)
-            .saturating_sub(VIEWER_TOOLBAR_HEIGHT as i32)
-            .max(1);
-        let video_y = y.saturating_sub(VIEWER_TOOLBAR_HEIGHT as i32);
-        if x < 0 || x >= width || video_y < 0 || video_y >= height {
-            return None;
+        self.dpi = dpi;
+        let font = unsafe { message_font(dpi) };
+        for control in self.toolbar_controls() {
+            unsafe { set_font(control, font) };
         }
-        Some((
-            (i64::from(x) * 65_535 / i64::from((width - 1).max(1))) as u16,
-            (i64::from(video_y) * 65_535 / i64::from((height - 1).max(1))) as u16,
-        ))
+        let old = std::mem::replace(&mut self.font, font);
+        if !old.is_invalid() {
+            let _ = unsafe { DeleteObject(HGDIOBJ(old.0)) };
+        }
+        self.layout_toolbar(window);
+        self.resize_pending = true;
+    }
+
+    fn toolbar_controls(&self) -> [HWND; 18] {
+        [
+            self.user_combo,
+            self.display_combo,
+            self.quality_combo,
+            self.chroma_combo,
+            self.diagnostics_button,
+            self.settings_button,
+            self.file_button,
+            self.chat_button,
+            self.secure_attention_button,
+            self.type_clipboard_button,
+            self.credential_buttons[0],
+            self.credential_buttons[1],
+            self.credential_buttons[2],
+            self.credential_label,
+            self.minimize_button,
+            self.maximize_button,
+            self.close_button,
+            self.debug_overlay,
+        ]
     }
 
     fn set_quality(&self, preset: QualityPreset) {
@@ -171,97 +262,78 @@ impl WindowContext {
             return;
         }
         let width = rect.right.saturating_sub(rect.left);
-        let _ = unsafe {
-            MoveWindow(
-                self.toolbar,
-                0,
-                0,
-                width,
-                VIEWER_TOOLBAR_HEIGHT as i32,
-                true,
-            )
+        let px = |value| self.px(value);
+        let place = |control: HWND, x: i32, y: i32, width: i32, height: i32| {
+            let _ = unsafe { MoveWindow(control, x, y, width, height, true) };
         };
-        let _ = unsafe { MoveWindow(self.user_combo, 8, 5, 158, 300, true) };
-        let _ = unsafe { MoveWindow(self.display_combo, 172, 5, 110, 300, true) };
-        let _ = unsafe { MoveWindow(self.quality_combo, 288, 5, 154, 300, true) };
-        let _ = unsafe { MoveWindow(self.chroma_combo, 448, 5, 124, 300, true) };
+        place(self.toolbar, 0, 0, width, toolbar_height(self.dpi));
+        place(self.user_combo, px(8), px(5), px(158), px(300));
+        place(self.display_combo, px(172), px(5), px(110), px(300));
+        place(self.quality_combo, px(288), px(5), px(154), px(300));
+        place(self.chroma_combo, px(448), px(5), px(124), px(300));
         for (i, button) in self.credential_buttons.iter().enumerate() {
-            let _ = unsafe { MoveWindow(*button, 8 + i as i32 * 184, 38, 180, 24, true) };
+            place(*button, px(8 + i as i32 * 184), px(38), px(180), px(24));
         }
-        let _ = unsafe {
-            MoveWindow(
-                self.credential_label,
-                566,
-                42,
-                (width - 574).max(1),
-                20,
-                true,
-            )
-        };
-        let caption_x = width.saturating_sub(138);
-        let _ = unsafe { MoveWindow(self.minimize_button, caption_x, 0, 46, 34, true) };
-        let _ = unsafe { MoveWindow(self.maximize_button, caption_x + 46, 0, 46, 34, true) };
-        let _ = unsafe { MoveWindow(self.close_button, caption_x + 92, 0, 46, 34, true) };
-        let _ = unsafe {
-            MoveWindow(
-                self.diagnostics_button,
-                caption_x.saturating_sub(78),
-                5,
-                34,
-                24,
-                true,
-            )
-        };
-        let _ = unsafe {
-            MoveWindow(
-                self.settings_button,
-                caption_x.saturating_sub(40),
-                5,
-                34,
-                24,
-                true,
-            )
-        };
-        let _ = unsafe {
-            MoveWindow(
-                self.chat_button,
-                caption_x.saturating_sub(138),
-                5,
-                54,
-                24,
-                true,
-            )
-        };
-        let _ = unsafe {
-            MoveWindow(
-                self.file_button,
-                caption_x.saturating_sub(180),
-                5,
-                38,
-                24,
-                true,
-            )
-        };
-        let _ = unsafe {
-            MoveWindow(
-                self.secure_attention_button,
-                caption_x.saturating_sub(296),
-                5,
-                110,
-                24,
-                true,
-            )
-        };
-        let _ = unsafe {
-            MoveWindow(
-                self.type_clipboard_button,
-                caption_x.saturating_sub(422),
-                5,
-                120,
-                24,
-                true,
-            )
-        };
+        place(
+            self.credential_label,
+            px(566),
+            px(42),
+            (width - px(574)).max(1),
+            px(20),
+        );
+        let caption_x = width.saturating_sub(px(138));
+        place(self.minimize_button, caption_x, 0, px(46), px(34));
+        place(self.maximize_button, caption_x + px(46), 0, px(46), px(34));
+        place(self.close_button, caption_x + px(92), 0, px(46), px(34));
+        place(
+            self.diagnostics_button,
+            caption_x.saturating_sub(px(78)),
+            px(5),
+            px(34),
+            px(24),
+        );
+        place(
+            self.settings_button,
+            caption_x.saturating_sub(px(40)),
+            px(5),
+            px(34),
+            px(24),
+        );
+        place(
+            self.chat_button,
+            caption_x.saturating_sub(px(138)),
+            px(5),
+            px(54),
+            px(24),
+        );
+        place(
+            self.file_button,
+            caption_x.saturating_sub(px(180)),
+            px(5),
+            px(38),
+            px(24),
+        );
+        place(
+            self.secure_attention_button,
+            caption_x.saturating_sub(px(296)),
+            px(5),
+            px(110),
+            px(24),
+        );
+        place(
+            self.type_clipboard_button,
+            caption_x.saturating_sub(px(422)),
+            px(5),
+            px(120),
+            px(24),
+        );
+        place(
+            self.debug_overlay,
+            px(12),
+            toolbar_height(self.dpi) + px(12),
+            px(640),
+            px(300),
+        );
         if let Some(chat) = &self.chat_popup {
             chat.layout();
         }
@@ -430,7 +502,20 @@ impl WindowContext {
     }
 
     fn move_pointer(&self, window: HWND, lparam: LPARAM) {
-        if let Some((x, y)) = self.pointer_position(window, lparam) {
+        let position = if self.pressed_buttons.is_empty() {
+            self.pointer_position(window, lparam)
+        } else {
+            // A drag that started on the video keeps mouse capture; pin the
+            // remote pointer to the nearest edge instead of dropping motion.
+            self.video_rect(window).map(|video| {
+                video_layout::normalize_clamped(
+                    video,
+                    signed_low_word(lparam.0),
+                    signed_high_word(lparam.0),
+                )
+            })
+        };
+        if let Some((x, y)) = position {
             self.send(SessionMessage::Input(RemoteInput::PointerMove {
                 display_id: self.active_display.id,
                 x,
@@ -547,6 +632,201 @@ impl WindowContext {
 unsafe fn window_context(window: HWND) -> Option<&'static mut WindowContext> {
     let pointer = unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) } as *mut WindowContext;
     unsafe { pointer.as_mut() }
+}
+
+/// Scales a 96-DPI length to `dpi`, rounding to the nearest pixel.
+fn scale(value: i32, dpi: u32) -> i32 {
+    ((i64::from(value) * i64::from(dpi) + 48).div_euclid(96)) as i32
+}
+
+fn toolbar_height(dpi: u32) -> i32 {
+    scale(VIEWER_TOOLBAR_HEIGHT as i32, dpi)
+}
+
+unsafe fn window_dpi(window: HWND) -> u32 {
+    match unsafe { GetDpiForWindow(window) } {
+        0 => 96,
+        dpi => dpi,
+    }
+}
+
+unsafe fn client_size(window: HWND) -> Option<(u32, u32)> {
+    let mut rect = RECT::default();
+    unsafe { GetClientRect(window, &mut rect) }.ok()?;
+    Some((
+        u32::try_from(rect.right.saturating_sub(rect.left)).unwrap_or(0),
+        u32::try_from(rect.bottom.saturating_sub(rect.top)).unwrap_or(0),
+    ))
+}
+
+/// The Windows message font at `dpi`. The caller owns the returned font.
+unsafe fn message_font(dpi: u32) -> HFONT {
+    let mut metrics = NONCLIENTMETRICSW {
+        cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
+        ..Default::default()
+    };
+    let loaded = unsafe {
+        SystemParametersInfoForDpi(
+            SPI_GETNONCLIENTMETRICS.0,
+            metrics.cbSize,
+            Some((&mut metrics as *mut NONCLIENTMETRICSW).cast()),
+            0,
+            dpi,
+        )
+    };
+    let font = if loaded.is_ok() {
+        unsafe { CreateFontIndirectW(&metrics.lfMessageFont) }
+    } else {
+        HFONT::default()
+    };
+    if font.is_invalid() {
+        // Stock objects ignore DeleteObject, so the fallback is safe to own.
+        HFONT(unsafe { GetStockObject(DEFAULT_GUI_FONT) }.0)
+    } else {
+        font
+    }
+}
+
+unsafe fn set_font(control: HWND, font: HFONT) {
+    unsafe {
+        SendMessageW(
+            control,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        )
+    };
+}
+
+struct Rescale {
+    parent: HWND,
+    from: u32,
+    to: u32,
+    font: HFONT,
+}
+
+/// Moves and resizes a window's direct children from one DPI to another and
+/// gives them `font`.
+unsafe fn rescale_children(parent: HWND, from: u32, to: u32, font: HFONT) {
+    unsafe extern "system" fn rescale_child(child: HWND, data: LPARAM) -> windows::core::BOOL {
+        let rescale = unsafe { &*(data.0 as *const Rescale) };
+        if unsafe { GetParent(child) }.ok() != Some(rescale.parent) {
+            return true.into();
+        }
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(child, &mut rect) }.is_ok() {
+            let mut points = [
+                windows::Win32::Foundation::POINT {
+                    x: rect.left,
+                    y: rect.top,
+                },
+                windows::Win32::Foundation::POINT {
+                    x: rect.right,
+                    y: rect.bottom,
+                },
+            ];
+            unsafe { MapWindowPoints(None, Some(rescale.parent), &mut points) };
+            let convert = |value: i32| {
+                (i64::from(value) * i64::from(rescale.to) / i64::from(rescale.from.max(1))) as i32
+            };
+            let _ = unsafe {
+                MoveWindow(
+                    child,
+                    convert(points[0].x),
+                    convert(points[0].y),
+                    convert(points[1].x - points[0].x),
+                    convert(points[1].y - points[0].y),
+                    true,
+                )
+            };
+        }
+        unsafe { set_font(child, rescale.font) };
+        true.into()
+    }
+    let rescale = Rescale {
+        parent,
+        from,
+        to,
+        font,
+    };
+    let _ = unsafe {
+        EnumChildWindows(
+            Some(parent),
+            Some(rescale_child),
+            LPARAM(&rescale as *const Rescale as isize),
+        )
+    };
+}
+
+/// Sizes a new window to show the video at 1:1 when it fits in 90% of the
+/// monitor's work area, and scales it down otherwise, then centers it.
+unsafe fn place_initial_window(window: HWND, style: WINDOW_STYLE, format: VideoFormat, dpi: u32) {
+    let monitor = unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return;
+    }
+    let work = info.rcWork;
+    let work_width = work.right - work.left;
+    let work_height = work.bottom - work.top;
+    let mut frame = RECT::default();
+    if unsafe {
+        AdjustWindowRectExForDpi(&mut frame, style, false, WINDOW_EX_STYLE::default(), dpi)
+    }
+    .is_err()
+    {
+        return;
+    }
+    let frame_width = frame.right - frame.left;
+    let frame_height = frame.bottom - frame.top;
+    let toolbar = toolbar_height(dpi);
+    let (video_width, video_height) = video_layout::fit_within(
+        format.width,
+        format.height,
+        work_width * 9 / 10 - frame_width,
+        work_height * 9 / 10 - frame_height - toolbar,
+    );
+    let width = (video_width + frame_width)
+        .max(scale(MINIMUM_WINDOW_WIDTH, dpi))
+        .min(work_width);
+    let height = (video_height + toolbar + frame_height)
+        .max(scale(MINIMUM_WINDOW_HEIGHT, dpi))
+        .min(work_height);
+    let _ = unsafe {
+        SetWindowPos(
+            window,
+            None,
+            work.left + (work_width - width) / 2,
+            work.top + (work_height - height) / 2,
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    };
+}
+
+/// The current client layout, for creating the swap chain.
+pub(super) unsafe fn client_layout(window: HWND) -> Option<ClientLayout> {
+    let context = unsafe { window_context(window) }?;
+    let (width, height) = unsafe { client_size(window) }?;
+    Some(ClientLayout {
+        width,
+        height,
+        video: context.video_rect_for(width, height),
+    })
+}
+
+/// The new client layout if the window was resized or changed DPI since the
+/// last call.
+pub(super) unsafe fn take_resize(window: HWND) -> Option<ClientLayout> {
+    let context = unsafe { window_context(window) }?;
+    if !std::mem::take(&mut context.resize_pending) {
+        return None;
+    }
+    unsafe { client_layout(window) }
 }
 
 fn signed_low_word(value: isize) -> i32 {
@@ -770,6 +1050,31 @@ unsafe extern "system" fn settings_window_proc(
             let _ = unsafe { ShowWindow(window, SW_HIDE) };
             LRESULT(0)
         }
+        WM_DPICHANGED => {
+            let dpi = (wparam.0 & 0xffff) as u32;
+            if let Some(context) = unsafe { window_context(owner) } {
+                let font = unsafe { message_font(dpi) };
+                unsafe { rescale_children(window, context.settings_dpi, dpi, font) };
+                let old = std::mem::replace(&mut context.settings_font, font);
+                if !old.is_invalid() {
+                    let _ = unsafe { DeleteObject(HGDIOBJ(old.0)) };
+                }
+                context.settings_dpi = dpi;
+            }
+            let suggested = unsafe { &*(lparam.0 as *const RECT) };
+            let _ = unsafe {
+                SetWindowPos(
+                    window,
+                    None,
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            };
+            LRESULT(0)
+        }
         _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
     }
 }
@@ -801,8 +1106,8 @@ unsafe fn create_settings_window(
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            560,
-            626,
+            SETTINGS_WINDOW_WIDTH,
+            SETTINGS_WINDOW_HEIGHT,
             Some(owner),
             None,
             Some(instance),
@@ -1126,6 +1431,7 @@ unsafe fn create_settings_window(
     unsafe { show_settings_category(settings, true) };
     Ok(SettingsControls {
         window: settings,
+        dpi: 96,
         quality_buttons: [
             (ultra_data_saver, QualityPreset::UltraDataSaver),
             (data_saver, QualityPreset::DataSaver),
@@ -1163,8 +1469,27 @@ pub(super) unsafe fn create_window(
             WM_GETMINMAXINFO => {
                 let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
                 // Leave room for display/quality controls, session actions and caption buttons.
-                info.ptMinTrackSize.x = 1176;
-                info.ptMinTrackSize.y = 300;
+                let dpi = unsafe { window_dpi(window) };
+                info.ptMinTrackSize.x = scale(MINIMUM_WINDOW_WIDTH, dpi);
+                info.ptMinTrackSize.y = scale(MINIMUM_WINDOW_HEIGHT, dpi);
+                LRESULT(0)
+            }
+            WM_DPICHANGED => {
+                if let Some(context) = context {
+                    context.set_dpi(window, (wparam.0 & 0xffff) as u32);
+                }
+                let suggested = unsafe { &*(lparam.0 as *const RECT) };
+                let _ = unsafe {
+                    SetWindowPos(
+                        window,
+                        None,
+                        suggested.left,
+                        suggested.top,
+                        suggested.right - suggested.left,
+                        suggested.bottom - suggested.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                };
                 LRESULT(0)
             }
             WM_NCHITTEST => {
@@ -1181,10 +1506,11 @@ pub(super) unsafe fn create_window(
                     && unsafe { GetClientRect(window, &mut bounds) }.is_ok()
                 {
                     let width = bounds.right.saturating_sub(bounds.left);
+                    let dpi = unsafe { window_dpi(window) };
                     if point.y >= 0
-                        && point.y < VIEWER_TOOLBAR_HEIGHT as i32
-                        && point.x >= 302
-                        && point.x < width.saturating_sub(220)
+                        && point.y < toolbar_height(dpi)
+                        && point.x >= scale(302, dpi)
+                        && point.x < width.saturating_sub(scale(220, dpi))
                     {
                         return LRESULT(HTCAPTION as isize);
                     }
@@ -1222,6 +1548,11 @@ pub(super) unsafe fn create_window(
             }
             WM_SIZE => {
                 if let Some(context) = context {
+                    // The worker resizes the swap chain after the message pump
+                    // returns, which is after a border drag ends.
+                    if wparam.0 != SIZE_MINIMIZED as usize {
+                        context.resize_pending = true;
+                    }
                     context.layout_toolbar(window);
                 }
                 LRESULT(0)
@@ -1565,15 +1896,7 @@ pub(super) unsafe fn create_window(
             return Err(error).context("remote desktop window class registration failed");
         }
     }
-    let mut rect = RECT {
-        left: 0,
-        top: 0,
-        right: format.width as i32,
-        bottom: format.height.saturating_add(VIEWER_TOOLBAR_HEIGHT) as i32,
-    };
     let window_style = WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 & !WS_CAPTION.0);
-    unsafe { AdjustWindowRect(&mut rect, window_style, false) }
-        .context("remote window bounds calculation failed")?;
     let title = HSTRING::from(format!(
         "MeshRMM Remote Desktop — {} ({}) — F8 display · F12 diagnostics",
         active_display.name,
@@ -1584,6 +1907,13 @@ pub(super) unsafe fn create_window(
         }
     ));
     let context = Box::new(WindowContext {
+        video_width: format.width,
+        video_height: format.height,
+        dpi: 96,
+        font: HFONT::default(),
+        settings_dpi: 96,
+        settings_font: HFONT::default(),
+        resize_pending: false,
         active_display,
         displays,
         control,
@@ -1630,11 +1960,11 @@ pub(super) unsafe fn create_window(
             WINDOW_EX_STYLE::default(),
             class,
             PCWSTR(title.as_ptr()),
-            window_style | WS_VISIBLE,
+            window_style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            scale(MINIMUM_WINDOW_WIDTH, 96),
+            scale(MINIMUM_WINDOW_HEIGHT, 96),
             None,
             None,
             Some(instance),
@@ -1648,16 +1978,23 @@ pub(super) unsafe fn create_window(
             return Err(error).context("native remote desktop window creation failed");
         }
     };
+    let dpi = unsafe { window_dpi(window) };
+    let font = unsafe { message_font(dpi) };
+    if let Some(context) = unsafe { window_context(window) } {
+        context.dpi = dpi;
+        context.font = font;
+    }
+    unsafe { place_initial_window(window, window_style, format, dpi) };
     let overlay = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("STATIC"),
             w!(""),
             WS_CHILD | WS_BORDER,
-            12,
-            VIEWER_TOOLBAR_HEIGHT as i32 + 12,
-            640,
-            300,
+            0,
+            0,
+            1,
+            1,
             Some(window),
             None,
             Some(instance),
@@ -1673,8 +2010,8 @@ pub(super) unsafe fn create_window(
             WS_CHILD | WS_VISIBLE | WS_BORDER,
             0,
             0,
-            format.width as i32,
-            VIEWER_TOOLBAR_HEIGHT as i32,
+            1,
+            1,
             Some(window),
             None,
             Some(instance),
@@ -1909,8 +2246,8 @@ pub(super) unsafe fn create_window(
     let minimize_button = make_toolbar_button(MINIMIZE_BUTTON_ID, w!("─"), caption_button_style)?;
     let maximize_button = make_toolbar_button(MAXIMIZE_BUTTON_ID, w!("□"), caption_button_style)?;
     let close_button = make_toolbar_button(CLOSE_BUTTON_ID, w!("×"), caption_button_style)?;
-    let header_font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
     for control in [
+        overlay,
         user_combo,
         display_combo,
         quality_combo,
@@ -1929,16 +2266,23 @@ pub(super) unsafe fn create_window(
         maximize_button,
         close_button,
     ] {
-        unsafe {
-            SendMessageW(
-                control,
-                WM_SETFONT,
-                Some(WPARAM(header_font.0 as usize)),
-                Some(LPARAM(1)),
-            )
-        };
+        unsafe { set_font(control, font) };
     }
     let settings = unsafe { create_settings_window(window, instance) }?;
+    let settings_dpi = unsafe { window_dpi(settings.window) };
+    let settings_font = unsafe { message_font(settings_dpi) };
+    unsafe { rescale_children(settings.window, settings.dpi, settings_dpi, settings_font) };
+    let _ = unsafe {
+        SetWindowPos(
+            settings.window,
+            None,
+            0,
+            0,
+            scale(SETTINGS_WINDOW_WIDTH, settings_dpi),
+            scale(SETTINGS_WINDOW_HEIGHT, settings_dpi),
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE,
+        )
+    };
     if let Some(context) = unsafe { window_context(window) } {
         context.debug_overlay = overlay;
         context.toolbar = toolbar;
@@ -1961,6 +2305,8 @@ pub(super) unsafe fn create_window(
         context.maximize_button = maximize_button;
         context.close_button = close_button;
         context.settings_window = settings.window;
+        context.settings_dpi = settings_dpi;
+        context.settings_font = settings_font;
         context.quality_buttons = settings.quality_buttons;
         context.chroma_buttons = settings.chroma_buttons;
         if !context.control.supports_chroma(ChromaMode::Yuv444) {
