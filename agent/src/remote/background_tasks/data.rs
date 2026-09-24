@@ -1,5 +1,6 @@
 //! Native, read-only sampling. Slow queries never run on the window thread.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, ensure};
@@ -98,10 +99,67 @@ pub fn identified_handle(row: &Process, access: PROCESS_ACCESS_RIGHTS) -> anyhow
     );
     Ok(handle)
 }
-pub fn termination_handle(row: &Process) -> anyhow::Result<Handle> {
+/// Processes that `pid` descends from, following each parent only while it is older than its
+/// child, so a recycled parent PID ends the chain.
+pub fn ancestors(processes: &[Process], pid: u32) -> HashSet<u32> {
+    let mut result = HashSet::new();
+    let mut child = processes.iter().find(|p| p.pid == pid);
+    while let Some(current) = child {
+        child = processes.iter().find(|parent| {
+            parent.pid == current.parent
+                && parent.pid != current.pid
+                && parent
+                    .created
+                    .zip(current.created)
+                    .is_some_and(|(parent, child)| parent <= child)
+        });
+        if child.is_some_and(|parent| !result.insert(parent.pid)) {
+            break;
+        }
+    }
+    result
+}
+
+/// Whether `path` is the Agent executable or a copy of it, such as an update helper. Copies are
+/// compared by content, so another program cannot gain this protection by its name or folder.
+fn is_agent_image(path: &str) -> bool {
+    !path.is_empty()
+        && std::env::current_exe()
+            .and_then(|agent| same_contents(&agent, Path::new(path)))
+            .unwrap_or(false)
+}
+
+fn same_contents(first: &Path, second: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+
+    let (mut first, mut second) = (std::fs::File::open(first)?, std::fs::File::open(second)?);
+    if first.metadata()?.len() != second.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut a, mut b) = (vec![0; 64 * 1024], vec![0; 64 * 1024]);
+    loop {
+        let read = first.read(&mut a)?;
+        if read == 0 {
+            return Ok(true);
+        }
+        second.read_exact(&mut b[..read])?;
+        if a[..read] != b[..read] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Opens `row` for ending it, unless it is this Task Manager, one of the `protected` processes
+/// that run it, an Agent process, or a process Windows needs.
+pub fn termination_handle(row: &Process, protected: &HashSet<u32>) -> anyhow::Result<Handle> {
     ensure!(
         row.pid != std::process::id(),
         "The process manager cannot end itself."
+    );
+    ensure!(
+        !protected.contains(&row.pid) && !is_agent_image(&row.path),
+        "{} is part of the MeshRMM Agent, which runs this remote session; it cannot be ended here.",
+        row.name
     );
     let handle = identified_handle(row, PROCESS_TERMINATE)?;
     let mut critical = windows::core::BOOL(0);
@@ -391,7 +449,7 @@ pub enum ServiceAction {
 pub fn service_action(name: &str, action: ServiceAction) -> anyhow::Result<()> {
     // Losing this service also loses the connection needed to finish the action.
     ensure!(
-        !name.eq_ignore_ascii_case("MeshRMMAgent"),
+        !crate::service::is_agent_service(name),
         "The remote connection service cannot be changed here."
     );
     unsafe {
@@ -1058,7 +1116,7 @@ mod tests {
             .find(|p| p.pid == std::process::id())
             .unwrap();
         assert!(row.created.is_some());
-        assert!(termination_handle(row).is_err());
+        assert!(termination_handle(row, &HashSet::new()).is_err());
         let second = sample(&first, false).unwrap();
         assert!(second.cpu.is_some_and(|n| (0.0..=100.0).contains(&n)));
     }
@@ -1073,13 +1131,66 @@ mod tests {
         let row = rows.iter_mut().find(|p| p.pid == child.id()).unwrap();
         let identity = row.created;
         row.created = identity.map(|v| v.wrapping_add(1));
-        assert!(termination_handle(row).is_err());
+        assert!(termination_handle(row, &HashSet::new()).is_err());
         row.created = identity;
-        let handle = termination_handle(row).unwrap();
+        // Processes that run the Task Manager, and Agent images, are refused.
+        assert!(termination_handle(row, &HashSet::from([child.id()])).is_err());
+        let path = std::mem::replace(
+            &mut row.path,
+            std::env::current_exe().unwrap().display().to_string(),
+        );
+        let error = termination_handle(row, &HashSet::new()).err().unwrap();
+        assert!(error.to_string().contains("part of the MeshRMM Agent"));
+        row.path = path;
+        let handle = termination_handle(row, &HashSet::new()).unwrap();
         unsafe {
             TerminateProcess(handle.0, 1).unwrap();
         }
         child.wait().unwrap();
+    }
+    #[test]
+    fn ancestors_stop_at_recycled_parents() {
+        let process = |pid, parent, created| Process {
+            pid,
+            parent,
+            created: Some(created),
+            ..Default::default()
+        };
+        let rows = [
+            process(4, 0, 1),
+            process(10, 4, 2),
+            process(20, 10, 3),
+            process(30, 20, 4),
+            // Started after its child, so it reused the real parent's PID.
+            process(50, 0, 9),
+            process(60, 50, 5),
+            // A PID that names itself as its parent.
+            process(70, 70, 6),
+            process(80, 70, 7),
+        ];
+        assert_eq!(ancestors(&rows, 30), HashSet::from([20, 10, 4]));
+        assert_eq!(ancestors(&rows, 60), HashSet::new());
+        assert_eq!(ancestors(&rows, 80), HashSet::from([70]));
+        assert_eq!(ancestors(&rows, 99), HashSet::new());
+    }
+    #[test]
+    fn agent_copies_are_recognized_by_content() {
+        let agent = std::env::current_exe().unwrap();
+        let directory = std::env::temp_dir().join(format!("meshrmm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let copy = directory.join("update-helper-test.exe");
+        std::fs::copy(&agent, &copy).unwrap();
+        let identical = is_agent_image(&copy.display().to_string());
+        let mut bytes = std::fs::read(&copy).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&copy, bytes).unwrap();
+        let changed = is_agent_image(&copy.display().to_string());
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(is_agent_image(&agent.display().to_string()));
+        assert!(identical);
+        assert!(!changed);
+        assert!(!is_agent_image(r"C:\Windows\System32\cmd.exe"));
+        assert!(!is_agent_image(""));
     }
     #[test]
     fn startup_toggle_preserves_command_and_rejects_stale_state() {
@@ -1148,6 +1259,7 @@ mod tests {
     fn connection_service_is_protected() {
         assert!(service_action("MeshRMMAgent", ServiceAction::Stop).is_err());
         assert!(service_action("meshrmmagent", ServiceAction::Restart).is_err());
+        assert!(service_action("PulseRMMAgent", ServiceAction::Stop).is_err());
     }
     #[test]
     #[ignore = "Requires a disposable MeshRMMTaskManagerTest service supplied by the validation harness"]

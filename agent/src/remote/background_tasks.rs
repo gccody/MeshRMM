@@ -1163,9 +1163,13 @@ impl State {
                 }
             }
         }
+        let protected = data::ancestors(&self.snapshot.processes, std::process::id());
         let mut handles = Vec::new();
         for index in indices.iter().rev() {
-            handles.push(data::termination_handle(&self.snapshot.processes[*index])?);
+            handles.push(data::termination_handle(
+                &self.snapshot.processes[*index],
+                &protected,
+            )?);
         }
         self.notice = format!(
             "End {} — {} process(es)? Unsaved work will be lost.",
@@ -1209,7 +1213,7 @@ impl State {
                     "Wait for the pending service operation."
                 );
                 ensure!(
-                    !s.name.eq_ignore_ascii_case("MeshRMMAgent"),
+                    !crate::service::is_agent_service(&s.name),
                     "The remote connection service cannot be changed here."
                 );
                 self.notice = format!(
@@ -1416,7 +1420,7 @@ impl State {
                     .clone();
                 let start = id == SERVICE_START;
                 ensure!(
-                    !s.name.eq_ignore_ascii_case("MeshRMMAgent"),
+                    !crate::service::is_agent_service(&s.name),
                     "The remote connection service cannot be changed here."
                 );
                 self.notice = format!(
