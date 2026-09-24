@@ -42,8 +42,8 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 | T29 CI hardening | Low | Done | `d8307fa` |
 | T30 Documentation accuracy / TLS 1.3 | Low | Done | `1297f0f` |
 | T31 Token rotation edge cases | Low | Done | `f95d930` |
-| T32 File transfer sliding window | Low | **Next** | |
-| T39 Native log rotation (+ viewer update helper logging) | Low | Todo | |
+| T32 File transfer sliding window | Low | Done | `21316da` |
+| T39 Native log rotation (+ viewer update helper logging) | Low | **Next** | |
 | T33 Local dashboard dev loop | QoL | Todo | |
 | T34 Server deploy script + schema version in /healthz | QoL | Todo | |
 | T35 Viewer input QoL (Win/Alt+Tab hook, rebindable keys) | QoL | Todo | |
@@ -72,9 +72,9 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 
 ## Endpoint state
 
-After T30, DESKTOP-85R6S28 runs a release build of `1297f0f` (SHA-256 `5DACF2F3…71D0`), which
-includes T17, T18, T23 and T30. The service is running and connected; the build it replaced
-(`e5a50b2`, SHA-256 `C0B701A7…E8E7`) is kept as `meshrmm-agent.exe.before-local-20260924-160459`.
+After T32, DESKTOP-85R6S28 runs a release build of `21316da` (SHA-256 `75508B37…ECD0`), which
+includes T17, T18, T23, T30 and T32. The service is running and connected; the build it replaced
+(`1297f0f`, SHA-256 `5DACF2F3…71D0`) is kept as `meshrmm-agent.exe.before-local-20260924-164046`.
 T19–T22, T24–T29 and T31 did not change the Agent. Earlier builds are kept as
 `C:\Program Files\MeshRMM\Agent\meshrmm-agent.exe.before-local-*`. T01 removed the explicit
 `gccody` permission on `ProgramData\MeshRMM\Agent`, so a non-elevated `gccody` process can no longer
@@ -189,6 +189,16 @@ These need a live dashboard → viewer → agent session, which the agent-driven
   a pending credential, promotion deleting the plaintext copy, replacing a pending hash that was
   never sent, and not sending one D1 withdrew; it fails against the previous code. A failed
   send cannot be simulated there, so its withdrawal is covered by the SQL regressions only.
+- T32: a live transfer over WebRTC. A temporary probe on the endpoint ran a viewer and an agent
+  worker against each other through a relay adding 25 ms each way. 8 MiB took 14.7 s (0.54 MiB/s)
+  each way with the previous code and 1.1 s (7.3 MiB/s) with the window; both copies matched their
+  SHA-256, at most 16 messages were in flight, and an unrequested push still failed at Begin with
+  the viewer showing the real reason. A real session will be slower: the file channel keeps at
+  most 64 KiB unacknowledged by SCTP (about 96 KiB per round trip with the message in progress),
+  which the plan's 1–4 MiB would exceed. All data channels share one SCTP association whose send
+  queue is FIFO and capped at 128 KiB, so more buffered file data would queue input behind it.
+  The protocol is unchanged; a window of 16 fits the 32-command queue of deployed receivers. The
+  installed service started and connected with the new build.
 
 ## Remaining tasks
 
