@@ -6,7 +6,10 @@ mod matroska;
 mod platform;
 mod preferences;
 mod recording;
+mod shutdown;
 mod signaling;
+#[cfg(windows)]
+mod single_instance;
 mod transport;
 #[cfg(any(windows, target_os = "macos"))]
 mod updater;
@@ -16,6 +19,11 @@ mod video_layout;
 use anyhow::Context;
 use meshrmm_signaling_client::ReconnectBackoff;
 use std::time::Duration;
+
+/// How long a new viewer waits for the previous viewer of the same device to
+/// release its session. Ending a session retries for up to about 16 seconds.
+#[cfg(windows)]
+const VIEWER_REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn initialize(launch_deep_link: Option<&str>) -> anyhow::Result<config::Config> {
     #[cfg(windows)]
@@ -170,6 +178,9 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
             }
             Err(error) => {
                 let delay = backoff.next_delay();
+                if shutdown::requested() {
+                    return signaling::end_session(&config, &bootstrap).await;
+                }
                 tracing::warn!(
                     error = ?error,
                     session_id = %bootstrap.session_id,
@@ -197,7 +208,12 @@ async fn run_session(config: config::Config) -> anyhow::Result<()> {
                         );
                     }
                 }
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    () = shutdown::wait() => {
+                        return signaling::end_session(&config, &bootstrap).await;
+                    }
+                }
             }
         }
     }
@@ -216,6 +232,15 @@ async fn main() -> anyhow::Result<()> {
         return updater::apply_scheduled_update();
     }
     let mut config = initialize(None)?;
+    // Held on the main thread until the process exits.
+    let _instance = match config.device_id.as_deref() {
+        Some(device_id) => Some(single_instance::claim(
+            device_id,
+            VIEWER_REPLACEMENT_TIMEOUT,
+            || shutdown::request("a new dashboard link opened this device"),
+        )?),
+        None => None,
+    };
     if config.bootstrap.is_none() {
         config.bootstrap = Some(signaling::create_session(&config).await?);
     }

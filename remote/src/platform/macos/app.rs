@@ -7,7 +7,40 @@ use objc2_app_kit::{
 
 struct AppDelegateIvars {
     deep_link_tx: Sender<String>,
-    termination_confirmed: std::cell::Cell<bool>,
+}
+
+/// How long a replaced viewer waits for its session to end before it starts
+/// the replacement anyway. Ending a session retries for up to ~16 seconds.
+const REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A later dashboard link, started once this viewer's session has ended.
+static REPLACEMENT: Mutex<Option<String>> = Mutex::new(None);
+
+/// Starts the viewer for a pending replacement link. Returns whether one was
+/// pending; each link is launched at most once.
+fn launch_replacement() -> bool {
+    let Some(link) = REPLACEMENT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+    else {
+        return false;
+    };
+    let launched = std::env::current_exe()
+        .context("could not locate the macOS viewer executable")
+        .and_then(|executable| {
+            std::process::Command::new(executable)
+                .env_remove("MESHRMM_SESSION_BOOTSTRAP")
+                .env_remove("MESHRMM_UPDATE_READY_FILE")
+                .arg(link)
+                .spawn()
+                .context("could not launch the replacement macOS viewer")
+        });
+    match launched {
+        Ok(_) => tracing::info!("started the macOS viewer for the new dashboard link"),
+        Err(error) => tracing::error!(error = %error, "failed to restart the macOS viewer"),
+    }
+    true
 }
 
 define_class!(
@@ -27,16 +60,14 @@ define_class!(
             &self,
             _application: &NSApplication,
         ) -> objc2_app_kit::NSApplicationTerminateReply {
-            if !self.ivars().termination_confirmed.get()
-                && super::presenter::request_user_disconnect()
-            {
+            if super::presenter::request_user_disconnect() {
                 objc2_app_kit::NSApplicationTerminateReply::TerminateCancel
             } else {
                 objc2_app_kit::NSApplicationTerminateReply::TerminateNow
             }
         }
         #[unsafe(method(application:openURLs:))]
-        fn application_open_urls(&self, application: &NSApplication, urls: &NSArray<NSURL>) {
+        fn application_open_urls(&self, _application: &NSApplication, urls: &NSArray<NSURL>) {
             tracing::info!(
                 url_count = urls.len(),
                 "macOS viewer received a dashboard handoff"
@@ -51,31 +82,31 @@ define_class!(
             if let Err(error) = self.ivars().deep_link_tx.send(value) {
                 // The launch receiver is intentionally consumed by the first
                 // session. A later dashboard handoff means the user is
-                // replacing a stale/broken session, so start a fresh process
-                // with that single-use URL before terminating this one.
+                // replacing a stale/broken session. End this session first:
+                // the server refuses the new handoff while its lease is active.
                 if !super::presenter::confirm_session_replacement() {
                     return;
                 }
-                let replacement = std::env::current_exe()
-                    .context("could not locate the macOS viewer executable")
-                    .and_then(|executable| {
-                        std::process::Command::new(executable)
-                            .env_remove("MESHRMM_SESSION_BOOTSTRAP")
-                            .env_remove("MESHRMM_UPDATE_READY_FILE")
-                            .arg(error.0)
-                            .spawn()
-                            .context("could not launch the replacement macOS viewer")
+                let first = REPLACEMENT
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .replace(error.0)
+                    .is_none();
+                tracing::warn!("ending this session to replace it with a new dashboard handoff");
+                crate::shutdown::request("a new dashboard link replaces this session");
+                if first {
+                    let when = dispatch2::DispatchTime::try_from(REPLACEMENT_TIMEOUT)
+                        .unwrap_or(dispatch2::DispatchTime::NOW);
+                    let scheduled = DispatchQueue::main().after(when, || {
+                        if launch_replacement() {
+                            tracing::warn!(
+                                "the replaced session did not end in time; exiting without its cleanup"
+                            );
+                            std::process::exit(0);
+                        }
                     });
-                match replacement {
-                    Ok(_) => {
-                        tracing::warn!(
-                            "replacing the macOS viewer process for a new dashboard handoff"
-                        );
-                        self.ivars().termination_confirmed.set(true);
-                        application.terminate(None);
-                    }
-                    Err(error) => {
-                        tracing::error!(error = %error, "failed to restart the macOS viewer")
+                    if scheduled.is_err() {
+                        tracing::warn!("could not schedule the viewer replacement deadline");
                     }
                 }
             }
@@ -85,10 +116,7 @@ define_class!(
 
 impl AppDelegate {
     fn new(mtm: MainThreadMarker, deep_link_tx: Sender<String>) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(AppDelegateIvars {
-            deep_link_tx,
-            termination_confirmed: std::cell::Cell::new(false),
-        });
+        let this = Self::alloc(mtm).set_ivars(AppDelegateIvars { deep_link_tx });
         // Safety: this invokes NSObject's parameterless initializer.
         unsafe { msg_send![super(this), init] }
     }
@@ -1591,10 +1619,16 @@ where
             let _ = result_tx.send(result);
             DispatchQueue::main().exec_async(move || {
                 if let Some(mtm) = MainThreadMarker::new() {
-                    if let Some(error) = error.as_deref() {
-                        show_connection_error(mtm, error);
-                    } else {
-                        close_connecting_window();
+                    // A replaced session starts its successor instead of
+                    // reporting how its own cleanup went.
+                    let replaced = launch_replacement();
+                    match error.as_deref() {
+                        Some(error) if !replaced => {
+                            show_connection_error(mtm, error);
+                            // A link opened while the error was shown.
+                            launch_replacement();
+                        }
+                        _ => close_connecting_window(),
                     }
                     let application = NSApplication::sharedApplication(mtm);
                     application.stop(None);

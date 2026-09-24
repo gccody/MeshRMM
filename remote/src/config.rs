@@ -12,6 +12,10 @@ pub struct Config {
     pub update_manifest_url: String,
     pub auto_update: bool,
     pub json_logs: bool,
+    /// The dashboard's device ID from the link. It only selects which viewer
+    /// a new link replaces; the handoff token alone authorizes the session.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -57,6 +61,7 @@ struct FileConfig {
 struct LinkedSession {
     server: String,
     handoff_token: String,
+    device_id: Option<String>,
 }
 
 impl Config {
@@ -78,6 +83,9 @@ impl Config {
             .map(session_from_deep_link)
             .transpose()?;
 
+        let device_id = linked
+            .as_ref()
+            .and_then(|session| session.device_id.clone());
         let server = linked
             .as_ref()
             .map(|session| session.server.clone())
@@ -109,6 +117,7 @@ impl Config {
             update_manifest_url,
             auto_update: file.auto_update.unwrap_or(true),
             json_logs: arguments.json_logs || file.json_logs.unwrap_or(false),
+            device_id,
         })
     }
 }
@@ -120,10 +129,14 @@ fn session_from_deep_link(value: &str) -> anyhow::Result<LinkedSession> {
     }
     let mut server = None;
     let mut handoff_token = None;
+    let mut device_id = None;
     for (key, value) in link.query_pairs() {
         match key.as_ref() {
             "server" => server = Some(value.into_owned()),
             "handoff" => handoff_token = Some(value.into_owned()),
+            // Older dashboards omit it; a malformed one is ignored rather than
+            // failing a link whose token is valid.
+            "device" if is_device_id(&value) => device_id = Some(value.into_owned()),
             _ => {}
         }
     }
@@ -135,7 +148,17 @@ fn session_from_deep_link(value: &str) -> anyhow::Result<LinkedSession> {
     Ok(LinkedSession {
         server,
         handoff_token,
+        device_id,
     })
+}
+
+/// The server's identifier rule, which also keeps it safe in a kernel object name.
+fn is_device_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn validate_server(value: &str) -> anyhow::Result<()> {
@@ -185,6 +208,26 @@ mod tests {
         .unwrap();
         assert_eq!(linked.server, "https://api.example.com");
         assert_eq!(linked.handoff_token, token);
+        assert_eq!(linked.device_id, None);
+    }
+
+    #[test]
+    fn reads_an_optional_device_id_and_ignores_a_malformed_one() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let link = |device: &str| {
+            session_from_deep_link(&format!(
+                "meshrmm://connect?handoff={token}&server=https%3A%2F%2Fapi.example.com&device={device}"
+            ))
+            .unwrap()
+            .device_id
+        };
+        assert_eq!(
+            link("3f2a9c1e-0b7d-4e21-9a55-6c0d8e1f2a3b").as_deref(),
+            Some("3f2a9c1e-0b7d-4e21-9a55-6c0d8e1f2a3b")
+        );
+        assert_eq!(link("..%5CGlobal%5Cx"), None);
+        assert_eq!(link(""), None);
+        assert_eq!(link(&"a".repeat(129)), None);
     }
 
     #[test]
