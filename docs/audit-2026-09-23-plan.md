@@ -27,12 +27,12 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 | T14 macOS viewer keyboard (Cmd→Win, ISO/JIS, stuck Shift) | Medium | Done | `871e913` |
 | T15 Windows viewer GUI subsystem + friendly errors (+ deep-link registration) | Medium | Done | `f8cb85d` |
 | T16 Reconnect UX + recordings + wallpaper setting persistence | Medium | Done | `5a9b6bf` |
-| T17 File transfer roles, limits, cache cleanup | Medium | **Next** | |
-| T18 Quarantine / Mark-of-the-Web on received files | Medium | Todo | |
-| T19 Server auth error mapping + JWKS cache | Medium | Todo | |
-| T20 Company status transition guards | Medium | Todo | |
-| T21 Suspension fan-out resilience | Medium | Todo | |
-| T22 Presence failure must not block agent connect | Medium | Todo | |
+| T17 File transfer roles, limits, cache cleanup | Medium | Done | `66723ae`, `1d75e02` |
+| T18 Quarantine / Mark-of-the-Web on received files | Medium | Done | `a048609` |
+| T19 Server auth error mapping + JWKS cache | Medium | Done | `aba76c6` |
+| T20 Company status transition guards | Medium | Done | `8e29720` |
+| T21 Suspension fan-out resilience | Medium | Done | `92a395b` |
+| T22 Presence failure must not block agent connect | Medium | **Next** | |
 | T23 Coordinator reconnect restarts healthy session | Medium | Todo | |
 | T24 `npm run deploy` wipes production downloads | Medium | Todo | |
 | T25 Release workflow branch restriction | Medium | Todo | |
@@ -72,10 +72,10 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 
 ## Endpoint state
 
-After T11, DESKTOP-85R6S28 runs a release build of `6178050` (SHA-256 `466070DE…4B04`). The
-service is running and connected. T12–T16 changed only the viewer, the dashboard link and shared
-crates in ways that leave the Agent's behavior unchanged (the chat banner path is the same), so the
-installed Agent was not replaced. Earlier builds are kept as
+After T18, DESKTOP-85R6S28 runs a release build of `a048609` (SHA-256 `591FD24D…9154`), which
+includes T17 and T18. The service is running and connected; the build it replaced (`6178050`, SHA-256
+`466070DE…4B04`) is kept as `meshrmm-agent.exe.before-local-20260924-140304`. T19–T21 changed only
+the server. Earlier builds are kept as
 `C:\Program Files\MeshRMM\Agent\meshrmm-agent.exe.before-local-*`. T01 removed the explicit
 `gccody` permission on `ProgramData\MeshRMM\Agent`, so a non-elevated `gccody` process can no longer
 read that folder. `updates\local-3273ef617bd940a68963ee6b2d11b6ad` came from an earlier session and was
@@ -127,6 +127,29 @@ These need a live dashboard → viewer → agent session, which the agent-driven
   the "Reconnecting…" popup centered over the video, the title suffix, and new windows taking the
   previous window's position, size and maximized state. The macOS label, Quit handling and frame
   reuse are untested beyond compiling and the unit tests.
+- T17: a live transfer through the installed service. A temporary probe on the endpoint ran a
+  viewer-role and an agent-role worker against each other in the interactive session: a second
+  Documents copy got a new name instead of replacing the first, the viewer refused an unrequested
+  Documents transfer and a drop and ignored the peer's pick request, an explicit clipboard copy
+  reached the Windows clipboard, and a 513 MiB clipboard copy was refused before any data was sent.
+  The probe could not script the agent's real file picker, so the Receive-files path is covered by
+  unit tests only. A clipboard copy over the limit made on the device is only logged there: the
+  protocol has no message that would tell the viewer.
+- T18: Gatekeeper and SmartScreen prompts for a received app or installer. Unit tests read the
+  `com.apple.quarantine` attribute (`0081;…;MeshRMM;<uuid>`) on macOS and the `Zone.Identifier`
+  stream (`ZoneId=3`) on Windows.
+- T19: a real WorkOS or D1 outage. The Miniflare suite covers one JWKS fetch across requests, no
+  refetch for unknown key IDs within 30 seconds, and a D1 failure returning 503 with `Retry-After`.
+  The dashboard shows a 503 as an error without locking; retrying the account load is T26. The
+  wasm32 check ran on the Mac with rustup's toolchain: Homebrew's `cargo` comes first in `PATH`
+  there and has no wasm32 target.
+- T20: provisioning against WorkOS. SQL regressions cover every status.
+- T21: a real suspension. The Miniflare suite covers a failing coordinator during suspension and a
+  coordinator revoking its Agent at the next request after a missed revocation. The coordinator
+  does not re-check on a timer, because hibernated Agent sockets wake it for nothing else and the
+  suite deliberately forbids a recurring alarm. An idle Agent that missed its revocation stays
+  connected until its next session request, presence alarm or reconnect; every route that could
+  send it work already refuses a suspended company.
 
 ## Remaining tasks
 
