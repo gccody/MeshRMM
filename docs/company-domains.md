@@ -52,10 +52,12 @@ switcher.
    cd server
    npx wrangler d1 migrations apply DB --remote
    npx wrangler deploy
-
-   cd ../dashboard
-   npm run deploy
    ```
+
+   Then deploy the dashboard by running the **Publish native release**
+   workflow; see [automated native releases](native-releases.md). Do not run
+   `npm run deploy` from a checkout: it replaces the published Agent and viewer
+   downloads, so it refuses to run outside that workflow.
 
 ## What company creation does
 
