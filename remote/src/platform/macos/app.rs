@@ -1,7 +1,9 @@
+use super::keyboard::{self, CommandKey, Keyboard, RemoteKey};
 use super::*;
 use meshrmm_protocol::SessionCloseAction;
+use objc2::runtime::AnyObject;
 use objc2_app_kit::{
-    NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSMenu, NSMenuItem,
+    NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSEventMask, NSMenu, NSMenuItem,
     NSPasteboardTypeFileURL,
 };
 
@@ -173,6 +175,8 @@ pub(super) struct RemoteViewIvars {
     chat_popup: RefCell<Option<meshrmm_chat::ChatPopup>>,
     control: ControlSink,
     pressed_keys: RefCell<Vec<(u16, bool)>>,
+    keyboard: RefCell<Keyboard>,
+    key_up_monitor: RefCell<Option<Retained<AnyObject>>>,
     pressed_buttons: RefCell<Vec<PointerButton>>,
     wheel_normalizer: RefCell<WheelNormalizer>,
     cursor_shape: RefCell<CursorShape>,
@@ -329,6 +333,8 @@ define_class!(
             if horizontal == 0 && vertical == 0 {
                 return;
             }
+            self.sync_modifiers(event.modifierFlags());
+            self.engage_command();
             self.send(SessionMessage::Input(RemoteInput::WheelAt {
                 display_id: self.ivars().active_display.borrow().id,
                 x,
@@ -359,34 +365,23 @@ define_class!(
                 self.select_adjacent(event.keyCode() == 124);
                 return;
             }
+            self.engage_command();
             self.send_key(event.keyCode(), true);
         }
 
         #[unsafe(method(keyUp:))]
         fn key_up(&self, event: &NSEvent) {
-            self.sync_modifiers(event.modifierFlags());
-            if event.keyCode() == 111 {
-                return;
-            }
-            self.send_key(event.keyCode(), false);
+            self.handle_key_up(event);
         }
 
         #[unsafe(method(flagsChanged:))]
         fn flags_changed(&self, event: &NSEvent) {
-            let code = event.keyCode();
-            if code == 57 {
-                self.send_key(code, true);
-                self.send_key(code, false);
-                return;
-            }
-            let flag = match code {
-                54 | 55 => NSEventModifierFlags::Command,
-                56 | 60 => NSEventModifierFlags::Shift,
-                58 | 61 => NSEventModifierFlags::Option,
-                59 | 62 => NSEventModifierFlags::Control,
-                _ => return,
-            };
-            self.send_key(code, event.modifierFlags().contains(flag));
+            let keys = self
+                .ivars()
+                .keyboard
+                .borrow_mut()
+                .flags_changed(event.keyCode(), event.modifierFlags().0 as u64);
+            self.send_keys(keys);
         }
 
         #[unsafe(method(selectDisplayFromToolbar:))]
@@ -429,6 +424,7 @@ define_class!(
                 (if self.ivars().control.audio_muted() { "Unmute audio" } else { "Mute audio" }, sel!(toggleAudio:)),
                 (if self.ivars().control.allow_idle_override() { "Prevent idle lock" } else { "Prevent idle lock (company managed)" }, sel!(togglePreventIdleLock:)),
                 ("Disconnect confirmation", sel!(toggleDisconnectConfirmation:)),
+                ("Command key sends Ctrl", sel!(toggleCommandAsControl:)),
                 ("Sync clipboard", sel!(toggleClipboardSync:)),
                 ("Clear clipboard on session close", sel!(toggleClearClipboardOnClose:)),
                 ("Highlight viewed monitor on agent", sel!(toggleDisplayBorder:)),
@@ -445,6 +441,7 @@ define_class!(
                 if action == sel!(toggleAgentInput:) && self.ivars().control.maintenance_state().blacked_out { item.setEnabled(false); }
                 if action == sel!(togglePreventIdleLock:) { item.setState(isize::from(self.ivars().control.prevent_idle_lock())); item.setEnabled(self.ivars().control.allow_idle_override()); }
                 if action == sel!(toggleDisconnectConfirmation:) { item.setState(isize::from(self.ivars().control.disconnect_confirmation())); }
+                if action == sel!(toggleCommandAsControl:) { item.setState(isize::from(self.ivars().control.command_as_control())); }
                 if action == sel!(toggleClipboardSync:) { item.setState(isize::from(self.ivars().control.clipboard_sync())); }
                 if action == sel!(toggleClearClipboardOnClose:) { item.setState(isize::from(self.ivars().control.clear_clipboard_on_close())); }
                 if action == sel!(toggleDisplayBorder:) { item.setState(isize::from(self.ivars().control.display_border())); }
@@ -489,6 +486,17 @@ define_class!(
         #[unsafe(method(toggleDisconnectConfirmation:))]
         fn toggle_disconnect_confirmation(&self, _sender: &NSMenuItem) {
             self.ivars().control.toggle_disconnect_confirmation();
+        }
+
+        #[unsafe(method(toggleCommandAsControl:))]
+        fn toggle_command_as_control(&self, _sender: &NSMenuItem) {
+            self.ivars().control.toggle_command_as_control();
+            let keys = self
+                .ivars()
+                .keyboard
+                .borrow_mut()
+                .set_command_key(command_key(&self.ivars().control));
+            self.send_keys(keys);
         }
 
         #[unsafe(method(selectSessionCloseAction:))]
@@ -710,6 +718,7 @@ impl RemoteView {
             unsafe { NSFontWeightRegular },
         )));
         debug_label.setHidden(true);
+        let command = command_key(&control);
         let this = Self::alloc(mtm).set_ivars(RemoteViewIvars {
             active_display: RefCell::new(active_display),
             displays: RefCell::new(displays),
@@ -726,6 +735,8 @@ impl RemoteView {
             window_closed: std::cell::Cell::new(false),
             control,
             pressed_keys: RefCell::new(Vec::new()),
+            keyboard: RefCell::new(Keyboard::new(command)),
+            key_up_monitor: RefCell::new(None),
             pressed_buttons: RefCell::new(Vec::new()),
             wheel_normalizer: RefCell::new(WheelNormalizer::default()),
             cursor_shape: RefCell::new(CursorShape::Default),
@@ -738,7 +749,68 @@ impl RemoteView {
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         this.addSubview(&this.ivars().debug_label);
         this.install_toolbar(mtm, frame);
+        this.install_key_up_monitor();
         this
+    }
+
+    /// AppKit does not send `keyUp:` for keys released while Command is held,
+    /// which would leave Cmd-L's L down on the remote. A local monitor sees
+    /// those events first and hands them to this view.
+    fn install_key_up_monitor(&self) {
+        let view = objc2::rc::Weak::new(self);
+        let handler = block2::RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+            // Safety: AppKit passes a valid event for the handler's duration.
+            let event_ref = unsafe { event.as_ref() };
+            if let Some(view) = view.load()
+                && view.takes_command_key_up(event_ref)
+            {
+                view.handle_key_up(event_ref);
+                return ptr::null_mut();
+            }
+            event.as_ptr()
+        });
+        // Safety: the handler returns the event it was given or null.
+        let monitor = unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyUp, &handler)
+        };
+        *self.ivars().key_up_monitor.borrow_mut() = monitor;
+    }
+
+    pub(super) fn remove_key_up_monitor(&self) {
+        if let Some(monitor) = self.ivars().key_up_monitor.borrow_mut().take() {
+            // Safety: the monitor came from addLocalMonitorForEventsMatchingMask.
+            unsafe { NSEvent::removeMonitor(&monitor) };
+        }
+    }
+
+    fn takes_command_key_up(&self, event: &NSEvent) -> bool {
+        if !event
+            .modifierFlags()
+            .contains(NSEventModifierFlags::Command)
+        {
+            return false;
+        }
+        let Some(window) = self.window() else {
+            return false;
+        };
+        let ours = event
+            .window(self.mtm())
+            .is_some_and(|target| Retained::as_ptr(&target) == Retained::as_ptr(&window));
+        let focused = window.firstResponder().is_some_and(|responder| {
+            ptr::eq(
+                Retained::as_ptr(&responder).cast::<u8>(),
+                (self as *const Self).cast::<u8>(),
+            )
+        });
+        ours && focused && window.isKeyWindow()
+    }
+
+    fn handle_key_up(&self, event: &NSEvent) {
+        self.sync_modifiers(event.modifierFlags());
+        if event.keyCode() == 111 {
+            return;
+        }
+        self.send_key(event.keyCode(), false);
     }
 
     fn install_toolbar(&self, mtm: MainThreadMarker, frame: NSRect) {
@@ -1025,8 +1097,13 @@ impl RemoteView {
     }
 
     fn send_button(&self, event: &NSEvent, button: PointerButton, pressed: bool) {
-        let mut buttons = self.ivars().pressed_buttons.borrow_mut();
         let position = self.pointer_position(event);
+        if pressed && position.is_some() {
+            // Cmd-click and Ctrl-click use the held modifier.
+            self.sync_modifiers(event.modifierFlags());
+            self.engage_command();
+        }
+        let mut buttons = self.ivars().pressed_buttons.borrow_mut();
         match position {
             Some((x, y)) => self.send(SessionMessage::Input(RemoteInput::PointerButtonAt {
                 display_id: self.ivars().active_display.borrow().id,
@@ -1056,31 +1133,31 @@ impl RemoteView {
     }
 
     fn sync_modifiers(&self, flags: NSEventModifierFlags) {
-        for (left, right, flag) in [
-            (59, 62, NSEventModifierFlags::Control),
-            (56, 60, NSEventModifierFlags::Shift),
-            (58, 61, NSEventModifierFlags::Option),
-            (55, 54, NSEventModifierFlags::Command),
-        ] {
-            let left_scan = mac_key_to_windows_scan_code(left).unwrap();
-            let right_scan = mac_key_to_windows_scan_code(right).unwrap();
-            let keys = self.ivars().pressed_keys.borrow();
-            let held = keys.contains(&left_scan) || keys.contains(&right_scan);
-            drop(keys);
-            if flags.contains(flag) && !held {
-                self.send_key(left, true);
-            }
-            if !flags.contains(flag) && held {
-                self.send_key(left, false);
-                self.send_key(right, false);
-            }
-        }
+        let keys = self.ivars().keyboard.borrow_mut().sync(flags.0 as u64);
+        self.send_keys(keys);
+    }
+
+    /// Sends any held Command key before an action that uses it.
+    fn engage_command(&self) {
+        let keys = self.ivars().keyboard.borrow_mut().engage_command();
+        self.send_keys(keys);
     }
 
     fn send_key(&self, key_code: u16, pressed: bool) {
-        let Some((scan_code, extended)) = mac_key_to_windows_scan_code(key_code) else {
+        let iso = matches!(key_code, 10 | 50) && keyboard::keyboard_is_iso();
+        let Some((scan_code, extended)) = keyboard::scan_code(key_code, iso) else {
             return;
         };
+        self.send_scan_code(scan_code, extended, pressed);
+    }
+
+    fn send_keys(&self, keys: Vec<RemoteKey>) {
+        for key in keys {
+            self.send_scan_code(key.scan_code, key.extended, key.pressed);
+        }
+    }
+
+    fn send_scan_code(&self, scan_code: u16, extended: bool, pressed: bool) {
         self.send(SessionMessage::Input(RemoteInput::Key {
             display_id: self.ivars().active_display.borrow().id,
             scan_code,
@@ -1222,6 +1299,7 @@ impl RemoteView {
     }
 
     pub(super) fn release_input(&self) {
+        self.ivars().keyboard.borrow_mut().reset();
         for (scan_code, extended) in self.ivars().pressed_keys.take() {
             self.send(SessionMessage::Input(RemoteInput::Key {
                 display_id: self.ivars().active_display.borrow().id,
@@ -1307,111 +1385,12 @@ fn mac_cursor(shape: CursorShape) -> Retained<NSCursor> {
     }
 }
 
-fn mac_key_to_windows_scan_code(code: u16) -> Option<(u16, bool)> {
-    Some(match code {
-        0 => (0x1e, false),
-        1 => (0x1f, false),
-        2 => (0x20, false),
-        3 => (0x21, false),
-        4 => (0x23, false),
-        5 => (0x22, false),
-        6 => (0x2c, false),
-        7 => (0x2d, false),
-        8 => (0x2e, false),
-        9 => (0x2f, false),
-        11 => (0x30, false),
-        12 => (0x10, false),
-        13 => (0x11, false),
-        14 => (0x12, false),
-        15 => (0x13, false),
-        16 => (0x15, false),
-        17 => (0x14, false),
-        18 => (0x02, false),
-        19 => (0x03, false),
-        20 => (0x04, false),
-        21 => (0x05, false),
-        22 => (0x07, false),
-        23 => (0x06, false),
-        24 => (0x0d, false),
-        25 => (0x0a, false),
-        26 => (0x08, false),
-        27 => (0x0c, false),
-        28 => (0x09, false),
-        29 => (0x0b, false),
-        30 => (0x1b, false),
-        31 => (0x18, false),
-        32 => (0x16, false),
-        33 => (0x1a, false),
-        34 => (0x17, false),
-        35 => (0x19, false),
-        36 => (0x1c, false),
-        37 => (0x26, false),
-        38 => (0x24, false),
-        39 => (0x28, false),
-        40 => (0x25, false),
-        41 => (0x27, false),
-        42 => (0x2b, false),
-        43 => (0x33, false),
-        44 => (0x35, false),
-        45 => (0x31, false),
-        46 => (0x32, false),
-        47 => (0x34, false),
-        48 => (0x0f, false),
-        49 => (0x39, false),
-        50 => (0x29, false),
-        51 => (0x0e, false),
-        53 => (0x01, false),
-        54 => (0x5c, true),
-        55 => (0x5b, true),
-        56 => (0x2a, false),
-        57 => (0x3a, false),
-        58 => (0x38, false),
-        59 => (0x1d, false),
-        60 => (0x36, false),
-        61 => (0x38, true),
-        62 => (0x1d, true),
-        65 => (0x53, false),
-        67 => (0x37, false),
-        69 => (0x4e, false),
-        71 => (0x45, false),
-        75 => (0x35, true),
-        76 => (0x1c, true),
-        78 => (0x4a, false),
-        81 => (0x0d, false),
-        82 => (0x52, false),
-        83 => (0x4f, false),
-        84 => (0x50, false),
-        85 => (0x51, false),
-        86 => (0x4b, false),
-        87 => (0x4c, false),
-        88 => (0x4d, false),
-        89 => (0x47, false),
-        91 => (0x48, false),
-        92 => (0x49, false),
-        96 => (0x3f, false),
-        97 => (0x40, false),
-        98 => (0x41, false),
-        99 => (0x3d, false),
-        100 => (0x42, false),
-        101 => (0x43, false),
-        103 => (0x57, false),
-        109 => (0x44, false),
-        111 => (0x58, false),
-        114 => (0x52, true),
-        115 => (0x47, true),
-        116 => (0x49, true),
-        117 => (0x53, true),
-        118 => (0x3e, false),
-        119 => (0x4f, true),
-        120 => (0x3c, false),
-        121 => (0x51, true),
-        122 => (0x3b, false),
-        123 => (0x4b, true),
-        124 => (0x4d, true),
-        125 => (0x50, true),
-        126 => (0x48, true),
-        _ => return None,
-    })
+fn command_key(control: &ControlSink) -> CommandKey {
+    if control.command_as_control() {
+        CommandKey::Control
+    } else {
+        CommandKey::Windows
+    }
 }
 
 thread_local! {
