@@ -45,27 +45,51 @@ pub struct ControlSink {
     profiles: Arc<Vec<meshrmm_protocol::VideoProfile>>,
 }
 
+/// What a [`ControlSink`] is made of: the session state the viewer window
+/// reads and changes, and the transport callbacks it sends through.
+pub struct ControlSinkParts {
+    pub idle: Arc<Mutex<IdlePreference>>,
+    pub display_border: Arc<Mutex<Option<bool>>>,
+    pub files: meshrmm_file_transfer::TransferSession,
+    pub chat: meshrmm_chat::ChatSession,
+    pub audio: meshrmm_audio::PlaybackState,
+    pub recording: crate::recording::Recorder,
+    pub send: Arc<dyn Fn(meshrmm_protocol::SessionMessage) + Send + Sync>,
+    pub set_input_enabled: Arc<dyn Fn(bool) + Send + Sync>,
+    pub maintenance: Arc<Mutex<MaintenanceState>>,
+    pub credentials: Arc<Mutex<meshrmm_protocol::CredentialState>>,
+    pub technician_blocked: Arc<std::sync::atomic::AtomicBool>,
+    pub wallpaper_hidden: Arc<std::sync::atomic::AtomicBool>,
+    pub remote_cursor_hidden: Arc<std::sync::atomic::AtomicBool>,
+    pub session_close_action: Arc<Mutex<meshrmm_protocol::SessionCloseAction>>,
+    pub quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
+    pub chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
+    #[cfg(windows)]
+    pub profiles: Arc<Vec<meshrmm_protocol::VideoProfile>>,
+}
+
 impl ControlSink {
-    // Keep the shared session handles and transport callbacks explicit at construction.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        idle: Arc<Mutex<IdlePreference>>,
-        display_border: Arc<Mutex<Option<bool>>>,
-        files: meshrmm_file_transfer::TransferSession,
-        send: impl Fn(meshrmm_protocol::SessionMessage) + Send + Sync + 'static,
-        set_input_enabled: impl Fn(bool) + Send + Sync + 'static,
-        chat: meshrmm_chat::ChatSession,
-        audio: meshrmm_audio::PlaybackState,
-        recording: crate::recording::Recorder,
-        technician_blocked: Arc<std::sync::atomic::AtomicBool>,
-        remote_cursor_hidden: Arc<std::sync::atomic::AtomicBool>,
-        wallpaper_hidden: Arc<std::sync::atomic::AtomicBool>,
-        session_close_action: Arc<Mutex<meshrmm_protocol::SessionCloseAction>>,
-        maintenance: Arc<Mutex<MaintenanceState>>,
-        quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
-        chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
-        #[cfg(windows)] profiles: Arc<Vec<meshrmm_protocol::VideoProfile>>,
-    ) -> Self {
+    pub fn new(parts: ControlSinkParts) -> Self {
+        let ControlSinkParts {
+            idle,
+            display_border,
+            files,
+            chat,
+            audio,
+            recording,
+            send,
+            set_input_enabled,
+            maintenance,
+            credentials,
+            technician_blocked,
+            wallpaper_hidden,
+            remote_cursor_hidden,
+            session_close_action,
+            quality,
+            chroma,
+            #[cfg(windows)]
+            profiles,
+        } = parts;
         Self {
             idle,
             display_border,
@@ -73,14 +97,14 @@ impl ControlSink {
             chat,
             audio,
             recording,
+            send,
+            set_input_enabled,
+            maintenance,
+            credentials,
             technician_blocked,
+            wallpaper_hidden,
             remote_cursor_hidden,
             session_close_action,
-            wallpaper_hidden,
-            maintenance,
-            credentials: Arc::new(Mutex::new(Default::default())),
-            send: Arc::new(send),
-            set_input_enabled: Arc::new(set_input_enabled),
             quality,
             chroma,
             #[cfg(windows)]
@@ -93,13 +117,6 @@ impl ControlSink {
             .lock()
             .map(|s| s.clone())
             .unwrap_or_default()
-    }
-    pub fn with_credentials(
-        mut self,
-        state: Arc<Mutex<meshrmm_protocol::CredentialState>>,
-    ) -> Self {
-        self.credentials = state;
-        self
     }
 
     pub fn send(&self, message: meshrmm_protocol::SessionMessage) {

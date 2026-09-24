@@ -1,5 +1,6 @@
 use super::keyboard::{self, CommandKey, Keyboard, RemoteKey};
 use super::*;
+use crate::input::HeldInput;
 use meshrmm_protocol::SessionCloseAction;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
@@ -187,10 +188,9 @@ pub(super) struct RemoteViewIvars {
     credential_label: RefCell<Option<Retained<NSTextField>>>,
     chat_popup: RefCell<Option<meshrmm_chat::ChatPopup>>,
     control: ControlSink,
-    pressed_keys: RefCell<Vec<(u16, bool)>>,
+    held: RefCell<HeldInput>,
     keyboard: RefCell<Keyboard>,
     key_up_monitor: RefCell<Option<Retained<AnyObject>>>,
-    pressed_buttons: RefCell<Vec<PointerButton>>,
     wheel_normalizer: RefCell<WheelNormalizer>,
     cursor_shape: RefCell<CursorShape>,
     agent_pointer_display: std::cell::Cell<Option<meshrmm_protocol::DisplayId>>,
@@ -802,10 +802,9 @@ impl RemoteView {
             confirming_disconnect: std::cell::Cell::new(false),
             window_closed: std::cell::Cell::new(false),
             control,
-            pressed_keys: RefCell::new(Vec::new()),
+            held: RefCell::new(HeldInput::default()),
             keyboard: RefCell::new(Keyboard::new(command)),
             key_up_monitor: RefCell::new(None),
-            pressed_buttons: RefCell::new(Vec::new()),
             wheel_normalizer: RefCell::new(WheelNormalizer::default()),
             cursor_shape: RefCell::new(CursorShape::Default),
             agent_pointer_display: std::cell::Cell::new(None),
@@ -1178,32 +1177,14 @@ impl RemoteView {
             self.sync_modifiers(event.modifierFlags());
             self.engage_command();
         }
-        let mut buttons = self.ivars().pressed_buttons.borrow_mut();
-        match position {
-            Some((x, y)) => self.send(SessionMessage::Input(RemoteInput::PointerButtonAt {
-                display_id: self.ivars().active_display.borrow().id,
-                x,
-                y,
-                button,
-                pressed,
-            })),
-            None if !pressed && buttons.contains(&button) => {
-                // Finish a drag that began over the video without moving the
-                // remote pointer to an out-of-bounds/clamped position.
-                self.send(SessionMessage::Input(RemoteInput::PointerButton {
-                    display_id: self.ivars().active_display.borrow().id,
-                    button,
-                    pressed: false,
-                }));
-            }
-            None => return,
-        }
-        if pressed {
-            if !buttons.contains(&button) {
-                buttons.push(button);
-            }
-        } else {
-            buttons.retain(|candidate| *candidate != button);
+        let display_id = self.ivars().active_display.borrow().id;
+        let input = self
+            .ivars()
+            .held
+            .borrow_mut()
+            .button(display_id, position, button, pressed);
+        if let Some(input) = input {
+            self.send(SessionMessage::Input(input));
         }
     }
 
@@ -1233,20 +1214,13 @@ impl RemoteView {
     }
 
     fn send_scan_code(&self, scan_code: u16, extended: bool, pressed: bool) {
-        self.send(SessionMessage::Input(RemoteInput::Key {
-            display_id: self.ivars().active_display.borrow().id,
-            scan_code,
-            extended,
-            pressed,
-        }));
-        let mut keys = self.ivars().pressed_keys.borrow_mut();
-        if pressed {
-            if !keys.contains(&(scan_code, extended)) {
-                keys.push((scan_code, extended));
-            }
-        } else {
-            keys.retain(|candidate| *candidate != (scan_code, extended));
-        }
+        let display_id = self.ivars().active_display.borrow().id;
+        let input = self
+            .ivars()
+            .held
+            .borrow_mut()
+            .key(display_id, scan_code, extended, pressed);
+        self.send(SessionMessage::Input(input));
     }
 
     fn select_adjacent(&self, next: bool) {
@@ -1384,20 +1358,10 @@ impl RemoteView {
 
     pub(super) fn release_input(&self) {
         self.ivars().keyboard.borrow_mut().reset();
-        for (scan_code, extended) in self.ivars().pressed_keys.take() {
-            self.send(SessionMessage::Input(RemoteInput::Key {
-                display_id: self.ivars().active_display.borrow().id,
-                scan_code,
-                extended,
-                pressed: false,
-            }));
-        }
-        for button in self.ivars().pressed_buttons.take() {
-            self.send(SessionMessage::Input(RemoteInput::PointerButton {
-                display_id: self.ivars().active_display.borrow().id,
-                button,
-                pressed: false,
-            }));
+        let display_id = self.ivars().active_display.borrow().id;
+        let released = self.ivars().held.borrow_mut().release_all(display_id);
+        for input in released {
+            self.send(SessionMessage::Input(input));
         }
     }
 

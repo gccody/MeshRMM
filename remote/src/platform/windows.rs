@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr;
