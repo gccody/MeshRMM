@@ -20,6 +20,7 @@ use windows_service::service::{
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use crate::private_directory;
 use crate::service::{LEGACY_SERVICE_NAME, SERVICE_NAME};
 
 const ENROLLMENT_MAGIC: &[u8] = b"MESHRMM-BOOTSTRAP-V1";
@@ -113,33 +114,36 @@ pub fn install_and_notify() -> anyhow::Result<()> {
 /// stop and remove the service without trying to delete the executable that is currently running.
 pub fn schedule_uninstall() -> anyhow::Result<()> {
     let source = std::env::current_exe().context("could not locate the Agent executable")?;
-    let helper_directory = std::env::temp_dir().join("MeshRMM");
-    std::fs::create_dir_all(&helper_directory).with_context(|| {
-        format!(
-            "failed to create uninstall helper directory {}",
-            helper_directory.display()
-        )
-    })?;
-    let helper = helper_directory.join(format!(
-        "uninstall-{}-{}.exe",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    ));
-    std::fs::copy(&source, &helper)
-        .with_context(|| format!("failed to create uninstall helper {}", helper.display()))?;
+    let helper = stage_uninstall_helper(&required_system_directory("ProgramData")?, &source)?;
+    let helper_directory = helper
+        .parent()
+        .context("the uninstall helper has no parent directory")?;
     Command::new(&helper)
         .arg("--uninstall")
         // The desktop worker normally runs from the install directory. Do not let the helper
         // inherit that working directory or Windows will keep the otherwise-empty directory
         // in use while the helper tries to remove it.
-        .current_dir(&helper_directory)
+        .current_dir(helper_directory)
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn()
         .with_context(|| format!("failed to start uninstall helper {}", helper.display()))?;
     Ok(())
+}
+
+/// The helper runs as LocalSystem, so it is copied into a new administrator-only directory. A
+/// shared temporary folder can be pre-created by a standard user, who could then replace the
+/// executable or plant DLLs beside it. The directory sits beside the Agent data it deletes, and
+/// the helper removes it through `schedule_helper_cleanup`.
+fn stage_uninstall_helper(program_data: &Path, source: &Path) -> anyhow::Result<PathBuf> {
+    let helper_directory = program_data.join(format!(
+        "MeshRMM-uninstall-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    private_directory::create_new(&helper_directory)?;
+    let helper = helper_directory.join("meshrmm-agent-uninstall.exe");
+    std::fs::copy(source, &helper)
+        .with_context(|| format!("failed to create uninstall helper {}", helper.display()))?;
+    Ok(helper)
 }
 
 pub fn uninstall() -> anyhow::Result<()> {
@@ -198,12 +202,15 @@ fn install() -> anyhow::Result<()> {
     let program_files = required_system_directory("ProgramFiles")?;
     let program_data = required_system_directory("ProgramData")?;
     let install_directory = program_files.join("MeshRMM").join("Agent");
-    let config_directory = program_data.join("MeshRMM").join("Agent");
+    let data_root = program_data.join("MeshRMM");
+    let config_directory = data_root.join("Agent");
     std::fs::create_dir_all(&install_directory)
         .with_context(|| format!("failed to create {}", install_directory.display()))?;
-    std::fs::create_dir_all(&config_directory)
-        .with_context(|| format!("failed to create {}", config_directory.display()))?;
-    restrict_config_directory(&config_directory)?;
+    // The credential and the SYSTEM update helper live here, and standard users may create
+    // folders under ProgramData, so secure the whole chain before reading or writing anything.
+    secure_or_replace_directory(&data_root)?;
+    secure_or_replace_directory(&config_directory)?;
+    private_directory::secure_contents(&config_directory)?;
 
     let machine_name = machine_name()?;
     let recovery_path = config_directory.join("enrollment-recovery.json");
@@ -488,30 +495,40 @@ fn restart_after(seconds: u64) -> ServiceAction {
     }
 }
 
-fn restrict_config_directory(path: &Path) -> anyhow::Result<()> {
-    let output = Command::new("icacls.exe")
-        .arg(path)
-        .args([
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-18:(OI)(CI)F",
-            "*S-1-5-32-544:(OI)(CI)F",
-        ])
-        .output()
-        .context("failed to start icacls while protecting the Agent credential")?;
-    if !output.status.success() {
-        let details = if output.stderr.is_empty() {
-            String::from_utf8_lossy(&output.stdout)
-        } else {
-            String::from_utf8_lossy(&output.stderr)
-        };
-        bail!(
-            "icacls could not protect {}: {}",
-            path.display(),
-            details.trim()
-        );
+/// Secures an Agent data directory. One owned by another account is moved aside and replaced by a
+/// new private directory: resetting its ACL in place would not revoke a WRITE_DAC handle its
+/// owner opened beforehand, and nothing that account left inside can be trusted.
+fn secure_or_replace_directory(path: &Path) -> anyhow::Result<()> {
+    let Err(error) = private_directory::secure(path) else {
+        return Ok(());
+    };
+    if error
+        .downcast_ref::<private_directory::UntrustedOwner>()
+        .is_none()
+    {
+        return Err(error);
     }
-    Ok(())
+    let name = path
+        .file_name()
+        .with_context(|| format!("{} has no directory name", path.display()))?;
+    let mut quarantine_name = name.to_owned();
+    quarantine_name.push(format!(".untrusted-{}", uuid::Uuid::new_v4().simple()));
+    let quarantine = path.with_file_name(quarantine_name);
+    let source = wide(path.as_os_str());
+    let destination = wide(quarantine.as_os_str());
+    unsafe {
+        windows::Win32::Storage::FileSystem::MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            windows::Win32::Storage::FileSystem::MOVE_FILE_FLAGS(0),
+        )
+    }
+    .with_context(|| {
+        format!("{error}, and it could not be moved aside; close programs using it or delete it")
+    })?;
+    // Nothing reads the quarantined copy, so anything left behind only costs disk space.
+    let _ = std::fs::remove_dir_all(&quarantine);
+    private_directory::create_new(path)
 }
 
 pub(crate) fn replace_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
@@ -535,6 +552,19 @@ pub(crate) fn replace_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
         )
     }
     .with_context(|| format!("failed to replace {}", path.display()))
+}
+
+/// Whether `path` is the configuration directory an installer created under ProgramData.
+pub(crate) fn is_managed_config_directory(path: &Path) -> anyhow::Result<bool> {
+    let program_data = required_system_directory("ProgramData")?;
+    let path = path.to_string_lossy();
+    Ok(["MeshRMM", "PulseRMM"].into_iter().any(|product| {
+        program_data
+            .join(product)
+            .join("Agent")
+            .to_string_lossy()
+            .eq_ignore_ascii_case(path.trim_end_matches(['\\', '/']))
+    }))
 }
 
 fn required_system_directory(name: &str) -> anyhow::Result<PathBuf> {
@@ -711,5 +741,72 @@ mod tests {
     #[test]
     fn ignores_regular_agent_binary() {
         assert!(parse_embedded(b"mock-pe-image").unwrap().is_none());
+    }
+
+    #[test]
+    fn recognizes_only_installer_managed_config_directories() {
+        let program_data = required_system_directory("ProgramData").unwrap();
+        let managed = program_data.join("MeshRMM").join("Agent");
+        assert!(is_managed_config_directory(&managed).unwrap());
+        let upper = PathBuf::from(managed.to_string_lossy().to_uppercase() + "\\");
+        assert!(is_managed_config_directory(&upper).unwrap());
+        let legacy = program_data.join("PulseRMM").join("Agent");
+        assert!(is_managed_config_directory(&legacy).unwrap());
+        assert!(!is_managed_config_directory(&managed.join("updates")).unwrap());
+        assert!(!is_managed_config_directory(Path::new(r"C:\MeshRMM\Agent")).unwrap());
+    }
+
+    #[test]
+    fn stages_each_uninstall_helper_in_a_new_private_directory() {
+        use crate::private_directory::test_support::*;
+        if !elevated() {
+            return;
+        }
+        let program_data = scratch("uninstall");
+        let source = program_data.join("meshrmm-agent.exe");
+        std::fs::write(&source, b"MZ helper").unwrap();
+
+        let first = stage_uninstall_helper(&program_data, &source).unwrap();
+        let second = stage_uninstall_helper(&program_data, &source).unwrap();
+        assert_eq!(std::fs::read(&first).unwrap(), b"MZ helper");
+        let directory = first.parent().unwrap();
+        assert_ne!(directory, second.parent().unwrap());
+        assert_eq!(directory.parent().unwrap(), program_data);
+        assert!(
+            directory
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("MeshRMM-uninstall-")
+        );
+        assert_eq!(sddl_of(directory), PRIVATE);
+        remove(&program_data);
+    }
+
+    #[test]
+    fn replaces_data_directory_owned_by_another_account() {
+        use crate::private_directory::test_support::*;
+        if !elevated() {
+            return;
+        }
+        let data_root = scratch("squatted");
+        let config_directory = data_root.join("Agent");
+        std::fs::create_dir(&config_directory).unwrap();
+        std::fs::write(config_directory.join("enrollment-pending.json"), b"{}").unwrap();
+        set_sddl(&config_directory, "O:BUD:(A;OICI;FA;;;BU)(A;OICI;FA;;;BA)");
+
+        secure_or_replace_directory(&config_directory).unwrap();
+        assert_eq!(sddl_of(&config_directory), PRIVATE);
+        assert_eq!(std::fs::read_dir(&config_directory).unwrap().count(), 0);
+        let remaining = std::fs::read_dir(&data_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, [OsString::from("Agent")]);
+        // A trusted directory keeps its contents.
+        std::fs::write(config_directory.join("agent.json"), b"{}").unwrap();
+        secure_or_replace_directory(&config_directory).unwrap();
+        assert!(config_directory.join("agent.json").exists());
+        remove(&data_root);
     }
 }

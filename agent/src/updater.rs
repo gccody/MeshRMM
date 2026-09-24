@@ -10,6 +10,7 @@ use meshrmm_self_update::{AGENT_WINDOWS_X64, CURRENT_VERSION, UpdateManifest};
 use windows_service::service::{ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use crate::private_directory;
 use crate::remote::config::Config;
 use crate::service::service_name_for_path;
 
@@ -40,17 +41,13 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
     }
 
     let current = std::env::current_exe().context("could not locate the Agent executable")?;
-    let update_directory = config
-        .config_path
-        .parent()
-        .context("Agent configuration has no parent directory")?
-        .join("updates");
-    std::fs::create_dir_all(&update_directory).with_context(|| {
-        format!(
-            "failed to create Agent update directory {}",
-            update_directory.display()
-        )
-    })?;
+    let update_directory = prepare_update_directory(
+        config
+            .config_path
+            .parent()
+            .context("Agent configuration has no parent directory")?,
+    )
+    .context("failed to prepare a private Agent update directory")?;
     let suffix = unique_suffix();
     let staged = update_directory.join(format!("agent-{}-{suffix}.exe", release.version));
     let helper = update_directory.join(format!("update-helper-{suffix}.exe"));
@@ -107,6 +104,24 @@ pub fn apply_scheduled_update() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(backup);
     schedule_cleanup(&helper, &helper_directory)?;
     Ok(())
+}
+
+/// The helper staged here runs as LocalSystem, so every directory that could rename or replace it
+/// must be administrator-only. The installer-managed ProgramData chain is secured as a whole; the
+/// parents of a custom configuration directory are not the Agent's to change.
+fn prepare_update_directory(config_directory: &Path) -> anyhow::Result<PathBuf> {
+    if crate::installer::is_managed_config_directory(config_directory)? {
+        let data_root = config_directory
+            .parent()
+            .context("Agent configuration directory has no parent directory")?;
+        private_directory::secure(data_root)?;
+        private_directory::secure(config_directory)?;
+        // Existing installations were protected with icacls, which left extra ACEs in place.
+        private_directory::secure_contents(config_directory)?;
+    }
+    let update_directory = config_directory.join("updates");
+    private_directory::secure(&update_directory)?;
+    Ok(update_directory)
 }
 
 fn http_agent() -> ureq::Agent {
