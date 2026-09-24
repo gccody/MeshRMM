@@ -1,7 +1,7 @@
 use futures_util::lock::Mutex;
 use meshrmm_protocol_types::{AgentCommand, AgentSessionRequest, AgentStatusMessage};
 use serde::{Deserialize, Serialize};
-use worker::*;
+use worker::{query, *};
 
 use crate::company_presence::{self, PresenceMutation};
 
@@ -135,6 +135,9 @@ impl DurableObject for AgentCoordinator {
             }
             (Method::Post, "/request") => {
                 let session: AgentSessionRequest = request.json().await?;
+                if self.revoke_if_company_inactive().await? {
+                    return Response::error("company is not active", 403);
+                }
                 if self
                     .state
                     .storage()
@@ -178,6 +181,9 @@ impl DurableObject for AgentCoordinator {
             }
             (Method::Post, "/resume-request") => {
                 let session: AgentSessionRequest = request.json().await?;
+                if self.revoke_if_company_inactive().await? {
+                    return Response::error("company is not active", 403);
+                }
                 if !self.owns_session(&session).await? {
                     return Response::error("remote session no longer owns this Agent", 410);
                 }
@@ -213,6 +219,9 @@ impl DurableObject for AgentCoordinator {
             }
             (Method::Post, "/lease") => {
                 let session: AgentSessionRequest = request.json().await?;
+                if self.revoke_if_company_inactive().await? {
+                    return Response::error("company is not active", 403);
+                }
                 if !self.owns_session(&session).await? {
                     return Response::error("remote session no longer owns this Agent", 410);
                 }
@@ -231,32 +240,7 @@ impl DurableObject for AgentCoordinator {
                 Response::ok("renewed")
             }
             (Method::Post, "/revoke") => {
-                let session = self
-                    .state
-                    .storage()
-                    .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
-                    .await?;
-                self.state.storage().delete(ACTIVE_SESSION_KEY).await?;
-                for socket in self.state.get_websockets_with_tag(AGENT_TAG) {
-                    if let Some(active) = &session {
-                        let _ = socket.send_with_str(serde_json::to_string(
-                            &AgentCommand::EndSession {
-                                session_id: active.session_id.clone(),
-                            },
-                        )?);
-                    }
-                    let _ = socket.close(Some(4001), Some("Agent authorization revoked"));
-                }
-                if let Some(active) = session {
-                    let request = Request::new("https://session.internal/expire", Method::Post)?;
-                    crate::object_stub(
-                        &self.environment,
-                        "REMOTE_SESSION",
-                        active.session_id.as_str(),
-                    )?
-                    .fetch_with_request(request)
-                    .await?;
-                }
+                self.revoke().await?;
                 Response::ok("revoked")
             }
             (Method::Post, "/close-session") => {
@@ -305,7 +289,7 @@ impl DurableObject for AgentCoordinator {
             .get::<AgentIdentity>(IDENTITY_KEY)
             .await?
         {
-            let connected = !identity.uninstall_requested
+            let mut connected = !identity.uninstall_requested
                 && self
                     .state
                     .get_websockets_with_tag(AGENT_TAG)
@@ -317,6 +301,9 @@ impl DurableObject for AgentCoordinator {
                             .flatten()
                             .is_some_and(|id| id == identity.connection_id)
                     });
+            if connected && self.revoke_if_company_inactive().await? {
+                connected = false;
+            }
             self.publish_presence(&identity, connected).await?;
         }
         Response::ok("presence delivered")
@@ -376,6 +363,72 @@ impl DurableObject for AgentCoordinator {
 }
 
 impl AgentCoordinator {
+    /// Ends the active session and disconnects the Agent.
+    async fn revoke(&self) -> Result<()> {
+        let session = self
+            .state
+            .storage()
+            .get::<AgentSessionRequest>(ACTIVE_SESSION_KEY)
+            .await?;
+        self.state.storage().delete(ACTIVE_SESSION_KEY).await?;
+        for socket in self.state.get_websockets_with_tag(AGENT_TAG) {
+            if let Some(active) = &session {
+                let _ = socket.send_with_str(serde_json::to_string(&AgentCommand::EndSession {
+                    session_id: active.session_id.clone(),
+                })?);
+            }
+            let _ = socket.close(Some(4001), Some("Agent authorization revoked"));
+        }
+        if let Some(active) = session {
+            let request = Request::new("https://session.internal/expire", Method::Post)?;
+            crate::object_stub(
+                &self.environment,
+                "REMOTE_SESSION",
+                active.session_id.as_str(),
+            )?
+            .fetch_with_request(request)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Revokes the Agent when its company is no longer active, so a suspension
+    /// whose revocation did not reach this coordinator still takes effect at
+    /// the next session request or alarm. A failed lookup revokes nothing.
+    async fn revoke_if_company_inactive(&self) -> Result<bool> {
+        let Some(identity) = self
+            .state
+            .storage()
+            .get::<AgentIdentity>(IDENTITY_KEY)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let active = async {
+            let db = self.environment.d1("DB")?;
+            query!(
+                &db,
+                "SELECT 1 AS active FROM companies WHERE id = ?1 AND status = 'active'",
+                identity.company_id
+            )?
+            .first::<i64>(Some("active"))
+            .await
+        }
+        .await;
+        match active {
+            Ok(Some(_)) => Ok(false),
+            Ok(None) => {
+                console_log!("event=agent_revoked_for_inactive_company");
+                self.revoke().await?;
+                Ok(true)
+            }
+            Err(error) => {
+                console_error!("event=agent_company_check_failed error={}", error);
+                Ok(false)
+            }
+        }
+    }
+
     async fn clear_session(&self, session_id: &str) -> Result<()> {
         if self
             .state

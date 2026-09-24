@@ -432,6 +432,31 @@ pub(crate) async fn suspend_platform_company(
     .run()
     .await?;
     // Revoke live capabilities as well as blocking future authentication.
+    // Dashboards go first. One failure does not stop the rest: the company is
+    // already suspended, sessions stop at their next activity check, and each
+    // coordinator revokes its Agent at its next session request or alarm.
+    let mut request =
+        internal_json_request("https://presence.internal/revoke", &serde_json::json!({}))?;
+    request
+        .headers_mut()?
+        .set("X-Mesh-Company-Id", company_id)?;
+    let presence = match object_stub(environment, "COMPANY_PRESENCE", company_id) {
+        Ok(stub) => match stub.fetch_with_request(request).await {
+            Ok(response) => ensure_success(response, "revoke subscriptions").await,
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
+    if let Err(error) = presence {
+        console_error!(
+            "{}",
+            serde_json::json!({
+                "event": "company_suspension_presence_revoke_failed",
+                "company_id": company_id,
+                "error": error.to_string(),
+            })
+        );
+    }
     let agents = query!(
         &db,
         "SELECT id FROM agents WHERE company_id = ?1",
@@ -440,31 +465,24 @@ pub(crate) async fn suspend_platform_company(
     .all()
     .await?
     .results::<serde_json::Value>()?;
-    for agent in agents {
-        if let Some(id) = agent.get("id").and_then(serde_json::Value::as_str) {
-            let request = Request::new("https://agent.internal/revoke", Method::Post)?;
-            ensure_success(
-                object_stub(environment, "AGENT_COORDINATOR", id)?
-                    .fetch_with_request(request)
-                    .await?,
-                "revoke Agent",
-            )
-            .await?;
-        }
+    let agent_ids: Vec<String> = agents
+        .iter()
+        .filter_map(|agent| agent.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    let failed = revoke_agents(environment, &agent_ids).await;
+    if !failed.is_empty() {
+        console_error!(
+            "{}",
+            serde_json::json!({
+                "event": "company_suspension_agent_revoke_failed",
+                "company_id": company_id,
+                "failed": failed.len(),
+                "agents": agent_ids.len(),
+                "first_error": failed.first(),
+            })
+        );
     }
-    let request =
-        internal_json_request("https://presence.internal/revoke", &serde_json::json!({}))?;
-    let mut request = request;
-    request
-        .headers_mut()?
-        .set("X-Mesh-Company-Id", company_id)?;
-    ensure_success(
-        object_stub(environment, "COMPANY_PRESENCE", company_id)?
-            .fetch_with_request(request)
-            .await?,
-        "revoke subscriptions",
-    )
-    .await?;
     Response::empty().map(|response| response.with_status(204))
 }
 
@@ -510,6 +528,27 @@ pub(crate) async fn activate_platform_company(
     .run()
     .await?;
     Response::from_json(&load_platform_company(&db, company_id).await?)
+}
+
+/// Coordinators revoked at once while suspending a company. Bounds the
+/// Worker's concurrent subrequests for companies with many Agents.
+const REVOKE_CONCURRENCY: usize = 8;
+
+/// Revokes each Agent's coordinator and returns the errors of those that failed.
+async fn revoke_agents(environment: &Env, agent_ids: &[String]) -> Vec<String> {
+    use futures_util::StreamExt;
+    futures_util::stream::iter(agent_ids)
+        .map(|id| async move {
+            let request = Request::new("https://agent.internal/revoke", Method::Post)?;
+            let response = object_stub(environment, "AGENT_COORDINATOR", id)?
+                .fetch_with_request(request)
+                .await?;
+            ensure_success(response, "revoke Agent").await
+        })
+        .buffer_unordered(REVOKE_CONCURRENCY)
+        .filter_map(|result| async move { result.err().map(|error| error.to_string()) })
+        .collect()
+        .await
 }
 
 async fn provision_company(
