@@ -32,12 +32,12 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 | T19 Server auth error mapping + JWKS cache | Medium | Done | `aba76c6` |
 | T20 Company status transition guards | Medium | Done | `8e29720` |
 | T21 Suspension fan-out resilience | Medium | Done | `92a395b` |
-| T22 Presence failure must not block agent connect | Medium | **Next** | |
-| T23 Coordinator reconnect restarts healthy session | Medium | Todo | |
-| T24 `npm run deploy` wipes production downloads | Medium | Todo | |
-| T25 Release workflow branch restriction | Medium | Todo | |
-| T26 Dashboard account-load retry + sign-out handling | Medium | Todo | |
-| T27 Platform console error handling | Medium | Todo | |
+| T22 Presence failure must not block agent connect | Medium | Done | `bc5684d` |
+| T23 Coordinator reconnect restarts healthy session | Medium | Done | `e5a50b2` |
+| T24 `npm run deploy` wipes production downloads | Medium | Done | `b84c249` |
+| T25 Release workflow branch restriction | Medium | Done | `f9e4582` |
+| T26 Dashboard account-load retry + sign-out handling | Medium | Done | `094a4e9` |
+| T27 Platform console error handling | Medium | **Next** | |
 | T28 Remove `dashboard/pulsermm-site.tar.gz` | Low | Todo | |
 | T29 CI hardening | Low | Todo | |
 | T30 Documentation accuracy / TLS 1.3 | Low | Todo | |
@@ -72,10 +72,10 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 
 ## Endpoint state
 
-After T18, DESKTOP-85R6S28 runs a release build of `a048609` (SHA-256 `591FD24D…9154`), which
-includes T17 and T18. The service is running and connected; the build it replaced (`6178050`, SHA-256
-`466070DE…4B04`) is kept as `meshrmm-agent.exe.before-local-20260924-140304`. T19–T21 changed only
-the server. Earlier builds are kept as
+After T23, DESKTOP-85R6S28 runs a release build of `e5a50b2` (SHA-256 `C0B701A7…E8E7`), which
+includes T17, T18 and T23. The service is running and connected; the build it replaced (`a048609`,
+SHA-256 `591FD24D…9154`) is kept as `meshrmm-agent.exe.before-local-20260924-151551`. T19–T22 and
+T24–T26 did not change the Agent. Earlier builds are kept as
 `C:\Program Files\MeshRMM\Agent\meshrmm-agent.exe.before-local-*`. T01 removed the explicit
 `gccody` permission on `ProgramData\MeshRMM\Agent`, so a non-elevated `gccody` process can no longer
 read that folder. `updates\local-3273ef617bd940a68963ee6b2d11b6ad` came from an earlier session and was
@@ -150,6 +150,23 @@ These need a live dashboard → viewer → agent session, which the agent-driven
   suite deliberately forbids a recurring alarm. An idle Agent that missed its revocation stays
   connected until its next session request, presence alarm or reconnect; every route that could
   send it work already refuses a suspended company.
+
+- T22: a real presence outage. The Miniflare suite covers a reconnect while publishing to the
+  company's presence fails: the socket is accepted, the live session is resumed on it, the
+  publication stays in the outbox with an alarm, and the alarm delivers it.
+- T23: a real coordinator reconnect during a live session. The Miniflare suite shows the replay
+  after a lease renewal is byte-for-byte the request the Agent received (it fails without the
+  server change), and Agent unit tests, also run on the endpoint, cover the comparison. The
+  installed service started and connected with the new build. The Agent compares whole requests
+  except the expiry rather than only the session ID and token, because a resume sends new TURN
+  credentials and must still restart the session, as before.
+- T24: the release workflow's deploy. `npm run predeploy` was run in both modes on the Mac; deploy
+  itself was not run. The guard also refuses unexpected files in `public/downloads/` and URLs off
+  `download_origin`. `scripts/verify-dashboard-deploy.test.mjs` is not yet run in CI (T29).
+- T25: a real manual run. The YAML parses, and the new step's download and check were run on the
+  Mac against the live manifest (0.2.8, passed).
+- T26: a live dashboard. The local dev loop cannot create a company session yet (T33); unit tests
+  cover the retry policy and `npm run verify` passes.
 
 ## Remaining tasks
 
