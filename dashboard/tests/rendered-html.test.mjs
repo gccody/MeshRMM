@@ -13,7 +13,7 @@ import {
   timeoutMilliseconds,
 } from "../features/session/idle-session.ts";
 
-async function render(pathname = "/", hostname = "meshrmm.com", company = null, init = {}) {
+async function render(pathname = "/", hostname = "meshrmm.com", company = null, init = {}, apiFetch = async () => new Response("API")) {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
@@ -32,11 +32,26 @@ async function render(pathname = "/", hostname = "meshrmm.com", company = null, 
           return { bind() { return { first: async () => company }; } };
         },
       },
-      MESHRMM_API: { fetch: async () => new Response("API") },
+      MESHRMM_API: { fetch: apiFetch },
     },
     { waitUntil() {}, passThroughOnException() {} },
   );
 }
+
+test("invitation broker returns the company redirect to the browser without following it in the API", async () => {
+  const destination = "https://acme.meshrmm.com/login?invitation_token=test-invitation";
+  const response = await render("/login?invitation_token=test-invitation", "auth.meshrmm.com", null, {}, async (request) => {
+    assert.equal(request.url, "https://auth.meshrmm.com/v1/auth/invitations/resolve?invitation_token=test-invitation");
+    // Model service-binding fetch: automatic redirect following would route
+    // the company /login request to the API instead of the dashboard.
+    return request.redirect === "manual"
+      ? new Response(null, { status: 302, headers: { Location: destination, "Cache-Control": "no-store" } })
+      : Response.json({ error: "route not found" }, { status: 404 });
+  });
+  assert.equal(response.status, 302);
+  assert.equal(response.headers.get("location"), destination);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+});
 
 test("tenant routing preserves the authentication POST body", async () => {
   const response = await render("/auth/login", "acme.meshrmm.com", {

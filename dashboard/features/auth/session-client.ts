@@ -16,7 +16,11 @@ export async function authRequest<T>(path: string, body: unknown = {}): Promise<
     body: JSON.stringify(body),
   });
   if (response.status === 401) throw new LoginRequiredError("Your session has expired. Please sign in again.");
-  if (!response.ok) throw new Error("Session service is unavailable. Please retry.");
+  if (!response.ok) {
+    if (response.status === 400) throw new Error("Sign-in expired or could not be verified. Please sign in again.");
+    if (response.status === 403) throw new Error("You do not have access to this company. Accept its invitation from your email using the invited account, then sign in again.");
+    throw new Error("Session service is unavailable. Please retry.");
+  }
   return response.json() as Promise<T>;
 }
 
