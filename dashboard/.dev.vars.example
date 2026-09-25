@@ -1,0 +1,7 @@
+# Copy to .dev.vars for `npm run dev`; .dev.vars is ignored and never deployed.
+# Serves localhost, admin.localhost and <slug>.localhost like the production hosts.
+MESHRMM_DEV_ROOT_DOMAIN=localhost
+# Any 32 random bytes, base64-encoded: openssl rand -base64 32
+DASHBOARD_SESSION_KEY=
+# Client ID of a WorkOS staging environment (never production's).
+WORKOS_CLIENT_ID=

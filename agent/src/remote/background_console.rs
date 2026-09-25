@@ -17,7 +17,11 @@ use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Console::*;
 use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 use windows::core::{BOOL, w};
+
+/// How often the helper checks whether any program still uses its console.
+const CONSOLE_WATCH_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Serialize, Deserialize)]
 enum ConsoleCommand {
@@ -116,6 +120,17 @@ impl ConsoleInput {
         let _ = self.send(ConsoleCommand::Release);
     }
 
+    /// Whether the helper has exited or its console window has closed.
+    pub fn finished(&mut self) -> bool {
+        !matches!(self.child.try_wait(), Ok(None))
+            || !unsafe { IsWindow(Some(self.window)) }.as_bool()
+    }
+
+    #[cfg(test)]
+    pub fn helper_process_id(&self) -> u32 {
+        self.child.id()
+    }
+
     fn send(&self, command: ConsoleCommand) -> anyhow::Result<()> {
         self.sender
             .as_ref()
@@ -148,7 +163,7 @@ pub fn run_child() -> anyhow::Result<()> {
     }
     anyhow::ensure!(session == 0, "console input must stay in Session 0");
     // Command's redirected handles are retained explicitly before attachment.
-    // This helper creates no threads and restores the handles before any I/O.
+    // No other thread runs until the handles are restored, before any I/O.
     let handles = unsafe {
         [
             GetStdHandle(STD_INPUT_HANDLE)?,
@@ -204,6 +219,23 @@ fn run_console_commands(input: HANDLE) -> anyhow::Result<()> {
         unsafe { GetConsoleWindow() }.0 as usize
     )?;
     std::io::stdout().flush()?;
+    // This helper's attachment alone keeps the console, and its window, open. Once
+    // no other program uses it, as after `exit`, detach so the console closes.
+    std::thread::Builder::new()
+        .name("meshrmm-console-watch".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(CONSOLE_WATCH_INTERVAL);
+                let mut processes = [0_u32; 2];
+                if unsafe { GetConsoleProcessList(&mut processes) } <= 1 {
+                    unsafe {
+                        let _ = FreeConsole();
+                    }
+                    std::process::exit(0);
+                }
+            }
+        })
+        .context("could not watch the background console")?;
     let mut keyboard = ConsoleKeyboard {
         input,
         keys: [0; 256],

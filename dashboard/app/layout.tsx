@@ -3,22 +3,29 @@ import { Geist, Geist_Mono } from "next/font/google";
 import { headers } from "next/headers";
 import "./globals.css";
 import Providers from "./providers";
+import { classifyHost } from "../lib/hosts";
 
 const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
 const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
+
+// The local dev server serves localhost and *.localhost over plain HTTP.
+function defaultProtocol(hostname: string) {
+  return hostname === "localhost" || hostname.endsWith(".localhost") ? "http" : "https";
+}
 
 export async function generateMetadata(): Promise<Metadata> {
   const incoming = await headers();
   const host = incoming.get("host") ?? incoming.get("x-forwarded-host") ?? "localhost:3000";
   const hostname = host.split(":")[0].toLowerCase();
-  const protocol = incoming.get("x-forwarded-proto") ?? (host.startsWith("localhost") ? "http" : "https");
+  const protocol = incoming.get("x-forwarded-proto") ?? defaultProtocol(hostname);
   const image = `${protocol}://${host}/og.png`;
-  const title = hostname === "meshrmm.com"
+  const { surface } = classifyHost(hostname, process.env.MESHRMM_DEV_ROOT_DOMAIN);
+  const title = surface === "marketing"
     ? "MeshRMM | Secure remote monitoring"
-    : hostname === "admin.meshrmm.com"
+    : surface === "platform"
       ? "Platform Admin | MeshRMM"
       : "Devices | MeshRMM";
-  const description = hostname === "meshrmm.com"
+  const description = surface === "marketing"
     ? "Company-isolated remote monitoring and management with secure endpoint access."
     : "Monitor connected agents and launch secure remote desktop sessions from MeshRMM.";
   return {
@@ -33,13 +40,10 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
   const incoming = await headers();
   const rawHost = incoming.get("host") ?? incoming.get("x-forwarded-host") ?? "localhost:3000";
   const hostname = rawHost.split(":")[0].toLowerCase();
-  const protocol = incoming.get("x-forwarded-proto") ?? (hostname === "localhost" ? "http" : "https");
+  const protocol = incoming.get("x-forwarded-proto") ?? defaultProtocol(hostname);
   const origin = `${protocol}://${rawHost}`;
-  const surface = hostname === "meshrmm.com"
-    ? "marketing"
-    : hostname === "admin.meshrmm.com"
-      ? "platform"
-      : "tenant";
+  const host = classifyHost(hostname, process.env.MESHRMM_DEV_ROOT_DOMAIN);
+  const surface = host.surface === "marketing" || host.surface === "platform" ? host.surface : "tenant";
   const serverUrl = process.env.MESHRMM_SERVER_URL || origin;
   return (
     <html lang="en">

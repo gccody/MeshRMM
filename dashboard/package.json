@@ -7,8 +7,10 @@
   },
   "scripts": {
     "dev": "vinext dev",
+    "dev:seed": "node scripts/seed-local.mjs",
     "build": "vinext build",
     "start": "vinext start",
+    "predeploy": "node ../scripts/verify-dashboard-deploy.mjs",
     "deploy": "vinext-cloudflare deploy",
     "deploy:dry-run": "vinext-cloudflare deploy --dry-run",
     "test": "npm run build && node --experimental-strip-types --test tests/*.test.mjs",

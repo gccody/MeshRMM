@@ -12,6 +12,95 @@ def sql(file, prefix):
     return next(query for query in re.findall(r'"([^"\n]+)"', source) if query.startswith(prefix))
 
 
+SQL_START = re.compile(r"\s*(SELECT|INSERT|UPDATE|DELETE|WITH|REPLACE)\b")
+
+
+def shipped_sql():
+    """Every SQL string literal in the Worker's source, with where it appears."""
+    for path in sorted((ROOT / "server/src").rglob("*.rs")):
+        source = path.read_text()
+        for match in re.finditer(r'"((?:[^"\\\n]|\\.)*)"', source):
+            if SQL_START.match(match.group(1)):
+                line = source.count("\n", 0, match.start()) + 1
+                yield f"{path.relative_to(ROOT)}:{line}", match.group(1)
+
+
+def migrated_database():
+    db = sqlite3.connect(":memory:", isolation_level=None)
+    for migration in sorted((ROOT / "server/migrations").glob("*.sql")):
+        db.executescript(migration.read_text())
+    # Wrangler creates this table when it applies migrations; /healthz reads it.
+    db.execute("CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL)")
+    return db
+
+
+class ShippedSqlTests(unittest.TestCase):
+    """Compiles each query against the migrated schema, so a query naming a column or table a
+    migration never created fails here instead of in production."""
+
+    def compile(self, db, query):
+        numbered = [int(number) for number in re.findall(r"\?(\d+)", query)]
+        count = max(numbered) if numbered else len(re.findall(r"\?(?!\d)", query))
+        db.execute(f"EXPLAIN {query}", (None,) * count)
+
+    def test_every_query_compiles_against_the_migrated_schema(self):
+        db = migrated_database()
+        queries = list(shipped_sql())
+        self.assertGreater(len(queries), 50)
+        for location, query in queries:
+            with self.subTest(location=location):
+                try:
+                    self.compile(db, query)
+                except sqlite3.Error as error:
+                    self.fail(f"{location}: {error}\n{query}")
+
+    def test_a_query_naming_a_missing_column_fails(self):
+        db = migrated_database()
+        with self.assertRaises(sqlite3.OperationalError):
+            self.compile(db, "SELECT no_such_column FROM companies WHERE id = ?1")
+
+
+class CompanyProvisioningTests(unittest.TestCase):
+    def setUp(self):
+        self.db = sqlite3.connect(":memory:", isolation_level=None)
+        for migration in sorted((ROOT / "server/migrations").glob("*.sql")):
+            self.db.executescript(migration.read_text())
+        platform = "server/src/routes/platform.rs"
+        self.retry = sql(platform, "UPDATE companies SET status = 'provisioning'")
+        self.complete = sql(platform, "UPDATE companies SET status = ?1, provisioning_error = NULL")
+        self.fail = sql(platform, "UPDATE companies SET status = 'failed'")
+
+    def company(self, status):
+        self.db.execute("DELETE FROM companies")
+        self.db.execute("INSERT INTO companies (id,name,created_at,slug,status) VALUES ('co','Company',0,'acme',?)", (status,))
+
+    def status(self):
+        return self.db.execute("SELECT status FROM companies WHERE id='co'").fetchone()[0]
+
+    def test_retry_is_limited_to_unfinished_provisioning(self):
+        for status, claimed in [("provisioning", 1), ("failed", 1), ("active", 0), ("awaiting_admin", 0), ("suspended", 0)]:
+            self.company(status)
+            self.assertEqual(self.db.execute(self.retry, (5, "co")).rowcount, claimed, status)
+            self.assertEqual(self.status(), "provisioning" if claimed else status)
+
+    def test_provisioning_outcomes_keep_a_status_set_meanwhile(self):
+        for status in ["suspended", "active", "awaiting_admin"]:
+            self.company(status)
+            self.db.execute(self.complete, ("active" if status != "active" else "awaiting_admin", 5, "co"))
+            self.assertEqual(self.status(), status)
+            self.db.execute(self.fail, ("WorkOS error", 5, "co"))
+            self.assertEqual(self.status(), status)
+
+    def test_provisioning_outcomes_apply_to_unfinished_companies(self):
+        for status in ["provisioning", "failed"]:
+            self.company(status)
+            self.db.execute(self.complete, ("awaiting_admin", 5, "co"))
+            self.assertEqual(self.status(), "awaiting_admin")
+            self.company(status)
+            self.db.execute(self.fail, ("WorkOS error", 5, "co"))
+            self.assertEqual(self.db.execute("SELECT status, provisioning_error FROM companies").fetchone(), ("failed", "WorkOS error"))
+
+
 class EnrollmentTests(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(":memory:", isolation_level=None)
@@ -31,6 +120,17 @@ class EnrollmentTests(unittest.TestCase):
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+
+    def test_agents_a_company_can_enroll_stay_connected(self):
+        self.db.execute("UPDATE companies SET status='awaiting_admin'")
+        self.redeem()
+        revoke = sql("server/src/agent_coordinator.rs", "SELECT 1 AS active FROM companies")
+        connect = sql("server/src/lib.rs", "SELECT 1 AS allowed FROM companies")
+        device = sql("server/src/infrastructure.rs", "SELECT 1 AS allowed FROM agents a JOIN companies")
+        for status, allowed in [("awaiting_admin", True), ("active", True), ("suspended", False)]:
+            self.db.execute("UPDATE companies SET status=?", (status,))
+            for query, argument in [(revoke, "co"), (connect, "co"), (device, "device")]:
+                self.assertEqual(self.db.execute(query, (argument,)).fetchone() is not None, allowed, (status, query))
 
     def test_catalog_outbox_commits_with_changes_and_coalesces_without_losing_newer_edits(self):
         self.redeem()
@@ -143,14 +243,47 @@ class EnrollmentTests(unittest.TestCase):
             row = self.db.execute(redeem, (1, token, "co")).fetchone()
             self.assertEqual(row[3], int(mode))
 
+    def rotation_sql(self):
+        coordinator = "server/src/agent_coordinator.rs"
+        return (
+            sql(coordinator, "SELECT pending_auth_token_hash FROM agents"),
+            sql(coordinator, "UPDATE agents SET pending_auth_token_hash = ?1"),
+            sql(coordinator, "UPDATE agents SET pending_auth_token_hash = NULL"),
+            sql("server/src/lib.rs", "UPDATE agents SET auth_token_hash = ?1, pending_auth_token_hash = NULL"),
+        )
+
+    def credentials(self):
+        return self.db.execute("SELECT auth_token_hash,pending_auth_token_hash FROM agents").fetchone()
+
     def test_rotation_stages_without_disabling_current_credential(self):
         self.redeem()
-        query = sql("server/src/routes/agents.rs", "UPDATE agents SET pending_auth_token_hash")
-        self.db.execute(query, ("c" * 64, 2, "device", "co"))
-        self.assertEqual(self.db.execute("SELECT auth_token_hash,pending_auth_token_hash FROM agents").fetchone(), ("b" * 64, "c" * 64))
-        self.db.execute(query, ("d" * 64, 3, "device", "co"))
-        self.assertEqual(self.db.execute("SELECT pending_auth_token_hash FROM agents").fetchone(), ("c" * 64,))
+        state, stage, _, _ = self.rotation_sql()
+        self.assertEqual(self.db.execute(state, ("device", "co")).fetchone(), (None,))
+        self.assertEqual(self.db.execute(stage, ("c" * 64, 2, "device", "co", None)).rowcount, 1)
+        self.assertEqual(self.credentials(), ("b" * 64, "c" * 64))
+        # Staging expects the pending hash it read, so a concurrent change wins.
+        self.assertEqual(self.db.execute(stage, ("d" * 64, 3, "device", "co", None)).rowcount, 0)
+        self.assertEqual(self.db.execute(stage, ("d" * 64, 3, "device", "other", "c" * 64)).rowcount, 0)
+        self.assertEqual(self.credentials(), ("b" * 64, "c" * 64))
+        # A pending hash that was never sent can be replaced.
+        self.assertEqual(self.db.execute(stage, ("d" * 64, 3, "device", "co", "c" * 64)).rowcount, 1)
+        self.assertEqual(self.credentials(), ("b" * 64, "d" * 64))
+        self.db.execute("UPDATE agents SET deletion_requested_at=1")
+        self.assertIsNone(self.db.execute(state, ("device", "co")).fetchone())
+        self.assertEqual(self.db.execute(stage, ("e" * 64, 4, "device", "co", "d" * 64)).rowcount, 0)
 
+    def test_undelivered_rotation_is_withdrawn_only_while_still_pending(self):
+        self.redeem()
+        _, stage, withdraw, promote = self.rotation_sql()
+        self.db.execute(stage, ("c" * 64, 2, "device", "co", None))
+        self.assertEqual(self.db.execute(withdraw, ("device", "d" * 64)).rowcount, 0)
+        self.assertEqual(self.db.execute(withdraw, ("device", "c" * 64)).rowcount, 1)
+        self.assertEqual(self.credentials(), ("b" * 64, None))
+        # After promotion there is nothing left to withdraw.
+        self.db.execute(stage, ("c" * 64, 3, "device", "co", None))
+        self.assertEqual(self.db.execute(promote, ("c" * 64, "device")).rowcount, 1)
+        self.assertEqual(self.db.execute(withdraw, ("device", "c" * 64)).rowcount, 0)
+        self.assertEqual(self.credentials(), ("c" * 64, None))
 
 if __name__ == "__main__":
     unittest.main()

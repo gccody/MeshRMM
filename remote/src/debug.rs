@@ -3,6 +3,35 @@ use std::time::{Duration, Instant};
 
 use meshrmm_protocol::Codec;
 
+/// Periodic statistics refresh the diagnostics overlay every two seconds but
+/// reach the log only this often, so a long session does not fill it.
+const STATISTICS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Says when periodic statistics are next due in the log: at once, then every
+/// [`STATISTICS_LOG_INTERVAL`].
+pub struct StatisticsLog {
+    next: Instant,
+}
+impl Default for StatisticsLog {
+    fn default() -> Self {
+        Self {
+            next: Instant::now(),
+        }
+    }
+}
+impl StatisticsLog {
+    pub fn due(&mut self) -> bool {
+        self.due_at(Instant::now())
+    }
+    fn due_at(&mut self, now: Instant) -> bool {
+        if now < self.next {
+            return false;
+        }
+        self.next = now + STATISTICS_LOG_INTERVAL;
+        true
+    }
+}
+
 #[derive(Clone)]
 pub struct DebugInfo {
     state: Arc<Mutex<DebugState>>,
@@ -336,5 +365,16 @@ mod tests {
         assert!(text.contains("Bandwidth: receive=-- available=--"));
         assert!(text.contains("FPS:"));
         assert!(text.contains("Drops:"));
+    }
+
+    #[test]
+    fn statistics_are_logged_at_once_then_every_thirty_seconds() {
+        let start = Instant::now();
+        let mut log = StatisticsLog { next: start };
+        assert!(log.due_at(start));
+        assert!(!log.due_at(start + Duration::from_secs(2)));
+        assert!(!log.due_at(start + STATISTICS_LOG_INTERVAL - Duration::from_millis(1)));
+        assert!(log.due_at(start + STATISTICS_LOG_INTERVAL));
+        assert!(!log.due_at(start + STATISTICS_LOG_INTERVAL + Duration::from_secs(2)));
     }
 }

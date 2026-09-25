@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr;
@@ -29,7 +29,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, ReleaseCapture, SetCapture, SetFocus, VK_F8, VK_F12,
+    EnableWindow, ReleaseCapture, SetCapture, SetFocus,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, Interface, PCWSTR, w};
@@ -37,6 +37,7 @@ use windows::core::{HSTRING, Interface, PCWSTR, w};
 use super::ControlSink;
 use crate::debug::DebugInfo;
 
+mod keyboard_hook;
 mod pipeline;
 mod renderer;
 mod window;
@@ -64,6 +65,7 @@ struct Shared {
     agent_pointer_display: Mutex<Option<Option<meshrmm_protocol::DisplayId>>>,
     ready: Condvar,
     stopping: AtomicBool,
+    reconnecting: AtomicBool,
     running: AtomicBool,
     failure: Mutex<Option<String>>,
     replaced_frames: AtomicU64,
@@ -91,6 +93,7 @@ impl Presenter {
             agent_pointer_display: Mutex::new(None),
             ready: Condvar::new(),
             stopping: AtomicBool::new(false),
+            reconnecting: AtomicBool::new(false),
             running: AtomicBool::new(false),
             failure: Mutex::new(None),
             replaced_frames: AtomicU64::new(0),
@@ -179,6 +182,13 @@ impl Presenter {
     /// The window pump already refreshes controls without waiting for frames.
     pub fn refresh_controls(&self) {}
 
+    /// Marks the window as waiting for the connection to be restored.
+    pub fn set_reconnecting(&self, reconnecting: bool) {
+        self.shared
+            .reconnecting
+            .store(reconnecting, Ordering::Release);
+    }
+
     pub fn set_cursor_shape(&self, shape: CursorShape) {
         if let Ok(mut pending) = self.shared.cursor_shape.lock() {
             *pending = Some(shape);
@@ -243,8 +253,23 @@ fn run_worker(
     };
 
     let mut decoder_blocked_since = None::<std::time::Instant>;
+    let mut reconnecting = false;
     while !shared.stopping.load(Ordering::Acquire) {
         if unsafe { pump_window_messages(pipeline.window()) } {
+            break;
+        }
+        let wanted = shared.reconnecting.load(Ordering::Acquire);
+        if wanted != reconnecting {
+            reconnecting = wanted;
+            unsafe { window::set_reconnecting(pipeline.window(), reconnecting) };
+        }
+        if let Some(layout) = unsafe { window::take_resize(pipeline.window()) }
+            && let Err(error) = unsafe { pipeline.resize(&layout) }
+        {
+            tracing::error!(error = %error, "viewer swap chain resize failed");
+            if let Ok(mut failure) = shared.failure.lock() {
+                *failure = Some(error.to_string());
+            }
             break;
         }
         if let Some(display_id) = shared
@@ -340,6 +365,57 @@ fn run_worker(
     shared.running.store(false, Ordering::Release);
 }
 
+/// Opts the viewer into per-monitor DPI awareness so Windows does not
+/// bitmap-stretch its window, and pointer coordinates are physical pixels.
+/// Must run before the first window is created.
+pub fn enable_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    };
+    if let Err(error) =
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+    {
+        // Access denied means a manifest or an earlier call already set it.
+        tracing::debug!(%error, "could not set per-monitor DPI awareness");
+    }
+}
+
+/// Attaches to the console of the process that started the viewer, if any,
+/// so command-line output reaches a terminal despite the GUI subsystem.
+pub fn attach_parent_console() {
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // Fails when started from Explorer or a browser, which have no console.
+    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+/// Shows a notice after the session, such as where a recording was saved.
+pub fn show_notice(title: &str, message: &str) {
+    let title = HSTRING::from(title);
+    let text = HSTRING::from(message);
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+        )
+    };
+}
+
+/// Shows why the viewer stopped. Without a console, this is the only place
+/// a fatal error appears apart from the log.
+pub fn show_fatal_error(message: &str) {
+    let text = HSTRING::from(message);
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            w!("MeshRMM Remote"),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        )
+    };
+}
+
 pub fn monotonic_timestamp_us() -> u64 {
     unsafe {
         let mut counter = 0_i64;
@@ -351,10 +427,37 @@ pub fn monotonic_timestamp_us() -> u64 {
         {
             return 0;
         }
-        (counter as u64).saturating_mul(1_000_000) / frequency as u64
+        counter_to_us(counter as u64, frequency as u64)
     }
+}
+
+/// Converts QPC ticks to microseconds without overflowing the intermediate
+/// product, which a u64 would after ~21 days of uptime at 10 MHz.
+fn counter_to_us(counter: u64, frequency: u64) -> u64 {
+    u64::try_from(u128::from(counter) * 1_000_000 / u128::from(frequency)).unwrap_or(u64::MAX)
 }
 
 pub fn supported_video_profiles(format: VideoFormat) -> Vec<VideoProfile> {
     unsafe { pipeline::supported_video_profiles(format) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::counter_to_us;
+
+    #[test]
+    fn converts_performance_counter_past_u64_product_range() {
+        const FREQUENCY: u64 = 10_000_000;
+        // 30 days of uptime: counter * 1_000_000 no longer fits in a u64.
+        let counter = 30 * 24 * 60 * 60 * FREQUENCY + 12_345;
+        assert!(counter.checked_mul(1_000_000).is_none());
+        assert_eq!(counter_to_us(counter, FREQUENCY), 2_592_000_001_234);
+        assert_eq!(
+            counter_to_us(counter + FREQUENCY, FREQUENCY) - counter_to_us(counter, FREQUENCY),
+            1_000_000
+        );
+        assert_eq!(counter_to_us(u64::MAX, FREQUENCY), u64::MAX / 10);
+        assert_eq!(counter_to_us(u64::MAX, 1), u64::MAX);
+        assert_eq!(counter_to_us(3, 3_000_000), 1);
+    }
 }

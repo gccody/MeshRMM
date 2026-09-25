@@ -24,7 +24,7 @@ impl Theme {
 <dependency><dependentAssembly><assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/></dependentAssembly></dependency>
 </assembly>"#)?;
         drop(file);
-        let path = super::wide(&manifest.to_string_lossy());
+        let path = super::wide(&*manifest.to_string_lossy());
         let result = unsafe {
             CreateActCtxW(&ACTCTXW {
                 cbSize: std::mem::size_of::<ACTCTXW>() as u32,

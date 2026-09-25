@@ -3,9 +3,10 @@ use anyhow::{Context, bail, ensure};
 use meshrmm_protocol::{FILE_CHUNK_BYTES, FileDestination, FileMessage};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
-    path::PathBuf,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -27,10 +28,55 @@ pub fn clipboard_has_files() -> bool {
     native::clipboard_files().is_ok_and(|paths| !paths.is_empty())
 }
 
+/// Folder, under Documents or the cache, that receives transferred files.
+const TRANSFER_FOLDER: &str = "MeshRMM Transferred Files";
+/// Clipboard copies (automatic sync and explicit paste) stay small; larger
+/// files go through Send/Receive files or a drop instead.
+pub const CLIPBOARD_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+/// Upper bound for one Documents or drop transfer.
+pub const TRANSFER_LIMIT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Free space a transfer must leave on the receiving volume.
+const FREE_SPACE_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
+/// A peer's files are accepted into Documents this long after asking for them.
+const PEER_PICK_WINDOW: Duration = Duration::from_secs(15 * 60);
+/// The ID of the agent's [`FileMessage::Error`] saying a requested pick sent nothing, which closes
+/// the viewer's request. Transfer IDs are timestamps, so none is 0, and earlier viewers ignore
+/// errors for transfers they do not know.
+const PEER_PICK_ID: u64 = 0;
+/// Transfer messages, mostly [`FILE_CHUNK_BYTES`] chunks, a sender keeps
+/// unacknowledged. The file channel holds at most 64 KiB unacknowledged by
+/// SCTP (see `meshrmm_session_transport::ServiceChannel::writable`), so this
+/// covers that plus the receiver's queues. Earlier receivers queue 32
+/// commands, which leaves room for their acknowledgements and local requests.
+const SEND_WINDOW: usize = 16;
+/// Commands a worker queues: a window of the peer's transfer, the
+/// acknowledgements for its own, and local requests.
+pub const COMMAND_QUEUE: usize = 64;
+/// Interrupted transfers leave `.partial-*` folders; untouched ones are removed.
+const STALE_PARTIAL_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Clipboard and drop copies live in the cache while an app may still read them.
+const CACHE_BATCH_AGE: Duration = Duration::from_secs(60 * 60);
+/// Receipts sweep the cache at most this often, since walking it can take a while and batches
+/// only expire after [`CACHE_BATCH_AGE`].
+const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Which end of a session a worker serves. The agent follows the viewer's
+/// requests. The viewer never opens its own picker for the peer and saves only
+/// the files it asked for, so a compromised endpoint cannot push files onto the
+/// technician's machine or make it upload local files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Viewer,
+    Agent,
+}
+
 pub enum Command {
     Peer(FileMessage),
     Send(Vec<PathBuf>, FileDestination),
+    /// Choose local files and send them to the peer's Documents folder.
     Pick,
+    /// Ask the peer to choose files and send them to this side's Documents folder.
+    RequestPeerPick,
 }
 #[derive(Clone)]
 struct OutgoingFiles {
@@ -53,19 +99,19 @@ pub struct TransferSession {
     ready: Arc<tokio::sync::Notify>,
     clipboard_enabled: fn() -> bool,
 }
-impl Default for TransferSession {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 impl TransferSession {
-    pub fn new() -> Self {
-        Self::with_clipboard_policy(|| true)
+    /// The endpoint's worker, which answers the viewer's pick requests.
+    pub fn agent() -> Self {
+        Self::spawn(Role::Agent, || true)
     }
-    /// Clipboard file copies are skipped, not sent, and rejected on receipt
-    /// while `clipboard_enabled` returns false; other transfers are unaffected.
-    pub fn with_clipboard_policy(clipboard_enabled: fn() -> bool) -> Self {
-        let (tx, commands) = mpsc::sync_channel(32);
+    /// The technician's worker. Clipboard file copies are skipped, not sent,
+    /// and rejected on receipt while `clipboard_enabled` returns false; other
+    /// transfers are unaffected.
+    pub fn viewer(clipboard_enabled: fn() -> bool) -> Self {
+        Self::spawn(Role::Viewer, clipboard_enabled)
+    }
+    fn spawn(role: Role, clipboard_enabled: fn() -> bool) -> Self {
+        let (tx, commands) = mpsc::sync_channel(COMMAND_QUEUE);
         let (sender, rx) = mpsc::sync_channel(8);
         let ready = Arc::new(tokio::sync::Notify::new());
         let out = OutgoingFiles {
@@ -74,7 +120,7 @@ impl TransferSession {
         };
         let status = Arc::new(Mutex::new("Waiting for file-transfer support…".into()));
         let worker_status = status.clone();
-        std::thread::spawn(move || worker(commands, out, worker_status, clipboard_enabled));
+        std::thread::spawn(move || worker(role, commands, out, worker_status, clipboard_enabled));
         Self {
             tx,
             rx: Arc::new(Mutex::new(rx)),
@@ -83,12 +129,13 @@ impl TransferSession {
             clipboard_enabled,
         }
     }
-    /// Run native OLE operations on a dedicated helper's main thread while its
-    /// pipe transport runs separately and remains responsive to cancellation.
+    /// Run an agent worker's native OLE operations on a dedicated helper's main
+    /// thread while its pipe transport runs separately and remains responsive
+    /// to cancellation.
     pub fn run_on_current_thread<T: Send + 'static>(
         client: impl FnOnce(Self) -> T + Send + 'static,
     ) -> T {
-        let (tx, commands) = mpsc::sync_channel(32);
+        let (tx, commands) = mpsc::sync_channel(COMMAND_QUEUE);
         let (sender, rx) = mpsc::sync_channel(8);
         let ready = Arc::new(tokio::sync::Notify::new());
         let out = OutgoingFiles {
@@ -104,7 +151,7 @@ impl TransferSession {
             clipboard_enabled: || true,
         };
         let transport = std::thread::spawn(move || client(session));
-        worker(commands, out, status, || true);
+        worker(Role::Agent, commands, out, status, || true);
         transport.join().expect("file transport thread panicked")
     }
     pub fn command(&self, command: Command) {
@@ -131,6 +178,9 @@ impl TransferSession {
     }
     pub fn pick(&self) {
         self.command(Command::Pick);
+    }
+    pub fn request_peer_pick(&self) {
+        self.command(Command::RequestPeerPick);
     }
     pub fn outgoing_ready(&self) -> Arc<tokio::sync::Notify> {
         self.ready.clone()
@@ -160,7 +210,69 @@ fn id() -> u64 {
     now.max(previous + 1)
 }
 
+/// Decides which of the peer's requests this side acts on.
+struct Admission {
+    role: Role,
+    /// When this side asked the peer to pick files, oldest first.
+    peer_picks: VecDeque<Instant>,
+}
+impl Admission {
+    fn new(role: Role) -> Self {
+        Self {
+            role,
+            peer_picks: VecDeque::new(),
+        }
+    }
+    fn request_peer_pick(&mut self, now: Instant) {
+        if self.peer_picks.len() == 4 {
+            self.peer_picks.pop_front();
+        }
+        self.peer_picks.push_back(now);
+    }
+    /// The peer answered the oldest request without sending files, or with files this side
+    /// rejected, so that request no longer admits a transfer.
+    fn close_peer_pick(&mut self) {
+        self.peer_picks.pop_front();
+    }
+    /// Only the agent opens a file picker for its peer.
+    fn allows_peer_pick(&self) -> bool {
+        self.role == Role::Agent
+    }
+    fn admit(
+        &mut self,
+        destination: &FileDestination,
+        clipboard_enabled: bool,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        let clipboard = matches!(
+            destination,
+            FileDestination::Clipboard | FileDestination::ClipboardPaste { .. }
+        );
+        if clipboard && !clipboard_enabled {
+            return Err("Clipboard file transfers are disabled");
+        }
+        if self.role == Role::Agent {
+            return Ok(());
+        }
+        match destination {
+            FileDestination::Clipboard => Ok(()),
+            FileDestination::Documents => {
+                self.peer_picks
+                    .retain(|requested| now.duration_since(*requested) < PEER_PICK_WINDOW);
+                self.peer_picks
+                    .pop_front()
+                    .map(drop)
+                    .ok_or("Files are accepted only after you choose Receive files")
+            }
+            FileDestination::ClipboardPaste { .. } | FileDestination::Drop { .. } => {
+                Err("The viewer does not accept pasted or dropped files")
+            }
+        }
+    }
+}
+
 fn worker(
+    role: Role,
     commands: mpsc::Receiver<Command>,
     out: OutgoingFiles,
     status: Arc<Mutex<String>>,
@@ -173,21 +285,56 @@ fn worker(
             return;
         }
     };
+    sweep_transfer_folders();
     let _ = out.send(FileMessage::Available);
+    let mut admission = Admission::new(role);
     let mut incoming: Option<Incoming> = None;
+    // Transfers rejected or failed here, whose in-flight messages are dropped.
+    let mut ended = VecDeque::new();
     let mut progress: Option<native::Progress> = None;
     let mut progress_updated = Instant::now();
     let mut sender: Option<(u64, mpsc::SyncSender<bool>)> = None;
     let mut sender_thread: Option<std::thread::JoinHandle<()>> = None;
-    let mut pending = std::collections::VecDeque::new();
+    let mut pending = VecDeque::new();
     let mut available = false;
     let mut last_clipboard_sequence = native::clipboard_sequence();
+    // The sweep at startup covered the cache.
+    let mut last_cache_sweep = Instant::now();
     let mut poll = Instant::now();
     loop {
         let command = match commands.recv_timeout(Duration::from_millis(20)) {
             Ok(c) => Some(c),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(_) => None,
+        };
+        let command = match command {
+            Some(Command::Peer(FileMessage::Begin { id, destination })) => {
+                // Rejecting a new transfer leaves the one in progress intact.
+                let admitted = if incoming.is_some() {
+                    if destination == FileDestination::Documents {
+                        admission.close_peer_pick();
+                    }
+                    Err("Another transfer is in progress")
+                } else {
+                    admission.admit(&destination, clipboard_enabled(), Instant::now())
+                };
+                match admitted {
+                    Ok(()) => Some(Command::Peer(FileMessage::Begin { id, destination })),
+                    Err(reason) => {
+                        tracing::info!(id, ?destination, reason, "rejected file transfer");
+                        end_transfer(&mut ended, id);
+                        if role == Role::Viewer && destination != FileDestination::Clipboard {
+                            *status.lock().unwrap() = reason.into();
+                        }
+                        let reason = reason.into();
+                        if out.send(FileMessage::Error { id, reason }).is_err() {
+                            break;
+                        }
+                        None
+                    }
+                }
+            }
+            command => command,
         };
         let mut send = None;
         match command {
@@ -202,6 +349,16 @@ fn worker(
                     }
                 }
             }
+            Some(Command::RequestPeerPick) => {
+                if !available {
+                    *status.lock().unwrap() = "Waiting for file-transfer support…".into();
+                } else {
+                    admission.request_peer_pick(Instant::now());
+                    if out.send(FileMessage::Pick).is_err() {
+                        break;
+                    }
+                }
+            }
             Some(Command::Send(paths, destination)) => {
                 if available {
                     send = Some((paths, destination));
@@ -211,16 +368,41 @@ fn worker(
                 available = true;
                 *status.lock().unwrap() = "Ready".into();
             }
+            Some(Command::Peer(FileMessage::Pick)) if !admission.allows_peer_pick() => {
+                tracing::warn!("ignored a request to pick local files for the remote device");
+            }
             Some(Command::Peer(FileMessage::Pick)) => {
-                if available {
+                let picked = if !available {
+                    Err("File transfers are not ready".to_owned())
+                } else {
                     match native::pick() {
-                        Ok(paths) => send = Some((paths, FileDestination::Documents)),
+                        Ok(paths) if paths.is_empty() => Err("No files were chosen".to_owned()),
+                        Ok(paths) => Ok(paths),
                         Err(error) => {
                             tracing::warn!(%error, "file picker failed");
                             *status.lock().unwrap() = format!("File picker failed: {error:#}");
+                            Err(format!("File picker failed: {error:#}"))
+                        }
+                    }
+                };
+                match picked {
+                    Ok(paths) => send = Some((paths, FileDestination::Documents)),
+                    Err(reason) => {
+                        let reply = FileMessage::Error {
+                            id: PEER_PICK_ID,
+                            reason,
+                        };
+                        if out.send(reply).is_err() {
+                            break;
                         }
                     }
                 }
+            }
+            Some(Command::Peer(FileMessage::Error { id, reason }))
+                if id == PEER_PICK_ID && role == Role::Viewer =>
+            {
+                admission.close_peer_pick();
+                *status.lock().unwrap() = format!("No files received: {reason}");
             }
             Some(Command::Peer(FileMessage::Ack { id })) => {
                 if let Some((active, tx)) = &sender
@@ -246,21 +428,13 @@ fn worker(
                     progress = None;
                 }
             }
-            Some(Command::Peer(FileMessage::Begin {
-                id,
-                destination: FileDestination::Clipboard | FileDestination::ClipboardPaste { .. },
-            })) if !clipboard_enabled() => {
-                tracing::info!(id, "clipboard sync is off; rejected file transfer");
-                let reason = "Clipboard file transfers are disabled".into();
-                if out.send(FileMessage::Error { id, reason }).is_err() {
-                    break;
-                }
-            }
+            // A sender has a window of messages in flight when it learns its
+            // transfer failed; answering each would only repeat the error.
+            Some(Command::Peer(message)) if ended.contains(&message_id(&message)) => {}
             Some(Command::Peer(message)) => {
                 let packet_id = message_id(&message);
                 let result = (|| -> anyhow::Result<()> {
                     if let FileMessage::Begin { id, destination } = message {
-                        ensure!(incoming.is_none(), "another transfer is in progress");
                         tracing::info!(id, ?destination, "receiving file transfer");
                         let storage = if destination == FileDestination::Documents {
                             native::documents()?
@@ -299,10 +473,20 @@ fn worker(
                                             false
                                         });
                                     if !accepted {
-                                        commit_documents(paths, native::documents()?)?;
+                                        commit_documents(paths.clone(), native::documents()?)?;
+                                        remove_batch(&paths);
                                     }
                                 }
                                 FileDestination::Documents => {}
+                            }
+                            if state.destination != FileDestination::Documents
+                                && last_cache_sweep.elapsed() >= CACHE_SWEEP_INTERVAL
+                            {
+                                last_cache_sweep = Instant::now();
+                                // Off this thread, which acknowledges the peer's transfers.
+                                let base = state.base.clone();
+                                let keep = native::clipboard_files().unwrap_or_default();
+                                std::thread::spawn(move || sweep_cache(&base, &keep));
                             }
                             tracing::info!(id = packet_id, "file transfer received and verified");
                             *status.lock().unwrap() = "Transfer complete".into();
@@ -331,7 +515,9 @@ fn worker(
                     Err(e) => {
                         incoming = None;
                         progress = None;
+                        end_transfer(&mut ended, packet_id);
                         let reason = format!("{e:#}");
+                        tracing::warn!(id = packet_id, %reason, "file transfer failed");
                         *status.lock().unwrap() = reason.clone();
                         FileMessage::Error {
                             id: packet_id,
@@ -369,6 +555,16 @@ fn worker(
             } else {
                 *status.lock().unwrap() =
                     "Transfer queue is full; try again after completion".into();
+                if answers_peer_pick(role, &job.1) {
+                    let reason = "The remote transfer queue is full".into();
+                    let reply = FileMessage::Error {
+                        id: PEER_PICK_ID,
+                        reason,
+                    };
+                    if out.send(reply).is_err() {
+                        break;
+                    }
+                }
             }
         }
         if sender_thread
@@ -377,30 +573,36 @@ fn worker(
             && let Some((paths, destination)) = pending.pop_front()
         {
             let transfer_id = id();
-            let (ack, acknowledgements) = mpsc::sync_channel(1);
+            let (ack, acknowledgements) = mpsc::sync_channel(SEND_WINDOW + 1);
             sender = Some((transfer_id, ack));
             let out = out.clone();
             let status = status.clone();
+            let answers_pick = answers_peer_pick(role, &destination);
             sender_thread = Some(std::thread::spawn(move || {
                 let _native = native::initialize();
                 *status.lock().unwrap() = "Transferring files…".into();
+                let mut window = AckWindow::new(&acknowledgements, SEND_WINDOW);
+                let mut began = false;
                 let result = send_paths(transfer_id, paths, destination, |message| {
+                    began |= matches!(message, FileMessage::Begin { .. });
+                    let settle = window.settles(&message);
                     out.send(message).context("session closed")?;
-                    ensure!(
-                        acknowledgements
-                            .recv_timeout(Duration::from_secs(120))
-                            .context("transfer acknowledgement timed out")?,
-                        "peer rejected transfer"
-                    );
-                    Ok(())
+                    window.sent(settle)
                 });
                 *status.lock().unwrap() = match &result {
                     Ok(()) => "Transfer complete".into(),
                     Err(e) => format!("Transfer failed: {e:#}"),
                 };
                 if let Err(e) = result {
+                    tracing::warn!(error = %format!("{e:#}"), "file transfer not sent");
+                    // A pick that failed before its transfer began still has to answer the request.
+                    let id = if answers_pick && !began {
+                        PEER_PICK_ID
+                    } else {
+                        transfer_id
+                    };
                     let _ = out.send(FileMessage::Error {
-                        id: transfer_id,
+                        id,
                         reason: format!("{e:#}"),
                     });
                 }
@@ -408,6 +610,183 @@ fn worker(
         }
     }
 }
+
+/// Whether this job is the agent's answer to a viewer's request to pick files, the only way the
+/// agent sends files to the viewer's Documents folder.
+fn answers_peer_pick(role: Role, destination: &FileDestination) -> bool {
+    role == Role::Agent && *destination == FileDestination::Documents
+}
+
+fn end_transfer(ended: &mut VecDeque<u64>, id: u64) {
+    if ended.len() == 8 {
+        ended.pop_front();
+    }
+    ended.push_back(id);
+}
+
+/// Keeps up to `limit` transfer messages unacknowledged. The receiver
+/// acknowledges each message in order or answers with an error.
+struct AckWindow<'a> {
+    acknowledgements: &'a mpsc::Receiver<bool>,
+    limit: usize,
+    unacknowledged: usize,
+}
+impl<'a> AckWindow<'a> {
+    fn new(acknowledgements: &'a mpsc::Receiver<bool>, limit: usize) -> Self {
+        Self {
+            acknowledgements,
+            limit,
+            unacknowledged: 0,
+        }
+    }
+    /// A receiver rejects a transfer when it begins or learns its totals, so
+    /// nothing follows those until they are accepted. A transfer is complete
+    /// once its finish is acknowledged.
+    fn settles(&self, message: &FileMessage) -> bool {
+        matches!(
+            message,
+            FileMessage::Begin { .. } | FileMessage::Totals { .. } | FileMessage::Finish { .. }
+        )
+    }
+    /// Records one sent message, then waits until another may be sent.
+    fn sent(&mut self, settle: bool) -> anyhow::Result<()> {
+        self.unacknowledged += 1;
+        let limit = if settle { 1 } else { self.limit };
+        while self.unacknowledged >= limit {
+            ensure!(
+                self.acknowledgements
+                    .recv_timeout(Duration::from_secs(120))
+                    .context("transfer acknowledgement timed out")?,
+                "peer rejected transfer"
+            );
+            self.unacknowledged -= 1;
+        }
+        Ok(())
+    }
+}
+
+/// Removes what earlier sessions left behind: interrupted transfers in both
+/// transfer folders and clipboard/drop copies no app can still be reading.
+fn sweep_transfer_folders() {
+    if let Ok(documents) = native::documents() {
+        sweep_partials(&documents.join(TRANSFER_FOLDER), SystemTime::now());
+    }
+    if let Ok(cache) = native::cache() {
+        let keep = native::clipboard_files().unwrap_or_default();
+        sweep_cache(&cache.join(TRANSFER_FOLDER), &keep);
+    }
+}
+
+/// `keep` lists the files on the clipboard, whose batches stay.
+fn sweep_cache(base: &Path, keep: &[PathBuf]) {
+    sweep_partials(base, SystemTime::now());
+    sweep_batches(base, keep, SystemTime::now());
+}
+
+/// Deletes `.partial-*` folders nothing has written to for [`STALE_PARTIAL_AGE`].
+/// Another viewer may be receiving into the same folder, so recent ones stay.
+fn sweep_partials(base: &Path, now: SystemTime) {
+    sweep(base, ".partial-", STALE_PARTIAL_AGE, &[], now);
+}
+
+/// Deletes finished clipboard/drop batches older than [`CACHE_BATCH_AGE`]
+/// unless they hold a file that is still on the clipboard.
+fn sweep_batches(base: &Path, keep: &[PathBuf], now: SystemTime) {
+    sweep(base, "transfer-", CACHE_BATCH_AGE, keep, now);
+}
+
+fn sweep(base: &Path, prefix: &str, age: Duration, keep: &[PathBuf], now: SystemTime) {
+    let Ok(children) = fs::read_dir(base) else {
+        return;
+    };
+    for child in children.flatten() {
+        let path = child.path();
+        let named = child
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(prefix));
+        let is_dir = child.file_type().is_ok_and(|kind| kind.is_dir());
+        if !named || !is_dir || keep.iter().any(|kept| kept.starts_with(&path)) {
+            continue;
+        }
+        let stale = latest_write(&path, 0)
+            .is_ok_and(|written| now.duration_since(written).is_ok_and(|idle| idle >= age));
+        if stale {
+            match fs::remove_dir_all(&path) {
+                Ok(()) => tracing::info!(path = %path.display(), "removed old transferred files"),
+                Err(error) => {
+                    tracing::debug!(%error, path = %path.display(), "could not remove old transfer")
+                }
+            }
+        }
+    }
+}
+
+/// The most recent modification time in a folder tree, without following links.
+fn latest_write(path: &Path, depth: usize) -> io::Result<SystemTime> {
+    let metadata = fs::symlink_metadata(path)?;
+    let mut latest = metadata.modified()?;
+    if metadata.is_dir() && depth < 128 {
+        for child in fs::read_dir(path)? {
+            latest = latest.max(latest_write(&child?.path(), depth + 1)?);
+        }
+    }
+    Ok(latest)
+}
+
+/// Deletes the cache batch that holds `paths` once they were copied elsewhere.
+fn remove_batch(paths: &[PathBuf]) {
+    let Some(batch) = paths.first().and_then(|path| path.parent()) else {
+        return;
+    };
+    if batch
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("transfer-"))
+        && let Err(error) = fs::remove_dir_all(batch)
+    {
+        tracing::debug!(%error, "could not remove a copied transfer batch");
+    }
+}
+
+fn mebibytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GiB", bytes as f64 / (1024. * 1024. * 1024.))
+    } else {
+        format!("{:.0} MiB", (bytes as f64 / (1024. * 1024.)).ceil())
+    }
+}
+
+/// The largest transfer accepted for `destination`.
+fn transfer_limit(destination: &FileDestination) -> u64 {
+    match destination {
+        FileDestination::Clipboard | FileDestination::ClipboardPaste { .. } => {
+            CLIPBOARD_LIMIT_BYTES
+        }
+        FileDestination::Documents | FileDestination::Drop { .. } => TRANSFER_LIMIT_BYTES,
+    }
+}
+
+/// Checks a transfer's declared size against its destination's limit.
+fn check_limit(destination: &FileDestination, bytes: u64) -> anyhow::Result<()> {
+    let limit = transfer_limit(destination);
+    if bytes <= limit {
+        return Ok(());
+    }
+    if limit == CLIPBOARD_LIMIT_BYTES {
+        bail!(
+            "Copied files total {}, over the {} clipboard limit; use Send files instead",
+            mebibytes(bytes),
+            mebibytes(limit)
+        );
+    }
+    bail!(
+        "Files total {}, over the {} transfer limit",
+        mebibytes(bytes),
+        mebibytes(limit)
+    )
+}
+
 fn progress_detail(bytes: u64, total: u64, entries: usize, total_entries: u64) -> String {
     let percent = if total == 0 {
         entries as f64 / total_entries.max(1) as f64
@@ -435,6 +814,36 @@ fn message_id(m: &FileMessage) -> u64 {
         _ => 0,
     }
 }
+/// Device names Windows reserves in every folder, compared against a name's
+/// part before the first dot with trailing spaces removed.
+fn reserved_on_windows(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let Some(number) = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    let mut digits = number.chars();
+    matches!(
+        (digits.next(), digits.next()),
+        (Some('0'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+    )
+}
+
+/// Accepts a relative `/`-separated manifest path that is safe to create on
+/// both Windows and macOS.
 fn valid_path(path: &str) -> anyhow::Result<PathBuf> {
     ensure!(
         !path.is_empty() && path.len() <= 4096,
@@ -444,26 +853,73 @@ fn valid_path(path: &str) -> anyhow::Result<PathBuf> {
     for component in path.split('/') {
         ensure!(
             !component.is_empty()
+                && component.len() <= 255
                 && component != "."
                 && component != ".."
-                && !component.contains(['\\', ':', '\0'])
+                && !component.chars().any(|c| {
+                    c < ' ' || matches!(c, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*')
+                })
                 && !component.ends_with(['.', ' ']),
-            "unsafe file name"
+            "{component:?} is not a valid file name"
         );
-        let stem = component.split('.').next().unwrap().to_ascii_uppercase();
         ensure!(
-            ![
-                "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-                "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
-                "LPT9"
-            ]
-            .contains(&stem.as_str()),
-            "reserved file name"
+            !reserved_on_windows(component),
+            "{component:?} is a reserved Windows file name"
         );
         result.push(component);
     }
     Ok(result)
 }
+
+/// Tags a received file or folder the way browsers tag downloads (the
+/// quarantine attribute on macOS, Mark of the Web on Windows), so opening a
+/// received app or installer gets the same checks. Both the viewer and the
+/// agent tag what they receive. A volume without extended attributes or
+/// alternate streams keeps the file untagged.
+fn mark_received(path: &Path) {
+    if let Err(error) = native::mark_received(path) {
+        tracing::warn!(%error, path = %path.display(), "could not mark a received file as downloaded");
+    }
+}
+
+/// Moves `from` to `to`, failing with [`io::ErrorKind::AlreadyExists`]
+/// instead of replacing an existing file or folder.
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    match native::rename_no_replace(from, to) {
+        // Some network volumes lack an atomic no-replace rename.
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            if to.try_exists()? {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            fs::rename(from, to)
+        }
+        result => result,
+    }
+}
+
+/// Moves `from` into `folder` as `name`, or under a name from `fallback`
+/// while that name is taken, without ever replacing an existing file.
+fn move_unique(
+    from: &Path,
+    folder: &Path,
+    name: &str,
+    fallback: impl Fn() -> String,
+) -> anyhow::Result<PathBuf> {
+    let mut target = folder.join(name);
+    for _ in 0..8 {
+        match rename_no_replace(from, &target) {
+            Ok(()) => return Ok(target),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                target = folder.join(fallback());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("could not save {name:?}"));
+            }
+        }
+    }
+    bail!("could not find a free name for {name:?}")
+}
+
 struct Incoming {
     id: u64,
     destination: FileDestination,
@@ -473,13 +929,15 @@ struct Incoming {
     file: Option<(File, u64, Sha256)>,
     entries: usize,
     received_bytes: u64,
+    /// Sum of the file sizes announced so far; never above `total_bytes`.
+    declared_bytes: u64,
     total_bytes: u64,
     total_entries: u64,
     current_name: String,
 }
 impl Incoming {
     fn new(id: u64, destination: FileDestination, documents: PathBuf) -> anyhow::Result<Self> {
-        let base = documents.join("MeshRMM Transferred Files");
+        let base = documents.join(TRANSFER_FOLDER);
         fs::create_dir_all(&base)?;
         ensure!(
             !fs::symlink_metadata(&base)?.file_type().is_symlink(),
@@ -496,6 +954,7 @@ impl Incoming {
             file: None,
             entries: 0,
             received_bytes: 0,
+            declared_bytes: 0,
             total_bytes: 0,
             total_entries: 0,
             current_name: String::new(),
@@ -505,18 +964,38 @@ impl Incoming {
         match message {
             FileMessage::Totals { bytes, entries, .. } => {
                 ensure!(
-                    self.entries == 0 && entries > 0 && entries <= 100_000,
+                    self.total_entries == 0 && entries > 0 && entries <= 100_000,
                     "invalid transfer totals"
+                );
+                check_limit(&self.destination, bytes)?;
+                let free = native::available_space(&self.stage)
+                    .context("could not check free disk space")?;
+                ensure!(
+                    free >= bytes.saturating_add(FREE_SPACE_RESERVE_BYTES),
+                    "Not enough disk space: the files need {} and {} is free",
+                    mebibytes(bytes),
+                    mebibytes(free)
                 );
                 self.total_bytes = bytes;
                 self.total_entries = entries;
             }
             FileMessage::Entry { path, size, .. } => {
+                ensure!(self.total_entries > 0, "transfer totals are missing");
                 self.current_name = path.clone();
                 ensure!(self.file.is_none(), "previous file is unfinished");
+                ensure!(
+                    (self.entries as u64) < self.total_entries,
+                    "more entries than announced"
+                );
                 self.entries += 1;
-                ensure!(self.entries <= 100_000, "too many entries");
                 let relative = valid_path(&path)?;
+                if let Some(size) = size {
+                    self.declared_bytes = self
+                        .declared_bytes
+                        .checked_add(size)
+                        .filter(|declared| *declared <= self.total_bytes)
+                        .context("files are larger than announced")?;
+                }
                 let root = path.split('/').next().unwrap().to_owned();
                 if !self.roots.contains(&root) {
                     self.roots.push(root);
@@ -526,16 +1005,15 @@ impl Incoming {
                     ensure!(parent.is_dir(), "parent directory missing");
                 }
                 if let Some(size) = size {
-                    self.file = Some((
-                        OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(target)?,
-                        size,
-                        Sha256::new(),
-                    ));
+                    let file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&target)?;
+                    mark_received(&target);
+                    self.file = Some((file, size, Sha256::new()));
                 } else {
-                    fs::create_dir(target)?;
+                    fs::create_dir(&target)?;
+                    mark_received(&target);
                 }
             }
             FileMessage::Chunk { data, .. } => {
@@ -570,25 +1048,25 @@ impl Incoming {
     }
     fn finish(&mut self) -> anyhow::Result<Vec<PathBuf>> {
         ensure!(
-            self.file.is_none() && !self.roots.is_empty(),
+            self.file.is_none()
+                && !self.roots.is_empty()
+                && self.entries as u64 == self.total_entries
+                && self.received_bytes == self.total_bytes,
             "incomplete transfer"
         );
         if self.destination != FileDestination::Documents {
-            let batch = self.base.join(format!("transfer-{}", crate::id()));
-            fs::rename(&self.stage, &batch)?;
+            let batch_name = || format!("transfer-{}", crate::id());
+            let batch = move_unique(&self.stage, &self.base, &batch_name(), batch_name)?;
             return Ok(self.roots.iter().map(|root| batch.join(root)).collect());
         }
-        let mut paths = Vec::new();
-        for root in &self.roots {
-            let mut target = self.base.join(root);
-            if target.try_exists()? {
-                target = self.base.join(format!("{}-{}", crate::id(), root));
-            }
-            ensure!(!target.try_exists()?, "destination already exists");
-            fs::rename(self.stage.join(root), &target)?;
-            paths.push(target);
-        }
-        Ok(paths)
+        self.roots
+            .iter()
+            .map(|root| {
+                move_unique(&self.stage.join(root), &self.base, root, || {
+                    format!("{}-{root}", crate::id())
+                })
+            })
+            .collect()
     }
 }
 impl Drop for Incoming {
@@ -659,6 +1137,7 @@ fn send_paths(
         sum.checked_add(size.unwrap_or(0))
             .context("transfer size overflow")
     })?;
+    check_limit(&destination, bytes)?;
     send(FileMessage::Begin { id, destination })?;
     send(FileMessage::Totals {
         id,
@@ -671,28 +1150,46 @@ fn send_paths(
             path: relative,
             size,
         })?;
-        if size.is_some() {
-            let mut file = File::open(path)?;
-            let mut hash = Sha256::new();
-            let mut buffer = vec![0; FILE_CHUNK_BYTES];
-            loop {
-                let count = file.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                hash.update(&buffer[..count]);
-                send(FileMessage::Chunk {
-                    id,
-                    data: buffer[..count].to_vec(),
-                })?;
-            }
-            send(FileMessage::EndEntry {
-                id,
-                sha256: hash.finalize().to_vec(),
-            })?;
+        if let Some(size) = size {
+            send_file(id, &path, size, &mut send)?;
         }
     }
     send(FileMessage::Finish { id })
+}
+
+/// Sends exactly `size` bytes of `path` and its checksum. A file that grew
+/// since it was listed is cut at `size`; one that shrank fails the transfer.
+fn send_file(
+    id: u64,
+    path: &Path,
+    size: u64,
+    send: &mut impl FnMut(FileMessage) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut file = File::open(path)?.take(size);
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0; FILE_CHUNK_BYTES];
+    let mut sent = 0;
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        sent += count as u64;
+        hash.update(&buffer[..count]);
+        send(FileMessage::Chunk {
+            id,
+            data: buffer[..count].to_vec(),
+        })?;
+    }
+    ensure!(
+        sent == size,
+        "{} changed while it was being sent",
+        path.display()
+    );
+    send(FileMessage::EndEntry {
+        id,
+        sha256: hash.finalize().to_vec(),
+    })
 }
 
 fn commit_documents(paths: Vec<PathBuf>, documents: PathBuf) -> anyhow::Result<Vec<PathBuf>> {
@@ -809,6 +1306,13 @@ mod tests {
         let mut receiver = Incoming::new(2, FileDestination::Documents, sandbox.0.clone()).unwrap();
         let stage = receiver.stage.clone();
         receiver
+            .accept(FileMessage::Totals {
+                id: 2,
+                bytes: 2,
+                entries: 1,
+            })
+            .unwrap();
+        receiver
             .accept(FileMessage::Entry {
                 id: 2,
                 path: "test".into(),
@@ -840,6 +1344,453 @@ mod tests {
         );
         drop(receiver);
         assert!(!stage.exists());
+    }
+    fn totals(bytes: u64, entries: u64) -> FileMessage {
+        FileMessage::Totals {
+            id: 1,
+            bytes,
+            entries,
+        }
+    }
+    fn entry(path: &str, size: Option<u64>) -> FileMessage {
+        FileMessage::Entry {
+            id: 1,
+            path: path.into(),
+            size,
+        }
+    }
+    #[test]
+    fn rejects_windows_reserved_and_invalid_names() {
+        for path in [
+            "COM0",
+            "com1.txt",
+            "LPT0.log",
+            "LPT9",
+            "COM\u{b9}",
+            "lpt\u{b3}.txt",
+            "CONIN$",
+            "conout$.txt",
+            "NUL .txt",
+            "folder/AUX",
+            "a<b",
+            "a>b",
+            "a:b",
+            "a\"b",
+            "a|b",
+            "what?",
+            "star*",
+            "tab\tname",
+            "bell\u{7}",
+            &"x".repeat(256),
+        ] {
+            assert!(valid_path(path).is_err(), "{path:?}");
+        }
+        for path in [
+            "COM10",
+            "LPT",
+            "CONSOLE.txt",
+            "nul-file",
+            "résumé.pdf",
+            "folder/COM1x",
+            &"x".repeat(255),
+        ] {
+            assert!(valid_path(path).is_ok(), "{path:?}");
+        }
+    }
+    #[test]
+    fn receiver_requires_totals_and_enforces_them() {
+        let sandbox = Sandbox::new();
+        let mut receiver = Incoming::new(1, FileDestination::Documents, sandbox.0.clone()).unwrap();
+        assert!(receiver.accept(entry("early", Some(1))).is_err());
+        receiver.accept(totals(4, 2)).unwrap();
+        assert!(receiver.accept(totals(4, 2)).is_err(), "totals twice");
+        assert!(
+            receiver.accept(entry("big", Some(5))).is_err(),
+            "file larger than the announced total"
+        );
+
+        let mut receiver = Incoming::new(1, FileDestination::Documents, sandbox.0.clone()).unwrap();
+        receiver.accept(totals(4, 1)).unwrap();
+        receiver.accept(entry("folder", None)).unwrap();
+        assert!(
+            receiver.accept(entry("folder/extra", None)).is_err(),
+            "more entries than announced"
+        );
+
+        // A transfer that ends short of its announced bytes is incomplete.
+        let mut receiver = Incoming::new(1, FileDestination::Documents, sandbox.0.clone()).unwrap();
+        receiver.accept(totals(4, 1)).unwrap();
+        receiver.accept(entry("short", Some(2))).unwrap();
+        receiver
+            .accept(FileMessage::Chunk {
+                id: 1,
+                data: vec![7; 2],
+            })
+            .unwrap();
+        receiver
+            .accept(FileMessage::EndEntry {
+                id: 1,
+                sha256: Sha256::digest([7, 7]).to_vec(),
+            })
+            .unwrap();
+        assert!(receiver.finish().is_err());
+    }
+    #[test]
+    fn receiver_enforces_per_destination_limits() {
+        let sandbox = Sandbox::new();
+        for destination in [
+            FileDestination::Clipboard,
+            FileDestination::ClipboardPaste {
+                display_id: meshrmm_protocol::DisplayId(1),
+            },
+        ] {
+            let mut receiver = Incoming::new(1, destination, sandbox.0.clone()).unwrap();
+            let error = receiver
+                .accept(totals(CLIPBOARD_LIMIT_BYTES + 1, 1))
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("clipboard limit"),
+                "{error:#}"
+            );
+        }
+        let mut receiver = Incoming::new(1, FileDestination::Documents, sandbox.0.clone()).unwrap();
+        assert!(
+            receiver
+                .accept(totals(TRANSFER_LIMIT_BYTES + 1, 1))
+                .is_err()
+        );
+        // Within the limit but beyond any disk this test runs on.
+        let mut receiver = Incoming::new(1, FileDestination::Documents, sandbox.0.clone()).unwrap();
+        let free = native::available_space(&sandbox.0).unwrap();
+        assert!(free > 0);
+        if free < TRANSFER_LIMIT_BYTES {
+            let error = receiver
+                .accept(totals(TRANSFER_LIMIT_BYTES, 1))
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("disk space"), "{error:#}");
+        }
+    }
+    #[test]
+    fn sender_refuses_oversized_clipboard_copies_before_sending() {
+        let source = Sandbox::new();
+        let file = source.0.join("large.bin");
+        File::create(&file)
+            .unwrap()
+            .set_len(CLIPBOARD_LIMIT_BYTES + 1)
+            .unwrap();
+        let mut sent = 0;
+        let error = send_paths(1, vec![file], FileDestination::Clipboard, |_| {
+            sent += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(sent, 0);
+        assert!(format!("{error:#}").contains("Send files"), "{error:#}");
+    }
+    #[test]
+    fn sender_sends_exactly_the_listed_size() {
+        let source = Sandbox::new();
+        let file = source.0.join("growing.txt");
+        fs::write(&file, "0123456789").unwrap();
+        let mut data = Vec::new();
+        let mut checksum = Vec::new();
+        send_file(1, &file, 4, &mut |message| {
+            match message {
+                FileMessage::Chunk { data: chunk, .. } => data.extend(chunk),
+                FileMessage::EndEntry { sha256, .. } => checksum = sha256,
+                _ => panic!("unexpected message"),
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(data, b"0123");
+        assert_eq!(checksum, Sha256::digest(b"0123").to_vec());
+        let error = send_file(1, &file, 11, &mut |_| Ok(())).unwrap_err();
+        assert!(format!("{error:#}").contains("changed"), "{error:#}");
+    }
+    #[test]
+    fn rename_never_replaces_an_existing_file_or_folder() {
+        let sandbox = Sandbox::new();
+        let (from, to) = (sandbox.0.join("from.txt"), sandbox.0.join("to.txt"));
+        fs::write(&from, "new").unwrap();
+        fs::write(&to, "original").unwrap();
+        let error = rename_no_replace(&from, &to).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&to).unwrap(), "original");
+        let (folder, taken) = (sandbox.0.join("folder"), sandbox.0.join("taken"));
+        fs::create_dir(&folder).unwrap();
+        fs::create_dir(&taken).unwrap();
+        let error = rename_no_replace(&folder, &taken).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        let moved = move_unique(&from, &sandbox.0, "to.txt", || "fallback.txt".into()).unwrap();
+        assert_eq!(moved, sandbox.0.join("fallback.txt"));
+        assert_eq!(fs::read_to_string(moved).unwrap(), "new");
+        assert_eq!(fs::read_to_string(&to).unwrap(), "original");
+    }
+    #[test]
+    fn sweeps_only_stale_partials_and_unused_cache_batches() {
+        let sandbox = Sandbox::new();
+        let base = &sandbox.0;
+        for name in [
+            ".partial-1",
+            "transfer-1",
+            "transfer-2",
+            "kept.txt",
+            "other",
+        ] {
+            fs::create_dir(base.join(name)).unwrap();
+            fs::write(base.join(name).join("file"), "x").unwrap();
+        }
+        let now = SystemTime::now();
+        sweep_partials(base, now);
+        sweep_batches(base, &[], now);
+        assert_eq!(
+            fs::read_dir(base).unwrap().count(),
+            5,
+            "recent folders stay"
+        );
+
+        let clipboard = [base.join("transfer-2").join("file")];
+        sweep_partials(base, now + STALE_PARTIAL_AGE);
+        sweep_batches(base, &clipboard, now + CACHE_BATCH_AGE);
+        assert!(!base.join(".partial-1").exists());
+        assert!(!base.join("transfer-1").exists());
+        assert!(base.join("transfer-2").exists(), "still on the clipboard");
+        assert!(base.join("kept.txt").exists() && base.join("other").exists());
+    }
+    #[test]
+    fn copied_drop_batch_is_removed() {
+        let sandbox = Sandbox::new();
+        let batch = sandbox.0.join("transfer-5");
+        fs::create_dir(&batch).unwrap();
+        fs::write(batch.join("a.txt"), "a").unwrap();
+        remove_batch(&[batch.join("a.txt")]);
+        assert!(!batch.exists());
+        let other = sandbox.0.join("Documents");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("a.txt"), "a").unwrap();
+        remove_batch(&[other.join("a.txt")]);
+        assert!(other.exists());
+    }
+    #[test]
+    fn ack_window_pipelines_chunks_and_settles_the_rest() {
+        let (acks, acknowledgements) = mpsc::sync_channel(SEND_WINDOW + 1);
+        let mut window = AckWindow::new(&acknowledgements, 3);
+        let chunk = FileMessage::Chunk {
+            id: 1,
+            data: vec![0],
+        };
+        assert!(!window.settles(&chunk));
+        for message in [
+            FileMessage::Begin {
+                id: 1,
+                destination: FileDestination::Documents,
+            },
+            totals(1, 1),
+            FileMessage::Finish { id: 1 },
+        ] {
+            assert!(window.settles(&message));
+        }
+        // Two chunks go out without waiting; the third waits for one ack.
+        window.sent(false).unwrap();
+        window.sent(false).unwrap();
+        acks.send(true).unwrap();
+        window.sent(false).unwrap();
+        assert_eq!(window.unacknowledged, 2);
+        // A settling message waits for every earlier one too.
+        for _ in 0..3 {
+            acks.send(true).unwrap();
+        }
+        window.sent(true).unwrap();
+        assert_eq!(window.unacknowledged, 0);
+        window.sent(false).unwrap();
+        window.sent(false).unwrap();
+        acks.send(false).unwrap();
+        let error = window.sent(false).unwrap_err();
+        assert!(format!("{error:#}").contains("rejected"), "{error:#}");
+    }
+    #[test]
+    fn windowed_transfer_keeps_a_window_in_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let source = Sandbox::new();
+        let target = Sandbox::new();
+        let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 253) as u8).collect();
+        let file = source.0.join("large.bin");
+        fs::write(&file, &data).unwrap();
+        let (wire, packets) = mpsc::sync_channel::<FileMessage>(SEND_WINDOW + 1);
+        let (acks, acknowledgements) = mpsc::sync_channel(SEND_WINDOW + 1);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let receiver_in_flight = in_flight.clone();
+        let documents = target.0.clone();
+        let receiver = std::thread::spawn(move || {
+            let mut incoming = Incoming::new(1, FileDestination::Documents, documents).unwrap();
+            let mut received = Vec::new();
+            for packet in packets {
+                // A slow receiver lets the sender fill its window.
+                std::thread::sleep(Duration::from_millis(3));
+                let finished = matches!(packet, FileMessage::Finish { .. });
+                match packet {
+                    FileMessage::Begin { .. } => {}
+                    FileMessage::Finish { .. } => received = incoming.finish().unwrap(),
+                    packet => incoming.accept(packet).unwrap(),
+                }
+                receiver_in_flight.fetch_sub(1, Ordering::SeqCst);
+                acks.send(true).unwrap();
+                if finished {
+                    break;
+                }
+            }
+            received
+        });
+        let mut window = AckWindow::new(&acknowledgements, SEND_WINDOW);
+        let mut peak = 0;
+        send_paths(1, vec![file], FileDestination::Documents, |message| {
+            let settle = window.settles(&message);
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            if matches!(
+                message,
+                FileMessage::Begin { .. } | FileMessage::Totals { .. }
+            ) {
+                assert_eq!(now, 1, "nothing follows a transfer until it is accepted");
+            }
+            peak = peak.max(now);
+            wire.send(message).unwrap();
+            window.sent(settle)
+        })
+        .unwrap();
+        let received = receiver.join().unwrap();
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(peak, SEND_WINDOW);
+        assert_eq!(fs::read(&received[0]).unwrap(), data);
+    }
+    #[test]
+    fn viewer_accepts_only_requested_documents_and_clipboard_copies() {
+        let start = Instant::now();
+        let paste = FileDestination::ClipboardPaste {
+            display_id: meshrmm_protocol::DisplayId(1),
+        };
+        let drop = FileDestination::Drop {
+            display_id: meshrmm_protocol::DisplayId(1),
+            x: 0,
+            y: 0,
+        };
+        let mut viewer = Admission::new(Role::Viewer);
+        assert!(!viewer.allows_peer_pick());
+        assert!(
+            viewer
+                .admit(&FileDestination::Clipboard, true, start)
+                .is_ok()
+        );
+        assert!(
+            viewer
+                .admit(&FileDestination::Clipboard, false, start)
+                .is_err()
+        );
+        assert!(viewer.admit(&paste, true, start).is_err());
+        assert!(viewer.admit(&drop, true, start).is_err());
+        assert!(
+            viewer
+                .admit(&FileDestination::Documents, true, start)
+                .is_err()
+        );
+        viewer.request_peer_pick(start);
+        assert!(
+            viewer
+                .admit(&FileDestination::Documents, true, start)
+                .is_ok()
+        );
+        assert!(
+            viewer
+                .admit(&FileDestination::Documents, true, start)
+                .is_err(),
+            "one request admits one transfer"
+        );
+        viewer.request_peer_pick(start);
+        assert!(
+            viewer
+                .admit(&FileDestination::Documents, true, start + PEER_PICK_WINDOW)
+                .is_err(),
+            "requests expire"
+        );
+        viewer.request_peer_pick(start);
+        viewer.close_peer_pick();
+        assert!(
+            viewer
+                .admit(&FileDestination::Documents, true, start)
+                .is_err(),
+            "a request the peer answered without files admits nothing"
+        );
+
+        let mut agent = Admission::new(Role::Agent);
+        assert!(agent.allows_peer_pick());
+        for destination in [
+            FileDestination::Documents,
+            FileDestination::Clipboard,
+            paste.clone(),
+            drop,
+        ] {
+            assert!(agent.admit(&destination, true, start).is_ok());
+        }
+        assert!(agent.admit(&paste, false, start).is_err());
+    }
+    /// Reads the tag `mark_received` leaves, if any.
+    #[cfg(target_os = "macos")]
+    fn received_mark(path: &Path) -> Option<String> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = c"com.apple.quarantine";
+        let mut value = [0u8; 256];
+        // SAFETY: both strings are NUL-terminated and `value` is writable.
+        let length = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            )
+        };
+        (length >= 0).then(|| String::from_utf8_lossy(&value[..length as usize]).into_owned())
+    }
+    #[cfg(windows)]
+    fn received_mark(path: &Path) -> Option<String> {
+        let mut stream = path.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        fs::read_to_string(stream).ok()
+    }
+    #[test]
+    fn received_files_are_marked_as_downloaded() {
+        let source = Sandbox::new();
+        let target = Sandbox::new();
+        let folder = source.0.join("Tool.app");
+        fs::create_dir_all(folder.join("Contents")).unwrap();
+        fs::write(folder.join("Contents").join("setup.exe"), "MZ").unwrap();
+        assert!(received_mark(&folder.join("Contents").join("setup.exe")).is_none());
+        for destination in [FileDestination::Documents, FileDestination::Clipboard] {
+            let mut receiver = Incoming::new(1, destination.clone(), target.0.clone()).unwrap();
+            let mut received = Vec::new();
+            send_paths(1, vec![folder.clone()], destination, |message| {
+                match message {
+                    FileMessage::Begin { .. } => {}
+                    FileMessage::Finish { .. } => received = receiver.finish()?,
+                    message => receiver.accept(message)?,
+                }
+                Ok(())
+            })
+            .unwrap();
+            let file = received[0].join("Contents").join("setup.exe");
+            let mark = received_mark(&file).expect("received file is marked");
+            #[cfg(target_os = "macos")]
+            {
+                assert!(mark.contains(";MeshRMM;"), "{mark}");
+                let folder_mark = received_mark(&received[0]).expect("received folder is marked");
+                assert!(folder_mark.contains(";MeshRMM;"), "{folder_mark}");
+            }
+            #[cfg(windows)]
+            assert!(mark.contains("ZoneId=3"), "{mark}");
+        }
+        assert!(received_mark(&folder.join("Contents").join("setup.exe")).is_none());
     }
     #[test]
     fn clipboard_batches_preserve_names_across_repeated_copies() {

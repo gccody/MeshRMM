@@ -21,7 +21,7 @@
 # misc
 .DS_Store
 *.pem
-/meshrmm-site.tar.gz
+/*-site.tar.gz
 
 # debug
 npm-debug.log*
@@ -32,6 +32,7 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 .dev.vars*
+!.dev.vars.example
 
 # vercel
 .vercel

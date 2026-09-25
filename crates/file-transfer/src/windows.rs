@@ -556,6 +556,58 @@ pub fn paste_files(display_id: meshrmm_protocol::DisplayId) -> anyhow::Result<()
     Ok(())
 }
 
+/// Maps a Win32 failure to the matching `io::ErrorKind`.
+fn io_error(error: windows::core::Error) -> std::io::Error {
+    let code = error.code().0 as u32;
+    if code & 0xFFFF_0000 == 0x8007_0000 {
+        std::io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+    } else {
+        std::io::Error::other(error)
+    }
+}
+
+pub fn rename_no_replace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    use windows::Win32::Storage::FileSystem::{MOVE_FILE_FLAGS, MoveFileExW};
+    let (from, to) = (wide(from), wide(to));
+    // Without MOVEFILE_REPLACE_EXISTING, an existing target fails the move.
+    unsafe {
+        MoveFileExW(
+            windows::core::PCWSTR(from.as_ptr()),
+            windows::core::PCWSTR(to.as_ptr()),
+            MOVE_FILE_FLAGS(0),
+        )
+    }
+    .map_err(io_error)
+}
+
+/// Adds the Internet zone's Mark of the Web to a received file, so
+/// SmartScreen and Office check it as they do a download. Folders carry no
+/// mark; the files inside them do.
+pub fn mark_received(path: &std::path::Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        return Ok(());
+    }
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    std::fs::write(stream, "[ZoneTransfer]\r\nZoneId=3\r\n")
+}
+
+/// Bytes available to this user on the volume holding `path`.
+pub fn available_space(path: &std::path::Path) -> std::io::Result<u64> {
+    let path = wide(path);
+    let mut free = 0;
+    unsafe {
+        windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            windows::core::PCWSTR(path.as_ptr()),
+            Some(&mut free),
+            None,
+            None,
+        )
+    }
+    .map_err(io_error)?;
+    Ok(free)
+}
+
 pub fn cache() -> anyhow::Result<PathBuf> {
     unsafe {
         let text = SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, None)?;

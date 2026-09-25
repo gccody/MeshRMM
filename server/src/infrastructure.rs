@@ -360,83 +360,11 @@ pub(crate) fn api_error(status: u16, message: &str) -> Result<Response> {
     .with_status(status))
 }
 
-pub(crate) fn workos_auth_error(error: Error) -> Result<Response> {
-    let detail = error.to_string();
-    let reason = if detail.contains("no organization") {
-        "missing_organization"
-    } else if detail.contains("authorization header") || detail.contains("bearer") {
-        "missing_bearer_token"
-    } else if detail.contains("unsupported WorkOS token algorithm") {
-        "unsupported_algorithm"
-    } else if detail.contains("missing a key ID") {
-        "missing_key_id"
-    } else if detail.contains("JWKS returned HTTP") {
-        "jwks_request_failed"
-    } else if detail.contains("signing key was not found") {
-        "signing_key_not_found"
-    } else if detail.contains("invalid WorkOS signing key") {
-        "invalid_signing_key"
-    } else if detail.contains("invalid WorkOS access token claims") {
-        "client_or_issuer_mismatch"
-    } else if detail.contains("invalid WorkOS access token") {
-        if detail.contains("InvalidSignature") || detail.contains("Invalid signature") {
-            "invalid_signature"
-        } else if detail.contains("InvalidIssuer") || detail.contains("Invalid issuer") {
-            "invalid_issuer"
-        } else if detail.contains("ExpiredSignature") || detail.contains("Expired signature") {
-            "expired_token"
-        } else if detail.contains("MissingRequiredClaim")
-            || detail.contains("Missing required claim")
-        {
-            "missing_required_claim"
-        } else if detail.contains("JSON") || detail.contains("Json") {
-            "invalid_claims_shape"
-        } else {
-            "invalid_signature_or_standard_claims"
-        }
-    } else {
-        "unexpected_validation_error"
-    };
-
-    console_error!(
-        "{}",
-        serde_json::json!({
-            "event": "workos_auth_rejected",
-            "reason": reason,
-        })
-    );
-
-    if detail.contains("platform owner access is required")
-        || detail.contains("platform owner access is restricted")
-    {
-        api_error(403, "platform owner access is required")
-    } else if detail.contains("does not match the company hostname") {
-        api_error(
-            403,
-            "this account cannot access the requested company hostname",
-        )
-    } else if detail.contains("company is not active") {
-        api_error(403, "this company is not active")
-    } else if detail.contains("company has not been provisioned") {
-        api_error(404, "company hostname was not found")
-    } else if reason == "missing_organization" {
-        api_error(
-            401,
-            "select a WorkOS organization before accessing company data",
-        )
-    } else {
-        api_error(
-            401,
-            "your WorkOS session could not be verified; sign out and sign in again",
-        )
-    }
-}
-
 /// Resolve authorization from the device record even on the legacy API hostname.
 pub(crate) async fn device_is_active(environment: &Env, device_id: &str) -> Result<bool> {
     let db = environment.d1("DB")?;
     Ok(query!(&db,
-        "SELECT 1 AS allowed FROM agents a JOIN companies c ON c.id = a.company_id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL AND c.status = 'active'",
+        "SELECT 1 AS allowed FROM agents a JOIN companies c ON c.id = a.company_id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL AND c.status IN ('active', 'awaiting_admin')",
         device_id
     )?.first::<i64>(Some("allowed")).await?.is_some())
 }

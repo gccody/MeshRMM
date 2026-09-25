@@ -47,7 +47,6 @@
   ],
   "vars": {
     "WORKOS_CLIENT_ID": "client_01M0FT1AN01PAT37N98EMRSNVW",
-    "WORKOS_REDIRECT_URI": "https://meshrmm.com",
     "MESHRMM_SERVER_URL": ""
   },
   "observability": {

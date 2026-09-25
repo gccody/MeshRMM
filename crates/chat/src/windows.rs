@@ -1,14 +1,25 @@
 use super::*;
 use ::windows::Win32::Foundation::*;
-use ::windows::Win32::Graphics::Gdi::{COLOR_WINDOW, GetSysColorBrush, ScreenToClient};
+use ::windows::Win32::Graphics::Gdi::{COLOR_WINDOW, GetSysColorBrush};
 use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use ::windows::Win32::System::Threading::GetCurrentThreadId;
 use ::windows::Win32::UI::Controls::{EM_SCROLLCARET, EM_SETLIMITTEXT, EM_SETSEL};
+use ::windows::Win32::UI::HiDpi::GetDpiForWindow;
 use ::windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use ::windows::Win32::UI::WindowsAndMessaging::*;
 use ::windows::core::{PCWSTR, w};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+
+/// Scales a 96-DPI length to the DPI of `window`. Windows of processes that
+/// are not DPI aware always report 96.
+fn scaled(window: HWND, value: i32) -> i32 {
+    let dpi = match unsafe { GetDpiForWindow(window) } {
+        0 => 96,
+        dpi => dpi,
+    };
+    ((i64::from(value) * i64::from(dpi) + 48) / 96) as i32
+}
 
 pub(super) struct Window {
     thread: Option<JoinHandle<()>>,
@@ -69,12 +80,13 @@ struct Ui {
     send: HWND,
     revision: u64,
     popup: bool,
-    owned: bool,
+    banner: bool,
 }
+/// With a parent, creates an owned popup; `banner` keeps it above all windows.
 unsafe fn create(
     state: Arc<Mutex<State>>,
     parent: Option<HWND>,
-    owned: bool,
+    banner: bool,
 ) -> ::windows::core::Result<(HWND, *mut Ui)> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
@@ -88,19 +100,17 @@ unsafe fn create(
             ..Default::default()
         });
         let hwnd = CreateWindowExW(
-            if owned {
+            if banner {
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_CONTROLPARENT | WS_EX_CLIENTEDGE
             } else if parent.is_some() {
-                WS_EX_CONTROLPARENT | WS_EX_CLIENTEDGE
+                WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT | WS_EX_CLIENTEDGE
             } else {
                 WINDOW_EX_STYLE::default()
             },
             class,
             w!("MeshRMM Chat — this session only"),
-            if owned {
+            if parent.is_some() {
                 WS_POPUP | WS_CLIPCHILDREN
-            } else if parent.is_some() {
-                WS_CHILD | WS_CLIPCHILDREN
             } else {
                 WS_OVERLAPPEDWINDOW
             },
@@ -181,7 +191,7 @@ unsafe fn create(
             send,
             revision: u64::MAX,
             popup: parent.is_some(),
-            owned,
+            banner,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, data as isize);
         SetTimer(Some(hwnd), 1, 200, None);
@@ -197,7 +207,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         if !ptr.is_null() {
             let ui = &mut *ptr;
             match msg {
-                WM_ACTIVATE if ui.owned && wp.0 & 0xffff == WA_INACTIVE as usize => {
+                WM_ACTIVATE if ui.banner && wp.0 & 0xffff == WA_INACTIVE as usize => {
                     ui.state.lock().unwrap_or_else(|e| e.into_inner()).visible = false;
                     let _ = ShowWindow(hwnd, SW_HIDE);
                     return LRESULT(0);
@@ -214,11 +224,33 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 WM_SIZE => {
                     let mut rect = RECT::default();
                     let _ = GetClientRect(hwnd, &mut rect);
-                    let width = rect.right.max(240);
-                    let height = rect.bottom.max(160);
-                    let _ = MoveWindow(ui.history, 12, 12, width - 24, height - 66, true);
-                    let _ = MoveWindow(ui.entry, 12, height - 42, width - 110, 30, true);
-                    let _ = MoveWindow(ui.send, width - 90, height - 42, 78, 30, true);
+                    let px = |value| scaled(hwnd, value);
+                    let width = rect.right.max(px(240));
+                    let height = rect.bottom.max(px(160));
+                    let _ = MoveWindow(
+                        ui.history,
+                        px(12),
+                        px(12),
+                        width - px(24),
+                        height - px(66),
+                        true,
+                    );
+                    let _ = MoveWindow(
+                        ui.entry,
+                        px(12),
+                        height - px(42),
+                        width - px(110),
+                        px(30),
+                        true,
+                    );
+                    let _ = MoveWindow(
+                        ui.send,
+                        width - px(90),
+                        height - px(42),
+                        px(78),
+                        px(30),
+                        true,
+                    );
                     return LRESULT(0);
                 }
                 WM_COMMAND
@@ -287,7 +319,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
     }
 }
 
-/// A child panel in the viewer; it has no separate taskbar window.
+/// A panel owned by the viewer window and placed under its chat button. It
+/// is a popup rather than a child window because the viewer's video would
+/// cover a child. It has no taskbar button.
 pub struct Popup {
     window: HWND,
     data: *mut Ui,
@@ -295,7 +329,7 @@ pub struct Popup {
     button: HWND,
     session: ChatSession,
     badge: std::cell::Cell<(bool, usize)>,
-    owned: bool,
+    banner: bool,
 }
 impl Popup {
     /// All methods must be called from the owning viewer UI thread.
@@ -316,9 +350,9 @@ impl Popup {
         parent: HWND,
         button: HWND,
         session: ChatSession,
-        owned: bool,
+        banner: bool,
     ) -> anyhow::Result<Self> {
-        let (window, data) = unsafe { create(Arc::clone(&session.state), Some(parent), owned) }?;
+        let (window, data) = unsafe { create(Arc::clone(&session.state), Some(parent), banner) }?;
         let draft = session
             .state
             .lock()
@@ -336,7 +370,7 @@ impl Popup {
             button,
             session,
             badge: std::cell::Cell::new((false, usize::MAX)),
-            owned,
+            banner,
         })
     }
     pub fn refresh(&self) {
@@ -345,7 +379,7 @@ impl Popup {
                 let _ = ShowWindow(self.window, SW_HIDE);
             }
         }
-        if self.owned {
+        if self.banner {
             return;
         }
         let unread = self.session.unread();
@@ -375,9 +409,7 @@ impl Popup {
             self.layout();
             unsafe {
                 let _ = ShowWindow(self.window, SW_SHOW);
-                if self.owned {
-                    let _ = SetForegroundWindow(self.window);
-                }
+                let _ = SetForegroundWindow(self.window);
                 let _ = SetFocus(Some((*self.data).entry));
             }
         }
@@ -385,51 +417,29 @@ impl Popup {
     }
     pub fn layout(&self) {
         unsafe {
-            let mut bounds = RECT::default();
             let mut anchor = RECT::default();
-            let _ = GetClientRect(self.parent, &mut bounds);
             let _ = GetWindowRect(self.button, &mut anchor);
-            let mut point = POINT {
-                x: anchor.right,
-                y: anchor.bottom,
+            let monitor = ::windows::Win32::Graphics::Gdi::MonitorFromWindow(
+                self.parent,
+                ::windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+            );
+            let mut info = ::windows::Win32::Graphics::Gdi::MONITORINFO {
+                cbSize: std::mem::size_of::<::windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,
+                ..Default::default()
             };
-            if self.owned {
-                let monitor = ::windows::Win32::Graphics::Gdi::MonitorFromWindow(
-                    self.parent,
-                    ::windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
-                );
-                let mut info = ::windows::Win32::Graphics::Gdi::MONITORINFO {
-                    cbSize: std::mem::size_of::<::windows::Win32::Graphics::Gdi::MONITORINFO>()
-                        as u32,
-                    ..Default::default()
-                };
-                if !::windows::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut info).as_bool() {
-                    return;
-                }
-                let work = info.rcWork;
-                let width = 480.min(work.right - work.left);
-                let height = 400.min(work.bottom - work.top);
-                let x = (point.x - width).clamp(work.left, work.right - width);
-                let y = (point.y + 5).clamp(work.top, work.bottom - height);
-                let _ = SetWindowPos(
-                    self.window,
-                    Some(HWND_TOPMOST),
-                    x,
-                    y,
-                    width,
-                    height,
-                    SWP_NOACTIVATE,
-                );
+            if !::windows::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut info).as_bool() {
                 return;
             }
-            let _ = ScreenToClient(self.parent, &mut point);
-            let width = 480.min((bounds.right - 16).max(240));
-            let height = 400.min((bounds.bottom - point.y - 16).max(160));
+            let work = info.rcWork;
+            let width = scaled(self.parent, 480).min(work.right - work.left);
+            let height = scaled(self.parent, 400).min(work.bottom - work.top);
+            let x = (anchor.right - width).clamp(work.left, work.right - width);
+            let y = (anchor.bottom + scaled(self.parent, 5)).clamp(work.top, work.bottom - height);
             let _ = SetWindowPos(
                 self.window,
-                Some(HWND_TOP),
-                (point.x - width).max(8),
-                point.y + 5,
+                Some(if self.banner { HWND_TOPMOST } else { HWND_TOP }),
+                x,
+                y,
                 width,
                 height,
                 SWP_NOACTIVATE,
@@ -465,10 +475,11 @@ impl Popup {
             return false;
         }
         unsafe {
-            // Owned banner popups dismiss through WM_ACTIVATE. Windows may
-            // deny foreground activation for an incoming message; the popup
-            // must remain visible even when that happens.
-            if !self.owned && GetForegroundWindow() != self.parent {
+            // Banner popups dismiss through WM_ACTIVATE. Windows may deny
+            // foreground activation for an incoming message; the popup must
+            // remain visible even when that happens.
+            let foreground = GetForegroundWindow();
+            if !self.banner && foreground != self.parent && foreground != self.window {
                 self.close();
                 return false;
             }

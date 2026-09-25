@@ -1859,6 +1859,7 @@ dependencies = [
  "meshrmm-chat",
  "meshrmm-clipboard",
  "meshrmm-file-transfer",
+ "meshrmm-log-file",
  "meshrmm-protocol",
  "meshrmm-remote-screen",
  "meshrmm-self-update",
@@ -1920,6 +1921,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "dispatch2",
+ "libc",
  "meshrmm-protocol",
  "objc2",
  "objc2-app-kit",
@@ -1930,6 +1932,10 @@ dependencies = [
  "windows 0.62.2",
  "windows-core 0.62.2",
 ]
+
+[[package]]
+name = "meshrmm-log-file"
+version = "0.2.0"
 
 [[package]]
 name = "meshrmm-protocol"
@@ -1954,6 +1960,7 @@ name = "meshrmm-remote"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "block2",
  "bytes",
  "clap",
  "dispatch2",
@@ -1963,6 +1970,7 @@ dependencies = [
  "meshrmm-chat",
  "meshrmm-clipboard",
  "meshrmm-file-transfer",
+ "meshrmm-log-file",
  "meshrmm-protocol",
  "meshrmm-self-update",
  "meshrmm-session-transport",
@@ -2008,6 +2016,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "url",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -2050,8 +2059,13 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "rcgen",
+ "rustls",
+ "rustls-native-certs",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
+ "tracing",
  "url",
 ]
 

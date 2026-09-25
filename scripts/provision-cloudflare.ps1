@@ -60,4 +60,4 @@ finally {
 }
 
 Write-Host "Cloudflare TURN credentials are configured."
-Write-Host "Create companies in WorkOS and create tenant-scoped Agents from https://meshrmm.com."
+Write-Host "Create companies from https://admin.meshrmm.com; each company creates its Agents from its own <slug>.meshrmm.com dashboard."

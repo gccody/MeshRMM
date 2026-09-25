@@ -1,5 +1,8 @@
 export class AuthenticationRequired extends Error {}
 
+// Calls a control-plane path with the current access token.
+export type AuthorizedFetch = (path: string, init?: RequestInit) => Promise<Response>;
+
 export const normalizeServer = (server: string) =>
   server.trim().replace(/\/+$/, "");
 

@@ -352,6 +352,28 @@ pub(crate) async fn retry_platform_company(
     let Some(operation_id) = operation_id else {
         return api_error(404, "company provisioning operation was not found");
     };
+    // Only unfinished provisioning is retried. Retrying an active or suspended
+    // company would reactivate it, or mark it failed and lock out its users
+    // and Agents when WorkOS returns an error.
+    let claimed = query!(
+        &db,
+        "UPDATE companies SET status = 'provisioning', provisioning_error = NULL, updated_at = ?1 WHERE id = ?2 AND status IN ('provisioning', 'failed')",
+        now_ms_i64()?,
+        company_id
+    )?
+    .run()
+    .await?;
+    if claimed
+        .meta()?
+        .and_then(|meta| meta.changes)
+        .unwrap_or_default()
+        == 0
+    {
+        return api_error(
+            409,
+            "only a company that is still provisioning or failed provisioning can be retried",
+        );
+    }
     query!(
         &db,
         "INSERT INTO platform_audit_events (id, actor_user_id, action, company_id, created_at) VALUES (?1, ?2, 'company.provisioning_retry', ?3, ?4)",
@@ -410,6 +432,31 @@ pub(crate) async fn suspend_platform_company(
     .run()
     .await?;
     // Revoke live capabilities as well as blocking future authentication.
+    // Dashboards go first. One failure does not stop the rest: the company is
+    // already suspended, sessions stop at their next activity check, and each
+    // coordinator revokes its Agent at its next session request or alarm.
+    let mut request =
+        internal_json_request("https://presence.internal/revoke", &serde_json::json!({}))?;
+    request
+        .headers_mut()?
+        .set("X-Mesh-Company-Id", company_id)?;
+    let presence = match object_stub(environment, "COMPANY_PRESENCE", company_id) {
+        Ok(stub) => match stub.fetch_with_request(request).await {
+            Ok(response) => ensure_success(response, "revoke subscriptions").await,
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
+    if let Err(error) = presence {
+        console_error!(
+            "{}",
+            serde_json::json!({
+                "event": "company_suspension_presence_revoke_failed",
+                "company_id": company_id,
+                "error": error.to_string(),
+            })
+        );
+    }
     let agents = query!(
         &db,
         "SELECT id FROM agents WHERE company_id = ?1",
@@ -418,31 +465,24 @@ pub(crate) async fn suspend_platform_company(
     .all()
     .await?
     .results::<serde_json::Value>()?;
-    for agent in agents {
-        if let Some(id) = agent.get("id").and_then(serde_json::Value::as_str) {
-            let request = Request::new("https://agent.internal/revoke", Method::Post)?;
-            ensure_success(
-                object_stub(environment, "AGENT_COORDINATOR", id)?
-                    .fetch_with_request(request)
-                    .await?,
-                "revoke Agent",
-            )
-            .await?;
-        }
+    let agent_ids: Vec<String> = agents
+        .iter()
+        .filter_map(|agent| agent.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    let failed = revoke_agents(environment, &agent_ids).await;
+    if !failed.is_empty() {
+        console_error!(
+            "{}",
+            serde_json::json!({
+                "event": "company_suspension_agent_revoke_failed",
+                "company_id": company_id,
+                "failed": failed.len(),
+                "agents": agent_ids.len(),
+                "first_error": failed.first(),
+            })
+        );
     }
-    let request =
-        internal_json_request("https://presence.internal/revoke", &serde_json::json!({}))?;
-    let mut request = request;
-    request
-        .headers_mut()?
-        .set("X-Mesh-Company-Id", company_id)?;
-    ensure_success(
-        object_stub(environment, "COMPANY_PRESENCE", company_id)?
-            .fetch_with_request(request)
-            .await?,
-        "revoke subscriptions",
-    )
-    .await?;
     Response::empty().map(|response| response.with_status(204))
 }
 
@@ -488,6 +528,27 @@ pub(crate) async fn activate_platform_company(
     .run()
     .await?;
     Response::from_json(&load_platform_company(&db, company_id).await?)
+}
+
+/// Coordinators revoked at once while suspending a company. Bounds the
+/// Worker's concurrent subrequests for companies with many Agents.
+const REVOKE_CONCURRENCY: usize = 8;
+
+/// Revokes each Agent's coordinator and returns the errors of those that failed.
+async fn revoke_agents(environment: &Env, agent_ids: &[String]) -> Vec<String> {
+    use futures_util::StreamExt;
+    futures_util::stream::iter(agent_ids)
+        .map(|id| async move {
+            let request = Request::new("https://agent.internal/revoke", Method::Post)?;
+            let response = object_stub(environment, "AGENT_COORDINATOR", id)?
+                .fetch_with_request(request)
+                .await?;
+            ensure_success(response, "revoke Agent").await
+        })
+        .buffer_unordered(REVOKE_CONCURRENCY)
+        .filter_map(|result| async move { result.err().map(|error| error.to_string()) })
+        .collect()
+        .await
 }
 
 async fn provision_company(
@@ -585,9 +646,10 @@ async fn provision_company(
             now,
             operation_id
         )?,
+        // A company suspended while provisioning stays suspended.
         query!(
             &db,
-            "UPDATE companies SET status = ?1, provisioning_error = NULL, updated_at = ?2 WHERE id = ?3",
+            "UPDATE companies SET status = ?1, provisioning_error = NULL, updated_at = ?2 WHERE id = ?3 AND status IN ('provisioning', 'failed')",
             status,
             now,
             company.id
@@ -849,9 +911,10 @@ async fn mark_provisioning_failed(
     let detail = error.chars().take(1_000).collect::<String>();
     let now = now_ms_i64()?;
     db.batch(vec![
+        // Only unfinished provisioning can fail; other statuses are kept.
         query!(
             db,
-            "UPDATE companies SET status = 'failed', provisioning_error = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE companies SET status = 'failed', provisioning_error = ?1, updated_at = ?2 WHERE id = ?3 AND status IN ('provisioning', 'failed')",
             detail,
             now,
             company_id

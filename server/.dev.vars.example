@@ -1,0 +1,9 @@
+# Copy to .dev.vars. `npm run dev` in dashboard/ runs this Worker with these
+# values; .dev.vars is ignored and never deployed.
+TENANT_ROOT_DOMAIN=localhost
+DASHBOARD_ORIGIN=http://localhost:3000
+# The same WorkOS staging environment as dashboard/.dev.vars.
+WORKOS_CLIENT_ID=
+WORKOS_ISSUER=https://api.workos.com/user_management/<WORKOS_CLIENT_ID>
+# Your WorkOS staging user ID, to use the platform console at admin.localhost.
+PLATFORM_OWNER_USER_IDS=

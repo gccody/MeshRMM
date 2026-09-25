@@ -75,6 +75,14 @@ The deploy job waits for every build, assembles
 the complete release to the workflow run, and deploys the dashboard to
 Cloudflare. No server deployment or D1 migration is involved.
 
+This workflow is the only way to deploy the dashboard, because a deployment
+replaces every published download. Before deploying, `npm run deploy` checks
+that `dashboard/public/downloads/` holds exactly the three artifacts for
+`release.json`'s version, their checksums, and a manifest whose URLs use
+`download_origin`. It refuses to run unless the workflow's
+`MESHRMM_RELEASE_DEPLOY=1` is set. To publish a dashboard change without a new
+native version, run the workflow manually.
+
 Agents discover the update at service startup or within six hours. Viewers
 discover it the next time a dashboard remote session launches.
 
@@ -82,7 +90,10 @@ discover it the next time a dashboard remote session launches.
 
 If a transient failure occurs, open the failed workflow and use **Re-run all
 jobs**. The `workflow_dispatch` trigger can also republish the current version
-without another version bump.
+without another version bump. A manual run publishes only from `main`, and only
+when `release.json`'s version is not older than any release in the published
+`update-manifest.json`; if that manifest cannot be read, the run fails. Runs on
+other branches still run the checks but build and publish nothing.
 
 Each run retains the platform artifacts for 14 days and the assembled release
 for 30 days. The deploy job is the only job that writes to Cloudflare, so a

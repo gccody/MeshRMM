@@ -34,13 +34,6 @@ pub fn viewer_directory() -> anyhow::Result<PathBuf> {
     Ok(root.join("MeshRMM/viewer-identity"))
 }
 
-pub fn agent_directory() -> anyhow::Result<PathBuf> {
-    Ok(
-        PathBuf::from(std::env::var_os("ProgramData").context("ProgramData is unavailable")?)
-            .join("MeshRMM/Agent/identity"),
-    )
-}
-
 fn private_directory(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {

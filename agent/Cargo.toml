@@ -20,6 +20,7 @@ meshrmm-clipboard = { path = "../crates/clipboard" }
 bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+meshrmm-log-file.workspace = true
 meshrmm-protocol.workspace = true
 meshrmm-self-update.workspace = true
 meshrmm-signaling-client.workspace = true
@@ -60,6 +61,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Console",
     "Win32_Storage_FileSystem",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
     "Win32_UI_Accessibility",
@@ -79,3 +81,6 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Controls",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+meshrmm-signaling-client = { workspace = true, features = ["test-support"] }
