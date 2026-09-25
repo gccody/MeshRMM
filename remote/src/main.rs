@@ -11,6 +11,7 @@ mod errors;
 mod h264;
 mod http;
 mod input;
+mod launch_status;
 mod matroska;
 mod platform;
 mod preferences;
@@ -27,6 +28,7 @@ mod updater;
 mod video_layout;
 
 use anyhow::Context;
+use launch_status::LaunchStatus;
 use meshrmm_signaling_client::ReconnectBackoff;
 use std::time::Duration;
 
@@ -176,9 +178,12 @@ async fn run_resumable_session(
 ) -> anyhow::Result<()> {
     let mut bootstrap = match config.bootstrap.clone() {
         Some(bootstrap) => bootstrap,
-        None => signaling::create_session(config)
-            .await
-            .context("remote session request failed")?,
+        None => {
+            launch_status::report(LaunchStatus::RequestingSession);
+            signaling::create_session(config)
+                .await
+                .context("remote session request failed")?
+        }
     };
     tracing::info!(
         session_id = %bootstrap.session_id,
@@ -295,6 +300,7 @@ fn main() -> std::process::ExitCode {
         .build()
         .context("failed to create the viewer network runtime")
         .and_then(|runtime| runtime.block_on(run_windows_viewer(&mut recording_notice)));
+    platform::close_launch_status();
     // The instance mutex was released with the session, so a new link does
     // not wait on these dialogs.
     if let Some(notice) = recording_notice {
@@ -323,6 +329,7 @@ async fn run_windows_viewer(recording_notice: &mut Option<String>) -> anyhow::Re
         None => None,
     };
     if config.bootstrap.is_none() {
+        launch_status::report(LaunchStatus::RequestingSession);
         config.bootstrap = Some(
             signaling::create_session(&config)
                 .await
@@ -366,6 +373,7 @@ fn main() -> anyhow::Result<()> {
             .build()
             .context("failed to create the macOS network runtime")?;
         if config.bootstrap.is_none() {
+            launch_status::report(LaunchStatus::RequestingSession);
             config.bootstrap = Some(
                 runtime
                     .block_on(signaling::create_session(&config))
