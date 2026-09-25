@@ -15,9 +15,6 @@ struct AppDelegateIvars {
 /// How long a replaced viewer waits for its session to end before it starts
 /// the replacement anyway. Ending a session retries for up to ~16 seconds.
 const REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(20);
-/// How long a lone Command press waits before it taps the Windows key. Cmd-Tab
-/// moves focus to another app right after Command is released, which cancels it.
-const COMMAND_TAP_DELAY: Duration = Duration::from_millis(200);
 
 /// A later dashboard link, started once this viewer's session has ended.
 static REPLACEMENT: Mutex<Option<String>> = Mutex::new(None);
@@ -193,9 +190,8 @@ pub(super) struct RemoteViewIvars {
     control: ControlSink,
     held: RefCell<HeldInput>,
     keyboard: RefCell<Keyboard>,
-    /// A Windows key tap waiting for `COMMAND_TAP_DELAY`, and which request it is.
-    command_tap: std::cell::Cell<Option<keyboard::ScanCode>>,
-    command_tap_generation: std::cell::Cell<u64>,
+    /// The system's key-down count at the last `flagsChanged:` event.
+    key_downs: std::cell::Cell<u32>,
     key_up_monitor: RefCell<Option<Retained<AnyObject>>>,
     wheel_normalizer: RefCell<WheelNormalizer>,
     cursor_shape: RefCell<CursorShape>,
@@ -399,15 +395,21 @@ define_class!(
 
         #[unsafe(method(flagsChanged:))]
         fn flags_changed(&self, event: &NSEvent) {
-            self.send_command_tap();
+            let key_downs = keyboard::system_key_downs();
             let (keys, tap) = {
                 let mut keyboard = self.ivars().keyboard.borrow_mut();
+                // Keys AppKit delivers engage Command themselves; a count that
+                // moved anyway means the system took one, as in Cmd-Tab.
+                if self.ivars().key_downs.replace(key_downs) != key_downs {
+                    keyboard.cancel_command_tap();
+                }
                 let keys = keyboard.flags_changed(event.keyCode(), event.modifierFlags().0 as u64);
                 (keys, keyboard.take_command_tap())
             };
             self.send_keys(keys);
-            if let Some(tap) = tap {
-                self.defer_command_tap(tap);
+            if let Some((scan_code, extended)) = tap {
+                self.send_scan_code(scan_code, extended, true);
+                self.send_scan_code(scan_code, extended, false);
             }
         }
 
@@ -814,8 +816,7 @@ impl RemoteView {
             control,
             held: RefCell::new(HeldInput::default()),
             keyboard: RefCell::new(Keyboard::new(command)),
-            command_tap: std::cell::Cell::new(None),
-            command_tap_generation: std::cell::Cell::new(0),
+            key_downs: std::cell::Cell::new(keyboard::system_key_downs()),
             key_up_monitor: RefCell::new(None),
             wheel_normalizer: RefCell::new(WheelNormalizer::default()),
             cursor_shape: RefCell::new(CursorShape::Default),
@@ -1201,45 +1202,8 @@ impl RemoteView {
     }
 
     fn sync_modifiers(&self, flags: NSEventModifierFlags) {
-        self.send_command_tap();
         let keys = self.ivars().keyboard.borrow_mut().sync(flags.0 as u64);
         self.send_keys(keys);
-    }
-
-    /// Taps the Windows key after `COMMAND_TAP_DELAY` unless the view loses
-    /// focus first, as it does when the Command press was Cmd-Tab or Cmd-Space.
-    fn defer_command_tap(&self, tap: keyboard::ScanCode) {
-        let generation = self.ivars().command_tap_generation.get().wrapping_add(1);
-        self.ivars().command_tap_generation.set(generation);
-        self.ivars().command_tap.set(Some(tap));
-        let view = dispatch2::MainThreadBound::new(objc2::rc::Weak::new(self), self.mtm());
-        let when = dispatch2::DispatchTime::try_from(COMMAND_TAP_DELAY)
-            .unwrap_or(dispatch2::DispatchTime::NOW);
-        let scheduled = DispatchQueue::main().after(when, move || {
-            let Some(mtm) = MainThreadMarker::new() else {
-                return;
-            };
-            if let Some(view) = view.get(mtm).load()
-                && view.ivars().command_tap_generation.get() == generation
-            {
-                view.send_command_tap();
-            }
-        });
-        if scheduled.is_err() {
-            tracing::warn!("could not schedule the Windows key tap");
-            self.ivars().command_tap.set(None);
-        }
-    }
-
-    /// Sends a waiting Windows key tap now. Later input sends it first, so the
-    /// remote sees the keys in the order they were pressed.
-    fn send_command_tap(&self) {
-        if let Some((scan_code, extended)) = self.ivars().command_tap.take()
-            && self.window().is_some_and(|window| window.isKeyWindow())
-        {
-            self.send_scan_code(scan_code, extended, true);
-            self.send_scan_code(scan_code, extended, false);
-        }
     }
 
     /// Sends any held Command key before an action that uses it.
@@ -1406,7 +1370,6 @@ impl RemoteView {
     }
 
     pub(super) fn release_input(&self) {
-        self.ivars().command_tap.set(None);
         self.ivars().keyboard.borrow_mut().reset();
         let display_id = self.ivars().active_display.borrow().id;
         let released = self.ivars().held.borrow_mut().release_all(display_id);
