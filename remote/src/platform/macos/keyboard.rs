@@ -3,8 +3,9 @@
 //! Modifiers are tracked per physical key from the event's device-dependent
 //! flag bits, so releasing Right Shift while Left Shift is held keeps Shift
 //! down on the remote. Command is only sent once a key, click or scroll uses
-//! it: Cmd-Tab or Cmd-Space alone must not reach the remote as a Windows key
-//! tap, which opens the Start menu.
+//! it. Pressed and released alone it becomes a Windows key tap, which the view
+//! sends after a short delay: Cmd-Tab and Cmd-Space also reach the viewer as a
+//! lone Command press, and the focus change they cause cancels the tap.
 
 /// A Windows keyboard scan code and whether it has the E0 prefix.
 pub(super) type ScanCode = (u16, bool);
@@ -115,6 +116,10 @@ pub(super) struct Keyboard {
     held: [bool; 8],
     /// Held Command keys that a key, click or scroll has used.
     engaged: [bool; 8],
+    /// The Command key held alone, which becomes a tap if released unused.
+    tap: Option<Modifier>,
+    /// A Windows key tap for the view to send.
+    pending_tap: Option<ScanCode>,
     /// Scan codes the remote currently has down for modifiers.
     down: Vec<ScanCode>,
 }
@@ -125,6 +130,8 @@ impl Keyboard {
             command,
             held: [false; 8],
             engaged: [false; 8],
+            tap: None,
+            pending_tap: None,
             down: Vec::new(),
         }
     }
@@ -138,6 +145,13 @@ impl Keyboard {
 
     /// Updates the held modifiers from an event's modifier flags.
     pub(super) fn sync(&mut self, flags: u64) -> Vec<RemoteKey> {
+        self.sync_flags(flags, false)
+    }
+
+    /// `taps` is whether a Command release here may be a tap: only a
+    /// `flagsChanged:` event for the key itself says it was just released.
+    fn sync_flags(&mut self, flags: u64, taps: bool) -> Vec<RemoteKey> {
+        let was_held = self.held;
         let has_device_bits = MODIFIERS
             .iter()
             .any(|modifier| flags & modifier.bits().0 != 0);
@@ -160,7 +174,41 @@ impl Keyboard {
                 self.engaged[index] = false;
             }
         }
+        self.track_tap(was_held, taps);
         self.update()
+    }
+
+    fn track_tap(&mut self, was_held: [bool; 8], taps: bool) {
+        let alone = |held: &[bool; 8], modifier: Modifier| {
+            held.iter()
+                .enumerate()
+                .all(|(index, &down)| down == (index == modifier.index()))
+        };
+        for modifier in [Modifier::LeftCommand, Modifier::RightCommand] {
+            if !was_held[modifier.index()] && self.held[modifier.index()] {
+                self.tap = (self.command == CommandKey::Windows && alone(&self.held, modifier))
+                    .then_some(modifier);
+            }
+        }
+        let Some(modifier) = self.tap else {
+            return;
+        };
+        if self.held[modifier.index()] {
+            if !alone(&self.held, modifier) {
+                // Another modifier joined: a chord, not a tap.
+                self.tap = None;
+            }
+        } else {
+            self.tap = None;
+            if taps && alone(&was_held, modifier) {
+                self.pending_tap = Some(modifier.scan_code(self.command));
+            }
+        }
+    }
+
+    /// The Windows key tap from a Command key pressed and released alone.
+    pub(super) fn take_command_tap(&mut self) -> Option<ScanCode> {
+        self.pending_tap.take()
     }
 
     /// A `flagsChanged:` event for `key_code`.
@@ -181,12 +229,13 @@ impl Keyboard {
                 },
             ];
         }
-        self.sync(flags)
+        self.sync_flags(flags, true)
     }
 
     /// Call before sending a non-modifier key press, click or scroll: held
     /// Command keys now take part and are sent.
     pub(super) fn engage_command(&mut self) -> Vec<RemoteKey> {
+        self.tap = None;
         for modifier in [Modifier::LeftCommand, Modifier::RightCommand] {
             self.engaged[modifier.index()] = self.held[modifier.index()];
         }
@@ -197,6 +246,8 @@ impl Keyboard {
     pub(super) fn reset(&mut self) {
         self.held = [false; 8];
         self.engaged = [false; 8];
+        self.tap = None;
+        self.pending_tap = None;
         self.down.clear();
     }
 
@@ -212,6 +263,8 @@ impl Keyboard {
             .collect();
         self.held = [false; 8];
         self.engaged = [false; 8];
+        self.tap = None;
+        self.pending_tap = None;
         released
     }
 
@@ -397,15 +450,64 @@ mod tests {
     const LEFT_CMD: u64 = COMMAND | DEVICE_LEFT_COMMAND;
 
     #[test]
-    fn command_alone_never_reaches_the_remote() {
+    fn command_alone_is_held_back_and_released_as_a_windows_tap() {
         let mut keyboard = Keyboard::new(CommandKey::Windows);
-        // Cmd-Tab: AppKit sees Command go down and up, never the Tab.
+        // Cmd-Tab looks the same: AppKit sees Command go down and up, never
+        // the Tab. The view delays the tap so the focus change can cancel it.
         assert!(
             keyboard
                 .flags_changed(LEFT_COMMAND_KEY, LEFT_CMD)
                 .is_empty()
         );
+        assert_eq!(keyboard.take_command_tap(), None, "not while held");
         assert!(keyboard.flags_changed(LEFT_COMMAND_KEY, 0).is_empty());
+        assert_eq!(keyboard.take_command_tap(), Some((0x5b, true)));
+        assert_eq!(keyboard.take_command_tap(), None, "taken once");
+        keyboard.flags_changed(RIGHT_COMMAND_KEY, COMMAND | DEVICE_RIGHT_COMMAND);
+        keyboard.flags_changed(RIGHT_COMMAND_KEY, 0);
+        assert_eq!(keyboard.take_command_tap(), Some((0x5c, true)));
+    }
+
+    #[test]
+    fn command_that_was_used_or_chorded_is_not_a_tap() {
+        let mut keyboard = Keyboard::new(CommandKey::Windows);
+        keyboard.flags_changed(LEFT_COMMAND_KEY, LEFT_CMD);
+        keyboard.engage_command();
+        keyboard.flags_changed(LEFT_COMMAND_KEY, 0);
+        assert_eq!(keyboard.take_command_tap(), None, "Cmd-R");
+
+        let shift = SHIFT | DEVICE_LEFT_SHIFT;
+        keyboard.flags_changed(LEFT_COMMAND_KEY, LEFT_CMD);
+        keyboard.flags_changed(56, LEFT_CMD | shift);
+        keyboard.flags_changed(56, LEFT_CMD);
+        keyboard.flags_changed(LEFT_COMMAND_KEY, 0);
+        assert_eq!(keyboard.take_command_tap(), None, "Cmd-Shift");
+
+        keyboard.flags_changed(56, shift);
+        keyboard.flags_changed(LEFT_COMMAND_KEY, shift | LEFT_CMD);
+        keyboard.flags_changed(LEFT_COMMAND_KEY, shift);
+        assert_eq!(keyboard.take_command_tap(), None, "Shift-Cmd");
+    }
+
+    #[test]
+    fn command_tap_is_dropped_by_reset_and_missed_releases() {
+        let mut keyboard = Keyboard::new(CommandKey::Windows);
+        keyboard.flags_changed(LEFT_COMMAND_KEY, LEFT_CMD);
+        keyboard.flags_changed(LEFT_COMMAND_KEY, 0);
+        keyboard.reset();
+        assert_eq!(keyboard.take_command_tap(), None);
+        // A release seen only through a later event's flags is not a tap.
+        keyboard.flags_changed(LEFT_COMMAND_KEY, LEFT_CMD);
+        keyboard.sync(0);
+        assert_eq!(keyboard.take_command_tap(), None);
+    }
+
+    #[test]
+    fn command_sending_control_never_taps() {
+        let mut keyboard = Keyboard::new(CommandKey::Control);
+        keyboard.flags_changed(LEFT_COMMAND_KEY, LEFT_CMD);
+        keyboard.flags_changed(LEFT_COMMAND_KEY, 0);
+        assert_eq!(keyboard.take_command_tap(), None);
     }
 
     #[test]
