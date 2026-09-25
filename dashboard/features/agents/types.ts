@@ -1,4 +1,10 @@
-export type Agent = { id: string; name: string; connected: boolean };
+export type Agent = {
+  id: string;
+  name: string;
+  connected: boolean;
+  /** The release an offline Agent went offline to install. */
+  updating_to?: string;
+};
 
 export type AgentSnapshot = {
   type: "snapshot";

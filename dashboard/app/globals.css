@@ -145,6 +145,7 @@ button { color: inherit; }
 .status-badge i { width: 5px; height: 5px; border-radius: 50%; }
 .status-badge.online { color: #15815a; background: #eaf8f1; }.status-badge.online i { background: #1da873; }
 .status-badge.offline { color: #747783; background: #f0f1f4; }.status-badge.offline i { background: #9a9ca5; }
+.status-badge.updating { color: #9a5d12; background: #fff4e4; cursor: help; }.status-badge.updating i { background: #d98a22; animation: pulse 1.2s ease-in-out infinite; }
 .os-cell { gap: 6px; color: #727582; font-size: 12px; }
 .muted-cell { color: #7c7e8b; font-size: 12px; }
 .last-seen strong { display: block; color: #555866; font-size: 12px; font-weight: 560; }
@@ -271,6 +272,7 @@ button { color: inherit; }
 .sidebar-scrim { display: none; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse { 50% { opacity: .3; } }
 @keyframes fade-in { from { opacity: 0; } }
 @keyframes modal-in { from { opacity: 0; transform: translateY(8px) scale(.985); } }
 
@@ -335,6 +337,7 @@ button { color: inherit; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
+  .status-badge.updating i { animation: none; }
 }
 
 .close-session-button { height: 31px; padding: 0 9px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid #e5d5cd; border-radius: 7px; color: #925338; background: #fffaf7; cursor: pointer; font-size: 12px; font-weight: 680; white-space: nowrap; }

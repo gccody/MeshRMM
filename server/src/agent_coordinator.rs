@@ -15,6 +15,10 @@ const IDENTITY_KEY: &str = "agent_identity";
 const PRESENCE_DELIVERY_KEY: &str = "presence_delivery";
 const ACTIVE_SESSION_KEY: &str = "active_session";
 const ACTIVE_SESSION_LEASE_KEY: &str = "active_session_lease";
+const PENDING_UPDATE_KEY: &str = "pending_update";
+/// How long an Agent that went offline to install an update shows as updating. An update
+/// normally restarts the Agent within a minute; one that does not come back shows as offline.
+const UPDATE_GRACE_MS: u64 = 10 * 60_000;
 /// The rotated credential last sent to the Agent, in plaintext, kept only
 /// while D1 still holds its hash as the pending credential.
 const PENDING_ROTATION_KEY: &str = "pending_rotation";
@@ -43,6 +47,16 @@ struct PresenceDelivery {
     connection_id: String,
     connected: bool,
     acknowledged: bool,
+    #[serde(default)]
+    updating_to: Option<String>,
+}
+
+/// An update the Agent announced just before it went offline to install it.
+#[derive(Debug, Deserialize, Serialize)]
+struct PendingUpdate {
+    connection_id: String,
+    version: String,
+    expires_at_unix_ms: u64,
 }
 
 // Lease renewals are stored apart from the active session request, which must
@@ -95,6 +109,8 @@ impl DurableObject for AgentCoordinator {
                 // Arm recovery before changing the durable identity or accepting a socket.
                 self.state.storage().set_alarm(30_000_i64).await?;
                 self.state.storage().put(IDENTITY_KEY, &identity).await?;
+                // The update, if any, is over: the Agent is back.
+                self.state.storage().delete(PENDING_UPDATE_KEY).await?;
                 let pair = WebSocketPair::new()?;
                 pair.server
                     .serialize_attachment(identity.connection_id.clone())?;
@@ -335,6 +351,9 @@ impl DurableObject for AgentCoordinator {
                 match serde_json::from_str::<AgentStatusMessage>(&value) {
                     Ok(AgentStatusMessage::UninstallScheduled) => {
                         self.acknowledge_uninstall(&socket).await?;
+                    }
+                    Ok(AgentStatusMessage::Updating { version }) => {
+                        self.record_update(&socket, version).await?;
                     }
                     Err(_) => {
                         socket.close(Some(1003), Some("unsupported Agent registry message"))?;
@@ -646,6 +665,55 @@ impl AgentCoordinator {
         Ok(())
     }
 
+    /// Remembers that the Agent on `socket` is about to go offline to install `version`, so its
+    /// disconnection is published as an update rather than an outage.
+    async fn record_update(&self, socket: &WebSocket, version: String) -> Result<()> {
+        if !meshrmm_protocol_types::is_release_version(&version) {
+            socket.close(Some(1003), Some("invalid Agent update version"))?;
+            return Ok(());
+        }
+        let _guard = self.presence_lock.lock().await;
+        let Some(connection_id) = socket.deserialize_attachment::<String>()? else {
+            return Ok(());
+        };
+        let Some(identity) = self
+            .state
+            .storage()
+            .get::<AgentIdentity>(IDENTITY_KEY)
+            .await?
+        else {
+            return Ok(());
+        };
+        if identity.connection_id != connection_id {
+            return Ok(());
+        }
+        console_log!("event=agent_update_announced version={}", version);
+        self.state
+            .storage()
+            .put(
+                PENDING_UPDATE_KEY,
+                &PendingUpdate {
+                    connection_id,
+                    version,
+                    expires_at_unix_ms: Date::now().as_millis() + UPDATE_GRACE_MS,
+                },
+            )
+            .await
+    }
+
+    /// The update the current connection announced, while it is still expected to finish.
+    async fn pending_update(&self, identity: &AgentIdentity) -> Result<Option<PendingUpdate>> {
+        Ok(self
+            .state
+            .storage()
+            .get::<PendingUpdate>(PENDING_UPDATE_KEY)
+            .await?
+            .filter(|update| {
+                update.connection_id == identity.connection_id
+                    && update.expires_at_unix_ms > Date::now().as_millis()
+            }))
+    }
+
     async fn publish_disconnected_if_current(&self, socket: &WebSocket) {
         let _guard = self.presence_lock.lock().await;
         if let Err(error) = self.state.storage().set_alarm(30_000_i64).await {
@@ -681,19 +749,29 @@ impl AgentCoordinator {
     }
 
     async fn publish_presence(&self, identity: &AgentIdentity, connected: bool) -> Result<()> {
+        let update = if connected {
+            None
+        } else {
+            self.pending_update(identity).await?
+        };
+        let updating_to = update.as_ref().map(|update| update.version.clone());
         let mut delivery = self
             .state
             .storage()
             .get::<PresenceDelivery>(PRESENCE_DELIVERY_KEY)
             .await?
             .unwrap_or_default();
-        if delivery.connection_id != identity.connection_id || delivery.connected != connected {
+        if delivery.connection_id != identity.connection_id
+            || delivery.connected != connected
+            || delivery.updating_to != updating_to
+        {
             delivery.generation = delivery
                 .generation
                 .checked_add(1)
                 .ok_or_else(|| Error::RustError("presence generation exhausted".into()))?;
             delivery.connection_id = identity.connection_id.clone();
             delivery.connected = connected;
+            delivery.updating_to = updating_to;
             delivery.acknowledged = false;
         }
         if !delivery.acknowledged {
@@ -708,6 +786,7 @@ impl AgentCoordinator {
                 agent_id: identity.device_id.clone(),
                 connected,
                 generation: delivery.generation,
+                updating_to: delivery.updating_to.clone(),
             };
             company_presence::publish(&self.environment, &identity.company_id, &mutation).await?;
             delivery.acknowledged = true;
@@ -716,7 +795,19 @@ impl AgentCoordinator {
                 .put(PRESENCE_DELIVERY_KEY, &delivery)
                 .await?;
         }
-        self.state.storage().delete_alarm().await?;
+        match update {
+            // Publishes the Agent as offline if the update never brings it back.
+            Some(update) => {
+                let remaining = update
+                    .expires_at_unix_ms
+                    .saturating_sub(Date::now().as_millis());
+                self.state
+                    .storage()
+                    .set_alarm(i64::try_from(remaining).unwrap_or(i64::MAX))
+                    .await?;
+            }
+            None => self.state.storage().delete_alarm().await?,
+        }
         Ok(())
     }
 }

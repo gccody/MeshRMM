@@ -25,6 +25,7 @@ function instrument(Inner) {
         alarm: await this.ctx.storage.getAlarm(),
         presence: await this.ctx.storage.get('presence'),
         delivery: await this.ctx.storage.get('presence_delivery'),
+        pendingUpdate: await this.ctx.storage.get('pending_update'),
         session: await this.ctx.storage.get('session'), statusCalls: this.statusCalls,
       });
       if (path === '/__test/fail') { await this.ctx.storage.put('test_failure', await request.json()); return new Response('ok'); }
@@ -34,6 +35,11 @@ function instrument(Inner) {
           const attachment = socket.deserializeAttachment();
           socket.serializeAttachment(typeof attachment === 'number' ? 1 : { ...attachment, expires_at_unix_ms: 1 });
         }
+        return new Response('ok');
+      }
+      if (path === '/__test/expire-update') {
+        const update = await this.ctx.storage.get('pending_update');
+        await this.ctx.storage.put('pending_update', { ...update, expires_at_unix_ms: 1 });
         return new Response('ok');
       }
       if (path === '/__test/advance-session') {
@@ -195,6 +201,44 @@ try {
   assert.equal((await snapshot()).agents[0].connected, false);
   assert.equal((await state(agent)).alarm, null);
 
+  // An Agent that stops to install an update shows as updating, not just
+  // offline, until it reconnects.
+  const updatingAgent = async () => {
+    const socket = collect(await connectAgent());
+    await until(async () => (await snapshot()).agents[0].connected, 'online before the update');
+    socket.socket.send(JSON.stringify({ type: 'updating', version: '9.9.9' }));
+    await until(async () => (await state(agent)).pendingUpdate?.version === '9.9.9', 'update recorded');
+    socket.socket.close();
+    await until(() => dashboard.messages.at(-1)?.agent?.updating_to === '9.9.9', 'push updating');
+  };
+  await updatingAgent();
+  assert.equal(dashboard.messages.at(-1).agent.connected, false);
+  assert.equal((await snapshot()).agents[0].updating_to, '9.9.9');
+  assert.ok((await state(agent)).alarm > Date.now() + 60_000, 'the update grace period is scheduled');
+  const updated = collect(await connectAgent());
+  await until(() => dashboard.messages.at(-1)?.agent?.connected === true, 'push online after the update');
+  assert.equal(dashboard.messages.at(-1).agent.updating_to, undefined);
+  assert.equal((await state(agent)).pendingUpdate, undefined, 'reconnecting ends the update');
+  updated.socket.close();
+  await until(async () => (await state(agent)).delivery.connected === false && (await state(agent)).delivery.acknowledged, 'ordinary disconnect');
+  assert.equal((await snapshot()).agents[0].updating_to, undefined, 'a later outage is not an update');
+  // An update that never brings the Agent back shows as offline after the grace period.
+  await updatingAgent();
+  await post(agent, '/__test/expire-update');
+  await post(agent, '/__test/alarm');
+  await until(async () => (await snapshot()).agents[0].updating_to === undefined, 'update grace period ended');
+  assert.equal(dashboard.messages.at(-1).agent.updating_to, undefined);
+  assert.equal((await snapshot()).agents[0].connected, false);
+  assert.equal((await state(agent)).alarm, null);
+  // Only a release version is accepted, since the dashboard displays it.
+  const invalid = collect(await connectAgent());
+  const invalidClosed = new Promise(resolve => invalid.socket.addEventListener('close', event => resolve(event.code)));
+  invalid.socket.send(JSON.stringify({ type: 'updating', version: '<b>1</b>' }));
+  assert.equal(await invalidClosed, 1003);
+  await until(async () => (await state(agent)).delivery.connected === false && (await state(agent)).delivery.acknowledged, 'invalid update rejected');
+  assert.equal((await snapshot()).agents[0].updating_to, undefined);
+  assert.equal((await state(agent)).pendingUpdate, undefined);
+
   // Deleted devices cannot reappear through a delayed creation or connection event.
   await db.exec("UPDATE agents SET deletion_requested_at = 1 WHERE id = 'device-test'");
   // Simulate a lost HTTP notification: the existing alarm drains the durable outbox.
@@ -283,7 +327,7 @@ try {
   assert.equal((await post(failing, '/lease', lease)).status, 403);
   assert.equal(await failingClosed, 4001, 'the missed Agent is revoked at its next request');
   await db.exec("UPDATE companies SET status = 'active'");
-  console.log('Presence integration passed: event-only snapshots, durable retry, replacement ordering, renewal isolation/expiry/revocation, signing-key caching, retryable auth outages, deletion, session alarm preservation, unchanged replays after lease renewal, Agent connect past a presence failure, suspension fan-out past failures, and revocation after a missed suspension.');
+  console.log('Presence integration passed: event-only snapshots, durable retry, replacement ordering, renewal isolation/expiry/revocation, signing-key caching, retryable auth outages, Agent update status and its grace period, deletion, session alarm preservation, unchanged replays after lease renewal, Agent connect past a presence failure, suspension fan-out past failures, and revocation after a missed suspension.');
 } finally {
   for (const socket of sockets) { try { socket.close(); } catch {} }
   await runtime.dispose();

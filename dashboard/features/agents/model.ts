@@ -22,7 +22,8 @@ const isAgent = (value: unknown): value is Agent => {
   return (
     typeof candidate.id === "string" &&
     typeof candidate.name === "string" &&
-    typeof candidate.connected === "boolean"
+    typeof candidate.connected === "boolean" &&
+    (candidate.updating_to === undefined || typeof candidate.updating_to === "string")
   );
 };
 
