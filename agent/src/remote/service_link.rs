@@ -1,8 +1,10 @@
 //! Private pipes between the Agent service and the coordinator it launches. The service closes
 //! the coordinator's stdin to ask it to stop, so remote sessions end and run their close actions
 //! before the process exits, and reads session activity from its stdout so automatic updates
-//! wait for live remote sessions.
-use std::io::{Read, Write};
+//! wait for live remote sessions. Before stopping it for an automatic update, the service first
+//! writes the release version to that stdin, so the coordinator can tell the server why the
+//! Agent is going offline.
+use std::io::{BufRead, Write};
 use std::os::windows::io::AsRawHandle;
 use std::sync::{Arc, Mutex};
 
@@ -13,10 +15,14 @@ use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetH
 pub const SESSION_ACTIVE: &str = "session-active";
 /// Written when the last remote session ends.
 pub const SESSION_IDLE: &str = "session-idle";
+/// Written by the service, followed by the release version, before it stops the coordinator to
+/// install an automatic update.
+pub const UPDATING_PREFIX: &str = "updating ";
 
 pub struct ServiceLink {
     stop: watch::Receiver<bool>,
     activity: Option<Arc<Activity>>,
+    update: Arc<Mutex<Option<String>>>,
 }
 
 impl ServiceLink {
@@ -24,10 +30,12 @@ impl ServiceLink {
     /// stops on Ctrl+C and reports nothing.
     pub fn new(attached: bool) -> Self {
         let (sender, stop) = watch::channel(false);
+        let update = Arc::new(Mutex::new(None));
         if !attached {
             return Self {
                 stop,
                 activity: None,
+                update,
             };
         }
         // Helpers launched with inherited handles, some as the signed-in user, must not
@@ -42,20 +50,28 @@ impl ServiceLink {
                 tracing::warn!(%error, "could not keep the Agent service pipes from helpers");
             }
         }
+        let announced = Arc::clone(&update);
         let watcher = std::thread::Builder::new()
             .name("meshrmm-service-link".into())
             .spawn(move || {
                 let mut input = std::io::stdin().lock();
-                let mut buffer = [0_u8; 64];
+                let mut line = Vec::new();
                 loop {
-                    match input.read(&mut buffer) {
+                    line.clear();
+                    match input.read_until(b'\n', &mut line) {
                         Ok(0) => {
                             tracing::info!(
                                 "the Agent service is stopping; ending remote sessions and stopping the coordinator"
                             );
                             break;
                         }
-                        Ok(_) => {}
+                        Ok(_) => {
+                            if let Some(version) = update_announcement(&line) {
+                                tracing::info!(%version, "the Agent service is stopping to install an update");
+                                *announced.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(version);
+                            }
+                        }
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                         Err(error) => {
                             tracing::warn!(%error, "lost the Agent service control pipe; stopping the coordinator");
@@ -71,7 +87,16 @@ impl ServiceLink {
         Self {
             stop,
             activity: Some(Arc::new(Activity::new(Box::new(std::io::stdout())))),
+            update,
         }
+    }
+
+    /// The release the service announced it is stopping the coordinator to install.
+    pub fn update_version(&self) -> Option<String> {
+        self.update
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Resolves once the service or Ctrl+C asks the coordinator to stop.
@@ -96,6 +121,16 @@ impl ServiceLink {
             SessionGuard(Arc::clone(activity))
         })
     }
+}
+
+/// The version in an update announcement from the service. Anything that is not a plausible
+/// release version is ignored rather than sent to the server.
+fn update_announcement(line: &[u8]) -> Option<String> {
+    let version = std::str::from_utf8(line)
+        .ok()?
+        .trim()
+        .strip_prefix(UPDATING_PREFIX)?;
+    meshrmm_protocol::is_release_version(version).then(|| version.to_owned())
 }
 
 pub struct SessionGuard(Arc<Activity>);
@@ -165,6 +200,7 @@ mod tests {
         let link = ServiceLink {
             stop: watch::channel(false).1,
             activity: Some(activity),
+            update: Arc::default(),
         };
         let first = link.session_started();
         let replacement = link.session_started();
@@ -175,6 +211,18 @@ mod tests {
             String::from_utf8(output.0.lock().unwrap().clone()).unwrap(),
             format!("{SESSION_ACTIVE}\n{SESSION_IDLE}\n{SESSION_ACTIVE}\n{SESSION_IDLE}\n")
         );
+    }
+
+    #[test]
+    fn reads_only_plausible_update_announcements() {
+        assert_eq!(
+            update_announcement(b"updating 0.3.1-rc.1+build.5\r\n").as_deref(),
+            Some("0.3.1-rc.1+build.5")
+        );
+        assert_eq!(update_announcement(b"updating \n"), None);
+        assert_eq!(update_announcement(b"updating 1.0 <script>\n"), None);
+        assert_eq!(update_announcement(b"session-active\n"), None);
+        assert_eq!(update_announcement(&[0xff, 0xfe]), None);
     }
 
     #[test]

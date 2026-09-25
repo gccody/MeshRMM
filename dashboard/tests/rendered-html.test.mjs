@@ -161,6 +161,16 @@ test("rejects malformed Agent API and event payloads", () => {
     }),
     { agents: [{ id: "a", name: "Alpha", connected: true }], revision: 4 },
   );
+  const updating = { id: "a", name: "Alpha", connected: false, updating_to: "0.3.1" };
+  assert.deepEqual(parseAgentEvent({ type: "agent_upsert", revision: 5, agent: updating }), {
+    type: "agent_upsert",
+    revision: 5,
+    agent: updating,
+  });
+  assert.equal(
+    parseAgentEvent({ type: "agent_upsert", revision: 5, agent: { ...updating, updating_to: 3 } }),
+    null,
+  );
 });
 
 test("uses a four-hour dashboard idle timeout by default", () => {
