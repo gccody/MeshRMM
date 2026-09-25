@@ -31,6 +31,9 @@ struct SessionRecord {
     session_id: String,
     #[serde(default)]
     device_id: String,
+    /// Tags resumed TURN credentials. Empty for sessions created before it was stored.
+    #[serde(default)]
+    company_id: String,
     client_token: String,
     agent_token: String,
     expires_at_unix_ms: u64,
@@ -51,12 +54,12 @@ pub struct RemoteSession {
     environment: Env,
 }
 
-impl DurableObject for RemoteSession {
-    fn new(state: State, environment: Env) -> Self {
+impl RemoteSession {
+    fn construct(state: State, environment: Env) -> Self {
         Self { state, environment }
     }
 
-    async fn fetch(&self, mut request: Request) -> Result<Response> {
+    async fn handle_fetch(&self, mut request: Request) -> Result<Response> {
         match (request.method(), request.path().as_str()) {
             (Method::Post, "/init") => {
                 if self
@@ -93,7 +96,7 @@ impl DurableObject for RemoteSession {
         }
     }
 
-    async fn alarm(&self) -> Result<Response> {
+    async fn handle_alarm(&self) -> Result<Response> {
         let Some(record) = self.state.storage().get::<SessionRecord>("session").await? else {
             return Response::ok("already expired");
         };
@@ -110,7 +113,7 @@ impl DurableObject for RemoteSession {
         Response::ok("expired")
     }
 
-    async fn websocket_message(
+    async fn handle_websocket_message(
         &self,
         socket: WebSocket,
         message: WebSocketIncomingMessage,
@@ -204,7 +207,7 @@ impl DurableObject for RemoteSession {
         Ok(())
     }
 
-    async fn websocket_close(
+    async fn handle_websocket_close(
         &self,
         _socket: WebSocket,
         code: usize,
@@ -224,9 +227,51 @@ impl DurableObject for RemoteSession {
         Ok(())
     }
 
-    async fn websocket_error(&self, _socket: WebSocket, error: Error) -> Result<()> {
+    async fn handle_websocket_error(&self, _socket: WebSocket, error: Error) -> Result<()> {
         console_error!("event=remote_signal_peer_error error={}", error);
         Ok(())
+    }
+}
+
+/// Every event is metered, so the D1 rows it reads and writes are charged to
+/// the company that owns this object.
+impl DurableObject for RemoteSession {
+    fn new(state: State, environment: Env) -> Self {
+        Self::construct(state, environment)
+    }
+
+    async fn fetch(&self, request: Request) -> Result<Response> {
+        crate::usage::metered_object(&self.state, &self.environment, self.handle_fetch(request))
+            .await
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        crate::usage::metered_object(&self.state, &self.environment, self.handle_alarm()).await
+    }
+
+    async fn websocket_message(
+        &self,
+        socket: WebSocket,
+        message: WebSocketIncomingMessage,
+    ) -> Result<()> {
+        let handled = self.handle_websocket_message(socket, message);
+        crate::usage::metered_object(&self.state, &self.environment, handled).await
+    }
+
+    async fn websocket_close(
+        &self,
+        socket: WebSocket,
+        code: usize,
+        reason: String,
+        was_clean: bool,
+    ) -> Result<()> {
+        let handled = self.handle_websocket_close(socket, code, reason, was_clean);
+        crate::usage::metered_object(&self.state, &self.environment, handled).await
+    }
+
+    async fn websocket_error(&self, socket: WebSocket, error: Error) -> Result<()> {
+        let handled = self.handle_websocket_error(socket, error);
+        crate::usage::metered_object(&self.state, &self.environment, handled).await
     }
 }
 
@@ -284,8 +329,12 @@ impl RemoteSession {
         }
 
         let idle_timeout_seconds = record.idle_timeout_ms.div_ceil(1000);
-        let ice_servers =
-            crate::generate_ice_servers(&self.environment, idle_timeout_seconds).await?;
+        let ice_servers = crate::generate_ice_servers(
+            &self.environment,
+            idle_timeout_seconds,
+            &record.company_id,
+        )
+        .await?;
         // TURN generation yields to other requests; an expiry or revocation
         // during that await must not be overwritten by this older record.
         let Some(current) = self.state.storage().get::<SessionRecord>("session").await? else {

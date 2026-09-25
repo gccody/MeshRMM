@@ -39,6 +39,13 @@
       "database_id": "4650d279-149e-4a0b-8ec9-3058711885ea"
     }
   ],
+  // Per-company usage for the platform cost report; see docs/cost-tracking.md.
+  "analytics_engine_datasets": [
+    {
+      "binding": "USAGE",
+      "dataset": "meshrmm_usage"
+    }
+  ],
   "services": [
     {
       "binding": "MESHRMM_API",

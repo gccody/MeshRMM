@@ -90,7 +90,10 @@ pub(crate) fn is_legacy_control_plane_request(
         || matches!(hostname.as_str(), "localhost" | "127.0.0.1"))
 }
 
-fn tenant_slug_from_hostname<'a>(hostname: &'a str, root_domain: &str) -> Option<&'a str> {
+pub(crate) fn tenant_slug_from_hostname<'a>(
+    hostname: &'a str,
+    root_domain: &str,
+) -> Option<&'a str> {
     let suffix = format!(".{root_domain}");
     let slug = hostname.strip_suffix(&suffix)?;
     (!slug.is_empty() && !slug.contains('.')).then_some(slug)
@@ -110,7 +113,7 @@ pub(crate) async fn company_for_request(
             "SELECT id, workos_organization_id, status FROM companies WHERE slug = ?1 COLLATE NOCASE",
             slug
         )?
-        .first::<TenantCompany>(None)
+        .metered_first::<TenantCompany>(None)
         .await;
     }
 
@@ -125,7 +128,7 @@ pub(crate) async fn company_for_request(
         "SELECT id, workos_organization_id, status FROM companies WHERE workos_organization_id = ?1",
         workos_organization_id
     )?
-    .first::<TenantCompany>(None)
+    .metered_first::<TenantCompany>(None)
     .await
 }
 
@@ -144,7 +147,7 @@ pub(crate) async fn request_tenant_company(
         "SELECT id, workos_organization_id, status FROM companies WHERE slug = ?1 COLLATE NOCASE",
         slug
     )?
-    .first::<TenantCompany>(None)
+    .metered_first::<TenantCompany>(None)
     .await
 }
 
@@ -158,7 +161,7 @@ pub(crate) async fn canonical_company_url(
         slug: Option<String>,
     }
     let company = query!(db, "SELECT slug FROM companies WHERE id = ?1", company_id)?
-        .first::<CompanySlug>(None)
+        .metered_first::<CompanySlug>(None)
         .await?
         .ok_or_else(|| Error::RustError("company has not been provisioned".into()))?;
     match company.slug {
@@ -258,28 +261,23 @@ pub(crate) fn session_idle_timeout(environment: &Env) -> Result<u64> {
     }
 }
 
+/// Generates TURN credentials for a session of `company_id`. Cloudflare reports
+/// relay traffic per custom identifier, which attributes it to the company.
 pub(crate) async fn generate_ice_servers(
     environment: &Env,
     ttl_seconds: u64,
+    company_id: &str,
 ) -> Result<Vec<IceServer>> {
-    let key_id = environment.secret("TURN_KEY_ID")?.to_string();
-    let api_token = environment.secret("TURN_KEY_API_TOKEN")?.to_string();
-    let headers = Headers::new();
-    headers.set("Authorization", &format!("Bearer {api_token}"))?;
-    headers.set("Content-Type", "application/json")?;
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post)
-        .with_headers(headers)
-        .with_body(Some(
-            serde_json::to_string(&serde_json::json!({ "ttl": ttl_seconds }))?.into(),
-        ));
-    let request = Request::new_with_init(
-        &format!(
-            "https://rtc.live.cloudflare.com/v1/turn/keys/{key_id}/credentials/generate-ice-servers"
-        ),
-        &init,
-    )?;
-    let mut response = Fetch::Request(request).send().await?;
+    let mut response = request_ice_servers(environment, ttl_seconds, Some(company_id)).await?;
+    if (400..500).contains(&response.status_code()) && !company_id.is_empty() {
+        // A rejected identifier must not block remote support; the traffic is
+        // then reported as platform usage.
+        console_warn!(
+            "event=turn_custom_identifier_rejected status={}",
+            response.status_code()
+        );
+        response = request_ice_servers(environment, ttl_seconds, None).await?;
+    }
     if !(200..300).contains(&response.status_code()) {
         return Err(Error::RustError(format!(
             "TURN credential service returned HTTP {}",
@@ -299,6 +297,35 @@ pub(crate) async fn generate_ice_servers(
         ));
     }
     Ok(response.ice_servers)
+}
+
+async fn request_ice_servers(
+    environment: &Env,
+    ttl_seconds: u64,
+    company_id: Option<&str>,
+) -> Result<Response> {
+    let key_id = environment.secret("TURN_KEY_ID")?.to_string();
+    let api_token = environment.secret("TURN_KEY_API_TOKEN")?.to_string();
+    let headers = Headers::new();
+    headers.set("Authorization", &format!("Bearer {api_token}"))?;
+    headers.set("Content-Type", "application/json")?;
+    let body = match company_id.filter(|id| !id.is_empty()) {
+        Some(company_id) => {
+            serde_json::json!({ "ttl": ttl_seconds, "customIdentifier": company_id })
+        }
+        None => serde_json::json!({ "ttl": ttl_seconds }),
+    };
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(serde_json::to_string(&body)?.into()));
+    let request = Request::new_with_init(
+        &format!(
+            "https://rtc.live.cloudflare.com/v1/turn/keys/{key_id}/credentials/generate-ice-servers"
+        ),
+        &init,
+    )?;
+    Fetch::Request(request).send().await
 }
 
 pub(crate) fn supported_ice_url(url: &str) -> bool {
@@ -366,5 +393,5 @@ pub(crate) async fn device_is_active(environment: &Env, device_id: &str) -> Resu
     Ok(query!(&db,
         "SELECT 1 AS allowed FROM agents a JOIN companies c ON c.id = a.company_id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL AND c.status IN ('active', 'awaiting_admin')",
         device_id
-    )?.first::<i64>(Some("allowed")).await?.is_some())
+    )?.metered_first::<i64>(Some("allowed")).await?.is_some())
 }

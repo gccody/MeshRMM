@@ -285,9 +285,11 @@ pub(crate) async fn authorize_workos_user(
             now_ms_i64()?,
             company.id
         )?
-        .run()
+        .metered_run()
         .await?;
     }
+    crate::usage::attribute_company(&company.id);
+    crate::usage::record_active_user(&db, &company.id, &claims.sub, Date::now().as_millis()).await;
     Ok(Identity {
         user_id: claims.sub,
         company_id: company.id,

@@ -130,7 +130,7 @@ pub(crate) async fn resolve_workos_invitation(
         "SELECT slug, status FROM companies WHERE workos_organization_id = ?1",
         organization_id
     )?
-    .first::<InvitationCompany>(None)
+    .metered_first::<InvitationCompany>(None)
     .await?;
     let Some(company) = company else {
         return api_error(404, "invitation company was not found");
@@ -163,8 +163,7 @@ pub(crate) async fn list_platform_companies(
         &db,
         "SELECT id, name, slug, workos_organization_id, status, initial_admin_email, provisioning_error, created_at, updated_at FROM companies ORDER BY created_at DESC"
     )
-    .all()
-    .await?
+    .metered_all().await?
     .results::<PlatformCompany>()?;
     Response::from_json(&serde_json::json!({ "companies": companies }))
 }
@@ -203,7 +202,7 @@ pub(crate) async fn assign_platform_company_domain(
         "SELECT id FROM companies WHERE slug = ?1 COLLATE NOCASE",
         slug
     )?
-    .first::<String>(Some("id"))
+    .metered_first::<String>(Some("id"))
     .await?
     .is_some()
     {
@@ -237,7 +236,7 @@ pub(crate) async fn assign_platform_company_domain(
             now
         )?,
     ];
-    if let Err(error) = db.batch(statements).await {
+    if let Err(error) = metered_batch(&db, statements).await {
         if error.to_string().contains("UNIQUE constraint failed") {
             return api_error(409, "that company slug is already reserved");
         }
@@ -311,7 +310,7 @@ pub(crate) async fn create_platform_company(
             now
         )?,
     ];
-    if let Err(error) = db.batch(statements).await {
+    if let Err(error) = metered_batch(&db, statements).await {
         let detail = error.to_string();
         if detail.contains("UNIQUE constraint failed") {
             return api_error(409, "that company slug is already reserved");
@@ -347,7 +346,7 @@ pub(crate) async fn retry_platform_company(
         "SELECT id FROM company_provisioning_operations WHERE company_id = ?1 ORDER BY created_at DESC LIMIT 1",
         company_id
     )?
-    .first::<String>(Some("id"))
+    .metered_first::<String>(Some("id"))
     .await?;
     let Some(operation_id) = operation_id else {
         return api_error(404, "company provisioning operation was not found");
@@ -361,7 +360,7 @@ pub(crate) async fn retry_platform_company(
         now_ms_i64()?,
         company_id
     )?
-    .run()
+    .metered_run()
     .await?;
     if claimed
         .meta()?
@@ -382,7 +381,7 @@ pub(crate) async fn retry_platform_company(
         company_id,
         now_ms_i64()?
     )?
-    .run()
+    .metered_run()
     .await?;
     match provision_company(environment, company_id, &operation_id).await {
         Ok(company) => Response::from_json(&company),
@@ -411,7 +410,7 @@ pub(crate) async fn suspend_platform_company(
         now,
         company_id
     )?
-    .run()
+    .metered_run()
     .await?;
     if result
         .meta()?
@@ -429,7 +428,7 @@ pub(crate) async fn suspend_platform_company(
         company_id,
         now
     )?
-    .run()
+    .metered_run()
     .await?;
     // Revoke live capabilities as well as blocking future authentication.
     // Dashboards go first. One failure does not stop the rest: the company is
@@ -462,7 +461,7 @@ pub(crate) async fn suspend_platform_company(
         "SELECT id FROM agents WHERE company_id = ?1",
         company_id
     )?
-    .all()
+    .metered_all()
     .await?
     .results::<serde_json::Value>()?;
     let agent_ids: Vec<String> = agents
@@ -504,7 +503,7 @@ pub(crate) async fn activate_platform_company(
         now,
         company_id
     )?
-    .run()
+    .metered_run()
     .await?;
     if result
         .meta()?
@@ -525,7 +524,7 @@ pub(crate) async fn activate_platform_company(
         company_id,
         now
     )?
-    .run()
+    .metered_run()
     .await?;
     Response::from_json(&load_platform_company(&db, company_id).await?)
 }
@@ -562,7 +561,7 @@ async fn provision_company(
         "SELECT id, name, slug, workos_organization_id, initial_admin_email FROM companies WHERE id = ?1",
         company_id
     )?
-    .first::<ProvisioningCompany>(None)
+    .metered_first::<ProvisioningCompany>(None)
     .await?
     .ok_or_else(|| Error::RustError("company was not found".into()))?;
     let slug = company
@@ -580,7 +579,7 @@ async fn provision_company(
         now,
         operation_id
     )?
-    .run()
+    .metered_run()
     .await?;
 
     let organization_id = match company.workos_organization_id {
@@ -596,7 +595,7 @@ async fn provision_company(
                 now_ms_i64()?,
                 company.id
             )?
-            .run()
+            .metered_run()
             .await?;
             organization.id
         }
@@ -608,7 +607,7 @@ async fn provision_company(
         now_ms_i64()?,
         operation_id
     )?
-    .run()
+    .metered_run()
     .await?;
     ensure_workos_company_admin_role(environment).await?;
 
@@ -618,7 +617,7 @@ async fn provision_company(
         now_ms_i64()?,
         operation_id
     )?
-    .run()
+    .metered_run()
     .await?;
     configure_workos_cors_origin(environment, slug).await?;
 
@@ -628,7 +627,7 @@ async fn provision_company(
         now_ms_i64()?,
         operation_id
     )?
-    .run()
+    .metered_run()
     .await?;
     let invitation =
         find_or_create_workos_invitation(environment, &organization_id, admin_email).await?;
@@ -638,7 +637,7 @@ async fn provision_company(
         "awaiting_admin"
     };
     let now = now_ms_i64()?;
-    db.batch(vec![
+    metered_batch(&db, vec![
         query!(
             &db,
             "UPDATE company_provisioning_operations SET state = 'complete', workos_invitation_id = ?1, last_error = NULL, updated_at = ?2 WHERE id = ?3",
@@ -910,7 +909,7 @@ async fn mark_provisioning_failed(
 ) -> Result<()> {
     let detail = error.chars().take(1_000).collect::<String>();
     let now = now_ms_i64()?;
-    db.batch(vec![
+    metered_batch(db, vec![
         // Only unfinished provisioning can fail; other statuses are kept.
         query!(
             db,
@@ -937,7 +936,7 @@ async fn load_platform_company(db: &D1Database, company_id: &str) -> Result<Plat
         "SELECT id, name, slug, workos_organization_id, status, initial_admin_email, provisioning_error, created_at, updated_at FROM companies WHERE id = ?1",
         company_id
     )?
-    .first::<PlatformCompany>(None)
+    .metered_first::<PlatformCompany>(None)
     .await?
     .ok_or_else(|| Error::RustError("company was not found".into()))
 }

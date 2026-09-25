@@ -22,6 +22,13 @@
       "database_id": "4650d279-149e-4a0b-8ec9-3058711885ea"
     }
   ],
+  // Per-company usage for the platform cost report; see docs/cost-tracking.md.
+  "analytics_engine_datasets": [
+    {
+      "binding": "USAGE",
+      "dataset": "meshrmm_usage"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
@@ -57,7 +64,10 @@
     // Multiple emergency owner IDs may be comma-separated.
     "PLATFORM_OWNER_USER_IDS": "user_01M0FX7EVSBWF41FK70SW36N4P",
     "WORKOS_CLIENT_ID": "client_01M0FT1AN01PAT37N98EMRSNVW",
-    "WORKOS_ISSUER": "https://api.workos.com/user_management/client_01M0FT1AN01PAT37N98EMRSNVW"
+    "WORKOS_ISSUER": "https://api.workos.com/user_management/client_01M0FT1AN01PAT37N98EMRSNVW",
+    // The account whose analytics the platform cost report reads, with the
+    // CLOUDFLARE_ANALYTICS_API_TOKEN secret (Account Analytics: Read).
+    "CLOUDFLARE_ACCOUNT_ID": "023f5fc9ffca88a15dac8e9f27b8d21f"
   },
   "observability": {
     "enabled": true,

@@ -15,7 +15,7 @@ async fn account_for_identity(environment: &Env, identity: Identity) -> Result<R
         "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, display_border, prevent_idle_lock, allow_idle_override, slug, status FROM companies WHERE id = ?1",
         identity.company_id
     )?
-    .first::<Company>(None)
+    .metered_first::<Company>(None)
     .await?;
     Response::from_json(&AccountResponse {
         user_id: identity.user_id,
@@ -64,7 +64,7 @@ pub(crate) async fn update_company_settings(
         "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, display_border, prevent_idle_lock, allow_idle_override, slug, status FROM companies WHERE id = ?1",
         identity.company_id
     )?
-    .first::<Company>(None)
+    .metered_first::<Company>(None)
     .await?
     .is_some();
     if !company_exists {
@@ -80,7 +80,7 @@ pub(crate) async fn update_company_settings(
         body.prevent_idle_lock.map(i32::from),
         body.allow_idle_override.map(i32::from)
     )?
-    .run()
+    .metered_run()
     .await?;
     audit(
         &db,

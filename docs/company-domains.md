@@ -86,7 +86,9 @@ Failures are retained in D1 and can be retried from the owner console. WorkOS
 resources are looked up before creation, making retries safe after partial
 completion. Suspending a company immediately stops dashboard and Agent
 control-plane authorization. Billing is deliberately absent from company
-settings and remains a platform-owner responsibility.
+settings and remains a platform-owner responsibility. The owner console shows
+each company's Cloudflare and WorkOS costs; see
+[provider cost tracking](cost-tracking.md).
 
 Companies created before the domain migration appear in the owner console with
 an empty slug. The owner can assign each one a slug exactly once; the API rejects

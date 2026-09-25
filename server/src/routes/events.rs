@@ -24,7 +24,7 @@ pub(crate) async fn create_agent_event_subscription(
         "DELETE FROM agent_event_subscriptions WHERE expires_at <= ?1",
         now
     )?
-    .run()
+    .metered_run()
     .await?;
     let subscription_token = random_token();
     let token_hash = sha256_hex(&subscription_token);
@@ -40,7 +40,7 @@ pub(crate) async fn create_agent_event_subscription(
         now,
         expires_at_i64
     )?
-    .run()
+    .metered_run()
     .await?;
     let company_url = canonical_company_url(&db, environment, &identity.company_id).await?;
     Response::from_json(&AgentEventSubscription {
@@ -82,7 +82,7 @@ pub(crate) async fn subscribe_agent_events(
         now,
         token_hash
     )?
-    .first::<AgentEventSubscriptionRow>(None)
+    .metered_first::<AgentEventSubscriptionRow>(None)
     .await?;
     let Some(subscription) = subscription else {
         return api_error(401, "Agent event subscription is invalid or expired");
@@ -95,6 +95,7 @@ pub(crate) async fn subscribe_agent_events(
     {
         return api_error(403, "subscription does not match company hostname");
     }
+    crate::usage::attribute_company(&subscription.company_id);
     let protocol = if request
         .url()?
         .query_pairs()

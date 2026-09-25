@@ -5,6 +5,8 @@ use futures_util::lock::Mutex;
 use serde::{Deserialize, Serialize};
 use worker::*;
 
+use crate::usage::MeteredStatement;
+
 const DASHBOARD_TAG: &str = "dashboard";
 const COMPANY_HEADER: &str = "X-Mesh-Company-Id";
 const COMPANY_KEY: &str = "company_id";
@@ -122,8 +124,8 @@ pub struct CompanyPresence {
     updates: Mutex<()>,
 }
 
-impl DurableObject for CompanyPresence {
-    fn new(state: State, environment: Env) -> Self {
+impl CompanyPresence {
+    fn construct(state: State, environment: Env) -> Self {
         Self {
             state,
             environment,
@@ -131,7 +133,7 @@ impl DurableObject for CompanyPresence {
         }
     }
 
-    async fn fetch(&self, mut request: Request) -> Result<Response> {
+    async fn handle_fetch(&self, mut request: Request) -> Result<Response> {
         let _guard = self.updates.lock().await;
         let company_id = self.bind_company(&request).await?;
         match (request.method(), request.path().as_str()) {
@@ -166,7 +168,7 @@ impl DurableObject for CompanyPresence {
         }
     }
 
-    async fn alarm(&self) -> Result<Response> {
+    async fn handle_alarm(&self) -> Result<Response> {
         let _guard = self.updates.lock().await;
         if self.state.get_websockets().is_empty() {
             return Response::ok("no subscribers");
@@ -184,7 +186,7 @@ impl DurableObject for CompanyPresence {
             "SELECT 1 AS allowed FROM companies WHERE id = ?1 AND status IN ('active', 'awaiting_admin')",
             company
         )?
-        .first::<i64>(Some("allowed"))
+        .metered_first::<i64>(Some("allowed"))
         .await?
         .is_some();
         for socket in self.state.get_websockets() {
@@ -209,7 +211,7 @@ impl DurableObject for CompanyPresence {
         Response::ok("subscriptions checked")
     }
 
-    async fn websocket_message(
+    async fn handle_websocket_message(
         &self,
         socket: WebSocket,
         message: WebSocketIncomingMessage,
@@ -244,7 +246,7 @@ impl DurableObject for CompanyPresence {
         Ok(())
     }
 
-    async fn websocket_close(
+    async fn handle_websocket_close(
         &self,
         socket: WebSocket,
         code: usize,
@@ -260,10 +262,52 @@ impl DurableObject for CompanyPresence {
         Ok(())
     }
 
-    async fn websocket_error(&self, socket: WebSocket, error: Error) -> Result<()> {
+    async fn handle_websocket_error(&self, socket: WebSocket, error: Error) -> Result<()> {
         let _ = socket.close(Some(1011), Some("presence stream failed"));
         console_error!("event=agent_event_subscription_error error={}", error);
         Ok(())
+    }
+}
+
+/// Every event is metered, so the D1 rows it reads and writes are charged to
+/// the company that owns this object.
+impl DurableObject for CompanyPresence {
+    fn new(state: State, environment: Env) -> Self {
+        Self::construct(state, environment)
+    }
+
+    async fn fetch(&self, request: Request) -> Result<Response> {
+        crate::usage::metered_object(&self.state, &self.environment, self.handle_fetch(request))
+            .await
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        crate::usage::metered_object(&self.state, &self.environment, self.handle_alarm()).await
+    }
+
+    async fn websocket_message(
+        &self,
+        socket: WebSocket,
+        message: WebSocketIncomingMessage,
+    ) -> Result<()> {
+        let handled = self.handle_websocket_message(socket, message);
+        crate::usage::metered_object(&self.state, &self.environment, handled).await
+    }
+
+    async fn websocket_close(
+        &self,
+        socket: WebSocket,
+        code: usize,
+        reason: String,
+        was_clean: bool,
+    ) -> Result<()> {
+        let handled = self.handle_websocket_close(socket, code, reason, was_clean);
+        crate::usage::metered_object(&self.state, &self.environment, handled).await
+    }
+
+    async fn websocket_error(&self, socket: WebSocket, error: Error) -> Result<()> {
+        let handled = self.handle_websocket_error(socket, error);
+        crate::usage::metered_object(&self.state, &self.environment, handled).await
     }
 }
 
@@ -342,7 +386,7 @@ impl CompanyPresence {
             "SELECT 1 AS allowed FROM companies WHERE id = ?1 AND status IN ('active', 'awaiting_admin')",
             company_id
         )?
-        .first::<i64>(Some("allowed"))
+        .metered_first::<i64>(Some("allowed"))
         .await?
         .is_some();
         if !active {
@@ -386,7 +430,7 @@ impl CompanyPresence {
         let changes = query!(&db,
             "SELECT o.agent_id, o.event_id, a.name FROM presence_catalog_outbox o LEFT JOIN agents a ON a.id = o.agent_id AND a.company_id = o.company_id AND a.deletion_requested_at IS NULL WHERE o.company_id = ?1 ORDER BY o.agent_id LIMIT 16",
             company_id
-        )?.all().await?.results::<Change>()?;
+        )?.metered_all().await?.results::<Change>()?;
         for change in changes {
             let mutation = match change.name {
                 Some(name) => PresenceMutation::Upsert {
@@ -404,7 +448,7 @@ impl CompanyPresence {
             query!(&db,
                 "DELETE FROM presence_catalog_outbox WHERE agent_id = ?1 AND company_id = ?2 AND event_id = ?3",
                 change.agent_id, company_id, change.event_id
-            )?.run().await?;
+            )?.metered_run().await?;
         }
         Ok(())
     }
@@ -417,8 +461,7 @@ impl CompanyPresence {
             "SELECT id, name FROM agents WHERE company_id = ?1 AND deletion_requested_at IS NULL ORDER BY name COLLATE NOCASE, id",
             company_id
         )?
-        .all()
-        .await?;
+        .metered_all().await?;
         let mut agents = result
             .results::<AgentRow>()?
             .into_iter()
@@ -582,7 +625,7 @@ impl CompanyPresence {
             &db,
             "SELECT id, name FROM agents WHERE id = ?1 AND company_id = ?2 AND deletion_requested_at IS NULL",
             agent_id, company_id
-        )?.first::<AgentRow>(None).await?;
+        )?.metered_first::<AgentRow>(None).await?;
         let Some(row) = row else { return Ok(None) };
         let name = row.name;
         let connected =
