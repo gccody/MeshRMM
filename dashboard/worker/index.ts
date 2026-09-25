@@ -27,7 +27,9 @@ const worker = {
     if (host.surface === "auth") {
       if (url.pathname !== "/login") return notFound();
       url.pathname = "/v1/auth/invitations/resolve";
-      return env.MESHRMM_API.fetch(new Request(url, { headers: request.headers }));
+      // The company redirect belongs in the browser. Following it through the
+      // service binding sends /login back to the API, which has no such route.
+      return env.MESHRMM_API.fetch(new Request(url, { headers: request.headers, redirect: "manual" }));
     }
 
     if (url.pathname.startsWith("/v1/") && host.surface === "marketing") return notFound();

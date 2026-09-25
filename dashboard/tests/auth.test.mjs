@@ -153,6 +153,13 @@ test("rejects a callback granting a different company", async (t) => {
   assert.match(result.headers.get("set-cookie"), /Max-Age=0/);
 });
 
+test("client explains rejected sign-ins without exposing upstream error content", async (t) => {
+  for (const [status, message] of [[400, /Sign-in expired.*sign in again/], [403, /Accept its invitation from your email/]]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json({ error: "sensitive upstream detail" }, { status }));
+    await assert.rejects(authRequest("callback"), (error) => message.test(error.message) && !error.message.includes("sensitive"));
+  }
+});
+
 test("expired encrypted cookies cannot restore a session", async (t) => {
   const response = await login(t);
   const cookies = getCookie(response, sessionName);
