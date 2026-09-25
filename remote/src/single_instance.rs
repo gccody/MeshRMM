@@ -66,6 +66,7 @@ pub fn claim(
             device_id,
             "asking the open viewer for this device to end its session"
         );
+        crate::launch_status::report(crate::launch_status::LaunchStatus::ClosingPreviousViewer);
         let deadline = Instant::now() + timeout;
         let waited = loop {
             // Signal again after each slice. When several viewers start at once, the one that

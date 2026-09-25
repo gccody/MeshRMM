@@ -1455,7 +1455,7 @@ fn command_key(control: &ControlSink) -> CommandKey {
 }
 
 thread_local! {
-    static CONNECTING_WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
+    static CONNECTING_WINDOW: RefCell<Option<ConnectingWindow>> = const { RefCell::new(None) };
     static PENDING_ALERTS: RefCell<AlertQueue> = const { RefCell::new(AlertQueue::new()) };
 }
 
@@ -1515,12 +1515,19 @@ pub(super) fn activate_application(mtm: MainThreadMarker) {
     application.activateIgnoringOtherApps(true);
 }
 
+/// Shown from launch until the first remote display window replaces it. Its
+/// label says what the launch is waiting on.
+struct ConnectingWindow {
+    window: Retained<NSWindow>,
+    status: Retained<NSTextField>,
+}
+
 fn show_connecting_window(mtm: MainThreadMarker) -> anyhow::Result<()> {
     tracing::info!("showing macOS viewer connecting window");
     let rect = NSRect {
         origin: NSPoint { x: 0.0, y: 0.0 },
         size: NSSize {
-            width: 420.0,
+            width: 460.0,
             height: 150.0,
         },
     };
@@ -1544,7 +1551,7 @@ fn show_connecting_window(mtm: MainThreadMarker) -> anyhow::Result<()> {
     spinner.setIndeterminate(true);
     spinner.setDisplayedWhenStopped(true);
     spinner.setFrame(NSRect {
-        origin: NSPoint { x: 198.0, y: 82.0 },
+        origin: NSPoint { x: 218.0, y: 88.0 },
         size: NSSize {
             width: 24.0,
             height: 24.0,
@@ -1553,37 +1560,55 @@ fn show_connecting_window(mtm: MainThreadMarker) -> anyhow::Result<()> {
     unsafe { spinner.startAnimation(None) };
     view.addSubview(&spinner);
 
-    let label = NSTextField::labelWithString(
+    // Two lines fit the longest status, an update with its restart notice.
+    let status = NSTextField::wrappingLabelWithString(
         &NSString::from_str("Connecting to the remote computer…"),
         mtm,
     );
-    label.setAlignment(NSTextAlignment::Center);
-    label.setFrame(NSRect {
-        origin: NSPoint { x: 30.0, y: 45.0 },
+    status.setAlignment(NSTextAlignment::Center);
+    status.setFrame(NSRect {
+        origin: NSPoint { x: 30.0, y: 30.0 },
         size: NSSize {
-            width: 360.0,
-            height: 24.0,
+            width: 400.0,
+            height: 44.0,
         },
     });
-    view.addSubview(&label);
+    view.addSubview(&status);
 
     window.center();
     activate_application(mtm);
     window.makeKeyAndOrderFront(None);
     window.orderFrontRegardless();
     CONNECTING_WINDOW.with(|state| {
-        if let Some(old) = state.borrow_mut().replace(window) {
-            old.orderOut(None);
+        if let Some(old) = state
+            .borrow_mut()
+            .replace(ConnectingWindow { window, status })
+        {
+            old.window.orderOut(None);
         }
     });
     Ok(())
 }
 
+/// Shows what the launch is waiting on. Does nothing once the connecting
+/// window has closed.
+pub fn show_launch_status(message: String) {
+    DispatchQueue::main().exec_async(move || {
+        CONNECTING_WINDOW.with(|state| {
+            if let Some(connecting) = state.borrow().as_ref() {
+                connecting
+                    .status
+                    .setStringValue(&NSString::from_str(&message));
+            }
+        });
+    });
+}
+
 pub(super) fn close_connecting_window() {
     CONNECTING_WINDOW.with(|state| {
-        if let Some(window) = state.borrow_mut().take() {
+        if let Some(connecting) = state.borrow_mut().take() {
             tracing::info!("closing macOS viewer connecting window");
-            window.orderOut(None);
+            connecting.window.orderOut(None);
         }
     });
 }

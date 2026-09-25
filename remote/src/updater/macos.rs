@@ -8,7 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, bail};
 use meshrmm_self_update::{CLIENT_MACOS_ARM64, CLIENT_MACOS_X64, CURRENT_VERSION, UpdateManifest};
 
+use super::download;
 use crate::config::Config;
+use crate::launch_status::{self, LaunchStatus};
 
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_UPDATE_BYTES: usize = 512 * 1024 * 1024;
@@ -30,13 +32,19 @@ pub async fn check_and_schedule(
     if std::env::var_os("MESHRMM_UPDATE_READY_FILE").is_some() {
         return Ok(false);
     }
+    launch_status::report(LaunchStatus::CheckingForUpdate);
     let http = crate::http::client_builder()
         .timeout(Duration::from_secs(60))
         .build()
         .context("failed to create client update HTTP client")?;
-    let manifest_bytes = download(&http, &config.update_manifest_url, MAX_MANIFEST_BYTES)
-        .await
-        .context("failed to download the client update manifest")?;
+    let manifest_bytes = download(
+        &http,
+        &config.update_manifest_url,
+        MAX_MANIFEST_BYTES,
+        |_| {},
+    )
+    .await
+    .context("failed to download the client update manifest")?;
     let manifest = UpdateManifest::parse(&manifest_bytes)?;
     let target = if cfg!(target_arch = "aarch64") {
         CLIENT_MACOS_ARM64
@@ -52,10 +60,15 @@ pub async fn check_and_schedule(
         release_version = %release.version,
         "downloading signed macOS client update for this launch"
     );
-    let archive = download(&http, &release.url, MAX_UPDATE_BYTES)
-        .await
-        .context("failed to download the macOS client update")?;
+    let archive = download(&http, &release.url, MAX_UPDATE_BYTES, |progress| {
+        launch_status::report(progress.status(&release.version))
+    })
+    .await
+    .context("failed to download the macOS client update")?;
     release.verify(&archive)?;
+    launch_status::report(LaunchStatus::InstallingUpdate {
+        version: release.version.clone(),
+    });
 
     let executable = std::env::current_exe().context("could not locate the client executable")?;
     let app_bundle = app_bundle_for_executable(&executable)?;
@@ -191,24 +204,6 @@ fn apply_update_inner() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(backup);
     let _ = std::fs::remove_dir_all(helper_directory);
     Ok(())
-}
-
-async fn download(http: &reqwest::Client, url: &str, maximum: usize) -> anyhow::Result<Vec<u8>> {
-    let mut response = http.get(url).send().await?.error_for_status()?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > maximum as u64)
-    {
-        bail!("download exceeds the {maximum}-byte size limit");
-    }
-    let mut contents = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if chunk.len() > maximum.saturating_sub(contents.len()) {
-            bail!("download exceeds the {maximum}-byte size limit");
-        }
-        contents.extend_from_slice(&chunk);
-    }
-    Ok(contents)
 }
 
 fn app_bundle_for_executable(executable: &Path) -> anyhow::Result<PathBuf> {

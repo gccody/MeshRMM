@@ -29,6 +29,7 @@ use super::video::install_video_handler;
 use super::{ActivePresenter, ReceiverLifecycle, ViewerResumeState};
 use crate::config::Config;
 use crate::debug::DebugInfo;
+use crate::launch_status::{self, LaunchStatus};
 use crate::signaling::{authenticated_websocket, session_signal_url};
 
 const SESSION_ACTIVITY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -99,6 +100,7 @@ pub async fn run_receiver(
     outgoing_tx.send(SignalMessage::Ready)?;
     outgoing_tx.send(SignalMessage::Activity)?;
     session_state = session_state.transition(SessionState::Connecting)?;
+    launch_status::report(LaunchStatus::WaitingForRemoteComputer);
     let mut presenter_missing_since = Some(tokio::time::Instant::now());
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut statistics_log = crate::debug::StatisticsLog::default();
@@ -143,6 +145,7 @@ pub async fn run_receiver(
                         let signal: SignalMessage = serde_json::from_str(text.as_str())?;
                         match signal {
                             SignalMessage::Offer { sdp } => {
+                                launch_status::report(LaunchStatus::EstablishingConnection);
                                 debug.set_peer_fingerprint(identity.verify_sdp(&sdp)?);
                                 peer.set_remote_description(RTCSessionDescription::offer(sdp)?).await?;
                                 remote_description_set = true;
@@ -201,6 +204,7 @@ pub async fn run_receiver(
                 {
                     session_state = session_state.transition(SessionState::Streaming)?;
                     outgoing_tx.send(SignalMessage::Activity)?;
+                    launch_status::report(LaunchStatus::StartingDisplay);
                 }
                 if state == RTCPeerConnectionState::Connected {
                     disconnected_since = None;

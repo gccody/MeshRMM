@@ -396,6 +396,7 @@ pub(super) fn install_control_handler(
                         debug.clone(),
                     ) {
                         Ok(new_presenter) => {
+                            crate::launch_status::finish();
                             if let Ok(display) = pointer_display.lock() { new_presenter.set_agent_pointer_display(*display); }
                             if let Ok(shape) = cursor_shape.lock() {
                                 new_presenter.set_cursor_shape(*shape);

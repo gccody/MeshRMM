@@ -8,6 +8,53 @@ pub use macos::*;
 #[cfg(windows)]
 pub use windows::*;
 
+/// How much of a download has arrived.
+#[derive(Clone, Copy)]
+pub(super) struct Progress {
+    downloaded: u64,
+    total: Option<u64>,
+}
+
+impl Progress {
+    fn status(self, version: &str) -> crate::launch_status::LaunchStatus {
+        crate::launch_status::LaunchStatus::DownloadingUpdate {
+            version: version.to_owned(),
+            downloaded: self.downloaded,
+            total: self.total,
+        }
+    }
+}
+
+/// Downloads at most `maximum` bytes, reporting progress after each chunk.
+pub(super) async fn download(
+    http: &reqwest::Client,
+    url: &str,
+    maximum: usize,
+    mut progress: impl FnMut(Progress),
+) -> anyhow::Result<Vec<u8>> {
+    let mut response = http.get(url).send().await?.error_for_status()?;
+    let total = response.content_length();
+    if total.is_some_and(|length| length > maximum as u64) {
+        anyhow::bail!("download exceeds the {maximum}-byte size limit");
+    }
+    let mut contents = Vec::new();
+    progress(Progress {
+        downloaded: 0,
+        total,
+    });
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > maximum.saturating_sub(contents.len()) {
+            anyhow::bail!("download exceeds the {maximum}-byte size limit");
+        }
+        contents.extend_from_slice(&chunk);
+        progress(Progress {
+            downloaded: contents.len() as u64,
+            total,
+        });
+    }
+    Ok(contents)
+}
+
 /// Wait for application initialization, rather than merely process creation.
 pub(super) fn launch_verified(command: std::process::Command) -> anyhow::Result<()> {
     launch_verified_with(command, &std::env::current_exe()?.with_extension("ready"))
