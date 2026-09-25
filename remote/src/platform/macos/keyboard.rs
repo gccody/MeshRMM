@@ -3,9 +3,9 @@
 //! Modifiers are tracked per physical key from the event's device-dependent
 //! flag bits, so releasing Right Shift while Left Shift is held keeps Shift
 //! down on the remote. Command is only sent once a key, click or scroll uses
-//! it. Pressed and released alone it becomes a Windows key tap, which the view
-//! sends after a short delay: Cmd-Tab and Cmd-Space also reach the viewer as a
-//! lone Command press, and the focus change they cause cancels the tap.
+//! it. Pressed and released alone it becomes a Windows key tap. Cmd-Tab and
+//! Cmd-Space also reach the viewer as a lone Command press, so the view cancels
+//! the tap when the system saw a key go down that the viewer never received.
 
 /// A Windows keyboard scan code and whether it has the E0 prefix.
 pub(super) type ScanCode = (u16, bool);
@@ -211,6 +211,12 @@ impl Keyboard {
         self.pending_tap.take()
     }
 
+    /// A key went down that the viewer did not receive, such as the Tab of
+    /// Cmd-Tab: a held Command key is no longer a tap.
+    pub(super) fn cancel_command_tap(&mut self) {
+        self.tap = None;
+    }
+
     /// A `flagsChanged:` event for `key_code`.
     pub(super) fn flags_changed(&mut self, key_code: u16, flags: u64) -> Vec<RemoteKey> {
         if key_code == CAPS_LOCK_KEY {
@@ -306,6 +312,21 @@ impl Keyboard {
 unsafe extern "C" {
     fn LMGetKbdType() -> u8;
     fn KBGetLayoutType(keyboard_type: i16) -> u32;
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGEventSourceCounterForEventType(state_id: i32, event_type: u32) -> u32;
+}
+
+/// `kCGEventSourceStateHIDSystemState` and `kCGEventKeyDown`.
+const HID_SYSTEM_STATE: i32 = 1;
+const KEY_DOWN: u32 = 10;
+
+/// How many keys have gone down system-wide, including ones the system
+/// handles itself, such as the Tab of Cmd-Tab. Needs no permission.
+pub(super) fn system_key_downs() -> u32 {
+    unsafe { CGEventSourceCounterForEventType(HID_SYSTEM_STATE, KEY_DOWN) }
 }
 
 /// HIToolbox's `kKeyboardISO` physical layout type.
@@ -453,7 +474,7 @@ mod tests {
     fn command_alone_is_held_back_and_released_as_a_windows_tap() {
         let mut keyboard = Keyboard::new(CommandKey::Windows);
         // Cmd-Tab looks the same: AppKit sees Command go down and up, never
-        // the Tab. The view delays the tap so the focus change can cancel it.
+        // the Tab. The view cancels the tap when the system saw the Tab.
         assert!(
             keyboard
                 .flags_changed(LEFT_COMMAND_KEY, LEFT_CMD)
@@ -500,6 +521,22 @@ mod tests {
         keyboard.flags_changed(LEFT_COMMAND_KEY, LEFT_CMD);
         keyboard.sync(0);
         assert_eq!(keyboard.take_command_tap(), None);
+    }
+
+    #[test]
+    fn command_tap_is_cancelled_by_a_key_the_system_took() {
+        let mut keyboard = Keyboard::new(CommandKey::Windows);
+        keyboard.flags_changed(LEFT_COMMAND_KEY, LEFT_CMD);
+        keyboard.cancel_command_tap();
+        keyboard.flags_changed(LEFT_COMMAND_KEY, 0);
+        assert_eq!(keyboard.take_command_tap(), None, "Cmd-Tab");
+        keyboard.flags_changed(LEFT_COMMAND_KEY, LEFT_CMD);
+        keyboard.flags_changed(LEFT_COMMAND_KEY, 0);
+        assert_eq!(
+            keyboard.take_command_tap(),
+            Some((0x5b, true)),
+            "next press"
+        );
     }
 
     #[test]
