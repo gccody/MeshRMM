@@ -13,6 +13,9 @@ import {
   timeoutMilliseconds,
 } from "../features/session/idle-session.ts";
 
+// Data points the dashboard Worker writes for the platform cost report.
+const usagePoints = [];
+
 async function render(pathname = "/", hostname = "meshrmm.com", company = null, init = {}, apiFetch = async () => new Response("API")) {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
@@ -29,10 +32,11 @@ async function render(pathname = "/", hostname = "meshrmm.com", company = null, 
       DASHBOARD_SESSION_KEY: Buffer.alloc(32, 7).toString("base64"),
       DB: {
         prepare() {
-          return { bind() { return { first: async () => company }; } };
+          return { bind() { return { run: async () => ({ results: company ? [company] : [], meta: { rows_read: 1, rows_written: 0 } }) }; } };
         },
       },
       MESHRMM_API: { fetch: apiFetch },
+      USAGE: { writeDataPoint: (point) => usagePoints.push(point) },
     },
     { waitUntil() {}, passThroughOnException() {} },
   );
@@ -90,10 +94,14 @@ test("server-renders the owner console only on the admin hostname", async () => 
 });
 
 test("resolves a provisioned company before rendering its fixed workspace", async () => {
+  usagePoints.length = 0;
   const response = await render("/", "acme.meshrmm.com", {
+    id: "company-acme",
     workos_organization_id: "org_acme",
   });
   assert.equal(response.status, 200);
+  // The request and its company lookup are charged to the company.
+  assert.deepEqual(usagePoints, [{ indexes: ["company-acme"], blobs: ["dashboard"], doubles: [1, 1, 1, 0] }]);
   const html = await response.text();
   assert.match(html, /Company workspace/);
   assert.match(html, /<title>Devices \| MeshRMM<\/title>/);
@@ -128,9 +136,11 @@ test("settings has a dedicated route and retains tenant isolation", async () => 
 });
 
 test("rejects unknown tenant hostnames before rendering", async () => {
+  usagePoints.length = 0;
   const response = await render("/", "unknown.meshrmm.com");
   assert.equal(response.status, 404);
   assert.equal(await response.text(), "Company not found");
+  assert.deepEqual(usagePoints.map((point) => point.indexes), [["slug:unknown"]]);
 });
 
 test("serves the WorkOS initiate-login route", async () => {

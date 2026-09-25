@@ -15,10 +15,12 @@ mod health;
 mod infrastructure;
 mod remote_session;
 mod routes;
+mod usage;
 
 use auth::*;
 use infrastructure::*;
 use routes::*;
+use usage::{MeteredStatement, metered_batch};
 
 const DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 900;
 const MAX_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 3600;
@@ -212,6 +214,7 @@ struct SessionInit<'a> {
     viewer_name: &'a str,
     session_id: &'a str,
     device_id: &'a str,
+    company_id: &'a str,
     client_token: &'a str,
     agent_token: &'a str,
     expires_at_unix_ms: u64,
@@ -225,7 +228,20 @@ struct TurnResponse {
 }
 
 #[event(fetch)]
-async fn fetch(mut request: Request, environment: Env, _context: Context) -> Result<Response> {
+async fn fetch(request: Request, environment: Env, _context: Context) -> Result<Response> {
+    // Requests for a company hostname reach this Worker through the dashboard
+    // Worker's service binding, which Cloudflare does not bill a second time.
+    let billable = is_legacy_control_plane_request(&request, &environment).unwrap_or(true);
+    let hostname = request_hostname(&request).unwrap_or_default();
+    let root_domain = tenant_root_domain(&environment).unwrap_or_default();
+    let source = usage::Source::Api {
+        billable,
+        tenant_slug: tenant_slug_from_hostname(&hostname, &root_domain),
+    };
+    usage::metered(&environment, source, route(request, environment.clone())).await
+}
+
+async fn route(mut request: Request, environment: Env) -> Result<Response> {
     if request.method() == Method::Options {
         return cors(Response::empty()?, &environment);
     }
@@ -245,6 +261,7 @@ async fn fetch(mut request: Request, environment: Env, _context: Context) -> Res
         (Method::Get, ["v1", "platform", "companies"]) => {
             list_platform_companies(&request, &environment).await
         }
+        (Method::Get, ["v1", "platform", "costs"]) => platform_costs(&request, &environment).await,
         (Method::Post, ["v1", "platform", "companies"]) => {
             create_platform_company(&mut request, &environment).await
         }
@@ -384,7 +401,7 @@ async fn authorize_agent(
         "SELECT auth_token_hash, pending_auth_token_hash, company_id, deletion_requested_at FROM agents WHERE id = ?1",
         device_id
     )?
-    .first::<AgentCredentialRow>(None)
+    .metered_first::<AgentCredentialRow>(None)
     .await?
     .ok_or_else(|| Error::RustError("unauthorized Agent".into()))?;
     let supplied_hash = sha256_hex(&supplied);
@@ -416,15 +433,16 @@ async fn authorize_agent(
         "SELECT 1 AS allowed FROM companies WHERE id = ?1 AND status IN ('active', 'awaiting_admin')",
         credential.company_id
     )?
-    .first::<i64>(Some("allowed"))
+    .metered_first::<i64>(Some("allowed"))
     .await?
     .is_some();
     if !active {
         return Err(Error::RustError("company is not active".into()));
     }
     if pending_matches {
-        query!(&db, "UPDATE agents SET auth_token_hash = ?1, pending_auth_token_hash = NULL WHERE id = ?2 AND pending_auth_token_hash = ?1", supplied_hash, device_id)?.run().await?;
+        query!(&db, "UPDATE agents SET auth_token_hash = ?1, pending_auth_token_hash = NULL WHERE id = ?2 AND pending_auth_token_hash = ?1", supplied_hash, device_id)?.metered_run().await?;
     }
+    usage::attribute_company(&credential.company_id);
     Ok(AgentAuthorization {
         company_id: credential.company_id,
         deletion_requested: credential.deletion_requested_at.is_some(),
@@ -437,7 +455,7 @@ async fn ensure_company_exists(db: &D1Database, company_id: &str) -> Result<()> 
         "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, display_border, prevent_idle_lock, allow_idle_override, slug, status FROM companies WHERE id = ?1",
         company_id
     )?
-    .first::<Company>(None)
+    .metered_first::<Company>(None)
     .await?
     .is_none()
     {
@@ -466,7 +484,7 @@ async fn audit(
         metadata_json,
         now_ms_i64()?
     )?
-    .run()
+    .metered_run()
     .await?;
     Ok(())
 }

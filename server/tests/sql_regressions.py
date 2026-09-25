@@ -20,6 +20,9 @@ def shipped_sql():
     for path in sorted((ROOT / "server/src").rglob("*.rs")):
         source = path.read_text()
         for match in re.finditer(r'"((?:[^"\\\n]|\\.)*)"', source):
+            # Analytics Engine queries run on Cloudflare's SQL API, not D1.
+            if "_sample_interval" in match.group(1):
+                continue
             if SQL_START.match(match.group(1)):
                 line = source.count("\n", 0, match.start()) + 1
                 yield f"{path.relative_to(ROOT)}:{line}", match.group(1)
@@ -175,8 +178,8 @@ class EnrollmentTests(unittest.TestCase):
         self.db.execute(update, (60, "Maintenance by {user_name}\nPlease wait", "co", 0, 0, 0))
         self.db.execute(update, (120, None, "co", None, None, None))
         self.assertEqual(self.db.execute("SELECT blackout_message FROM companies WHERE id='other'").fetchone(), (default,))
-        policy = sql("server/src/routes/handoffs.rs", "SELECT c.blackout_message")
-        self.assertEqual(self.db.execute(policy, ("device",)).fetchone(), ("Maintenance by {user_name}\nPlease wait", 0, 0, 0))
+        policy = sql("server/src/routes/handoffs.rs", "SELECT c.id AS company_id, c.blackout_message")
+        self.assertEqual(self.db.execute(policy, ("device",)).fetchone(), ("co", "Maintenance by {user_name}\nPlease wait", 0, 0, 0))
         self.db.execute("UPDATE agents SET deletion_requested_at=1")
         self.assertIsNone(self.db.execute(policy, ("device",)).fetchone())
 
@@ -284,6 +287,55 @@ class EnrollmentTests(unittest.TestCase):
         self.assertEqual(self.db.execute(promote, ("c" * 64, "device")).rowcount, 1)
         self.assertEqual(self.db.execute(withdraw, ("device", "c" * 64)).rowcount, 0)
         self.assertEqual(self.credentials(), ("c" * 64, None))
+
+
+class UsageMeteringTests(unittest.TestCase):
+    """The rows the platform cost report attributes Cloudflare and WorkOS usage with."""
+
+    def setUp(self):
+        self.db = migrated_database()
+        self.db.execute("PRAGMA foreign_keys = ON")
+        for company in ("a", "b"):
+            self.db.execute("INSERT INTO companies (id,name,created_at,slug,status) VALUES (?,?,0,?,'active')", (company, company.upper(), company))
+
+    def test_agents_and_sessions_are_attributed_to_their_company(self):
+        self.db.execute("INSERT INTO agents (id,company_id,name,auth_token_hash,created_by_user_id,created_at,updated_at) VALUES ('device','a','PC',?,'user',5,5)", ("a" * 64,))
+        record = sql("server/src/routes/handoffs.rs", "INSERT OR IGNORE INTO usage_object_owners")
+        self.db.execute(record, ("session", "b", 7))
+        self.db.execute(record, ("session", "a", 8))
+        owners = sql("server/src/routes/costs.rs", "SELECT object_name, company_id FROM usage_object_owners")
+        self.assertEqual(sorted(self.db.execute(owners).fetchall()), [("device", "a"), ("session", "b")])
+        prune = sql("server/src/routes/costs.rs", "DELETE FROM usage_object_owners")
+        self.db.execute(prune, (10,))
+        self.assertEqual(self.db.execute(owners).fetchall(), [("device", "a")], "only old sessions are pruned")
+
+    def test_agents_enrolled_before_metering_are_backfilled(self):
+        db = sqlite3.connect(":memory:", isolation_level=None)
+        migrations = sorted((ROOT / "server/migrations").glob("*.sql"))
+        for migration in migrations[:-1]:
+            db.executescript(migration.read_text())
+        db.execute("INSERT INTO companies (id,name,created_at) VALUES ('a','A',0)")
+        db.execute("INSERT INTO agents (id,company_id,name,auth_token_hash,created_by_user_id,created_at,updated_at) VALUES ('device','a','PC',?,'user',5,5)", ("a" * 64,))
+        self.assertEqual(migrations[-1].name, "0013_usage_metering.sql")
+        db.executescript(migrations[-1].read_text())
+        self.assertEqual(db.execute("SELECT object_name, company_id, kind FROM usage_object_owners").fetchall(), [("device", "a", "agent")])
+
+    def test_active_users_count_once_per_company_and_month(self):
+        record = sql("server/src/usage.rs", "INSERT OR IGNORE INTO company_active_users")
+        for company, month, user in [("a", "2026-09", "u1"), ("a", "2026-09", "u1"), ("a", "2026-09", "u2"), ("b", "2026-09", "u1"), ("a", "2026-08", "u3")]:
+            self.db.execute(record, (company, month, user, 1))
+        count = sql("server/src/routes/costs.rs", "SELECT company_id, COUNT(*) AS count FROM company_active_users")
+        self.assertEqual(sorted(self.db.execute(count, ("2026-09",)).fetchall()), [("a", 2), ("b", 1)])
+        prune = sql("server/src/routes/costs.rs", "DELETE FROM company_active_users")
+        self.db.execute(prune, ("2026-09",))
+        self.assertEqual(self.db.execute("SELECT DISTINCT month FROM company_active_users").fetchall(), [("2026-09",)])
+
+    def test_storage_is_apportioned_by_company_rows(self):
+        self.db.execute("INSERT INTO agents (id,company_id,name,auth_token_hash,created_by_user_id,created_at,updated_at) VALUES ('device','a','PC',?,'user',5,5)", ("a" * 64,))
+        self.db.execute("INSERT INTO audit_events (id,company_id,actor_user_id,action,target_type,target_id,created_at) VALUES ('e','b','u','x','y','z',0)")
+        rows = sql("server/src/routes/costs.rs", "SELECT company_id, SUM(count) AS count")
+        # The Agent's row and its usage owner row.
+        self.assertEqual(sorted(self.db.execute(rows).fetchall()), [("a", 2), ("b", 1)])
 
 if __name__ == "__main__":
     unittest.main()

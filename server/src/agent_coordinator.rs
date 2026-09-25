@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use worker::{query, *};
 
 use crate::company_presence::{self, PresenceMutation};
+use crate::usage::MeteredStatement;
 
 const AGENT_TAG: &str = "agent";
 const COMPANY_HEADER: &str = "X-Mesh-Company-Id";
@@ -81,8 +82,8 @@ pub struct AgentCoordinator {
     presence_lock: Mutex<()>,
 }
 
-impl DurableObject for AgentCoordinator {
-    fn new(state: State, environment: Env) -> Self {
+impl AgentCoordinator {
+    fn construct(state: State, environment: Env) -> Self {
         Self {
             state,
             environment,
@@ -90,7 +91,7 @@ impl DurableObject for AgentCoordinator {
         }
     }
 
-    async fn fetch(&self, mut request: Request) -> Result<Response> {
+    async fn handle_fetch(&self, mut request: Request) -> Result<Response> {
         match (request.method(), request.path().as_str()) {
             (Method::Get, "/connect") => {
                 let _guard = self.presence_lock.lock().await;
@@ -310,7 +311,7 @@ impl DurableObject for AgentCoordinator {
         }
     }
 
-    async fn alarm(&self) -> Result<Response> {
+    async fn handle_alarm(&self) -> Result<Response> {
         let _guard = self.presence_lock.lock().await;
         if let Some(identity) = self
             .state
@@ -338,7 +339,7 @@ impl DurableObject for AgentCoordinator {
         Response::ok("presence delivered")
     }
 
-    async fn websocket_message(
+    async fn handle_websocket_message(
         &self,
         socket: WebSocket,
         message: WebSocketIncomingMessage,
@@ -367,7 +368,7 @@ impl DurableObject for AgentCoordinator {
         Ok(())
     }
 
-    async fn websocket_close(
+    async fn handle_websocket_close(
         &self,
         socket: WebSocket,
         code: usize,
@@ -386,11 +387,53 @@ impl DurableObject for AgentCoordinator {
         Ok(())
     }
 
-    async fn websocket_error(&self, socket: WebSocket, error: Error) -> Result<()> {
+    async fn handle_websocket_error(&self, socket: WebSocket, error: Error) -> Result<()> {
         let _ = socket.close(Some(1011), Some("Agent signaling failed"));
         self.publish_disconnected_if_current(&socket).await;
         console_error!("event=agent_signaling_error error={}", error);
         Ok(())
+    }
+}
+
+/// Every event is metered, so the D1 rows it reads and writes are charged to
+/// the company that owns this object.
+impl DurableObject for AgentCoordinator {
+    fn new(state: State, environment: Env) -> Self {
+        Self::construct(state, environment)
+    }
+
+    async fn fetch(&self, request: Request) -> Result<Response> {
+        crate::usage::metered_object(&self.state, &self.environment, self.handle_fetch(request))
+            .await
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        crate::usage::metered_object(&self.state, &self.environment, self.handle_alarm()).await
+    }
+
+    async fn websocket_message(
+        &self,
+        socket: WebSocket,
+        message: WebSocketIncomingMessage,
+    ) -> Result<()> {
+        let handled = self.handle_websocket_message(socket, message);
+        crate::usage::metered_object(&self.state, &self.environment, handled).await
+    }
+
+    async fn websocket_close(
+        &self,
+        socket: WebSocket,
+        code: usize,
+        reason: String,
+        was_clean: bool,
+    ) -> Result<()> {
+        let handled = self.handle_websocket_close(socket, code, reason, was_clean);
+        crate::usage::metered_object(&self.state, &self.environment, handled).await
+    }
+
+    async fn websocket_error(&self, socket: WebSocket, error: Error) -> Result<()> {
+        let handled = self.handle_websocket_error(socket, error);
+        crate::usage::metered_object(&self.state, &self.environment, handled).await
     }
 }
 
@@ -460,7 +503,7 @@ impl AgentCoordinator {
                     company_id,
                     credential.pending_auth_token_hash
                 )?
-                .run()
+                .metered_run()
                 .await?
                 .meta()?
                 .and_then(|meta| meta.changes)
@@ -493,7 +536,7 @@ impl AgentCoordinator {
                 device_id,
                 hash
             )?
-            .run()
+            .metered_run()
             .await?;
             storage.delete(PENDING_ROTATION_KEY).await?;
         }
@@ -542,7 +585,7 @@ impl AgentCoordinator {
                 "SELECT 1 AS active FROM companies WHERE id = ?1 AND status IN ('active', 'awaiting_admin')",
                 identity.company_id
             )?
-            .first::<i64>(Some("active"))
+            .metered_first::<i64>(Some("active"))
             .await
         }
         .await;
@@ -823,7 +866,7 @@ async fn credential_state(
         device_id,
         company_id
     )?
-    .first::<CredentialState>(None)
+    .metered_first::<CredentialState>(None)
     .await
 }
 

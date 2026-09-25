@@ -1,12 +1,14 @@
 "use client";
 
 import { LoginRequiredError, useAuth } from "../auth/auth-provider";
-import { Building2, LoaderCircle, LogOut, Network, Plus, RefreshCw, ShieldCheck, X } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { Building2, ChevronDown, LoaderCircle, LogOut, Network, Plus, Receipt, RefreshCw, ShieldCheck, X } from "lucide-react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { errorMessage, normalizeServer } from "../../lib/http";
 import { useRuntimeConfig } from "../../app/providers";
 import { errorAfterFailure, ownerAccessAfterFailure, PlatformRequestError, type OwnerAccess } from "./platform-access";
+import { formatUsd, monthLabel, recentMonths, type CostReport } from "./costs";
+import { CostBreakdown, ProviderCosts } from "./provider-costs";
 
 type PlatformCompany = {
   id: string;
@@ -33,6 +35,13 @@ export function PlatformDashboard() {
   const [pendingCompany, setPendingCompany] = useState<string | null>(null);
   const [domainDrafts, setDomainDrafts] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
+  const costMonths = useMemo(() => recentMonths(new Date()), []);
+  const [costMonth, setCostMonth] = useState(costMonths[0]);
+  const [costs, setCosts] = useState<CostReport | null>(null);
+  const [costsError, setCostsError] = useState<string | null>(null);
+  const [isLoadingCosts, setIsLoadingCosts] = useState(false);
+  const [expandedCosts, setExpandedCosts] = useState<string | null>(null);
+  const costRequest = useRef(0);
 
   const authorizedFetch = useCallback(async (path: string, init: RequestInit = {}) => {
     let token: string;
@@ -76,6 +85,32 @@ export function PlatformDashboard() {
     const timeout = window.setTimeout(() => void loadCompanies(), 0);
     return () => window.clearTimeout(timeout);
   }, [isAuthLoading, loadCompanies, user]);
+
+  // Loaded apart from the companies: the report queries Cloudflare and WorkOS,
+  // so it is slower and can fail without hiding company management.
+  const loadCosts = useCallback(async (month: string) => {
+    const request = ++costRequest.current;
+    setIsLoadingCosts(true);
+    setCostsError(null);
+    try {
+      const response = await authorizedFetch(`/v1/platform/costs?month=${encodeURIComponent(month)}`);
+      if (!response.ok) throw new Error(await errorMessage(response, "Costs could not be loaded."));
+      const report = (await response.json()) as CostReport;
+      if (request === costRequest.current) setCosts(report);
+    } catch (requestError) {
+      if (request === costRequest.current) setCostsError(requestError instanceof Error ? requestError.message : "Costs could not be loaded.");
+    } finally {
+      if (request === costRequest.current) setIsLoadingCosts(false);
+    }
+  }, [authorizedFetch]);
+
+  useEffect(() => {
+    if (!hasOwnerAccess) return;
+    const timeout = window.setTimeout(() => void loadCosts(costMonth), 0);
+    return () => window.clearTimeout(timeout);
+  }, [costMonth, hasOwnerAccess, loadCosts]);
+
+  const toggleCosts = (key: string) => setExpandedCosts((current) => current === key ? null : key);
 
   const createCompany = async (event: FormEvent) => {
     event.preventDefault();
@@ -207,10 +242,21 @@ export function PlatformDashboard() {
       <div className="platform-content">
         <section className="page-heading">
           <div><p className="eyebrow">Workspace management</p><h1>Companies</h1><p>Create company workspaces and invite their administrators.</p></div>
-          <button className="secondary-button" onClick={() => { setError(null); void loadCompanies(); }} disabled={isLoading}><RefreshCw size={16} className={isLoading ? "spin" : ""} /> Refresh</button>
+          <button className="secondary-button" onClick={() => { setError(null); void loadCompanies(); void loadCosts(costMonth); }} disabled={isLoading || isLoadingCosts}><RefreshCw size={16} className={isLoading || isLoadingCosts ? "spin" : ""} /> Refresh</button>
         </section>
 
         {error && <div className="error-banner" role="alert"><X size={17} /><span>{error}</span><button onClick={() => setError(null)} aria-label="Dismiss"><X size={16} /></button></div>}
+
+        <ProviderCosts
+          costs={costs}
+          error={costsError}
+          isLoading={isLoadingCosts}
+          month={costMonth}
+          months={costMonths}
+          onMonthChange={(month) => { setExpandedCosts(null); setCostMonth(month); }}
+          expanded={expandedCosts}
+          onToggle={toggleCosts}
+        />
 
         <section className="platform-grid">
           <form className="platform-create-card" onSubmit={createCompany}>
@@ -225,28 +271,38 @@ export function PlatformDashboard() {
             <div className="management-heading"><h2>Provisioned companies</h2><p>{companies.length} company workspace{companies.length === 1 ? "" : "s"}</p></div>
             {isLoading && companies.length === 0 ? <div className="company-empty"><LoaderCircle className="spin" /> Loading companies</div> : companies.length === 0 ? <div className="company-empty"><Building2 /> No companies have been created.</div> : (
               <div className="company-list">
-                {companies.map((company) => (
-                  <article className="company-row" key={company.id}>
-                    <div className="workspace-avatar">{company.name.slice(0, 2).toUpperCase()}</div>
-                    <div className="company-row-main">
-                      <div><strong>{company.name}</strong><span className={`company-status status-${company.status}`}>{company.status.replace("_", " ")}</span></div>
-                      {company.slug ? <a href={`https://${company.slug}.meshrmm.com`}>{company.slug}.meshrmm.com</a> : (
-                        <div className="legacy-domain-form">
-                          <input aria-label={`Domain slug for ${company.name}`} value={domainDrafts[company.id] ?? ""} onChange={(event) => setDomainDrafts((current) => ({ ...current, [company.id]: event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "") }))} placeholder="assign-slug" />
-                          <span>.meshrmm.com</span>
-                          <button className="secondary-button" disabled={pendingCompany === company.id || !(domainDrafts[company.id]?.trim())} onClick={() => void assignDomain(company)}>Assign once</button>
-                        </div>
-                      )}
-                      <small>{company.initial_admin_email}</small>
-                      {company.provisioning_error && <p>{company.provisioning_error}</p>}
-                    </div>
-                    <div className="company-row-actions">
-                      {(company.status === "failed" || company.status === "provisioning") && <button className="secondary-button" disabled={pendingCompany === company.id} onClick={() => void mutateCompany(company, "retry")}>Retry</button>}
-                      {company.status === "suspended" && <button className="secondary-button" disabled={pendingCompany === company.id} onClick={() => void mutateCompany(company, "activate")}>Activate</button>}
-                      {!(["suspended", "provisioning"] as string[]).includes(company.status) && <button className="danger-button" disabled={pendingCompany === company.id} onClick={() => void mutateCompany(company, "suspend")}>Suspend</button>}
-                    </div>
-                  </article>
-                ))}
+                {companies.map((company) => {
+                  const companyCosts = costs?.companies.find((candidate) => candidate.company_id === company.id);
+                  const costsExpanded = expandedCosts === company.id;
+                  return (
+                    <article className="company-row" key={company.id}>
+                      <div className="workspace-avatar">{company.name.slice(0, 2).toUpperCase()}</div>
+                      <div className="company-row-main">
+                        <div><strong>{company.name}</strong><span className={`company-status status-${company.status}`}>{company.status.replace("_", " ")}</span></div>
+                        {company.slug ? <a href={`https://${company.slug}.meshrmm.com`}>{company.slug}.meshrmm.com</a> : (
+                          <div className="legacy-domain-form">
+                            <input aria-label={`Domain slug for ${company.name}`} value={domainDrafts[company.id] ?? ""} onChange={(event) => setDomainDrafts((current) => ({ ...current, [company.id]: event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "") }))} placeholder="assign-slug" />
+                            <span>.meshrmm.com</span>
+                            <button className="secondary-button" disabled={pendingCompany === company.id || !(domainDrafts[company.id]?.trim())} onClick={() => void assignDomain(company)}>Assign once</button>
+                          </div>
+                        )}
+                        <small>{company.initial_admin_email}</small>
+                        {company.provisioning_error && <p>{company.provisioning_error}</p>}
+                        {companyCosts && costs && (
+                          <button className="company-cost" aria-expanded={costsExpanded} onClick={() => toggleCosts(company.id)}>
+                            <Receipt size={13} /> {formatUsd(companyCosts.total_usd)} in {monthLabel(costs.month)} <ChevronDown size={13} />
+                          </button>
+                        )}
+                      </div>
+                      <div className="company-row-actions">
+                        {(company.status === "failed" || company.status === "provisioning") && <button className="secondary-button" disabled={pendingCompany === company.id} onClick={() => void mutateCompany(company, "retry")}>Retry</button>}
+                        {company.status === "suspended" && <button className="secondary-button" disabled={pendingCompany === company.id} onClick={() => void mutateCompany(company, "activate")}>Activate</button>}
+                        {!(["suspended", "provisioning"] as string[]).includes(company.status) && <button className="danger-button" disabled={pendingCompany === company.id} onClick={() => void mutateCompany(company, "suspend")}>Suspend</button>}
+                      </div>
+                      {costsExpanded && companyCosts && <div className="company-cost-details"><CostBreakdown summary={companyCosts} /></div>}
+                    </article>
+                  );
+                })}
               </div>
             )}
           </section>

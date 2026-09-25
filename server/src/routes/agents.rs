@@ -25,7 +25,7 @@ pub(crate) async fn create_agent_installer(
         "DELETE FROM agent_install_tokens WHERE expires_at <= ?1",
         now
     )?
-    .run()
+    .metered_run()
     .await?;
     let install_id = Uuid::new_v4().to_string();
     let install_token = random_token();
@@ -44,7 +44,7 @@ pub(crate) async fn create_agent_installer(
         now,
         expires_at_i64
     )?
-    .run()
+    .metered_run()
     .await?;
     audit(
         &db,
@@ -126,17 +126,18 @@ pub(crate) async fn redeem_agent_installer(
         name,
         tenant_id
     )?;
-    db.batch(vec![claim, insert]).await?;
+    metered_batch(&db, vec![claim, insert]).await?;
     let ticket = query!(&db,
         "SELECT t.id, t.company_id, t.created_by_user_id, t.device_id FROM agent_install_tokens t JOIN agents a ON a.id = t.device_id WHERE t.token_hash = ?1 AND t.redemption_key_hash = ?2 AND t.computer_name = ?3 AND t.expires_at > ?4 AND a.deletion_requested_at IS NULL AND a.auth_token_hash = ?5 AND (?6 = '' OR t.company_id = ?6) AND EXISTS (SELECT 1 FROM companies WHERE companies.id = t.company_id AND companies.status IN ('active', 'awaiting_admin'))",
         token_hash, key_hash, name, now, agent_token_hash, tenant_id
-    )?.first::<AgentInstallTokenRow>(None).await?;
+    )?.metered_first::<AgentInstallTokenRow>(None).await?;
     let Some(ticket) = ticket else {
         return api_error(
             401,
             "Agent installer is invalid, expired, or claimed by another endpoint",
         );
     };
+    crate::usage::attribute_company(&ticket.company_id);
     let device_id = ticket.device_id;
     let identity = Identity {
         user_id: ticket.created_by_user_id,
@@ -189,7 +190,7 @@ pub(crate) async fn delete_agent(
         device_id,
         identity.company_id
     )?
-    .run()
+    .metered_run()
     .await?;
     if result
         .meta()?

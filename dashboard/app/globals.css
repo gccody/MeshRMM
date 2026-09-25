@@ -268,6 +268,38 @@ button { color: inherit; }
 .company-row-actions { display: flex; gap: 6px; }
 .danger-button { height: 36px; padding: 0 11px; border: 1px solid #ecd8d4; border-radius: 8px; color: #a74f41; background: #fff8f6; cursor: pointer; font-size: 12px; font-weight: 650; }
 .danger-button:disabled { cursor: wait; opacity: .6; }
+.cost-card { margin-top: 24px; padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: #fff; box-shadow: 0 3px 12px rgba(30,30,50,.025); }
+.cost-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.cost-card-heading h2 { margin: 0; font-size: 16px; }
+.cost-card-heading p { max-width: 720px; margin: 5px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.cost-month { display: grid; gap: 5px; color: #4b4d59; font-size: 12px; font-weight: 650; }
+.cost-month select { height: 36px; padding: 0 10px; border: 1px solid #dcdee5; border-radius: 8px; outline: 0; color: var(--ink); background: #fbfbfc; font-size: 13px; }
+.cost-stats { margin-top: 16px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.cost-stats > div { padding: 12px 14px; display: grid; gap: 4px; align-content: start; justify-items: start; border: 1px solid var(--line); border-radius: 10px; background: #fafafb; }
+.cost-stats span { color: var(--muted); font-size: 12px; font-weight: 650; }
+.cost-stats strong { font-size: 20px; font-variant-numeric: tabular-nums; }
+.cost-error, .cost-warning { margin: 12px 0 0; padding: 9px 11px; border-radius: 8px; font-size: 12px; line-height: 1.45; }
+.cost-error { color: #ad4f3e; background: #fff0ed; }
+.cost-warning { color: #8a621e; background: #fff3df; }
+.company-cost { margin-top: 7px; padding: 3px 7px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); background: #fff; cursor: pointer; font-size: 12px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.company-cost:hover { border-color: #c9c3f2; background: var(--purple-soft); }
+.company-cost svg:last-child { color: var(--muted); transition: transform .15s; }
+.company-cost[aria-expanded="true"] svg:last-child { transform: rotate(180deg); }
+.company-cost-details { grid-column: 1 / -1; min-width: 0; }
+/* Wide breakdown tables scroll inside the row instead of widening the page. */
+.company-list-card, .company-row { min-width: 0; }
+.cost-breakdown { margin-top: 12px; display: grid; gap: 12px; overflow-x: auto; }
+.cost-breakdown table { width: 100%; min-width: 600px; table-layout: fixed; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+.cost-breakdown th:first-child { width: 38%; }
+.cost-breakdown h3 { margin: 0 0 6px; padding: 0 8px; display: flex; justify-content: space-between; color: var(--ink); font-size: 13px; font-variant-numeric: tabular-nums; }
+.cost-breakdown th, .cost-breakdown td { padding: 7px 8px; border-top: 1px solid var(--line); text-align: right; white-space: nowrap; }
+.cost-breakdown thead th { color: #989aa5; background: #fafafb; font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.cost-breakdown th:first-child { text-align: left; }
+.cost-breakdown tbody th { font-weight: 600; }
+.cost-basis { margin-left: 7px; padding: 2px 5px; border-radius: 999px; color: #6d6f7c; background: #f0f1f4; font-size: 10px; font-weight: 700; text-transform: capitalize; cursor: help; }
+.cost-basis.basis-metered { color: #13815a; background: #eaf8f1; }
+.cost-basis.basis-allocated, .cost-basis.basis-estimated { color: #8a621e; background: #fff3df; }
+.cost-empty { margin: 12px 0 0; color: var(--muted); font-size: 12px; }
 .spin { animation: spin .8s linear infinite; }
 .sidebar-scrim { display: none; }
 
@@ -282,6 +314,7 @@ button { color: inherit; }
 
 @media (max-width: 900px) {
   .platform-grid { grid-template-columns: 1fr; }
+  .cost-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .sidebar { transform: translateX(-100%); transition: transform .2s ease; box-shadow: 18px 0 50px rgba(20,20,40,.13); }
   .sidebar.sidebar-open { transform: translateX(0); }
   .sidebar-close { display: grid; place-items: center; }
@@ -303,6 +336,7 @@ button { color: inherit; }
   .platform-content { padding: 26px 14px 40px; }
   .company-row { grid-template-columns: 36px minmax(0, 1fr); }
   .company-row-actions { grid-column: 2; }
+  .cost-card-heading { flex-direction: column; }
   .topbar { height: 61px; padding: 0 14px; }
   .global-search { display: none; }
   .topbar-actions { margin-left: auto; }

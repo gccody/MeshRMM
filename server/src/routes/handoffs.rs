@@ -17,7 +17,7 @@ pub(crate) async fn create_handoff(request: &mut Request, environment: &Env) -> 
         body.device_id,
         identity.company_id
     )?
-    .first::<i64>(Some("permitted"))
+    .metered_first::<i64>(Some("permitted"))
     .await?
     .is_some();
     if !permitted {
@@ -32,7 +32,7 @@ pub(crate) async fn create_handoff(request: &mut Request, environment: &Env) -> 
         "DELETE FROM remote_handoffs WHERE expires_at <= ?1",
         now_ms_i64()?
     )?
-    .run()
+    .metered_run()
     .await?;
     query!(
         &db,
@@ -45,7 +45,7 @@ pub(crate) async fn create_handoff(request: &mut Request, environment: &Env) -> 
         i64::try_from(expires_at).map_err(|_| Error::RustError("clock overflow".into()))?,
         body.start_in_background
     )?
-    .run()
+    .metered_run()
     .await?;
     audit(
         &db,
@@ -84,7 +84,7 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
             token_hash,
             tenant.id
         )?
-        .first::<HandoffRow>(None)
+        .metered_first::<HandoffRow>(None)
         .await?
     } else {
         query!(
@@ -93,12 +93,13 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
             now,
             token_hash
         )?
-        .first::<HandoffRow>(None)
+        .metered_first::<HandoffRow>(None)
         .await?
     };
     let Some(handoff) = handoff else {
         return api_error(401, "remote handoff is invalid, expired, or already used");
     };
+    crate::usage::attribute_company(&handoff.company_id);
     validate_identifier(&handoff.user_id, "user ID")?;
     let mut profile_response = super::platform::workos_request(
         environment,
@@ -148,6 +149,7 @@ pub(crate) async fn create_session_for_device(
     let db = environment.d1("DB")?;
     #[derive(Deserialize)]
     struct MaintenancePolicy {
+        company_id: String,
         blackout_message: String,
         #[serde(deserialize_with = "deserialize_sql_bool")]
         display_border: bool,
@@ -157,9 +159,9 @@ pub(crate) async fn create_session_for_device(
         allow_idle_override: bool,
     }
     let policy = query!(&db,
-        "SELECT c.blackout_message, c.display_border, c.prevent_idle_lock, c.allow_idle_override FROM companies c JOIN agents a ON a.company_id = c.id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL",
+        "SELECT c.id AS company_id, c.blackout_message, c.display_border, c.prevent_idle_lock, c.allow_idle_override FROM companies c JOIN agents a ON a.company_id = c.id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL",
         device_id
-    )?.first::<MaintenancePolicy>(None).await?;
+    )?.metered_first::<MaintenancePolicy>(None).await?;
     let Some(policy) = policy else {
         return api_error(404, "agent not found");
     };
@@ -173,7 +175,19 @@ pub(crate) async fn create_session_for_device(
     let idle_timeout_seconds = session_idle_timeout(environment)?;
     let idle_timeout_ms = idle_timeout_seconds * 1000;
     let expires_at_unix_ms = Date::now().as_millis() + idle_timeout_ms.max(15 * 60 * 1000);
-    let ice_servers = generate_ice_servers(environment, idle_timeout_seconds).await?;
+    let ice_servers =
+        generate_ice_servers(environment, idle_timeout_seconds, &policy.company_id).await?;
+    // The session's Durable Object is named after the session, so its usage is
+    // attributed through this record.
+    query!(
+        &db,
+        "INSERT OR IGNORE INTO usage_object_owners (object_name, company_id, kind, created_at) VALUES (?1, ?2, 'remote_session', ?3)",
+        session_id,
+        policy.company_id,
+        now_ms_i64()?
+    )?
+    .metered_run()
+    .await?;
 
     let init = SessionInit {
         start_in_background,
@@ -183,6 +197,7 @@ pub(crate) async fn create_session_for_device(
         viewer_name,
         session_id: &session_id,
         device_id,
+        company_id: &policy.company_id,
         client_token: &client_token,
         agent_token: &agent_token,
         expires_at_unix_ms,
@@ -270,7 +285,7 @@ pub(crate) async fn close_agent_session(
     let permitted = query!(&db,
         "SELECT 1 AS permitted FROM agents WHERE id = ?1 AND company_id = ?2 AND deletion_requested_at IS NULL",
         device_id, identity.company_id
-    )?.first::<i64>(Some("permitted")).await?.is_some();
+    )?.metered_first::<i64>(Some("permitted")).await?.is_some();
     if !permitted {
         return api_error(404, "Agent not found");
     }
