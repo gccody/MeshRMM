@@ -220,51 +220,54 @@ pub(crate) async fn rotate_agent_token(
         Ok(_) => return api_error(403, "company administrator access is required"),
         Err(error) => return workos_auth_error(error),
     };
-    let agent_token = random_token();
-    let token_hash = sha256_hex(&agent_token);
-    let now = now_ms_i64()?;
-    let db = environment.d1("DB")?;
-    let result = query!(
-        &db,
-        "UPDATE agents SET pending_auth_token_hash = ?1, updated_at = ?2 WHERE id = ?3 AND company_id = ?4 AND deletion_requested_at IS NULL AND pending_auth_token_hash IS NULL",
-        token_hash,
-        now,
-        device_id,
-        identity.company_id
-    )?
-    .run()
-    .await?;
-    if result
-        .meta()?
-        .and_then(|meta| meta.changes)
-        .unwrap_or_default()
-        == 0
+    // The coordinator stages the credential and sends it in one step, so a
+    // credential is never pending in D1 without the Agent being able to get it.
+    let headers = Headers::new();
+    headers.set("X-Mesh-Company-Id", &identity.company_id)?;
+    headers.set("X-Mesh-Device-Id", device_id)?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post).with_headers(headers);
+    let rotation = Request::new_with_init("https://agent.internal/rotate-token", &init)?;
+    let mut response = match object_stub(environment, "AGENT_COORDINATOR", device_id)?
+        .fetch_with_request(rotation)
+        .await
     {
-        return api_error(
-            409,
-            "Agent not found or a credential rotation is already pending",
-        );
+        Ok(response) => response,
+        Err(error) => {
+            console_error!("event=agent_rotation_failed error={}", error);
+            return api_error(
+                503,
+                "the new credential could not be delivered; the current credential remains valid, so try again",
+            );
+        }
+    };
+    match response.status_code() {
+        200 => {}
+        status @ (404 | 409) => return api_error(status, &response.text().await?),
+        status => {
+            console_error!("event=agent_rotation_failed status={}", status);
+            return api_error(
+                503,
+                "the new credential could not be delivered; the current credential remains valid, so try again",
+            );
+        }
     }
+    let redelivered = response
+        .json::<serde_json::Value>()
+        .await?
+        .get("redelivered")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_default();
+    let db = environment.d1("DB")?;
     audit(
         &db,
         &identity,
         "agent.rotate_token",
         "agent",
         device_id,
-        "{}",
+        &serde_json::json!({ "redelivered": redelivered }).to_string(),
     )
     .await?;
-    let command = meshrmm_protocol_types::AgentCommand::RotateToken { token: agent_token };
-    let request = internal_json_request("https://agent.internal/rotate-token", &command)?;
-    let response = object_stub(environment, "AGENT_COORDINATOR", device_id)?
-        .fetch_with_request(request)
-        .await?;
-    if response.status_code() != 200 {
-        return api_error(
-            409,
-            "Agent must be online to receive its new credential; current credential remains valid",
-        );
-    }
     Response::from_json(
         &serde_json::json!({ "device_id": device_id, "status": "rotation_pending" }),
     )

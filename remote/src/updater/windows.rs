@@ -2,10 +2,12 @@ use std::ffi::OsString;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread::sleep;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
+use meshrmm_self_update::windows::{
+    PreviousProcess, current_process_created, helper_cleanup_command,
+};
 use meshrmm_self_update::{CLIENT_WINDOWS_X64, CURRENT_VERSION, UpdateManifest};
 
 use crate::config::Config;
@@ -14,6 +16,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_UPDATE_BYTES: usize = 256 * 1024 * 1024;
+/// The viewer exits as soon as the helper starts, so this only allows for a slow shutdown.
+const VIEWER_EXIT_TIMEOUT: Duration = Duration::from_secs(60);
+const TERMINATED_VIEWER_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn is_helper_invocation() -> bool {
     std::env::args_os()
@@ -29,7 +34,7 @@ pub async fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
     if std::env::var_os("MESHRMM_UPDATE_READY_FILE").is_some() {
         return Ok(false);
     }
-    let http = reqwest::Client::builder()
+    let http = crate::http::client_builder()
         .timeout(Duration::from_secs(30))
         .build()
         .context("failed to create client update HTTP client")?;
@@ -63,19 +68,33 @@ pub async fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
         "meshrmm-remote-{}.update-{suffix}.exe",
         release.version
     ));
-    write_new_file(&staged, &executable)?;
-
     let helper_directory = std::env::temp_dir()
         .join("MeshRMM")
         .join(format!("client-update-{suffix}"));
-    std::fs::create_dir_all(&helper_directory).with_context(|| {
+    let scheduled = write_new_file(&staged, &executable)
+        .and_then(|()| start_helper(config, &current, &staged, &helper_directory));
+    if let Err(error) = scheduled {
+        remove_if_present(&staged);
+        let _ = std::fs::remove_dir_all(&helper_directory);
+        return Err(error);
+    }
+    Ok(true)
+}
+
+fn start_helper(
+    config: &Config,
+    current: &Path,
+    staged: &Path,
+    helper_directory: &Path,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(helper_directory).with_context(|| {
         format!(
             "failed to create client update helper directory {}",
             helper_directory.display()
         )
     })?;
     let helper = helper_directory.join("update-helper.exe");
-    std::fs::copy(&current, &helper)
+    std::fs::copy(current, &helper)
         .with_context(|| format!("failed to create client update helper {}", helper.display()))?;
     let launch_arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     Command::new(&helper)
@@ -89,68 +108,106 @@ pub async fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
             )?,
         )
         .arg("--apply-client-update")
-        .arg(&current)
-        .arg(&staged)
+        .arg(current)
+        .arg(staged)
+        // The helper waits for this process to exit before replacing its executable.
+        .arg(std::process::id().to_string())
         .args(launch_arguments)
-        .current_dir(&helper_directory)
+        .current_dir(helper_directory)
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn()
         .with_context(|| format!("failed to start client update helper {}", helper.display()))?;
-    Ok(true)
+    Ok(())
 }
 
+/// Runs as a copy of the previous viewer. Whatever fails, it relaunches the viewer that is left
+/// installed, removes the staged executable, and schedules its own removal.
 pub fn apply_scheduled_update() -> anyhow::Result<()> {
-    let result = apply_update_inner();
-    if result.is_err() {
-        let arguments = std::env::args_os().skip(2).collect::<Vec<_>>();
-        let target_index = 0;
-        if let Some(target) = arguments.get(target_index) {
-            let target = PathBuf::from(target);
-            if target.exists() {
-                let launch_arguments = arguments.into_iter().skip(2).collect::<Vec<_>>();
-                launch(&target, &launch_arguments)
-                    .context("update failed and the restored viewer could not be relaunched")?;
-            }
-        }
-    }
-    result
-}
-
-fn apply_update_inner() -> anyhow::Result<()> {
     let arguments = std::env::args_os().skip(2).collect::<Vec<_>>();
-    if arguments.len() < 2 {
-        bail!("the client update helper requires target and staged executable paths");
-    }
-    let target = PathBuf::from(&arguments[0]);
-    let staged = PathBuf::from(&arguments[1]);
-    let launch_arguments = arguments.into_iter().skip(2).collect::<Vec<OsString>>();
+    let [target, staged, process_id, launch_arguments @ ..] = arguments.as_slice() else {
+        bail!(
+            "the client update helper requires target and staged executable paths and the viewer process ID"
+        );
+    };
+    let target = PathBuf::from(target);
+    let staged = PathBuf::from(staged);
     let helper = std::env::current_exe().context("could not locate the client update helper")?;
     let helper_directory = helper
         .parent()
         .context("client update helper has no parent directory")?
         .to_owned();
+    tracing::info!(
+        target = %target.display(),
+        staged = %staged.display(),
+        viewer_process_id = ?process_id,
+        "client update helper started"
+    );
 
-    wait_until_replaceable(&target, Duration::from_secs(60))?;
+    let mut result = process_id
+        .to_str()
+        .and_then(|value| value.parse::<u32>().ok())
+        .context("the client update helper received an invalid viewer process ID")
+        .and_then(|process_id| install_update(&target, &staged, process_id, launch_arguments));
+    if let Err(error) = &result
+        && target.exists()
+    {
+        tracing::warn!(error = ?error, "client update failed; relaunching the installed viewer");
+        if let Err(relaunch_error) = launch(&target, launch_arguments) {
+            result = result.with_context(|| {
+                format!("the restored viewer could not be relaunched either: {relaunch_error:#}")
+            });
+        }
+    }
+    remove_if_present(&staged);
+    let cleanup = schedule_cleanup(&helper, &helper_directory);
+    if let Err(error) = &cleanup {
+        tracing::warn!(error = ?error, "could not schedule removal of the client update helper");
+    }
+    result.and(cleanup)
+}
+
+/// Replaces the viewer once the process that scheduled the update has exited, and restores the
+/// previous executable when the update cannot be installed or does not start.
+fn install_update(
+    target: &Path,
+    staged: &Path,
+    process_id: u32,
+    launch_arguments: &[OsString],
+) -> anyhow::Result<()> {
+    // The helper was started by that viewer, so the viewer was created before it.
+    let created_before =
+        current_process_created().context("could not read the client update helper start time")?;
+    wait_for_viewer_exit(
+        process_id,
+        target,
+        created_before,
+        VIEWER_EXIT_TIMEOUT,
+        TERMINATED_VIEWER_TIMEOUT,
+    )?;
+    tracing::info!("the previous viewer exited; replacing it");
+
     let backup = target.with_extension("exe.previous");
-    let _ = std::fs::remove_file(&backup);
-    std::fs::rename(&target, &backup)
+    remove_if_present(&backup);
+    std::fs::rename(target, &backup)
         .with_context(|| format!("failed to back up client {}", target.display()))?;
-    if let Err(error) = std::fs::rename(&staged, &target) {
-        std::fs::rename(&backup, &target).context("could not restore the previous viewer")?;
+    if let Err(error) = std::fs::rename(staged, target) {
+        std::fs::rename(&backup, target).context("could not restore the previous viewer")?;
+        tracing::warn!("restored the previous viewer after the update could not be installed");
         return Err(error)
             .with_context(|| format!("failed to install client update {}", target.display()));
     }
 
-    if let Err(update_error) = launch(&target, &launch_arguments) {
-        let _ = std::fs::remove_file(&target);
-        std::fs::rename(&backup, &target).context(
+    if let Err(update_error) = launch(target, launch_arguments) {
+        let _ = std::fs::remove_file(target);
+        std::fs::rename(&backup, target).context(
             "the client update failed and the previous executable could not be restored",
         )?;
+        tracing::warn!("restored the previous viewer after the update could not be launched");
         return Err(update_error).context("the updated client could not be launched");
     }
 
-    let _ = std::fs::remove_file(backup);
-    schedule_cleanup(&helper, &helper_directory)?;
+    remove_if_present(&backup);
+    tracing::info!(target = %target.display(), "installed and launched the client update");
     Ok(())
 }
 
@@ -184,21 +241,41 @@ fn write_new_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
         .with_context(|| format!("failed to flush staged client update {}", path.display()))
 }
 
-fn wait_until_replaceable(target: &Path, timeout: Duration) -> anyhow::Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let probe = target.with_extension("exe.update-probe");
-        match std::fs::rename(target, &probe) {
-            Ok(()) => {
-                std::fs::rename(&probe, target)
-                    .context("failed to restore client after update readiness probe")?;
-                return Ok(());
-            }
-            Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(200)),
-            Err(error) => {
-                return Err(error).context("timed out waiting for the client to exit");
-            }
-        }
+/// Waits for the viewer that scheduled the update to exit. Windows lets a running executable be
+/// renamed, so a successful rename does not show that the viewer has released it, and relaunching
+/// while it is still closing could race it. The viewer has already committed to exiting, so one
+/// that does not exit in time is terminated.
+fn wait_for_viewer_exit(
+    process_id: u32,
+    image: &Path,
+    created_before: u64,
+    timeout: Duration,
+    terminated_timeout: Duration,
+) -> anyhow::Result<()> {
+    let Some(process) = PreviousProcess::open(process_id, image, created_before) else {
+        return Ok(());
+    };
+    if process.wait(timeout) {
+        return Ok(());
+    }
+    tracing::warn!(
+        process_id,
+        "the previous viewer did not exit in time; terminating it"
+    );
+    process
+        .terminate()
+        .context("failed to terminate the previous viewer")?;
+    if !process.wait(terminated_timeout) {
+        bail!("the previous viewer is still running after it was terminated");
+    }
+    Ok(())
+}
+
+fn remove_if_present(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(path = %path.display(), %error, "could not remove file"),
     }
 }
 
@@ -212,16 +289,7 @@ fn schedule_cleanup(helper: &Path, helper_directory: &Path) -> anyhow::Result<()
     let working_directory = helper_directory
         .parent()
         .context("client update helper directory has no parent directory")?;
-    let cleanup = format!(
-        "ping.exe 127.0.0.1 -n 3 >NUL & del /f /q \"{}\" & rmdir /q \"{}\"",
-        helper.display(),
-        helper_directory.display()
-    );
-    Command::new("cmd.exe")
-        .args(["/D", "/S", "/C"])
-        .arg(cleanup)
-        .current_dir(working_directory)
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+    helper_cleanup_command(helper, helper_directory, working_directory)
         .spawn()
         .context("failed to schedule client update cleanup")?;
     Ok(())
@@ -236,4 +304,74 @@ fn unique_suffix() -> String {
             .unwrap_or_default()
             .as_millis()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ping(count: u32) -> (PathBuf, std::process::Child) {
+        let ping = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("PING.EXE");
+        let child = Command::new(&ping)
+            .args(["127.0.0.1", "-n", &count.to_string()])
+            .stdout(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        (ping, child)
+    }
+
+    #[test]
+    fn waits_for_the_viewer_to_exit() {
+        let (image, mut child) = ping(3);
+        let started = std::time::Instant::now();
+        wait_for_viewer_exit(
+            child.id(),
+            &image,
+            u64::MAX,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert!(child.try_wait().unwrap().unwrap().success());
+    }
+
+    #[test]
+    fn terminates_a_viewer_that_does_not_exit() {
+        let (image, mut child) = ping(60);
+        wait_for_viewer_exit(
+            child.id(),
+            &image,
+            u64::MAX,
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(1));
+    }
+
+    #[test]
+    fn ignores_a_recycled_process_id() {
+        let (image, mut child) = ping(60);
+        let other_image = image.with_file_name("meshrmm-remote.exe");
+        let helper_started = current_process_created().unwrap();
+        for (image, created_before) in [(&other_image, u64::MAX), (&image, helper_started)] {
+            let started = std::time::Instant::now();
+            wait_for_viewer_exit(
+                child.id(),
+                image,
+                created_before,
+                Duration::from_millis(200),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert!(started.elapsed() < Duration::from_millis(200));
+        }
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 }

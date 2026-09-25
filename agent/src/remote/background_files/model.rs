@@ -1,5 +1,5 @@
 //! Filesystem operations run off the UI thread. Never follow reparse points during recursive mutations.
-use super::{MAX_ENTRIES, MAX_PREVIEW, path_wide, wide};
+use super::{MAX_ENTRIES, MAX_PREVIEW, wide};
 use anyhow::{Context, ensure};
 use std::{
     io::Read,
@@ -128,7 +128,7 @@ pub(super) fn entries(path: &Path) -> anyhow::Result<Vec<Entry>> {
                 let mut info = SHFILEINFOW::default();
                 unsafe {
                     SHGetFileInfoW(
-                        PCWSTR(path_wide(&path).as_ptr()),
+                        PCWSTR(wide(&path).as_ptr()),
                         FILE_ATTRIBUTE_DIRECTORY,
                         Some(&mut info),
                         std::mem::size_of::<SHFILEINFOW>() as u32,
@@ -167,7 +167,7 @@ pub(super) fn entries(path: &Path) -> anyhow::Result<Vec<Entry>> {
         let mut info = SHFILEINFOW::default();
         unsafe {
             SHGetFileInfoW(
-                PCWSTR(path_wide(&entry.path()).as_ptr()),
+                PCWSTR(wide(entry.path()).as_ptr()),
                 if directory {
                     FILE_ATTRIBUTE_DIRECTORY
                 } else {
@@ -239,8 +239,8 @@ pub(super) fn copy_file(source: &Path, destination: &Path) -> anyhow::Result<()>
     ensure!(source.is_file(), "Select a regular file to copy.");
     unsafe {
         CopyFileW(
-            PCWSTR(path_wide(source).as_ptr()),
-            PCWSTR(path_wide(destination).as_ptr()),
+            PCWSTR(wide(source).as_ptr()),
+            PCWSTR(wide(destination).as_ptr()),
             true,
         )?;
     }
@@ -249,8 +249,8 @@ pub(super) fn copy_file(source: &Path, destination: &Path) -> anyhow::Result<()>
 pub(super) fn rename(source: &Path, destination: &Path) -> anyhow::Result<()> {
     unsafe {
         MoveFileW(
-            PCWSTR(path_wide(source).as_ptr()),
-            PCWSTR(path_wide(destination).as_ptr()),
+            PCWSTR(wide(source).as_ptr()),
+            PCWSTR(wide(destination).as_ptr()),
         )?;
     }
     Ok(())
@@ -448,7 +448,7 @@ mod tests {
             "file1 - Copy (2).txt"
         );
         unsafe {
-            SetFileAttributesW(PCWSTR(path_wide(&first).as_ptr()), FILE_ATTRIBUTE_HIDDEN).unwrap();
+            SetFileAttributesW(PCWSTR(wide(&first).as_ptr()), FILE_ATTRIBUTE_HIDDEN).unwrap();
         }
         assert!(
             entries(&f.0)
@@ -528,7 +528,7 @@ struct FileIdentity {
 fn identity(path: &Path) -> anyhow::Result<FileIdentity> {
     unsafe {
         let handle = CreateFileW(
-            PCWSTR(path_wide(path).as_ptr()),
+            PCWSTR(wide(path).as_ptr()),
             FILE_READ_ATTRIBUTES.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,

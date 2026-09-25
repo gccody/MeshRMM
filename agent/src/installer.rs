@@ -1,26 +1,34 @@
 use std::ffi::{OsStr, OsString};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Registry::{
+    HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
+};
 use windows::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{
+    FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellExecuteW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_SHOWNORMAL,
 };
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{PCWSTR, PWSTR, w};
 use windows_service::service::{
     ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl, ServiceFailureActions,
     ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use crate::private_directory;
 use crate::service::{LEGACY_SERVICE_NAME, SERVICE_NAME};
+use crate::win32::wide;
 
 const ENROLLMENT_MAGIC: &[u8] = b"MESHRMM-BOOTSTRAP-V1";
 const CONFIG_LENGTH_BYTES: usize = 8;
@@ -92,11 +100,15 @@ pub fn launch_if_embedded() -> anyhow::Result<bool> {
 
 pub fn install_and_notify() -> anyhow::Result<()> {
     match install() {
-        Ok(()) => {
-            message(
+        Ok(notice) => {
+            let mut text = String::from(
                 "MeshRMM Agent installed successfully. The LocalSystem service is running. You can now delete the downloaded installer.",
-                false,
             );
+            if let Some(notice) = notice {
+                text.push_str("\n\n");
+                text.push_str(&notice);
+            }
+            message(&text, false);
             Ok(())
         }
         Err(error) => {
@@ -113,36 +125,46 @@ pub fn install_and_notify() -> anyhow::Result<()> {
 /// stop and remove the service without trying to delete the executable that is currently running.
 pub fn schedule_uninstall() -> anyhow::Result<()> {
     let source = std::env::current_exe().context("could not locate the Agent executable")?;
-    let helper_directory = std::env::temp_dir().join("MeshRMM");
-    std::fs::create_dir_all(&helper_directory).with_context(|| {
-        format!(
-            "failed to create uninstall helper directory {}",
-            helper_directory.display()
-        )
-    })?;
-    let helper = helper_directory.join(format!(
-        "uninstall-{}-{}.exe",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    ));
-    std::fs::copy(&source, &helper)
-        .with_context(|| format!("failed to create uninstall helper {}", helper.display()))?;
+    let helper = stage_uninstall_helper(&program_data()?, &source)?;
+    let helper_directory = helper
+        .parent()
+        .context("the uninstall helper has no parent directory")?;
     Command::new(&helper)
         .arg("--uninstall")
         // The desktop worker normally runs from the install directory. Do not let the helper
         // inherit that working directory or Windows will keep the otherwise-empty directory
         // in use while the helper tries to remove it.
-        .current_dir(&helper_directory)
+        .current_dir(helper_directory)
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn()
         .with_context(|| format!("failed to start uninstall helper {}", helper.display()))?;
     Ok(())
 }
 
+/// The helper runs as LocalSystem, so it is copied into a new administrator-only directory. A
+/// shared temporary folder can be pre-created by a standard user, who could then replace the
+/// executable or plant DLLs beside it. The directory sits beside the Agent data it deletes, and
+/// the helper removes it through `schedule_helper_cleanup`.
+fn stage_uninstall_helper(program_data: &Path, source: &Path) -> anyhow::Result<PathBuf> {
+    let helper_directory = program_data.join(format!(
+        "MeshRMM-uninstall-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    private_directory::create_new(&helper_directory)?;
+    let helper = helper_directory.join("meshrmm-agent-uninstall.exe");
+    std::fs::copy(source, &helper)
+        .with_context(|| format!("failed to create uninstall helper {}", helper.display()))?;
+    Ok(helper)
+}
+
 pub fn uninstall() -> anyhow::Result<()> {
+    let result = remove_agent();
+    // The helper is not rerun after a failure, so it removes itself either way.
+    let cleanup = schedule_helper_cleanup();
+    result.and(cleanup)
+}
+
+fn remove_agent() -> anyhow::Result<()> {
     // Give the worker enough time to flush its coordinator acknowledgement before stopping the
     // service terminates that worker process.
     sleep(Duration::from_secs(1));
@@ -159,22 +181,17 @@ pub fn uninstall() -> anyhow::Result<()> {
     }
     drop(manager);
 
-    let install_directory = required_system_directory("ProgramFiles")?
-        .join("MeshRMM")
-        .join("Agent");
-    let config_directory = required_system_directory("ProgramData")?
-        .join("MeshRMM")
-        .join("Agent");
+    let install_directory = program_files()?.join("MeshRMM").join("Agent");
+    let config_directory = program_data()?.join("MeshRMM").join("Agent");
     remove_directory_if_present(&config_directory)?;
     remove_directory_if_present(&install_directory)?;
     remove_empty_parent(&config_directory);
     remove_empty_parent(&install_directory);
-    remove_legacy_directories()?;
-    schedule_helper_cleanup()?;
-    Ok(())
+    remove_legacy_directories()
 }
 
-fn install() -> anyhow::Result<()> {
+/// Installs or repairs the Agent, returning a notice for the user when legacy state was skipped.
+fn install() -> anyhow::Result<Option<String>> {
     let source_path = std::env::current_exe().context("could not locate the Agent installer")?;
     let source_bytes = std::fs::read(&source_path).context("could not read the Agent installer")?;
     let embedded = parse_embedded(&source_bytes)?
@@ -195,15 +212,18 @@ fn install() -> anyhow::Result<()> {
         .open_service(LEGACY_SERVICE_NAME, service_access | ServiceAccess::DELETE)
         .ok();
 
-    let program_files = required_system_directory("ProgramFiles")?;
-    let program_data = required_system_directory("ProgramData")?;
+    let program_files = program_files()?;
+    let program_data = program_data()?;
     let install_directory = program_files.join("MeshRMM").join("Agent");
-    let config_directory = program_data.join("MeshRMM").join("Agent");
+    let data_root = program_data.join("MeshRMM");
+    let config_directory = data_root.join("Agent");
     std::fs::create_dir_all(&install_directory)
         .with_context(|| format!("failed to create {}", install_directory.display()))?;
-    std::fs::create_dir_all(&config_directory)
-        .with_context(|| format!("failed to create {}", config_directory.display()))?;
-    restrict_config_directory(&config_directory)?;
+    // The credential and the SYSTEM update helper live here, and standard users may create
+    // folders under ProgramData, so secure the whole chain before reading or writing anything.
+    secure_or_replace_directory(&data_root)?;
+    secure_or_replace_directory(&config_directory)?;
+    private_directory::secure_contents(&config_directory)?;
 
     let machine_name = machine_name()?;
     let recovery_path = config_directory.join("enrollment-recovery.json");
@@ -222,17 +242,30 @@ fn install() -> anyhow::Result<()> {
     };
     let config_path = config_directory.join("agent.json");
     // Repair preserves the installed identity, including legacy installations.
+    let mut notice = None;
     let previous_config = if config_path.exists() {
-        Some(config_path.clone())
+        Some(std::fs::read(&config_path)?)
     } else {
+        // Nothing re-secured the legacy directory, so a configuration that another account could
+        // have planted, for example one naming its own server, is ignored and the endpoint
+        // enrolls as a new device instead.
         let legacy = program_data
             .join("PulseRMM")
             .join("Agent")
             .join("agent.json");
-        legacy.exists().then_some(legacy)
+        match private_directory::read_protected_file(&legacy) {
+            Ok(config) => config,
+            Err(error) => {
+                let untrusted = error.downcast::<private_directory::UntrustedPath>()?;
+                notice = Some(format!(
+                    "The previous PulseRMM configuration was not imported because {untrusted}. This endpoint was enrolled as a new device."
+                ));
+                None
+            }
+        }
     };
-    let provisioned_config = if let Some(path) = previous_config {
-        serde_json::from_slice::<ProvisionedAgentConfig>(&std::fs::read(path)?)?
+    let provisioned_config = if let Some(config) = previous_config {
+        serde_json::from_slice::<ProvisionedAgentConfig>(&config)?
     } else {
         let pending = config_directory.join("enrollment-pending.json");
         if pending.exists() {
@@ -341,7 +374,7 @@ fn install() -> anyhow::Result<()> {
             .context("failed to unregister the legacy Agent service")?;
         remove_legacy_directories()?;
     }
-    Ok(())
+    Ok(notice)
 }
 
 fn read_optional(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
@@ -395,12 +428,8 @@ impl Drop for InstallationRollback {
 }
 
 fn remove_legacy_directories() -> anyhow::Result<()> {
-    let install_directory = required_system_directory("ProgramFiles")?
-        .join("PulseRMM")
-        .join("Agent");
-    let config_directory = required_system_directory("ProgramData")?
-        .join("PulseRMM")
-        .join("Agent");
+    let install_directory = program_files()?.join("PulseRMM").join("Agent");
+    let config_directory = program_data()?.join("PulseRMM").join("Agent");
     remove_directory_if_present(&config_directory)?;
     remove_directory_if_present(&install_directory)?;
     remove_empty_parent(&config_directory);
@@ -442,19 +471,14 @@ fn schedule_helper_cleanup() -> anyhow::Result<()> {
     let cleanup_working_directory = helper_directory
         .parent()
         .context("the uninstall helper directory has no parent directory")?;
-    let cleanup = format!(
-        "ping.exe 127.0.0.1 -n 3 >NUL & del /f /q \"{}\" & rmdir /q \"{}\"",
-        helper.display(),
-        helper_directory.display()
-    );
-    Command::new("cmd.exe")
-        .args(["/D", "/S", "/C"])
-        .arg(cleanup)
-        // The cleanup process must not keep the helper directory open while removing it.
-        .current_dir(cleanup_working_directory)
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-        .spawn()
-        .context("failed to schedule uninstall helper cleanup")?;
+    // The cleanup process must not keep the helper directory open while removing it.
+    meshrmm_self_update::windows::helper_cleanup_command(
+        &helper,
+        helper_directory,
+        cleanup_working_directory,
+    )
+    .spawn()
+    .context("failed to schedule uninstall helper cleanup")?;
     Ok(())
 }
 
@@ -488,30 +512,40 @@ fn restart_after(seconds: u64) -> ServiceAction {
     }
 }
 
-fn restrict_config_directory(path: &Path) -> anyhow::Result<()> {
-    let output = Command::new("icacls.exe")
-        .arg(path)
-        .args([
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-18:(OI)(CI)F",
-            "*S-1-5-32-544:(OI)(CI)F",
-        ])
-        .output()
-        .context("failed to start icacls while protecting the Agent credential")?;
-    if !output.status.success() {
-        let details = if output.stderr.is_empty() {
-            String::from_utf8_lossy(&output.stdout)
-        } else {
-            String::from_utf8_lossy(&output.stderr)
-        };
-        bail!(
-            "icacls could not protect {}: {}",
-            path.display(),
-            details.trim()
-        );
+/// Secures an Agent data directory. One owned by another account is moved aside and replaced by a
+/// new private directory: resetting its ACL in place would not revoke a WRITE_DAC handle its
+/// owner opened beforehand, and nothing that account left inside can be trusted.
+fn secure_or_replace_directory(path: &Path) -> anyhow::Result<()> {
+    let Err(error) = private_directory::secure(path) else {
+        return Ok(());
+    };
+    if error
+        .downcast_ref::<private_directory::UntrustedOwner>()
+        .is_none()
+    {
+        return Err(error);
     }
-    Ok(())
+    let name = path
+        .file_name()
+        .with_context(|| format!("{} has no directory name", path.display()))?;
+    let mut quarantine_name = name.to_owned();
+    quarantine_name.push(format!(".untrusted-{}", uuid::Uuid::new_v4().simple()));
+    let quarantine = path.with_file_name(quarantine_name);
+    let source = wide(path.as_os_str());
+    let destination = wide(quarantine.as_os_str());
+    unsafe {
+        windows::Win32::Storage::FileSystem::MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            windows::Win32::Storage::FileSystem::MOVE_FILE_FLAGS(0),
+        )
+    }
+    .with_context(|| {
+        format!("{error}, and it could not be moved aside; close programs using it or delete it")
+    })?;
+    // Nothing reads the quarantined copy, so anything left behind only costs disk space.
+    let _ = std::fs::remove_dir_all(&quarantine);
+    private_directory::create_new(path)
 }
 
 pub(crate) fn replace_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
@@ -537,11 +571,102 @@ pub(crate) fn replace_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     .with_context(|| format!("failed to replace {}", path.display()))
 }
 
-fn required_system_directory(name: &str) -> anyhow::Result<PathBuf> {
-    std::env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .with_context(|| format!("Windows did not provide the {name} directory"))
+/// Whether `path` is the configuration directory an installer created under ProgramData.
+pub(crate) fn is_managed_config_directory(path: &Path) -> anyhow::Result<bool> {
+    let program_data = program_data()?;
+    let path = path.to_string_lossy();
+    Ok(["MeshRMM", "PulseRMM"].into_iter().any(|product| {
+        program_data
+            .join(product)
+            .join("Agent")
+            .to_string_lossy()
+            .eq_ignore_ascii_case(path.trim_end_matches(['\\', '/']))
+    }))
+}
+
+/// ProgramData as Windows registers it. The elevated installer inherits the environment of the
+/// user who launched it, so a user-defined `ProgramData` variable could redirect where it writes
+/// the credential and the SYSTEM helpers. FOLDERID_ProgramData is not enough either: it expands
+/// the registered `%SystemDrive%\ProgramData` with the caller's `SystemDrive` variable, so that
+/// drive is taken from the Windows directory the kernel reports instead.
+pub(crate) fn program_data() -> anyhow::Result<PathBuf> {
+    let registered = registered_program_data()?;
+    let windows = crate::win32::windows_directory()?;
+    let Some(Component::Prefix(drive)) = windows.components().next() else {
+        bail!("the Windows directory {} has no drive", windows.display());
+    };
+    const SYSTEM_DRIVE: &str = "%SystemDrive%";
+    let expanded = match registered.get(..SYSTEM_DRIVE.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(SYSTEM_DRIVE) => {
+            let mut path = drive.as_os_str().to_owned();
+            path.push(&registered[SYSTEM_DRIVE.len()..]);
+            PathBuf::from(path)
+        }
+        _ => PathBuf::from(&registered),
+    };
+    if expanded.as_os_str().to_string_lossy().contains('%') || !expanded.is_absolute() {
+        bail!("the registered ProgramData directory {registered} cannot be resolved");
+    }
+    Ok(expanded)
+}
+
+fn registered_program_data() -> anyhow::Result<String> {
+    let key = w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList");
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+    let mut size = 0;
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key,
+            w!("ProgramData"),
+            flags,
+            None,
+            None,
+            Some(&mut size),
+        )
+    }
+    .ok()
+    .context("Windows did not register the ProgramData directory")?;
+    let mut value = vec![0_u16; (size as usize).div_ceil(2)];
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key,
+            w!("ProgramData"),
+            flags,
+            None,
+            Some(value.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    }
+    .ok()
+    .context("Windows did not register the ProgramData directory")?;
+    let length = value
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(value.len());
+    String::from_utf16(&value[..length]).context("the registered ProgramData directory is invalid")
+}
+
+/// The native Program Files directory as Windows registers it, for the same reason. Unlike
+/// ProgramData, this known folder is stored as a literal path.
+fn program_files() -> anyhow::Result<PathBuf> {
+    let path = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, None) }
+        .context("Windows did not provide the Program Files directory")?;
+    let value = OsString::from_wide(unsafe { path.as_wide() });
+    unsafe { CoTaskMemFree(Some(path.0.cast_const().cast())) };
+    if value.is_empty() {
+        bail!("Windows did not provide the Program Files directory");
+    }
+    Ok(PathBuf::from(value))
+}
+
+/// Where the Agent keeps its WebRTC identity, beside its other ProgramData state.
+pub(crate) fn identity_directory() -> anyhow::Result<PathBuf> {
+    Ok(program_data()?
+        .join("MeshRMM")
+        .join("Agent")
+        .join("identity"))
 }
 
 fn validate_bootstrap(config: &[u8]) -> anyhow::Result<InstallerBootstrap> {
@@ -603,11 +728,7 @@ fn redeem_installer(
         .https_only(true)
         .timeout_global(Some(Duration::from_secs(30)))
         .http_status_as_error(false)
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
+        .tls_config(crate::updater::https_tls_config())
         .build()
         .new_agent();
     let mut response = http
@@ -684,10 +805,6 @@ fn message(text: &str, error: bool) {
     }
 }
 
-fn wide(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(Some(0)).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,5 +828,123 @@ mod tests {
     #[test]
     fn ignores_regular_agent_binary() {
         assert!(parse_embedded(b"mock-pe-image").unwrap().is_none());
+    }
+
+    #[test]
+    fn system_directories_ignore_the_environment() {
+        const EXPECTED: &str = "MESHRMM_TEST_SYSTEM_DIRECTORIES";
+        let actual = format!(
+            "{}|{}",
+            program_data().unwrap().display(),
+            program_files().unwrap().display()
+        );
+        if let Some(expected) = std::env::var_os(EXPECTED) {
+            assert_eq!(actual, expected.to_string_lossy());
+            return;
+        }
+        // Without a hostile environment the result matches the known folder.
+        let known = unsafe {
+            SHGetKnownFolderPath(
+                &windows::Win32::UI::Shell::FOLDERID_ProgramData,
+                KF_FLAG_DEFAULT,
+                None,
+            )
+        }
+        .unwrap();
+        let known_path = PathBuf::from(OsString::from_wide(unsafe { known.as_wide() }));
+        unsafe { CoTaskMemFree(Some(known.0.cast_const().cast())) };
+        assert_eq!(program_data().unwrap(), known_path);
+        // Run this test again in a child whose environment points every variable a user could
+        // set at a directory they control.
+        let decoy = std::env::temp_dir().join("meshrmm-decoy");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "installer::tests::system_directories_ignore_the_environment",
+                "--nocapture",
+            ])
+            .env(EXPECTED, &actual)
+            .env("ProgramData", &decoy)
+            .env("ALLUSERSPROFILE", &decoy)
+            .env("ProgramFiles", &decoy)
+            .env("ProgramW6432", &decoy)
+            .env("SystemDrive", "Z:")
+            .env("SystemRoot", &decoy)
+            .env("windir", &decoy)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn recognizes_only_installer_managed_config_directories() {
+        let program_data = program_data().unwrap();
+        let managed = program_data.join("MeshRMM").join("Agent");
+        assert!(is_managed_config_directory(&managed).unwrap());
+        let upper = PathBuf::from(managed.to_string_lossy().to_uppercase() + "\\");
+        assert!(is_managed_config_directory(&upper).unwrap());
+        let legacy = program_data.join("PulseRMM").join("Agent");
+        assert!(is_managed_config_directory(&legacy).unwrap());
+        assert!(!is_managed_config_directory(&managed.join("updates")).unwrap());
+        assert!(!is_managed_config_directory(Path::new(r"C:\MeshRMM\Agent")).unwrap());
+    }
+
+    #[test]
+    fn stages_each_uninstall_helper_in_a_new_private_directory() {
+        use crate::private_directory::test_support::*;
+        if !elevated() {
+            return;
+        }
+        let program_data = scratch("uninstall");
+        let source = program_data.join("meshrmm-agent.exe");
+        std::fs::write(&source, b"MZ helper").unwrap();
+
+        let first = stage_uninstall_helper(&program_data, &source).unwrap();
+        let second = stage_uninstall_helper(&program_data, &source).unwrap();
+        assert_eq!(std::fs::read(&first).unwrap(), b"MZ helper");
+        let directory = first.parent().unwrap();
+        assert_ne!(directory, second.parent().unwrap());
+        assert_eq!(directory.parent().unwrap(), program_data);
+        assert!(
+            directory
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("MeshRMM-uninstall-")
+        );
+        assert_eq!(sddl_of(directory), PRIVATE);
+        remove(&program_data);
+    }
+
+    #[test]
+    fn replaces_data_directory_owned_by_another_account() {
+        use crate::private_directory::test_support::*;
+        if !elevated() {
+            return;
+        }
+        let data_root = scratch("squatted");
+        let config_directory = data_root.join("Agent");
+        std::fs::create_dir(&config_directory).unwrap();
+        std::fs::write(config_directory.join("enrollment-pending.json"), b"{}").unwrap();
+        set_sddl(&config_directory, "O:BUD:(A;OICI;FA;;;BU)(A;OICI;FA;;;BA)");
+
+        secure_or_replace_directory(&config_directory).unwrap();
+        assert_eq!(sddl_of(&config_directory), PRIVATE);
+        assert_eq!(std::fs::read_dir(&config_directory).unwrap().count(), 0);
+        let remaining = std::fs::read_dir(&data_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, [OsString::from("Agent")]);
+        // A trusted directory keeps its contents.
+        std::fs::write(config_directory.join("agent.json"), b"{}").unwrap();
+        secure_or_replace_directory(&config_directory).unwrap();
+        assert!(config_directory.join("agent.json").exists());
+        remove(&data_root);
     }
 }

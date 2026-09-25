@@ -1,9 +1,9 @@
 //! Association launches stay on the current maintenance desktop and inherit its job.
-use super::{path_wide, wide};
+use super::wide;
 use anyhow::{Context, ensure};
 use std::path::Path;
 use windows::{
-    Win32::{Foundation::CloseHandle, System::Threading::*, UI::Shell::*},
+    Win32::{System::Threading::CREATE_NEW_CONSOLE, UI::Shell::*},
     core::{PCWSTR, PWSTR},
 };
 
@@ -104,35 +104,15 @@ pub(super) fn open(path: &Path) -> anyhow::Result<()> {
             )?,
         )
     };
-    let executable = wide(&executable);
-    let mut command = wide(&command);
-    let mut desktop = wide(&meshrmm_remote_screen::background::desktop_path()?);
-    let directory = path_wide(path.parent().context("File has no parent folder")?);
-    let startup = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        lpDesktop: PWSTR(desktop.as_mut_ptr()),
+    // It inherits the launcher's kill-on-close job.
+    super::super::background::launch::launch(super::super::background::launch::Launch {
+        executable: Some(Path::new(&executable)),
+        command: &command,
+        directory: Some(path.parent().context("File has no parent folder")?),
+        flags: CREATE_NEW_CONSOLE,
         ..Default::default()
-    };
-    let mut process = PROCESS_INFORMATION::default();
-    unsafe {
-        // No ShellExecute/DDE activation: those can redirect into another session.
-        // CreateProcess inherits the launcher's kill-on-close job by default.
-        CreateProcessW(
-            PCWSTR(executable.as_ptr()),
-            Some(PWSTR(command.as_mut_ptr())),
-            None,
-            None,
-            false,
-            CREATE_NEW_CONSOLE,
-            None,
-            PCWSTR(directory.as_ptr()),
-            &startup,
-            &mut process,
-        )
-        .context("The associated application could not start on the background desktop")?;
-        let _ = CloseHandle(process.hThread);
-        let _ = CloseHandle(process.hProcess);
-    }
+    })
+    .context("The associated application could not start on the background desktop")?;
     Ok(())
 }
 #[cfg(test)]

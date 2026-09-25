@@ -34,6 +34,8 @@ mod platform;
 #[cfg(any(windows, test))]
 mod secure_attention;
 #[cfg(windows)]
+pub(crate) mod service_link;
+#[cfg(windows)]
 mod session;
 #[cfg(any(windows, test))]
 pub(crate) mod session_close;
@@ -69,6 +71,42 @@ struct ActiveSession {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Whether `request` repeats the session the Agent is running, as the coordinator does when the
+/// Agent reconnects. Servers that renew the session's lease rewrite the expiry of the request they
+/// replay, so the expiry is ignored. A resume carries new TURN credentials, so it still restarts
+/// the session.
+#[cfg(any(windows, test))]
+fn replays_session(
+    active: &meshrmm_protocol::AgentSessionRequest,
+    request: &meshrmm_protocol::AgentSessionRequest,
+) -> bool {
+    *active
+        == meshrmm_protocol::AgentSessionRequest {
+            expires_at_unix_ms: active.expires_at_unix_ms,
+            ..request.clone()
+        }
+}
+
+/// Ends the remote session and runs its close actions before the coordinator exits, since the
+/// session cannot outlive it and nothing else would run them.
+#[cfg(windows)]
+async fn end_sessions(
+    active_session: &mut Option<ActiveSession>,
+    session_close: &mut Option<(
+        meshrmm_protocol::RemoteSessionId,
+        std::sync::Arc<session_close::SessionClose>,
+    )>,
+) {
+    if let Some(active) = active_session.take() {
+        active.task.abort();
+        let _ = active.task.await;
+        tracing::info!(session_id = %active.session_id, "stopped remote session because the Agent is stopping");
+    }
+    if let Some((id, close)) = session_close.take() {
+        close.finish(&id).await;
+    }
+}
+
 #[cfg_attr(not(windows), allow(unused_variables))]
 pub async fn run(
     #[allow(unused_mut)] mut config: Config,
@@ -79,6 +117,7 @@ pub async fn run(
 
     #[cfg(windows)]
     {
+        let link = service_link::ServiceLink::new(mode == ExecutionMode::Worker);
         let mut retry_delay = Duration::from_secs(1);
         let mut active_session = None::<ActiveSession>;
         // Outlives session tasks, which end whenever the viewer drops its
@@ -162,7 +201,7 @@ pub async fn run(
                                                 }
                                             };
                                             if active_session.as_ref().is_some_and(|active| {
-                                                active.request == request
+                                                replays_session(&active.request, &request)
                                                     && !active.task.is_finished()
                                             }) {
                                                 tracing::info!(
@@ -194,7 +233,9 @@ pub async fn run(
                                             let active_request = request.clone();
                                             let session_config = config.clone();
                                             let task_session_id = session_id.clone();
+                                            let activity = link.session_started();
                                             let task = tokio::spawn(async move {
+                                                let _activity = activity;
                                                 if let Err(error) = session::run(&session_config, request, mode, close).await {
                                                     tracing::error!(
                                                         error = ?error,
@@ -217,16 +258,13 @@ pub async fn run(
                                         _ => {}
                                     }
                                 }
-                                _ = tokio::signal::ctrl_c() => break Ok(true),
+                                () = link.stopped() => break Ok(true),
                             }
                         }
                     }.await;
                     match connection_result {
                         Ok(true) => {
-                            if let Some(active) = active_session.take() {
-                                active.task.abort();
-                                let _ = active.task.await;
-                            }
+                            end_sessions(&mut active_session, &mut session_close).await;
                             return Ok(());
                         }
                         Ok(false) => tracing::warn!("Agent signaling disconnected"),
@@ -241,15 +279,61 @@ pub async fn run(
             }
             tokio::select! {
                 _ = sleep(retry_delay) => {},
-                _ = tokio::signal::ctrl_c() => {
-                    if let Some(active) = active_session.take() {
-                        active.task.abort();
-                        let _ = active.task.await;
-                    }
+                () = link.stopped() => {
+                    end_sessions(&mut active_session, &mut session_close).await;
                     return Ok(());
                 },
             }
             retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use meshrmm_protocol::{AgentSessionRequest, IceServer, RemoteSessionId};
+
+    use super::replays_session;
+
+    fn request() -> AgentSessionRequest {
+        AgentSessionRequest {
+            start_in_background: false,
+            idle_policy: Default::default(),
+            blackout_message: String::new(),
+            viewer_name: "Ada Lovelace".into(),
+            session_id: RemoteSessionId::new("session"),
+            signaling_token: "token".into(),
+            expires_at_unix_ms: 1_000,
+            ice_servers: vec![IceServer {
+                urls: vec!["turn:turn.cloudflare.com:3478?transport=udp".into()],
+                username: Some("first".into()),
+                credential: Some("secret".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn renewed_lease_replay_keeps_the_running_session() {
+        let active = request();
+        let mut replayed = active.clone();
+        replayed.expires_at_unix_ms = 31_000;
+        assert!(replays_session(&active, &active));
+        assert!(replays_session(&active, &replayed));
+    }
+
+    #[test]
+    fn other_or_resumed_sessions_restart() {
+        let active = request();
+        let mut other = active.clone();
+        other.session_id = RemoteSessionId::new("other");
+        let mut token = active.clone();
+        token.signaling_token = "other".into();
+        let mut resumed = active.clone();
+        resumed.ice_servers[0].username = Some("second".into());
+        let mut background = active.clone();
+        background.start_in_background = true;
+        for request in [other, token, resumed, background] {
+            assert!(!replays_session(&active, &request));
         }
     }
 }

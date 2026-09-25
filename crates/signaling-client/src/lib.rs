@@ -6,7 +6,7 @@ use anyhow::{Context, bail};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
     tungstenite::{
         client::IntoClientRequest,
         handshake::client::Response,
@@ -95,10 +95,14 @@ pub async fn authenticated_websocket(url: Url, token: &str) -> anyhow::Result<(S
         HeaderValue::from_str(&format!("Bearer {token}"))
             .context("invalid authentication token header")?,
     );
-    tokio::time::timeout(Duration::from_secs(15), connect_async(request))
-        .await
-        .context("signaling WebSocket handshake timed out")?
-        .context("signaling WebSocket handshake failed")
+    let tls = tls::websocket_client_config().context("failed to configure signaling TLS")?;
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        connect_async_tls_with_config(request, None, false, Some(Connector::Rustls(tls))),
+    )
+    .await
+    .context("signaling WebSocket handshake timed out")?
+    .context("signaling WebSocket handshake failed")
 }
 
 /// Returns true when retrying a WebSocket with the same credentials cannot
@@ -200,8 +204,9 @@ mod tests {
     }
 }
 
+/// The server closed signaling because the session was ended or revoked.
 #[derive(Debug)]
-struct TerminalClose;
+pub struct TerminalClose;
 impl std::fmt::Display for TerminalClose {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "remote session was ended or revoked")
@@ -224,3 +229,6 @@ pub fn signaling_close_error(
 
 mod connection;
 pub use connection::SignalingConnection;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+pub mod tls;

@@ -5,7 +5,6 @@ interface __BaseEnv_Env {
 	DB: D1Database;
 	ASSETS: Fetcher;
 	WORKOS_CLIENT_ID: "client_01M0FT1AN01PAT37N98EMRSNVW";
-	WORKOS_REDIRECT_URI: "https://meshrmm.com";
 	MESHRMM_SERVER_URL: "";
 	MESHRMM_API: Fetcher /* pulsermm-server */;
 }
@@ -20,7 +19,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "WORKOS_CLIENT_ID" | "WORKOS_REDIRECT_URI" | "MESHRMM_SERVER_URL">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "WORKOS_CLIENT_ID" | "MESHRMM_SERVER_URL">> {}
 }
 
 // Begin runtime types

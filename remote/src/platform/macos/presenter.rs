@@ -1,5 +1,6 @@
 use super::app::{RemoteView, VideoHostView, activate_application};
 use super::*;
+use dispatch2::DispatchTime;
 
 thread_local! {
     /// AppKit and Core Animation objects never leave the main thread.
@@ -26,6 +27,10 @@ struct Shared {
 }
 
 const MAX_PRESENTER_QUEUE_FRAMES: usize = 15;
+/// Main-queue blocks can run from nested AppKit event loops (modals, menus,
+/// live resize). Work that finds the UI state already borrowed is retried
+/// after this delay instead of panicking across dispatch's `extern "C"` frame.
+const UI_BUSY_RETRY: Duration = Duration::from_millis(50);
 
 impl Shared {
     fn begin_recovery(&self, stream_id: VideoStreamId) {
@@ -82,13 +87,26 @@ impl Presenter {
         });
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         DispatchQueue::main().exec_async(move || {
-            let result =
-                MacUi::new(id, format, active_display, displays, control, debug).map(|ui| {
+            // A replacement window opens where the one it replaces was.
+            let frame = UI.with(|state| {
+                state
+                    .try_borrow()
+                    .ok()?
+                    .as_ref()
+                    .map(|ui| ui.window.frame())
+            });
+            let result = MacUi::new(id, format, active_display, displays, control, debug, frame)
+                .and_then(|ui| {
                     UI.with(|state| {
-                        if let Some(old) = state.borrow_mut().replace(ui) {
+                        let Ok(mut state) = state.try_borrow_mut() else {
+                            ui.close();
+                            bail!("macOS viewer UI state is busy");
+                        };
+                        if let Some(old) = state.replace(ui) {
                             old.close();
                         }
-                    });
+                        Ok(())
+                    })
                 });
             let _ = started_tx.send(result);
         });
@@ -165,16 +183,17 @@ impl Presenter {
         let (reset_tx, reset_rx) = std::sync::mpsc::sync_channel(1);
         DispatchQueue::main().exec_async(move || {
             let result = UI.with(|state| {
-                let mut state = state.borrow_mut();
+                let mut state = state
+                    .try_borrow_mut()
+                    .ok()
+                    .context("macOS viewer UI state is busy")?;
                 let ui = state
                     .as_mut()
                     .filter(|ui| ui.id == id)
                     .context("macOS viewer window is no longer available")?;
                 ui.reset_stream(format)?;
-                ui.window.setTitle(&NSString::from_str(&format!(
-                    "MeshRMM Remote Desktop — {} — Control-Option-Arrow display · F12 diagnostics",
-                    display.name
-                )));
+                ui.window
+                    .setTitle(&NSString::from_str(&window_title(&display.name)));
                 ui.input_view
                     .configure_display(display, displays, format.width, format.height);
                 Ok(())
@@ -190,36 +209,26 @@ impl Presenter {
     }
 
     pub fn set_agent_pointer_display(&self, display_id: Option<meshrmm_protocol::DisplayId>) {
-        let id = self.shared.id;
-        DispatchQueue::main().exec_async(move || {
-            UI.with(|state| {
-                if let Some(ui) = state.borrow().as_ref().filter(|ui| ui.id == id) {
-                    ui.input_view.set_agent_pointer_display(display_id);
-                }
-            });
+        exec_with_ui(self.shared.id, move |ui| {
+            ui.input_view.set_agent_pointer_display(display_id);
         });
     }
 
     /// Agent status can change on a static desktop that sends no frames.
     pub fn refresh_controls(&self) {
-        let id = self.shared.id;
-        DispatchQueue::main().exec_async(move || {
-            UI.with(|state| {
-                if let Some(ui) = state.borrow().as_ref().filter(|ui| ui.id == id) {
-                    ui.input_view.refresh_debug(false);
-                }
-            });
+        exec_with_ui(self.shared.id, |ui| ui.input_view.refresh_debug(false));
+    }
+
+    /// Marks the window as waiting for the connection to be restored.
+    pub fn set_reconnecting(&self, reconnecting: bool) {
+        exec_with_ui(self.shared.id, move |ui| {
+            ui.input_view.set_reconnecting(reconnecting)
         });
     }
 
     pub fn set_cursor_shape(&self, shape: CursorShape) {
-        let id = self.shared.id;
-        DispatchQueue::main().exec_async(move || {
-            UI.with(|state| {
-                if let Some(ui) = state.borrow().as_ref().filter(|ui| ui.id == id) {
-                    ui.input_view.set_cursor_shape(shape);
-                }
-            });
+        exec_with_ui(self.shared.id, move |ui| {
+            ui.input_view.set_cursor_shape(shape)
         });
     }
 
@@ -230,9 +239,11 @@ impl Presenter {
         // on a static desktop. Poll UI health independently of frame arrival
         // so HEVC failures still trigger the negotiated H.264 fallback.
         DispatchQueue::main().exec_async(move || {
+            // A busy UI is simply checked again on the next poll.
             let failure = UI.with(|state| {
                 state
-                    .borrow()
+                    .try_borrow()
+                    .ok()?
                     .as_ref()
                     .filter(|ui| ui.id == id)
                     .and_then(MacUi::presentation_failure)
@@ -264,16 +275,7 @@ impl Presenter {
         }
         self.stopped = true;
         let id = self.shared.id;
-        DispatchQueue::main().exec_async(move || {
-            UI.with(|state| {
-                let mut state = state.borrow_mut();
-                if state.as_ref().is_some_and(|ui| ui.id == id)
-                    && let Some(ui) = state.take()
-                {
-                    ui.close();
-                }
-            });
-        });
+        DispatchQueue::main().exec_async(move || close_ui(id));
         tracing::info!(
             presenter_id = self.shared.id,
             latest_frames_dropped = self.shared.replaced.load(Ordering::Relaxed),
@@ -290,6 +292,52 @@ impl Drop for Presenter {
     }
 }
 
+/// Retries `work` on the main queue until the UI state can be borrowed. Work
+/// for a replaced or closed presenter is discarded.
+fn exec_with_ui(id: u64, work: impl Fn(&MacUi) + Send + 'static) {
+    DispatchQueue::main().exec_async(move || run_with_ui(id, work));
+}
+
+fn run_with_ui(id: u64, work: impl Fn(&MacUi) + Send + 'static) {
+    let ran = UI.with(|state| {
+        let Ok(state) = state.try_borrow() else {
+            return false;
+        };
+        if let Some(ui) = state.as_ref().filter(|ui| ui.id == id) {
+            work(ui);
+        }
+        true
+    });
+    if !ran {
+        retry_on_main(move || run_with_ui(id, work));
+    }
+}
+
+fn close_ui(id: u64) {
+    let closed = UI.with(|state| {
+        let Ok(mut state) = state.try_borrow_mut() else {
+            return false;
+        };
+        if state.as_ref().is_some_and(|ui| ui.id == id)
+            && let Some(ui) = state.take()
+        {
+            ui.close();
+        }
+        true
+    });
+    if !closed {
+        retry_on_main(move || close_ui(id));
+    }
+}
+
+fn retry_on_main(work: impl FnOnce() + Send + 'static) {
+    tracing::debug!("macOS viewer UI state is busy; retrying main-thread work");
+    let when = DispatchTime::try_from(UI_BUSY_RETRY).unwrap_or(DispatchTime::NOW);
+    if DispatchQueue::main().after(when, work).is_err() {
+        tracing::warn!("macOS viewer could not schedule busy UI work");
+    }
+}
+
 fn schedule_latest(shared: Arc<Shared>) {
     if shared
         .scheduled
@@ -298,52 +346,63 @@ fn schedule_latest(shared: Arc<Shared>) {
     {
         return;
     }
-    DispatchQueue::main().exec_async(move || {
+    DispatchQueue::main().exec_async(move || present_latest(shared));
+}
+
+fn present_latest(shared: Arc<Shared>) {
+    let presented = UI.with(|state| {
+        // Leave frames queued and `scheduled` set while the UI is busy so
+        // publishers do not stack duplicate blocks.
+        let mut state = state.try_borrow_mut().ok()?;
         let queued = shared
             .queued
             .lock()
             .ok()
             .and_then(|mut frames| frames.pop_front());
-        if let Some(queued) = queued {
+        Some(queued.map(|queued| {
             let stream_id = queued.frame.stream_id;
-            let result = UI.with(|state| {
-                let mut state = state.borrow_mut();
-                let ui = state
-                    .as_mut()
-                    .filter(|ui| ui.id == shared.id)
-                    .context("macOS viewer window is no longer available")?;
-                ui.enqueue(queued)
-            });
-            match result {
-                Ok(true) => {
-                    shared.submitted.fetch_add(1, Ordering::Relaxed);
+            let result = state
+                .as_mut()
+                .filter(|ui| ui.id == shared.id)
+                .context("macOS viewer window is no longer available")
+                .and_then(|ui| ui.enqueue(queued));
+            (stream_id, result)
+        }))
+    });
+    let Some(presented) = presented else {
+        retry_on_main(move || present_latest(shared));
+        return;
+    };
+    if let Some((stream_id, result)) = presented {
+        match result {
+            Ok(true) => {
+                shared.submitted.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {
+                shared.dropped_by_renderer.fetch_add(1, Ordering::Relaxed);
+                shared.begin_recovery(stream_id);
+                if let Ok(mut frames) = shared.queued.lock() {
+                    shared
+                        .replaced
+                        .fetch_add(frames.len() as u64, Ordering::Relaxed);
+                    frames.clear();
                 }
-                Ok(false) => {
-                    shared.dropped_by_renderer.fetch_add(1, Ordering::Relaxed);
-                    shared.begin_recovery(stream_id);
-                    if let Ok(mut frames) = shared.queued.lock() {
-                        shared
-                            .replaced
-                            .fetch_add(frames.len() as u64, Ordering::Relaxed);
-                        frames.clear();
-                    }
-                    shared.debug.set_presenter_frames_dropped(
-                        shared.replaced.load(Ordering::Relaxed)
-                            + shared.dropped_by_renderer.load(Ordering::Relaxed),
-                    );
-                }
-                Err(error) => {
-                    if let Ok(mut failure) = shared.failure.lock() {
-                        *failure = Some(error.to_string());
-                    }
+                shared.debug.set_presenter_frames_dropped(
+                    shared.replaced.load(Ordering::Relaxed)
+                        + shared.dropped_by_renderer.load(Ordering::Relaxed),
+                );
+            }
+            Err(error) => {
+                if let Ok(mut failure) = shared.failure.lock() {
+                    *failure = Some(error.to_string());
                 }
             }
         }
-        shared.scheduled.store(false, Ordering::Release);
-        if shared.queued.lock().is_ok_and(|queued| !queued.is_empty()) {
-            schedule_latest(shared);
-        }
-    });
+    }
+    shared.scheduled.store(false, Ordering::Release);
+    if shared.queued.lock().is_ok_and(|queued| !queued.is_empty()) {
+        schedule_latest(shared);
+    }
 }
 
 struct MacUi {
@@ -357,6 +416,7 @@ struct MacUi {
     frames_submitted: u64,
     total_frames_submitted: u64,
     stats_started: Instant,
+    statistics_log: crate::debug::StatisticsLog,
     debug: DebugInfo,
     codec: Codec,
     layer_backpressured: bool,
@@ -370,6 +430,7 @@ impl MacUi {
         displays: Vec<Display>,
         control: ControlSink,
         debug: DebugInfo,
+        frame: Option<NSRect>,
     ) -> anyhow::Result<Self> {
         let mtm =
             MainThreadMarker::new().context("AppKit must be initialized on the main thread")?;
@@ -406,7 +467,7 @@ impl MacUi {
         };
         // NSWindow releases itself when the user closes it by default. Keep the
         // window alive until MacUi is dropped so queued frames can safely detect
-        // that it is no longer visible and end the remote session.
+        // that it was closed and end the remote session.
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
         window.setTitlebarAppearsTransparent(true);
@@ -415,10 +476,7 @@ impl MacUi {
         // that view into local window moves instead of remote pointer drags.
         // The native title bar remains draggable without this setting.
         window.setMovableByWindowBackground(false);
-        window.setTitle(&NSString::from_str(&format!(
-            "MeshRMM Remote Desktop — {} — Control-Option-Arrow display · F12 diagnostics",
-            active_display.name
-        )));
+        window.setTitle(&NSString::from_str(&window_title(&active_display.name)));
         let view = RemoteView::new(
             mtm,
             rect,
@@ -452,7 +510,10 @@ impl MacUi {
         video_host.setWantsLayer(true);
         view.addSubview_positioned_relativeTo(&video_host, NSWindowOrderingMode::Below, None);
         window.setAcceptsMouseMovedEvents(true);
-        window.center();
+        match frame {
+            Some(frame) => window.setFrame_display(frame, false),
+            None => window.center(),
+        }
         close_connecting_window();
         activate_application(mtm);
         window.makeKeyAndOrderFront(None);
@@ -477,6 +538,7 @@ impl MacUi {
             frames_submitted: 0,
             total_frames_submitted: 0,
             stats_started: Instant::now(),
+            statistics_log: Default::default(),
             debug,
             codec: format.codec,
             layer_backpressured: false,
@@ -513,7 +575,7 @@ impl MacUi {
 
     #[allow(deprecated)]
     fn enqueue(&mut self, queued: QueuedFrame) -> anyhow::Result<bool> {
-        if !self.window.isVisible() {
+        if self.input_view.window_closed() {
             bail!("macOS viewer window was closed");
         }
         if unsafe { self.layer.requiresFlushToResumeDecoding() } {
@@ -594,15 +656,17 @@ impl MacUi {
             let present_fps = self.frames_submitted as f64 / elapsed.as_secs_f64();
             self.debug
                 .update_presentation(None, present_fps, self.total_frames_submitted, None, 0);
-            tracing::info!(
-                submit_fps = present_fps,
-                frames_submitted = self.frames_submitted,
-                receive_to_submit_us =
-                    monotonic_timestamp_us().saturating_sub(queued.received_at_us),
-                ready_for_display = unsafe { self.layer.isReadyForDisplay() },
-                codec = ?self.codec,
-                "macOS hardware decode/presentation statistics"
-            );
+            if self.statistics_log.due() {
+                tracing::info!(
+                    submit_fps = present_fps,
+                    frames_submitted = self.frames_submitted,
+                    receive_to_submit_us =
+                        monotonic_timestamp_us().saturating_sub(queued.received_at_us),
+                    ready_for_display = unsafe { self.layer.isReadyForDisplay() },
+                    codec = ?self.codec,
+                    "macOS hardware decode/presentation statistics"
+                );
+            }
             self.frames_submitted = 0;
             self.stats_started = Instant::now();
         }
@@ -626,7 +690,7 @@ impl MacUi {
     }
 
     fn presentation_failure(&self) -> Option<String> {
-        if !self.window.isVisible() {
+        if self.input_view.window_closed() {
             return Some("macOS viewer window was closed".into());
         }
         self.decoder_failure()
@@ -649,6 +713,7 @@ impl MacUi {
             // that shares the same transport gate.
             self.input_view.release_input();
         }
+        self.input_view.remove_key_up_monitor();
         unsafe { self.layer.flushAndRemoveImage() };
         self.window.orderOut(None);
     }
@@ -806,21 +871,29 @@ fn check_status(status: i32, context: &'static str) -> anyhow::Result<()> {
     }
 }
 
+type ActiveWindow = (Retained<NSWindow>, Retained<RemoteView>);
+
 // Release the RefCell borrow before presenting a modal, which pumps AppKit events.
-fn active_window() -> Option<(Retained<NSWindow>, Retained<RemoteView>)> {
+// `Err` means the UI state is borrowed by an outer caller on this thread.
+fn active_window() -> Result<Option<ActiveWindow>, ()> {
     UI.with(|state| {
-        state
-            .borrow()
+        let state = state.try_borrow().map_err(|_| ())?;
+        Ok(state
             .as_ref()
-            .filter(|ui| ui.window.isVisible())
-            .map(|ui| (ui.window.clone(), ui.input_view.clone()))
+            .filter(|ui| !ui.input_view.window_closed())
+            .map(|ui| (ui.window.clone(), ui.input_view.clone())))
     })
 }
 pub(super) fn confirm_session_replacement() -> bool {
-    active_window().is_none_or(|(_, view)| view.confirm_disconnect())
+    // Keep the current session if its state cannot be inspected safely.
+    active_window().is_ok_and(|active| active.is_none_or(|(_, view)| view.confirm_disconnect()))
 }
 pub(super) fn request_user_disconnect() -> bool {
-    let Some((window, view)) = active_window() else {
+    let Ok(active) = active_window() else {
+        // Cancel termination rather than skip the disconnect confirmation.
+        return true;
+    };
+    let Some((window, view)) = active else {
         return false;
     };
     if view.confirm_disconnect() {
@@ -828,4 +901,14 @@ pub(super) fn request_user_disconnect() -> bool {
     }
     // Closing the window lets the transport finish recording and signal a clean stop.
     true
+}
+
+/// The window title, naming the display and the viewer's shortcuts.
+pub(crate) fn window_title(display: &str) -> String {
+    let diagnostics =
+        crate::preferences::shortcut_key(crate::shortcuts::ViewerShortcut::Diagnostics);
+    format!(
+        "MeshRMM Remote Desktop — {display} — {}",
+        crate::shortcuts::hint(Some("Control-Option-Arrow"), diagnostics)
+    )
 }

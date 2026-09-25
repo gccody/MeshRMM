@@ -227,7 +227,7 @@ impl VisualStyles {
 <dependency><dependentAssembly><assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/></dependentAssembly></dependency>
 </assembly>"#)?;
         drop(file);
-        let path = path_wide(&manifest);
+        let path = wide(&manifest);
         let context = ACTCTXW {
             cbSize: std::mem::size_of::<ACTCTXW>() as u32,
             lpSource: PCWSTR(path.as_ptr()),

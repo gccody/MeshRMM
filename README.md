@@ -57,16 +57,17 @@ and are used by ICE only when a direct candidate pair cannot connect.
 - Windows 10 version 1903 or newer for the Agent and Windows viewer.
 - Local administrator approval to install the Agent as a Windows service.
 - macOS 12 or newer for the macOS viewer.
-- A current stable Rust MSVC toolchain.
+- rustup. The first `cargo` command in the repository installs the toolchain
+  pinned in `rust-toolchain.toml` (the MSVC host toolchain on Windows) with
+  Clippy, rustfmt and the `wasm32-unknown-unknown` target.
 - A GPU/driver exposing Media Foundation hardware H.264 encode and decode
   transforms plus D3D11 NV12 video processing. Hardware H.265/HEVC and AYUV
   4:4:4 support are optional and negotiated only when available at both ends.
 - Node.js/npm and a Cloudflare account for the one-time server deployment.
-- The `wasm32-unknown-unknown` Rust target.
 
-```powershell
-rustup target add wasm32-unknown-unknown
-```
+A `cargo` that rustup does not manage, such as Homebrew's, ignores
+`rust-toolchain.toml` and has no wasm32 target. Put rustup's `cargo` first in
+`PATH`.
 
 There is deliberately no software codec fallback. Startup fails with a
 contextual error if the required hardware path is unavailable.
@@ -206,14 +207,11 @@ interval. TURN credentials use the same configured lifetime when issued.
 For local Worker development, bind a local D1 database, put the two TURN values
 in an ignored `server/.dev.vars` file, and use `npx wrangler dev`. Cloudflare
 TURN credential generation still needs real credentials and outbound access.
-Apply the D1 migrations before deploying a Worker that exposes the installer
-endpoints:
-
-```powershell
-Push-Location server
-npx wrangler d1 migrations apply DB --remote
-Pop-Location
-```
+Deploy the server with `node scripts/deploy-server.mjs` (add `--dry-run` to
+list pending migrations and build without deploying). It applies the D1
+migrations before deploying the Worker and then checks `/healthz`, which
+reports the newest applied migration and answers 503 when D1 is older than the
+Worker expects. See [company domains](docs/company-domains.md).
 
 ## Run
 
@@ -405,6 +403,18 @@ The **folder icon** offers **Send** and **Receive** using native multi-file/fold
 pickers on the source computer. Transfers preserve nested and empty folders and
 land in the signed-in user’s `Documents/MeshRMM Transferred Files` folder.
 Existing names are preserved by assigning a unique name to incoming duplicates.
+The viewer saves files from the device only after **Receive**, one transfer per
+request within 15 minutes; it ignores the device's own pick requests and never
+accepts pasted or dropped files. Clipboard file copies are limited to 512 MiB
+(use **Send** for larger files) and other transfers to 64 GiB, and the receiving
+computer must have enough free disk space. Interrupted transfers are removed
+after 24 hours, and cached clipboard/drop copies after an hour once they are no
+longer on the clipboard.
+Received files are tagged like browser downloads on both computers: the macOS
+quarantine attribute (with MeshRMM as the downloading app) on files and folders,
+and the Internet zone's Mark of the Web on Windows files. Opening a received app
+or installer therefore gets the Gatekeeper or SmartScreen check; use **Open
+Anyway** (macOS) or **Unblock** in the file's properties (Windows) to trust it.
 Drag files from Finder or Explorer onto the remote view to deliver a native
 Windows drop at that position (Explorer, desktop, or a browser drop target);
 if the target declines the drop, files go to the same Documents folder.
@@ -438,12 +448,22 @@ example, a UAC prompt) recreates the endpoint chat popup and clears its local
 history. Older peers can still connect, but chat requires updated builds.
 
 Viewer diagnostics are written to `%LOCALAPPDATA%\MeshRMM\remote.log` on
-Windows and `~/Library/Logs/MeshRMM/remote.log` on macOS.
+Windows and `~/Library/Logs/MeshRMM/remote.log` on macOS, and the Agent's to
+`%ProgramData%\MeshRMM\Agent\agent.log`. A log is rotated at 10 MiB, keeping
+the three previous files (`remote.1.log`, newest, to `remote.3.log`). Periodic
+connection and video statistics are logged every 30 seconds; the diagnostics
+overlay updates every two.
 Pointer coordinates are normalized to the display
 currently being streamed and every event carries that display ID, so the Agent
 rejects input left over from a previous display after a switch. On Windows,
 press **F8** in the viewer to cycle displays. On macOS, use
-**Control-Option-Left/Right Arrow**. On endpoints with multiple monitors,
+**Control-Option-Left/Right Arrow**. **F12** shows the diagnostics overlay.
+Either shortcut can use F8–F12 or be turned off, which sends the key to the
+device: on Windows under **Settings → Keyboard**, on macOS (diagnostics only)
+under the session menu's **Diagnostics key**. While the Windows viewer has
+keyboard focus it also sends the Windows key, Alt+Tab, Alt+Esc and Ctrl+Esc to
+the device instead of acting on them locally; turn this off under
+**Settings → Keyboard**. Ctrl+Alt+Del and Windows+L always stay local. On endpoints with multiple monitors,
 select **All monitors** from the viewer's display dropdown (also included in
 keyboard cycling) to view and control the complete desktop in one window.
 The combined view preserves monitor positions, including negative coordinates,
@@ -522,6 +542,10 @@ acknowledged credential rotation, and cancellation cleanup on endpoints. Older
 installers retain one-shot enrollment, and older agents retain their current token
 when they do not understand the staged rotation command. Rotation returns HTTP 202
 with `rotation_pending`; the agent commits the credential by reconnecting with it.
+The Agent must be online: an offline Agent gets HTTP 409 and nothing is staged.
+Rotating again before the Agent reconnects resends the same pending credential,
+and the coordinator deletes its copy of the credential once the Agent has
+authenticated with it.
 
 An agent accepts one active remote session. A second viewer receives a busy response;
 closing the current viewer releases the session. Suspending a company revokes its

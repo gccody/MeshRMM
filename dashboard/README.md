@@ -12,22 +12,72 @@ on immutable `<slug>.meshrmm.com` hostnames.
 
 ## Local development
 
-```bash
-npm install
-npm run dev
-npm run build
-npm run deploy
-```
+`npm run dev` serves the dashboard at `http://localhost:3000`. With
+`MESHRMM_DEV_ROOT_DOMAIN=localhost`, it serves the production hosts under
+`localhost`: marketing at `localhost:3000`, the owner console at
+`admin.localhost:3000`, and each company at `<slug>.localhost:3000`. Browsers
+resolve every `*.localhost` name to this computer, and the setting lives only in
+the ignored `.dev.vars`, so it never affects a deployed Worker. Chrome, Edge and
+Firefox treat `http://*.localhost` as secure, so the `__Host-` session cookies
+work without HTTPS; Safari does not.
+
+1. Build the control-plane Worker once, and after server changes. When
+   `server/build/` exists, `npm run dev` runs it beside the dashboard, sharing
+   the local D1 database, and `/v1/` requests reach it:
+
+   ```bash
+   cd ../server && worker-build --profile server-release
+   ```
+
+2. Copy `.dev.vars.example` to `.dev.vars` and `../server/.dev.vars.example` to
+   `../server/.dev.vars`, then fill them in. Use a WorkOS **staging**
+   environment: set its client ID in both files, and in WorkOS add
+   `http://<slug>.localhost:3000` (and `http://admin.localhost:3000` for the owner
+   console) as redirect URIs and CORS origins.
+
+3. Create the local database and a fixture company. The organization ID is a
+   WorkOS staging organization that your staging user belongs to:
+
+   ```bash
+   npm install
+   npm run dev:seed -- acme org_01...
+   npm run dev
+   ```
+
+   Then open `http://acme.localhost:3000`. The seed only writes local state
+   under `.wrangler/`; run it again after new migrations.
+
+The Agent list does not load locally. It arrives over a WebSocket that the
+control plane advertises as `wss://<slug>.<root>/v1/agents/events`, without the
+dev server's port or scheme. Sign-in, account and settings, and the owner
+console work; remote sessions, enrollment and installer downloads need the
+production configuration.
+
+## Deployment
+
+Deploy the dashboard only through the **Publish native release** GitHub Actions
+workflow. A deployment replaces every published Agent and viewer download, and
+`public/downloads/` is not committed, so a deployment from a normal checkout
+would remove them or publish local builds. `npm run deploy` refuses to run unless
+the workflow set `MESHRMM_RELEASE_DEPLOY=1` and `public/downloads/` holds the
+complete release for `release.json`'s version. To publish a dashboard change
+without a new native version, run the workflow manually. Use
+`npm run deploy:dry-run` to check a build without deploying. See
+[automated native releases](../docs/native-releases.md).
 
 Application code is organized by responsibility:
 
 - `app/` contains route composition and providers.
 - `features/agents/` owns Agent models, event-stream synchronization, and UI.
-- `features/enrollment/` owns installer enrollment UI.
-- `features/session/` owns organization-scoped dashboard inactivity handling.
+- `features/enrollment/` owns installer enrollment UI and the enrolled installer download.
+- `features/session/` owns organization-scoped dashboard inactivity handling and
+  remote viewer handoffs.
+- `features/settings/` owns the company settings page.
+- `features/workspace/` owns the company dashboard shell, account loading, and the account dialog.
 - `features/platform/` owns invite-only company provisioning for the platform owner.
 - `features/marketing/` owns the public root-domain experience.
-- `lib/` contains shared browser HTTP behavior.
+- `lib/` contains shared browser behavior: HTTP helpers, host classification, and
+  the accessible modal dialog.
 - `wrangler.jsonc` owns the production Worker, domain, and runtime settings.
 
 ## Session policy
@@ -57,7 +107,7 @@ sign-out across tabs where supported.
 
 MeshRMM enforces a per-organization dashboard inactivity timeout. New
 organizations default to four hours, and organization administrators can change
-the value under **Profile & session**. Expiry locks the dashboard and ends the
+the value under **Settings → Dashboard security**. Expiry locks the dashboard and ends the
 WorkOS session without navigating away; the user deliberately resumes through
 WorkOS when they return.
 

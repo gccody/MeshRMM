@@ -1,19 +1,6 @@
 import handler from "vinext/server/fetch-handler";
 import { handleAuth } from "./auth";
-
-const ROOT_DOMAIN = "meshrmm.com";
-const RESERVED_HOSTS = new Set(["admin", "api", "auth", "downloads", "status", "support", "www"]);
-
-function tenantSlug(hostname: string) {
-  const suffix = `.${ROOT_DOMAIN}`;
-  if (!hostname.endsWith(suffix)) return null;
-  const slug = hostname.slice(0, -suffix.length);
-  if (
-    !/^(?=.{2,63}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])$/.test(slug) ||
-    RESERVED_HOSTS.has(slug)
-  ) return null;
-  return slug;
-}
+import { classifyHost } from "../lib/hosts";
 
 function notFound() {
   return new Response("Company not found", {
@@ -31,25 +18,26 @@ const worker = {
     const url = new URL(request.url);
     let appRequest: Request = request;
     let organizationId: string | undefined;
-    if (url.hostname === "www.meshrmm.com") {
-      url.hostname = "meshrmm.com";
+    const host = classifyHost(url.hostname, env.MESHRMM_DEV_ROOT_DOMAIN);
+    if (host.surface === "www") {
+      url.hostname = host.rootDomain;
       return Response.redirect(url, 308);
     }
 
-    if (url.hostname === `auth.${ROOT_DOMAIN}`) {
+    if (host.surface === "auth") {
       if (url.pathname !== "/login") return notFound();
       url.pathname = "/v1/auth/invitations/resolve";
       return env.MESHRMM_API.fetch(new Request(url, { headers: request.headers }));
     }
 
-    if (url.pathname.startsWith("/v1/") && url.hostname === ROOT_DOMAIN) return notFound();
+    if (url.pathname.startsWith("/v1/") && host.surface === "marketing") return notFound();
     if (url.pathname === "/healthz" || url.pathname.startsWith("/v1/")) {
       return env.MESHRMM_API.fetch(request);
     }
 
-    if (url.hostname !== ROOT_DOMAIN && url.hostname !== `admin.${ROOT_DOMAIN}`) {
-      const slug = tenantSlug(url.hostname);
-      if (!slug) return notFound();
+    if (host.surface !== "marketing" && host.surface !== "platform") {
+      if (host.surface !== "tenant") return notFound();
+      const { slug } = host;
       const company = await env.DB.prepare(
         "SELECT workos_organization_id FROM companies WHERE slug = ?1 COLLATE NOCASE AND status IN ('active', 'awaiting_admin')",
       ).bind(slug).first<{ workos_organization_id: string | null }>();
@@ -68,7 +56,7 @@ const worker = {
     }
 
     if (url.pathname.startsWith("/auth/")) {
-      if (url.hostname === ROOT_DOMAIN) return notFound();
+      if (host.surface === "marketing") return notFound();
       return handleAuth(appRequest, env, organizationId);
     }
 

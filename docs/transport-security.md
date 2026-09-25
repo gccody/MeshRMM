@@ -5,8 +5,9 @@
 Authenticated sessions automatically accept peer certificate fingerprints supplied
 by signaling. No administrator verification, fingerprint prompts, or local
 pre-enrollment is required on either endpoint, including new viewers and replaced
-peer keys. Persistent local certificates, SHA-256 SDP validation, DTLS certificate
-matching/private-key proof, ECDHE/AEAD encryption, and TLS 1.3 remain enforced.
+peer keys. Persistent local certificates, SHA-256 SDP validation, DTLS 1.2
+certificate matching/private-key proof, and ECDHE/AEAD encryption remain
+enforced, and the HTTPS and WSS clients accept only TLS 1.3.
 Peer identity trusts the authenticated signaling service; this is not independent
 identity verification against a compromised control plane or trust-on-first-use
 key-change detection. The earlier manual enrollment requirement has been removed. Existing `trusted-peers` entries are not used for admission.
@@ -25,7 +26,18 @@ credentials. Viewer session HTTP requests and Agent enrollment are HTTPS-only,
 including redirects. Local plaintext WebSockets are used only by isolated
 network-liveness unit tests, without the authenticated connector.
 
-Screen, audio, input, clipboard, files, and chat use WebRTC data channels.
+Every native HTTPS and WSS client offers only TLS 1.3, matching the zone's
+TLS 1.3 minimum (see [strict public TLS](#strict-public-tls-follow-up--september-16-2026)):
+the Agent's and viewer's signaling WebSockets, the viewer's session API
+requests, the Agent's enrollment request, and both update checks and
+downloads. `meshrmm_signaling_client::tls` holds the shared settings. The
+WebSocket client trusts the operating system's root certificates; the Agent's
+ureq and the viewer's reqwest clients verify certificates through the
+operating system. Handshake tests against local TLS 1.2-only servers cover
+each client. A server that only offers TLS 1.2 cannot be reached.
+
+Screen, audio, input, clipboard, files, and chat use WebRTC data channels,
+which WebRTC encrypts with DTLS 1.2; the WebRTC stack has no DTLS 1.3.
 TURN relays forward the DTLS-encrypted traffic. Peer certificate fingerprints
 are authenticated through the signaling service; the control plane remains
 trusted for peer identity. These controls do not provide independent device
@@ -191,7 +203,9 @@ out of release artifacts and do not copy them between endpoints.
 
 The optional `--identity-fingerprint` command prints the local public certificate
 fingerprint without contacting a server. It is a diagnostic, not a connection
-prerequisite. Deploy the acknowledged-close server endpoint before the native
+prerequisite. The Windows viewer is a GUI application, so Command Prompt returns
+before its output appears; pipe the command, for example
+`meshrmm-remote.exe --identity-fingerprint | more`, or run it from PowerShell. Deploy the acknowledged-close server endpoint before the native
 release to enable acknowledged cleanup; no fingerprint provisioning is needed.
 
 The following records describe the earlier manual-enrollment validation. That

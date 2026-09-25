@@ -30,20 +30,17 @@ struct Session {
     directory: PathBuf,
 }
 
-/// The connection owns this guard; closing or losing it drains and saves video.
-pub struct RecordingGuard(pub Recorder);
-impl Drop for RecordingGuard {
-    fn drop(&mut self) {
-        self.0.stop();
-    }
-}
-
 impl Recorder {
     pub fn with_activity_callback(callback: impl Fn(bool) + Send + Sync + 'static) -> Self {
         Self(Arc::new(Mutex::new(State {
             on_active: Some(Arc::new(callback)),
             ..State::default()
         })))
+    }
+
+    #[cfg(test)]
+    pub fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     pub fn active(&self) -> bool {
@@ -139,6 +136,36 @@ impl Recorder {
             // Never wait for a slow disk on the UI or video thread.
             session.sender = None;
             state.finishing.push(session);
+        }
+    }
+
+    /// Ends recording when the session ends, and waits up to `timeout` for
+    /// the writer to save what it has queued: a writer still running when the
+    /// process exits would leave the last part truncated. Returns the notice
+    /// to show, if any.
+    pub fn finish(&self, timeout: std::time::Duration) -> Option<String> {
+        self.stop();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let finished = {
+                let mut state = self.0.lock().unwrap();
+                let (done, pending): (Vec<_>, Vec<_>) = std::mem::take(&mut state.finishing)
+                    .into_iter()
+                    .partition(|session| session.worker.is_finished());
+                state.finishing = pending;
+                done
+            };
+            for session in finished {
+                self.collect(session);
+            }
+            let waiting = !self.0.lock().unwrap().finishing.is_empty();
+            if !waiting || std::time::Instant::now() >= deadline {
+                if waiting {
+                    tracing::warn!("recording writer did not finish before the viewer closed");
+                }
+                return self.0.lock().unwrap().notice.take();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
@@ -286,6 +313,30 @@ mod tests {
                 .unwrap()
                 .contains("could not keep up")
         );
+    }
+
+    #[test]
+    fn finishing_waits_for_the_writer_and_returns_its_notice() {
+        let recorder = Recorder::default();
+        assert_eq!(recorder.finish(Duration::from_millis(10)), None);
+        let (sender, receiver) = mpsc::sync_channel::<(EncodedFrame, VideoFormat)>(1);
+        let (saved_tx, saved) = mpsc::channel();
+        recorder.0.lock().unwrap().session = Some(Session {
+            sender: Some(sender),
+            overloaded: false,
+            directory: PathBuf::from("recordings"),
+            worker: std::thread::spawn(move || {
+                // Drains until the recorder closes the queue, then saves.
+                for _ in receiver {}
+                std::thread::sleep(Duration::from_millis(100));
+                saved_tx.send(()).unwrap();
+                Ok(1)
+            }),
+        });
+        let notice = recorder.finish(Duration::from_secs(5)).unwrap();
+        assert!(saved.try_recv().is_ok(), "returned before the writer saved");
+        assert!(notice.starts_with("Recording saved to"), "{notice}");
+        assert!(!recorder.active());
     }
 
     #[test]

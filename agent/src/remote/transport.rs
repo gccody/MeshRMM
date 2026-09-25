@@ -323,7 +323,7 @@ async fn run_connected_sender(
     let (state_tx, mut state_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
     let (video_failure_tx, mut video_failure_rx) = mpsc::unbounded_channel::<String>();
     let identity = meshrmm_session_transport::identity::PeerIdentity::load(
-        &meshrmm_session_transport::identity::agent_directory()?,
+        &crate::installer::identity_directory()?,
     )?;
     let peer = create_peer(
         &ice_servers,
@@ -936,7 +936,7 @@ fn spawn_file_worker(
     mpsc::Sender<meshrmm_protocol::FileMessage>,
     super::native_task::NativeTask,
 )> {
-    let (sender, mut commands) = mpsc::channel(64);
+    let (sender, mut commands) = mpsc::channel(meshrmm_file_transfer::COMMAND_QUEUE);
     let task = super::native_task::NativeTask::spawn(
         "meshrmm-files",
         move |mut stop| async move {

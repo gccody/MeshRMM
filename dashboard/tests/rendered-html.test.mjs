@@ -85,6 +85,17 @@ test("resolves a provisioned company before rendering its fixed workspace", asyn
   assert.doesNotMatch(html, /Fixed company workspace|one-time remote handoffs|Cloudflare live inventory/);
 });
 
+test("available sidebar entries are links to their routes", async () => {
+  const response = await render("/settings", "acme.meshrmm.com", {
+    workos_organization_id: "org_acme",
+  });
+  const html = await response.text();
+  const nav = html.match(/<nav aria-label="Primary navigation">.*?<\/nav>/s)?.[0] ?? "";
+  // Devices can open in a new tab; Settings needs a company session first.
+  assert.match(nav, /<a href="\/" class="nav-item\s*"><svg[^>]*lucide-monitor/);
+  assert.match(nav, /<button type="button" class="nav-item active" aria-current="page" disabled=""><svg[^>]*lucide-settings/);
+});
+
 test("settings has a dedicated route and retains tenant isolation", async () => {
   const response = await render("/settings", "acme.meshrmm.com", {
     workos_organization_id: "org_acme",

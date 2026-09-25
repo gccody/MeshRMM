@@ -1,6 +1,6 @@
 //! A private, bounded, real-time ETW session for disk and network byte counts.
 //! Never attaches to, changes, or stops another application's trace session.
-use super::data::{Handle, wide};
+use crate::win32::{OwnedHandle, wide};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use windows::Win32::System::Diagnostics::Etw::*;
@@ -36,7 +36,7 @@ impl Properties {
     }
 }
 fn name(pid: u32) -> Vec<u16> {
-    wide(&format!("MeshRMM-TaskManager-{pid}"))
+    wide(format!("MeshRMM-TaskManager-{pid}"))
 }
 pub fn stop(pid: u32) {
     let name = name(pid);
@@ -205,7 +205,7 @@ pub fn update_threads(shared: &Shared) {
     let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }) else {
         return;
     };
-    let snapshot = Handle(snapshot);
+    let snapshot = OwnedHandle(snapshot);
     let mut threads = HashMap::new();
     let mut entry = THREADENTRY32 {
         dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
