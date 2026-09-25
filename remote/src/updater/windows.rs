@@ -10,7 +10,9 @@ use meshrmm_self_update::windows::{
 };
 use meshrmm_self_update::{CLIENT_WINDOWS_X64, CURRENT_VERSION, UpdateManifest};
 
+use super::download;
 use crate::config::Config;
+use crate::launch_status::{self, LaunchStatus};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -34,13 +36,19 @@ pub async fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
     if std::env::var_os("MESHRMM_UPDATE_READY_FILE").is_some() {
         return Ok(false);
     }
+    launch_status::report(LaunchStatus::CheckingForUpdate);
     let http = crate::http::client_builder()
         .timeout(Duration::from_secs(30))
         .build()
         .context("failed to create client update HTTP client")?;
-    let manifest_bytes = download(&http, &config.update_manifest_url, MAX_MANIFEST_BYTES)
-        .await
-        .context("failed to download the client update manifest")?;
+    let manifest_bytes = download(
+        &http,
+        &config.update_manifest_url,
+        MAX_MANIFEST_BYTES,
+        |_| {},
+    )
+    .await
+    .context("failed to download the client update manifest")?;
     let manifest = UpdateManifest::parse(&manifest_bytes)?;
     let Some(release) = manifest.newer_release(CLIENT_WINDOWS_X64, CURRENT_VERSION)? else {
         return Ok(false);
@@ -51,13 +59,18 @@ pub async fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
         release_version = %release.version,
         "downloading client update for this launch"
     );
-    let executable = download(&http, &release.url, MAX_UPDATE_BYTES)
-        .await
-        .context("failed to download the client update")?;
+    let executable = download(&http, &release.url, MAX_UPDATE_BYTES, |progress| {
+        launch_status::report(progress.status(&release.version))
+    })
+    .await
+    .context("failed to download the client update")?;
     release.verify(&executable)?;
     if !executable.starts_with(b"MZ") {
         bail!("downloaded client update is not a Windows executable");
     }
+    launch_status::report(LaunchStatus::InstallingUpdate {
+        version: release.version.clone(),
+    });
 
     let current = std::env::current_exe().context("could not locate the client executable")?;
     let parent = current
@@ -209,24 +222,6 @@ fn install_update(
     remove_if_present(&backup);
     tracing::info!(target = %target.display(), "installed and launched the client update");
     Ok(())
-}
-
-async fn download(http: &reqwest::Client, url: &str, maximum: usize) -> anyhow::Result<Vec<u8>> {
-    let mut response = http.get(url).send().await?.error_for_status()?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > maximum as u64)
-    {
-        bail!("download exceeds the {maximum}-byte size limit");
-    }
-    let mut contents = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if chunk.len() > maximum.saturating_sub(contents.len()) {
-            bail!("download exceeds the {maximum}-byte size limit");
-        }
-        contents.extend_from_slice(&chunk);
-    }
-    Ok(contents)
 }
 
 fn write_new_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {

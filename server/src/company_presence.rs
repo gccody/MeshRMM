@@ -15,6 +15,9 @@ pub struct PresenceAgent {
     pub id: String,
     pub name: String,
     pub connected: bool,
+    /// The release an offline Agent announced it is installing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updating_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -33,6 +36,8 @@ pub enum PresenceMutation {
         agent_id: String,
         connected: bool,
         generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updating_to: Option<String>,
     },
     Upsert {
         agent_id: String,
@@ -52,6 +57,17 @@ struct PresenceState {
     generations: BTreeMap<String, u64>,
     #[serde(default)]
     pending_event: Option<PresenceEvent>,
+    /// Offline Agents that went offline to install this release.
+    #[serde(default)]
+    updating: BTreeMap<String, String>,
+}
+
+impl PresenceState {
+    fn updating_to(&self, agent_id: &str, connected: bool) -> Option<String> {
+        (!connected)
+            .then(|| self.updating.get(agent_id).cloned())
+            .flatten()
+    }
 }
 
 // Read legacy attachments during rolling deployments. Only new attachments can
@@ -406,10 +422,14 @@ impl CompanyPresence {
         let mut agents = result
             .results::<AgentRow>()?
             .into_iter()
-            .map(|row| PresenceAgent {
-                connected: presence.connected_agent_ids.contains(&row.id),
-                id: row.id,
-                name: row.name,
+            .map(|row| {
+                let connected = presence.connected_agent_ids.contains(&row.id);
+                PresenceAgent {
+                    updating_to: presence.updating_to(&row.id, connected),
+                    connected,
+                    id: row.id,
+                    name: row.name,
+                }
             })
             .collect::<Vec<_>>();
         sort_agents(&mut agents);
@@ -424,11 +444,13 @@ impl CompanyPresence {
     async fn apply_mutation(&self, company_id: &str, mutation: PresenceMutation) -> Result<()> {
         self.flush_pending_event().await?;
         let mut presence = self.load_presence().await?;
-        let (mutation, generation) = match mutation {
+        // A connection event also replaces the update the Agent is installing, if any.
+        let (mutation, generation, updating_to) = match mutation {
             PresenceMutation::Connection {
                 agent_id,
                 connected,
                 generation,
+                updating_to,
             } => {
                 if !accept_generation(presence.generations.get(&agent_id).copied(), generation) {
                     return Ok(());
@@ -440,9 +462,10 @@ impl CompanyPresence {
                         connected: Some(connected),
                     },
                     Some(generation),
+                    Some(updating_to),
                 )
             }
-            mutation => (mutation, None),
+            mutation => (mutation, None, None),
         };
         let event = match mutation {
             PresenceMutation::Upsert {
@@ -458,11 +481,19 @@ impl CompanyPresence {
                     } else {
                         connected
                     };
-                let state_changed = match connected {
+                let connection_changed = match connected {
                     Some(true) => presence.connected_agent_ids.insert(agent_id.clone()),
                     Some(false) => presence.connected_agent_ids.remove(&agent_id),
                     None => true,
                 };
+                let update_changed = match updating_to {
+                    Some(Some(version)) => {
+                        presence.updating.insert(agent_id.clone(), version.clone()) != Some(version)
+                    }
+                    Some(None) => presence.updating.remove(&agent_id).is_some(),
+                    None => false,
+                };
+                let state_changed = connection_changed || update_changed;
                 if let Some(generation) = generation {
                     presence.generations.insert(agent_id.clone(), generation);
                 }
@@ -490,6 +521,7 @@ impl CompanyPresence {
             PresenceMutation::Delete { agent_id } => {
                 crate::validate_identifier(&agent_id, "device ID")?;
                 presence.connected_agent_ids.remove(&agent_id);
+                presence.updating.remove(&agent_id);
                 presence.revision = presence.revision.saturating_add(1);
                 PresenceEvent::AgentDeleted {
                     revision: presence.revision,
@@ -553,10 +585,13 @@ impl CompanyPresence {
         )?.first::<AgentRow>(None).await?;
         let Some(row) = row else { return Ok(None) };
         let name = row.name;
+        let connected =
+            connected.unwrap_or_else(|| presence.connected_agent_ids.contains(agent_id));
         Ok(Some(PresenceAgent {
             id: agent_id.to_owned(),
             name,
-            connected: connected.unwrap_or_else(|| presence.connected_agent_ids.contains(agent_id)),
+            connected,
+            updating_to: presence.updating_to(agent_id, connected),
         }))
     }
 
@@ -628,16 +663,19 @@ mod tests {
                 id: "b".into(),
                 name: "Zulu".into(),
                 connected: false,
+                updating_to: None,
             },
             PresenceAgent {
                 id: "c".into(),
                 name: "Alpha".into(),
                 connected: true,
+                updating_to: None,
             },
             PresenceAgent {
                 id: "a".into(),
                 name: "Alpha".into(),
                 connected: true,
+                updating_to: None,
             },
         ];
 

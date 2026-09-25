@@ -98,6 +98,15 @@ function ConnectMenu({ agent, disabled, connecting, background, onRemote, onRemo
   );
 }
 
+function StatusBadge({ agent }: { agent: Agent }) {
+  if (agent.connected) return <span className="status-badge online"><i />Online</span>;
+  if (agent.updating_to) {
+    const detail = `Installing Agent ${agent.updating_to}. The device reconnects when the update finishes.`;
+    return <span className="status-badge updating" title={detail}><i />Updating<span className="sr-only">. {detail}</span></span>;
+  }
+  return <span className="status-badge offline"><i />Offline</span>;
+}
+
 export function AgentOverview({
   agents,
   filteredAgents,
@@ -152,7 +161,7 @@ export function AgentOverview({
                   <div className={`device-avatar ${agent.connected ? "online" : ""}`}><Monitor size={20} /><span /></div>
                   <div className="device-identity"><strong title={agent.name}>{agent.name}</strong><details className="device-details"><summary>Device ID</summary><code>{agent.id}</code></details></div>
                 </td>
-                <td className="device-status"><span className={`status-badge ${agent.connected ? "online" : "offline"}`}><i />{agent.connected ? "Online" : "Offline"}</span></td>
+                <td className="device-status"><StatusBadge agent={agent} /></td>
                 <td className="row-actions">
                   <ConnectMenu agent={agent} disabled={!agent.connected || connectingId === agent.id || deletingId === agent.id || closingId === agent.id} connecting={connectingId === agent.id} background={connectingBackgroundId === agent.id} onRemote={onRemote} onRemoteBackground={onRemoteBackground} />
                   {canDelete && <button className="close-session-button" disabled={closingId !== null || connectingId === agent.id || deletingId === agent.id} onClick={() => onCloseSession(agent)} aria-label={`Close active session for ${agent.name}`} title="Close active session">{closingId === agent.id ? <LoaderCircle size={16} className="spin" /> : <Square size={16} />}<span className="sr-only">Close session</span></button>}

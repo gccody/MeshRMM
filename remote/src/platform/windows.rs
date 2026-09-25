@@ -38,10 +38,12 @@ use super::ControlSink;
 use crate::debug::DebugInfo;
 
 mod keyboard_hook;
+mod launch_window;
 mod pipeline;
 mod renderer;
 mod window;
 
+pub use launch_window::{close_launch_status, show_launch_status};
 use pipeline::WorkerPipeline;
 use renderer::D3d11Renderer;
 use window::{create_window, pump_window_messages, set_window_cursor};

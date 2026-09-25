@@ -40,7 +40,7 @@ pub(super) use toolbar::set_agent_pointer_display;
 static LAST_PLACEMENT: std::sync::Mutex<Option<WINDOWPLACEMENT>> = std::sync::Mutex::new(None);
 
 /// SS_CENTER and SS_CENTERIMAGE, which live in an otherwise unused Windows feature.
-const STATIC_CENTER: u32 = 0x0001;
+pub(super) const STATIC_CENTER: u32 = 0x0001;
 const STATIC_CENTER_VERTICALLY: u32 = 0x0200;
 
 /// The minimum outer window size, in 96-DPI pixels, that fits the toolbar.
@@ -323,7 +323,7 @@ fn window_title(display: &Display) -> HSTRING {
 }
 
 /// Scales a 96-DPI length to `dpi`, rounding to the nearest pixel.
-fn scale(value: i32, dpi: u32) -> i32 {
+pub(super) fn scale(value: i32, dpi: u32) -> i32 {
     ((i64::from(value) * i64::from(dpi) + 48).div_euclid(96)) as i32
 }
 
@@ -331,7 +331,7 @@ fn toolbar_height(dpi: u32) -> i32 {
     scale(VIEWER_TOOLBAR_HEIGHT as i32, dpi)
 }
 
-unsafe fn window_dpi(window: HWND) -> u32 {
+pub(super) unsafe fn window_dpi(window: HWND) -> u32 {
     match unsafe { GetDpiForWindow(window) } {
         0 => 96,
         dpi => dpi,
@@ -348,7 +348,7 @@ unsafe fn client_size(window: HWND) -> Option<(u32, u32)> {
 }
 
 /// The Windows message font at `dpi`. The caller owns the returned font.
-unsafe fn message_font(dpi: u32) -> HFONT {
+pub(super) unsafe fn message_font(dpi: u32) -> HFONT {
     let mut metrics = NONCLIENTMETRICSW {
         cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
         ..Default::default()
@@ -375,7 +375,7 @@ unsafe fn message_font(dpi: u32) -> HFONT {
     }
 }
 
-unsafe fn set_font(control: HWND, font: HFONT) {
+pub(super) unsafe fn set_font(control: HWND, font: HFONT) {
     unsafe {
         SendMessageW(
             control,
@@ -654,6 +654,7 @@ pub(super) unsafe fn create_window(
         )
     };
     let _ = unsafe { ShowWindow(window, SW_SHOW) };
+    super::close_launch_status();
     Ok(window)
 }
 

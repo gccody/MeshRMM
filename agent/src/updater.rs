@@ -38,13 +38,14 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_STARTUP_GRACE: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-pub fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
+/// Returns the version of the update it staged, after which the service must stop.
+pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
     let http = http_agent();
     let manifest_bytes = download(&http, &config.update_manifest_url, MAX_MANIFEST_BYTES)
         .context("failed to download the Agent update manifest")?;
     let manifest = UpdateManifest::parse(&manifest_bytes)?;
     let Some(release) = manifest.newer_release(AGENT_WINDOWS_X64, CURRENT_VERSION)? else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let update_directory = prepare_update_directory(
@@ -64,7 +65,7 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
             attempts = MAX_ATTEMPTS_PER_VERSION,
             "skipping an automatic Agent update that already failed repeatedly; it is retried after 24 hours"
         );
-        return Ok(false);
+        return Ok(None);
     };
 
     tracing::info!(
@@ -124,7 +125,7 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
         staged = %staged.display(),
         "started the Agent update helper"
     );
-    Ok(true)
+    Ok(Some(release.version))
 }
 
 /// Runs as a copy of the previous Agent after the service that staged the update stops. Whatever

@@ -2,7 +2,7 @@
 mod trays;
 
 use std::ffi::{OsStr, OsString};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::os::windows::io::IntoRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
@@ -24,7 +24,7 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::remote::config::Config;
-use crate::remote::service_link::{SESSION_ACTIVE, SESSION_IDLE};
+use crate::remote::service_link::{SESSION_ACTIVE, SESSION_IDLE, UPDATING_PREFIX};
 use crate::win32::{OwnedHandle, wide};
 
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -162,14 +162,17 @@ fn run_service() -> anyhow::Result<()> {
         let session_active = worker.as_ref().is_some_and(Coordinator::session_active);
         if updates.due(Instant::now(), session_active) {
             match crate::updater::check_and_schedule(config) {
-                Ok(true) => {
+                Ok(Some(version)) => {
                     // Stop cleanly: the helper restarts the service on every path, while a
                     // failure exit would let SCM recovery start this executable again while
                     // the helper is replacing it.
                     tracing::info!("staged an Agent update; stopping the service for replacement");
+                    if let Some(process) = worker.as_mut() {
+                        process.announce_update(&version);
+                    }
                     break true;
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(error = ?error, "automatic Agent update check failed");
                 }
@@ -319,6 +322,19 @@ impl Coordinator {
 
     fn session_active(&self) -> bool {
         self.process.is_running() && self.session_active.load(Ordering::Relaxed)
+    }
+
+    /// Tells the coordinator the stop that follows installs `version`, which it reports to the
+    /// server before disconnecting.
+    fn announce_update(&mut self, version: &str) {
+        let Some(control) = self.control.as_mut() else {
+            return;
+        };
+        if let Err(error) =
+            writeln!(control, "{UPDATING_PREFIX}{version}").and_then(|()| control.flush())
+        {
+            tracing::warn!(%error, "could not tell the Agent coordinator about the update");
+        }
     }
 
     /// Asks the coordinator to end its remote sessions, run their close actions, and exit.
