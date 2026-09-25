@@ -60,6 +60,21 @@ pub enum AgentCommand {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentStatusMessage {
     UninstallScheduled,
+    /// Sent just before the Agent stops to install an automatic update, so the
+    /// dashboard can say why it went offline.
+    Updating {
+        version: String,
+    },
+}
+
+/// Whether `version` has only what a semantic version can contain, so an announced update is
+/// safe to display.
+pub fn is_release_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 64
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +162,21 @@ mod tests {
             serde_json::to_string(&AgentStatusMessage::UninstallScheduled).unwrap(),
             r#"{"type":"uninstall_scheduled"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&AgentStatusMessage::Updating {
+                version: "0.3.1".to_owned(),
+            })
+            .unwrap(),
+            r#"{"type":"updating","version":"0.3.1"}"#
+        );
+    }
+
+    #[test]
+    fn accepts_only_release_versions() {
+        assert!(is_release_version("0.3.1-rc.1+build.5"));
+        assert!(!is_release_version(""));
+        assert!(!is_release_version("1.0 <b>"));
+        assert!(!is_release_version(&"1".repeat(65)));
         assert_eq!(
             serde_json::to_string(&AgentCommand::EndSession {
                 session_id: RemoteSessionId::new("session-123"),

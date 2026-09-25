@@ -89,6 +89,23 @@ fn replays_session(
 
 /// Ends the remote session and runs its close actions before the coordinator exits, since the
 /// session cannot outlive it and nothing else would run them.
+/// Tells the server the Agent is going offline to install `version`, so the dashboard shows
+/// the update instead of an unexplained outage. The stop goes ahead if this fails.
+#[cfg(windows)]
+async fn announce_update(socket: &meshrmm_signaling_client::SignalingConnection, version: String) {
+    let status = AgentStatusMessage::Updating { version };
+    let sent = match serde_json::to_string(&status) {
+        Ok(text) => socket.send(Message::Text(text.into())).await,
+        Err(error) => Err(error.into()),
+    };
+    match sent {
+        Ok(()) => tracing::info!(?status, "told the server the Agent is stopping to update"),
+        Err(error) => {
+            tracing::warn!(error = %error, "could not tell the server the Agent is stopping to update")
+        }
+    }
+}
+
 #[cfg(windows)]
 async fn end_sessions(
     active_session: &mut Option<ActiveSession>,
@@ -258,7 +275,12 @@ pub async fn run(
                                         _ => {}
                                     }
                                 }
-                                () = link.stopped() => break Ok(true),
+                                () = link.stopped() => {
+                                    if let Some(version) = link.update_version() {
+                                        announce_update(&socket, version).await;
+                                    }
+                                    break Ok(true);
+                                }
                             }
                         }
                     }.await;
