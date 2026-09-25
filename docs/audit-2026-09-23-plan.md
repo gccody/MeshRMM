@@ -297,10 +297,10 @@ These need a live dashboard → viewer → agent session, which the agent-driven
   touched after it is restored, or Cargo reuses the stale build: the final run first reported the
   T32 probe's file-transfer test binary until `lib.rs` was touched.
 
-## Remaining tasks
+## Task descriptions
 
----------------------------------------------------------------------------------------------------
-## MEDIUM — Viewer
+All tasks are done. The descriptions from T17 on are kept as the audit wrote them, as the
+reference for the notes above.
 
 ---------------------------------------------------------------------------------------------------
 ## MEDIUM — Shared crates
