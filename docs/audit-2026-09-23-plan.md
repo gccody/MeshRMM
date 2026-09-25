@@ -9,24 +9,24 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 
 | Task | Priority | Status | Commit(s) |
 | --- | --- | --- | --- |
-| T01 Installer: secure ProgramData dirs + uninstall-helper staging (LPE) | High | Done | `5618b00` |
-| T02 macOS viewer: minimize ends session | High | Done | `2eb9bde` |
-| T03 macOS viewer: modal alert while UI borrowed → abort | High | Done | `b7ba5bd` |
-| T04 Windows QPC → µs overflow after ~21 days | High | Done | `bfb6f3c` |
-| T04b Installer: legacy config trust + non-environment system paths | High | Done | `4debd96` |
-| T05 Updater failure paths / restart loop / exe ACL | Medium | Done | `eb52c2c` |
-| T05b Uninstall helper self-delete + viewer updater race | Medium | Done | `a5d39e4`, `1265e1c` |
-| T06 Defer updates during sessions; graceful worker stop | Medium | Done | `662ecb1` |
-| T07 Session-close actions bound to viewed user/session | Medium | Done | `c926dd9` |
-| T08 Task Manager protection names / own processes | Medium | Done | `0159bd8` |
-| T09 Capture-helper IPC hardening | Medium | Done | `30e0836` |
-| T10 Agent logging flush + write-error recovery | Medium | Done | `de94bca` |
-| T11 Background console `exit` cleanup | Medium | Done | `6178050` |
-| T12 Windows viewer pointer mapping / DPI / letterbox | Medium | Done | `2bd0db6`, `8e95162` |
-| T13 Relaunch replaces viewer without ending old session | Medium | Done | `233a875` |
-| T14 macOS viewer keyboard (Cmd→Win, ISO/JIS, stuck Shift) | Medium | Done | `871e913` |
-| T15 Windows viewer GUI subsystem + friendly errors (+ deep-link registration) | Medium | Done | `f8cb85d` |
-| T16 Reconnect UX + recordings + wallpaper setting persistence | Medium | Done | `5a9b6bf` |
+| T01 Installer: secure ProgramData dirs + uninstall-helper staging (LPE) | High | Done | `c669a12` |
+| T02 macOS viewer: minimize ends session | High | Done | `46a15ec` |
+| T03 macOS viewer: modal alert while UI borrowed → abort | High | Done | `a1cf6cc` |
+| T04 Windows QPC → µs overflow after ~21 days | High | Done | `f3323ba` |
+| T04b Installer: legacy config trust + non-environment system paths | High | Done | `e0ce014` |
+| T05 Updater failure paths / restart loop / exe ACL | Medium | Done | `cb95239` |
+| T05b Uninstall helper self-delete + viewer updater race | Medium | Done | `f5738c5`, `749f7cc` |
+| T06 Defer updates during sessions; graceful worker stop | Medium | Done | `1c22e64` |
+| T07 Session-close actions bound to viewed user/session | Medium | Done | `81ee624` |
+| T08 Task Manager protection names / own processes | Medium | Done | `2646788` |
+| T09 Capture-helper IPC hardening | Medium | Done | `414c860` |
+| T10 Agent logging flush + write-error recovery | Medium | Done | `ff86286` |
+| T11 Background console `exit` cleanup | Medium | Done | `867270a` |
+| T12 Windows viewer pointer mapping / DPI / letterbox | Medium | Done | `1c3ec24`, `a570ed7` |
+| T13 Relaunch replaces viewer without ending old session | Medium | Done | `a4a6380` |
+| T14 macOS viewer keyboard (Cmd→Win, ISO/JIS, stuck Shift) | Medium | Done | `cf38bbe` |
+| T15 Windows viewer GUI subsystem + friendly errors (+ deep-link registration) | Medium | Done | `afb18a6` |
+| T16 Reconnect UX + recordings + wallpaper setting persistence | Medium | Done | `0171212` |
 | T17 File transfer roles, limits, cache cleanup | Medium | Done | `66723ae`, `1d75e02` |
 | T18 Quarantine / Mark-of-the-Web on received files | Medium | Done | `a048609` |
 | T19 Server auth error mapping + JWKS cache | Medium | Done | `aba76c6` |
@@ -72,16 +72,52 @@ starts. Line numbers in the task descriptions come from the audit and may have d
 
 ## Endpoint state
 
-After T36, DESKTOP-85R6S28 runs a release build of `2d691a9` (SHA-256 `481985D9…0D76`), which
-includes T17, T18, T23, T30, T32, T39 and T36. The service is running and connected; the build it
-replaced (`797f7a5`, SHA-256 `EF774B2A…77ED`) is kept as
-`meshrmm-agent.exe.before-local-20260924-173653`. T39's first start rotated the 72.6 MB Agent log
-to `agent.1.log`, which will age out after three more rotations.
-T19–T22, T24–T29 and T31 did not change the Agent. Earlier builds are kept as
-`C:\Program Files\MeshRMM\Agent\meshrmm-agent.exe.before-local-*`. T01 removed the explicit
-`gccody` permission on `ProgramData\MeshRMM\Agent`, so a non-elevated `gccody` process can no longer
-read that folder. `updates\local-3273ef617bd940a68963ee6b2d11b6ad` came from an earlier session and was
-left untouched.
+After the 2026-09-25 pre-merge validation, DESKTOP-85R6S28 runs a release build of `8b3980a` plus
+the two fixes below (SHA-256 `4959EE96…D746`). The service is running and connected. The build it
+replaced (`8b3980a`, SHA-256 `16C3D359…2CE5`) is kept as
+`meshrmm-agent.exe.before-local-20260925-115910`; earlier builds are kept as
+`C:\Program Files\MeshRMM\Agent\meshrmm-agent.exe.before-local-*`. The `meshrmm:` link handler
+for `gccody` points at `~\audit-fixes-2026-09-23\audit-builds\viewer-8b3980a\meshrmm-remote.exe`
+(SHA-256 `483B01C6…E7D1`), which has the same fixes. T01 removed the explicit `gccody` permission on
+`ProgramData\MeshRMM\Agent`, so a non-elevated `gccody` process can no longer read that folder.
+`updates\local-3273ef617bd940a68963ee6b2d11b6ad` came from an earlier session and was left
+untouched.
+
+## Pre-merge validation (2026-09-25)
+
+Run on the whole branch at `8b3980a`, after the history rewrite (the hashes above are the rewritten
+ones).
+
+- CI passed on `8b3980a`. On the endpoint, the synced tree (SHA-256 manifest, 398 files, no
+  mismatches) passed native fmt, clippy and the workspace tests, and the seven SYSTEM-only ignored
+  Agent tests passed: the six Session 0 GUI tests and
+  `takes_over_a_directory_another_administrator_owns`.
+- A real update through the installed service: a build of `8b3980a` labelled 0.2.7 found the
+  published 0.2.8, and its helper waited for the old instance, backed up and replaced the
+  executable, restarted the service, which reconnected, and cleaned up after itself.
+  `ProgramData\MeshRMM` had been given to `gccody` first, as the older installer left it; the
+  update took it back for Administrators without an `UntrustedOwner` failure.
+- A live session from the Mac viewer to the endpoint, both built from the branch: reception of a
+  131 MB file, minimize and restore, recording, Command combinations, a reconnect after the service
+  restarted (about 2 s), a replacement by a second dashboard link, the background desktop's Task
+  Manager protection and console `exit`, and Lock plus clear clipboard on close, run on the viewed
+  logon.
+- The session found two problems, fixed afterwards:
+  - Sending files from the viewer stalled once 64 KiB was queued, and file sending then stopped for
+    the rest of the session. webrtc-rs calls `on_data_channel` before a peer-created channel opens
+    and drops a buffered-amount-low handler registered then, so the viewer's writers were never
+    woken. T32's window was the first to queue that much. `ServiceChannel` now registers the handler
+    once the channel is open; a network test reproduces the stall. After the fix, sends of 200 KB
+    and about 50 MB completed.
+  - At the user's request, Command pressed and released alone now taps the Windows key. The tap
+    waits 200 ms and is cancelled if the view loses focus, which Cmd-Tab and Cmd-Space cause; later
+    input sends it first.
+- Seen but not caused by this branch: the production server answered the viewer's session resume
+  with a 500 (the viewer then reused the session), and the Agent logs every desktop-helper stderr
+  line, including INFO statistics every 2 s, as a warning, as `main` does.
+- Not validated: a live session from the Windows viewer, the macOS viewer's self-update, the server
+  and dashboard changes against staging (the live session used the production server and dashboard
+  from `main`), and the release workflow, which runs only from `main`.
 
 ## Validation gaps in completed tasks
 
@@ -112,7 +148,7 @@ These need a live dashboard → viewer → agent session, which the agent-driven
   minimize/restore and a simulated 144-DPI change resized the swap chain without errors, and posted
   mouse moves mapped the letterboxed corners to 0 and 65535 and ignored the bars and the toolbar.
   A real monitor with another DPI was not available. The probes also showed that, before
-  `8e95162`, the first presented frame hid every toolbar control, the chat panel and the
+  `a570ed7`, the first presented frame hid every toolbar control, the chat panel and the
   diagnostics overlay; after it, `PrintWindow` captures show all of them.
 - T13: a real replaced session. On Windows, two real viewer processes for one device (with an
   unreachable server) showed the second signaling the first and waiting for it to exit; unit
