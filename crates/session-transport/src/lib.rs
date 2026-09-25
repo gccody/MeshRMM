@@ -24,12 +24,16 @@ pub fn service_label(message: &SessionMessage) -> Option<&'static str> {
     }
 }
 
+/// Writers wait while more than this is queued on a channel.
+const SEND_BUFFER_LIMIT: usize = 64 * 1024;
+
 /// One observer per physical channel, shared by legacy service routes too.
 /// Callbacks only wake consumers; no socket work runs in a callback.
 #[derive(Clone)]
 pub struct ServiceChannel {
     channel: Arc<RTCDataChannel>,
     changed: Arc<Notify>,
+    low_buffer_wake: Arc<OnceCell<()>>,
 }
 impl std::ops::Deref for ServiceChannel {
     type Target = Arc<RTCDataChannel>;
@@ -42,6 +46,7 @@ impl ServiceChannel {
         let result = Self {
             channel,
             changed: Arc::new(Notify::new()),
+            low_buffer_wake: Arc::new(OnceCell::new()),
         };
         let changed = result.changed.clone();
         result.channel.on_open(Box::new(move || {
@@ -54,18 +59,26 @@ impl ServiceChannel {
             Box::pin(async {})
         }));
         result
-            .channel
-            .set_buffered_amount_low_threshold(64 * 1024 - 1)
+    }
+
+    /// Wakes writers when the send buffer drains. webrtc-rs keeps a threshold and handler set
+    /// before a channel opens only for channels this side created: one the peer created reaches
+    /// `on_data_channel` unopened and would lose both. So they are set once the channel is open.
+    async fn wake_when_buffer_drains(&self) {
+        self.low_buffer_wake
+            .get_or_init(|| async {
+                self.channel
+                    .set_buffered_amount_low_threshold(SEND_BUFFER_LIMIT - 1)
+                    .await;
+                let changed = self.changed.clone();
+                self.channel
+                    .on_buffered_amount_low(Box::new(move || {
+                        changed.notify_waiters();
+                        Box::pin(async {})
+                    }))
+                    .await;
+            })
             .await;
-        let changed = result.changed.clone();
-        result
-            .channel
-            .on_buffered_amount_low(Box::new(move || {
-                changed.notify_waiters();
-                Box::pin(async {})
-            }))
-            .await;
-        result
     }
 
     /// Application open/close handlers that replace ours must forward the wake.
@@ -101,7 +114,8 @@ impl ServiceChannel {
                     self.ready_state() == RTCDataChannelState::Open,
                     "session channel is not open"
                 );
-                if self.buffered_amount().await < 64 * 1024 {
+                self.wake_when_buffer_drains().await;
+                if self.buffered_amount().await < SEND_BUFFER_LIMIT {
                     return Ok(());
                 }
                 changed.await;
@@ -236,21 +250,42 @@ mod network_tests {
     use super::*;
     use webrtc::api::APIBuilder;
     use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+    use webrtc::peer_connection::RTCPeerConnection;
     use webrtc::peer_connection::configuration::RTCConfiguration;
+
+    async fn peer() -> RTCPeerConnection {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        APIBuilder::new()
+            .build()
+            .new_peer_connection(RTCConfiguration::default())
+            .await
+            .unwrap()
+    }
+
+    /// Offers from `a` and answers from `b`.
+    async fn connect(a: &RTCPeerConnection, b: &RTCPeerConnection) {
+        let mut gathered = a.gathering_complete_promise().await;
+        a.set_local_description(a.create_offer(None).await.unwrap())
+            .await
+            .unwrap();
+        gathered.recv().await;
+        b.set_remote_description(a.local_description().await.unwrap())
+            .await
+            .unwrap();
+        let mut gathered = b.gathering_complete_promise().await;
+        b.set_local_description(b.create_answer(None).await.unwrap())
+            .await
+            .unwrap();
+        gathered.recv().await;
+        a.set_remote_description(b.local_description().await.unwrap())
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn blocked_file_receiver_does_not_block_input_stream() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let a = APIBuilder::new()
-            .build()
-            .new_peer_connection(RTCConfiguration::default())
-            .await
-            .unwrap();
-        let b = APIBuilder::new()
-            .build()
-            .new_peer_connection(RTCConfiguration::default())
-            .await
-            .unwrap();
+        let a = peer().await;
+        let b = peer().await;
         let entered = Arc::new(Notify::new());
         let (release, unblock) = tokio::sync::watch::channel(false);
         let (input, mut received) = tokio::sync::mpsc::channel(1);
@@ -297,22 +332,7 @@ mod network_tests {
                 .await
                 .is_err()
         );
-        let mut gathered = a.gathering_complete_promise().await;
-        a.set_local_description(a.create_offer(None).await.unwrap())
-            .await
-            .unwrap();
-        gathered.recv().await;
-        b.set_remote_description(a.local_description().await.unwrap())
-            .await
-            .unwrap();
-        let mut gathered = b.gathering_complete_promise().await;
-        b.set_local_description(b.create_answer(None).await.unwrap())
-            .await
-            .unwrap();
-        gathered.recv().await;
-        a.set_remote_description(b.local_description().await.unwrap())
-            .await
-            .unwrap();
+        connect(&a, &b).await;
         tokio::time::timeout(Duration::from_secs(10), async {
             let (files_open, controls_open) = tokio::join!(files.wait_open(), controls.wait_open());
             files_open.unwrap();
@@ -337,7 +357,7 @@ mod network_tests {
             .await
             .unwrap()
             .unwrap();
-            if files.buffered_amount().await >= 64 * 1024 {
+            if files.buffered_amount().await >= SEND_BUFFER_LIMIT {
                 break;
             }
         }
@@ -367,6 +387,63 @@ mod network_tests {
         files.close().await.unwrap();
         assert!(files.wait_open().await.is_err());
         assert!(files.writable().await.is_err());
+        a.close().await.unwrap();
+        b.close().await.unwrap();
+    }
+
+    /// The viewer wraps the Agent's service channels in `on_data_channel`, which webrtc-rs calls
+    /// before the channel opens. Its writers must still wake when the send buffer drains.
+    #[tokio::test]
+    async fn a_channel_the_peer_created_wakes_writers_when_its_buffer_drains() {
+        const CHUNK: usize = 16 * 1024;
+        const CHUNKS: usize = 64;
+        let a = peer().await;
+        let b = peer().await;
+        let (accepted, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+        b.on_data_channel(Box::new(move |channel| {
+            let accepted = accepted.clone();
+            Box::pin(async move {
+                let _ = accepted.send(ServiceChannel::new(channel).await);
+            })
+        }));
+        let files = a
+            .create_data_channel(
+                FILE_CHANNEL,
+                Some(RTCDataChannelInit {
+                    ordered: Some(true),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let (arrived, mut received) = tokio::sync::watch::channel(0);
+        files.on_message(Box::new(move |message| {
+            arrived.send_modify(|total| *total += message.data.len());
+            Box::pin(async {})
+        }));
+        connect(&a, &b).await;
+        let files = tokio::time::timeout(Duration::from_secs(10), incoming.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), files.wait_open())
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..CHUNKS {
+            files.writable().await.unwrap();
+            files
+                .send(&bytes::Bytes::from(vec![0; CHUNK]))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            received.wait_for(|total| *total == CHUNK * CHUNKS),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         a.close().await.unwrap();
         b.close().await.unwrap();
     }
