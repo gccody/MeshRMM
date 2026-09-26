@@ -15,6 +15,7 @@ mod launch_status;
 mod matroska;
 mod platform;
 mod preferences;
+mod reconnect;
 mod recording;
 mod shortcuts;
 mod shutdown;
@@ -30,7 +31,8 @@ mod video_layout;
 use anyhow::Context;
 use launch_status::LaunchStatus;
 use meshrmm_signaling_client::ReconnectBackoff;
-use std::time::Duration;
+use reconnect::Disposition;
+use std::time::{Duration, Instant};
 
 /// How long a new viewer waits for the previous viewer of the same device to
 /// release its session. Ending a session retries for up to about 16 seconds.
@@ -172,80 +174,135 @@ async fn run_session(
     result
 }
 
+/// Requests the remote session unless the user cancels first. A request
+/// cancelled in flight leaves its lease to expire on the server: without the
+/// response there is nothing to end it with.
+async fn request_session(
+    config: &config::Config,
+) -> anyhow::Result<Option<meshrmm_protocol::SessionBootstrap>> {
+    launch_status::report(LaunchStatus::RequestingSession);
+    tokio::select! {
+        biased;
+        () = shutdown::wait() => Ok(None),
+        bootstrap = signaling::create_session(config) => {
+            bootstrap.context("remote session request failed").map(Some)
+        }
+    }
+}
+
 async fn run_resumable_session(
     config: &config::Config,
     resume_state: &transport::ViewerResumeState,
 ) -> anyhow::Result<()> {
     let mut bootstrap = match config.bootstrap.clone() {
         Some(bootstrap) => bootstrap,
-        None => {
-            launch_status::report(LaunchStatus::RequestingSession);
-            signaling::create_session(config)
-                .await
-                .context("remote session request failed")?
-        }
+        None => match request_session(config).await? {
+            Some(bootstrap) => bootstrap,
+            None => return Ok(()),
+        },
     };
     tracing::info!(
         session_id = %bootstrap.session_id,
         expires_at_unix_ms = bootstrap.expires_at_unix_ms,
         "remote session authorized"
     );
+    if shutdown::requested() {
+        // Cancelled after the session was created: release its lease now.
+        end_session_after_disconnect(config, &bootstrap).await;
+        return Ok(());
+    }
     let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(15));
     if bootstrap.start_in_background {
         resume_state.select_background_display();
     }
+    let startup_started = Instant::now();
+    let mut startup_failures = 0_u32;
     loop {
-        match transport::run_receiver(config, bootstrap.clone(), resume_state.clone()).await {
-            Ok(()) => {
-                end_session_after_disconnect(config, &bootstrap).await;
-                return Ok(());
-            }
-            Err(error) if signaling::is_terminal_session_error(&error) => {
-                if let Err(cleanup) = signaling::end_session(config, &bootstrap).await {
-                    tracing::warn!(%cleanup, "could not acknowledge terminal session cleanup");
-                }
-                return Err(error).context("remote viewer session can no longer be resumed");
-            }
-            Err(error) => {
-                let delay = backoff.next_delay();
-                if shutdown::requested() {
+        resume_state.begin_attempt();
+        let error =
+            match transport::run_receiver(config, bootstrap.clone(), resume_state.clone()).await {
+                Ok(()) => {
                     end_session_after_disconnect(config, &bootstrap).await;
                     return Ok(());
                 }
+                Err(error) => error,
+            };
+        if shutdown::requested() {
+            end_session_after_disconnect(config, &bootstrap).await;
+            return Ok(());
+        }
+        let ever_presented = resume_state.ever_presented();
+        if !ever_presented {
+            startup_failures += 1;
+        }
+        let disposition = reconnect::disposition(
+            &error,
+            ever_presented,
+            startup_failures,
+            startup_started.elapsed(),
+        );
+        if disposition != Disposition::Retry {
+            tracing::error!(
+                error = ?error,
+                ?disposition,
+                startup_failures,
+                session_id = %bootstrap.session_id,
+                "remote viewer stopped retrying the session"
+            );
+            if let Err(cleanup) = signaling::end_session(config, &bootstrap).await {
+                tracing::warn!(%cleanup, "could not acknowledge terminal session cleanup");
+            }
+            return Err(reconnect::stopped_error(&error));
+        }
+        let delay = backoff.next_delay();
+        tracing::warn!(
+            error = ?error,
+            session_id = %bootstrap.session_id,
+            retry_seconds = delay.as_secs(),
+            streamed_seconds = resume_state
+                .attempt_streamed_for(Instant::now())
+                .map(|streamed| streamed.as_secs()),
+            startup_failures,
+            "remote viewer disconnected; waiting to resume"
+        );
+        if !ever_presented {
+            launch_status::report(LaunchStatus::Retrying {
+                attempt: startup_failures + 1,
+                max: reconnect::STARTUP_ATTEMPTS,
+            });
+        }
+        let resumed = tokio::select! {
+            resumed = signaling::resume_session(config, &bootstrap) => resumed,
+            () = shutdown::wait() => {
+                end_session_after_disconnect(config, &bootstrap).await;
+                return Ok(());
+            }
+        };
+        match resumed {
+            Ok(refreshed) => {
+                bootstrap = refreshed;
+                tracing::info!(
+                    session_id = %bootstrap.session_id,
+                    expires_at_unix_ms = bootstrap.expires_at_unix_ms,
+                    "refreshed remote-session credentials for reconnect"
+                );
+            }
+            Err(error) if signaling::is_terminal_session_error(&error) => {
+                return Err(error).context("remote viewer session can no longer be resumed");
+            }
+            Err(error) => {
                 tracing::warn!(
                     error = ?error,
                     session_id = %bootstrap.session_id,
-                    retry_seconds = delay.as_secs(),
-                    "remote viewer disconnected; waiting to resume"
+                    "could not refresh resume credentials; retrying the existing session"
                 );
-                match signaling::resume_session(config, &bootstrap).await {
-                    Ok(refreshed) => {
-                        bootstrap = refreshed;
-                        tracing::info!(
-                            session_id = %bootstrap.session_id,
-                            expires_at_unix_ms = bootstrap.expires_at_unix_ms,
-                            "refreshed remote-session credentials for reconnect"
-                        );
-                    }
-                    Err(error) if signaling::is_terminal_session_error(&error) => {
-                        return Err(error)
-                            .context("remote viewer session can no longer be resumed");
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            error = ?error,
-                            session_id = %bootstrap.session_id,
-                            "could not refresh resume credentials; retrying the existing session"
-                        );
-                    }
-                }
-                tokio::select! {
-                    () = tokio::time::sleep(delay) => {}
-                    () = shutdown::wait() => {
-                        end_session_after_disconnect(config, &bootstrap).await;
-                        return Ok(());
-                    }
-                }
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            () = shutdown::wait() => {
+                end_session_after_disconnect(config, &bootstrap).await;
+                return Ok(());
             }
         }
     }
@@ -253,12 +310,25 @@ async fn run_resumable_session(
 
 /// Releases the device lease after the session ended by choice. A failure
 /// is logged rather than reported: the disconnect itself succeeded, and the
-/// server expires the lease on its own.
+/// server expires the lease on its own. When the user asked to stop (Cancel,
+/// Quit, closing the window, or a replacing link), the release gets a short
+/// budget so an unreachable server cannot hold the viewer open.
 async fn end_session_after_disconnect(
     config: &config::Config,
     bootstrap: &meshrmm_protocol::SessionBootstrap,
 ) {
-    if let Err(error) = signaling::end_session(config, bootstrap).await {
+    let release = signaling::end_session(config, bootstrap);
+    let result = match shutdown::lease_release_budget(shutdown::requested()) {
+        Some(budget) => match tokio::time::timeout(budget, release).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "the server did not confirm session cleanup within {} seconds",
+                budget.as_secs()
+            )),
+        },
+        None => release.await,
+    };
+    if let Err(error) = result {
         tracing::warn!(
             error = ?error,
             session_id = %bootstrap.session_id,
@@ -328,15 +398,22 @@ async fn run_windows_viewer(recording_notice: &mut Option<String>) -> anyhow::Re
         )?),
         None => None,
     };
+    // Cancel while the previous viewer was closing takes effect here: the
+    // request below returns at once, and a session passed in by an update
+    // is ended when the session starts.
     if config.bootstrap.is_none() {
-        launch_status::report(LaunchStatus::RequestingSession);
-        config.bootstrap = Some(
-            signaling::create_session(&config)
-                .await
-                .context("remote session request failed")?,
-        );
+        match request_session(&config).await? {
+            Some(bootstrap) => config.bootstrap = Some(bootstrap),
+            None => return Ok(()),
+        }
     }
-    match updater::check_and_schedule(&config).await {
+    let update = tokio::select! {
+        biased;
+        // Downloads stay in memory, so abandoning one leaves nothing behind.
+        () = shutdown::wait() => Ok(false),
+        update = updater::check_and_schedule(&config) => update,
+    };
+    match update {
         Ok(true) => Ok(()),
         Ok(false) => run_session(config, recording_notice).await,
         Err(error) => {
@@ -373,17 +450,21 @@ fn main() -> anyhow::Result<()> {
             .build()
             .context("failed to create the macOS network runtime")?;
         if config.bootstrap.is_none() {
-            launch_status::report(LaunchStatus::RequestingSession);
-            config.bootstrap = Some(
-                runtime
-                    .block_on(signaling::create_session(&config))
-                    .context("remote session request failed")?,
-            );
+            match runtime.block_on(request_session(&config))? {
+                Some(bootstrap) => config.bootstrap = Some(bootstrap),
+                None => return Ok(()),
+            }
         }
         let mut recording_notice = None;
-        let result = match runtime
-            .block_on(updater::check_and_schedule(&config, deep_link.as_deref()))
-        {
+        let update = runtime.block_on(async {
+            tokio::select! {
+                biased;
+                // Downloads stay in memory, so abandoning one leaves nothing behind.
+                () = shutdown::wait() => Ok(false),
+                update = updater::check_and_schedule(&config, deep_link.as_deref()) => update,
+            }
+        });
+        let result = match update {
             Ok(true) => Ok(()),
             Ok(false) => runtime.block_on(run_session(config, &mut recording_notice)),
             Err(error) => {
