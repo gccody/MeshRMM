@@ -14,7 +14,7 @@ stand alone; read [Working rules](#working-rules), [Merge order](#merge-order), 
 | Task | Area | Wave | Depends on | Status | Commit(s) |
 | --- | --- | --- | --- | --- | --- |
 | 0.1 Viewer-missing detection + "Get the viewer" | Dashboard | 2 | 2.9 (soft) | Not started | |
-| 0.2 Startup failures: typed errors, retry cap, Cancel | Viewer, agent, protocol | 1 | — | Not started | |
+| 0.2 Startup failures: typed errors, retry cap, Cancel | Viewer, agent, protocol | 1 | — | Merged | `c424a4d`, `b63f8cd`, `41a1baa`, `32bc917` |
 | 2.9 Persistent workspace shell + filters in URL | Dashboard | 1 | — | Merged | `200591b`, `817785b` |
 | 2.10a Fewer D1 round trips + cron cleanup | Server | 1 | — | Merged | `9d5b338`, `3dde5f0`, `e962fef` |
 | 2.10b Start event subscription in parallel with account | Dashboard | 2 | 2.9, 2.10a (soft) | Not started | |
@@ -323,7 +323,48 @@ then upgrade and run a normal session and a service restart mid-session. No hook
 `HardwareEncoderUnavailable`; rely on unit tests and say so. No server deploy needed (pattern change
 only).
 
-**Notes.**
+**Notes.** Implemented in `c424a4d`, `b63f8cd`, `41a1baa` and `32bc917`. Deviations:
+- `HardwareEncoderUnavailable` is detected by the text `"no hardware Media Foundation"` anywhere in
+  the error chain, not by downcasting: `encoder::Error` is in a private module of
+  `meshrmm-remote-screen`, and the installed service only receives desktop-helper failures as
+  text. The text match covers both capture paths.
+- The agent-side types (`CodedSenderError`, `SenderFailureKind::Transport`) live in a new
+  `agent/src/remote/sender_failure.rs`, to keep `transport.rs` hunks small for 3.16b; its tests
+  run on the Mac. "Video data channel send failed" is also marked as a transport failure (it
+  happens when the viewer disconnects — the same stale-error case as F1).
+- A 30 s video timeout counts as `PeerNeverConnected` (UDP message) when the agent answered but
+  WebRTC never connected, rather than the "did not send its screen" text.
+- Cancel covers more than listed: session request, update check, signaling connect and resume all
+  `select!` on `shutdown::wait()`. Update downloads are held in memory (no partial file), so
+  Cancel is disabled only during `InstallingUpdate`, via `LaunchStatus::cancellable()`. Esc also
+  cancels on Windows (`IsDialogMessageW`).
+- Every give-up or terminal stop, including the existing terminal session errors, returns a
+  `UserFacing` root; the dialog text is unchanged. A failure after the user cancelled no longer
+  shows a dialog.
+- `AttemptProgress::mark_frame_presented` returns whether it was the attempt's first frame, for
+  3.14.
+- Added in review (`32bc917`): after a user-requested stop, the lease release gets one attempt
+  bounded to 3 s (`shutdown::lease_release_budget`); ordinary disconnects and the give-up path keep
+  the 3×5 s retries. Before this, Cancel against an unreachable server took 15.7 s to exit.
+
+Validation. macOS development host, on the rebased tree: `cargo fmt --check`, `cargo clippy -D
+warnings`, `cargo test --workspace`, wasm32 `cargo check -p meshrmm-server`, `sql_regressions.py`,
+`scripts/tests`, worker build, and all four Miniflare tests pass. macOS connecting window (debug
+build, unreachable server): Cancel, Esc and the close box exit with code 0 and no dialog in
+3.2–3.6 s; the startup cap against a refusing server shows "attempt 2 of 3", gives up after 3
+failures, and shows the "Could not reach the MeshRMM service…" dialog. DESKTOP-85R6S28 (synced tree
+at the pre-rebase commits, SHA-256 manifest of 413 files matched; the rebase only added server and
+dashboard changes): native fmt, clippy, `cargo test -p meshrmm-remote` and `-p meshrmm-agent` pass;
+the Windows connecting window's Cancel, close box and Esc exit with code 0 in ~0.5 s ("the user
+cancelled the connection" in the log); the startup cap reaches "attempt 2 of 3" and then the "Could
+not reach…" message box after 22 s. The agent built from the pre-review tip (`7209a81`, same agent
+code as `b63f8cd`) was installed, started, connected, and reconnected 1.7 s after a service
+restart with no WARN/ERROR lines; the previous build was then restored (see Endpoint state).
+
+**Incomplete:** no authenticated dashboard link was available, so new viewer vs. the old installed
+agent (legacy uncoded error), new agent vs. old viewer, a normal session and a mid-session service
+restart on the new agent, the UDP-blocked startup cap, and the agent-cannot-encode dialog were not
+exercised. `HardwareEncoderUnavailable` has no forcing hook and rests on unit tests.
 
 ---
 
@@ -1073,3 +1114,14 @@ unchanged.
 At plan creation (2026-09-26), DESKTOP-85R6S28 is as the 2026-09-23 plan's **Endpoint state**
 section left it. Record every agent install or link-handler change here: task, build/commit,
 SHA-256, backup file name, and whether it was restored.
+
+- **0.2 (2026-09-26).** Before: installed agent SHA-256 `6BF0C0296F87C5719B99670137B3DC6C0A14E6CE851B79A1FED4E1FA58DD4D60`
+  (release 0.3.1, package 0.2.0). 12:15 install: release build of `7209a81` (pre-rebase), SHA-256
+  `D017CA5AED06FC349978ED8D6926E4215D8A30FB928546546431E4CDBD643713`, backup
+  `meshrmm-agent.exe.before-local-20260926-121512`. 12:15 restore: `6BF0C029…4D60` reinstalled with
+  the install script, backup `meshrmm-agent.exe.before-local-20260926-121536` (the 0.2 build);
+  service running and connected; install lock released. The viewer tests re-registered the
+  `meshrmm:` handler to `~\ux-2026-09-26-0.2\target\debug\meshrmm-remote.exe`; it was restored to
+  `"C:\Users\gccody\audit-fixes-2026-09-23\audit-builds\viewer-8b3980a\meshrmm-remote.exe" -- "%1"`
+  and confirmed after the review round. Work tree: `~\ux-2026-09-26-0.2`. Every install/restore is
+  also logged in `~\ux-2026-09-26-endpoint-log.txt`.
