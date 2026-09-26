@@ -54,6 +54,8 @@
   ],
   "vars": {
     "WORKOS_CLIENT_ID": "client_01M0FT1AN01PAT37N98EMRSNVW",
+    // The MeshRMM organization; admin.meshrmm.com signs owners in to it.
+    "PLATFORM_WORKOS_ORGANIZATION_ID": "org_01M0FXR8A4Q1W8WAHXME7HPKQW",
     "MESHRMM_SERVER_URL": ""
   },
   "observability": {
