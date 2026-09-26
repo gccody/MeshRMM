@@ -289,6 +289,25 @@ class EnrollmentTests(unittest.TestCase):
         self.assertEqual(self.credentials(), ("c" * 64, None))
 
 
+class ExpiredTokenCleanupTests(unittest.TestCase):
+    """The scheduled cleanup that replaced the per-request expiry DELETEs."""
+
+    def test_only_tokens_expired_by_the_cutoff_are_removed(self):
+        db = migrated_database()
+        db.execute("INSERT INTO companies (id,name,created_at,slug,status) VALUES ('co','CO',0,'acme','active')")
+        db.execute("INSERT INTO agents (id,company_id,name,auth_token_hash,created_by_user_id,created_at,updated_at) VALUES ('device','co','PC',?,'user',0,0)", ("a" * 64,))
+        maintenance = "server/src/maintenance.rs"
+        for expires_at in (99, 100, 101):
+            token = f"{expires_at:064d}"
+            db.execute("INSERT INTO agent_event_subscriptions (token_hash,company_id,user_id,created_at,expires_at) VALUES (?,'co','user',0,?)", (token, expires_at))
+            db.execute("INSERT INTO remote_handoffs (token_hash,company_id,device_id,user_id,created_at,expires_at) VALUES (?,'co','device','user',0,?)", (token, expires_at))
+            db.execute("INSERT INTO agent_install_tokens (id,token_hash,company_id,created_by_user_id,platform,created_at,expires_at) VALUES (?,?,'co','user','windows-x64',0,?)", (token, token, expires_at))
+        for table in ("agent_event_subscriptions", "remote_handoffs", "agent_install_tokens"):
+            with self.subTest(table=table):
+                db.execute(sql(maintenance, f"DELETE FROM {table}"), (100,))
+                self.assertEqual(db.execute(f"SELECT expires_at FROM {table}").fetchall(), [(101,)])
+
+
 class UsageMeteringTests(unittest.TestCase):
     """The rows the platform cost report attributes Cloudflare and WorkOS usage with."""
 
