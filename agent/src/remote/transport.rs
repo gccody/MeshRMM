@@ -25,7 +25,7 @@ use webrtc::peer_connection::{
 };
 use webrtc::stats::StatsReportType;
 
-use super::bitrate::{AdaptiveBitrate, VideoPacer};
+use super::bitrate::{AdaptiveBitrate, EncoderStatus, RestartLadder, VideoPacer};
 use super::platform::{ScreenStreamer, StartedScreen, monotonic_timestamp_us};
 use super::sender_failure::{
     failure_signal, initial_start_error, profile_start_error, transport_failure,
@@ -71,6 +71,8 @@ enum ControlCommand {
     MaintenanceError(String),
     Keyframe,
     Bitrate(u32),
+    /// Restart an encoder that cannot change bitrate live (HEVC).
+    RestartBitrate(u32),
     ViewerCapabilities {
         profiles: Vec<VideoProfile>,
         quality: QualityPreset,
@@ -93,6 +95,7 @@ enum ControlCommand {
 
 struct CaptureStartup {
     quality_ceiling: Arc<AtomicU32>,
+    encoder_status: Arc<EncoderStatus>,
     initial_display: Option<DisplayId>,
     session_close: Arc<SessionClose>,
 }
@@ -578,12 +581,14 @@ async fn run_connected_sender(
     let slot = Arc::new(LatestFrameSlot::default());
     let stream_id = VideoStreamId(1);
     let quality_ceiling = Arc::new(AtomicU32::new(1));
+    let encoder_status = Arc::new(EncoderStatus::default());
     let (capture_tx, capture_rx) = mpsc::channel(64);
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let capture_streamer = Arc::clone(&streamer);
     let capture_slot = Arc::clone(&slot);
     let capture_channel = Arc::clone(&control_channel);
     let capture_ceiling = Arc::clone(&quality_ceiling);
+    let capture_encoder_status = Arc::clone(&encoder_status);
     let capture_failure = video_failure_tx.clone();
     let capture_task =
         super::native_task::NativeTask::spawn("meshrmm-capture-control", move |stop| async move {
@@ -593,6 +598,7 @@ async fn run_connected_sender(
                 capture_channel,
                 CaptureStartup {
                     quality_ceiling: capture_ceiling,
+                    encoder_status: capture_encoder_status,
                     initial_display: start_in_background
                         .then_some(DisplayId(meshrmm_remote_screen::background::DISPLAY_ID)),
                     session_close,
@@ -638,6 +644,7 @@ async fn run_connected_sender(
         Arc::clone(&slot),
         control_tx.clone(),
         Arc::clone(&quality_ceiling),
+        encoder_status,
         video_failure_tx,
     );
     cleanup.tasks.push(video_sender.abort_handle());
@@ -715,7 +722,7 @@ async fn run_connected_sender(
             }
             Some(command) = control_rx.recv() => {
                 match command {
-                    command @ (ControlCommand::Keyframe | ControlCommand::Bitrate(_)
+                    command @ (ControlCommand::Keyframe | ControlCommand::Bitrate(_) | ControlCommand::RestartBitrate(_)
                         | ControlCommand::Quality(_) | ControlCommand::ViewerCapabilities { .. }
                         | ControlCommand::DisplayBorder(_) | ControlCommand::Chroma(_) | ControlCommand::CursorCapture(_) | ControlCommand::InputOwnership(_) | ControlCommand::Recording(_) | ControlCommand::VideoProfileRejected { .. }
                         | ControlCommand::SelectDisplay(_)) => {
@@ -1063,9 +1070,13 @@ async fn run_capture_control(
     let mut stream_id = VideoStreamId(1);
     let CaptureStartup {
         quality_ceiling,
+        encoder_status,
         initial_display,
         session_close,
     } = startup;
+    // Congestion steps belong to one connection; a resumed sender starts at
+    // the quality bitrate and adapts again.
+    lock_streamer(&streamer)?.set_congestion_bitrate(None);
     let started = lock_streamer(&streamer)?.start(initial_display, stream_id, Arc::clone(&slot));
     let started = match started {
         Ok(started) => started,
@@ -1097,6 +1108,12 @@ async fn run_capture_control(
             return Ok(());
         }
         session_close.set_target(&active_display.session);
+        // Live CodecAPI bitrate changes are unsafe on HEVC hardware encoders.
+        encoder_status.publish(
+            format.bitrate_bits_per_second,
+            format.codec != Codec::H265,
+            recording,
+        );
         tokio::select! {
             biased;
             _ = stop.changed() => return Ok(()),
@@ -1120,6 +1137,46 @@ async fn run_capture_control(
                         let value = value.min(quality_ceiling.load(Ordering::Acquire));
                         if let Err(error) = lock_streamer(&streamer)?.set_adaptive_bitrate(value) {
                             tracing::warn!(error = %error, "could not set bitrate while the desktop is changing");
+                        }
+                    }
+                    ControlCommand::RestartBitrate(value) => {
+                        // Restarting with static settings is the safe way to
+                        // change an HEVC encoder's bitrate. Later restarts in
+                        // this connection keep the congestion bitrate.
+                        let ceiling = quality_ceiling.load(Ordering::Acquire);
+                        let value = value.min(ceiling).max(1);
+                        let previous = format.bitrate_bits_per_second;
+                        if !capture_running || format.codec != Codec::H265 || value == previous {
+                            continue;
+                        }
+                        lock_streamer(&streamer)?.set_congestion_bitrate((value < ceiling).then_some(value));
+                        lock_streamer(&streamer)?.stop()?;
+                        slot.clear();
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                        let candidates = profile_candidates(&viewer_profiles, requested_chroma, &rejected_profiles);
+                        match start_first_profile(&streamer, active_display.id, stream_id, &slot, &candidates) {
+                            Ok(started) => {
+                                displays = started.displays;
+                                active_display = started.active_display;
+                                active_profile = started.format.profile();
+                                format = started.format;
+                                capture_unavailable_since = None;
+                                send_control_message(&control_channel, SessionMessage::DisplayConfiguration {
+                                    displays: displays.clone(),
+                                    active_display_id: active_display.id,
+                                    stream_id,
+                                    format,
+                                }).await?;
+                                tracing::info!(previous_bits_per_second = previous, bits_per_second = format.bitrate_bits_per_second, ?active_profile, stream_id = stream_id.0, "restarted the video encoder at a congestion bitrate step");
+                            }
+                            Err(error) => {
+                                // A congestion step must never end the session;
+                                // the desktop lifecycle retries the start.
+                                capture_running = false;
+                                capture_unavailable_since = Some(std::time::Instant::now());
+                                capture_retry_after = std::time::Instant::now();
+                                tracing::warn!(error = ?error, bits_per_second = value, "video encoder did not restart at a congestion bitrate step; retrying");
+                            }
                         }
                     }
                     ControlCommand::Quality(quality)
@@ -1601,6 +1658,7 @@ async fn send_control_message(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_video_sender(
     channel: Arc<RTCDataChannel>,
     open: Arc<Notify>,
@@ -1608,6 +1666,7 @@ fn spawn_video_sender(
     slot: Arc<LatestFrameSlot>,
     recovery: mpsc::UnboundedSender<ControlCommand>,
     quality_ceiling: Arc<AtomicU32>,
+    encoder_status: Arc<EncoderStatus>,
     failure: mpsc::UnboundedSender<anyhow::Error>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1644,6 +1703,7 @@ fn spawn_video_sender(
         let mut recovering = false;
         let mut last_keyframe_request_us = 0_u64;
         let mut bitrate = AdaptiveBitrate::new(quality_ceiling.load(Ordering::Acquire).max(1));
+        let mut ladder = RestartLadder::new(quality_ceiling.load(Ordering::Acquire).max(1));
         let mut pacer = VideoPacer::default();
         loop {
             let source = if let Some(frame) = bootstrap_keyframe.take() {
@@ -1674,18 +1734,46 @@ fn spawn_video_sender(
 
             let now_us = monotonic_timestamp_us();
             let requested_maximum = quality_ceiling.load(Ordering::Acquire).max(1);
-            if let Some(bits_per_second) = bitrate.set_maximum(requested_maximum) {
-                let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
-            }
-            let mut buffered_bytes = channel.buffered_amount().await;
-            if let Some(bits_per_second) =
-                bitrate.observe(now_us, buffered_bytes, slot.len(), reference_chain_lost)
+            let live_bitrate = encoder_status.live_bitrate();
+            let encoder_bitrate = encoder_status.bits_per_second();
+            if let Some(bits_per_second) = bitrate.set_maximum(requested_maximum)
+                && live_bitrate
             {
                 let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
-                tracing::info!(
-                    bits_per_second,
-                    "adapted video bitrate to current transport capacity"
-                );
+            }
+            ladder.set_maximum(requested_maximum);
+            let mut buffered_bytes = channel.buffered_amount().await;
+            if live_bitrate {
+                if let Some(bits_per_second) =
+                    bitrate.observe(now_us, buffered_bytes, slot.len(), reference_chain_lost)
+                {
+                    let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
+                    tracing::info!(
+                        bits_per_second,
+                        "adapted video bitrate to current transport capacity"
+                    );
+                }
+            } else {
+                // Judge congestion against the rate the encoder actually
+                // runs at, and change it only by restarting the encoder.
+                bitrate.rebase(encoder_bitrate);
+                let queued_frames = slot.len();
+                if let Some(bits_per_second) = ladder.observe(
+                    now_us,
+                    encoder_bitrate,
+                    bitrate.congested(buffered_bytes, queued_frames, reference_chain_lost),
+                    bitrate.healthy(buffered_bytes, queued_frames),
+                    encoder_status.recording(),
+                ) {
+                    let _ = recovery.send(ControlCommand::RestartBitrate(bits_per_second));
+                    tracing::info!(
+                        previous_bits_per_second = encoder_bitrate,
+                        bits_per_second,
+                        buffered_bytes,
+                        queued_frames,
+                        "requested a video encoder restart at a new bitrate step"
+                    );
+                }
             }
             if recovering && !source.keyframe {
                 recovery_frames_dropped += 1;
@@ -1713,8 +1801,9 @@ fn spawn_video_sender(
                 buffered_frames_dropped += 1;
                 recovering = true;
                 let queued_frames_dropped = slot.drop_pending();
-                if let Some(bits_per_second) =
-                    bitrate.observe(now_us, buffered_bytes, queued_frames_dropped, true)
+                if live_bitrate
+                    && let Some(bits_per_second) =
+                        bitrate.observe(now_us, buffered_bytes, queued_frames_dropped, true)
                 {
                     let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
                     tracing::warn!(
@@ -1797,6 +1886,7 @@ fn spawn_video_sender(
                     obsolete_frames_dropped,
                     recovery_frames_dropped,
                     encoded_frames_dropped = slot.dropped(),
+                    encoder_bitrate_bits_per_second = encoder_status.bits_per_second(),
                     "video transport statistics"
                 );
                 frames_sent = 0;
