@@ -44,6 +44,12 @@ impl WindowContext {
     }
 
     pub(super) fn set_quality(&self, preset: QualityPreset) {
+        self.show_quality(preset);
+        self.send(SessionMessage::SetQuality { preset });
+    }
+
+    /// Selects `preset` in the toolbar and settings without sending it.
+    pub(super) fn show_quality(&self, preset: QualityPreset) {
         let controls = self.controls();
         let selected = quality_index(preset);
         unsafe {
@@ -58,15 +64,13 @@ impl WindowContext {
             let state = usize::from(candidate == preset);
             unsafe { SendMessageW(button, BM_SETCHECK, Some(WPARAM(state)), None) };
         }
-        self.send(SessionMessage::SetQuality { preset });
     }
 
     pub(super) fn set_chroma(&self, mode: ChromaMode) {
-        let controls = self.controls();
         if !self.control.supports_chroma(mode) {
             unsafe {
                 SendMessageW(
-                    controls.chroma_combo,
+                    self.controls().chroma_combo,
                     CB_SETCURSEL,
                     Some(WPARAM(chroma_index(self.control.chroma_mode()))),
                     None,
@@ -74,6 +78,13 @@ impl WindowContext {
             };
             return;
         }
+        self.show_chroma(mode);
+        self.send(SessionMessage::SetChroma { mode });
+    }
+
+    /// Selects `mode` in the toolbar and settings without sending it.
+    pub(super) fn show_chroma(&self, mode: ChromaMode) {
+        let controls = self.controls();
         let selected = chroma_index(mode);
         unsafe {
             SendMessageW(
@@ -87,7 +98,74 @@ impl WindowContext {
             let state = usize::from(candidate == mode);
             unsafe { SendMessageW(button, BM_SETCHECK, Some(WPARAM(state)), None) };
         }
-        self.send(SessionMessage::SetChroma { mode });
+    }
+
+    /// Fills the user and display selectors from the display list.
+    pub(super) fn populate_session_controls(&self) {
+        let controls = self.controls();
+        let active = self.active_display();
+        let sessions = Display::sessions(&self.displays());
+        unsafe { SendMessageW(controls.user_combo, CB_RESETCONTENT, None, None) };
+        for session in &sessions {
+            let title = HSTRING::from(session.label());
+            unsafe {
+                SendMessageW(
+                    controls.user_combo,
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(title.as_ptr() as isize)),
+                );
+            }
+        }
+        let active_session = sessions
+            .iter()
+            .position(|s| *s == active.session)
+            .unwrap_or(0);
+        unsafe {
+            SendMessageW(
+                controls.user_combo,
+                CB_SETCURSEL,
+                Some(WPARAM(active_session)),
+                None,
+            );
+        }
+        let displays = self.displays();
+        let active_index = active
+            .session_displays(&displays)
+            .iter()
+            .position(|d| d.id == active.id)
+            .unwrap_or(0);
+        self.populate_display_combo(active_index);
+    }
+
+    /// Lists the active session's displays, marks the one the device's
+    /// pointer is on, and selects `selected`.
+    fn populate_display_combo(&self, selected: usize) {
+        let combo = self.controls().display_combo;
+        let displays = self.displays();
+        let visible = self.active_display().session_displays(&displays);
+        let pointer_display = self.agent_pointer_display.get();
+        unsafe { SendMessageW(combo, CB_RESETCONTENT, None, None) };
+        for (index, display) in visible.iter().enumerate() {
+            let title = if pointer_display == Some(display.id) {
+                format!("➤ {}", display.selection_label(index))
+            } else {
+                display.selection_label(index)
+            };
+            let title = HSTRING::from(title);
+            unsafe {
+                SendMessageW(
+                    combo,
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(title.as_ptr() as isize)),
+                );
+            }
+        }
+        unsafe {
+            SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(selected)), None);
+            let _ = EnableWindow(combo, visible.len() > 1);
+        }
     }
 
     pub(super) fn layout_toolbar(&self, window: HWND) {
@@ -231,11 +309,10 @@ impl WindowContext {
     }
 
     fn select_display(&self, index: usize) {
-        if let Some(display) = self
-            .active_display
-            .session_displays(&self.displays)
-            .get(index)
-            && display.id != self.active_display.id
+        let active = self.active_display();
+        let displays = self.displays();
+        if let Some(display) = active.session_displays(&displays).get(index)
+            && display.id != active.id
         {
             self.send(SessionMessage::SelectDisplay {
                 display_id: display.id,
@@ -244,14 +321,15 @@ impl WindowContext {
     }
 
     fn select_user(&self, index: usize) {
-        let sessions = Display::sessions(&self.displays);
+        let active = self.active_display();
+        let displays = self.displays();
+        let sessions = Display::sessions(&displays);
         if let Some(session) = sessions.get(index)
-            && *session != self.active_display.session
-            && let Some(display) = self
-                .displays
+            && *session != active.session
+            && let Some(display) = displays
                 .iter()
                 .find(|d| &d.session == session && d.primary)
-                .or_else(|| self.displays.iter().find(|d| &d.session == session))
+                .or_else(|| displays.iter().find(|d| &d.session == session))
         {
             self.send(SessionMessage::SelectDisplay {
                 display_id: display.id,
@@ -259,7 +337,7 @@ impl WindowContext {
         }
         let current = sessions
             .iter()
-            .position(|s| *s == self.active_display.session)
+            .position(|s| *s == active.session)
             .unwrap_or(0);
         unsafe {
             SendMessageW(
@@ -272,14 +350,13 @@ impl WindowContext {
     }
 
     pub(super) fn select_next_display(&self) {
-        let displays = self.active_display.session_displays(&self.displays);
+        let active = self.active_display();
+        let all_displays = self.displays();
+        let displays = active.session_displays(&all_displays);
         if displays.len() < 2 {
             return;
         }
-        let current = displays
-            .iter()
-            .position(|d| d.id == self.active_display.id)
-            .unwrap_or(0);
+        let current = displays.iter().position(|d| d.id == active.id).unwrap_or(0);
         self.send(SessionMessage::SelectDisplay {
             display_id: displays[(current + 1) % displays.len()].id,
         });
@@ -349,7 +426,7 @@ impl WindowContext {
         }
         if control_id == TYPE_CLIPBOARD_BUTTON_ID {
             self.release_input();
-            self.control.type_clipboard(self.active_display.id);
+            self.control.type_clipboard(self.active_display_id());
             let _ = unsafe { SetFocus(Some(window)) };
             return true;
         }
@@ -535,50 +612,6 @@ pub(super) unsafe fn create_toolbar(
         )
     }
     .context("user dropdown creation failed")?;
-    let sessions = Display::sessions(&context.displays);
-    for session in &sessions {
-        let title = HSTRING::from(session.label());
-        unsafe {
-            SendMessageW(
-                user_combo,
-                CB_ADDSTRING,
-                None,
-                Some(LPARAM(title.as_ptr() as isize)),
-            );
-        }
-    }
-    let active_session = sessions
-        .iter()
-        .position(|s| *s == context.active_display.session)
-        .unwrap_or(0);
-    unsafe {
-        SendMessageW(user_combo, CB_SETCURSEL, Some(WPARAM(active_session)), None);
-    }
-    let visible = context.active_display.session_displays(&context.displays);
-    for (index, display) in visible.iter().enumerate() {
-        let title = HSTRING::from(display.selection_label(index));
-        unsafe {
-            SendMessageW(
-                display_combo,
-                CB_ADDSTRING,
-                None,
-                Some(LPARAM(title.as_ptr() as isize)),
-            );
-        }
-    }
-    let active_index = visible
-        .iter()
-        .position(|d| d.id == context.active_display.id)
-        .unwrap_or(0);
-    unsafe {
-        SendMessageW(
-            display_combo,
-            CB_SETCURSEL,
-            Some(WPARAM(active_index)),
-            None,
-        );
-        let _ = EnableWindow(display_combo, visible.len() > 1);
-    }
     let quality_combo = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -775,32 +808,10 @@ pub(in crate::platform::windows) unsafe fn set_agent_pointer_display(
     display_id: Option<meshrmm_protocol::DisplayId>,
 ) {
     if let Some(context) = unsafe { window_context(window) } {
-        unsafe {
-            let combo = GetDlgItem(Some(window), DISPLAY_COMBO_ID as i32);
-            if let Ok(combo) = combo {
-                let selected = SendMessageW(combo, CB_GETCURSEL, None, None);
-                SendMessageW(combo, CB_RESETCONTENT, None, None);
-                for (index, display) in context
-                    .active_display
-                    .session_displays(&context.displays)
-                    .iter()
-                    .enumerate()
-                {
-                    let title = if display_id == Some(display.id) {
-                        format!("➤ {}", display.selection_label(index))
-                    } else {
-                        display.selection_label(index)
-                    };
-                    let title = HSTRING::from(title);
-                    SendMessageW(
-                        combo,
-                        CB_ADDSTRING,
-                        None,
-                        Some(LPARAM(title.as_ptr() as isize)),
-                    );
-                }
-                SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(selected.0 as usize)), None);
-            }
-        }
+        context.agent_pointer_display.set(display_id);
+        // Keep a selection the user just made while its stream starts.
+        let selected =
+            unsafe { SendMessageW(context.controls().display_combo, CB_GETCURSEL, None, None) };
+        context.populate_display_combo(selected.0 as usize);
     }
 }
