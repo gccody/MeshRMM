@@ -1,8 +1,8 @@
 use crate::*;
 
 pub(crate) async fn create_handoff(request: &mut Request, environment: &Env) -> Result<Response> {
-    let identity = match authorize_workos_user(request, environment).await {
-        Ok(identity) => identity,
+    let (identity, company) = match authorize_workos_company(request, environment).await {
+        Ok(authorized) => authorized,
         Err(error) => return workos_auth_error(error),
     };
     let body: HandoffRequest = request
@@ -11,32 +11,16 @@ pub(crate) async fn create_handoff(request: &mut Request, environment: &Env) -> 
         .map_err(|_| Error::RustError("invalid remote handoff request".into()))?;
     validate_identifier(&body.device_id, "device ID")?;
     let db = environment.d1("DB")?;
-    let permitted = query!(
-        &db,
-        "SELECT 1 AS permitted FROM agents WHERE id = ?1 AND company_id = ?2 AND deletion_requested_at IS NULL",
-        body.device_id,
-        identity.company_id
-    )?
-    .metered_first::<i64>(Some("permitted"))
-    .await?
-    .is_some();
-    if !permitted {
-        return api_error(404, "Agent not found");
-    }
     let handoff_token = random_token();
     let token_hash = sha256_hex(&handoff_token);
     let created_at = Date::now().as_millis();
     let expires_at = created_at + HANDOFF_TTL_MS;
-    query!(
+    // The handoff is created only for the company's own undeleted Agent, and
+    // the audit event only with it, so both take one round trip. Expired
+    // handoffs are purged by the scheduled maintenance task.
+    let insert = query!(
         &db,
-        "DELETE FROM remote_handoffs WHERE expires_at <= ?1",
-        now_ms_i64()?
-    )?
-    .metered_run()
-    .await?;
-    query!(
-        &db,
-        "INSERT INTO remote_handoffs (token_hash, company_id, device_id, user_id, created_at, expires_at, start_in_background) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO remote_handoffs (token_hash, company_id, device_id, user_id, created_at, expires_at, start_in_background) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE EXISTS (SELECT 1 FROM agents WHERE agents.id = ?3 AND agents.company_id = ?2 AND agents.deletion_requested_at IS NULL)",
         token_hash,
         identity.company_id,
         body.device_id,
@@ -44,21 +28,32 @@ pub(crate) async fn create_handoff(request: &mut Request, environment: &Env) -> 
         i64::try_from(created_at).map_err(|_| Error::RustError("clock overflow".into()))?,
         i64::try_from(expires_at).map_err(|_| Error::RustError("clock overflow".into()))?,
         body.start_in_background
-    )?
-    .metered_run()
-    .await?;
-    audit(
+    )?;
+    let audit = query!(
         &db,
-        &identity,
+        "INSERT INTO audit_events (id, company_id, actor_user_id, action, target_type, target_id, metadata_json, created_at) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 WHERE EXISTS (SELECT 1 FROM remote_handoffs WHERE token_hash = ?9)",
+        Uuid::new_v4().to_string(),
+        identity.company_id,
+        identity.user_id,
         "remote.handoff_create",
         "agent",
-        &body.device_id,
+        body.device_id,
         "{}",
-    )
-    .await?;
+        now_ms_i64()?,
+        token_hash
+    )?;
+    let results = metered_batch(&db, vec![insert, audit]).await?;
+    let created = results
+        .first()
+        .and_then(|result| result.meta().ok().flatten())
+        .and_then(|meta| meta.changes)
+        .unwrap_or_default();
+    if created != 1 {
+        return api_error(404, "Agent not found");
+    }
     Response::from_json(&HandoffResponse {
         handoff_token,
-        api_url: canonical_company_url(&db, environment, &identity.company_id).await?,
+        api_url: company_url(environment, company.slug.as_deref())?,
         expires_at_unix_ms: expires_at,
         start_in_background: body.start_in_background,
     })

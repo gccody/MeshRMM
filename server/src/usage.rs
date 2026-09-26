@@ -64,6 +64,10 @@ pub(crate) enum Source<'a> {
     /// A Durable Object event. Cloudflare reports the object's requests and
     /// duration itself, so only D1 usage is recorded, and only when there is some.
     DurableObject { object_id: String },
+    /// A cron trigger invocation. Cloudflare counts each one as a Workers
+    /// request, and the report prices every request before allowances, so it
+    /// is billable. No company causes it, so it is platform overhead.
+    Scheduled,
 }
 
 thread_local! {
@@ -109,6 +113,11 @@ pub(crate) async fn metered<F: Future>(
             usage.fallback_owner = Some(format!("{OBJECT_OWNER_PREFIX}{object_id}"));
             "do"
         }
+        Source::Scheduled => {
+            usage.invocations = 1.0;
+            usage.billable_requests = 1.0;
+            "scheduled"
+        }
     };
     let usage = Rc::new(RefCell::new(usage));
     let output = Scoped {
@@ -118,7 +127,7 @@ pub(crate) async fn metered<F: Future>(
     .await;
     let usage = usage.take();
     let used_d1 = usage.d1_rows_read > 0.0 || usage.d1_rows_written > 0.0;
-    if matches!(source, Source::Api { .. }) || used_d1 {
+    if matches!(source, Source::Api { .. } | Source::Scheduled) || used_d1 {
         write(environment, label, &usage);
     }
     output
