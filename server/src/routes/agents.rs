@@ -4,8 +4,8 @@ pub(crate) async fn create_agent_installer(
     request: &mut Request,
     environment: &Env,
 ) -> Result<Response> {
-    let identity = match authorize_workos_user(request, environment).await {
-        Ok(identity) if identity.has_permission("agents:manage") => identity,
+    let (identity, company) = match authorize_workos_company(request, environment).await {
+        Ok((identity, company)) if identity.has_permission("agents:manage") => (identity, company),
         Ok(_) => return api_error(403, "company administrator access is required"),
         Err(error) => return workos_auth_error(error),
     };
@@ -17,23 +17,16 @@ pub(crate) async fn create_agent_installer(
         return api_error(400, "unsupported Agent installer platform");
     }
 
+    // Expired installer tokens are purged by the scheduled maintenance task.
     let db = environment.d1("DB")?;
-    ensure_company_exists(&db, &identity.company_id).await?;
     let now = now_ms_i64()?;
-    query!(
-        &db,
-        "DELETE FROM agent_install_tokens WHERE expires_at <= ?1",
-        now
-    )?
-    .metered_run()
-    .await?;
     let install_id = Uuid::new_v4().to_string();
     let install_token = random_token();
     let token_hash = sha256_hex(&install_token);
     let expires_at = Date::now().as_millis() + AGENT_INSTALL_TTL_MS;
     let expires_at_i64 =
         i64::try_from(expires_at).map_err(|_| Error::RustError("clock overflow".into()))?;
-    query!(
+    let insert = query!(
         &db,
         "INSERT INTO agent_install_tokens (id, token_hash, company_id, created_by_user_id, platform, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         install_id,
@@ -43,20 +36,18 @@ pub(crate) async fn create_agent_installer(
         body.platform,
         now,
         expires_at_i64
-    )?
-    .metered_run()
-    .await?;
-    audit(
+    )?;
+    let audit = audit_statement(
         &db,
         &identity,
         "agent_installer.issue",
         "agent_installer",
         &install_id,
         &serde_json::json!({ "platform": body.platform }).to_string(),
-    )
-    .await?;
+    )?;
+    metered_batch(&db, vec![insert, audit]).await?;
     Response::from_json(&AgentInstallerBootstrap {
-        server: canonical_company_url(&db, environment, &identity.company_id).await?,
+        server: company_url(environment, company.slug.as_deref())?,
         install_token,
         expires_at_unix_ms: expires_at,
     })

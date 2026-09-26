@@ -69,6 +69,11 @@
     // CLOUDFLARE_ANALYTICS_API_TOKEN secret (Account Analytics: Read).
     "CLOUDFLARE_ACCOUNT_ID": "023f5fc9ffca88a15dac8e9f27b8d21f"
   },
+  // Purges expired event subscriptions, remote handoffs and installer tokens;
+  // see server/src/maintenance.rs.
+  "triggers": {
+    "crons": ["*/30 * * * *"]
+  },
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1

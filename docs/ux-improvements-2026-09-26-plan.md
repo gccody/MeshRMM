@@ -16,7 +16,7 @@ stand alone; read [Working rules](#working-rules), [Merge order](#merge-order), 
 | 0.1 Viewer-missing detection + "Get the viewer" | Dashboard | 2 | 2.9 (soft) | Not started | |
 | 0.2 Startup failures: typed errors, retry cap, Cancel | Viewer, agent, protocol | 1 | — | Not started | |
 | 2.9 Persistent workspace shell + filters in URL | Dashboard | 1 | — | Not started | |
-| 2.10a Fewer D1 round trips + cron cleanup | Server | 1 | — | Not started | |
+| 2.10a Fewer D1 round trips + cron cleanup | Server | 1 | — | Merged | `9d5b338`, `3dde5f0`, `e962fef` |
 | 2.10b Start event subscription in parallel with account | Dashboard | 2 | 2.9, 2.10a (soft) | Not started | |
 | 2.11 Inventory keeps data, stale state, per-source errors | Dashboard | 2 | 2.9 | Not started | |
 | 2.12 Scope WorkOS widgets and Radix CSS to admin pages | Dashboard | 2 | 2.9 (soft) | Not started | |
@@ -485,7 +485,32 @@ handoff create 2. No `DELETE … expires_at` left in `server/src/routes/*`. Cron
 `/v1/remote/handoffs` unchanged. All server checks in [Working rules](#working-rules) pass.
 Backward compatible with the current dashboard — no client change required.
 
-**Notes.**
+**Notes.** Implemented in `9d5b338`, `3dde5f0` and `e962fef`. Subscription create, handoff create and
+installer create (optional step 5, done) now take 2 D1 round trips each, and the WebSocket upgrade
+takes 1; `server/tests/request_path.mjs` (added to the `server-wasm` CI job) asserts these counts
+with a counting D1 wrapper. A `*/30` cron (`maintenance::purge_expired_tokens`) deletes rows from
+all three token tables once they are more than 10 minutes past expiry, in one batch. It is metered
+as billable platform usage under the new source label `scheduled`, whose CPU time `costs.rs` counts
+with the API Worker's runs (noted in `docs/cost-tracking.md`). `ensure_company_exists` was removed
+(no other callers); `audit()` now builds on a new `audit_statement()` helper that the installer
+batch uses. Response shapes are unchanged.
+
+Correction to the design: `api.meshrmm.com` parses as the company hostname `api`, so computing the
+tenant slug first would reject every token on the legacy host. The upgrade therefore checks for the
+legacy host before the company hostname (`api` is a reserved slug no company can have). Separately,
+and not caused by this change: dashboard-authorized routes on `api.meshrmm.com` already return 404
+because they resolve that host as company `api`; only `localhost` works as a legacy host there, so
+the test creates legacy-host subscriptions through `localhost`. Worth a separate look. A token
+presented on another company's hostname now gets 401 and stays unused (before: consumed, then 403).
+
+Checks (macOS development host, at the merged tree): `cargo fmt --check`, `cargo clippy -D warnings`,
+`cargo test --workspace`, wasm32 `cargo check -p meshrmm-server`, `sql_regressions.py`,
+`scripts/tests` unittest, `node --test scripts/*.test.mjs`, `worker-build --profile server-release`
+(built worker exports `scheduled`), and `presence.mjs`, `session_cleanup.mjs`, `token_rotation.mjs`,
+`request_path.mjs` — all passed. One earlier full `cargo test` run in the task worktree saw
+`meshrmm-file-transfer`'s `windowed_transfer_keeps_a_window_in_flight` fail once (13 vs 16) under
+parallel load; it passed on every rerun and is unrelated. No endpoint validation needed
+(server-only).
 
 ---
 

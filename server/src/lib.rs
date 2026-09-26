@@ -13,6 +13,7 @@ mod auth;
 mod company_presence;
 mod health;
 mod infrastructure;
+mod maintenance;
 mod remote_session;
 mod routes;
 mod usage;
@@ -52,6 +53,7 @@ struct TenantCompany {
     id: String,
     workos_organization_id: Option<String>,
     status: String,
+    slug: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -239,6 +241,15 @@ async fn fetch(request: Request, environment: Env, _context: Context) -> Result<
         tenant_slug: tenant_slug_from_hostname(&hostname, &root_domain),
     };
     usage::metered(&environment, source, route(request, environment.clone())).await
+}
+
+// Housekeeping that would otherwise delay requests; see wrangler.jsonc.
+#[event(scheduled)]
+async fn scheduled(_event: ScheduledEvent, environment: Env, _context: ScheduleContext) {
+    let purge = async { maintenance::purge_expired_tokens(&environment, now_ms_i64()?).await };
+    if let Err(error) = usage::metered(&environment, usage::Source::Scheduled, purge).await {
+        console_error!("event=expired_token_purge_failed error={}", error);
+    }
 }
 
 async fn route(mut request: Request, environment: Env) -> Result<Response> {
@@ -449,21 +460,6 @@ async fn authorize_agent(
     })
 }
 
-async fn ensure_company_exists(db: &D1Database, company_id: &str) -> Result<()> {
-    if query!(
-        db,
-        "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, display_border, prevent_idle_lock, allow_idle_override, slug, status FROM companies WHERE id = ?1",
-        company_id
-    )?
-    .metered_first::<Company>(None)
-    .await?
-    .is_none()
-    {
-        return Err(Error::RustError("company has not been provisioned".into()));
-    }
-    Ok(())
-}
-
 async fn audit(
     db: &D1Database,
     identity: &Identity,
@@ -472,6 +468,21 @@ async fn audit(
     target_id: &str,
     metadata_json: &str,
 ) -> Result<()> {
+    audit_statement(db, identity, action, target_type, target_id, metadata_json)?
+        .metered_run()
+        .await?;
+    Ok(())
+}
+
+/// The audit insert, for a caller that batches it with the change it records.
+fn audit_statement(
+    db: &D1Database,
+    identity: &Identity,
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    metadata_json: &str,
+) -> Result<D1PreparedStatement> {
     query!(
         db,
         "INSERT INTO audit_events (id, company_id, actor_user_id, action, target_type, target_id, metadata_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -483,10 +494,7 @@ async fn audit(
         target_id,
         metadata_json,
         now_ms_i64()?
-    )?
-    .metered_run()
-    .await?;
-    Ok(())
+    )
 }
 
 fn cors(response: Response, environment: &Env) -> Result<Response> {
