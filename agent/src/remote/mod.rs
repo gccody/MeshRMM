@@ -6,6 +6,8 @@ pub(crate) mod background_console;
 pub(crate) mod background_files;
 #[cfg(windows)]
 pub(crate) mod background_tasks;
+#[cfg(any(windows, test))]
+mod bitrate;
 #[cfg(windows)]
 mod blackout;
 #[cfg(windows)]
@@ -45,7 +47,9 @@ pub(crate) mod session_close;
 mod signaling;
 #[cfg(windows)]
 mod transport;
-#[cfg(windows)]
+// The bitrate controller's tests share the encoded-frame queue bound.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
 mod video;
 #[cfg(windows)]
 pub(crate) mod wallpaper;
