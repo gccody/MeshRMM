@@ -2,6 +2,10 @@
 //! error chain still goes to the viewer log.
 use std::fmt;
 
+use meshrmm_protocol::SignalErrorCode;
+
+use crate::transport::{FailureKind, SessionFailure};
+
 /// An error response from the MeshRMM API.
 #[derive(Debug)]
 pub struct ApiError {
@@ -58,6 +62,7 @@ enum Cause<'a> {
     Identity,
     Ended,
     Explained(&'a str),
+    Session(&'a FailureKind),
     Other,
 }
 
@@ -66,6 +71,9 @@ fn cause(error: &anyhow::Error) -> Cause<'_> {
     for cause in error.chain() {
         if let Some(explained) = cause.downcast_ref::<UserFacing>() {
             return Cause::Explained(&explained.0);
+        }
+        if let Some(failure) = cause.downcast_ref::<SessionFailure>() {
+            return Cause::Session(&failure.kind);
         }
         if let Some(api) = cause.downcast_ref::<ApiError>() {
             return Cause::Status(api.status);
@@ -126,7 +134,38 @@ pub fn user_message(error: &anyhow::Error) -> String {
         Cause::Identity => {
             "The device's identity did not match the identity this viewer trusts, so the connection was stopped. If the device was reinstalled, trust its new identity first."
         }
-        Cause::Status(_) | Cause::Other => {
+        Cause::Session(FailureKind::VideoTimeout) => {
+            "The remote computer accepted the connection but did not send its screen within 30 seconds. The MeshRMM Agent may be unable to capture the display. Try again, or restart the remote computer if this keeps happening."
+        }
+        Cause::Session(FailureKind::PeerNeverConnected) => {
+            "Could not open a network path to the remote computer. A firewall on either network may block the UDP traffic MeshRMM uses. Try another network or ask your administrator to allow UDP."
+        }
+        Cause::Session(FailureKind::PeerConnectionLost) => {
+            "The connection to the remote computer was lost and could not be restored."
+        }
+        Cause::Session(FailureKind::AgentReported(Some(
+            SignalErrorCode::HardwareEncoderUnavailable,
+        ))) => {
+            "The remote computer has no hardware video encoder MeshRMM can use, so its screen cannot be streamed. Updating its display driver may help."
+        }
+        Cause::Session(FailureKind::AgentReported(Some(SignalErrorCode::NoMutualProfile))) => {
+            "The remote computer and this viewer have no video format in common. Update the MeshRMM Agent and viewer."
+        }
+        Cause::Session(FailureKind::AgentReported(Some(SignalErrorCode::CaptureUnavailable))) => {
+            "The remote computer could not capture its screen. It may be at a secure or locked screen, or have no active display."
+        }
+        Cause::Session(FailureKind::AgentReported(Some(SignalErrorCode::IdentityMismatch))) => {
+            // The receiver turns this code into an identity error; kept for completeness.
+            "The device's identity did not match the identity this viewer trusts, so the connection was stopped. If the device was reinstalled, trust its new identity first."
+        }
+        Cause::Status(_)
+        | Cause::Session(
+            FailureKind::AgentReported(None | Some(SignalErrorCode::Unknown))
+            | FailureKind::SignalingLost
+            | FailureKind::PresentationFailed
+            | FailureKind::AgentLeft,
+        )
+        | Cause::Other => {
             let detail: String = format!("{error:#}").chars().take(400).collect();
             return format!("The remote session could not continue.\n\nDetails: {detail}");
         }
@@ -199,6 +238,60 @@ mod tests {
         let message = user_message(&error);
         assert!(message.starts_with("The remote session could not continue."));
         assert!(message.contains("Agent disconnected"));
+    }
+
+    #[test]
+    fn every_session_failure_renders_plain_text() {
+        let kinds = [
+            FailureKind::SignalingLost,
+            FailureKind::PeerNeverConnected,
+            FailureKind::PeerConnectionLost,
+            FailureKind::VideoTimeout,
+            FailureKind::PresentationFailed,
+            FailureKind::AgentLeft,
+            FailureKind::AgentReported(None),
+            FailureKind::AgentReported(Some(SignalErrorCode::HardwareEncoderUnavailable)),
+            FailureKind::AgentReported(Some(SignalErrorCode::NoMutualProfile)),
+            FailureKind::AgentReported(Some(SignalErrorCode::IdentityMismatch)),
+            FailureKind::AgentReported(Some(SignalErrorCode::CaptureUnavailable)),
+            FailureKind::AgentReported(Some(SignalErrorCode::Unknown)),
+        ];
+        for kind in kinds {
+            let error = anyhow::Error::new(SessionFailure::new(kind, "technical detail"))
+                .context("remote viewer attempt failed");
+            let message = user_message(&error);
+            assert!(!message.is_empty(), "{kind:?}");
+            for debug_text in ["FailureKind", "AgentReported", "Some(", "None"] {
+                assert!(!message.contains(debug_text), "{kind:?}: {message}");
+            }
+        }
+        for (kind, expected) in [
+            (FailureKind::VideoTimeout, "within 30 seconds"),
+            (FailureKind::PeerNeverConnected, "allow UDP"),
+            (FailureKind::PeerConnectionLost, "could not be restored"),
+            (
+                FailureKind::AgentReported(Some(SignalErrorCode::HardwareEncoderUnavailable)),
+                "no hardware video encoder",
+            ),
+            (
+                FailureKind::AgentReported(Some(SignalErrorCode::NoMutualProfile)),
+                "no video format in common",
+            ),
+            (
+                FailureKind::AgentReported(Some(SignalErrorCode::CaptureUnavailable)),
+                "could not capture its screen",
+            ),
+        ] {
+            let message = user_message(&SessionFailure::new(kind, "technical detail").into());
+            assert!(message.contains(expected), "{kind:?}: {message}");
+            assert!(!message.contains("technical detail"), "{kind:?}: {message}");
+        }
+        // Old Agents send no code: the detail is kept, as before.
+        let legacy = user_message(
+            &SessionFailure::new(FailureKind::AgentReported(None), "capture failed").into(),
+        );
+        assert!(legacy.starts_with("The remote session could not continue."));
+        assert!(legacy.contains("capture failed"));
     }
 
     #[test]
