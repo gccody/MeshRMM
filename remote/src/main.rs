@@ -310,12 +310,25 @@ async fn run_resumable_session(
 
 /// Releases the device lease after the session ended by choice. A failure
 /// is logged rather than reported: the disconnect itself succeeded, and the
-/// server expires the lease on its own.
+/// server expires the lease on its own. When the user asked to stop (Cancel,
+/// Quit, closing the window, or a replacing link), the release gets a short
+/// budget so an unreachable server cannot hold the viewer open.
 async fn end_session_after_disconnect(
     config: &config::Config,
     bootstrap: &meshrmm_protocol::SessionBootstrap,
 ) {
-    if let Err(error) = signaling::end_session(config, bootstrap).await {
+    let release = signaling::end_session(config, bootstrap);
+    let result = match shutdown::lease_release_budget(shutdown::requested()) {
+        Some(budget) => match tokio::time::timeout(budget, release).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "the server did not confirm session cleanup within {} seconds",
+                budget.as_secs()
+            )),
+        },
+        None => release.await,
+    };
+    if let Err(error) = result {
         tracing::warn!(
             error = ?error,
             session_id = %bootstrap.session_id,
