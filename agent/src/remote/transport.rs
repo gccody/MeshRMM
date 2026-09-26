@@ -26,6 +26,9 @@ use webrtc::peer_connection::{
 use webrtc::stats::StatsReportType;
 
 use super::platform::{ScreenStreamer, StartedScreen, monotonic_timestamp_us};
+use super::sender_failure::{
+    failure_signal, initial_start_error, profile_start_error, transport_failure,
+};
 use super::session_close::SessionClose;
 use super::signaling::authenticated_websocket;
 use super::video::LatestFrameSlot;
@@ -260,14 +263,11 @@ fn start_first_profile(
             Ok(started) => return Ok(started),
             Err(error) => {
                 tracing::warn!(?profile, error = ?error, "hardware encoder profile unavailable");
-                failures.push(format!("{profile:?}: {error:#}"));
+                failures.push((*profile, error));
             }
         }
     }
-    anyhow::bail!(
-        "no mutually supported hardware video profile could start: {}",
-        failures.join("; ")
-    )
+    Err(profile_start_error(failures))
 }
 
 // Session-scoped state is owned by the caller so it survives sender reconnects.
@@ -321,7 +321,7 @@ async fn run_connected_sender(
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<SignalMessage>();
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ControlCommand>();
     let (state_tx, mut state_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
-    let (video_failure_tx, mut video_failure_rx) = mpsc::unbounded_channel::<String>();
+    let (video_failure_tx, mut video_failure_rx) = mpsc::unbounded_channel::<anyhow::Error>();
     let identity = meshrmm_session_transport::identity::PeerIdentity::load(
         &crate::installer::identity_directory()?,
     )?;
@@ -724,7 +724,7 @@ async fn run_connected_sender(
             )
             .await;
             if let Err(error) = result {
-                let _ = capture_failure.send(format!("capture worker: {error:#}"));
+                let _ = capture_failure.send(error.context("capture worker"));
             }
             if let Err(error) = lock_streamer(&capture_streamer).and_then(|mut s| s.shutdown()) {
                 tracing::warn!(%error, "capture worker cleanup failed");
@@ -790,7 +790,7 @@ async fn run_connected_sender(
                 signal.send(Message::Text(json.into())).await?;
             }
             incoming = signal.next() => {
-                let Some(incoming) = incoming else { break Err(anyhow::anyhow!("signaling connection closed")); };
+                let Some(incoming) = incoming else { break Err(transport_failure("signaling connection closed")); };
                 match incoming? {
                     Message::Text(text) => {
                         let signal: SignalMessage = serde_json::from_str(text.as_str())?;
@@ -821,9 +821,9 @@ async fn run_connected_sender(
                                 }
                             }
                             SignalMessage::PeerLeft => {
-                                break Err(anyhow::anyhow!("viewer disconnected from the remote session"));
+                                break Err(transport_failure("viewer disconnected from the remote session"));
                             }
-                            SignalMessage::Error { message } => break Err(anyhow::anyhow!(message)),
+                            SignalMessage::Error { message, .. } => break Err(anyhow::anyhow!(message)),
                             _ => {}
                         }
                     }
@@ -869,16 +869,16 @@ async fn run_connected_sender(
                     disconnected_since.get_or_insert_with(tokio::time::Instant::now);
                 }
                 if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
-                    break Err(anyhow::anyhow!("WebRTC connection ended in state {state:?}"));
+                    break Err(transport_failure(format!("WebRTC connection ended in state {state:?}")));
                 }
             }
-            Some(error) = video_failure_rx.recv() => break Err(anyhow::anyhow!(error)),
+            Some(error) = video_failure_rx.recv() => break Err(error),
             _ = stats_interval.tick() => {
                 if disconnected_since.is_some_and(|since| since.elapsed() >= DISCONNECTED_GRACE_PERIOD) {
-                    break Err(anyhow::anyhow!(
+                    break Err(transport_failure(format!(
                         "WebRTC remained disconnected for {} seconds",
                         DISCONNECTED_GRACE_PERIOD.as_secs()
-                    ));
+                    )));
                 }
                 log_network_stats(&peer).await;
             },
@@ -1191,7 +1191,7 @@ async fn run_capture_control(
     let started = match started {
         Ok(started) => started,
         Err(error) => {
-            let _ = started_tx.send(Err(error));
+            let _ = started_tx.send(Err(initial_start_error(error)));
             return Ok(());
         }
     };
@@ -1578,8 +1578,9 @@ async fn run_capture_control(
 }
 
 async fn report_sender_failure(connection: &mut SignalingConnection, error: &anyhow::Error) {
-    let signal = SignalMessage::Error {
-        message: format!("{error:#}"),
+    let Some(signal) = failure_signal(error) else {
+        tracing::debug!(error = %error, "not reporting a transport failure the viewer detects itself");
+        return;
     };
     match serde_json::to_string(&signal) {
         Ok(message) => {
@@ -1728,7 +1729,7 @@ fn spawn_video_sender(
     slot: Arc<LatestFrameSlot>,
     recovery: mpsc::UnboundedSender<ControlCommand>,
     quality_ceiling: Arc<AtomicU32>,
-    failure: mpsc::UnboundedSender<String>,
+    failure: mpsc::UnboundedSender<anyhow::Error>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         open.notified().await;
@@ -1748,9 +1749,9 @@ fn spawn_video_sender(
                     Some(frame)
                 }
                 Err(_) => {
-                    let _ = failure.send(
-                        "capture/encoder produced no bootstrap keyframe for 10 seconds".into(),
-                    );
+                    let _ = failure.send(anyhow::anyhow!(
+                        "capture/encoder produced no bootstrap keyframe for 10 seconds"
+                    ));
                     return;
                 }
             };
@@ -1887,7 +1888,9 @@ fn spawn_video_sender(
                 bytes_sent = bytes_sent.saturating_add(bytes.len() as u64);
                 if let Err(error) = channel.send(&Bytes::from(bytes)).await {
                     tracing::warn!(error = %error, "video data channel send failed");
-                    let _ = failure.send(format!("video data channel send failed: {error}"));
+                    let _ = failure.send(transport_failure(format!(
+                        "video data channel send failed: {error}"
+                    )));
                     return;
                 }
             }
