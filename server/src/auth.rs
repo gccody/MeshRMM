@@ -261,6 +261,17 @@ pub(crate) async fn authorize_workos_user(
     request: &Request,
     environment: &Env,
 ) -> std::result::Result<Identity, AuthError> {
+    authorize_workos_company(request, environment)
+        .await
+        .map(|(identity, _)| identity)
+}
+
+/// Authorizes a dashboard user and returns the company row it was checked
+/// against, so a route does not need to read the company again.
+pub(crate) async fn authorize_workos_company(
+    request: &Request,
+    environment: &Env,
+) -> std::result::Result<(Identity, TenantCompany), AuthError> {
     let claims = authorize_workos_claims(request, environment).await?;
     let workos_organization_id = claims
         .org_id
@@ -269,7 +280,7 @@ pub(crate) async fn authorize_workos_user(
     validate_identifier(workos_organization_id, "WorkOS organization ID")
         .map_err(|_| AuthError::InvalidToken("invalid_organization"))?;
     let db = environment.d1("DB")?;
-    let company = company_for_request(&db, request, environment, Some(workos_organization_id))
+    let mut company = company_for_request(&db, request, environment, Some(workos_organization_id))
         .await?
         .ok_or(AuthError::CompanyNotFound)?;
     if company.status != "active" && company.status != "awaiting_admin" {
@@ -287,16 +298,18 @@ pub(crate) async fn authorize_workos_user(
         )?
         .metered_run()
         .await?;
+        company.status = "active".to_owned();
     }
     crate::usage::attribute_company(&company.id);
     crate::usage::record_active_user(&db, &company.id, &claims.sub, Date::now().as_millis()).await;
-    Ok(Identity {
+    let identity = Identity {
         user_id: claims.sub,
-        company_id: company.id,
+        company_id: company.id.clone(),
         role: claims.role,
         roles: claims.roles,
         permissions: claims.permissions,
-    })
+    };
+    Ok((identity, company))
 }
 
 async fn authorize_workos_claims(
