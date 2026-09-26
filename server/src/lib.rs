@@ -13,6 +13,7 @@ mod auth;
 mod company_presence;
 mod health;
 mod infrastructure;
+mod maintenance;
 mod remote_session;
 mod routes;
 mod usage;
@@ -239,6 +240,15 @@ async fn fetch(request: Request, environment: Env, _context: Context) -> Result<
         tenant_slug: tenant_slug_from_hostname(&hostname, &root_domain),
     };
     usage::metered(&environment, source, route(request, environment.clone())).await
+}
+
+// Housekeeping that would otherwise delay requests; see wrangler.jsonc.
+#[event(scheduled)]
+async fn scheduled(_event: ScheduledEvent, environment: Env, _context: ScheduleContext) {
+    let purge = async { maintenance::purge_expired_tokens(&environment, now_ms_i64()?).await };
+    if let Err(error) = usage::metered(&environment, usage::Source::Scheduled, purge).await {
+        console_error!("event=expired_token_purge_failed error={}", error);
+    }
 }
 
 async fn route(mut request: Request, environment: Env) -> Result<Response> {
