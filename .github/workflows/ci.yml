@@ -57,6 +57,7 @@ jobs:
       - run: node server/tests/presence.mjs
       - run: node server/tests/session_cleanup.mjs
       - run: node server/tests/token_rotation.mjs
+      - run: node server/tests/request_path.mjs
 
   dashboard:
     runs-on: ubuntu-latest
