@@ -37,6 +37,11 @@ switcher.
 5. Replace `user_REPLACE_WITH_PLATFORM_OWNER` in `server/wrangler.jsonc` with
    the immutable WorkOS user ID allowed to use the owner console. More than one
    break-glass owner may be supplied as a comma-separated list.
+   Set `PLATFORM_WORKOS_ORGANIZATION_ID` in `dashboard/wrangler.jsonc` to a
+   WorkOS organization every owner belongs to. The owner console signs in to
+   it, so owners who belong to several companies skip the WorkOS organization
+   picker. Access is still decided by user ID; leave it empty to show the
+   picker.
 6. Store the WorkOS API key as a Worker secret; never place it in
    `wrangler.jsonc`:
 

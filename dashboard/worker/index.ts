@@ -60,6 +60,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext, host: Ho
     appRequest = new Request(request, { headers });
   }
 
+  if (host.surface === "platform") {
+    // Platform owners are authorized by user ID, not organization. Signing in
+    // to a fixed organization skips the WorkOS organization picker that owners
+    // with several memberships would otherwise see.
+    organizationId = env.PLATFORM_WORKOS_ORGANIZATION_ID || undefined;
+  }
+
   if (url.pathname.startsWith("/auth/")) {
     if (host.surface === "marketing") return notFound();
     return handleAuth(appRequest, env, organizationId);

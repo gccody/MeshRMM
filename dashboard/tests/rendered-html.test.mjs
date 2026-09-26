@@ -16,7 +16,7 @@ import {
 // Data points the dashboard Worker writes for the platform cost report.
 const usagePoints = [];
 
-async function render(pathname = "/", hostname = "meshrmm.com", company = null, init = {}, apiFetch = async () => new Response("API")) {
+async function render(pathname = "/", hostname = "meshrmm.com", company = null, init = {}, apiFetch = async () => new Response("API"), env = {}) {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
@@ -37,6 +37,7 @@ async function render(pathname = "/", hostname = "meshrmm.com", company = null, 
       },
       MESHRMM_API: { fetch: apiFetch },
       USAGE: { writeDataPoint: (point) => usagePoints.push(point) },
+      ...env,
     },
     { waitUntil() {}, passThroughOnException() {} },
   );
@@ -69,6 +70,20 @@ test("tenant routing preserves the authentication POST body", async () => {
   const url = new URL((await response.json()).url);
   assert.equal(url.searchParams.get("organization_id"), "org_acme");
   assert.match(response.headers.get("set-cookie"), /__Host-meshrmm-login=/);
+});
+
+test("owner console signs in to the configured organization without a picker", async () => {
+  const login = (env) => render("/auth/login", "admin.meshrmm.com", null, {
+    method: "POST",
+    headers: { origin: "https://admin.meshrmm.com", "X-MeshRMM-Auth": "1" },
+    body: "{}",
+  }, undefined, env);
+  const configured = await login({ PLATFORM_WORKOS_ORGANIZATION_ID: "org_platform" });
+  assert.equal(configured.status, 200);
+  assert.equal(new URL((await configured.json()).url).searchParams.get("organization_id"), "org_platform");
+  const unset = await login({ PLATFORM_WORKOS_ORGANIZATION_ID: "" });
+  assert.equal(unset.status, 200);
+  assert.equal(new URL((await unset.json()).url).searchParams.has("organization_id"), false);
 });
 
 test("server-renders the public marketing site at the root domain", async () => {
