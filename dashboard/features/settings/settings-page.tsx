@@ -5,16 +5,14 @@ import { type FormEvent, useState } from "react";
 import { AuthenticationRequired, type AuthorizedFetch, errorMessage } from "../../lib/http";
 import type { Account, Company } from "../workspace/types";
 import {
-  type CompanySettingsDraft,
   DEFAULT_BLACKOUT_MESSAGE,
   SETTINGS_TABS,
-  type SettingsTab,
   companySettingsBody,
-  draftFromCompany,
   draftMatchesCompany,
   isBlackoutMessageValid,
   settingsTabForKey,
 } from "./company-settings";
+import type { SettingsDraft } from "./use-settings-draft";
 
 type Props = {
   company: Company | null | undefined;
@@ -23,22 +21,15 @@ type Props = {
   authorizedFetch: AuthorizedFetch;
   onSaved: (account: Account) => void;
   reportError: (message: string | null) => void;
+  // Owned by the workspace shell so unsaved edits survive navigation.
+  settingsDraft: SettingsDraft;
 };
 
-export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, onSaved, reportError }: Props) {
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>("dashboard-security");
-  const [draft, setDraft] = useState(() => draftFromCompany(company));
-  const [draftSource, setDraftSource] = useState(company);
+export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, onSaved, reportError, settingsDraft }: Props) {
+  const { draft, updateDraft, settingsTab, setSettingsTab } = settingsDraft;
   const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
 
-  // A loaded or saved account replaces any unsaved edits.
-  if (company !== draftSource) {
-    setDraftSource(company);
-    setDraft(draftFromCompany(company));
-  }
-
-  const updateDraft = (change: Partial<CompanySettingsDraft>) => setDraft((current) => ({ ...current, ...change }));
   const blackoutMessageValid = isBlackoutMessageValid(draft.blackoutMessage);
 
   const saveSettings = async (event: FormEvent) => {

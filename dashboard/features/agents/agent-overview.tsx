@@ -14,9 +14,8 @@ import {
   Wifi,
   WifiOff,
 } from "lucide-react";
+import type { AgentStatusFilter } from "./device-filters";
 import type { Agent } from "./types";
-
-export type AgentStatusFilter = "all" | "online" | "offline";
 
 type Props = {
   agents: Agent[];
