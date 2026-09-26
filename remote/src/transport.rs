@@ -10,12 +10,15 @@ use meshrmm_protocol::{ChromaMode, QualityPreset, SessionMessage, VideoProfile, 
 use tokio::sync::mpsc;
 
 use crate::platform::Presenter;
+use crate::reconnect::AttemptProgress;
 
 mod control;
+mod failure;
 mod receiver;
 mod services;
 mod video;
 
+pub use failure::{FailureKind, SessionFailure, failure_kind};
 pub use receiver::run_receiver;
 
 /// How long the end of a session waits for a recording to be saved.
@@ -32,6 +35,17 @@ struct ActivePresenter {
 struct ReceiverLifecycle {
     presentation_failure: mpsc::UnboundedSender<String>,
     shutting_down: Arc<AtomicBool>,
+    progress: Arc<Mutex<AttemptProgress>>,
+}
+
+impl ReceiverLifecycle {
+    /// Records a frame handed to the presenter.
+    fn frame_presented(&self) {
+        self.progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .mark_frame_presented(std::time::Instant::now());
+    }
 }
 
 /// Viewer choices that should survive rebuilding the signaling and WebRTC
@@ -55,6 +69,8 @@ pub struct ViewerResumeState {
     /// The window of a lost connection, shown as reconnecting until the next
     /// connection opens its own.
     reconnecting: Arc<Mutex<Option<ActivePresenter>>>,
+    /// Whether the remote display has appeared, in this attempt and ever.
+    progress: Arc<Mutex<AttemptProgress>>,
 }
 
 impl Default for ViewerResumeState {
@@ -84,6 +100,7 @@ impl Default for ViewerResumeState {
             }),
             recording_outgoing,
             reconnecting: Default::default(),
+            progress: Default::default(),
         }
     }
 }
@@ -117,6 +134,27 @@ impl ViewerResumeState {
     /// waits for it to be saved. Returns the notice to show the user.
     pub fn finish_recording(&self) -> Option<String> {
         self.recording.finish(RECORDING_FINISH_TIMEOUT)
+    }
+
+    fn progress(&self) -> std::sync::MutexGuard<'_, AttemptProgress> {
+        self.progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Starts tracking a new connection attempt.
+    pub fn begin_attempt(&self) {
+        self.progress().begin_attempt();
+    }
+
+    /// Whether any attempt has shown the remote display.
+    pub fn ever_presented(&self) -> bool {
+        self.progress().ever_presented()
+    }
+
+    /// How long the current attempt has shown the remote display, if it has.
+    pub fn attempt_streamed_for(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.progress().attempt_streamed_for(now)
     }
 
     pub fn select_background_display(&self) {
