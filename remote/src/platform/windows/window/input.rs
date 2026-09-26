@@ -20,7 +20,7 @@ impl WindowContext {
         };
         if let Some((x, y)) = position {
             self.send(SessionMessage::Input(RemoteInput::PointerMove {
-                display_id: self.active_display.id,
+                display_id: self.active_display_id(),
                 x,
                 y,
             }));
@@ -43,7 +43,7 @@ impl WindowContext {
         let input =
             self.held
                 .borrow_mut()
-                .button(self.active_display.id, position, button, pressed);
+                .button(self.active_display_id(), position, button, pressed);
         let Some(input) = input else {
             return;
         };
@@ -65,7 +65,7 @@ impl WindowContext {
         {
             let delta = ((wparam.0 >> 16) as u16) as i16;
             self.send(SessionMessage::Input(RemoteInput::WheelAt {
-                display_id: self.active_display.id,
+                display_id: self.active_display_id(),
                 x,
                 y,
                 horizontal: if message == WM_MOUSEHWHEEL { delta } else { 0 },
@@ -94,7 +94,7 @@ impl WindowContext {
         if pressed
             && wparam.0 == 0x56
             && unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) } < 0
-            && self.control.files().paste_files(self.active_display.id)
+            && self.control.files().paste_files(self.active_display_id())
         {
             self.release_input();
             return;
@@ -111,13 +111,13 @@ impl WindowContext {
         let input =
             self.held
                 .borrow_mut()
-                .key(self.active_display.id, scan_code, extended, pressed);
+                .key(self.active_display_id(), scan_code, extended, pressed);
         self.send(SessionMessage::Input(input));
     }
 
     /// Releases every key and button held on the device.
     pub(super) fn release_input(&self) {
-        let released = self.held.borrow_mut().release_all(self.active_display.id);
+        let released = self.held.borrow_mut().release_all(self.active_display_id());
         for input in released {
             self.send(SessionMessage::Input(input));
         }
@@ -136,7 +136,7 @@ impl WindowContext {
         let destination = self
             .normalized_client_position(window, point.x, point.y)
             .map(|(x, y)| meshrmm_protocol::FileDestination::Drop {
-                display_id: self.active_display.id,
+                display_id: self.active_display_id(),
                 x,
                 y,
             })

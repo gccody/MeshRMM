@@ -22,6 +22,8 @@ mod shutdown;
 mod signaling;
 #[cfg(windows)]
 mod single_instance;
+#[cfg(any(windows, test))]
+mod stream_reset;
 mod transport;
 #[cfg(any(windows, target_os = "macos"))]
 mod updater;

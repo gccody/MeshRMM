@@ -1,4 +1,5 @@
 use super::*;
+use crate::stream_reset::ResetPlan;
 use crate::video_layout::VideoRect;
 use window::ClientLayout;
 
@@ -11,6 +12,8 @@ pub(super) struct D3d11Renderer {
     video_context: ID3D11VideoContext,
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
+    /// The stream the video processor was created for.
+    format: VideoFormat,
     output_view: Option<ID3D11VideoProcessorOutputView>,
     swap_chain: IDXGISwapChain2,
     /// Redrawn after a resize, since a static desktop sends no new frames.
@@ -20,6 +23,10 @@ pub(super) struct D3d11Renderer {
 impl D3d11Renderer {
     pub(super) fn window(&self) -> HWND {
         self.window
+    }
+
+    pub(super) fn format(&self) -> VideoFormat {
+        self.format
     }
 
     pub(super) unsafe fn new(
@@ -65,81 +72,8 @@ impl D3d11Renderer {
 
         let video_device: ID3D11VideoDevice = device.cast()?;
         let video_context: ID3D11VideoContext = context.cast()?;
-        let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
-            InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-            InputFrameRate: DXGI_RATIONAL {
-                Numerator: u32::from(format.frames_per_second),
-                Denominator: 1,
-            },
-            InputWidth: format.width,
-            InputHeight: format.height,
-            OutputFrameRate: DXGI_RATIONAL {
-                Numerator: u32::from(format.frames_per_second),
-                Denominator: 1,
-            },
-            OutputWidth: layout.width.max(1),
-            OutputHeight: layout.height.max(1),
-            Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-        };
-        let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&content) }
-            .context("D3D11 presentation video processor enumeration failed")?;
-        let input_format = match format.pixel_format {
-            meshrmm_protocol::PixelFormat::Nv12 => DXGI_FORMAT_NV12,
-            meshrmm_protocol::PixelFormat::Ayuv => DXGI_FORMAT_AYUV,
-        };
-        let input_support = unsafe { enumerator.CheckVideoProcessorFormat(input_format) }?;
-        let output_support =
-            unsafe { enumerator.CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM) }?;
-        if input_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT.0 as u32 == 0
-            || output_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32 == 0
-        {
-            bail!("GPU cannot convert the decoded YUV surfaces to BGRA presentation surfaces");
-        }
-        let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
-            .context("D3D11 presentation video processor creation failed")?;
-        unsafe {
-            video_context.VideoProcessorSetStreamFrameFormat(
-                &processor,
-                0,
-                D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-            )
-        };
-        let source_rect = RECT {
-            left: 0,
-            top: 0,
-            right: format.width as i32,
-            bottom: format.height as i32,
-        };
-        unsafe {
-            video_context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&source_rect))
-        };
-        // Letterbox bars stay black.
-        let black = D3D11_VIDEO_COLOR {
-            Anonymous: D3D11_VIDEO_COLOR_0 {
-                RGBA: D3D11_VIDEO_COLOR_RGBA {
-                    R: 0.0,
-                    G: 0.0,
-                    B: 0.0,
-                    A: 1.0,
-                },
-            },
-        };
-        unsafe { video_context.VideoProcessorSetOutputBackgroundColor(&processor, false, &black) };
-        if let Ok(video_context1) = video_context.cast::<ID3D11VideoContext1>() {
-            unsafe {
-                video_context1.VideoProcessorSetStreamColorSpace1(
-                    &processor,
-                    0,
-                    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-                )
-            };
-            unsafe {
-                video_context1.VideoProcessorSetOutputColorSpace1(
-                    &processor,
-                    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
-                )
-            };
-        }
+        let (enumerator, processor) =
+            unsafe { configure_stream(&video_device, &video_context, format, &layout)? };
         let mut renderer = Self {
             window,
             context: context.clone(),
@@ -147,6 +81,7 @@ impl D3d11Renderer {
             video_context,
             enumerator,
             processor,
+            format,
             output_view: None,
             swap_chain,
             last_frame: None,
@@ -198,6 +133,67 @@ impl D3d11Renderer {
             );
         }
         Ok(())
+    }
+
+    /// Switches the video processor to a replacement stream. A new processor
+    /// replaces the old one only once it exists, so a failure changes
+    /// nothing. Call [`Self::configure_layout`] once the window has the new
+    /// video size.
+    pub(super) unsafe fn reset_stream(
+        &mut self,
+        plan: &ResetPlan,
+        format: VideoFormat,
+    ) -> anyhow::Result<()> {
+        if plan.recreate_processor {
+            let layout = unsafe { self.buffer_layout(format)? };
+            let (enumerator, processor) = unsafe {
+                configure_stream(&self.video_device, &self.video_context, format, &layout)?
+            };
+            // Views from the old enumerator cannot be used with the new one.
+            self.output_view = None;
+            self.enumerator = enumerator;
+            self.processor = processor;
+        }
+        if plan.drop_last_frame {
+            // The flip-model swap chain keeps showing the last image until
+            // the replacement keyframe is presented.
+            self.last_frame = None;
+        }
+        self.format = format;
+        Ok(())
+    }
+
+    /// Places the video in `layout` after a reset. A minimized window has
+    /// no client area; the swap chain keeps its size until it is restored.
+    pub(super) unsafe fn configure_layout(&mut self, layout: &ClientLayout) -> anyhow::Result<()> {
+        if layout.width == 0 || layout.height == 0 {
+            let layout = unsafe { self.buffer_layout(self.format)? };
+            unsafe { self.configure_output(&layout) }
+        } else {
+            unsafe { self.resize(layout) }
+        }
+    }
+
+    /// The swap chain's current size with `format` letterboxed in it.
+    unsafe fn buffer_layout(&self, format: VideoFormat) -> anyhow::Result<ClientLayout> {
+        let desc = unsafe { self.swap_chain.GetDesc1() }
+            .context("DXGI swap chain description unavailable")?;
+        let width = desc.Width.max(1);
+        let height = desc.Height.max(1);
+        Ok(ClientLayout {
+            width,
+            height,
+            video: crate::video_layout::letterbox(
+                VideoRect {
+                    left: 0,
+                    top: 0,
+                    width: i32::try_from(width).unwrap_or(i32::MAX),
+                    height: i32::try_from(height).unwrap_or(i32::MAX),
+                },
+                format.width,
+                format.height,
+            ),
+        })
     }
 
     /// Resizes the swap chain to the video window and redraws the last frame.
@@ -289,6 +285,93 @@ impl D3d11Renderer {
             .ok()
             .context("DXGI presentation failed")
     }
+}
+
+/// Creates the video processor that converts `format`'s decoded surfaces to
+/// the swap chain's BGRA, with its enumerator, which the processor's views
+/// must come from.
+unsafe fn configure_stream(
+    video_device: &ID3D11VideoDevice,
+    video_context: &ID3D11VideoContext,
+    format: VideoFormat,
+    layout: &ClientLayout,
+) -> anyhow::Result<(ID3D11VideoProcessorEnumerator, ID3D11VideoProcessor)> {
+    let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+        InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+        InputFrameRate: DXGI_RATIONAL {
+            Numerator: u32::from(format.frames_per_second),
+            Denominator: 1,
+        },
+        InputWidth: format.width,
+        InputHeight: format.height,
+        OutputFrameRate: DXGI_RATIONAL {
+            Numerator: u32::from(format.frames_per_second),
+            Denominator: 1,
+        },
+        OutputWidth: layout.width.max(1),
+        OutputHeight: layout.height.max(1),
+        Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+    };
+    let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&content) }
+        .context("D3D11 presentation video processor enumeration failed")?;
+    let input_format = match format.pixel_format {
+        meshrmm_protocol::PixelFormat::Nv12 => DXGI_FORMAT_NV12,
+        meshrmm_protocol::PixelFormat::Ayuv => DXGI_FORMAT_AYUV,
+    };
+    let input_support = unsafe { enumerator.CheckVideoProcessorFormat(input_format) }?;
+    let output_support =
+        unsafe { enumerator.CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM) }?;
+    if input_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT.0 as u32 == 0
+        || output_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32 == 0
+    {
+        bail!("GPU cannot convert the decoded YUV surfaces to BGRA presentation surfaces");
+    }
+    let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
+        .context("D3D11 presentation video processor creation failed")?;
+    unsafe {
+        video_context.VideoProcessorSetStreamFrameFormat(
+            &processor,
+            0,
+            D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+        )
+    };
+    let source_rect = RECT {
+        left: 0,
+        top: 0,
+        right: format.width as i32,
+        bottom: format.height as i32,
+    };
+    unsafe {
+        video_context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&source_rect))
+    };
+    // Letterbox bars stay black.
+    let black = D3D11_VIDEO_COLOR {
+        Anonymous: D3D11_VIDEO_COLOR_0 {
+            RGBA: D3D11_VIDEO_COLOR_RGBA {
+                R: 0.0,
+                G: 0.0,
+                B: 0.0,
+                A: 1.0,
+            },
+        },
+    };
+    unsafe { video_context.VideoProcessorSetOutputBackgroundColor(&processor, false, &black) };
+    if let Ok(video_context1) = video_context.cast::<ID3D11VideoContext1>() {
+        unsafe {
+            video_context1.VideoProcessorSetStreamColorSpace1(
+                &processor,
+                0,
+                DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+            )
+        };
+        unsafe {
+            video_context1.VideoProcessorSetOutputColorSpace1(
+                &processor,
+                DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+            )
+        };
+    }
+    Ok((enumerator, processor))
 }
 
 fn rect(video: VideoRect) -> RECT {

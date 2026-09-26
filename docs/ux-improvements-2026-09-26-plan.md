@@ -23,7 +23,7 @@ stand alone; read [Working rules](#working-rules), [Merge order](#merge-order), 
 | 3.14 Backoff reset, reconnect reason, Retry now | Viewer, agent | 2 | 0.2 | Not started | |
 | 3.16a Audio: send only when unmuted, stereo, Opus | Agent, viewer, protocol | 3 | 3.16b, 3.17 | Not started | |
 | 3.16b HEVC bitrate adaptation via restart ladder | Agent | 1 | — | Not started | |
-| 3.17 Windows viewer resets the stream in place | Windows viewer | 1 | — | Not started | |
+| 3.17 Windows viewer resets the stream in place | Windows viewer | 1 | — | Merged | `5ce8cc7` |
 
 "Soft" dependencies can start early if the task keeps its edits to the listed wiring points; see
 the task section.
@@ -1096,7 +1096,53 @@ unchanged.
 3. macOS regression session.
 4. Viewer-only change: no agent reinstall needed.
 
-**Notes.**
+**Notes.** Implemented in `5ce8cc7`. The Windows presenter hands resets to its decode/present thread through
+a pending-reset slot (5 s timeout; a timed-out reset is taken back so it is never applied late;
+frames are dropped meanwhile) and creates the new decoder and video processor before touching the
+window, so any failure changes nothing and falls back to `Presenter::start` — an undecodable
+profile still reaches `VideoProfileRejected`. `Presenter::can_reset_in_place` exists on both
+platforms (the macOS predicate moved onto its presenter) and `control.rs` has no `cfg` split. The
+pure `ResetPlan` lives in `remote/src/stream_reset.rs`; the probe is
+`remote/src/platform/windows/reset_probe.rs` (`#[ignore]`).
+
+Deviations:
+1. The reset re-selects quality and chroma in the toolbar controls without sending them: the Agent
+   answers every `SetQuality`, even an unchanged one, with a new `DisplayConfiguration`, so
+   resending would loop resets.
+2. Related finding, not fixed: `create_window` still sends `SetQuality` and `SetChroma` on every
+   new window. By code reading, before 3.17 that echo recreated the window a second time; now it
+   causes one harmless extra in-place reset. Follow-up: drop those sends (the capabilities
+   message already carries both).
+3. No `resize_pending(true)`: the renderer resizes and redraws during the reset, and a minimized
+   window uses the swap chain's current size.
+4. The last frame is also dropped on a chroma change (a 4:2:0 frame can't feed a 4:4:4
+   processor), not only on a size change.
+5. The renderer creates its new processor before the window is touched, so a processor failure
+   also leaves everything unchanged. The optional "drop the old decoder and retry" was skipped (the
+   old path also had two decoders alive at once).
+6. `WorkerPipeline` is now a decoder plus a new `Presentation` (window, renderer, device,
+   runtimes), so the probe runs without a decoder. Teardown order is now decoder → window/renderer
+   → device → Media Foundation → COM (before, COM and MF shut down first).
+7. The display-list pointer marker is stored in the window so rebuilt lists keep it.
+
+Validation. macOS development host, on the rebased tree: `cargo fmt --check`, `cargo clippy -D
+warnings`, `cargo test --workspace` pass (the macOS reset rule test included). DESKTOP-85R6S28:
+the task thread's pre-rebase tree (`681cfa7`, manifest of 412 files matched) passed native fmt,
+clippy and workspace tests, and the ignored `reset_probe` passed in console session 1: the same
+top-level, child and popup HWNDs, keyboard focus, chat transcript and unsent draft through a display
+switch, portrait, 4:4:4 and minimize/restore; title and combos followed the new display; pointer
+corners mapped to 0/65535 after each reset; a new-size frame presented; `PrintWindow` showed the
+toolbar and chat; quality/chroma were never resent; all four profiles were refused with nothing
+changed. After rebasing onto 0.2, the rebased tree (`5ce8cc7`, 429 files matched by SHA-256
+manifest, in `~\ux-2026-09-26-3.17\rebased-5ce8cc7`) passed native fmt, clippy and `cargo test
+--workspace` (remote: 82 passed, 2 ignored). The endpoint's RTX 3080 registers no H.264 or HEVC
+hardware decoder MFTs (the profile check returned only the always-added H.264 4:2:0 profile). No
+agent install; the `meshrmm:` handler was not changed by this task.
+
+**Incomplete:** end-to-end validation (F8, All monitors, portrait, quality/chroma, lock/unlock,
+UAC, HEVC step restarts) needs a second Windows machine with hardware decoders; none was available.
+The keyboard hook and Win/Alt+Tab after a switch were checked by code reading only (the reset never
+touches the hook and focus doesn't change). No live macOS regression session (unit tests only).
 
 ---
 
