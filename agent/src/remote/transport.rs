@@ -25,6 +25,7 @@ use webrtc::peer_connection::{
 };
 use webrtc::stats::StatsReportType;
 
+use super::bitrate::{AdaptiveBitrate, EncoderStatus, RestartLadder, VideoPacer};
 use super::platform::{ScreenStreamer, StartedScreen, monotonic_timestamp_us};
 use super::sender_failure::{
     failure_signal, initial_start_error, profile_start_error, transport_failure,
@@ -70,6 +71,8 @@ enum ControlCommand {
     MaintenanceError(String),
     Keyframe,
     Bitrate(u32),
+    /// Restart an encoder that cannot change bitrate live (HEVC).
+    RestartBitrate(u32),
     ViewerCapabilities {
         profiles: Vec<VideoProfile>,
         quality: QualityPreset,
@@ -92,137 +95,16 @@ enum ControlCommand {
 
 struct CaptureStartup {
     quality_ceiling: Arc<AtomicU32>,
+    encoder_status: Arc<EncoderStatus>,
     initial_display: Option<DisplayId>,
     session_close: Arc<SessionClose>,
 }
 
-const VIDEO_BUFFER_DRAIN_MS: u32 = 50;
-const VIDEO_BUFFER_CONGESTED_MS: u32 = 150;
 const VIDEO_BUFFER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(80);
 const KEYFRAME_RETRY_INTERVAL_US: u64 = 250_000;
-const BITRATE_DECREASE_INTERVAL_US: u64 = 500_000;
-const BITRATE_INCREASE_INTERVAL_US: u64 = 5_000_000;
 const DESKTOP_LIFECYCLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const DESKTOP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const DISCONNECTED_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
-
-// Encoder CBR is a target, not a transport limit. Pace video fragments even
-// when the network is fast enough to hide encoder overshoot from congestion
-// control. Allow a small burst, but never accumulate credit while idle.
-const VIDEO_PACING_BURST_US: u64 = 20_000;
-
-#[derive(Default)]
-struct VideoPacer {
-    next_send_us: u64,
-}
-
-impl VideoPacer {
-    fn reserve(&mut self, now_us: u64, bytes: usize, bits_per_second: u32) -> u64 {
-        let duration_us = (bytes as u64)
-            .saturating_mul(8_000_000)
-            .div_ceil(u64::from(bits_per_second.max(1)));
-        self.next_send_us = self.next_send_us.max(now_us).saturating_add(duration_us);
-        self.next_send_us
-            .saturating_sub(now_us.saturating_add(VIDEO_PACING_BURST_US))
-    }
-}
-
-#[derive(Debug)]
-struct AdaptiveBitrate {
-    minimum: u32,
-    maximum: u32,
-    current: u32,
-    last_decrease_us: u64,
-    healthy_since_us: u64,
-}
-
-impl AdaptiveBitrate {
-    fn new(maximum: u32) -> Self {
-        let minimum = (maximum / 8).max(1_000_000).min(maximum);
-        Self {
-            minimum,
-            maximum,
-            current: maximum,
-            last_decrease_us: 0,
-            healthy_since_us: 0,
-        }
-    }
-
-    fn set_maximum(&mut self, maximum: u32) -> Option<u32> {
-        let maximum = maximum.max(1);
-        if self.maximum == maximum {
-            return None;
-        }
-        self.maximum = maximum;
-        self.minimum = (maximum / 8).max(500_000).min(maximum);
-        self.current = maximum;
-        self.last_decrease_us = 0;
-        self.healthy_since_us = 0;
-        Some(maximum)
-    }
-
-    fn observe(
-        &mut self,
-        now_us: u64,
-        buffered_bytes: usize,
-        queued_frames: usize,
-        reference_chain_lost: bool,
-    ) -> Option<u32> {
-        let congested = reference_chain_lost
-            || buffered_bytes >= self.congested_bytes()
-            || queued_frames >= (super::video::MAX_ENCODED_FRAME_QUEUE * 4) / 5;
-        if congested {
-            self.healthy_since_us = 0;
-            if self.last_decrease_us == 0
-                || now_us.saturating_sub(self.last_decrease_us) >= BITRATE_DECREASE_INTERVAL_US
-            {
-                self.last_decrease_us = now_us.max(1);
-                let reduced = ((u64::from(self.current) * 3) / 4) as u32;
-                let reduced = reduced.max(self.minimum);
-                if reduced < self.current {
-                    self.current = reduced;
-                    return Some(self.current);
-                }
-            }
-            return None;
-        }
-
-        let healthy = buffered_bytes <= self.drain_bytes() && queued_frames <= 1;
-        if !healthy || self.current >= self.maximum {
-            self.healthy_since_us = 0;
-            return None;
-        }
-        if self.healthy_since_us == 0 {
-            self.healthy_since_us = now_us.max(1);
-            return None;
-        }
-        if now_us.saturating_sub(self.healthy_since_us) >= BITRATE_INCREASE_INTERVAL_US {
-            self.healthy_since_us = now_us.max(1);
-            let increase = (self.current / 10).max(250_000);
-            self.current = self.current.saturating_add(increase).min(self.maximum);
-            return Some(self.current);
-        }
-        None
-    }
-
-    fn drain_bytes(&self) -> usize {
-        bitrate_duration_bytes(self.current, VIDEO_BUFFER_DRAIN_MS)
-    }
-
-    fn congested_bytes(&self) -> usize {
-        bitrate_duration_bytes(self.current, VIDEO_BUFFER_CONGESTED_MS)
-    }
-}
-
-fn bitrate_duration_bytes(bits_per_second: u32, duration_ms: u32) -> usize {
-    usize::try_from(
-        u64::from(bits_per_second)
-            .saturating_mul(u64::from(duration_ms))
-            .div_ceil(8_000),
-    )
-    .unwrap_or(usize::MAX)
-    .max(16 * 1024)
-}
 
 fn profile_candidates(
     profiles: &[VideoProfile],
@@ -699,12 +581,14 @@ async fn run_connected_sender(
     let slot = Arc::new(LatestFrameSlot::default());
     let stream_id = VideoStreamId(1);
     let quality_ceiling = Arc::new(AtomicU32::new(1));
+    let encoder_status = Arc::new(EncoderStatus::default());
     let (capture_tx, capture_rx) = mpsc::channel(64);
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let capture_streamer = Arc::clone(&streamer);
     let capture_slot = Arc::clone(&slot);
     let capture_channel = Arc::clone(&control_channel);
     let capture_ceiling = Arc::clone(&quality_ceiling);
+    let capture_encoder_status = Arc::clone(&encoder_status);
     let capture_failure = video_failure_tx.clone();
     let capture_task =
         super::native_task::NativeTask::spawn("meshrmm-capture-control", move |stop| async move {
@@ -714,6 +598,7 @@ async fn run_connected_sender(
                 capture_channel,
                 CaptureStartup {
                     quality_ceiling: capture_ceiling,
+                    encoder_status: capture_encoder_status,
                     initial_display: start_in_background
                         .then_some(DisplayId(meshrmm_remote_screen::background::DISPLAY_ID)),
                     session_close,
@@ -759,6 +644,7 @@ async fn run_connected_sender(
         Arc::clone(&slot),
         control_tx.clone(),
         Arc::clone(&quality_ceiling),
+        encoder_status,
         video_failure_tx,
     );
     cleanup.tasks.push(video_sender.abort_handle());
@@ -836,7 +722,7 @@ async fn run_connected_sender(
             }
             Some(command) = control_rx.recv() => {
                 match command {
-                    command @ (ControlCommand::Keyframe | ControlCommand::Bitrate(_)
+                    command @ (ControlCommand::Keyframe | ControlCommand::Bitrate(_) | ControlCommand::RestartBitrate(_)
                         | ControlCommand::Quality(_) | ControlCommand::ViewerCapabilities { .. }
                         | ControlCommand::DisplayBorder(_) | ControlCommand::Chroma(_) | ControlCommand::CursorCapture(_) | ControlCommand::InputOwnership(_) | ControlCommand::Recording(_) | ControlCommand::VideoProfileRejected { .. }
                         | ControlCommand::SelectDisplay(_)) => {
@@ -1184,9 +1070,13 @@ async fn run_capture_control(
     let mut stream_id = VideoStreamId(1);
     let CaptureStartup {
         quality_ceiling,
+        encoder_status,
         initial_display,
         session_close,
     } = startup;
+    // Congestion steps belong to one connection; a resumed sender starts at
+    // the quality bitrate and adapts again.
+    lock_streamer(&streamer)?.set_congestion_bitrate(None);
     let started = lock_streamer(&streamer)?.start(initial_display, stream_id, Arc::clone(&slot));
     let started = match started {
         Ok(started) => started,
@@ -1218,6 +1108,12 @@ async fn run_capture_control(
             return Ok(());
         }
         session_close.set_target(&active_display.session);
+        // Live CodecAPI bitrate changes are unsafe on HEVC hardware encoders.
+        encoder_status.publish(
+            format.bitrate_bits_per_second,
+            format.codec != Codec::H265,
+            recording,
+        );
         tokio::select! {
             biased;
             _ = stop.changed() => return Ok(()),
@@ -1241,6 +1137,46 @@ async fn run_capture_control(
                         let value = value.min(quality_ceiling.load(Ordering::Acquire));
                         if let Err(error) = lock_streamer(&streamer)?.set_adaptive_bitrate(value) {
                             tracing::warn!(error = %error, "could not set bitrate while the desktop is changing");
+                        }
+                    }
+                    ControlCommand::RestartBitrate(value) => {
+                        // Restarting with static settings is the safe way to
+                        // change an HEVC encoder's bitrate. Later restarts in
+                        // this connection keep the congestion bitrate.
+                        let ceiling = quality_ceiling.load(Ordering::Acquire);
+                        let value = value.min(ceiling).max(1);
+                        let previous = format.bitrate_bits_per_second;
+                        if !capture_running || format.codec != Codec::H265 || value == previous {
+                            continue;
+                        }
+                        lock_streamer(&streamer)?.set_congestion_bitrate((value < ceiling).then_some(value));
+                        lock_streamer(&streamer)?.stop()?;
+                        slot.clear();
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                        let candidates = profile_candidates(&viewer_profiles, requested_chroma, &rejected_profiles);
+                        match start_first_profile(&streamer, active_display.id, stream_id, &slot, &candidates) {
+                            Ok(started) => {
+                                displays = started.displays;
+                                active_display = started.active_display;
+                                active_profile = started.format.profile();
+                                format = started.format;
+                                capture_unavailable_since = None;
+                                send_control_message(&control_channel, SessionMessage::DisplayConfiguration {
+                                    displays: displays.clone(),
+                                    active_display_id: active_display.id,
+                                    stream_id,
+                                    format,
+                                }).await?;
+                                tracing::info!(previous_bits_per_second = previous, bits_per_second = format.bitrate_bits_per_second, ?active_profile, stream_id = stream_id.0, "restarted the video encoder at a congestion bitrate step");
+                            }
+                            Err(error) => {
+                                // A congestion step must never end the session;
+                                // the desktop lifecycle retries the start.
+                                capture_running = false;
+                                capture_unavailable_since = Some(std::time::Instant::now());
+                                capture_retry_after = std::time::Instant::now();
+                                tracing::warn!(error = ?error, bits_per_second = value, "video encoder did not restart at a congestion bitrate step; retrying");
+                            }
                         }
                     }
                     ControlCommand::Quality(quality)
@@ -1722,6 +1658,7 @@ async fn send_control_message(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_video_sender(
     channel: Arc<RTCDataChannel>,
     open: Arc<Notify>,
@@ -1729,6 +1666,7 @@ fn spawn_video_sender(
     slot: Arc<LatestFrameSlot>,
     recovery: mpsc::UnboundedSender<ControlCommand>,
     quality_ceiling: Arc<AtomicU32>,
+    encoder_status: Arc<EncoderStatus>,
     failure: mpsc::UnboundedSender<anyhow::Error>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1765,6 +1703,7 @@ fn spawn_video_sender(
         let mut recovering = false;
         let mut last_keyframe_request_us = 0_u64;
         let mut bitrate = AdaptiveBitrate::new(quality_ceiling.load(Ordering::Acquire).max(1));
+        let mut ladder = RestartLadder::new(quality_ceiling.load(Ordering::Acquire).max(1));
         let mut pacer = VideoPacer::default();
         loop {
             let source = if let Some(frame) = bootstrap_keyframe.take() {
@@ -1795,18 +1734,46 @@ fn spawn_video_sender(
 
             let now_us = monotonic_timestamp_us();
             let requested_maximum = quality_ceiling.load(Ordering::Acquire).max(1);
-            if let Some(bits_per_second) = bitrate.set_maximum(requested_maximum) {
-                let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
-            }
-            let mut buffered_bytes = channel.buffered_amount().await;
-            if let Some(bits_per_second) =
-                bitrate.observe(now_us, buffered_bytes, slot.len(), reference_chain_lost)
+            let live_bitrate = encoder_status.live_bitrate();
+            let encoder_bitrate = encoder_status.bits_per_second();
+            if let Some(bits_per_second) = bitrate.set_maximum(requested_maximum)
+                && live_bitrate
             {
                 let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
-                tracing::info!(
-                    bits_per_second,
-                    "adapted video bitrate to current transport capacity"
-                );
+            }
+            ladder.set_maximum(requested_maximum);
+            let mut buffered_bytes = channel.buffered_amount().await;
+            if live_bitrate {
+                if let Some(bits_per_second) =
+                    bitrate.observe(now_us, buffered_bytes, slot.len(), reference_chain_lost)
+                {
+                    let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
+                    tracing::info!(
+                        bits_per_second,
+                        "adapted video bitrate to current transport capacity"
+                    );
+                }
+            } else {
+                // Judge congestion against the rate the encoder actually
+                // runs at, and change it only by restarting the encoder.
+                bitrate.rebase(encoder_bitrate);
+                let queued_frames = slot.len();
+                if let Some(bits_per_second) = ladder.observe(
+                    now_us,
+                    encoder_bitrate,
+                    bitrate.congested(buffered_bytes, queued_frames, reference_chain_lost),
+                    bitrate.healthy(buffered_bytes, queued_frames),
+                    encoder_status.recording(),
+                ) {
+                    let _ = recovery.send(ControlCommand::RestartBitrate(bits_per_second));
+                    tracing::info!(
+                        previous_bits_per_second = encoder_bitrate,
+                        bits_per_second,
+                        buffered_bytes,
+                        queued_frames,
+                        "requested a video encoder restart at a new bitrate step"
+                    );
+                }
             }
             if recovering && !source.keyframe {
                 recovery_frames_dropped += 1;
@@ -1834,8 +1801,9 @@ fn spawn_video_sender(
                 buffered_frames_dropped += 1;
                 recovering = true;
                 let queued_frames_dropped = slot.drop_pending();
-                if let Some(bits_per_second) =
-                    bitrate.observe(now_us, buffered_bytes, queued_frames_dropped, true)
+                if live_bitrate
+                    && let Some(bits_per_second) =
+                        bitrate.observe(now_us, buffered_bytes, queued_frames_dropped, true)
                 {
                     let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
                     tracing::warn!(
@@ -1918,6 +1886,7 @@ fn spawn_video_sender(
                     obsolete_frames_dropped,
                     recovery_frames_dropped,
                     encoded_frames_dropped = slot.dropped(),
+                    encoder_bitrate_bits_per_second = encoder_status.bits_per_second(),
                     "video transport statistics"
                 );
                 frames_sent = 0;
@@ -1934,99 +1903,6 @@ fn spawn_video_sender(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn video_pacing_bounds_sustained_overshoot_and_idle_bursts() {
-        let mut pacer = VideoPacer::default();
-        let mut now = 1_000_000;
-        let started = now;
-        let mut bytes = 0;
-        // Model an encoder producing far more than Data Saver's 3 Mbps.
-        for _ in 0..1000 {
-            now += pacer.reserve(now, 12_000, 3_000_000);
-            bytes += 12_000_u64;
-            assert!(bytes * 8_000_000 <= (now - started + VIDEO_PACING_BURST_US) * 3_000_000);
-        }
-        now += 60_000_000;
-        assert_eq!(pacer.reserve(now, 12_000, 3_000_000), 12_000);
-    }
-
-    #[test]
-    fn video_pacing_applies_quality_changes_to_the_next_fragment() {
-        let mut pacer = VideoPacer::default();
-        assert_eq!(pacer.reserve(1_000_000, 12_000, 12_000_000), 0);
-        assert_eq!(pacer.reserve(1_008_000, 12_000, 3_000_000), 12_000);
-        assert_eq!(pacer.reserve(2_000_000, 12_000, 6_000_000), 0);
-        assert_eq!(pacer.reserve(2_000_000, 12_000, 6_000_000), 12_000);
-    }
-
-    #[test]
-    fn adaptive_bitrate_uses_aimd_without_oscillating() {
-        let mut bitrate = AdaptiveBitrate::new(12_000_000);
-        let congested_bytes = bitrate.congested_bytes();
-
-        assert_eq!(
-            bitrate.observe(1_000, congested_bytes, 0, false),
-            Some(9_000_000)
-        );
-        let congested_bytes = bitrate.congested_bytes();
-        assert_eq!(
-            bitrate.observe(2_000, congested_bytes, 0, false),
-            None,
-            "decreases are rate limited"
-        );
-        let congested_bytes = bitrate.congested_bytes();
-        assert_eq!(
-            bitrate.observe(
-                1_000 + BITRATE_DECREASE_INTERVAL_US,
-                congested_bytes,
-                0,
-                false,
-            ),
-            Some(6_750_000)
-        );
-
-        let healthy_start = 2_000_000;
-        assert_eq!(bitrate.observe(healthy_start, 0, 0, false), None);
-        assert_eq!(
-            bitrate.observe(healthy_start + BITRATE_INCREASE_INTERVAL_US, 0, 0, false),
-            Some(7_425_000)
-        );
-    }
-
-    #[test]
-    fn adaptive_bitrate_never_drops_below_its_floor() {
-        let mut bitrate = AdaptiveBitrate::new(4_000_000);
-        let mut now_us = 1;
-        for _ in 0..20 {
-            let _ = bitrate.observe(now_us, usize::MAX, usize::MAX, true);
-            now_us += BITRATE_DECREASE_INTERVAL_US;
-        }
-        assert_eq!(bitrate.current, 1_000_000);
-    }
-
-    #[test]
-    fn quality_ceiling_change_takes_effect_immediately() {
-        let mut bitrate = AdaptiveBitrate::new(12_000_000);
-        assert_eq!(bitrate.set_maximum(3_000_000), Some(3_000_000));
-        assert_eq!(bitrate.current, 3_000_000);
-        assert_eq!(bitrate.maximum, 3_000_000);
-
-        assert_eq!(bitrate.set_maximum(6_000_000), Some(6_000_000));
-        assert_eq!(bitrate.current, 6_000_000);
-        assert_eq!(bitrate.set_maximum(6_000_000), None);
-    }
-
-    #[test]
-    fn transport_buffer_thresholds_represent_time_not_a_fixed_byte_count() {
-        let low = AdaptiveBitrate::new(3_000_000);
-        let high = AdaptiveBitrate::new(12_000_000);
-
-        assert_eq!(low.drain_bytes(), 18_750);
-        assert_eq!(low.congested_bytes(), 56_250);
-        assert_eq!(high.drain_bytes(), 75_000);
-        assert_eq!(high.congested_bytes(), 225_000);
-    }
 
     #[test]
     fn profile_negotiation_prefers_hevc_and_falls_back_to_420() {
