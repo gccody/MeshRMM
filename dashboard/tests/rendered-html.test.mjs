@@ -225,3 +225,24 @@ test("falls back to the safe idle default for an invalid policy", () => {
   assert.equal(timeoutMilliseconds(0), 14_400_000);
   assert.equal(timeoutMilliseconds(1_441), 14_400_000);
 });
+
+test("server-renders the Devices filters from the URL", async () => {
+  const response = await render("/?q=alpha&status=offline", "acme.meshrmm.com", {
+    workos_organization_id: "org_acme",
+  });
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /<input aria-label="Search devices"[^>]* value="alpha"/);
+  assert.match(html, /<option value="offline" selected="">Offline<\/option>/);
+  assert.match(html, /<button class="metric-card metric-selected"[^>]*aria-pressed="true">/);
+});
+
+test("workspace routes keep the marketing site and owner console on their hosts", async () => {
+  const marketing = await (await render("/users")).text();
+  assert.match(marketing, /Every company gets a private MeshRMM workspace/);
+  assert.doesNotMatch(marketing, /Primary navigation|Search devices/);
+
+  const platform = await (await render("/settings", "admin.meshrmm.com")).text();
+  assert.match(platform, /Checking administrator access/);
+  assert.doesNotMatch(platform, /Primary navigation|Settings categories/);
+});
