@@ -53,6 +53,7 @@ struct TenantCompany {
     id: String,
     workos_organization_id: Option<String>,
     status: String,
+    slug: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -459,21 +460,6 @@ async fn authorize_agent(
     })
 }
 
-async fn ensure_company_exists(db: &D1Database, company_id: &str) -> Result<()> {
-    if query!(
-        db,
-        "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, display_border, prevent_idle_lock, allow_idle_override, slug, status FROM companies WHERE id = ?1",
-        company_id
-    )?
-    .metered_first::<Company>(None)
-    .await?
-    .is_none()
-    {
-        return Err(Error::RustError("company has not been provisioned".into()));
-    }
-    Ok(())
-}
-
 async fn audit(
     db: &D1Database,
     identity: &Identity,
@@ -482,6 +468,21 @@ async fn audit(
     target_id: &str,
     metadata_json: &str,
 ) -> Result<()> {
+    audit_statement(db, identity, action, target_type, target_id, metadata_json)?
+        .metered_run()
+        .await?;
+    Ok(())
+}
+
+/// The audit insert, for a caller that batches it with the change it records.
+fn audit_statement(
+    db: &D1Database,
+    identity: &Identity,
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    metadata_json: &str,
+) -> Result<D1PreparedStatement> {
     query!(
         db,
         "INSERT INTO audit_events (id, company_id, actor_user_id, action, target_type, target_id, metadata_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -493,10 +494,7 @@ async fn audit(
         target_id,
         metadata_json,
         now_ms_i64()?
-    )?
-    .metered_run()
-    .await?;
-    Ok(())
+    )
 }
 
 fn cors(response: Response, environment: &Env) -> Result<Response> {

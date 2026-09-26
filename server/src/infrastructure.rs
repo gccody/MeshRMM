@@ -110,7 +110,7 @@ pub(crate) async fn company_for_request(
     if let Some(slug) = tenant_slug_from_hostname(&hostname, &root_domain) {
         return query!(
             db,
-            "SELECT id, workos_organization_id, status FROM companies WHERE slug = ?1 COLLATE NOCASE",
+            "SELECT id, workos_organization_id, status, slug FROM companies WHERE slug = ?1 COLLATE NOCASE",
             slug
         )?
         .metered_first::<TenantCompany>(None)
@@ -125,7 +125,7 @@ pub(crate) async fn company_for_request(
     };
     query!(
         db,
-        "SELECT id, workos_organization_id, status FROM companies WHERE workos_organization_id = ?1",
+        "SELECT id, workos_organization_id, status, slug FROM companies WHERE workos_organization_id = ?1",
         workos_organization_id
     )?
     .metered_first::<TenantCompany>(None)
@@ -144,7 +144,7 @@ pub(crate) async fn request_tenant_company(
     };
     query!(
         db,
-        "SELECT id, workos_organization_id, status FROM companies WHERE slug = ?1 COLLATE NOCASE",
+        "SELECT id, workos_organization_id, status, slug FROM companies WHERE slug = ?1 COLLATE NOCASE",
         slug
     )?
     .metered_first::<TenantCompany>(None)
@@ -164,7 +164,13 @@ pub(crate) async fn canonical_company_url(
         .metered_first::<CompanySlug>(None)
         .await?
         .ok_or_else(|| Error::RustError("company has not been provisioned".into()))?;
-    match company.slug {
+    company_url(environment, company.slug.as_deref())
+}
+
+/// The API origin for a company: its own hostname, or the legacy API hostname
+/// for a company created before company hostnames.
+pub(crate) fn company_url(environment: &Env, slug: Option<&str>) -> Result<String> {
+    match slug {
         Some(slug) => Ok(format!(
             "https://{slug}.{}",
             tenant_root_domain(environment)?
