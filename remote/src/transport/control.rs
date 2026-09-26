@@ -19,16 +19,6 @@ use crate::platform::{ControlSink, ControlSinkParts, Presenter};
 
 const POINTER_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
 
-#[cfg(target_os = "macos")]
-fn can_reset_presenter_in_place(
-    current: meshrmm_protocol::VideoFormat,
-    format: meshrmm_protocol::VideoFormat,
-) -> bool {
-    // The sample-buffer layer reads dimensions from the replacement keyframe.
-    // Display identity and resolution do not require a new native window.
-    current.codec == format.codec && current.pixel_format == format.pixel_format
-}
-
 /// Mouse-move events can arrive substantially faster than the network can
 /// usefully deliver them. Keep only the newest unsent position so transient
 /// congestion cannot put keyboard and button events behind an unbounded trail
@@ -313,11 +303,10 @@ pub(super) fn install_control_handler(
                         format.frames_per_second,
                         format.codec,
                     );
-                    #[cfg(target_os = "macos")]
                     let reset_in_place = if capabilities_sent.load(Ordering::Acquire)
                         && let Ok(mut guard) = presenter.lock()
                         && let Some(active) = guard.as_mut()
-                        && can_reset_presenter_in_place(active.format, format)
+                        && Presenter::can_reset_in_place(active.format, format)
                     {
                         match active.presenter.reset_stream(format, active_display.clone(), displays.clone()) {
                             Ok(()) => {
@@ -331,7 +320,7 @@ pub(super) fn install_control_handler(
                                     stream_id = stream_id.0,
                                     bitrate_bits_per_second = format.bitrate_bits_per_second,
                                     codec = ?format.codec,
-                                    "reset the macOS decoder in place for a replacement stream"
+                                    "reconfigured the video decoder in place for a replacement stream"
                                 );
                                 true
                             }
@@ -341,7 +330,7 @@ pub(super) fn install_control_handler(
                                     configuration_sequence,
                                     previous_stream_id = active.stream_id.0,
                                     stream_id = stream_id.0,
-                                    "could not reset the macOS decoder in place; replacing the presenter"
+                                    "could not reconfigure the video decoder in place; replacing the presenter"
                                 );
                                 false
                             }
@@ -349,8 +338,6 @@ pub(super) fn install_control_handler(
                     } else {
                         false
                     };
-                    #[cfg(not(target_os = "macos"))]
-                    let reset_in_place = false;
 
                     if reset_in_place {
                         viewer_control.send(SessionMessage::RequestKeyframe { stream_id });
@@ -539,39 +526,72 @@ mod tests {
         assert!(rx.try_recv().is_ok());
     }
 
+    const CURRENT_FORMAT: meshrmm_protocol::VideoFormat = meshrmm_protocol::VideoFormat {
+        width: 1920,
+        height: 1080,
+        frames_per_second: 60,
+        codec: Codec::H264,
+        pixel_format: meshrmm_protocol::PixelFormat::Nv12,
+        bitrate_bits_per_second: 12_000_000,
+    };
+
+    const REPLACEMENT_FORMAT: meshrmm_protocol::VideoFormat = meshrmm_protocol::VideoFormat {
+        width: 2560,
+        height: 1440,
+        frames_per_second: 30,
+        bitrate_bits_per_second: 8_000_000,
+        ..CURRENT_FORMAT
+    };
+
     #[cfg(target_os = "macos")]
     #[test]
     fn monitor_resolution_changes_reuse_the_presenter_but_codec_changes_do_not() {
-        let current = meshrmm_protocol::VideoFormat {
-            width: 1920,
-            height: 1080,
-            frames_per_second: 60,
-            codec: Codec::H264,
-            pixel_format: meshrmm_protocol::PixelFormat::Nv12,
-            bitrate_bits_per_second: 12_000_000,
-        };
-        let replacement = meshrmm_protocol::VideoFormat {
-            width: 2560,
-            height: 1440,
-            frames_per_second: 30,
-            bitrate_bits_per_second: 8_000_000,
-            ..current
-        };
-        assert!(can_reset_presenter_in_place(current, replacement));
-        assert!(!can_reset_presenter_in_place(
-            current,
+        assert!(Presenter::can_reset_in_place(
+            CURRENT_FORMAT,
+            REPLACEMENT_FORMAT
+        ));
+        assert!(!Presenter::can_reset_in_place(
+            CURRENT_FORMAT,
             meshrmm_protocol::VideoFormat {
                 codec: Codec::H265,
-                ..replacement
+                ..REPLACEMENT_FORMAT
             }
         ));
-        assert!(!can_reset_presenter_in_place(
-            current,
+        assert!(!Presenter::can_reset_in_place(
+            CURRENT_FORMAT,
             meshrmm_protocol::VideoFormat {
                 pixel_format: meshrmm_protocol::PixelFormat::Ayuv,
-                ..replacement
+                ..REPLACEMENT_FORMAT
             }
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resets_the_presenter_across_resolution_codec_and_chroma() {
+        // The worker rebuilds the decoder and video processor on the same
+        // device and window; one that cannot falls back to a new presenter.
+        for replacement in [
+            REPLACEMENT_FORMAT,
+            meshrmm_protocol::VideoFormat {
+                codec: Codec::H265,
+                ..REPLACEMENT_FORMAT
+            },
+            meshrmm_protocol::VideoFormat {
+                pixel_format: meshrmm_protocol::PixelFormat::Ayuv,
+                ..REPLACEMENT_FORMAT
+            },
+            meshrmm_protocol::VideoFormat {
+                width: 1080,
+                height: 1920,
+                ..CURRENT_FORMAT
+            },
+        ] {
+            assert!(
+                Presenter::can_reset_in_place(CURRENT_FORMAT, replacement),
+                "{replacement:?}"
+            );
+        }
     }
 
     #[test]

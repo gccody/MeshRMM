@@ -41,6 +41,8 @@ mod keyboard_hook;
 mod launch_window;
 mod pipeline;
 mod renderer;
+#[cfg(test)]
+mod reset_probe;
 mod window;
 
 pub use launch_window::{close_launch_status, show_launch_status};
@@ -54,11 +56,22 @@ const MAX_DECODER_PENDING_FRAMES: usize = 16;
 // reference loss; the worker still presents only the newest decoded surface.
 const MAX_PRESENTER_QUEUE_FRAMES: usize = 15;
 const DECODER_INPUT_STALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a stream reset waits for the worker thread before the caller
+/// replaces the presenter instead.
+const STREAM_RESET_TIMEOUT: Duration = Duration::from_secs(5);
 const VIEWER_TOOLBAR_HEIGHT: u32 = 68;
 
 struct QueuedFrame {
     frame: EncodedFrame,
     received_at_us: u64,
+}
+
+/// A replacement stream for the worker to apply to its window and device.
+struct PendingReset {
+    format: VideoFormat,
+    display: Display,
+    displays: Vec<Display>,
+    reply: std::sync::mpsc::SyncSender<anyhow::Result<()>>,
 }
 
 struct Shared {
@@ -72,8 +85,35 @@ struct Shared {
     failure: Mutex<Option<String>>,
     replaced_frames: AtomicU64,
     recovering: AtomicBool,
+    resetting: AtomicBool,
+    reset: Mutex<Option<PendingReset>>,
     control: ControlSink,
     debug: DebugInfo,
+}
+
+impl Shared {
+    fn new(control: ControlSink, debug: DebugInfo) -> Self {
+        Self {
+            queued: Mutex::new(VecDeque::with_capacity(MAX_PRESENTER_QUEUE_FRAMES)),
+            cursor_shape: Mutex::new(None),
+            agent_pointer_display: Mutex::new(None),
+            ready: Condvar::new(),
+            stopping: AtomicBool::new(false),
+            reconnecting: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+            failure: Mutex::new(None),
+            replaced_frames: AtomicU64::new(0),
+            recovering: AtomicBool::new(false),
+            resetting: AtomicBool::new(false),
+            reset: Mutex::new(None),
+            control,
+            debug,
+        }
+    }
+
+    fn reset_pending(&self) -> bool {
+        self.reset.lock().is_ok_and(|reset| reset.is_some())
+    }
 }
 
 pub struct Presenter {
@@ -89,20 +129,7 @@ impl Presenter {
         control: ControlSink,
         debug: DebugInfo,
     ) -> anyhow::Result<Self> {
-        let shared = Arc::new(Shared {
-            queued: Mutex::new(VecDeque::with_capacity(MAX_PRESENTER_QUEUE_FRAMES)),
-            cursor_shape: Mutex::new(None),
-            agent_pointer_display: Mutex::new(None),
-            ready: Condvar::new(),
-            stopping: AtomicBool::new(false),
-            reconnecting: AtomicBool::new(false),
-            running: AtomicBool::new(false),
-            failure: Mutex::new(None),
-            replaced_frames: AtomicU64::new(0),
-            recovering: AtomicBool::new(false),
-            control: control.clone(),
-            debug,
-        });
+        let shared = Arc::new(Shared::new(control.clone(), debug));
         let worker_shared = Arc::clone(&shared);
         let worker_debug = worker_shared.debug.clone();
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
@@ -134,6 +161,10 @@ impl Presenter {
         let Ok(mut queued) = self.shared.queued.lock() else {
             return false;
         };
+        if self.shared.resetting.load(Ordering::Acquire) {
+            self.shared.replaced_frames.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         if self.shared.recovering.load(Ordering::Acquire) && !frame.keyframe {
             self.shared.replaced_frames.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -172,6 +203,79 @@ impl Presenter {
         self.shared.recovering.store(false, Ordering::Release);
         self.shared.ready.notify_one();
         true
+    }
+
+    /// Whether [`Self::reset_stream`] can take `next` in the current window.
+    /// The worker recreates the decoder and video processor on its device for
+    /// any change, and a reset that fails leaves the caller to replace the
+    /// presenter.
+    pub fn can_reset_in_place(_current: VideoFormat, _next: VideoFormat) -> bool {
+        true
+    }
+
+    /// Moves the window, device and swap chain to a replacement stream
+    /// instead of opening a new window. The worker thread owns them and
+    /// applies the reset between window messages. While it shows a modal
+    /// message box it cannot, and the reset times out.
+    pub fn reset_stream(
+        &self,
+        format: VideoFormat,
+        display: Display,
+        displays: Vec<Display>,
+    ) -> anyhow::Result<()> {
+        self.reset_stream_within(format, display, displays, STREAM_RESET_TIMEOUT)
+    }
+
+    fn reset_stream_within(
+        &self,
+        format: VideoFormat,
+        display: Display,
+        displays: Vec<Display>,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        if !self.shared.running.load(Ordering::Acquire) {
+            bail!("the Windows decode/presentation worker is not running");
+        }
+        self.shared.resetting.store(true, Ordering::Release);
+        self.shared.recovering.store(true, Ordering::Release);
+        if let Ok(mut queued) = self.shared.queued.lock() {
+            self.shared
+                .replaced_frames
+                .fetch_add(queued.len() as u64, Ordering::Relaxed);
+            queued.clear();
+        }
+        let (reply, response) = std::sync::mpsc::sync_channel(1);
+        let Ok(mut pending) = self.shared.reset.lock() else {
+            self.shared.resetting.store(false, Ordering::Release);
+            bail!("the Windows presenter's reset state is unavailable");
+        };
+        *pending = Some(PendingReset {
+            format,
+            display,
+            displays,
+            reply,
+        });
+        drop(pending);
+        self.shared.ready.notify_all();
+        let result = match response.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The caller falls back to a new presenter; the worker must
+                // not apply this reset afterwards.
+                if let Ok(mut pending) = self.shared.reset.lock() {
+                    pending.take();
+                }
+                Err(anyhow::anyhow!(
+                    "the Windows presentation thread did not reset the stream within {} ms",
+                    timeout.as_millis()
+                ))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+                "the Windows presentation thread stopped before resetting the stream"
+            )),
+        };
+        self.shared.resetting.store(false, Ordering::Release);
+        result
     }
 
     pub fn set_agent_pointer_display(&self, display_id: Option<meshrmm_protocol::DisplayId>) {
@@ -260,6 +364,22 @@ fn run_worker(
         if unsafe { pump_window_messages(pipeline.window()) } {
             break;
         }
+        if let Some(PendingReset {
+            format,
+            display,
+            displays,
+            reply,
+        }) = shared
+            .reset
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
+        {
+            let result = unsafe { pipeline.reset_stream(format, display, displays) };
+            // The new decoder has not been offered any input yet.
+            decoder_blocked_since = None;
+            let _ = reply.send(result);
+        }
         let wanted = shared.reconnecting.load(Ordering::Acquire);
         if wanted != reconnecting {
             reconnecting = wanted;
@@ -333,7 +453,9 @@ fn run_worker(
                 shared
                     .ready
                     .wait_timeout_while(queued, Duration::from_millis(4), |queue| {
-                        queue.is_empty() && !shared.stopping.load(Ordering::Acquire)
+                        queue.is_empty()
+                            && !shared.stopping.load(Ordering::Acquire)
+                            && !shared.reset_pending()
                     })
             else {
                 break;
@@ -365,6 +487,10 @@ fn run_worker(
         }
     }
     shared.running.store(false, Ordering::Release);
+    // A reset stored after the last check fails now instead of timing out.
+    if let Ok(mut pending) = shared.reset.lock() {
+        pending.take();
+    }
 }
 
 /// Opts the viewer into per-monitor DPI awareness so Windows does not
@@ -443,9 +569,203 @@ pub fn supported_video_profiles(format: VideoFormat) -> Vec<VideoProfile> {
     unsafe { pipeline::supported_video_profiles(format) }
 }
 
+/// A control sink that records what the window sends, for tests on a real
+/// window without a transport.
+#[cfg(test)]
+fn test_sink(
+    sent: Arc<Mutex<Vec<SessionMessage>>>,
+    chat: meshrmm_chat::ChatSession,
+) -> ControlSink {
+    ControlSink::new(super::ControlSinkParts {
+        idle: Default::default(),
+        display_border: Default::default(),
+        files: meshrmm_file_transfer::TransferSession::viewer(|| false),
+        chat,
+        audio: Default::default(),
+        recording: crate::recording::Recorder::with_activity_callback(|_| {}),
+        send: Arc::new(move |message| {
+            sent.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(message)
+        }),
+        set_input_enabled: Arc::new(|_| {}),
+        maintenance: Default::default(),
+        credentials: Default::default(),
+        technician_blocked: Default::default(),
+        wallpaper_hidden: Default::default(),
+        remote_cursor_hidden: Default::default(),
+        session_close_action: Default::default(),
+        quality: Default::default(),
+        chroma: Default::default(),
+        profiles: Arc::new(vec![
+            VideoProfile {
+                codec: Codec::H264,
+                chroma: ChromaMode::Yuv420,
+            },
+            VideoProfile {
+                codec: Codec::H264,
+                chroma: ChromaMode::Yuv444,
+            },
+        ]),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::counter_to_us;
+    use meshrmm_protocol::{DesktopSession, DisplayId, PixelFormat, VideoStreamId};
+
+    use super::*;
+
+    const FORMAT: VideoFormat = VideoFormat {
+        width: 1920,
+        height: 1080,
+        frames_per_second: 60,
+        codec: Codec::H264,
+        pixel_format: PixelFormat::Nv12,
+        bitrate_bits_per_second: 12_000_000,
+    };
+
+    fn display(id: u32) -> Display {
+        Display {
+            session: DesktopSession::Console,
+            id: DisplayId(id),
+            name: format!("Display {id}"),
+            x: 0,
+            y: 0,
+            width: FORMAT.width,
+            height: FORMAT.height,
+            primary: id == 1,
+        }
+    }
+
+    fn frame(keyframe: bool) -> EncodedFrame {
+        EncodedFrame {
+            stream_id: VideoStreamId(2),
+            frame_id: 1,
+            capture_timestamp_us: 0,
+            encode_complete_timestamp_us: 0,
+            send_timestamp_us: 0,
+            keyframe,
+            data: vec![0, 0, 0, 1],
+        }
+    }
+
+    /// A presenter whose worker is replaced by the test.
+    fn presenter(running: bool) -> Presenter {
+        let shared = Shared::new(
+            test_sink(Default::default(), Default::default()),
+            DebugInfo::new("test"),
+        );
+        shared.running.store(running, Ordering::Release);
+        Presenter {
+            shared: Arc::new(shared),
+            worker: None,
+        }
+    }
+
+    #[test]
+    fn a_stopped_worker_refuses_a_stream_reset() {
+        let presenter = presenter(false);
+        assert!(
+            presenter
+                .reset_stream(FORMAT, display(1), vec![display(1)])
+                .is_err()
+        );
+        assert!(!presenter.shared.resetting.load(Ordering::Acquire));
+        assert!(!presenter.shared.reset_pending());
+    }
+
+    #[test]
+    fn a_reset_the_worker_does_not_take_times_out_and_is_withdrawn() {
+        // A modal message box on the worker thread blocks its loop.
+        let presenter = presenter(true);
+        let error = presenter
+            .reset_stream_within(
+                FORMAT,
+                display(1),
+                vec![display(1)],
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("did not reset"), "{error}");
+        // The worker must not apply it once the caller has fallen back.
+        assert!(!presenter.shared.reset_pending());
+        assert!(!presenter.shared.resetting.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn the_worker_applies_a_reset_while_frames_are_dropped() {
+        let presenter = presenter(true);
+        assert!(presenter.publish(frame(true), 0));
+        let replacement = VideoFormat {
+            width: 2560,
+            height: 1440,
+            ..FORMAT
+        };
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                // Waits until the reset is handed over, as `run_worker` is
+                // woken for it, then takes it.
+                let shared = &presenter.shared;
+                let queued = shared.queued.lock().unwrap();
+                let (queued, _) = shared
+                    .ready
+                    .wait_timeout_while(queued, Duration::from_secs(5), |_| !shared.reset_pending())
+                    .unwrap();
+                // The queued frame belonged to the old stream.
+                assert!(queued.is_empty());
+                drop(queued);
+                let reset = shared.reset.lock().unwrap().take().unwrap();
+                // Frames that arrive during the reset are dropped, even
+                // keyframes: the caller requests one once it returns.
+                assert!(!presenter.publish(frame(true), 0));
+                assert!(!presenter.publish(frame(false), 0));
+                reset.reply.send(Ok(())).unwrap();
+                (reset.format, reset.display.id)
+            });
+            presenter
+                .reset_stream_within(
+                    replacement,
+                    display(2),
+                    vec![display(1), display(2)],
+                    Duration::from_secs(5),
+                )
+                .unwrap();
+            assert_eq!(worker.join().unwrap(), (replacement, DisplayId(2)));
+        });
+        assert!(!presenter.shared.resetting.load(Ordering::Acquire));
+        // Only a keyframe of the new stream ends the recovery.
+        assert!(!presenter.publish(frame(false), 0));
+        assert!(presenter.publish(frame(true), 0));
+        assert!(presenter.publish(frame(false), 0));
+        assert_eq!(presenter.shared.replaced_frames.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn a_failed_reset_is_returned_to_the_caller() {
+        let presenter = presenter(true);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let shared = &presenter.shared;
+                let queued = shared.queued.lock().unwrap();
+                let (queued, _) = shared
+                    .ready
+                    .wait_timeout_while(queued, Duration::from_secs(5), |_| !shared.reset_pending())
+                    .unwrap();
+                drop(queued);
+                let reset = shared.reset.lock().unwrap().take().unwrap();
+                reset
+                    .reply
+                    .send(Err(anyhow::anyhow!("no hardware decoder")))
+                    .unwrap();
+            });
+            let error = presenter
+                .reset_stream_within(FORMAT, display(1), vec![display(1)], Duration::from_secs(5))
+                .unwrap_err();
+            assert_eq!(error.to_string(), "no hardware decoder");
+        });
+        assert!(!presenter.shared.resetting.load(Ordering::Acquire));
+    }
 
     #[test]
     fn converts_performance_counter_past_u64_product_range() {

@@ -447,7 +447,7 @@ impl WindowContext {
                 .and_then(|index| ShortcutKey::ALL.get(index))
             {
                 self.control.set_shortcut_key(shortcut, *key);
-                let title = window_title(&self.active_display);
+                let title = window_title(&self.active_display());
                 self.title.replace(title.clone());
                 let _ = unsafe { SetWindowTextW(owner, PCWSTR(title.as_ptr())) };
             }

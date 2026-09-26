@@ -164,6 +164,13 @@ impl Presenter {
         true
     }
 
+    /// Whether [`Self::reset_stream`] can take `next` in the current window.
+    pub fn can_reset_in_place(current: VideoFormat, next: VideoFormat) -> bool {
+        // The sample-buffer layer reads dimensions from the replacement keyframe.
+        // Display identity and resolution do not require a new native window.
+        current.codec == next.codec && current.pixel_format == next.pixel_format
+    }
+
     pub fn reset_stream(
         &self,
         format: VideoFormat,
