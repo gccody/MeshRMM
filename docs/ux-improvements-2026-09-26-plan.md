@@ -15,7 +15,7 @@ stand alone; read [Working rules](#working-rules), [Merge order](#merge-order), 
 | --- | --- | --- | --- | --- | --- |
 | 0.1 Viewer-missing detection + "Get the viewer" | Dashboard | 2 | 2.9 (soft) | Not started | |
 | 0.2 Startup failures: typed errors, retry cap, Cancel | Viewer, agent, protocol | 1 | — | Not started | |
-| 2.9 Persistent workspace shell + filters in URL | Dashboard | 1 | — | Not started | |
+| 2.9 Persistent workspace shell + filters in URL | Dashboard | 1 | — | Merged | `200591b`, `817785b` |
 | 2.10a Fewer D1 round trips + cron cleanup | Server | 1 | — | Merged | `9d5b338`, `3dde5f0`, `e962fef` |
 | 2.10b Start event subscription in parallel with account | Dashboard | 2 | 2.9, 2.10a (soft) | Not started | |
 | 2.11 Inventory keeps data, stale state, per-source errors | Dashboard | 2 | 2.9 | Not started | |
@@ -404,7 +404,28 @@ renders "Checking administrator access".
 survives. Reloading `/?q=x&status=online` restores the filter. Marketing and platform unchanged.
 `npm run verify` green.
 
-**Notes.**
+**Notes.** Implemented as specified in `200591b` and `817785b`. Confirmed in vinext 1.0.0-beta.8: the
+`(workspace)` layout's key drops the group segment, and the patched `replaceState` updates
+`useSearchParams()` only for history state vinext doesn't own, so filters are written with
+`history.replaceState(null, …)`. `SettingsPanel` lives in `features/settings/settings-panel.tsx`
+(the target structure didn't name a file). `WorkspaceContext.Provider` wraps the whole shell, so
+wave-2 tasks can call `useWorkspace()` from shell-level UI as well as from panels. The Devices
+search box updates `devicesSearch` on every keystroke and only the URL write is debounced, so
+leaving within 250 ms keeps the filter. Marketing pages no longer preload any workspace chunk.
+
+Verified on the macOS development host: `npm run verify` (typecheck, lint, build, 72/72 tests) on
+the rebased tree. In the task worktree, Chromium against the production build with mocked
+`/auth/session`, `/v1/*` and WebSocket endpoints: one `/v1/account`, one subscription and one
+WebSocket (never closed) across Devices → Settings → Users → Devices and back/forward, with the
+shell's DOM node unchanged; the filter was restored via the nav link, back/forward and reload; an
+unsaved settings edit and its tab survived. The old build showed three account loads and three
+subscriptions for Devices → Settings → Devices. Not verified: real WorkOS sign-in and widgets
+(CORS with the mock token), a live control-plane WebSocket, Safari's `replaceState` rate limit.
+
+Known limitations: with an unsaved settings edit, starting a remote session from Devices may show
+the browser's leave-page prompt, because opening the `meshrmm:` link can fire `beforeunload`
+(`use-remote-handoff.ts` is left to 0.1). "Clear filters" leaves the old `q` in the URL for ~250 ms
+before the final URL is written.
 
 ---
 
