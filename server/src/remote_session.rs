@@ -134,7 +134,7 @@ impl RemoteSession {
         };
         if matches!(
             &signal,
-            SignalMessage::Error { message }
+            SignalMessage::Error { message, .. }
                 if message == "remote input/control channel closed unexpectedly"
         ) {
             // Older Agents report the viewer's intentional reconnect teardown
