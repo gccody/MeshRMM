@@ -22,7 +22,7 @@ stand alone; read [Working rules](#working-rules), [Merge order](#merge-order), 
 | 2.12 Scope WorkOS widgets and Radix CSS to admin pages | Dashboard | 2 | 2.9 (soft) | Not started | |
 | 3.14 Backoff reset, reconnect reason, Retry now | Viewer, agent | 2 | 0.2 | Not started | |
 | 3.16a Audio: send only when unmuted, stereo, Opus | Agent, viewer, protocol | 3 | 3.16b, 3.17 | Not started | |
-| 3.16b HEVC bitrate adaptation via restart ladder | Agent | 1 | — | Not started | |
+| 3.16b HEVC bitrate adaptation via restart ladder | Agent | 1 | — | Merged | `f939623`, `f3b552c` |
 | 3.17 Windows viewer resets the stream in place | Windows viewer | 1 | — | Merged | `5ce8cc7` |
 
 "Soft" dependencies can start early if the task keeps its edits to the listed wiring points; see
@@ -1001,7 +1001,53 @@ from the macOS viewer (Apple silicon HEVC decode). Throttle with macOS Network L
 -AppPathNameMatchCondition … -ThrottleRateActionBitsPerSecond` — remove the policy afterwards.
 Check step timing in the service log, then remove the throttle and confirm step-up.
 
-**Notes.**
+**Notes.** Implemented in `f939623` (pure move) and `f3b552c`. **For 3.16a:** `VideoPacer`,
+`AdaptiveBitrate`, `bitrate_duration_bytes` and their tests now live in
+`agent/src/remote/bitrate.rs` (`cfg(any(windows, test))`). `VideoPacer::reserve(now_us, bytes,
+bits_per_second)` is still called from `spawn_video_sender` in `transport.rs` with
+`quality_ceiling`, so the audio budget goes at that call site or into the pacer in `bitrate.rs`.
+`agent/src/remote/mod.rs` now also builds `video.rs` under `cfg(any(windows, test))` (AIMD uses its
+`MAX_ENCODED_FRAME_QUEUE`), so the `video.rs` tests also run on the Mac.
+
+HEVC changes bitrate by restarting the encoder: `RestartLadder` steps it to 100/70/50/35/25 % of
+the ceiling, never below `max(C/8, 500 kbps)`, and derives its current step from the encoder's
+actual bitrate on every frame, so a dropped or overridden restart can't desynchronize it. AIMD gains
+`rebase`, `congested()` and `healthy()`; for HEVC the sender no longer runs `observe` or emits
+`Bitrate`, and the congestion thresholds follow the real encoder bitrate (fixes the fictitious-
+`current` bug). The sender picks the ladder or live AIMD from a shared `EncoderStatus` (encoder
+bitrate, live-bitrate allowed = `codec != H265`, recording flag) that capture control publishes at
+the top of each loop. The video statistics log line gains `encoder_bitrate_bits_per_second`.
+
+Deviations:
+1. Gaps under 1 s don't end a congestion episode: dropping frames while waiting for a keyframe
+   briefly empties the buffer, so a strictly continuous 2.5 s would rarely be reached.
+2. The stepped bitrate lasts one connection: `set_bitrate` alone would store it in the
+   session-wide streamer, and on resume `configured_maximum_bitrate` is read back from it, capping
+   the session. `ScreenStreamer::set_congestion_bitrate(Option<u32>)` holds it instead; a quality
+   change or a new connection clears it, later restarts within the connection keep it.
+3. "Stable for 60 s" counts from a step-up that stayed uncongested, not from "no restart for
+   60 s", which would reset the hold while waiting and bring back oscillation.
+4. Shared state is one `EncoderStatus` struct rather than two atomics (it also carries recording).
+5. `RestartBitrate` is also ignored when the active codec isn't H.265, so H.264 is unchanged.
+6. The pacer still paces at the quality ceiling; left for 3.16a.
+
+Rebase: `spawn_video_sender`'s parameter list conflicted with 0.2 (`encoder_status` vs. 0.2's
+`anyhow::Error` failure channel); resolved by keeping both.
+
+Validation. macOS development host, rebased tree: `cargo fmt --check`, `cargo clippy -D warnings`,
+`cargo test --workspace` pass. DESKTOP-85R6S28: the task thread's tree (`2c59072`, 411 files
+matched) passed native fmt, clippy and `cargo test -p meshrmm-agent`; its release build installed,
+started and connected (no session run), then was restored. The rebased integration tip
+(`f3b552c` = 2.10a + 2.9 + 0.2 + 3.17 + 3.16b; 430 files matched by SHA-256 manifest in
+`~\ux-2026-09-26-3.16b\rebased-f3b552c`) passed native fmt, clippy and `cargo test --workspace`
+(agent 144 passed / 18 ignored, all 17 `bitrate.rs` tests; remote 82 passed / 2 ignored). Its
+release agent was installed with `install-agent-local.ps1 -SkipBuild`: started, signaling
+connected, reconnected ~1.7 s after `Restart-Service`, no WARN/ERROR lines in the service log;
+then 0.3.1 was restored (see Endpoint state). No QoS policy was created.
+
+**Incomplete:** no authenticated dashboard link was available, so the live throttled HEVC session
+from the macOS viewer (step timing ≥ 5 s apart with a `DisplayConfiguration` each, macOS in-place
+reset, dropped-frame/keyframe rates, step-up after removing the throttle) was not run.
 
 ---
 
@@ -1171,3 +1217,23 @@ SHA-256, backup file name, and whether it was restored.
   `"C:\Users\gccody\audit-fixes-2026-09-23\audit-builds\viewer-8b3980a\meshrmm-remote.exe" -- "%1"`
   and confirmed after the review round. Work tree: `~\ux-2026-09-26-0.2`. Every install/restore is
   also logged in `~\ux-2026-09-26-endpoint-log.txt`.
+
+- **3.16b (2026-09-26, task thread).** 12:10 install: release build of `2c59072` (pre-rebase),
+  SHA-256 `F38FCF711E11C9E1D6FAD8AB2F41EFB9B9CD172A084614D1DC6CBD7972B21024`, backup
+  `meshrmm-agent.exe.before-local-20260926-121007` (the 0.3.1 build `6BF0C029…4D60`). Started and
+  connected; no session. 12:10 restore: `6BF0C029…4D60`, backup
+  `meshrmm-agent.exe.before-local-20260926-121051` (the 3.16b build); running and connected; lock
+  released. A copy of the install script and the 0.3.1 exe is kept in
+  `~\ux-2026-09-26-3.16b\.ux-tools\restore` for restores.
+- **3.16b (2026-09-26, coordinator, integrated tip `f3b552c`).** 12:28 install: SHA-256
+  `36F3EF9D44B540A5097C6701B7E8E841375DA492B078CB70071572384CF8DBB4`, backup
+  `meshrmm-agent.exe.before-local-20260926-122845` (`6BF0C029…4D60`). Started, connected, survived a
+  service restart. 12:30 restore: `6BF0C029…4D60` from `.ux-tools\restore`, backup
+  `meshrmm-agent.exe.before-local-20260926-123000` (the integrated build); running and connected;
+  lock file removed.
+- **3.17 (2026-09-26).** Used only `~\ux-2026-09-26-3.17` (checks, probe; the rebased tree in
+  `rebased-5ce8cc7`). No agent install or restart; its `ux317-reset-probe` scheduled task was
+  deleted; the `meshrmm:` handler was not changed by this task.
+- **End of wave 1.** The service runs release 0.3.1 (`6BF0C029…4D60`), connected. The `meshrmm:`
+  handler is `"C:\Users\gccody\audit-fixes-2026-09-23\audit-builds\viewer-8b3980a\meshrmm-remote.exe" -- "%1"`.
+  `Get-NetQosPolicy` returns none. No install lock is held.
