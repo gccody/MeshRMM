@@ -623,3 +623,16 @@ button { color: inherit; }
 .viewer-download-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
 .viewer-download-other summary { width: fit-content; cursor: pointer; font-size: 12px; font-weight: 650; }
 .viewer-download-other[open] summary { margin-bottom: 6px; }
+.sidebar { overflow-y: auto; }
+.viewer-card { margin-top: auto; border-color: #2b374d; background: #1a263b; }
+.viewer-card + .profile-row { margin-top: 16px; }
+.viewer-card .support-icon { color: #c7d2fe; background: #33415b; box-shadow: none; }
+.viewer-card strong { display: block; color: #f1f5f9; font-size: 13px; }
+.viewer-card p { margin: 4px 0 0; color: #b0bbce; }
+.viewer-card .viewer-downloads a { color: #c7d2fe; font-size: 12px; }
+.viewer-card .viewer-download-primary { align-items: flex-start; }
+.viewer-card .viewer-download-primary svg { flex: 0 0 auto; margin-top: 1px; }
+.viewer-card .viewer-download-other summary { color: #b0bbce; }
+@media (max-height: 640px) {
+  .viewer-card .support-icon { display: none; }
+}
