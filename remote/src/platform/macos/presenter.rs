@@ -1,5 +1,6 @@
 use super::app::{RemoteView, VideoHostView, activate_application};
 use super::*;
+use crate::reconnect::ReconnectStatus;
 use dispatch2::DispatchTime;
 
 thread_local! {
@@ -31,6 +32,7 @@ const MAX_PRESENTER_QUEUE_FRAMES: usize = 15;
 /// live resize). Work that finds the UI state already borrowed is retried
 /// after this delay instead of panicking across dispatch's `extern "C"` frame.
 const UI_BUSY_RETRY: Duration = Duration::from_millis(50);
+const RECONNECT_REFRESH: Duration = Duration::from_millis(250);
 
 impl Shared {
     fn begin_recovery(&self, stream_id: VideoStreamId) {
@@ -226,10 +228,14 @@ impl Presenter {
         exec_with_ui(self.shared.id, |ui| ui.input_view.refresh_debug(false));
     }
 
-    /// Marks the window as waiting for the connection to be restored.
-    pub fn set_reconnecting(&self, reconnecting: bool) {
-        exec_with_ui(self.shared.id, move |ui| {
-            ui.input_view.set_reconnecting(reconnecting)
+    /// Shows why the window is waiting for the connection to be restored,
+    /// or hides that (`None`).
+    pub fn set_reconnect_status(&self, status: Option<ReconnectStatus>) {
+        let id = self.shared.id;
+        exec_with_ui(id, move |ui| {
+            if ui.input_view.set_reconnect_status(status) {
+                schedule_reconnect_refresh(id);
+            }
         });
     }
 
@@ -334,6 +340,23 @@ fn close_ui(id: u64) {
     });
     if !closed {
         retry_on_main(move || close_ui(id));
+    }
+}
+
+/// Keeps the reconnect panel's elapsed time and countdown current until the
+/// panel is hidden or the window closes. Checked more often than once a
+/// second so the counts do not skip a second.
+fn schedule_reconnect_refresh(id: u64) {
+    let when = DispatchTime::try_from(RECONNECT_REFRESH).unwrap_or(DispatchTime::NOW);
+    let work = move || {
+        run_with_ui(id, move |ui| {
+            if ui.input_view.refresh_reconnect_status() {
+                schedule_reconnect_refresh(id);
+            }
+        });
+    };
+    if DispatchQueue::main().after(when, work).is_err() {
+        tracing::warn!("macOS viewer could not schedule a reconnect status refresh");
     }
 }
 

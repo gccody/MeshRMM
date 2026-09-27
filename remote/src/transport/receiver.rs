@@ -85,6 +85,7 @@ pub async fn run_receiver(
         presentation_failure: presentation_failure_tx,
         shutting_down: Arc::new(AtomicBool::new(false)),
         progress: Arc::clone(&resume_state.progress),
+        reconnect_status: Arc::clone(&resume_state.reconnect_status),
     };
     let (remote_text_tx, _services) = start_viewer_services(
         viewer_control.clone(),
@@ -336,11 +337,10 @@ pub async fn run_receiver(
         session_state = session_state.transition(SessionState::Closing)?;
     }
     if let Some(mut active) = presenter.lock().ok().and_then(|mut guard| guard.take()) {
-        if result.is_ok() {
-            active.presenter.stop();
-        } else {
+        match &result {
+            Ok(()) => active.presenter.stop(),
             // The session may resume; keep its window up until then.
-            resume_state.keep_while_reconnecting(active);
+            Err(error) => resume_state.keep_while_reconnecting(active, error),
         }
     }
     viewer_control.chat.set_available(false);

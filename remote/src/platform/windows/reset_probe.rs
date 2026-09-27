@@ -52,7 +52,7 @@ fn format(width: u32, height: u32, codec: Codec, pixel_format: PixelFormat) -> V
 }
 
 /// Runs the window's messages for a while, as the worker loop does.
-unsafe fn pump(window: HWND, duration: Duration) {
+pub(super) unsafe fn pump(window: HWND, duration: Duration) {
     let started = std::time::Instant::now();
     while started.elapsed() < duration {
         unsafe { pump_window_messages(window) };
@@ -108,7 +108,7 @@ unsafe fn synthetic_frame(
 
 /// Presents a synthetic frame. Drivers differ in which surfaces the video
 /// processor takes as input, so this tries the bindings a decoder uses.
-unsafe fn present_synthetic(
+pub(super) unsafe fn present_synthetic(
     presentation: &mut Presentation,
     width: u32,
     height: u32,

@@ -10,7 +10,7 @@ use meshrmm_protocol::{ChromaMode, QualityPreset, SessionMessage, VideoProfile, 
 use tokio::sync::mpsc;
 
 use crate::platform::Presenter;
-use crate::reconnect::AttemptProgress;
+use crate::reconnect::{AttemptProgress, ReconnectPhase, ReconnectStatus};
 
 mod control;
 mod failure;
@@ -36,15 +36,24 @@ struct ReceiverLifecycle {
     presentation_failure: mpsc::UnboundedSender<String>,
     shutting_down: Arc<AtomicBool>,
     progress: Arc<Mutex<AttemptProgress>>,
+    reconnect_status: Arc<Mutex<Option<ReconnectStatus>>>,
 }
 
 impl ReceiverLifecycle {
-    /// Records a frame handed to the presenter.
+    /// Records a frame handed to the presenter. The attempt's first frame
+    /// ends the reconnect, so the next failure starts a new one.
     fn frame_presented(&self) {
-        self.progress
+        let first = self
+            .progress
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .mark_frame_presented(std::time::Instant::now());
+        if first {
+            self.reconnect_status
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+        }
     }
 }
 
@@ -71,6 +80,9 @@ pub struct ViewerResumeState {
     reconnecting: Arc<Mutex<Option<ActivePresenter>>>,
     /// Whether the remote display has appeared, in this attempt and ever.
     progress: Arc<Mutex<AttemptProgress>>,
+    /// Why and since when the session is reconnecting; `None` while the
+    /// remote display is up.
+    reconnect_status: Arc<Mutex<Option<ReconnectStatus>>>,
 }
 
 impl Default for ViewerResumeState {
@@ -101,13 +113,17 @@ impl Default for ViewerResumeState {
             recording_outgoing,
             reconnecting: Default::default(),
             progress: Default::default(),
+            reconnect_status: Default::default(),
         }
     }
 }
 
 impl ViewerResumeState {
-    fn keep_while_reconnecting(&self, active: ActivePresenter) {
-        active.presenter.set_reconnecting(true);
+    /// Keeps the window of a connection that failed with `error` up, showing
+    /// why it is reconnecting, until the next connection opens its own.
+    fn keep_while_reconnecting(&self, active: ActivePresenter, error: &anyhow::Error) {
+        let status = self.record_failure(error, std::time::Instant::now());
+        active.presenter.set_reconnect_status(Some(status));
         let previous = self
             .reconnecting
             .lock()
@@ -116,6 +132,54 @@ impl ViewerResumeState {
         if let Some(mut previous) = previous {
             previous.presenter.stop();
         }
+    }
+
+    fn reconnect_status(&self) -> std::sync::MutexGuard<'_, Option<ReconnectStatus>> {
+        self.reconnect_status
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Records that an attempt failed with `error` and returns the new
+    /// status. It is not shown until [`Self::update_reconnect_status`] or
+    /// [`Self::keep_while_reconnecting`] passes it on.
+    pub fn record_failure(
+        &self,
+        error: &anyhow::Error,
+        now: std::time::Instant,
+    ) -> ReconnectStatus {
+        let reason = crate::reconnect::classify(error);
+        let mut current = self.reconnect_status();
+        let status = ReconnectStatus::after_failure(*current, reason, now);
+        *current = Some(status);
+        status
+    }
+
+    /// Changes the reconnect status, if there is one, and shows it in the
+    /// kept window.
+    pub fn update_reconnect_status(&self, update: impl FnOnce(&mut ReconnectStatus)) {
+        let status = {
+            let mut current = self.reconnect_status();
+            let Some(status) = current.as_mut() else {
+                return;
+            };
+            update(status);
+            *status
+        };
+        if let Some(kept) = self
+            .reconnecting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            kept.presenter.set_reconnect_status(Some(status));
+        }
+    }
+
+    /// Sets what the kept window shows next: waiting out the backoff, or
+    /// attempting to reconnect.
+    pub fn set_reconnect_phase(&self, phase: ReconnectPhase) {
+        self.update_reconnect_status(|status| status.phase = phase);
     }
 
     /// Closes the window kept from a lost connection.
