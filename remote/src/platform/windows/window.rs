@@ -40,9 +40,8 @@ pub(super) use toolbar::set_agent_pointer_display;
 /// codec or connection takes its place instead of jumping to a new one.
 static LAST_PLACEMENT: std::sync::Mutex<Option<WINDOWPLACEMENT>> = std::sync::Mutex::new(None);
 
-/// SS_CENTER and SS_CENTERIMAGE, which live in an otherwise unused Windows feature.
+/// SS_CENTER, which lives in an otherwise unused Windows feature.
 pub(super) const STATIC_CENTER: u32 = 0x0001;
-const STATIC_CENTER_VERTICALLY: u32 = 0x0200;
 
 /// The minimum outer window size, in 96-DPI pixels, that fits the toolbar.
 const MINIMUM_WINDOW_WIDTH: i32 = 1176;
@@ -66,8 +65,13 @@ struct Controls {
     video_window: HWND,
     /// Owned popup: a child window over the video would be hidden by it.
     debug_overlay: HWND,
-    /// Owned popup shown while the connection is being restored.
+    /// Owned popup shown while the connection is being restored. It holds
+    /// the two children below and forwards their notifications here.
+    reconnect_panel: HWND,
+    /// Why, for how long, and when the next attempt starts.
     reconnecting_label: HWND,
+    /// "Retry now", which ends the wait before the next attempt.
+    retry_button: HWND,
     toolbar: HWND,
     user_combo: HWND,
     display_combo: HWND,
@@ -94,7 +98,9 @@ impl Default for Controls {
         Self {
             video_window: HWND::default(),
             debug_overlay: HWND::default(),
+            reconnect_panel: HWND::default(),
             reconnecting_label: HWND::default(),
+            retry_button: HWND::default(),
             toolbar: HWND::default(),
             user_combo: HWND::default(),
             display_combo: HWND::default(),
@@ -240,14 +246,24 @@ impl WindowContext {
         self.resize_pending.set(true);
     }
 
-    fn set_reconnecting(&self, window: HWND, reconnecting: bool) {
-        self.reconnecting.set(reconnecting);
+    /// Shows the reconnect overlay with `text`, or hides it (`None`).
+    fn set_reconnect_text(&self, window: HWND, text: Option<&ReconnectText>) {
+        let controls = self.controls();
+        if let Some(text) = text {
+            let label = HSTRING::from(format!("{}\r\n{}", text.title, text.detail));
+            let _ = unsafe { SetWindowTextW(controls.reconnecting_label, PCWSTR(label.as_ptr())) };
+            let _ = unsafe { EnableWindow(controls.retry_button, text.retry_enabled) };
+        }
+        let reconnecting = text.is_some();
+        if self.reconnecting.replace(reconnecting) == reconnecting {
+            return;
+        }
         let command = if reconnecting {
             SW_SHOWNOACTIVATE
         } else {
             SW_HIDE
         };
-        let _ = unsafe { ShowWindow(self.controls().reconnecting_label, command) };
+        let _ = unsafe { ShowWindow(controls.reconnect_panel, command) };
         self.show_title(window);
     }
 
@@ -753,9 +769,9 @@ unsafe fn remember_placement(window: HWND) {
     }
 }
 
-pub(super) unsafe fn set_reconnecting(window: HWND, reconnecting: bool) {
+pub(super) unsafe fn set_reconnect_text(window: HWND, text: Option<&ReconnectText>) {
     if let Some(context) = unsafe { window_context(window) } {
-        context.set_reconnecting(window, reconnecting);
+        context.set_reconnect_text(window, text);
     }
 }
 
