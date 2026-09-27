@@ -17,7 +17,7 @@ stand alone; read [Working rules](#working-rules), [Merge order](#merge-order), 
 | 0.2 Startup failures: typed errors, retry cap, Cancel | Viewer, agent, protocol | 1 | — | Merged | `c424a4d`, `b63f8cd`, `41a1baa`, `32bc917` |
 | 2.9 Persistent workspace shell + filters in URL | Dashboard | 1 | — | Merged | `200591b`, `817785b` |
 | 2.10a Fewer D1 round trips + cron cleanup | Server | 1 | — | Merged | `9d5b338`, `3dde5f0`, `e962fef` |
-| 2.10b Start event subscription in parallel with account | Dashboard | 2 | 2.9, 2.10a (soft) | Not started | |
+| 2.10b Start event subscription in parallel with account | Dashboard | 2 | 2.9, 2.10a (soft) | Merged | `070f56d` |
 | 2.11 Inventory keeps data, stale state, per-source errors | Dashboard | 2 | 2.9 | Not started | |
 | 2.12 Scope WorkOS widgets and Radix CSS to admin pages | Dashboard | 2 | 2.9 (soft) | Not started | |
 | 3.14 Backoff reset, reconnect reason, Retry now | Viewer, agent | 2 | 0.2 | Not started | |
@@ -610,6 +610,31 @@ the account.
 `/auth/session`.
 
 **Notes.**
+Implemented as specified in `070f56d`. `useAgentInventory`'s `companyId` option is now
+`subscriptionKey`; only the option type, destructuring, gate and effect deps changed (the
+`connect()` body is left to 2.11). The shell keys the subscription on `workosOrganizationId` and
+disables it once the account fails in a way that is not retried. The finding holds:
+`create_agent_event_subscription` and `/v1/account` both authorize through the token's organization
+and the tenant host, so they fail together (403/404) for a suspended or unknown company. No test
+file was added: the change is hook/shell wiring with no hook test harness, so it was checked in the
+browser instead.
+
+Deviation from the expected edge case: when the account returns 404, the subscription's 404 also
+appears in the shell error banner above the account error card and stays until dismissed, not only
+briefly. 2.11 removes that banner and moves inventory errors into the Devices panel (not rendered
+while the account is pending), which removes the duplicate.
+
+Verified on the macOS development host: `npm run verify` (typecheck, lint, build, 72/72 tests).
+Chrome (playwright-core outside the repo) against the production build with mocked
+`/auth/session`, `/v1/*` and WebSocket endpoints: resource timing showed
+`POST /v1/agents/events/subscriptions` starting in the same millisecond as `GET /v1/account`
+(409 ms), right after `/auth/session` ended (405 ms); the socket opened ~300 ms before the account
+response, with one account load, one subscription and one WebSocket. The previous build started the
+subscription only after the account response (768 ms vs 358 ms). With the account returning 404,
+no reconnect or socket followed, and "Retry now" with a successful account restarted the
+subscription and cleared the banner. With a retried 503, the stream went live while the account
+card kept retrying and the list stayed hidden. Not verified: real WorkOS sign-in, a live
+control-plane WebSocket, Safari and Firefox.
 
 ---
 
