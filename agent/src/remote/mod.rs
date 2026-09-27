@@ -37,6 +37,8 @@ mod platform;
 mod secure_attention;
 #[cfg(any(windows, test))]
 mod sender_failure;
+#[cfg(any(windows, test))]
+mod sender_progress;
 #[cfg(windows)]
 pub(crate) mod service_link;
 #[cfg(windows)]

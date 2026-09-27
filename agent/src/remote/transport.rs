@@ -30,6 +30,7 @@ use super::platform::{ScreenStreamer, StartedScreen, monotonic_timestamp_us};
 use super::sender_failure::{
     failure_signal, initial_start_error, profile_start_error, transport_failure,
 };
+use super::sender_progress::SenderProgress;
 use super::session_close::SessionClose;
 use super::signaling::authenticated_websocket;
 use super::video::LatestFrameSlot;
@@ -163,6 +164,7 @@ pub async fn run_sender(
     idle_policy: meshrmm_protocol::IdlePolicy,
     start_in_background: bool,
     session_close: Arc<SessionClose>,
+    progress: &SenderProgress,
 ) -> anyhow::Result<()> {
     let (socket, _) = authenticated_websocket(signal_url, signaling_token).await?;
     let mut signal = SignalingConnection::new(socket);
@@ -176,6 +178,7 @@ pub async fn run_sender(
         idle_policy,
         start_in_background,
         session_close,
+        progress,
     )
     .await;
     if let Err(error) = &result
@@ -196,6 +199,7 @@ async fn run_connected_sender(
     idle_policy: meshrmm_protocol::IdlePolicy,
     start_in_background: bool,
     session_close: Arc<SessionClose>,
+    progress: &SenderProgress,
 ) -> anyhow::Result<()> {
     // Input has its own synchronized controller so capture startup, encoder
     // recovery, and video teardown never hold the path used by control events.
@@ -748,6 +752,7 @@ async fn run_connected_sender(
                     && session_state == SessionState::Connecting
                 {
                     session_state = session_state.transition(SessionState::Streaming)?;
+                    progress.mark_streaming(std::time::Instant::now());
                 }
                 if state == RTCPeerConnectionState::Connected {
                     disconnected_since = None;
