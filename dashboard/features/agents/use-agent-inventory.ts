@@ -11,14 +11,14 @@ const MAX_EVENT_RECONNECT_DELAY_MS = 30_000;
 
 type Options = {
   enabled: boolean;
-  companyId?: string;
+  subscriptionKey?: string;
   authorizedFetch: AuthorizedFetch;
   reportError: (message: string | null) => void;
 };
 
 export function useAgentInventory({
   enabled,
-  companyId,
+  subscriptionKey,
   authorizedFetch,
   reportError,
 }: Options) {
@@ -71,7 +71,7 @@ export function useAgentInventory({
   );
 
   useEffect(() => {
-    if (!enabled || !companyId) return;
+    if (!enabled || !subscriptionKey) return;
     revision.current = -1;
     let disposed = false;
     let socket: WebSocket | null = null;
@@ -206,7 +206,7 @@ export function useAgentInventory({
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
       socket?.close(1000, "dashboard subscription ended");
     };
-  }, [authorizedFetch, companyId, enabled, reportError]);
+  }, [authorizedFetch, enabled, reportError, subscriptionKey]);
 
   return {
     agents: enabled ? agents : [],
