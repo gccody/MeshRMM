@@ -102,7 +102,30 @@ pub enum SignalMessage {
     PeerLeft,
     Error {
         message: String,
+        /// What failed, for peers that act on it. Older peers send and
+        /// expect no code; the message stays the human-readable detail.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<SignalErrorCode>,
     },
+}
+
+/// Why a peer stopped the session, carried by [`SignalMessage::Error`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalErrorCode {
+    /// The remote computer has no usable hardware encoder. Terminal before
+    /// the first frame.
+    HardwareEncoderUnavailable,
+    /// The peers share no video profile. Terminal before the first frame.
+    NoMutualProfile,
+    /// A peer's identity did not match the one trusted. Always terminal.
+    IdentityMismatch,
+    /// Capture could not start; this is often transient (UAC, lock screen,
+    /// RDP switches), so it is retried.
+    CaptureUnavailable,
+    /// A code added by a newer peer.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +191,81 @@ mod tests {
             })
             .unwrap(),
             r#"{"type":"updating","version":"0.3.1"}"#
+        );
+    }
+
+    #[test]
+    fn signal_errors_without_a_code_still_decode() {
+        let legacy: SignalMessage =
+            serde_json::from_str(r#"{"type":"error","message":"capture failed"}"#).unwrap();
+        assert_eq!(
+            legacy,
+            SignalMessage::Error {
+                message: "capture failed".into(),
+                code: None,
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            r#"{"type":"error","message":"capture failed"}"#
+        );
+    }
+
+    #[test]
+    fn signal_error_codes_round_trip_and_unknown_codes_decode() {
+        let coded = SignalMessage::Error {
+            message: "no encoder".into(),
+            code: Some(SignalErrorCode::HardwareEncoderUnavailable),
+        };
+        let json = serde_json::to_string(&coded).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"error","message":"no encoder","code":"hardware_encoder_unavailable"}"#
+        );
+        assert_eq!(serde_json::from_str::<SignalMessage>(&json).unwrap(), coded);
+        for code in [
+            SignalErrorCode::NoMutualProfile,
+            SignalErrorCode::IdentityMismatch,
+            SignalErrorCode::CaptureUnavailable,
+        ] {
+            let message = SignalMessage::Error {
+                message: String::new(),
+                code: Some(code),
+            };
+            let decoded: SignalMessage =
+                serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+            assert_eq!(decoded, message);
+        }
+        let newer: SignalMessage =
+            serde_json::from_str(r#"{"type":"error","message":"later","code":"something_new"}"#)
+                .unwrap();
+        assert_eq!(
+            newer,
+            SignalMessage::Error {
+                message: "later".into(),
+                code: Some(SignalErrorCode::Unknown),
+            }
+        );
+    }
+
+    #[test]
+    fn peers_built_before_error_codes_decode_coded_errors() {
+        // The shape of `SignalMessage` before `code` existed.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldSignalMessage {
+            Error { message: String },
+        }
+        let json = serde_json::to_string(&SignalMessage::Error {
+            message: "no encoder".into(),
+            code: Some(SignalErrorCode::HardwareEncoderUnavailable),
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<OldSignalMessage>(&json).unwrap(),
+            OldSignalMessage::Error {
+                message: "no encoder".into()
+            }
         );
     }
 

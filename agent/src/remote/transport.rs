@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use bytes::Bytes;
 use meshrmm_protocol::{
-    CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, ChromaMode, Codec, DEFAULT_FRAGMENT_PAYLOAD,
-    Display, DisplayId, IceServer, QualityPreset, RemoteSessionId, SessionMessage, SessionState,
-    SignalMessage, VideoProfile, VideoStreamId, fragment_frame,
+    AudioFormat, CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, ChromaMode, Codec,
+    DEFAULT_FRAGMENT_PAYLOAD, Display, DisplayId, IceServer, QualityPreset, RemoteSessionId,
+    SessionMessage, SessionState, SignalMessage, VideoProfile, VideoStreamId, fragment_frame,
 };
 use meshrmm_session_transport::{
     CHAT_CHANNEL, CLIPBOARD_CHANNEL, FILE_CHANNEL, ServiceChannel, ServiceRoute,
@@ -25,7 +25,15 @@ use webrtc::peer_connection::{
 };
 use webrtc::stats::StatsReportType;
 
+use super::audio_mode::{AudioEvent, AudioMode, buffered_audio_limit};
+use super::bitrate::{
+    AdaptiveBitrate, EncoderStatus, RestartLadder, VideoPacer, video_pacing_bitrate,
+};
 use super::platform::{ScreenStreamer, StartedScreen, monotonic_timestamp_us};
+use super::sender_failure::{
+    failure_signal, initial_start_error, profile_start_error, transport_failure,
+};
+use super::sender_progress::SenderProgress;
 use super::session_close::SessionClose;
 use super::signaling::authenticated_websocket;
 use super::video::LatestFrameSlot;
@@ -67,6 +75,8 @@ enum ControlCommand {
     MaintenanceError(String),
     Keyframe,
     Bitrate(u32),
+    /// Restart an encoder that cannot change bitrate live (HEVC).
+    RestartBitrate(u32),
     ViewerCapabilities {
         profiles: Vec<VideoProfile>,
         quality: QualityPreset,
@@ -89,136 +99,35 @@ enum ControlCommand {
 
 struct CaptureStartup {
     quality_ceiling: Arc<AtomicU32>,
+    encoder_status: Arc<EncoderStatus>,
     initial_display: Option<DisplayId>,
     session_close: Arc<SessionClose>,
 }
 
-const VIDEO_BUFFER_DRAIN_MS: u32 = 50;
-const VIDEO_BUFFER_CONGESTED_MS: u32 = 150;
 const VIDEO_BUFFER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(80);
 const KEYFRAME_RETRY_INTERVAL_US: u64 = 250_000;
-const BITRATE_DECREASE_INTERVAL_US: u64 = 500_000;
-const BITRATE_INCREASE_INTERVAL_US: u64 = 5_000_000;
 const DESKTOP_LIFECYCLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const DESKTOP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const DISCONNECTED_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+/// Decides the audio mode for viewers that never send `ViewerCapabilities`.
+const AUDIO_MODE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(3);
+const AUDIO_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Without new audio for this long the stream counts as idle: WASAPI
+/// loopback delivers nothing while the device is silent.
+const AUDIO_IDLE: std::time::Duration = std::time::Duration::from_millis(100);
+/// Audio formats this Agent can send.
+const SUPPORTED_AUDIO_FORMATS: &[AudioFormat] = &[AudioFormat::Opus, AudioFormat::Pcm16];
 
-// Encoder CBR is a target, not a transport limit. Pace video fragments even
-// when the network is fast enough to hide encoder overshoot from congestion
-// control. Allow a small burst, but never accumulate credit while idle.
-const VIDEO_PACING_BURST_US: u64 = 20_000;
-
-#[derive(Default)]
-struct VideoPacer {
-    next_send_us: u64,
-}
-
-impl VideoPacer {
-    fn reserve(&mut self, now_us: u64, bytes: usize, bits_per_second: u32) -> u64 {
-        let duration_us = (bytes as u64)
-            .saturating_mul(8_000_000)
-            .div_ceil(u64::from(bits_per_second.max(1)));
-        self.next_send_us = self.next_send_us.max(now_us).saturating_add(duration_us);
-        self.next_send_us
-            .saturating_sub(now_us.saturating_add(VIDEO_PACING_BURST_US))
-    }
-}
-
-#[derive(Debug)]
-struct AdaptiveBitrate {
-    minimum: u32,
-    maximum: u32,
-    current: u32,
-    last_decrease_us: u64,
-    healthy_since_us: u64,
-}
-
-impl AdaptiveBitrate {
-    fn new(maximum: u32) -> Self {
-        let minimum = (maximum / 8).max(1_000_000).min(maximum);
-        Self {
-            minimum,
-            maximum,
-            current: maximum,
-            last_decrease_us: 0,
-            healthy_since_us: 0,
+fn apply_audio_event(mode: &tokio::sync::watch::Sender<AudioMode>, event: AudioEvent<'_>) {
+    mode.send_if_modified(|mode| {
+        let next = mode.next(event, SUPPORTED_AUDIO_FORMATS);
+        if next == *mode {
+            return false;
         }
-    }
-
-    fn set_maximum(&mut self, maximum: u32) -> Option<u32> {
-        let maximum = maximum.max(1);
-        if self.maximum == maximum {
-            return None;
-        }
-        self.maximum = maximum;
-        self.minimum = (maximum / 8).max(500_000).min(maximum);
-        self.current = maximum;
-        self.last_decrease_us = 0;
-        self.healthy_since_us = 0;
-        Some(maximum)
-    }
-
-    fn observe(
-        &mut self,
-        now_us: u64,
-        buffered_bytes: usize,
-        queued_frames: usize,
-        reference_chain_lost: bool,
-    ) -> Option<u32> {
-        let congested = reference_chain_lost
-            || buffered_bytes >= self.congested_bytes()
-            || queued_frames >= (super::video::MAX_ENCODED_FRAME_QUEUE * 4) / 5;
-        if congested {
-            self.healthy_since_us = 0;
-            if self.last_decrease_us == 0
-                || now_us.saturating_sub(self.last_decrease_us) >= BITRATE_DECREASE_INTERVAL_US
-            {
-                self.last_decrease_us = now_us.max(1);
-                let reduced = ((u64::from(self.current) * 3) / 4) as u32;
-                let reduced = reduced.max(self.minimum);
-                if reduced < self.current {
-                    self.current = reduced;
-                    return Some(self.current);
-                }
-            }
-            return None;
-        }
-
-        let healthy = buffered_bytes <= self.drain_bytes() && queued_frames <= 1;
-        if !healthy || self.current >= self.maximum {
-            self.healthy_since_us = 0;
-            return None;
-        }
-        if self.healthy_since_us == 0 {
-            self.healthy_since_us = now_us.max(1);
-            return None;
-        }
-        if now_us.saturating_sub(self.healthy_since_us) >= BITRATE_INCREASE_INTERVAL_US {
-            self.healthy_since_us = now_us.max(1);
-            let increase = (self.current / 10).max(250_000);
-            self.current = self.current.saturating_add(increase).min(self.maximum);
-            return Some(self.current);
-        }
-        None
-    }
-
-    fn drain_bytes(&self) -> usize {
-        bitrate_duration_bytes(self.current, VIDEO_BUFFER_DRAIN_MS)
-    }
-
-    fn congested_bytes(&self) -> usize {
-        bitrate_duration_bytes(self.current, VIDEO_BUFFER_CONGESTED_MS)
-    }
-}
-
-fn bitrate_duration_bytes(bits_per_second: u32, duration_ms: u32) -> usize {
-    usize::try_from(
-        u64::from(bits_per_second)
-            .saturating_mul(u64::from(duration_ms))
-            .div_ceil(8_000),
-    )
-    .unwrap_or(usize::MAX)
-    .max(16 * 1024)
+        tracing::info!(previous = ?*mode, mode = ?next, "remote audio mode changed");
+        *mode = next;
+        true
+    });
 }
 
 fn profile_candidates(
@@ -260,14 +169,11 @@ fn start_first_profile(
             Ok(started) => return Ok(started),
             Err(error) => {
                 tracing::warn!(?profile, error = ?error, "hardware encoder profile unavailable");
-                failures.push(format!("{profile:?}: {error:#}"));
+                failures.push((*profile, error));
             }
         }
     }
-    anyhow::bail!(
-        "no mutually supported hardware video profile could start: {}",
-        failures.join("; ")
-    )
+    Err(profile_start_error(failures))
 }
 
 // Session-scoped state is owned by the caller so it survives sender reconnects.
@@ -281,6 +187,7 @@ pub async fn run_sender(
     idle_policy: meshrmm_protocol::IdlePolicy,
     start_in_background: bool,
     session_close: Arc<SessionClose>,
+    progress: &SenderProgress,
 ) -> anyhow::Result<()> {
     let (socket, _) = authenticated_websocket(signal_url, signaling_token).await?;
     let mut signal = SignalingConnection::new(socket);
@@ -294,6 +201,7 @@ pub async fn run_sender(
         idle_policy,
         start_in_background,
         session_close,
+        progress,
     )
     .await;
     if let Err(error) = &result
@@ -314,6 +222,7 @@ async fn run_connected_sender(
     idle_policy: meshrmm_protocol::IdlePolicy,
     start_in_background: bool,
     session_close: Arc<SessionClose>,
+    progress: &SenderProgress,
 ) -> anyhow::Result<()> {
     // Input has its own synchronized controller so capture startup, encoder
     // recovery, and video teardown never hold the path used by control events.
@@ -321,7 +230,7 @@ async fn run_connected_sender(
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<SignalMessage>();
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ControlCommand>();
     let (state_tx, mut state_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
-    let (video_failure_tx, mut video_failure_rx) = mpsc::unbounded_channel::<String>();
+    let (video_failure_tx, mut video_failure_rx) = mpsc::unbounded_channel::<anyhow::Error>();
     let identity = meshrmm_session_transport::identity::PeerIdentity::load(
         &crate::installer::identity_directory()?,
     )?;
@@ -351,8 +260,25 @@ async fn run_connected_sender(
             }),
         )
         .await?;
+    // Created up front: the offer is made before the viewer's version is known.
+    let opus_channel = peer
+        .create_data_channel(
+            meshrmm_audio::OPUS_CHANNEL,
+            Some(RTCDataChannelInit {
+                ordered: Some(true),
+                max_retransmits: Some(0),
+                protocol: Some(meshrmm_audio::OPUS_PROTOCOL.into()),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    // The viewer decides whether and how audio is sent; capture only then.
+    let audio_mode = Arc::new(tokio::sync::watch::Sender::new(AudioMode::Undetermined));
+    // The audio bitrate being streamed now, left out of video pacing.
+    let audio_bits = Arc::new(AtomicU32::new(0));
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(8);
     let audio_input = Arc::clone(&input);
+    let mut capture_mode = audio_mode.subscribe();
     let audio_capture = super::native_task::NativeTask::spawn(
         "meshrmm-audio-capture",
         move |mut stop| async move {
@@ -361,32 +287,129 @@ async fn run_connected_sender(
             loop {
                 tokio::select! {
                     _ = stop.changed() => break,
-                    _ = retry.tick() => {
-                        if !audio_input.is_console_session() { stream = None; continue; }
-                        if stream.as_ref().is_some_and(meshrmm_audio::Capture::healthy) { continue; }
-                        stream = None;
-                        let sender = audio_tx.clone();
-                        match meshrmm_audio::capture(move |packet| { let _ = sender.try_send(packet); }) {
-                            Ok(capture) => stream = Some(capture),
-                            Err(error) => tracing::debug!(%error, "system audio unavailable; retrying"),
-                        }
+                    // Start or stop at once when the viewer mutes or unmutes.
+                    Ok(()) = capture_mode.changed() => {}
+                    _ = retry.tick() => {}
+                }
+                let mode = *capture_mode.borrow_and_update();
+                if !mode.captures() || !audio_input.is_console_session() {
+                    if stream.take().is_some() {
+                        tracing::info!(?mode, "system audio capture stopped");
                     }
+                    continue;
+                }
+                if stream.as_ref().is_some_and(meshrmm_audio::Capture::healthy) {
+                    continue;
+                }
+                stream = None;
+                let sender = audio_tx.clone();
+                match meshrmm_audio::capture(move |packet| {
+                    let _ = sender.try_send(packet);
+                }) {
+                    Ok(capture) => stream = Some(capture),
+                    Err(error) => tracing::debug!(%error, "system audio unavailable; retrying"),
                 }
             }
         },
     )?;
     cleanup.workers.push(audio_capture);
     let audio_input = Arc::clone(&input);
+    let sender_mode = audio_mode.subscribe();
+    let sender_bits = Arc::clone(&audio_bits);
     let audio_sender = tokio::spawn(async move {
-        while let Some(packet) = audio_rx.recv().await {
-            if audio_input.is_console_session()
-                && audio_channel.ready_state() == RTCDataChannelState::Open
-                && audio_channel.buffered_amount().await < 32_000
-                && audio_channel.send(&Bytes::from(packet)).await.is_err()
-            {
-                break;
+        let mut opus = None::<meshrmm_audio::OpusEncoder>;
+        let mut opus_unavailable = false;
+        let mut bytes_sent = 0_u64;
+        let mut packets_dropped = 0_u64;
+        let mut stats_started = tokio::time::Instant::now();
+        'send: loop {
+            let packet = tokio::select! {
+                packet = audio_rx.recv() => match packet {
+                    Some(packet) => packet,
+                    None => break,
+                },
+                _ = tokio::time::sleep(AUDIO_IDLE) => {
+                    sender_bits.store(0, Ordering::Relaxed);
+                    // Encode what follows the gap as a new stream.
+                    if let Some(encoder) = opus.as_mut() {
+                        encoder.reset();
+                    }
+                    if bytes_sent == 0 {
+                        stats_started = tokio::time::Instant::now();
+                    }
+                    continue;
+                }
+            };
+            let mode = *sender_mode.borrow();
+            if !mode.captures() || !audio_input.is_console_session() {
+                sender_bits.store(0, Ordering::Relaxed);
+                continue;
+            }
+            if mode == AudioMode::Opus && opus.is_none() && !opus_unavailable {
+                match meshrmm_audio::OpusEncoder::new() {
+                    Ok(encoder) => opus = Some(encoder),
+                    Err(error) => {
+                        // The viewer that asked for Opus also plays PCM.
+                        tracing::warn!(%error, "Opus encoder unavailable; sending PCM audio");
+                        opus_unavailable = true;
+                    }
+                }
+            }
+            let (format, channel, packets, bits) =
+                match opus.as_mut().filter(|_| mode == AudioMode::Opus) {
+                    Some(encoder) => match encoder.encode(&packet) {
+                        Ok(packets) => (
+                            AudioFormat::Opus,
+                            &opus_channel,
+                            packets,
+                            meshrmm_audio::OPUS_BITS_PER_SECOND,
+                        ),
+                        Err(error) => {
+                            tracing::debug!(%error, "discarding audio the Opus encoder rejected");
+                            continue;
+                        }
+                    },
+                    None => {
+                        if let Some(encoder) = opus.as_mut() {
+                            encoder.reset();
+                        }
+                        let Some(bits) = meshrmm_audio::pcm_bits_per_second(&packet) else {
+                            continue;
+                        };
+                        (AudioFormat::Pcm16, &audio_channel, vec![packet], bits)
+                    }
+                };
+            if channel.ready_state() != RTCDataChannelState::Open {
+                sender_bits.store(0, Ordering::Relaxed);
+                continue;
+            }
+            sender_bits.store(bits, Ordering::Relaxed);
+            for packet in packets {
+                if channel.buffered_amount().await >= buffered_audio_limit(bits) {
+                    packets_dropped += 1;
+                    continue;
+                }
+                bytes_sent += packet.len() as u64;
+                if channel.send(&Bytes::from(packet)).await.is_err() {
+                    break 'send;
+                }
+            }
+            if stats_started.elapsed() >= AUDIO_STATS_INTERVAL {
+                tracing::info!(
+                    ?mode,
+                    ?format,
+                    nominal_bits_per_second = bits,
+                    audio_bits_per_second =
+                        bytes_sent as f64 * 8.0 / stats_started.elapsed().as_secs_f64(),
+                    packets_dropped,
+                    "audio transport statistics"
+                );
+                bytes_sent = 0;
+                packets_dropped = 0;
+                stats_started = tokio::time::Instant::now();
             }
         }
+        sender_bits.store(0, Ordering::Relaxed);
     });
     cleanup.tasks.push(audio_sender.abort_handle());
 
@@ -533,8 +556,10 @@ async fn run_connected_sender(
         let clipboard_tx = clipboard_tx.clone();
         let maintenance_tx = maintenance_tx.clone();
         let message_session_close = Arc::clone(&session_close);
+        let message_audio_mode = Arc::clone(&audio_mode);
         control_channel.on_message(Box::new(move |message| {
             let session_close = Arc::clone(&message_session_close);
+            let audio_mode = Arc::clone(&message_audio_mode);
             let tx = control_messages_tx.clone();
             let decoder_ready = Arc::clone(&decoder_ready);
             let input_tx = input_tx.clone();
@@ -555,11 +580,24 @@ async fn run_connected_sender(
                         profiles,
                         quality,
                         chroma,
-                    }) => Some(ControlCommand::ViewerCapabilities {
-                        profiles,
-                        quality,
-                        chroma,
-                    }),
+                    }) => {
+                        apply_audio_event(&audio_mode, AudioEvent::ViewerCapabilities);
+                        Some(ControlCommand::ViewerCapabilities {
+                            profiles,
+                            quality,
+                            chroma,
+                        })
+                    }
+                    Ok(SessionMessage::SetAudio { enabled, formats }) => {
+                        apply_audio_event(
+                            &audio_mode,
+                            AudioEvent::SetAudio {
+                                enabled,
+                                formats: &formats,
+                            },
+                        );
+                        None
+                    }
                     Ok(SessionMessage::SetQuality { preset }) => {
                         Some(ControlCommand::Quality(preset))
                     }
@@ -699,12 +737,14 @@ async fn run_connected_sender(
     let slot = Arc::new(LatestFrameSlot::default());
     let stream_id = VideoStreamId(1);
     let quality_ceiling = Arc::new(AtomicU32::new(1));
+    let encoder_status = Arc::new(EncoderStatus::default());
     let (capture_tx, capture_rx) = mpsc::channel(64);
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let capture_streamer = Arc::clone(&streamer);
     let capture_slot = Arc::clone(&slot);
     let capture_channel = Arc::clone(&control_channel);
     let capture_ceiling = Arc::clone(&quality_ceiling);
+    let capture_encoder_status = Arc::clone(&encoder_status);
     let capture_failure = video_failure_tx.clone();
     let capture_task =
         super::native_task::NativeTask::spawn("meshrmm-capture-control", move |stop| async move {
@@ -714,6 +754,7 @@ async fn run_connected_sender(
                 capture_channel,
                 CaptureStartup {
                     quality_ceiling: capture_ceiling,
+                    encoder_status: capture_encoder_status,
                     initial_display: start_in_background
                         .then_some(DisplayId(meshrmm_remote_screen::background::DISPLAY_ID)),
                     session_close,
@@ -724,7 +765,7 @@ async fn run_connected_sender(
             )
             .await;
             if let Err(error) = result {
-                let _ = capture_failure.send(format!("capture worker: {error:#}"));
+                let _ = capture_failure.send(error.context("capture worker"));
             }
             if let Err(error) = lock_streamer(&capture_streamer).and_then(|mut s| s.shutdown()) {
                 tracing::warn!(%error, "capture worker cleanup failed");
@@ -759,6 +800,8 @@ async fn run_connected_sender(
         Arc::clone(&slot),
         control_tx.clone(),
         Arc::clone(&quality_ceiling),
+        encoder_status,
+        Arc::clone(&audio_bits),
         video_failure_tx,
     );
     cleanup.tasks.push(video_sender.abort_handle());
@@ -770,6 +813,7 @@ async fn run_connected_sender(
         active_display.id,
         stream_id,
         format,
+        Arc::clone(&audio_mode),
     );
     cleanup.tasks.push(control_start.abort_handle());
 
@@ -790,7 +834,7 @@ async fn run_connected_sender(
                 signal.send(Message::Text(json.into())).await?;
             }
             incoming = signal.next() => {
-                let Some(incoming) = incoming else { break Err(anyhow::anyhow!("signaling connection closed")); };
+                let Some(incoming) = incoming else { break Err(transport_failure("signaling connection closed")); };
                 match incoming? {
                     Message::Text(text) => {
                         let signal: SignalMessage = serde_json::from_str(text.as_str())?;
@@ -821,9 +865,9 @@ async fn run_connected_sender(
                                 }
                             }
                             SignalMessage::PeerLeft => {
-                                break Err(anyhow::anyhow!("viewer disconnected from the remote session"));
+                                break Err(transport_failure("viewer disconnected from the remote session"));
                             }
-                            SignalMessage::Error { message } => break Err(anyhow::anyhow!(message)),
+                            SignalMessage::Error { message, .. } => break Err(anyhow::anyhow!(message)),
                             _ => {}
                         }
                     }
@@ -836,7 +880,7 @@ async fn run_connected_sender(
             }
             Some(command) = control_rx.recv() => {
                 match command {
-                    command @ (ControlCommand::Keyframe | ControlCommand::Bitrate(_)
+                    command @ (ControlCommand::Keyframe | ControlCommand::Bitrate(_) | ControlCommand::RestartBitrate(_)
                         | ControlCommand::Quality(_) | ControlCommand::ViewerCapabilities { .. }
                         | ControlCommand::DisplayBorder(_) | ControlCommand::Chroma(_) | ControlCommand::CursorCapture(_) | ControlCommand::InputOwnership(_) | ControlCommand::Recording(_) | ControlCommand::VideoProfileRejected { .. }
                         | ControlCommand::SelectDisplay(_)) => {
@@ -862,6 +906,7 @@ async fn run_connected_sender(
                     && session_state == SessionState::Connecting
                 {
                     session_state = session_state.transition(SessionState::Streaming)?;
+                    progress.mark_streaming(std::time::Instant::now());
                 }
                 if state == RTCPeerConnectionState::Connected {
                     disconnected_since = None;
@@ -869,16 +914,16 @@ async fn run_connected_sender(
                     disconnected_since.get_or_insert_with(tokio::time::Instant::now);
                 }
                 if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
-                    break Err(anyhow::anyhow!("WebRTC connection ended in state {state:?}"));
+                    break Err(transport_failure(format!("WebRTC connection ended in state {state:?}")));
                 }
             }
-            Some(error) = video_failure_rx.recv() => break Err(anyhow::anyhow!(error)),
+            Some(error) = video_failure_rx.recv() => break Err(error),
             _ = stats_interval.tick() => {
                 if disconnected_since.is_some_and(|since| since.elapsed() >= DISCONNECTED_GRACE_PERIOD) {
-                    break Err(anyhow::anyhow!(
+                    break Err(transport_failure(format!(
                         "WebRTC remained disconnected for {} seconds",
                         DISCONNECTED_GRACE_PERIOD.as_secs()
-                    ));
+                    )));
                 }
                 log_network_stats(&peer).await;
             },
@@ -1184,14 +1229,18 @@ async fn run_capture_control(
     let mut stream_id = VideoStreamId(1);
     let CaptureStartup {
         quality_ceiling,
+        encoder_status,
         initial_display,
         session_close,
     } = startup;
+    // Congestion steps belong to one connection; a resumed sender starts at
+    // the quality bitrate and adapts again.
+    lock_streamer(&streamer)?.set_congestion_bitrate(None);
     let started = lock_streamer(&streamer)?.start(initial_display, stream_id, Arc::clone(&slot));
     let started = match started {
         Ok(started) => started,
         Err(error) => {
-            let _ = started_tx.send(Err(error));
+            let _ = started_tx.send(Err(initial_start_error(error)));
             return Ok(());
         }
     };
@@ -1218,6 +1267,12 @@ async fn run_capture_control(
             return Ok(());
         }
         session_close.set_target(&active_display.session);
+        // Live CodecAPI bitrate changes are unsafe on HEVC hardware encoders.
+        encoder_status.publish(
+            format.bitrate_bits_per_second,
+            format.codec != Codec::H265,
+            recording,
+        );
         tokio::select! {
             biased;
             _ = stop.changed() => return Ok(()),
@@ -1241,6 +1296,46 @@ async fn run_capture_control(
                         let value = value.min(quality_ceiling.load(Ordering::Acquire));
                         if let Err(error) = lock_streamer(&streamer)?.set_adaptive_bitrate(value) {
                             tracing::warn!(error = %error, "could not set bitrate while the desktop is changing");
+                        }
+                    }
+                    ControlCommand::RestartBitrate(value) => {
+                        // Restarting with static settings is the safe way to
+                        // change an HEVC encoder's bitrate. Later restarts in
+                        // this connection keep the congestion bitrate.
+                        let ceiling = quality_ceiling.load(Ordering::Acquire);
+                        let value = value.min(ceiling).max(1);
+                        let previous = format.bitrate_bits_per_second;
+                        if !capture_running || format.codec != Codec::H265 || value == previous {
+                            continue;
+                        }
+                        lock_streamer(&streamer)?.set_congestion_bitrate((value < ceiling).then_some(value));
+                        lock_streamer(&streamer)?.stop()?;
+                        slot.clear();
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                        let candidates = profile_candidates(&viewer_profiles, requested_chroma, &rejected_profiles);
+                        match start_first_profile(&streamer, active_display.id, stream_id, &slot, &candidates) {
+                            Ok(started) => {
+                                displays = started.displays;
+                                active_display = started.active_display;
+                                active_profile = started.format.profile();
+                                format = started.format;
+                                capture_unavailable_since = None;
+                                send_control_message(&control_channel, SessionMessage::DisplayConfiguration {
+                                    displays: displays.clone(),
+                                    active_display_id: active_display.id,
+                                    stream_id,
+                                    format,
+                                }).await?;
+                                tracing::info!(previous_bits_per_second = previous, bits_per_second = format.bitrate_bits_per_second, ?active_profile, stream_id = stream_id.0, "restarted the video encoder at a congestion bitrate step");
+                            }
+                            Err(error) => {
+                                // A congestion step must never end the session;
+                                // the desktop lifecycle retries the start.
+                                capture_running = false;
+                                capture_unavailable_since = Some(std::time::Instant::now());
+                                capture_retry_after = std::time::Instant::now();
+                                tracing::warn!(error = ?error, bits_per_second = value, "video encoder did not restart at a congestion bitrate step; retrying");
+                            }
                         }
                     }
                     ControlCommand::Quality(quality)
@@ -1578,8 +1673,9 @@ async fn run_capture_control(
 }
 
 async fn report_sender_failure(connection: &mut SignalingConnection, error: &anyhow::Error) {
-    let signal = SignalMessage::Error {
-        message: format!("{error:#}"),
+    let Some(signal) = failure_signal(error) else {
+        tracing::debug!(error = %error, "not reporting a transport failure the viewer detects itself");
+        return;
     };
     match serde_json::to_string(&signal) {
         Ok(message) => {
@@ -1681,6 +1777,7 @@ async fn create_peer(
     Ok(peer)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_control_start(
     channel: Arc<RTCDataChannel>,
     open: Arc<Notify>,
@@ -1689,6 +1786,7 @@ fn spawn_control_start(
     active_display_id: DisplayId,
     stream_id: VideoStreamId,
     format: meshrmm_protocol::VideoFormat,
+    audio_mode: Arc<tokio::sync::watch::Sender<AudioMode>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         open.notified().await;
@@ -1700,7 +1798,12 @@ fn spawn_control_start(
         };
         if let Err(error) = send_control_message(&channel, message).await {
             tracing::warn!(error = %error, %session_id, "failed to send stream configuration");
+            return;
         }
+        // Viewers answer this configuration with their audio preference and
+        // capabilities. Very old viewers send neither; give them audio anyway.
+        tokio::time::sleep(AUDIO_MODE_BACKSTOP).await;
+        apply_audio_event(&audio_mode, AudioEvent::Backstop);
     })
 }
 
@@ -1721,6 +1824,7 @@ async fn send_control_message(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_video_sender(
     channel: Arc<RTCDataChannel>,
     open: Arc<Notify>,
@@ -1728,7 +1832,9 @@ fn spawn_video_sender(
     slot: Arc<LatestFrameSlot>,
     recovery: mpsc::UnboundedSender<ControlCommand>,
     quality_ceiling: Arc<AtomicU32>,
-    failure: mpsc::UnboundedSender<String>,
+    encoder_status: Arc<EncoderStatus>,
+    audio_bits: Arc<AtomicU32>,
+    failure: mpsc::UnboundedSender<anyhow::Error>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         open.notified().await;
@@ -1748,9 +1854,9 @@ fn spawn_video_sender(
                     Some(frame)
                 }
                 Err(_) => {
-                    let _ = failure.send(
-                        "capture/encoder produced no bootstrap keyframe for 10 seconds".into(),
-                    );
+                    let _ = failure.send(anyhow::anyhow!(
+                        "capture/encoder produced no bootstrap keyframe for 10 seconds"
+                    ));
                     return;
                 }
             };
@@ -1764,6 +1870,7 @@ fn spawn_video_sender(
         let mut recovering = false;
         let mut last_keyframe_request_us = 0_u64;
         let mut bitrate = AdaptiveBitrate::new(quality_ceiling.load(Ordering::Acquire).max(1));
+        let mut ladder = RestartLadder::new(quality_ceiling.load(Ordering::Acquire).max(1));
         let mut pacer = VideoPacer::default();
         loop {
             let source = if let Some(frame) = bootstrap_keyframe.take() {
@@ -1794,18 +1901,46 @@ fn spawn_video_sender(
 
             let now_us = monotonic_timestamp_us();
             let requested_maximum = quality_ceiling.load(Ordering::Acquire).max(1);
-            if let Some(bits_per_second) = bitrate.set_maximum(requested_maximum) {
-                let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
-            }
-            let mut buffered_bytes = channel.buffered_amount().await;
-            if let Some(bits_per_second) =
-                bitrate.observe(now_us, buffered_bytes, slot.len(), reference_chain_lost)
+            let live_bitrate = encoder_status.live_bitrate();
+            let encoder_bitrate = encoder_status.bits_per_second();
+            if let Some(bits_per_second) = bitrate.set_maximum(requested_maximum)
+                && live_bitrate
             {
                 let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
-                tracing::info!(
-                    bits_per_second,
-                    "adapted video bitrate to current transport capacity"
-                );
+            }
+            ladder.set_maximum(requested_maximum);
+            let mut buffered_bytes = channel.buffered_amount().await;
+            if live_bitrate {
+                if let Some(bits_per_second) =
+                    bitrate.observe(now_us, buffered_bytes, slot.len(), reference_chain_lost)
+                {
+                    let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
+                    tracing::info!(
+                        bits_per_second,
+                        "adapted video bitrate to current transport capacity"
+                    );
+                }
+            } else {
+                // Judge congestion against the rate the encoder actually
+                // runs at, and change it only by restarting the encoder.
+                bitrate.rebase(encoder_bitrate);
+                let queued_frames = slot.len();
+                if let Some(bits_per_second) = ladder.observe(
+                    now_us,
+                    encoder_bitrate,
+                    bitrate.congested(buffered_bytes, queued_frames, reference_chain_lost),
+                    bitrate.healthy(buffered_bytes, queued_frames),
+                    encoder_status.recording(),
+                ) {
+                    let _ = recovery.send(ControlCommand::RestartBitrate(bits_per_second));
+                    tracing::info!(
+                        previous_bits_per_second = encoder_bitrate,
+                        bits_per_second,
+                        buffered_bytes,
+                        queued_frames,
+                        "requested a video encoder restart at a new bitrate step"
+                    );
+                }
             }
             if recovering && !source.keyframe {
                 recovery_frames_dropped += 1;
@@ -1833,8 +1968,9 @@ fn spawn_video_sender(
                 buffered_frames_dropped += 1;
                 recovering = true;
                 let queued_frames_dropped = slot.drop_pending();
-                if let Some(bits_per_second) =
-                    bitrate.observe(now_us, buffered_bytes, queued_frames_dropped, true)
+                if live_bitrate
+                    && let Some(bits_per_second) =
+                        bitrate.observe(now_us, buffered_bytes, queued_frames_dropped, true)
                 {
                     let _ = recovery.send(ControlCommand::Bitrate(bits_per_second));
                     tracing::warn!(
@@ -1879,7 +2015,10 @@ fn spawn_video_sender(
                 let delay_us = pacer.reserve(
                     monotonic_timestamp_us(),
                     bytes.len(),
-                    quality_ceiling.load(Ordering::Acquire),
+                    video_pacing_bitrate(
+                        quality_ceiling.load(Ordering::Acquire),
+                        audio_bits.load(Ordering::Relaxed),
+                    ),
                 );
                 if delay_us != 0 {
                     tokio::time::sleep(std::time::Duration::from_micros(delay_us)).await;
@@ -1887,7 +2026,9 @@ fn spawn_video_sender(
                 bytes_sent = bytes_sent.saturating_add(bytes.len() as u64);
                 if let Err(error) = channel.send(&Bytes::from(bytes)).await {
                     tracing::warn!(error = %error, "video data channel send failed");
-                    let _ = failure.send(format!("video data channel send failed: {error}"));
+                    let _ = failure.send(transport_failure(format!(
+                        "video data channel send failed: {error}"
+                    )));
                     return;
                 }
             }
@@ -1915,6 +2056,7 @@ fn spawn_video_sender(
                     obsolete_frames_dropped,
                     recovery_frames_dropped,
                     encoded_frames_dropped = slot.dropped(),
+                    encoder_bitrate_bits_per_second = encoder_status.bits_per_second(),
                     "video transport statistics"
                 );
                 frames_sent = 0;
@@ -1931,99 +2073,6 @@ fn spawn_video_sender(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn video_pacing_bounds_sustained_overshoot_and_idle_bursts() {
-        let mut pacer = VideoPacer::default();
-        let mut now = 1_000_000;
-        let started = now;
-        let mut bytes = 0;
-        // Model an encoder producing far more than Data Saver's 3 Mbps.
-        for _ in 0..1000 {
-            now += pacer.reserve(now, 12_000, 3_000_000);
-            bytes += 12_000_u64;
-            assert!(bytes * 8_000_000 <= (now - started + VIDEO_PACING_BURST_US) * 3_000_000);
-        }
-        now += 60_000_000;
-        assert_eq!(pacer.reserve(now, 12_000, 3_000_000), 12_000);
-    }
-
-    #[test]
-    fn video_pacing_applies_quality_changes_to_the_next_fragment() {
-        let mut pacer = VideoPacer::default();
-        assert_eq!(pacer.reserve(1_000_000, 12_000, 12_000_000), 0);
-        assert_eq!(pacer.reserve(1_008_000, 12_000, 3_000_000), 12_000);
-        assert_eq!(pacer.reserve(2_000_000, 12_000, 6_000_000), 0);
-        assert_eq!(pacer.reserve(2_000_000, 12_000, 6_000_000), 12_000);
-    }
-
-    #[test]
-    fn adaptive_bitrate_uses_aimd_without_oscillating() {
-        let mut bitrate = AdaptiveBitrate::new(12_000_000);
-        let congested_bytes = bitrate.congested_bytes();
-
-        assert_eq!(
-            bitrate.observe(1_000, congested_bytes, 0, false),
-            Some(9_000_000)
-        );
-        let congested_bytes = bitrate.congested_bytes();
-        assert_eq!(
-            bitrate.observe(2_000, congested_bytes, 0, false),
-            None,
-            "decreases are rate limited"
-        );
-        let congested_bytes = bitrate.congested_bytes();
-        assert_eq!(
-            bitrate.observe(
-                1_000 + BITRATE_DECREASE_INTERVAL_US,
-                congested_bytes,
-                0,
-                false,
-            ),
-            Some(6_750_000)
-        );
-
-        let healthy_start = 2_000_000;
-        assert_eq!(bitrate.observe(healthy_start, 0, 0, false), None);
-        assert_eq!(
-            bitrate.observe(healthy_start + BITRATE_INCREASE_INTERVAL_US, 0, 0, false),
-            Some(7_425_000)
-        );
-    }
-
-    #[test]
-    fn adaptive_bitrate_never_drops_below_its_floor() {
-        let mut bitrate = AdaptiveBitrate::new(4_000_000);
-        let mut now_us = 1;
-        for _ in 0..20 {
-            let _ = bitrate.observe(now_us, usize::MAX, usize::MAX, true);
-            now_us += BITRATE_DECREASE_INTERVAL_US;
-        }
-        assert_eq!(bitrate.current, 1_000_000);
-    }
-
-    #[test]
-    fn quality_ceiling_change_takes_effect_immediately() {
-        let mut bitrate = AdaptiveBitrate::new(12_000_000);
-        assert_eq!(bitrate.set_maximum(3_000_000), Some(3_000_000));
-        assert_eq!(bitrate.current, 3_000_000);
-        assert_eq!(bitrate.maximum, 3_000_000);
-
-        assert_eq!(bitrate.set_maximum(6_000_000), Some(6_000_000));
-        assert_eq!(bitrate.current, 6_000_000);
-        assert_eq!(bitrate.set_maximum(6_000_000), None);
-    }
-
-    #[test]
-    fn transport_buffer_thresholds_represent_time_not_a_fixed_byte_count() {
-        let low = AdaptiveBitrate::new(3_000_000);
-        let high = AdaptiveBitrate::new(12_000_000);
-
-        assert_eq!(low.drain_bytes(), 18_750);
-        assert_eq!(low.congested_bytes(), 56_250);
-        assert_eq!(high.drain_bytes(), 75_000);
-        assert_eq!(high.congested_bytes(), 225_000);
-    }
 
     #[test]
     fn profile_negotiation_prefers_hevc_and_falls_back_to_420() {

@@ -6,6 +6,7 @@ use meshrmm_signaling_client::{ReconnectBackoff, is_terminal_websocket_error};
 
 use super::config::{Config, ExecutionMode};
 use super::platform::{PlatformScreenStreamer, ScreenStreamer};
+use super::sender_progress::SenderProgress;
 use super::session_close::SessionClose;
 use super::signaling::session_signal_url;
 
@@ -35,6 +36,7 @@ pub async fn run(
         ))));
     tracing::info!(session_id = %session_id, "remote session requested");
     let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(15));
+    let progress = SenderProgress::default();
     loop {
         match super::transport::run_sender(
             signal_url.clone(),
@@ -45,6 +47,7 @@ pub async fn run(
             request.idle_policy,
             request.start_in_background,
             Arc::clone(&session_close),
+            &progress,
         )
         .await
         {
@@ -62,11 +65,16 @@ pub async fn run(
                 return Err(error);
             }
             Err(error) => {
-                let delay = backoff.next_delay();
+                // A stable connection restarts the schedule. Per viewer resume
+                // the server restarts this task, so this matters only when the
+                // sender fails without one.
+                let streamed_for = progress.take().map(|since| since.elapsed());
+                let delay = backoff.delay_after(streamed_for);
                 tracing::warn!(
                     error = ?error,
                     session_id = %session_id,
                     retry_seconds = delay.as_secs(),
+                    streamed_seconds = streamed_for.map(|streamed| streamed.as_secs()),
                     "remote sender disconnected; waiting to resume"
                 );
                 tokio::time::sleep(delay).await;

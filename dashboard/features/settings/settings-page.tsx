@@ -5,16 +5,14 @@ import { type FormEvent, useState } from "react";
 import { AuthenticationRequired, type AuthorizedFetch, errorMessage } from "../../lib/http";
 import type { Account, Company } from "../workspace/types";
 import {
-  type CompanySettingsDraft,
   DEFAULT_BLACKOUT_MESSAGE,
   SETTINGS_TABS,
-  type SettingsTab,
   companySettingsBody,
-  draftFromCompany,
   draftMatchesCompany,
   isBlackoutMessageValid,
   settingsTabForKey,
 } from "./company-settings";
+import type { SettingsDraft } from "./use-settings-draft";
 
 type Props = {
   company: Company | null | undefined;
@@ -22,30 +20,23 @@ type Props = {
   displayName: string;
   authorizedFetch: AuthorizedFetch;
   onSaved: (account: Account) => void;
-  reportError: (message: string | null) => void;
+  // Owned by the workspace shell so unsaved edits survive navigation.
+  settingsDraft: SettingsDraft;
 };
 
-export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, onSaved, reportError }: Props) {
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>("dashboard-security");
-  const [draft, setDraft] = useState(() => draftFromCompany(company));
-  const [draftSource, setDraftSource] = useState(company);
+export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, onSaved, settingsDraft }: Props) {
+  const { draft, updateDraft, settingsTab, setSettingsTab } = settingsDraft;
   const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
 
-  // A loaded or saved account replaces any unsaved edits.
-  if (company !== draftSource) {
-    setDraftSource(company);
-    setDraft(draftFromCompany(company));
-  }
-
-  const updateDraft = (change: Partial<CompanySettingsDraft>) => setDraft((current) => ({ ...current, ...change }));
   const blackoutMessageValid = isBlackoutMessageValid(draft.blackoutMessage);
 
   const saveSettings = async (event: FormEvent) => {
     event.preventDefault();
     setIsSaving(true);
     setSettingsNotice(null);
-    reportError(null);
+    setSaveError(null);
     try {
       const response = await authorizedFetch("/v1/company/settings", {
         method: "PUT",
@@ -59,7 +50,7 @@ export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, o
       setSettingsNotice("Company settings saved. Remote defaults apply to new sessions.");
     } catch (requestError) {
       if (!(requestError instanceof AuthenticationRequired)) {
-        reportError(requestError instanceof Error ? requestError.message : "The session policy could not be saved.");
+        setSaveError(requestError instanceof Error ? requestError.message : "The session policy could not be saved.");
       }
     } finally {
       setIsSaving(false);
@@ -132,6 +123,7 @@ export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, o
           </fieldset>
           {settingsTab !== "blackout" && !blackoutMessageValid && <p role="alert">Check the blackout message before saving: it must contain text and be no larger than 2 KB.</p>}
           {isAdmin && <div className="settings-save">
+            {saveError && <p className="settings-save-error" role="alert">{saveError}</p>}
             <button className="primary-button" disabled={isSaving || !blackoutMessageValid || draftMatchesCompany(draft, company)}>{isSaving ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save company settings</button>
           </div>}
           {settingsNotice && <p role="status" className="session-notice">{settingsNotice}</p>}

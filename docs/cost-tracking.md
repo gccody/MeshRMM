@@ -52,8 +52,9 @@ counted only from when metering is deployed, so the first month is partial.
 | SSO and Directory Sync connections | Active connections per WorkOS organization. Each is priced at the average of WorkOS's graduated volume tiers for the account's total. | Metered |
 
 Usage that no company caused is shown as **platform overhead**. That covers
-the marketing site, the owner console, sign-in, unauthenticated requests,
-traffic before metering began, and objects or TURN traffic without an owner.
+the marketing site, the owner console, sign-in, unauthenticated requests, the
+API Worker's scheduled cleanup of expired tokens, traffic before metering
+began, and objects or TURN traffic without an owner.
 
 ## Limits
 

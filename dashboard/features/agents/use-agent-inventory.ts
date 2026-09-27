@@ -3,34 +3,42 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { errorMessage } from "../../lib/http";
 import { AuthenticationRequired, type AuthorizedFetch } from "../../lib/http";
-import { applyAgentDelta, parseAgentEvent, parseAgentList, sortAgents } from "./model";
+import { type InventoryConnection, STALE_GRACE_MS, inventoryStatus, inventoryStream } from "./inventory-stream";
+import { parseAgentList, sortAgents } from "./model";
 import { subscriptionRenewal } from "./subscription-renewal";
-import type { Agent, AgentDelta, AgentEventSubscription } from "./types";
-
-const MAX_EVENT_RECONNECT_DELAY_MS = 30_000;
+import type { Agent } from "./types";
 
 type Options = {
   enabled: boolean;
-  companyId?: string;
+  subscriptionKey?: string;
   authorizedFetch: AuthorizedFetch;
-  reportError: (message: string | null) => void;
 };
+
+// `since` is when the stream last stopped being live; null before it starts.
+type Link = { connection: InventoryConnection; since: number | null };
 
 export function useAgentInventory({
   enabled,
-  companyId,
+  subscriptionKey,
   authorizedFetch,
-  reportError,
 }: Options) {
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [isLive, setIsLive] = useState(false);
+  const [hasData, setHasData] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [lastUpdated, setLastUpdated] = useState(() => new Date());
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [link, setLink] = useState<Link>({ connection: "connecting", since: null });
+  // Advanced by a timer when the stale grace period ends.
+  const [clock, setClock] = useState(0);
   const revision = useRef(-1);
+  const stream = useRef<ReturnType<typeof inventoryStream> | null>(null);
 
+  // Only sign-out and the session lock discard the inventory.
   const reset = useCallback(() => {
     setAgents([]);
-    setIsLive(false);
+    setHasData(false);
+    setLastUpdated(null);
+    setError(null);
     revision.current = -1;
   }, []);
 
@@ -38,7 +46,6 @@ export function useAgentInventory({
     async (silent = false) => {
       if (!enabled) return false;
       if (!silent) setIsRefreshing(true);
-      reportError(null);
       try {
         const response = await authorizedFetch("/v1/agents");
         if (!response.ok) {
@@ -48,172 +55,122 @@ export function useAgentInventory({
         }
         const data = parseAgentList(await response.json());
         if (!data) throw new Error("The live agent service returned an invalid response.");
+        setError(null);
         if (data.revision < revision.current) return true;
         revision.current = data.revision;
         setAgents(sortAgents(data.agents));
+        setHasData(true);
         setLastUpdated(new Date());
         return true;
       } catch (requestError) {
         if (requestError instanceof AuthenticationRequired) return false;
-        setIsLive(false);
-        setAgents([]);
-        reportError(
+        // Keep the devices already on screen; the stale state explains them.
+        setError(`Couldn’t refresh devices: ${
           requestError instanceof Error
             ? requestError.message
-            : "The live agent service could not be reached.",
-        );
+            : "The live agent service could not be reached."
+        }`);
         return false;
       } finally {
         setIsRefreshing(false);
       }
     },
-    [authorizedFetch, enabled, reportError],
+    [authorizedFetch, enabled],
   );
 
   useEffect(() => {
-    if (!enabled || !companyId) return;
+    if (!enabled || !subscriptionKey) return;
     revision.current = -1;
-    let disposed = false;
-    let socket: WebSocket | null = null;
-    let stopRenewal: (() => void) | undefined;
-    let reconnectTimer: number | undefined;
-    let reconnectDelay = 1_000;
-    let awaitingSnapshot = true;
-    let pendingEvents: AgentDelta[] = [];
-
-    const scheduleReconnect = () => {
-      if (disposed || reconnectTimer !== undefined) return;
-      reconnectTimer = window.setTimeout(() => {
-        reconnectTimer = undefined;
-        void connect();
-      }, reconnectDelay);
-      reconnectDelay = Math.min(reconnectDelay * 2, MAX_EVENT_RECONNECT_DELAY_MS);
-    };
-
-    const connect = async () => {
-      try {
-        const response = await authorizedFetch("/v1/agents/events/subscriptions", {
-          method: "POST",
-        });
-        if (!response.ok) {
-          throw new Error(
-            await errorMessage(response, "The live Agent event stream could not be opened."),
-          );
+    const current = inventoryStream({
+      subscribe: async () => {
+        try {
+          return await authorizedFetch("/v1/agents/events/subscriptions", { method: "POST" });
+        } catch (requestError) {
+          if (requestError instanceof AuthenticationRequired) return null;
+          throw requestError;
         }
-        const subscription = (await response.json()) as AgentEventSubscription;
-        if (disposed) return;
-        const websocketUrl = new URL(subscription.websocket_url);
-        websocketUrl.searchParams.set("token", subscription.subscription_token);
-        websocketUrl.searchParams.set("protocol", "2");
-        const nextSocket = new WebSocket(websocketUrl);
-        socket = nextSocket;
-        const renewal = subscriptionRenewal(authorizedFetch, () => nextSocket.close(4001, "fresh authorization required"));
-        stopRenewal = renewal.stop;
-        awaitingSnapshot = true;
-        pendingEvents = [];
-
-        const requestSnapshot = () => {
-          if (nextSocket.readyState === WebSocket.OPEN) nextSocket.send("refresh");
-        };
-
-        nextSocket.addEventListener("open", () => {
-          if (disposed || socket !== nextSocket) return;
-          reconnectDelay = 1_000;
-          reportError(null);
+      },
+      openSocket: (url) => new WebSocket(url),
+      renewal: (disconnect) => subscriptionRenewal(authorizedFetch, disconnect),
+      revision,
+      onAgents: (update) => {
+        setAgents(update);
+        setHasData(true);
+        setLastUpdated(new Date());
+        setError(null);
+      },
+      onConnection: (connection) => {
+        const at = Date.now();
+        setLink((previous) => {
+          if (previous.connection === connection && previous.since !== null) return previous;
+          const since = previous.connection === "live" || previous.since === null ? at : previous.since;
+          return { connection, since };
         });
-        nextSocket.addEventListener("message", (message) => {
-          if (disposed || socket !== nextSocket || typeof message.data !== "string") return;
-          try {
-            const value: unknown = JSON.parse(message.data);
-            if (renewal.accept(value)) return;
-            const event = parseAgentEvent(value);
-            if (!event) {
-              requestSnapshot();
-              return;
-            }
-            if (event.type === "snapshot") {
-              if (event.revision < revision.current) {
-                requestSnapshot();
-                return;
-              }
-              let nextAgents = sortAgents(event.agents);
-              let nextRevision = event.revision;
-              for (const pending of pendingEvents.sort(
-                (left, right) => left.revision - right.revision,
-              )) {
-                if (pending.revision <= nextRevision) continue;
-                if (pending.revision !== nextRevision + 1) {
-                  pendingEvents = [];
-                  awaitingSnapshot = true;
-                  requestSnapshot();
-                  return;
-                }
-                nextAgents = applyAgentDelta(nextAgents, pending);
-                nextRevision = pending.revision;
-              }
-              pendingEvents = [];
-              awaitingSnapshot = false;
-              revision.current = nextRevision;
-              setAgents(nextAgents);
-            } else {
-              if (awaitingSnapshot) {
-                pendingEvents.push(event);
-                if (pendingEvents.length > 1_000) {
-                  nextSocket.close(1009, "too many pending Agent events");
-                }
-                return;
-              }
-              if (event.revision <= revision.current) return;
-              if (event.revision !== revision.current + 1) {
-                awaitingSnapshot = true;
-                pendingEvents = [event];
-                requestSnapshot();
-                return;
-              }
-              revision.current = event.revision;
-              setAgents((current) => applyAgentDelta(current, event));
-            }
-            setIsLive(true);
-            setLastUpdated(new Date());
-          } catch {
-            requestSnapshot();
-          }
-        });
-        nextSocket.addEventListener("error", () => nextSocket.close());
-        nextSocket.addEventListener("close", () => {
-          renewal.stop();
-          if (disposed || socket !== nextSocket) return;
-          socket = null;
-          setIsLive(false);
-          scheduleReconnect();
-        });
-      } catch (requestError) {
-        if (disposed || requestError instanceof AuthenticationRequired) return;
-        setIsLive(false);
-        reportError(
-          requestError instanceof Error
-            ? requestError.message
-            : "The live Agent event stream could not be opened.",
-        );
-        scheduleReconnect();
-      }
-    };
-
-    void connect();
+      },
+      onError: setError,
+      online: navigator.onLine,
+    });
+    stream.current = current;
     return () => {
-      disposed = true;
-      stopRenewal?.();
-      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
-      socket?.close(1000, "dashboard subscription ended");
+      current.stop();
+      stream.current = null;
     };
-  }, [authorizedFetch, companyId, enabled, reportError]);
+  }, [authorizedFetch, enabled, subscriptionKey]);
 
+  // Resynchronize when the network returns or the tab becomes visible again,
+  // for example after the computer wakes from sleep.
+  useEffect(() => {
+    if (!enabled) return;
+    const handleOnline = () => {
+      stream.current?.setOnline(true);
+      stream.current?.wake();
+    };
+    const handleOffline = () => stream.current?.setOnline(false);
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") stream.current?.wake();
+    };
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, [enabled]);
+
+  useEffect(() => {
+    if (link.connection === "live" || link.since === null) return;
+    const timer = window.setTimeout(
+      () => setClock(Date.now()),
+      Math.max(0, link.since + STALE_GRACE_MS - Date.now()),
+    );
+    return () => window.clearTimeout(timer);
+  }, [link]);
+
+  // Reconnects now (also after the server refused the subscription).
+  const reconnect = useCallback(() => stream.current?.wake(), []);
+
+  // Refresh reloads the list and, while the stream is down, skips the
+  // reconnect wait. An open stream is already current.
+  const isStreamLive = link.connection === "live";
+  const refresh = useCallback(() => {
+    if (!isStreamLive) stream.current?.wake();
+    return loadAgents();
+  }, [isStreamLive, loadAgents]);
+
+  const status = inventoryStatus({ hasData, connection: link.connection, since: link.since, now: clock });
   return {
     agents: enabled ? agents : [],
-    isLive: enabled && isLive,
-    isRefreshing,
+    hasData: enabled && hasData,
+    status: enabled ? status : "loading",
+    connection: link.connection,
     lastUpdated,
+    error: enabled ? error : null,
+    isRefreshing,
     loadAgents,
+    refresh,
+    reconnect,
     reset,
   };
 }

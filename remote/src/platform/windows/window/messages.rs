@@ -231,6 +231,28 @@ pub(super) unsafe extern "system" fn video_proc(
 }
 
 /// Light text on the dark toolbar and settings backgrounds.
+/// The reconnect panel: an owned popup, so it shows over the swap chain,
+/// that hosts the reconnect text and "Retry now" as children. A button that
+/// is itself a popup reports its clicks to the desktop rather than to its
+/// owner, so the panel passes its children's notifications to the owner.
+pub(super) unsafe extern "system" fn reconnect_panel_proc(
+    panel: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_COMMAND => {
+            if let Ok(owner) = unsafe { GetWindow(panel, GW_OWNER) } {
+                return unsafe { SendMessageW(owner, message, Some(wparam), Some(lparam)) };
+            }
+            LRESULT(0)
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => unsafe { dark_control_colors(wparam) },
+        _ => unsafe { DefWindowProcW(panel, message, wparam, lparam) },
+    }
+}
+
 pub(super) unsafe fn dark_control_colors(wparam: WPARAM) -> LRESULT {
     unsafe {
         SetTextColor(

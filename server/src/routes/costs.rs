@@ -451,7 +451,7 @@ fn price_cloudflare(
         ledger.add(owner, Item::AnalyticsEngine, row.data_points);
         ledger.add(owner, Item::WorkersLogs, row.invocations);
         let script = match row.source.as_str() {
-            "api" => API_SCRIPT,
+            "api" | "scheduled" => API_SCRIPT,
             "dashboard" => DASHBOARD_SCRIPT,
             _ => continue,
         };

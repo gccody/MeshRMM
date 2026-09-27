@@ -17,9 +17,10 @@ const CREDENTIAL_BUTTON_ID: usize = 4020;
 const MINIMIZE_BUTTON_ID: usize = 4005;
 const MAXIMIZE_BUTTON_ID: usize = 4006;
 const CLOSE_BUTTON_ID: usize = 4007;
+const RETRY_BUTTON_ID: usize = 4030;
 
 impl WindowContext {
-    pub(super) fn toolbar_controls(&self) -> [HWND; 18] {
+    pub(super) fn toolbar_controls(&self) -> [HWND; 20] {
         let controls = self.controls();
         [
             controls.user_combo,
@@ -40,10 +41,18 @@ impl WindowContext {
             controls.maximize_button,
             controls.close_button,
             controls.debug_overlay,
+            controls.reconnecting_label,
+            controls.retry_button,
         ]
     }
 
     pub(super) fn set_quality(&self, preset: QualityPreset) {
+        self.show_quality(preset);
+        self.send(SessionMessage::SetQuality { preset });
+    }
+
+    /// Selects `preset` in the toolbar and settings without sending it.
+    pub(super) fn show_quality(&self, preset: QualityPreset) {
         let controls = self.controls();
         let selected = quality_index(preset);
         unsafe {
@@ -58,15 +67,13 @@ impl WindowContext {
             let state = usize::from(candidate == preset);
             unsafe { SendMessageW(button, BM_SETCHECK, Some(WPARAM(state)), None) };
         }
-        self.send(SessionMessage::SetQuality { preset });
     }
 
     pub(super) fn set_chroma(&self, mode: ChromaMode) {
-        let controls = self.controls();
         if !self.control.supports_chroma(mode) {
             unsafe {
                 SendMessageW(
-                    controls.chroma_combo,
+                    self.controls().chroma_combo,
                     CB_SETCURSEL,
                     Some(WPARAM(chroma_index(self.control.chroma_mode()))),
                     None,
@@ -74,6 +81,13 @@ impl WindowContext {
             };
             return;
         }
+        self.show_chroma(mode);
+        self.send(SessionMessage::SetChroma { mode });
+    }
+
+    /// Selects `mode` in the toolbar and settings without sending it.
+    pub(super) fn show_chroma(&self, mode: ChromaMode) {
+        let controls = self.controls();
         let selected = chroma_index(mode);
         unsafe {
             SendMessageW(
@@ -87,7 +101,74 @@ impl WindowContext {
             let state = usize::from(candidate == mode);
             unsafe { SendMessageW(button, BM_SETCHECK, Some(WPARAM(state)), None) };
         }
-        self.send(SessionMessage::SetChroma { mode });
+    }
+
+    /// Fills the user and display selectors from the display list.
+    pub(super) fn populate_session_controls(&self) {
+        let controls = self.controls();
+        let active = self.active_display();
+        let sessions = Display::sessions(&self.displays());
+        unsafe { SendMessageW(controls.user_combo, CB_RESETCONTENT, None, None) };
+        for session in &sessions {
+            let title = HSTRING::from(session.label());
+            unsafe {
+                SendMessageW(
+                    controls.user_combo,
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(title.as_ptr() as isize)),
+                );
+            }
+        }
+        let active_session = sessions
+            .iter()
+            .position(|s| *s == active.session)
+            .unwrap_or(0);
+        unsafe {
+            SendMessageW(
+                controls.user_combo,
+                CB_SETCURSEL,
+                Some(WPARAM(active_session)),
+                None,
+            );
+        }
+        let displays = self.displays();
+        let active_index = active
+            .session_displays(&displays)
+            .iter()
+            .position(|d| d.id == active.id)
+            .unwrap_or(0);
+        self.populate_display_combo(active_index);
+    }
+
+    /// Lists the active session's displays, marks the one the device's
+    /// pointer is on, and selects `selected`.
+    fn populate_display_combo(&self, selected: usize) {
+        let combo = self.controls().display_combo;
+        let displays = self.displays();
+        let visible = self.active_display().session_displays(&displays);
+        let pointer_display = self.agent_pointer_display.get();
+        unsafe { SendMessageW(combo, CB_RESETCONTENT, None, None) };
+        for (index, display) in visible.iter().enumerate() {
+            let title = if pointer_display == Some(display.id) {
+                format!("➤ {}", display.selection_label(index))
+            } else {
+                display.selection_label(index)
+            };
+            let title = HSTRING::from(title);
+            unsafe {
+                SendMessageW(
+                    combo,
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(title.as_ptr() as isize)),
+                );
+            }
+        }
+        unsafe {
+            SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(selected)), None);
+            let _ = EnableWindow(combo, visible.len() > 1);
+        }
     }
 
     pub(super) fn layout_toolbar(&self, window: HWND) {
@@ -207,23 +288,43 @@ impl WindowContext {
         }
         let (width, height) = unsafe { client_size(window) }.unwrap_or_default();
         let video = self.video_rect_for(width, height);
-        let (label_width, label_height) = (self.px(360), self.px(48));
+        let (panel_width, panel_height) = (self.px(440), self.px(104));
         let mut center = windows::Win32::Foundation::POINT {
-            x: video.left + (video.width - label_width) / 2,
-            y: video.top + (video.height - label_height) / 2,
+            x: video.left + (video.width - panel_width) / 2,
+            y: video.top + (video.height - panel_height) / 2,
         };
         if unsafe { ClientToScreen(window, &mut center) }.as_bool() {
             let _ = unsafe {
                 SetWindowPos(
-                    controls.reconnecting_label,
+                    controls.reconnect_panel,
                     None,
                     center.x,
                     center.y,
-                    label_width,
-                    label_height,
+                    panel_width,
+                    panel_height,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 )
             };
+            // Two lines of text above the button, in panel coordinates.
+            let place = |control: HWND, x: i32, y: i32, width: i32, height: i32| {
+                let _ = unsafe { MoveWindow(control, x, y, width, height, true) };
+            };
+            let margin = self.px(12);
+            place(
+                controls.reconnecting_label,
+                margin,
+                margin,
+                panel_width - 2 * margin,
+                self.px(40),
+            );
+            let (button_width, button_height) = (self.px(120), self.px(28));
+            place(
+                controls.retry_button,
+                (panel_width - button_width) / 2,
+                panel_height - button_height - self.px(14),
+                button_width,
+                button_height,
+            );
         }
         if let Some(chat) = self.chat_popup.get() {
             chat.layout();
@@ -231,11 +332,10 @@ impl WindowContext {
     }
 
     fn select_display(&self, index: usize) {
-        if let Some(display) = self
-            .active_display
-            .session_displays(&self.displays)
-            .get(index)
-            && display.id != self.active_display.id
+        let active = self.active_display();
+        let displays = self.displays();
+        if let Some(display) = active.session_displays(&displays).get(index)
+            && display.id != active.id
         {
             self.send(SessionMessage::SelectDisplay {
                 display_id: display.id,
@@ -244,14 +344,15 @@ impl WindowContext {
     }
 
     fn select_user(&self, index: usize) {
-        let sessions = Display::sessions(&self.displays);
+        let active = self.active_display();
+        let displays = self.displays();
+        let sessions = Display::sessions(&displays);
         if let Some(session) = sessions.get(index)
-            && *session != self.active_display.session
-            && let Some(display) = self
-                .displays
+            && *session != active.session
+            && let Some(display) = displays
                 .iter()
                 .find(|d| &d.session == session && d.primary)
-                .or_else(|| self.displays.iter().find(|d| &d.session == session))
+                .or_else(|| displays.iter().find(|d| &d.session == session))
         {
             self.send(SessionMessage::SelectDisplay {
                 display_id: display.id,
@@ -259,7 +360,7 @@ impl WindowContext {
         }
         let current = sessions
             .iter()
-            .position(|s| *s == self.active_display.session)
+            .position(|s| *s == active.session)
             .unwrap_or(0);
         unsafe {
             SendMessageW(
@@ -272,14 +373,13 @@ impl WindowContext {
     }
 
     pub(super) fn select_next_display(&self) {
-        let displays = self.active_display.session_displays(&self.displays);
+        let active = self.active_display();
+        let all_displays = self.displays();
+        let displays = active.session_displays(&all_displays);
         if displays.len() < 2 {
             return;
         }
-        let current = displays
-            .iter()
-            .position(|d| d.id == self.active_display.id)
-            .unwrap_or(0);
+        let current = displays.iter().position(|d| d.id == active.id).unwrap_or(0);
         self.send(SessionMessage::SelectDisplay {
             display_id: displays[(current + 1) % displays.len()].id,
         });
@@ -349,7 +449,7 @@ impl WindowContext {
         }
         if control_id == TYPE_CLIPBOARD_BUTTON_ID {
             self.release_input();
-            self.control.type_clipboard(self.active_display.id);
+            self.control.type_clipboard(self.active_display_id());
             let _ = unsafe { SetFocus(Some(window)) };
             return true;
         }
@@ -418,6 +518,14 @@ impl WindowContext {
             unsafe { SendMessageW(window, WM_CLOSE, None, None) };
             return true;
         }
+        // Forwarded by the reconnect panel.
+        if control_id == RETRY_BUTTON_ID && notification == BN_CLICKED as usize {
+            // Disabled until the session loop starts its next wait.
+            let _ = unsafe { EnableWindow(controls.retry_button, false) };
+            crate::reconnect::request_retry_now();
+            let _ = unsafe { SetFocus(Some(window)) };
+            return true;
+        }
         false
     }
 }
@@ -463,12 +571,27 @@ pub(super) unsafe fn create_toolbar(
         )
     }
     .context("debug overlay creation failed")?;
-    let reconnecting_label = unsafe {
+    let panel_class = w!("MeshRmmReconnectPanel");
+    let panel_window_class = WNDCLASSW {
+        lpfnWndProc: Some(messages::reconnect_panel_proc),
+        hInstance: instance,
+        lpszClassName: panel_class,
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }?,
+        hbrBackground: HBRUSH(unsafe { GetStockObject(BLACK_BRUSH) }.0),
+        ..Default::default()
+    };
+    if unsafe { RegisterClassW(&panel_window_class) } == 0 {
+        let error = windows::core::Error::from_thread();
+        if error.code() != windows::core::HRESULT::from_win32(ERROR_CLASS_ALREADY_EXISTS.0) {
+            return Err(error).context("reconnect panel class registration failed");
+        }
+    }
+    let reconnect_panel = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            w!("STATIC"),
-            w!("Reconnecting to the remote computer…"),
-            WINDOW_STYLE(WS_POPUP.0 | WS_BORDER.0 | STATIC_CENTER | STATIC_CENTER_VERTICALLY),
+            panel_class,
+            w!(""),
+            WS_POPUP | WS_BORDER | WS_CLIPCHILDREN,
             0,
             0,
             1,
@@ -479,7 +602,41 @@ pub(super) unsafe fn create_toolbar(
             None,
         )
     }
+    .context("reconnect panel creation failed")?;
+    let reconnecting_label = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!("Reconnecting to the remote computer…"),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | STATIC_CENTER),
+            0,
+            0,
+            1,
+            1,
+            Some(reconnect_panel),
+            None,
+            Some(instance),
+            None,
+        )
+    }
     .context("reconnecting label creation failed")?;
+    let retry_button = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("BUTTON"),
+            w!("Retry now"),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_DISABLED.0 | BS_PUSHBUTTON as u32),
+            0,
+            0,
+            1,
+            1,
+            Some(reconnect_panel),
+            Some(HMENU(RETRY_BUTTON_ID as *mut c_void)),
+            Some(instance),
+            None,
+        )
+    }
+    .context("retry button creation failed")?;
     let toolbar = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -535,50 +692,6 @@ pub(super) unsafe fn create_toolbar(
         )
     }
     .context("user dropdown creation failed")?;
-    let sessions = Display::sessions(&context.displays);
-    for session in &sessions {
-        let title = HSTRING::from(session.label());
-        unsafe {
-            SendMessageW(
-                user_combo,
-                CB_ADDSTRING,
-                None,
-                Some(LPARAM(title.as_ptr() as isize)),
-            );
-        }
-    }
-    let active_session = sessions
-        .iter()
-        .position(|s| *s == context.active_display.session)
-        .unwrap_or(0);
-    unsafe {
-        SendMessageW(user_combo, CB_SETCURSEL, Some(WPARAM(active_session)), None);
-    }
-    let visible = context.active_display.session_displays(&context.displays);
-    for (index, display) in visible.iter().enumerate() {
-        let title = HSTRING::from(display.selection_label(index));
-        unsafe {
-            SendMessageW(
-                display_combo,
-                CB_ADDSTRING,
-                None,
-                Some(LPARAM(title.as_ptr() as isize)),
-            );
-        }
-    }
-    let active_index = visible
-        .iter()
-        .position(|d| d.id == context.active_display.id)
-        .unwrap_or(0);
-    unsafe {
-        SendMessageW(
-            display_combo,
-            CB_SETCURSEL,
-            Some(WPARAM(active_index)),
-            None,
-        );
-        let _ = EnableWindow(display_combo, visible.len() > 1);
-    }
     let quality_combo = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -726,6 +839,7 @@ pub(super) unsafe fn create_toolbar(
     for control in [
         overlay,
         reconnecting_label,
+        retry_button,
         user_combo,
         display_combo,
         quality_combo,
@@ -748,7 +862,9 @@ pub(super) unsafe fn create_toolbar(
     }
     Ok(Controls {
         debug_overlay: overlay,
+        reconnect_panel,
         reconnecting_label,
+        retry_button,
         toolbar,
         user_combo,
         display_combo,
@@ -775,32 +891,10 @@ pub(in crate::platform::windows) unsafe fn set_agent_pointer_display(
     display_id: Option<meshrmm_protocol::DisplayId>,
 ) {
     if let Some(context) = unsafe { window_context(window) } {
-        unsafe {
-            let combo = GetDlgItem(Some(window), DISPLAY_COMBO_ID as i32);
-            if let Ok(combo) = combo {
-                let selected = SendMessageW(combo, CB_GETCURSEL, None, None);
-                SendMessageW(combo, CB_RESETCONTENT, None, None);
-                for (index, display) in context
-                    .active_display
-                    .session_displays(&context.displays)
-                    .iter()
-                    .enumerate()
-                {
-                    let title = if display_id == Some(display.id) {
-                        format!("➤ {}", display.selection_label(index))
-                    } else {
-                        display.selection_label(index)
-                    };
-                    let title = HSTRING::from(title);
-                    SendMessageW(
-                        combo,
-                        CB_ADDSTRING,
-                        None,
-                        Some(LPARAM(title.as_ptr() as isize)),
-                    );
-                }
-                SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(selected.0 as usize)), None);
-            }
-        }
+        context.agent_pointer_display.set(display_id);
+        // Keep a selection the user just made while its stream starts.
+        let selected =
+            unsafe { SendMessageW(context.controls().display_combo, CB_GETCURSEL, None, None) };
+        context.populate_display_combo(selected.0 as usize);
     }
 }

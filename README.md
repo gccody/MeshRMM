@@ -60,6 +60,11 @@ and are used by ICE only when a direct candidate pair cannot connect.
 - rustup. The first `cargo` command in the repository installs the toolchain
   pinned in `rust-toolchain.toml` (the MSVC host toolchain on Windows) with
   Clippy, rustfmt and the `wasm32-unknown-unknown` target.
+- CMake and a C compiler, which build the bundled libopus audio codec. On
+  Windows, the Visual Studio C++ build tools provide the compiler, and their
+  "C++ CMake tools for Windows" component provides CMake:
+  `scripts\use-cmake.ps1`, which the build scripts dot-source, finds it with
+  `vswhere` when `cmake` isn't on `PATH`.
 - A GPU/driver exposing Media Foundation hardware H.264 encode and decode
   transforms plus D3D11 NV12 video processing. Hardware H.265/HEVC and AYUV
   4:4:4 support are optional and negotiated only when available at both ends.

@@ -26,6 +26,7 @@ $logCopy = Join-Path $dist 'agent-after-local-install.log'
 if (-not $SkipBuild) {
     Push-Location $repositoryRoot
     try {
+        . (Join-Path $PSScriptRoot 'use-cmake.ps1')
         & cargo build --locked --release -p meshrmm-agent --target-dir (Join-Path $repositoryRoot 'target')
         if ($LASTEXITCODE -ne 0) { throw 'Agent build failed; installed service was not changed.' }
     } finally { Pop-Location }

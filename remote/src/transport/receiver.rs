@@ -9,7 +9,7 @@ use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use meshrmm_protocol::{
     CONTROL_CHANNEL_LABEL, ChromaMode, Codec, IceServer, SessionBootstrap, SessionMessage,
-    SessionState, SignalMessage, VideoProfile,
+    SessionState, SignalErrorCode, SignalMessage, VideoProfile,
 };
 use meshrmm_session_transport::{SERVICE_CHANNELS, ServiceChannel};
 use tokio::sync::mpsc;
@@ -24,6 +24,7 @@ use webrtc::peer_connection::{
 use webrtc::stats::StatsReportType;
 
 use super::control::{ViewerControlQueue, flush_pointer_motion, install_control_handler};
+use super::failure::{FailureKind, SessionFailure};
 use super::services::{ServiceInbox, start_viewer_services};
 use super::video::install_video_handler;
 use super::{ActivePresenter, ReceiverLifecycle, ViewerResumeState};
@@ -58,7 +59,11 @@ pub async fn run_receiver(
     )?;
     let debug = DebugInfo::new(bootstrap.session_id.as_str());
     let url = session_signal_url(&config.server, bootstrap.session_id.as_str())?;
-    let socket = authenticated_websocket(url, &bootstrap.signaling_token).await?;
+    // Connecting can take a while on a bad network; Cancel must not wait for it.
+    let socket = tokio::select! {
+        socket = authenticated_websocket(url, &bootstrap.signaling_token) => socket?,
+        () = crate::shutdown::wait() => return Ok(()),
+    };
     let (mut signal_writer, mut signal_reader) = socket.split();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<SignalMessage>();
     let (state_tx, mut state_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
@@ -79,6 +84,8 @@ pub async fn run_receiver(
     let lifecycle = ReceiverLifecycle {
         presentation_failure: presentation_failure_tx,
         shutting_down: Arc::new(AtomicBool::new(false)),
+        progress: Arc::clone(&resume_state.progress),
+        reconnect_status: Arc::clone(&resume_state.reconnect_status),
     };
     let (remote_text_tx, _services) = start_viewer_services(
         viewer_control.clone(),
@@ -117,6 +124,10 @@ pub async fn run_receiver(
     let mut remote_description_set = false;
     let mut pending_candidates = Vec::new();
     let mut disconnected_since = None::<tokio::time::Instant>;
+    // Whether WebRTC connected in this attempt, and whether the Agent
+    // answered at all, tell a blocked network path from a silent Agent.
+    let mut peer_connected = false;
+    let mut offer_received = false;
     let mut last_signal_message = tokio::time::Instant::now();
     // Pointer pacing must not depend on the receiver loop being available: a
     // control-channel send can await long enough for a short movement burst to
@@ -137,7 +148,7 @@ pub async fn run_receiver(
             }
             incoming = signal_reader.next() => {
                 let Some(incoming) = incoming else {
-                    break Err(anyhow::anyhow!("signaling connection closed"));
+                    break Err(SessionFailure::new(FailureKind::SignalingLost, "signaling connection closed").into());
                 };
                 last_signal_message = tokio::time::Instant::now();
                 match incoming? {
@@ -145,6 +156,7 @@ pub async fn run_receiver(
                         let signal: SignalMessage = serde_json::from_str(text.as_str())?;
                         match signal {
                             SignalMessage::Offer { sdp } => {
+                                offer_received = true;
                                 launch_status::report(LaunchStatus::EstablishingConnection);
                                 debug.set_peer_fingerprint(identity.verify_sdp(&sdp)?);
                                 peer.set_remote_description(RTCSessionDescription::offer(sdp)?).await?;
@@ -168,13 +180,15 @@ pub async fn run_receiver(
                                 }
                             }
                             SignalMessage::PeerLeft => {
-                                break Err(anyhow::anyhow!("Agent disconnected from the remote session"));
+                                break Err(SessionFailure::new(FailureKind::AgentLeft, "Agent disconnected from the remote session").into());
                             }
-                            SignalMessage::Error { message } => {
-                                if message.starts_with("Peer identity verification failed:") {
+                            SignalMessage::Error { message, code } => {
+                                if code == Some(SignalErrorCode::IdentityMismatch)
+                                    || message.starts_with("Peer identity verification failed:")
+                                {
                                     break Err(meshrmm_session_transport::identity::IdentityError(message).into());
                                 }
-                                break Err(anyhow::anyhow!(message));
+                                break Err(SessionFailure::new(FailureKind::AgentReported(code), message).into());
                             }
                             _ => {}
                         }
@@ -188,10 +202,13 @@ pub async fn run_receiver(
             }
             _ = heartbeat_interval.tick() => {
                 if last_signal_message.elapsed() >= SIGNAL_LIVENESS_TIMEOUT {
-                    break Err(anyhow::anyhow!(
-                        "signaling server did not respond for {} seconds",
-                        SIGNAL_LIVENESS_TIMEOUT.as_secs()
-                    ));
+                    break Err(SessionFailure::new(
+                        FailureKind::SignalingLost,
+                        format!(
+                            "signaling server did not respond for {} seconds",
+                            SIGNAL_LIVENESS_TIMEOUT.as_secs()
+                        ),
+                    ).into());
                 }
                 signal_writer.send(Message::Ping(Default::default())).await
                     .context("failed to send signaling heartbeat")?;
@@ -207,33 +224,45 @@ pub async fn run_receiver(
                     launch_status::report(LaunchStatus::StartingDisplay);
                 }
                 if state == RTCPeerConnectionState::Connected {
+                    peer_connected = true;
                     disconnected_since = None;
                 } else if state == RTCPeerConnectionState::Disconnected {
                     disconnected_since.get_or_insert_with(tokio::time::Instant::now);
                 }
                 if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
-                    break Err(anyhow::anyhow!("WebRTC connection ended in state {state:?}"));
+                    break Err(SessionFailure::new(
+                        peer_failure_kind(peer_connected),
+                        format!("WebRTC connection ended in state {state:?}"),
+                    ).into());
                 }
             }
             Some(error) = presentation_failure_rx.recv() => {
                 tracing::error!(%error, "viewer presentation path reported a terminal failure");
-                break Err(anyhow::anyhow!(error));
+                break Err(SessionFailure::new(FailureKind::PresentationFailed, error).into());
             }
             _ = stats_interval.tick() => {
                 if disconnected_since.is_some_and(|since| since.elapsed() >= DISCONNECTED_GRACE_PERIOD) {
-                    break Err(anyhow::anyhow!(
-                        "WebRTC remained disconnected for {} seconds",
-                        DISCONNECTED_GRACE_PERIOD.as_secs()
-                    ));
+                    break Err(SessionFailure::new(
+                        peer_failure_kind(peer_connected),
+                        format!(
+                            "WebRTC remained disconnected for {} seconds",
+                            DISCONNECTED_GRACE_PERIOD.as_secs()
+                        ),
+                    ).into());
                 }
-                let presenter_missing = presenter.lock().is_ok_and(|guard| guard.is_none());
+                let presenter_missing = presenter.lock().is_ok_and(|guard| {
+                    let presented = guard.as_ref().and_then(|active| active.presenter.first_presented_at());
+                    lifecycle.observe_presentation(presented);
+                    presented.is_none()
+                });
                 if presenter_missing {
                     let waiting_since = presenter_missing_since
                         .get_or_insert_with(tokio::time::Instant::now);
                     if waiting_since.elapsed() >= std::time::Duration::from_secs(30) {
-                        break Err(anyhow::anyhow!(
-                            "timed out waiting 30 seconds for the remote video stream; check the Agent's WebRTC and ICE logs"
-                        ));
+                        break Err(SessionFailure::new(
+                            video_timeout_kind(offer_received, peer_connected),
+                            "timed out waiting 30 seconds for the remote video stream; check the Agent's WebRTC and ICE logs",
+                        ).into());
                     }
                 } else {
                     presenter_missing_since = None;
@@ -271,7 +300,11 @@ pub async fn run_receiver(
                             }
                             presenter_missing_since = Some(tokio::time::Instant::now());
                         }
-                        (_, ended) => break ended.map_err(anyhow::Error::msg),
+                        (_, ended) => {
+                            break ended.map_err(|reason| {
+                                SessionFailure::new(FailureKind::PresentationFailed, reason).into()
+                            });
+                        }
                     }
                 }
             },
@@ -281,6 +314,14 @@ pub async fn run_receiver(
         }
     }
     .await;
+    // A frame can finish between the last health poll and a transport failure.
+    if let Ok(guard) = presenter.lock() {
+        lifecycle.observe_presentation(
+            guard
+                .as_ref()
+                .and_then(|active| active.presenter.first_presented_at()),
+        );
+    }
     lifecycle.shutting_down.store(true, Ordering::Release);
     pointer_flusher.abort();
     let _ = pointer_flusher.await;
@@ -308,11 +349,10 @@ pub async fn run_receiver(
         session_state = session_state.transition(SessionState::Closing)?;
     }
     if let Some(mut active) = presenter.lock().ok().and_then(|mut guard| guard.take()) {
-        if result.is_ok() {
-            active.presenter.stop();
-        } else {
+        match &result {
+            Ok(()) => active.presenter.stop(),
             // The session may resume; keep its window up until then.
-            resume_state.keep_while_reconnecting(active);
+            Err(error) => resume_state.keep_while_reconnecting(active, error),
         }
     }
     viewer_control.chat.set_available(false);
@@ -331,6 +371,26 @@ pub async fn run_receiver(
         }
     }
     result
+}
+
+/// A WebRTC failure is a lost connection only if it ever connected; otherwise
+/// no network path opened.
+fn peer_failure_kind(peer_connected: bool) -> FailureKind {
+    if peer_connected {
+        FailureKind::PeerConnectionLost
+    } else {
+        FailureKind::PeerNeverConnected
+    }
+}
+
+/// No video arrived in time. If the Agent answered but WebRTC never
+/// connected, the network path is at fault rather than the Agent's capture.
+fn video_timeout_kind(offer_received: bool, peer_connected: bool) -> FailureKind {
+    if offer_received && !peer_connected {
+        FailureKind::PeerNeverConnected
+    } else {
+        FailureKind::VideoTimeout
+    }
 }
 
 /// Refreshes the diagnostics overlay, and logs the statistics when `log` is set.
@@ -513,6 +573,12 @@ fn install_data_channel_handler(
                 meshrmm_audio::CHANNEL => {
                     channel.on_message(Box::new(move |message| {
                         audio.receive(&message.data);
+                        Box::pin(async {})
+                    }));
+                }
+                meshrmm_audio::OPUS_CHANNEL => {
+                    channel.on_message(Box::new(move |message| {
+                        audio.receive_opus(&message.data);
                         Box::pin(async {})
                     }));
                 }

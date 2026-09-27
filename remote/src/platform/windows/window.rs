@@ -19,6 +19,7 @@ use super::keyboard_hook;
 use super::*;
 use crate::input::HeldInput;
 use crate::shortcuts::{ShortcutKey, ViewerShortcut};
+use crate::stream_reset::ResetPlan;
 use crate::video_layout::{self, VideoRect};
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CreateFontIndirectW, DeleteObject, GetMonitorInfoW, HFONT, HGDIOBJ,
@@ -39,9 +40,8 @@ pub(super) use toolbar::set_agent_pointer_display;
 /// codec or connection takes its place instead of jumping to a new one.
 static LAST_PLACEMENT: std::sync::Mutex<Option<WINDOWPLACEMENT>> = std::sync::Mutex::new(None);
 
-/// SS_CENTER and SS_CENTERIMAGE, which live in an otherwise unused Windows feature.
+/// SS_CENTER, which lives in an otherwise unused Windows feature.
 pub(super) const STATIC_CENTER: u32 = 0x0001;
-const STATIC_CENTER_VERTICALLY: u32 = 0x0200;
 
 /// The minimum outer window size, in 96-DPI pixels, that fits the toolbar.
 const MINIMUM_WINDOW_WIDTH: i32 = 1176;
@@ -65,8 +65,13 @@ struct Controls {
     video_window: HWND,
     /// Owned popup: a child window over the video would be hidden by it.
     debug_overlay: HWND,
-    /// Owned popup shown while the connection is being restored.
+    /// Owned popup shown while the connection is being restored. It holds
+    /// the two children below and forwards their notifications here.
+    reconnect_panel: HWND,
+    /// Why, for how long, and when the next attempt starts.
     reconnecting_label: HWND,
+    /// "Retry now", which ends the wait before the next attempt.
+    retry_button: HWND,
     toolbar: HWND,
     user_combo: HWND,
     display_combo: HWND,
@@ -93,7 +98,9 @@ impl Default for Controls {
         Self {
             video_window: HWND::default(),
             debug_overlay: HWND::default(),
+            reconnect_panel: HWND::default(),
             reconnecting_label: HWND::default(),
+            retry_button: HWND::default(),
             toolbar: HWND::default(),
             user_combo: HWND::default(),
             display_combo: HWND::default(),
@@ -126,10 +133,15 @@ impl Default for Controls {
 }
 
 struct WindowContext {
-    video_width: u32,
-    video_height: u32,
-    active_display: Display,
-    displays: Vec<Display>,
+    // The stream fields change when the device replaces the stream; see
+    // `reset_stream`. Read them through the cloning accessors.
+    video_width: Cell<u32>,
+    video_height: Cell<u32>,
+    active_display: RefCell<Display>,
+    displays: RefCell<Vec<Display>>,
+    /// The display the device's pointer is on, marked in the display list.
+    agent_pointer_display: Cell<Option<meshrmm_protocol::DisplayId>>,
+    reconnecting: Cell<bool>,
     control: ControlSink,
     debug: DebugInfo,
     dpi: Cell<u32>,
@@ -166,6 +178,18 @@ impl WindowContext {
         self.controls.get()
     }
 
+    fn active_display(&self) -> Display {
+        self.active_display.borrow().clone()
+    }
+
+    fn active_display_id(&self) -> meshrmm_protocol::DisplayId {
+        self.active_display.borrow().id
+    }
+
+    fn displays(&self) -> Vec<Display> {
+        self.displays.borrow().clone()
+    }
+
     /// Converts 96-DPI layout pixels to this window's physical pixels.
     fn px(&self, value: i32) -> i32 {
         scale(value, self.dpi.get())
@@ -182,8 +206,8 @@ impl WindowContext {
                 width,
                 height: height.saturating_sub(toolbar),
             },
-            self.video_width,
-            self.video_height,
+            self.video_width.get(),
+            self.video_height.get(),
         )
     }
 
@@ -222,19 +246,69 @@ impl WindowContext {
         self.resize_pending.set(true);
     }
 
-    fn set_reconnecting(&self, window: HWND, reconnecting: bool) {
+    /// Shows the reconnect overlay with `text`, or hides it (`None`).
+    fn set_reconnect_text(&self, window: HWND, text: Option<&ReconnectText>) {
+        let controls = self.controls();
+        if let Some(text) = text {
+            let label = HSTRING::from(format!("{}\r\n{}", text.title, text.detail));
+            let _ = unsafe { SetWindowTextW(controls.reconnecting_label, PCWSTR(label.as_ptr())) };
+            let _ = unsafe { EnableWindow(controls.retry_button, text.retry_enabled) };
+        }
+        let reconnecting = text.is_some();
+        if self.reconnecting.replace(reconnecting) == reconnecting {
+            return;
+        }
         let command = if reconnecting {
             SW_SHOWNOACTIVATE
         } else {
             SW_HIDE
         };
-        let _ = unsafe { ShowWindow(self.controls().reconnecting_label, command) };
-        let title = if reconnecting {
+        let _ = unsafe { ShowWindow(controls.reconnect_panel, command) };
+        self.show_title(window);
+    }
+
+    /// Shows the title, marked while the connection is being restored.
+    fn show_title(&self, window: HWND) {
+        let title = if self.reconnecting.get() {
             HSTRING::from(format!("{} — Reconnecting…", self.title.borrow()))
         } else {
             self.title.borrow().clone()
         };
         let _ = unsafe { SetWindowTextW(window, PCWSTR(title.as_ptr())) };
+    }
+
+    /// Moves the window to a replacement stream. The window, its placement,
+    /// DPI, settings, chat popup, diagnostics overlay and keyboard hook stay
+    /// as they are; the pointer mapping, title and selectors follow the new
+    /// display. The renderer places the video afterwards.
+    fn reset_stream(
+        &self,
+        window: HWND,
+        plan: &ResetPlan,
+        format: VideoFormat,
+        display: Display,
+        displays: Vec<Display>,
+    ) {
+        if plan.display_changed {
+            // Key-ups and button-ups name the display they were pressed on.
+            self.release_input();
+            // A drag on the old display has ended with its button-up.
+            if unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() } == window {
+                let _ = unsafe { ReleaseCapture() };
+            }
+        }
+        self.video_width.set(format.width);
+        self.video_height.set(format.height);
+        self.title.replace(window_title(&display));
+        self.active_display.replace(display);
+        self.displays.replace(displays);
+        self.show_title(window);
+        self.populate_session_controls();
+        // Only the controls: sending the choices again would make the device
+        // echo its configuration and reset the stream again.
+        self.show_quality(self.control.quality_preset());
+        self.show_chroma(self.control.chroma_mode());
+        self.place_popups(window);
     }
 
     fn toggle_debug(&self) {
@@ -436,6 +510,25 @@ unsafe fn place_initial_window(window: HWND, style: WINDOW_STYLE, format: VideoF
     };
 }
 
+/// The display the window's input goes to.
+pub(super) unsafe fn active_display_id(window: HWND) -> Option<meshrmm_protocol::DisplayId> {
+    let context = unsafe { window_context(window) }?;
+    Some(context.active_display_id())
+}
+
+/// Moves the window to a replacement stream; see [`WindowContext::reset_stream`].
+pub(super) unsafe fn reset_stream(
+    window: HWND,
+    plan: &ResetPlan,
+    format: VideoFormat,
+    display: Display,
+    displays: Vec<Display>,
+) {
+    if let Some(context) = unsafe { window_context(window) } {
+        context.reset_stream(window, plan, format, display, displays);
+    }
+}
+
 /// The window that hosts the swap chain.
 pub(super) unsafe fn video_window(window: HWND) -> Option<HWND> {
     let context = unsafe { window_context(window) }?;
@@ -520,10 +613,12 @@ pub(super) unsafe fn create_window(
         .unwrap_or_else(|error| error.into_inner());
     let title = window_title(&active_display);
     let context = Rc::new(WindowContext {
-        video_width: format.width,
-        video_height: format.height,
-        active_display,
-        displays,
+        video_width: Cell::new(format.width),
+        video_height: Cell::new(format.height),
+        active_display: RefCell::new(active_display),
+        displays: RefCell::new(displays),
+        agent_pointer_display: Cell::new(None),
+        reconnecting: Cell::new(false),
         control,
         debug,
         dpi: Cell::new(96),
@@ -628,6 +723,7 @@ pub(super) unsafe fn create_window(
     controls.quality_buttons = settings.quality_buttons;
     controls.chroma_buttons = settings.chroma_buttons;
     context.controls.set(controls);
+    context.populate_session_controls();
     context.settings_dpi.set(settings_dpi);
     context.settings_font.set(settings_font);
     let chat_popup = unsafe {
@@ -673,9 +769,9 @@ unsafe fn remember_placement(window: HWND) {
     }
 }
 
-pub(super) unsafe fn set_reconnecting(window: HWND, reconnecting: bool) {
+pub(super) unsafe fn set_reconnect_text(window: HWND, text: Option<&ReconnectText>) {
     if let Some(context) = unsafe { window_context(window) } {
-        context.set_reconnecting(window, reconnecting);
+        context.set_reconnect_text(window, text);
     }
 }
 
@@ -757,4 +853,90 @@ pub(super) unsafe fn pump_window_messages(window: HWND) -> bool {
         unsafe { DispatchMessageW(&message) };
     }
     false
+}
+
+/// What the reset probe reads back from a live window.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProbeState {
+    pub(super) title: String,
+    pub(super) video_size: (u32, u32),
+    pub(super) active_display: meshrmm_protocol::DisplayId,
+    pub(super) users: Vec<String>,
+    pub(super) selected_user: isize,
+    pub(super) displays: Vec<String>,
+    pub(super) selected_display: isize,
+    pub(super) display_combo_enabled: bool,
+    pub(super) quality: isize,
+    pub(super) chroma: isize,
+    pub(super) toolbar_height: i32,
+    /// The letterboxed video in the window's client coordinates.
+    pub(super) video: Option<VideoRect>,
+}
+
+#[cfg(test)]
+pub(super) unsafe fn probe_state(window: HWND) -> Option<ProbeState> {
+    let context = unsafe { window_context(window) }?;
+    let controls = context.controls();
+    let title = unsafe {
+        let mut text = vec![0_u16; GetWindowTextLengthW(window).max(0) as usize + 1];
+        let length = GetWindowTextW(window, &mut text).max(0) as usize;
+        String::from_utf16_lossy(&text[..length])
+    };
+    let items = |combo: HWND| -> Vec<String> {
+        let count = unsafe { SendMessageW(combo, CB_GETCOUNT, None, None) }.0;
+        (0..count.max(0) as usize)
+            .map(|index| unsafe {
+                let length = SendMessageW(combo, CB_GETLBTEXTLEN, Some(WPARAM(index)), None).0;
+                let mut text = vec![0_u16; length.max(0) as usize + 1];
+                let copied = SendMessageW(
+                    combo,
+                    CB_GETLBTEXT,
+                    Some(WPARAM(index)),
+                    Some(LPARAM(text.as_mut_ptr() as isize)),
+                )
+                .0;
+                String::from_utf16_lossy(&text[..copied.max(0) as usize])
+            })
+            .collect()
+    };
+    let selected = |combo: HWND| unsafe { SendMessageW(combo, CB_GETCURSEL, None, None) }.0;
+    Some(ProbeState {
+        title,
+        video_size: (context.video_width.get(), context.video_height.get()),
+        active_display: context.active_display_id(),
+        users: items(controls.user_combo),
+        selected_user: selected(controls.user_combo),
+        displays: items(controls.display_combo),
+        selected_display: selected(controls.display_combo),
+        display_combo_enabled: unsafe {
+            windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(controls.display_combo)
+        }
+        .as_bool(),
+        quality: selected(controls.quality_combo),
+        chroma: selected(controls.chroma_combo),
+        toolbar_height: toolbar_height(context.dpi.get()),
+        video: context.video_rect(window),
+    })
+}
+
+/// The reconnect panel, its label and its "Retry now" button, for the
+/// reconnect probe.
+#[cfg(test)]
+pub(super) unsafe fn probe_reconnect_panel(window: HWND) -> Option<(HWND, HWND, HWND)> {
+    let controls = unsafe { window_context(window) }?.controls();
+    Some((
+        controls.reconnect_panel,
+        controls.reconnecting_label,
+        controls.retry_button,
+    ))
+}
+
+#[cfg(test)]
+pub(super) unsafe fn probe_toggle_chat(window: HWND) {
+    if let Some(context) = unsafe { window_context(window) }
+        && let Some(chat) = context.chat_popup.get()
+    {
+        chat.toggle();
+    }
 }

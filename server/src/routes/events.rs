@@ -12,20 +12,13 @@ pub(crate) async fn create_agent_event_subscription(
     request: &Request,
     environment: &Env,
 ) -> Result<Response> {
-    let identity = match authorize_workos_user(request, environment).await {
-        Ok(identity) => identity,
+    let (identity, company) = match authorize_workos_company(request, environment).await {
+        Ok(authorized) => authorized,
         Err(error) => return workos_auth_error(error),
     };
+    // Expired subscriptions are purged by the scheduled maintenance task.
     let db = environment.d1("DB")?;
-    ensure_company_exists(&db, &identity.company_id).await?;
     let now = now_ms_i64()?;
-    query!(
-        &db,
-        "DELETE FROM agent_event_subscriptions WHERE expires_at <= ?1",
-        now
-    )?
-    .metered_run()
-    .await?;
     let subscription_token = random_token();
     let token_hash = sha256_hex(&subscription_token);
     let expires_at = Date::now().as_millis() + AGENT_EVENT_SUBSCRIPTION_TTL_MS;
@@ -42,7 +35,7 @@ pub(crate) async fn create_agent_event_subscription(
     )?
     .metered_run()
     .await?;
-    let company_url = canonical_company_url(&db, environment, &identity.company_id).await?;
+    let company_url = company_url(environment, company.slug.as_deref())?;
     Response::from_json(&AgentEventSubscription {
         subscription_token,
         websocket_url: agent_event_websocket_url(&company_url)?,
@@ -73,28 +66,35 @@ pub(crate) async fn subscribe_agent_events(
     if supplied.len() != 64 || !supplied.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return api_error(401, "Agent event subscription is invalid or expired");
     }
+    // The legacy API hostname accepts a subscription for any company; a
+    // company hostname names its company by slug. The legacy hostname is
+    // checked first because it also has the form of a company hostname.
+    let hostname = request_hostname(&request)?;
+    let root_domain = tenant_root_domain(environment)?;
+    let tenant_slug = if is_legacy_control_plane_request(&request, environment)? {
+        ""
+    } else if let Some(slug) = tenant_slug_from_hostname(&hostname, &root_domain) {
+        slug
+    } else {
+        return api_error(403, "subscription does not match company hostname");
+    };
     let now = now_ms_i64()?;
     let token_hash = sha256_hex(&supplied);
     let db = environment.d1("DB")?;
+    // The hostname is checked in the claim itself, so a token presented to
+    // another company's hostname is rejected without being used up.
     let subscription = query!(
         &db,
-        "UPDATE agent_event_subscriptions SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = agent_event_subscriptions.company_id AND companies.status IN ('active', 'awaiting_admin')) RETURNING company_id, user_id",
+        "UPDATE agent_event_subscriptions SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = agent_event_subscriptions.company_id AND companies.status IN ('active', 'awaiting_admin') AND (?3 = '' OR companies.slug = ?3 COLLATE NOCASE)) RETURNING company_id, user_id",
         now,
-        token_hash
+        token_hash,
+        tenant_slug
     )?
     .metered_first::<AgentEventSubscriptionRow>(None)
     .await?;
     let Some(subscription) = subscription else {
         return api_error(401, "Agent event subscription is invalid or expired");
     };
-    let tenant = request_tenant_company(&db, &request, environment).await?;
-    if tenant
-        .as_ref()
-        .is_some_and(|tenant| tenant.id != subscription.company_id)
-        || (tenant.is_none() && !is_legacy_control_plane_request(&request, environment)?)
-    {
-        return api_error(403, "subscription does not match company hostname");
-    }
     crate::usage::attribute_company(&subscription.company_id);
     let protocol = if request
         .url()?

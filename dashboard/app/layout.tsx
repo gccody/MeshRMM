@@ -1,25 +1,15 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
-import { headers } from "next/headers";
 import "./globals.css";
 import Providers from "./providers";
-import { classifyHost } from "../lib/hosts";
+import { requestHost } from "../lib/request-surface";
 
 const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
 const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
 
-// The local dev server serves localhost and *.localhost over plain HTTP.
-function defaultProtocol(hostname: string) {
-  return hostname === "localhost" || hostname.endsWith(".localhost") ? "http" : "https";
-}
-
 export async function generateMetadata(): Promise<Metadata> {
-  const incoming = await headers();
-  const host = incoming.get("host") ?? incoming.get("x-forwarded-host") ?? "localhost:3000";
-  const hostname = host.split(":")[0].toLowerCase();
-  const protocol = incoming.get("x-forwarded-proto") ?? defaultProtocol(hostname);
-  const image = `${protocol}://${host}/og.png`;
-  const { surface } = classifyHost(hostname, process.env.MESHRMM_DEV_ROOT_DOMAIN);
+  const { origin, surface } = await requestHost();
+  const image = `${origin}/og.png`;
   const title = surface === "marketing"
     ? "MeshRMM | Secure remote monitoring"
     : surface === "platform"
@@ -37,13 +27,7 @@ export async function generateMetadata(): Promise<Metadata> {
 }
 
 export default async function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  const incoming = await headers();
-  const rawHost = incoming.get("host") ?? incoming.get("x-forwarded-host") ?? "localhost:3000";
-  const hostname = rawHost.split(":")[0].toLowerCase();
-  const protocol = incoming.get("x-forwarded-proto") ?? defaultProtocol(hostname);
-  const origin = `${protocol}://${rawHost}`;
-  const host = classifyHost(hostname, process.env.MESHRMM_DEV_ROOT_DOMAIN);
-  const surface = host.surface === "marketing" || host.surface === "platform" ? host.surface : "tenant";
+  const { headers: incoming, hostname, origin, surface } = await requestHost();
   const serverUrl = process.env.MESHRMM_SERVER_URL || origin;
   return (
     <html lang="en">

@@ -1,5 +1,25 @@
-@import "@radix-ui/themes/styles.css";
-@import "@workos-inc/widgets/styles.css";
+/* The page baseline. These values match what the app-wide Radix root theme
+   used to apply, so pages look the same without its stylesheet. */
+.app-root {
+  position: relative;
+  z-index: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  overflow-wrap: break-word;
+  line-height: 1.5;
+  color: #211f26;
+  background: #fff;
+  text-size-adjust: none;
+  -webkit-text-size-adjust: none;
+  -moz-osx-font-smoothing: grayscale;
+}
+.app-root ::selection { background-color: #3600ff26; }
+@supports (color: color(display-p3 1 1 1)) {
+  @media (color-gamut: p3) {
+    .app-root { color: color(display-p3 0.128 0.122 0.147); }
+    .app-root ::selection { background-color: color(display-p3 0.165 0.008 1 / 0.15); }
+  }
+}
 :root {
   --ink: #172033;
   --muted: #647084;
@@ -573,3 +593,70 @@ button { color: inherit; }
   .settings-categories { gap: 8px; }
   .settings-categories [role=tab] { font-size: 12px; }
 }
+
+/* Inventory freshness and per-action errors (2.11) */
+.page-wrap > .error-banner { margin: 0 0 18px; }
+.inventory-strip { min-height: 53px; margin: 0 0 18px; padding: 10px 13px; display: flex; align-items: center; gap: 11px; border: 1px solid #f1dfc1; border-radius: 10px; color: #7a4a0e; background: #fffaf2; font-size: 13px; line-height: 1.5; }
+.inventory-strip > svg { flex: 0 0 auto; }
+.inventory-strip > span { flex: 1 1 220px; }
+.inventory-strip-detail { color: #6b5842; }
+.inventory-strip button { margin-left: auto; flex: 0 0 auto; min-height: 34px; padding: 6px 12px; font-size: 12px; }
+.status-dot.stale { background: #d98a22; box-shadow: 0 0 0 4px #fff4e4; }
+/* Stale rows are muted by color rather than opacity to keep text at AA contrast. */
+.agent-row.stale { background: #fafafb; }
+.agent-row.stale .device-cell strong { color: #4a5264; }
+.agent-row.stale .device-avatar { filter: grayscale(1); }
+.agent-row.stale .status-badge.online { color: #3f6353; background: #eef2f0; }
+.agent-row.stale .status-badge.online i { background: #7f978b; }
+/* "last known" goes on its own line in the narrow desktop status column. */
+.agent-row.stale .status-badge.online { flex-wrap: wrap; row-gap: 1px; border-radius: 10px; white-space: normal; }
+.status-badge-note { flex-basis: 100%; font-size: 11px; font-weight: 550; white-space: nowrap; }
+.status-badge-separator { display: none; }
+.settings-save { align-items: center; gap: 16px; }
+.settings-save-error { margin: 0; color: #ad4f3e; font-size: 13px; }
+.signed-out-card > p.session-paused-error { color: #ad4f3e; }
+@media (max-width: 650px) {
+  .inventory-strip { flex-wrap: wrap; }
+  .agent-row.stale .status-badge.online { flex-wrap: nowrap; border-radius: 20px; }
+  .status-badge-note { flex-basis: auto; font-size: inherit; font-weight: inherit; }
+  .status-badge-separator { display: inline; }
+}
+
+/* Remote viewer: launch notice and download card */
+.viewer-launch-notice { margin: 0 0 20px; padding: 12px 14px 12px 16px; display: flex; align-items: flex-start; gap: 10px; border: 1px solid #dfe3f0; border-radius: 10px; background: #fff; color: var(--ink); font-size: 13px; line-height: 1.55; }
+.viewer-launch-notice > svg { flex: 0 0 auto; margin-top: 2px; color: var(--purple); }
+.viewer-launch-notice.not-detected { border-color: #f0d49c; background: #fffaf0; color: #6b420a; }
+.viewer-launch-body { flex: 1; min-width: 0; }
+.viewer-launch-body p { margin: 0; }
+.viewer-launch-body strong { color: inherit; }
+.viewer-launch-actions { margin-top: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
+.viewer-launch-dismiss { flex: 0 0 auto; width: 28px; height: 28px; display: grid; place-items: center; border: 0; border-radius: 6px; background: none; color: #647084; cursor: pointer; }
+.viewer-launch-dismiss:hover { background: #f1f4f9; color: var(--ink); }
+.link-button { padding: 0; border: 0; background: none; color: #4338ca; cursor: pointer; font: inherit; font-weight: 650; text-decoration: underline; text-underline-offset: 3px; }
+.link-button:hover { color: #312e81; }
+.viewer-downloads { margin-top: 10px; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.viewer-downloads a { color: #4338ca; font-weight: 650; text-underline-offset: 3px; }
+.viewer-download-primary { display: inline-flex; align-items: center; gap: 7px; }
+.viewer-launch-notice .viewer-download-primary { min-height: 38px; padding: 8px 14px; border: 1px solid var(--purple-dark); border-radius: 8px; background: var(--purple); color: #fff !important; text-decoration: none; }
+.viewer-launch-notice .viewer-download-primary:hover { background: var(--purple-dark); }
+.viewer-download-setup, .viewer-download-list span { display: block; font-size: 12px; color: inherit; opacity: .85; }
+.viewer-download-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.viewer-download-other summary { width: fit-content; cursor: pointer; font-size: 12px; font-weight: 650; }
+.viewer-download-other[open] summary { margin-bottom: 6px; }
+.sidebar { overflow-y: auto; }
+.viewer-card { margin-top: auto; border-color: #2b374d; background: #1a263b; }
+.viewer-card + .profile-row { margin-top: 16px; }
+.viewer-card .support-icon { color: #c7d2fe; background: #33415b; box-shadow: none; }
+.viewer-card strong { display: block; color: #f1f5f9; font-size: 13px; }
+.viewer-card p { margin: 4px 0 0; color: #b0bbce; }
+.viewer-card .viewer-downloads a { color: #c7d2fe; font-size: 12px; }
+.viewer-card .viewer-download-primary { align-items: flex-start; }
+.viewer-card .viewer-download-primary svg { flex: 0 0 auto; margin-top: 1px; }
+.viewer-card .viewer-download-other summary { color: #b0bbce; }
+@media (max-height: 640px) {
+  .viewer-card .support-icon { display: none; }
+}
+
+/* WorkOS widgets (2.12) */
+.widget-loading p { margin: 0; display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 13px; }
+.widget-loading .secondary-button { margin-top: 12px; }
