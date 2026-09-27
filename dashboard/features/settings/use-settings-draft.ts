@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { isOpeningExternalLink } from "../session/viewer-launch";
 import type { Company } from "../workspace/types";
 import {
   type CompanySettingsDraft,
@@ -33,7 +34,10 @@ export function useSettingsDraft(company: Company | null | undefined) {
 
   useEffect(() => {
     if (!isDirty) return;
-    const warnBeforeUnload = (event: BeforeUnloadEvent) => event.preventDefault();
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      // Opening the remote viewer's link fires beforeunload but keeps the page.
+      if (!isOpeningExternalLink()) event.preventDefault();
+    };
     window.addEventListener("beforeunload", warnBeforeUnload);
     return () => window.removeEventListener("beforeunload", warnBeforeUnload);
   }, [isDirty]);

@@ -13,7 +13,7 @@ stand alone; read [Working rules](#working-rules), [Merge order](#merge-order), 
 
 | Task | Area | Wave | Depends on | Status | Commit(s) |
 | --- | --- | --- | --- | --- | --- |
-| 0.1 Viewer-missing detection + "Get the viewer" | Dashboard | 2 | 2.9 (soft) | Not started | |
+| 0.1 Viewer-missing detection + "Get the viewer" | Dashboard | 2 | 2.9 (soft) | Merged | `3c41686`, `225bdf8`, `d841747`, `7d9e932`, `473f4cf` |
 | 0.2 Startup failures: typed errors, retry cap, Cancel | Viewer, agent, protocol | 1 | — | Merged | `c424a4d`, `b63f8cd`, `41a1baa`, `32bc917` |
 | 2.9 Persistent workspace shell + filters in URL | Dashboard | 1 | — | Merged | `200591b`, `817785b` |
 | 2.10a Fewer D1 round trips + cron cleanup | Server | 1 | — | Merged | `9d5b338`, `3dde5f0`, `e962fef` |
@@ -176,7 +176,46 @@ Windows, Safari and Chrome on macOS (installed / not installed).
 **If starting before 2.9 merges:** keep logic in the new modules and limit `dashboard.tsx` edits to
 the hook call (~line 167), the notice (~385), and the sidebar card (~286–288).
 
-**Notes.**
+**Notes.** Implemented in `3c41686`, `225bdf8`, `d841747`, `7d9e932` and `473f4cf`, rebased onto 2.10b
+and 2.11. `useRemoteHandoff` keeps its `reportError` option (the shell passes 2.11's
+`reportActionError("remote")`, so close-session errors still go under `"remote"`). `connectingId`
+and `connectingBackgroundId` are derived from the new `launch` state, and the hook adds
+`dismissLaunch()` and `retryLaunch(agents)`, which reports through `reportError` if the device is no
+longer online. A failed handoff clears the spinner and the notice at once. The notice renders in
+`DevicesPanel` below the close-session notice and above 2.11's action-error banners; the launch
+state lives in the shell, so it survives page changes. Files the plan didn't name:
+`use-viewer-platform.ts` (the `useSyncExternalStore` hook, so `viewer-downloads.ts` stays free of
+React for tests) and `viewer-download-links.tsx` (the sidebar card and the links shared with the
+notice). Deviations: in the not-detected state the plan's **Dismiss** is the only close control;
+the handed-off/unknown notice closes after 10 s unless its downloads are expanded; Try again is
+disabled while offline, like 2.11's Connect; the download drift guard reads the file names in
+`scripts/verify-release-assets.mjs`. This also fixes 2.9's known limitation: Chrome fires
+`beforeunload` synchronously inside `location.assign("meshrmm:…")`, so the link now opens through
+`openExternalLink` and the settings leave-page guard ignores that event (Firefox and Safari timing
+unverified; if they fire it later, the prompt can still appear there).
+
+Known false positives/negatives (documented, not eliminated): Chrome 154 on macOS shows its "Open
+MeshRMM Remote?" prompt without blurring the page, so an installed viewer without "always allow"
+reads as not-detected until the user chooses Open; alt-tab (for example to Finder to install)
+within 60 s reads as handed-off; Intel Macs are offered the Apple silicon build, because Safari
+can't report the CPU; a Connect started while the page is already hidden or unfocused reports
+unknown.
+
+Verified on the macOS development host on the rebased tree: `npm run verify` (typecheck, lint,
+build, 97/97 tests). System Chrome 154 (playwright-core outside the repo) against a fresh
+production build with mocked `/auth/session`, `/v1/*` (including `POST /v1/remote/handoffs`) and
+WebSocket endpoints; "not installed" was simulated by rewriting the link scheme in the served
+bundle, because this Mac has MeshRMM Remote registered for `meshrmm:` (`~/Applications`). Connect
+showed "Opening…", then the not-detected notice ~2.5 s after the handoff returned, with the
+OS-correct download (Mac, Windows and Linux user agents). Try again made a new handoff request. A
+synthetic blur, and a real tab switch in Chrome driven over raw CDP, cleared the spinner as
+handed-off, including the late upgrade. A handoff 500 cleared the spinner at once and showed its
+error in 2.11's banner. While stale, Connect and Try again still created handoffs; offline, both
+were disabled. The launch notice, a delete error banner and the connection strip stack cleanly. An
+unsaved settings edit no longer prompted on Connect, and a real close still did. The sidebar card
+showed the detected build and "Other platforms", including in the mobile sidebar. Not verified:
+Safari (remote automation is disabled on this Mac), every Windows row of the manual matrix (the
+endpoint was in use by 3.14), and accepting the browser prompt to launch the installed viewer.
 
 ---
 

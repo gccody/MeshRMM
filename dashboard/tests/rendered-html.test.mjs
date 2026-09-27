@@ -246,3 +246,17 @@ test("workspace routes keep the marketing site and owner console on their hosts"
   assert.match(platform, /Checking administrator access/);
   assert.doesNotMatch(platform, /Primary navigation|Settings categories/);
 });
+
+test("the workspace sidebar links every remote viewer build", async () => {
+  const html = await (await render("/", "acme.meshrmm.com", {
+    workos_organization_id: "org_acme",
+  })).text();
+  const card = html.match(/<section class="support-card viewer-card".*?<\/section>/s)?.[0] ?? "";
+  assert.match(card, /Needed to connect to devices/);
+  // The server cannot see the platform, so it lists both builds.
+  assert.match(card, /href="\/downloads\/meshrmm-remote-windows-x64\.exe"/);
+  assert.match(card, /href="\/downloads\/meshrmm-remote-macos-arm64\.zip"/);
+
+  const marketing = await (await render("/")).text();
+  assert.doesNotMatch(marketing, /meshrmm-remote-/);
+});
