@@ -111,7 +111,7 @@ function ConnectMenu({ agent, disabled, title, connecting, background, onRemote,
 }
 
 function StatusBadge({ agent, stale }: { agent: Agent; stale: boolean }) {
-  if (agent.connected) return <span className="status-badge online"><i />{stale ? "Online · last known" : "Online"}</span>;
+  if (agent.connected) return <span className="status-badge online"><i />{stale ? <>Online<span className="status-badge-note"><span className="status-badge-separator"> · </span>last known</span></> : "Online"}</span>;
   if (agent.updating_to) {
     const detail = `Installing Agent ${agent.updating_to}. The device reconnects when the update finishes.`;
     return <span className="status-badge updating" title={detail}><i />Updating<span className="sr-only">. {detail}</span></span>;
@@ -167,7 +167,7 @@ export function AgentOverview({
   const stale = inventory.status === "stale";
   const isOffline = inventory.connection === "offline";
   const time = formatTime(inventory.lastUpdated);
-  const [footerTime, footerState] = !hasData ? ["Waiting for updates", "Connecting…"]
+  const [footerTime, footerState] = !hasData ? ["Waiting for updates", isOffline ? "Offline" : inventory.connection === "unavailable" ? "Live updates unavailable" : "Connecting…"]
     : !stale ? [`Updated ${time}`, "Updates automatically"]
     : isOffline ? [`You’re offline · showing devices from ${time}`, "Offline"]
     : inventory.connection === "unavailable" ? [`Last updated ${time}`, "Live updates unavailable"]

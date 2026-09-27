@@ -65,7 +65,7 @@ export function useAgentInventory({
       } catch (requestError) {
         if (requestError instanceof AuthenticationRequired) return false;
         // Keep the devices already on screen; the stale state explains them.
-        setError(`Couldn't refresh devices: ${
+        setError(`Couldn’t refresh devices: ${
           requestError instanceof Error
             ? requestError.message
             : "The live agent service could not be reached."
