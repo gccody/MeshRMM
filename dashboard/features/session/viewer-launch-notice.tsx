@@ -12,8 +12,10 @@ const SETTLED_NOTICE_MS = 10_000;
 // Progress and recovery for the latest Connect. Detection is a guess (see
 // viewer-launch.ts), so every outcome keeps "Try again" and the download, and
 // the copy never states that the viewer is missing.
-export function ViewerLaunchNotice({ launch, onRetry, onDismiss }: {
+export function ViewerLaunchNotice({ launch, offline = false, onRetry, onDismiss }: {
   launch: ViewerLaunch;
+  // Like Connect, Try again waits until the browser is back online.
+  offline?: boolean;
   onRetry: () => void;
   onDismiss: () => void;
 }) {
@@ -42,7 +44,7 @@ export function ViewerLaunchNotice({ launch, onRetry, onDismiss }: {
         <div className="viewer-launch-body">
           <p>
             Continue in MeshRMM Remote. Didn’t open?{" "}
-            <button type="button" className="link-button" onClick={onRetry}>Try again</button>
+            <button type="button" className="link-button" onClick={onRetry} disabled={offline} title={offline ? "You’re offline" : undefined}>Try again</button>
             {" · "}
             <button type="button" className="link-button" onClick={() => setShowDownloads((shown) => !shown)} aria-expanded={showDownloads}>Get MeshRMM Remote</button>
           </p>
@@ -63,7 +65,7 @@ export function ViewerLaunchNotice({ launch, onRetry, onDismiss }: {
         </p>
         <ViewerDownloadLinks platform={platform} withSetup />
         <div className="viewer-launch-actions">
-          <button type="button" className="secondary-button" onClick={onRetry}>Try again</button>
+          <button type="button" className="secondary-button" onClick={onRetry} disabled={offline} title={offline ? "You’re offline" : undefined}>Try again</button>
           <button type="button" className="link-button" onClick={onDismiss}>Dismiss</button>
         </div>
       </div>

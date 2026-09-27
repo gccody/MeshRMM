@@ -66,7 +66,7 @@ export function DevicesPanel() {
   return (
     <>
       {remote.sessionNotice && <div className="session-notice" role="status">{remote.sessionNotice}</div>}
-      {remote.launch && <ViewerLaunchNotice key={remote.launch.attempt} launch={remote.launch} onRetry={() => remote.retryLaunch(inventory.agents)} onDismiss={remote.dismissLaunch} />}
+      {remote.launch && <ViewerLaunchNotice key={remote.launch.attempt} launch={remote.launch} offline={inventory.connection === "offline"} onRetry={() => remote.retryLaunch(inventory.agents)} onDismiss={remote.dismissLaunch} />}
       {listActionErrors(actionErrors, DEVICE_ACTIONS).map(({ source, message }) => (
         <div key={source} className="error-banner" role="alert">
           <CircleAlert size={17} aria-hidden="true" /><span>{message}</span>
