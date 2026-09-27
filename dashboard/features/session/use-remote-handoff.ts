@@ -1,22 +1,46 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AuthenticationRequired, type AuthorizedFetch, errorMessage } from "../../lib/http";
 import type { Agent } from "../agents/types";
 import { remoteViewerLink } from "./remote-link";
+import { type ViewerLaunchOutcome, browserLaunchEnv, openExternalLink, watchViewerLaunch } from "./viewer-launch";
 
 type Options = {
   authorizedFetch: AuthorizedFetch;
   reportError: (message: string | null) => void;
 };
 
+// The latest Connect: "opening" until the handoff is created and the page shows
+// (or doesn't show) that the viewer took over.
+export type ViewerLaunch = {
+  attempt: number;
+  agentId: string;
+  agentName: string;
+  background: boolean;
+  phase: "opening" | ViewerLaunchOutcome;
+};
+
 // Starts remote sessions through a one-time handoff to the native viewer, and
 // closes a device's active session.
 export function useRemoteHandoff({ authorizedFetch, reportError }: Options) {
-  const [connectingId, setConnectingId] = useState<string | null>(null);
-  const [connectingBackgroundId, setConnectingBackgroundId] = useState<string | null>(null);
+  const [launch, setLaunch] = useState<ViewerLaunch | null>(null);
   const [closingId, setClosingId] = useState<string | null>(null);
   const [sessionNotice, setSessionNotice] = useState<string | null>(null);
+  // Each Connect supersedes the previous one, including its launch watcher.
+  const attempts = useRef(0);
+  const cancelWatch = useRef<(() => void) | null>(null);
+
+  const stopWatching = () => {
+    cancelWatch.current?.();
+    cancelWatch.current = null;
+  };
+
+  useEffect(() => () => {
+    attempts.current += 1;
+    cancelWatch.current?.();
+    cancelWatch.current = null;
+  }, []);
 
   const closeSession = async (agent: Agent) => {
     setClosingId(agent.id);
@@ -41,8 +65,9 @@ export function useRemoteHandoff({ authorizedFetch, reportError }: Options) {
   const connect = async (agent: Agent, startInBackground = false) => {
     setSessionNotice(null);
     if (!agent.connected) return;
-    setConnectingId(agent.id);
-    setConnectingBackgroundId(startInBackground ? agent.id : null);
+    stopWatching();
+    const attempt = ++attempts.current;
+    setLaunch({ attempt, agentId: agent.id, agentName: agent.name, background: startInBackground, phase: "opening" });
     reportError(null);
     try {
       const response = await authorizedFetch("/v1/remote/handoffs", {
@@ -55,17 +80,51 @@ export function useRemoteHandoff({ authorizedFetch, reportError }: Options) {
       if (startInBackground && handoff.start_in_background !== true) {
         throw new Error("Background launch requires an updated server. Try again after the server is updated.");
       }
-      window.location.assign(remoteViewerLink(handoff.handoff_token, handoff.api_url, agent.id));
+      if (attempt !== attempts.current) return;
+      // Watch first: a viewer that is already running can take focus before
+      // assign() returns.
+      cancelWatch.current = watchViewerLaunch(browserLaunchEnv(), (phase) => {
+        setLaunch((current) => (current?.attempt === attempt ? { ...current, phase } : current));
+      });
+      openExternalLink(remoteViewerLink(handoff.handoff_token, handoff.api_url, agent.id));
     } catch (requestError) {
-      reportError(requestError instanceof Error ? requestError.message : "The remote session could not be started.");
-    } finally {
-      // Keep the spinner while the browser hands the link to the viewer.
-      window.setTimeout(() => {
-        setConnectingId(null);
-        setConnectingBackgroundId(null);
-      }, 1200);
+      if (attempt !== attempts.current) return;
+      setLaunch(null);
+      if (!(requestError instanceof AuthenticationRequired)) {
+        reportError(requestError instanceof Error ? requestError.message : "The remote session could not be started.");
+      }
     }
   };
 
-  return { connectingId, connectingBackgroundId, closingId, sessionNotice, connect, closeSession };
+  // Hides the launch notice and stops watching for the viewer.
+  const dismissLaunch = useCallback(() => {
+    cancelWatch.current?.();
+    cancelWatch.current = null;
+    setLaunch(null);
+  }, []);
+
+  // Always a fresh handoff: tokens are single-use and expire after a minute.
+  const retryLaunch = (agents: Agent[]) => {
+    if (!launch) return;
+    const agent = agents.find((candidate) => candidate.id === launch.agentId);
+    if (!agent?.connected) {
+      dismissLaunch();
+      reportError(`${agent?.name ?? launch.agentName} is not online, so a remote session cannot start. Connect when it is back online.`);
+      return;
+    }
+    void connect(agent, launch.background);
+  };
+
+  const opening = launch?.phase === "opening" ? launch : null;
+  return {
+    connectingId: opening?.agentId ?? null,
+    connectingBackgroundId: opening?.background ? opening.agentId : null,
+    closingId,
+    sessionNotice,
+    launch,
+    connect,
+    closeSession,
+    dismissLaunch,
+    retryLaunch,
+  };
 }
