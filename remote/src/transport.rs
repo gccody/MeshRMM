@@ -40,14 +40,15 @@ struct ReceiverLifecycle {
 }
 
 impl ReceiverLifecycle {
-    /// Records a frame handed to the presenter. The attempt's first frame
+    /// Records a frame confirmed by the native presentation path. The attempt's first frame
     /// ends the reconnect, so the next failure starts a new one.
-    fn frame_presented(&self) {
+    fn observe_presentation(&self, at: Option<std::time::Instant>) {
+        let Some(at) = at else { return };
         let first = self
             .progress
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .mark_frame_presented(std::time::Instant::now());
+            .mark_frame_presented(at);
         if first {
             self.reconnect_status
                 .lock()
@@ -240,5 +241,75 @@ impl ViewerResumeState {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
             Some(meshrmm_protocol::BACKGROUND_DISPLAY_ID);
+    }
+}
+
+#[cfg(test)]
+mod presentation_progress_tests {
+    use super::*;
+    use crate::reconnect::{Disposition, ReconnectReason};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn failed_decoding_before_the_first_displayed_frame_keeps_the_startup_cap() {
+        let (presentation_failure, _) = mpsc::unbounded_channel();
+        let progress = Arc::new(Mutex::new(AttemptProgress::default()));
+        let now = Instant::now();
+        let reconnect_status = Arc::new(Mutex::new(Some(ReconnectStatus::after_failure(
+            None,
+            ReconnectReason::VideoRestarting,
+            now,
+        ))));
+        let lifecycle = ReceiverLifecycle {
+            presentation_failure,
+            shutting_down: Default::default(),
+            progress: Arc::clone(&progress),
+            reconnect_status: Arc::clone(&reconnect_status),
+        };
+        let error =
+            SessionFailure::new(FailureKind::PresentationFailed, "decoder rejected input").into();
+        for attempt in 1..=3 {
+            progress.lock().unwrap().begin_attempt();
+            // Encoded frames may have arrived or been accepted into a queue,
+            // but neither operation acknowledges native presentation.
+            lifecycle.observe_presentation(None);
+            let progress = progress.lock().unwrap();
+            assert!(!progress.ever_presented());
+            assert_eq!(progress.attempt_streamed_for(now), None);
+            assert_eq!(
+                crate::reconnect::disposition(
+                    &error,
+                    progress.ever_presented(),
+                    attempt,
+                    Duration::from_secs(5)
+                ),
+                if attempt == 3 {
+                    Disposition::GiveUp
+                } else {
+                    Disposition::Retry
+                }
+            );
+            assert!(reconnect_status.lock().unwrap().is_some());
+        }
+        lifecycle.observe_presentation(Some(now));
+        // Later health polls preserve the actual first presentation time.
+        lifecycle.observe_presentation(Some(now + Duration::from_secs(2)));
+        assert_eq!(
+            progress
+                .lock()
+                .unwrap()
+                .attempt_streamed_for(now + Duration::from_secs(5)),
+            Some(Duration::from_secs(5))
+        );
+        assert!(reconnect_status.lock().unwrap().is_none());
+        assert_eq!(
+            crate::reconnect::disposition(
+                &error,
+                progress.lock().unwrap().ever_presented(),
+                3,
+                Duration::from_secs(70)
+            ),
+            Disposition::Retry
+        );
     }
 }

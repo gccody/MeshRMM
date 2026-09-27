@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -82,6 +82,7 @@ struct PendingReset {
 
 struct Shared {
     queued: Mutex<VecDeque<QueuedFrame>>,
+    first_presented: Arc<OnceLock<std::time::Instant>>,
     cursor_shape: Mutex<Option<CursorShape>>,
     agent_pointer_display: Mutex<Option<Option<meshrmm_protocol::DisplayId>>>,
     ready: Condvar,
@@ -102,6 +103,7 @@ impl Shared {
     fn new(control: ControlSink, debug: DebugInfo) -> Self {
         Self {
             queued: Mutex::new(VecDeque::with_capacity(MAX_PRESENTER_QUEUE_FRAMES)),
+            first_presented: Default::default(),
             cursor_shape: Mutex::new(None),
             agent_pointer_display: Mutex::new(None),
             ready: Condvar::new(),
@@ -364,6 +366,10 @@ impl Presenter {
         );
     }
 
+    pub fn first_presented_at(&self) -> Option<std::time::Instant> {
+        self.shared.first_presented.get().copied()
+    }
+
     pub fn poll_ended(&self) -> Option<Result<(), String>> {
         if self.shared.running.load(Ordering::Acquire) {
             return None;
@@ -393,8 +399,16 @@ fn run_worker(
     debug: DebugInfo,
     started: std::sync::mpsc::SyncSender<anyhow::Result<()>>,
 ) {
-    let initialized =
-        unsafe { WorkerPipeline::new(format, active_display, displays, control, debug) };
+    let initialized = unsafe {
+        WorkerPipeline::new(
+            format,
+            active_display,
+            displays,
+            control,
+            debug,
+            Arc::clone(&shared.first_presented),
+        )
+    };
     let mut pipeline = match initialized {
         Ok(pipeline) => {
             shared.running.store(true, Ordering::Release);
@@ -742,6 +756,7 @@ mod tests {
     fn the_worker_applies_a_reset_while_frames_are_dropped() {
         let presenter = presenter(true);
         assert!(presenter.publish(frame(true), 0));
+        assert_eq!(presenter.first_presented_at(), None);
         let replacement = VideoFormat {
             width: 2560,
             height: 1440,

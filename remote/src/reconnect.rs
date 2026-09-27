@@ -282,7 +282,7 @@ impl AttemptProgress {
         self.attempt_first_frame_at = None;
     }
 
-    /// Records a frame handed to the presenter. Returns whether it was this
+    /// Records a frame confirmed by the native presentation path. Returns whether it was this
     /// attempt's first.
     pub fn mark_frame_presented(&mut self, now: Instant) -> bool {
         self.ever_presented = true;
