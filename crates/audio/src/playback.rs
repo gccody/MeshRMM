@@ -2,14 +2,20 @@ use super::*;
 use anyhow::Context;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+/// A received audio packet, tagged with the mute generation it arrived in.
+enum Incoming {
+    Pcm(Vec<u8>),
+    Opus(Vec<u8>),
+}
+
 #[derive(Clone)]
 pub struct Player {
-    sender: std::sync::mpsc::SyncSender<(u64, Vec<u8>)>,
+    sender: std::sync::mpsc::SyncSender<(u64, Incoming)>,
     state: PlaybackState,
 }
 impl Player {
     pub fn new(state: PlaybackState) -> Self {
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(8);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<(u64, Incoming)>(8);
         let playback = state.clone();
         let result = std::thread::Builder::new()
             .name("meshrmm-audio-playback".into())
@@ -23,11 +29,21 @@ impl Player {
         }
         Self { sender, state }
     }
+    /// Queues a packet from the PCM16 v1 channel.
     pub fn receive(&self, bytes: &[u8]) {
-        if Packet::decode(bytes).is_some()
-            && let Ok(buffer) = self.state.0.lock()
-        {
-            let _ = self.sender.try_send((buffer.generation, bytes.to_vec()));
+        if Packet::decode(bytes).is_some() {
+            self.queue(Incoming::Pcm(bytes.to_vec()));
+        }
+    }
+    /// Queues a packet from the Opus channel.
+    pub fn receive_opus(&self, bytes: &[u8]) {
+        if super::opus::valid_packet(bytes) {
+            self.queue(Incoming::Opus(bytes.to_vec()));
+        }
+    }
+    fn queue(&self, incoming: Incoming) {
+        if let Ok(buffer) = self.state.0.lock() {
+            let _ = self.sender.try_send((buffer.generation, incoming));
         }
     }
 }
@@ -80,25 +96,33 @@ impl Output {
 }
 fn run(
     state: PlaybackState,
-    receiver: std::sync::mpsc::Receiver<(u64, Vec<u8>)>,
+    receiver: std::sync::mpsc::Receiver<(u64, Incoming)>,
 ) -> anyhow::Result<()> {
     let mut output = None::<Output>;
     let mut retry = std::time::Instant::now() - std::time::Duration::from_secs(2);
     let mut resampler = Resampler::default();
-    let mut received = false;
+    let mut decoder = None::<super::opus::OpusDecoder>;
+    let mut received = None::<&str>;
     let mut generation = 0;
-    while let Ok((packet_generation, bytes)) = receiver.recv() {
-        let Some(packet) = Packet::decode(&bytes) else {
-            continue;
+    while let Ok((packet_generation, incoming)) = receiver.recv() {
+        let (format, rate, channels) = match &incoming {
+            Incoming::Pcm(bytes) => {
+                let Some(packet) = Packet::decode(bytes) else {
+                    continue;
+                };
+                ("pcm16", packet.rate, packet.channels)
+            }
+            Incoming::Opus(_) => ("opus", super::opus::RATE, super::opus::CHANNELS),
         };
-        if !received {
+        if received != Some(format) {
             tracing::info!(
-                rate = packet.rate,
-                channels = packet.channels,
+                format,
+                rate,
+                channels,
                 muted = state.muted(),
                 "system audio stream received"
             );
-            received = true;
+            received = Some(format);
         }
         if retry.elapsed() >= std::time::Duration::from_secs(2) {
             retry = std::time::Instant::now();
@@ -125,17 +149,42 @@ fn run(
             resampler = Resampler::default();
             generation = packet_generation;
         }
-        let samples = resampler.convert(
-            packet,
-            output.config.sample_rate.0,
-            usize::from(output.config.channels),
-        );
+        let rate_out = output.config.sample_rate.0;
+        let channels_out = usize::from(output.config.channels);
+        let samples = match incoming {
+            Incoming::Pcm(bytes) => match Packet::decode(&bytes) {
+                Some(packet) => resampler.convert(packet, rate_out, channels_out),
+                None => continue,
+            },
+            Incoming::Opus(bytes) => {
+                if decoder.is_none() {
+                    match super::opus::OpusDecoder::new() {
+                        Ok(created) => decoder = Some(created),
+                        Err(error) => {
+                            tracing::warn!(%error, "Opus decoder unavailable");
+                            continue;
+                        }
+                    }
+                }
+                let Some(decoder) = decoder.as_mut() else {
+                    continue;
+                };
+                let decoded = decoder.decode(&bytes);
+                resampler.convert_samples(
+                    super::opus::RATE,
+                    super::opus::CHANNELS,
+                    &decoded,
+                    rate_out,
+                    channels_out,
+                )
+            }
+        };
         let mut buffer = state.0.lock().unwrap_or_else(|e| e.into_inner());
         if buffer.muted || buffer.generation != packet_generation {
             continue;
         }
         // Bound accumulated latency to 100 ms, even when output is stalled.
-        let limit = output.config.sample_rate.0 as usize * usize::from(output.config.channels) / 10;
+        let limit = rate_out as usize * channels_out / 10;
         if buffer.samples.len() + samples.len() > limit {
             buffer.samples.clear();
         }

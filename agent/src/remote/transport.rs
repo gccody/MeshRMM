@@ -116,7 +116,7 @@ const AUDIO_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// loopback delivers nothing while the device is silent.
 const AUDIO_IDLE: std::time::Duration = std::time::Duration::from_millis(100);
 /// Audio formats this Agent can send.
-const SUPPORTED_AUDIO_FORMATS: &[AudioFormat] = &[AudioFormat::Pcm16];
+const SUPPORTED_AUDIO_FORMATS: &[AudioFormat] = &[AudioFormat::Opus, AudioFormat::Pcm16];
 
 fn apply_audio_event(mode: &tokio::sync::watch::Sender<AudioMode>, event: AudioEvent<'_>) {
     mode.send_if_modified(|mode| {
@@ -260,6 +260,18 @@ async fn run_connected_sender(
             }),
         )
         .await?;
+    // Created up front: the offer is made before the viewer's version is known.
+    let opus_channel = peer
+        .create_data_channel(
+            meshrmm_audio::OPUS_CHANNEL,
+            Some(RTCDataChannelInit {
+                ordered: Some(true),
+                max_retransmits: Some(0),
+                protocol: Some(meshrmm_audio::OPUS_PROTOCOL.into()),
+                ..Default::default()
+            }),
+        )
+        .await?;
     // The viewer decides whether and how audio is sent; capture only then.
     let audio_mode = Arc::new(tokio::sync::watch::Sender::new(AudioMode::Undetermined));
     // The audio bitrate being streamed now, left out of video pacing.
@@ -305,10 +317,12 @@ async fn run_connected_sender(
     let sender_mode = audio_mode.subscribe();
     let sender_bits = Arc::clone(&audio_bits);
     let audio_sender = tokio::spawn(async move {
+        let mut opus = None::<meshrmm_audio::OpusEncoder>;
+        let mut opus_unavailable = false;
         let mut bytes_sent = 0_u64;
         let mut packets_dropped = 0_u64;
         let mut stats_started = tokio::time::Instant::now();
-        loop {
+        'send: loop {
             let packet = tokio::select! {
                 packet = audio_rx.recv() => match packet {
                     Some(packet) => packet,
@@ -316,6 +330,10 @@ async fn run_connected_sender(
                 },
                 _ = tokio::time::sleep(AUDIO_IDLE) => {
                     sender_bits.store(0, Ordering::Relaxed);
+                    // Encode what follows the gap as a new stream.
+                    if let Some(encoder) = opus.as_mut() {
+                        encoder.reset();
+                    }
                     if bytes_sent == 0 {
                         stats_started = tokio::time::Instant::now();
                     }
@@ -323,28 +341,63 @@ async fn run_connected_sender(
                 }
             };
             let mode = *sender_mode.borrow();
-            let Some(bits) = meshrmm_audio::pcm_bits_per_second(&packet) else {
+            if !mode.captures() || !audio_input.is_console_session() {
+                sender_bits.store(0, Ordering::Relaxed);
                 continue;
-            };
-            if !mode.captures()
-                || !audio_input.is_console_session()
-                || audio_channel.ready_state() != RTCDataChannelState::Open
-            {
+            }
+            if mode == AudioMode::Opus && opus.is_none() && !opus_unavailable {
+                match meshrmm_audio::OpusEncoder::new() {
+                    Ok(encoder) => opus = Some(encoder),
+                    Err(error) => {
+                        // The viewer that asked for Opus also plays PCM.
+                        tracing::warn!(%error, "Opus encoder unavailable; sending PCM audio");
+                        opus_unavailable = true;
+                    }
+                }
+            }
+            let (format, channel, packets, bits) =
+                match opus.as_mut().filter(|_| mode == AudioMode::Opus) {
+                    Some(encoder) => match encoder.encode(&packet) {
+                        Ok(packets) => (
+                            AudioFormat::Opus,
+                            &opus_channel,
+                            packets,
+                            meshrmm_audio::OPUS_BITS_PER_SECOND,
+                        ),
+                        Err(error) => {
+                            tracing::debug!(%error, "discarding audio the Opus encoder rejected");
+                            continue;
+                        }
+                    },
+                    None => {
+                        if let Some(encoder) = opus.as_mut() {
+                            encoder.reset();
+                        }
+                        let Some(bits) = meshrmm_audio::pcm_bits_per_second(&packet) else {
+                            continue;
+                        };
+                        (AudioFormat::Pcm16, &audio_channel, vec![packet], bits)
+                    }
+                };
+            if channel.ready_state() != RTCDataChannelState::Open {
                 sender_bits.store(0, Ordering::Relaxed);
                 continue;
             }
             sender_bits.store(bits, Ordering::Relaxed);
-            if audio_channel.buffered_amount().await >= buffered_audio_limit(bits) {
-                packets_dropped += 1;
-            } else {
+            for packet in packets {
+                if channel.buffered_amount().await >= buffered_audio_limit(bits) {
+                    packets_dropped += 1;
+                    continue;
+                }
                 bytes_sent += packet.len() as u64;
-                if audio_channel.send(&Bytes::from(packet)).await.is_err() {
-                    break;
+                if channel.send(&Bytes::from(packet)).await.is_err() {
+                    break 'send;
                 }
             }
             if stats_started.elapsed() >= AUDIO_STATS_INTERVAL {
                 tracing::info!(
                     ?mode,
+                    ?format,
                     nominal_bits_per_second = bits,
                     audio_bits_per_second =
                         bytes_sent as f64 * 8.0 / stats_started.elapsed().as_secs_f64(),

@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 /// Audio formats this viewer plays, most preferred first.
-const AUDIO_FORMATS: &[meshrmm_protocol::AudioFormat] = &[meshrmm_protocol::AudioFormat::Pcm16];
+const AUDIO_FORMATS: &[meshrmm_protocol::AudioFormat] = &[
+    meshrmm_protocol::AudioFormat::Opus,
+    meshrmm_protocol::AudioFormat::Pcm16,
+];
 
 /// The Agent sends system audio only while the viewer is unmuted.
 pub fn audio_preference(muted: bool) -> meshrmm_protocol::SessionMessage {
@@ -504,7 +507,7 @@ mod tests {
             audio_preference(true),
             SessionMessage::SetAudio {
                 enabled: false,
-                formats: vec![AudioFormat::Pcm16],
+                formats: vec![AudioFormat::Opus, AudioFormat::Pcm16],
             }
         );
         assert!(matches!(
