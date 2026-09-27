@@ -93,7 +93,8 @@ test("server-renders the public marketing site at the root domain", async () => 
 
   const html = await response.text();
   assert.match(html, /<title>MeshRMM \| Secure remote monitoring<\/title>/i);
-  assert.match(html, /data-woswidgets-root="true"/);
+  // The WorkOS widgets and their Radix theme belong to the admin pages only.
+  assert.doesNotMatch(html, /data-woswidgets-root/);
   assert.match(html, /Every company gets a private MeshRMM workspace/);
   assert.match(html, /Request an invitation/);
   assert.doesNotMatch(html, /desktop-01|office-pc|sample agent|fake data/i);

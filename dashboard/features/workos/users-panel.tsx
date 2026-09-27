@@ -1,12 +1,17 @@
 "use client";
 
-import { UsersManagement } from "@workos-inc/widgets";
+import dynamic from "next/dynamic";
 import { useWorkspace } from "../workspace/workspace-context";
+import { widgetLoading } from "./widget-loading";
+
+// The widgets and their Radix Themes styles load only for administrators on
+// this page.
+const UsersWidgets = dynamic(() => import("./users-widgets"), { ssr: false, loading: widgetLoading("user management") });
 
 export function UsersPanel() {
   const { isAdmin, getAccessToken } = useWorkspace();
   if (!isAdmin) return <AdministratorsOnly />;
-  return <section className="management-panel"><UsersManagement authToken={getAccessToken} /></section>;
+  return <UsersWidgets authToken={getAccessToken} />;
 }
 
 export function AdministratorsOnly() {
