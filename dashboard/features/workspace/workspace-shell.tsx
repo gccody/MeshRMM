@@ -84,7 +84,6 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
     account?.roles.some((candidate) => candidate === "admin" || candidate === "company_admin") ||
     account?.permissions.includes("company:settings:manage"),
   );
-  const companyId = account?.company?.id;
   const accountPending = hasTenantSession && !account;
   const idleTimeoutMinutes = account?.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES;
 
@@ -121,9 +120,12 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
     return response;
   }, [getAccessToken, lockSession, serverUrl]);
 
+  // The server derives the company from the access token and host, so the
+  // event subscription starts alongside the account request rather than after
+  // it. It stops once the account fails in a way that is not retried.
   const inventory = useAgentInventory({
-    enabled: Boolean(hasTenantSession && !sessionPauseReason),
-    companyId,
+    enabled: Boolean(hasTenantSession && !sessionPauseReason && !(accountError && !accountError.retrying)),
+    subscriptionKey: workosOrganizationId,
     authorizedFetch,
     reportError: setError,
   });
