@@ -170,7 +170,6 @@ pub(super) fn install_video_handler(
         let presenter = Arc::clone(&presenter);
         let viewer_control = viewer_control.clone();
         let debug = debug.clone();
-        let lifecycle = lifecycle.clone();
         Box::pin(async move {
             let received_at_us = monotonic_timestamp_us();
             let packet = match VideoPacket::decode(&message.data) {
@@ -227,7 +226,6 @@ pub(super) fn install_video_handler(
                 {
                     viewer_control.recording.receive(&frame, active.format);
                     active.presenter.publish(frame, received_at_us);
-                    lifecycle.frame_presented();
                 }
                 tracing::trace!(encode_us, received_at_us, "encoded frame reassembled");
                 if log_statistics {

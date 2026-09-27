@@ -2,6 +2,7 @@ use super::app::{RemoteView, VideoHostView, activate_application};
 use super::*;
 use crate::reconnect::ReconnectStatus;
 use dispatch2::DispatchTime;
+use std::sync::OnceLock;
 
 thread_local! {
     /// AppKit and Core Animation objects never leave the main thread.
@@ -20,6 +21,7 @@ struct Shared {
     failure: Mutex<Option<String>>,
     replaced: AtomicU64,
     submitted: AtomicU64,
+    first_presented: OnceLock<Instant>,
     dropped_by_renderer: AtomicU64,
     recovering: AtomicBool,
     resetting: AtomicBool,
@@ -81,6 +83,7 @@ impl Presenter {
             failure: Mutex::new(None),
             replaced: AtomicU64::new(0),
             submitted: AtomicU64::new(0),
+            first_presented: OnceLock::new(),
             dropped_by_renderer: AtomicU64::new(0),
             recovering: AtomicBool::new(false),
             resetting: AtomicBool::new(false),
@@ -245,6 +248,10 @@ impl Presenter {
         });
     }
 
+    pub fn first_presented_at(&self) -> Option<Instant> {
+        self.shared.first_presented.get().copied()
+    }
+
     pub fn poll_ended(&self) -> Option<Result<(), String>> {
         let id = self.shared.id;
         let shared = Arc::clone(&self.shared);
@@ -259,7 +266,10 @@ impl Presenter {
                     .ok()?
                     .as_ref()
                     .filter(|ui| ui.id == id)
-                    .and_then(MacUi::presentation_failure)
+                    .and_then(|ui| {
+                        ui.observe_presentation(&shared);
+                        ui.presentation_failure()
+                    })
             });
             if let Some(failure) = failure
                 && let Ok(mut current) = shared.failure.lock()
@@ -395,7 +405,11 @@ fn present_latest(shared: Arc<Shared>) {
                 .as_mut()
                 .filter(|ui| ui.id == shared.id)
                 .context("macOS viewer window is no longer available")
-                .and_then(|ui| ui.enqueue(queued));
+                .and_then(|ui| {
+                    let result = ui.enqueue(queued);
+                    ui.observe_presentation(&shared);
+                    result
+                });
             (stream_id, result)
         }))
     });
@@ -717,6 +731,18 @@ impl MacUi {
             "macOS {:?} hardware decoder failed: {detail}",
             self.codec
         ))
+    }
+
+    /// Enqueue succeeds before AVFoundation decodes. Only ReadyForDisplay
+    /// confirms a decoded image, including a static desktop's single frame.
+    #[allow(deprecated)]
+    fn observe_presentation(&self, shared: &Shared) {
+        if self.total_frames_submitted > 0
+            && self.decoder_failure().is_none()
+            && unsafe { self.layer.isReadyForDisplay() }
+        {
+            shared.first_presented.get_or_init(Instant::now);
+        }
     }
 
     fn presentation_failure(&self) -> Option<String> {

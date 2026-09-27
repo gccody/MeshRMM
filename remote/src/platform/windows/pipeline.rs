@@ -5,6 +5,7 @@ pub(super) struct WorkerPipeline {
     // Fields drop in order: the decoder before the device and runtimes it
     // uses.
     decoder: HardwareDecoder,
+    first_presented: Arc<OnceLock<std::time::Instant>>,
     presentation: Presentation,
     decoded: u64,
     presented: u64,
@@ -131,12 +132,14 @@ impl WorkerPipeline {
         displays: Vec<Display>,
         control: ControlSink,
         debug: DebugInfo,
+        first_presented: Arc<OnceLock<std::time::Instant>>,
     ) -> anyhow::Result<Self> {
         let presentation =
             unsafe { Presentation::new(format, active_display, displays, control, debug.clone())? };
         let decoder = unsafe { HardwareDecoder::new(&presentation.device, format)? };
         Ok(Self {
             decoder,
+            first_presented,
             presentation,
             decoded: 0,
             presented: 0,
@@ -207,6 +210,7 @@ impl WorkerPipeline {
                     .present(&frame.texture, frame.subresource)?
             };
             let presentation_us = monotonic_timestamp_us();
+            self.first_presented.get_or_init(std::time::Instant::now);
             self.presented += 1;
             self.interval_presented += 1;
             tracing::debug!(

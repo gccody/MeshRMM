@@ -1,5 +1,8 @@
 # UX improvement plan — 2026-09-26
 
+Latest PR review fixes and live endpoint results:
+[PR 39 review follow-up validation](pr39-review-validation.md).
+
 Tracks the user-experience fixes chosen from the 2026-09-26 UX review. Work happens on branch
 `ux-improvements-2026-09-26`, cut from `main` at `c4824f1`. Task IDs match the review's numbering
 (`0.x` = P0, `2.x` = P2, `3.x` = P3). Line numbers were taken at `c4824f1` and will drift; search

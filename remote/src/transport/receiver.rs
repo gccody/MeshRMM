@@ -250,7 +250,11 @@ pub async fn run_receiver(
                         ),
                     ).into());
                 }
-                let presenter_missing = presenter.lock().is_ok_and(|guard| guard.is_none());
+                let presenter_missing = presenter.lock().is_ok_and(|guard| {
+                    let presented = guard.as_ref().and_then(|active| active.presenter.first_presented_at());
+                    lifecycle.observe_presentation(presented);
+                    presented.is_none()
+                });
                 if presenter_missing {
                     let waiting_since = presenter_missing_since
                         .get_or_insert_with(tokio::time::Instant::now);
@@ -310,6 +314,14 @@ pub async fn run_receiver(
         }
     }
     .await;
+    // A frame can finish between the last health poll and a transport failure.
+    if let Ok(guard) = presenter.lock() {
+        lifecycle.observe_presentation(
+            guard
+                .as_ref()
+                .and_then(|active| active.presenter.first_presented_at()),
+        );
+    }
     lifecycle.shutting_down.store(true, Ordering::Release);
     pointer_flusher.abort();
     let _ = pointer_flusher.await;
