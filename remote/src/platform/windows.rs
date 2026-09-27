@@ -36,10 +36,13 @@ use windows::core::{HSTRING, Interface, PCWSTR, w};
 
 use super::ControlSink;
 use crate::debug::DebugInfo;
+use crate::reconnect::{ReconnectStatus, ReconnectText};
 
 mod keyboard_hook;
 mod launch_window;
 mod pipeline;
+#[cfg(test)]
+mod reconnect_probe;
 mod renderer;
 #[cfg(test)]
 mod reset_probe;
@@ -56,6 +59,9 @@ const MAX_DECODER_PENDING_FRAMES: usize = 16;
 // reference loss; the worker still presents only the newest decoded surface.
 const MAX_PRESENTER_QUEUE_FRAMES: usize = 15;
 const DECODER_INPUT_STALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often the worker redraws the reconnect overlay's elapsed time and
+/// countdown. More often than once a second, so the counts do not skip one.
+const RECONNECT_REFRESH: Duration = Duration::from_millis(250);
 /// How long a stream reset waits for the worker thread before the caller
 /// replaces the presenter instead.
 const STREAM_RESET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -80,7 +86,8 @@ struct Shared {
     agent_pointer_display: Mutex<Option<Option<meshrmm_protocol::DisplayId>>>,
     ready: Condvar,
     stopping: AtomicBool,
-    reconnecting: AtomicBool,
+    reconnect_status: Mutex<Option<ReconnectStatus>>,
+    reconnect_changed: AtomicBool,
     running: AtomicBool,
     failure: Mutex<Option<String>>,
     replaced_frames: AtomicU64,
@@ -99,7 +106,8 @@ impl Shared {
             agent_pointer_display: Mutex::new(None),
             ready: Condvar::new(),
             stopping: AtomicBool::new(false),
-            reconnecting: AtomicBool::new(false),
+            reconnect_status: Mutex::new(None),
+            reconnect_changed: AtomicBool::new(false),
             running: AtomicBool::new(false),
             failure: Mutex::new(None),
             replaced_frames: AtomicU64::new(0),
@@ -113,6 +121,48 @@ impl Shared {
 
     fn reset_pending(&self) -> bool {
         self.reset.lock().is_ok_and(|reset| reset.is_some())
+    }
+
+    fn set_reconnect_status(&self, status: Option<ReconnectStatus>) {
+        if let Ok(mut current) = self.reconnect_status.lock() {
+            *current = status;
+        }
+        self.reconnect_changed.store(true, Ordering::Release);
+    }
+}
+
+/// Keeps a window's reconnect overlay in step with its presenter's status.
+struct ReconnectOverlay {
+    shown: Option<ReconnectText>,
+    rendered: std::time::Instant,
+}
+
+impl ReconnectOverlay {
+    fn new() -> Self {
+        Self {
+            shown: None,
+            rendered: std::time::Instant::now(),
+        }
+    }
+
+    /// Redraws the overlay when the status changed, and while it is shown,
+    /// when its text changed: about once a second.
+    unsafe fn refresh(&mut self, window: HWND, shared: &Shared) {
+        let changed = shared.reconnect_changed.swap(false, Ordering::AcqRel);
+        if !changed && (self.shown.is_none() || self.rendered.elapsed() < RECONNECT_REFRESH) {
+            return;
+        }
+        self.rendered = std::time::Instant::now();
+        let wanted = shared
+            .reconnect_status
+            .lock()
+            .ok()
+            .and_then(|status| *status)
+            .map(|status| status.render(self.rendered));
+        if wanted != self.shown {
+            unsafe { window::set_reconnect_text(window, wanted.as_ref()) };
+            self.shown = wanted;
+        }
     }
 }
 
@@ -288,11 +338,10 @@ impl Presenter {
     /// The window pump already refreshes controls without waiting for frames.
     pub fn refresh_controls(&self) {}
 
-    /// Marks the window as waiting for the connection to be restored.
-    pub fn set_reconnecting(&self, reconnecting: bool) {
-        self.shared
-            .reconnecting
-            .store(reconnecting, Ordering::Release);
+    /// Shows why the window is waiting for the connection to be restored,
+    /// or hides that (`None`).
+    pub fn set_reconnect_status(&self, status: Option<ReconnectStatus>) {
+        self.shared.set_reconnect_status(status);
     }
 
     pub fn set_cursor_shape(&self, shape: CursorShape) {
@@ -359,7 +408,7 @@ fn run_worker(
     };
 
     let mut decoder_blocked_since = None::<std::time::Instant>;
-    let mut reconnecting = false;
+    let mut reconnect_overlay = ReconnectOverlay::new();
     while !shared.stopping.load(Ordering::Acquire) {
         if unsafe { pump_window_messages(pipeline.window()) } {
             break;
@@ -380,11 +429,7 @@ fn run_worker(
             decoder_blocked_since = None;
             let _ = reply.send(result);
         }
-        let wanted = shared.reconnecting.load(Ordering::Acquire);
-        if wanted != reconnecting {
-            reconnecting = wanted;
-            unsafe { window::set_reconnecting(pipeline.window(), reconnecting) };
-        }
+        unsafe { reconnect_overlay.refresh(pipeline.window(), &shared) };
         if let Some(layout) = unsafe { window::take_resize(pipeline.window()) }
             && let Err(error) = unsafe { pipeline.resize(&layout) }
         {

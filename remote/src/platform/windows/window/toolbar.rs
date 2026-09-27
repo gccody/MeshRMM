@@ -17,9 +17,10 @@ const CREDENTIAL_BUTTON_ID: usize = 4020;
 const MINIMIZE_BUTTON_ID: usize = 4005;
 const MAXIMIZE_BUTTON_ID: usize = 4006;
 const CLOSE_BUTTON_ID: usize = 4007;
+const RETRY_BUTTON_ID: usize = 4030;
 
 impl WindowContext {
-    pub(super) fn toolbar_controls(&self) -> [HWND; 18] {
+    pub(super) fn toolbar_controls(&self) -> [HWND; 20] {
         let controls = self.controls();
         [
             controls.user_combo,
@@ -40,6 +41,8 @@ impl WindowContext {
             controls.maximize_button,
             controls.close_button,
             controls.debug_overlay,
+            controls.reconnecting_label,
+            controls.retry_button,
         ]
     }
 
@@ -285,23 +288,43 @@ impl WindowContext {
         }
         let (width, height) = unsafe { client_size(window) }.unwrap_or_default();
         let video = self.video_rect_for(width, height);
-        let (label_width, label_height) = (self.px(360), self.px(48));
+        let (panel_width, panel_height) = (self.px(440), self.px(104));
         let mut center = windows::Win32::Foundation::POINT {
-            x: video.left + (video.width - label_width) / 2,
-            y: video.top + (video.height - label_height) / 2,
+            x: video.left + (video.width - panel_width) / 2,
+            y: video.top + (video.height - panel_height) / 2,
         };
         if unsafe { ClientToScreen(window, &mut center) }.as_bool() {
             let _ = unsafe {
                 SetWindowPos(
-                    controls.reconnecting_label,
+                    controls.reconnect_panel,
                     None,
                     center.x,
                     center.y,
-                    label_width,
-                    label_height,
+                    panel_width,
+                    panel_height,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 )
             };
+            // Two lines of text above the button, in panel coordinates.
+            let place = |control: HWND, x: i32, y: i32, width: i32, height: i32| {
+                let _ = unsafe { MoveWindow(control, x, y, width, height, true) };
+            };
+            let margin = self.px(12);
+            place(
+                controls.reconnecting_label,
+                margin,
+                margin,
+                panel_width - 2 * margin,
+                self.px(40),
+            );
+            let (button_width, button_height) = (self.px(120), self.px(28));
+            place(
+                controls.retry_button,
+                (panel_width - button_width) / 2,
+                panel_height - button_height - self.px(14),
+                button_width,
+                button_height,
+            );
         }
         if let Some(chat) = self.chat_popup.get() {
             chat.layout();
@@ -495,6 +518,14 @@ impl WindowContext {
             unsafe { SendMessageW(window, WM_CLOSE, None, None) };
             return true;
         }
+        // Forwarded by the reconnect panel.
+        if control_id == RETRY_BUTTON_ID && notification == BN_CLICKED as usize {
+            // Disabled until the session loop starts its next wait.
+            let _ = unsafe { EnableWindow(controls.retry_button, false) };
+            crate::reconnect::request_retry_now();
+            let _ = unsafe { SetFocus(Some(window)) };
+            return true;
+        }
         false
     }
 }
@@ -540,12 +571,27 @@ pub(super) unsafe fn create_toolbar(
         )
     }
     .context("debug overlay creation failed")?;
-    let reconnecting_label = unsafe {
+    let panel_class = w!("MeshRmmReconnectPanel");
+    let panel_window_class = WNDCLASSW {
+        lpfnWndProc: Some(messages::reconnect_panel_proc),
+        hInstance: instance,
+        lpszClassName: panel_class,
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }?,
+        hbrBackground: HBRUSH(unsafe { GetStockObject(BLACK_BRUSH) }.0),
+        ..Default::default()
+    };
+    if unsafe { RegisterClassW(&panel_window_class) } == 0 {
+        let error = windows::core::Error::from_thread();
+        if error.code() != windows::core::HRESULT::from_win32(ERROR_CLASS_ALREADY_EXISTS.0) {
+            return Err(error).context("reconnect panel class registration failed");
+        }
+    }
+    let reconnect_panel = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            w!("STATIC"),
-            w!("Reconnecting to the remote computer…"),
-            WINDOW_STYLE(WS_POPUP.0 | WS_BORDER.0 | STATIC_CENTER | STATIC_CENTER_VERTICALLY),
+            panel_class,
+            w!(""),
+            WS_POPUP | WS_BORDER | WS_CLIPCHILDREN,
             0,
             0,
             1,
@@ -556,7 +602,41 @@ pub(super) unsafe fn create_toolbar(
             None,
         )
     }
+    .context("reconnect panel creation failed")?;
+    let reconnecting_label = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!("Reconnecting to the remote computer…"),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | STATIC_CENTER),
+            0,
+            0,
+            1,
+            1,
+            Some(reconnect_panel),
+            None,
+            Some(instance),
+            None,
+        )
+    }
     .context("reconnecting label creation failed")?;
+    let retry_button = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("BUTTON"),
+            w!("Retry now"),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_DISABLED.0 | BS_PUSHBUTTON as u32),
+            0,
+            0,
+            1,
+            1,
+            Some(reconnect_panel),
+            Some(HMENU(RETRY_BUTTON_ID as *mut c_void)),
+            Some(instance),
+            None,
+        )
+    }
+    .context("retry button creation failed")?;
     let toolbar = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -759,6 +839,7 @@ pub(super) unsafe fn create_toolbar(
     for control in [
         overlay,
         reconnecting_label,
+        retry_button,
         user_combo,
         display_combo,
         quality_combo,
@@ -781,7 +862,9 @@ pub(super) unsafe fn create_toolbar(
     }
     Ok(Controls {
         debug_overlay: overlay,
+        reconnect_panel,
         reconnecting_label,
+        retry_button,
         toolbar,
         user_combo,
         display_combo,

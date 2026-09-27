@@ -17,6 +17,11 @@ use url::Url;
 
 pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// How long an attempt must stream before its failure restarts the reconnect
+/// schedule. Shorter attempts keep backing off, so a peer that connects and
+/// then fails within seconds does not reconnect every second forever.
+pub const STABLE_CONNECTION: Duration = Duration::from_secs(20);
+
 /// Capped exponential delay shared by the Agent and viewer reconnect loops.
 /// A fresh loop retries quickly, then backs off enough to avoid hammering the
 /// control plane while a machine is rebooting or a network is unavailable.
@@ -46,6 +51,17 @@ impl ReconnectBackoff {
 
     pub fn reset(&mut self) {
         self.next = self.initial;
+    }
+
+    /// The delay after an attempt that streamed for `streamed_for` (`None`
+    /// if it never streamed). An attempt that streamed for at least
+    /// [`STABLE_CONNECTION`] restarts the schedule; a connect-then-fail loop
+    /// keeps growing.
+    pub fn delay_after(&mut self, streamed_for: Option<Duration>) -> Duration {
+        if streamed_for.is_some_and(|streamed| streamed >= STABLE_CONNECTION) {
+            self.reset();
+        }
+        self.next_delay()
     }
 }
 
@@ -201,6 +217,24 @@ mod tests {
         assert_eq!(backoff.next_delay(), Duration::from_secs(15));
         backoff.reset();
         assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn only_a_stable_attempt_restarts_the_backoff() {
+        let seconds = Duration::from_secs;
+        let mut backoff = ReconnectBackoff::new(seconds(1), seconds(15));
+        // Never streamed, or failed 5 s after each connect: keeps growing.
+        assert_eq!(backoff.delay_after(None), seconds(1));
+        assert_eq!(backoff.delay_after(Some(seconds(5))), seconds(2));
+        assert_eq!(backoff.delay_after(Some(seconds(5))), seconds(4));
+        assert_eq!(backoff.delay_after(Some(seconds(19))), seconds(8));
+        assert_eq!(backoff.delay_after(None), seconds(15));
+        assert_eq!(backoff.delay_after(Some(seconds(5))), seconds(15));
+        // A stable attempt restarts the schedule, which then grows again.
+        assert_eq!(backoff.delay_after(Some(STABLE_CONNECTION)), seconds(1));
+        assert_eq!(backoff.delay_after(Some(seconds(5))), seconds(2));
+        assert_eq!(backoff.delay_after(None), seconds(4));
+        assert_eq!(backoff.delay_after(Some(seconds(3600))), seconds(1));
     }
 }
 
