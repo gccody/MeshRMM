@@ -1,7 +1,6 @@
 "use client";
 
 import { AuthProvider } from "../features/auth/auth-provider";
-import { WorkOsWidgets } from "@workos-inc/widgets";
 import { createContext, useContext } from "react";
 export { LOGIN_ATTEMPT_KEY, AUTH_REFRESH_FAILED_EVENT } from "../features/auth/auth-provider";
 
@@ -38,11 +37,11 @@ export default function Providers({
 }>) {
   return (
     <AuthProvider enabled={surface !== "marketing"}>
-      <WorkOsWidgets theme={{ accentColor: "violet", radius: "medium", fontFamily: "var(--font-geist-sans)" }}>
-        <RuntimeConfigContext.Provider value={{ serverUrl, surface, hostname, tenantSlug, workosOrganizationId }}>
-          {children}
-        </RuntimeConfigContext.Provider>
-      </WorkOsWidgets>
+      <RuntimeConfigContext.Provider value={{ serverUrl, surface, hostname, tenantSlug, workosOrganizationId }}>
+        {/* Carries the page baseline in globals.css. The WorkOS widgets bring
+            their own Radix theme on the pages that use them. */}
+        <div className="app-root">{children}</div>
+      </RuntimeConfigContext.Provider>
     </AuthProvider>
   );
 }
