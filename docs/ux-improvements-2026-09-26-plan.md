@@ -20,7 +20,7 @@ stand alone; read [Working rules](#working-rules), [Merge order](#merge-order), 
 | 2.10b Start event subscription in parallel with account | Dashboard | 2 | 2.9, 2.10a (soft) | Merged | `070f56d` |
 | 2.11 Inventory keeps data, stale state, per-source errors | Dashboard | 2 | 2.9 | Merged | `c8a985f`, `a2f4cc5`, `3829369`, `bea60b2` |
 | 2.12 Scope WorkOS widgets and Radix CSS to admin pages | Dashboard | 2 | 2.9 (soft) | Merged | `33a9fef`, `7d35d61` |
-| 3.14 Backoff reset, reconnect reason, Retry now | Viewer, agent | 2 | 0.2 | Not started | |
+| 3.14 Backoff reset, reconnect reason, Retry now | Viewer, agent | 2 | 0.2 | Merged | `32fab6a`, `96ef7aa`, `ed6c44d`, `a4d38b7` |
 | 3.16a Audio: send only when unmuted, stereo, Opus | Agent, viewer, protocol | 3 | 3.16b, 3.17 | Not started | |
 | 3.16b HEVC bitrate adaptation via restart ladder | Agent | 1 | — | Merged | `f939623`, `f3b552c` |
 | 3.17 Windows viewer resets the stream in place | Windows viewer | 1 | — | Merged | `5ce8cc7` |
@@ -963,7 +963,51 @@ Endpoint: native clippy/tests; Windows overlay and the owned-popup button (probe
 isn't possible there). Install the agent (session.rs/transport.rs change), confirm it connects,
 restart the service mid-session from a macOS viewer, and check the reason and the reset backoff.
 
-**Notes.**
+**Notes.** Implemented in `32fab6a`, `96ef7aa`, `ed6c44d` and `a4d38b7`, rebased onto 2.10b, 2.11,
+0.1 and 2.12 (pre-rebase `fe50c40`, `91767e2`, `918418f`, `c6fbb8c`). Deviations:
+- **The owned-popup button does not work.** On the endpoint, a `BUTTON` that is itself an owned
+  `WS_POPUP` never delivered `BN_CLICKED` to the viewer window: `BM_CLICK` left the retry counter
+  unchanged even when matched by HWND, and `GetDlgCtrlID` returned 0. Windows therefore uses the
+  fallback: a registered popup class `MeshRmmReconnectPanel`, owned by the viewer window, hosts the
+  text `STATIC` and the "Retry now" button as children and forwards their `WM_COMMAND` to its
+  owner. This also gives the two lines of text real padding, and the label and button now follow
+  DPI font changes.
+- Titles: "The remote computer is restarting or offline", "Network connection lost", "Connection to
+  the remote computer was interrupted", "Restarting the remote display…".
+- `VideoTimeout` also maps to "restarting or offline": during a reconnect it means the Agent never
+  answered. Resume failures are `reqwest` status errors from `error_for_status`, not `ApiError`, so
+  `classify` handles both. 409 and 5xx mean the Agent is offline, connect and timeout errors mean
+  the network was lost, and other resume failures keep the attempt's reason.
+- The loop still resumes first and then waits. The panel shows "reconnecting…" during the resume
+  request, and the countdown starts when the wait starts.
+- Both platforms refresh the counts every 250 ms rather than 1 s, so they never skip a second.
+  Windows redraws only when the text changes.
+- "Retry now" disables itself on click until the next wait starts.
+- The streamed time is measured from the attempt's first frame to failure detection, so it includes
+  up to the 10 s disconnected grace.
+- `SenderProgress` lives in the new `agent/src/remote/sender_progress.rs`, keeping `transport.rs`
+  hunks to 5 lines.
+
+Validation. The rebase changed only dashboard and docs files: `git diff c6fbb8c a4d38b7 --
+':!dashboard' ':!docs'` is empty, so the endpoint results below carry over. macOS development host
+on the rebased tree: `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test --workspace`
+(278 passed, 1 ignored) pass. macOS panel, through an uncommitted harness driving the real presenter
+and `RemoteView`: the text, live counts ("1:05 · retrying in 9 s" to "1:07 · retrying in 7 s"),
+"Retry now" ending a backoff wait in 0.4 s through `performClick:`, disabled and ignored while
+attempting, and hidden when cleared. No physical click was made, to avoid moving the mouse on the
+shared host. DESKTOP-85R6S28, synced tree at `c6fbb8c` (SHA-256 manifest of 432 files matched):
+native fmt, clippy, and tests for `meshrmm-signaling-client`, `meshrmm-remote` and `meshrmm-agent`
+pass. The new ignored `reconnect_probe` passes in the console session: the text and live counts,
+`BM_CLICK` and a real `SendInput` click both reaching the window, and clicks while attempting are
+ignored. The Agent built from `c6fbb8c` was installed, started, connected, and reconnected 0.28 s
+after a service restart with no WARN/ERROR lines; release 0.3.1 was then restored (see Endpoint
+state).
+
+**Incomplete:** no authenticated dashboard link was available, so these were not exercised: the
+live overlay in a real session, the backoff timings end to end (1 s after a stable session; 1, 2,
+4, 8, 15 s for a connect-then-fail loop), "Network connection lost" after a real network drop,
+"restarting or offline" after stopping the Agent mid-session, and "Retry now" in a real session. The
+Mac's network was not toggled because it is the shared development host.
 
 ---
 
@@ -1375,3 +1419,12 @@ SHA-256, backup file name, and whether it was restored.
 - **End of wave 1.** The service runs release 0.3.1 (`6BF0C029…4D60`), connected. The `meshrmm:`
   handler is `"C:\Users\gccody\audit-fixes-2026-09-23\audit-builds\viewer-8b3980a\meshrmm-remote.exe" -- "%1"`.
   `Get-NetQosPolicy` returns none. No install lock is held.
+- **3.14 (2026-09-27).** 16:59 install: release build of `c6fbb8c` (pre-rebase; same code as
+  `a4d38b7` outside dashboard and docs), SHA-256
+  `136D18D4EEF01204790B728490CC5B873EFAB169BDE3FC99598AEDCAB52C9110`, backup
+  `meshrmm-agent.exe.before-local-20260927-165953` (the 0.3.1 build `6BF0C029…4D60`). Started,
+  connected, and reconnected 0.28 s after a service restart; no session. 17:00 restore:
+  `6BF0C029…4D60` from a copy in `~\ux-2026-09-26-3.14\.ux-tools\restore`, backup
+  `meshrmm-agent.exe.before-local-20260927-170031` (the 3.14 build); running and connected; lock
+  released. Work tree: `~\ux-2026-09-26-3.14`. Its `ux314-reconnect-probe` scheduled task was
+  deleted; the `meshrmm:` handler was not changed; `Get-NetQosPolicy` returns none.
