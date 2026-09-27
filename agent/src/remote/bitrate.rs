@@ -1,6 +1,6 @@
-//! Video rate control shared by the sender: fragment pacing and the live
-//! AIMD bitrate controller, and the restart ladder for encoders that cannot
-//! change bitrate live.
+//! Video rate control shared by the sender: fragment pacing (which leaves
+//! room for audio) and the live AIMD bitrate controller, and the restart
+//! ladder for encoders that cannot change bitrate live.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -28,6 +28,14 @@ impl VideoPacer {
         self.next_send_us
             .saturating_sub(now_us.saturating_add(VIDEO_PACING_BURST_US))
     }
+}
+
+/// The rate video fragments are paced at: the quality ceiling less the audio
+/// the sender is currently streaming, but never below half the ceiling.
+pub(super) fn video_pacing_bitrate(ceiling: u32, audio_bits_per_second: u32) -> u32 {
+    ceiling
+        .saturating_sub(audio_bits_per_second)
+        .max(ceiling / 2)
 }
 
 #[derive(Debug)]
@@ -340,6 +348,14 @@ mod tests {
         assert_eq!(pacer.reserve(1_008_000, 12_000, 3_000_000), 12_000);
         assert_eq!(pacer.reserve(2_000_000, 12_000, 6_000_000), 0);
         assert_eq!(pacer.reserve(2_000_000, 12_000, 6_000_000), 12_000);
+    }
+
+    #[test]
+    fn video_pacing_leaves_room_for_audio_down_to_half_the_ceiling() {
+        assert_eq!(video_pacing_bitrate(3_000_000, 0), 3_000_000);
+        assert_eq!(video_pacing_bitrate(3_000_000, 110_000), 2_890_000);
+        assert_eq!(video_pacing_bitrate(1_000_000, 1_536_000), 500_000);
+        assert_eq!(video_pacing_bitrate(2, u32::MAX), 1);
     }
 
     #[test]

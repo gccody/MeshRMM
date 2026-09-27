@@ -24,6 +24,8 @@ struct Preferences {
     diagnostics_key: ShortcutKey,
     /// Windows: cycles the viewed display.
     next_display_key: ShortcutKey,
+    /// Remote system audio starts muted, and the Agent sends none while muted.
+    audio_muted: bool,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -35,6 +37,7 @@ impl Default for Preferences {
             send_windows_shortcuts: true,
             diagnostics_key: ShortcutKey::F12,
             next_display_key: ShortcutKey::F8,
+            audio_muted: true,
         }
     }
 }
@@ -119,6 +122,12 @@ pub fn send_windows_shortcuts() -> bool {
 pub fn toggle_send_windows_shortcuts() -> anyhow::Result<()> {
     toggle(|p| &mut p.send_windows_shortcuts)
 }
+pub fn audio_muted() -> bool {
+    get(|p| p.audio_muted)
+}
+pub fn set_audio_muted(muted: bool) -> anyhow::Result<()> {
+    update(|p| p.audio_muted = muted)
+}
 pub fn shortcut_key(shortcut: ViewerShortcut) -> ShortcutKey {
     let (diagnostics, next_display) = get(|p| (p.diagnostics_key, p.next_display_key));
     match shortcut {
@@ -199,6 +208,16 @@ mod tests {
         assert!(!load(&path).clipboard_sync);
         assert!(!load(&path).clear_clipboard_on_close);
         assert!(load(&path).command_as_control);
+        assert!(load(&path).audio_muted);
+        save(
+            &path,
+            &Preferences {
+                audio_muted: false,
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+        assert!(!load(&path).audio_muted);
         save(&path, &Preferences::default()).unwrap();
         assert!(load(&path).disconnect_confirmation);
         assert!(load(&path).clipboard_sync);
@@ -212,6 +231,7 @@ mod tests {
         assert!(load(&path).send_windows_shortcuts);
         assert_eq!(load(&path).diagnostics_key, ShortcutKey::F12);
         assert_eq!(load(&path).next_display_key, ShortcutKey::F8);
+        assert!(load(&path).audio_muted);
         // The session close action used to be saved here; it is now per session.
         std::fs::write(
             &path,

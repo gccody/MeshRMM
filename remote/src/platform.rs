@@ -7,6 +7,17 @@ mod macos;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+/// Audio formats this viewer plays, most preferred first.
+const AUDIO_FORMATS: &[meshrmm_protocol::AudioFormat] = &[meshrmm_protocol::AudioFormat::Pcm16];
+
+/// The Agent sends system audio only while the viewer is unmuted.
+pub fn audio_preference(muted: bool) -> meshrmm_protocol::SessionMessage {
+    meshrmm_protocol::SessionMessage::SetAudio {
+        enabled: !muted,
+        formats: AUDIO_FORMATS.to_vec(),
+    }
+}
+
 #[derive(Default)]
 pub struct IdlePreference {
     pub policy: meshrmm_protocol::IdlePolicy,
@@ -158,8 +169,16 @@ impl ControlSink {
         self.audio.muted()
     }
 
+    /// Mutes or unmutes remote audio, tells the Agent, and remembers the
+    /// choice for later sessions.
     pub fn toggle_audio(&self) {
-        self.audio.toggle();
+        let muted = self.audio.toggle();
+        self.send(audio_preference(muted));
+        if let Err(error) = crate::preferences::set_audio_muted(muted)
+            && let Ok(mut state) = self.maintenance.lock()
+        {
+            state.error = Some(error.to_string());
+        }
     }
 
     pub fn type_clipboard(&self, display_id: meshrmm_protocol::DisplayId) {
@@ -473,3 +492,28 @@ pub use macos::{
     Presenter, monotonic_timestamp_us, run_application, show_launch_status, show_notice,
     supported_video_profiles,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_preference_enables_audio_only_while_unmuted() {
+        use meshrmm_protocol::{AudioFormat, SessionMessage};
+        assert_eq!(
+            audio_preference(true),
+            SessionMessage::SetAudio {
+                enabled: false,
+                formats: vec![AudioFormat::Pcm16],
+            }
+        );
+        assert!(matches!(
+            audio_preference(false),
+            SessionMessage::SetAudio { enabled: true, .. }
+        ));
+        // Sessions start muted unless the saved preference says otherwise,
+        // and tests never read the user's preference file.
+        assert!(crate::transport::ViewerResumeState::default().audio_muted());
+        assert!(!crate::transport::ViewerResumeState::with_audio_muted(false).audio_muted());
+    }
+}
