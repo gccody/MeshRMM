@@ -920,6 +920,18 @@ pub(super) unsafe fn probe_state(window: HWND) -> Option<ProbeState> {
     })
 }
 
+/// The reconnect panel, its label and its "Retry now" button, for the
+/// reconnect probe.
+#[cfg(test)]
+pub(super) unsafe fn probe_reconnect_panel(window: HWND) -> Option<(HWND, HWND, HWND)> {
+    let controls = unsafe { window_context(window) }?.controls();
+    Some((
+        controls.reconnect_panel,
+        controls.reconnecting_label,
+        controls.retry_button,
+    ))
+}
+
 #[cfg(test)]
 pub(super) unsafe fn probe_toggle_chat(window: HWND) {
     if let Some(context) = unsafe { window_context(window) }

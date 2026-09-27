@@ -41,6 +41,8 @@ use crate::reconnect::{ReconnectStatus, ReconnectText};
 mod keyboard_hook;
 mod launch_window;
 mod pipeline;
+#[cfg(test)]
+mod reconnect_probe;
 mod renderer;
 #[cfg(test)]
 mod reset_probe;
