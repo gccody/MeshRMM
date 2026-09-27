@@ -18,6 +18,14 @@ use remote::config::{Config, ExecutionMode};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--third-party-notices")
+    {
+        print!("{}", meshrmm_audio::THIRD_PARTY_NOTICES);
+        return Ok(());
+    }
+
     #[cfg(windows)]
     if std::env::args_os()
         .nth(1)

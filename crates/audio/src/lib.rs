@@ -1,12 +1,23 @@
-//! Bounded, independent system-audio transport. v1 carries interleaved PCM16.
+//! Bounded, independent system-audio transport. v1 carries interleaved
+//! PCM16; the Opus channel carries 48 kHz stereo Opus.
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 pub const CHANNEL: &str = "meshrmm-audio-v1";
 pub const PROTOCOL: &str = "meshrmm.audio.pcm16.v1";
+pub const OPUS_CHANNEL: &str = "meshrmm-audio-opus-v1";
+pub const OPUS_PROTOCOL: &str = "meshrmm.audio.opus.v1";
+/// The Opus stream's nominal rate: 96 kbps constrained VBR plus framing.
+pub const OPUS_BITS_PER_SECOND: u32 = 110_000;
+/// Third-party license notices for code built into this crate (libopus).
+pub const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD_PARTY_NOTICES.txt");
 const HEADER: usize = 6;
 const MAX_PACKET: usize = 16_000;
 
+#[cfg(any(windows, target_os = "macos"))]
+mod opus;
+#[cfg(any(windows, target_os = "macos"))]
+pub use opus::OpusEncoder;
 #[cfg(any(windows, target_os = "macos"))]
 mod playback;
 #[cfg(any(windows, target_os = "macos"))]

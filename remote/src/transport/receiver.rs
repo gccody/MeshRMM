@@ -564,6 +564,12 @@ fn install_data_channel_handler(
                         Box::pin(async {})
                     }));
                 }
+                meshrmm_audio::OPUS_CHANNEL => {
+                    channel.on_message(Box::new(move |message| {
+                        audio.receive_opus(&message.data);
+                        Box::pin(async {})
+                    }));
+                }
                 CONTROL_CHANNEL_LABEL => {
                     let channel = ServiceChannel::new(channel).await;
                     control_channel.send_replace(Some(channel.clone()));
