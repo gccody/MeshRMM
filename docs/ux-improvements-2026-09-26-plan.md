@@ -18,7 +18,7 @@ stand alone; read [Working rules](#working-rules), [Merge order](#merge-order), 
 | 2.9 Persistent workspace shell + filters in URL | Dashboard | 1 | — | Merged | `200591b`, `817785b` |
 | 2.10a Fewer D1 round trips + cron cleanup | Server | 1 | — | Merged | `9d5b338`, `3dde5f0`, `e962fef` |
 | 2.10b Start event subscription in parallel with account | Dashboard | 2 | 2.9, 2.10a (soft) | Merged | `070f56d` |
-| 2.11 Inventory keeps data, stale state, per-source errors | Dashboard | 2 | 2.9 | Not started | |
+| 2.11 Inventory keeps data, stale state, per-source errors | Dashboard | 2 | 2.9 | Merged | `c8a985f`, `a2f4cc5`, `3829369`, `bea60b2` |
 | 2.12 Scope WorkOS widgets and Radix CSS to admin pages | Dashboard | 2 | 2.9 (soft) | Not started | |
 | 3.14 Backoff reset, reconnect reason, Retry now | Viewer, agent | 2 | 0.2 | Not started | |
 | 3.16a Audio: send only when unmuted, stereo, Opus | Agent, viewer, protocol | 3 | 3.16b, 3.17 | Not started | |
@@ -694,7 +694,40 @@ current behavior; close → reconnecting with agents retained. `tests/action-err
 online: reconnects within ~1 s. Sleep/wake: resync on visible. Failed Refresh keeps the rows. A
 delete error survives a socket reconnect. Settings error shows beside Save.
 
-**Notes.**
+**Notes.** Implemented in `c8a985f`, `a2f4cc5`, `3829369` and `bea60b2`, rebased onto 2.10b (the
+hook keeps its `subscriptionKey` option; effect deps are `[authorizedFetch, enabled,
+subscriptionKey]`). `features/agents/inventory-stream.ts` holds the socket logic moved out of the
+hook, with snapshot and buffered-delta handling unchanged, plus a `connecting` guard, 1 → 30 s
+backoff, `wake()` (reconnect now with the delay reset, or `send("refresh")` on an open socket),
+`setOnline()`, and the pure `inventoryStatus()` with a 5 s stale grace period. Deviations: a fifth
+connection state, `"unavailable"`, for a 403/404 subscription response (2.10b lets the
+subscription fail before the account loads); it stops automatic retries, and any later `wake()`
+(Reconnect now, Refresh, `online`, tab visible) tries once more. The controller, not the hook, owns
+the offline override so it is testable. Refresh does the HTTP load and calls `wake()` only while
+the stream isn't live. Connect is disabled at once when offline, while stale styling waits for the
+grace period. `useRemoteHandoff` keeps its single `reportError`, so close-session errors are
+reported under `"remote"`; the `"close-session"` key is kept for 0.1. The hook keeps devices until
+`reset()`, clears the inventory error whenever live data arrives, and `lastUpdated` stays null until
+the first data. The shell-level banner is gone: device actions show dismissible per-source banners
+in the Devices panel, the resume error shows in the paused card, and Settings shows `saveError`
+beside Save. On desktop the stale badge puts "last known" on a second line, because the status
+column is too narrow for one line.
+
+Verified on the macOS development host on the rebased tree: `npm run verify` (typecheck, lint,
+build, 87/87 tests). System Chrome 154 (playwright-core outside the repo) against a fresh production
+build with mocked `/auth/session`, `/auth/login`, `/v1/*` and WebSocket endpoints, 26/26 checks:
+offline keeps the list and disables Connect at once, with stale styling at 5 s; back online
+reconnected in ~60 ms; a 4001 close plus reconnect showed no stale flash; a visibility event sent
+`refresh`; a failed Refresh kept the rows; delete and handoff errors survived a socket reconnect
+and dismissed independently; the settings error showed beside Save and the resume error in the
+paused card; a subscription 403/404 made one attempt in 6 s and recovered through Reconnect now.
+With the account and the subscription both returning 404 (the 2.10b edge case), the duplicate
+banner is gone: the user sees only the "Your company workspace could not be loaded" card with the
+server message and Retry now, with one account request and one subscription and no retries. Retry
+now with both requests succeeding loaded the workspace and started a new, live subscription. Not
+verified: real DevTools offline and real sleep/wake (headless Chrome doesn't hide tabs; the
+visibility check used a synthetic event), a live control-plane WebSocket and 4001 renewal, real
+WorkOS sign-in, Safari and Firefox.
 
 ---
 
