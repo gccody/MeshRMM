@@ -15,14 +15,14 @@ import {
   Settings,
   ShieldCheck,
   Users,
-  WifiOff,
   X,
 } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { AUTH_REFRESH_FAILED_EVENT, useRuntimeConfig } from "../../app/providers";
 import { useAgentInventory } from "../agents/use-agent-inventory";
+import type { InventoryConnection } from "../agents/inventory-stream";
 import type { Agent } from "../agents/types";
 import { EnrollmentModal } from "../enrollment/enrollment-modal";
 import { useInstallerDownload } from "../enrollment/use-installer-download";
@@ -34,6 +34,7 @@ import {
 import { useRemoteHandoff } from "../session/use-remote-handoff";
 import { useSettingsDraft } from "../settings/use-settings-draft";
 import { AccountLoadError, accountLoader } from "./account-load";
+import { type ActionErrorSource, actionErrorsReducer } from "./action-errors";
 import { AccountModal } from "./account-modal";
 import type { Account } from "./types";
 import { useIdleSession } from "../session/use-idle-session";
@@ -41,6 +42,15 @@ import { VIEW_COPY, VIEW_PATHS, type View, viewForPath } from "./views";
 import { type Workspace, WorkspaceContext } from "./workspace-context";
 
 type SessionPauseReason = "idle" | "expired";
+
+// The topbar pill while the inventory on screen is out of date.
+const CONNECTION_PILL: Record<InventoryConnection, string> = {
+  connecting: "Reconnecting",
+  live: "Connected",
+  reconnecting: "Reconnecting",
+  offline: "Offline",
+  unavailable: "Updates paused",
+};
 
 // The company workspace around every tenant page. The (workspace) route group
 // layout renders it, so it stays mounted while the user moves between pages:
@@ -70,7 +80,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
   // The control that opened the account or enrollment dialog gets focus back.
   const dialogOpener = useRef<HTMLElement | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [actionErrors, dispatchActionError] = useReducer(actionErrorsReducer, {});
   const [sessionPauseReason, setSessionPauseReason] = useState<SessionPauseReason | null>(null);
   const [isResumingSession, setIsResumingSession] = useState(false);
 
@@ -127,9 +137,13 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
     enabled: Boolean(hasTenantSession && !sessionPauseReason && !(accountError && !accountError.retrying)),
     subscriptionKey: workosOrganizationId,
     authorizedFetch,
-    reportError: setError,
   });
-  const { agents, isLive, isRefreshing, loadAgents, reset: resetInventory } = inventory;
+  const { agents, hasData, status: inventoryStatus, connection, isRefreshing, refresh, reset: resetInventory } = inventory;
+  const reportActionError = useCallback(
+    (source: ActionErrorSource, message: string | null) => dispatchActionError({ source, message }),
+    [],
+  );
+  const reportRemoteError = useCallback((message: string | null) => reportActionError("remote", message), [reportActionError]);
 
   const pauseIdleSession = useCallback(() => {
     resetInventory();
@@ -156,7 +170,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
   }, [lockSession, resetInventory]);
 
   const installer = useInstallerDownload(authorizedFetch);
-  const remote = useRemoteHandoff({ authorizedFetch, reportError: setError });
+  const remote = useRemoteHandoff({ authorizedFetch, reportError: reportRemoteError });
   const settingsDraft = useSettingsDraft(account?.company);
 
   const fetchAccount = useCallback(async () => {
@@ -198,11 +212,11 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
 
   const resumeSession = async () => {
     setIsResumingSession(true);
-    setError(null);
+    reportActionError("resume", null);
     try {
       await signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } });
     } catch (resumeError) {
-      setError(resumeError instanceof Error ? resumeError.message : "Your session could not be resumed.");
+      reportActionError("resume", resumeError instanceof Error ? resumeError.message : "Your session could not be resumed.");
       setIsResumingSession(false);
     }
   };
@@ -213,7 +227,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
     );
     if (!confirmed) return;
     setDeletingId(agent.id);
-    setError(null);
+    reportActionError("delete", null);
     try {
       const response = await authorizedFetch(`/v1/agents/${encodeURIComponent(agent.id)}`, {
         method: "DELETE",
@@ -224,7 +238,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
       // The backend publishes agent_deleted to the existing subscription.
     } catch (requestError) {
       if (!(requestError instanceof AuthenticationRequired)) {
-        setError(requestError instanceof Error ? requestError.message : "The Agent could not be deleted.");
+        reportActionError("delete", requestError instanceof Error ? requestError.message : "The Agent could not be deleted.");
       }
     } finally {
       setDeletingId(null);
@@ -259,7 +273,8 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
     remote,
     deleteAgent,
     deletingId,
-    reportError: setError,
+    actionErrors,
+    reportActionError,
     devicesSearch,
     setDevicesSearch,
     settingsDraft,
@@ -282,7 +297,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
 
           <nav aria-label="Primary navigation">
             <p className="nav-label">Company</p>
-            <NavItem view="agents" search={devicesSearch} current={view} disabled={Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Monitor size={18} /><span>Devices</span>{isLive ? <em>{agents.length}</em> : null}</NavItem>
+            <NavItem view="agents" search={devicesSearch} current={view} disabled={Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Monitor size={18} /><span>Devices</span>{hasData ? <em>{agents.length}</em> : null}</NavItem>
             {isAdmin && <NavItem view="team" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Users size={18} /><span>Users</span></NavItem>}
             {isAdmin && <NavItem view="sso" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><KeyRound size={18} /><span>Authentication</span></NavItem>}
             <NavItem view="settings" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Settings size={18} /><span>Settings</span></NavItem>
@@ -303,8 +318,8 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
             <div className="workspace-breadcrumb"><Building2 size={16} /><span>{companyLabel}</span></div>
             <div className="topbar-actions">
               <div className="connection-pill" role="status">
-                <span className={`status-dot ${isLive ? "live" : ""}`} />
-                {sessionPauseReason ? "Session paused" : isAuthLoading ? "Checking session" : isLive ? "Connected" : user ? "Signed in" : "Signed out"}
+                <span className={`status-dot ${inventoryStatus === "stale" ? "stale" : inventoryStatus === "live" ? "live" : ""}`} />
+                {sessionPauseReason ? "Session paused" : isAuthLoading ? "Checking session" : inventoryStatus === "live" ? "Connected" : inventoryStatus === "stale" ? CONNECTION_PILL[connection] : user ? "Signed in" : "Signed out"}
               </div>
             </div>
           </header>
@@ -316,6 +331,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
                 <p className="eyebrow">Session paused</p>
                 <h1>{sessionPauseReason === "idle" ? "You’ve been signed out for inactivity" : "Your session needs to be renewed"}</h1>
                 <p>{sessionPauseReason === "idle" ? `Your organization pauses inactive dashboards after ${formatIdleTimeout(idleTimeoutMinutes)}.` : "Sign in again to continue managing your devices."}</p>
+                {actionErrors.resume && <p className="session-paused-error" role="alert">{actionErrors.resume}</p>}
                 <button className="primary-button" onClick={() => void resumeSession()} disabled={isResumingSession}>{isResumingSession ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />} Continue securely</button>
               </section>
             ) : !user && !isAuthLoading ? (
@@ -354,12 +370,10 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
                     <p>{VIEW_COPY[view].description}</p>
                   </div>
                   {view === "agents" && !accountPending && <div className="heading-actions">
-                    <button className="secondary-button" onClick={() => void loadAgents()}><RefreshCw size={16} className={isRefreshing ? "spin" : ""} /> Refresh</button>
+                    <button className="secondary-button" onClick={() => void refresh()}><RefreshCw size={16} className={isRefreshing ? "spin" : ""} /> Refresh</button>
                     {isAdmin && <button className="primary-button" onClick={(event) => { dialogOpener.current = event.currentTarget; installer.reset(); setIsAgentOpen(true); }} aria-haspopup="dialog"><Plus size={16} /> Add device</button>}
                   </div>}
                 </section>
-
-                {error && <div className="error-banner" role="alert"><WifiOff size={17} /><span>{error}</span><button onClick={() => setError(null)} aria-label="Dismiss"><X size={16} /></button></div>}
 
                 {accountPending ? (
                   <section className="management-panel account-status">

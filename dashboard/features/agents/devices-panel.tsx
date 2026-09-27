@@ -1,7 +1,9 @@
 "use client";
 
+import { CircleAlert, X } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
+import { type ActionErrorSource, listActionErrors } from "../workspace/action-errors";
 import { useWorkspace } from "../workspace/workspace-context";
 import { AgentOverview } from "./agent-overview";
 import {
@@ -12,6 +14,10 @@ import {
   parseDeviceFilters,
   serializeDeviceFilters,
 } from "./device-filters";
+
+// Errors from the actions this page starts. A session-resume error shows in
+// the paused card instead.
+const DEVICE_ACTIONS: readonly ActionErrorSource[] = ["remote", "close-session", "delete"];
 
 // Safari rate-limits history updates, so typing reaches the URL in batches.
 const QUERY_WRITE_DELAY_MS = 250;
@@ -25,7 +31,7 @@ function writeFilters(filters: DeviceFilters) {
 }
 
 export function DevicesPanel() {
-  const { inventory, remote, deleteAgent, deletingId, isAdmin, setDevicesSearch } = useWorkspace();
+  const { inventory, remote, deleteAgent, deletingId, isAdmin, setDevicesSearch, actionErrors, reportActionError } = useWorkspace();
   const filters = parseDeviceFilters(useSearchParams());
   const status = filters.status;
   // The search box updates at once; the URL follows after a pause in typing.
@@ -59,11 +65,17 @@ export function DevicesPanel() {
   return (
     <>
       {remote.sessionNotice && <div className="session-notice" role="status">{remote.sessionNotice}</div>}
+      {listActionErrors(actionErrors, DEVICE_ACTIONS).map(({ source, message }) => (
+        <div key={source} className="error-banner" role="alert">
+          <CircleAlert size={17} aria-hidden="true" /><span>{message}</span>
+          <button onClick={() => reportActionError(source, null)} aria-label="Dismiss"><X size={16} /></button>
+        </div>
+      ))}
       <AgentOverview
         agents={inventory.agents}
         filteredAgents={filteredAgents}
-        isLive={inventory.isLive}
-        lastUpdated={inventory.lastUpdated}
+        inventory={inventory}
+        onReconnect={inventory.reconnect}
         query={queryInput}
         status={status}
         connectingId={remote.connectingId}
