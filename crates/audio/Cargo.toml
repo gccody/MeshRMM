@@ -14,3 +14,5 @@ tracing.workspace = true
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 cpal = "0.16.0"
+# Builds the bundled libopus (BSD-3-Clause) with CMake.
+opus = "0.4.0"

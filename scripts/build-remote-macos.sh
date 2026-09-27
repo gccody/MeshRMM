@@ -55,8 +55,9 @@ CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 
 rm -rf -- "$APP_DIR"
-mkdir -p -- "$MACOS_DIR"
+mkdir -p -- "$MACOS_DIR" "$CONTENTS_DIR/Resources"
 cp -- "$SOURCE_EXECUTABLE" "$MACOS_DIR/meshrmm-remote"
+cp -- "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$CONTENTS_DIR/Resources/THIRD_PARTY_NOTICES.txt"
 cp -- "$CONFIG_PATH" "$MACOS_DIR/remote.json"
 if [ "$LOCAL_BUILD" = true ]; then
     node - "$MACOS_DIR/remote.json" <<'JS'

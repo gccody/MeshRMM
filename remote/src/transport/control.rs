@@ -363,6 +363,9 @@ pub(super) fn install_control_handler(
                         viewer_control.send(SessionMessage::SetCursorCapture {
                             enabled: sink.show_remote_cursor(),
                         });
+                        // Before the capabilities, so the Agent never starts
+                        // audio for a muted viewer.
+                        viewer_control.send(crate::platform::audio_preference(sink.audio_muted()));
                         viewer_control.send(SessionMessage::ViewerCapabilities {
                             profiles: profiles.as_ref().clone(),
                             quality: sink.quality_preset(),
