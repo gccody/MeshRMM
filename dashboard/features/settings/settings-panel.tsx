@@ -4,7 +4,7 @@ import { useWorkspace } from "../workspace/workspace-context";
 import { SettingsPage } from "./settings-page";
 
 export function SettingsPanel() {
-  const { company, isAdmin, displayName, authorizedFetch, setAccount, reportError, settingsDraft } = useWorkspace();
+  const { company, isAdmin, displayName, authorizedFetch, setAccount, settingsDraft } = useWorkspace();
   return (
     <SettingsPage
       company={company}
@@ -12,7 +12,6 @@ export function SettingsPanel() {
       displayName={displayName}
       authorizedFetch={authorizedFetch}
       onSaved={setAccount}
-      reportError={reportError}
       settingsDraft={settingsDraft}
     />
   );

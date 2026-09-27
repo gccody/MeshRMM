@@ -6,6 +6,7 @@ import type { Agent } from "../agents/types";
 import type { useAgentInventory } from "../agents/use-agent-inventory";
 import type { useRemoteHandoff } from "../session/use-remote-handoff";
 import type { SettingsDraft } from "../settings/use-settings-draft";
+import type { ActionErrorSource, ActionErrors } from "./action-errors";
 import type { Account, Company } from "./types";
 
 // What the persistent workspace shell shares with the page beneath it. The
@@ -23,7 +24,9 @@ export type Workspace = {
   remote: ReturnType<typeof useRemoteHandoff>;
   deleteAgent: (agent: Agent) => Promise<void>;
   deletingId: string | null;
-  reportError: (message: string | null) => void;
+  // Errors from device actions, per source; a null message clears one source.
+  actionErrors: ActionErrors;
+  reportActionError: (source: ActionErrorSource, message: string | null) => void;
   // The Devices filters as a "?…" search string, kept for the Devices link.
   devicesSearch: string;
   setDevicesSearch: (search: string) => void;

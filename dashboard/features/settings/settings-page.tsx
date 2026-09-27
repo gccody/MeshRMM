@@ -20,14 +20,14 @@ type Props = {
   displayName: string;
   authorizedFetch: AuthorizedFetch;
   onSaved: (account: Account) => void;
-  reportError: (message: string | null) => void;
   // Owned by the workspace shell so unsaved edits survive navigation.
   settingsDraft: SettingsDraft;
 };
 
-export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, onSaved, reportError, settingsDraft }: Props) {
+export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, onSaved, settingsDraft }: Props) {
   const { draft, updateDraft, settingsTab, setSettingsTab } = settingsDraft;
   const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
 
   const blackoutMessageValid = isBlackoutMessageValid(draft.blackoutMessage);
@@ -36,7 +36,7 @@ export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, o
     event.preventDefault();
     setIsSaving(true);
     setSettingsNotice(null);
-    reportError(null);
+    setSaveError(null);
     try {
       const response = await authorizedFetch("/v1/company/settings", {
         method: "PUT",
@@ -50,7 +50,7 @@ export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, o
       setSettingsNotice("Company settings saved. Remote defaults apply to new sessions.");
     } catch (requestError) {
       if (!(requestError instanceof AuthenticationRequired)) {
-        reportError(requestError instanceof Error ? requestError.message : "The session policy could not be saved.");
+        setSaveError(requestError instanceof Error ? requestError.message : "The session policy could not be saved.");
       }
     } finally {
       setIsSaving(false);
@@ -123,6 +123,7 @@ export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, o
           </fieldset>
           {settingsTab !== "blackout" && !blackoutMessageValid && <p role="alert">Check the blackout message before saving: it must contain text and be no larger than 2 KB.</p>}
           {isAdmin && <div className="settings-save">
+            {saveError && <p className="settings-save-error" role="alert">{saveError}</p>}
             <button className="primary-button" disabled={isSaving || !blackoutMessageValid || draftMatchesCompany(draft, company)}>{isSaving ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save company settings</button>
           </div>}
           {settingsNotice && <p role="status" className="session-notice">{settingsNotice}</p>}
