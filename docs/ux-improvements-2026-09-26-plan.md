@@ -19,7 +19,7 @@ stand alone; read [Working rules](#working-rules), [Merge order](#merge-order), 
 | 2.10a Fewer D1 round trips + cron cleanup | Server | 1 | — | Merged | `9d5b338`, `3dde5f0`, `e962fef` |
 | 2.10b Start event subscription in parallel with account | Dashboard | 2 | 2.9, 2.10a (soft) | Merged | `070f56d` |
 | 2.11 Inventory keeps data, stale state, per-source errors | Dashboard | 2 | 2.9 | Merged | `c8a985f`, `a2f4cc5`, `3829369`, `bea60b2` |
-| 2.12 Scope WorkOS widgets and Radix CSS to admin pages | Dashboard | 2 | 2.9 (soft) | Not started | |
+| 2.12 Scope WorkOS widgets and Radix CSS to admin pages | Dashboard | 2 | 2.9 (soft) | Merged | `33a9fef`, `7d35d61` |
 | 3.14 Backoff reset, reconnect reason, Retry now | Viewer, agent | 2 | 0.2 | Not started | |
 | 3.16a Audio: send only when unmuted, stereo, Opus | Agent, viewer, protocol | 3 | 3.16b, 3.17 | Not started | |
 | 3.16b HEVC bitrate adaptation via restart ladder | Agent | 1 | — | Merged | `f939623`, `f3b552c` |
@@ -825,7 +825,48 @@ disabled and the Coverage tab on `/`, `/users`, and marketing. Record before/aft
 `/authentication` render the widgets correctly, including dialogs. No visual regressions in the
 screenshots. `npm run verify` green.
 
-**Notes.**
+**Notes.** Implemented in `33a9fef` and `7d35d61`, rebased onto 2.10b, 2.11 and 0.1. **User
+decision:** keep today's effective white page background, with no visual change. The baseline lives
+on an `.app-root` wrapper in `Providers` (not `body`), so the stacking context and the `#f7f8fb`
+page background outside it stay as before. Values measured on the `c4824f1`-era build rather than
+taken from the list above: `line-height: 1.5` (unitless, which Chrome reports as "24px"), `color:
+#211f26` (Radix `--gray-12` for the violet accent, with its `display-p3` variant; not `#202020`),
+`background: #fff`, `overflow-wrap: break-word`, `text-size-adjust: none`, grayscale smoothing,
+`position: relative; z-index: 0`, `min-height: 100vh/100dvh`, and the violet-a5 `::selection`
+colour. The font is still Geist, inherited from `body`. `features/workos/widgets-scope.tsx` imports
+`workos-widgets.css` (both stylesheets plus `.workos-widgets-scope { min-height: 0 }`) and renders
+`WorkOsWidgets` from its subpath with `hasBackground: false`. `users-widgets.tsx` and
+`authentication-widgets.tsx` use the subpath exports and are loaded by the panels with
+`next/dynamic({ ssr: false })`. The authentication headings moved into the on-demand chunk so the
+stack appears at once. The loading fallback's error state offers a page reload, because Chrome
+remembers a failed module import and `next/dynamic`'s retry did not recover (verified).
+
+Measured gzip (raw) on the rebased tree against the integration tip without 2.12 (`3035cdf`): the
+single 762.0 KB CSS file (95.5 KB gzip) became `index` 45.7 KB (9.8 KB) and `widgets-scope` 716.9
+KB (86.3 KB), and the second file loads only on `/users` and `/authentication`. Total linked CSS+JS
+per route went from 270.8 to 148.6 KB (marketing), 277.6 to 155.5 (platform), 290.5 to 168.4
+(devices), 287.7 to 165.7 (settings) and 267.5 to 145.4 (login). Including the on-demand widget
+load, `/users` went from 341.1 to 344.0 KB and `/authentication` from 349.7 to 333.4 KB. The widget
+JS is now `users-widgets` 19.6 KB, `authentication-widgets` 8.6 KB and `widgets-scope` 72.9 KB,
+where every page used to load `widgets-context` (34.0 KB) and `/users` added `users-panel` (55.5
+KB). In `clientReferenceDeps`, only the users-panel chunk (used by both panels) references widget
+code, down from 6 entries.
+
+Verified on the macOS development host on the rebased tree: `npm run verify` (typecheck, lint,
+build, 100/100 tests). The new asset tests fail on the pre-2.12 build. System Chrome 154
+(playwright-core outside the repo) against production builds of `3035cdf` and the rebased branch,
+with mocked `/auth/session`, `/v1/*` and WebSocket endpoints and, for the widgets, a mocked WorkOS
+API with a JWT-shaped token. Marketing, platform, `/`, `/settings`, `/login`, `/users` and
+`/authentication` at 1440×900 and 390×844 are pixel-identical. So are the users table, row menu,
+Invite user dialog and domain/SSO widgets. The same holds for the 0.1 and 2.11 additions: the
+viewer card on the dark sidebar (also the open mobile sidebar), the not-detected launch notice,
+the delete error banner, and the offline strip with stale rows. The only differences are clock
+text ("Updated …", "from 5:00 PM"). Widget assets load only on the admin routes, including after
+in-app navigation. A slow widget download shows the loading panel, and a failed one recovers with
+the reload button. Not verified: real WorkOS data and sign-in, Safari and Firefox, a real P3
+display. Found, not changed: portaled widget dialogs and menus use Radix's default system font
+instead of Geist, because the font variable is set inline on the scope element (unchanged from
+before).
 
 ---
 
