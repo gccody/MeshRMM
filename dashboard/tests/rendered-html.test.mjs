@@ -93,7 +93,8 @@ test("server-renders the public marketing site at the root domain", async () => 
 
   const html = await response.text();
   assert.match(html, /<title>MeshRMM \| Secure remote monitoring<\/title>/i);
-  assert.match(html, /data-woswidgets-root="true"/);
+  // The WorkOS widgets and their Radix theme belong to the admin pages only.
+  assert.doesNotMatch(html, /data-woswidgets-root/);
   assert.match(html, /Every company gets a private MeshRMM workspace/);
   assert.match(html, /Request an invitation/);
   assert.doesNotMatch(html, /desktop-01|office-pc|sample agent|fake data/i);
@@ -259,4 +260,57 @@ test("the workspace sidebar links every remote viewer build", async () => {
 
   const marketing = await (await render("/")).text();
   assert.doesNotMatch(marketing, /meshrmm-remote-/);
+});
+
+// The stylesheets and scripts a server-rendered page links, read from the
+// build output with their sizes and contents.
+async function linkedAssets(html) {
+  const { readFile } = await import("node:fs/promises");
+  const hrefs = (pattern) => [...new Set([...html.matchAll(pattern)].map((match) => match[1]))];
+  const read = (paths) => Promise.all(paths.map(async (path) => {
+    const text = await readFile(new URL(`../dist/client${path}`, import.meta.url), "utf8");
+    return { path, text, bytes: Buffer.byteLength(text) };
+  }));
+  return {
+    stylesheets: await read(hrefs(/<link rel="stylesheet" href="([^"]+)"/g)),
+    scripts: await read(hrefs(/<(?:link rel="modulepreload"[^>]*? href|script[^>]*? src)="([^"]+\.js)"/g)),
+  };
+}
+
+const WIDGET_CODE = /UsersManagement|radix-themes/;
+
+test("the marketing site stays within its asset budget and loads no widgets", async () => {
+  const { stylesheets, scripts } = await linkedAssets(await (await render()).text());
+  assert.ok(stylesheets.length > 0 && scripts.length > 0);
+  const cssBytes = stylesheets.reduce((total, sheet) => total + sheet.bytes, 0);
+  assert.ok(cssBytes < 80_000, `marketing stylesheets are ${cssBytes} bytes`);
+  for (const script of scripts) assert.doesNotMatch(script.text, WIDGET_CODE, script.path);
+});
+
+test("tenant devices and settings load no Radix Themes or WorkOS widget code", async () => {
+  for (const pathname of ["/", "/settings"]) {
+    const html = await (await render(pathname, "acme.meshrmm.com", { workos_organization_id: "org_acme" })).text();
+    assert.doesNotMatch(html, /data-woswidgets-root/);
+    const { stylesheets, scripts } = await linkedAssets(html);
+    for (const sheet of stylesheets) assert.doesNotMatch(sheet.text, /\.rt-BaseDialogContent/, `${pathname} ${sheet.path}`);
+    for (const script of scripts) assert.doesNotMatch(script.text, WIDGET_CODE, `${pathname} ${script.path}`);
+  }
+});
+
+test("the users and authentication pages fetch the widgets and their styles on demand", async () => {
+  const { readFile } = await import("node:fs/promises");
+  for (const [pathname, chunk] of [["/users", "users-widgets"], ["/authentication", "authentication-widgets"]]) {
+    const html = await (await render(pathname, "acme.meshrmm.com", { workos_organization_id: "org_acme" })).text();
+    const { stylesheets, scripts } = await linkedAssets(html);
+    for (const sheet of stylesheets) assert.doesNotMatch(sheet.text, /\.rt-BaseDialogContent/, `${pathname} ${sheet.path}`);
+    for (const script of scripts) assert.doesNotMatch(script.text, WIDGET_CODE, `${pathname} ${script.path}`);
+    // A linked chunk lists the widget chunk and the Radix stylesheet to load
+    // when the page renders in the browser.
+    const loader = scripts.find((script) => script.text.includes(`/${chunk}-`));
+    assert.ok(loader, `${pathname} links no chunk that loads ${chunk}`);
+    const deps = [...loader.text.matchAll(/"(_next\/static\/[^"]+)"/g)].map((match) => match[1]);
+    const lazy = await Promise.all(deps.map((path) => readFile(new URL(`../dist/client/${path}`, import.meta.url), "utf8")));
+    assert.ok(lazy.some((text) => text.includes(".rt-BaseDialogContent")), `${pathname} loads no Radix stylesheet`);
+    assert.ok(lazy.some((text) => /radix-themes/.test(text)), `${pathname} loads no Radix theme code`);
+  }
 });

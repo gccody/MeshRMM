@@ -1,5 +1,25 @@
-@import "@radix-ui/themes/styles.css";
-@import "@workos-inc/widgets/styles.css";
+/* The page baseline. These values match what the app-wide Radix root theme
+   used to apply, so pages look the same without its stylesheet. */
+.app-root {
+  position: relative;
+  z-index: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  overflow-wrap: break-word;
+  line-height: 1.5;
+  color: #211f26;
+  background: #fff;
+  text-size-adjust: none;
+  -webkit-text-size-adjust: none;
+  -moz-osx-font-smoothing: grayscale;
+}
+.app-root ::selection { background-color: #3600ff26; }
+@supports (color: color(display-p3 1 1 1)) {
+  @media (color-gamut: p3) {
+    .app-root { color: color(display-p3 0.128 0.122 0.147); }
+    .app-root ::selection { background-color: color(display-p3 0.165 0.008 1 / 0.15); }
+  }
+}
 :root {
   --ink: #172033;
   --muted: #647084;
@@ -636,3 +656,7 @@ button { color: inherit; }
 @media (max-height: 640px) {
   .viewer-card .support-icon { display: none; }
 }
+
+/* WorkOS widgets (2.12) */
+.widget-loading p { margin: 0; display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 13px; }
+.widget-loading .secondary-button { margin-top: 12px; }
