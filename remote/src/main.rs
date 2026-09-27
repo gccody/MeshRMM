@@ -166,7 +166,7 @@ async fn run_session(
     config: config::Config,
     recording_notice: &mut Option<String>,
 ) -> anyhow::Result<()> {
-    let resume_state = transport::ViewerResumeState::default();
+    let resume_state = transport::ViewerResumeState::with_audio_muted(preferences::audio_muted());
     let result = run_resumable_session(&config, &resume_state).await;
     resume_state.close_reconnecting_window();
     let recording = resume_state.clone();

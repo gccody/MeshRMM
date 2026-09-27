@@ -1,3 +1,5 @@
+#[cfg(any(windows, test))]
+mod audio_mode;
 #[cfg(windows)]
 mod background;
 #[cfg(windows)]

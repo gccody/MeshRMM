@@ -156,6 +156,27 @@ pub enum SessionMessage {
     AutofillCredentials,
     ForgetCredentials,
     CredentialState(CredentialState),
+    /// Viewer audio preference, sent before `ViewerCapabilities` and on each
+    /// mute change. The Agent captures system audio only while `enabled`,
+    /// in the first of `formats` it supports. Appended to preserve postcard
+    /// tags; older Agents discard it and keep sending PCM.
+    SetAudio {
+        enabled: bool,
+        formats: Vec<AudioFormat>,
+    },
+}
+
+/// System-audio encodings, in the viewer's order of preference. Append new
+/// formats before `Unsupported` so older peers still decode the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioFormat {
+    /// Interleaved PCM16 on the `meshrmm-audio-v1` channel.
+    Pcm16,
+    /// 48 kHz stereo Opus on the `meshrmm-audio-opus-v1` channel.
+    Opus,
+    /// A format added after this build; never sent.
+    #[serde(other)]
+    Unsupported,
 }
 
 /// Session-scoped status only; never contains a password or protected credential blob.
@@ -817,5 +838,35 @@ mod credential_tests {
                 message
             );
         }
+    }
+
+    #[test]
+    fn audio_preference_appends_after_credential_state() {
+        let credential = SessionMessage::CredentialState(CredentialState::default())
+            .encode()
+            .unwrap()[0];
+        assert_eq!(credential, 38);
+        let message = SessionMessage::SetAudio {
+            enabled: true,
+            formats: vec![AudioFormat::Opus, AudioFormat::Pcm16],
+        };
+        let bytes = message.encode().unwrap();
+        assert_eq!(bytes, vec![39, 1, 2, 1, 0]);
+        assert_eq!(SessionMessage::decode(&bytes).unwrap(), message);
+        for (format, tag) in [(AudioFormat::Pcm16, 0), (AudioFormat::Opus, 1)] {
+            assert_eq!(postcard::to_stdvec(&format).unwrap(), vec![tag]);
+        }
+        // A format from a newer viewer must not make the whole list unreadable.
+        assert_eq!(
+            SessionMessage::decode(&[39, 1, 3, 7, 1, 0]).unwrap(),
+            SessionMessage::SetAudio {
+                enabled: true,
+                formats: vec![
+                    AudioFormat::Unsupported,
+                    AudioFormat::Opus,
+                    AudioFormat::Pcm16
+                ],
+            }
+        );
     }
 }
