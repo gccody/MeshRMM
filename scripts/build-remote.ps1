@@ -29,12 +29,14 @@ if ($LASTEXITCODE -ne 0) {
 }
 $version = $configuredVersion.Trim()
 
+. (Join-Path $PSScriptRoot 'use-cmake.ps1')
 & cargo build --locked --release --manifest-path $manifestPath
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
 New-Item -ItemType Directory -Path $distributionDirectory -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $repositoryRoot 'THIRD_PARTY_NOTICES.txt') -Destination $distributionDirectory -Force
 New-Item -ItemType Directory -Path $dashboardDownloadDirectory -Force | Out-Null
 Copy-Item -LiteralPath $sourceExecutable -Destination $destinationExecutable -Force
 Copy-Item -LiteralPath $sourceExecutable -Destination $dashboardExecutable -Force

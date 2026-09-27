@@ -122,6 +122,7 @@ pub(super) fn install_video_handler(
     {
         let debug = debug.clone();
         let closed = Arc::clone(&closed);
+        let lifecycle = lifecycle.clone();
         channel.on_close(Box::new(move || {
             let debug = debug.clone();
             let closed = Arc::clone(&closed);

@@ -1,10 +1,12 @@
 use super::*;
+use crate::stream_reset::ResetPlan;
 
 pub(super) struct WorkerPipeline {
-    _com: ComRuntime,
-    _mf: MediaFoundationRuntime,
+    // Fields drop in order: the decoder before the device and runtimes it
+    // uses.
     decoder: HardwareDecoder,
-    renderer: D3d11Renderer,
+    first_presented: Arc<OnceLock<std::time::Instant>>,
+    presentation: Presentation,
     decoded: u64,
     presented: u64,
     decoded_frames_dropped: u64,
@@ -15,15 +17,18 @@ pub(super) struct WorkerPipeline {
     debug: DebugInfo,
 }
 
-impl WorkerPipeline {
-    pub(super) fn window(&self) -> HWND {
-        self.renderer.window()
-    }
+/// Everything the worker owns apart from the decoder: the COM and Media
+/// Foundation runtimes, the D3D11 device, and the window with its renderer.
+/// It is built as a separate step so a probe can present synthetic frames
+/// on a GPU without hardware decoders.
+pub(super) struct Presentation {
+    renderer: D3d11Renderer,
+    device: ID3D11Device,
+    _mf: MediaFoundationRuntime,
+    _com: ComRuntime,
+}
 
-    pub(super) unsafe fn set_cursor_shape(&self, shape: CursorShape) {
-        unsafe { set_window_cursor(self.window(), shape) };
-    }
-
+impl Presentation {
     pub(super) unsafe fn new(
         format: VideoFormat,
         active_display: Display,
@@ -42,15 +47,100 @@ impl WorkerPipeline {
                 active_display,
                 displays,
                 control,
-                debug.clone(),
+                debug,
             )?
         };
-        let decoder = unsafe { HardwareDecoder::new(&device, format)? };
         Ok(Self {
-            _com: com,
-            _mf: mf,
-            decoder,
             renderer,
+            device,
+            _mf: mf,
+            _com: com,
+        })
+    }
+
+    pub(super) fn window(&self) -> HWND {
+        self.renderer.window()
+    }
+
+    #[cfg(test)]
+    pub(super) fn device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    #[cfg(test)]
+    pub(super) fn renderer(&mut self) -> &mut D3d11Renderer {
+        &mut self.renderer
+    }
+
+    /// Creates the decoder for a replacement stream, then moves the window
+    /// and renderer to it. The decoder comes first: when the GPU cannot
+    /// decode the new profile, nothing has changed yet.
+    pub(super) unsafe fn reset_stream(
+        &mut self,
+        format: VideoFormat,
+        display: Display,
+        displays: Vec<Display>,
+    ) -> anyhow::Result<HardwareDecoder> {
+        let decoder = unsafe { HardwareDecoder::new(&self.device, format)? };
+        unsafe { self.reset_presentation(format, display, displays)? };
+        Ok(decoder)
+    }
+
+    /// Moves the window and renderer to a replacement stream. The window,
+    /// its popups, placement and keyboard hook stay as they are.
+    pub(super) unsafe fn reset_presentation(
+        &mut self,
+        format: VideoFormat,
+        display: Display,
+        displays: Vec<Display>,
+    ) -> anyhow::Result<()> {
+        let window = self.window();
+        let current_display = unsafe { window::active_display_id(window) }
+            .context("the viewer window is no longer available")?;
+        let plan = ResetPlan::between(self.renderer.format(), format, current_display, display.id);
+        let display_id = display.id;
+        unsafe { self.renderer.reset_stream(&plan, format)? };
+        unsafe { window::reset_stream(window, &plan, format, display, displays) };
+        let layout = unsafe { window::client_layout(window) }
+            .context("remote window client area is unavailable")?;
+        unsafe { self.renderer.configure_layout(&layout)? };
+        tracing::info!(
+            display_id = display_id.0,
+            width = format.width,
+            height = format.height,
+            recreated_processor = plan.recreate_processor,
+            dropped_last_frame = plan.drop_last_frame,
+            display_changed = plan.display_changed,
+            "reset the Windows viewer window for a replacement stream"
+        );
+        Ok(())
+    }
+}
+
+impl WorkerPipeline {
+    pub(super) fn window(&self) -> HWND {
+        self.presentation.window()
+    }
+
+    pub(super) unsafe fn set_cursor_shape(&self, shape: CursorShape) {
+        unsafe { set_window_cursor(self.window(), shape) };
+    }
+
+    pub(super) unsafe fn new(
+        format: VideoFormat,
+        active_display: Display,
+        displays: Vec<Display>,
+        control: ControlSink,
+        debug: DebugInfo,
+        first_presented: Arc<OnceLock<std::time::Instant>>,
+    ) -> anyhow::Result<Self> {
+        let presentation =
+            unsafe { Presentation::new(format, active_display, displays, control, debug.clone())? };
+        let decoder = unsafe { HardwareDecoder::new(&presentation.device, format)? };
+        Ok(Self {
+            decoder,
+            first_presented,
+            presentation,
             decoded: 0,
             presented: 0,
             decoded_frames_dropped: 0,
@@ -62,8 +152,20 @@ impl WorkerPipeline {
         })
     }
 
+    /// Replaces the decoder and moves the window to a replacement stream.
+    /// On failure the old decoder keeps running.
+    pub(super) unsafe fn reset_stream(
+        &mut self,
+        format: VideoFormat,
+        display: Display,
+        displays: Vec<Display>,
+    ) -> anyhow::Result<()> {
+        self.decoder = unsafe { self.presentation.reset_stream(format, display, displays)? };
+        Ok(())
+    }
+
     pub(super) unsafe fn resize(&mut self, layout: &window::ClientLayout) -> anyhow::Result<()> {
-        unsafe { self.renderer.resize(layout) }
+        unsafe { self.presentation.renderer.resize(layout) }
     }
 
     pub(super) fn wants_input(&self) -> bool {
@@ -102,8 +204,13 @@ impl WorkerPipeline {
             let receive_to_decode_start_us =
                 frame.decode_start_us.saturating_sub(frame.received_at_us);
             let render_start = monotonic_timestamp_us();
-            unsafe { self.renderer.present(&frame.texture, frame.subresource)? };
+            unsafe {
+                self.presentation
+                    .renderer
+                    .present(&frame.texture, frame.subresource)?
+            };
             let presentation_us = monotonic_timestamp_us();
+            self.first_presented.get_or_init(std::time::Instant::now);
             self.presented += 1;
             self.interval_presented += 1;
             tracing::debug!(
@@ -293,7 +400,7 @@ struct DecodeResult {
     frames: Vec<DecodedFrame>,
 }
 
-struct HardwareDecoder {
+pub(super) struct HardwareDecoder {
     transform: IMFTransform,
     events: Option<IMFMediaEventGenerator>,
     asynchronous: bool,

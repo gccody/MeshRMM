@@ -25,6 +25,12 @@ pub enum LaunchStatus {
     WaitingForRemoteComputer,
     EstablishingConnection,
     StartingDisplay,
+    /// An attempt failed before the remote display appeared; `attempt` is
+    /// the one about to start.
+    Retrying {
+        attempt: u32,
+        max: u32,
+    },
 }
 
 impl LaunchStatus {
@@ -61,7 +67,16 @@ impl LaunchStatus {
             }
             Self::EstablishingConnection => "Establishing a secure connection…".to_owned(),
             Self::StartingDisplay => "Starting the remote display…".to_owned(),
+            Self::Retrying { attempt, max } => format!(
+                "Could not start the remote display; trying again (attempt {attempt} of {max})…"
+            ),
         }
+    }
+
+    /// Whether the connecting window offers Cancel. Installing an update
+    /// replaces the viewer and then relaunches it, so it runs to the end.
+    pub fn cancellable(&self) -> bool {
+        !matches!(self, Self::InstallingUpdate { .. })
     }
 }
 
@@ -119,7 +134,7 @@ pub fn report(status: LaunchStatus) {
         });
     }
     #[cfg(any(windows, target_os = "macos"))]
-    crate::platform::show_launch_status(status.message());
+    crate::platform::show_launch_status(status.message(), status.cancellable());
 }
 
 /// Records that the remote desktop appeared, ending the launch.
@@ -175,6 +190,22 @@ mod tests {
         assert_eq!(
             downloading(0, Some(0)).message(),
             "Downloading viewer update 0.3.1… 0.0 MB"
+        );
+    }
+
+    #[test]
+    fn retrying_names_the_attempt() {
+        assert_eq!(
+            LaunchStatus::Retrying { attempt: 2, max: 3 }.message(),
+            "Could not start the remote display; trying again (attempt 2 of 3)…"
+        );
+        assert!(LaunchStatus::Retrying { attempt: 2, max: 3 }.cancellable());
+        assert!(downloading(1, None).cancellable());
+        assert!(
+            !LaunchStatus::InstallingUpdate {
+                version: "0.3.1".to_owned()
+            }
+            .cancellable()
         );
     }
 

@@ -289,6 +289,76 @@ class EnrollmentTests(unittest.TestCase):
         self.assertEqual(self.credentials(), ("c" * 64, None))
 
 
+class TokenLifecycleTests(unittest.TestCase):
+    """Handoffs, event subscriptions and their cleanup, which the request path no longer
+    checks or purges in separate round trips."""
+
+    def setUp(self):
+        self.db = migrated_database()
+        for company, slug, status in (("co", "acme", "active"), ("other", "other", "active"), ("legacy", None, "active"), ("held", "held", "suspended")):
+            self.db.execute("INSERT INTO companies (id,name,created_at,slug,status) VALUES (?,?,0,?,?)", (company, company.upper(), slug, status))
+        for device, company, deleted in (("device", "co", None), ("foreign", "other", None), ("deleted", "co", 1)):
+            self.db.execute("INSERT INTO agents (id,company_id,name,auth_token_hash,created_by_user_id,created_at,updated_at,deletion_requested_at) VALUES (?,?,'PC',?,'user',0,0,?)", (device, company, "a" * 64, deleted))
+        handoffs = "server/src/routes/handoffs.rs"
+        self.handoff = sql(handoffs, "INSERT INTO remote_handoffs")
+        self.audit = sql(handoffs, "INSERT INTO audit_events")
+        self.claim = sql("server/src/routes/events.rs", "UPDATE agent_event_subscriptions SET used_at")
+
+    def count(self, table):
+        return self.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+    def test_handoffs_are_created_only_for_the_companys_own_undeleted_agent(self):
+        for device, created in (("device", 1), ("foreign", 0), ("deleted", 0), ("missing", 0)):
+            token = device[0] * 64
+            self.assertEqual(self.db.execute(self.handoff, (token, "co", device, "user", 0, 1000, False)).rowcount, created, device)
+        self.assertEqual(self.db.execute("SELECT company_id, device_id FROM remote_handoffs").fetchall(), [("co", "device")])
+
+    def test_handoff_audit_is_recorded_only_with_its_handoff(self):
+        self.db.execute(self.handoff, ("d" * 64, "co", "device", "user", 0, 1000, False))
+        audit = lambda event, token: self.db.execute(self.audit, (event, "co", "user", "remote.handoff_create", "agent", "device", "{}", 5, token)).rowcount
+        self.assertEqual(audit("missing", "f" * 64), 0)
+        self.assertEqual(audit("created", "d" * 64), 1)
+        self.assertEqual(self.db.execute("SELECT id, action, target_id FROM audit_events").fetchall(), [("created", "remote.handoff_create", "device")])
+
+    def subscribe(self, company, expires_at=1000):
+        token = company[0] * 63 + "0"
+        self.db.execute("DELETE FROM agent_event_subscriptions")
+        self.db.execute("INSERT INTO agent_event_subscriptions (token_hash,company_id,user_id,created_at,expires_at) VALUES (?,?,'user',0,?)", (token, company, expires_at))
+        return token
+
+    def used_at(self):
+        return self.db.execute("SELECT used_at FROM agent_event_subscriptions").fetchone()[0]
+
+    def test_subscription_claim_checks_the_hostname_before_using_the_token(self):
+        for company, host, claimed in (("co", "", True), ("legacy", "", True), ("co", "ACME", True), ("co", "other", False), ("legacy", "acme", False), ("held", "held", False), ("held", "", False)):
+            with self.subTest(company=company, host=host):
+                token = self.subscribe(company)
+                row = self.db.execute(self.claim, (5, token, host)).fetchone()
+                self.assertEqual(row, (company, "user") if claimed else None)
+                self.assertEqual(self.used_at(), 5 if claimed else None)
+        token = self.subscribe("co", expires_at=5)
+        self.assertIsNone(self.db.execute(self.claim, (5, token, "acme")).fetchone())
+        self.assertIsNone(self.used_at())
+
+class ExpiredTokenCleanupTests(unittest.TestCase):
+    """The scheduled cleanup that replaced the per-request expiry DELETEs."""
+
+    def test_only_tokens_expired_by_the_cutoff_are_removed(self):
+        db = migrated_database()
+        db.execute("INSERT INTO companies (id,name,created_at,slug,status) VALUES ('co','CO',0,'acme','active')")
+        db.execute("INSERT INTO agents (id,company_id,name,auth_token_hash,created_by_user_id,created_at,updated_at) VALUES ('device','co','PC',?,'user',0,0)", ("a" * 64,))
+        maintenance = "server/src/maintenance.rs"
+        for expires_at in (99, 100, 101):
+            token = f"{expires_at:064d}"
+            db.execute("INSERT INTO agent_event_subscriptions (token_hash,company_id,user_id,created_at,expires_at) VALUES (?,'co','user',0,?)", (token, expires_at))
+            db.execute("INSERT INTO remote_handoffs (token_hash,company_id,device_id,user_id,created_at,expires_at) VALUES (?,'co','device','user',0,?)", (token, expires_at))
+            db.execute("INSERT INTO agent_install_tokens (id,token_hash,company_id,created_by_user_id,platform,created_at,expires_at) VALUES (?,?,'co','user','windows-x64',0,?)", (token, token, expires_at))
+        for table in ("agent_event_subscriptions", "remote_handoffs", "agent_install_tokens"):
+            with self.subTest(table=table):
+                db.execute(sql(maintenance, f"DELETE FROM {table}"), (100,))
+                self.assertEqual(db.execute(f"SELECT expires_at FROM {table}").fetchall(), [(101,)])
+
+
 class UsageMeteringTests(unittest.TestCase):
     """The rows the platform cost report attributes Cloudflare and WorkOS usage with."""
 
