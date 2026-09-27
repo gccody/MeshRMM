@@ -32,6 +32,7 @@ import {
   formatIdleTimeout,
 } from "../session/idle-session";
 import { useRemoteHandoff } from "../session/use-remote-handoff";
+import { ViewerDownloadCard } from "../session/viewer-download-links";
 import { useSettingsDraft } from "../settings/use-settings-draft";
 import { AccountLoadError, accountLoader } from "./account-load";
 import { type ActionErrorSource, actionErrorsReducer } from "./action-errors";
@@ -302,6 +303,8 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
             {isAdmin && <NavItem view="sso" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><KeyRound size={18} /><span>Authentication</span></NavItem>}
             <NavItem view="settings" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Settings size={18} /><span>Settings</span></NavItem>
           </nav>
+
+          <ViewerDownloadCard />
 
           <button className="profile-row profile-button" onClick={(event) => { dialogOpener.current = event.currentTarget; setIsSidebarOpen(false); setIsAuthOpen(true); }} disabled={Boolean(sessionPauseReason)} aria-haspopup="dialog">
             <div className="profile-avatar">{initials}</div>
