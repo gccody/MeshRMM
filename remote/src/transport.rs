@@ -119,6 +119,19 @@ impl Default for ViewerResumeState {
 }
 
 impl ViewerResumeState {
+    /// A session's state, with remote audio muted as the viewer last left it.
+    pub fn with_audio_muted(muted: bool) -> Self {
+        Self {
+            audio: meshrmm_audio::PlaybackState::new(muted),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audio_muted(&self) -> bool {
+        self.audio.muted()
+    }
+
     /// Keeps the window of a connection that failed with `error` up, showing
     /// why it is reconnecting, until the next connection opens its own.
     fn keep_while_reconnecting(&self, active: ActivePresenter, error: &anyhow::Error) {

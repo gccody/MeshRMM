@@ -41,7 +41,8 @@ pub fn capture(send: impl Fn(Vec<u8>) + Send + 'static) -> anyhow::Result<Captur
     stream.play()?;
     tracing::info!(
         rate = config.sample_rate.0,
-        channels = config.channels,
+        device_channels = config.channels,
+        channels = config.channels.min(2),
         "system audio capture started"
     );
     Ok(Capture {
@@ -57,25 +58,35 @@ fn input<T: cpal::SizedSample>(
     failed: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
-    i16: cpal::FromSample<T>,
+    f32: cpal::FromSample<T>,
 {
     use cpal::Sample;
     let rate = config.sample_rate.0;
-    let channels = config.channels;
-    let chunk = ((rate as usize / 100).max(1) * usize::from(channels))
-        .min((MAX_PACKET - HEADER) / (usize::from(channels) * 2) * usize::from(channels));
+    let channels = usize::from(config.channels);
+    // Surround is mixed to stereo here, so the wire never carries more.
+    let output_channels: u16 = if channels == 1 { 1 } else { 2 };
+    let frames_per_packet = (rate as usize / 100)
+        .max(1)
+        .min((MAX_PACKET - HEADER) / (usize::from(output_channels) * 2));
     device.build_input_stream(
         config,
         move |data: &[T], _| {
-            for samples in data.chunks(chunk) {
-                let mut bytes = Vec::with_capacity(HEADER + samples.len() * 2);
+            let mut frame = [0.0_f32; 8];
+            for samples in data.chunks(frames_per_packet * channels) {
+                let frames = samples.len() / channels;
+                let mut bytes =
+                    Vec::with_capacity(HEADER + frames * usize::from(output_channels) * 2);
                 bytes.extend(rate.to_le_bytes());
-                bytes.extend(channels.to_le_bytes());
-                bytes.extend(
-                    samples
-                        .iter()
-                        .flat_map(|&s| i16::from_sample(s).to_le_bytes()),
-                );
+                bytes.extend(output_channels.to_le_bytes());
+                for input in samples.chunks_exact(channels) {
+                    for (value, &sample) in frame.iter_mut().zip(input) {
+                        *value = f32::from_sample(sample);
+                    }
+                    let mixed = downmix(&frame[..channels]);
+                    for &value in &mixed[..usize::from(output_channels)] {
+                        bytes.extend(i16::from_sample(value).to_le_bytes());
+                    }
+                }
                 send(bytes);
             }
         },

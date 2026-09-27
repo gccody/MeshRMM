@@ -166,7 +166,7 @@ async fn run_session(
     config: config::Config,
     recording_notice: &mut Option<String>,
 ) -> anyhow::Result<()> {
-    let resume_state = transport::ViewerResumeState::default();
+    let resume_state = transport::ViewerResumeState::with_audio_muted(preferences::audio_muted());
     let result = run_resumable_session(&config, &resume_state).await;
     resume_state.close_reconnecting_window();
     let recording = resume_state.clone();
@@ -358,11 +358,22 @@ async fn end_session_after_disconnect(
     }
 }
 
+/// `--third-party-notices` prints the licenses of bundled third-party code.
+fn third_party_notices_requested() -> bool {
+    std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--third-party-notices")
+}
+
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
     // Lets the identity commands print when run from a terminal.
     platform::attach_parent_console();
+    if third_party_notices_requested() {
+        print!("{}", meshrmm_audio::THIRD_PARTY_NOTICES);
+        return ExitCode::SUCCESS;
+    }
     platform::enable_dpi_awareness();
     match meshrmm_session_transport::identity::handle_command(
         meshrmm_session_transport::identity::viewer_directory,
@@ -446,6 +457,10 @@ async fn run_windows_viewer(recording_notice: &mut Option<String>) -> anyhow::Re
 
 #[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
+    if third_party_notices_requested() {
+        print!("{}", meshrmm_audio::THIRD_PARTY_NOTICES);
+        return Ok(());
+    }
     if meshrmm_session_transport::identity::handle_command(
         meshrmm_session_transport::identity::viewer_directory,
     )? {

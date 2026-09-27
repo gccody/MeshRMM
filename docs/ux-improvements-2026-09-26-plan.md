@@ -21,7 +21,7 @@ stand alone; read [Working rules](#working-rules), [Merge order](#merge-order), 
 | 2.11 Inventory keeps data, stale state, per-source errors | Dashboard | 2 | 2.9 | Merged | `c8a985f`, `a2f4cc5`, `3829369`, `bea60b2` |
 | 2.12 Scope WorkOS widgets and Radix CSS to admin pages | Dashboard | 2 | 2.9 (soft) | Merged | `33a9fef`, `7d35d61` |
 | 3.14 Backoff reset, reconnect reason, Retry now | Viewer, agent | 2 | 0.2 | Merged | `32fab6a`, `96ef7aa`, `ed6c44d`, `a4d38b7` |
-| 3.16a Audio: send only when unmuted, stereo, Opus | Agent, viewer, protocol | 3 | 3.16b, 3.17 | Not started | |
+| 3.16a Audio: send only when unmuted, stereo, Opus | Agent, viewer, protocol | 3 | 3.16b, 3.17 | Merged | `7e650d5`, `9778c88` |
 | 3.16b HEVC bitrate adaptation via restart ladder | Agent | 1 | — | Merged | `f939623`, `f3b552c` |
 | 3.17 Windows viewer resets the stream in place | Windows viewer | 1 | — | Merged | `5ce8cc7` |
 
@@ -1111,7 +1111,96 @@ check capture start/stop in the service log; compare `bytes_sent` deltas muted v
 audio on the console; lock/unlock and UAC. Run a previous release viewer against the new agent.
 Build the Windows viewer on the endpoint (Opus decode must build there).
 
-**Notes.**
+**Notes.** Implemented as a1 `7e650d5` (`SetAudio`, capture only while unmuted, downmix, persisted
+mute, audio-aware pacer) and a2 `9778c88` (Opus). The integration branch had not moved, so no
+rebase was needed. Crate: `opus` 0.4.0 (latest on crates.io, MIT/Apache-2.0). It builds libopus
+1.6.1 through `opusic-sys` 0.7.5 with its default `bundled` feature, which needs CMake. Deviations
+and findings:
+- **The backstop timer starts when `DisplayConfiguration` is sent**, not when the control channel
+  opens. Viewers answer that message, and capture startup can take longer than 3 s after the
+  channel opens, which would briefly start capture for a muted viewer.
+- `AudioFormat` has a trailing `#[serde(other)] Unsupported`. A newer viewer's unknown format then
+  decodes instead of making the whole `SetAudio` unreadable on this Agent. New formats go before it.
+  `SetAudio` is tag 39 (`[39, enabled, len, formats…]`); tag tests are pinned.
+- Downmix normalises each side by the sum of its gains, for example 5.1 L = (FL + 0.707 FC +
+  0.707 BL) / 2.414. Stereo content on a surround device therefore plays about 7.7 dB quieter than
+  it would unnormalised; clamping still handles float input above full scale. Quad, 5.1 and 7.1 use
+  the WASAPI order; 3, 5 and 7 channels alternate even/odd. The live endpoint device is stereo, so
+  surround is covered only by unit tests.
+- Opus reset: after a capture gap over 100 ms, or when leaving Opus mode, the encoder resets and
+  the sequence skips ahead by 6, so the viewer's decoder also starts over instead of concealing.
+  The decoder drops packets older than one already played. The Agent falls back to PCM if its
+  encoder cannot be created.
+- The idle rule (no packet for 100 ms) also zeroes the published audio rate. WASAPI loopback
+  delivers nothing during silence, so the pacer reserves nothing then.
+- New `audio transport statistics` log line every 10 s (mode, format, measured bitrate, drops).
+  `log_network_stats` is not usable for this: its nominated-pair `bytes_sent` was 0 in every
+  session (existing webrtc-rs behaviour), so measurements use that line, the viewer's data-channel
+  statistics, and `nettop` on the Mac.
+- `scripts/use-cmake.ps1` holds the vswhere lookup. `build-agent.ps1`, `build-remote.ps1` and
+  `install-agent-local.ps1` dot-source it. CMake is documented in README prerequisites and in the
+  local AGENTS.md, which is excluded from git (`.git/info/exclude`), so that edit is not in a
+  commit.
+- `THIRD_PARTY_NOTICES.txt` (libopus BSD-3-Clause text and patent-licence pointers):
+  `build-agent.ps1` and `build-remote.ps1` copy it to `dist\agent` and `dist\remote`, and
+  `build-remote-macos.sh` copies it to `Contents/Resources`. The Windows downloads are single
+  executables, so the Agent and both viewers also embed it and print it with
+  `--third-party-notices`.
+- As the plan expected, an old Agent logs `discarding invalid control message` once per
+  `SetAudio`.
+
+Validation.
+- **macOS development host** (rustup cargo 1.97.1) on `9778c88`:
+  - fmt, clippy `-D warnings` and `cargo test --workspace` pass (290 passed, 1 ignored).
+  - Opus round trip with uneven 44.1 kHz packets: 40.8 dB SNR at about 99 kbit/s.
+  - `cargo build --release --target x86_64-apple-darwin -p meshrmm-remote` succeeds; the binary
+    links libopus and prints the notices.
+  - Server and dashboard code are unchanged.
+- **DESKTOP-85R6S28** (tree synced to `~\ux-2026-09-26-3.16a`, 451 files matched by SHA-256
+  manifest):
+  - CMake was found through `use-cmake.ps1` (VS 18 BuildTools).
+  - Native fmt, clippy and `cargo test --workspace` pass (agent 150 passed / 18 ignored, remote
+    88 / 3, audio 8).
+  - Release Agent `1F11E21D…5895` and Windows viewer `82CBE71A…CA82` build.
+- **Installed service:** the new Agent was installed with the install script. It started and
+  connected to production signaling (config unchanged), then served the sessions below.
+
+Live sessions ran from the macOS viewer against the installed service through a **test-only
+control plane**, with the user's approval. The compiled Worker ran under Miniflare on the
+endpoint, with seeded test rows and mocked WorkOS/TURN. It was reached through an SSH forward and
+a temporary Cloudflare quick tunnel for trusted TLS. The service's `agent.json` pointed at it and
+was then restored. It ran on the endpoint because workerd on this macOS (Darwin 27) cannot load
+any Wasm module, even an empty one, with workerd 1.20260911.1 or 1.20260926.1. The same failure
+breaks `server/tests/*.mjs` on the Mac. A quiet 440/660 Hz stereo tone played in the console
+session.
+
+| Viewer / Agent | Viewer mute | Agent mode | Audio sent (Agent) | Viewer inbound, all traffic |
+| --- | --- | --- | --- | --- |
+| new / new | muted (default) | `Off`; no capture started | 0 bytes on both audio channels | ≈ 1 kbit/s |
+| new / new | unmuted (saved preference) | `Opus` | 97.1–97.3 kbit/s, 0 drops (viewer: 97.2 kbit/s, 50 packets/s) | 126 kbit/s |
+| old 0.3.1 / new | muted (0.3.1 default) | `Legacy` at `ViewerCapabilities` | PCM16 48 kHz stereo, 1.54 Mbit/s | 1.65 Mbit/s |
+| new / old 0.3.1 | muted, then unmuted | n/a (0.3.1 ignores `SetAudio`) | PCM16, as before | 1.65 Mbit/s both |
+
+- **Unmuted:** capture started 14 ms after `mode=Opus`, and the viewer logged `system audio stream
+  received format="opus"` and started playback.
+- **Old viewer:** logged `ignoring unknown WebRTC data channel label="meshrmm-audio-opus-v1"` once
+  and played PCM on v1.
+- **New viewer, old Agent:** played `format="pcm16"` when unmuted.
+- The new Agent's service log for the session window has no ERROR lines and no audio warnings;
+  only the usual ICE, encoder and teardown warnings appeared.
+- Opus uses about 1/16 of the PCM bitrate, and a muted viewer receives no audio.
+
+**Incomplete:**
+- A mid-session mute toggle was not clicked, to avoid driving the UI on the shared Mac host. So
+  capture stop/start on toggle, "audible within ~300 ms" after a toggle, and saving the choice on
+  toggle were not exercised live. Muted and unmuted starts came from the saved preference, which
+  the viewer read correctly.
+- Lock/unlock and UAC were not run: unlocking needs the user's password.
+- Surround downmix is not tested live (stereo device).
+- The pre-`ViewerCapabilities` backstop is not tested live: no such viewer build.
+- Opus playback in the Windows viewer is not tested live: the endpoint has no hardware H.264
+  decoder. The Windows viewer builds and passes its tests.
+- Nobody listened for audibility.
 
 ---
 
@@ -1428,3 +1517,19 @@ SHA-256, backup file name, and whether it was restored.
   `meshrmm-agent.exe.before-local-20260927-170031` (the 3.14 build); running and connected; lock
   released. Work tree: `~\ux-2026-09-26-3.14`. Its `ux314-reconnect-probe` scheduled task was
   deleted; the `meshrmm:` handler was not changed; `Get-NetQosPolicy` returns none.
+- **3.16a (2026-09-27).**
+  - 17:37 install: release build of `9778c88`, SHA-256
+    `1F11E21D87C4EF23AC6C59B3EC6F0F0C4739DAEB77111C7FD3D6DB49854F5895`, backup
+    `meshrmm-agent.exe.before-local-20260927-173715` (the 0.3.1 build `6BF0C029…4D60`). Started
+    and connected to production.
+  - 17:37: `agent.json` was pointed at the test-only control plane (production copy saved beside
+    it).
+  - 17:47 install: 0.3.1 (`6BF0C029…4D60`) from `~\ux-2026-09-26-3.16a\.ux-tools\restore`,
+    backup `meshrmm-agent.exe.before-local-20260927-174753` (the 3.16a build), for the old-Agent
+    check.
+  - 17:50 restore: production `agent.json` (SHA-256 `961900BB…99AE`) put back. Service restarted,
+    running release 0.3.1 and connected to production. The saved copy, the `ux316a-tone` scheduled
+    task and the test control plane were removed.
+  - The `meshrmm:` handler was not changed; `Get-NetQosPolicy` returns none; lock released.
+  - Work tree: `~\ux-2026-09-26-3.16a`; every step is also in
+    `~\ux-2026-09-26-endpoint-log.txt`.

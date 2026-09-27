@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use bytes::Bytes;
 use meshrmm_protocol::{
-    CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, ChromaMode, Codec, DEFAULT_FRAGMENT_PAYLOAD,
-    Display, DisplayId, IceServer, QualityPreset, RemoteSessionId, SessionMessage, SessionState,
-    SignalMessage, VideoProfile, VideoStreamId, fragment_frame,
+    AudioFormat, CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, ChromaMode, Codec,
+    DEFAULT_FRAGMENT_PAYLOAD, Display, DisplayId, IceServer, QualityPreset, RemoteSessionId,
+    SessionMessage, SessionState, SignalMessage, VideoProfile, VideoStreamId, fragment_frame,
 };
 use meshrmm_session_transport::{
     CHAT_CHANNEL, CLIPBOARD_CHANNEL, FILE_CHANNEL, ServiceChannel, ServiceRoute,
@@ -25,7 +25,10 @@ use webrtc::peer_connection::{
 };
 use webrtc::stats::StatsReportType;
 
-use super::bitrate::{AdaptiveBitrate, EncoderStatus, RestartLadder, VideoPacer};
+use super::audio_mode::{AudioEvent, AudioMode, buffered_audio_limit};
+use super::bitrate::{
+    AdaptiveBitrate, EncoderStatus, RestartLadder, VideoPacer, video_pacing_bitrate,
+};
 use super::platform::{ScreenStreamer, StartedScreen, monotonic_timestamp_us};
 use super::sender_failure::{
     failure_signal, initial_start_error, profile_start_error, transport_failure,
@@ -106,6 +109,26 @@ const KEYFRAME_RETRY_INTERVAL_US: u64 = 250_000;
 const DESKTOP_LIFECYCLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const DESKTOP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const DISCONNECTED_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+/// Decides the audio mode for viewers that never send `ViewerCapabilities`.
+const AUDIO_MODE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(3);
+const AUDIO_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Without new audio for this long the stream counts as idle: WASAPI
+/// loopback delivers nothing while the device is silent.
+const AUDIO_IDLE: std::time::Duration = std::time::Duration::from_millis(100);
+/// Audio formats this Agent can send.
+const SUPPORTED_AUDIO_FORMATS: &[AudioFormat] = &[AudioFormat::Opus, AudioFormat::Pcm16];
+
+fn apply_audio_event(mode: &tokio::sync::watch::Sender<AudioMode>, event: AudioEvent<'_>) {
+    mode.send_if_modified(|mode| {
+        let next = mode.next(event, SUPPORTED_AUDIO_FORMATS);
+        if next == *mode {
+            return false;
+        }
+        tracing::info!(previous = ?*mode, mode = ?next, "remote audio mode changed");
+        *mode = next;
+        true
+    });
+}
 
 fn profile_candidates(
     profiles: &[VideoProfile],
@@ -237,8 +260,25 @@ async fn run_connected_sender(
             }),
         )
         .await?;
+    // Created up front: the offer is made before the viewer's version is known.
+    let opus_channel = peer
+        .create_data_channel(
+            meshrmm_audio::OPUS_CHANNEL,
+            Some(RTCDataChannelInit {
+                ordered: Some(true),
+                max_retransmits: Some(0),
+                protocol: Some(meshrmm_audio::OPUS_PROTOCOL.into()),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    // The viewer decides whether and how audio is sent; capture only then.
+    let audio_mode = Arc::new(tokio::sync::watch::Sender::new(AudioMode::Undetermined));
+    // The audio bitrate being streamed now, left out of video pacing.
+    let audio_bits = Arc::new(AtomicU32::new(0));
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(8);
     let audio_input = Arc::clone(&input);
+    let mut capture_mode = audio_mode.subscribe();
     let audio_capture = super::native_task::NativeTask::spawn(
         "meshrmm-audio-capture",
         move |mut stop| async move {
@@ -247,32 +287,129 @@ async fn run_connected_sender(
             loop {
                 tokio::select! {
                     _ = stop.changed() => break,
-                    _ = retry.tick() => {
-                        if !audio_input.is_console_session() { stream = None; continue; }
-                        if stream.as_ref().is_some_and(meshrmm_audio::Capture::healthy) { continue; }
-                        stream = None;
-                        let sender = audio_tx.clone();
-                        match meshrmm_audio::capture(move |packet| { let _ = sender.try_send(packet); }) {
-                            Ok(capture) => stream = Some(capture),
-                            Err(error) => tracing::debug!(%error, "system audio unavailable; retrying"),
-                        }
+                    // Start or stop at once when the viewer mutes or unmutes.
+                    Ok(()) = capture_mode.changed() => {}
+                    _ = retry.tick() => {}
+                }
+                let mode = *capture_mode.borrow_and_update();
+                if !mode.captures() || !audio_input.is_console_session() {
+                    if stream.take().is_some() {
+                        tracing::info!(?mode, "system audio capture stopped");
                     }
+                    continue;
+                }
+                if stream.as_ref().is_some_and(meshrmm_audio::Capture::healthy) {
+                    continue;
+                }
+                stream = None;
+                let sender = audio_tx.clone();
+                match meshrmm_audio::capture(move |packet| {
+                    let _ = sender.try_send(packet);
+                }) {
+                    Ok(capture) => stream = Some(capture),
+                    Err(error) => tracing::debug!(%error, "system audio unavailable; retrying"),
                 }
             }
         },
     )?;
     cleanup.workers.push(audio_capture);
     let audio_input = Arc::clone(&input);
+    let sender_mode = audio_mode.subscribe();
+    let sender_bits = Arc::clone(&audio_bits);
     let audio_sender = tokio::spawn(async move {
-        while let Some(packet) = audio_rx.recv().await {
-            if audio_input.is_console_session()
-                && audio_channel.ready_state() == RTCDataChannelState::Open
-                && audio_channel.buffered_amount().await < 32_000
-                && audio_channel.send(&Bytes::from(packet)).await.is_err()
-            {
-                break;
+        let mut opus = None::<meshrmm_audio::OpusEncoder>;
+        let mut opus_unavailable = false;
+        let mut bytes_sent = 0_u64;
+        let mut packets_dropped = 0_u64;
+        let mut stats_started = tokio::time::Instant::now();
+        'send: loop {
+            let packet = tokio::select! {
+                packet = audio_rx.recv() => match packet {
+                    Some(packet) => packet,
+                    None => break,
+                },
+                _ = tokio::time::sleep(AUDIO_IDLE) => {
+                    sender_bits.store(0, Ordering::Relaxed);
+                    // Encode what follows the gap as a new stream.
+                    if let Some(encoder) = opus.as_mut() {
+                        encoder.reset();
+                    }
+                    if bytes_sent == 0 {
+                        stats_started = tokio::time::Instant::now();
+                    }
+                    continue;
+                }
+            };
+            let mode = *sender_mode.borrow();
+            if !mode.captures() || !audio_input.is_console_session() {
+                sender_bits.store(0, Ordering::Relaxed);
+                continue;
+            }
+            if mode == AudioMode::Opus && opus.is_none() && !opus_unavailable {
+                match meshrmm_audio::OpusEncoder::new() {
+                    Ok(encoder) => opus = Some(encoder),
+                    Err(error) => {
+                        // The viewer that asked for Opus also plays PCM.
+                        tracing::warn!(%error, "Opus encoder unavailable; sending PCM audio");
+                        opus_unavailable = true;
+                    }
+                }
+            }
+            let (format, channel, packets, bits) =
+                match opus.as_mut().filter(|_| mode == AudioMode::Opus) {
+                    Some(encoder) => match encoder.encode(&packet) {
+                        Ok(packets) => (
+                            AudioFormat::Opus,
+                            &opus_channel,
+                            packets,
+                            meshrmm_audio::OPUS_BITS_PER_SECOND,
+                        ),
+                        Err(error) => {
+                            tracing::debug!(%error, "discarding audio the Opus encoder rejected");
+                            continue;
+                        }
+                    },
+                    None => {
+                        if let Some(encoder) = opus.as_mut() {
+                            encoder.reset();
+                        }
+                        let Some(bits) = meshrmm_audio::pcm_bits_per_second(&packet) else {
+                            continue;
+                        };
+                        (AudioFormat::Pcm16, &audio_channel, vec![packet], bits)
+                    }
+                };
+            if channel.ready_state() != RTCDataChannelState::Open {
+                sender_bits.store(0, Ordering::Relaxed);
+                continue;
+            }
+            sender_bits.store(bits, Ordering::Relaxed);
+            for packet in packets {
+                if channel.buffered_amount().await >= buffered_audio_limit(bits) {
+                    packets_dropped += 1;
+                    continue;
+                }
+                bytes_sent += packet.len() as u64;
+                if channel.send(&Bytes::from(packet)).await.is_err() {
+                    break 'send;
+                }
+            }
+            if stats_started.elapsed() >= AUDIO_STATS_INTERVAL {
+                tracing::info!(
+                    ?mode,
+                    ?format,
+                    nominal_bits_per_second = bits,
+                    audio_bits_per_second =
+                        bytes_sent as f64 * 8.0 / stats_started.elapsed().as_secs_f64(),
+                    packets_dropped,
+                    "audio transport statistics"
+                );
+                bytes_sent = 0;
+                packets_dropped = 0;
+                stats_started = tokio::time::Instant::now();
             }
         }
+        sender_bits.store(0, Ordering::Relaxed);
     });
     cleanup.tasks.push(audio_sender.abort_handle());
 
@@ -419,8 +556,10 @@ async fn run_connected_sender(
         let clipboard_tx = clipboard_tx.clone();
         let maintenance_tx = maintenance_tx.clone();
         let message_session_close = Arc::clone(&session_close);
+        let message_audio_mode = Arc::clone(&audio_mode);
         control_channel.on_message(Box::new(move |message| {
             let session_close = Arc::clone(&message_session_close);
+            let audio_mode = Arc::clone(&message_audio_mode);
             let tx = control_messages_tx.clone();
             let decoder_ready = Arc::clone(&decoder_ready);
             let input_tx = input_tx.clone();
@@ -441,11 +580,24 @@ async fn run_connected_sender(
                         profiles,
                         quality,
                         chroma,
-                    }) => Some(ControlCommand::ViewerCapabilities {
-                        profiles,
-                        quality,
-                        chroma,
-                    }),
+                    }) => {
+                        apply_audio_event(&audio_mode, AudioEvent::ViewerCapabilities);
+                        Some(ControlCommand::ViewerCapabilities {
+                            profiles,
+                            quality,
+                            chroma,
+                        })
+                    }
+                    Ok(SessionMessage::SetAudio { enabled, formats }) => {
+                        apply_audio_event(
+                            &audio_mode,
+                            AudioEvent::SetAudio {
+                                enabled,
+                                formats: &formats,
+                            },
+                        );
+                        None
+                    }
                     Ok(SessionMessage::SetQuality { preset }) => {
                         Some(ControlCommand::Quality(preset))
                     }
@@ -649,6 +801,7 @@ async fn run_connected_sender(
         control_tx.clone(),
         Arc::clone(&quality_ceiling),
         encoder_status,
+        Arc::clone(&audio_bits),
         video_failure_tx,
     );
     cleanup.tasks.push(video_sender.abort_handle());
@@ -660,6 +813,7 @@ async fn run_connected_sender(
         active_display.id,
         stream_id,
         format,
+        Arc::clone(&audio_mode),
     );
     cleanup.tasks.push(control_start.abort_handle());
 
@@ -1623,6 +1777,7 @@ async fn create_peer(
     Ok(peer)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_control_start(
     channel: Arc<RTCDataChannel>,
     open: Arc<Notify>,
@@ -1631,6 +1786,7 @@ fn spawn_control_start(
     active_display_id: DisplayId,
     stream_id: VideoStreamId,
     format: meshrmm_protocol::VideoFormat,
+    audio_mode: Arc<tokio::sync::watch::Sender<AudioMode>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         open.notified().await;
@@ -1642,7 +1798,12 @@ fn spawn_control_start(
         };
         if let Err(error) = send_control_message(&channel, message).await {
             tracing::warn!(error = %error, %session_id, "failed to send stream configuration");
+            return;
         }
+        // Viewers answer this configuration with their audio preference and
+        // capabilities. Very old viewers send neither; give them audio anyway.
+        tokio::time::sleep(AUDIO_MODE_BACKSTOP).await;
+        apply_audio_event(&audio_mode, AudioEvent::Backstop);
     })
 }
 
@@ -1672,6 +1833,7 @@ fn spawn_video_sender(
     recovery: mpsc::UnboundedSender<ControlCommand>,
     quality_ceiling: Arc<AtomicU32>,
     encoder_status: Arc<EncoderStatus>,
+    audio_bits: Arc<AtomicU32>,
     failure: mpsc::UnboundedSender<anyhow::Error>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1853,7 +2015,10 @@ fn spawn_video_sender(
                 let delay_us = pacer.reserve(
                     monotonic_timestamp_us(),
                     bytes.len(),
-                    quality_ceiling.load(Ordering::Acquire),
+                    video_pacing_bitrate(
+                        quality_ceiling.load(Ordering::Acquire),
+                        audio_bits.load(Ordering::Relaxed),
+                    ),
                 );
                 if delay_us != 0 {
                     tokio::time::sleep(std::time::Duration::from_micros(delay_us)).await;
