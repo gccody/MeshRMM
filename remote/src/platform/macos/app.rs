@@ -1,6 +1,7 @@
 use super::keyboard::{self, CommandKey, Keyboard, RemoteKey};
 use super::*;
 use crate::input::HeldInput;
+use crate::reconnect::ReconnectStatus;
 use meshrmm_protocol::SessionCloseAction;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
@@ -194,7 +195,10 @@ pub(super) struct RemoteViewIvars {
     agent_pointer_display: std::cell::Cell<Option<meshrmm_protocol::DisplayId>>,
     debug: DebugInfo,
     debug_label: Retained<NSTextField>,
-    reconnecting_label: Retained<NSTextField>,
+    reconnect_panel: ReconnectPanel,
+    reconnect_status: std::cell::Cell<Option<ReconnectStatus>>,
+    /// Whether a refresh of the elapsed time and countdown is scheduled.
+    reconnect_ticking: std::cell::Cell<bool>,
     debug_visible: RefCell<bool>,
     debug_refreshed: RefCell<Instant>,
 }
@@ -420,6 +424,13 @@ define_class!(
                     display_id: display.id,
                 });
             }
+        }
+
+        #[unsafe(method(retryReconnect:))]
+        fn retry_reconnect(&self, _sender: &NSButton) {
+            // Disabled until the session loop starts its next wait.
+            self.ivars().reconnect_panel.retry.setEnabled(false);
+            crate::reconnect::request_retry_now();
         }
 
         #[unsafe(method(selectUserFromToolbar:))]
@@ -735,6 +746,82 @@ fn clamp_wheel_delta(delta: f64) -> i16 {
         .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
 }
 
+/// Shown over the video while the connection is being restored: the reason,
+/// how long it has been down, when the next attempt starts, and "Retry now".
+struct ReconnectPanel {
+    panel: Retained<NSView>,
+    title: Retained<NSTextField>,
+    detail: Retained<NSTextField>,
+    retry: Retained<NSButton>,
+}
+
+impl ReconnectPanel {
+    const WIDTH: f64 = 500.0;
+    const HEIGHT: f64 = 120.0;
+
+    /// A hidden panel centered over the video area of a view of `frame`.
+    fn new(mtm: MainThreadMarker, frame: NSRect) -> Self {
+        let panel = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(
+                NSPoint::new(
+                    ((frame.size.width - Self::WIDTH) / 2.0).max(0.0),
+                    ((frame.size.height - VIEWER_TOOLBAR_HEIGHT - Self::HEIGHT) / 2.0).max(0.0),
+                ),
+                NSSize::new(Self::WIDTH, Self::HEIGHT),
+            ),
+        );
+        panel.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMinXMargin
+                | NSAutoresizingMaskOptions::ViewMaxXMargin
+                | NSAutoresizingMaskOptions::ViewMinYMargin
+                | NSAutoresizingMaskOptions::ViewMaxYMargin,
+        );
+        panel.setWantsLayer(true);
+        if let Some(layer) = panel.layer() {
+            let background = NSColor::colorWithWhite_alpha(0.04, 0.88).CGColor();
+            layer.setBackgroundColor(Some(&background));
+            layer.setCornerRadius(10.0);
+        }
+        let label = |y: f64, height: f64, font: &NSFont, white: f64| {
+            let label = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+            label.setAlignment(NSTextAlignment::Center);
+            label.setTextColor(Some(&NSColor::colorWithWhite_alpha(white, 1.0)));
+            label.setFont(Some(font));
+            label.setFrame(NSRect::new(
+                NSPoint::new(16.0, y),
+                NSSize::new(Self::WIDTH - 32.0, height),
+            ));
+            panel.addSubview(&label);
+            label
+        };
+        let title = label(78.0, 24.0, &NSFont::boldSystemFontOfSize(16.0), 1.0);
+        let detail = label(52.0, 20.0, &NSFont::systemFontOfSize(13.0), 0.8);
+        // The target is set once the view exists.
+        let retry = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Retry now"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        retry.setFrame(NSRect::new(
+            NSPoint::new((Self::WIDTH - 120.0) / 2.0, 12.0),
+            NSSize::new(120.0, 28.0),
+        ));
+        retry.setEnabled(false);
+        panel.addSubview(&retry);
+        panel.setHidden(true);
+        Self {
+            panel,
+            title,
+            detail,
+            retry,
+        }
+    }
+}
+
 impl RemoteView {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
@@ -770,30 +857,7 @@ impl RemoteView {
             unsafe { NSFontWeightRegular },
         )));
         debug_label.setHidden(true);
-        let reconnecting_label = NSTextField::labelWithString(
-            &NSString::from_str("Reconnecting to the remote computer…"),
-            mtm,
-        );
-        reconnecting_label.setAlignment(NSTextAlignment::Center);
-        reconnecting_label.setDrawsBackground(true);
-        reconnecting_label.setBackgroundColor(Some(&NSColor::colorWithWhite_alpha(0.04, 0.88)));
-        reconnecting_label.setTextColor(Some(&NSColor::whiteColor()));
-        reconnecting_label.setFont(Some(&NSFont::systemFontOfSize(16.0)));
-        let label_size = NSSize::new(360.0, 32.0);
-        reconnecting_label.setFrame(NSRect::new(
-            NSPoint::new(
-                ((frame.size.width - label_size.width) / 2.0).max(0.0),
-                ((frame.size.height - VIEWER_TOOLBAR_HEIGHT - label_size.height) / 2.0).max(0.0),
-            ),
-            label_size,
-        ));
-        reconnecting_label.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewMinXMargin
-                | NSAutoresizingMaskOptions::ViewMaxXMargin
-                | NSAutoresizingMaskOptions::ViewMinYMargin
-                | NSAutoresizingMaskOptions::ViewMaxYMargin,
-        );
-        reconnecting_label.setHidden(true);
+        let reconnect_panel = ReconnectPanel::new(mtm, frame);
         let command = command_key(&control);
         let this = Self::alloc(mtm).set_ivars(RemoteViewIvars {
             active_display: RefCell::new(active_display),
@@ -819,13 +883,23 @@ impl RemoteView {
             agent_pointer_display: std::cell::Cell::new(None),
             debug,
             debug_label,
-            reconnecting_label,
+            reconnect_panel,
+            reconnect_status: std::cell::Cell::new(None),
+            reconnect_ticking: std::cell::Cell::new(false),
             debug_visible: RefCell::new(false),
             debug_refreshed: RefCell::new(Instant::now()),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         this.addSubview(&this.ivars().debug_label);
-        this.addSubview(&this.ivars().reconnecting_label);
+        this.addSubview(&this.ivars().reconnect_panel.panel);
+        // Button targets are weak, so this does not keep the view alive.
+        unsafe {
+            this.ivars().reconnect_panel.retry.setTarget(Some(&this));
+            this.ivars()
+                .reconnect_panel
+                .retry
+                .setAction(Some(sel!(retryReconnect:)));
+        }
         this.install_toolbar(mtm, frame);
         this.install_key_up_monitor();
         this
@@ -1080,9 +1154,32 @@ impl RemoteView {
         self.ivars().control.send(message);
     }
 
-    /// Shows that the connection is being restored; input waits until then.
-    pub(super) fn set_reconnecting(&self, reconnecting: bool) {
-        self.ivars().reconnecting_label.setHidden(!reconnecting);
+    /// Shows why and for how long the connection is being restored, or
+    /// hides that (`None`); input waits until then. Returns whether the
+    /// caller should start refreshing the elapsed time and countdown.
+    pub(super) fn set_reconnect_status(&self, status: Option<ReconnectStatus>) -> bool {
+        self.ivars().reconnect_status.set(status);
+        self.refresh_reconnect_status();
+        status.is_some() && !self.ivars().reconnect_ticking.replace(status.is_some())
+    }
+
+    /// Redraws the reconnect panel for the current time. Returns whether it
+    /// is still shown, so the refresh continues.
+    pub(super) fn refresh_reconnect_status(&self) -> bool {
+        let panel = &self.ivars().reconnect_panel;
+        let Some(status) = self.ivars().reconnect_status.get() else {
+            panel.panel.setHidden(true);
+            self.ivars().reconnect_ticking.set(false);
+            return false;
+        };
+        let text = status.render(Instant::now());
+        panel.title.setStringValue(&NSString::from_str(text.title));
+        panel
+            .detail
+            .setStringValue(&NSString::from_str(&text.detail));
+        panel.retry.setEnabled(text.retry_enabled);
+        panel.panel.setHidden(false);
+        true
     }
 
     pub(super) fn window_closed(&self) -> bool {

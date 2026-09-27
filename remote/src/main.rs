@@ -33,7 +33,7 @@ mod video_layout;
 use anyhow::Context;
 use launch_status::LaunchStatus;
 use meshrmm_signaling_client::ReconnectBackoff;
-use reconnect::Disposition;
+use reconnect::{Disposition, ReconnectPhase};
 use std::time::{Duration, Instant};
 
 /// How long a new viewer waits for the previous viewer of the same device to
@@ -256,14 +256,18 @@ async fn run_resumable_session(
             }
             return Err(reconnect::stopped_error(&error));
         }
-        let delay = backoff.next_delay();
+        let failed_at = Instant::now();
+        let streamed_for = resume_state.attempt_streamed_for(failed_at);
+        let delay = backoff.delay_after(streamed_for);
+        let status = resume_state.record_failure(&error, failed_at);
+        // Shows the reason in the kept window while the session resumes.
+        resume_state.set_reconnect_phase(ReconnectPhase::Attempting);
         tracing::warn!(
             error = ?error,
             session_id = %bootstrap.session_id,
             retry_seconds = delay.as_secs(),
-            streamed_seconds = resume_state
-                .attempt_streamed_for(Instant::now())
-                .map(|streamed| streamed.as_secs()),
+            streamed_seconds = streamed_for.map(|streamed| streamed.as_secs()),
+            reason = ?status.reason,
             startup_failures,
             "remote viewer disconnected; waiting to resume"
         );
@@ -293,20 +297,35 @@ async fn run_resumable_session(
                 return Err(error).context("remote viewer session can no longer be resumed");
             }
             Err(error) => {
+                let reason = reconnect::classify_resume_failure(&error);
+                if let Some(reason) = reason {
+                    resume_state.update_reconnect_status(|status| status.reason = reason);
+                }
                 tracing::warn!(
                     error = ?error,
                     session_id = %bootstrap.session_id,
+                    ?reason,
                     "could not refresh resume credentials; retrying the existing session"
                 );
             }
         }
+        // "Retry now" ends only this wait: a click from before it is ignored,
+        // and skipping the wait leaves the backoff where it is.
+        let retry = reconnect::retry_generation();
+        resume_state.set_reconnect_phase(ReconnectPhase::Waiting {
+            until: Instant::now() + delay,
+        });
         tokio::select! {
             () = tokio::time::sleep(delay) => {}
+            () = reconnect::wait_for_retry_after(retry) => {
+                tracing::info!(session_id = %bootstrap.session_id, "reconnecting now at the user's request");
+            }
             () = shutdown::wait() => {
                 end_session_after_disconnect(config, &bootstrap).await;
                 return Ok(());
             }
         }
+        resume_state.set_reconnect_phase(ReconnectPhase::Attempting);
     }
 }
 
