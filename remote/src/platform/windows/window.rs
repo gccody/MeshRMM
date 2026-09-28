@@ -44,7 +44,7 @@ static LAST_PLACEMENT: std::sync::Mutex<Option<WINDOWPLACEMENT>> = std::sync::Mu
 pub(super) const STATIC_CENTER: u32 = 0x0001;
 
 /// The minimum outer window size, in 96-DPI pixels, that fits the toolbar.
-const MINIMUM_WINDOW_WIDTH: i32 = 1176;
+const MINIMUM_WINDOW_WIDTH: i32 = 760;
 const MINIMUM_WINDOW_HEIGHT: i32 = 300;
 
 /// The video window's size and the letterboxed video inside it, in physical pixels.
@@ -72,22 +72,10 @@ struct Controls {
     reconnecting_label: HWND,
     /// "Retry now", which ends the wait before the next attempt.
     retry_button: HWND,
+    /// The toolbar the viewer draws; see [`toolbar`].
     toolbar: HWND,
-    user_combo: HWND,
-    display_combo: HWND,
-    quality_combo: HWND,
-    chroma_combo: HWND,
-    diagnostics_button: HWND,
-    settings_button: HWND,
-    file_button: HWND,
-    chat_button: HWND,
-    secure_attention_button: HWND,
-    type_clipboard_button: HWND,
-    credential_buttons: [HWND; 3],
-    credential_label: HWND,
-    minimize_button: HWND,
-    maximize_button: HWND,
-    close_button: HWND,
+    /// The toolbar's tooltips, if the common controls are available.
+    tooltip: HWND,
     settings_window: HWND,
     quality_buttons: [(HWND, QualityPreset); 4],
     chroma_buttons: [(HWND, ChromaMode); 2],
@@ -102,21 +90,7 @@ impl Default for Controls {
             reconnecting_label: HWND::default(),
             retry_button: HWND::default(),
             toolbar: HWND::default(),
-            user_combo: HWND::default(),
-            display_combo: HWND::default(),
-            quality_combo: HWND::default(),
-            chroma_combo: HWND::default(),
-            diagnostics_button: HWND::default(),
-            settings_button: HWND::default(),
-            file_button: HWND::default(),
-            chat_button: HWND::default(),
-            secure_attention_button: HWND::default(),
-            type_clipboard_button: HWND::default(),
-            credential_buttons: [HWND::default(); 3],
-            credential_label: HWND::default(),
-            minimize_button: HWND::default(),
-            maximize_button: HWND::default(),
-            close_button: HWND::default(),
+            tooltip: HWND::default(),
             settings_window: HWND::default(),
             quality_buttons: [
                 (HWND::default(), QualityPreset::UltraDataSaver),
@@ -133,6 +107,8 @@ impl Default for Controls {
 }
 
 struct WindowContext {
+    /// The viewer window, once created.
+    window: Cell<HWND>,
     // The stream fields change when the device replaces the stream; see
     // `reset_stream`. Read them through the cloning accessors.
     video_width: Cell<u32>,
@@ -146,6 +122,7 @@ struct WindowContext {
     debug: DebugInfo,
     dpi: Cell<u32>,
     font: Cell<HFONT>,
+    toolbar_font: Cell<HFONT>,
     settings_dpi: Cell<u32>,
     settings_font: Cell<HFONT>,
     resize_pending: Cell<bool>,
@@ -156,12 +133,17 @@ struct WindowContext {
     debug_refreshed: Cell<std::time::Instant>,
     recording_visible: Cell<bool>,
     controls: Cell<Controls>,
+    toolbar: RefCell<toolbar::ToolbarModel>,
     chat_popup: OnceCell<meshrmm_chat::ChatPopup>,
 }
 
 impl Drop for WindowContext {
     fn drop(&mut self) {
-        for font in [self.font.get(), self.settings_font.get()] {
+        for font in [
+            self.font.get(),
+            self.toolbar_font.get(),
+            self.settings_font.get(),
+        ] {
             if !font.is_invalid() {
                 let _ = unsafe { DeleteObject(HGDIOBJ(font.0)) };
             }
@@ -238,9 +220,14 @@ impl WindowContext {
         for control in self.toolbar_controls() {
             unsafe { set_font(control, font) };
         }
-        let old = self.font.replace(font);
-        if !old.is_invalid() {
-            let _ = unsafe { DeleteObject(HGDIOBJ(old.0)) };
+        let toolbar_font = unsafe { toolbar::toolbar_font(dpi) };
+        for old in [
+            self.font.replace(font),
+            self.toolbar_font.replace(toolbar_font),
+        ] {
+            if !old.is_invalid() {
+                let _ = unsafe { DeleteObject(HGDIOBJ(old.0)) };
+            }
         }
         self.layout_toolbar(window);
         self.resize_pending.set(true);
@@ -303,7 +290,6 @@ impl WindowContext {
         self.active_display.replace(display);
         self.displays.replace(displays);
         self.show_title(window);
-        self.populate_session_controls();
         // Only the controls: sending the choices again would make the device
         // echo its configuration and reset the stream again.
         self.show_quality(self.control.quality_preset());
@@ -317,14 +303,6 @@ impl WindowContext {
         let controls = self.controls();
         let command = if visible { SW_SHOWNOACTIVATE } else { SW_HIDE };
         let _ = unsafe { ShowWindow(controls.debug_overlay, command) };
-        unsafe {
-            SendMessageW(
-                controls.diagnostics_button,
-                BM_SETCHECK,
-                Some(WPARAM(usize::from(visible))),
-                None,
-            )
-        };
         if let Ok(button) = unsafe {
             GetDlgItem(
                 Some(controls.settings_window),
@@ -343,6 +321,7 @@ impl WindowContext {
         if visible {
             self.refresh_debug(true);
         }
+        self.refresh_toolbar();
     }
 
     fn refresh_debug(&self, force: bool) {
@@ -613,6 +592,7 @@ pub(super) unsafe fn create_window(
         .unwrap_or_else(|error| error.into_inner());
     let title = window_title(&active_display);
     let context = Rc::new(WindowContext {
+        window: Cell::new(HWND::default()),
         video_width: Cell::new(format.width),
         video_height: Cell::new(format.height),
         active_display: RefCell::new(active_display),
@@ -623,6 +603,7 @@ pub(super) unsafe fn create_window(
         debug,
         dpi: Cell::new(96),
         font: Cell::new(HFONT::default()),
+        toolbar_font: Cell::new(HFONT::default()),
         settings_dpi: Cell::new(96),
         settings_font: Cell::new(HFONT::default()),
         resize_pending: Cell::new(false),
@@ -633,6 +614,7 @@ pub(super) unsafe fn create_window(
         debug_refreshed: Cell::new(std::time::Instant::now()),
         recording_visible: Cell::new(false),
         controls: Cell::new(Controls::default()),
+        toolbar: RefCell::new(toolbar::ToolbarModel::default()),
         chat_popup: OnceCell::new(),
     });
     // The window's own reference, released on WM_NCDESTROY.
@@ -666,8 +648,12 @@ pub(super) unsafe fn create_window(
     };
     let dpi = unsafe { window_dpi(window) };
     let font = unsafe { message_font(dpi) };
+    context.window.set(window);
     context.dpi.set(dpi);
     context.font.set(font);
+    context
+        .toolbar_font
+        .set(unsafe { toolbar::toolbar_font(dpi) });
     match placement {
         Some(mut placement) => {
             if placement.showCmd == SW_SHOWMINIMIZED.0 as u32 {
@@ -723,12 +709,9 @@ pub(super) unsafe fn create_window(
     controls.quality_buttons = settings.quality_buttons;
     controls.chroma_buttons = settings.chroma_buttons;
     context.controls.set(controls);
-    context.populate_session_controls();
     context.settings_dpi.set(settings_dpi);
     context.settings_font.set(settings_font);
-    let chat_popup = unsafe {
-        meshrmm_chat::ChatPopup::new(window, controls.chat_button, context.control.chat())
-    }?;
+    let chat_popup = unsafe { meshrmm_chat::ChatPopup::new(window, context.control.chat()) }?;
     let _ = context.chat_popup.set(chat_popup);
     if !context.control.supports_chroma(ChromaMode::Yuv444) {
         let _ = unsafe { EnableWindow(controls.chroma_buttons[1].0, false) };
@@ -736,19 +719,6 @@ pub(super) unsafe fn create_window(
     context.layout_toolbar(window);
     context.set_quality(context.control.quality_preset());
     context.set_chroma(context.control.chroma_mode());
-    // New children are added below their siblings. Put the strip under
-    // every control created after it, or its background paints over them.
-    let _ = unsafe {
-        SetWindowPos(
-            controls.toolbar,
-            Some(HWND_BOTTOM),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        )
-    };
     let _ = unsafe { ShowWindow(window, SW_SHOW) };
     super::close_launch_status();
     Ok(window)
@@ -877,44 +847,41 @@ pub(super) struct ProbeState {
 #[cfg(test)]
 pub(super) unsafe fn probe_state(window: HWND) -> Option<ProbeState> {
     let context = unsafe { window_context(window) }?;
-    let controls = context.controls();
     let title = unsafe {
         let mut text = vec![0_u16; GetWindowTextLengthW(window).max(0) as usize + 1];
         let length = GetWindowTextW(window, &mut text).max(0) as usize;
         String::from_utf16_lossy(&text[..length])
     };
-    let items = |combo: HWND| -> Vec<String> {
-        let count = unsafe { SendMessageW(combo, CB_GETCOUNT, None, None) }.0;
-        (0..count.max(0) as usize)
-            .map(|index| unsafe {
-                let length = SendMessageW(combo, CB_GETLBTEXTLEN, Some(WPARAM(index)), None).0;
-                let mut text = vec![0_u16; length.max(0) as usize + 1];
-                let copied = SendMessageW(
-                    combo,
-                    CB_GETLBTEXT,
-                    Some(WPARAM(index)),
-                    Some(LPARAM(text.as_mut_ptr() as isize)),
-                )
-                .0;
-                String::from_utf16_lossy(&text[..copied.max(0) as usize])
-            })
-            .collect()
-    };
-    let selected = |combo: HWND| unsafe { SendMessageW(combo, CB_GETCURSEL, None, None) }.0;
+    let state = context.toolbar_state();
+    let displays = crate::toolbar::menu(crate::toolbar::Action::Display, &state)
+        .into_iter()
+        .filter_map(|entry| match entry {
+            crate::toolbar::MenuEntry::Item { label, .. } => Some(label),
+            crate::toolbar::MenuEntry::Separator => None,
+        })
+        .collect::<Vec<_>>();
     Some(ProbeState {
         title,
         video_size: (context.video_width.get(), context.video_height.get()),
         active_display: context.active_display_id(),
-        users: items(controls.user_combo),
-        selected_user: selected(controls.user_combo),
-        displays: items(controls.display_combo),
-        selected_display: selected(controls.display_combo),
-        display_combo_enabled: unsafe {
-            windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(controls.display_combo)
-        }
-        .as_bool(),
-        quality: selected(controls.quality_combo),
-        chroma: selected(controls.chroma_combo),
+        users: state.sessions.clone(),
+        selected_user: state.session as isize,
+        display_combo_enabled: displays.len() > 1,
+        displays,
+        selected_display: state.display as isize,
+        quality: [
+            QualityPreset::UltraDataSaver,
+            QualityPreset::DataSaver,
+            QualityPreset::Balanced,
+            QualityPreset::BestQuality,
+        ]
+        .iter()
+        .position(|preset| *preset == state.quality)
+        .map_or(-1, |index| index as isize),
+        chroma: match state.chroma {
+            Some((ChromaMode::Yuv444, _)) => 1,
+            _ => 0,
+        },
         toolbar_height: toolbar_height(context.dpi.get()),
         video: context.video_rect(window),
     })
@@ -939,4 +906,24 @@ pub(super) unsafe fn probe_toggle_chat(window: HWND) {
     {
         chat.toggle();
     }
+}
+
+/// The toolbar's items with their rectangles in client pixels.
+#[cfg(test)]
+pub(super) type ProbeItems = Vec<(crate::toolbar::Item, RECT)>;
+
+/// The toolbar window, its tooltip control, and its items, for the toolbar
+/// probe.
+#[cfg(test)]
+pub(super) unsafe fn probe_toolbar(window: HWND) -> Option<(HWND, HWND, ProbeItems)> {
+    let context = unsafe { window_context(window) }?;
+    let controls = context.controls();
+    let items = context.probe_toolbar_items();
+    Some((controls.toolbar, controls.tooltip, items))
+}
+
+/// What the toolbar shows, for the toolbar probe.
+#[cfg(test)]
+pub(super) unsafe fn probe_toolbar_state(window: HWND) -> Option<crate::toolbar::State> {
+    Some(unsafe { window_context(window) }?.toolbar_state())
 }

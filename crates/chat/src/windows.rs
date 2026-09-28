@@ -5,7 +5,7 @@ use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use ::windows::Win32::System::Threading::GetCurrentThreadId;
 use ::windows::Win32::UI::Controls::{EM_SCROLLCARET, EM_SETLIMITTEXT, EM_SETSEL};
 use ::windows::Win32::UI::HiDpi::GetDpiForWindow;
-use ::windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use ::windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use ::windows::Win32::UI::WindowsAndMessaging::*;
 use ::windows::core::{PCWSTR, w};
 use std::sync::mpsc;
@@ -326,29 +326,30 @@ pub struct Popup {
     window: HWND,
     data: *mut Ui,
     parent: HWND,
-    button: HWND,
+    /// The chat button, in the parent's client coordinates. The viewer's
+    /// toolbar draws the button, its unread count and its tooltip. A banner
+    /// popup has none and sits under its owner.
+    anchor: std::cell::Cell<Option<RECT>>,
     session: ChatSession,
-    badge: std::cell::Cell<(bool, usize)>,
     banner: bool,
 }
 impl Popup {
     /// All methods must be called from the owning viewer UI thread.
     ///
     /// # Safety
-    /// `parent` and `button` must be live HWNDs on the calling thread.
-    pub unsafe fn new(parent: HWND, button: HWND, session: ChatSession) -> anyhow::Result<Self> {
-        unsafe { Self::create_popup(parent, button, session, false) }
+    /// `parent` must be a live HWND on the calling thread.
+    pub unsafe fn new(parent: HWND, session: ChatSession) -> anyhow::Result<Self> {
+        unsafe { Self::create_popup(parent, session, false) }
     }
     /// An attached, titleless popup for a small agent banner. No taskbar entry.
     ///
     /// # Safety
     /// `owner` must be a live HWND on the calling thread.
     pub unsafe fn for_banner(owner: HWND, session: ChatSession) -> anyhow::Result<Self> {
-        unsafe { Self::create_popup(owner, owner, session, true) }
+        unsafe { Self::create_popup(owner, session, true) }
     }
     unsafe fn create_popup(
         parent: HWND,
-        button: HWND,
         session: ChatSession,
         banner: bool,
     ) -> anyhow::Result<Self> {
@@ -367,38 +368,70 @@ impl Popup {
             window,
             data,
             parent,
-            button,
+            anchor: std::cell::Cell::new(None),
             session,
-            badge: std::cell::Cell::new((false, usize::MAX)),
             banner,
         })
+    }
+    /// Places the popup under `anchor`, in the parent's client coordinates.
+    pub fn set_anchor(&self, anchor: RECT) {
+        self.anchor.set(Some(anchor));
+        if self.session.visible() {
+            self.layout();
+        }
+    }
+    /// The anchor in screen coordinates.
+    fn anchor_on_screen(&self) -> RECT {
+        let mut anchor = RECT::default();
+        unsafe {
+            match self.anchor.get() {
+                Some(rect) => {
+                    let mut corners = [
+                        POINT {
+                            x: rect.left,
+                            y: rect.top,
+                        },
+                        POINT {
+                            x: rect.right,
+                            y: rect.bottom,
+                        },
+                    ];
+                    let _ = ::windows::Win32::Graphics::Gdi::MapWindowPoints(
+                        Some(self.parent),
+                        None,
+                        &mut corners,
+                    );
+                    anchor = RECT {
+                        left: corners[0].x,
+                        top: corners[0].y,
+                        right: corners[1].x,
+                        bottom: corners[1].y,
+                    };
+                }
+                None => {
+                    let _ = GetWindowRect(self.parent, &mut anchor);
+                }
+            }
+        }
+        anchor
+    }
+    /// A click on the chat button toggles the popup rather than dismissing it.
+    fn on_anchor(&self, message: &MSG) -> bool {
+        if self.anchor.get().is_none() {
+            return message.hwnd == self.parent;
+        }
+        let anchor = self.anchor_on_screen();
+        (anchor.left..anchor.right).contains(&message.pt.x)
+            && (anchor.top..anchor.bottom).contains(&message.pt.y)
     }
     pub fn refresh(&self) {
         if !self.session.available() {
             unsafe {
                 let _ = ShowWindow(self.window, SW_HIDE);
             }
-        }
-        if self.banner {
-            return;
-        }
-        let unread = self.session.unread();
-        let available = self.session.available();
-        if self.badge.replace((available, unread)) == (available, unread) {
-            return;
-        }
-        let title = if unread == 0 {
-            "💬".to_owned()
-        } else {
-            format!("💬 {unread}")
-        };
-        let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
-        unsafe {
-            let _ = SetWindowTextW(self.button, PCWSTR(title.as_ptr()));
-            let _ = EnableWindow(self.button, self.session.available());
-        }
-        if !self.session.available() && self.session.visible() {
-            self.close();
+            if !self.banner && self.session.visible() {
+                self.close();
+            }
         }
     }
     pub fn toggle(&self) {
@@ -417,8 +450,7 @@ impl Popup {
     }
     pub fn layout(&self) {
         unsafe {
-            let mut anchor = RECT::default();
-            let _ = GetWindowRect(self.button, &mut anchor);
+            let anchor = self.anchor_on_screen();
             let monitor = ::windows::Win32::Graphics::Gdi::MonitorFromWindow(
                 self.parent,
                 ::windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
@@ -491,7 +523,7 @@ impl Popup {
             }
             if matches!(message.message, WM_LBUTTONDOWN | WM_RBUTTONDOWN)
                 && !inside
-                && message.hwnd != self.button
+                && !self.on_anchor(message)
             {
                 self.close();
                 return true; // The dismissal click must not control the remote computer.

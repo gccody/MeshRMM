@@ -1,15 +1,15 @@
 # Windows credential autofill
 
-The macOS and Windows viewers expose **Prompt for credentials** at the top of
-an installed-service session. It opens a native Windows dialog on the viewed
-endpoint. The remote user enters `DOMAIN\user`, `user@domain`, or `.\localuser`
+The macOS and Windows viewers expose **Prompt for credentials** in the toolbar's
+credentials (key icon) menu in an installed-service session. It opens a native
+Windows dialog on the viewed endpoint. The remote user enters `DOMAIN\user`, `user@domain`, or `.\localuser`
 and their Windows password (not a Hello PIN). The dialog explains how the
 credentials will be used. Cancel leaves any previous saved credentials intact.
 
 Windows performs one interactive `LogonUserW` validation per submission. Failed
-validation never replaces the saved credential, and its error appears in the
-viewer status. There are no automatic authentication retries. Local/domain logon
-policies, account restrictions, and domain availability still apply.
+validation never replaces the saved credential, and its error appears as the
+first line of the credentials menu and in the key icon's tooltip. There are no
+automatic authentication retries. Local/domain logon policies, account restrictions, and domain availability still apply.
 
 After successful validation, the endpoint encrypts the credential using
 user-scoped Windows DPAPI under the LocalSystem helper identity. The service
@@ -21,12 +21,12 @@ ciphertext is sent to the viewer/server, placed on a clipboard, or logged.
 
 Saved credentials persist across remote sessions, reconnects, Windows user
 switches, background sessions, agent updates, and reboots. There is one saved
-credential per endpoint; a new successful prompt replaces it. Only **Forget
+credential per endpoint; a new successful prompt replaces it. Only **Forget saved
 credentials** (available in any session mode) or uninstalling the agent deletes
 it.
 
-When a supported Windows login or UAC password field is visible, **Autofill
-credentials?** appears. Each fill requires a click and rechecks the foreground
+When a supported Windows login or UAC password field is visible, the key icon
+shows a blue dot and its menu offers **Autofill saved credentials**. Each fill requires a click and rechecks the foreground
 process and fields. Only `System32\LogonUI.exe` and `System32\consent.exe` are
 accepted, with visible, enabled, unambiguous password controls belonging to that
 process. Hello PINs, arbitrary application password boxes, consent-only UAC

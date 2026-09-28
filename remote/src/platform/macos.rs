@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use dispatch2::DispatchQueue;
 use meshrmm_protocol::{
-    ChromaMode, Codec, CursorShape, Display, EncodedFrame, PointerButton, QualityPreset,
-    RemoteInput, SessionMessage, VideoFormat, VideoProfile, VideoStreamId,
+    ChromaMode, Codec, CursorShape, Display, EncodedFrame, PointerButton, RemoteInput,
+    SessionMessage, VideoFormat, VideoProfile, VideoStreamId,
 };
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -19,7 +19,7 @@ use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_se
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor, NSCursor, NSEvent,
-    NSEventModifierFlags, NSFont, NSFontWeightRegular, NSPopUpButton, NSProgressIndicator,
+    NSEventModifierFlags, NSFont, NSFontWeightRegular, NSProgressIndicator,
     NSProgressIndicatorStyle, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowDelegate,
     NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
 };
@@ -45,6 +45,7 @@ use crate::h264::annex_b_to_length_prefixed;
 mod app;
 mod keyboard;
 mod presenter;
+mod toolbar;
 
 use app::close_connecting_window;
 #[cfg(test)]
@@ -77,7 +78,7 @@ pub fn supported_video_profiles(_format: VideoFormat) -> Vec<VideoProfile> {
 }
 
 static NEXT_PRESENTER_ID: AtomicU64 = AtomicU64::new(1);
-const VIEWER_TOOLBAR_HEIGHT: f64 = 70.0;
+const VIEWER_TOOLBAR_HEIGHT: f64 = crate::toolbar::HEIGHT;
 
 #[cfg(test)]
 mod tests {

@@ -347,11 +347,11 @@ and all-monitor blackout. Company admins customize the blackout notice under
 **Profile & session**. See [maintenance controls](docs/maintenance-controls.md)
 for usage, Windows requirements, and cleanup behavior.
 
-**On session close** (session menu on macOS; Troubleshooting settings on Windows)
-chooses what the Agent does to the Windows session being viewed when the remote
-session ends: **No action** (default), **Lock**, or **Logout**. The choice is not
-saved: every new remote session starts with **No action**, so choose it again each
-session. It is kept across reconnects of the same session.
+**On session close** (**When the session ends → Remote user** in the macOS gear
+menu; Troubleshooting settings on Windows) chooses what the Agent does to the Windows session being viewed when the remote
+session ends: **No action** (default; **Leave signed in** on macOS), **Lock**, or
+**Logout** (**Sign out** on macOS). The choice is not saved: every new remote
+session starts with **No action**, so choose it again each session. It is kept across reconnects of the same session.
 The action runs when the server ends the session: when the viewer closes it, when
 it is closed from the dashboard, or when an unreachable viewer reaches the session
 idle timeout. It does not run while the viewer is reconnecting to the same session. The action applies to the console or RDP user session viewed last.
@@ -359,8 +359,8 @@ If no user is signed in, or the session was in background mode, nothing happens.
 Logout does not save open work. Updating or restarting the Agent service skips
 the action.
 
-**Clear clipboard on session close** (session menu on macOS; Troubleshooting
-settings on Windows) empties the clipboard of that same Windows session when the
+**Clear clipboard on session close** (**When the session ends → Clear remote
+clipboard** in the macOS gear menu; Troubleshooting settings on Windows) empties the clipboard of that same Windows session when the
 remote session ends, at the same points as **On session close** and before any
 Lock. It is on by default, saved for the current viewer user, and sent to the Agent
 when each connection starts. Logout skips it because signing out discards the
@@ -368,16 +368,17 @@ clipboard. Windows clipboard history (Win+V) is left unchanged.
 
 System audio from the Windows default playback device is forwarded to both native
 viewers over a separate, bounded WebRTC audio channel, including while muted.
-Each new session starts muted. On macOS, choose **Unmute audio** in the session
-controls menu; on Windows, clear **Mute audio** under **Settings → Troubleshooting**.
+Each new session starts muted. On macOS, check **Play remote audio** in the gear
+menu; on Windows, clear **Mute audio** under **Settings → Troubleshooting**.
 The choice survives reconnects within the same session. Muting discards buffered
 sound. Capture includes the system output mix, not the microphone, and follows
 default playback-device changes. Audio uses PCM16 at the source sample rate
 (about 1.5 Mbps for 48 kHz stereo); congested queues drop audio to keep it live.
 
 To record the remote display locally, choose **Record video to Downloads** in
-macOS **Controls** or Windows **Settings → Troubleshooting**. **REC** stays
-visible while recording; choose **Stop recording and save** to finish. Video-only
+the macOS gear menu's **Session** section or Windows **Settings → Troubleshooting**.
+A red **REC** item stays in the toolbar while recording; click it, or choose
+**Stop recording and save**, to finish. Video-only
 Matroska (`.mkv`) files are saved under `Downloads/MeshRMM Recordings/session-…`
 on the viewer's computer, and the saved location is shown when stopped. Open
 these files in a player supporting H.264/HEVC in MKV, such as VLC.
@@ -398,13 +399,13 @@ are detected every 250 ms. Rich text and images require updated peers on both
 ends. Payloads are capped at 32 MiB (uncompressed RGBA pixels for images) and
 sent in paced 60 KiB chunks; larger copies take longer to arrive. File lists
 continue to use the file-transfer path. RTF-only formatting is not synchronized.
-Turn off **Sync clipboard** (session menu on macOS; Troubleshooting settings on
+Turn off **Sync clipboard** (gear menu on macOS; Troubleshooting settings on
 Windows) to stop this exchange, including copied files, in both directions. The
 choice is saved for the current viewer user and defaults to on. When it is turned
 back on, only later copies are sent; content copied while sync was off stays local.
-**Type clipboard**, **Send**/**Receive**, and drag-and-drop are unaffected.
+**Type clipboard** (clipboard icon), **Send**/**Receive**, and drag-and-drop are unaffected.
 
-The **folder icon** offers **Send** and **Receive** using native multi-file/folder
+The **folder icon** offers **Send files…** and **Receive files…** using native multi-file/folder
 pickers on the source computer. Transfers preserve nested and empty folders and
 land in the signed-in user’s `Documents/MeshRMM Transferred Files` folder.
 Existing names are preserved by assigning a unique name to incoming duplicates.
@@ -465,11 +466,11 @@ press **F8** in the viewer to cycle displays. On macOS, use
 **Control-Option-Left/Right Arrow**. **F12** shows the diagnostics overlay.
 Either shortcut can use F8–F12 or be turned off, which sends the key to the
 device: on Windows under **Settings → Keyboard**, on macOS (diagnostics only)
-under the session menu's **Diagnostics key**. While the Windows viewer has
+under the gear menu's **Diagnostics shortcut**. While the Windows viewer has
 keyboard focus it also sends the Windows key, Alt+Tab, Alt+Esc and Ctrl+Esc to
 the device instead of acting on them locally; turn this off under
 **Settings → Keyboard**. Ctrl+Alt+Del and Windows+L always stay local. On endpoints with multiple monitors,
-select **All monitors** from the viewer's display dropdown (also included in
+select **All displays** from the viewer's monitor menu (also included in
 keyboard cycling) to view and control the complete desktop in one window.
 The combined view preserves monitor positions, including negative coordinates,
 with black space between monitors. Select an individual monitor to return to
@@ -609,7 +610,7 @@ Windows' synchronous capture API, while input remains in a separate helper.
 
 ### Sending Ctrl+Alt+Del
 
-Use **Ctrl+Alt+Del** in the Windows or macOS remote client's toolbar to send the
+Use the keyboard icon (**Send Ctrl+Alt+Del**) in the Windows or macOS remote client's toolbar to send the
 secure attention sequence to the Windows agent. Update both the client and agent
 for this command. The agent must run through its installed Windows service.
 
