@@ -1,7 +1,7 @@
 use super::*;
 use dispatch2::DispatchQueue;
-use objc2::rc::Retained;
-use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
+use objc2::rc::{Retained, Weak};
+use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::*;
 use objc2_foundation::{
     MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -264,7 +264,8 @@ struct PopupIvars {
     popover: Retained<NSPopover>,
     /// The view the popover points at. The viewer's toolbar draws the chat
     /// button, its unread badge and its tooltip.
-    anchor: Retained<NSView>,
+    // The anchor may own this popup; retaining it would prevent teardown.
+    anchor: Weak<NSView>,
     content: RefCell<Content>,
     input_gate: Box<dyn Fn(bool)>,
 }
@@ -279,7 +280,7 @@ define_class!(
         fn did_close(&self, _notification: &objc2_foundation::NSNotification) {
             self.ivars().content.borrow().save_draft();
             self.ivars().session.set_visible(false);
-            (self.ivars().input_gate)(self.ivars().anchor.window().is_some_and(|w| w.isKeyWindow()));
+            (self.ivars().input_gate)(self.ivars().anchor.load().and_then(|anchor| anchor.window()).is_some_and(|w| w.isKeyWindow()));
             self.refresh();
         }
     }
@@ -319,7 +320,7 @@ impl Popup {
         let controller = PopupController::alloc(mtm).set_ivars(PopupIvars {
             session,
             popover,
-            anchor: anchor.retain(),
+            anchor: Weak::new(anchor),
             content: RefCell::new(content),
             input_gate: Box::new(input_gate),
         });
@@ -340,14 +341,16 @@ impl Popup {
         let vars = self.controller.ivars();
         if vars.popover.isShown() {
             vars.popover.close();
-        } else if vars.session.available() {
+        } else if vars.session.available()
+            && let Some(anchor) = vars.anchor.load()
+        {
             vars.session.set_visible(true);
             (vars.input_gate)(false);
             vars.content.borrow_mut().refresh();
             // The anchor is not flipped, so the bottom edge is MinY.
             vars.popover.showRelativeToRect_ofView_preferredEdge(
                 rect,
-                &vars.anchor,
+                &anchor,
                 objc2_foundation::NSRectEdge::MinY,
             );
             if let Some(window) = vars.content.borrow().view.window() {
