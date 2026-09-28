@@ -189,6 +189,9 @@ fn users_can_read_and_execute(handle: &OwnedHandle, path: &Path) -> anyhow::Resu
         let mut ace = std::ptr::null_mut();
         unsafe { GetAce(dacl, index.into(), &mut ace) }
             .with_context(|| format!("failed to read the DACL of {}", path.display()))?;
+        if ace.is_null() {
+            bail!("the DACL of {} is missing ACE {index}", path.display());
+        }
         let header = unsafe { &*ace.cast::<ACE_HEADER>() };
         if u32::from(header.AceFlags) & INHERIT_ONLY_ACE.0 != 0
             || !matches!(
@@ -382,6 +385,9 @@ fn ensure_protected(handle: &OwnedHandle, path: &Path, forbidden: u32) -> anyhow
         let mut ace = std::ptr::null_mut();
         unsafe { GetAce(dacl, index.into(), &mut ace) }
             .with_context(|| format!("failed to read the DACL of {}", path.display()))?;
+        if ace.is_null() {
+            bail!("the DACL of {} is missing ACE {index}", path.display());
+        }
         let header = unsafe { &*ace.cast::<ACE_HEADER>() };
         if u32::from(header.AceFlags) & INHERIT_ONLY_ACE.0 != 0 {
             continue;
