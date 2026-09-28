@@ -1,0 +1,6 @@
+name: MeshRMM CodeQL config
+
+# vendor/ holds third-party sources (the policy-patched `dtls` crate); findings
+# there belong upstream and drown out alerts in our own code.
+paths-ignore:
+  - vendor
