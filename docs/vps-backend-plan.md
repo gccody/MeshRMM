@@ -27,8 +27,11 @@ This document is only the plan. No code changes are part of the PR that introduc
   `server/src/usage.rs`, the dashboard costs page, `docs/cost-tracking.md`).
 - **The dashboard stays on Cloudflare**, and **TURN stays on Cloudflare Realtime** (the server keeps
   calling the TURN credential API).
-- **One server process.** Scaling past one VPS is out of scope; it would need a shared routing layer
-  for the in-memory registries.
+- **Hosting: a Contabo VPS in the US East (New York) region**, the closest to the D1 primary
+  (`running_in_region: ENAM` in `wrangler d1 info pulsermm-production`, checked 2026-09-27).
+- **One server process for now, with room to scale out.** Running several servers is out of scope
+  for this rewrite, but nothing here should block it. See [Scaling out later](#scaling-out-later).
+  Postgres was considered and deferred; D1 is already shared by any number of servers.
 
 ## Features that must survive
 
@@ -120,7 +123,7 @@ exceed. Cloudflare's recommended pattern is a proxy Worker with a D1 binding.
 - The server's `Db` module exposes `first`, `all`, `run` and `batch` with the same SQL and `?N`
   parameters used today. Queries that run together go in one `batch` call to save round trips; for
   example Agent authentication, which is several lookups today.
-- Put the VPS in the region nearest the D1 primary, since every query crosses the gateway.
+- The VPS is in the region nearest the D1 primary (ENAM), since every query crosses the gateway.
 - Migrations stay in `server/migrations/` and keep being applied with `wrangler d1 migrations apply`.
   This plan adds one **additive** migration (`remote_sessions`, and update-grace columns on `agents`;
   see T3 and T4). Tables that only the old design used (`agent_event_subscriptions`,
@@ -156,9 +159,10 @@ the Agent's control connection already reconnects with backoff, and a second per
 
 ### Restarts and deployment
 
-**Platform: a single Linux VPS running the server under systemd, behind Caddy, behind the Cloudflare
-proxy for `api.meshrmm.com`.** Any KVM provider works (Hetzner Cloud, DigitalOcean, Vultr); pick the
-one with a region nearest the D1 primary. Managed platforms with rolling deploys (Fly.io, Railway,
+**Platform: a Contabo VPS (US East) running the server under systemd, behind Caddy, behind the
+Cloudflare proxy for `api.meshrmm.com`.** Contabo has no managed services and its disk and network
+performance varies, which suits this design: the server keeps no data on disk (D1 holds it), so
+the VPS can be rebuilt from `deploy/` at any time. Managed platforms with rolling deploys (Fly.io, Railway,
 Render) were considered and rejected: a rolling deploy runs the old and new instance side by side,
 which splits the in-memory registries (an Agent connected to the old instance, its viewer to the
 new one) and would require a cross-instance routing layer. Their deploys also close WebSockets,
@@ -188,6 +192,24 @@ It would add real complexity to save the 1–2 second reconnect.
 
 Crash restarts (not graceful) behave the same except that sockets close without 1012, so clients
 use their normal backoff, and session deadlines may be up to one minute stale (T4).
+
+### Scaling out later
+
+Not built in this rewrite, but kept possible:
+
+- **Database:** D1 is reached over the network, so several servers can share it through the gateway
+  as they are. If D1 is replaced later, Postgres is the candidate that keeps this property; a local
+  SQLite file would not.
+- **Keep cross-connection calls behind one interface.** Handlers never touch another connection's
+  socket; they call the Agent hub (`deliver(device_id, command)`) and the presence publisher
+  (`publish(company_id, event)`). In this rewrite those are in-memory. With several servers they
+  become "look up which server holds the Agent, and send it there" and "publish to every server",
+  through a message bus.
+- **Viewer signaling goes to the Agent's server.** With several servers, `SessionBootstrap` and
+  `resume` would return the signaling URL of the server holding the Agent's connection, so SDP is
+  never relayed between servers.
+- **Deploys** could then start a new server, move connections over, and stop the old one, instead
+  of restarting in place.
 
 ## Status
 
