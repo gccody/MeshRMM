@@ -175,11 +175,17 @@ class EnrollmentTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT blackout_message FROM companies WHERE id='co'").fetchone(), (default,))
         update = sql("server/src/routes/account.rs", "UPDATE companies SET dashboard_idle_timeout_minutes")
         self.db.execute("INSERT INTO companies (id,name,created_at,slug,status) VALUES ('other','Other',0,'other','active')")
-        self.db.execute(update, (60, "Maintenance by {user_name}\nPlease wait", "co", 0, 0, 0, 0))
-        self.db.execute(update, (120, None, "co", None, None, None, None))
-        self.assertEqual(self.db.execute("SELECT blackout_message, session_banner FROM companies WHERE id='other'").fetchone(), (default, 1))
+        notice = "{user_name} has connected to this computer."
+        self.assertEqual(self.db.execute("SELECT connection_notification, background_connection_notification, connection_notification_message FROM companies WHERE id='co'").fetchone(), (1, 0, notice))
+        self.db.execute(update, (60, "Maintenance by {user_name}\nPlease wait", "co", 0, 0, 0, 0, 0, "{user_name} is here\nSay hi", 1))
+        self.db.execute(update, (120, None, "co", None, None, None, None, None, None, None))
+        self.assertEqual(self.db.execute("SELECT blackout_message, session_banner, connection_notification, background_connection_notification, connection_notification_message FROM companies WHERE id='other'").fetchone(), (default, 1, 1, 0, notice))
         policy = sql("server/src/routes/handoffs.rs", "SELECT c.id AS company_id, c.blackout_message")
-        self.assertEqual(self.db.execute(policy, ("device",)).fetchone(), ("co", "Maintenance by {user_name}\nPlease wait", 0, 0, 0, 0))
+        self.assertEqual(self.db.execute(policy, ("device",)).fetchone(), ("co", "Maintenance by {user_name}\nPlease wait", 0, 0, 0, 0, 0, 1, "{user_name} is here\nSay hi"))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("UPDATE companies SET connection_notification = 2 WHERE id='co'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("UPDATE companies SET background_connection_notification = 2 WHERE id='co'")
         self.db.execute("UPDATE agents SET deletion_requested_at=1")
         self.assertIsNone(self.db.execute(policy, ("device",)).fetchone())
 

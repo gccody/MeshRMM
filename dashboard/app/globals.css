@@ -417,6 +417,21 @@ button { color: inherit; }
   overflow-wrap: anywhere;
   text-align: center;
 }
+.connection-notification-preview {
+  display: grid;
+  gap: 6px;
+  max-width: 360px;
+  padding: 16px;
+  border: 1px solid #4b5563;
+  border-left: 4px solid #6366f1;
+  border-radius: 6px;
+  background: #212b38;
+  color: #e2e5eb;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.connection-notification-preview strong { color: #fff; font-weight: 600; }
+.settings-section .connection-notification-preview { margin: 18px 0; }
 
 /* Company settings */
 .settings-page { max-width: 960px; }

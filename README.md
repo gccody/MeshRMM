@@ -265,6 +265,15 @@ authenticated handoff owner and retains it across session reconnects. Deploy
 both the server and updated Windows Agent to enable named banners; older
 session records use “Remote user”.
 
+When a technician connects, the Windows endpoint also shows a connection
+notification in the bottom-right corner of the primary monitor, above the
+taskbar. It shows once per session and closes when clicked or after 15 seconds.
+It is on by default for sessions that view the user's desktop. Background-mode
+sessions notify the user only if an administrator enables that separately.
+Company administrators configure both and edit the message under **Settings →
+Connection notification**; see
+[maintenance controls](docs/maintenance-controls.md#connection-notification).
+
 Company administrators use the embedded WorkOS user-management, domain, and
 SSO widgets to invite users, assign roles, verify domains, and configure a SAML
 or OIDC identity provider. The application has no company switcher; a user with

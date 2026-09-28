@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   DEFAULT_BLACKOUT_MESSAGE,
+  DEFAULT_CONNECTION_NOTIFICATION_MESSAGE,
   SETTINGS_TABS,
   companySettingsBody,
   draftFromCompany,
   draftMatchesCompany,
   isBlackoutMessageValid,
+  isConnectionNotificationMessageValid,
   settingsTabForKey,
 } from "../features/settings/company-settings.ts";
 import { DEFAULT_IDLE_TIMEOUT_MINUTES } from "../features/session/idle-session.ts";
@@ -22,6 +24,9 @@ const company = {
   prevent_idle_lock: false,
   allow_idle_override: true,
   session_banner: false,
+  connection_notification: false,
+  background_connection_notification: true,
+  connection_notification_message: "{user_name} is here.",
 };
 
 test("drafts start from the saved settings, or the defaults before the account loads", () => {
@@ -32,6 +37,9 @@ test("drafts start from the saved settings, or the defaults before the account l
     preventIdleLock: false,
     allowIdleOverride: true,
     sessionBanner: false,
+    connectionNotification: false,
+    backgroundConnectionNotification: true,
+    connectionNotificationMessage: "{user_name} is here.",
   });
   assert.deepEqual(draftFromCompany(null), {
     idleTimeoutMinutes: DEFAULT_IDLE_TIMEOUT_MINUTES,
@@ -40,6 +48,9 @@ test("drafts start from the saved settings, or the defaults before the account l
     preventIdleLock: true,
     allowIdleOverride: true,
     sessionBanner: true,
+    connectionNotification: true,
+    backgroundConnectionNotification: false,
+    connectionNotificationMessage: DEFAULT_CONNECTION_NOTIFICATION_MESSAGE,
   });
 });
 
@@ -53,6 +64,9 @@ test("saving is offered only when a draft differs from the saved settings", () =
     { preventIdleLock: true },
     { allowIdleOverride: false },
     { sessionBanner: true },
+    { connectionNotification: true },
+    { backgroundConnectionNotification: false },
+    { connectionNotificationMessage: "Hello" },
   ]) {
     assert.equal(draftMatchesCompany({ ...draft, ...change }, company), false, JSON.stringify(change));
   }
@@ -69,6 +83,15 @@ test("the blackout message needs visible text and at most 2 KB of UTF-8", () => 
   assert.equal(isBlackoutMessageValid("é".repeat(1025)), false);
 });
 
+test("the connection notification message needs visible text and at most 512 bytes of UTF-8", () => {
+  assert.equal(isConnectionNotificationMessageValid(DEFAULT_CONNECTION_NOTIFICATION_MESSAGE), true);
+  assert.equal(isConnectionNotificationMessageValid(" \n "), false);
+  assert.equal(isConnectionNotificationMessageValid("a".repeat(512)), true);
+  assert.equal(isConnectionNotificationMessageValid("a".repeat(513)), false);
+  assert.equal(isConnectionNotificationMessageValid("é".repeat(256)), true);
+  assert.equal(isConnectionNotificationMessageValid("é".repeat(257)), false);
+});
+
 test("the saved body uses the control plane's field names", () => {
   assert.deepEqual(companySettingsBody(draftFromCompany(company)), {
     dashboard_idle_timeout_minutes: 30,
@@ -77,6 +100,9 @@ test("the saved body uses the control plane's field names", () => {
     prevent_idle_lock: false,
     allow_idle_override: true,
     session_banner: false,
+    connection_notification: false,
+    background_connection_notification: true,
+    connection_notification_message: "{user_name} is here.",
   });
 });
 

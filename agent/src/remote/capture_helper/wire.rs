@@ -23,6 +23,12 @@ pub(super) fn write_command(mut writer: impl Write, command: &ParentCommand) -> 
             writer.write_all(viewer_name.as_bytes())?;
             writer.write_all(&[u8::from(*show_banner)])
         }
+        ParentCommand::ShowConnectionNotification { text } => {
+            checked_len(text.len(), MAX_CONTROL_BYTES, "connection notification")?;
+            writer.write_all(&[25])?;
+            write_u32(&mut writer, text.len() as u32)?;
+            writer.write_all(text.as_bytes())
+        }
         ParentCommand::Files(message) => {
             writer.write_all(&[12])?;
             write_file_message(&mut writer, message)
@@ -133,6 +139,19 @@ pub(super) fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
             Ok(ParentCommand::StartChatHelper {
                 viewer_name,
                 show_banner: read_bool(&mut reader)?,
+            })
+        }
+        25 => {
+            let length = bounded_len(
+                read_u32(&mut reader)?,
+                MAX_CONTROL_BYTES,
+                "connection notification",
+            )?;
+            let mut text = vec![0; length];
+            reader.read_exact(&mut text)?;
+            Ok(ParentCommand::ShowConnectionNotification {
+                text: String::from_utf8(text)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
             })
         }
         COMMAND_START => {

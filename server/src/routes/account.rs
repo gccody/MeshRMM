@@ -12,7 +12,7 @@ async fn account_for_identity(environment: &Env, identity: Identity) -> Result<R
     let db = environment.d1("DB")?;
     let company = query!(
         &db,
-        "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, display_border, prevent_idle_lock, allow_idle_override, session_banner, slug, status FROM companies WHERE id = ?1",
+        "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, display_border, prevent_idle_lock, allow_idle_override, session_banner, connection_notification, background_connection_notification, connection_notification_message, slug, status FROM companies WHERE id = ?1",
         identity.company_id
     )?
     .metered_first::<Company>(None)
@@ -58,10 +58,20 @@ pub(crate) async fn update_company_settings(
             "blackout message must be nonempty, at most 2048 UTF-8 bytes, and contain no control characters except newlines",
         );
     }
+    if body
+        .connection_notification_message
+        .as_deref()
+        .is_some_and(|text| !meshrmm_protocol_types::valid_connection_notification_message(text))
+    {
+        return api_error(
+            400,
+            "connection notification message must be nonempty, at most 512 UTF-8 bytes, and contain no control characters except newlines",
+        );
+    }
     let db = environment.d1("DB")?;
     let company_exists = query!(
         &db,
-        "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, display_border, prevent_idle_lock, allow_idle_override, session_banner, slug, status FROM companies WHERE id = ?1",
+        "SELECT id, name, dashboard_idle_timeout_minutes, blackout_message, display_border, prevent_idle_lock, allow_idle_override, session_banner, connection_notification, background_connection_notification, connection_notification_message, slug, status FROM companies WHERE id = ?1",
         identity.company_id
     )?
     .metered_first::<Company>(None)
@@ -72,14 +82,17 @@ pub(crate) async fn update_company_settings(
     }
     query!(
         &db,
-        "UPDATE companies SET dashboard_idle_timeout_minutes = ?1, blackout_message = COALESCE(?2, blackout_message), display_border = COALESCE(?4, display_border), prevent_idle_lock = COALESCE(?5, prevent_idle_lock), allow_idle_override = COALESCE(?6, allow_idle_override), session_banner = COALESCE(?7, session_banner) WHERE id = ?3",
+        "UPDATE companies SET dashboard_idle_timeout_minutes = ?1, blackout_message = COALESCE(?2, blackout_message), display_border = COALESCE(?4, display_border), prevent_idle_lock = COALESCE(?5, prevent_idle_lock), allow_idle_override = COALESCE(?6, allow_idle_override), session_banner = COALESCE(?7, session_banner), connection_notification = COALESCE(?8, connection_notification), connection_notification_message = COALESCE(?9, connection_notification_message), background_connection_notification = COALESCE(?10, background_connection_notification) WHERE id = ?3",
         timeout,
         body.blackout_message.clone(),
         identity.company_id,
         body.display_border.map(i32::from),
         body.prevent_idle_lock.map(i32::from),
         body.allow_idle_override.map(i32::from),
-        body.session_banner.map(i32::from)
+        body.session_banner.map(i32::from),
+        body.connection_notification.map(i32::from),
+        body.connection_notification_message.clone(),
+        body.background_connection_notification.map(i32::from)
     )?
     .metered_run()
     .await?;
@@ -89,7 +102,7 @@ pub(crate) async fn update_company_settings(
         "company.settings.update",
         "company",
         &identity.company_id,
-        &serde_json::json!({ "dashboard_idle_timeout_minutes": timeout, "blackout_message": body.blackout_message, "display_border": body.display_border, "prevent_idle_lock": body.prevent_idle_lock, "allow_idle_override": body.allow_idle_override, "session_banner": body.session_banner }).to_string(),
+        &serde_json::json!({ "dashboard_idle_timeout_minutes": timeout, "blackout_message": body.blackout_message, "display_border": body.display_border, "prevent_idle_lock": body.prevent_idle_lock, "allow_idle_override": body.allow_idle_override, "session_banner": body.session_banner, "connection_notification": body.connection_notification, "background_connection_notification": body.background_connection_notification, "connection_notification_message": body.connection_notification_message }).to_string(),
     )
     .await?;
     account_for_identity(environment, identity).await

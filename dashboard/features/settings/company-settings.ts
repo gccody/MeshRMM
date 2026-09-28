@@ -5,11 +5,14 @@ import type { Company } from "../workspace/types";
 
 export const DEFAULT_BLACKOUT_MESSAGE = "This machine is under maintenance by {user_name}.";
 export const MAX_BLACKOUT_MESSAGE_BYTES = 2048;
+export const DEFAULT_CONNECTION_NOTIFICATION_MESSAGE = "{user_name} has connected to this computer.";
+export const MAX_CONNECTION_NOTIFICATION_MESSAGE_BYTES = 512;
 
 export const SETTINGS_TABS = [
   { id: "dashboard-security", label: "Dashboard security" },
   { id: "remote-sessions", label: "Remote sessions" },
   { id: "blackout", label: "Blackout message" },
+  { id: "connection-notification", label: "Connection notification" },
 ] as const;
 export type SettingsTab = (typeof SETTINGS_TABS)[number]["id"];
 
@@ -20,6 +23,9 @@ export type CompanySettingsDraft = {
   preventIdleLock: boolean;
   allowIdleOverride: boolean;
   sessionBanner: boolean;
+  connectionNotification: boolean;
+  backgroundConnectionNotification: boolean;
+  connectionNotificationMessage: string;
 };
 
 // The saved values, or the defaults a company starts with.
@@ -31,6 +37,9 @@ export function draftFromCompany(company: Company | null | undefined): CompanySe
     preventIdleLock: company?.prevent_idle_lock ?? true,
     allowIdleOverride: company?.allow_idle_override ?? true,
     sessionBanner: company?.session_banner ?? true,
+    connectionNotification: company?.connection_notification ?? true,
+    backgroundConnectionNotification: company?.background_connection_notification ?? false,
+    connectionNotificationMessage: company?.connection_notification_message ?? DEFAULT_CONNECTION_NOTIFICATION_MESSAGE,
   };
 }
 
@@ -42,13 +51,25 @@ export function draftMatchesCompany(draft: CompanySettingsDraft, company: Compan
     draft.displayBorder === saved.displayBorder &&
     draft.preventIdleLock === saved.preventIdleLock &&
     draft.allowIdleOverride === saved.allowIdleOverride &&
-    draft.sessionBanner === saved.sessionBanner
+    draft.sessionBanner === saved.sessionBanner &&
+    draft.connectionNotification === saved.connectionNotification &&
+    draft.backgroundConnectionNotification === saved.backgroundConnectionNotification &&
+    draft.connectionNotificationMessage === saved.connectionNotificationMessage
   );
+}
+
+function isTemplateValid(message: string, maxBytes: number) {
+  return Boolean(message.trim()) && new TextEncoder().encode(message).length <= maxBytes;
 }
 
 // The server stores at most 2 KB of UTF-8 and requires visible text.
 export function isBlackoutMessageValid(message: string) {
-  return Boolean(message.trim()) && new TextEncoder().encode(message).length <= MAX_BLACKOUT_MESSAGE_BYTES;
+  return isTemplateValid(message, MAX_BLACKOUT_MESSAGE_BYTES);
+}
+
+// The notification is a small popup, so the server allows only 512 bytes.
+export function isConnectionNotificationMessageValid(message: string) {
+  return isTemplateValid(message, MAX_CONNECTION_NOTIFICATION_MESSAGE_BYTES);
 }
 
 // The request body for PUT /v1/company/settings.
@@ -60,6 +81,9 @@ export function companySettingsBody(draft: CompanySettingsDraft) {
     prevent_idle_lock: draft.preventIdleLock,
     allow_idle_override: draft.allowIdleOverride,
     session_banner: draft.sessionBanner,
+    connection_notification: draft.connectionNotification,
+    background_connection_notification: draft.backgroundConnectionNotification,
+    connection_notification_message: draft.connectionNotificationMessage,
   };
 }
 

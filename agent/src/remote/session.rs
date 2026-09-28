@@ -31,6 +31,7 @@ pub async fn run(
                 &request.viewer_name,
             ),
             request.session_banner,
+            super::connection_notification::ConnectionNotification::for_request(&request),
             config
                 .config_path
                 .with_file_name("autofill-credentials.dat"),

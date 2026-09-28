@@ -41,6 +41,18 @@ pub struct AgentSessionRequest {
     /// server sets it, so viewers cannot hide the banner.
     #[serde(default = "default_enabled")]
     pub session_banner: bool,
+    /// Company policy for the popup on the Agent's primary monitor when a
+    /// technician connects, and its template. `connection_notification`
+    /// covers sessions that view a user's desktop, and
+    /// `background_connection_notification` covers sessions on the background
+    /// desktop. Only the server sets them, so viewers cannot suppress the
+    /// notification. Older servers never sent one.
+    #[serde(default)]
+    pub connection_notification: bool,
+    #[serde(default)]
+    pub background_connection_notification: bool,
+    #[serde(default)]
+    pub connection_notification_message: String,
     #[serde(default)]
     pub viewer_name: String,
     pub session_id: RemoteSessionId,
@@ -174,8 +186,14 @@ mod tests {
         assert!(!request.start_in_background);
         assert!(request.viewer_name.is_empty());
         assert!(request.session_banner, "legacy servers keep the banner");
+        assert!(!request.connection_notification);
+        assert!(!request.background_connection_notification);
+        assert!(request.connection_notification_message.is_empty());
         request.viewer_name = "Zoë 王".into();
         request.session_banner = false;
+        request.connection_notification = true;
+        request.background_connection_notification = true;
+        request.connection_notification_message = "{user_name} is here".into();
         let decoded: AgentSessionRequest =
             serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
         assert_eq!(decoded, request);

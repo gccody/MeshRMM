@@ -51,7 +51,7 @@ fn rdp_catalog_preserves_all_monitors_and_maps_the_active_monitor() {
         primary: true,
     };
     let mut streamer =
-        DesktopCaptureStreamer::new(String::new(), String::new(), true, PathBuf::new());
+        DesktopCaptureStreamer::new(String::new(), String::new(), true, None, PathBuf::new());
     streamer.console_displays = vec![console.clone()];
     streamer.selected_session = Some(3);
     streamer.session_displays = vec![(
@@ -127,7 +127,7 @@ fn background_start_preserves_all_console_displays_when_switching() {
         })
         .collect();
     let mut streamer =
-        DesktopCaptureStreamer::new(String::new(), String::new(), true, PathBuf::new());
+        DesktopCaptureStreamer::new(String::new(), String::new(), true, None, PathBuf::new());
     streamer.console_displays = console.clone();
     let format = ActiveFormat {
         width: 1920,
@@ -433,6 +433,9 @@ fn command_protocol_round_trips_desktop_input() {
         ParentCommand::BlockInput(true),
         ParentCommand::BlockInput(false),
         ParentCommand::Clipboard("winget install Example.Package\n".into()),
+        ParentCommand::ShowConnectionNotification {
+            text: "Zoë 王 has connected\nSay hi".into(),
+        },
         ParentCommand::Stop,
     ];
     for command in commands {
@@ -456,7 +459,29 @@ fn command_protocol_round_trips_desktop_input() {
         {
             assert_eq!(show_banner, expected);
         }
+        if let ParentCommand::ShowConnectionNotification { text } = &decoded {
+            assert_eq!(text, "Zoë 王 has connected\nSay hi");
+        }
     }
+}
+
+#[test]
+fn only_helper_start_commands_choose_a_helper() {
+    assert_eq!(
+        HelperKind::started_by(&ParentCommand::ShowConnectionNotification {
+            text: "Hello".into()
+        }),
+        Some(HelperKind::Notification)
+    );
+    assert_eq!(
+        HelperKind::started_by(&ParentCommand::StartFiles),
+        Some(HelperKind::Files)
+    );
+    assert_eq!(HelperKind::started_by(&ParentCommand::Stop), None);
+    assert_eq!(
+        HelperKind::started_by(&ParentCommand::EnumerateDisplays),
+        None
+    );
 }
 
 #[test]
@@ -577,6 +602,7 @@ fn command_name(command: &ParentCommand) -> u8 {
         ParentCommand::StartFiles => 13,
         ParentCommand::StartClipboard => 16,
         ParentCommand::StartChatHelper { .. } => 17,
+        ParentCommand::ShowConnectionNotification { .. } => 25,
         ParentCommand::PromptCredentials => 23,
         ParentCommand::AutofillCredentials(_) => 24,
         ParentCommand::Files(_) => 12,
@@ -673,6 +699,10 @@ mod isolation_tests {
         ));
         assert!(!helper_uses_user_token(
             HelperKind::Chat,
+            DesktopTarget::Default
+        ));
+        assert!(!helper_uses_user_token(
+            HelperKind::Notification,
             DesktopTarget::Default
         ));
         assert!(helper_uses_user_token(
@@ -919,9 +949,9 @@ mod service_event_tests {
             ChildEvent::Chat("hello".into()),
         ];
         let expected: [&[HelperKind]; 11] = [
-            &[Input, Files, Clipboard, Chat],
-            &[Input, Files, Clipboard, Chat],
-            &[Input, Files, Clipboard, Chat],
+            &[Input, Files, Clipboard, Chat, Notification],
+            &[Input, Files, Clipboard, Chat, Notification],
+            &[Input, Files, Clipboard, Chat, Notification],
             &[Input],
             &[Input],
             &[Input],
@@ -932,7 +962,7 @@ mod service_event_tests {
             &[Chat],
         ];
         for (event, senders) in events.iter().zip(expected) {
-            for kind in [Input, Files, Clipboard, Chat] {
+            for kind in [Input, Files, Clipboard, Chat, Notification] {
                 assert_eq!(
                     helper_sends(kind, event),
                     senders.contains(&kind),
