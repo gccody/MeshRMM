@@ -345,8 +345,7 @@ impl WindowContext {
                 model.hovered == Some(index),
                 model.pressed == Some(index),
             );
-            let text = item
-                .label
+            let text = model.layout.labels[index]
                 .as_deref()
                 .map(|label| (label, self.measure(dc, label)));
             let parts = toolbar::parts(item, *rect, text.map_or(0.0, |(_, width)| width));
