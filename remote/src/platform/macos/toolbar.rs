@@ -7,13 +7,15 @@ use std::cell::Cell;
 
 use super::app::RemoteView;
 use super::*;
-use crate::toolbar::{self, Command, Item, Layout, MenuEntry, Paint, Rect, Segment};
+use crate::toolbar::{self, Action, Command, Item, Layout, MenuEntry, Paint, Rect, Segment};
 use objc2::AnyThread;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
-    NSBezierPath, NSFontAttributeName, NSFontWeightMedium, NSForegroundColorAttributeName,
-    NSLineCapStyle, NSLineJoinStyle, NSMenu, NSMenuItem, NSStringDrawing, NSTrackingArea,
-    NSTrackingAreaOptions,
+    NSAccessibility, NSAccessibilityButtonRole, NSAccessibilityElement,
+    NSAccessibilityLayoutChangedNotification, NSAccessibilityPopUpButtonRole,
+    NSAccessibilityPostNotification, NSAccessibilityToolbarRole, NSBezierPath, NSFontAttributeName,
+    NSFontWeightMedium, NSForegroundColorAttributeName, NSLineCapStyle, NSLineJoinStyle, NSMenu,
+    NSMenuItem, NSStringDrawing, NSTrackingArea, NSTrackingAreaOptions,
 };
 use objc2_foundation::NSDictionary;
 
@@ -34,6 +36,56 @@ pub(super) struct ToolbarViewIvars {
     /// keep them alive.
     tooltips: RefCell<Vec<Retained<NSString>>>,
     font: Retained<NSFont>,
+    accessible_items: RefCell<Vec<Retained<ToolbarElement>>>,
+}
+
+struct ToolbarElementIvars {
+    owner: objc2::rc::Weak<ToolbarView>,
+    action: Action,
+}
+
+define_class!(
+    // Virtual controls share the drawn items' geometry and commands. Both
+    // the AppKit parent property and our owner reference are weak.
+    #[unsafe(super = NSAccessibilityElement)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = ToolbarElementIvars]
+    struct ToolbarElement;
+
+    unsafe impl NSObjectProtocol for ToolbarElement {}
+
+    impl ToolbarElement {
+        #[unsafe(method(accessibilityFrame))]
+        fn accessibility_frame(&self) -> NSRect {
+            let Some(owner) = self.ivars().owner.load() else { return NSRect::ZERO; };
+            let Some(index) = owner.action_index(self.ivars().action) else { return NSRect::ZERO; };
+            let Some(window) = owner.window() else { return NSRect::ZERO; };
+            let rect = owner.ivars().layout.borrow().rects[index];
+            window.convertRectToScreen(owner.convertRect_toView(ns_rect(rect), None))
+        }
+
+        #[unsafe(method(accessibilityPerformPress))]
+        fn accessibility_perform_press(&self) -> bool {
+            self.press()
+        }
+    }
+);
+
+impl ToolbarElement {
+    fn press(&self) -> bool {
+        let Some(owner) = self.ivars().owner.load() else {
+            return false;
+        };
+        let Some(index) = owner.action_index(self.ivars().action) else {
+            return false;
+        };
+        let enabled = owner.ivars().items.borrow()[index].enabled;
+        if !enabled {
+            return false;
+        }
+        owner.fire(index);
+        true
+    }
 }
 
 define_class!(
@@ -176,6 +228,7 @@ impl ToolbarView {
             menu: RefCell::new(Vec::new()),
             tooltips: RefCell::new(Vec::new()),
             font,
+            accessible_items: RefCell::new(Vec::new()),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         // Safety: the tracking area's owner is this view, which outlives it.
@@ -192,6 +245,9 @@ impl ToolbarView {
             )
         };
         this.addTrackingArea(&tracking);
+        this.setAccessibilityElement(true);
+        this.setAccessibilityRole(Some(unsafe { NSAccessibilityToolbarRole }));
+        this.setAccessibilityLabel(Some(&NSString::from_str("Viewer controls")));
         this
     }
 
@@ -332,7 +388,72 @@ impl ToolbarView {
         }
         self.ivars().tooltips.replace(tooltips);
         self.ivars().layout.replace(layout);
+        self.sync_accessibility();
         self.setNeedsDisplay(true);
+    }
+
+    fn action_index(&self, action: Action) -> Option<usize> {
+        self.ivars()
+            .items
+            .borrow()
+            .iter()
+            .position(|item| item.action == action)
+    }
+
+    fn sync_accessibility(&self) {
+        let old = self.ivars().accessible_items.borrow();
+        let mut children = Vec::new();
+        for item in self.ivars().items.borrow().iter() {
+            // Stable identity preserves VoiceOver's current item through
+            // hover, resize, and state changes (including the REC insertion).
+            let child = old
+                .iter()
+                .find(|child| child.ivars().action == item.action)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let child = ToolbarElement::alloc(self.mtm()).set_ivars(ToolbarElementIvars {
+                        owner: objc2::rc::Weak::new(self),
+                        action: item.action,
+                    });
+                    let child: Retained<ToolbarElement> = unsafe { msg_send![super(child), init] };
+                    unsafe {
+                        child.setAccessibilityParent(Some(self));
+                    }
+                    child.setAccessibilityElement(true);
+                    child
+                });
+            child.setAccessibilityRole(Some(unsafe {
+                if item.menu {
+                    NSAccessibilityPopUpButtonRole
+                } else {
+                    NSAccessibilityButtonRole
+                }
+            }));
+            child.setAccessibilityLabel(Some(&NSString::from_str(&item.tooltip)));
+            child.setAccessibilityEnabled(item.enabled);
+            child.setAccessibilityValueDescription(Some(&NSString::from_str(if item.active {
+                "On"
+            } else {
+                ""
+            })));
+            children.push(child);
+        }
+        let changed = old
+            .iter()
+            .map(|child| child.ivars().action)
+            .ne(children.iter().map(|child| child.ivars().action));
+        drop(old);
+        let refs: Vec<&AnyObject> = children.iter().map(|child| child.as_ref()).collect();
+        // AppKit copies the array and keeps the virtual elements alive.
+        unsafe {
+            self.setAccessibilityChildren(Some(&NSArray::from_slice(&refs)));
+        }
+        self.ivars().accessible_items.replace(children);
+        if changed {
+            unsafe {
+                NSAccessibilityPostNotification(self, NSAccessibilityLayoutChangedNotification);
+            }
+        }
     }
 
     fn draw(&self) {
