@@ -1,6 +1,9 @@
 export type Company = {
   prevent_idle_lock: boolean;
   allow_idle_override: boolean;
+  // Minutes a remote session may sit idle before it is disconnected; null never disconnects.
+  idle_disconnect_minutes: number | null;
+  allow_idle_disconnect_override: boolean;
   display_border: boolean;
   session_banner: boolean;
   connection_notification: boolean;

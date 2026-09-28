@@ -10,6 +10,7 @@ mod deep_link;
 mod errors;
 mod h264;
 mod http;
+mod idle_disconnect;
 mod input;
 mod launch_status;
 mod matroska;
@@ -161,21 +162,52 @@ fn initialize_update_helper_tracing() {
         .try_init();
 }
 
-/// Runs the session until it ends. A recording still running is saved, and
-/// its notice goes to `recording_notice` for the caller to show once any
+/// A message for the user once the session has ended: its title and text.
+type Notice = (&'static str, String);
+
+/// Runs the session until it ends, or until the technician has been idle for
+/// the chosen time. A recording still running is saved. Notices about how the
+/// session ended go to `notices` for the caller to show once any
 /// session-wide lock is released.
-async fn run_session(
-    config: config::Config,
-    recording_notice: &mut Option<String>,
-) -> anyhow::Result<()> {
+async fn run_session(config: config::Config, notices: &mut Vec<Notice>) -> anyhow::Result<()> {
     let resume_state = transport::ViewerResumeState::with_audio_muted(preferences::audio_muted());
-    let result = run_resumable_session(&config, &resume_state).await;
+    let session = run_resumable_session(&config, &resume_state);
+    tokio::pin!(session);
+    let result = tokio::select! {
+        result = &mut session => result,
+        minutes = disconnect_when_idle(&resume_state) => {
+            tracing::info!(minutes, "the technician was idle; ending the remote session");
+            shutdown::request("the session was idle");
+            notices.push((
+                "Session ended",
+                format!(
+                    "The session was disconnected after {} of inactivity.",
+                    idle_disconnect::label(Some(minutes))
+                ),
+            ));
+            session.await
+        }
+    };
     resume_state.close_reconnecting_window();
     let recording = resume_state.clone();
-    *recording_notice = tokio::task::spawn_blocking(move || recording.finish_recording())
+    let recording_notice = tokio::task::spawn_blocking(move || recording.finish_recording())
         .await
         .unwrap_or_default();
+    notices.extend(recording_notice.map(|notice| ("Session recording", notice)));
     result
+}
+
+/// Completes with the idle time, in minutes, once the technician has been
+/// idle that long.
+async fn disconnect_when_idle(resume_state: &transport::ViewerResumeState) -> u32 {
+    let mut check = tokio::time::interval(idle_disconnect::CHECK_INTERVAL);
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        check.tick().await;
+        if let Some(minutes) = resume_state.idle_disconnect_expired(Instant::now()) {
+            return minutes;
+        }
+    }
 }
 
 /// Requests the remote session unless the user cancels first. A request
@@ -398,17 +430,17 @@ fn main() -> std::process::ExitCode {
             }
         };
     }
-    let mut recording_notice = None;
+    let mut notices = Vec::new();
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to create the viewer network runtime")
-        .and_then(|runtime| runtime.block_on(run_windows_viewer(&mut recording_notice)));
+        .and_then(|runtime| runtime.block_on(run_windows_viewer(&mut notices)));
     platform::close_launch_status();
     // The instance mutex was released with the session, so a new link does
     // not wait on these dialogs.
-    if let Some(notice) = recording_notice {
-        platform::show_notice("Session recording", &notice);
+    for (title, notice) in notices {
+        platform::show_notice(title, &notice);
     }
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -421,7 +453,7 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(windows)]
-async fn run_windows_viewer(recording_notice: &mut Option<String>) -> anyhow::Result<()> {
+async fn run_windows_viewer(notices: &mut Vec<Notice>) -> anyhow::Result<()> {
     let mut config = initialize(None)?;
     // Held on the main thread until the process exits.
     let _instance = match config.device_id.as_deref() {
@@ -449,10 +481,10 @@ async fn run_windows_viewer(recording_notice: &mut Option<String>) -> anyhow::Re
     };
     match update {
         Ok(true) => Ok(()),
-        Ok(false) => run_session(config, recording_notice).await,
+        Ok(false) => run_session(config, notices).await,
         Err(error) => {
             tracing::warn!(error = ?error, "client update check failed; continuing with this launch");
-            run_session(config, recording_notice).await
+            run_session(config, notices).await
         }
     }
 }
@@ -493,7 +525,7 @@ fn main() -> anyhow::Result<()> {
                 None => return Ok(()),
             }
         }
-        let mut recording_notice = None;
+        let mut notices = Vec::new();
         let update = runtime.block_on(async {
             tokio::select! {
                 biased;
@@ -504,14 +536,14 @@ fn main() -> anyhow::Result<()> {
         });
         let result = match update {
             Ok(true) => Ok(()),
-            Ok(false) => runtime.block_on(run_session(config, &mut recording_notice)),
+            Ok(false) => runtime.block_on(run_session(config, &mut notices)),
             Err(error) => {
                 tracing::warn!(error = ?error, "client update check failed; continuing with this launch");
-                runtime.block_on(run_session(config, &mut recording_notice))
+                runtime.block_on(run_session(config, &mut notices))
             }
         };
-        if let Some(notice) = recording_notice {
-            platform::show_notice("Session recording", &notice);
+        for (title, notice) in notices {
+            platform::show_notice(title, &notice);
         }
         result
     })

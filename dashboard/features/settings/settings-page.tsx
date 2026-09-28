@@ -7,9 +7,11 @@ import type { Account, Company } from "../workspace/types";
 import {
   DEFAULT_BLACKOUT_MESSAGE,
   DEFAULT_CONNECTION_NOTIFICATION_MESSAGE,
+  IDLE_DISCONNECT_MINUTES,
   SETTINGS_TABS,
   companySettingsBody,
   draftMatchesCompany,
+  formatIdleDisconnect,
   isBlackoutMessageValid,
   isConnectionNotificationMessageValid,
   settingsTabForKey,
@@ -112,7 +114,14 @@ export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, o
                 <input type="checkbox" checked={draft.preventIdleLock} onChange={(event) => updateDraft({ preventIdleLock: event.target.checked })} /> Prevent remote devices from locking while idle by default</label>
               <label>
                 <input type="checkbox" checked={draft.allowIdleOverride} onChange={(event) => updateDraft({ allowIdleOverride: event.target.checked })} /> Allow users to change idle-lock prevention per session</label>
-              <p>The per-session permission above applies only to idle-lock prevention.</p>
+              <label htmlFor="idle-disconnect">Disconnect remote sessions after the technician is idle for<select id="idle-disconnect" value={draft.idleDisconnectMinutes ?? ""} onChange={(event) => updateDraft({ idleDisconnectMinutes: event.target.value === "" ? null : Number(event.target.value) })} aria-describedby="idle-disconnect-help">
+                <option value="">{formatIdleDisconnect(null)}</option>
+                {IDLE_DISCONNECT_MINUTES.map((minutes) => <option key={minutes} value={minutes}>{formatIdleDisconnect(minutes)}</option>)}
+              </select>
+              </label>
+              <label>
+                <input type="checkbox" checked={draft.allowIdleDisconnectOverride} onChange={(event) => updateDraft({ allowIdleDisconnectOverride: event.target.checked })} aria-describedby="idle-disconnect-help" /> Allow users to change the idle disconnect time per session</label>
+              <p id="idle-disconnect-help">The viewer ends the session when the technician sends no keyboard, mouse or chat input for this long. A user’s change lasts only for that session; the next session starts with this default.</p>
               <label>
                 <input type="checkbox" checked={draft.sessionBanner} onChange={(event) => updateDraft({ sessionBanner: event.target.checked })} aria-describedby="session-banner-help" /> Show a banner on the agent’s screen while a technician is connected</label>
               <p id="session-banner-help">Applies to every new session and cannot be changed by users. Chat messages still appear on the agent when the banner is hidden.</p>

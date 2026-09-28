@@ -21,6 +21,8 @@ struct SessionRecord {
     start_in_background: bool,
     #[serde(default)]
     idle_policy: meshrmm_protocol_types::IdlePolicy,
+    #[serde(default)]
+    idle_disconnect: meshrmm_protocol_types::IdleDisconnectPolicy,
     #[serde(default = "meshrmm_protocol_types::default_enabled")]
     display_border: bool,
     #[serde(default = "meshrmm_protocol_types::default_enabled")]
@@ -399,6 +401,7 @@ impl RemoteSession {
         Response::from_json(&SessionBootstrap {
             start_in_background: record.start_in_background,
             idle_policy: record.idle_policy,
+            idle_disconnect: record.idle_disconnect,
             display_border: record.display_border,
             session_id: RemoteSessionId::new(record.session_id),
             signaling_token: record.client_token,
