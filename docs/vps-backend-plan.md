@@ -12,303 +12,400 @@ This document is only the plan. No code changes are part of the PR that introduc
   do not need to keep working. Server, Agent, viewer and dashboard changes land together.
 - **As simple as possible without losing a user-facing feature.** The Durable Object design exists to
   minimize Cloudflare cost: hibernation, attachments, storage write-through, alarms, and per-object
-  usage metering. None of that carries over. A single long-running process with ordinary WebSockets
-  and in-memory state replaces it.
+  usage metering. None of that carries over. One long-running process with ordinary WebSockets
+  replaces it.
+- **Users still sign in at `company.meshrmm.com`.** The dashboard Worker keeps serving each company
+  hostname and keeps binding the signed-in user to that company. See [Tenancy](#tenancy).
+- **The database stays on D1 for now.** The VPS reaches D1 through a small gateway Worker. Moving the
+  data to SQLite on the VPS is a later, separate change; the server's database layer is written so
+  that swap only replaces one module. See [Database access](#database-access).
+- **Remote sessions survive server restarts, and restarts are close to invisible.** See
+  [Restarts and deployment](#restarts-and-deployment).
+- **The Agent's session signaling moves onto its control connection.** The viewer keeps its own
+  signaling socket. See [Signaling](#signaling).
 - **The platform cost report is dropped** (`GET /v1/platform/costs`, `server/src/routes/costs.rs`,
-  `server/src/usage.rs`, the dashboard costs page, `docs/cost-tracking.md`). It may come back later
-  as VPS-side numbers.
-- **The dashboard stays on Cloudflare.** The dashboard Worker keeps serving the app and its auth flow,
-  but forwards API traffic to the VPS instead of a service binding, and stops reading D1.
-- **TURN stays on Cloudflare Realtime.** The server keeps calling the TURN credential API. Moving to
-  `coturn` is out of scope.
-- **One process, one SQLite file.** Scaling past one VPS is out of scope. If it is ever needed, the
-  in-memory registries described below need a shared routing layer.
+  `server/src/usage.rs`, the dashboard costs page, `docs/cost-tracking.md`).
+- **The dashboard stays on Cloudflare**, and **TURN stays on Cloudflare Realtime** (the server keeps
+  calling the TURN credential API).
+- **One server process.** Scaling past one VPS is out of scope; it would need a shared routing layer
+  for the in-memory registries.
 
 ## Features that must survive
 
 | Feature | Today | After |
 | --- | --- | --- |
-| Health check | `GET /healthz`, checks the applied D1 migration | Same route, checks the SQLite schema |
-| WorkOS sign-in, invitation resolve | `GET /v1/auth/invitations/resolve` | Same |
+| Health check | `GET /healthz`, checks the applied D1 migration | Same, through the gateway |
+| Company sign-in and invitation resolve | `company.meshrmm.com`, `auth.meshrmm.com/login` → `GET /v1/auth/invitations/resolve` | Same |
 | Account, company settings | `GET /v1/account`, `PUT /v1/company/settings` | Same |
-| Platform company admin | list/create/retry/domain/suspend/activate under `/v1/platform/companies` | Same, minus `/v1/platform/costs` |
+| Platform company admin on `admin.meshrmm.com` | list/create/retry/domain/suspend/activate under `/v1/platform/companies` | Same, minus `/v1/platform/costs` |
 | Agent inventory | `GET /v1/agents` | Same |
-| Live presence (online/offline/updating) | subscription token + renew + `GET /v1/agents/events` socket | One dashboard socket, see [Dashboard presence](#t5-dashboard-presence-socket) |
+| Live presence (online/offline/updating) | subscription token + renew + `GET /v1/agents/events` socket | One dashboard socket, see [T5](#t5-dashboard-presence-socket) |
 | Installers | `POST /v1/agent-installers`, `POST /v1/agent-installers/redeem` | Same |
 | Agent delete/uninstall, close session, rotate token | `DELETE /v1/agents/{id}`, `POST .../close-session`, `POST .../rotate-token` | Same |
-| Agent control connection | `GET /v1/agents/{id}/connect` → `AgentCoordinator` | Same route, handled by an in-memory Agent hub |
-| Remote handoff and session | handoffs + redeem, sessions `end`/`resume`/`signal` → `RemoteSession` | Same routes, in-memory session table |
-| Session idle timeout, activity, TURN credentials | alarms + stored leases | Timers inside the session task |
+| Agent control connection | `GET /v1/agents/{id}/connect` → `AgentCoordinator` | Same route, in-memory Agent hub, also carries session signaling |
+| Remote handoff and session | handoffs + redeem, sessions `end`/`resume`/`signal` → `RemoteSession` | Same routes; sessions stored in D1 so they outlive restarts |
+| Session idle timeout, activity, TURN credentials | alarms + stored leases | A deadline per session, checked by one timer |
 | Expired token cleanup | Cron trigger every 30 minutes | `tokio::time::interval` |
-| Audit events | D1 tables | Same tables in SQLite |
+| Audit events | D1 tables | Same |
 
 ## Architecture
 
 ```text
-Browser ──> dashboard Worker (Cloudflare) ──fetch──> ┐
-Agent  ─────────────── wss://api.meshrmm.com ──────> ├─ Caddy (TLS) ─> meshrmm-server (axum) ─> SQLite
-Viewer ─────────────── https://api.meshrmm.com ────> ┘                         │
-                                                                            WorkOS, Cloudflare TURN API
+Browser ─> company.meshrmm.com ─> dashboard Worker ─┐  (adds tenant + edge secret)
+Agent  ────────────────── wss://api.meshrmm.com ────┤
+Viewer ────────────────── https://api.meshrmm.com ──┴─> Cloudflare proxy ─> Caddy ─> meshrmm-server
+                                                                                        │
+                                          D1 gateway Worker ─> D1  <─── HTTPS + secret ─┤
+                                                                   WorkOS, TURN API  <──┘
 ```
 
 `meshrmm-server` becomes an ordinary binary crate in the workspace, using `axum` (WebSockets),
-`tokio`, `sqlx` with SQLite (WAL mode), `reqwest` (WorkOS, JWKS, TURN), `tower-http` (CORS,
-tracing) and `tracing`. Configuration comes from environment variables loaded from an env file:
-`DATABASE_PATH`, `LISTEN_ADDR`, `PUBLIC_API_URL`, `DASHBOARD_ORIGIN`, `TENANT_ROOT_DOMAIN`,
+`tokio`, `reqwest` (D1 gateway, WorkOS, JWKS, TURN), `tower-http` and `tracing`. Configuration comes
+from an env file: `LISTEN_ADDR`, `PUBLIC_API_URL`, `DASHBOARD_ORIGIN`, `TENANT_ROOT_DOMAIN`,
 `PLATFORM_OWNER_USER_IDS`, `WORKOS_CLIENT_ID`, `WORKOS_ISSUER`, `WORKOS_API_KEY`, `TURN_KEY_ID`,
-`TURN_KEY_API_TOKEN`, `REMOTE_SESSION_IDLE_TIMEOUT_SECONDS`. `CLOUDFLARE_ACCOUNT_ID` and
-`CLOUDFLARE_ANALYTICS_API_TOKEN` are only used by the cost report and go away.
+`TURN_KEY_API_TOKEN`, `REMOTE_SESSION_IDLE_TIMEOUT_SECONDS`, `D1_GATEWAY_URL`, `D1_GATEWAY_TOKEN`,
+`EDGE_TOKEN`. `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_ANALYTICS_API_TOKEN` only served the cost
+report and go away.
 
 Shared state:
 
 ```rust
 struct AppState {
-    db: SqlitePool,
+    db: Db,                                                  // D1 gateway client (SQLite later)
     config: Config,
     http: reqwest::Client,
     jwks: JwksCache,
-    agents: Mutex<HashMap<DeviceId, AgentHandle>>,        // connected Agents
-    sessions: Mutex<HashMap<SessionId, Arc<Session>>>,    // active remote sessions
+    agents: Mutex<HashMap<DeviceId, AgentHandle>>,           // connected Agents
+    sessions: Mutex<HashMap<SessionId, Session>>,            // cache of active D1 session rows
     presence: Mutex<HashMap<CompanyId, broadcast::Sender<PresenceEvent>>>,
-    updating: Mutex<HashMap<DeviceId, (String, Instant)>>,// update-grace entries
 }
 ```
 
 Each WebSocket is served by one task that `select!`s over the socket, a bounded command channel, and
-its timers. Registries hold channel senders, never sockets. Plain `std::sync::Mutex` or `DashMap`
-is fine; no lock is held across an `.await`.
-
-**A restart drops every connection.** Agents and viewers already reconnect with backoff
-(`crates/signaling-client`, `agent/src/remote/mod.rs` `run`). Presence rebuilds itself as Agents
-reconnect. Active remote sessions do not survive a restart: `resume` returns 410 and the user starts
-a new session from the dashboard. This is acceptable for now and should be noted in the README.
+its timers. Registries hold channel senders, never sockets. No lock is held across an `.await`.
 
 ### Tenancy
 
 Today the API derives the tenant from the request hostname (`request_tenant_company`,
-`is_legacy_control_plane_request` in `server/src/infrastructure.rs`) because tenant hostnames reach
-the API through the dashboard Worker's service binding. After the move, **the server derives the
-company only from credentials**: the WorkOS `org_id` claim, the Agent token, a handoff token, or a
-session token. Hostnames no longer matter to the server, which removes the "legacy control plane"
-branches.
+`is_legacy_control_plane_request` in `server/src/infrastructure.rs`), because company hostnames
+reach the API through the dashboard Worker's service binding. That stays true for people:
 
-- Native clients (Agent, viewer) talk to `PUBLIC_API_URL` (`https://api.meshrmm.com`) directly.
-  `company_url()` is no longer used for Agent `server` values or handoff `api_url`.
-- The dashboard keeps calling same-origin `/v1/*`; its Worker forwards to the VPS.
-- CORS allows the dashboard origin and `https://*.{TENANT_ROOT_DOMAIN}`.
+- The dashboard Worker (`dashboard/worker/index.ts`) keeps resolving `company.meshrmm.com` against D1
+  and keeps its sign-in flow. For `/healthz` and `/v1/*` it forwards the request to the VPS with
+  `fetch`, replacing the `MESHRMM_API` service binding. It adds `X-Mesh-Tenant-Host` (the original
+  hostname) and `X-Mesh-Edge-Token` (a shared secret), and strips any client-supplied copies.
+- The server trusts `X-Mesh-Tenant-Host` only when `X-Mesh-Edge-Token` matches (constant-time), and
+  uses it where it uses the request hostname today. **WorkOS-authenticated routes are rejected
+  without a trusted tenant host**, so the dashboard API cannot be used except through
+  `company.meshrmm.com` (or `admin.meshrmm.com` / `auth.meshrmm.com` for their routes). The existing
+  check that the token's organization matches the company hostname stays.
+- Browser traffic is same-origin through the Worker, so the server needs no CORS for it.
+- Machine credentials already identify the company, so the Agent and viewer talk to
+  `https://api.meshrmm.com` directly: Agent connect, installer redeem, handoff redeem, and session
+  end/resume/signal. The installer and handoff responses return `PUBLIC_API_URL` instead of the
+  company URL. Keeping long-lived Agent sockets out of the dashboard Worker also means a dashboard
+  deploy never disconnects Agents.
 
-### Signaling stays on a per-session socket
+### Database access
 
-Earlier discussion considered moving the Agent's side of session signaling onto its control socket.
-**This plan keeps the separate `/v1/remote/sessions/{id}/signal?role=agent` socket.** The Agent's
-sender (`agent/src/remote/transport.rs`, `run_sender`) is built around its own `SignalingConnection`,
-and relaying between two sockets is ~100 lines in axum. Multiplexing would force an Agent refactor
-without simplifying the server. Both peers keep using `SignalMessage` unchanged.
+Querying D1 from outside Workers through Cloudflare's REST API is meant for administration: it shares
+the account's global API limit of 1,200 requests per 5 minutes, which reconnecting Agents alone could
+exceed. Cloudflare's recommended pattern is a proxy Worker with a D1 binding.
 
-## Removed
+- New Worker `d1-gateway/` (a few dozen lines of TypeScript) bound to `pulsermm-production`.
+  `POST /query` takes `{ "statements": [{ "sql": "...", "params": [...] }] }`, runs them with
+  `DB.batch()` (a transaction), and returns each result's rows and `meta.changes`. It requires
+  `Authorization: Bearer <D1_GATEWAY_TOKEN>`, compared in constant time, and has no other routes.
+  Enable Smart Placement so it runs near the database.
+- The server's `Db` module exposes `first`, `all`, `run` and `batch` with the same SQL and `?N`
+  parameters used today. Queries that run together go in one `batch` call to save round trips; for
+  example Agent authentication, which is several lookups today.
+- Put the VPS in the region nearest the D1 primary, since every query crosses the gateway.
+- Migrations stay in `server/migrations/` and keep being applied with `wrangler d1 migrations apply`.
+  This plan adds one **additive** migration (`remote_sessions`, and update-grace columns on `agents`;
+  see T3 and T4). Tables that only the old design used (`agent_event_subscriptions`,
+  `presence_catalog_outbox` and its triggers, `usage_object_owners` and its trigger,
+  `company_active_users`) are left in place and unused until the move off D1, where they are simply
+  not carried over.
+- Moving to SQLite later means a new `Db` implementation and a data copy; no handler changes.
 
-- `server/wrangler.jsonc`, `worker`/`worker-macros` dependencies, the wasm32 target for the server,
-  `worker-build`, `getrandom`/`uuid` `js` features.
-- `server/src/agent_coordinator.rs`, `remote_session.rs`, `company_presence.rs` (replaced, not ported),
-  `usage.rs`, `routes/costs.rs`, `maintenance.rs` (becomes a few lines in `main.rs`).
-- Tables: `agent_event_subscriptions`, `presence_catalog_outbox` and its triggers,
-  `usage_object_owners` and its trigger, `company_active_users`.
-- Endpoints: `GET /v1/platform/costs`, `POST /v1/agents/events/subscriptions`,
-  `POST /v1/agents/events/subscriptions/renew`, `GET /v1/agents/events`.
-- Dashboard: `features/agents/subscription-renewal.ts`, `features/platform/costs.ts` and its UI,
-  `worker/usage.ts`, the `DB`, `USAGE` and `MESHRMM_API` bindings in `dashboard/wrangler.jsonc`.
-- `server/tests/*.mjs` (Miniflare), `scripts/deploy-server.mjs` and its test, the cost-related parts
-  of `scripts/provision-cloudflare.ps1`, `docs/cost-tracking.md`.
+### Signaling
+
+Today each remote session opens a second socket for signaling on both sides
+(`/v1/remote/sessions/{id}/signal?role=agent|client`), and **both peers end the live stream when that
+socket closes**, even though video flows peer-to-peer and never touches the server:
+`agent/src/remote/transport.rs` breaks with "signaling connection closed", and
+`remote/src/transport/receiver.rs` breaks with `FailureKind::SignalingLost`. Any server restart
+would therefore drop every live session.
+
+The separate Agent socket has no remaining benefit: the viewer needs a socket of its own regardless,
+the Agent's control connection already reconnects with backoff, and a second per-session credential
+(`AgentSessionRequest.signaling_token`) is one more thing to issue and check. So:
+
+- **Agent:** session signaling rides the control connection as
+  `AgentCommand::Signal { session_id, signal }` (server → Agent) and
+  `AgentStatusMessage::Signal { session_id, signal }` (Agent → server). The Agent's control loop
+  forwards them to and from the session task through channels. The session task no longer owns a
+  socket, so a control reconnect does not touch the stream. `signaling_token` is removed from
+  `AgentSessionRequest`.
+- **Viewer:** keeps `GET /v1/remote/sessions/{id}/signal`. Once WebRTC is connected, losing that
+  socket is no longer fatal: the viewer reconnects it in the background and keeps streaming. Before
+  WebRTC connects, the existing failure and resume path stays.
+- **Server:** relays viewer ↔ Agent by looking up the session's device in the Agent hub. No
+  two-socket pairing and no per-role tokens.
+
+### Restarts and deployment
+
+**Platform: a single Linux VPS running the server under systemd, behind Caddy, behind the Cloudflare
+proxy for `api.meshrmm.com`.** Any KVM provider works (Hetzner Cloud, DigitalOcean, Vultr); pick the
+one with a region nearest the D1 primary. Managed platforms with rolling deploys (Fly.io, Railway,
+Render) were considered and rejected: a rolling deploy runs the old and new instance side by side,
+which splits the in-memory registries (an Agent connected to the old instance, its viewer to the
+new one) and would require a cross-instance routing layer. Their deploys also close WebSockets,
+so they offer nothing over a local restart.
+
+What a restart looks like:
+
+1. The deploy script uploads the new binary to `releases/<commit>/`, runs it with `--check` (config
+   loads, gateway reachable, D1 schema version expected), then points the `current` symlink at it.
+2. `systemctl restart meshrmm-server` sends SIGTERM. The server stops accepting, writes any pending
+   session deadlines to D1, closes every WebSocket with **1012 (Service Restart)**, and exits.
+3. systemd starts the new binary. It loads active sessions from D1 and starts listening, typically
+   in well under a second.
+4. Caddy holds requests that arrive in that gap and retries the upstream (`lb_try_duration`), so no
+   HTTP request fails.
+5. Agents, viewers and dashboards treat 1012 as "reconnect now": no backoff, 0–2 s of random jitter
+   to spread the reconnects.
+
+Result: no failed HTTP requests; control, signaling and presence sockets are back within about
+1–2 seconds; **live remote sessions keep streaming**, because the video path is peer-to-peer and the
+session state is in D1. The dashboard waits a few seconds before showing an Agent as offline (T5),
+so a restart does not flash every Agent offline. Rollback is the same procedure pointing
+`current` at the previous release.
+
+Holding WebSockets open across a process restart (socket handoff between processes) is not planned.
+It would add real complexity to save the 1–2 second reconnect.
+
+Crash restarts (not graceful) behave the same except that sockets close without 1012, so clients
+use their normal backoff, and session deadlines may be up to one minute stale (T4).
 
 ## Status
 
 | Task | Area | Wave | Depends on | Status |
 | --- | --- | --- | --- | --- |
-| T1 Server skeleton, config, schema, health | Server | 1 | — | Not started |
-| T2 HTTP routes and WorkOS auth | Server | 2 | T1 | Not started |
-| T3 Agent hub (`/v1/agents/{id}/connect`) | Server | 2 | T1 | Not started |
-| T4 Remote sessions and signaling relay | Server | 3 | T2, T3 | Not started |
+| T1 Server skeleton, D1 gateway, `Db` layer, health | Server, gateway | 1 | — | Not started |
+| T2 HTTP routes, WorkOS auth, edge tenant trust | Server | 2 | T1 | Not started |
+| T3 Agent hub | Server, protocol | 2 | T1 | Not started |
+| T4 Remote sessions and relay | Server | 3 | T2, T3 | Not started |
 | T5 Dashboard presence socket | Server, dashboard | 3 | T2, T3 | Not started |
 | T6 Dashboard Worker forwards to the VPS | Dashboard | 3 | T2 | Not started |
-| T7 Native clients point at the API host | Agent, viewer, installer | 3 | T2 | Not started |
-| T8 Tests and CI | Server, CI | 4 | T2–T5 | Not started |
-| T9 Deployment | Ops | 4 | T1 | Not started |
-| T10 Cutover and endpoint validation | All | 5 | T1–T9 | Not started |
+| T7 Agent: signaling over the control connection | Agent, protocol | 3 | T3 | Not started |
+| T8 Viewer: signaling loss is not fatal | Viewer, signaling client | 3 | T4 | Not started |
+| T9 Graceful restart and deployment | Server, ops | 4 | T1, T4 | Not started |
+| T10 Tests and CI | Server, CI | 4 | T2–T5 | Not started |
+| T11 Cutover and endpoint validation | All | 5 | T1–T10 | Not started |
 
 ## Tasks
 
-### T1 Server skeleton, config, schema, health
+### T1 Server skeleton, D1 gateway, `Db` layer, health
 
-- Convert `server/Cargo.toml` to a `[[bin]]` crate (`meshrmm-server`). Drop `cdylib`.
-- `main.rs`: load config, open the SQLite pool (`journal_mode=WAL`, `foreign_keys=ON`,
-  `busy_timeout`), run migrations with `sqlx::migrate!`, build the router, spawn the maintenance
-  interval (the purge in `server/src/maintenance.rs`), serve with graceful shutdown.
-- Replace `server/migrations/*` with a single `0001_initial.sql` holding the current end state of
-  `companies`, `company_domains`, `company_provisioning_operations`, `agents`,
-  `agent_install_tokens`, `remote_handoffs`, `audit_events`, `platform_audit_events`. Drop the
-  tables listed under [Removed](#removed).
-- Keep `deserialize_sql_bool` behavior or map booleans with `sqlx` directly; API JSON must still
-  expose booleans.
-- `GET /healthz` reports the applied migration version as today (`server/src/health.rs`).
-- Error type: one `ApiError` that renders `{"error": "..."}` with a status, matching
+- Convert `server/Cargo.toml` to a `[[bin]]` crate (`meshrmm-server`). Drop `cdylib`, `worker`,
+  `worker-macros`, and the `js` features of `getrandom` and `uuid`.
+- Add the `d1-gateway/` Worker and its `wrangler.jsonc` ([Database access](#database-access)).
+- `Db` module: `first`/`all`/`run`/`batch` over the gateway, typed with `serde`. Keep
+  `deserialize_sql_bool` so API JSON still exposes booleans.
+- `main.rs`: load config, build the router, spawn the maintenance interval (the purge in
+  `server/src/maintenance.rs`), serve with graceful shutdown (T9 fills in the shutdown steps).
+- `GET /healthz` reports the applied D1 migration as today (`server/src/health.rs`).
+- One error type that renders `{"error": "..."}` with a status, matching
   `meshrmm_protocol_types::ApiError`.
 
-### T2 HTTP routes and WorkOS auth
+### T2 HTTP routes, WorkOS auth, edge tenant trust
 
 Port the handlers in `server/src/routes/*.rs`, `auth.rs`, and `infrastructure.rs` to axum
-extractors. Keep behavior; drop metering and hostname-tenant logic.
+extractors. Keep the behavior and the SQL; drop metering.
 
-- `auth.rs`: keep the JWKS cache semantics (cache until expiry, refetch unknown `kid` at most once per
-  interval, keep known keys through a WorkOS outage for a day) and their unit tests. Store the cache
-  in `AppState` instead of a global.
-- Identity extractor: bearer JWT → `Identity`; company from `org_id` via
-  `SELECT … FROM companies WHERE workos_organization_id = ?`. Platform-owner extractor from
-  `PLATFORM_OWNER_USER_IDS`.
-- Agent auth (`authorize_agent` in `server/src/lib.rs`): same hash / pending-hash promotion logic, no
-  hostname check.
-- Suspending a company (`suspend_platform_company`) and deleting an Agent call into the Agent hub
-  directly (T3) instead of `revoke_agents` fanning out to Durable Objects.
-- Add `GET /v1/tenants/{slug}` returning `{ organization_id, status }` for active/awaiting-admin
-  companies only. The dashboard Worker needs it (T6).
-- Keep the SQL; `query!` macro calls become `sqlx::query`/`query_as`. Batches become transactions.
+- `auth.rs`: keep the JWKS cache semantics (cache until expiry, refetch an unknown `kid` at most once
+  per interval, keep known keys through a WorkOS outage for a day) and their unit tests. Store the
+  cache in `AppState`.
+- Tenant extractor: `X-Mesh-Tenant-Host` when `X-Mesh-Edge-Token` is valid, otherwise none.
+  `request_hostname()` callers use it. WorkOS routes return 404 "company hostname was not found"
+  without it, matching today's response for unknown hosts.
+- Agent auth (`authorize_agent` in `server/src/lib.rs`): same hash and pending-hash promotion, done
+  in one gateway batch; the company-hostname comparison is dropped because Agents connect to the API
+  host directly.
+- Suspending a company and deleting an Agent call the Agent hub (T3) directly instead of
+  `revoke_agents` fanning out to Durable Objects.
 
 ### T3 Agent hub
 
-`GET /v1/agents/{id}/connect` upgrades after Agent auth and runs one task per Agent:
+`GET /v1/agents/{id}/connect` upgrades after Agent authentication and runs one task per Agent.
 
 - **Superseding:** registering a device closes any previous connection for it (close code 4000, as
   today).
-- **On connect:** clear any update-grace entry; if `deletion_requested_at` is set, send
-  `AgentCommand::Uninstall`; otherwise publish `connected=true`, replay the active session request if
-  one exists (T4), and resend a staged rotation.
-- **Messages:** text `ping` → `pong`; `AgentStatusMessage::UninstallScheduled` → close the socket
-  with 4001 (the row stays soft-deleted via `deletion_requested_at`, as today; the dashboard already
-  got `agent_deleted` when the admin deleted it); `AgentStatusMessage::Updating { version }` → record the update-grace entry
-  (`UPDATE_GRACE_MS` = 10 minutes) so the disconnect publishes `updating_to`.
-- **Commands** arrive on the task's channel: session request, end session, rotate token, uninstall,
-  revoke (company suspended), close.
-- **Token rotation:** generate a token, store only its hash as `pending_auth_token_hash`, keep the
-  plaintext in the connection task, and send `AgentCommand::RotateToken`. Agent auth already
-  promotes the pending hash on the next connect. If the Agent reconnects before promotion, the new
-  task resends the plaintext it received from the rotate handler; if the server restarted, the
-  plaintext is gone and the rotation is simply abandoned (the old credential still works, and the
-  admin can rotate again). No plaintext is stored anywhere.
-- **Disconnect:** publish `connected=false` (with `updating_to` if in the grace window) only if the
-  closing task is still the registered one, so a superseded socket cannot mark a live Agent offline.
+- **Hello:** the Agent's first message is `AgentStatusMessage::Hello { active_session: Option<SessionId> }`.
+  The server reconciles it with D1: an Agent session the server no longer has gets
+  `AgentCommand::EndSession`; a server session the Agent no longer runs (for example after an Agent
+  restart) gets a fresh `AgentSessionRequest` with new TURN credentials. This replaces replaying the
+  stored request byte-for-byte, which `replays_session` in `agent/src/remote/mod.rs` exists to
+  tolerate.
+- **On connect:** if `deletion_requested_at` is set, send `AgentCommand::Uninstall`; otherwise
+  publish `connected=true`, clear the update-grace columns, and resend a staged rotation.
+- **Messages:** text `ping` → `pong`; `UninstallScheduled` → close with 4001 (the row stays
+  soft-deleted, as today); `Updating { version }` → set `agents.updating_to` and
+  `agents.updating_until` (now + 10 minutes, `UPDATE_GRACE_MS`) so the disconnect is shown as an
+  update, even across a server restart; `Signal { session_id, signal }` → relay to the viewer (T4).
+- **Commands** arrive on the task's channel: session request, signal, end session, rotate token,
+  uninstall, revoke (company suspended).
+- **Token rotation:** store only the new token's hash as `pending_auth_token_hash`, keep the plaintext
+  in the connection task, send `AgentCommand::RotateToken`. Agent auth already promotes the pending
+  hash on the next connect. After a server restart the plaintext is gone and the rotation is
+  abandoned; the old credential still works and the admin can rotate again. No plaintext is stored.
+- **Disconnect:** publish `connected=false` only if the closing task is still the registered one, so
+  a superseded socket cannot mark a live Agent offline.
 
-The Agent side of this protocol does not change.
+### T4 Remote sessions and relay
 
-### T4 Remote sessions and signaling relay
-
-A `Session` holds: id, company, device, viewer name, policy (`start_in_background`, `idle_policy`,
-`display_border`, `blackout_message`), `client_token`, `agent_token`, `idle_timeout`, deadline, the
-current client and agent senders, and at most one pending terminal signal per side.
+New D1 table `remote_sessions`: `id`, `company_id`, `device_id`, `viewer_name`, the policy
+(`start_in_background`, `idle_policy`, `display_border`, `blackout_message`), `client_token_hash`,
+`idle_timeout_ms`, `expires_at`, `created_at`. At most one row per device. The server caches active
+rows in memory and loads them at startup.
 
 - `POST /v1/remote/handoffs` and `…/redeem`: same SQL and WorkOS name lookup
-  (`server/src/routes/handoffs.rs`). Redeem creates the session, generates TURN credentials, asks the
-  Agent hub to deliver `AgentSessionRequest` (409 if the Agent is offline or already busy), and
-  returns `SessionBootstrap`.
-- `GET /v1/remote/sessions/{id}/signal?role=client|agent`: bearer token must match the role's token
-  (constant-time). A new socket for a role replaces the old one (close 4000). Deliver a pending
-  terminal signal for that role on connect.
-- Relay rules from `server/src/remote_session.rs` `handle_websocket_message`: max 64 KiB text, JSON
-  must parse as `SignalMessage`, only the client may send `Activity` (refreshes the deadline) or
-  `EndSession` (expires the session), `Error` is held as a pending terminal signal until delivered,
-  and socket close is advisory (no `PeerLeft` from stale sockets).
+  (`server/src/routes/handoffs.rs`). Redeem inserts the session row, generates TURN credentials,
+  delivers `AgentSessionRequest` through the hub (409 if the Agent is offline or busy, removing the
+  row), and returns `SessionBootstrap`.
+- `GET /v1/remote/sessions/{id}/signal`: bearer token must hash to `client_token_hash`
+  (constant-time). A new viewer socket replaces the old one (close 4000).
+- Relay rules from `server/src/remote_session.rs` `handle_websocket_message`: text only, at most
+  64 KiB, must parse as `SignalMessage`; `Activity` and `EndSession` are accepted only from the
+  viewer; an `Error` from the Agent is held in memory until the viewer socket receives it; socket
+  closes are not forwarded as `PeerLeft`.
+- **Deadlines:** `Activity` moves the in-memory deadline. It is written to D1 only when it has moved
+  by at least a minute since the last write, and on graceful shutdown, so D1 sees about one write per
+  active session per minute. One timer task expires overdue sessions.
 - `POST …/resume`: client token, regenerate TURN credentials, extend the deadline, re-send the
-  session request to the Agent (the Agent's `replays_session` check makes an identical request a
-  no-op), return a fresh `SessionBootstrap`.
-- `POST …/end`: client token, expire. Idempotent: an unknown session returns success.
-- Expiry (idle deadline, end, close-session, Agent revoked or deleted): close both sockets with 4001
-  and the reason, tell the Agent `AgentCommand::EndSession`, remove from the table. A single
-  deadline timer per session replaces alarms and leases.
-- `POST /v1/agents/{id}/close-session` expires the Agent's active session and returns
+  session request to the Agent, return a fresh `SessionBootstrap`.
+- `POST …/end`: client token, expire. An unknown session returns success (idempotent).
+- **Expiry** (deadline, end, close-session, Agent revoked or deleted): close the viewer socket with
+  4001 and the reason, send `AgentCommand::EndSession`, delete the row.
+- `POST /v1/agents/{id}/close-session` expires the device's session and returns
   `{ "closed": bool }` as today.
 
 ### T5 Dashboard presence socket
 
-Replaces the subscription/renew/events flow with `GET /v1/dashboard/events`.
+Replaces the subscription/renew/events flow with `GET /v1/dashboard/events`, reached through the
+dashboard Worker on the company hostname.
 
 - Browsers cannot set `Authorization` on a WebSocket, so the first client message is
-  `{ "type": "auth", "token": "<WorkOS access token>" }`. The server validates it, checks `Origin`,
-  and sends a snapshot. Before the token expires the dashboard sends another `auth` message with a
-  fresh token; the server closes the socket when the current token expires without one.
-- Server messages keep today's shapes so the UI changes stay small: a `snapshot` with `revision`,
-  `agents` (`id`, `name`, `connected`, `updating_to`) and `generated_at_unix_ms`, then
-  `agent_upsert` / `agent_deleted` events with increasing `revision`. The revision is a per-company
-  counter in memory; a reconnect always starts with a snapshot, so no persisted revision is needed.
-- Sources of events: the Agent hub (connect/disconnect/updating), Agent create (installer redeem),
-  and delete (`deletion_requested_at` set). These replace the `presence_catalog_outbox` triggers. Each goes through the company's `broadcast` channel. A lagging receiver closes its
-  socket and the dashboard reconnects for a fresh snapshot.
-- Dashboard: update `features/agents/use-agent-inventory.ts` to open the socket, send `auth`, and
-  re-authenticate on token refresh; delete `subscription-renewal.ts` and its tests.
+  `{ "type": "auth", "token": "<WorkOS access token>" }`. The server validates it against the
+  trusted tenant host and sends a snapshot. The dashboard sends another `auth` message with a fresh
+  token before the current one expires; the server closes the socket when a token expires without
+  a replacement.
+- Messages keep today's shapes: a `snapshot` (`revision`, `agents` with `id`, `name`, `connected`,
+  `updating_to`, and `generated_at_unix_ms`), then `agent_upsert` / `agent_deleted` with increasing
+  `revision`. The revision is an in-memory counter per company; every connection starts with a
+  snapshot, so it never needs to persist.
+- Events come from the Agent hub (connect, disconnect, updating), installer redeem (new Agent), and
+  Agent delete. They replace the `presence_catalog_outbox` triggers. A lagging subscriber is closed
+  and reconnects for a fresh snapshot.
+- Dashboard: `features/agents/use-agent-inventory.ts` opens the socket, sends `auth`, re-sends it on
+  token refresh, reconnects immediately on close code 1012, and shows an Agent as offline only after
+  it has stayed disconnected for about 10 seconds. Delete `subscription-renewal.ts` and its tests.
 
 ### T6 Dashboard Worker forwards to the VPS
 
 `dashboard/worker/index.ts`:
 
-- Replace `env.MESHRMM_API.fetch(...)` with `fetch` against `MESHRMM_SERVER_URL` (already a var,
-  currently empty), preserving method, headers, body and WebSocket upgrades. The `auth` surface's
-  `/login` → `/v1/auth/invitations/resolve` rewrite keeps `redirect: "manual"`.
-- Replace the D1 tenant lookup with `GET /v1/tenants/{slug}` on the server, cached briefly with the
-  Cache API.
-- Remove the `DB`, `USAGE` and `MESHRMM_API` bindings, `worker/usage.ts`, and the costs page.
+- Replace `env.MESHRMM_API.fetch(...)` with `fetch` to `MESHRMM_SERVER_URL` (already a var,
+  currently empty), preserving method, headers, body and WebSocket upgrades, and adding the tenant
+  and edge headers ([Tenancy](#tenancy)). The `auth` surface's `/login` rewrite keeps
+  `redirect: "manual"`.
+- Keep the `DB` binding and the tenant lookup. Remove the `USAGE` and `MESHRMM_API` bindings,
+  `worker/usage.ts`, and the costs page and `features/platform/costs.ts`.
+- Add `EDGE_TOKEN` as a Worker secret.
 
-### T7 Native clients point at the API host
+### T7 Agent: signaling over the control connection
 
-- Installer bootstrap (`AgentInstallerBootstrap.server`) and redeemed `AgentConfig.server` become
-  `PUBLIC_API_URL`. Handoff `api_url` becomes `PUBLIC_API_URL`.
-- Replace "Cloudflare" in client log and error strings (for example
-  `agent/src/remote/mod.rs` "connecting Agent to Cloudflare signaling",
-  `remote/src/signaling.rs` "Cloudflare session API request failed").
-- Protocol types in `crates/protocol-types/src/signaling.rs` stay as they are; the server keeps the
-  same URLs for Agent connect, handoff redeem, and session end/resume/signal.
-- Check TLS settings in `crates/signaling-client/src/tls.rs` still accept the VPS certificate chain
-  (Let's Encrypt via Caddy).
+- `crates/protocol-types/src/signaling.rs`: add `AgentCommand::Signal`, `AgentStatusMessage::Signal`
+  and `AgentStatusMessage::Hello`; remove `AgentSessionRequest.signaling_token`.
+- `agent/src/remote/transport.rs` `run_sender`: take a pair of channels instead of a signal URL and
+  token. The loop around `signal.next()` reads from the channel; the channel only closes when the
+  session ends.
+- `agent/src/remote/mod.rs` `run`: send `Hello` after connecting; route `Signal` commands to the
+  active session's channel and forward its outgoing signals over the socket. Signals produced while
+  disconnected wait in a small bounded queue and are sent after reconnecting; if it fills, the oldest
+  are dropped, and the viewer's negotiation retry recovers. The session task keeps running while the
+  control connection reconnects.
+- Close code 1012 reconnects after 0–2 s of jitter instead of the backoff.
+- Drop `session_signal_url` and the Agent-side session socket. Replace "Cloudflare" in log strings
+  (for example "connecting Agent to Cloudflare signaling").
+- The installer (`agent/src/installer.rs`) already takes its server URL from the redeem response,
+  which now returns `PUBLIC_API_URL`.
 
-### T8 Tests and CI
+### T8 Viewer: signaling loss is not fatal
 
-- Rust integration tests in `server/tests/` start the server on an ephemeral port with a temp SQLite
-  file, a local JWKS stub (sign tokens with a test RSA key, as `server/tests/presence.mjs` does),
-  and a stub TURN endpoint. Drive them with `tokio-tungstenite` and `reqwest`.
-- Port the scenarios covered by `presence.mjs`, `session_cleanup.mjs`, `token_rotation.mjs` and
-  `request_path.mjs`: superseded Agent sockets, presence on connect/disconnect/update grace, session
-  delivery and 409 when busy/offline, relay rules, idle expiry, resume, end idempotency,
-  close-session, rotation promotion and abandoned rotation, suspension revoking Agents and sessions.
-- Keep or retarget `server/tests/sql_regressions.py` to the new schema and SQL locations; drop it if
-  every query is covered by the integration tests.
-- CI (`.github/workflows/ci.yml`): remove the `server-wasm` job's wasm check, `worker-build` and
-  `node server/tests/*.mjs`; the server's tests run with the normal workspace `cargo test`.
+- `remote/src/transport/receiver.rs`: once the peer connection is connected, a closed signaling
+  socket starts a background reconnect (1012: immediately with jitter; otherwise the
+  `ReconnectBackoff` in `crates/signaling-client`) instead of ending with
+  `FailureKind::SignalingLost`. `Activity` messages are skipped while disconnected. Before the peer
+  connects, the current failure and resume behavior stays.
+- Close codes 1008 and 4001 stay terminal (`signaling_close_error` in
+  `crates/signaling-client/src/lib.rs`).
+- Replace "Cloudflare" in error strings (`remote/src/signaling.rs` "Cloudflare session API request
+  failed").
 
-### T9 Deployment
+### T9 Graceful restart and deployment
 
-Add `deploy/` with:
+- Server: on SIGTERM, stop accepting, flush session deadlines, close sockets with 1012, exit within
+  10 seconds. `--check` validates config, gateway access and schema version, then exits.
+- Add `deploy/`:
+  - systemd unit running `current/meshrmm-server` as an unprivileged user with an
+    `EnvironmentFile`, `KillSignal=SIGTERM`, `TimeoutStopSec=15`, `Restart=always`.
+  - Caddyfile for `api.meshrmm.com` with a Cloudflare Origin CA certificate, proxying to
+    `LISTEN_ADDR` with `lb_try_duration` of about 10 s. TLS 1.3 must stay available, since the
+    native clients accept only TLS 1.3 (`crates/signaling-client/src/tls.rs`).
+  - Firewall: accept 443 only from Cloudflare's IP ranges.
+  - `deploy.sh`: build for the VPS's architecture, upload to `releases/<commit>/`, run `--check`,
+    swap `current`, restart, poll `/healthz`, and roll back automatically if it fails. Keep the last
+    few releases.
+- Replace `scripts/deploy-server.mjs` and its test. Trim the server and cost parts of
+  `scripts/provision-cloudflare.ps1`; add the gateway Worker's deploy.
 
-- A systemd unit running `meshrmm-server` as an unprivileged user with an `EnvironmentFile`.
-- A Caddyfile terminating TLS for `api.meshrmm.com` and proxying to `LISTEN_ADDR` (WebSockets work
-  without extra config).
-- A backup job: `sqlite3 … ".backup …"` on a timer, copied off the host.
-- A short `deploy/README.md`: build (`cargo build --release -p meshrmm-server`, target the VPS's
-  architecture), copy, restart, check `/healthz`.
+### T10 Tests and CI
 
-Open question for the user: VPS provider, OS and architecture, and whether they prefer Docker over
-systemd.
+- Rust integration tests in `server/tests/` start the server on an ephemeral port against an
+  in-memory fake of the `Db` interface backed by `rusqlite` with the real migrations applied, a
+  local JWKS stub (sign tokens with a test RSA key, as `server/tests/presence.mjs` does), and a stub
+  TURN endpoint. Drive them with `tokio-tungstenite` and `reqwest`.
+- Port the scenarios in `presence.mjs`, `session_cleanup.mjs`, `token_rotation.mjs` and
+  `request_path.mjs`, and add: edge-token enforcement, hello reconciliation, relay through the Agent
+  hub, deadline persistence, and **a restart test** (stop the server with a live session, start a new
+  one on the same database, and check the session, its deadline, presence and update grace).
+- Agent and viewer tests for continuing a connected session across a signaling drop, and for 1012.
+- Keep `server/tests/sql_regressions.py` pointed at the server's SQL (the SQL is unchanged).
+- CI (`.github/workflows/ci.yml`): remove the server's wasm check, `worker-build` and
+  `node server/tests/*.mjs`. The server's tests run with the workspace `cargo test`. Add a
+  typecheck for `d1-gateway/`.
 
-### T10 Cutover and endpoint validation
+### T11 Cutover and endpoint validation
 
-- DNS: point `api.meshrmm.com` at the VPS. Keep the old Worker until the new server is validated,
-  then delete it and its Durable Object namespaces.
-- Data: start from a fresh database and re-enroll test Agents, unless the user wants companies and
-  Agents copied from D1 (`wrangler d1 export`, then import the kept tables).
+- Apply the additive D1 migration. Deploy the gateway Worker, the VPS, and the dashboard Worker
+  with `MESHRMM_SERVER_URL` set. Point `api.meshrmm.com` at the VPS. Keep the old API Worker
+  deployed until validation passes, then remove it and its Durable Object namespaces (ask first).
+- Existing enrolled Agents keep their credentials (they are in D1), but need the updated Agent build,
+  and their stored `server` value must be `https://api.meshrmm.com`.
 - Validate on DESKTOP-85R6S28 per [AGENTS.md](../AGENTS.md): install the updated Agent service,
-  confirm it connects to the VPS, then exercise presence in the dashboard, a remote session from the
-  macOS and Windows viewers, resume after a network drop, idle timeout, close-session, token
-  rotation, uninstall, update grace, and a server restart with reconnection. Leave a working
-  service installed.
+  confirm it connects, then exercise presence in the dashboard on a company hostname; a remote
+  session from the macOS and Windows viewers; **a server restart during a live session** (the stream
+  continues, signaling reconnects, the dashboard does not show the Agent offline); a restart during
+  an Agent update; idle timeout; close-session; token rotation; uninstall; and a rollback. Leave a
+  working service installed.
 
 ## Working rules
 
-- Don't deploy, change DNS, delete Cloudflare resources, or push to `main` unless the user asks.
+- Don't deploy, change DNS, apply remote D1 migrations, delete Cloudflare resources, or push to
+  `main` unless the user asks.
 - Before changing code, read the code paths involved. If something in this plan turns out to be
   wrong, record why in the task's section instead of silently deviating.
 - Match the surrounding style and comment density. Add tests for the behavior you change.
@@ -319,5 +416,7 @@ systemd.
 
 ## Estimate
 
-About 4–6 focused days. The server should shrink from ~7,400 lines to roughly 3,000–4,000. Most of
-the effort is T2 (mechanical but broad), T4 (the relay rules), T8, and T10.
+About 6–8 focused days. That is more than the first estimate because restart survival adds the
+Agent and viewer signaling changes (T7, T8), session persistence (T4), and the deploy tooling
+(T9), and keeping D1 adds the gateway (T1). The server itself should shrink from ~7,400 lines to
+roughly 3,500–4,500.
