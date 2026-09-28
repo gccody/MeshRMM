@@ -152,6 +152,9 @@ pub(crate) async fn create_session_for_device(
         prevent_idle_lock: bool,
         #[serde(deserialize_with = "deserialize_sql_bool")]
         allow_idle_override: bool,
+        idle_disconnect_minutes: Option<u32>,
+        #[serde(deserialize_with = "deserialize_sql_bool")]
+        allow_idle_disconnect_override: bool,
         #[serde(deserialize_with = "deserialize_sql_bool")]
         session_banner: bool,
         #[serde(deserialize_with = "deserialize_sql_bool")]
@@ -161,7 +164,7 @@ pub(crate) async fn create_session_for_device(
         connection_notification_message: String,
     }
     let policy = query!(&db,
-        "SELECT c.id AS company_id, c.blackout_message, c.display_border, c.prevent_idle_lock, c.allow_idle_override, c.session_banner, c.connection_notification, c.background_connection_notification, c.connection_notification_message FROM companies c JOIN agents a ON a.company_id = c.id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL",
+        "SELECT c.id AS company_id, c.blackout_message, c.display_border, c.prevent_idle_lock, c.allow_idle_override, c.idle_disconnect_minutes, c.allow_idle_disconnect_override, c.session_banner, c.connection_notification, c.background_connection_notification, c.connection_notification_message FROM companies c JOIN agents a ON a.company_id = c.id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL",
         device_id
     )?.metered_first::<MaintenancePolicy>(None).await?;
     let Some(policy) = policy else {
@@ -170,6 +173,10 @@ pub(crate) async fn create_session_for_device(
     let idle_policy = meshrmm_protocol_types::IdlePolicy {
         prevent_idle_lock: policy.prevent_idle_lock,
         allow_override: policy.allow_idle_override,
+    };
+    let idle_disconnect = meshrmm_protocol_types::IdleDisconnectPolicy {
+        minutes: policy.idle_disconnect_minutes,
+        allow_override: policy.allow_idle_disconnect_override,
     };
     let session_id = Uuid::new_v4().to_string();
     let client_token = random_token();
@@ -194,6 +201,7 @@ pub(crate) async fn create_session_for_device(
     let init = SessionInit {
         start_in_background,
         idle_policy,
+        idle_disconnect,
         display_border: policy.display_border,
         session_banner: policy.session_banner,
         connection_notification: policy.connection_notification,
@@ -253,6 +261,7 @@ pub(crate) async fn create_session_for_device(
     Response::from_json(&SessionBootstrap {
         start_in_background,
         idle_policy,
+        idle_disconnect,
         display_border: policy.display_border,
         session_id: RemoteSessionId::new(session_id),
         signaling_token: client_token,

@@ -3,10 +3,12 @@ import test from "node:test";
 import {
   DEFAULT_BLACKOUT_MESSAGE,
   DEFAULT_CONNECTION_NOTIFICATION_MESSAGE,
+  IDLE_DISCONNECT_MINUTES,
   SETTINGS_TABS,
   companySettingsBody,
   draftFromCompany,
   draftMatchesCompany,
+  formatIdleDisconnect,
   isBlackoutMessageValid,
   isConnectionNotificationMessageValid,
   settingsTabForKey,
@@ -23,6 +25,8 @@ const company = {
   display_border: false,
   prevent_idle_lock: false,
   allow_idle_override: true,
+  idle_disconnect_minutes: 15,
+  allow_idle_disconnect_override: false,
   session_banner: false,
   connection_notification: false,
   background_connection_notification: true,
@@ -36,6 +40,8 @@ test("drafts start from the saved settings, or the defaults before the account l
     displayBorder: false,
     preventIdleLock: false,
     allowIdleOverride: true,
+    idleDisconnectMinutes: 15,
+    allowIdleDisconnectOverride: false,
     sessionBanner: false,
     connectionNotification: false,
     backgroundConnectionNotification: true,
@@ -47,6 +53,8 @@ test("drafts start from the saved settings, or the defaults before the account l
     displayBorder: true,
     preventIdleLock: true,
     allowIdleOverride: true,
+    idleDisconnectMinutes: null,
+    allowIdleDisconnectOverride: true,
     sessionBanner: true,
     connectionNotification: true,
     backgroundConnectionNotification: false,
@@ -63,6 +71,9 @@ test("saving is offered only when a draft differs from the saved settings", () =
     { displayBorder: true },
     { preventIdleLock: true },
     { allowIdleOverride: false },
+    { idleDisconnectMinutes: null },
+    { idleDisconnectMinutes: 30 },
+    { allowIdleDisconnectOverride: true },
     { sessionBanner: true },
     { connectionNotification: true },
     { backgroundConnectionNotification: false },
@@ -99,11 +110,25 @@ test("the saved body uses the control plane's field names", () => {
     display_border: false,
     prevent_idle_lock: false,
     allow_idle_override: true,
+    idle_disconnect_minutes: 15,
+    allow_idle_disconnect_override: false,
     session_banner: false,
     connection_notification: false,
     background_connection_notification: true,
     connection_notification_message: "{user_name} is here.",
   });
+  // Never is sent as null, which the server requires rather than defaults.
+  assert.equal(
+    companySettingsBody({ ...draftFromCompany(company), idleDisconnectMinutes: null }).idle_disconnect_minutes,
+    null,
+  );
+});
+
+test("idle disconnect choices read as durations, with never first", () => {
+  assert.deepEqual(
+    [null, ...IDLE_DISCONNECT_MINUTES].map(formatIdleDisconnect),
+    ["Never", "5 minutes", "10 minutes", "15 minutes", "30 minutes", "1 hour", "2 hours", "4 hours", "8 hours"],
+  );
 });
 
 test("arrow keys wrap between settings tabs and Home/End jump to the ends", () => {

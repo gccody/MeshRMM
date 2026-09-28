@@ -6,7 +6,7 @@ use crate::usage::MeteredStatement;
 
 /// The newest D1 migration the Worker's queries rely on. A test keeps it in
 /// step with `server/migrations`.
-pub(crate) const SCHEMA_MIGRATION: &str = "0015_connection_notification.sql";
+pub(crate) const SCHEMA_MIGRATION: &str = "0016_idle_disconnect.sql";
 
 #[derive(Debug, PartialEq, Serialize)]
 struct Health {

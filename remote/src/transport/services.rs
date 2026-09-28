@@ -173,7 +173,10 @@ pub(super) fn start_viewer_services(
                             }
                         }
                         _ = chat_ready.notified(), if label == CHAT_CHANNEL => {
-                            while let Some(text) = viewer.chat.poll() { viewer.send(SessionMessage::Chat { text }); }
+                            while let Some(text) = viewer.chat.poll() {
+                                viewer.resume_state.note_activity();
+                                viewer.send(SessionMessage::Chat { text });
+                            }
                         }
                         _ = files_ready.notified(), if label == FILE_CHANNEL => files_pending = true,
                         permit = service_sender.reserve(), if label == FILE_CHANNEL && files_pending => {

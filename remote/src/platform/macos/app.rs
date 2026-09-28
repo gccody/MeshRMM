@@ -455,6 +455,13 @@ define_class!(
             }
         }
 
+        #[unsafe(method(selectIdleDisconnect:))]
+        fn select_idle_disconnect(&self, sender: &NSMenuItem) {
+            if let Some(minutes) = usize::try_from(sender.tag()).ok().and_then(|index| crate::idle_disconnect::choices().nth(index)) {
+                self.ivars().control.set_idle_disconnect_minutes(minutes);
+            }
+        }
+
         #[unsafe(method(selectDiagnosticsKey:))]
         fn select_diagnostics_key(&self, sender: &NSMenuItem) {
             if let Some(key) = usize::try_from(sender.tag()).ok().and_then(|index| crate::shortcuts::ShortcutKey::ALL.get(index)) {
@@ -1001,6 +1008,32 @@ impl RemoteView {
             sel!(toggleClipboardSync:),
             Some(control.clipboard_sync()),
         ));
+        let idle_minutes = control.idle_disconnect_minutes();
+        let idle_choices: Vec<_> = crate::idle_disconnect::choices()
+            .map(|choice| {
+                (
+                    crate::idle_disconnect::label(choice),
+                    choice == idle_minutes,
+                )
+            })
+            .collect();
+        let idle_disconnect = self.menu_choices(
+            &format!(
+                "Disconnect when idle: {}{}",
+                crate::idle_disconnect::label(idle_minutes),
+                if control.allow_idle_disconnect_override() {
+                    ""
+                } else {
+                    " (company managed)"
+                }
+            ),
+            idle_choices
+                .iter()
+                .map(|(label, selected)| (label.as_str(), *selected)),
+            sel!(selectIdleDisconnect:),
+        );
+        idle_disconnect.setEnabled(control.allow_idle_disconnect_override());
+        menu.addItem(&idle_disconnect);
 
         menu.addItem(&NSMenuItem::separatorItem(self.mtm()));
         self.add_menu_header(&menu, "Remote computer");

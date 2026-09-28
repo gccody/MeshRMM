@@ -5,7 +5,7 @@ use super::*;
 
 /// The settings window's outer size, in 96-DPI pixels.
 pub(super) const SETTINGS_WINDOW_WIDTH: i32 = 560;
-pub(super) const SETTINGS_WINDOW_HEIGHT: i32 = 626;
+pub(super) const SETTINGS_WINDOW_HEIGHT: i32 = 690;
 
 const QUALITY_ULTRA_DATA_SAVER_ID: usize = 4104;
 const QUALITY_DATA_SAVER_ID: usize = 4101;
@@ -41,6 +41,8 @@ const SETTINGS_WALLPAPER_ID: usize = 4229;
 const SETTINGS_REMOTE_CURSOR_ID: usize = 4227;
 const SETTINGS_CLOSE_TITLE_ID: i32 = 4234;
 const SETTINGS_CLEAR_CLIPBOARD_ID: usize = 4238;
+const SETTINGS_IDLE_DISCONNECT_TITLE_ID: i32 = 4239;
+const SETTINGS_IDLE_DISCONNECT_ID: usize = 4240;
 const SETTINGS_CLOSE_ACTION_IDS: [(usize, SessionCloseAction); 3] = [
     (4235, SessionCloseAction::NoAction),
     (4236, SessionCloseAction::Lock),
@@ -58,6 +60,7 @@ pub(super) struct SettingsControls {
 impl WindowContext {
     pub(super) fn refresh_maintenance_controls(&self) {
         self.refresh_shortcut_keys();
+        self.refresh_idle_disconnect();
         self.refresh_toolbar();
         let controls = self.controls();
         let close_action = self.control.session_close_action();
@@ -173,6 +176,34 @@ impl WindowContext {
         }
     }
 
+    fn refresh_idle_disconnect(&self) {
+        let settings_window = self.controls().settings_window;
+        let allowed = self.control.allow_idle_disconnect_override();
+        let minutes = self.control.idle_disconnect_minutes();
+        unsafe {
+            if let Ok(title) = GetDlgItem(Some(settings_window), SETTINGS_IDLE_DISCONNECT_TITLE_ID)
+            {
+                let _ = SetWindowTextW(
+                    title,
+                    if allowed {
+                        w!("Disconnect when idle")
+                    } else {
+                        w!("Disconnect when idle (company managed)")
+                    },
+                );
+            }
+            if let Ok(combo) = GetDlgItem(Some(settings_window), SETTINGS_IDLE_DISCONNECT_ID as i32)
+            {
+                // A time outside the offered choices shows no selection.
+                let index = crate::idle_disconnect::choices()
+                    .position(|choice| choice == minutes)
+                    .unwrap_or(usize::MAX);
+                SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(index)), None);
+                let _ = EnableWindow(combo, allowed);
+            }
+        }
+    }
+
     pub(super) fn show_settings(&self) {
         self.refresh_maintenance_controls();
         let settings_window = self.controls().settings_window;
@@ -216,6 +247,8 @@ unsafe fn show_settings_category(window: HWND, category: SettingsCategory) {
         SETTINGS_CLIPBOARD_ID as i32,
         SETTINGS_CLEAR_CLIPBOARD_ID as i32,
         SETTINGS_CLOSE_TITLE_ID,
+        SETTINGS_IDLE_DISCONNECT_TITLE_ID,
+        SETTINGS_IDLE_DISCONNECT_ID as i32,
     ]
     .into_iter()
     .chain(SETTINGS_CLOSE_ACTION_IDS.map(|(id, _)| id as i32))
@@ -408,6 +441,21 @@ impl WindowContext {
         }
         if control_id == SETTINGS_DIAGNOSTICS_ID {
             self.toggle_debug();
+            return true;
+        }
+        if control_id == SETTINGS_IDLE_DISCONNECT_ID {
+            if notification == CBN_SELCHANGE as usize {
+                let selected = unsafe {
+                    SendMessageW(HWND(lparam.0 as *mut c_void), CB_GETCURSEL, None, None).0
+                };
+                if let Some(minutes) = usize::try_from(selected)
+                    .ok()
+                    .and_then(|index| crate::idle_disconnect::choices().nth(index))
+                {
+                    self.control.set_idle_disconnect_minutes(minutes);
+                }
+                self.refresh_maintenance_controls();
+            }
             return true;
         }
         let shortcut = match control_id {
@@ -754,6 +802,39 @@ pub(super) unsafe fn create_settings_window(
             28,
             id,
         )?;
+    }
+    let _ = make_control(
+        w!("STATIC"),
+        w!("Disconnect when idle"),
+        static_style,
+        162,
+        542,
+        340,
+        24,
+        SETTINGS_IDLE_DISCONNECT_TITLE_ID as usize,
+    )?;
+    let idle_disconnect = make_control(
+        w!("COMBOBOX"),
+        w!(""),
+        WINDOW_STYLE(
+            WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
+        ),
+        162,
+        570,
+        280,
+        240,
+        SETTINGS_IDLE_DISCONNECT_ID,
+    )?;
+    for choice in crate::idle_disconnect::choices() {
+        let label = HSTRING::from(crate::idle_disconnect::label(choice));
+        unsafe {
+            SendMessageW(
+                idle_disconnect,
+                CB_ADDSTRING,
+                None,
+                Some(LPARAM(label.as_ptr() as isize)),
+            );
+        }
     }
     let _ = make_control(
         w!("BUTTON"),

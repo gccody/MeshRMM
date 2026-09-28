@@ -54,6 +54,11 @@ pub async fn run_receiver(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .policy = bootstrap.idle_policy;
+    resume_state
+        .idle_disconnect
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_policy(bootstrap.idle_disconnect);
     let identity = meshrmm_session_transport::identity::PeerIdentity::load(
         &meshrmm_session_transport::identity::viewer_directory()?,
     )?;

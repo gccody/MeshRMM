@@ -8,6 +8,16 @@ export const MAX_BLACKOUT_MESSAGE_BYTES = 2048;
 export const DEFAULT_CONNECTION_NOTIFICATION_MESSAGE = "{user_name} has connected to this computer.";
 export const MAX_CONNECTION_NOTIFICATION_MESSAGE_BYTES = 512;
 
+// The server accepts only these idle times, in minutes, or null for never.
+export const IDLE_DISCONNECT_MINUTES = [5, 10, 15, 30, 60, 120, 240, 480] as const;
+
+export function formatIdleDisconnect(minutes: number | null) {
+  if (minutes === null) return "Never";
+  if (minutes < 60) return `${minutes} minutes`;
+  const hours = minutes / 60;
+  return `${hours} ${hours === 1 ? "hour" : "hours"}`;
+}
+
 export const SETTINGS_TABS = [
   { id: "dashboard-security", label: "Dashboard security" },
   { id: "remote-sessions", label: "Remote sessions" },
@@ -22,6 +32,8 @@ export type CompanySettingsDraft = {
   displayBorder: boolean;
   preventIdleLock: boolean;
   allowIdleOverride: boolean;
+  idleDisconnectMinutes: number | null;
+  allowIdleDisconnectOverride: boolean;
   sessionBanner: boolean;
   connectionNotification: boolean;
   backgroundConnectionNotification: boolean;
@@ -36,6 +48,8 @@ export function draftFromCompany(company: Company | null | undefined): CompanySe
     displayBorder: company?.display_border ?? true,
     preventIdleLock: company?.prevent_idle_lock ?? true,
     allowIdleOverride: company?.allow_idle_override ?? true,
+    idleDisconnectMinutes: company?.idle_disconnect_minutes ?? null,
+    allowIdleDisconnectOverride: company?.allow_idle_disconnect_override ?? true,
     sessionBanner: company?.session_banner ?? true,
     connectionNotification: company?.connection_notification ?? true,
     backgroundConnectionNotification: company?.background_connection_notification ?? false,
@@ -51,6 +65,8 @@ export function draftMatchesCompany(draft: CompanySettingsDraft, company: Compan
     draft.displayBorder === saved.displayBorder &&
     draft.preventIdleLock === saved.preventIdleLock &&
     draft.allowIdleOverride === saved.allowIdleOverride &&
+    draft.idleDisconnectMinutes === saved.idleDisconnectMinutes &&
+    draft.allowIdleDisconnectOverride === saved.allowIdleDisconnectOverride &&
     draft.sessionBanner === saved.sessionBanner &&
     draft.connectionNotification === saved.connectionNotification &&
     draft.backgroundConnectionNotification === saved.backgroundConnectionNotification &&
@@ -80,6 +96,8 @@ export function companySettingsBody(draft: CompanySettingsDraft) {
     display_border: draft.displayBorder,
     prevent_idle_lock: draft.preventIdleLock,
     allow_idle_override: draft.allowIdleOverride,
+    idle_disconnect_minutes: draft.idleDisconnectMinutes,
+    allow_idle_disconnect_override: draft.allowIdleDisconnectOverride,
     session_banner: draft.sessionBanner,
     connection_notification: draft.connectionNotification,
     background_connection_notification: draft.backgroundConnectionNotification,

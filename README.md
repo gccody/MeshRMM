@@ -378,6 +378,21 @@ Lock. It is on by default, saved for the current viewer user, and sent to the Ag
 when each connection starts. Logout skips it because signing out discards the
 clipboard. Windows clipboard history (Win+V) is left unchanged.
 
+**Disconnect when idle** (macOS gear menu **Session** section; Windows
+**Settings → Advanced**) ends the remote session after the technician has been
+idle in the viewer for 5, 10, 15 or 30 minutes, or 1, 2, 4 or 8 hours, or
+**Never**. Keyboard, mouse and wheel input over the remote display, viewer
+controls that act on the session, and sent chat messages count as activity.
+Time spent connecting or reconnecting does not count, and the idle time
+restarts once the remote display is back. When it runs out, the viewer ends the
+session as if the technician had disconnected (any **On session close**
+action runs) and says why. Company administrators choose the default under
+**Settings → Remote sessions** (**Never** for new organizations) and whether
+users may choose another time. A user's choice lasts only for that session,
+including its reconnects; the next session starts with the company default.
+Apply migration `0016_idle_disconnect.sql` before deploying the updated server;
+`/healthz` expects it.
+
 System audio from the Windows default playback device is forwarded to both native
 viewers over a separate, bounded WebRTC audio channel, including while muted.
 Each new session starts muted. On macOS, check **Play remote audio** in the gear

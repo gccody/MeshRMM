@@ -44,6 +44,9 @@ struct Company {
     prevent_idle_lock: bool,
     #[serde(deserialize_with = "deserialize_sql_bool")]
     allow_idle_override: bool,
+    idle_disconnect_minutes: Option<u32>,
+    #[serde(deserialize_with = "deserialize_sql_bool")]
+    allow_idle_disconnect_override: bool,
     #[serde(deserialize_with = "deserialize_sql_bool")]
     session_banner: bool,
     #[serde(deserialize_with = "deserialize_sql_bool")]
@@ -160,6 +163,10 @@ struct UpdateCompanySettingsRequest {
     display_border: Option<bool>,
     prevent_idle_lock: Option<bool>,
     allow_idle_override: Option<bool>,
+    /// Required, because `null` means never: sessions are not disconnected.
+    #[serde(deserialize_with = "Option::deserialize")]
+    idle_disconnect_minutes: Option<u32>,
+    allow_idle_disconnect_override: Option<bool>,
     session_banner: Option<bool>,
     connection_notification: Option<bool>,
     background_connection_notification: Option<bool>,
@@ -222,6 +229,7 @@ struct HandoffResponse {
 struct SessionInit<'a> {
     start_in_background: bool,
     idle_policy: meshrmm_protocol_types::IdlePolicy,
+    idle_disconnect: meshrmm_protocol_types::IdleDisconnectPolicy,
     blackout_message: &'a str,
     display_border: bool,
     session_banner: bool,
@@ -594,13 +602,15 @@ mod company_policy_tests {
     #[test]
     fn sqlite_flags_are_exposed_as_json_booleans() {
         for enabled in [0, 1] {
-            let row = serde_json::json!({"id":"c","name":"Company","dashboard_idle_timeout_minutes":60,"blackout_message":"Maintenance","display_border":enabled,"prevent_idle_lock":1,"allow_idle_override":0,"session_banner":enabled,"connection_notification":enabled,"background_connection_notification":1-enabled,"connection_notification_message":"{user_name} is here","slug":"company","status":"active"});
+            let row = serde_json::json!({"id":"c","name":"Company","dashboard_idle_timeout_minutes":60,"blackout_message":"Maintenance","display_border":enabled,"prevent_idle_lock":1,"allow_idle_override":0,"idle_disconnect_minutes":null,"allow_idle_disconnect_override":enabled,"session_banner":enabled,"connection_notification":enabled,"background_connection_notification":1-enabled,"connection_notification_message":"{user_name} is here","slug":"company","status":"active"});
             let company: Company = serde_json::from_value(row).unwrap();
             let company = serde_json::to_value(company).unwrap();
             assert_eq!(company["display_border"], enabled == 1);
             assert_eq!(company["session_banner"], enabled == 1);
             assert_eq!(company["connection_notification"], enabled == 1);
             assert_eq!(company["background_connection_notification"], enabled == 0);
+            assert_eq!(company["idle_disconnect_minutes"], serde_json::Value::Null);
+            assert_eq!(company["allow_idle_disconnect_override"], enabled == 1);
         }
     }
 }
