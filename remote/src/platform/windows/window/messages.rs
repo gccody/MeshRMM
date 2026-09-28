@@ -43,6 +43,22 @@ pub(super) unsafe extern "system" fn window_proc(
             };
             LRESULT(0)
         }
+        // Windows gives every overlapped window a caption, whatever its
+        // style. The toolbar replaces it: the client area starts at the top
+        // of the window, and the side and bottom borders stay.
+        WM_NCCALCSIZE if wparam.0 != 0 => {
+            let params = lparam.0 as *mut NCCALCSIZE_PARAMS;
+            let top = unsafe { (*params).rgrc[0].top };
+            let result = unsafe { DefWindowProcW(window, message, wparam, lparam) };
+            // A maximized window extends past the monitor by its border.
+            let inset = if unsafe { IsZoomed(window) }.as_bool() {
+                unsafe { resize_border(window) }
+            } else {
+                0
+            };
+            unsafe { (*params).rgrc[0].top = top + inset };
+            result
+        }
         WM_NCHITTEST => {
             let default_hit = unsafe { DefWindowProcW(window, message, wparam, lparam) };
             if default_hit.0 != HTCLIENT as isize {
@@ -52,17 +68,15 @@ pub(super) unsafe extern "system" fn window_proc(
                 x: signed_low_word(lparam.0),
                 y: signed_high_word(lparam.0),
             };
-            let mut bounds = RECT::default();
-            if unsafe { ScreenToClient(window, &mut point) }.as_bool()
-                && unsafe { GetClientRect(window, &mut bounds) }.is_ok()
-            {
-                let width = bounds.right.saturating_sub(bounds.left);
-                let dpi = unsafe { window_dpi(window) };
-                if point.y >= 0
-                    && point.y < toolbar_height(dpi)
-                    && point.x >= scale(302, dpi)
-                    && point.x < width.saturating_sub(scale(220, dpi))
+            // The toolbar passes the space between its items through. Its
+            // top edge resizes the window, as the caption's did.
+            if unsafe { ScreenToClient(window, &mut point) }.as_bool() && point.y >= 0 {
+                if point.y < unsafe { resize_border(window) }
+                    && !unsafe { IsZoomed(window) }.as_bool()
                 {
+                    return LRESULT(HTTOP as isize);
+                }
+                if point.y < toolbar_height(unsafe { window_dpi(window) }) {
                     return LRESULT(HTCAPTION as isize);
                 }
             }
@@ -108,8 +122,10 @@ pub(super) unsafe extern "system" fn window_proc(
             unsafe { DefWindowProcW(window, message, wparam, lparam) }
         }
         WM_SETCURSOR => {
+            // The toolbar keeps its own arrow cursor.
             if let Some(context) = context
                 && (lparam.0 as u32 & 0xffff) == HTCLIENT
+                && wparam.0 != context.controls().toolbar.0 as usize
             {
                 unsafe {
                     apply_cursor(
@@ -264,5 +280,14 @@ pub(super) unsafe fn dark_control_colors(wparam: WPARAM) -> LRESULT {
             windows::Win32::Foundation::COLORREF(0x0014_1414),
         );
         LRESULT(GetStockObject(BLACK_BRUSH).0 as isize)
+    }
+}
+
+/// The height of the window's sizing border.
+unsafe fn resize_border(window: HWND) -> i32 {
+    let dpi = unsafe { window_dpi(window) };
+    unsafe {
+        windows::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi)
+            + windows::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
     }
 }

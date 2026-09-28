@@ -58,34 +58,12 @@ pub(super) struct SettingsControls {
 impl WindowContext {
     pub(super) fn refresh_maintenance_controls(&self) {
         self.refresh_shortcut_keys();
+        self.refresh_toolbar();
         let controls = self.controls();
-        let state = self.control.credential_state();
-        for (i, button) in controls.credential_buttons.iter().enumerate() {
-            unsafe {
-                let _ = EnableWindow(
-                    *button,
-                    !self.control.technician_blocked()
-                        && match i {
-                            0 => state.available && !state.prompt_active,
-                            1 => state.can_autofill,
-                            _ => state.saved && !state.prompt_active,
-                        },
-                );
-                if i == 1 {
-                    let _ = ShowWindow(*button, if state.can_autofill { SW_SHOW } else { SW_HIDE });
-                }
-            }
-        }
-        let text: Vec<u16> = state.message.encode_utf16().chain(Some(0)).collect();
-        let _ = unsafe { SetWindowTextW(controls.credential_label, PCWSTR(text.as_ptr())) };
         let close_action = self.control.session_close_action();
         let recording = self.control.recording().active();
         if self.recording_visible.replace(recording) != recording {
             unsafe {
-                let _ = SetWindowTextW(
-                    controls.settings_button,
-                    if recording { w!("REC") } else { w!("⚙") },
-                );
                 if let Ok(button) =
                     GetDlgItem(Some(controls.settings_window), SETTINGS_RECORDING_ID as i32)
                 {

@@ -1,6 +1,6 @@
 use super::*;
 use dispatch2::DispatchQueue;
-use objc2::rc::Retained;
+use objc2::rc::{Retained, Weak};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::*;
 use objc2_foundation::{
@@ -12,22 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 thread_local! { static UI: RefCell<Option<Ui>> = const { RefCell::new(None) }; }
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-// Draw the badge directly: a text-field glyph can be clipped by its cell's
-// text margins, even when the field itself fits inside the button.
-define_class!(
-    #[unsafe(super = NSView)]
-    #[thread_kind = MainThreadOnly]
-    #[ivars = ()]
-    struct UnreadBadge;
-    unsafe impl NSObjectProtocol for UnreadBadge {}
-    impl UnreadBadge {
-        #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, _dirty_rect: NSRect) {
-            NSColor::systemRedColor().setFill();
-            NSBezierPath::bezierPathWithOvalInRect(rect(1., 1., 10., 10.)).fill();
-        }
-    }
-);
 pub(super) struct Window {
     id: u64,
 }
@@ -278,8 +262,10 @@ impl Content {
 struct PopupIvars {
     session: ChatSession,
     popover: Retained<NSPopover>,
-    button: Retained<NSButton>,
-    badge: Retained<UnreadBadge>,
+    /// The view the popover points at. The viewer's toolbar draws the chat
+    /// button, its unread badge and its tooltip.
+    // The anchor may own this popup; retaining it would prevent teardown.
+    anchor: Weak<NSView>,
     content: RefCell<Content>,
     input_gate: Box<dyn Fn(bool)>,
 }
@@ -294,7 +280,7 @@ define_class!(
         fn did_close(&self, _notification: &objc2_foundation::NSNotification) {
             self.ivars().content.borrow().save_draft();
             self.ivars().session.set_visible(false);
-            (self.ivars().input_gate)(self.ivars().button.window().is_some_and(|w| w.isKeyWindow()));
+            (self.ivars().input_gate)(self.ivars().anchor.load().and_then(|anchor| anchor.window()).is_some_and(|w| w.isKeyWindow()));
             self.refresh();
         }
     }
@@ -306,25 +292,8 @@ define_class!(
 impl PopupController {
     fn refresh(&self) {
         let vars = self.ivars();
-        let available = vars.session.available();
-        vars.button.setEnabled(available);
-        let unread = vars.session.unread();
-        vars.badge.setHidden(unread == 0);
-        let label = if !available {
-            "Chat is unavailable until the agent connects".to_owned()
-        } else if unread > 0 {
-            format!(
-                "Chat — {unread} unread {}",
-                if unread == 1 { "message" } else { "messages" }
-            )
-        } else {
-            "Chat".to_owned()
-        };
-        vars.button.setToolTip(Some(&NSString::from_str(&label)));
-        vars.button
-            .setAccessibilityLabel(Some(&NSString::from_str(&label)));
         if vars.popover.isShown() {
-            if !available {
+            if !vars.session.available() {
                 vars.popover.close();
             } else {
                 vars.content.borrow_mut().refresh();
@@ -332,17 +301,13 @@ impl PopupController {
         }
     }
 }
-/// Main-thread native popover anchored to the viewer's toolbar button.
+/// Main-thread native popover shown under the viewer's toolbar chat button.
 pub struct Popup {
     controller: Retained<PopupController>,
     timer: Retained<objc2_foundation::NSTimer>,
 }
 impl Popup {
-    pub fn new(
-        session: ChatSession,
-        button: &Retained<NSButton>,
-        input_gate: impl Fn(bool) + 'static,
-    ) -> Self {
+    pub fn new(session: ChatSession, anchor: &NSView, input_gate: impl Fn(bool) + 'static) -> Self {
         let mtm = MainThreadMarker::new().expect("chat popup uses the main thread");
         let popover = NSPopover::new(mtm);
         popover.setBehavior(NSPopoverBehavior::Transient);
@@ -352,24 +317,10 @@ impl Popup {
         vc.setView(&content.view);
         popover.setContentViewController(Some(&vc));
         popover.setContentSize(NSSize::new(480., 400.));
-        if let Some(icon) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &NSString::from_str("bubble.left"),
-            Some(&NSString::from_str("Chat")),
-        ) {
-            button.setImage(Some(&icon));
-            button.setTitle(&NSString::from_str(""));
-        }
-        let badge = UnreadBadge::alloc(mtm).set_ivars(());
-        let badge: Retained<UnreadBadge> =
-            unsafe { msg_send![super(badge), initWithFrame: rect(32., -5., 12., 12.)] };
-        badge.setHidden(true);
-        button.setClipsToBounds(false);
-        button.addSubview(&badge);
         let controller = PopupController::alloc(mtm).set_ivars(PopupIvars {
             session,
             popover,
-            button: button.clone(),
-            badge,
+            anchor: Weak::new(anchor),
             content: RefCell::new(content),
             input_gate: Box::new(input_gate),
         });
@@ -384,17 +335,22 @@ impl Popup {
         controller.refresh();
         Self { controller, timer }
     }
-    pub fn toggle(&self) {
+    /// Shows the popover under `rect`, in the anchor view's coordinates, or
+    /// closes it.
+    pub fn toggle(&self, rect: NSRect) {
         let vars = self.controller.ivars();
         if vars.popover.isShown() {
             vars.popover.close();
-        } else if vars.session.available() {
+        } else if vars.session.available()
+            && let Some(anchor) = vars.anchor.load()
+        {
             vars.session.set_visible(true);
             (vars.input_gate)(false);
             vars.content.borrow_mut().refresh();
+            // The anchor is not flipped, so the bottom edge is MinY.
             vars.popover.showRelativeToRect_ofView_preferredEdge(
-                vars.button.bounds(),
-                &vars.button,
+                rect,
+                &anchor,
                 objc2_foundation::NSRectEdge::MinY,
             );
             if let Some(window) = vars.content.borrow().view.window() {

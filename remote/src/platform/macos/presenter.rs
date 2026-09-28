@@ -515,6 +515,12 @@ impl MacUi {
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
         window.setTitlebarAppearsTransparent(true);
+        // An empty compact toolbar makes the title bar as tall as the viewer's
+        // own toolbar, which the content view draws under it, and centers
+        // the window buttons in it. Clicks still reach the content view.
+        let title_bar = objc2_app_kit::NSToolbar::new(mtm);
+        window.setToolbar(Some(&title_bar));
+        window.setToolbarStyle(objc2_app_kit::NSWindowToolbarStyle::UnifiedCompact);
         // The content view handles mouse input for the remote desktop. Making
         // the window movable by its background causes AppKit to turn drags on
         // that view into local window moves instead of remote pointer drags.
@@ -531,7 +537,7 @@ impl MacUi {
             control,
             debug.clone(),
         );
-        window.setContentMinSize(NSSize::new(948., 240.));
+        window.setContentMinSize(NSSize::new(640., 240.));
         window.setContentView(Some(&view));
         window.setDelegate(Some(ProtocolObject::from_ref(&*view)));
         let layer = unsafe { AVSampleBufferDisplayLayer::new() };

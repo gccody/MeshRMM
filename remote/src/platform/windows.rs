@@ -46,6 +46,8 @@ mod reconnect_probe;
 mod renderer;
 #[cfg(test)]
 mod reset_probe;
+#[cfg(test)]
+mod toolbar_probe;
 mod window;
 
 pub use launch_window::{close_launch_status, show_launch_status};
@@ -65,7 +67,7 @@ const RECONNECT_REFRESH: Duration = Duration::from_millis(250);
 /// How long a stream reset waits for the worker thread before the caller
 /// replaces the presenter instead.
 const STREAM_RESET_TIMEOUT: Duration = Duration::from_secs(5);
-const VIEWER_TOOLBAR_HEIGHT: u32 = 68;
+const VIEWER_TOOLBAR_HEIGHT: u32 = crate::toolbar::HEIGHT as u32;
 
 struct QueuedFrame {
     frame: EncodedFrame,
