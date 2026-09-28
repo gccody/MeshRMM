@@ -152,9 +152,11 @@ pub(crate) async fn create_session_for_device(
         prevent_idle_lock: bool,
         #[serde(deserialize_with = "deserialize_sql_bool")]
         allow_idle_override: bool,
+        #[serde(deserialize_with = "deserialize_sql_bool")]
+        session_banner: bool,
     }
     let policy = query!(&db,
-        "SELECT c.id AS company_id, c.blackout_message, c.display_border, c.prevent_idle_lock, c.allow_idle_override FROM companies c JOIN agents a ON a.company_id = c.id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL",
+        "SELECT c.id AS company_id, c.blackout_message, c.display_border, c.prevent_idle_lock, c.allow_idle_override, c.session_banner FROM companies c JOIN agents a ON a.company_id = c.id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL",
         device_id
     )?.metered_first::<MaintenancePolicy>(None).await?;
     let Some(policy) = policy else {
@@ -188,6 +190,7 @@ pub(crate) async fn create_session_for_device(
         start_in_background,
         idle_policy,
         display_border: policy.display_border,
+        session_banner: policy.session_banner,
         blackout_message: &policy.blackout_message,
         viewer_name,
         session_id: &session_id,
@@ -210,6 +213,7 @@ pub(crate) async fn create_session_for_device(
         start_in_background,
         idle_policy,
         blackout_message: policy.blackout_message,
+        session_banner: policy.session_banner,
         viewer_name: viewer_name.to_owned(),
         session_id: RemoteSessionId::new(&session_id),
         signaling_token: agent_token,

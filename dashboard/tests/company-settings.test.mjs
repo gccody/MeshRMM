@@ -21,6 +21,7 @@ const company = {
   display_border: false,
   prevent_idle_lock: false,
   allow_idle_override: true,
+  session_banner: false,
 };
 
 test("drafts start from the saved settings, or the defaults before the account loads", () => {
@@ -30,6 +31,7 @@ test("drafts start from the saved settings, or the defaults before the account l
     displayBorder: false,
     preventIdleLock: false,
     allowIdleOverride: true,
+    sessionBanner: false,
   });
   assert.deepEqual(draftFromCompany(null), {
     idleTimeoutMinutes: DEFAULT_IDLE_TIMEOUT_MINUTES,
@@ -37,6 +39,7 @@ test("drafts start from the saved settings, or the defaults before the account l
     displayBorder: true,
     preventIdleLock: true,
     allowIdleOverride: true,
+    sessionBanner: true,
   });
 });
 
@@ -49,6 +52,7 @@ test("saving is offered only when a draft differs from the saved settings", () =
     { displayBorder: true },
     { preventIdleLock: true },
     { allowIdleOverride: false },
+    { sessionBanner: true },
   ]) {
     assert.equal(draftMatchesCompany({ ...draft, ...change }, company), false, JSON.stringify(change));
   }
@@ -72,6 +76,7 @@ test("the saved body uses the control plane's field names", () => {
     display_border: false,
     prevent_idle_lock: false,
     allow_idle_override: true,
+    session_banner: false,
   });
 });
 

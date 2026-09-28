@@ -44,6 +44,8 @@ struct Company {
     prevent_idle_lock: bool,
     #[serde(deserialize_with = "deserialize_sql_bool")]
     allow_idle_override: bool,
+    #[serde(deserialize_with = "deserialize_sql_bool")]
+    session_banner: bool,
     slug: Option<String>,
     status: String,
 }
@@ -153,6 +155,7 @@ struct UpdateCompanySettingsRequest {
     display_border: Option<bool>,
     prevent_idle_lock: Option<bool>,
     allow_idle_override: Option<bool>,
+    session_banner: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,6 +216,7 @@ struct SessionInit<'a> {
     idle_policy: meshrmm_protocol_types::IdlePolicy,
     blackout_message: &'a str,
     display_border: bool,
+    session_banner: bool,
     viewer_name: &'a str,
     session_id: &'a str,
     device_id: &'a str,
@@ -579,12 +583,11 @@ mod company_policy_tests {
     #[test]
     fn sqlite_flags_are_exposed_as_json_booleans() {
         for enabled in [0, 1] {
-            let row = serde_json::json!({"id":"c","name":"Company","dashboard_idle_timeout_minutes":60,"blackout_message":"Maintenance","display_border":enabled,"prevent_idle_lock":1,"allow_idle_override":0,"slug":"company","status":"active"});
+            let row = serde_json::json!({"id":"c","name":"Company","dashboard_idle_timeout_minutes":60,"blackout_message":"Maintenance","display_border":enabled,"prevent_idle_lock":1,"allow_idle_override":0,"session_banner":enabled,"slug":"company","status":"active"});
             let company: Company = serde_json::from_value(row).unwrap();
-            assert_eq!(
-                serde_json::to_value(company).unwrap()["display_border"],
-                enabled == 1
-            );
+            let company = serde_json::to_value(company).unwrap();
+            assert_eq!(company["display_border"], enabled == 1);
+            assert_eq!(company["session_banner"], enabled == 1);
         }
     }
 }

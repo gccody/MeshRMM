@@ -1,5 +1,7 @@
 //! Desktop-owned session notice. The guard closes the UI on stop, cancellation,
 //! helper pipe EOF, or capture failure; no network credentials enter this window.
+//! When company policy hides the banner, its window stays hidden but still owns
+//! the chat popup, which opens for incoming viewer messages.
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use windows::Win32::Foundation::*;
@@ -18,13 +20,17 @@ pub struct SessionIndicator {
 }
 
 impl SessionIndicator {
-    pub fn show(name: &str, chat: meshrmm_chat::ChatSession) -> anyhow::Result<Self> {
+    pub fn show(
+        name: &str,
+        chat: meshrmm_chat::ChatSession,
+        visible: bool,
+    ) -> anyhow::Result<Self> {
         let name = meshrmm_protocol::session_viewer_name(name);
         let (tx, rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("session-indicator".into())
             .spawn(move || {
-                let result = unsafe { create_window(name, chat) };
+                let result = unsafe { create_window(name, chat, visible) };
                 match result {
                     Ok((hwnd, state)) => {
                         unsafe {
@@ -122,6 +128,7 @@ impl State {
 unsafe fn create_window(
     name: String,
     chat: meshrmm_chat::ChatSession,
+    visible: bool,
 ) -> windows::core::Result<(HWND, *mut State)> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
@@ -177,7 +184,9 @@ unsafe fn create_window(
             }
         }
         SetTimer(Some(hwnd), 1, 100, None);
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        if visible {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
         Ok((hwnd, state))
     }
 }
@@ -479,7 +488,7 @@ mod tests {
     fn incoming_viewer_message_opens_banner_chat_without_reopening_after_dismissal() {
         let chat = meshrmm_chat::ChatSession::with_peer("Viewer");
         chat.set_available(true);
-        let indicator = SessionIndicator::show("Chat check", chat.clone()).unwrap();
+        let indicator = SessionIndicator::show("Chat check", chat.clone(), true).unwrap();
         let hwnd = HWND(indicator.window as *mut _);
         unsafe {
             let mut initial = RECT::default();
@@ -548,13 +557,53 @@ mod tests {
     }
 
     #[test]
+    fn hidden_banner_stays_hidden_but_still_opens_incoming_chat() {
+        let chat = meshrmm_chat::ChatSession::with_peer("Viewer");
+        chat.set_available(true);
+        let indicator = SessionIndicator::show("Hidden check", chat.clone(), false).unwrap();
+        let hwnd = HWND(indicator.window as *mut _);
+        unsafe {
+            let tick = || {
+                assert_ne!(
+                    SendMessageTimeoutW(
+                        hwnd,
+                        WM_TIMER,
+                        WPARAM(1),
+                        LPARAM(0),
+                        SMTO_ABORTIFHUNG,
+                        1000,
+                        None
+                    )
+                    .0,
+                    0
+                );
+            };
+            tick();
+            assert!(!IsWindowVisible(hwnd).as_bool());
+            chat.receive("Message with the banner hidden".into());
+            tick();
+            assert!(chat.visible());
+            assert_eq!(chat.unread(), 0);
+            assert!(
+                !IsWindowVisible(hwnd).as_bool(),
+                "chat must not reveal a banner hidden by policy"
+            );
+        }
+        drop(indicator);
+        assert!(!chat.visible());
+    }
+
+    #[test]
     fn toggles_and_repaints_without_waiting_for_idle() {
         // This is a behavior test, not a 100 ms scheduling benchmark. Shared CI
         // runners can deschedule the GUI thread while repainting or destroying it.
         const UI_TIMEOUT: Duration = Duration::from_secs(2);
-        let indicator =
-            SessionIndicator::show("Banner latency check", meshrmm_chat::ChatSession::default())
-                .unwrap();
+        let indicator = SessionIndicator::show(
+            "Banner latency check",
+            meshrmm_chat::ChatSession::default(),
+            true,
+        )
+        .unwrap();
         let hwnd = HWND(indicator.window as *mut _);
         let mut initial = RECT::default();
         unsafe {

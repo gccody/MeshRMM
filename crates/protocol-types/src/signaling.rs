@@ -37,6 +37,10 @@ pub struct AgentSessionRequest {
     pub idle_policy: IdlePolicy,
     #[serde(default)]
     pub blackout_message: String,
+    /// Company policy for the Agent's on-screen connection banner. Only the
+    /// server sets it, so viewers cannot hide the banner.
+    #[serde(default = "default_enabled")]
+    pub session_banner: bool,
     #[serde(default)]
     pub viewer_name: String,
     pub session_id: RemoteSessionId,
@@ -169,7 +173,9 @@ mod tests {
         let mut request: AgentSessionRequest = serde_json::from_value(legacy).unwrap();
         assert!(!request.start_in_background);
         assert!(request.viewer_name.is_empty());
+        assert!(request.session_banner, "legacy servers keep the banner");
         request.viewer_name = "Zoë 王".into();
+        request.session_banner = false;
         let decoded: AgentSessionRequest =
             serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
         assert_eq!(decoded, request);

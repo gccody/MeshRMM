@@ -199,3 +199,36 @@ if a hidden blackout-message draft prevents saving.
 On macOS / Node 22.22.0, `npm run verify` passed TypeScript, ESLint, the production
 build, and all 10 tests (including tab semantics and initial selection in the
 settings route). `git diff --check` passed. This is a dashboard-only update.
+
+## Company-controlled session banner
+
+Company administrators choose whether the Agent shows the "connected remotely"
+banner at the top of its screen (**Settings → Remote sessions**; on by default).
+Only company administrators can save it; there is no per-session or viewer
+override. The server resolves the policy from the device's company and sends it
+only in the authenticated Agent session request. The viewer bootstrap does not
+carry it. Requests from servers without the field keep the banner. When the
+banner is off, its window stays hidden but still owns the chat popup, so viewer
+messages still open chat on the Agent. The end user cannot reopen a dismissed
+chat until the next message arrives. Deploy `0014_session_banner.sql` with the
+server/dashboard changes. `/healthz` now expects it.
+
+Validation on September 28, 2026:
+
+- macOS: protocol and server tests, server WASM check, SQL regressions, and
+  dashboard `npm run verify` (Node 26.5.0).
+- Windows `DESKTOP-85R6S28`: source hashes checked against the working tree;
+  `cargo fmt --check`, workspace Clippy (`-D warnings`) and tests, and release
+  build. Native tests cover the hidden banner opening incoming chat without
+  becoming visible. Wire tests cover the helper start flag.
+- Installed-service test: the local Agent was built with `install-agent-local.ps1`
+  (SHA-256 `79D81580B6BE3350AFA3CE70092B892C7D63E47CEA32BBB4DB3EC113ECD306CE`).
+  Live sessions ran against this change's Worker under Miniflare, fronted by a
+  temporary trusted `localhost` certificate. With `session_banner = 0`, the
+  per-user helper created the banner window hidden, and the screenshot showed no
+  banner while frames streamed. With `session_banner = 1`, the banner was visible
+  at the top centre. Afterward, the production configuration was restored, and
+  the test certificate and control plane were removed. The service reconnected
+  to production.
+- Not exercised: saving through the deployed dashboard with a real WorkOS admin
+  and non-admin; console-mode (non-service) Agent sessions.

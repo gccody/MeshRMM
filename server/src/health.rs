@@ -6,7 +6,7 @@ use crate::usage::MeteredStatement;
 
 /// The newest D1 migration the Worker's queries rely on. A test keeps it in
 /// step with `server/migrations`.
-pub(crate) const SCHEMA_MIGRATION: &str = "0013_usage_metering.sql";
+pub(crate) const SCHEMA_MIGRATION: &str = "0014_session_banner.sql";
 
 #[derive(Debug, PartialEq, Serialize)]
 struct Health {
@@ -87,7 +87,7 @@ mod tests {
             (health.status, code)
         };
         assert_eq!(status(Ok(Some(SCHEMA_MIGRATION.into()))), ("ok", 200));
-        assert_eq!(status(Ok(Some("0014_next.sql".into()))), ("ok", 200));
+        assert_eq!(status(Ok(Some("0015_next.sql".into()))), ("ok", 200));
         assert_eq!(
             status(Ok(Some("0011_presence_catalog_outbox.sql".into()))),
             ("schema_behind", 503)

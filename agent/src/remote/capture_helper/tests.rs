@@ -50,7 +50,8 @@ fn rdp_catalog_preserves_all_monitors_and_maps_the_active_monitor() {
         height: 1080,
         primary: true,
     };
-    let mut streamer = DesktopCaptureStreamer::new(String::new(), String::new(), PathBuf::new());
+    let mut streamer =
+        DesktopCaptureStreamer::new(String::new(), String::new(), true, PathBuf::new());
     streamer.console_displays = vec![console.clone()];
     streamer.selected_session = Some(3);
     streamer.session_displays = vec![(
@@ -125,7 +126,8 @@ fn background_start_preserves_all_console_displays_when_switching() {
             primary: id == 1,
         })
         .collect();
-    let mut streamer = DesktopCaptureStreamer::new(String::new(), String::new(), PathBuf::new());
+    let mut streamer =
+        DesktopCaptureStreamer::new(String::new(), String::new(), true, PathBuf::new());
     streamer.console_displays = console.clone();
     let format = ActiveFormat {
         width: 1920,
@@ -410,6 +412,11 @@ fn command_protocol_round_trips_desktop_input() {
         ParentCommand::StartClipboard,
         ParentCommand::StartChatHelper {
             viewer_name: "Zoë 王".into(),
+            show_banner: false,
+        },
+        ParentCommand::StartChatHelper {
+            viewer_name: "Zoë 王".into(),
+            show_banner: true,
         },
         ParentCommand::RequestKeyframe,
         ParentCommand::SetBitrate(4_000_000),
@@ -434,9 +441,20 @@ fn command_protocol_round_trips_desktop_input() {
         let decoded = read_command(bytes.as_slice()).unwrap();
         assert_eq!(command_name(&decoded), command_name(&command));
         if let ParentCommand::Start { viewer_name, .. }
-        | ParentCommand::StartInput { viewer_name, .. } = decoded
+        | ParentCommand::StartInput { viewer_name, .. }
+        | ParentCommand::StartChatHelper { viewer_name, .. } = &decoded
         {
             assert_eq!(viewer_name, "Zoë 王");
+        }
+        if let (
+            ParentCommand::StartChatHelper { show_banner, .. },
+            ParentCommand::StartChatHelper {
+                show_banner: expected,
+                ..
+            },
+        ) = (&decoded, &command)
+        {
+            assert_eq!(show_banner, expected);
         }
     }
 }

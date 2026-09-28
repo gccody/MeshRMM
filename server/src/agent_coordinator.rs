@@ -934,6 +934,7 @@ mod lease_tests {
             start_in_background: false,
             idle_policy: Default::default(),
             blackout_message: String::new(),
+            session_banner: true,
             viewer_name: "Ada Lovelace".into(),
             session_id: meshrmm_protocol_types::RemoteSessionId::new("one"),
             signaling_token: "token".into(),

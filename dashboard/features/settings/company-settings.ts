@@ -19,6 +19,7 @@ export type CompanySettingsDraft = {
   displayBorder: boolean;
   preventIdleLock: boolean;
   allowIdleOverride: boolean;
+  sessionBanner: boolean;
 };
 
 // The saved values, or the defaults a company starts with.
@@ -29,6 +30,7 @@ export function draftFromCompany(company: Company | null | undefined): CompanySe
     displayBorder: company?.display_border ?? true,
     preventIdleLock: company?.prevent_idle_lock ?? true,
     allowIdleOverride: company?.allow_idle_override ?? true,
+    sessionBanner: company?.session_banner ?? true,
   };
 }
 
@@ -39,7 +41,8 @@ export function draftMatchesCompany(draft: CompanySettingsDraft, company: Compan
     draft.blackoutMessage === saved.blackoutMessage &&
     draft.displayBorder === saved.displayBorder &&
     draft.preventIdleLock === saved.preventIdleLock &&
-    draft.allowIdleOverride === saved.allowIdleOverride
+    draft.allowIdleOverride === saved.allowIdleOverride &&
+    draft.sessionBanner === saved.sessionBanner
   );
 }
 
@@ -56,6 +59,7 @@ export function companySettingsBody(draft: CompanySettingsDraft) {
     display_border: draft.displayBorder,
     prevent_idle_lock: draft.preventIdleLock,
     allow_idle_override: draft.allowIdleOverride,
+    session_banner: draft.sessionBanner,
   };
 }
 

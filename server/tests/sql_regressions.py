@@ -175,11 +175,11 @@ class EnrollmentTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT blackout_message FROM companies WHERE id='co'").fetchone(), (default,))
         update = sql("server/src/routes/account.rs", "UPDATE companies SET dashboard_idle_timeout_minutes")
         self.db.execute("INSERT INTO companies (id,name,created_at,slug,status) VALUES ('other','Other',0,'other','active')")
-        self.db.execute(update, (60, "Maintenance by {user_name}\nPlease wait", "co", 0, 0, 0))
-        self.db.execute(update, (120, None, "co", None, None, None))
-        self.assertEqual(self.db.execute("SELECT blackout_message FROM companies WHERE id='other'").fetchone(), (default,))
+        self.db.execute(update, (60, "Maintenance by {user_name}\nPlease wait", "co", 0, 0, 0, 0))
+        self.db.execute(update, (120, None, "co", None, None, None, None))
+        self.assertEqual(self.db.execute("SELECT blackout_message, session_banner FROM companies WHERE id='other'").fetchone(), (default, 1))
         policy = sql("server/src/routes/handoffs.rs", "SELECT c.id AS company_id, c.blackout_message")
-        self.assertEqual(self.db.execute(policy, ("device",)).fetchone(), ("co", "Maintenance by {user_name}\nPlease wait", 0, 0, 0))
+        self.assertEqual(self.db.execute(policy, ("device",)).fetchone(), ("co", "Maintenance by {user_name}\nPlease wait", 0, 0, 0, 0))
         self.db.execute("UPDATE agents SET deletion_requested_at=1")
         self.assertIsNone(self.db.execute(policy, ("device",)).fetchone())
 
@@ -382,12 +382,12 @@ class UsageMeteringTests(unittest.TestCase):
     def test_agents_enrolled_before_metering_are_backfilled(self):
         db = sqlite3.connect(":memory:", isolation_level=None)
         migrations = sorted((ROOT / "server/migrations").glob("*.sql"))
-        for migration in migrations[:-1]:
+        metering = next(migration for migration in migrations if migration.name == "0013_usage_metering.sql")
+        for migration in migrations[:migrations.index(metering)]:
             db.executescript(migration.read_text())
         db.execute("INSERT INTO companies (id,name,created_at) VALUES ('a','A',0)")
         db.execute("INSERT INTO agents (id,company_id,name,auth_token_hash,created_by_user_id,created_at,updated_at) VALUES ('device','a','PC',?,'user',5,5)", ("a" * 64,))
-        self.assertEqual(migrations[-1].name, "0013_usage_metering.sql")
-        db.executescript(migrations[-1].read_text())
+        db.executescript(metering.read_text())
         self.assertEqual(db.execute("SELECT object_name, company_id, kind FROM usage_object_owners").fetchall(), [("device", "a", "agent")])
 
     def test_active_users_count_once_per_company_and_month(self):
