@@ -1,11 +1,60 @@
-//! Passive notification-area UI. Runs as the signed-in user, without agent config.
+//! Notification-area UI. Runs as the signed-in user, without agent config.
+//! During a remote session its icon opens the session chat, which the session
+//! notice window owns, possibly in a LocalSystem helper on the same desktop.
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::w;
+use windows::core::{PCWSTR, w};
 
 const ICON: &[u8] = include_bytes!("../assets/tray.ico");
+const ICON_ID: u32 = 1;
+const ICON_CALLBACK: u32 = WM_APP + 1;
+pub(crate) const TRAY_CLASS: PCWSTR = w!("MeshRMMAgentTray");
+pub(crate) const SESSION_CLASS: PCWSTR = w!("MeshRMMSessionIndicator");
+/// Tray to session command: toggle the chat popup. `LPARAM` carries the
+/// click point as two signed 16-bit screen coordinates.
+pub(crate) const CHAT_TOGGLE: usize = 1;
+/// Tray to session command: report chat availability again.
+pub(crate) const CHAT_STATUS_REQUEST: usize = 2;
+static CHAT_AVAILABLE: AtomicBool = AtomicBool::new(false);
+static LAST_KEY_SELECT: AtomicI32 = AtomicI32::new(0);
+
+/// Sent by the tray to session windows; `WPARAM` is `CHAT_TOGGLE` or
+/// `CHAT_STATUS_REQUEST`.
+pub(crate) fn chat_command_message() -> u32 {
+    unsafe { RegisterWindowMessageW(w!("MeshRMMSessionChatCommand")) }
+}
+
+/// Sent by a session window to the tray; `WPARAM` is 1 while chat is available.
+pub(crate) fn chat_status_message() -> u32 {
+    unsafe { RegisterWindowMessageW(w!("MeshRMMSessionChatStatus")) }
+}
+
+/// Top-level windows of `class` on the calling thread's desktop.
+pub(crate) fn windows_of_class(class: PCWSTR) -> Vec<HWND> {
+    let mut windows = Vec::new();
+    let mut after = None;
+    while let Ok(hwnd) = unsafe { FindWindowExW(None, after, class, PCWSTR::null()) } {
+        windows.push(hwnd);
+        after = Some(hwnd);
+    }
+    windows
+}
+
+/// Where the Agent icon is, for popups opened without a click.
+pub(crate) fn icon_rect() -> Option<RECT> {
+    windows_of_class(TRAY_CLASS).into_iter().find_map(|hwnd| {
+        let identifier = NOTIFYICONIDENTIFIER {
+            cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
+            hWnd: hwnd,
+            uID: ICON_ID,
+            ..Default::default()
+        };
+        unsafe { Shell_NotifyIconGetRect(&identifier) }.ok()
+    })
+}
 
 pub fn run() -> anyhow::Result<()> {
     use windows_service::service::{ServiceAccess, ServiceState};
@@ -33,7 +82,7 @@ pub fn run() -> anyhow::Result<()> {
     });
     unsafe {
         let instance = GetModuleHandleW(None)?;
-        let class = w!("MeshRMMAgentTray");
+        let class = TRAY_CLASS;
         let definition = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance.into(),
@@ -64,6 +113,8 @@ pub fn run() -> anyhow::Result<()> {
         // Retry while Explorer is starting, and recover after Explorer restarts.
         SetTimer(Some(hwnd), 1, 2_000, None);
         add_icon(hwnd, icon);
+        // Recover the chat state of a session that outlived a previous tray.
+        post_to_sessions(CHAT_STATUS_REQUEST, LPARAM(0));
         let window = hwnd.0 as usize;
         std::thread::spawn(move || {
             // SCM handles are thread-bound; open and query on the monitor thread.
@@ -106,19 +157,31 @@ fn load_icon() -> anyhow::Result<HICON> {
     Ok(unsafe { CreateIconFromResourceEx(data, true, 0x0003_0000, 0, 0, LR_DEFAULTCOLOR) }?)
 }
 
+fn tooltip(chat_available: bool) -> &'static str {
+    if chat_available {
+        "MeshRMM Agent — click to chat with the remote viewer"
+    } else {
+        "MeshRMM Agent is running"
+    }
+}
+
 fn notification(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
     let mut data = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
-        uID: 1,
-        uFlags: NIF_ICON | NIF_TIP,
+        uID: ICON_ID,
+        // Version 4 hides the standard tooltip unless NIF_SHOWTIP asks for it.
+        uFlags: NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP,
+        uCallbackMessage: ICON_CALLBACK,
         hIcon: icon,
         ..Default::default()
     };
+    data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
     for (slot, character) in data
         .szTip
         .iter_mut()
-        .zip("MeshRMM Agent is running".encode_utf16())
+        .take(127)
+        .zip(tooltip(CHAT_AVAILABLE.load(Ordering::Relaxed)).encode_utf16())
     {
         *slot = character;
     }
@@ -126,8 +189,35 @@ fn notification(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
 }
 
 unsafe fn add_icon(hwnd: HWND, icon: HICON) {
-    if unsafe { Shell_NotifyIconW(NIM_ADD, &notification(hwnd, icon)) }.as_bool() {
+    let data = notification(hwnd, icon);
+    if unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
+        // Version 4 reports keyboard selection and the icon's anchor point.
+        let _ = unsafe { Shell_NotifyIconW(NIM_SETVERSION, &data) };
         let _ = unsafe { KillTimer(Some(hwnd), 1) };
+    }
+}
+
+fn post_to_sessions(command: usize, lp: LPARAM) -> bool {
+    let message = chat_command_message();
+    let sessions = windows_of_class(SESSION_CLASS);
+    for &session in &sessions {
+        unsafe {
+            let mut process = 0;
+            if command == CHAT_TOGGLE && GetWindowThreadProcessId(session, Some(&mut process)) != 0
+            {
+                // The shell lets the icon owner take the foreground after a
+                // click; pass that on so the user can type immediately.
+                let _ = AllowSetForegroundWindow(process);
+            }
+            let _ = PostMessageW(Some(session), message, WPARAM(command), lp);
+        }
+    }
+    !sessions.is_empty()
+}
+
+unsafe fn set_chat_available(hwnd: HWND, icon: HICON, available: bool) {
+    if CHAT_AVAILABLE.swap(available, Ordering::Relaxed) != available && !icon.is_invalid() {
+        let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &notification(hwnd, icon)) };
     }
 }
 
@@ -139,6 +229,29 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             if !icon.is_invalid() {
                 SetTimer(Some(hwnd), 1, 2_000, None);
                 add_icon(hwnd, icon);
+            }
+            return LRESULT(0);
+        }
+        let chat_status = chat_status_message();
+        if chat_status != 0 && message == chat_status {
+            set_chat_available(hwnd, icon, wp.0 == 1);
+            return LRESULT(0);
+        }
+        if message == ICON_CALLBACK {
+            // Version 4: the event is in the low word, the anchor point in WPARAM.
+            let event = lp.0 as u32 & 0xffff;
+            let key = event == NIN_SELECT | NINF_KEY;
+            // Enter reports the keyboard selection twice; one press is one toggle.
+            let repeated = key && {
+                let time = GetMessageTime();
+                time.wrapping_sub(LAST_KEY_SELECT.swap(time, Ordering::Relaxed)) < 200
+            };
+            if (event == NIN_SELECT || key)
+                && !repeated
+                && !post_to_sessions(CHAT_TOGGLE, LPARAM(wp.0 as u32 as isize))
+            {
+                // A session helper that exited abruptly never reported its end.
+                set_chat_available(hwnd, icon, false);
             }
             return LRESULT(0);
         }

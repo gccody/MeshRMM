@@ -209,8 +209,8 @@ override. The server resolves the policy from the device's company and sends it
 only in the authenticated Agent session request. The viewer bootstrap does not
 carry it. Requests from servers without the field keep the banner. When the
 banner is off, its window stays hidden but still owns the chat popup, so viewer
-messages still open chat on the Agent. The end user cannot reopen a dismissed
-chat until the next message arrives. Deploy `0014_session_banner.sql` with the
+messages still open chat on the Agent, and the notification-area icon reopens
+it. Deploy `0014_session_banner.sql` with the
 server/dashboard changes. `/healthz` now expects it.
 
 Validation on September 28, 2026:
@@ -232,3 +232,38 @@ Validation on September 28, 2026:
   to production.
 - Not exercised: saving through the deployed dashboard with a real WorkOS admin
   and non-admin; console-mode (non-service) Agent sessions.
+
+## Agent chat from the notification-area icon
+
+The Agent's chat now opens from its existing notification-area (tray) icon
+instead of a button on the session banner. The tray helper runs as the signed-in
+user. It forwards icon clicks and keyboard selection to the session window,
+which may belong to the LocalSystem chat helper and accepts only that message
+from lower integrity. The session window reports chat availability back, and
+the tooltip changes to "click to chat with the remote viewer". The popup opens
+beside the icon, above or below the taskbar. When the icon is in the
+hidden-icons flyout, incoming messages open it at the flyout button. A click that
+dismisses the popup by activating the taskbar does not reopen it. The banner no
+longer has a chat button, and its size no longer depends on chat state.
+Console-mode Agents have no tray process, so there chat opens only for incoming
+messages.
+
+Validation on September 28, 2026 (Windows `DESKTOP-85R6S28`):
+
+- Source hashes matched the working tree (456 files). `cargo fmt --check`,
+  workspace Clippy (`-D warnings`) and tests pass. New native tests cover icon
+  toggling, placement beside the click, and ignoring the dismissing click.
+- Installed with `install-agent-local.ps1` (SHA-256
+  `A84E207F58473093D0A642E4E277944827A03F5CDAE8F3393198BA0A0EBE8D07`). The
+  service reconnected and restarted its tray helper.
+- The installed chat helper ran as LocalSystem in the console session, as the
+  service launches it, and used its real pipe protocol. It was driven by
+  real mouse clicks on the Agent's tray icon, both in the hidden-icons flyout and
+  pinned to the taskbar, with the banner shown and hidden. The icon opened, closed
+  and reopened chat with focus, right-aligned to the icon above the taskbar.
+  Incoming messages opened it at the icon. Escape closed it. The tooltip
+  reverted after the helper stopped.
+- Not exercised: a full viewer↔Agent session. On this endpoint the viewer found
+  no Media Foundation H.264 hardware decoder MFT and ended each session. This is
+  unrelated to this change; the NVIDIA driver registers only an MJPEG decoder
+  MFT.

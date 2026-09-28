@@ -1,7 +1,9 @@
 //! Desktop-owned session notice. The guard closes the UI on stop, cancellation,
 //! helper pipe EOF, or capture failure; no network credentials enter this window.
-//! When company policy hides the banner, its window stays hidden but still owns
-//! the chat popup, which opens for incoming viewer messages.
+//! The window owns the chat popup but has no chat button: the Agent's
+//! notification-area icon toggles the popup, which also opens for incoming
+//! viewer messages. When company policy hides the banner, its window stays
+//! hidden and the chat still works.
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use windows::Win32::Foundation::*;
@@ -50,6 +52,7 @@ impl SessionIndicator {
                                 }
                             }
                             (*state).popup = None;
+                            report_chat(false);
                             let _ = DestroyWindow(hwnd);
                             drop(Box::from_raw(state));
                         }
@@ -96,7 +99,7 @@ struct State {
     drag: Option<Drag>,
     chat: meshrmm_chat::ChatSession,
     popup: Option<meshrmm_chat::ChatPopup>,
-    chat_status: (bool, usize),
+    chat_available: bool,
 }
 
 struct Drag {
@@ -165,7 +168,7 @@ unsafe fn create_window(
             drag: None,
             chat,
             popup: None,
-            chat_status: (false, 0),
+            chat_available: false,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
         refresh_layout(hwnd);
@@ -182,6 +185,15 @@ unsafe fn create_window(
                 tracing::error!(%error, "could not create banner chat popup");
                 return Err(windows::core::Error::from_hresult(E_FAIL));
             }
+        }
+        // The tray runs as the signed-in user; this window may run as LocalSystem.
+        if let Err(error) = ChangeWindowMessageFilterEx(
+            hwnd,
+            crate::tray::chat_command_message(),
+            MSGFLT_ALLOW,
+            None,
+        ) {
+            tracing::warn!(%error, "notification-area icon cannot open session chat");
         }
         SetTimer(Some(hwnd), 1, 100, None);
         if visible {
@@ -225,14 +237,13 @@ unsafe fn position(hwnd: HWND, collapsed: bool) -> windows::core::Result<()> {
     unsafe {
         let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const State;
         let work = (*state).work;
-        let chat_available = (*state).chat.available();
-        let desired_width = (if collapsed {
+        let desired_width = if collapsed {
             32
         } else {
             (*state).expanded_width
-        }) + if chat_available { 32 } else { 0 };
+        };
         let width = desired_width.min((work.right - work.left).max(1));
-        let height = if collapsed && !chat_available { 16 } else { 24 };
+        let height = if collapsed { 16 } else { 24 };
         // Submit pixels, size, and location as one layered-window update. A
         // separate SetWindowPos/WM_PAINT pair lets capture see resized old pixels.
         let screen = GetDC(None);
@@ -261,7 +272,7 @@ unsafe fn position(hwnd: HWND, collapsed: bool) -> windows::core::Result<()> {
         let mut text: Vec<u16> = (&*state).label().encode_utf16().collect();
         let padding = if collapsed { 0 } else { 8 };
         rect.left += padding;
-        rect.right -= padding + if chat_available { 32 } else { 0 };
+        rect.right -= padding;
         DrawTextW(
             dc,
             &mut text,
@@ -269,29 +280,6 @@ unsafe fn position(hwnd: HWND, collapsed: bool) -> windows::core::Result<()> {
             DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
         SelectObject(dc, old_font);
-        if chat_available {
-            // A drawn outline and circle avoid missing emoji fonts and clipping.
-            let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00ffffff));
-            let old_pen = SelectObject(dc, pen.into());
-            let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-            let x = width - 25;
-            let _ = RoundRect(dc, x, 6, x + 17, 18, 4, 4);
-            let _ = MoveToEx(dc, x + 4, 17, None);
-            let _ = LineTo(dc, x + 4, 21);
-            let _ = LineTo(dc, x + 8, 17);
-            SelectObject(dc, old_pen);
-            SelectObject(dc, old_brush);
-            let _ = DeleteObject(pen.into());
-            if (*state).chat.unread() > 0 {
-                let brush = CreateSolidBrush(COLORREF(0x004545ff));
-                let old_brush = SelectObject(dc, brush.into());
-                let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
-                let _ = Ellipse(dc, width - 12, 1, width - 3, 10);
-                SelectObject(dc, old_pen);
-                SelectObject(dc, old_brush);
-                let _ = DeleteObject(brush.into());
-            }
-        }
         let destination = POINT {
             x: (&*state).left(width),
             y: work.top,
@@ -329,6 +317,53 @@ unsafe fn position(hwnd: HWND, collapsed: bool) -> windows::core::Result<()> {
     }
 }
 
+/// Tells the tray whether its icon can open chat, so its tooltip says so.
+fn report_chat(available: bool) {
+    let message = crate::tray::chat_status_message();
+    for tray in crate::tray::windows_of_class(crate::tray::TRAY_CLASS) {
+        unsafe {
+            let _ = PostMessageW(Some(tray), message, WPARAM(available as usize), LPARAM(0));
+        }
+    }
+}
+
+/// The Agent icon, or the notification-area corner of the primary work area
+/// when the icon is unavailable, e.g. on the secure desktop.
+unsafe fn icon_anchor(state: *const State) -> RECT {
+    crate::tray::icon_rect().unwrap_or_else(|| {
+        let work = unsafe { (*state).work };
+        RECT {
+            left: work.right - 1,
+            top: work.bottom - 1,
+            right: work.right,
+            bottom: work.bottom,
+        }
+    })
+}
+
+/// A click on the Agent icon. Its screen point arrives as two signed 16-bit
+/// coordinates.
+unsafe fn toggle_from_icon(state: *mut State, lp: LPARAM) {
+    unsafe {
+        let Some(popup) = &(*state).popup else {
+            return;
+        };
+        // Clicking the icon activates the taskbar, which already hid the popup.
+        if !(*state).chat.visible() && popup.recently_dismissed() {
+            return;
+        }
+        let x = lp.0 as u16 as i16 as i32;
+        let y = (lp.0 >> 16) as u16 as i16 as i32;
+        popup.set_screen_anchor(RECT {
+            left: x,
+            top: y,
+            right: x + 1,
+            bottom: y + 1,
+        });
+        popup.toggle();
+    }
+}
+
 // Use signed client coordinates: captured mouse moves can lie outside the tab.
 unsafe fn pointer_x(hwnd: HWND, lp: LPARAM) -> i32 {
     unsafe {
@@ -362,6 +397,15 @@ unsafe fn drag_to(hwnd: HWND, state: *mut State, x: i32) {
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
+        let chat_command = crate::tray::chat_command_message();
+        if chat_command != 0 && msg == chat_command && !state.is_null() {
+            match wp.0 {
+                crate::tray::CHAT_TOGGLE => toggle_from_icon(state, lp),
+                crate::tray::CHAT_STATUS_REQUEST => report_chat((*state).chat_available),
+                _ => {}
+            }
+            return LRESULT(0);
+        }
         match msg {
             WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
             WM_CLOSE => return LRESULT(0),
@@ -372,27 +416,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                         && !(*state).chat.visible()
                         && (*state).chat.unread() > 0
                     {
+                        popup.set_screen_anchor(icon_anchor(state));
                         popup.toggle();
                     }
                 }
-                let status = ((*state).chat.available(), (*state).chat.unread());
-                if status != (*state).chat_status {
-                    (*state).chat_status = status;
-                    let _ = position(hwnd, (*state).collapsed);
+                let available = (*state).chat.available();
+                if available != (*state).chat_available {
+                    (*state).chat_available = available;
+                    report_chat(available);
                 }
                 return LRESULT(0);
             }
             WM_LBUTTONDOWN if !state.is_null() => {
-                let mut client = RECT::default();
-                let _ = GetClientRect(hwnd, &mut client);
-                let x = lp.0 as u16 as i16 as i32;
-                if (*state).chat.available() && x >= client.right - 32 {
-                    if let Some(popup) = &(*state).popup {
-                        popup.toggle();
-                    }
-                    let _ = position(hwnd, (*state).collapsed);
-                    return LRESULT(0);
-                }
                 if let Some(popup) = &(*state).popup {
                     popup.close();
                 }
@@ -472,7 +507,7 @@ mod tests {
             drag: None,
             chat: meshrmm_chat::ChatSession::default(),
             popup: None,
-            chat_status: (false, 0),
+            chat_available: false,
         };
         for width in [32, 320] {
             state.center_x = Some(-3000);
@@ -484,50 +519,60 @@ mod tests {
         }
     }
 
+    fn send(hwnd: HWND, message: u32, wp: usize, lp: isize) {
+        let result = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                message,
+                WPARAM(wp),
+                LPARAM(lp),
+                SMTO_ABORTIFHUNG,
+                1000,
+                None,
+            )
+        };
+        assert_ne!(result.0, 0, "indicator UI did not answer");
+    }
+
+    fn icon_click(hwnd: HWND, x: i32, y: i32) {
+        send(
+            hwnd,
+            crate::tray::chat_command_message(),
+            crate::tray::CHAT_TOGGLE,
+            (((y as u16 as u32) << 16) | x as u16 as u32) as isize,
+        );
+    }
+
+    fn chat_popup(owner: HWND) -> HWND {
+        let mut after = None;
+        while let Ok(popup) = unsafe {
+            FindWindowExW(
+                None,
+                after,
+                w!("MeshRMMChat"),
+                windows::core::PCWSTR::null(),
+            )
+        } {
+            if unsafe { GetWindow(popup, GW_OWNER) }.ok() == Some(owner) {
+                return popup;
+            }
+            after = Some(popup);
+        }
+        panic!("indicator has no chat popup");
+    }
+
     #[test]
-    fn incoming_viewer_message_opens_banner_chat_without_reopening_after_dismissal() {
+    fn incoming_viewer_message_opens_chat_without_reopening_after_dismissal() {
         let chat = meshrmm_chat::ChatSession::with_peer("Viewer");
         chat.set_available(true);
         let indicator = SessionIndicator::show("Chat check", chat.clone(), true).unwrap();
         let hwnd = HWND(indicator.window as *mut _);
+        let tick = || send(hwnd, WM_TIMER, 1, 0);
         unsafe {
             let mut initial = RECT::default();
             GetWindowRect(hwnd, &mut initial).unwrap();
-            let tick = || {
-                assert_ne!(
-                    SendMessageTimeoutW(
-                        hwnd,
-                        WM_TIMER,
-                        WPARAM(1),
-                        LPARAM(0),
-                        SMTO_ABORTIFHUNG,
-                        1000,
-                        None
-                    )
-                    .0,
-                    0
-                );
-            };
             tick();
             assert!(!chat.visible());
-            let x = initial.right - initial.left - 16;
-            let click = || {
-                for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
-                    assert_ne!(
-                        SendMessageTimeoutW(
-                            hwnd,
-                            message,
-                            WPARAM(0),
-                            LPARAM(((12 << 16) | x) as isize),
-                            SMTO_ABORTIFHUNG,
-                            1000,
-                            None
-                        )
-                        .0,
-                        0
-                    );
-                }
-            };
             chat.receive("Message while closed".into());
             tick();
             assert!(chat.visible());
@@ -536,7 +581,7 @@ mod tests {
             tick();
             assert!(chat.visible());
             assert_eq!(chat.unread(), 0);
-            click();
+            icon_click(hwnd, initial.left, initial.bottom);
             assert!(!chat.visible());
             tick();
             assert!(
@@ -547,10 +592,61 @@ mod tests {
             assert_eq!(chat.unread(), 1);
             let mut after = RECT::default();
             GetWindowRect(hwnd, &mut after).unwrap();
-            assert_eq!(initial, after);
+            assert_eq!(initial, after, "chat must not change the banner");
             tick();
             assert!(chat.visible());
             assert_eq!(chat.unread(), 0);
+        }
+        drop(indicator);
+        assert!(!chat.visible());
+    }
+
+    #[test]
+    fn notification_icon_toggles_chat_beside_the_click() {
+        let chat = meshrmm_chat::ChatSession::with_peer("Viewer");
+        let indicator = SessionIndicator::show("Icon check", chat.clone(), true).unwrap();
+        let hwnd = HWND(indicator.window as *mut _);
+        let popup = chat_popup(hwnd);
+        unsafe {
+            let mut work = RECT::default();
+            SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some((&mut work as *mut RECT).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+            .unwrap();
+            let x = work.right - 40;
+            let y = work.bottom + 10;
+            icon_click(hwnd, x, y);
+            assert!(!chat.visible(), "no chat before the viewer enables it");
+            chat.set_available(true);
+            icon_click(hwnd, x, y);
+            assert!(chat.visible());
+            let mut placed = RECT::default();
+            GetWindowRect(popup, &mut placed).unwrap();
+            assert_eq!(placed.right, x + 1, "popup must align with the icon");
+            assert_eq!(
+                placed.bottom, work.bottom,
+                "popup must sit above the taskbar"
+            );
+            icon_click(hwnd, x, y);
+            assert!(!chat.visible());
+            icon_click(hwnd, x, y);
+            assert!(
+                chat.visible(),
+                "closing from the icon must not block reopening"
+            );
+            // The icon click activates the taskbar first, which hides the popup.
+            send(popup, WM_ACTIVATE, WA_INACTIVE as usize, 0);
+            assert!(!chat.visible());
+            icon_click(hwnd, x, y);
+            assert!(!chat.visible(), "the dismissing click must not reopen chat");
+            thread::sleep(Duration::from_millis(
+                u64::from(windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime()) + 50,
+            ));
+            icon_click(hwnd, x, y);
+            assert!(chat.visible());
         }
         drop(indicator);
         assert!(!chat.visible());
