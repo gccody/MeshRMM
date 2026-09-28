@@ -5,7 +5,7 @@ use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use ::windows::Win32::System::Threading::GetCurrentThreadId;
 use ::windows::Win32::UI::Controls::{EM_SCROLLCARET, EM_SETLIMITTEXT, EM_SETSEL};
 use ::windows::Win32::UI::HiDpi::GetDpiForWindow;
-use ::windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use ::windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, SetFocus};
 use ::windows::Win32::UI::WindowsAndMessaging::*;
 use ::windows::core::{PCWSTR, w};
 use std::sync::mpsc;
@@ -81,6 +81,8 @@ struct Ui {
     revision: u64,
     popup: bool,
     banner: bool,
+    /// When a banner popup last lost activation while shown.
+    dismissed: Option<std::time::Instant>,
 }
 /// With a parent, creates an owned popup; `banner` keeps it above all windows.
 unsafe fn create(
@@ -192,6 +194,7 @@ unsafe fn create(
             revision: u64::MAX,
             popup: parent.is_some(),
             banner,
+            dismissed: None,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, data as isize);
         SetTimer(Some(hwnd), 1, 200, None);
@@ -208,7 +211,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             let ui = &mut *ptr;
             match msg {
                 WM_ACTIVATE if ui.banner && wp.0 & 0xffff == WA_INACTIVE as usize => {
-                    ui.state.lock().unwrap_or_else(|e| e.into_inner()).visible = false;
+                    let mut state = ui.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if state.visible {
+                        ui.dismissed = Some(std::time::Instant::now());
+                    }
+                    state.visible = false;
+                    drop(state);
                     let _ = ShowWindow(hwnd, SW_HIDE);
                     return LRESULT(0);
                 }
@@ -328,8 +336,10 @@ pub struct Popup {
     parent: HWND,
     /// The chat button, in the parent's client coordinates. The viewer's
     /// toolbar draws the button, its unread count and its tooltip. A banner
-    /// popup has none and sits under its owner.
+    /// popup has none and sits under its owner unless given a screen anchor.
     anchor: std::cell::Cell<Option<RECT>>,
+    /// A notification-area icon or click point, in screen coordinates.
+    screen_anchor: std::cell::Cell<Option<RECT>>,
     session: ChatSession,
     banner: bool,
 }
@@ -341,7 +351,9 @@ impl Popup {
     pub unsafe fn new(parent: HWND, session: ChatSession) -> anyhow::Result<Self> {
         unsafe { Self::create_popup(parent, session, false) }
     }
-    /// An attached, titleless popup for a small agent banner. No taskbar entry.
+    /// An attached, titleless popup for the agent's session notice. It opens
+    /// from the notification-area icon rather than from the banner itself.
+    /// No taskbar entry.
     ///
     /// # Safety
     /// `owner` must be a live HWND on the calling thread.
@@ -369,6 +381,7 @@ impl Popup {
             data,
             parent,
             anchor: std::cell::Cell::new(None),
+            screen_anchor: std::cell::Cell::new(None),
             session,
             banner,
         })
@@ -380,8 +393,26 @@ impl Popup {
             self.layout();
         }
     }
+    /// Places the popup beside `anchor`, in screen coordinates. It stays on
+    /// the anchor's monitor, above or below a taskbar at either screen edge.
+    pub fn set_screen_anchor(&self, anchor: RECT) {
+        self.screen_anchor.set(Some(anchor));
+        if self.session.visible() {
+            self.layout();
+        }
+    }
+    /// Whether the popup was just hidden because another window, such as the
+    /// taskbar whose icon toggles it, took activation. That click must not
+    /// reopen it.
+    pub fn recently_dismissed(&self) -> bool {
+        let limit = std::time::Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }));
+        unsafe { (*self.data).dismissed }.is_some_and(|dismissed| dismissed.elapsed() < limit)
+    }
     /// The anchor in screen coordinates.
     fn anchor_on_screen(&self) -> RECT {
+        if let Some(anchor) = self.screen_anchor.get() {
+            return anchor;
+        }
         let mut anchor = RECT::default();
         unsafe {
             match self.anchor.get() {
@@ -451,10 +482,17 @@ impl Popup {
     pub fn layout(&self) {
         unsafe {
             let anchor = self.anchor_on_screen();
-            let monitor = ::windows::Win32::Graphics::Gdi::MonitorFromWindow(
-                self.parent,
-                ::windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
-            );
+            let monitor = if self.screen_anchor.get().is_some() {
+                ::windows::Win32::Graphics::Gdi::MonitorFromRect(
+                    &anchor,
+                    ::windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+                )
+            } else {
+                ::windows::Win32::Graphics::Gdi::MonitorFromWindow(
+                    self.parent,
+                    ::windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+                )
+            };
             let mut info = ::windows::Win32::Graphics::Gdi::MONITORINFO {
                 cbSize: std::mem::size_of::<::windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,
                 ..Default::default()

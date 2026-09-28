@@ -438,8 +438,10 @@ privileged capture/input helper, so pickers and shell actions use that user’s
 profile. Both endpoints must run a file-transfer-capable build.
 
 When both computers run a chat-capable version, click the **chat bubble** in the
-viewer's top bar or the Windows agent's connection banner to open an attached
-chat popup. The banner keeps its chat button when collapsed. Type a message and
+viewer's top bar to open an attached chat popup. On the Windows agent, click the
+MeshRMM Agent icon in the taskbar's notification area (or select it with the
+keyboard); its tooltip says when chat is available. The agent popup opens beside
+the icon, whether or not the connection banner is shown. Type a message and
 choose **Send** or press Enter. Incoming viewer messages automatically open the
 agent's chat popup. Incoming agent messages leave the viewer popup closed and
 show an unread indicator on its chat icon; opening it clears the indicator. Click the icon again,
