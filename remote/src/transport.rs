@@ -63,6 +63,9 @@ impl ReceiverLifecycle {
 #[derive(Clone)]
 pub struct ViewerResumeState {
     idle: Arc<Mutex<crate::platform::IdlePreference>>,
+    /// Chosen per remote session, so a new session starts from the company
+    /// default again.
+    idle_disconnect: Arc<Mutex<crate::idle_disconnect::IdleDisconnect>>,
     display_border: Arc<Mutex<Option<bool>>>,
     technician_blocked: Arc<AtomicBool>,
     remote_cursor_hidden: Arc<AtomicBool>,
@@ -93,6 +96,7 @@ impl Default for ViewerResumeState {
         let activity = Arc::clone(&recording_outgoing);
         Self {
             idle: Default::default(),
+            idle_disconnect: Default::default(),
             display_border: Default::default(),
             technician_blocked: Default::default(),
             remote_cursor_hidden: Default::default(),
@@ -235,6 +239,31 @@ impl ViewerResumeState {
         self.progress().attempt_streamed_for(now)
     }
 
+    fn idle_disconnect(&self) -> std::sync::MutexGuard<'_, crate::idle_disconnect::IdleDisconnect> {
+        self.idle_disconnect
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Restarts the idle time after the technician used the session.
+    pub fn note_activity(&self) {
+        self.idle_disconnect()
+            .note_activity(std::time::Instant::now());
+    }
+
+    /// The idle time that has run out, in minutes, once the technician has
+    /// been idle that long. Only time with the remote display up counts:
+    /// connecting and reconnecting restart the idle time.
+    pub fn idle_disconnect_expired(&self, now: std::time::Instant) -> Option<u32> {
+        let streaming = self.ever_presented() && self.reconnect_status().is_none();
+        let mut idle = self.idle_disconnect();
+        if !streaming {
+            idle.note_activity(now);
+            return None;
+        }
+        idle.expired(now)
+    }
+
     pub fn select_background_display(&self) {
         *self
             .display_id
@@ -311,5 +340,38 @@ mod presentation_progress_tests {
             ),
             Disposition::Retry
         );
+    }
+}
+
+#[cfg(test)]
+mod idle_disconnect_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn idle_time_counts_only_while_the_remote_display_is_up() {
+        let state = ViewerResumeState::default();
+        state
+            .idle_disconnect()
+            .set_policy(meshrmm_protocol::IdleDisconnectPolicy {
+                minutes: Some(5),
+                allow_override: true,
+            });
+        let start = Instant::now();
+        let five = Duration::from_secs(5 * 60);
+        // Connecting does not count.
+        assert_eq!(state.idle_disconnect_expired(start + five), None);
+        state.begin_attempt();
+        state.progress().mark_frame_presented(start + five);
+        assert_eq!(state.idle_disconnect_expired(start + five * 2), Some(5));
+        // Neither does reconnecting, and the idle time restarts afterwards.
+        state.record_failure(&anyhow::anyhow!("connection lost"), start + five * 2);
+        assert_eq!(state.idle_disconnect_expired(start + five * 3), None);
+        state.reconnect_status().take();
+        assert_eq!(
+            state.idle_disconnect_expired(start + five * 4 - Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(state.idle_disconnect_expired(start + five * 4), Some(5));
     }
 }

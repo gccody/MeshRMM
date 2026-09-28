@@ -40,6 +40,7 @@ pub struct MaintenanceState {
 #[derive(Clone)]
 pub struct ControlSink {
     idle: Arc<Mutex<IdlePreference>>,
+    idle_disconnect: Arc<Mutex<crate::idle_disconnect::IdleDisconnect>>,
     display_border: Arc<Mutex<Option<bool>>>,
     files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
@@ -63,6 +64,7 @@ pub struct ControlSink {
 /// reads and changes, and the transport callbacks it sends through.
 pub struct ControlSinkParts {
     pub idle: Arc<Mutex<IdlePreference>>,
+    pub idle_disconnect: Arc<Mutex<crate::idle_disconnect::IdleDisconnect>>,
     pub display_border: Arc<Mutex<Option<bool>>>,
     pub files: meshrmm_file_transfer::TransferSession,
     pub chat: meshrmm_chat::ChatSession,
@@ -86,6 +88,7 @@ impl ControlSink {
     pub fn new(parts: ControlSinkParts) -> Self {
         let ControlSinkParts {
             idle,
+            idle_disconnect,
             display_border,
             files,
             chat,
@@ -106,6 +109,7 @@ impl ControlSink {
         } = parts;
         Self {
             idle,
+            idle_disconnect,
             display_border,
             files,
             chat,
@@ -133,7 +137,10 @@ impl ControlSink {
             .unwrap_or_default()
     }
 
+    /// Sends a message on the technician's behalf. Everything sent here
+    /// comes from the technician, so it also counts as activity.
     pub fn send(&self, message: meshrmm_protocol::SessionMessage) {
+        self.note_activity();
         if self.technician_blocked()
             && matches!(
                 &message,
@@ -390,6 +397,35 @@ impl ControlSink {
             enabled
         };
         self.send(meshrmm_protocol::SessionMessage::SetPreventIdleLock { enabled });
+    }
+
+    fn idle_disconnect(&self) -> std::sync::MutexGuard<'_, crate::idle_disconnect::IdleDisconnect> {
+        self.idle_disconnect
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Restarts the idle time before the session is disconnected.
+    pub fn note_activity(&self) {
+        self.idle_disconnect()
+            .note_activity(std::time::Instant::now());
+    }
+
+    /// How long this session may be idle before it is disconnected, in
+    /// minutes; `None` never disconnects.
+    pub fn idle_disconnect_minutes(&self) -> Option<u32> {
+        self.idle_disconnect().minutes()
+    }
+
+    pub fn allow_idle_disconnect_override(&self) -> bool {
+        self.idle_disconnect().allow_override()
+    }
+
+    /// Chosen per remote session; every new session starts with the company
+    /// default. Ignored when the company does not allow a choice.
+    pub fn set_idle_disconnect_minutes(&self, minutes: Option<u32>) {
+        self.idle_disconnect()
+            .choose(minutes, std::time::Instant::now());
     }
 
     pub fn display_border(&self) -> bool {

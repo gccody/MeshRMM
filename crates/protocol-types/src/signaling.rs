@@ -21,6 +21,8 @@ pub struct SessionBootstrap {
     pub start_in_background: bool,
     #[serde(default)]
     pub idle_policy: IdlePolicy,
+    #[serde(default)]
+    pub idle_disconnect: IdleDisconnectPolicy,
     #[serde(default = "default_enabled")]
     pub display_border: bool,
     pub session_id: RemoteSessionId,
@@ -334,6 +336,84 @@ impl IdlePolicy {
         }
     }
 }
+
+/// The idle times, in minutes, after which a remote session can be
+/// disconnected. Company policy and viewer choices are limited to these.
+pub const IDLE_DISCONNECT_MINUTES: [u32; 8] = [5, 10, 15, 30, 60, 120, 240, 480];
+
+pub fn valid_idle_disconnect_minutes(minutes: u32) -> bool {
+    IDLE_DISCONNECT_MINUTES.contains(&minutes)
+}
+
+/// Trusted company policy for ending a remote session after the technician
+/// has been idle in the viewer. Only the viewer enforces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdleDisconnectPolicy {
+    /// The company default; `None` never disconnects.
+    #[serde(default)]
+    pub minutes: Option<u32>,
+    /// Whether the technician may choose another time for their session.
+    #[serde(default = "default_enabled")]
+    pub allow_override: bool,
+}
+impl Default for IdleDisconnectPolicy {
+    fn default() -> Self {
+        Self {
+            minutes: None,
+            allow_override: true,
+        }
+    }
+}
+impl IdleDisconnectPolicy {
+    /// The idle time in force, given the technician's choice for this
+    /// session: `None` for no choice, `Some(None)` for never.
+    pub fn effective(self, choice: Option<Option<u32>>) -> Option<u32> {
+        match choice {
+            Some(choice) if self.allow_override => choice,
+            _ => self.minutes,
+        }
+    }
+}
+
+#[cfg(test)]
+mod idle_disconnect_tests {
+    use super::*;
+    #[test]
+    fn locked_policies_ignore_the_session_choice() {
+        for minutes in [None, Some(15)] {
+            for allowed in [true, false] {
+                let policy = IdleDisconnectPolicy {
+                    minutes,
+                    allow_override: allowed,
+                };
+                assert_eq!(policy.effective(None), minutes);
+                for choice in [None, Some(5), Some(480)] {
+                    assert_eq!(
+                        policy.effective(Some(choice)),
+                        if allowed { choice } else { minutes }
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            serde_json::from_str::<IdleDisconnectPolicy>("{}").unwrap(),
+            IdleDisconnectPolicy::default()
+        );
+    }
+
+    #[test]
+    fn only_listed_idle_times_are_valid() {
+        assert!(
+            IDLE_DISCONNECT_MINUTES
+                .into_iter()
+                .all(valid_idle_disconnect_minutes)
+        );
+        for minutes in [0, 1, 7, 481, u32::MAX] {
+            assert!(!valid_idle_disconnect_minutes(minutes));
+        }
+    }
+}
+
 #[cfg(test)]
 mod idle_policy_tests {
     use super::*;
