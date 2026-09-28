@@ -20,9 +20,11 @@ pub struct SessionBootstrap {
     #[serde(default)]
     pub start_in_background: bool,
     #[serde(default)]
-    pub idle_policy: IdlePolicy,
+    pub idle_policy: TogglePolicy,
     #[serde(default)]
     pub idle_disconnect: IdleDisconnectPolicy,
+    #[serde(default)]
+    pub clear_clipboard_policy: TogglePolicy,
     #[serde(default = "default_enabled")]
     pub display_border: bool,
     pub session_id: RemoteSessionId,
@@ -36,7 +38,11 @@ pub struct AgentSessionRequest {
     #[serde(default)]
     pub start_in_background: bool,
     #[serde(default)]
-    pub idle_policy: IdlePolicy,
+    pub idle_policy: TogglePolicy,
+    /// Company policy for emptying the viewed session's clipboard when the
+    /// remote session ends. The Agent enforces it over the viewer's choice.
+    #[serde(default)]
+    pub clear_clipboard_policy: TogglePolicy,
     #[serde(default)]
     pub blackout_message: String,
     /// Company policy for the Agent's on-screen connection banner. Only the
@@ -311,28 +317,29 @@ mod tests {
     }
 }
 
-/// Trusted company policy, supplied separately to both session peers.
+/// A company default for a per-session toggle, and whether viewers may change
+/// it. Trusted policy, supplied separately to both session peers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IdlePolicy {
+pub struct TogglePolicy {
     #[serde(default = "default_enabled")]
-    pub prevent_idle_lock: bool,
+    pub enabled: bool,
     #[serde(default = "default_enabled")]
     pub allow_override: bool,
 }
-impl Default for IdlePolicy {
+impl Default for TogglePolicy {
     fn default() -> Self {
         Self {
-            prevent_idle_lock: true,
+            enabled: true,
             allow_override: true,
         }
     }
 }
-impl IdlePolicy {
+impl TogglePolicy {
     pub fn effective(self, choice: Option<bool>) -> bool {
         if self.allow_override {
-            choice.unwrap_or(self.prevent_idle_lock)
+            choice.unwrap_or(self.enabled)
         } else {
-            self.prevent_idle_lock
+            self.enabled
         }
     }
 }
@@ -415,14 +422,14 @@ mod idle_disconnect_tests {
 }
 
 #[cfg(test)]
-mod idle_policy_tests {
+mod toggle_policy_tests {
     use super::*;
     #[test]
     fn locked_policies_ignore_both_override_directions() {
         for default in [true, false] {
             for allowed in [true, false] {
-                let policy = IdlePolicy {
-                    prevent_idle_lock: default,
+                let policy = TogglePolicy {
+                    enabled: default,
                     allow_override: allowed,
                 };
                 assert_eq!(policy.effective(None), default);
@@ -433,8 +440,8 @@ mod idle_policy_tests {
             }
         }
         assert_eq!(
-            serde_json::from_str::<IdlePolicy>("{}").unwrap(),
-            IdlePolicy::default()
+            serde_json::from_str::<TogglePolicy>("{}").unwrap(),
+            TogglePolicy::default()
         );
     }
 }

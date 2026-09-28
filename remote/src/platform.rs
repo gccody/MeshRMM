@@ -21,10 +21,27 @@ pub fn audio_preference(muted: bool) -> meshrmm_protocol::SessionMessage {
     }
 }
 
+/// A company policy for a per-session toggle, and the viewer's choice for
+/// this session. Every new session starts from the company default.
 #[derive(Default)]
-pub struct IdlePreference {
-    pub policy: meshrmm_protocol::IdlePolicy,
+pub struct PolicyChoice {
+    pub policy: meshrmm_protocol::TogglePolicy,
     pub choice: Option<bool>,
+}
+impl PolicyChoice {
+    fn enabled(&self) -> bool {
+        self.policy.effective(self.choice)
+    }
+
+    /// Flips the choice, or returns `None` while the company manages it.
+    fn toggle(&mut self) -> Option<bool> {
+        if !self.policy.allow_override {
+            return None;
+        }
+        let enabled = !self.enabled();
+        self.choice = Some(enabled);
+        Some(enabled)
+    }
 }
 
 #[derive(Default, Clone)]
@@ -39,8 +56,9 @@ pub struct MaintenanceState {
 /// with the native window's foreground state.
 #[derive(Clone)]
 pub struct ControlSink {
-    idle: Arc<Mutex<IdlePreference>>,
+    idle: Arc<Mutex<PolicyChoice>>,
     idle_disconnect: Arc<Mutex<crate::idle_disconnect::IdleDisconnect>>,
+    clear_clipboard: Arc<Mutex<PolicyChoice>>,
     display_border: Arc<Mutex<Option<bool>>>,
     files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
@@ -63,8 +81,9 @@ pub struct ControlSink {
 /// What a [`ControlSink`] is made of: the session state the viewer window
 /// reads and changes, and the transport callbacks it sends through.
 pub struct ControlSinkParts {
-    pub idle: Arc<Mutex<IdlePreference>>,
+    pub idle: Arc<Mutex<PolicyChoice>>,
     pub idle_disconnect: Arc<Mutex<crate::idle_disconnect::IdleDisconnect>>,
+    pub clear_clipboard: Arc<Mutex<PolicyChoice>>,
     pub display_border: Arc<Mutex<Option<bool>>>,
     pub files: meshrmm_file_transfer::TransferSession,
     pub chat: meshrmm_chat::ChatSession,
@@ -89,6 +108,7 @@ impl ControlSink {
         let ControlSinkParts {
             idle,
             idle_disconnect,
+            clear_clipboard,
             display_border,
             files,
             chat,
@@ -110,6 +130,7 @@ impl ControlSink {
         Self {
             idle,
             idle_disconnect,
+            clear_clipboard,
             display_border,
             files,
             chat,
@@ -340,20 +361,31 @@ impl ControlSink {
         }
     }
 
+    /// Starts from the company default; changeable for this session only
+    /// when the company allows it.
     pub fn clear_clipboard_on_close(&self) -> bool {
-        crate::preferences::clear_clipboard_on_close()
+        self.clear_clipboard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enabled()
+    }
+
+    pub fn allow_clear_clipboard_override(&self) -> bool {
+        self.clear_clipboard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .policy
+            .allow_override
     }
 
     pub fn toggle_clear_clipboard_on_close(&self) {
-        match crate::preferences::toggle_clear_clipboard_on_close() {
-            Ok(()) => self.send(meshrmm_protocol::SessionMessage::SetClearClipboardOnClose {
-                enabled: self.clear_clipboard_on_close(),
-            }),
-            Err(error) => {
-                if let Ok(mut state) = self.maintenance.lock() {
-                    state.error = Some(error.to_string());
-                }
-            }
+        let toggled = self
+            .clear_clipboard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .toggle();
+        if let Some(enabled) = toggled {
+            self.send(meshrmm_protocol::SessionMessage::SetClearClipboardOnClose { enabled });
         }
     }
 
@@ -374,8 +406,10 @@ impl ControlSink {
     }
 
     pub fn prevent_idle_lock(&self) -> bool {
-        let idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
-        idle.policy.effective(idle.choice)
+        self.idle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enabled()
     }
 
     pub fn allow_idle_override(&self) -> bool {
@@ -387,16 +421,10 @@ impl ControlSink {
     }
 
     pub fn toggle_prevent_idle_lock(&self) {
-        let enabled = {
-            let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
-            if !idle.policy.allow_override {
-                return;
-            }
-            let enabled = !idle.policy.effective(idle.choice);
-            idle.choice = Some(enabled);
-            enabled
-        };
-        self.send(meshrmm_protocol::SessionMessage::SetPreventIdleLock { enabled });
+        let toggled = self.idle.lock().unwrap_or_else(|e| e.into_inner()).toggle();
+        if let Some(enabled) = toggled {
+            self.send(meshrmm_protocol::SessionMessage::SetPreventIdleLock { enabled });
+        }
     }
 
     fn idle_disconnect(&self) -> std::sync::MutexGuard<'_, crate::idle_disconnect::IdleDisconnect> {

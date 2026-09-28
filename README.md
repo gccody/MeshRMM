@@ -374,9 +374,12 @@ the action.
 **Clear clipboard on session close** (**When the session ends → Clear remote
 clipboard** in the macOS gear menu; Troubleshooting settings on Windows) empties the clipboard of that same Windows session when the
 remote session ends, at the same points as **On session close** and before any
-Lock. It is on by default, saved for the current viewer user, and sent to the Agent
-when each connection starts. Logout skips it because signing out discards the
-clipboard. Windows clipboard history (Win+V) is left unchanged.
+Lock. Company admins set its default for new sessions under **Settings → Remote
+sessions**, and choose whether users may change it per session. When allowed, the
+viewer's choice applies to the current session only and is kept across reconnects;
+otherwise the toggle is shown as company managed and the Agent enforces the
+default. Logout skips it because signing out discards the clipboard. Windows
+clipboard history (Win+V) is left unchanged.
 
 **Disconnect when idle** (macOS gear menu **Session** section; Windows
 **Settings → Advanced**) ends the remote session after the technician has been

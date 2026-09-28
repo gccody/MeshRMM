@@ -62,10 +62,11 @@ impl ReceiverLifecycle {
 /// transports after a network change or remote reboot.
 #[derive(Clone)]
 pub struct ViewerResumeState {
-    idle: Arc<Mutex<crate::platform::IdlePreference>>,
+    idle: Arc<Mutex<crate::platform::PolicyChoice>>,
     /// Chosen per remote session, so a new session starts from the company
     /// default again.
     idle_disconnect: Arc<Mutex<crate::idle_disconnect::IdleDisconnect>>,
+    clear_clipboard: Arc<Mutex<crate::platform::PolicyChoice>>,
     display_border: Arc<Mutex<Option<bool>>>,
     technician_blocked: Arc<AtomicBool>,
     remote_cursor_hidden: Arc<AtomicBool>,
@@ -97,6 +98,7 @@ impl Default for ViewerResumeState {
         Self {
             idle: Default::default(),
             idle_disconnect: Default::default(),
+            clear_clipboard: Default::default(),
             display_border: Default::default(),
             technician_blocked: Default::default(),
             remote_cursor_hidden: Default::default(),

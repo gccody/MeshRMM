@@ -20,9 +20,11 @@ struct SessionRecord {
     #[serde(default)]
     start_in_background: bool,
     #[serde(default)]
-    idle_policy: meshrmm_protocol_types::IdlePolicy,
+    idle_policy: meshrmm_protocol_types::TogglePolicy,
     #[serde(default)]
     idle_disconnect: meshrmm_protocol_types::IdleDisconnectPolicy,
+    #[serde(default)]
+    clear_clipboard_policy: meshrmm_protocol_types::TogglePolicy,
     #[serde(default = "meshrmm_protocol_types::default_enabled")]
     display_border: bool,
     #[serde(default = "meshrmm_protocol_types::default_enabled")]
@@ -370,6 +372,7 @@ impl RemoteSession {
         let agent_request = AgentSessionRequest {
             start_in_background: record.start_in_background,
             idle_policy: record.idle_policy,
+            clear_clipboard_policy: record.clear_clipboard_policy,
             blackout_message: record.blackout_message.clone(),
             session_banner: record.session_banner,
             connection_notification: record.connection_notification,
@@ -402,6 +405,7 @@ impl RemoteSession {
             start_in_background: record.start_in_background,
             idle_policy: record.idle_policy,
             idle_disconnect: record.idle_disconnect,
+            clear_clipboard_policy: record.clear_clipboard_policy,
             display_border: record.display_border,
             session_id: RemoteSessionId::new(record.session_id),
             signaling_token: record.client_token,
@@ -426,6 +430,7 @@ impl RemoteSession {
         let lease = AgentSessionRequest {
             start_in_background: record.start_in_background,
             idle_policy: record.idle_policy,
+            clear_clipboard_policy: record.clear_clipboard_policy,
             blackout_message: record.blackout_message.clone(),
             session_banner: record.session_banner,
             connection_notification: record.connection_notification,
@@ -567,6 +572,9 @@ mod maintenance_tests {
         assert!(legacy.session_banner);
         assert!(!legacy.connection_notification);
         assert!(!legacy.background_connection_notification);
+        assert_eq!(legacy.clear_clipboard_policy, Default::default());
+        value["clear_clipboard_policy"] =
+            serde_json::json!({ "enabled": false, "allow_override": false });
         value["blackout_message"] = serde_json::json!("Maintenance by {user_name}");
         value["session_banner"] = serde_json::json!(false);
         value["connection_notification"] = serde_json::json!(true);
@@ -584,5 +592,12 @@ mod maintenance_tests {
             "{user_name} is here"
         );
         assert_eq!(restored.viewer_name, "Zoë 王");
+        assert_eq!(
+            restored.clear_clipboard_policy,
+            meshrmm_protocol_types::TogglePolicy {
+                enabled: false,
+                allow_override: false,
+            }
+        );
     }
 }
