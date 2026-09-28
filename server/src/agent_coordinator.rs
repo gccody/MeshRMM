@@ -933,6 +933,7 @@ mod lease_tests {
         let active = AgentSessionRequest {
             start_in_background: false,
             idle_policy: Default::default(),
+            clear_clipboard_policy: Default::default(),
             blackout_message: String::new(),
             session_banner: true,
             connection_notification: true,

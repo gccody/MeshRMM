@@ -133,9 +133,13 @@ natively; that UI was not manually exercised.
 
 ## Clear clipboard on session close
 
-**Clear clipboard on session close** is a per-OS-user viewer preference, on by
-default, stored with **Disconnect confirmation** and sent to the Agent on each
-connection.
+**Clear clipboard on session close** is company policy, like idle-lock
+prevention: `clear_clipboard_on_close` sets the default (on) and
+`allow_clear_clipboard_override` (on) lets viewers change it for the current
+session (migration `0017_clear_clipboard_on_close.sql`). The server resolves both
+from the device's company and sends them to both peers. The viewer's choice is
+not saved and is sent to the Agent on each connection; the Agent starts from the
+company default and ignores the viewer's choice when overrides are not allowed.
 The Agent keeps it with the session close action and runs it at the same points,
 once, before Lock. It launches a `--clear-clipboard` helper as the signed-in user on
 `winsta0\default`, which calls `EmptyClipboard` and retries briefly while another

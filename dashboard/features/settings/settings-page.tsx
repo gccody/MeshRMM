@@ -123,6 +123,10 @@ export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, o
                 <input type="checkbox" checked={draft.allowIdleDisconnectOverride} onChange={(event) => updateDraft({ allowIdleDisconnectOverride: event.target.checked })} aria-describedby="idle-disconnect-help" /> Allow users to change the idle disconnect time per session</label>
               <p id="idle-disconnect-help">The viewer ends the session when the technician sends no keyboard, mouse or chat input for this long. A user’s change lasts only for that session; the next session starts with this default.</p>
               <label>
+                <input type="checkbox" checked={draft.clearClipboardOnClose} onChange={(event) => updateDraft({ clearClipboardOnClose: event.target.checked })} /> Clear the remote device’s clipboard when a session ends by default</label>
+              <label>
+                <input type="checkbox" checked={draft.allowClearClipboardOverride} onChange={(event) => updateDraft({ allowClearClipboardOverride: event.target.checked })} /> Allow users to change clipboard clearing per session</label>
+              <label>
                 <input type="checkbox" checked={draft.sessionBanner} onChange={(event) => updateDraft({ sessionBanner: event.target.checked })} aria-describedby="session-banner-help" /> Show a banner on the agent’s screen while a technician is connected</label>
               <p id="session-banner-help">Applies to every new session and cannot be changed by users. Chat messages still appear on the agent when the banner is hidden.</p>
             </section>

@@ -184,7 +184,7 @@ pub async fn run_sender(
     ice_servers: Vec<IceServer>,
     streamer: Arc<Mutex<Box<dyn ScreenStreamer>>>,
     session_id: RemoteSessionId,
-    idle_policy: meshrmm_protocol::IdlePolicy,
+    idle_policy: meshrmm_protocol::TogglePolicy,
     start_in_background: bool,
     session_close: Arc<SessionClose>,
     progress: &SenderProgress,
@@ -219,7 +219,7 @@ async fn run_connected_sender(
     streamer: Arc<Mutex<Box<dyn ScreenStreamer>>>,
     session_id: RemoteSessionId,
     failure_reported: &mut bool,
-    idle_policy: meshrmm_protocol::IdlePolicy,
+    idle_policy: meshrmm_protocol::TogglePolicy,
     start_in_background: bool,
     session_close: Arc<SessionClose>,
     progress: &SenderProgress,
@@ -536,7 +536,7 @@ async fn run_connected_sender(
         let initial_idle = maintenance_tx.clone();
         control_channel.on_open(Box::new(move || {
             let _ = initial_idle.try_send(SessionMessage::SetPreventIdleLock {
-                enabled: idle_policy.prevent_idle_lock,
+                enabled: idle_policy.enabled,
             });
             opening.notify_waiters();
             let notify = Arc::clone(&notify);

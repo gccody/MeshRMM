@@ -103,7 +103,7 @@ impl WindowContext {
             (
                 SETTINGS_CLEAR_CLIPBOARD_ID,
                 self.control.clear_clipboard_on_close(),
-                true,
+                self.control.allow_clear_clipboard_override(),
             ),
             (
                 SETTINGS_REMOTE_CURSOR_ID,
@@ -144,6 +144,16 @@ impl WindowContext {
                                 w!("Prevent idle lock")
                             } else {
                                 w!("Prevent idle lock (company managed)")
+                            },
+                        );
+                    }
+                    if id == SETTINGS_CLEAR_CLIPBOARD_ID {
+                        let _ = SetWindowTextW(
+                            button,
+                            if enabled {
+                                w!("Clear clipboard on session close")
+                            } else {
+                                w!("Clear clipboard on close (company managed)")
                             },
                         );
                     }

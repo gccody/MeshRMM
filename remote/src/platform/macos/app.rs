@@ -1102,11 +1102,17 @@ impl RemoteView {
             sel!(toggleDisconnectConfirmation:),
             Some(control.disconnect_confirmation()),
         ));
-        menu.addItem(&self.menu_item(
-            "Clear remote clipboard",
+        let clear_clipboard = self.menu_item(
+            if control.allow_clear_clipboard_override() {
+                "Clear remote clipboard"
+            } else {
+                "Clear remote clipboard (company managed)"
+            },
             sel!(toggleClearClipboardOnClose:),
             Some(control.clear_clipboard_on_close()),
-        ));
+        );
+        clear_clipboard.setEnabled(control.allow_clear_clipboard_override());
+        menu.addItem(&clear_clipboard);
         let close_action = control.session_close_action();
         menu.addItem(
             &self.menu_choices(

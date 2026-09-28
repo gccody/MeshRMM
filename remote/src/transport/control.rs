@@ -279,6 +279,7 @@ pub(super) fn install_control_handler(
                     let sink = ControlSink::new(ControlSinkParts {
                         idle: Arc::clone(&viewer_control.resume_state.idle),
                         idle_disconnect: Arc::clone(&viewer_control.resume_state.idle_disconnect),
+                        clear_clipboard: Arc::clone(&viewer_control.resume_state.clear_clipboard),
                         display_border: Arc::clone(&viewer_control.resume_state.display_border),
                         files: viewer_control.files.clone(),
                         chat: viewer_control.chat.clone(),

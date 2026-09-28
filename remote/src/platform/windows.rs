@@ -640,6 +640,7 @@ fn test_sink(
     ControlSink::new(super::ControlSinkParts {
         idle: Default::default(),
         idle_disconnect: Default::default(),
+        clear_clipboard: Default::default(),
         display_border: Default::default(),
         files: meshrmm_file_transfer::TransferSession::viewer(|| false),
         chat,
