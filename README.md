@@ -217,6 +217,9 @@ list pending migrations and build without deploying). It applies the D1
 migrations before deploying the Worker and then checks `/healthz`, which
 reports the newest applied migration and answers 503 when D1 is older than the
 Worker expects. See [company domains](docs/company-domains.md).
+`node scripts/deploy-prod.mjs` deploys the server and publishes a native release
+in one step, then verifies production. See
+[automated native releases](docs/native-releases.md#deploy-everything-to-production).
 
 ## Run
 

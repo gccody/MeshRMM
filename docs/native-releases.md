@@ -36,6 +36,24 @@ configured together:
 The workflow uses GitHub's `production` environment. If that environment has
 required reviewers, approve the deployment after all native builds pass.
 
+## Deploy everything to production
+
+`node scripts/deploy-prod.mjs` deploys `main` end to end. It refuses to run
+unless `main` is clean, matches `origin/main`, and has passed CI, and it checks
+the GitHub and Cloudflare sign-ins and the Worker secrets. It then deploys the
+server with `scripts/deploy-server.mjs`. If anything outside `server/` and the
+docs changed since the last release, it bumps the patch version in
+`release.json`, pushes the release commit, and waits for the **Publish native
+release** workflow. Finally it checks `/healthz`, `meshrmm.com`,
+`admin.meshrmm.com`, and that every download in the live update manifest has the
+released version and SHA-256.
+
+Start with `--dry-run`, which runs the checks, builds the Worker, and prints the
+plan. It lists any pending D1 migrations. Other options include `--message
+<text>` for the release commit summary, `--minor`/`--major`/`--version`,
+`--no-release`/`--release`, `--skip-server`, `--yes`, and `--verify-only`. See
+`--help` for the full list.
+
 ## Publish an update
 
 1. Change only `version` in `release.json` to a higher semantic version.
