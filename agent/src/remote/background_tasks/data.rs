@@ -906,7 +906,7 @@ pub fn sample(previous: &Snapshot, inventory: bool) -> anyhow::Result<Snapshot> 
         next.threads = performance.ThreadCount;
         next.uptime = GetTickCount64() / 1000;
         let mut table = std::ptr::null_mut();
-        if GetIfTable2(&mut table).is_ok() {
+        if GetIfTable2(&mut table).is_ok() && !table.is_null() {
             for row in
                 std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
             {
