@@ -376,8 +376,9 @@ default playback-device changes. Audio uses PCM16 at the source sample rate
 (about 1.5 Mbps for 48 kHz stereo); congested queues drop audio to keep it live.
 
 To record the remote display locally, choose **Record video to Downloads** in
-macOS **Controls** or Windows **Settings → Troubleshooting**. **REC** stays
-visible while recording; choose **Stop recording and save** to finish. Video-only
+the macOS session controls (gear) menu or Windows **Settings → Troubleshooting**.
+A red **REC** item stays in the toolbar while recording; click it, or choose
+**Stop recording and save**, to finish. Video-only
 Matroska (`.mkv`) files are saved under `Downloads/MeshRMM Recordings/session-…`
 on the viewer's computer, and the saved location is shown when stopped. Open
 these files in a player supporting H.264/HEVC in MKV, such as VLC.
@@ -402,9 +403,9 @@ Turn off **Sync clipboard** (session menu on macOS; Troubleshooting settings on
 Windows) to stop this exchange, including copied files, in both directions. The
 choice is saved for the current viewer user and defaults to on. When it is turned
 back on, only later copies are sent; content copied while sync was off stays local.
-**Type clipboard**, **Send**/**Receive**, and drag-and-drop are unaffected.
+**Type clipboard** (clipboard icon), **Send**/**Receive**, and drag-and-drop are unaffected.
 
-The **folder icon** offers **Send** and **Receive** using native multi-file/folder
+The **folder icon** offers **Send files…** and **Receive files…** using native multi-file/folder
 pickers on the source computer. Transfers preserve nested and empty folders and
 land in the signed-in user’s `Documents/MeshRMM Transferred Files` folder.
 Existing names are preserved by assigning a unique name to incoming duplicates.
@@ -469,7 +470,7 @@ under the session menu's **Diagnostics key**. While the Windows viewer has
 keyboard focus it also sends the Windows key, Alt+Tab, Alt+Esc and Ctrl+Esc to
 the device instead of acting on them locally; turn this off under
 **Settings → Keyboard**. Ctrl+Alt+Del and Windows+L always stay local. On endpoints with multiple monitors,
-select **All monitors** from the viewer's display dropdown (also included in
+select **All displays** from the viewer's monitor menu (also included in
 keyboard cycling) to view and control the complete desktop in one window.
 The combined view preserves monitor positions, including negative coordinates,
 with black space between monitors. Select an individual monitor to return to
@@ -609,7 +610,7 @@ Windows' synchronous capture API, while input remains in a separate helper.
 
 ### Sending Ctrl+Alt+Del
 
-Use **Ctrl+Alt+Del** in the Windows or macOS remote client's toolbar to send the
+Use the keyboard icon (**Send Ctrl+Alt+Del**) in the Windows or macOS remote client's toolbar to send the
 secure attention sequence to the Windows agent. Update both the client and agent
 for this command. The agent must run through its installed Windows service.
 
