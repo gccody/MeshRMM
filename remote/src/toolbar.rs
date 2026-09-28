@@ -413,6 +413,8 @@ impl Rect {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Layout {
     pub rects: Vec<Rect>,
+    /// Labels fitted to the available width; full text stays in item tooltips.
+    pub labels: Vec<Option<String>>,
     /// The horizontal centers of the lines between groups.
     pub separators: Vec<f64>,
 }
@@ -453,10 +455,63 @@ pub fn layout(
     leading_inset: f64,
     measure: &dyn Fn(&str) -> f64,
 ) -> Layout {
-    let widths: Vec<f64> = items
+    let mut labels: Vec<_> = items.iter().map(|item| item.label.clone()).collect();
+    let mut widths: Vec<f64> = items
         .iter()
         .map(|item| item_width(item, item.label.as_deref().map_or(0.0, measure)))
         .collect();
+    let natural = layout_widths(items, width, leading_inset, &widths);
+    let leading_end = items
+        .iter()
+        .zip(&natural.rects)
+        .filter(|(item, _)| !item.trailing)
+        .map(|(_, rect)| rect.right())
+        .fold(leading_inset, f64::max);
+    let trailing_start = items
+        .iter()
+        .zip(&natural.rects)
+        .filter(|(item, _)| item.trailing)
+        .map(|(_, rect)| rect.x)
+        .fold(width, f64::min);
+    let mut excess = (leading_end + GROUP_GAP - trailing_start).max(0.0);
+    // Session and display names can be arbitrarily long. Preserve all the
+    // controls, including REC, by shortening only the leading labels.
+    for (index, item) in items.iter().enumerate().filter(|(_, item)| !item.trailing) {
+        if excess <= 0.0 {
+            break;
+        }
+        if let Some(label) = &labels[index] {
+            let old_width = widths[index];
+            let budget = (old_width - item_width(item, 0.0) - excess).max(0.0);
+            let fitted = fit_label(label, budget, measure);
+            widths[index] = item_width(item, measure(&fitted));
+            excess = (excess - (old_width - widths[index])).max(0.0);
+            labels[index] = Some(fitted);
+        }
+    }
+    let mut layout = layout_widths(items, width, leading_inset, &widths);
+    layout.labels = labels;
+    layout
+}
+
+fn fit_label(text: &str, width: f64, measure: &dyn Fn(&str) -> f64) -> String {
+    if measure(text).ceil() <= width {
+        return text.to_owned();
+    }
+    if measure("…").ceil() > width {
+        return String::new();
+    }
+    let mut fitted = text.to_owned();
+    while fitted.pop().is_some() {
+        let candidate = format!("{fitted}…");
+        if measure(&candidate).ceil() <= width {
+            return candidate;
+        }
+    }
+    "…".into()
+}
+
+fn layout_widths(items: &[Item], width: f64, leading_inset: f64, widths: &[f64]) -> Layout {
     let top = ((HEIGHT - BUTTON_HEIGHT) / 2.0).round();
     let mut rects = vec![Rect::default(); items.len()];
     let mut separators = Vec::new();
@@ -500,13 +555,21 @@ pub fn layout(
         }
         previous = Some(item);
     }
-    Layout { rects, separators }
+    Layout {
+        rects,
+        separators,
+        labels: Vec::new(),
+    }
 }
 
 /// The narrowest toolbar that fits `items` without overlap.
 #[cfg(test)]
 fn minimum_width(items: &[Item], leading_inset: f64, measure: &dyn Fn(&str) -> f64) -> f64 {
-    let layout = layout(items, 0.0, leading_inset, measure);
+    let widths: Vec<_> = items
+        .iter()
+        .map(|item| item_width(item, item.label.as_deref().map_or(0.0, measure)))
+        .collect();
+    let layout = layout_widths(items, 0.0, leading_inset, &widths);
     let leading_end = items
         .iter()
         .zip(&layout.rects)
@@ -1224,6 +1287,55 @@ mod tests {
         for pair in sorted.windows(2) {
             assert!(pair[0].right() <= pair[1].x, "{pair:?}");
         }
+    }
+
+    #[test]
+    fn long_labels_fit_at_both_platform_minimum_widths() {
+        for (width, inset, caption) in [(640.0, 84.0, None), (744.0, 0.0, Some(false))] {
+            for session in [
+                "administrator (RDP 2)",
+                "非常に長いユーザー名".repeat(20).as_str(),
+            ] {
+                let state = State {
+                    sessions: vec!["Console".into(), session.into()],
+                    session: 1,
+                    displays: vec!["VeryLongDisplayName".repeat(20), "Display 2".into()],
+                    recording: true,
+                    caption,
+                    ..State::default()
+                };
+                let items = items(&state);
+                let fitted = layout(&items, width, inset, &measure);
+                for (index, rect) in fitted.rects.iter().enumerate() {
+                    assert!(rect.x >= inset && rect.right() <= width);
+                    assert_eq!(fitted.hit(rect.x + rect.width / 2.0, 20.0), Some(index));
+                    for other in &fitted.rects[index + 1..] {
+                        assert!(rect.right() <= other.x || other.right() <= rect.x);
+                    }
+                    let text_width = fitted.labels[index].as_deref().map_or(0.0, &measure);
+                    assert!(item_width(&items[index], text_width) <= rect.width);
+                }
+                assert_eq!(items[0].label.as_deref(), Some(session));
+                assert!(fitted.labels[0].as_ref().unwrap().len() < session.len());
+                let recording = items
+                    .iter()
+                    .position(|i| i.action == Action::Recording)
+                    .unwrap();
+                assert_eq!(fitted.labels[recording].as_deref(), Some("REC"));
+            }
+        }
+    }
+
+    #[test]
+    fn fitting_labels_preserves_unicode_and_full_labels_when_space_allows() {
+        assert_eq!(fit_label("日本語の名前", 28.0, &measure), "日本語…");
+        assert_eq!(fit_label("日本語", 21.0, &measure), "日本語");
+        assert_eq!(fit_label("日本語", 0.0, &measure), "");
+        let items = items(&state());
+        assert_eq!(
+            layout(&items, 1400.0, 0.0, &measure).labels,
+            items.iter().map(|i| i.label.clone()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

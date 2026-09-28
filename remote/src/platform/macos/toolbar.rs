@@ -358,8 +358,7 @@ impl ToolbarView {
             if let Some(background) = style.background {
                 fill_path(&toolbar::rounded_rect(*rect, style.radius), background);
             }
-            let text = item
-                .label
+            let text = layout.labels[index]
                 .as_deref()
                 .map(|label| (label, self.measure(label)));
             let parts = toolbar::parts(item, *rect, text.map_or(0.0, |(_, width)| width));
