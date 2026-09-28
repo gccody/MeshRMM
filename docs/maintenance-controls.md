@@ -1,7 +1,7 @@
 # Remote maintenance controls
 
-The native viewer provides three independent controls. On macOS, open **Session**
-in the toolbar. On Windows, open **Settings → Advanced**.
+The native viewer provides three independent controls. On macOS, open the gear
+(session controls) menu in the toolbar. On Windows, open **Settings → Advanced**.
 
 - **Block technician input** stops the viewer's keyboard, mouse, and wheel events.
   It releases held remote keys/buttons before blocking. The choice survives focus

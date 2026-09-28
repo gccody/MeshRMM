@@ -1,7 +1,9 @@
 use super::keyboard::{self, CommandKey, Keyboard, RemoteKey};
+use super::toolbar::ToolbarView;
 use super::*;
 use crate::input::HeldInput;
 use crate::reconnect::ReconnectStatus;
+use crate::toolbar::{self, Action, Command};
 use meshrmm_protocol::SessionCloseAction;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
@@ -173,16 +175,11 @@ pub(super) struct RemoteViewIvars {
     displays: RefCell<Vec<Display>>,
     video_width: std::cell::Cell<u32>,
     video_height: std::cell::Cell<u32>,
-    user_popup: RefCell<Option<Retained<NSPopUpButton>>>,
-    display_popup: RefCell<Option<Retained<NSPopUpButton>>>,
-    recording_visible: std::cell::Cell<bool>,
+    toolbar: RefCell<Option<Retained<ToolbarView>>>,
     confirming_disconnect: std::cell::Cell<bool>,
     // A miniaturized window or hidden application also reports
     // `isVisible == false`, so only this flag means the session window closed.
     window_closed: std::cell::Cell<bool>,
-    session_button: RefCell<Option<Retained<NSButton>>>,
-    credential_buttons: RefCell<Vec<Retained<NSButton>>>,
-    credential_label: RefCell<Option<Retained<NSTextField>>>,
     chat_popup: RefCell<Option<meshrmm_chat::ChatPopup>>,
     control: ControlSink,
     held: RefCell<HeldInput>,
@@ -413,113 +410,11 @@ define_class!(
             }
         }
 
-        #[unsafe(method(selectDisplayFromToolbar:))]
-        fn select_display_from_toolbar(&self, sender: &NSPopUpButton) {
-            let index = sender.indexOfSelectedItem();
-            if index >= 0
-                && let Some(display) = self.ivars().active_display.borrow().session_displays(&self.ivars().displays.borrow()).get(index as usize)
-                && display.id != self.ivars().active_display.borrow().id
-            {
-                self.send(SessionMessage::SelectDisplay {
-                    display_id: display.id,
-                });
-            }
-        }
-
         #[unsafe(method(retryReconnect:))]
         fn retry_reconnect(&self, _sender: &NSButton) {
             // Disabled until the session loop starts its next wait.
             self.ivars().reconnect_panel.retry.setEnabled(false);
             crate::reconnect::request_retry_now();
-        }
-
-        #[unsafe(method(selectUserFromToolbar:))]
-        fn select_user_from_toolbar(&self, sender: &NSPopUpButton) {
-            let displays = self.ivars().displays.borrow();
-            let sessions = Display::sessions(&displays);
-            if let Some(session) = sessions.get(sender.indexOfSelectedItem() as usize)
-                && *session != self.ivars().active_display.borrow().session
-                && let Some(display) = displays.iter().find(|d| &d.session == session && d.primary)
-                    .or_else(|| displays.iter().find(|d| &d.session == session)) {
-                self.release_input();
-                self.send(SessionMessage::SelectDisplay { display_id: display.id });
-            }
-            // Selection is committed only once the agent confirms its stream.
-            self.refresh_display_selectors();
-        }
-
-        #[unsafe(method(showSessionControls:))]
-        fn show_session_controls(&self, sender: &NSButton) {
-            self.release_input();
-            let menu = NSMenu::new(self.mtm());
-            menu.setAutoenablesItems(false);
-            for (title, action) in [
-                (if self.ivars().control.technician_blocked() { "Allow technician input" } else { "Block technician input" }, sel!(toggleTechnicianInput:)),
-                (if self.ivars().control.agent_blocked() { "Allow agent input" } else { "Block agent keyboard and mouse" }, sel!(toggleAgentInput:)),
-                (if self.ivars().control.maintenance_state().blacked_out { "Restore agent monitors" } else { "Black out all agent monitors" }, sel!(toggleBlackout:)),
-                (if self.ivars().control.audio_muted() { "Unmute audio" } else { "Mute audio" }, sel!(toggleAudio:)),
-                (if self.ivars().control.allow_idle_override() { "Prevent idle lock" } else { "Prevent idle lock (company managed)" }, sel!(togglePreventIdleLock:)),
-                ("Disconnect confirmation", sel!(toggleDisconnectConfirmation:)),
-                ("Command key sends Ctrl", sel!(toggleCommandAsControl:)),
-                ("Sync clipboard", sel!(toggleClipboardSync:)),
-                ("Clear clipboard on session close", sel!(toggleClearClipboardOnClose:)),
-                ("Highlight viewed monitor on agent", sel!(toggleDisplayBorder:)),
-                ("Hide remote wallpaper", sel!(toggleWallpaper:)),
-                ("Show remote cursor", sel!(toggleRemoteCursor:)),
-                ("Diagnostics", sel!(toggleDiagnostics:)),
-                (if self.ivars().control.recording().active() { "Stop recording and save" } else { "Record video to Downloads" }, sel!(toggleRecording:)),
-            ] {
-                let item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(self.mtm()), &NSString::from_str(title), Some(action), &NSString::from_str(""),
-                ) };
-                unsafe { item.setTarget(Some(self)); }
-                if action == sel!(toggleAgentInput:) || action == sel!(toggleBlackout:) { item.setEnabled(self.ivars().control.maintenance_state().available); }
-                if action == sel!(toggleAgentInput:) && self.ivars().control.maintenance_state().blacked_out { item.setEnabled(false); }
-                if action == sel!(togglePreventIdleLock:) { item.setState(isize::from(self.ivars().control.prevent_idle_lock())); item.setEnabled(self.ivars().control.allow_idle_override()); }
-                if action == sel!(toggleDisconnectConfirmation:) { item.setState(isize::from(self.ivars().control.disconnect_confirmation())); }
-                if action == sel!(toggleCommandAsControl:) { item.setState(isize::from(self.ivars().control.command_as_control())); }
-                if action == sel!(toggleClipboardSync:) { item.setState(isize::from(self.ivars().control.clipboard_sync())); }
-                if action == sel!(toggleClearClipboardOnClose:) { item.setState(isize::from(self.ivars().control.clear_clipboard_on_close())); }
-                if action == sel!(toggleDisplayBorder:) { item.setState(isize::from(self.ivars().control.display_border())); }
-                if action == sel!(toggleWallpaper:) { item.setState(isize::from(self.ivars().control.wallpaper_hidden())); }
-                if action == sel!(toggleRemoteCursor:) { item.setState(isize::from(self.ivars().control.show_remote_cursor())); }
-                menu.addItem(&item);
-                if action == sel!(toggleDiagnostics:) {
-                    let shortcut = NSMenuItem::new(self.mtm());
-                    shortcut.setTitle(&NSString::from_str("Diagnostics key"));
-                    let choices = NSMenu::new(self.mtm());
-                    let selected = self.ivars().control.shortcut_key(crate::shortcuts::ViewerShortcut::Diagnostics);
-                    for (index, key) in crate::shortcuts::ShortcutKey::ALL.into_iter().enumerate() {
-                        let choice_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(
-                            NSMenuItem::alloc(self.mtm()), &NSString::from_str(key.label()), Some(sel!(selectDiagnosticsKey:)), &NSString::new(),
-                        ) };
-                        unsafe { choice_item.setTarget(Some(self)); }
-                        choice_item.setTag(index as isize);
-                        choice_item.setState(isize::from(key == selected));
-                        choices.addItem(&choice_item);
-                    }
-                    shortcut.setSubmenu(Some(&choices));
-                    menu.addItem(&shortcut);
-                }
-                if action == sel!(toggleDisconnectConfirmation:) {
-                    let close = NSMenuItem::new(self.mtm());
-                    close.setTitle(&NSString::from_str("On session close"));
-                    let choices = NSMenu::new(self.mtm());
-                    let selected = self.ivars().control.session_close_action();
-                    for (index, choice) in SessionCloseAction::ALL.into_iter().enumerate() {
-                        let choice_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(
-                            NSMenuItem::alloc(self.mtm()), &NSString::from_str(choice.label()), Some(sel!(selectSessionCloseAction:)), &NSString::new(),
-                        ) };
-                        unsafe { choice_item.setTarget(Some(self)); }
-                        choice_item.setTag(index as isize);
-                        choice_item.setState(isize::from(choice == selected));
-                        choices.addItem(&choice_item);
-                    }
-                    close.setSubmenu(Some(&choices));
-                    menu.addItem(&close);
-                }
-            }
-            menu.popUpMenuPositioningItem_atLocation_inView(None, NSPoint::new(0., 0.), Some(sender));
         }
 
         #[unsafe(method(toggleTechnicianInput:))]
@@ -616,73 +511,8 @@ define_class!(
             self.ivars().control.toggle_agent_input();
         }
 
-        #[unsafe(method(selectQualityFromToolbar:))]
-        fn select_quality_from_toolbar(&self, sender: &NSPopUpButton) {
-            let preset = match sender.indexOfSelectedItem() {
-                0 => QualityPreset::UltraDataSaver,
-                1 => QualityPreset::DataSaver,
-                3 => QualityPreset::BestQuality,
-                _ => QualityPreset::Balanced,
-            };
-            self.send(SessionMessage::SetQuality { preset });
-            if let Some(window) = self.window()
-                && !window.makeFirstResponder(Some(self))
-            {
-                tracing::warn!(
-                    "macOS viewer could not restore input focus after changing quality"
-                );
-            }
-        }
-
-        #[unsafe(method(showFiles:))]
-        fn show_files(&self, sender: &NSButton) {
-            self.disable_input();
-            let menu = NSMenu::new(self.mtm());
-            for (title, action) in [("Send", sel!(sendFiles:)), ("Receive", sel!(receiveFiles:))] {
-                let item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(self.mtm()), &NSString::from_str(title), Some(action), &NSString::new()) };
-                unsafe { item.setTarget(Some(self)); } menu.addItem(&item);
-            }
-            let status = self.ivars().control.files().status();
-            if !status.is_empty() {
-                menu.addItem(&NSMenuItem::separatorItem(self.mtm()));
-                let item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(self.mtm()), &NSString::from_str(&status), None, &NSString::new()) };
-                item.setEnabled(false); menu.addItem(&item);
-            }
-            menu.popUpMenuPositioningItem_atLocation_inView(None, NSPoint::new(0., 0.), Some(sender));
-            self.ivars().control.set_input_enabled(true);
-        }
-        #[unsafe(method(sendFiles:))]
-        fn send_files(&self, _: &NSMenuItem) { self.ivars().control.files().pick(); }
-        #[unsafe(method(receiveFiles:))]
-        fn receive_files(&self, _: &NSMenuItem) { self.ivars().control.files().request_peer_pick(); }
-
-        #[unsafe(method(promptCredentials:))]
-        fn prompt_credentials(&self, _: &NSButton) { self.release_input(); self.send(SessionMessage::PromptForCredentials); }
-        #[unsafe(method(autofillCredentials:))]
-        fn autofill_credentials(&self, _: &NSButton) { self.release_input(); self.send(SessionMessage::AutofillCredentials); }
-        #[unsafe(method(forgetCredentials:))]
-        fn forget_credentials(&self, _: &NSButton) { self.send(SessionMessage::ForgetCredentials); }
-
-        #[unsafe(method(typeClipboard:))]
-        fn type_clipboard(&self, _sender: &NSButton) {
-            self.release_input();
-            self.ivars().control.type_clipboard(self.ivars().active_display.borrow().id);
-        }
-
-        #[unsafe(method(sendSecureAttention:))]
-        fn send_secure_attention(&self, _sender: &NSButton) {
-            self.release_input();
-            self.ivars().control.send_secure_attention();
-        }
-
-        #[unsafe(method(toggleChat:))]
-        fn toggle_chat_action(&self, _sender: &NSButton) {
-            self.disable_input();
-            if let Some(popup) = self.ivars().chat_popup.borrow().as_ref() { popup.toggle(); }
-        }
-
         #[unsafe(method(toggleDiagnostics:))]
-        fn toggle_diagnostics_action(&self, _sender: &NSButton) {
+        fn toggle_diagnostics_action(&self, _sender: &NSMenuItem) {
             self.toggle_debug();
         }
     }
@@ -864,13 +694,8 @@ impl RemoteView {
             displays: RefCell::new(displays),
             video_width: std::cell::Cell::new(video_width),
             video_height: std::cell::Cell::new(video_height),
-            user_popup: RefCell::new(None),
-            display_popup: RefCell::new(None),
+            toolbar: RefCell::new(None),
             chat_popup: RefCell::new(None),
-            session_button: RefCell::new(None),
-            credential_buttons: RefCell::new(Vec::new()),
-            credential_label: RefCell::new(None),
-            recording_visible: std::cell::Cell::new(false),
             confirming_disconnect: std::cell::Cell::new(false),
             window_closed: std::cell::Cell::new(false),
             control,
@@ -966,188 +791,353 @@ impl RemoteView {
     }
 
     fn install_toolbar(&self, mtm: MainThreadMarker, frame: NSRect) {
-        let toolbar = NSView::initWithFrame(
-            NSView::alloc(mtm),
-            NSRect {
-                origin: NSPoint {
-                    x: 0.0,
-                    y: (frame.size.height - VIEWER_TOOLBAR_HEIGHT).max(0.0),
-                },
-                size: NSSize {
-                    width: frame.size.width,
-                    height: VIEWER_TOOLBAR_HEIGHT,
-                },
-            },
+        let toolbar = ToolbarView::new(
+            mtm,
+            NSRect::new(
+                NSPoint::new(0.0, (frame.size.height - VIEWER_TOOLBAR_HEIGHT).max(0.0)),
+                NSSize::new(frame.size.width, VIEWER_TOOLBAR_HEIGHT),
+            ),
+            self,
         );
         toolbar.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
         );
-        toolbar.setWantsLayer(true);
-        if let Some(layer) = toolbar.layer() {
-            let background = NSColor::colorWithWhite_alpha(0.08, 0.96).CGColor();
-            layer.setBackgroundColor(Some(&background));
-        }
-
-        let display_popup = NSPopUpButton::initWithFrame_pullsDown(
-            NSPopUpButton::alloc(mtm),
-            NSRect {
-                origin: NSPoint { x: 234.0, y: 6.0 },
-                size: NSSize {
-                    width: 110.0,
-                    height: 24.0,
-                },
-            },
-            false,
-        );
-        unsafe {
-            display_popup.setTarget(Some(self));
-            display_popup.setAction(Some(sel!(selectDisplayFromToolbar:)));
-        }
-        display_popup.setToolTip(Some(&NSString::from_str(
-            "➤ marks the monitor with the agent-side mouse when the local user controls input.",
-        )));
-        toolbar.addSubview(&display_popup);
-        *self.ivars().display_popup.borrow_mut() = Some(display_popup);
-
-        let user_popup = NSPopUpButton::initWithFrame_pullsDown(
-            NSPopUpButton::alloc(mtm),
-            NSRect::new(NSPoint::new(78., 6.), NSSize::new(150., 24.)),
-            false,
-        );
-        user_popup.setToolTip(Some(&NSString::from_str("User session")));
-        unsafe {
-            user_popup.setTarget(Some(self));
-            user_popup.setAction(Some(sel!(selectUserFromToolbar:)));
-        }
-        toolbar.addSubview(&user_popup);
-        *self.ivars().user_popup.borrow_mut() = Some(user_popup);
-        self.refresh_display_selectors();
-
-        let quality_popup = NSPopUpButton::initWithFrame_pullsDown(
-            NSPopUpButton::alloc(mtm),
-            NSRect {
-                origin: NSPoint { x: 356.0, y: 6.0 },
-                size: NSSize {
-                    width: 154.0,
-                    height: 24.0,
-                },
-            },
-            false,
-        );
-        for title in ["Ultra data saver", "Data saver", "Balanced", "Best quality"] {
-            quality_popup.addItemWithTitle(&NSString::from_str(title));
-        }
-        quality_popup.selectItemAtIndex(quality_index(self.ivars().control.quality_preset()));
-        unsafe {
-            quality_popup.setTarget(Some(self));
-            quality_popup.setAction(Some(sel!(selectQualityFromToolbar:)));
-        }
-        toolbar.addSubview(&quality_popup);
-
-        let diagnostics = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("Session"),
-                Some(self),
-                Some(sel!(showSessionControls:)),
-                mtm,
-            )
-        };
-        diagnostics.setFrame(NSRect {
-            origin: NSPoint { x: 516.0, y: 6.0 },
-            size: NSSize {
-                width: 88.0,
-                height: 24.0,
-            },
-        });
-        toolbar.addSubview(&diagnostics);
-        *self.ivars().session_button.borrow_mut() = Some(diagnostics);
+        self.addSubview(&toolbar);
+        *self.ivars().toolbar.borrow_mut() = Some(toolbar);
         self.registerForDraggedTypes(&NSArray::from_slice(&[unsafe { NSPasteboardTypeFileURL }]));
-        let file_button = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("📁"),
-                Some(self),
-                Some(sel!(showFiles:)),
-                self.mtm(),
-            )
-        };
-        file_button.setFrame(NSRect::new(NSPoint::new(654., 6.), NSSize::new(40., 24.)));
-        file_button.setToolTip(Some(&NSString::from_str(
-            "Send or receive files and folders",
-        )));
-        toolbar.addSubview(&file_button);
-        let chat_button = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("Chat"),
-                Some(self),
-                Some(sel!(toggleChat:)),
-                mtm,
-            )
-        };
-        chat_button.setFrame(NSRect::new(NSPoint::new(610., 6.), NSSize::new(40., 24.)));
-        toolbar.addSubview(&chat_button);
-        let secure_attention_button = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("Ctrl+Alt+Del"),
-                Some(self),
-                Some(sel!(sendSecureAttention:)),
-                mtm,
-            )
-        };
-        secure_attention_button
-            .setFrame(NSRect::new(NSPoint::new(700., 6.), NSSize::new(110., 24.)));
-        toolbar.addSubview(&secure_attention_button);
-        let type_clipboard_button = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("Type clipboard"),
-                Some(self),
-                Some(sel!(typeClipboard:)),
-                mtm,
-            )
-        };
-        type_clipboard_button.setFrame(NSRect::new(NSPoint::new(816., 6.), NSSize::new(120., 24.)));
-        type_clipboard_button.setToolTip(Some(&NSString::from_str(
-            "Type local clipboard text into the focused remote field",
-        )));
-        toolbar.addSubview(&type_clipboard_button);
-        for (i, (title, action)) in [
-            ("Prompt for credentials", sel!(promptCredentials:)),
-            ("Autofill credentials?", sel!(autofillCredentials:)),
-            ("Forget credentials", sel!(forgetCredentials:)),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let button = unsafe {
-                NSButton::buttonWithTitle_target_action(
-                    &NSString::from_str(title),
-                    Some(self),
-                    Some(action),
-                    mtm,
-                )
-            };
-            button.setFrame(NSRect::new(
-                NSPoint::new(80. + i as f64 * 184., 40.),
-                NSSize::new(180., 24.),
-            ));
-            button.setEnabled(false);
-            toolbar.addSubview(&button);
-            self.ivars().credential_buttons.borrow_mut().push(button);
-        }
-        let label = NSTextField::labelWithString(&NSString::from_str(""), mtm);
-        label.setFrame(NSRect::new(
-            NSPoint::new(638., 42.),
-            NSSize::new((frame.size.width - 646.).max(100.), 20.),
-        ));
-        label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
-        toolbar.addSubview(&label);
-        *self.ivars().credential_label.borrow_mut() = Some(label);
         let control = self.ivars().control.clone();
         *self.ivars().chat_popup.borrow_mut() = Some(meshrmm_chat::ChatPopup::new(
             control.chat(),
-            &chat_button,
+            self,
             move |enabled| control.set_input_enabled(enabled),
         ));
-        self.addSubview(&toolbar);
+        self.refresh_toolbar();
+    }
+
+    /// What the toolbar shows now.
+    fn toolbar_state(&self) -> toolbar::State {
+        let displays = self.ivars().displays.borrow();
+        let active = self.ivars().active_display.borrow();
+        let sessions = Display::sessions(&displays);
+        let visible = active.session_displays(&displays);
+        let control = &self.ivars().control;
+        let chat = control.chat();
+        toolbar::State {
+            sessions: sessions.iter().map(|session| session.label()).collect(),
+            session: sessions
+                .iter()
+                .position(|session| *session == active.session)
+                .unwrap_or(0),
+            displays: visible
+                .iter()
+                .enumerate()
+                .map(|(index, display)| display.selection_label(index))
+                .collect(),
+            display: visible
+                .iter()
+                .position(|display| display.id == active.id)
+                .unwrap_or(0),
+            pointer_display: self
+                .ivars()
+                .agent_pointer_display
+                .get()
+                .and_then(|id| visible.iter().position(|display| display.id == id)),
+            quality: control.quality_preset(),
+            chroma: None,
+            credentials: control.credential_state(),
+            input_blocked: control.technician_blocked(),
+            chat_available: chat.available(),
+            chat_unread: chat.unread(),
+            file_status: control.files().status(),
+            recording: control.recording().active(),
+            diagnostics: *self.ivars().debug_visible.borrow(),
+            settings_menu: true,
+            caption: None,
+        }
+    }
+
+    fn refresh_toolbar(&self) {
+        let state = self.toolbar_state();
+        if let Some(toolbar) = self.ivars().toolbar.borrow().as_ref() {
+            toolbar.set_state(state);
+        }
+    }
+
+    /// A click on the toolbar item for `action`, at `rect` in the toolbar.
+    pub(super) fn toolbar_action(&self, action: Action, rect: toolbar::Rect) {
+        let Some(toolbar_view) = self.ivars().toolbar.borrow().clone() else {
+            return;
+        };
+        match action {
+            Action::User | Action::Display | Action::Quality | Action::Credentials => {
+                self.release_input();
+                toolbar_view.show_menu(&toolbar::menu(action, &toolbar_view.state()), rect);
+            }
+            Action::Files => {
+                self.disable_input();
+                toolbar_view.show_menu(&toolbar::menu(action, &toolbar_view.state()), rect);
+                self.ivars().control.set_input_enabled(true);
+            }
+            Action::Recording => self.ivars().control.toggle_recording(),
+            Action::SecureAttention => {
+                self.release_input();
+                self.ivars().control.send_secure_attention();
+            }
+            Action::TypeClipboard => {
+                self.release_input();
+                self.ivars()
+                    .control
+                    .type_clipboard(self.ivars().active_display.borrow().id);
+            }
+            Action::Chat => {
+                self.disable_input();
+                let anchor = toolbar_view.convertRect_toView(
+                    NSRect::new(
+                        NSPoint::new(rect.x, rect.y),
+                        NSSize::new(rect.width, rect.height),
+                    ),
+                    Some(self),
+                );
+                if let Some(popup) = self.ivars().chat_popup.borrow().as_ref() {
+                    popup.toggle(anchor);
+                }
+            }
+            Action::Diagnostics => self.toggle_debug(),
+            Action::Settings => self.show_session_controls(rect),
+            // The window's own buttons stand in for the caption buttons.
+            Action::Minimize | Action::Maximize | Action::Close => {}
+        }
+        self.refresh_toolbar();
+    }
+
+    /// A choice from a toolbar menu.
+    pub(super) fn toolbar_command(&self, command: Command) {
+        match command {
+            Command::Session(index) => {
+                let target = {
+                    let displays = self.ivars().displays.borrow();
+                    let active = self.ivars().active_display.borrow();
+                    Display::sessions(&displays)
+                        .get(index)
+                        .filter(|session| **session != active.session)
+                        .and_then(|session| {
+                            displays
+                                .iter()
+                                .find(|d| &d.session == session && d.primary)
+                                .or_else(|| displays.iter().find(|d| &d.session == session))
+                                .map(|display| display.id)
+                        })
+                };
+                // The selection changes once the agent confirms its stream.
+                if let Some(display_id) = target {
+                    self.release_input();
+                    self.send(SessionMessage::SelectDisplay { display_id });
+                }
+            }
+            Command::Display(index) => {
+                let target = {
+                    let displays = self.ivars().displays.borrow();
+                    let active = self.ivars().active_display.borrow();
+                    active
+                        .session_displays(&displays)
+                        .get(index)
+                        .map(|display| display.id)
+                        .filter(|id| *id != active.id)
+                };
+                if let Some(display_id) = target {
+                    self.send(SessionMessage::SelectDisplay { display_id });
+                }
+            }
+            Command::Quality(preset) => self.send(SessionMessage::SetQuality { preset }),
+            // The macOS viewer decodes 4:2:0 only and does not offer the choice.
+            Command::Chroma(_) => {}
+            Command::PromptCredentials => {
+                self.release_input();
+                self.send(SessionMessage::PromptForCredentials);
+            }
+            Command::AutofillCredentials => {
+                self.release_input();
+                self.send(SessionMessage::AutofillCredentials);
+            }
+            Command::ForgetCredentials => self.send(SessionMessage::ForgetCredentials),
+            Command::SendFiles => self.ivars().control.files().pick(),
+            Command::ReceiveFiles => self.ivars().control.files().request_peer_pick(),
+        }
+        self.refresh_toolbar();
+    }
+
+    /// The session controls, which the toolbar's settings item opens.
+    fn show_session_controls(&self, anchor: toolbar::Rect) {
+        self.release_input();
+        let menu = NSMenu::new(self.mtm());
+        menu.setAutoenablesItems(false);
+        for (title, action) in [
+            (
+                if self.ivars().control.technician_blocked() {
+                    "Allow technician input"
+                } else {
+                    "Block technician input"
+                },
+                sel!(toggleTechnicianInput:),
+            ),
+            (
+                if self.ivars().control.agent_blocked() {
+                    "Allow agent input"
+                } else {
+                    "Block agent keyboard and mouse"
+                },
+                sel!(toggleAgentInput:),
+            ),
+            (
+                if self.ivars().control.maintenance_state().blacked_out {
+                    "Restore agent monitors"
+                } else {
+                    "Black out all agent monitors"
+                },
+                sel!(toggleBlackout:),
+            ),
+            (
+                if self.ivars().control.audio_muted() {
+                    "Unmute audio"
+                } else {
+                    "Mute audio"
+                },
+                sel!(toggleAudio:),
+            ),
+            (
+                if self.ivars().control.allow_idle_override() {
+                    "Prevent idle lock"
+                } else {
+                    "Prevent idle lock (company managed)"
+                },
+                sel!(togglePreventIdleLock:),
+            ),
+            (
+                "Disconnect confirmation",
+                sel!(toggleDisconnectConfirmation:),
+            ),
+            ("Command key sends Ctrl", sel!(toggleCommandAsControl:)),
+            ("Sync clipboard", sel!(toggleClipboardSync:)),
+            (
+                "Clear clipboard on session close",
+                sel!(toggleClearClipboardOnClose:),
+            ),
+            (
+                "Highlight viewed monitor on agent",
+                sel!(toggleDisplayBorder:),
+            ),
+            ("Hide remote wallpaper", sel!(toggleWallpaper:)),
+            ("Show remote cursor", sel!(toggleRemoteCursor:)),
+            ("Diagnostics", sel!(toggleDiagnostics:)),
+            (
+                if self.ivars().control.recording().active() {
+                    "Stop recording and save"
+                } else {
+                    "Record video to Downloads"
+                },
+                sel!(toggleRecording:),
+            ),
+        ] {
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(self.mtm()),
+                    &NSString::from_str(title),
+                    Some(action),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe {
+                item.setTarget(Some(self));
+            }
+            if action == sel!(toggleAgentInput:) || action == sel!(toggleBlackout:) {
+                item.setEnabled(self.ivars().control.maintenance_state().available);
+            }
+            if action == sel!(toggleAgentInput:)
+                && self.ivars().control.maintenance_state().blacked_out
+            {
+                item.setEnabled(false);
+            }
+            if action == sel!(togglePreventIdleLock:) {
+                item.setState(isize::from(self.ivars().control.prevent_idle_lock()));
+                item.setEnabled(self.ivars().control.allow_idle_override());
+            }
+            if action == sel!(toggleDisconnectConfirmation:) {
+                item.setState(isize::from(self.ivars().control.disconnect_confirmation()));
+            }
+            if action == sel!(toggleCommandAsControl:) {
+                item.setState(isize::from(self.ivars().control.command_as_control()));
+            }
+            if action == sel!(toggleClipboardSync:) {
+                item.setState(isize::from(self.ivars().control.clipboard_sync()));
+            }
+            if action == sel!(toggleClearClipboardOnClose:) {
+                item.setState(isize::from(self.ivars().control.clear_clipboard_on_close()));
+            }
+            if action == sel!(toggleDisplayBorder:) {
+                item.setState(isize::from(self.ivars().control.display_border()));
+            }
+            if action == sel!(toggleWallpaper:) {
+                item.setState(isize::from(self.ivars().control.wallpaper_hidden()));
+            }
+            if action == sel!(toggleRemoteCursor:) {
+                item.setState(isize::from(self.ivars().control.show_remote_cursor()));
+            }
+            menu.addItem(&item);
+            if action == sel!(toggleDiagnostics:) {
+                let shortcut = NSMenuItem::new(self.mtm());
+                shortcut.setTitle(&NSString::from_str("Diagnostics key"));
+                let choices = NSMenu::new(self.mtm());
+                let selected = self
+                    .ivars()
+                    .control
+                    .shortcut_key(crate::shortcuts::ViewerShortcut::Diagnostics);
+                for (index, key) in crate::shortcuts::ShortcutKey::ALL.into_iter().enumerate() {
+                    let choice_item = unsafe {
+                        NSMenuItem::initWithTitle_action_keyEquivalent(
+                            NSMenuItem::alloc(self.mtm()),
+                            &NSString::from_str(key.label()),
+                            Some(sel!(selectDiagnosticsKey:)),
+                            &NSString::new(),
+                        )
+                    };
+                    unsafe {
+                        choice_item.setTarget(Some(self));
+                    }
+                    choice_item.setTag(index as isize);
+                    choice_item.setState(isize::from(key == selected));
+                    choices.addItem(&choice_item);
+                }
+                shortcut.setSubmenu(Some(&choices));
+                menu.addItem(&shortcut);
+            }
+            if action == sel!(toggleDisconnectConfirmation:) {
+                let close = NSMenuItem::new(self.mtm());
+                close.setTitle(&NSString::from_str("On session close"));
+                let choices = NSMenu::new(self.mtm());
+                let selected = self.ivars().control.session_close_action();
+                for (index, choice) in SessionCloseAction::ALL.into_iter().enumerate() {
+                    let choice_item = unsafe {
+                        NSMenuItem::initWithTitle_action_keyEquivalent(
+                            NSMenuItem::alloc(self.mtm()),
+                            &NSString::from_str(choice.label()),
+                            Some(sel!(selectSessionCloseAction:)),
+                            &NSString::new(),
+                        )
+                    };
+                    unsafe {
+                        choice_item.setTarget(Some(self));
+                    }
+                    choice_item.setTag(index as isize);
+                    choice_item.setState(isize::from(choice == selected));
+                    choices.addItem(&choice_item);
+                }
+                close.setSubmenu(Some(&choices));
+                menu.addItem(&close);
+            }
+        }
+        if let Some(toolbar) = self.ivars().toolbar.borrow().clone() {
+            toolbar.pop_up(&menu, anchor);
+        }
     }
 
     fn send(&self, message: SessionMessage) {
@@ -1212,25 +1202,7 @@ impl RemoteView {
         display_id: Option<meshrmm_protocol::DisplayId>,
     ) {
         self.ivars().agent_pointer_display.set(display_id);
-        if let Some(popup) = self.ivars().display_popup.borrow().as_ref() {
-            for (index, display) in self
-                .ivars()
-                .active_display
-                .borrow()
-                .session_displays(&self.ivars().displays.borrow())
-                .iter()
-                .enumerate()
-            {
-                if let Some(item) = popup.itemAtIndex(index as isize) {
-                    let title = if display_id == Some(display.id) {
-                        format!("➤ {}", display.selection_label(index))
-                    } else {
-                        display.selection_label(index)
-                    };
-                    item.setTitle(&NSString::from_str(&title));
-                }
-            }
-        }
+        self.refresh_toolbar();
     }
 
     pub(super) fn set_cursor_shape(&self, shape: CursorShape) {
@@ -1366,40 +1338,14 @@ impl RemoteView {
         if visible {
             self.refresh_debug(true);
         }
+        self.refresh_toolbar();
     }
 
     pub(super) fn refresh_debug(&self, force: bool) {
-        let state = self.ivars().control.credential_state();
-        for (i, button) in self.ivars().credential_buttons.borrow().iter().enumerate() {
-            button.setEnabled(
-                !self.ivars().control.technician_blocked()
-                    && match i {
-                        0 => state.available && !state.prompt_active,
-                        1 => state.can_autofill,
-                        _ => state.saved && !state.prompt_active,
-                    },
-            );
-            if i == 1 {
-                button.setHidden(!state.can_autofill);
-            }
-        }
-        if let Some(label) = self.ivars().credential_label.borrow().as_ref() {
-            label.setStringValue(&NSString::from_str(&state.message));
-            label.setToolTip(Some(&NSString::from_str(&state.message)));
-        }
         if let Some(notice) = self.ivars().control.recording().take_notice() {
             queue_alert("Session recording", notice);
         }
-        let recording = self.ivars().control.recording().active();
-        if self.ivars().recording_visible.replace(recording) != recording
-            && let Some(button) = self.ivars().session_button.borrow().as_ref()
-        {
-            button.setTitle(&NSString::from_str(if recording {
-                "● REC"
-            } else {
-                "Controls"
-            }));
-        }
+        self.refresh_toolbar();
         if let Some(error) = self.ivars().control.take_maintenance_error() {
             queue_alert("Maintenance control failed", error);
         }
@@ -1415,35 +1361,6 @@ impl RemoteView {
             .setStringValue(&NSString::from_str(&self.ivars().debug.render()));
     }
 
-    fn refresh_display_selectors(&self) {
-        let displays = self.ivars().displays.borrow();
-        let active = self.ivars().active_display.borrow();
-        if let Some(popup) = self.ivars().user_popup.borrow().as_ref() {
-            popup.removeAllItems();
-            let sessions = Display::sessions(&displays);
-            for session in &sessions {
-                popup.addItemWithTitle(&NSString::from_str(&session.label()));
-            }
-            popup.selectItemAtIndex(
-                sessions
-                    .iter()
-                    .position(|s| *s == active.session)
-                    .unwrap_or(0) as isize,
-            );
-        }
-        if let Some(popup) = self.ivars().display_popup.borrow().as_ref() {
-            popup.removeAllItems();
-            let visible = active.session_displays(&displays);
-            for (index, display) in visible.iter().enumerate() {
-                popup.addItemWithTitle(&NSString::from_str(&display.selection_label(index)));
-            }
-            popup.selectItemAtIndex(
-                visible.iter().position(|d| d.id == active.id).unwrap_or(0) as isize
-            );
-            popup.setEnabled(visible.len() > 1);
-        }
-    }
-
     pub(super) fn configure_display(
         &self,
         display: Display,
@@ -1456,8 +1373,7 @@ impl RemoteView {
         }
         *self.ivars().active_display.borrow_mut() = display;
         *self.ivars().displays.borrow_mut() = displays;
-        self.refresh_display_selectors();
-        self.set_agent_pointer_display(self.ivars().agent_pointer_display.get());
+        self.refresh_toolbar();
         self.ivars().video_width.set(width);
         self.ivars().video_height.set(height);
     }
@@ -1474,15 +1390,6 @@ impl RemoteView {
     pub(super) fn disable_input(&self) {
         self.release_input();
         self.ivars().control.set_input_enabled(false);
-    }
-}
-
-fn quality_index(preset: QualityPreset) -> isize {
-    match preset {
-        QualityPreset::UltraDataSaver => 0,
-        QualityPreset::DataSaver => 1,
-        QualityPreset::Balanced => 2,
-        QualityPreset::BestQuality => 3,
     }
 }
 

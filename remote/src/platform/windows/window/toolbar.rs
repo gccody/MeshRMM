@@ -1,45 +1,60 @@
-//! The toolbar above the video: user, display, quality and color selectors,
-//! session actions, and the caption buttons of the borderless window.
+//! The toolbar above the video, drawn by the viewer: see [`crate::toolbar`]
+//! for its items, layout and icons. A child window paints them, with GDI+
+//! for the shapes and GDI for ClearType text, tracks the mouse, shows their
+//! menus and tooltips, and lets the empty space between them move the
+//! window. The borderless window's caption buttons are toolbar items too.
+//! This module also creates the owned popups over the video.
+
+use std::sync::OnceLock;
 
 use super::*;
+use crate::toolbar::{self, Action, Command, Item, Layout, MenuEntry, Paint, Rect, Segment};
+use windows::Win32::Foundation::{COLORREF, POINT, SIZE};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DT_LEFT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DrawTextW, EndPaint, FillRect, GetDC,
+    GetTextExtentPoint32W, HDC, InvalidateRect, PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject,
+    SetBkMode, TRANSPARENT,
+};
+use windows::Win32::Graphics::GdiPlus::{
+    DashCapRound, FillModeWinding, GdipAddPathBezier, GdipAddPathLine, GdipClosePathFigure,
+    GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush,
+    GdipDeleteGraphics, GdipDeletePath, GdipDeletePen, GdipDrawPath, GdipFillPath,
+    GdipSetPenLineCap197819, GdipSetPenLineJoin, GdipSetPixelOffsetMode, GdipSetSmoothingMode,
+    GdipStartPathFigure, GdiplusStartup, GdiplusStartupInput, GpGraphics, GpPath, LineCapRound,
+    LineJoinRound, PixelOffsetModeHalf, SmoothingModeAntiAlias, UnitPixel,
+};
+use windows::Win32::UI::Controls::{
+    ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, NMHDR, NMTTDISPINFOW,
+    TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_DELTOOLW, TTM_SETMAXTIPWIDTH,
+    TTN_GETDISPINFOW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, WM_MOUSELEAVE,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::core::PWSTR;
 
-const USER_COMBO_ID: usize = 4013;
-const DISPLAY_COMBO_ID: usize = 4001;
-const QUALITY_COMBO_ID: usize = 4002;
-const CHROMA_COMBO_ID: usize = 4008;
-const DIAGNOSTICS_BUTTON_ID: usize = 4003;
-const SETTINGS_BUTTON_ID: usize = 4004;
-const FILE_BUTTON_ID: usize = 4010;
-const CHAT_BUTTON_ID: usize = 4009;
-const SECURE_ATTENTION_BUTTON_ID: usize = 4011;
-const TYPE_CLIPBOARD_BUTTON_ID: usize = 4012;
-const CREDENTIAL_BUTTON_ID: usize = 4020;
-const MINIMIZE_BUTTON_ID: usize = 4005;
-const MAXIMIZE_BUTTON_ID: usize = 4006;
-const CLOSE_BUTTON_ID: usize = 4007;
 const RETRY_BUTTON_ID: usize = 4030;
 
+/// The toolbar's items, where they are, and the mouse over them.
+#[derive(Default)]
+pub(super) struct ToolbarModel {
+    state: toolbar::State,
+    items: Vec<Item>,
+    /// In 96-DPI pixels.
+    layout: Layout,
+    /// The items' tooltips, which the tooltip control reads by item index.
+    tooltips: Vec<HSTRING>,
+    /// How many tools the tooltip control has.
+    tools: usize,
+    hovered: Option<usize>,
+    pressed: Option<usize>,
+    tracking: bool,
+}
+
 impl WindowContext {
-    pub(super) fn toolbar_controls(&self) -> [HWND; 20] {
+    /// The native controls that use the message font.
+    pub(super) fn toolbar_controls(&self) -> [HWND; 3] {
         let controls = self.controls();
         [
-            controls.user_combo,
-            controls.display_combo,
-            controls.quality_combo,
-            controls.chroma_combo,
-            controls.diagnostics_button,
-            controls.settings_button,
-            controls.file_button,
-            controls.chat_button,
-            controls.secure_attention_button,
-            controls.type_clipboard_button,
-            controls.credential_buttons[0],
-            controls.credential_buttons[1],
-            controls.credential_buttons[2],
-            controls.credential_label,
-            controls.minimize_button,
-            controls.maximize_button,
-            controls.close_button,
             controls.debug_overlay,
             controls.reconnecting_label,
             controls.retry_button,
@@ -47,130 +62,586 @@ impl WindowContext {
     }
 
     pub(super) fn set_quality(&self, preset: QualityPreset) {
-        self.show_quality(preset);
         self.send(SessionMessage::SetQuality { preset });
+        self.show_quality(preset);
     }
 
-    /// Selects `preset` in the toolbar and settings without sending it.
+    /// Shows `preset` in the toolbar and settings without sending it.
     pub(super) fn show_quality(&self, preset: QualityPreset) {
-        let controls = self.controls();
-        let selected = quality_index(preset);
-        unsafe {
-            SendMessageW(
-                controls.quality_combo,
-                CB_SETCURSEL,
-                Some(WPARAM(selected)),
-                None,
-            )
-        };
-        for (button, candidate) in controls.quality_buttons {
+        for (button, candidate) in self.controls().quality_buttons {
             let state = usize::from(candidate == preset);
             unsafe { SendMessageW(button, BM_SETCHECK, Some(WPARAM(state)), None) };
         }
+        self.refresh_toolbar();
     }
 
     pub(super) fn set_chroma(&self, mode: ChromaMode) {
-        if !self.control.supports_chroma(mode) {
-            unsafe {
-                SendMessageW(
-                    self.controls().chroma_combo,
-                    CB_SETCURSEL,
-                    Some(WPARAM(chroma_index(self.control.chroma_mode()))),
-                    None,
-                )
-            };
-            return;
+        if self.control.supports_chroma(mode) {
+            self.send(SessionMessage::SetChroma { mode });
         }
-        self.show_chroma(mode);
-        self.send(SessionMessage::SetChroma { mode });
+        self.show_chroma(self.control.chroma_mode());
     }
 
-    /// Selects `mode` in the toolbar and settings without sending it.
+    /// Shows `mode` in the toolbar and settings without sending it.
     pub(super) fn show_chroma(&self, mode: ChromaMode) {
-        let controls = self.controls();
-        let selected = chroma_index(mode);
-        unsafe {
-            SendMessageW(
-                controls.chroma_combo,
-                CB_SETCURSEL,
-                Some(WPARAM(selected)),
-                None,
-            )
-        };
-        for (button, candidate) in controls.chroma_buttons {
+        for (button, candidate) in self.controls().chroma_buttons {
             let state = usize::from(candidate == mode);
             unsafe { SendMessageW(button, BM_SETCHECK, Some(WPARAM(state)), None) };
         }
+        self.refresh_toolbar();
     }
 
-    /// Fills the user and display selectors from the display list.
-    pub(super) fn populate_session_controls(&self) {
+    /// What the toolbar shows now.
+    pub(super) fn toolbar_state(&self) -> toolbar::State {
+        let displays = self.displays.borrow();
+        let active = self.active_display.borrow();
+        let sessions = Display::sessions(&displays);
+        let visible = active.session_displays(&displays);
+        let chat = self.control.chat();
+        toolbar::State {
+            sessions: sessions.iter().map(|session| session.label()).collect(),
+            session: sessions
+                .iter()
+                .position(|session| *session == active.session)
+                .unwrap_or(0),
+            displays: visible
+                .iter()
+                .enumerate()
+                .map(|(index, display)| display.selection_label(index))
+                .collect(),
+            display: visible
+                .iter()
+                .position(|display| display.id == active.id)
+                .unwrap_or(0),
+            pointer_display: self
+                .agent_pointer_display
+                .get()
+                .and_then(|id| visible.iter().position(|display| display.id == id)),
+            quality: self.control.quality_preset(),
+            chroma: Some((
+                self.control.chroma_mode(),
+                self.control.supports_chroma(ChromaMode::Yuv444),
+            )),
+            credentials: self.control.credential_state(),
+            input_blocked: self.control.technician_blocked(),
+            chat_available: chat.available(),
+            chat_unread: chat.unread(),
+            file_status: self.control.files().status(),
+            recording: self.control.recording().active(),
+            diagnostics: self.debug_visible.get(),
+            settings_menu: false,
+            caption: Some(unsafe { IsZoomed(self.window.get()) }.as_bool()),
+        }
+    }
+
+    /// Shows the current state, redrawing only when an item changed.
+    pub(super) fn refresh_toolbar(&self) {
+        self.update_toolbar(false);
+    }
+
+    fn update_toolbar(&self, relayout: bool) {
+        let state = self.toolbar_state();
+        let changed = {
+            let mut model = self.toolbar.borrow_mut();
+            if model.state == state && !relayout {
+                return;
+            }
+            let items = toolbar::items(&state);
+            model.state = state;
+            if model.items == items {
+                false
+            } else {
+                model.tooltips = items
+                    .iter()
+                    .map(|item| HSTRING::from(&item.tooltip))
+                    .collect();
+                model.items = items;
+                true
+            }
+        };
+        if changed || relayout {
+            self.relayout_toolbar();
+        }
+    }
+
+    fn scale_factor(&self) -> f64 {
+        f64::from(self.dpi.get()) / 96.0
+    }
+
+    /// A toolbar rectangle in the toolbar's client pixels, which are also
+    /// the window's.
+    fn device_rect(&self, rect: Rect) -> RECT {
+        let scale = self.scale_factor();
+        RECT {
+            left: (rect.x * scale).round() as i32,
+            top: (rect.y * scale).round() as i32,
+            right: (rect.right() * scale).round() as i32,
+            bottom: (rect.bottom() * scale).round() as i32,
+        }
+    }
+
+    /// Labels' widths in 96-DPI pixels, measured on `dc` in the toolbar font.
+    fn measure(&self, dc: HDC, text: &str) -> f64 {
+        let text: Vec<u16> = text.encode_utf16().collect();
+        let mut size = SIZE::default();
+        let _ = unsafe { GetTextExtentPoint32W(dc, &text, &mut size) };
+        f64::from(size.cx) / self.scale_factor()
+    }
+
+    fn relayout_toolbar(&self) {
         let controls = self.controls();
-        let active = self.active_display();
-        let sessions = Display::sessions(&self.displays());
-        unsafe { SendMessageW(controls.user_combo, CB_RESETCONTENT, None, None) };
-        for session in &sessions {
-            let title = HSTRING::from(session.label());
+        if controls.toolbar.is_invalid() {
+            return;
+        }
+        let (width, _) = unsafe { client_size(controls.toolbar) }.unwrap_or_default();
+        let width = f64::from(width) / self.scale_factor();
+        let layout = unsafe {
+            let dc = GetDC(Some(controls.toolbar));
+            let old = SelectObject(dc, HGDIOBJ(self.toolbar_font.get().0));
+            let layout = toolbar::layout(&self.toolbar.borrow().items, width, 0.0, &|text| {
+                self.measure(dc, text)
+            });
+            SelectObject(dc, old);
+            ReleaseDC(Some(controls.toolbar), dc);
+            layout
+        };
+        let rects: Vec<RECT> = layout
+            .rects
+            .iter()
+            .map(|rect| self.device_rect(*rect))
+            .collect();
+        let chat = {
+            let mut model = self.toolbar.borrow_mut();
+            let chat = model
+                .items
+                .iter()
+                .position(|item| item.action == Action::Chat)
+                .map(|index| rects[index]);
+            model.layout = layout;
+            chat
+        };
+        unsafe { self.sync_tooltips(&rects) };
+        if let (Some(anchor), Some(popup)) = (chat, self.chat_popup.get()) {
+            popup.set_anchor(anchor);
+        }
+        let _ = unsafe { InvalidateRect(Some(controls.toolbar), None, false) };
+    }
+
+    /// Gives each item a tooltip tool over its rectangle. The control asks
+    /// for the text when it shows a tip.
+    unsafe fn sync_tooltips(&self, rects: &[RECT]) {
+        let controls = self.controls();
+        if controls.tooltip.is_invalid() {
+            return;
+        }
+        let tool = |id: usize, rect: RECT| TTTOOLINFOW {
+            // Without the reserved field, which comctl32 before version 6
+            // rejects.
+            cbSize: std::mem::offset_of!(TTTOOLINFOW, lpReserved) as u32,
+            uFlags: TTF_SUBCLASS,
+            hwnd: controls.toolbar,
+            uId: id,
+            rect,
+            lpszText: PWSTR(usize::MAX as *mut u16),
+            ..Default::default()
+        };
+        let old_tools = std::mem::replace(&mut self.toolbar.borrow_mut().tools, rects.len());
+        for id in 0..old_tools {
+            let info = tool(id, RECT::default());
             unsafe {
                 SendMessageW(
-                    controls.user_combo,
-                    CB_ADDSTRING,
+                    controls.tooltip,
+                    TTM_DELTOOLW,
                     None,
-                    Some(LPARAM(title.as_ptr() as isize)),
-                );
+                    Some(LPARAM(&info as *const _ as isize)),
+                )
+            };
+        }
+        for (id, rect) in rects.iter().enumerate() {
+            let info = tool(id, *rect);
+            unsafe {
+                SendMessageW(
+                    controls.tooltip,
+                    TTM_ADDTOOLW,
+                    None,
+                    Some(LPARAM(&info as *const _ as isize)),
+                )
+            };
+        }
+    }
+
+    /// Paints the toolbar into a memory bitmap, then onto the window.
+    unsafe fn paint_toolbar(&self, toolbar_window: HWND) {
+        let mut paint = PAINTSTRUCT::default();
+        let dc = unsafe { BeginPaint(toolbar_window, &mut paint) };
+        let (width, height) = unsafe { client_size(toolbar_window) }.unwrap_or_default();
+        let (width, height) = (width as i32, height as i32);
+        if width > 0 && height > 0 {
+            unsafe {
+                let memory = CreateCompatibleDC(Some(dc));
+                let bitmap = CreateCompatibleBitmap(dc, width, height);
+                let old_bitmap = SelectObject(memory, HGDIOBJ(bitmap.0));
+                self.draw_toolbar(memory, width);
+                let _ = BitBlt(dc, 0, 0, width, height, Some(memory), 0, 0, SRCCOPY);
+                SelectObject(memory, old_bitmap);
+                let _ = DeleteObject(HGDIOBJ(bitmap.0));
+                let _ = DeleteDC(memory);
             }
         }
-        let active_session = sessions
-            .iter()
-            .position(|s| *s == active.session)
-            .unwrap_or(0);
+        let _ = unsafe { EndPaint(toolbar_window, &paint) };
+    }
+
+    unsafe fn draw_toolbar(&self, dc: HDC, width: i32) {
+        let scale = self.scale_factor();
+        let height = toolbar_height(self.dpi.get());
         unsafe {
-            SendMessageW(
-                controls.user_combo,
-                CB_SETCURSEL,
-                Some(WPARAM(active_session)),
-                None,
+            fill_rect(
+                dc,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                },
+                toolbar::BACKGROUND,
+            );
+            let border = (scale.round() as i32).max(1);
+            fill_rect(
+                dc,
+                RECT {
+                    left: 0,
+                    top: height - border,
+                    right: width,
+                    bottom: height,
+                },
+                toolbar::BORDER,
             );
         }
-        let displays = self.displays();
-        let active_index = active
-            .session_displays(&displays)
-            .iter()
-            .position(|d| d.id == active.id)
-            .unwrap_or(0);
-        self.populate_display_combo(active_index);
-    }
-
-    /// Lists the active session's displays, marks the one the device's
-    /// pointer is on, and selects `selected`.
-    fn populate_display_combo(&self, selected: usize) {
-        let combo = self.controls().display_combo;
-        let displays = self.displays();
-        let visible = self.active_display().session_displays(&displays);
-        let pointer_display = self.agent_pointer_display.get();
-        unsafe { SendMessageW(combo, CB_RESETCONTENT, None, None) };
-        for (index, display) in visible.iter().enumerate() {
-            let title = if pointer_display == Some(display.id) {
-                format!("➤ {}", display.selection_label(index))
-            } else {
-                display.selection_label(index)
+        let model = self.toolbar.borrow();
+        for x in &model.layout.separators {
+            let left = ((x - 0.5) * scale).round() as i32;
+            let line = RECT {
+                left,
+                top: (12.0 * scale).round() as i32,
+                right: left + (scale.round() as i32).max(1),
+                bottom: (28.0 * scale).round() as i32,
             };
-            let title = HSTRING::from(title);
-            unsafe {
-                SendMessageW(
-                    combo,
-                    CB_ADDSTRING,
-                    None,
-                    Some(LPARAM(title.as_ptr() as isize)),
+            unsafe { fill_rect(dc, line, toolbar::SEPARATOR) };
+        }
+        let old_font = unsafe { SelectObject(dc, HGDIOBJ(self.toolbar_font.get().0)) };
+        let scaled = |rect: Rect| {
+            Rect::new(
+                rect.x * scale,
+                rect.y * scale,
+                rect.width * scale,
+                rect.height * scale,
+            )
+        };
+        let mut labels = Vec::new();
+        let graphics = unsafe { Graphics::new(dc) };
+        for (index, (item, rect)) in model.items.iter().zip(&model.layout.rects).enumerate() {
+            let style = toolbar::style(
+                item,
+                model.hovered == Some(index),
+                model.pressed == Some(index),
+            );
+            let text = item
+                .label
+                .as_deref()
+                .map(|label| (label, self.measure(dc, label)));
+            let parts = toolbar::parts(item, *rect, text.map_or(0.0, |(_, width)| width));
+            if let (Some((label, _)), Some(area)) = (text, parts.label) {
+                labels.push((label.to_owned(), area, style.label));
+            }
+            let Some(graphics) = graphics.as_ref() else {
+                continue;
+            };
+            if let Some(background) = style.background {
+                graphics.paint(
+                    &toolbar::rounded_rect(scaled(*rect), style.radius * scale),
+                    Paint::Fill,
+                    background,
+                );
+            }
+            for shape in toolbar::icon(item.icon) {
+                let (segments, paint) = toolbar::place(&shape, scaled(parts.icon));
+                graphics.paint(&segments, paint, style.foreground);
+            }
+            if let Some(chevron) = parts.chevron {
+                for shape in toolbar::icon(toolbar::Icon::Chevron) {
+                    let (segments, paint) = toolbar::place(&shape, scaled(chevron));
+                    graphics.paint(&segments, paint, style.foreground);
+                }
+            }
+            if let (Some((x, y)), Some(color)) = (parts.badge, style.badge) {
+                let (x, y) = (x * scale, y * scale);
+                let ring = (style.badge_radius + 1.5) * scale;
+                graphics.paint(&toolbar::circle(x, y, ring), Paint::Fill, style.badge_ring);
+                graphics.paint(
+                    &toolbar::circle(x, y, style.badge_radius * scale),
+                    Paint::Fill,
+                    color,
                 );
             }
         }
-        unsafe {
-            SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(selected)), None);
-            let _ = EnableWindow(combo, visible.len() > 1);
+        // GDI draws on the bitmap once GDI+ has finished with it.
+        drop(graphics);
+        unsafe { SetBkMode(dc, TRANSPARENT) };
+        for (label, area, color) in labels {
+            let mut text: Vec<u16> = label.encode_utf16().collect();
+            let mut area = self.device_rect(area);
+            // Rounding must not clip the last glyph.
+            area.right += 2;
+            unsafe {
+                SetTextColor(dc, colorref(color));
+                DrawTextW(
+                    dc,
+                    &mut text,
+                    &mut area,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+            }
+        }
+        unsafe { SelectObject(dc, old_font) };
+    }
+
+    fn toolbar_point(&self, lparam: LPARAM) -> (f64, f64) {
+        let scale = self.scale_factor();
+        (
+            f64::from(signed_low_word(lparam.0)) / scale,
+            f64::from(signed_high_word(lparam.0)) / scale,
+        )
+    }
+
+    fn toolbar_hit(&self, point: (f64, f64)) -> Option<usize> {
+        self.toolbar.borrow().layout.hit(point.0, point.1)
+    }
+
+    fn set_hovered(&self, toolbar_window: HWND, hovered: Option<usize>) {
+        let changed = {
+            let mut model = self.toolbar.borrow_mut();
+            std::mem::replace(&mut model.hovered, hovered) != hovered
+        };
+        if changed {
+            let _ = unsafe { InvalidateRect(Some(toolbar_window), None, false) };
         }
     }
 
+    fn toolbar_mouse_move(&self, toolbar_window: HWND, lparam: LPARAM) {
+        let start_tracking = !std::mem::replace(&mut self.toolbar.borrow_mut().tracking, true);
+        if start_tracking {
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: toolbar_window,
+                dwHoverTime: 0,
+            };
+            let _ = unsafe { TrackMouseEvent(&mut track) };
+        }
+        let hovered = self.toolbar_hit(self.toolbar_point(lparam));
+        self.set_hovered(toolbar_window, hovered);
+    }
+
+    fn toolbar_mouse_leave(&self, toolbar_window: HWND) {
+        self.toolbar.borrow_mut().tracking = false;
+        self.set_hovered(toolbar_window, None);
+    }
+
+    /// The item under the pointer now, after a menu consumed the mouse.
+    fn track_cursor(&self, toolbar_window: HWND) {
+        let mut point = POINT::default();
+        let hovered = if unsafe { GetCursorPos(&mut point) }.is_ok()
+            && unsafe { ScreenToClient(toolbar_window, &mut point) }.as_bool()
+        {
+            let scale = self.scale_factor();
+            self.toolbar_hit((f64::from(point.x) / scale, f64::from(point.y) / scale))
+        } else {
+            None
+        };
+        self.set_hovered(toolbar_window, hovered);
+    }
+
+    fn toolbar_button_down(&self, toolbar_window: HWND, lparam: LPARAM) {
+        let Some(index) = self.toolbar_hit(self.toolbar_point(lparam)) else {
+            return;
+        };
+        let Some(item) = self.toolbar.borrow().items.get(index).cloned() else {
+            return;
+        };
+        if !item.enabled {
+            return;
+        }
+        self.toolbar.borrow_mut().pressed = Some(index);
+        let _ = unsafe { InvalidateRect(Some(toolbar_window), None, false) };
+        if item.menu {
+            // The menu tracks the mouse until it closes.
+            self.fire(index);
+            self.toolbar.borrow_mut().pressed = None;
+            self.track_cursor(toolbar_window);
+            let _ = unsafe { InvalidateRect(Some(toolbar_window), None, false) };
+        } else {
+            let _ = unsafe { SetCapture(toolbar_window) };
+        }
+    }
+
+    fn toolbar_button_up(&self, toolbar_window: HWND, lparam: LPARAM) {
+        let Some(pressed) = self.toolbar.borrow_mut().pressed.take() else {
+            return;
+        };
+        let _ = unsafe { ReleaseCapture() };
+        let _ = unsafe { InvalidateRect(Some(toolbar_window), None, false) };
+        if self.toolbar_hit(self.toolbar_point(lparam)) == Some(pressed) {
+            self.fire(pressed);
+        }
+    }
+
+    fn fire(&self, index: usize) {
+        let target = {
+            let model = self.toolbar.borrow();
+            model
+                .items
+                .get(index)
+                .map(|item| item.action)
+                .zip(model.layout.rects.get(index).copied())
+        };
+        if let Some((action, rect)) = target {
+            self.toolbar_action(action, rect);
+        }
+    }
+
+    /// A click on the toolbar item for `action`, at `rect` in the toolbar.
+    fn toolbar_action(&self, action: Action, rect: Rect) {
+        let window = self.window.get();
+        match action {
+            Action::User | Action::Display | Action::Quality | Action::Credentials => {
+                self.release_input();
+                let entries = toolbar::menu(action, &self.toolbar.borrow().state);
+                if let Some(command) = unsafe { self.show_menu(window, &entries, rect) } {
+                    self.toolbar_command(command);
+                }
+            }
+            Action::Files => {
+                self.release_input();
+                self.control.set_input_enabled(false);
+                let entries = toolbar::menu(action, &self.toolbar.borrow().state);
+                if let Some(command) = unsafe { self.show_menu(window, &entries, rect) } {
+                    self.toolbar_command(command);
+                }
+                self.control.set_input_enabled(true);
+            }
+            Action::Recording => self.control.toggle_recording(),
+            Action::SecureAttention => {
+                self.release_input();
+                self.control.send_secure_attention();
+            }
+            Action::TypeClipboard => {
+                self.release_input();
+                self.control.type_clipboard(self.active_display_id());
+            }
+            Action::Chat => {
+                self.release_input();
+                self.control.set_input_enabled(false);
+                if let Some(chat) = self.chat_popup.get() {
+                    chat.toggle();
+                }
+            }
+            Action::Diagnostics => self.toggle_debug(),
+            Action::Settings => self.show_settings(),
+            Action::Minimize => {
+                let _ = unsafe { ShowWindow(window, SW_MINIMIZE) };
+            }
+            Action::Maximize => {
+                let command = if unsafe { IsZoomed(window) }.as_bool() {
+                    SW_RESTORE
+                } else {
+                    SW_MAXIMIZE
+                };
+                let _ = unsafe { ShowWindow(window, command) };
+            }
+            Action::Close => {
+                // Posted: closing destroys this toolbar, whose click is
+                // still being handled.
+                let _ = unsafe { PostMessageW(Some(window), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            }
+        }
+        self.refresh_toolbar();
+    }
+
+    /// Shows `entries` under the item at `rect` and returns the chosen
+    /// command.
+    unsafe fn show_menu(&self, window: HWND, entries: &[MenuEntry], rect: Rect) -> Option<Command> {
+        let menu = unsafe { CreatePopupMenu() }.ok()?;
+        for (index, entry) in entries.iter().enumerate() {
+            unsafe {
+                let _ = match entry {
+                    MenuEntry::Separator => AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()),
+                    MenuEntry::Item {
+                        label,
+                        checked,
+                        enabled,
+                        command,
+                    } => {
+                        let mut flags = MF_STRING;
+                        if *checked {
+                            flags |= MF_CHECKED;
+                        }
+                        if !*enabled || command.is_none() {
+                            flags |= MF_GRAYED;
+                        }
+                        AppendMenuW(menu, flags, index + 1, &HSTRING::from(label))
+                    }
+                };
+            }
+        }
+        let anchor = self.device_rect(rect);
+        let mut point = POINT {
+            x: anchor.left,
+            y: anchor.bottom + self.px(2),
+        };
+        let _ = unsafe { ClientToScreen(self.controls().toolbar, &mut point) };
+        let chosen = unsafe {
+            TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+                point.x,
+                point.y,
+                None,
+                window,
+                None,
+            )
+        }
+        .0;
+        let _ = unsafe { DestroyMenu(menu) };
+        let index = usize::try_from(chosen).ok()?.checked_sub(1)?;
+        toolbar::commands(entries).get(index).copied().flatten()
+    }
+
+    /// A choice from a toolbar menu.
+    fn toolbar_command(&self, command: Command) {
+        match command {
+            Command::Session(index) => {
+                self.release_input();
+                self.select_user(index);
+            }
+            Command::Display(index) => self.select_display(index),
+            Command::Quality(preset) => self.set_quality(preset),
+            Command::Chroma(mode) => self.set_chroma(mode),
+            Command::PromptCredentials => {
+                self.release_input();
+                self.control.send(SessionMessage::PromptForCredentials);
+            }
+            Command::AutofillCredentials => {
+                self.release_input();
+                self.control.send(SessionMessage::AutofillCredentials);
+            }
+            Command::ForgetCredentials => self.control.send(SessionMessage::ForgetCredentials),
+            Command::SendFiles => self.control.files().pick(),
+            Command::ReceiveFiles => self.control.files().request_peer_pick(),
+        }
+        self.refresh_toolbar();
+    }
+
+    /// Places the toolbar, the video and the popups for the window's size.
     pub(super) fn layout_toolbar(&self, window: HWND) {
         let mut rect = RECT::default();
         if unsafe { GetClientRect(window, &mut rect) }.is_err() {
@@ -179,77 +650,10 @@ impl WindowContext {
         let controls = self.controls();
         let dpi = self.dpi.get();
         let width = rect.right.saturating_sub(rect.left);
-        let px = |value| self.px(value);
         let place = |control: HWND, x: i32, y: i32, width: i32, height: i32| {
             let _ = unsafe { MoveWindow(control, x, y, width, height, true) };
         };
         place(controls.toolbar, 0, 0, width, toolbar_height(dpi));
-        place(controls.user_combo, px(8), px(5), px(158), px(300));
-        place(controls.display_combo, px(172), px(5), px(110), px(300));
-        place(controls.quality_combo, px(288), px(5), px(154), px(300));
-        place(controls.chroma_combo, px(448), px(5), px(124), px(300));
-        for (i, button) in controls.credential_buttons.iter().enumerate() {
-            place(*button, px(8 + i as i32 * 184), px(38), px(180), px(24));
-        }
-        place(
-            controls.credential_label,
-            px(566),
-            px(42),
-            (width - px(574)).max(1),
-            px(20),
-        );
-        let caption_x = width.saturating_sub(px(138));
-        place(controls.minimize_button, caption_x, 0, px(46), px(34));
-        place(
-            controls.maximize_button,
-            caption_x + px(46),
-            0,
-            px(46),
-            px(34),
-        );
-        place(controls.close_button, caption_x + px(92), 0, px(46), px(34));
-        place(
-            controls.diagnostics_button,
-            caption_x.saturating_sub(px(78)),
-            px(5),
-            px(34),
-            px(24),
-        );
-        place(
-            controls.settings_button,
-            caption_x.saturating_sub(px(40)),
-            px(5),
-            px(34),
-            px(24),
-        );
-        place(
-            controls.chat_button,
-            caption_x.saturating_sub(px(138)),
-            px(5),
-            px(54),
-            px(24),
-        );
-        place(
-            controls.file_button,
-            caption_x.saturating_sub(px(180)),
-            px(5),
-            px(38),
-            px(24),
-        );
-        place(
-            controls.secure_attention_button,
-            caption_x.saturating_sub(px(296)),
-            px(5),
-            px(110),
-            px(24),
-        );
-        place(
-            controls.type_clipboard_button,
-            caption_x.saturating_sub(px(422)),
-            px(5),
-            px(120),
-            px(24),
-        );
         place(
             controls.video_window,
             0,
@@ -258,12 +662,8 @@ impl WindowContext {
             (rect.bottom - rect.top - toolbar_height(dpi)).max(0),
         );
         self.place_popups(window);
-        let maximize_title = if unsafe { IsZoomed(window) }.as_bool() {
-            w!("❐")
-        } else {
-            w!("□")
-        };
-        let _ = unsafe { SetWindowTextW(controls.maximize_button, maximize_title) };
+        // Also shows whether the window is maximized.
+        self.update_toolbar(true);
     }
 
     /// Keeps the owned popups over the video when the window moves or resizes.
@@ -343,6 +743,7 @@ impl WindowContext {
         }
     }
 
+    /// The selection changes once the device confirms the new stream.
     fn select_user(&self, index: usize) {
         let active = self.active_display();
         let displays = self.displays();
@@ -357,18 +758,6 @@ impl WindowContext {
             self.send(SessionMessage::SelectDisplay {
                 display_id: display.id,
             });
-        }
-        let current = sessions
-            .iter()
-            .position(|s| *s == active.session)
-            .unwrap_or(0);
-        unsafe {
-            SendMessageW(
-                self.controls().user_combo,
-                CB_SETCURSEL,
-                Some(WPARAM(current)),
-                None,
-            );
         }
     }
 
@@ -385,143 +774,31 @@ impl WindowContext {
         });
     }
 
-    /// Handles WM_COMMAND from a toolbar control. Returns whether it did.
+    #[cfg(test)]
+    pub(super) fn probe_toolbar_items(&self) -> Vec<(Item, RECT)> {
+        let model = self.toolbar.borrow();
+        model
+            .items
+            .iter()
+            .cloned()
+            .zip(
+                model
+                    .layout
+                    .rects
+                    .iter()
+                    .map(|rect| self.device_rect(*rect)),
+            )
+            .collect()
+    }
+
+    /// Handles WM_COMMAND from a native control. Returns whether it did.
     pub(super) fn command(&self, window: HWND, wparam: WPARAM) -> bool {
-        let controls = self.controls();
         let control_id = wparam.0 & 0xffff;
         let notification = (wparam.0 >> 16) & 0xffff;
-        if control_id == USER_COMBO_ID && notification == CBN_SELCHANGE as usize {
-            let selected = unsafe { SendMessageW(controls.user_combo, CB_GETCURSEL, None, None).0 };
-            if selected >= 0 {
-                self.release_input();
-                self.select_user(selected as usize);
-            }
-            let _ = unsafe { SetFocus(Some(window)) };
-            return true;
-        }
-        if control_id == DISPLAY_COMBO_ID && notification == CBN_SELCHANGE as usize {
-            let selected =
-                unsafe { SendMessageW(controls.display_combo, CB_GETCURSEL, None, None).0 };
-            if selected >= 0 {
-                self.select_display(selected as usize);
-            }
-            let _ = unsafe { SetFocus(Some(window)) };
-            return true;
-        }
-        if control_id == QUALITY_COMBO_ID && notification == CBN_SELCHANGE as usize {
-            let selected =
-                unsafe { SendMessageW(controls.quality_combo, CB_GETCURSEL, None, None).0 };
-            let preset = match selected {
-                0 => QualityPreset::UltraDataSaver,
-                1 => QualityPreset::DataSaver,
-                3 => QualityPreset::BestQuality,
-                _ => QualityPreset::Balanced,
-            };
-            self.set_quality(preset);
-            let _ = unsafe { SetFocus(Some(window)) };
-            return true;
-        }
-        if control_id == CHROMA_COMBO_ID && notification == CBN_SELCHANGE as usize {
-            let selected =
-                unsafe { SendMessageW(controls.chroma_combo, CB_GETCURSEL, None, None).0 };
-            let mode = if selected == 1 {
-                ChromaMode::Yuv444
-            } else {
-                ChromaMode::Yuv420
-            };
-            self.set_chroma(mode);
-            let _ = unsafe { SetFocus(Some(window)) };
-            return true;
-        }
-        if control_id == DIAGNOSTICS_BUTTON_ID {
-            self.toggle_debug();
-            let _ = unsafe { SetFocus(Some(window)) };
-            return true;
-        }
-        if (CREDENTIAL_BUTTON_ID..CREDENTIAL_BUTTON_ID + 3).contains(&control_id) {
-            self.release_input();
-            self.control.send(match control_id - CREDENTIAL_BUTTON_ID {
-                0 => SessionMessage::PromptForCredentials,
-                1 => SessionMessage::AutofillCredentials,
-                _ => SessionMessage::ForgetCredentials,
-            });
-            return true;
-        }
-        if control_id == TYPE_CLIPBOARD_BUTTON_ID {
-            self.release_input();
-            self.control.type_clipboard(self.active_display_id());
-            let _ = unsafe { SetFocus(Some(window)) };
-            return true;
-        }
-        if control_id == SECURE_ATTENTION_BUTTON_ID {
-            self.release_input();
-            self.control.send_secure_attention();
-            let _ = unsafe { SetFocus(Some(window)) };
-            return true;
-        }
-        if control_id == FILE_BUTTON_ID {
-            self.release_input();
-            self.control.set_input_enabled(false);
-            unsafe {
-                if let Ok(menu) = CreatePopupMenu() {
-                    let _ = AppendMenuW(menu, MF_STRING, 1, w!("Send"));
-                    let _ = AppendMenuW(menu, MF_STRING, 2, w!("Receive"));
-                    let status = self.control.files().status();
-                    if !status.is_empty() {
-                        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-                        let _ =
-                            AppendMenuW(menu, MF_STRING | MF_DISABLED, 3, &HSTRING::from(status));
-                    }
-                    let mut point = windows::Win32::Foundation::POINT::default();
-                    let _ = GetCursorPos(&mut point);
-                    let chosen =
-                        TrackPopupMenu(menu, TPM_RETURNCMD, point.x, point.y, None, window, None).0;
-                    let _ = DestroyMenu(menu);
-                    if chosen == 1 {
-                        self.control.files().pick();
-                    }
-                    if chosen == 2 {
-                        self.control.files().request_peer_pick();
-                    }
-                }
-            }
-            self.control.set_input_enabled(true);
-            return true;
-        }
-        if control_id == CHAT_BUTTON_ID {
-            self.release_input();
-            self.control.set_input_enabled(false);
-            if let Some(chat) = self.chat_popup.get() {
-                chat.toggle();
-            }
-            return true;
-        }
-        if control_id == SETTINGS_BUTTON_ID {
-            self.show_settings();
-            return true;
-        }
-        if control_id == MINIMIZE_BUTTON_ID {
-            let _ = unsafe { ShowWindow(window, SW_MINIMIZE) };
-            return true;
-        }
-        if control_id == MAXIMIZE_BUTTON_ID {
-            let command = if unsafe { IsZoomed(window) }.as_bool() {
-                SW_RESTORE
-            } else {
-                SW_MAXIMIZE
-            };
-            let _ = unsafe { ShowWindow(window, command) };
-            self.layout_toolbar(window);
-            return true;
-        }
-        if control_id == CLOSE_BUTTON_ID {
-            unsafe { SendMessageW(window, WM_CLOSE, None, None) };
-            return true;
-        }
         // Forwarded by the reconnect panel.
         if control_id == RETRY_BUTTON_ID && notification == BN_CLICKED as usize {
             // Disabled until the session loop starts its next wait.
-            let _ = unsafe { EnableWindow(controls.retry_button, false) };
+            let _ = unsafe { EnableWindow(self.controls().retry_button, false) };
             crate::reconnect::request_retry_now();
             let _ = unsafe { SetFocus(Some(window)) };
             return true;
@@ -530,19 +807,208 @@ impl WindowContext {
     }
 }
 
-fn quality_index(preset: QualityPreset) -> usize {
-    match preset {
-        QualityPreset::UltraDataSaver => 0,
-        QualityPreset::DataSaver => 1,
-        QualityPreset::Balanced => 2,
-        QualityPreset::BestQuality => 3,
+fn colorref(color: toolbar::Color) -> COLORREF {
+    let toolbar::Color(red, green, blue) = color;
+    COLORREF(u32::from(red) | u32::from(green) << 8 | u32::from(blue) << 16)
+}
+
+fn argb(color: toolbar::Color) -> u32 {
+    let toolbar::Color(red, green, blue) = color;
+    0xff00_0000 | u32::from(red) << 16 | u32::from(green) << 8 | u32::from(blue)
+}
+
+unsafe fn fill_rect(dc: HDC, rect: RECT, color: toolbar::Color) {
+    unsafe {
+        let brush = CreateSolidBrush(colorref(color));
+        FillRect(dc, &rect, brush);
+        let _ = DeleteObject(HGDIOBJ(brush.0));
     }
 }
 
-fn chroma_index(mode: ChromaMode) -> usize {
-    match mode {
-        ChromaMode::Yuv420 => 0,
-        ChromaMode::Yuv444 => 1,
+/// Starts GDI+ for the process once. It is never shut down: the viewer's
+/// windows use it until the process exits.
+fn gdiplus_started() -> bool {
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    *STARTED.get_or_init(|| {
+        let input = GdiplusStartupInput {
+            GdiplusVersion: 1,
+            ..Default::default()
+        };
+        let mut token = 0;
+        let status = unsafe { GdiplusStartup(&mut token, &input, ptr::null_mut()) };
+        if status.0 != 0 {
+            tracing::warn!(
+                status = status.0,
+                "GDI+ is unavailable; toolbar icons are not drawn"
+            );
+        }
+        status.0 == 0
+    })
+}
+
+/// Anti-aliased GDI+ drawing on a device context.
+struct Graphics(*mut GpGraphics);
+
+impl Graphics {
+    unsafe fn new(dc: HDC) -> Option<Self> {
+        if !gdiplus_started() {
+            return None;
+        }
+        let mut graphics = ptr::null_mut();
+        if unsafe { GdipCreateFromHDC(dc, &mut graphics) }.0 != 0 || graphics.is_null() {
+            return None;
+        }
+        unsafe {
+            GdipSetSmoothingMode(graphics, SmoothingModeAntiAlias);
+            GdipSetPixelOffsetMode(graphics, PixelOffsetModeHalf);
+        }
+        Some(Self(graphics))
+    }
+
+    fn paint(&self, segments: &[Segment], paint: Paint, color: toolbar::Color) {
+        unsafe {
+            let path = path(segments);
+            if path.is_null() {
+                return;
+            }
+            match paint {
+                Paint::Fill => {
+                    let mut brush = ptr::null_mut();
+                    if GdipCreateSolidFill(argb(color), &mut brush).0 == 0 {
+                        GdipFillPath(self.0, brush.cast(), path);
+                        GdipDeleteBrush(brush.cast());
+                    }
+                }
+                Paint::Stroke(width) => {
+                    let mut pen = ptr::null_mut();
+                    if GdipCreatePen1(argb(color), width as f32, UnitPixel, &mut pen).0 == 0 {
+                        GdipSetPenLineCap197819(pen, LineCapRound, LineCapRound, DashCapRound);
+                        GdipSetPenLineJoin(pen, LineJoinRound);
+                        GdipDrawPath(self.0, pen, path);
+                        GdipDeletePen(pen);
+                    }
+                }
+            }
+            GdipDeletePath(path);
+        }
+    }
+}
+
+impl Drop for Graphics {
+    fn drop(&mut self) {
+        unsafe { GdipDeleteGraphics(self.0) };
+    }
+}
+
+/// A GDI+ path of `segments`, which the caller deletes.
+unsafe fn path(segments: &[Segment]) -> *mut GpPath {
+    let mut path = ptr::null_mut();
+    if unsafe { GdipCreatePath(FillModeWinding, &mut path) }.0 != 0 {
+        return ptr::null_mut();
+    }
+    let mut current = (0.0_f32, 0.0_f32);
+    for segment in segments {
+        unsafe {
+            match *segment {
+                Segment::Move(x, y) => {
+                    GdipStartPathFigure(path);
+                    current = (x as f32, y as f32);
+                }
+                Segment::Line(x, y) => {
+                    let next = (x as f32, y as f32);
+                    GdipAddPathLine(path, current.0, current.1, next.0, next.1);
+                    current = next;
+                }
+                Segment::Cubic(ax, ay, bx, by, x, y) => {
+                    let next = (x as f32, y as f32);
+                    GdipAddPathBezier(
+                        path, current.0, current.1, ax as f32, ay as f32, bx as f32, by as f32,
+                        next.0, next.1,
+                    );
+                    current = next;
+                }
+                Segment::Close => {
+                    GdipClosePathFigure(path);
+                }
+            }
+        }
+    }
+    path
+}
+
+/// The toolbar window's procedure. Its owner's context does the work.
+unsafe extern "system" fn toolbar_proc(
+    toolbar_window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let context = unsafe { GetParent(toolbar_window) }
+        .ok()
+        .and_then(|window| unsafe { window_context(window) });
+    let Some(context) = context else {
+        return unsafe { DefWindowProcW(toolbar_window, message, wparam, lparam) };
+    };
+    match message {
+        WM_NCHITTEST => {
+            let mut point = POINT {
+                x: signed_low_word(lparam.0),
+                y: signed_high_word(lparam.0),
+            };
+            let _ = unsafe { ScreenToClient(toolbar_window, &mut point) };
+            let scale = context.scale_factor();
+            let item =
+                context.toolbar_hit((f64::from(point.x) / scale, f64::from(point.y) / scale));
+            // The window moves by the empty space: its own hit test makes
+            // that the caption.
+            LRESULT(if item.is_some() {
+                HTCLIENT as isize
+            } else {
+                HTTRANSPARENT as isize
+            })
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            unsafe { context.paint_toolbar(toolbar_window) };
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            context.toolbar_mouse_move(toolbar_window, lparam);
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            context.toolbar_mouse_leave(toolbar_window);
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            context.toolbar_button_down(toolbar_window, lparam);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            context.toolbar_button_up(toolbar_window, lparam);
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            if context.toolbar.borrow_mut().pressed.take().is_some() {
+                let _ = unsafe { InvalidateRect(Some(toolbar_window), None, false) };
+            }
+            LRESULT(0)
+        }
+        // Clicks on the toolbar never reach the remote computer.
+        WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN
+        | WM_XBUTTONUP | WM_MOUSEWHEEL | WM_MOUSEHWHEEL => LRESULT(0),
+        WM_NOTIFY => {
+            let header = unsafe { &*(lparam.0 as *const NMHDR) };
+            if header.code == TTN_GETDISPINFOW {
+                let info = unsafe { &mut *(lparam.0 as *mut NMTTDISPINFOW) };
+                // The text lives in the model until the items change.
+                if let Some(text) = context.toolbar.borrow().tooltips.get(header.idFrom) {
+                    info.lpszText = PWSTR(text.as_ptr().cast_mut());
+                }
+            }
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(toolbar_window, message, wparam, lparam) },
     }
 }
 
@@ -580,12 +1046,8 @@ pub(super) unsafe fn create_toolbar(
         hbrBackground: HBRUSH(unsafe { GetStockObject(BLACK_BRUSH) }.0),
         ..Default::default()
     };
-    if unsafe { RegisterClassW(&panel_window_class) } == 0 {
-        let error = windows::core::Error::from_thread();
-        if error.code() != windows::core::HRESULT::from_win32(ERROR_CLASS_ALREADY_EXISTS.0) {
-            return Err(error).context("reconnect panel class registration failed");
-        }
-    }
+    unsafe { register_class(&panel_window_class) }
+        .context("reconnect panel class registration failed")?;
     let reconnect_panel = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -637,12 +1099,22 @@ pub(super) unsafe fn create_toolbar(
         )
     }
     .context("retry button creation failed")?;
+    let toolbar_class = w!("MeshRmmViewerToolbar");
+    let toolbar_window_class = WNDCLASSW {
+        lpfnWndProc: Some(toolbar_proc),
+        hInstance: instance,
+        lpszClassName: toolbar_class,
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }?,
+        ..Default::default()
+    };
+    unsafe { register_class(&toolbar_window_class) }
+        .context("viewer toolbar class registration failed")?;
     let toolbar = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
-            w!("STATIC"),
+            toolbar_class,
             w!(""),
-            WS_CHILD | WS_VISIBLE | WS_BORDER | WS_CLIPSIBLINGS,
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
             0,
             0,
             1,
@@ -654,210 +1126,48 @@ pub(super) unsafe fn create_toolbar(
         )
     }
     .context("viewer toolbar creation failed")?;
-    let display_combo = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("COMBOBOX"),
-            w!(""),
-            WINDOW_STYLE(
-                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
-            ),
-            12,
-            10,
-            200,
-            300,
-            Some(window),
-            Some(HMENU(DISPLAY_COMBO_ID as *mut c_void)),
-            Some(instance),
-            None,
-        )
-    }
-    .context("display dropdown creation failed")?;
-    let user_combo = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("COMBOBOX"),
-            w!(""),
-            WINDOW_STYLE(
-                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
-            ),
-            8,
-            5,
-            158,
-            300,
-            Some(window),
-            Some(HMENU(USER_COMBO_ID as *mut c_void)),
-            Some(instance),
-            None,
-        )
-    }
-    .context("user dropdown creation failed")?;
-    let quality_combo = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("COMBOBOX"),
-            w!(""),
-            WINDOW_STYLE(
-                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
-            ),
-            222,
-            10,
-            150,
-            300,
-            Some(window),
-            Some(HMENU(QUALITY_COMBO_ID as *mut c_void)),
-            Some(instance),
-            None,
-        )
-    }
-    .context("quality dropdown creation failed")?;
-    for title in [
-        w!("Ultra data saver"),
-        w!("Data saver"),
-        w!("Balanced"),
-        w!("Best quality"),
-    ] {
-        unsafe {
-            SendMessageW(
-                quality_combo,
-                CB_ADDSTRING,
-                None,
-                Some(LPARAM(title.as_ptr() as isize)),
-            )
-        };
-    }
-    let chroma_combo = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("COMBOBOX"),
-            w!(""),
-            WINDOW_STYLE(
-                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
-            ),
-            378,
-            10,
-            150,
-            300,
-            Some(window),
-            Some(HMENU(CHROMA_COMBO_ID as *mut c_void)),
-            Some(instance),
-            None,
-        )
-    }
-    .context("chroma dropdown creation failed")?;
-    for title in [w!("4:2:0 efficient"), w!("4:4:4 crisp")] {
-        unsafe {
-            SendMessageW(
-                chroma_combo,
-                CB_ADDSTRING,
-                None,
-                Some(LPARAM(title.as_ptr() as isize)),
-            )
-        };
-    }
-    let make_toolbar_button =
-        |id: usize, text: PCWSTR, style: WINDOW_STYLE| -> anyhow::Result<HWND> {
-            unsafe {
-                CreateWindowExW(
-                    WINDOW_EX_STYLE::default(),
-                    w!("BUTTON"),
-                    text,
-                    style,
-                    0,
-                    0,
-                    1,
-                    1,
-                    Some(window),
-                    Some(HMENU(id as *mut c_void)),
-                    Some(instance),
-                    None,
-                )
-            }
-            .context("viewer toolbar button creation failed")
-        };
-    let toolbar_button_style = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
-    let diagnostics_button = make_toolbar_button(
-        DIAGNOSTICS_BUTTON_ID,
-        w!("ⓘ"),
-        WINDOW_STYLE(toolbar_button_style.0 | BS_AUTOCHECKBOX as u32),
-    )?;
-    let settings_button = make_toolbar_button(SETTINGS_BUTTON_ID, w!("⚙"), toolbar_button_style)?;
     unsafe {
         windows::Win32::UI::Shell::DragAcceptFiles(window, true);
     }
-    let file_button = make_toolbar_button(FILE_BUTTON_ID, w!("📁"), toolbar_button_style)?;
-    let chat_button = make_toolbar_button(CHAT_BUTTON_ID, w!("💬"), toolbar_button_style)?;
-    let type_clipboard_button = make_toolbar_button(
-        TYPE_CLIPBOARD_BUTTON_ID,
-        w!("Type clipboard"),
-        toolbar_button_style,
-    )?;
-    let credential_buttons = [
-        make_toolbar_button(
-            CREDENTIAL_BUTTON_ID,
-            w!("Prompt for credentials"),
-            toolbar_button_style,
-        )?,
-        make_toolbar_button(
-            CREDENTIAL_BUTTON_ID + 1,
-            w!("Autofill credentials?"),
-            toolbar_button_style,
-        )?,
-        make_toolbar_button(
-            CREDENTIAL_BUTTON_ID + 2,
-            w!("Forget credentials"),
-            toolbar_button_style,
-        )?,
-    ];
-    let credential_label = unsafe {
+    let initialized = unsafe {
+        InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_BAR_CLASSES,
+        })
+    };
+    if !initialized.as_bool() {
+        tracing::warn!("common controls are unavailable; the toolbar has no tooltips");
+    }
+    // Tooltips are optional: the toolbar works without them.
+    let tooltip = unsafe {
         CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("STATIC"),
+            WS_EX_TOPMOST,
+            TOOLTIPS_CLASSW,
             w!(""),
-            WS_CHILD | WS_VISIBLE,
-            0,
-            0,
-            1,
-            1,
-            Some(window),
+            WINDOW_STYLE(WS_POPUP.0 | TTS_ALWAYSTIP | TTS_NOPREFIX),
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            Some(toolbar),
             None,
             Some(instance),
             None,
         )
     }
-    .context("credential status label creation failed")?;
-    let secure_attention_button = make_toolbar_button(
-        SECURE_ATTENTION_BUTTON_ID,
-        w!("Ctrl+Alt+Del"),
-        toolbar_button_style,
-    )?;
-    let caption_button_style =
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | BS_PUSHBUTTON as u32 | BS_FLAT as u32);
-    let minimize_button = make_toolbar_button(MINIMIZE_BUTTON_ID, w!("─"), caption_button_style)?;
-    let maximize_button = make_toolbar_button(MAXIMIZE_BUTTON_ID, w!("□"), caption_button_style)?;
-    let close_button = make_toolbar_button(CLOSE_BUTTON_ID, w!("×"), caption_button_style)?;
-    for control in [
-        overlay,
-        reconnecting_label,
-        retry_button,
-        user_combo,
-        display_combo,
-        quality_combo,
-        chroma_combo,
-        diagnostics_button,
-        settings_button,
-        file_button,
-        chat_button,
-        secure_attention_button,
-        type_clipboard_button,
-        credential_buttons[0],
-        credential_buttons[1],
-        credential_buttons[2],
-        credential_label,
-        minimize_button,
-        maximize_button,
-        close_button,
-    ] {
+    .unwrap_or_default();
+    if !tooltip.is_invalid() {
+        unsafe {
+            SendMessageW(
+                tooltip,
+                TTM_SETMAXTIPWIDTH,
+                None,
+                Some(LPARAM(scale(360, context.dpi.get()) as isize)),
+            );
+            set_font(tooltip, font);
+        }
+    }
+    for control in [overlay, reconnecting_label, retry_button] {
         unsafe { set_font(control, font) };
     }
     Ok(Controls {
@@ -866,23 +1176,43 @@ pub(super) unsafe fn create_toolbar(
         reconnecting_label,
         retry_button,
         toolbar,
-        user_combo,
-        display_combo,
-        quality_combo,
-        chroma_combo,
-        diagnostics_button,
-        settings_button,
-        file_button,
-        chat_button,
-        secure_attention_button,
-        type_clipboard_button,
-        credential_buttons,
-        credential_label,
-        minimize_button,
-        maximize_button,
-        close_button,
+        tooltip,
         ..context.controls()
     })
+}
+
+/// Registers a window class unless an earlier window already did.
+unsafe fn register_class(class: &WNDCLASSW) -> windows::core::Result<()> {
+    if unsafe { RegisterClassW(class) } == 0 {
+        let error = windows::core::Error::from_thread();
+        if error.code() != windows::core::HRESULT::from_win32(ERROR_CLASS_ALREADY_EXISTS.0) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// The toolbar font: Segoe UI Semibold at the toolbar's label size. The
+/// caller owns the returned font.
+pub(super) unsafe fn toolbar_font(dpi: u32) -> HFONT {
+    let mut face = [0_u16; 32];
+    for (slot, unit) in face.iter_mut().zip("Segoe UI".encode_utf16()) {
+        *slot = unit;
+    }
+    let font = unsafe {
+        CreateFontIndirectW(&windows::Win32::Graphics::Gdi::LOGFONTW {
+            lfHeight: -((toolbar::FONT_SIZE * f64::from(dpi) / 96.0).round() as i32),
+            lfWeight: 600,
+            lfQuality: windows::Win32::Graphics::Gdi::CLEARTYPE_QUALITY,
+            lfFaceName: face,
+            ..Default::default()
+        })
+    };
+    if font.is_invalid() {
+        unsafe { message_font(dpi) }
+    } else {
+        font
+    }
 }
 
 // Only monitor/ownership transitions reach this path, never individual mouse moves.
@@ -892,9 +1222,6 @@ pub(in crate::platform::windows) unsafe fn set_agent_pointer_display(
 ) {
     if let Some(context) = unsafe { window_context(window) } {
         context.agent_pointer_display.set(display_id);
-        // Keep a selection the user just made while its stream starts.
-        let selected =
-            unsafe { SendMessageW(context.controls().display_combo, CB_GETCURSEL, None, None) };
-        context.populate_display_combo(selected.0 as usize);
+        context.refresh_toolbar();
     }
 }

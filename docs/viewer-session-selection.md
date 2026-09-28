@@ -1,8 +1,9 @@
 # Viewer user sessions and displays
 
-The macOS and Windows viewer toolbars have separate user-session and display
-selectors. Console lists its monitors, Background has one disabled Display 1
-selector, and each active RDP session lists its own monitors as Display 1, 2, 3,
+The macOS and Windows viewer toolbars have separate user-session (person icon)
+and display (monitor icon) menus. The user item names the session only when
+there is more than one. Console lists its monitors, Background has one disabled
+Display 1 item, and each active RDP session lists its own monitors as Display 1, 2, 3,
 etc. The existing combined-monitor entry remains available as All displays.
 Monitor keyboard shortcuts stay within the selected session. A session change
 selects that session's primary monitor, and the controls commit the selection
