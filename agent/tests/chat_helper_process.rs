@@ -25,6 +25,7 @@ fn chat_helper_process_starts_handles_commands_and_stops_cleanly() {
     let mut commands = vec![17]; // StartChatHelper
     commands.extend_from_slice(&(name.len() as u32).to_le_bytes());
     commands.extend_from_slice(name);
+    commands.push(1); // Show the session banner
     commands.push(10); // StartChat
     let message = b"event-driven helper lifecycle";
     commands.push(9); // Chat

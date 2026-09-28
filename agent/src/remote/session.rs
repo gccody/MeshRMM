@@ -30,6 +30,7 @@ pub async fn run(
                 &request.blackout_message,
                 &request.viewer_name,
             ),
+            request.session_banner,
             config
                 .config_path
                 .with_file_name("autofill-credentials.dat"),

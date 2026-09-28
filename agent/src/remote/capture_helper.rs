@@ -118,6 +118,7 @@ enum ParentCommand {
     StartClipboard,
     StartChatHelper {
         viewer_name: String,
+        show_banner: bool,
     },
     Files(meshrmm_protocol::FileMessage),
     Start {
@@ -240,6 +241,7 @@ pub struct DesktopCaptureStreamer {
     display_routes: Arc<Mutex<Vec<(DisplayId, DisplayId)>>>,
     blackout_message: String,
     viewer_name: String,
+    session_banner: bool,
     running: Option<RunningHelper>,
     input: Option<RunningInputHelper>,
     file_helper: Option<RunningInputHelper>,
@@ -262,7 +264,12 @@ pub struct DesktopCaptureStreamer {
 }
 
 impl DesktopCaptureStreamer {
-    pub fn new(viewer_name: String, blackout_message: String, credential_store: PathBuf) -> Self {
+    pub fn new(
+        viewer_name: String,
+        blackout_message: String,
+        session_banner: bool,
+        credential_store: PathBuf,
+    ) -> Self {
         Self {
             background_active: Arc::new(AtomicBool::new(false)),
             console_displays: Vec::new(),
@@ -273,6 +280,7 @@ impl DesktopCaptureStreamer {
             display_routes: Arc::new(Mutex::new(Vec::new())),
             viewer_name,
             blackout_message,
+            session_banner,
             running: None,
             input: None,
             file_helper: None,
@@ -760,6 +768,7 @@ impl DesktopCaptureStreamer {
                 self.stop_file_helper();
                 match start_input_helper(
                     &self.viewer_name,
+                    self.session_banner,
                     match target {
                         DesktopTarget::Rdp(id, _) => DesktopTarget::Rdp(id, false),
                         _ => DesktopTarget::Default,
@@ -795,6 +804,7 @@ impl DesktopCaptureStreamer {
                 self.stop_chat_helper();
                 match start_input_helper(
                     &self.viewer_name,
+                    self.session_banner,
                     target,
                     display_id,
                     Arc::clone(&self.cursor),
@@ -821,6 +831,7 @@ impl DesktopCaptureStreamer {
                 self.stop_clipboard_helper();
                 match start_input_helper(
                     &self.viewer_name,
+                    self.session_banner,
                     target,
                     display_id,
                     Arc::clone(&self.cursor),
@@ -871,6 +882,7 @@ impl DesktopCaptureStreamer {
             .unwrap_or_else(|error| error.into_inner()) = None;
         let helper = start_input_helper(
             &self.viewer_name,
+            self.session_banner,
             target,
             display_id,
             Arc::clone(&self.cursor),
@@ -969,6 +981,7 @@ impl Default for DesktopCaptureStreamer {
         Self::new(
             String::new(),
             meshrmm_protocol::render_blackout_message("", ""),
+            true,
             PathBuf::new(),
         )
     }
@@ -1684,6 +1697,7 @@ fn helper_uses_user_token(kind: HelperKind, target: DesktopTarget) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn start_input_helper(
     viewer_name: &str,
+    show_banner: bool,
     target: DesktopTarget,
     display_id: DisplayId,
     cursor: HelperCursor,
@@ -1729,6 +1743,7 @@ fn start_input_helper(
             HelperKind::Clipboard => ParentCommand::StartClipboard,
             HelperKind::Chat => ParentCommand::StartChatHelper {
                 viewer_name: viewer_name.to_owned(),
+                show_banner,
             },
             HelperKind::Input => ParentCommand::StartInput {
                 display_id,

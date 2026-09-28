@@ -76,7 +76,10 @@ pub fn run_child() -> anyhow::Result<()> {
         }
         ParentCommand::StartFiles => run_file_child(command_rx),
         ParentCommand::StartClipboard => run_clipboard_child(command_rx),
-        ParentCommand::StartChatHelper { viewer_name } => run_chat_child(command_rx, viewer_name),
+        ParentCommand::StartChatHelper {
+            viewer_name,
+            show_banner,
+        } => run_chat_child(command_rx, viewer_name, show_banner),
         ParentCommand::StartInput {
             display_id,
             viewer_name,
@@ -593,10 +596,12 @@ pub(super) fn run_clipboard_child(
 pub(super) fn run_chat_child(
     commands: mpsc::Receiver<io::Result<ParentCommand>>,
     viewer_name: String,
+    show_banner: bool,
 ) -> anyhow::Result<()> {
     let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
     let chat = meshrmm_chat::ChatSession::with_peer("Viewer");
-    let _indicator = crate::remote::indicator::SessionIndicator::show(&viewer_name, chat.clone())?;
+    let _indicator =
+        crate::remote::indicator::SessionIndicator::show(&viewer_name, chat.clone(), show_banner)?;
     emit_child_event(&output, ChildEvent::InputStarted)?;
     let mut commands = async_helper_commands(commands)?;
     let ready = chat.outgoing_ready();

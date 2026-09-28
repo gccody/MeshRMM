@@ -13,11 +13,15 @@ pub(super) fn write_command(mut writer: impl Write, command: &ParentCommand) -> 
         ParentCommand::EnumerateDisplays => writer.write_all(&[COMMAND_ENUMERATE_DISPLAYS]),
         ParentCommand::StartFiles => writer.write_all(&[13]),
         ParentCommand::StartClipboard => writer.write_all(&[16]),
-        ParentCommand::StartChatHelper { viewer_name } => {
+        ParentCommand::StartChatHelper {
+            viewer_name,
+            show_banner,
+        } => {
             checked_len(viewer_name.len(), MAX_CONTROL_BYTES, "viewer name")?;
             writer.write_all(&[17])?;
             write_u32(&mut writer, viewer_name.len() as u32)?;
-            writer.write_all(viewer_name.as_bytes())
+            writer.write_all(viewer_name.as_bytes())?;
+            writer.write_all(&[u8::from(*show_banner)])
         }
         ParentCommand::Files(message) => {
             writer.write_all(&[12])?;
@@ -126,7 +130,10 @@ pub(super) fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
             reader.read_exact(&mut name)?;
             let viewer_name = String::from_utf8(name)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(ParentCommand::StartChatHelper { viewer_name })
+            Ok(ParentCommand::StartChatHelper {
+                viewer_name,
+                show_banner: read_bool(&mut reader)?,
+            })
         }
         COMMAND_START => {
             let length = bounded_len(

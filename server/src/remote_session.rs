@@ -23,6 +23,8 @@ struct SessionRecord {
     idle_policy: meshrmm_protocol_types::IdlePolicy,
     #[serde(default = "meshrmm_protocol_types::default_enabled")]
     display_border: bool,
+    #[serde(default = "meshrmm_protocol_types::default_enabled")]
+    session_banner: bool,
     #[serde(default)]
     blackout_message: String,
     #[serde(default)]
@@ -361,6 +363,7 @@ impl RemoteSession {
             start_in_background: record.start_in_background,
             idle_policy: record.idle_policy,
             blackout_message: record.blackout_message.clone(),
+            session_banner: record.session_banner,
             viewer_name: record.viewer_name.clone(),
             session_id: RemoteSessionId::new(record.session_id.clone()),
             signaling_token: record.agent_token.clone(),
@@ -412,6 +415,7 @@ impl RemoteSession {
             start_in_background: record.start_in_background,
             idle_policy: record.idle_policy,
             blackout_message: record.blackout_message.clone(),
+            session_banner: record.session_banner,
             viewer_name: record.viewer_name.clone(),
             session_id: RemoteSessionId::new(record.session_id.clone()),
             signaling_token: record.agent_token.clone(),
@@ -545,11 +549,14 @@ mod maintenance_tests {
         });
         let legacy: SessionRecord = serde_json::from_value(value.clone()).unwrap();
         assert!(legacy.blackout_message.is_empty());
+        assert!(legacy.session_banner);
         value["blackout_message"] = serde_json::json!("Maintenance by {user_name}");
+        value["session_banner"] = serde_json::json!(false);
         let current: SessionRecord = serde_json::from_value(value).unwrap();
         let restored: SessionRecord =
             serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
         assert_eq!(restored.blackout_message, "Maintenance by {user_name}");
+        assert!(!restored.session_banner);
         assert_eq!(restored.viewer_name, "Zoë 王");
     }
 }

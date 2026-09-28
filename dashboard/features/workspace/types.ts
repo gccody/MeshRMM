@@ -2,6 +2,7 @@ export type Company = {
   prevent_idle_lock: boolean;
   allow_idle_override: boolean;
   display_border: boolean;
+  session_banner: boolean;
   blackout_message: string;
   id: string;
   name: string;

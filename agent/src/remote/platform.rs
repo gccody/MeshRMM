@@ -102,6 +102,7 @@ pub struct PlatformScreenStreamer {
     inner: CaptureBackend,
     viewer_name: String,
     blackout_message: String,
+    session_banner: bool,
     border_enabled: bool,
     border: Option<super::display_border::DisplayBorder>,
     border_display: Option<Display>,
@@ -129,6 +130,7 @@ impl PlatformScreenStreamer {
         capture_as_active_user: bool,
         viewer_name: String,
         blackout_message: String,
+        session_banner: bool,
         credential_store: std::path::PathBuf,
     ) -> Self {
         Self {
@@ -137,6 +139,7 @@ impl PlatformScreenStreamer {
                     super::capture_helper::DesktopCaptureStreamer::new(
                         viewer_name.clone(),
                         blackout_message.clone(),
+                        session_banner,
                         credential_store,
                     ),
                 ))
@@ -145,6 +148,7 @@ impl PlatformScreenStreamer {
             },
             viewer_name,
             blackout_message,
+            session_banner,
             border_enabled: false,
             border: None,
             border_display: None,
@@ -241,6 +245,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
                     self.indicator = Some(super::indicator::SessionIndicator::show(
                         &self.viewer_name,
                         self.direct_chat.clone(),
+                        self.session_banner,
                     )?);
                 }
                 Ok(StartedScreen {
