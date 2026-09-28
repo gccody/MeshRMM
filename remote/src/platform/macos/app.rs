@@ -5,7 +5,8 @@ use crate::input::HeldInput;
 use crate::reconnect::ReconnectStatus;
 use crate::toolbar::{self, Action, Command};
 use meshrmm_protocol::SessionCloseAction;
-use objc2::runtime::AnyObject;
+use objc2::ClassType;
+use objc2::runtime::{AnyObject, Sel};
 use objc2_app_kit::{
     NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSEventMask, NSMenu, NSMenuItem,
     NSPasteboardTypeFileURL,
@@ -510,11 +511,6 @@ define_class!(
             self.release_input();
             self.ivars().control.toggle_agent_input();
         }
-
-        #[unsafe(method(toggleDiagnostics:))]
-        fn toggle_diagnostics_action(&self, _sender: &NSMenuItem) {
-            self.toggle_debug();
-        }
     }
 );
 
@@ -966,178 +962,192 @@ impl RemoteView {
         self.refresh_toolbar();
     }
 
-    /// The session controls, which the toolbar's settings item opens.
+    /// The session controls, which the toolbar's settings item opens: labeled
+    /// sections of checkmarked toggles, so each item reads the same whatever
+    /// its state.
     fn show_session_controls(&self, anchor: toolbar::Rect) {
         self.release_input();
+        let control = &self.ivars().control;
+        let maintenance = control.maintenance_state();
         let menu = NSMenu::new(self.mtm());
         menu.setAutoenablesItems(false);
-        for (title, action) in [
-            (
-                if self.ivars().control.technician_blocked() {
-                    "Allow technician input"
-                } else {
-                    "Block technician input"
-                },
-                sel!(toggleTechnicianInput:),
+
+        self.add_menu_header(&menu, "Session");
+        menu.addItem(&self.menu_item(
+            if control.recording().active() {
+                "Stop recording and save"
+            } else {
+                "Record video to Downloads"
+            },
+            sel!(toggleRecording:),
+            None,
+        ));
+        menu.addItem(&self.menu_item(
+            "Play remote audio",
+            sel!(toggleAudio:),
+            Some(!control.audio_muted()),
+        ));
+        let view_only = self.menu_item(
+            "View only",
+            sel!(toggleTechnicianInput:),
+            Some(control.technician_blocked()),
+        );
+        view_only.setToolTip(Some(&NSString::from_str(
+            "Stop sending your keyboard and mouse to the remote computer.",
+        )));
+        menu.addItem(&view_only);
+        menu.addItem(&self.menu_item(
+            "Sync clipboard",
+            sel!(toggleClipboardSync:),
+            Some(control.clipboard_sync()),
+        ));
+
+        menu.addItem(&NSMenuItem::separatorItem(self.mtm()));
+        self.add_menu_header(&menu, "Remote computer");
+        let agent_input = self.menu_item(
+            "Block user's keyboard and mouse",
+            sel!(toggleAgentInput:),
+            Some(control.agent_blocked()),
+        );
+        agent_input.setEnabled(maintenance.available && !maintenance.blacked_out);
+        menu.addItem(&agent_input);
+        let blackout = self.menu_item(
+            "Black out screens",
+            sel!(toggleBlackout:),
+            Some(maintenance.blacked_out),
+        );
+        blackout.setEnabled(maintenance.available);
+        menu.addItem(&blackout);
+        let idle = self.menu_item(
+            if control.allow_idle_override() {
+                "Prevent idle lock"
+            } else {
+                "Prevent idle lock (company managed)"
+            },
+            sel!(togglePreventIdleLock:),
+            Some(control.prevent_idle_lock()),
+        );
+        idle.setEnabled(control.allow_idle_override());
+        menu.addItem(&idle);
+        menu.addItem(&self.menu_item(
+            "Highlight the monitor I'm viewing",
+            sel!(toggleDisplayBorder:),
+            Some(control.display_border()),
+        ));
+        menu.addItem(&self.menu_item(
+            "Hide wallpaper",
+            sel!(toggleWallpaper:),
+            Some(control.wallpaper_hidden()),
+        ));
+
+        menu.addItem(&NSMenuItem::separatorItem(self.mtm()));
+        self.add_menu_header(&menu, "This viewer");
+        menu.addItem(&self.menu_item(
+            "Show remote cursor",
+            sel!(toggleRemoteCursor:),
+            Some(control.show_remote_cursor()),
+        ));
+        menu.addItem(&self.menu_item(
+            "Command key sends Ctrl",
+            sel!(toggleCommandAsControl:),
+            Some(control.command_as_control()),
+        ));
+        let diagnostics_key = control.shortcut_key(crate::shortcuts::ViewerShortcut::Diagnostics);
+        menu.addItem(&self.menu_choices(
+            &format!(
+                "Diagnostics shortcut: {}",
+                diagnostics_key_title(diagnostics_key)
             ),
-            (
-                if self.ivars().control.agent_blocked() {
-                    "Allow agent input"
-                } else {
-                    "Block agent keyboard and mouse"
-                },
-                sel!(toggleAgentInput:),
+            crate::shortcuts::ShortcutKey::ALL.map(|key| (key.label(), key == diagnostics_key)),
+            sel!(selectDiagnosticsKey:),
+        ));
+
+        menu.addItem(&NSMenuItem::separatorItem(self.mtm()));
+        self.add_menu_header(&menu, "When the session ends");
+        menu.addItem(&self.menu_item(
+            "Ask before disconnecting",
+            sel!(toggleDisconnectConfirmation:),
+            Some(control.disconnect_confirmation()),
+        ));
+        menu.addItem(&self.menu_item(
+            "Clear remote clipboard",
+            sel!(toggleClearClipboardOnClose:),
+            Some(control.clear_clipboard_on_close()),
+        ));
+        let close_action = control.session_close_action();
+        menu.addItem(
+            &self.menu_choices(
+                &format!("Remote user: {}", close_action_label(close_action)),
+                SessionCloseAction::ALL
+                    .map(|choice| (close_action_label(choice), choice == close_action)),
+                sel!(selectSessionCloseAction:),
             ),
-            (
-                if self.ivars().control.maintenance_state().blacked_out {
-                    "Restore agent monitors"
-                } else {
-                    "Black out all agent monitors"
-                },
-                sel!(toggleBlackout:),
-            ),
-            (
-                if self.ivars().control.audio_muted() {
-                    "Unmute audio"
-                } else {
-                    "Mute audio"
-                },
-                sel!(toggleAudio:),
-            ),
-            (
-                if self.ivars().control.allow_idle_override() {
-                    "Prevent idle lock"
-                } else {
-                    "Prevent idle lock (company managed)"
-                },
-                sel!(togglePreventIdleLock:),
-            ),
-            (
-                "Disconnect confirmation",
-                sel!(toggleDisconnectConfirmation:),
-            ),
-            ("Command key sends Ctrl", sel!(toggleCommandAsControl:)),
-            ("Sync clipboard", sel!(toggleClipboardSync:)),
-            (
-                "Clear clipboard on session close",
-                sel!(toggleClearClipboardOnClose:),
-            ),
-            (
-                "Highlight viewed monitor on agent",
-                sel!(toggleDisplayBorder:),
-            ),
-            ("Hide remote wallpaper", sel!(toggleWallpaper:)),
-            ("Show remote cursor", sel!(toggleRemoteCursor:)),
-            ("Diagnostics", sel!(toggleDiagnostics:)),
-            (
-                if self.ivars().control.recording().active() {
-                    "Stop recording and save"
-                } else {
-                    "Record video to Downloads"
-                },
-                sel!(toggleRecording:),
-            ),
-        ] {
-            let item = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(self.mtm()),
-                    &NSString::from_str(title),
-                    Some(action),
-                    &NSString::from_str(""),
-                )
-            };
-            unsafe {
-                item.setTarget(Some(self));
-            }
-            if action == sel!(toggleAgentInput:) || action == sel!(toggleBlackout:) {
-                item.setEnabled(self.ivars().control.maintenance_state().available);
-            }
-            if action == sel!(toggleAgentInput:)
-                && self.ivars().control.maintenance_state().blacked_out
-            {
-                item.setEnabled(false);
-            }
-            if action == sel!(togglePreventIdleLock:) {
-                item.setState(isize::from(self.ivars().control.prevent_idle_lock()));
-                item.setEnabled(self.ivars().control.allow_idle_override());
-            }
-            if action == sel!(toggleDisconnectConfirmation:) {
-                item.setState(isize::from(self.ivars().control.disconnect_confirmation()));
-            }
-            if action == sel!(toggleCommandAsControl:) {
-                item.setState(isize::from(self.ivars().control.command_as_control()));
-            }
-            if action == sel!(toggleClipboardSync:) {
-                item.setState(isize::from(self.ivars().control.clipboard_sync()));
-            }
-            if action == sel!(toggleClearClipboardOnClose:) {
-                item.setState(isize::from(self.ivars().control.clear_clipboard_on_close()));
-            }
-            if action == sel!(toggleDisplayBorder:) {
-                item.setState(isize::from(self.ivars().control.display_border()));
-            }
-            if action == sel!(toggleWallpaper:) {
-                item.setState(isize::from(self.ivars().control.wallpaper_hidden()));
-            }
-            if action == sel!(toggleRemoteCursor:) {
-                item.setState(isize::from(self.ivars().control.show_remote_cursor()));
-            }
-            menu.addItem(&item);
-            if action == sel!(toggleDiagnostics:) {
-                let shortcut = NSMenuItem::new(self.mtm());
-                shortcut.setTitle(&NSString::from_str("Diagnostics key"));
-                let choices = NSMenu::new(self.mtm());
-                let selected = self
-                    .ivars()
-                    .control
-                    .shortcut_key(crate::shortcuts::ViewerShortcut::Diagnostics);
-                for (index, key) in crate::shortcuts::ShortcutKey::ALL.into_iter().enumerate() {
-                    let choice_item = unsafe {
-                        NSMenuItem::initWithTitle_action_keyEquivalent(
-                            NSMenuItem::alloc(self.mtm()),
-                            &NSString::from_str(key.label()),
-                            Some(sel!(selectDiagnosticsKey:)),
-                            &NSString::new(),
-                        )
-                    };
-                    unsafe {
-                        choice_item.setTarget(Some(self));
-                    }
-                    choice_item.setTag(index as isize);
-                    choice_item.setState(isize::from(key == selected));
-                    choices.addItem(&choice_item);
-                }
-                shortcut.setSubmenu(Some(&choices));
-                menu.addItem(&shortcut);
-            }
-            if action == sel!(toggleDisconnectConfirmation:) {
-                let close = NSMenuItem::new(self.mtm());
-                close.setTitle(&NSString::from_str("On session close"));
-                let choices = NSMenu::new(self.mtm());
-                let selected = self.ivars().control.session_close_action();
-                for (index, choice) in SessionCloseAction::ALL.into_iter().enumerate() {
-                    let choice_item = unsafe {
-                        NSMenuItem::initWithTitle_action_keyEquivalent(
-                            NSMenuItem::alloc(self.mtm()),
-                            &NSString::from_str(choice.label()),
-                            Some(sel!(selectSessionCloseAction:)),
-                            &NSString::new(),
-                        )
-                    };
-                    unsafe {
-                        choice_item.setTarget(Some(self));
-                    }
-                    choice_item.setTag(index as isize);
-                    choice_item.setState(isize::from(choice == selected));
-                    choices.addItem(&choice_item);
-                }
-                close.setSubmenu(Some(&choices));
-                menu.addItem(&close);
-            }
-        }
+        );
+
         if let Some(toolbar) = self.ivars().toolbar.borrow().clone() {
             toolbar.pop_up(&menu, anchor);
         }
+    }
+
+    /// A session-controls item sending `action` to this view, checkmarked
+    /// when `checked` is `Some(true)`.
+    fn menu_item(&self, title: &str, action: Sel, checked: Option<bool>) -> Retained<NSMenuItem> {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(self.mtm()),
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::new(),
+            )
+        };
+        unsafe {
+            item.setTarget(Some(self));
+        }
+        if let Some(checked) = checked {
+            item.setState(isize::from(checked));
+        }
+        item
+    }
+
+    /// An item titled `title` whose submenu offers `choices`, each sending
+    /// `action` with its index as the tag.
+    fn menu_choices<'a>(
+        &self,
+        title: &str,
+        choices: impl IntoIterator<Item = (&'a str, bool)>,
+        action: Sel,
+    ) -> Retained<NSMenuItem> {
+        let item = NSMenuItem::new(self.mtm());
+        item.setTitle(&NSString::from_str(title));
+        let submenu = NSMenu::new(self.mtm());
+        for (index, (label, selected)) in choices.into_iter().enumerate() {
+            let choice = self.menu_item(label, action, Some(selected));
+            choice.setTag(index as isize);
+            submenu.addItem(&choice);
+        }
+        item.setSubmenu(Some(&submenu));
+        item
+    }
+
+    /// Adds a section title: a native section header on macOS 14 and later,
+    /// otherwise a disabled item, which AppKit draws dimmed.
+    fn add_menu_header(&self, menu: &NSMenu, title: &str) {
+        let title = NSString::from_str(title);
+        let native: bool = unsafe {
+            msg_send![
+                NSMenuItem::class(),
+                respondsToSelector: sel!(sectionHeaderWithTitle:)
+            ]
+        };
+        let item = if native {
+            NSMenuItem::sectionHeaderWithTitle(&title, self.mtm())
+        } else {
+            let item = NSMenuItem::new(self.mtm());
+            item.setTitle(&title);
+            item.setEnabled(false);
+            item
+        };
+        menu.addItem(&item);
     }
 
     fn send(&self, message: SessionMessage) {
@@ -1443,6 +1453,23 @@ fn mac_cursor(shape: CursorShape) -> Retained<NSCursor> {
         CursorShape::Pointer => NSCursor::pointingHandCursor(),
         // AppKit has no public equivalent for these Windows system cursors.
         _ => NSCursor::arrowCursor(),
+    }
+}
+
+/// The session-close choice as the session controls name it.
+fn close_action_label(action: SessionCloseAction) -> &'static str {
+    match action {
+        SessionCloseAction::NoAction => "Leave signed in",
+        SessionCloseAction::Lock => "Lock",
+        SessionCloseAction::Logout => "Sign out",
+    }
+}
+
+/// The diagnostics key for the session controls' item title.
+fn diagnostics_key_title(key: crate::shortcuts::ShortcutKey) -> &'static str {
+    match key {
+        crate::shortcuts::ShortcutKey::Off => "Off",
+        key => key.label(),
     }
 }
 

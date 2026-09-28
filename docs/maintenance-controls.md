@@ -1,7 +1,10 @@
 # Remote maintenance controls
 
 The native viewer provides three independent controls. On macOS, open the gear
-(session controls) menu in the toolbar. On Windows, open **Settings → Advanced**.
+menu in the toolbar: **View only** is under **Session**, and the agent controls
+are under **Remote computer** as **Block user's keyboard and mouse** and **Black
+out screens**; each is a checkmarked toggle. On Windows, open **Settings →
+Advanced**, where they are named as below.
 
 - **Block technician input** stops the viewer's keyboard, mouse, and wheel events.
   It releases held remote keys/buttons before blocking. The choice survives focus
