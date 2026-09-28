@@ -3,6 +3,9 @@ export type Company = {
   allow_idle_override: boolean;
   display_border: boolean;
   session_banner: boolean;
+  connection_notification: boolean;
+  background_connection_notification: boolean;
+  connection_notification_message: string;
   blackout_message: string;
   id: string;
   name: string;

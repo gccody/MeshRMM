@@ -154,9 +154,14 @@ pub(crate) async fn create_session_for_device(
         allow_idle_override: bool,
         #[serde(deserialize_with = "deserialize_sql_bool")]
         session_banner: bool,
+        #[serde(deserialize_with = "deserialize_sql_bool")]
+        connection_notification: bool,
+        #[serde(deserialize_with = "deserialize_sql_bool")]
+        background_connection_notification: bool,
+        connection_notification_message: String,
     }
     let policy = query!(&db,
-        "SELECT c.id AS company_id, c.blackout_message, c.display_border, c.prevent_idle_lock, c.allow_idle_override, c.session_banner FROM companies c JOIN agents a ON a.company_id = c.id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL",
+        "SELECT c.id AS company_id, c.blackout_message, c.display_border, c.prevent_idle_lock, c.allow_idle_override, c.session_banner, c.connection_notification, c.background_connection_notification, c.connection_notification_message FROM companies c JOIN agents a ON a.company_id = c.id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL",
         device_id
     )?.metered_first::<MaintenancePolicy>(None).await?;
     let Some(policy) = policy else {
@@ -191,6 +196,9 @@ pub(crate) async fn create_session_for_device(
         idle_policy,
         display_border: policy.display_border,
         session_banner: policy.session_banner,
+        connection_notification: policy.connection_notification,
+        background_connection_notification: policy.background_connection_notification,
+        connection_notification_message: &policy.connection_notification_message,
         blackout_message: &policy.blackout_message,
         viewer_name,
         session_id: &session_id,
@@ -214,6 +222,9 @@ pub(crate) async fn create_session_for_device(
         idle_policy,
         blackout_message: policy.blackout_message,
         session_banner: policy.session_banner,
+        connection_notification: policy.connection_notification,
+        background_connection_notification: policy.background_connection_notification,
+        connection_notification_message: policy.connection_notification_message,
         viewer_name: viewer_name.to_owned(),
         session_id: RemoteSessionId::new(&session_id),
         signaling_token: agent_token,

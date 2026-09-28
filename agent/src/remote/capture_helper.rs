@@ -33,6 +33,7 @@ use meshrmm_remote_screen::{
     WindowsDesktopDuplicationStreamer,
 };
 
+use super::connection_notification::ConnectionNotification;
 use super::input::WindowsInputController;
 use super::platform::ScreenInput;
 use crate::win32::{OwnedHandle, wide};
@@ -119,6 +120,9 @@ enum ParentCommand {
     StartChatHelper {
         viewer_name: String,
         show_banner: bool,
+    },
+    ShowConnectionNotification {
+        text: String,
     },
     Files(meshrmm_protocol::FileMessage),
     Start {
@@ -242,6 +246,10 @@ pub struct DesktopCaptureStreamer {
     blackout_message: String,
     viewer_name: String,
     session_banner: bool,
+    /// Taken by the first start on a desktop whose policy allows it, so later
+    /// starts do not retry it.
+    connection_notification: Option<ConnectionNotification>,
+    notification_helper: Option<RunningInputHelper>,
     running: Option<RunningHelper>,
     input: Option<RunningInputHelper>,
     file_helper: Option<RunningInputHelper>,
@@ -268,6 +276,7 @@ impl DesktopCaptureStreamer {
         viewer_name: String,
         blackout_message: String,
         session_banner: bool,
+        connection_notification: Option<ConnectionNotification>,
         credential_store: PathBuf,
     ) -> Self {
         Self {
@@ -281,6 +290,8 @@ impl DesktopCaptureStreamer {
             viewer_name,
             blackout_message,
             session_banner,
+            connection_notification,
+            notification_helper: None,
             running: None,
             input: None,
             file_helper: None,
@@ -304,6 +315,66 @@ impl DesktopCaptureStreamer {
     }
 
     pub fn start(
+        &mut self,
+        config: StreamConfig,
+        display_id: Option<DisplayId>,
+        sink: EncodedFrameSink,
+    ) -> anyhow::Result<StartedDesktop> {
+        let started = self.start_capture(config, display_id, sink)?;
+        self.show_connection_notification();
+        Ok(started)
+    }
+
+    /// Shows the company's connection notification on the primary monitor of
+    /// the console, or of the viewed RDP session. It runs in its own helper,
+    /// so sessions on the background desktop can notify the user too, and a
+    /// desktop switch that replaces the other helpers leaves it alone.
+    fn show_connection_notification(&mut self) {
+        let background = self.background_active.load(Ordering::Acquire);
+        // A background session the company does not announce still notifies
+        // the user if the technician switches to the user's desktop.
+        if !self
+            .connection_notification
+            .as_ref()
+            .is_some_and(|notification| notification.allowed(background))
+        {
+            return;
+        }
+        let Some(notification) = self.connection_notification.take() else {
+            return;
+        };
+        if !notification.pending() {
+            return;
+        }
+        let target = match self.running.as_ref().map(|running| running.target) {
+            Some(DesktopTarget::Background) | None => preferred_desktop(),
+            Some(target) => target,
+        };
+        match start_input_helper(
+            ParentCommand::ShowConnectionNotification {
+                text: notification.text().to_owned(),
+            },
+            target,
+            DisplayId(0),
+            Arc::clone(&self.cursor),
+            Arc::clone(&self.clipboard),
+            Arc::clone(&self.files),
+            Arc::clone(&self.chat),
+            Arc::clone(&self.maintenance),
+            Arc::clone(&self.credentials),
+        ) {
+            Ok(helper) => {
+                notification.mark_shown();
+                self.stop_notification_helper();
+                self.notification_helper = Some(helper);
+            }
+            Err(error) => {
+                tracing::warn!(error = ?error, desktop = target.name(), "could not show the connection notification")
+            }
+        }
+    }
+
+    fn start_capture(
         &mut self,
         config: StreamConfig,
         display_id: Option<DisplayId>,
@@ -404,7 +475,7 @@ impl DesktopCaptureStreamer {
                 .find(|(d, _)| d.primary)
                 .or(self.session_displays.first())
         {
-            return self.start(config, Some(display.id), sink);
+            return self.start_capture(config, Some(display.id), sink);
         }
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no interactive desktop is available")))
     }
@@ -767,8 +838,7 @@ impl DesktopCaptureStreamer {
             {
                 self.stop_file_helper();
                 match start_input_helper(
-                    &self.viewer_name,
-                    self.session_banner,
+                    ParentCommand::StartFiles,
                     match target {
                         DesktopTarget::Rdp(id, _) => DesktopTarget::Rdp(id, false),
                         _ => DesktopTarget::Default,
@@ -780,7 +850,6 @@ impl DesktopCaptureStreamer {
                     Arc::clone(&self.chat),
                     Arc::clone(&self.maintenance),
                     Arc::clone(&self.credentials),
-                    HelperKind::Files,
                 ) {
                     Ok(helper) => {
                         let mut route = self.file_route.lock().unwrap();
@@ -803,8 +872,10 @@ impl DesktopCaptureStreamer {
             }) {
                 self.stop_chat_helper();
                 match start_input_helper(
-                    &self.viewer_name,
-                    self.session_banner,
+                    ParentCommand::StartChatHelper {
+                        viewer_name: self.viewer_name.clone(),
+                        show_banner: self.session_banner,
+                    },
                     target,
                     display_id,
                     Arc::clone(&self.cursor),
@@ -813,7 +884,6 @@ impl DesktopCaptureStreamer {
                     Arc::clone(&self.chat),
                     Arc::clone(&self.maintenance),
                     Arc::clone(&self.credentials),
-                    HelperKind::Chat,
                 ) {
                     Ok(helper) => {
                         if self.chat_enabled.load(Ordering::Acquire) {
@@ -830,8 +900,7 @@ impl DesktopCaptureStreamer {
             }) {
                 self.stop_clipboard_helper();
                 match start_input_helper(
-                    &self.viewer_name,
-                    self.session_banner,
+                    ParentCommand::StartClipboard,
                     target,
                     display_id,
                     Arc::clone(&self.cursor),
@@ -840,7 +909,6 @@ impl DesktopCaptureStreamer {
                     Arc::clone(&self.chat),
                     Arc::clone(&self.maintenance),
                     Arc::clone(&self.credentials),
-                    HelperKind::Clipboard,
                 ) {
                     Ok(helper) => {
                         *self.clipboard_route.lock().unwrap() = Some(Arc::clone(&helper.input));
@@ -881,8 +949,10 @@ impl DesktopCaptureStreamer {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
         let helper = start_input_helper(
-            &self.viewer_name,
-            self.session_banner,
+            ParentCommand::StartInput {
+                display_id,
+                viewer_name: self.viewer_name.clone(),
+            },
             target,
             display_id,
             Arc::clone(&self.cursor),
@@ -891,7 +961,6 @@ impl DesktopCaptureStreamer {
             Arc::clone(&self.chat),
             Arc::clone(&self.maintenance),
             Arc::clone(&self.credentials),
-            HelperKind::Input,
         )?;
         let mut route = self
             .input_route
@@ -928,6 +997,16 @@ impl DesktopCaptureStreamer {
             helper.finish();
         }
         self.chat.queue.lock().unwrap().clear();
+    }
+
+    fn stop_notification_helper(&mut self) {
+        if let Some(mut helper) = self.notification_helper.take() {
+            let _ = send_command(&helper.input, &ParentCommand::Stop);
+            if unsafe { WaitForSingleObject(helper.process.0, STOP_TIMEOUT_MS) } == WAIT_TIMEOUT {
+                terminate_and_wait(&helper.process);
+            }
+            helper.finish();
+        }
     }
 
     fn stop_clipboard_helper(&mut self) {
@@ -982,6 +1061,7 @@ impl Default for DesktopCaptureStreamer {
             String::new(),
             meshrmm_protocol::render_blackout_message("", ""),
             true,
+            None,
             PathBuf::new(),
         )
     }
@@ -989,6 +1069,9 @@ impl Default for DesktopCaptureStreamer {
 
 impl Drop for DesktopCaptureStreamer {
     fn drop(&mut self) {
+        // Internal shutdowns replace helpers when the viewer changes desktops;
+        // only the end of the connection closes the notification.
+        self.stop_notification_helper();
         let _ = self.shutdown();
     }
 }
@@ -1644,6 +1727,21 @@ enum HelperKind {
     Files,
     Clipboard,
     Chat,
+    Notification,
+}
+
+impl HelperKind {
+    /// The helper that `start` launches, if it launches one.
+    fn started_by(start: &ParentCommand) -> Option<Self> {
+        match start {
+            ParentCommand::StartInput { .. } => Some(Self::Input),
+            ParentCommand::StartFiles => Some(Self::Files),
+            ParentCommand::StartClipboard => Some(Self::Clipboard),
+            ParentCommand::StartChatHelper { .. } => Some(Self::Chat),
+            ParentCommand::ShowConnectionNotification { .. } => Some(Self::Notification),
+            _ => None,
+        }
+    }
 }
 
 /// Whether a helper of `kind` sends `event`, matching the child run loops. The
@@ -1696,8 +1794,7 @@ fn helper_uses_user_token(kind: HelperKind, target: DesktopTarget) -> bool {
 // Keep the helper's startup options and independently shared event destinations explicit.
 #[allow(clippy::too_many_arguments)]
 fn start_input_helper(
-    viewer_name: &str,
-    show_banner: bool,
+    start: ParentCommand,
     target: DesktopTarget,
     display_id: DisplayId,
     cursor: HelperCursor,
@@ -1706,8 +1803,8 @@ fn start_input_helper(
     chat: HelperChat,
     maintenance: HelperMaintenance,
     credentials: HelperCredentials,
-    kind: HelperKind,
 ) -> anyhow::Result<RunningInputHelper> {
+    let kind = HelperKind::started_by(&start).context("not a desktop helper start command")?;
     // Clipboard data can be owned/delayed-rendered by an interactive user app.
     // Use that user's token on the normal desktop, as the file helper does.
     let launched = launch_helper(target, helper_uses_user_token(kind, target))?;
@@ -1736,21 +1833,7 @@ fn start_input_helper(
         .spawn(move || drain_child_stderr(launched.stderr))
         .context("failed to start desktop input-helper error reader")?;
     let input = Arc::new(CommandWriter::new(launched.input)?);
-    if let Err(error) = send_command(
-        &input,
-        &match kind {
-            HelperKind::Files => ParentCommand::StartFiles,
-            HelperKind::Clipboard => ParentCommand::StartClipboard,
-            HelperKind::Chat => ParentCommand::StartChatHelper {
-                viewer_name: viewer_name.to_owned(),
-                show_banner,
-            },
-            HelperKind::Input => ParentCommand::StartInput {
-                display_id,
-                viewer_name: viewer_name.to_owned(),
-            },
-        },
-    ) {
+    if let Err(error) = send_command(&input, &start) {
         terminate_and_wait(&launched.process);
         let _ = reader.join();
         let _ = stderr.join();

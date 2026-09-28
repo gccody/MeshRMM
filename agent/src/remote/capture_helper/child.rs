@@ -80,6 +80,9 @@ pub fn run_child() -> anyhow::Result<()> {
             viewer_name,
             show_banner,
         } => run_chat_child(command_rx, viewer_name, show_banner),
+        ParentCommand::ShowConnectionNotification { text } => {
+            run_notification_child(command_rx, text)
+        }
         ParentCommand::StartInput {
             display_id,
             viewer_name,
@@ -212,6 +215,7 @@ pub(super) fn run_capture_child(
                     | ParentCommand::StartFiles
                     | ParentCommand::StartClipboard
                     | ParentCommand::StartChatHelper { .. }
+                    | ParentCommand::ShowConnectionNotification { .. }
                     | ParentCommand::StartInput { .. }
                     | ParentCommand::Input(_)
                     | ParentCommand::SetWallpaperHidden(_)
@@ -644,6 +648,25 @@ pub(super) fn run_chat_child(
             }
             Ok::<(), anyhow::Error>(())
         })?;
+    emit_child_event(&output, ChildEvent::Stopped)?;
+    Ok(())
+}
+
+/// Shows the connection notification, which closes itself, and stays until
+/// the parent stops it so that the end of the connection closes it too.
+pub(super) fn run_notification_child(
+    commands: mpsc::Receiver<io::Result<ParentCommand>>,
+    text: String,
+) -> anyhow::Result<()> {
+    let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+    let notification = crate::remote::connection_notification::NotificationWindow::show(&text)?;
+    emit_child_event(&output, ChildEvent::InputStarted)?;
+    match commands.recv() {
+        // An error or a closed pipe means the parent is gone.
+        Ok(Ok(ParentCommand::Stop)) | Ok(Err(_)) | Err(_) => {}
+        Ok(Ok(_)) => anyhow::bail!("notification helper received an unexpected command"),
+    }
+    drop(notification);
     emit_child_event(&output, ChildEvent::Stopped)?;
     Ok(())
 }

@@ -6,10 +6,12 @@ import { AuthenticationRequired, type AuthorizedFetch, errorMessage } from "../.
 import type { Account, Company } from "../workspace/types";
 import {
   DEFAULT_BLACKOUT_MESSAGE,
+  DEFAULT_CONNECTION_NOTIFICATION_MESSAGE,
   SETTINGS_TABS,
   companySettingsBody,
   draftMatchesCompany,
   isBlackoutMessageValid,
+  isConnectionNotificationMessageValid,
   settingsTabForKey,
 } from "./company-settings";
 import type { SettingsDraft } from "./use-settings-draft";
@@ -31,6 +33,7 @@ export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, o
   const [isSaving, setIsSaving] = useState(false);
 
   const blackoutMessageValid = isBlackoutMessageValid(draft.blackoutMessage);
+  const notificationMessageValid = isConnectionNotificationMessageValid(draft.connectionNotificationMessage);
 
   const saveSettings = async (event: FormEvent) => {
     event.preventDefault();
@@ -123,11 +126,30 @@ export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, o
               <div className="blackout-preview" aria-label="Blackout message preview">{draft.blackoutMessage.replaceAll("{user_name}", displayName)}</div>
               <button type="button" className="secondary-button" onClick={() => updateDraft({ blackoutMessage: DEFAULT_BLACKOUT_MESSAGE })}>Restore default message</button>
             </section>
+            <section className="settings-section" id="connection-notification" role="tabpanel" aria-labelledby="settings-tab-connection-notification" hidden={settingsTab !== "connection-notification"} tabIndex={0}>
+              <h2>Connection notification</h2>
+              <p>Shown in the corner of the remote device’s main monitor when a technician connects.</p>
+              <label>
+                <input type="checkbox" checked={draft.connectionNotification} onChange={(event) => updateDraft({ connectionNotification: event.target.checked })} /> Notify the agent’s user when a technician connects to their session</label>
+              <label>
+                <input type="checkbox" checked={draft.backgroundConnectionNotification} onChange={(event) => updateDraft({ backgroundConnectionNotification: event.target.checked })} aria-describedby="background-notification-help" /> Also notify the user when a technician connects in background mode</label>
+              <p id="background-notification-help">Background mode works on a separate desktop the user cannot see. If a technician switches from it to the user’s session, the first option applies.</p>
+              <p>Both apply to every new session and cannot be changed by users. The notification closes when clicked or after 15 seconds.</p>
+              <label htmlFor="connection-notification-message">Notification message<textarea id="connection-notification-message" rows={3} required maxLength={512} value={draft.connectionNotificationMessage} onChange={(event) => updateDraft({ connectionNotificationMessage: event.target.value })} aria-describedby="connection-notification-message-help" />
+              </label>
+              <p id="connection-notification-message-help">Use {"{user_name}"} for the technician’s banner name. Applies to new remote sessions. Keep the message short (up to 512 bytes).</p>
+              <div className="connection-notification-preview" aria-label="Connection notification preview">
+                <strong>Remote session started</strong>
+                <span>{draft.connectionNotificationMessage.replaceAll("{user_name}", displayName)}</span>
+              </div>
+              <button type="button" className="secondary-button" onClick={() => updateDraft({ connectionNotificationMessage: DEFAULT_CONNECTION_NOTIFICATION_MESSAGE })}>Restore default message</button>
+            </section>
           </fieldset>
           {settingsTab !== "blackout" && !blackoutMessageValid && <p role="alert">Check the blackout message before saving: it must contain text and be no larger than 2 KB.</p>}
+          {settingsTab !== "connection-notification" && !notificationMessageValid && <p role="alert">Check the connection notification message before saving: it must contain text and be no larger than 512 bytes.</p>}
           {isAdmin && <div className="settings-save">
             {saveError && <p className="settings-save-error" role="alert">{saveError}</p>}
-            <button className="primary-button" disabled={isSaving || !blackoutMessageValid || draftMatchesCompany(draft, company)}>{isSaving ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save company settings</button>
+            <button className="primary-button" disabled={isSaving || !blackoutMessageValid || !notificationMessageValid || draftMatchesCompany(draft, company)}>{isSaving ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save company settings</button>
           </div>}
           {settingsNotice && <p role="status" className="session-notice">{settingsNotice}</p>}
         </form>

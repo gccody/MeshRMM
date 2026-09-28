@@ -103,6 +103,9 @@ pub struct PlatformScreenStreamer {
     viewer_name: String,
     blackout_message: String,
     session_banner: bool,
+    /// Console mode shows the notification in-process; service helpers own theirs.
+    connection_notification: Option<super::connection_notification::ConnectionNotification>,
+    notification: Option<super::connection_notification::NotificationWindow>,
     border_enabled: bool,
     border: Option<super::display_border::DisplayBorder>,
     border_display: Option<Display>,
@@ -124,6 +127,8 @@ pub struct PlatformScreenStreamer {
 
 #[cfg(windows)]
 impl PlatformScreenStreamer {
+    // Capture settings plus the session's company policy, kept explicit.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         frames_per_second: u32,
         bitrate_bits_per_second: u32,
@@ -131,24 +136,35 @@ impl PlatformScreenStreamer {
         viewer_name: String,
         blackout_message: String,
         session_banner: bool,
+        connection_notification: Option<super::connection_notification::ConnectionNotification>,
         credential_store: std::path::PathBuf,
     ) -> Self {
-        Self {
-            inner: if capture_as_active_user {
+        let (inner, connection_notification) = if capture_as_active_user {
+            (
                 CaptureBackend::Desktop(Box::new(
                     super::capture_helper::DesktopCaptureStreamer::new(
                         viewer_name.clone(),
                         blackout_message.clone(),
                         session_banner,
+                        connection_notification,
                         credential_store,
                     ),
-                ))
-            } else {
-                CaptureBackend::Direct(meshrmm_remote_screen::WindowsScreenStreamer::new())
-            },
+                )),
+                None,
+            )
+        } else {
+            (
+                CaptureBackend::Direct(meshrmm_remote_screen::WindowsScreenStreamer::new()),
+                connection_notification,
+            )
+        };
+        Self {
+            inner,
             viewer_name,
             blackout_message,
             session_banner,
+            connection_notification,
+            notification: None,
             border_enabled: false,
             border: None,
             border_display: None,
@@ -247,6 +263,23 @@ impl ScreenStreamer for PlatformScreenStreamer {
                         self.direct_chat.clone(),
                         self.session_banner,
                     )?);
+                }
+                // Console mode has no background desktop.
+                if let Some(notification) = self.connection_notification.take()
+                    && notification.allowed(false)
+                    && notification.pending()
+                {
+                    match super::connection_notification::NotificationWindow::show(
+                        notification.text(),
+                    ) {
+                        Ok(window) => {
+                            notification.mark_shown();
+                            self.notification = Some(window);
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "could not show the connection notification")
+                        }
+                    }
                 }
                 Ok(StartedScreen {
                     displays,

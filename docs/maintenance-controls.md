@@ -49,6 +49,45 @@ in the session record. The viewer cannot supply a replacement template. Legacy
 session records and older servers use the default message. Apply migration
 `0008_blackout_message.sql` before deploying the updated server and dashboard.
 
+## Connection notification
+
+When a technician connects, the Agent shows a notification in the bottom-right
+corner of the primary monitor's work area. It does not take focus. It closes when
+clicked or after 15 seconds; resting the pointer on it restarts the countdown.
+Unlike the blackout notice, it is not excluded from capture, so the technician
+sees what the user sees.
+
+A company administrator configures it under **Settings → Connection
+notification**, with two settings:
+
+- **Notify the agent's user when a technician connects to their session** (on
+  by default) covers sessions that view the console or an RDP session.
+- **Also notify the user when a technician connects in background mode** (off
+  by default) covers sessions on the background desktop, which the user cannot
+  see. If the technician switches from background mode to the user's session,
+  the first setting applies and the user is notified then.
+
+Both use the same message. The default is:
+
+> {user_name} has connected to this computer.
+
+`{user_name}` works as it does in the blackout message. The template supports
+newlines and Unicode, must be nonempty, and is limited to 512 UTF-8 bytes. Only
+company administrators can save the setting. There is no per-session or viewer
+override: the server resolves the setting and template from the enrolled agent's
+company. It sends them only in the authenticated Agent session request and keeps
+them in the session record. Requests from servers without the fields show no
+notification. Changes apply to new remote sessions.
+
+The notification appears once per remote session. Viewer reconnects and resumes
+of the same session do not repeat it. As a service, the Agent shows it from a
+separate LocalSystem helper on the interactive desktop (the console, or the
+viewed RDP session). Background-mode sessions can therefore notify the
+signed-in user, and desktop switches that replace the other helpers leave it
+open. The notification closes when the session ends. Apply
+migration `0015_connection_notification.sql` before deploying the updated server
+and dashboard; `/healthz` expects it.
+
 ## Validation
 
 Automated checks cover protocol compatibility, name/template rendering, company

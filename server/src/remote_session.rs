@@ -26,6 +26,12 @@ struct SessionRecord {
     #[serde(default = "meshrmm_protocol_types::default_enabled")]
     session_banner: bool,
     #[serde(default)]
+    connection_notification: bool,
+    #[serde(default)]
+    background_connection_notification: bool,
+    #[serde(default)]
+    connection_notification_message: String,
+    #[serde(default)]
     blackout_message: String,
     #[serde(default)]
     viewer_name: String,
@@ -364,6 +370,9 @@ impl RemoteSession {
             idle_policy: record.idle_policy,
             blackout_message: record.blackout_message.clone(),
             session_banner: record.session_banner,
+            connection_notification: record.connection_notification,
+            background_connection_notification: record.background_connection_notification,
+            connection_notification_message: record.connection_notification_message.clone(),
             viewer_name: record.viewer_name.clone(),
             session_id: RemoteSessionId::new(record.session_id.clone()),
             signaling_token: record.agent_token.clone(),
@@ -416,6 +425,9 @@ impl RemoteSession {
             idle_policy: record.idle_policy,
             blackout_message: record.blackout_message.clone(),
             session_banner: record.session_banner,
+            connection_notification: record.connection_notification,
+            background_connection_notification: record.background_connection_notification,
+            connection_notification_message: record.connection_notification_message.clone(),
             viewer_name: record.viewer_name.clone(),
             session_id: RemoteSessionId::new(record.session_id.clone()),
             signaling_token: record.agent_token.clone(),
@@ -550,13 +562,24 @@ mod maintenance_tests {
         let legacy: SessionRecord = serde_json::from_value(value.clone()).unwrap();
         assert!(legacy.blackout_message.is_empty());
         assert!(legacy.session_banner);
+        assert!(!legacy.connection_notification);
+        assert!(!legacy.background_connection_notification);
         value["blackout_message"] = serde_json::json!("Maintenance by {user_name}");
         value["session_banner"] = serde_json::json!(false);
+        value["connection_notification"] = serde_json::json!(true);
+        value["background_connection_notification"] = serde_json::json!(true);
+        value["connection_notification_message"] = serde_json::json!("{user_name} is here");
         let current: SessionRecord = serde_json::from_value(value).unwrap();
         let restored: SessionRecord =
             serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
         assert_eq!(restored.blackout_message, "Maintenance by {user_name}");
         assert!(!restored.session_banner);
+        assert!(restored.connection_notification);
+        assert!(restored.background_connection_notification);
+        assert_eq!(
+            restored.connection_notification_message,
+            "{user_name} is here"
+        );
         assert_eq!(restored.viewer_name, "Zoë 王");
     }
 }

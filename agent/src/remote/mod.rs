@@ -17,6 +17,8 @@ pub(crate) mod capture_helper;
 #[cfg(windows)]
 mod clipboard;
 pub mod config;
+#[cfg(any(windows, test))]
+mod connection_notification;
 #[cfg(windows)]
 mod credentials;
 #[cfg(windows)]
@@ -333,6 +335,9 @@ mod tests {
             idle_policy: Default::default(),
             blackout_message: String::new(),
             session_banner: true,
+            connection_notification: true,
+            background_connection_notification: false,
+            connection_notification_message: String::new(),
             viewer_name: "Ada Lovelace".into(),
             session_id: RemoteSessionId::new("session"),
             signaling_token: "token".into(),
