@@ -489,7 +489,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
     use std::time::{Duration, Instant};
+
+    /// Opening a chat popup takes the foreground, and a banner's popup hides
+    /// when it loses activation. Tests that open popups run one at a time, or
+    /// one test's popup would close another's where tests may take the
+    /// foreground (as on CI runners).
+    fn exclusive_popup() -> MutexGuard<'static, ()> {
+        static POPUPS: Mutex<()> = Mutex::new(());
+        POPUPS.lock().unwrap_or_else(|error| error.into_inner())
+    }
 
     #[test]
     fn horizontal_position_stays_on_screen_in_both_states() {
@@ -563,6 +573,7 @@ mod tests {
 
     #[test]
     fn incoming_viewer_message_opens_chat_without_reopening_after_dismissal() {
+        let _popup = exclusive_popup();
         let chat = meshrmm_chat::ChatSession::with_peer("Viewer");
         chat.set_available(true);
         let indicator = SessionIndicator::show("Chat check", chat.clone(), true).unwrap();
@@ -603,6 +614,7 @@ mod tests {
 
     #[test]
     fn notification_icon_toggles_chat_beside_the_click() {
+        let _popup = exclusive_popup();
         let chat = meshrmm_chat::ChatSession::with_peer("Viewer");
         let indicator = SessionIndicator::show("Icon check", chat.clone(), true).unwrap();
         let hwnd = HWND(indicator.window as *mut _);
@@ -654,6 +666,7 @@ mod tests {
 
     #[test]
     fn hidden_banner_stays_hidden_but_still_opens_incoming_chat() {
+        let _popup = exclusive_popup();
         let chat = meshrmm_chat::ChatSession::with_peer("Viewer");
         chat.set_available(true);
         let indicator = SessionIndicator::show("Hidden check", chat.clone(), false).unwrap();
