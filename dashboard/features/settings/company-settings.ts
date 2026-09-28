@@ -34,6 +34,8 @@ export type CompanySettingsDraft = {
   allowIdleOverride: boolean;
   idleDisconnectMinutes: number | null;
   allowIdleDisconnectOverride: boolean;
+  clearClipboardOnClose: boolean;
+  allowClearClipboardOverride: boolean;
   sessionBanner: boolean;
   connectionNotification: boolean;
   backgroundConnectionNotification: boolean;
@@ -50,6 +52,8 @@ export function draftFromCompany(company: Company | null | undefined): CompanySe
     allowIdleOverride: company?.allow_idle_override ?? true,
     idleDisconnectMinutes: company?.idle_disconnect_minutes ?? null,
     allowIdleDisconnectOverride: company?.allow_idle_disconnect_override ?? true,
+    clearClipboardOnClose: company?.clear_clipboard_on_close ?? true,
+    allowClearClipboardOverride: company?.allow_clear_clipboard_override ?? true,
     sessionBanner: company?.session_banner ?? true,
     connectionNotification: company?.connection_notification ?? true,
     backgroundConnectionNotification: company?.background_connection_notification ?? false,
@@ -67,6 +71,8 @@ export function draftMatchesCompany(draft: CompanySettingsDraft, company: Compan
     draft.allowIdleOverride === saved.allowIdleOverride &&
     draft.idleDisconnectMinutes === saved.idleDisconnectMinutes &&
     draft.allowIdleDisconnectOverride === saved.allowIdleDisconnectOverride &&
+    draft.clearClipboardOnClose === saved.clearClipboardOnClose &&
+    draft.allowClearClipboardOverride === saved.allowClearClipboardOverride &&
     draft.sessionBanner === saved.sessionBanner &&
     draft.connectionNotification === saved.connectionNotification &&
     draft.backgroundConnectionNotification === saved.backgroundConnectionNotification &&
@@ -98,6 +104,8 @@ export function companySettingsBody(draft: CompanySettingsDraft) {
     allow_idle_override: draft.allowIdleOverride,
     idle_disconnect_minutes: draft.idleDisconnectMinutes,
     allow_idle_disconnect_override: draft.allowIdleDisconnectOverride,
+    clear_clipboard_on_close: draft.clearClipboardOnClose,
+    allow_clear_clipboard_override: draft.allowClearClipboardOverride,
     session_banner: draft.sessionBanner,
     connection_notification: draft.connectionNotification,
     background_connection_notification: draft.backgroundConnectionNotification,

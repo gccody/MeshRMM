@@ -178,19 +178,25 @@ class EnrollmentTests(unittest.TestCase):
         notice = "{user_name} has connected to this computer."
         self.assertEqual(self.db.execute("SELECT connection_notification, background_connection_notification, connection_notification_message FROM companies WHERE id='co'").fetchone(), (1, 0, notice))
         self.assertEqual(self.db.execute("SELECT idle_disconnect_minutes, allow_idle_disconnect_override FROM companies WHERE id='co'").fetchone(), (None, 1))
-        self.db.execute(update, (60, "Maintenance by {user_name}\nPlease wait", "co", 0, 0, 0, 0, 0, "{user_name} is here\nSay hi", 1, 30, 0))
-        self.db.execute(update, (120, None, "co", None, None, None, None, None, None, None, 15, None))
-        self.assertEqual(self.db.execute("SELECT blackout_message, session_banner, connection_notification, background_connection_notification, connection_notification_message FROM companies WHERE id='other'").fetchone(), (default, 1, 1, 0, notice))
+        self.assertEqual(self.db.execute("SELECT clear_clipboard_on_close, allow_clear_clipboard_override FROM companies WHERE id='co'").fetchone(), (1, 1))
+        self.db.execute(update, (60, "Maintenance by {user_name}\nPlease wait", "co", 0, 0, 0, 0, 0, "{user_name} is here\nSay hi", 1, 30, 0, 0, 0))
+        self.db.execute(update, (120, None, "co", None, None, None, None, None, None, None, 15, None, None, None))
+        self.assertEqual(self.db.execute("SELECT blackout_message, session_banner, connection_notification, background_connection_notification, connection_notification_message, clear_clipboard_on_close, allow_clear_clipboard_override FROM companies WHERE id='other'").fetchone(), (default, 1, 1, 0, notice, 1, 1))
         policy = sql("server/src/routes/handoffs.rs", "SELECT c.id AS company_id, c.blackout_message")
-        self.assertEqual(self.db.execute(policy, ("device",)).fetchone(), ("co", "Maintenance by {user_name}\nPlease wait", 0, 0, 0, 15, 0, 0, 0, 1, "{user_name} is here\nSay hi"))
-        self.db.execute(update, (120, None, "co", None, None, None, None, None, None, None, None, 1))
+        self.assertEqual(self.db.execute(policy, ("device",)).fetchone(), ("co", "Maintenance by {user_name}\nPlease wait", 0, 0, 0, 15, 0, 0, 0, 0, 0, 1, "{user_name} is here\nSay hi"))
+        self.db.execute(update, (120, None, "co", None, None, None, None, None, None, None, None, 1, None, None))
         self.assertEqual(self.db.execute("SELECT idle_disconnect_minutes, allow_idle_disconnect_override FROM companies WHERE id='co'").fetchone(), (None, 1))
+        self.assertEqual(self.db.execute("SELECT clear_clipboard_on_close, allow_clear_clipboard_override FROM companies WHERE id='co'").fetchone(), (0, 0))
         with self.assertRaises(sqlite3.IntegrityError):
             self.db.execute("UPDATE companies SET connection_notification = 2 WHERE id='co'")
         with self.assertRaises(sqlite3.IntegrityError):
             self.db.execute("UPDATE companies SET background_connection_notification = 2 WHERE id='co'")
         with self.assertRaises(sqlite3.IntegrityError):
             self.db.execute("UPDATE companies SET idle_disconnect_minutes = 0 WHERE id='co'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("UPDATE companies SET clear_clipboard_on_close = 2 WHERE id='co'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("UPDATE companies SET allow_clear_clipboard_override = 2 WHERE id='co'")
         self.db.execute("UPDATE agents SET deletion_requested_at=1")
         self.assertIsNone(self.db.execute(policy, ("device",)).fetchone())
 

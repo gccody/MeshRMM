@@ -48,6 +48,10 @@ struct Company {
     #[serde(deserialize_with = "deserialize_sql_bool")]
     allow_idle_disconnect_override: bool,
     #[serde(deserialize_with = "deserialize_sql_bool")]
+    clear_clipboard_on_close: bool,
+    #[serde(deserialize_with = "deserialize_sql_bool")]
+    allow_clear_clipboard_override: bool,
+    #[serde(deserialize_with = "deserialize_sql_bool")]
     session_banner: bool,
     #[serde(deserialize_with = "deserialize_sql_bool")]
     connection_notification: bool,
@@ -167,6 +171,8 @@ struct UpdateCompanySettingsRequest {
     #[serde(deserialize_with = "Option::deserialize")]
     idle_disconnect_minutes: Option<u32>,
     allow_idle_disconnect_override: Option<bool>,
+    clear_clipboard_on_close: Option<bool>,
+    allow_clear_clipboard_override: Option<bool>,
     session_banner: Option<bool>,
     connection_notification: Option<bool>,
     background_connection_notification: Option<bool>,
@@ -228,8 +234,9 @@ struct HandoffResponse {
 #[derive(Debug, Serialize)]
 struct SessionInit<'a> {
     start_in_background: bool,
-    idle_policy: meshrmm_protocol_types::IdlePolicy,
+    idle_policy: meshrmm_protocol_types::TogglePolicy,
     idle_disconnect: meshrmm_protocol_types::IdleDisconnectPolicy,
+    clear_clipboard_policy: meshrmm_protocol_types::TogglePolicy,
     blackout_message: &'a str,
     display_border: bool,
     session_banner: bool,
@@ -602,10 +609,12 @@ mod company_policy_tests {
     #[test]
     fn sqlite_flags_are_exposed_as_json_booleans() {
         for enabled in [0, 1] {
-            let row = serde_json::json!({"id":"c","name":"Company","dashboard_idle_timeout_minutes":60,"blackout_message":"Maintenance","display_border":enabled,"prevent_idle_lock":1,"allow_idle_override":0,"idle_disconnect_minutes":null,"allow_idle_disconnect_override":enabled,"session_banner":enabled,"connection_notification":enabled,"background_connection_notification":1-enabled,"connection_notification_message":"{user_name} is here","slug":"company","status":"active"});
+            let row = serde_json::json!({"id":"c","name":"Company","dashboard_idle_timeout_minutes":60,"blackout_message":"Maintenance","display_border":enabled,"prevent_idle_lock":1,"allow_idle_override":0,"idle_disconnect_minutes":null,"allow_idle_disconnect_override":enabled,"clear_clipboard_on_close":enabled,"allow_clear_clipboard_override":1-enabled,"session_banner":enabled,"connection_notification":enabled,"background_connection_notification":1-enabled,"connection_notification_message":"{user_name} is here","slug":"company","status":"active"});
             let company: Company = serde_json::from_value(row).unwrap();
             let company = serde_json::to_value(company).unwrap();
             assert_eq!(company["display_border"], enabled == 1);
+            assert_eq!(company["clear_clipboard_on_close"], enabled == 1);
+            assert_eq!(company["allow_clear_clipboard_override"], enabled == 0);
             assert_eq!(company["session_banner"], enabled == 1);
             assert_eq!(company["connection_notification"], enabled == 1);
             assert_eq!(company["background_connection_notification"], enabled == 0);

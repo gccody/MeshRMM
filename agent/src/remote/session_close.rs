@@ -2,7 +2,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use meshrmm_protocol::{DesktopSession, SessionCloseAction};
+use meshrmm_protocol::{DesktopSession, SessionCloseAction, TogglePolicy};
 
 #[cfg(windows)]
 use crate::win32::OwnedHandle;
@@ -30,6 +30,8 @@ struct Target {
 struct State {
     action: SessionCloseAction,
     clear_clipboard: bool,
+    /// The company's default for `clear_clipboard`, and whether the viewer may change it.
+    clear_clipboard_policy: TogglePolicy,
     target: Option<Target>,
     /// A blocking task is resolving the logon of the recorded session again.
     refreshing: bool,
@@ -54,21 +56,29 @@ struct Pending {
 
 /// Shared by every sender attempt of one remote session, so the choices
 /// survive viewer resumes and run once, when the server ends the session.
-#[derive(Default)]
 pub struct SessionClose {
     state: Mutex<State>,
 }
 
 impl SessionClose {
+    pub fn new(clear_clipboard_policy: TogglePolicy) -> Self {
+        Self {
+            state: Mutex::new(State {
+                clear_clipboard: clear_clipboard_policy.enabled,
+                clear_clipboard_policy,
+                ..State::default()
+            }),
+        }
+    }
+
     pub fn set_action(&self, action: SessionCloseAction) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).action = action;
     }
 
+    /// Applies the viewer's choice unless the company policy does not allow one.
     pub fn set_clear_clipboard(&self, enabled: bool) {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear_clipboard = enabled;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.clear_clipboard = state.clear_clipboard_policy.effective(Some(enabled));
     }
 
     /// Records the Windows session currently shown to the viewer and the user
@@ -459,6 +469,12 @@ mod tests {
         }
     }
 
+    /// Nothing is cleared unless the viewer asks for it.
+    const OFF_BY_DEFAULT: TogglePolicy = TogglePolicy {
+        enabled: false,
+        allow_override: true,
+    };
+
     fn view(close: &SessionClose, session: &DesktopSession, now: Instant, logon: Option<Logon>) {
         close.set_target_with(session, now, |_| {
             logon.ok_or_else(|| anyhow::anyhow!("no signed-in user"))
@@ -482,7 +498,7 @@ mod tests {
     #[test]
     fn action_runs_once_for_the_last_viewed_session() {
         let now = Instant::now();
-        let close = SessionClose::default();
+        let close = SessionClose::new(OFF_BY_DEFAULT);
         assert_eq!(close.take(), None);
         close.set_action(SessionCloseAction::Lock);
         // No action is possible before a desktop was ever shown.
@@ -511,7 +527,7 @@ mod tests {
     fn clipboard_clear_runs_once_and_is_skipped_by_logout() {
         let now = Instant::now();
         let console = Some(logon(1, 10));
-        let close = SessionClose::default();
+        let close = SessionClose::new(OFF_BY_DEFAULT);
         close.set_clear_clipboard(true);
         // Nothing to clear before a desktop was ever shown.
         assert_eq!(close.take(), None);
@@ -558,9 +574,37 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_clear_starts_from_the_company_default_and_can_be_locked() {
+        let now = Instant::now();
+        for enabled in [true, false] {
+            for allow_override in [true, false] {
+                for choice in [None, Some(true), Some(false)] {
+                    let close = SessionClose::new(TogglePolicy {
+                        enabled,
+                        allow_override,
+                    });
+                    if let Some(choice) = choice {
+                        close.set_clear_clipboard(choice);
+                    }
+                    view(&close, &DesktopSession::Console, now, Some(logon(1, 10)));
+                    let expected = match choice {
+                        Some(choice) if allow_override => choice,
+                        _ => enabled,
+                    };
+                    assert_eq!(
+                        close.take().is_some_and(|pending| pending.clear_clipboard),
+                        expected,
+                        "enabled={enabled} allow_override={allow_override} choice={choice:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn viewed_logon_follows_the_session_while_it_is_shown() {
         let now = Instant::now();
-        let close = SessionClose::default();
+        let close = SessionClose::new(OFF_BY_DEFAULT);
         close.set_action(SessionCloseAction::Lock);
         view(&close, &DesktopSession::Console, now, Some(logon(1, 10)));
         // The same session is not queried again within the refresh interval.

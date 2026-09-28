@@ -256,7 +256,14 @@ pub async fn run(
                                             }
                                             let close = std::sync::Arc::clone(
                                                 &session_close
-                                                    .get_or_insert_with(|| (session_id.clone(), Default::default()))
+                                                    .get_or_insert_with(|| {
+                                                        (
+                                                            session_id.clone(),
+                                                            std::sync::Arc::new(session_close::SessionClose::new(
+                                                                request.clear_clipboard_policy,
+                                                            )),
+                                                        )
+                                                    })
                                                     .1,
                                             );
                                             let active_request = request.clone();
@@ -333,6 +340,7 @@ mod tests {
         AgentSessionRequest {
             start_in_background: false,
             idle_policy: Default::default(),
+            clear_clipboard_policy: Default::default(),
             blackout_message: String::new(),
             session_banner: true,
             connection_notification: true,

@@ -16,7 +16,6 @@ use std::{
 struct Preferences {
     disconnect_confirmation: bool,
     clipboard_sync: bool,
-    clear_clipboard_on_close: bool,
     /// macOS: the Command key sends Ctrl instead of the Windows key.
     command_as_control: bool,
     /// Windows: the Windows key, Alt+Tab, Alt+Esc and Ctrl+Esc go to the device.
@@ -32,7 +31,6 @@ impl Default for Preferences {
         Self {
             disconnect_confirmation: true,
             clipboard_sync: true,
-            clear_clipboard_on_close: true,
             command_as_control: false,
             send_windows_shortcuts: true,
             diagnostics_key: ShortcutKey::F12,
@@ -98,13 +96,6 @@ pub fn clipboard_sync() -> bool {
 }
 pub fn toggle_clipboard_sync() -> anyhow::Result<()> {
     toggle(|p| &mut p.clipboard_sync)
-}
-/// Empty the viewed Windows session's clipboard when the remote session ends.
-pub fn clear_clipboard_on_close() -> bool {
-    get(|p| p.clear_clipboard_on_close)
-}
-pub fn toggle_clear_clipboard_on_close() -> anyhow::Result<()> {
-    toggle(|p| &mut p.clear_clipboard_on_close)
 }
 #[cfg(target_os = "macos")]
 pub fn command_as_control() -> bool {
@@ -198,7 +189,6 @@ mod tests {
             &Preferences {
                 disconnect_confirmation: false,
                 clipboard_sync: false,
-                clear_clipboard_on_close: false,
                 command_as_control: true,
                 ..Preferences::default()
             },
@@ -206,7 +196,6 @@ mod tests {
         .unwrap();
         assert!(!load(&path).disconnect_confirmation);
         assert!(!load(&path).clipboard_sync);
-        assert!(!load(&path).clear_clipboard_on_close);
         assert!(load(&path).command_as_control);
         assert!(load(&path).audio_muted);
         save(
@@ -221,12 +210,10 @@ mod tests {
         save(&path, &Preferences::default()).unwrap();
         assert!(load(&path).disconnect_confirmation);
         assert!(load(&path).clipboard_sync);
-        assert!(load(&path).clear_clipboard_on_close);
         // Files written before these preferences existed keep their defaults.
         std::fs::write(&path, r#"{"disconnect_confirmation":false}"#).unwrap();
         assert!(!load(&path).disconnect_confirmation);
         assert!(load(&path).clipboard_sync);
-        assert!(load(&path).clear_clipboard_on_close);
         assert!(!load(&path).command_as_control);
         assert!(load(&path).send_windows_shortcuts);
         assert_eq!(load(&path).diagnostics_key, ShortcutKey::F12);
@@ -242,7 +229,6 @@ mod tests {
         std::fs::write(&path, "broken json").unwrap();
         assert!(load(&path).disconnect_confirmation);
         assert!(load(&path).clipboard_sync);
-        assert!(load(&path).clear_clipboard_on_close);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
