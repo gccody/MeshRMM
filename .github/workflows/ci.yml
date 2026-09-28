@@ -2,8 +2,14 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_call:
+    inputs:
+      run-all:
+        description: Run every job regardless of which paths changed.
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -16,8 +22,68 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Each job runs only when a path it depends on changed. Required checks count a
+# skipped job as passing, so filtering here, rather than with workflow-level
+# `paths`, keeps pull requests mergeable. If `changes` fails or is skipped (as
+# in reusable calls, which must check everything), every job runs.
 jobs:
+  changes:
+    if: ${{ !inputs.run-all }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      remote: ${{ steps.filter.outputs.remote }}
+      server: ${{ steps.filter.outputs.server }}
+      dashboard: ${{ steps.filter.outputs.dashboard }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          # `!(*.md)` leaves out Markdown files, which no check reads.
+          filters: |
+            workflow: &workflow
+              - '.github/workflows/ci.yml'
+            cargo: &cargo
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'vendor/**/!(*.md)'
+            rust:
+              - *workflow
+              - *cargo
+              - 'agent/**/!(*.md)'
+              - 'crates/**/!(*.md)'
+              - 'remote/**/!(*.md)'
+              - 'server/**/!(*.md)'
+            remote:
+              - *workflow
+              - *cargo
+              - 'crates/**/!(*.md)'
+              - 'remote/**/!(*.md)'
+            server:
+              - *workflow
+              - *cargo
+              - 'crates/**/!(*.md)'
+              - 'server/**/!(*.md)'
+              - 'scripts/**/!(*.md)'
+              - 'release.json'
+              # The Worker tests run under the dashboard's Miniflare.
+              - 'dashboard/package.json'
+              - 'dashboard/package-lock.json'
+            dashboard:
+              - *workflow
+              - 'dashboard/**/!(*.md)'
+              - 'scripts/verify-release-assets.mjs'
+              - 'server/wrangler.jsonc'
+              - 'server/migrations/**'
+
   rust-windows:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -27,6 +93,8 @@ jobs:
       - run: cargo test --locked --workspace
 
   remote-macos:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.remote == 'true') }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -35,6 +103,8 @@ jobs:
       - run: cargo test --locked -p meshrmm-remote -p meshrmm-session-transport
 
   server-wasm:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.server == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -60,6 +130,8 @@ jobs:
       - run: node server/tests/request_path.mjs
 
   dashboard:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.dashboard == 'true') }}
     runs-on: ubuntu-latest
     defaults:
       run:
