@@ -248,21 +248,31 @@ impl std::fmt::Display for TerminalClose {
 }
 impl std::error::Error for TerminalClose {}
 
+/// The server closed this signaling socket because the same peer connected
+/// another one.
+#[derive(Debug)]
+pub struct SupersededClose;
+impl std::fmt::Display for SupersededClose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "signaling connection was superseded by a newer one")
+    }
+}
+impl std::error::Error for SupersededClose {}
+
 pub fn signaling_close_error(
     frame: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
 ) -> anyhow::Error {
-    if frame
-        .as_ref()
-        .is_some_and(|frame| matches!(u16::from(frame.code), 1008 | 4001))
-    {
-        TerminalClose.into()
-    } else {
-        anyhow::anyhow!("signaling connection closed: {frame:?}")
+    match frame.as_ref().map(|frame| u16::from(frame.code)) {
+        Some(1008 | 4001) => TerminalClose.into(),
+        Some(4000) => SupersededClose.into(),
+        _ => anyhow::anyhow!("signaling connection closed: {frame:?}"),
     }
 }
 
 mod connection;
+mod session;
 pub use connection::SignalingConnection;
+pub use session::SessionSignaling;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod tls;

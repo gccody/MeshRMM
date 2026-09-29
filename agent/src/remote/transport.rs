@@ -11,7 +11,7 @@ use meshrmm_protocol::{
 use meshrmm_session_transport::{
     CHAT_CHANNEL, CLIPBOARD_CHANNEL, FILE_CHANNEL, ServiceChannel, ServiceRoute,
 };
-use meshrmm_signaling_client::SignalingConnection;
+use meshrmm_signaling_client::SessionSignaling;
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
@@ -35,7 +35,6 @@ use super::sender_failure::{
 };
 use super::sender_progress::SenderProgress;
 use super::session_close::SessionClose;
-use super::signaling::authenticated_websocket;
 use super::video::LatestFrameSlot;
 
 // Cancellation and startup errors must release resources just like normal teardown.
@@ -189,8 +188,7 @@ pub async fn run_sender(
     session_close: Arc<SessionClose>,
     progress: &SenderProgress,
 ) -> anyhow::Result<()> {
-    let (socket, _) = authenticated_websocket(signal_url, signaling_token).await?;
-    let mut signal = SignalingConnection::new(socket);
+    let mut signal = SessionSignaling::connect(signal_url, signaling_token.to_owned()).await?;
     let mut failure_reported = false;
     let result = run_connected_sender(
         &mut signal,
@@ -214,7 +212,7 @@ pub async fn run_sender(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_connected_sender(
-    signal: &mut SignalingConnection,
+    signal: &mut SessionSignaling,
     ice_servers: Vec<IceServer>,
     streamer: Arc<Mutex<Box<dyn ScreenStreamer>>>,
     session_id: RemoteSessionId,
@@ -835,46 +833,38 @@ async fn run_connected_sender(
             }
             incoming = signal.next() => {
                 let Some(incoming) = incoming else { break Err(transport_failure("signaling connection closed")); };
-                match incoming? {
-                    Message::Text(text) => {
-                        let signal: SignalMessage = serde_json::from_str(text.as_str())?;
-                        match signal {
-                            SignalMessage::Ready if !offer_sent => {
-                                let offer = peer.create_offer(None).await?;
-                                peer.set_local_description(offer).await?;
-                                let local = peer.local_description().await
-                                    .ok_or_else(|| anyhow::anyhow!("WebRTC did not retain its local offer"))?;
-                                outgoing_tx.send(SignalMessage::Offer { sdp: local.sdp })?;
-                                offer_sent = true;
-                            }
-                            SignalMessage::Answer { sdp } => {
-                                identity.verify_sdp(&sdp)?;
-                                peer.set_remote_description(RTCSessionDescription::answer(sdp)?).await?;
-                                remote_description_set = true;
-                                for candidate in pending_candidates.drain(..) {
-                                    peer.add_ice_candidate(candidate).await?;
-                                }
-                            }
-                            SignalMessage::IceCandidate { candidate, sdp_mid, sdp_mline_index, username_fragment } => {
-                                let candidate = RTCIceCandidateInit { candidate, sdp_mid, sdp_mline_index, username_fragment };
-                                if remote_description_set {
-                                    peer.add_ice_candidate(candidate).await?;
-                                } else {
-                                    if pending_candidates.len() >= 256 { anyhow::bail!("too many pending ICE candidates"); }
-                                    pending_candidates.push(candidate);
-                                }
-                            }
-                            SignalMessage::PeerLeft => {
-                                break Err(transport_failure("viewer disconnected from the remote session"));
-                            }
-                            SignalMessage::Error { message, .. } => break Err(anyhow::anyhow!(message)),
-                            _ => {}
+                let Message::Text(text) = incoming? else { continue; };
+                let signal: SignalMessage = serde_json::from_str(text.as_str())?;
+                match signal {
+                    SignalMessage::Ready if !offer_sent => {
+                        let offer = peer.create_offer(None).await?;
+                        peer.set_local_description(offer).await?;
+                        let local = peer.local_description().await
+                            .ok_or_else(|| anyhow::anyhow!("WebRTC did not retain its local offer"))?;
+                        outgoing_tx.send(SignalMessage::Offer { sdp: local.sdp })?;
+                        offer_sent = true;
+                    }
+                    SignalMessage::Answer { sdp } => {
+                        identity.verify_sdp(&sdp)?;
+                        peer.set_remote_description(RTCSessionDescription::answer(sdp)?).await?;
+                        remote_description_set = true;
+                        for candidate in pending_candidates.drain(..) {
+                            peer.add_ice_candidate(candidate).await?;
                         }
                     }
-                    Message::Ping(payload) => signal.send(Message::Pong(payload)).await?,
-                    Message::Close(frame) => {
-                        break Err(meshrmm_signaling_client::signaling_close_error(frame));
+                    SignalMessage::IceCandidate { candidate, sdp_mid, sdp_mline_index, username_fragment } => {
+                        let candidate = RTCIceCandidateInit { candidate, sdp_mid, sdp_mline_index, username_fragment };
+                        if remote_description_set {
+                            peer.add_ice_candidate(candidate).await?;
+                        } else {
+                            if pending_candidates.len() >= 256 { anyhow::bail!("too many pending ICE candidates"); }
+                            pending_candidates.push(candidate);
+                        }
                     }
+                    SignalMessage::PeerLeft => {
+                        break Err(transport_failure("viewer disconnected from the remote session"));
+                    }
+                    SignalMessage::Error { message, .. } => break Err(anyhow::anyhow!(message)),
                     _ => {}
                 }
             }
@@ -909,6 +899,8 @@ async fn run_connected_sender(
                     progress.mark_streaming(std::time::Instant::now());
                 }
                 if state == RTCPeerConnectionState::Connected {
+                    // The session no longer depends on signaling.
+                    signal.peer_connected();
                     disconnected_since = None;
                 } else if state == RTCPeerConnectionState::Disconnected {
                     disconnected_since.get_or_insert_with(tokio::time::Instant::now);
@@ -1672,7 +1664,7 @@ async fn run_capture_control(
     }
 }
 
-async fn report_sender_failure(connection: &mut SignalingConnection, error: &anyhow::Error) {
+async fn report_sender_failure(connection: &mut SessionSignaling, error: &anyhow::Error) {
     let Some(signal) = failure_signal(error) else {
         tracing::debug!(error = %error, "not reporting a transport failure the viewer detects itself");
         return;
