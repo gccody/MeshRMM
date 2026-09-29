@@ -1,6 +1,6 @@
 use anyhow::Context;
 use meshrmm_protocol::SessionBootstrap;
-use meshrmm_signaling_client::{Socket, endpoint_url};
+use meshrmm_signaling_client::endpoint_url;
 use url::Url;
 
 use crate::config::Config;
@@ -91,11 +91,6 @@ pub fn session_signal_url(server: &str, session_id: &str) -> anyhow::Result<Url>
         &[("role", "client")],
         true,
     )
-}
-
-pub async fn authenticated_websocket(url: Url, token: &str) -> anyhow::Result<Socket> {
-    let (socket, _) = meshrmm_signaling_client::authenticated_websocket(url, token).await?;
-    Ok(socket)
 }
 
 /// End via a separate authenticated request even if the signaling socket died.

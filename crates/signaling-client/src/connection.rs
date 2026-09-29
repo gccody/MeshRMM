@@ -89,6 +89,15 @@ impl SignalingConnection {
         .await
         .context("signaling send timed out")?
     }
+
+    /// Queues `message` without waiting for the flush. Fails only if the
+    /// queue is full or the pump has stopped.
+    pub fn queue(&self, message: Message) -> anyhow::Result<()> {
+        let (done, _) = tokio::sync::oneshot::channel();
+        self.outgoing
+            .try_send((message, done))
+            .map_err(|_| anyhow::anyhow!("signaling writer full or closed"))
+    }
 }
 
 async fn send(socket: &mut crate::Socket, message: Message) -> anyhow::Result<()> {
