@@ -74,6 +74,15 @@ pub fn run_child() -> anyhow::Result<()> {
             output.flush()?;
             Ok(())
         }
+        ParentCommand::CaptureThumbnail => {
+            crate::remote::thumbnail::follow_input_desktop();
+            let thumbnail = crate::remote::thumbnail::capture_primary_display()
+                .map_err(|error| format!("{error:#}"));
+            let mut output = io::stdout().lock();
+            write_thumbnail(&mut output, &thumbnail)?;
+            output.flush()?;
+            Ok(())
+        }
         ParentCommand::StartFiles => run_file_child(command_rx),
         ParentCommand::StartClipboard => run_clipboard_child(command_rx),
         ParentCommand::StartChatHelper {
@@ -226,6 +235,7 @@ pub(super) fn run_capture_child(
                 }
                 Ok(Ok(
                     ParentCommand::EnumerateDisplays
+                    | ParentCommand::CaptureThumbnail
                     | ParentCommand::StartFiles
                     | ParentCommand::StartClipboard
                     | ParentCommand::StartChatHelper { .. }

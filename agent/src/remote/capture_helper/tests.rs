@@ -622,6 +622,7 @@ fn desktop_targets_alternate() {
 fn command_name(command: &ParentCommand) -> u8 {
     match command {
         ParentCommand::EnumerateDisplays => COMMAND_ENUMERATE_DISPLAYS,
+        ParentCommand::CaptureThumbnail => COMMAND_CAPTURE_THUMBNAIL,
         ParentCommand::Start { .. } => COMMAND_START,
         ParentCommand::SetWallpaperHidden(_) => 19,
         ParentCommand::SetPreventIdleLock(_) => 21,
@@ -1163,4 +1164,28 @@ mod credential_tests {
         assert!(read_event(&[12, 1, 128, 0, 0][..]).is_err());
         assert!(read_event(&[13, 2][..]).is_err());
     }
+}
+
+#[test]
+fn thumbnail_replies_round_trip_within_their_bounds() {
+    let mut bytes = Vec::new();
+    write_command(&mut bytes, &ParentCommand::CaptureThumbnail).unwrap();
+    assert!(matches!(
+        read_command(bytes.as_slice()).unwrap(),
+        ParentCommand::CaptureThumbnail
+    ));
+    for reply in [
+        Ok(vec![0xff, 0xd8, 0xff, 0xe0]),
+        Err("no display".to_owned()),
+    ] {
+        let mut bytes = Vec::new();
+        write_thumbnail(&mut bytes, &reply).unwrap();
+        assert_eq!(read_thumbnail(&mut bytes.as_slice()).unwrap(), reply);
+    }
+    let maximum = crate::remote::thumbnail::MAX_BYTES;
+    assert!(write_thumbnail(&mut Vec::new(), &Ok(vec![0; maximum + 1])).is_err());
+    let mut oversized = vec![0];
+    oversized.extend_from_slice(&(maximum as u32 + 1).to_le_bytes());
+    assert!(read_thumbnail(&mut oversized.as_slice()).is_err());
+    assert!(read_thumbnail(&mut [2_u8, 0, 0, 0, 0].as_slice()).is_err());
 }

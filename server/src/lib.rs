@@ -358,6 +358,12 @@ async fn route(mut request: Request, environment: Env) -> Result<Response> {
         (Method::Post, ["v1", "agents", device_id, "rotate-token"]) => {
             rotate_agent_token(&request, &environment, device_id).await
         }
+        (Method::Put, ["v1", "agents", device_id, "thumbnail"]) => {
+            upload_agent_thumbnail(&mut request, &environment, device_id).await
+        }
+        (Method::Get, ["v1", "agents", device_id, "thumbnail"]) => {
+            get_agent_thumbnail(&request, &environment, device_id).await
+        }
         (Method::Get, ["v1", "agents", device_id, "connect"]) => {
             let authorization = match authorize_agent(&request, &environment, device_id).await {
                 Ok(authorization) => authorization,
@@ -554,7 +560,8 @@ fn cors(response: Response, environment: &Env) -> Result<Response> {
                 Method::Delete,
                 Method::Options,
             ])
-            .with_allowed_headers(vec!["Authorization", "Content-Type"]),
+            .with_allowed_headers(vec!["Authorization", "Content-Type", "If-None-Match"])
+            .with_exposed_headers(vec!["ETag", "Last-Modified"]),
     )
 }
 

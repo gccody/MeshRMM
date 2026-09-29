@@ -6,6 +6,7 @@ import { AuthenticationRequired, type AuthorizedFetch } from "../../lib/http";
 import { type InventoryConnection, STALE_GRACE_MS, inventoryStatus, inventoryStream } from "./inventory-stream";
 import { parseAgentList, sortAgents } from "./model";
 import { subscriptionRenewal } from "./subscription-renewal";
+import { ThumbnailStore } from "./thumbnails";
 import type { Agent } from "./types";
 
 type Options = {
@@ -32,15 +33,23 @@ export function useAgentInventory({
   const [clock, setClock] = useState(0);
   const revision = useRef(-1);
   const stream = useRef<ReturnType<typeof inventoryStream> | null>(null);
+  // Screen images outlive page changes with the inventory they belong to.
+  const [thumbnails] = useState(() => new ThumbnailStore({ fetch: authorizedFetch }));
+  useEffect(() => thumbnails.setFetch(authorizedFetch), [authorizedFetch, thumbnails]);
 
   // Only sign-out and the session lock discard the inventory.
   const reset = useCallback(() => {
+    thumbnails.clear();
     setAgents([]);
     setHasData(false);
     setLastUpdated(null);
     setError(null);
     revision.current = -1;
-  }, []);
+  }, [thumbnails]);
+
+  useEffect(() => {
+    if (hasData) thumbnails.retain(new Set(agents.map((agent) => agent.id)));
+  }, [agents, hasData, thumbnails]);
 
   const loadAgents = useCallback(
     async (silent = false) => {
@@ -172,5 +181,6 @@ export function useAgentInventory({
     refresh,
     reconnect,
     reset,
+    thumbnails,
   };
 }

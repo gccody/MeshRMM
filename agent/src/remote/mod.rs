@@ -53,6 +53,8 @@ mod session;
 pub(crate) mod session_close;
 #[cfg(windows)]
 mod signaling;
+#[cfg(any(windows, test))]
+mod thumbnail;
 #[cfg(windows)]
 mod transport;
 // The bitrate controller's tests share the encoded-frame queue bound.
@@ -149,6 +151,8 @@ pub async fn run(
     #[cfg(windows)]
     {
         let link = service_link::ServiceLink::new(mode == ExecutionMode::Worker);
+        // Created once, so reconnecting does not capture again before the interval ends.
+        let mut thumbnails = thumbnail::Thumbnails::new(mode);
         let mut retry_delay = Duration::from_secs(1);
         let mut active_session = None::<ActiveSession>;
         // Outlives session tasks, which end whenever the viewer drops its
@@ -296,6 +300,7 @@ pub async fn run(
                                         _ => {}
                                     }
                                 }
+                                () = thumbnails.due() => thumbnails.refresh(&config),
                                 () = link.stopped() => {
                                     if let Some(version) = link.update_version() {
                                         announce_update(&socket, version).await;

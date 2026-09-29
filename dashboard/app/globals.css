@@ -699,3 +699,18 @@ button { color: inherit; }
 /* WorkOS widgets (2.12) */
 .widget-loading p { margin: 0; display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 13px; }
 .widget-loading .secondary-button { margin-top: 12px; }
+
+/* Screen thumbnails */
+.device-visual { display: inline-block; vertical-align: top; margin-right: 12px; }
+.device-visual .device-avatar { margin-right: 0; }
+.device-visual:has(.device-thumbnail) + .device-identity { max-width: calc(100% - 96px); }
+.device-thumbnail { position: relative; display: block; width: 80px; height: 50px; padding: 0; border: 1px solid var(--line); border-radius: 7px; background: #111827; cursor: zoom-in; }
+.device-thumbnail img { display: block; width: 100%; height: 100%; object-fit: contain; border-radius: 6px; }
+.device-thumbnail:not(.online) img, .agent-row.stale .device-thumbnail img { filter: grayscale(1); opacity: .75; }
+.device-thumbnail > span { position: absolute; right: -4px; bottom: -4px; width: 11px; height: 11px; border: 2px solid #fff; border-radius: 50%; background: #aeb0b8; }
+.device-thumbnail.online > span { background: #26a874; }
+.device-thumbnail:hover { border-color: #a5b4fc; }
+.device-thumbnail:focus-visible { outline: 2px solid var(--purple); outline-offset: 2px; }
+.thumbnail-modal { width: min(760px, 100%); }
+.thumbnail-modal > p:not(.eyebrow) { margin-bottom: 16px; }
+.thumbnail-preview { display: block; width: 100%; height: auto; max-height: calc(100dvh - 220px); object-fit: contain; border: 1px solid var(--line); border-radius: 9px; background: #111827; }
