@@ -1,17 +1,19 @@
 //! The signaling loop: exchanges the WebRTC offer, answer and candidates
-//! with the server, watches the connection and ends the session.
+//! with the server, watches the connection and ends the session. Once the
+//! peers connect, the session outlives the signaling socket, which
+//! reconnects in the background.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use futures_util::{SinkExt, StreamExt};
 use meshrmm_protocol::{
     CONTROL_CHANNEL_LABEL, ChromaMode, Codec, IceServer, SessionBootstrap, SessionMessage,
     SessionState, SignalErrorCode, SignalMessage, VideoProfile,
 };
 use meshrmm_session_transport::{SERVICE_CHANNELS, ServiceChannel};
+use meshrmm_signaling_client::SessionSignaling;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use webrtc::api::APIBuilder;
@@ -31,13 +33,11 @@ use super::{ActivePresenter, ReceiverLifecycle, ViewerResumeState};
 use crate::config::Config;
 use crate::debug::DebugInfo;
 use crate::launch_status::{self, LaunchStatus};
-use crate::signaling::{authenticated_websocket, session_signal_url};
+use crate::signaling::session_signal_url;
 
 const SESSION_ACTIVITY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const NEGOTIATION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const DISCONNECTED_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
-const SIGNAL_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
-const SIGNAL_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub async fn run_receiver(
     config: &Config,
@@ -70,11 +70,10 @@ pub async fn run_receiver(
     let debug = DebugInfo::new(bootstrap.session_id.as_str());
     let url = session_signal_url(&config.server, bootstrap.session_id.as_str())?;
     // Connecting can take a while on a bad network; Cancel must not wait for it.
-    let socket = tokio::select! {
-        socket = authenticated_websocket(url, &bootstrap.signaling_token) => socket?,
+    let mut signaling = tokio::select! {
+        signaling = SessionSignaling::connect(url, bootstrap.signaling_token.clone()) => signaling?,
         () = crate::shutdown::wait() => return Ok(()),
     };
-    let (mut signal_writer, mut signal_reader) = socket.split();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<SignalMessage>();
     let (state_tx, mut state_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
     let peer = create_peer(
@@ -122,9 +121,6 @@ pub async fn run_receiver(
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut statistics_log = crate::debug::StatisticsLog::default();
     stats_interval.tick().await;
-    let mut heartbeat_interval = tokio::time::interval(SIGNAL_HEARTBEAT_INTERVAL);
-    heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    heartbeat_interval.tick().await;
     let mut activity_interval = tokio::time::interval(SESSION_ACTIVITY_INTERVAL);
     activity_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     activity_interval.tick().await;
@@ -139,7 +135,6 @@ pub async fn run_receiver(
     let mut peer_connected = false;
     let mut offer_received = false;
     let mut awaiting_approval_since = None::<tokio::time::Instant>;
-    let mut last_signal_message = tokio::time::Instant::now();
     // Pointer pacing must not depend on the receiver loop being available: a
     // control-channel send can await long enough for a short movement burst to
     // end. This activity-driven flusher always queues that burst's newest
@@ -149,7 +144,7 @@ pub async fn run_receiver(
         loop {
             tokio::select! {
             Some(signal) = outgoing_rx.recv() => {
-                signal_writer.send(Message::Text(serde_json::to_string(&signal)?.into())).await?;
+                signaling.send(Message::Text(serde_json::to_string(&signal)?.into())).await?;
             }
             _ = activity_interval.tick() => {
                 outgoing_tx.send(SignalMessage::Activity)?;
@@ -157,82 +152,63 @@ pub async fn run_receiver(
             _ = negotiation_interval.tick(), if session_state == SessionState::Connecting => {
                 outgoing_tx.send(SignalMessage::Ready)?;
             }
-            incoming = signal_reader.next() => {
-                let Some(incoming) = incoming else {
-                    break Err(SessionFailure::new(FailureKind::SignalingLost, "signaling connection closed").into());
+            incoming = signaling.next() => {
+                let text = match incoming {
+                    Some(Ok(Message::Text(text))) => text,
+                    Some(Ok(_)) => continue,
+                    Some(Err(error)) if meshrmm_signaling_client::is_terminal_websocket_error(&error) => break Err(error),
+                    Some(Err(error)) => break Err(SessionFailure::new(FailureKind::SignalingLost, format!("{error:#}")).into()),
+                    None => break Err(SessionFailure::new(FailureKind::SignalingLost, "signaling connection closed").into()),
                 };
-                last_signal_message = tokio::time::Instant::now();
-                match incoming? {
-                    Message::Text(text) => {
-                        let signal: SignalMessage = serde_json::from_str(text.as_str())?;
-                        match signal {
-                            SignalMessage::Offer { sdp } => {
-                                offer_received = true;
-                                if let Some(since) = awaiting_approval_since.take() {
-                                    resume_state.add_approval_wait(since.elapsed());
-                                }
-                                launch_status::report(LaunchStatus::EstablishingConnection);
-                                debug.set_peer_fingerprint(identity.verify_sdp(&sdp)?);
-                                peer.set_remote_description(RTCSessionDescription::offer(sdp)?).await?;
-                                remote_description_set = true;
-                                for candidate in pending_candidates.drain(..) {
-                                    peer.add_ice_candidate(candidate).await?;
-                                }
-                                let answer = peer.create_answer(None).await?;
-                                peer.set_local_description(answer).await?;
-                                let local = peer.local_description().await
-                                    .ok_or_else(|| anyhow::anyhow!("WebRTC did not retain its local answer"))?;
-                                outgoing_tx.send(SignalMessage::Answer { sdp: local.sdp })?;
-                            }
-                            SignalMessage::IceCandidate { candidate, sdp_mid, sdp_mline_index, username_fragment } => {
-                                let candidate = RTCIceCandidateInit { candidate, sdp_mid, sdp_mline_index, username_fragment };
-                                if remote_description_set {
-                                    peer.add_ice_candidate(candidate).await?;
-                                } else {
-                                    if pending_candidates.len() >= 256 { anyhow::bail!("too many pending ICE candidates"); }
-                                    pending_candidates.push(candidate);
-                                }
-                            }
-                            SignalMessage::PeerLeft => {
-                                break Err(SessionFailure::new(FailureKind::AgentLeft, "Agent disconnected from the remote session").into());
-                            }
-                            SignalMessage::AwaitingApproval { remaining_seconds } if !offer_received => {
-                                launch_status::report(LaunchStatus::AwaitingApproval { remaining_seconds });
-                                // The video deadline starts once the user answers.
-                                let now = tokio::time::Instant::now();
-                                awaiting_approval_since.get_or_insert(now);
-                                presenter_missing_since = Some(now);
-                            }
-                            SignalMessage::Error { message, code } => {
-                                if code == Some(SignalErrorCode::IdentityMismatch)
-                                    || message.starts_with("Peer identity verification failed:")
-                                {
-                                    break Err(meshrmm_session_transport::identity::IdentityError(message).into());
-                                }
-                                break Err(SessionFailure::new(FailureKind::AgentReported(code), message).into());
-                            }
-                            _ => {}
+                let signal: SignalMessage = serde_json::from_str(text.as_str())?;
+                match signal {
+                    SignalMessage::Offer { sdp } => {
+                        offer_received = true;
+                        if let Some(since) = awaiting_approval_since.take() {
+                            resume_state.add_approval_wait(since.elapsed());
+                        }
+                        launch_status::report(LaunchStatus::EstablishingConnection);
+                        debug.set_peer_fingerprint(identity.verify_sdp(&sdp)?);
+                        peer.set_remote_description(RTCSessionDescription::offer(sdp)?).await?;
+                        remote_description_set = true;
+                        for candidate in pending_candidates.drain(..) {
+                            peer.add_ice_candidate(candidate).await?;
+                        }
+                        let answer = peer.create_answer(None).await?;
+                        peer.set_local_description(answer).await?;
+                        let local = peer.local_description().await
+                            .ok_or_else(|| anyhow::anyhow!("WebRTC did not retain its local answer"))?;
+                        outgoing_tx.send(SignalMessage::Answer { sdp: local.sdp })?;
+                    }
+                    SignalMessage::IceCandidate { candidate, sdp_mid, sdp_mline_index, username_fragment } => {
+                        let candidate = RTCIceCandidateInit { candidate, sdp_mid, sdp_mline_index, username_fragment };
+                        if remote_description_set {
+                            peer.add_ice_candidate(candidate).await?;
+                        } else {
+                            if pending_candidates.len() >= 256 { anyhow::bail!("too many pending ICE candidates"); }
+                            pending_candidates.push(candidate);
                         }
                     }
-                    Message::Ping(payload) => signal_writer.send(Message::Pong(payload)).await?,
-                    Message::Close(frame) => {
-                        break Err(meshrmm_signaling_client::signaling_close_error(frame));
+                    SignalMessage::PeerLeft => {
+                        break Err(SessionFailure::new(FailureKind::AgentLeft, "Agent disconnected from the remote session").into());
+                    }
+                    SignalMessage::AwaitingApproval { remaining_seconds } if !offer_received => {
+                        launch_status::report(LaunchStatus::AwaitingApproval { remaining_seconds });
+                        // The video deadline starts once the user answers.
+                        let now = tokio::time::Instant::now();
+                        awaiting_approval_since.get_or_insert(now);
+                        presenter_missing_since = Some(now);
+                    }
+                    SignalMessage::Error { message, code } => {
+                        if code == Some(SignalErrorCode::IdentityMismatch)
+                            || message.starts_with("Peer identity verification failed:")
+                        {
+                            break Err(meshrmm_session_transport::identity::IdentityError(message).into());
+                        }
+                        break Err(SessionFailure::new(FailureKind::AgentReported(code), message).into());
                     }
                     _ => {}
                 }
-            }
-            _ = heartbeat_interval.tick() => {
-                if last_signal_message.elapsed() >= SIGNAL_LIVENESS_TIMEOUT {
-                    break Err(SessionFailure::new(
-                        FailureKind::SignalingLost,
-                        format!(
-                            "signaling server did not respond for {} seconds",
-                            SIGNAL_LIVENESS_TIMEOUT.as_secs()
-                        ),
-                    ).into());
-                }
-                signal_writer.send(Message::Ping(Default::default())).await
-                    .context("failed to send signaling heartbeat")?;
             }
             Some(state) = state_rx.recv() => {
                 tracing::info!(?state, session_id = %bootstrap.session_id, "WebRTC connection state changed");
@@ -245,6 +221,8 @@ pub async fn run_receiver(
                     launch_status::report(LaunchStatus::StartingDisplay);
                 }
                 if state == RTCPeerConnectionState::Connected {
+                    // The session no longer depends on signaling.
+                    signaling.peer_connected();
                     peer_connected = true;
                     disconnected_since = None;
                 } else if state == RTCPeerConnectionState::Disconnected {
@@ -358,7 +336,7 @@ pub async fn run_receiver(
         })
     {
         let end_message = serde_json::to_string(&SignalMessage::EndSession)?;
-        if let Err(error) = signal_writer.send(Message::Text(end_message.into())).await {
+        if let Err(error) = signaling.send(Message::Text(end_message.into())).await {
             tracing::warn!(error = %error, "failed to notify the server that the viewer ended the session");
         }
     }
