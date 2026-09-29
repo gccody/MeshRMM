@@ -128,6 +128,7 @@ jobs:
       - run: node server/tests/session_cleanup.mjs
       - run: node server/tests/token_rotation.mjs
       - run: node server/tests/request_path.mjs
+      - run: node server/tests/thumbnails.mjs
 
   dashboard:
     needs: changes

@@ -85,6 +85,7 @@ export function DevicesPanel() {
         agents={inventory.agents}
         filteredAgents={filteredAgents}
         inventory={inventory}
+        thumbnails={inventory.thumbnails}
         onReconnect={inventory.reconnect}
         query={queryInput}
         status={status}

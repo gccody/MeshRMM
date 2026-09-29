@@ -11,6 +11,7 @@ pub(super) fn write_command(mut writer: impl Write, command: &ParentCommand) -> 
             writer.write_all(bytes)
         }
         ParentCommand::EnumerateDisplays => writer.write_all(&[COMMAND_ENUMERATE_DISPLAYS]),
+        ParentCommand::CaptureThumbnail => writer.write_all(&[COMMAND_CAPTURE_THUMBNAIL]),
         ParentCommand::StartFiles => writer.write_all(&[13]),
         ParentCommand::StartClipboard => writer.write_all(&[16]),
         ParentCommand::StartChatHelper {
@@ -145,6 +146,7 @@ pub(super) fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
             Ok(ParentCommand::AutofillCredentials(bytes))
         }
         COMMAND_ENUMERATE_DISPLAYS => Ok(ParentCommand::EnumerateDisplays),
+        COMMAND_CAPTURE_THUMBNAIL => Ok(ParentCommand::CaptureThumbnail),
         16 => Ok(ParentCommand::StartClipboard),
         17 => {
             let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "viewer name")?;
@@ -598,6 +600,43 @@ pub(super) fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
             format!("unknown desktop-helper event opcode {opcode}"),
         )),
     }
+}
+
+/// The thumbnail helper's reply: a JPEG, or why there is none.
+pub(super) fn write_thumbnail(
+    writer: &mut impl Write,
+    thumbnail: &Result<Vec<u8>, String>,
+) -> io::Result<()> {
+    let (status, bytes, maximum) = match thumbnail {
+        Ok(jpeg) => (0, jpeg.as_slice(), crate::remote::thumbnail::MAX_BYTES),
+        Err(message) => (1, message.as_bytes(), MAX_ERROR_BYTES),
+    };
+    checked_len(bytes.len(), maximum, "screen thumbnail")?;
+    writer.write_all(&[status])?;
+    write_u32(writer, bytes.len() as u32)?;
+    writer.write_all(bytes)
+}
+
+pub(super) fn read_thumbnail(reader: &mut impl Read) -> io::Result<Result<Vec<u8>, String>> {
+    let status = read_u8(reader)?;
+    let maximum = match status {
+        0 => crate::remote::thumbnail::MAX_BYTES,
+        1 => MAX_ERROR_BYTES,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid screen thumbnail status",
+            ));
+        }
+    };
+    let length = bounded_len(read_u32(reader)?, maximum, "screen thumbnail")?;
+    let mut bytes = vec![0; length];
+    reader.read_exact(&mut bytes)?;
+    Ok(if status == 0 {
+        Ok(bytes)
+    } else {
+        Err(String::from_utf8_lossy(&bytes).into_owned())
+    })
 }
 
 pub(super) fn write_display(writer: &mut impl Write, display: &Display) -> io::Result<()> {

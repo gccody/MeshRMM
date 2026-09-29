@@ -72,6 +72,7 @@ const EVENT_CLIPBOARD: u8 = 7;
 const EVENT_CHAT: u8 = 8;
 const EVENT_APPROVAL_DECISION: u8 = 14;
 const COMMAND_PROMPT_CONNECTION_APPROVAL: u8 = 26;
+const COMMAND_CAPTURE_THUMBNAIL: u8 = 27;
 const MAX_CODEC_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
@@ -79,6 +80,8 @@ const MAX_CONTROL_BYTES: usize = 64 * 1024;
 const MAX_DISPLAY_NAME_BYTES: usize = 4 * 1024;
 const MAX_DISPLAYS: usize = 64;
 const START_TIMEOUT: Duration = Duration::from_secs(5);
+/// Covers the helper's start, the capture and the JPEG encoding.
+const THUMBNAIL_TIMEOUT: Duration = Duration::from_secs(15);
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const STOP_TIMEOUT_MS: u32 = 5_000;
 const MAX_STDERR_LINE_BYTES: usize = 4 * 1024;
@@ -118,6 +121,8 @@ enum ParentCommand {
     PromptCredentials,
     AutofillCredentials(Vec<u8>),
     EnumerateDisplays,
+    /// Replies with a JPEG of the primary display on the input desktop, then exits.
+    CaptureThumbnail,
     StartFiles,
     StartClipboard,
     StartChatHelper {
@@ -1548,26 +1553,56 @@ fn enumerate_console_displays() -> anyhow::Result<Vec<Display>> {
 }
 
 fn enumerate_desktop_displays(target: DesktopTarget) -> anyhow::Result<Vec<Display>> {
+    let displays = ask_system_helper(
+        target,
+        ParentCommand::EnumerateDisplays,
+        START_TIMEOUT,
+        "console display enumeration",
+        |output| {
+            let count = bounded_len(read_u32(output)?, MAX_DISPLAYS, "display count")?;
+            (0..count)
+                .map(|_| read_display(output))
+                .collect::<io::Result<Vec<_>>>()
+        },
+    )?;
+    anyhow::ensure!(!displays.is_empty(), "console desktop reported no displays");
+    Ok(displays)
+}
+
+/// A JPEG of the console's primary display, captured by a one-shot LocalSystem
+/// helper that follows the input desktop, such as the lock screen.
+pub fn capture_thumbnail() -> anyhow::Result<Vec<u8>> {
+    ask_system_helper(
+        preferred_desktop(),
+        ParentCommand::CaptureThumbnail,
+        THUMBNAIL_TIMEOUT,
+        "screen thumbnail capture",
+        read_thumbnail,
+    )?
+    .map_err(|message| anyhow::anyhow!(message))
+}
+
+/// Sends one `command` to a new LocalSystem helper on `target`, reads its
+/// reply with `read`, and ends the helper.
+fn ask_system_helper<T: Send + 'static>(
+    target: DesktopTarget,
+    command: ParentCommand,
+    timeout: Duration,
+    label: &'static str,
+    read: impl FnOnce(&mut File) -> io::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
     let mut launched = launch_system_helper(target)?;
     let (sender, receiver) = mpsc::channel();
     let reader = thread::spawn(move || {
         let mut output = launched.output;
-        let result = (|| {
-            let count = bounded_len(read_u32(&mut output)?, MAX_DISPLAYS, "display count")?;
-            (0..count)
-                .map(|_| read_display(&mut output))
-                .collect::<io::Result<Vec<_>>>()
-        })();
-        let _ = sender.send(result);
+        let _ = sender.send(read(&mut output));
     });
     let stderr = thread::spawn(move || drain_child_stderr(launched.stderr));
     let result = (|| {
-        write_command(&mut launched.input, &ParentCommand::EnumerateDisplays)?;
-        let displays = receiver
-            .recv_timeout(START_TIMEOUT)
-            .context("console display enumeration timed out")??;
-        anyhow::ensure!(!displays.is_empty(), "console desktop reported no displays");
-        Ok(displays)
+        write_command(&mut launched.input, &command)?;
+        Ok(receiver
+            .recv_timeout(timeout)
+            .with_context(|| format!("{label} timed out"))??)
     })();
     terminate_and_wait(&launched.process);
     let _ = reader.join();
