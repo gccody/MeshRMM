@@ -16,6 +16,12 @@ permissions:
 jobs:
   checks:
     uses: ./.github/workflows/ci.yml
+    # A called workflow's jobs can't have more permissions than the caller
+    # grants, even jobs that are skipped, and CI's `changes` job reads pull
+    # requests.
+    permissions:
+      contents: read
+      pull-requests: read
 
   validate:
     name: Validate release version
