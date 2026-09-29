@@ -18,6 +18,19 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let session_id = request.session_id.clone();
     let signal_url = session_signal_url(config.server.as_str(), session_id.as_str(), "agent")?;
+    tracing::info!(session_id = %session_id, "remote session requested");
+    if let Some(approval) = super::connection_approval::ConnectionApproval::for_request(&request)
+        && !super::connection_approval::obtain(
+            &approval,
+            &signal_url,
+            &request.signaling_token,
+            mode,
+        )
+        .await?
+    {
+        tracing::info!(session_id = %session_id, "the user declined the remote session");
+        return Ok(());
+    }
     let bitrate_bits_per_second =
         QualityPreset::BestQuality.bitrate(config.bitrate_bits_per_second);
     let streamer: Arc<Mutex<Box<dyn ScreenStreamer>>> =
@@ -36,7 +49,6 @@ pub async fn run(
                 .config_path
                 .with_file_name("autofill-credentials.dat"),
         ))));
-    tracing::info!(session_id = %session_id, "remote session requested");
     let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(15));
     let progress = SenderProgress::default();
     loop {

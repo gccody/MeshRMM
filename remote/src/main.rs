@@ -275,7 +275,9 @@ async fn run_resumable_session(
             &error,
             ever_presented,
             startup_failures,
-            startup_started.elapsed(),
+            startup_started
+                .elapsed()
+                .saturating_sub(resume_state.approval_wait()),
         );
         if disposition != Disposition::Retry {
             tracing::error!(

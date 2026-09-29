@@ -93,6 +93,8 @@ mod tests {
             connection_notification: user,
             background_connection_notification: background,
             connection_notification_message: "{user_name} joined\nSay hi".into(),
+            connection_approval: None,
+            connection_reason: String::new(),
             viewer_name: "Zoë 王".into(),
             session_id: RemoteSessionId::new(session_id),
             signaling_token: "token".into(),

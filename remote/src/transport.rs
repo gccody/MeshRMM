@@ -88,6 +88,9 @@ pub struct ViewerResumeState {
     /// Why and since when the session is reconnecting; `None` while the
     /// remote display is up.
     reconnect_status: Arc<Mutex<Option<ReconnectStatus>>>,
+    /// How long the remote computer's user took to accept the connection,
+    /// which does not count against the startup retry window.
+    approval_wait: Arc<Mutex<std::time::Duration>>,
 }
 
 impl Default for ViewerResumeState {
@@ -121,6 +124,7 @@ impl Default for ViewerResumeState {
             reconnecting: Default::default(),
             progress: Default::default(),
             reconnect_status: Default::default(),
+            approval_wait: Default::default(),
         }
     }
 }
@@ -264,6 +268,21 @@ impl ViewerResumeState {
             return None;
         }
         idle.expired(now)
+    }
+
+    /// How long, in all, the session waited for its user to accept it.
+    pub fn approval_wait(&self) -> std::time::Duration {
+        *self
+            .approval_wait
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn add_approval_wait(&self, waited: std::time::Duration) {
+        *self
+            .approval_wait
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) += waited;
     }
 
     pub fn select_background_display(&self) {

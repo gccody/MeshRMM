@@ -7,6 +7,13 @@ export const DEFAULT_BLACKOUT_MESSAGE = "This machine is under maintenance by {u
 export const MAX_BLACKOUT_MESSAGE_BYTES = 2048;
 export const DEFAULT_CONNECTION_NOTIFICATION_MESSAGE = "{user_name} has connected to this computer.";
 export const MAX_CONNECTION_NOTIFICATION_MESSAGE_BYTES = 512;
+export const DEFAULT_CONNECTION_APPROVAL_MESSAGE = "{user_name} would like to connect.";
+export const MAX_CONNECTION_APPROVAL_MESSAGE_BYTES = 512;
+export const DEFAULT_CONNECTION_APPROVAL_TIMEOUT_SECONDS = 30;
+export const MIN_CONNECTION_APPROVAL_TIMEOUT_SECONDS = 5;
+export const MAX_CONNECTION_APPROVAL_TIMEOUT_SECONDS = 300;
+export const DEFAULT_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS = 60;
+export const MAX_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS = 3600;
 
 // The server accepts only these idle times, in minutes, or null for never.
 export const IDLE_DISCONNECT_MINUTES = [5, 10, 15, 30, 60, 120, 240, 480] as const;
@@ -23,6 +30,7 @@ export const SETTINGS_TABS = [
   { id: "remote-sessions", label: "Remote sessions" },
   { id: "blackout", label: "Blackout message" },
   { id: "connection-notification", label: "Connection notification" },
+  { id: "connection-approval", label: "Connection approval" },
 ] as const;
 export type SettingsTab = (typeof SETTINGS_TABS)[number]["id"];
 
@@ -40,6 +48,10 @@ export type CompanySettingsDraft = {
   connectionNotification: boolean;
   backgroundConnectionNotification: boolean;
   connectionNotificationMessage: string;
+  connectionApproval: boolean;
+  connectionApprovalMessage: string;
+  connectionApprovalTimeoutSeconds: number;
+  connectionApprovalLockIdleSeconds: number;
 };
 
 // The saved values, or the defaults a company starts with.
@@ -58,6 +70,10 @@ export function draftFromCompany(company: Company | null | undefined): CompanySe
     connectionNotification: company?.connection_notification ?? true,
     backgroundConnectionNotification: company?.background_connection_notification ?? false,
     connectionNotificationMessage: company?.connection_notification_message ?? DEFAULT_CONNECTION_NOTIFICATION_MESSAGE,
+    connectionApproval: company?.connection_approval ?? false,
+    connectionApprovalMessage: company?.connection_approval_message ?? DEFAULT_CONNECTION_APPROVAL_MESSAGE,
+    connectionApprovalTimeoutSeconds: company?.connection_approval_timeout_seconds ?? DEFAULT_CONNECTION_APPROVAL_TIMEOUT_SECONDS,
+    connectionApprovalLockIdleSeconds: company?.connection_approval_lock_idle_seconds ?? DEFAULT_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS,
   };
 }
 
@@ -76,7 +92,11 @@ export function draftMatchesCompany(draft: CompanySettingsDraft, company: Compan
     draft.sessionBanner === saved.sessionBanner &&
     draft.connectionNotification === saved.connectionNotification &&
     draft.backgroundConnectionNotification === saved.backgroundConnectionNotification &&
-    draft.connectionNotificationMessage === saved.connectionNotificationMessage
+    draft.connectionNotificationMessage === saved.connectionNotificationMessage &&
+    draft.connectionApproval === saved.connectionApproval &&
+    draft.connectionApprovalMessage === saved.connectionApprovalMessage &&
+    draft.connectionApprovalTimeoutSeconds === saved.connectionApprovalTimeoutSeconds &&
+    draft.connectionApprovalLockIdleSeconds === saved.connectionApprovalLockIdleSeconds
   );
 }
 
@@ -92,6 +112,33 @@ export function isBlackoutMessageValid(message: string) {
 // The notification is a small popup, so the server allows only 512 bytes.
 export function isConnectionNotificationMessageValid(message: string) {
   return isTemplateValid(message, MAX_CONNECTION_NOTIFICATION_MESSAGE_BYTES);
+}
+
+// The approval prompt is a small popup too, with the same limit.
+export function isConnectionApprovalMessageValid(message: string) {
+  return isTemplateValid(message, MAX_CONNECTION_APPROVAL_MESSAGE_BYTES);
+}
+
+function isWholeNumberBetween(value: number, min: number, max: number) {
+  return Number.isInteger(value) && value >= min && value <= max;
+}
+
+// Seconds the user has to answer before the connection is accepted for them.
+export function isConnectionApprovalTimeoutValid(seconds: number) {
+  return isWholeNumberBetween(seconds, MIN_CONNECTION_APPROVAL_TIMEOUT_SECONDS, MAX_CONNECTION_APPROVAL_TIMEOUT_SECONDS);
+}
+
+// Seconds a locked computer must have been idle to accept at once; 0 accepts
+// whenever it is locked.
+export function isConnectionApprovalLockIdleValid(seconds: number) {
+  return isWholeNumberBetween(seconds, 0, MAX_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS);
+}
+
+// Whether every approval setting can be saved.
+export function isConnectionApprovalDraftValid(draft: CompanySettingsDraft) {
+  return isConnectionApprovalMessageValid(draft.connectionApprovalMessage)
+    && isConnectionApprovalTimeoutValid(draft.connectionApprovalTimeoutSeconds)
+    && isConnectionApprovalLockIdleValid(draft.connectionApprovalLockIdleSeconds);
 }
 
 // The request body for PUT /v1/company/settings.
@@ -110,6 +157,10 @@ export function companySettingsBody(draft: CompanySettingsDraft) {
     connection_notification: draft.connectionNotification,
     background_connection_notification: draft.backgroundConnectionNotification,
     connection_notification_message: draft.connectionNotificationMessage,
+    connection_approval: draft.connectionApproval,
+    connection_approval_message: draft.connectionApprovalMessage,
+    connection_approval_timeout_seconds: draft.connectionApprovalTimeoutSeconds,
+    connection_approval_lock_idle_seconds: draft.connectionApprovalLockIdleSeconds,
   };
 }
 

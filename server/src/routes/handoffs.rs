@@ -10,6 +10,13 @@ pub(crate) async fn create_handoff(request: &mut Request, environment: &Env) -> 
         .await
         .map_err(|_| Error::RustError("invalid remote handoff request".into()))?;
     validate_identifier(&body.device_id, "device ID")?;
+    if !meshrmm_protocol_types::valid_connection_reason(&body.reason) {
+        return api_error(
+            400,
+            "connection reason must be at most 500 UTF-8 bytes and contain no control characters except newlines",
+        );
+    }
+    let reason = body.reason.trim();
     let db = environment.d1("DB")?;
     let handoff_token = random_token();
     let token_hash = sha256_hex(&handoff_token);
@@ -20,14 +27,15 @@ pub(crate) async fn create_handoff(request: &mut Request, environment: &Env) -> 
     // handoffs are purged by the scheduled maintenance task.
     let insert = query!(
         &db,
-        "INSERT INTO remote_handoffs (token_hash, company_id, device_id, user_id, created_at, expires_at, start_in_background) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE EXISTS (SELECT 1 FROM agents WHERE agents.id = ?3 AND agents.company_id = ?2 AND agents.deletion_requested_at IS NULL)",
+        "INSERT INTO remote_handoffs (token_hash, company_id, device_id, user_id, created_at, expires_at, start_in_background, reason) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 WHERE EXISTS (SELECT 1 FROM agents WHERE agents.id = ?3 AND agents.company_id = ?2 AND agents.deletion_requested_at IS NULL)",
         token_hash,
         identity.company_id,
         body.device_id,
         identity.user_id,
         i64::try_from(created_at).map_err(|_| Error::RustError("clock overflow".into()))?,
         i64::try_from(expires_at).map_err(|_| Error::RustError("clock overflow".into()))?,
-        body.start_in_background
+        body.start_in_background,
+        reason
     )?;
     let audit = query!(
         &db,
@@ -38,7 +46,7 @@ pub(crate) async fn create_handoff(request: &mut Request, environment: &Env) -> 
         "remote.handoff_create",
         "agent",
         body.device_id,
-        "{}",
+        serde_json::json!({ "reason": reason }).to_string(),
         now_ms_i64()?,
         token_hash
     )?;
@@ -74,7 +82,7 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
     let handoff = if let Some(tenant) = request_tenant.as_ref() {
         query!(
             &db,
-            "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND company_id = ?3 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = remote_handoffs.company_id AND companies.status IN ('active', 'awaiting_admin')) AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id, start_in_background",
+            "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND company_id = ?3 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = remote_handoffs.company_id AND companies.status IN ('active', 'awaiting_admin')) AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id, start_in_background, reason",
             now,
             token_hash,
             tenant.id
@@ -84,7 +92,7 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
     } else {
         query!(
             &db,
-            "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = remote_handoffs.company_id AND companies.status IN ('active', 'awaiting_admin')) AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id, start_in_background",
+            "UPDATE remote_handoffs SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 AND EXISTS (SELECT 1 FROM companies WHERE companies.id = remote_handoffs.company_id AND companies.status IN ('active', 'awaiting_admin')) AND EXISTS (SELECT 1 FROM agents WHERE agents.id = remote_handoffs.device_id AND agents.deletion_requested_at IS NULL) RETURNING company_id, device_id, user_id, start_in_background, reason",
             now,
             token_hash
         )?
@@ -113,6 +121,7 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
         &handoff.device_id,
         &viewer_name,
         handoff.start_in_background,
+        &handoff.reason,
     )
     .await?;
     let identity = Identity {
@@ -139,6 +148,7 @@ pub(crate) async fn create_session_for_device(
     device_id: &str,
     viewer_name: &str,
     start_in_background: bool,
+    connection_reason: &str,
 ) -> Result<Response> {
     // Resolve policy from the enrolled device's company, never from viewer input.
     let db = environment.d1("DB")?;
@@ -166,14 +176,28 @@ pub(crate) async fn create_session_for_device(
         #[serde(deserialize_with = "deserialize_sql_bool")]
         background_connection_notification: bool,
         connection_notification_message: String,
+        #[serde(deserialize_with = "deserialize_sql_bool")]
+        connection_approval: bool,
+        connection_approval_message: String,
+        connection_approval_timeout_seconds: u32,
+        connection_approval_lock_idle_seconds: u32,
     }
     let policy = query!(&db,
-        "SELECT c.id AS company_id, c.blackout_message, c.display_border, c.prevent_idle_lock, c.allow_idle_override, c.idle_disconnect_minutes, c.allow_idle_disconnect_override, c.clear_clipboard_on_close, c.allow_clear_clipboard_override, c.session_banner, c.connection_notification, c.background_connection_notification, c.connection_notification_message FROM companies c JOIN agents a ON a.company_id = c.id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL",
+        "SELECT c.id AS company_id, c.blackout_message, c.display_border, c.prevent_idle_lock, c.allow_idle_override, c.idle_disconnect_minutes, c.allow_idle_disconnect_override, c.clear_clipboard_on_close, c.allow_clear_clipboard_override, c.session_banner, c.connection_notification, c.background_connection_notification, c.connection_notification_message, c.connection_approval, c.connection_approval_message, c.connection_approval_timeout_seconds, c.connection_approval_lock_idle_seconds FROM companies c JOIN agents a ON a.company_id = c.id WHERE a.id = ?1 AND a.deletion_requested_at IS NULL",
         device_id
     )?.metered_first::<MaintenancePolicy>(None).await?;
     let Some(policy) = policy else {
         return api_error(404, "agent not found");
     };
+    let connection_approval =
+        policy
+            .connection_approval
+            .then(|| meshrmm_protocol_types::ConnectionApproval {
+                message: policy.connection_approval_message.clone(),
+                timeout_seconds: policy.connection_approval_timeout_seconds,
+                lock_idle_seconds: policy.connection_approval_lock_idle_seconds,
+            });
+    let connection_reason = meshrmm_protocol_types::connection_reason(connection_reason);
     let idle_policy = meshrmm_protocol_types::TogglePolicy {
         enabled: policy.prevent_idle_lock,
         allow_override: policy.allow_idle_override,
@@ -216,6 +240,8 @@ pub(crate) async fn create_session_for_device(
         connection_notification: policy.connection_notification,
         background_connection_notification: policy.background_connection_notification,
         connection_notification_message: &policy.connection_notification_message,
+        connection_approval: connection_approval.as_ref(),
+        connection_reason,
         blackout_message: &policy.blackout_message,
         viewer_name,
         session_id: &session_id,
@@ -243,6 +269,8 @@ pub(crate) async fn create_session_for_device(
         connection_notification: policy.connection_notification,
         background_connection_notification: policy.background_connection_notification,
         connection_notification_message: policy.connection_notification_message,
+        connection_approval,
+        connection_reason: connection_reason.to_owned(),
         viewer_name: viewer_name.to_owned(),
         session_id: RemoteSessionId::new(&session_id),
         signaling_token: agent_token,

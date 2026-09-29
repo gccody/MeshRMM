@@ -3,10 +3,12 @@
 import { CircleAlert, X } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
+import { ConnectionReasonModal } from "../session/connection-reason-modal";
 import { ViewerLaunchNotice } from "../session/viewer-launch-notice";
 import { type ActionErrorSource, listActionErrors } from "../workspace/action-errors";
 import { useWorkspace } from "../workspace/workspace-context";
 import { AgentOverview } from "./agent-overview";
+import type { Agent } from "./types";
 import {
   type AgentStatusFilter,
   type DeviceFilters,
@@ -32,7 +34,13 @@ function writeFilters(filters: DeviceFilters) {
 }
 
 export function DevicesPanel() {
-  const { inventory, remote, deleteAgent, deletingId, isAdmin, setDevicesSearch, actionErrors, reportActionError } = useWorkspace();
+  const { inventory, remote, company, deleteAgent, deletingId, isAdmin, setDevicesSearch, actionErrors, reportActionError } = useWorkspace();
+  // A connection the device's user must approve, waiting for its reason.
+  const [pendingConnect, setPendingConnect] = useState<{ agent: Agent; background: boolean } | null>(null);
+  const requestConnect = (agent: Agent, background: boolean) => {
+    if (company?.connection_approval) setPendingConnect({ agent, background });
+    else void remote.connect(agent, background);
+  };
   const filters = parseDeviceFilters(useSearchParams());
   const status = filters.status;
   // The search box updates at once; the URL follows after a pause in typing.
@@ -87,11 +95,20 @@ export function DevicesPanel() {
         canDelete={isAdmin}
         onQueryChange={(query) => setQueryInput(clampDeviceQuery(query))}
         onStatusChange={changeStatus}
-        onRemote={(agent) => void remote.connect(agent)}
-        onRemoteBackground={(agent) => void remote.connect(agent, true)}
+        onRemote={(agent) => requestConnect(agent, false)}
+        onRemoteBackground={(agent) => requestConnect(agent, true)}
         onCloseSession={(agent) => void remote.closeSession(agent)}
         onDelete={(agent) => void deleteAgent(agent)}
       />
+      {pendingConnect && <ConnectionReasonModal
+        agentName={pendingConnect.agent.name}
+        background={pendingConnect.background}
+        onCancel={() => setPendingConnect(null)}
+        onConnect={(reason) => {
+          setPendingConnect(null);
+          void remote.connect(pendingConnect.agent, pendingConnect.background, reason);
+        }}
+      />}
     </>
   );
 }

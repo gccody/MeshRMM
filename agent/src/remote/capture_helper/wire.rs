@@ -29,6 +29,22 @@ pub(super) fn write_command(mut writer: impl Write, command: &ParentCommand) -> 
             write_u32(&mut writer, text.len() as u32)?;
             writer.write_all(text.as_bytes())
         }
+        ParentCommand::PromptConnectionApproval {
+            text,
+            reason,
+            timeout_seconds,
+            lock_idle_seconds,
+        } => {
+            checked_len(text.len(), MAX_CONTROL_BYTES, "connection approval message")?;
+            checked_len(reason.len(), MAX_CONTROL_BYTES, "connection reason")?;
+            writer.write_all(&[COMMAND_PROMPT_CONNECTION_APPROVAL])?;
+            write_u32(&mut writer, text.len() as u32)?;
+            writer.write_all(text.as_bytes())?;
+            write_u32(&mut writer, reason.len() as u32)?;
+            writer.write_all(reason.as_bytes())?;
+            write_u32(&mut writer, *timeout_seconds)?;
+            write_u32(&mut writer, *lock_idle_seconds)
+        }
         ParentCommand::Files(message) => {
             writer.write_all(&[12])?;
             write_file_message(&mut writer, message)
@@ -152,6 +168,25 @@ pub(super) fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
             Ok(ParentCommand::ShowConnectionNotification {
                 text: String::from_utf8(text)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            })
+        }
+        COMMAND_PROMPT_CONNECTION_APPROVAL => {
+            let mut text = || -> io::Result<String> {
+                let length = bounded_len(
+                    read_u32(&mut reader)?,
+                    MAX_CONTROL_BYTES,
+                    "connection approval text",
+                )?;
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes)?;
+                String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            };
+            let (text, reason) = (text()?, text()?);
+            Ok(ParentCommand::PromptConnectionApproval {
+                text,
+                reason,
+                timeout_seconds: read_u32(&mut reader)?,
+                lock_idle_seconds: read_u32(&mut reader)?,
             })
         }
         COMMAND_START => {
@@ -376,6 +411,9 @@ pub(super) fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Res
             write_u32(&mut writer, text.len() as u32)?;
             writer.write_all(text.as_bytes())
         }
+        ChildEvent::ApprovalDecision(decision) => {
+            writer.write_all(&[EVENT_APPROVAL_DECISION, decision.to_byte()])
+        }
         ChildEvent::Error(message) => {
             let message = message.as_bytes();
             checked_len(message.len(), MAX_ERROR_BYTES, "desktop-helper error")?;
@@ -552,6 +590,9 @@ pub(super) fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
         }
         EVENT_STOPPED => Ok(ChildEvent::Stopped),
+        EVENT_APPROVAL_DECISION => Decision::from_byte(read_u8(&mut reader)?)
+            .map(ChildEvent::ApprovalDecision)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid approval decision")),
         opcode => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown desktop-helper event opcode {opcode}"),

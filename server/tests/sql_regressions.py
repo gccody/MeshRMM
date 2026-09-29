@@ -177,16 +177,22 @@ class EnrollmentTests(unittest.TestCase):
         self.db.execute("INSERT INTO companies (id,name,created_at,slug,status) VALUES ('other','Other',0,'other','active')")
         notice = "{user_name} has connected to this computer."
         self.assertEqual(self.db.execute("SELECT connection_notification, background_connection_notification, connection_notification_message FROM companies WHERE id='co'").fetchone(), (1, 0, notice))
+        approval = "{user_name} would like to connect."
+        self.assertEqual(self.db.execute("SELECT connection_approval, connection_approval_message, connection_approval_timeout_seconds, connection_approval_lock_idle_seconds FROM companies WHERE id='co'").fetchone(), (0, approval, 30, 60))
         self.assertEqual(self.db.execute("SELECT idle_disconnect_minutes, allow_idle_disconnect_override FROM companies WHERE id='co'").fetchone(), (None, 1))
         self.assertEqual(self.db.execute("SELECT clear_clipboard_on_close, allow_clear_clipboard_override FROM companies WHERE id='co'").fetchone(), (1, 1))
-        self.db.execute(update, (60, "Maintenance by {user_name}\nPlease wait", "co", 0, 0, 0, 0, 0, "{user_name} is here\nSay hi", 1, 30, 0, 0, 0))
-        self.db.execute(update, (120, None, "co", None, None, None, None, None, None, None, 15, None, None, None))
-        self.assertEqual(self.db.execute("SELECT blackout_message, session_banner, connection_notification, background_connection_notification, connection_notification_message, clear_clipboard_on_close, allow_clear_clipboard_override FROM companies WHERE id='other'").fetchone(), (default, 1, 1, 0, notice, 1, 1))
+        self.db.execute(update, (60, "Maintenance by {user_name}\nPlease wait", "co", 0, 0, 0, 0, 0, "{user_name} is here\nSay hi", 1, 30, 0, 0, 0, 1, "{user_name} asks\nOK?", 45, 0))
+        self.db.execute(update, (120, None, "co", None, None, None, None, None, None, None, 15, None, None, None, None, None, None, None))
+        self.assertEqual(self.db.execute("SELECT blackout_message, session_banner, connection_notification, background_connection_notification, connection_notification_message, clear_clipboard_on_close, allow_clear_clipboard_override, connection_approval, connection_approval_message, connection_approval_timeout_seconds, connection_approval_lock_idle_seconds FROM companies WHERE id='other'").fetchone(), (default, 1, 1, 0, notice, 1, 1, 0, approval, 30, 60))
         policy = sql("server/src/routes/handoffs.rs", "SELECT c.id AS company_id, c.blackout_message")
-        self.assertEqual(self.db.execute(policy, ("device",)).fetchone(), ("co", "Maintenance by {user_name}\nPlease wait", 0, 0, 0, 15, 0, 0, 0, 0, 0, 1, "{user_name} is here\nSay hi"))
-        self.db.execute(update, (120, None, "co", None, None, None, None, None, None, None, None, 1, None, None))
+        self.assertEqual(self.db.execute(policy, ("device",)).fetchone(), ("co", "Maintenance by {user_name}\nPlease wait", 0, 0, 0, 15, 0, 0, 0, 0, 0, 1, "{user_name} is here\nSay hi", 1, "{user_name} asks\nOK?", 45, 0))
+        self.db.execute(update, (120, None, "co", None, None, None, None, None, None, None, None, 1, None, None, None, None, None, None))
         self.assertEqual(self.db.execute("SELECT idle_disconnect_minutes, allow_idle_disconnect_override FROM companies WHERE id='co'").fetchone(), (None, 1))
         self.assertEqual(self.db.execute("SELECT clear_clipboard_on_close, allow_clear_clipboard_override FROM companies WHERE id='co'").fetchone(), (0, 0))
+        self.assertEqual(self.db.execute("SELECT connection_approval, connection_approval_message, connection_approval_timeout_seconds, connection_approval_lock_idle_seconds FROM companies WHERE id='co'").fetchone(), (1, "{user_name} asks\nOK?", 45, 0))
+        for column, value in (("connection_approval", 2), ("connection_approval_timeout_seconds", 4), ("connection_approval_timeout_seconds", 301), ("connection_approval_lock_idle_seconds", -1), ("connection_approval_lock_idle_seconds", 3601)):
+            with self.assertRaises(sqlite3.IntegrityError, msg=f"{column}={value}"):
+                self.db.execute(f"UPDATE companies SET {column} = ? WHERE id='co'", (value,))
         with self.assertRaises(sqlite3.IntegrityError):
             self.db.execute("UPDATE companies SET connection_notification = 2 WHERE id='co'")
         with self.assertRaises(sqlite3.IntegrityError):
@@ -258,10 +264,11 @@ class EnrollmentTests(unittest.TestCase):
         self.redeem()
         insert = sql("server/src/routes/handoffs.rs", "INSERT INTO remote_handoffs")
         redeem = sql("server/src/routes/handoffs.rs", "UPDATE remote_handoffs SET")
-        for mode, token in ((False, "c" * 64), (True, "d" * 64)):
-            self.db.execute(insert, (token, "co", "device", "user", 0, 1000, mode))
+        for mode, token, reason in ((False, "c" * 64, ""), (True, "d" * 64, "Printer queue\nticket 42")):
+            self.db.execute(insert, (token, "co", "device", "user", 0, 1000, mode, reason))
             row = self.db.execute(redeem, (1, token, "co")).fetchone()
             self.assertEqual(row[3], int(mode))
+            self.assertEqual(row[4], reason)
 
     def rotation_sql(self):
         coordinator = "server/src/agent_coordinator.rs"
@@ -327,11 +334,11 @@ class TokenLifecycleTests(unittest.TestCase):
     def test_handoffs_are_created_only_for_the_companys_own_undeleted_agent(self):
         for device, created in (("device", 1), ("foreign", 0), ("deleted", 0), ("missing", 0)):
             token = device[0] * 64
-            self.assertEqual(self.db.execute(self.handoff, (token, "co", device, "user", 0, 1000, False)).rowcount, created, device)
+            self.assertEqual(self.db.execute(self.handoff, (token, "co", device, "user", 0, 1000, False, "")).rowcount, created, device)
         self.assertEqual(self.db.execute("SELECT company_id, device_id FROM remote_handoffs").fetchall(), [("co", "device")])
 
     def test_handoff_audit_is_recorded_only_with_its_handoff(self):
-        self.db.execute(self.handoff, ("d" * 64, "co", "device", "user", 0, 1000, False))
+        self.db.execute(self.handoff, ("d" * 64, "co", "device", "user", 0, 1000, False, ""))
         audit = lambda event, token: self.db.execute(self.audit, (event, "co", "user", "remote.handoff_create", "agent", "device", "{}", 5, token)).rowcount
         self.assertEqual(audit("missing", "f" * 64), 0)
         self.assertEqual(audit("created", "d" * 64), 1)

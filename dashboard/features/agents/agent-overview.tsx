@@ -82,6 +82,9 @@ function ConnectMenu({ agent, disabled, title, connecting, background, onRemote,
 
   const choose = (action: (agent: Agent) => void) => {
     setOpen(false);
+    // The chosen option disappears with the menu; a dialog the action opens
+    // returns focus here.
+    triggerRef.current?.focus();
     action(agent);
   };
 

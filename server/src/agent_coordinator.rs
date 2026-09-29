@@ -939,6 +939,8 @@ mod lease_tests {
             connection_notification: true,
             background_connection_notification: false,
             connection_notification_message: String::new(),
+            connection_approval: None,
+            connection_reason: String::new(),
             viewer_name: "Ada Lovelace".into(),
             session_id: meshrmm_protocol_types::RemoteSessionId::new("one"),
             signaling_token: "token".into(),

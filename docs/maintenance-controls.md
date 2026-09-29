@@ -88,6 +88,54 @@ open. The notification closes when the session ends. Apply
 migration `0015_connection_notification.sql` before deploying the updated server
 and dashboard; `/healthz` expects it.
 
+## Connection approval
+
+A company administrator can make the Agent's user approve each connection under
+**Settings → Connection approval**. It is off by default. When it is on, the
+technician sees a dialog after choosing **Connect** or **Connect to
+background** and may give a reason, up to 500 UTF-8 bytes. The Agent then shows
+a prompt in the middle of the console's primary monitor, above other windows:
+
+> **Remote connection request**
+>
+> {user_name} would like to connect.
+>
+> Reason: *the technician's reason, when they gave one*
+>
+> Accepts automatically in 30 seconds. **[Deny] [Accept]**
+
+The message is a template like the connection notification's: `{user_name}`
+works as it does in the blackout message, and it is limited to 512 UTF-8 bytes.
+Without a reason the prompt shows only the message. The prompt does not take
+focus when it opens, so typing in another window cannot answer it. Once
+clicked, Tab moves between the buttons, Enter or Space presses the focused
+one, and Escape or closing the prompt denies the connection.
+
+Until the user answers, the technician's viewer shows that it is waiting and
+how long until the connection goes ahead; nothing is captured or streamed. A
+denial ends the session and the viewer says the user declined; it does not
+retry. The connection is accepted without an answer when:
+
+- **Nobody answers in time.** The administrator sets the time, from 5 to 300
+  seconds (30 by default).
+- **The computer has been sitting at the lock screen.** The administrator sets
+  how long it must have had no keyboard or mouse input, from 0 to 3600 seconds
+  (60 by default). A console nobody is signed in to counts as locked. With 0,
+  a locked computer accepts at once. A computer locked more recently keeps
+  asking, on the user's desktop, until it has been idle that long, the user
+  unlocks it and answers, or the time runs out.
+
+The policy applies to every new session, including background mode, and has
+no per-session or viewer override: the server resolves it from the enrolled
+agent's company and sends it only in the authenticated Agent session request.
+The reason is stored with the one-time handoff, recorded in the
+`remote.handoff_create` audit event, and kept in the session record. Viewer
+reconnects and resumes of the same session do not ask again; a session the user
+declined stays declined. As a service, the Agent shows the prompt from a
+separate LocalSystem helper on the console's desktop, which also measures the
+session's input idle time. Apply migration `0018_connection_approval.sql`
+before deploying the updated server and dashboard; `/healthz` expects it.
+
 ## Validation
 
 Automated checks cover protocol compatibility, name/template rendering, company

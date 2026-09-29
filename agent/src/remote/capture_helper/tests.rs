@@ -436,6 +436,12 @@ fn command_protocol_round_trips_desktop_input() {
         ParentCommand::ShowConnectionNotification {
             text: "Zoë 王 has connected\nSay hi".into(),
         },
+        ParentCommand::PromptConnectionApproval {
+            text: "Zoë 王 would like to connect.".into(),
+            reason: "Printer queue\nticket 42".into(),
+            timeout_seconds: 30,
+            lock_idle_seconds: 0,
+        },
         ParentCommand::Stop,
     ];
     for command in commands {
@@ -462,7 +468,37 @@ fn command_protocol_round_trips_desktop_input() {
         if let ParentCommand::ShowConnectionNotification { text } = &decoded {
             assert_eq!(text, "Zoë 王 has connected\nSay hi");
         }
+        if let ParentCommand::PromptConnectionApproval {
+            text,
+            reason,
+            timeout_seconds,
+            lock_idle_seconds,
+        } = &decoded
+        {
+            assert_eq!(text, "Zoë 王 would like to connect.");
+            assert_eq!(reason, "Printer queue\nticket 42");
+            assert_eq!((*timeout_seconds, *lock_idle_seconds), (30, 0));
+        }
     }
+}
+
+#[test]
+fn approval_decisions_round_trip_and_invalid_ones_are_rejected() {
+    use crate::remote::connection_approval::Decision;
+    for decision in [
+        Decision::Accepted,
+        Decision::Declined,
+        Decision::TimedOut,
+        Decision::LockedAndIdle,
+    ] {
+        let mut bytes = Vec::new();
+        write_event(&mut bytes, &ChildEvent::ApprovalDecision(decision)).unwrap();
+        assert!(matches!(
+            read_event(bytes.as_slice()).unwrap(),
+            ChildEvent::ApprovalDecision(decoded) if decoded == decision
+        ));
+    }
+    assert!(read_event([EVENT_APPROVAL_DECISION, 9].as_slice()).is_err());
 }
 
 #[test]
@@ -603,6 +639,7 @@ fn command_name(command: &ParentCommand) -> u8 {
         ParentCommand::StartClipboard => 16,
         ParentCommand::StartChatHelper { .. } => 17,
         ParentCommand::ShowConnectionNotification { .. } => 25,
+        ParentCommand::PromptConnectionApproval { .. } => COMMAND_PROMPT_CONNECTION_APPROVAL,
         ParentCommand::PromptCredentials => 23,
         ParentCommand::AutofillCredentials(_) => 24,
         ParentCommand::Files(_) => 12,
@@ -947,8 +984,9 @@ mod service_event_tests {
             ChildEvent::Files(meshrmm_protocol::FileMessage::Available),
             ChildEvent::Clipboard(ClipboardContent::Text("copied".into())),
             ChildEvent::Chat("hello".into()),
+            ChildEvent::ApprovalDecision(crate::remote::connection_approval::Decision::Accepted),
         ];
-        let expected: [&[HelperKind]; 11] = [
+        let expected: [&[HelperKind]; 12] = [
             &[Input, Files, Clipboard, Chat, Notification],
             &[Input, Files, Clipboard, Chat, Notification],
             &[Input, Files, Clipboard, Chat, Notification],
@@ -960,6 +998,8 @@ mod service_event_tests {
             &[Files],
             &[Clipboard],
             &[Chat],
+            // Only the approval helper, which has its own reader.
+            &[],
         ];
         for (event, senders) in events.iter().zip(expected) {
             for kind in [Input, Files, Clipboard, Chat, Notification] {

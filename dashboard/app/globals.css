@@ -207,6 +207,9 @@ button { color: inherit; }
 .settings-modal input:focus, .settings-modal select:focus { border-color: #9888e8; box-shadow: 0 0 0 3px #f0edff; }
 .field-help { color: #9294a0; font-size: 12px; font-weight: 500; line-height: 1.45; }
 .modal-submit { width: 100%; height: 40px; margin-top: 5px; }
+.connection-reason-modal textarea { min-height: 84px; padding: 10px 11px; border: 1px solid #dcdee5; border-radius: 8px; outline: 0; color: var(--ink); background: #fbfbfc; font: inherit; font-size: 13px; font-weight: 400; resize: vertical; }
+.connection-reason-modal textarea:focus { border-color: #9888e8; box-shadow: 0 0 0 3px #f0edff; }
+.connection-reason-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 5px; }
 .auth-actions { display: grid; gap: 7px; }
 .account-summary { min-height: 58px; margin: 4px 0 12px; padding: 10px 12px; display: grid; grid-template-columns: 36px 1fr; align-items: center; gap: 10px; border: 1px solid var(--line); border-radius: 10px; background: #fafaff; }
 .account-summary .profile-avatar { width: 36px; height: 36px; }
@@ -432,6 +435,27 @@ button { color: inherit; }
 }
 .connection-notification-preview strong { color: #fff; font-weight: 600; }
 .settings-section .connection-notification-preview { margin: 18px 0; }
+.connection-approval-preview {
+  display: grid;
+  gap: 6px;
+  max-width: 420px;
+  padding: 16px;
+  border: 1px solid #4b5563;
+  border-left: 4px solid #6366f1;
+  border-radius: 6px;
+  background: #212b38;
+  color: #e2e5eb;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.connection-approval-preview strong { color: #fff; font-weight: 600; }
+.connection-approval-preview small { color: #94a3b8; font-size: 12px; }
+.connection-approval-reason { color: #cbd5e1; font-style: italic; }
+.connection-approval-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+.connection-approval-buttons span { padding: 6px 16px; border: 1px solid #4b5563; border-radius: 4px; font-size: 13px; }
+.connection-approval-buttons span:last-child { border-color: #6366f1; background: #6366f1; color: #fff; }
+.settings-section .connection-approval-preview { margin: 18px 0; }
+.settings-section input[type=number] { display: block; width: 100%; max-width: 160px; margin-top: 8px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--soft); font: inherit; }
 
 /* Company settings */
 .settings-page { max-width: 960px; }

@@ -11,6 +11,10 @@ export type Company = {
   connection_notification: boolean;
   background_connection_notification: boolean;
   connection_notification_message: string;
+  connection_approval: boolean;
+  connection_approval_message: string;
+  connection_approval_timeout_seconds: number;
+  connection_approval_lock_idle_seconds: number;
   blackout_message: string;
   id: string;
   name: string;
