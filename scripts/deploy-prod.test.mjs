@@ -6,7 +6,9 @@ import {
   affectsNativeRelease,
   nextVersion,
   parseArguments,
+  releaseBranch,
   releaseCommitMessage,
+  releasePullRequestProgress,
   secretsReadByServer,
   verifyManifest,
   withVersion,
@@ -75,6 +77,31 @@ test("the release commit changes only the version", () => {
   assert.throws(() => withVersion("{}", "0.3.3"), /no version/);
   assert.equal(releaseCommitMessage("0.3.3", "chat fixes"), "chore(release): publish chat fixes 0.3.3");
   assert.equal(releaseCommitMessage("0.3.3"), "chore(release): publish 0.3.3");
+});
+
+test("the release pull request waits for its checks and squash merge", () => {
+  assert.equal(releaseBranch("0.3.5"), "release/0.3.5");
+  const open = { state: "OPEN", mergeStateStatus: "BLOCKED", autoMergeRequest: { mergeMethod: "SQUASH" } };
+  const run = (name, status, conclusion = "") => ({ __typename: "CheckRun", name, status, conclusion });
+  assert.deepEqual(releasePullRequestProgress({ ...open, statusCheckRollup: [] }), { waiting: "waiting for checks to start" });
+  assert.deepEqual(
+    releasePullRequestProgress({
+      ...open,
+      statusCheckRollup: [run("changes", "COMPLETED", "SUCCESS"), run("rust-windows", "IN_PROGRESS"),
+        { __typename: "StatusContext", context: "external", state: "PENDING" }],
+    }),
+    { waiting: "1/3 checks finished" },
+  );
+  assert.deepEqual(
+    releasePullRequestProgress({ ...open, statusCheckRollup: [run("dashboard", "COMPLETED", "FAILURE"),
+      { __typename: "StatusContext", context: "external", state: "ERROR" }] }),
+    { problem: "checks failed: dashboard, external" },
+  );
+  assert.match(releasePullRequestProgress({ ...open, mergeStateStatus: "BEHIND" }).problem, /main moved/);
+  assert.match(releasePullRequestProgress({ ...open, mergeStateStatus: "DIRTY" }).problem, /conflicts/);
+  assert.match(releasePullRequestProgress({ ...open, autoMergeRequest: null }).problem, /auto-merge/);
+  assert.match(releasePullRequestProgress({ state: "CLOSED" }).problem, /closed/);
+  assert.deepEqual(releasePullRequestProgress({ state: "MERGED", mergeCommit: { oid: "abc123" } }), { merged: "abc123" });
 });
 
 test("the manifest check compares versions and downloaded checksums", async () => {
