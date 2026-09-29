@@ -18,6 +18,8 @@ pub(crate) mod capture_helper;
 mod clipboard;
 pub mod config;
 #[cfg(any(windows, test))]
+mod connection_approval;
+#[cfg(any(windows, test))]
 mod connection_notification;
 #[cfg(windows)]
 mod credentials;
@@ -346,6 +348,8 @@ mod tests {
             connection_notification: true,
             background_connection_notification: false,
             connection_notification_message: String::new(),
+            connection_approval: None,
+            connection_reason: String::new(),
             viewer_name: "Ada Lovelace".into(),
             session_id: RemoteSessionId::new("session"),
             signaling_token: "token".into(),

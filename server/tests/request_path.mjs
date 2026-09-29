@@ -160,7 +160,7 @@ try {
   }
 
   // Handoff create: authorization, then the insert and its audit event in one batch.
-  const handoff = (host, organization, device) => post(host, '/v1/remote/handoffs', token(organization), { device_id: device, start_in_background: true });
+  const handoff = (host, organization, device, reason = '  Printer queue\nticket 42 ') => post(host, '/v1/remote/handoffs', token(organization), { device_id: device, start_in_background: true, reason });
   result = await handoff('acme.meshrmm.com', 'org-acme', 'device-acme');
   assert.equal(result.status, 200);
   const created = result.body;
@@ -168,8 +168,15 @@ try {
   assert.equal(created.api_url, 'https://acme.meshrmm.com');
   assert.equal(created.start_in_background, true);
   assert.equal(result.roundTrips, 2, 'handoff round trips');
-  assert.deepEqual(await db.prepare(`SELECT company_id, device_id, start_in_background FROM remote_handoffs WHERE token_hash = '${hash(created.handoff_token)}'`).first(), { company_id: 'company-acme', device_id: 'device-acme', start_in_background: 1 });
+  assert.deepEqual(await db.prepare(`SELECT company_id, device_id, start_in_background, reason FROM remote_handoffs WHERE token_hash = '${hash(created.handoff_token)}'`).first(), { company_id: 'company-acme', device_id: 'device-acme', start_in_background: 1, reason: 'Printer queue\nticket 42' });
   assert.equal(await count('audit_events', "action = 'remote.handoff_create' AND target_id = 'device-acme' AND company_id = 'company-acme'"), 1);
+  assert.deepEqual(JSON.parse((await db.prepare("SELECT metadata_json FROM audit_events WHERE action = 'remote.handoff_create'").first()).metadata_json), { reason: 'Printer queue\nticket 42' });
+  for (const reason of ['x'.repeat(501), 'bad\ttext']) {
+    const handoffs = await count('remote_handoffs');
+    result = await handoff('acme.meshrmm.com', 'org-acme', 'device-acme', reason);
+    assert.equal(result.status, 400, JSON.stringify(reason));
+    assert.equal(await count('remote_handoffs'), handoffs, 'an invalid reason creates no handoff');
+  }
   for (const device of ['device-other', 'device-deleted', 'device-missing']) {
     const handoffs = await count('remote_handoffs');
     const audits = await count('audit_events');

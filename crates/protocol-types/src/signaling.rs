@@ -61,12 +61,33 @@ pub struct AgentSessionRequest {
     pub background_connection_notification: bool,
     #[serde(default)]
     pub connection_notification_message: String,
+    /// Company policy that makes the Agent's user accept the connection
+    /// before the technician sees or controls anything. Only the server sets
+    /// it, so viewers cannot skip the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_approval: Option<ConnectionApproval>,
+    /// Why the technician is connecting, as they entered it in the dashboard.
+    /// Empty when they gave no reason.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub connection_reason: String,
     #[serde(default)]
     pub viewer_name: String,
     pub session_id: RemoteSessionId,
     pub signaling_token: String,
     pub expires_at_unix_ms: u64,
     pub ice_servers: Vec<IceServer>,
+}
+
+/// How the Agent asks its user to accept a connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionApproval {
+    /// The prompt's template; `{user_name}` is the technician.
+    pub message: String,
+    /// The connection is accepted when the user has not answered by then.
+    pub timeout_seconds: u32,
+    /// The connection is accepted at once while the computer is locked and
+    /// has had no input for this long.
+    pub lock_idle_seconds: u32,
 }
 
 /// Commands sent over the authenticated Agent coordinator connection.
@@ -124,6 +145,12 @@ pub enum SignalMessage {
     },
     IceComplete,
     PeerLeft,
+    /// The Agent is asking its user to accept the connection, which it
+    /// accepts for them after `remaining_seconds`. Sent in answer to the
+    /// viewer's `Ready` until the prompt is answered.
+    AwaitingApproval {
+        remaining_seconds: u32,
+    },
     Error {
         message: String,
         /// What failed, for peers that act on it. Older peers send and
@@ -147,6 +174,8 @@ pub enum SignalErrorCode {
     /// Capture could not start; this is often transient (UAC, lock screen,
     /// RDP switches), so it is retried.
     CaptureUnavailable,
+    /// The Agent's user declined the connection. Always terminal.
+    ConnectionDeclined,
     /// A code added by a newer peer.
     #[serde(other)]
     Unknown,
@@ -197,11 +226,19 @@ mod tests {
         assert!(!request.connection_notification);
         assert!(!request.background_connection_notification);
         assert!(request.connection_notification_message.is_empty());
+        assert_eq!(request.connection_approval, None);
+        assert!(request.connection_reason.is_empty());
         request.viewer_name = "Zoë 王".into();
         request.session_banner = false;
         request.connection_notification = true;
         request.background_connection_notification = true;
         request.connection_notification_message = "{user_name} is here".into();
+        request.connection_approval = Some(ConnectionApproval {
+            message: "{user_name} would like to connect.".into(),
+            timeout_seconds: 30,
+            lock_idle_seconds: 0,
+        });
+        request.connection_reason = "Printer queue\nticket 42".into();
         let decoded: AgentSessionRequest =
             serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
         assert_eq!(decoded, request);
@@ -259,6 +296,7 @@ mod tests {
             SignalErrorCode::NoMutualProfile,
             SignalErrorCode::IdentityMismatch,
             SignalErrorCode::CaptureUnavailable,
+            SignalErrorCode::ConnectionDeclined,
         ] {
             let message = SignalMessage::Error {
                 message: String::new(),
@@ -298,6 +336,22 @@ mod tests {
             OldSignalMessage::Error {
                 message: "no encoder".into()
             }
+        );
+    }
+
+    #[test]
+    fn awaiting_approval_uses_tagged_json() {
+        let waiting = SignalMessage::AwaitingApproval {
+            remaining_seconds: 25,
+        };
+        let json = serde_json::to_string(&waiting).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"awaiting_approval","remaining_seconds":25}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SignalMessage>(&json).unwrap(),
+            waiting
         );
     }
 

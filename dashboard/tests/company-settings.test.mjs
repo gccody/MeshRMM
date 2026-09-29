@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   DEFAULT_BLACKOUT_MESSAGE,
+  DEFAULT_CONNECTION_APPROVAL_MESSAGE,
   DEFAULT_CONNECTION_NOTIFICATION_MESSAGE,
   IDLE_DISCONNECT_MINUTES,
   SETTINGS_TABS,
@@ -10,6 +11,10 @@ import {
   draftMatchesCompany,
   formatIdleDisconnect,
   isBlackoutMessageValid,
+  isConnectionApprovalDraftValid,
+  isConnectionApprovalLockIdleValid,
+  isConnectionApprovalMessageValid,
+  isConnectionApprovalTimeoutValid,
   isConnectionNotificationMessageValid,
   settingsTabForKey,
 } from "../features/settings/company-settings.ts";
@@ -33,6 +38,10 @@ const company = {
   connection_notification: false,
   background_connection_notification: true,
   connection_notification_message: "{user_name} is here.",
+  connection_approval: true,
+  connection_approval_message: "{user_name} asks to connect.",
+  connection_approval_timeout_seconds: 45,
+  connection_approval_lock_idle_seconds: 0,
 };
 
 test("drafts start from the saved settings, or the defaults before the account loads", () => {
@@ -50,6 +59,10 @@ test("drafts start from the saved settings, or the defaults before the account l
     connectionNotification: false,
     backgroundConnectionNotification: true,
     connectionNotificationMessage: "{user_name} is here.",
+    connectionApproval: true,
+    connectionApprovalMessage: "{user_name} asks to connect.",
+    connectionApprovalTimeoutSeconds: 45,
+    connectionApprovalLockIdleSeconds: 0,
   });
   assert.deepEqual(draftFromCompany(null), {
     idleTimeoutMinutes: DEFAULT_IDLE_TIMEOUT_MINUTES,
@@ -65,6 +78,10 @@ test("drafts start from the saved settings, or the defaults before the account l
     connectionNotification: true,
     backgroundConnectionNotification: false,
     connectionNotificationMessage: DEFAULT_CONNECTION_NOTIFICATION_MESSAGE,
+    connectionApproval: false,
+    connectionApprovalMessage: DEFAULT_CONNECTION_APPROVAL_MESSAGE,
+    connectionApprovalTimeoutSeconds: 30,
+    connectionApprovalLockIdleSeconds: 60,
   });
 });
 
@@ -86,6 +103,10 @@ test("saving is offered only when a draft differs from the saved settings", () =
     { connectionNotification: true },
     { backgroundConnectionNotification: false },
     { connectionNotificationMessage: "Hello" },
+    { connectionApproval: false },
+    { connectionApprovalMessage: "Hello" },
+    { connectionApprovalTimeoutSeconds: 30 },
+    { connectionApprovalLockIdleSeconds: 60 },
   ]) {
     assert.equal(draftMatchesCompany({ ...draft, ...change }, company), false, JSON.stringify(change));
   }
@@ -111,6 +132,23 @@ test("the connection notification message needs visible text and at most 512 byt
   assert.equal(isConnectionNotificationMessageValid("é".repeat(257)), false);
 });
 
+test("approval settings need a short message and whole seconds in range", () => {
+  assert.equal(DEFAULT_CONNECTION_APPROVAL_MESSAGE, "{user_name} would like to connect.");
+  assert.equal(isConnectionApprovalMessageValid(DEFAULT_CONNECTION_APPROVAL_MESSAGE), true);
+  assert.equal(isConnectionApprovalMessageValid(" "), false);
+  assert.equal(isConnectionApprovalMessageValid("é".repeat(257)), false);
+  for (const [seconds, valid] of [[4, false], [5, true], [300, true], [301, false], [30.5, false], [Number.NaN, false]]) {
+    assert.equal(isConnectionApprovalTimeoutValid(seconds), valid, String(seconds));
+  }
+  for (const [seconds, valid] of [[-1, false], [0, true], [3600, true], [3601, false], [Number.NaN, false]]) {
+    assert.equal(isConnectionApprovalLockIdleValid(seconds), valid, String(seconds));
+  }
+  const draft = draftFromCompany(company);
+  assert.equal(isConnectionApprovalDraftValid(draft), true);
+  assert.equal(isConnectionApprovalDraftValid({ ...draft, connectionApprovalTimeoutSeconds: Number.NaN }), false);
+  assert.equal(isConnectionApprovalDraftValid({ ...draft, connectionApprovalMessage: "" }), false);
+});
+
 test("the saved body uses the control plane's field names", () => {
   assert.deepEqual(companySettingsBody(draftFromCompany(company)), {
     dashboard_idle_timeout_minutes: 30,
@@ -126,6 +164,10 @@ test("the saved body uses the control plane's field names", () => {
     connection_notification: false,
     background_connection_notification: true,
     connection_notification_message: "{user_name} is here.",
+    connection_approval: true,
+    connection_approval_message: "{user_name} asks to connect.",
+    connection_approval_timeout_seconds: 45,
+    connection_approval_lock_idle_seconds: 0,
   });
   // Never is sent as null, which the server requires rather than defaults.
   assert.equal(

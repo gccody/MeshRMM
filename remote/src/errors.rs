@@ -154,6 +154,9 @@ pub fn user_message(error: &anyhow::Error) -> String {
         Cause::Session(FailureKind::AgentReported(Some(SignalErrorCode::CaptureUnavailable))) => {
             "The remote computer could not capture its screen. It may be at a secure or locked screen, or have no active display."
         }
+        Cause::Session(FailureKind::AgentReported(Some(SignalErrorCode::ConnectionDeclined))) => {
+            "The person at the remote computer declined the connection."
+        }
         Cause::Session(FailureKind::AgentReported(Some(SignalErrorCode::IdentityMismatch))) => {
             // The receiver turns this code into an identity error; kept for completeness.
             "The device's identity did not match the identity this viewer trusts, so the connection was stopped. If the device was reinstalled, trust its new identity first."
@@ -254,6 +257,7 @@ mod tests {
             FailureKind::AgentReported(Some(SignalErrorCode::NoMutualProfile)),
             FailureKind::AgentReported(Some(SignalErrorCode::IdentityMismatch)),
             FailureKind::AgentReported(Some(SignalErrorCode::CaptureUnavailable)),
+            FailureKind::AgentReported(Some(SignalErrorCode::ConnectionDeclined)),
             FailureKind::AgentReported(Some(SignalErrorCode::Unknown)),
         ];
         for kind in kinds {
@@ -280,6 +284,10 @@ mod tests {
             (
                 FailureKind::AgentReported(Some(SignalErrorCode::CaptureUnavailable)),
                 "could not capture its screen",
+            ),
+            (
+                FailureKind::AgentReported(Some(SignalErrorCode::ConnectionDeclined)),
+                "declined the connection",
             ),
         ] {
             let message = user_message(&SessionFailure::new(kind, "technical detail").into());

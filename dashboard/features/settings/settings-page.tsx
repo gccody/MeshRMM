@@ -6,17 +6,28 @@ import { AuthenticationRequired, type AuthorizedFetch, errorMessage } from "../.
 import type { Account, Company } from "../workspace/types";
 import {
   DEFAULT_BLACKOUT_MESSAGE,
+  DEFAULT_CONNECTION_APPROVAL_MESSAGE,
   DEFAULT_CONNECTION_NOTIFICATION_MESSAGE,
   IDLE_DISCONNECT_MINUTES,
+  MAX_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS,
+  MAX_CONNECTION_APPROVAL_TIMEOUT_SECONDS,
+  MIN_CONNECTION_APPROVAL_TIMEOUT_SECONDS,
   SETTINGS_TABS,
   companySettingsBody,
   draftMatchesCompany,
   formatIdleDisconnect,
   isBlackoutMessageValid,
+  isConnectionApprovalDraftValid,
+  isConnectionApprovalLockIdleValid,
+  isConnectionApprovalMessageValid,
+  isConnectionApprovalTimeoutValid,
   isConnectionNotificationMessageValid,
   settingsTabForKey,
 } from "./company-settings";
 import type { SettingsDraft } from "./use-settings-draft";
+
+// A cleared number field holds NaN in the draft, which the input shows empty.
+const numberInputValue = (value: number) => (Number.isNaN(value) ? "" : value);
 
 type Props = {
   company: Company | null | undefined;
@@ -36,6 +47,7 @@ export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, o
 
   const blackoutMessageValid = isBlackoutMessageValid(draft.blackoutMessage);
   const notificationMessageValid = isConnectionNotificationMessageValid(draft.connectionNotificationMessage);
+  const approvalValid = isConnectionApprovalDraftValid(draft);
 
   const saveSettings = async (event: FormEvent) => {
     event.preventDefault();
@@ -157,12 +169,38 @@ export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, o
               </div>
               <button type="button" className="secondary-button" onClick={() => updateDraft({ connectionNotificationMessage: DEFAULT_CONNECTION_NOTIFICATION_MESSAGE })}>Restore default message</button>
             </section>
+            <section className="settings-section" id="connection-approval" role="tabpanel" aria-labelledby="settings-tab-connection-approval" hidden={settingsTab !== "connection-approval"} tabIndex={0}>
+              <h2>Connection approval</h2>
+              <p>Asks the remote device’s user to accept or deny each connection before the technician can see or control anything.</p>
+              <label>
+                <input type="checkbox" checked={draft.connectionApproval} onChange={(event) => updateDraft({ connectionApproval: event.target.checked })} aria-describedby="connection-approval-help" /> Prompt the agent’s user to approve each connection</label>
+              <p id="connection-approval-help">Applies to every new session, including background mode, and cannot be changed by users. Technicians can give a reason when they connect. A reconnect to the same session does not ask again.</p>
+              <label htmlFor="connection-approval-message">Prompt message<textarea id="connection-approval-message" rows={3} required maxLength={512} value={draft.connectionApprovalMessage} onChange={(event) => updateDraft({ connectionApprovalMessage: event.target.value })} aria-describedby="connection-approval-message-help" />
+              </label>
+              <p id="connection-approval-message-help">Use {"{user_name}"} for the technician’s banner name. The technician’s reason, if they give one, appears below it. Keep the message short (up to 512 bytes).</p>
+              {!isConnectionApprovalMessageValid(draft.connectionApprovalMessage) && <p role="alert">The prompt message must contain text and be no larger than 512 bytes.</p>}
+              <div className="connection-approval-preview" aria-label="Connection approval preview">
+                <strong>Remote connection request</strong>
+                <span>{draft.connectionApprovalMessage.replaceAll("{user_name}", displayName)}</span>
+                <span className="connection-approval-reason">Reason: Checking the printer queue</span>
+                <small>Accepts automatically in {numberInputValue(draft.connectionApprovalTimeoutSeconds)} seconds.</small>
+                <span className="connection-approval-buttons" aria-hidden="true"><span>Deny</span><span>Accept</span></span>
+              </div>
+              <button type="button" className="secondary-button" onClick={() => updateDraft({ connectionApprovalMessage: DEFAULT_CONNECTION_APPROVAL_MESSAGE })}>Restore default message</button>
+              <label htmlFor="connection-approval-timeout">Accept automatically when there is no answer after (seconds)<input id="connection-approval-timeout" type="number" inputMode="numeric" required min={MIN_CONNECTION_APPROVAL_TIMEOUT_SECONDS} max={MAX_CONNECTION_APPROVAL_TIMEOUT_SECONDS} step={1} value={numberInputValue(draft.connectionApprovalTimeoutSeconds)} onChange={(event) => updateDraft({ connectionApprovalTimeoutSeconds: event.target.valueAsNumber })} aria-describedby="connection-approval-timeout-help" aria-invalid={!isConnectionApprovalTimeoutValid(draft.connectionApprovalTimeoutSeconds)} />
+              </label>
+              <p id="connection-approval-timeout-help">Between {MIN_CONNECTION_APPROVAL_TIMEOUT_SECONDS} and {MAX_CONNECTION_APPROVAL_TIMEOUT_SECONDS} seconds. The technician waits at most this long.</p>
+              <label htmlFor="connection-approval-lock-idle">Accept at once when the device is locked and has been idle for (seconds)<input id="connection-approval-lock-idle" type="number" inputMode="numeric" required min={0} max={MAX_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS} step={1} value={numberInputValue(draft.connectionApprovalLockIdleSeconds)} onChange={(event) => updateDraft({ connectionApprovalLockIdleSeconds: event.target.valueAsNumber })} aria-describedby="connection-approval-lock-idle-help" aria-invalid={!isConnectionApprovalLockIdleValid(draft.connectionApprovalLockIdleSeconds)} />
+              </label>
+              <p id="connection-approval-lock-idle-help">Between 0 and {MAX_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS} seconds. Nobody is at a device that sits locked, so the technician does not wait. Use 0 to accept whenever the device is locked or nobody is signed in.</p>
+            </section>
           </fieldset>
           {settingsTab !== "blackout" && !blackoutMessageValid && <p role="alert">Check the blackout message before saving: it must contain text and be no larger than 2 KB.</p>}
           {settingsTab !== "connection-notification" && !notificationMessageValid && <p role="alert">Check the connection notification message before saving: it must contain text and be no larger than 512 bytes.</p>}
+          {settingsTab !== "connection-approval" && !approvalValid && <p role="alert">Check the connection approval settings before saving.</p>}
           {isAdmin && <div className="settings-save">
             {saveError && <p className="settings-save-error" role="alert">{saveError}</p>}
-            <button className="primary-button" disabled={isSaving || !blackoutMessageValid || !notificationMessageValid || draftMatchesCompany(draft, company)}>{isSaving ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save company settings</button>
+            <button className="primary-button" disabled={isSaving || !blackoutMessageValid || !notificationMessageValid || !approvalValid || draftMatchesCompany(draft, company)}>{isSaving ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save company settings</button>
           </div>}
           {settingsNotice && <p role="status" className="session-notice">{settingsNotice}</p>}
         </form>
