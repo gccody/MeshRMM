@@ -192,6 +192,9 @@ pub(crate) async fn delete_agent(
         return api_error(404, "Agent not found");
     }
     audit(&db, &identity, "agent.delete", "agent", device_id, "{}").await?;
+    if let Err(error) = delete_agent_thumbnail(environment, &identity.company_id, device_id).await {
+        console_error!("event=agent_thumbnail_delete_failed error={}", error);
+    }
     if let Err(error) = company_presence::flush_catalog(environment, &identity.company_id).await {
         console_error!("event=agent_deleted_publish_deferred error={}", error);
     }

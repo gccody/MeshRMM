@@ -15,7 +15,9 @@ import {
   WifiOff,
 } from "lucide-react";
 import type { AgentStatusFilter } from "./device-filters";
+import { DeviceThumbnail } from "./device-thumbnail";
 import type { InventoryConnection, InventoryStatus } from "./inventory-stream";
+import type { ThumbnailStore } from "./thumbnails";
 import type { Agent } from "./types";
 
 type InventoryState = {
@@ -29,6 +31,7 @@ type Props = {
   agents: Agent[];
   filteredAgents: Agent[];
   inventory: InventoryState;
+  thumbnails: ThumbnailStore;
   onReconnect: () => void;
   query: string;
   status: AgentStatusFilter;
@@ -148,6 +151,7 @@ export function AgentOverview({
   agents,
   filteredAgents,
   inventory,
+  thumbnails,
   onReconnect,
   query,
   status,
@@ -207,7 +211,7 @@ export function AgentOverview({
             {filteredAgents.map((agent) => (
               <tr className={`agent-row${stale ? " stale" : ""}`} key={agent.id}>
                 <td className="device-cell">
-                  <div className={`device-avatar ${agent.connected ? "online" : ""}`}><Monitor size={20} /><span /></div>
+                  <DeviceThumbnail agent={agent} store={thumbnails} />
                   <div className="device-identity"><strong title={agent.name}>{agent.name}</strong><details className="device-details"><summary>Device ID</summary><code>{agent.id}</code></details></div>
                 </td>
                 <td className="device-status"><StatusBadge agent={agent} stale={stale} /></td>
