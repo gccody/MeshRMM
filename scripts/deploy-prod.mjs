@@ -21,15 +21,15 @@ Deploys main to production and verifies it:
      and a server dry run builds.
   2. Deploys the control plane Worker (D1 migrations first, then /healthz).
   3. When anything outside server/docs changed since the last release, bumps
-     release.json, pushes the release commit to main, and waits for the
-     Publish native release workflow.
+     release.json in a release pull request, squash-merges it into main once its
+     required checks pass, and waits for the Publish native release workflow.
   4. Verifies /healthz, meshrmm.com and admin.meshrmm.com, and that every
      download in the live update manifest has the released version and SHA-256.
 
 Options:
   --dry-run          Run the preflight and print the plan. Changes nothing.
   --yes, -y          Don't ask for confirmation before deploying.
-  --message <text>   Release commit summary: "chore(release): publish <text> <version>".
+  --message <text>   Release summary: "chore(release): publish <text> <version>".
   --version <x.y.z>  Release this version instead of the next patch version.
   --minor, --major   Bump the minor or major version instead of the patch.
   --release          Publish a native release even if only server files changed.
@@ -115,6 +115,27 @@ export function secretsReadByServer(sources) {
 
 export function releaseCommitMessage(version, message) {
   return message ? `chore(release): publish ${message} ${version}` : `chore(release): publish ${version}`;
+}
+
+export const releaseBranch = (version) => `release/${version}`;
+
+const failedConclusions = new Set(["FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"]);
+
+// Reads a release pull request's state from `gh pr view --json state,mergeCommit,
+// mergeStateStatus,autoMergeRequest,statusCheckRollup`. Returns { merged: sha } once it is
+// squash-merged, { problem } when it can no longer merge on its own, or { waiting: summary }.
+export function releasePullRequestProgress(pr) {
+  if (pr.state === "MERGED") return { merged: pr.mergeCommit.oid };
+  if (pr.state === "CLOSED") return { problem: "it was closed without merging" };
+  const checks = pr.statusCheckRollup ?? [];
+  const failed = checks.filter((check) => failedConclusions.has(check.conclusion || check.state));
+  if (failed.length) return { problem: `checks failed: ${failed.map((check) => check.name ?? check.context).join(", ")}` };
+  if (pr.mergeStateStatus === "DIRTY") return { problem: "it conflicts with main" };
+  if (pr.mergeStateStatus === "BEHIND") return { problem: "main moved on; the required checks must run against the new main" };
+  if (!pr.autoMergeRequest) return { problem: "auto-merge was disabled" };
+  // Check runs report status and conclusion; commit statuses report only state.
+  const done = checks.filter((check) => (check.status ? check.status === "COMPLETED" : check.state !== "PENDING")).length;
+  return { waiting: checks.length ? `${done}/${checks.length} checks finished` : "waiting for checks to start" };
 }
 
 export function withVersion(configText, version) {
@@ -224,6 +245,53 @@ async function waitForRun(workflow, sha, label) {
   return run;
 }
 
+// Opens the release pull request, enables squash auto-merge and waits until main has the
+// squash commit. main requires a pull request, squash merges and green checks on an
+// up-to-date branch, so the release can't be pushed to main directly.
+async function mergeReleasePullRequest(version, message) {
+  const branch = releaseBranch(version);
+  const title = releaseCommitMessage(version, message);
+  git("switch", "--quiet", "-c", branch);
+  try {
+    writeFileSync(releaseConfigPath, withVersion(readFileSync(releaseConfigPath, "utf8"), version));
+    command("node", ["--test", "scripts/release-config.test.mjs"]);
+    git("commit", "--quiet", "-m", title, "--", "release.json");
+    command("git", ["push", "--quiet", "--set-upstream", "origin", branch], { inherit: true });
+  } finally {
+    git("restore", "release.json");
+    git("switch", "--quiet", "main");
+  }
+  const head = git("rev-parse", branch);
+  const url = command("gh", ["pr", "create", "--base", "main", "--head", branch, "--title", title,
+    "--body", `Publishes native release ${version}. Opened by \`scripts/deploy-prod.mjs\`.`]).stdout.split("\n").at(-1);
+  const number = url.split("/").at(-1);
+  console.log(`Opened ${url}`);
+  command("gh", ["pr", "merge", number, "--auto", "--squash", "--match-head-commit", head,
+    "--subject", `${title} (#${number})`, "--body", ""]);
+
+  const started = Date.now();
+  let last;
+  for (;;) {
+    const progress = releasePullRequestProgress(ghJson(["pr", "view", number, "--json",
+      "state,mergeCommit,mergeStateStatus,autoMergeRequest,statusCheckRollup"]));
+    if (progress.merged) {
+      console.log(`Squash-merged ${url} as ${progress.merged.slice(0, 7)}`);
+      git("fetch", "--quiet", "origin", "main");
+      git("merge", "--quiet", "--ff-only", "origin/main");
+      git("branch", "--quiet", "-D", branch);
+      return progress.merged;
+    }
+    if (progress.problem || Date.now() - started > 2 * 60 * 60 * 1000) {
+      throw new Error(
+        `release pull request ${url} did not merge: ${progress.problem ?? "timed out after two hours"}.\n` +
+          `Merge it once it can, or close it and delete ${branch} before rerunning.`,
+      );
+    }
+    if (progress.waiting !== last) console.log(`Waiting for the release pull request to merge: ${(last = progress.waiting)}`);
+    await sleep(20000);
+  }
+}
+
 async function confirm(question) {
   if (!process.stdin.isTTY) throw new Error("Not running in a terminal; pass --yes to deploy without confirmation.");
   const prompt = createInterface({ input: process.stdin, output: process.stdout });
@@ -300,6 +368,12 @@ async function preflight(options) {
   const version = release
     ? nextVersion({ configured: config.version, published, requested: options.version, bump: options.bump })
     : undefined;
+  // A failed earlier attempt at the same version leaves its release branch behind.
+  if (release && git("ls-remote", "--heads", "origin", releaseBranch(version))) {
+    throw new Error(
+      `origin already has ${releaseBranch(version)}. Close its pull request and delete the branch, or pass --version.`,
+    );
+  }
 
   if (options.server) {
     checkWasmToolchain();
@@ -375,7 +449,10 @@ async function deploy(options) {
   heading("Plan");
   console.log(`Server Worker: ${options.server ? "deploy (migrations, Worker, /healthz)" : "skip"}`);
   console.log(`Native release: ${plan.release ? `publish ${plan.version}` : "skip"} (${plan.reason})`);
-  if (plan.release) console.log(`Release commit: ${releaseCommitMessage(plan.version, options.message)}`);
+  if (plan.release) {
+    console.log(`Release pull request: ${releaseBranch(plan.version)} -> main, squash-merged as ` +
+      `"${releaseCommitMessage(plan.version, options.message)} (#<number>)"`);
+  }
 
   if (options.dryRun) {
     console.log("\nDry run: nothing was deployed.");
@@ -393,12 +470,7 @@ async function deploy(options) {
 
   if (plan.release) {
     heading(`Publish native release ${plan.version}`);
-    writeFileSync(releaseConfigPath, withVersion(readFileSync(releaseConfigPath, "utf8"), plan.version));
-    command("node", ["--test", "scripts/release-config.test.mjs"]);
-    git("commit", "--quiet", "-m", releaseCommitMessage(plan.version, options.message), "--", "release.json");
-    const sha = git("rev-parse", "HEAD");
-    command("git", ["push", "origin", "main"], { inherit: true });
-    console.log(`Pushed ${sha.slice(0, 7)} to main`);
+    const sha = await mergeReleasePullRequest(plan.version, options.message);
     await waitForRun("native-release-build.yml", sha, "Publish native release");
     await waitForRun("ci.yml", sha, "CI");
   }

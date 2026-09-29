@@ -2,7 +2,8 @@
 
 MeshRMM publishes its Agent and native viewers from GitHub Actions. After the
 one-time secret setup, a normal release consists of changing one value in
-`release.json` and pushing the commit to `main`.
+`release.json` and squash-merging that change into `main` through a pull
+request.
 
 ## One-time GitHub setup
 
@@ -43,21 +44,28 @@ unless `main` is clean, matches `origin/main`, and has passed CI, and it checks
 the GitHub and Cloudflare sign-ins and the Worker secrets. It then deploys the
 server with `scripts/deploy-server.mjs`. If anything outside `server/` and the
 docs changed since the last release, it bumps the patch version in
-`release.json`, pushes the release commit, and waits for the **Publish native
-release** workflow. Finally it checks `/healthz`, `meshrmm.com`,
+`release.json` on a `release/<version>` branch, opens a pull request, enables
+squash auto-merge, and waits for the required checks to pass and the pull
+request to merge. It then waits for the **Publish native release** workflow on
+the squash commit. `main` accepts changes only through squash-merged pull
+requests whose required checks passed on an up-to-date branch. If `main` moves
+while the release pull request waits, or a check fails, the script stops and
+leaves the pull request open. Merge it, or close it and delete the branch
+before running the script again. Finally it checks `/healthz`, `meshrmm.com`,
 `admin.meshrmm.com`, and that every download in the live update manifest has the
 released version and SHA-256.
 
 Start with `--dry-run`, which runs the checks, builds the Worker, and prints the
 plan. It lists any pending D1 migrations. Other options include `--message
-<text>` for the release commit summary, `--minor`/`--major`/`--version`,
+<text>` for the release summary, `--minor`/`--major`/`--version`,
 `--no-release`/`--release`, `--skip-server`, `--yes`, and `--verify-only`. See
 `--help` for the full list.
 
 ## Publish an update
 
 1. Change only `version` in `release.json` to a higher semantic version.
-2. Commit the change and push it to `main`.
+2. Commit the change on a branch, open a pull request into `main`, and
+   squash-merge it after the required checks pass.
 3. Watch the **Publish native release** workflow in the repository's Actions
    tab.
 
