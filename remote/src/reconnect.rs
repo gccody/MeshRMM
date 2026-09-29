@@ -44,7 +44,10 @@ pub fn disposition(
         Some(FailureKind::AgentReported(code)) => code,
         _ => None,
     };
-    if code == Some(SignalErrorCode::IdentityMismatch) {
+    if matches!(
+        code,
+        Some(SignalErrorCode::IdentityMismatch | SignalErrorCode::ConnectionDeclined)
+    ) {
         return Disposition::Terminal;
     }
     if ever_presented {
@@ -340,6 +343,19 @@ mod tests {
                 Disposition::Retry
             );
         }
+    }
+
+    #[test]
+    fn a_declined_connection_never_retries() {
+        let declined = || agent(SignalErrorCode::ConnectionDeclined);
+        assert_eq!(
+            disposition(&declined(), false, 1, SOON),
+            Disposition::Terminal
+        );
+        assert_eq!(
+            disposition(&declined(), true, 0, SOON),
+            Disposition::Terminal
+        );
     }
 
     #[test]

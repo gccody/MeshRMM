@@ -36,6 +36,10 @@ struct SessionRecord {
     #[serde(default)]
     connection_notification_message: String,
     #[serde(default)]
+    connection_approval: Option<meshrmm_protocol_types::ConnectionApproval>,
+    #[serde(default)]
+    connection_reason: String,
+    #[serde(default)]
     blackout_message: String,
     #[serde(default)]
     viewer_name: String,
@@ -378,6 +382,8 @@ impl RemoteSession {
             connection_notification: record.connection_notification,
             background_connection_notification: record.background_connection_notification,
             connection_notification_message: record.connection_notification_message.clone(),
+            connection_approval: record.connection_approval.clone(),
+            connection_reason: record.connection_reason.clone(),
             viewer_name: record.viewer_name.clone(),
             session_id: RemoteSessionId::new(record.session_id.clone()),
             signaling_token: record.agent_token.clone(),
@@ -436,6 +442,8 @@ impl RemoteSession {
             connection_notification: record.connection_notification,
             background_connection_notification: record.background_connection_notification,
             connection_notification_message: record.connection_notification_message.clone(),
+            connection_approval: record.connection_approval.clone(),
+            connection_reason: record.connection_reason.clone(),
             viewer_name: record.viewer_name.clone(),
             session_id: RemoteSessionId::new(record.session_id.clone()),
             signaling_token: record.agent_token.clone(),
@@ -572,6 +580,8 @@ mod maintenance_tests {
         assert!(legacy.session_banner);
         assert!(!legacy.connection_notification);
         assert!(!legacy.background_connection_notification);
+        assert_eq!(legacy.connection_approval, None);
+        assert!(legacy.connection_reason.is_empty());
         assert_eq!(legacy.clear_clipboard_policy, Default::default());
         value["clear_clipboard_policy"] =
             serde_json::json!({ "enabled": false, "allow_override": false });
@@ -580,6 +590,10 @@ mod maintenance_tests {
         value["connection_notification"] = serde_json::json!(true);
         value["background_connection_notification"] = serde_json::json!(true);
         value["connection_notification_message"] = serde_json::json!("{user_name} is here");
+        value["connection_approval"] = serde_json::json!({
+            "message": "{user_name} asks", "timeout_seconds": 30, "lock_idle_seconds": 60
+        });
+        value["connection_reason"] = serde_json::json!("Printer queue");
         let current: SessionRecord = serde_json::from_value(value).unwrap();
         let restored: SessionRecord =
             serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
@@ -591,6 +605,13 @@ mod maintenance_tests {
             restored.connection_notification_message,
             "{user_name} is here"
         );
+        assert_eq!(
+            restored
+                .connection_approval
+                .map(|approval| approval.timeout_seconds),
+            Some(30)
+        );
+        assert_eq!(restored.connection_reason, "Printer queue");
         assert_eq!(restored.viewer_name, "Zoë 王");
         assert_eq!(
             restored.clear_clipboard_policy,

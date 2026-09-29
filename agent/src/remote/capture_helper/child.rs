@@ -83,6 +83,20 @@ pub fn run_child() -> anyhow::Result<()> {
         ParentCommand::ShowConnectionNotification { text } => {
             run_notification_child(command_rx, text)
         }
+        ParentCommand::PromptConnectionApproval {
+            text,
+            reason,
+            timeout_seconds,
+            lock_idle_seconds,
+        } => run_approval_child(
+            command_rx,
+            ApprovalPrompt {
+                text,
+                reason,
+                timeout: Duration::from_secs(timeout_seconds.into()),
+                lock_idle: Duration::from_secs(lock_idle_seconds.into()),
+            },
+        ),
         ParentCommand::StartInput {
             display_id,
             viewer_name,
@@ -216,6 +230,7 @@ pub(super) fn run_capture_child(
                     | ParentCommand::StartClipboard
                     | ParentCommand::StartChatHelper { .. }
                     | ParentCommand::ShowConnectionNotification { .. }
+                    | ParentCommand::PromptConnectionApproval { .. }
                     | ParentCommand::StartInput { .. }
                     | ParentCommand::Input(_)
                     | ParentCommand::SetWallpaperHidden(_)
@@ -667,6 +682,26 @@ pub(super) fn run_notification_child(
         Ok(Ok(_)) => anyhow::bail!("notification helper received an unexpected command"),
     }
     drop(notification);
+    emit_child_event(&output, ChildEvent::Stopped)?;
+    Ok(())
+}
+
+/// Asks the user to accept the connection, reports the answer, and stays
+/// until the parent stops it. The parent sends nothing but Stop, so any
+/// command, like a closed pipe, means it no longer needs the answer.
+pub(super) fn run_approval_child(
+    commands: mpsc::Receiver<io::Result<ParentCommand>>,
+    prompt: ApprovalPrompt,
+) -> anyhow::Result<()> {
+    let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+    emit_child_event(&output, ChildEvent::InputStarted)?;
+    let decision = crate::remote::connection_approval::ask(&prompt, || {
+        !matches!(commands.try_recv(), Err(mpsc::TryRecvError::Empty))
+    });
+    if let Some(decision) = decision {
+        emit_child_event(&output, ChildEvent::ApprovalDecision(decision))?;
+        let _ = commands.recv();
+    }
     emit_child_event(&output, ChildEvent::Stopped)?;
     Ok(())
 }
