@@ -138,6 +138,7 @@ pub async fn run_receiver(
     // answered at all, tell a blocked network path from a silent Agent.
     let mut peer_connected = false;
     let mut offer_received = false;
+    let mut awaiting_approval_since = None::<tokio::time::Instant>;
     let mut last_signal_message = tokio::time::Instant::now();
     // Pointer pacing must not depend on the receiver loop being available: a
     // control-channel send can await long enough for a short movement burst to
@@ -167,6 +168,9 @@ pub async fn run_receiver(
                         match signal {
                             SignalMessage::Offer { sdp } => {
                                 offer_received = true;
+                                if let Some(since) = awaiting_approval_since.take() {
+                                    resume_state.add_approval_wait(since.elapsed());
+                                }
                                 launch_status::report(LaunchStatus::EstablishingConnection);
                                 debug.set_peer_fingerprint(identity.verify_sdp(&sdp)?);
                                 peer.set_remote_description(RTCSessionDescription::offer(sdp)?).await?;
@@ -191,6 +195,13 @@ pub async fn run_receiver(
                             }
                             SignalMessage::PeerLeft => {
                                 break Err(SessionFailure::new(FailureKind::AgentLeft, "Agent disconnected from the remote session").into());
+                            }
+                            SignalMessage::AwaitingApproval { remaining_seconds } if !offer_received => {
+                                launch_status::report(LaunchStatus::AwaitingApproval { remaining_seconds });
+                                // The video deadline starts once the user answers.
+                                let now = tokio::time::Instant::now();
+                                awaiting_approval_since.get_or_insert(now);
+                                presenter_missing_since = Some(now);
                             }
                             SignalMessage::Error { message, code } => {
                                 if code == Some(SignalErrorCode::IdentityMismatch)
@@ -324,6 +335,9 @@ pub async fn run_receiver(
         }
     }
     .await;
+    if let Some(since) = awaiting_approval_since.take() {
+        resume_state.add_approval_wait(since.elapsed());
+    }
     // A frame can finish between the last health poll and a transport failure.
     if let Ok(guard) = presenter.lock() {
         lifecycle.observe_presentation(

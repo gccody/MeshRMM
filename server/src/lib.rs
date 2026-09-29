@@ -58,6 +58,11 @@ struct Company {
     #[serde(deserialize_with = "deserialize_sql_bool")]
     background_connection_notification: bool,
     connection_notification_message: String,
+    #[serde(deserialize_with = "deserialize_sql_bool")]
+    connection_approval: bool,
+    connection_approval_message: String,
+    connection_approval_timeout_seconds: u32,
+    connection_approval_lock_idle_seconds: u32,
     slug: Option<String>,
     status: String,
 }
@@ -90,6 +95,7 @@ struct HandoffRow {
     user_id: String,
     #[serde(deserialize_with = "deserialize_sql_bool")]
     start_in_background: bool,
+    reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +183,10 @@ struct UpdateCompanySettingsRequest {
     connection_notification: Option<bool>,
     background_connection_notification: Option<bool>,
     connection_notification_message: Option<String>,
+    connection_approval: Option<bool>,
+    connection_approval_message: Option<String>,
+    connection_approval_timeout_seconds: Option<u32>,
+    connection_approval_lock_idle_seconds: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +231,9 @@ struct HandoffRequest {
     device_id: String,
     #[serde(default)]
     start_in_background: bool,
+    /// Why the technician is connecting, for the Agent's approval prompt.
+    #[serde(default)]
+    reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -243,6 +256,8 @@ struct SessionInit<'a> {
     connection_notification: bool,
     background_connection_notification: bool,
     connection_notification_message: &'a str,
+    connection_approval: Option<&'a meshrmm_protocol_types::ConnectionApproval>,
+    connection_reason: &'a str,
     viewer_name: &'a str,
     session_id: &'a str,
     device_id: &'a str,
@@ -609,7 +624,7 @@ mod company_policy_tests {
     #[test]
     fn sqlite_flags_are_exposed_as_json_booleans() {
         for enabled in [0, 1] {
-            let row = serde_json::json!({"id":"c","name":"Company","dashboard_idle_timeout_minutes":60,"blackout_message":"Maintenance","display_border":enabled,"prevent_idle_lock":1,"allow_idle_override":0,"idle_disconnect_minutes":null,"allow_idle_disconnect_override":enabled,"clear_clipboard_on_close":enabled,"allow_clear_clipboard_override":1-enabled,"session_banner":enabled,"connection_notification":enabled,"background_connection_notification":1-enabled,"connection_notification_message":"{user_name} is here","slug":"company","status":"active"});
+            let row = serde_json::json!({"id":"c","name":"Company","dashboard_idle_timeout_minutes":60,"blackout_message":"Maintenance","display_border":enabled,"prevent_idle_lock":1,"allow_idle_override":0,"idle_disconnect_minutes":null,"allow_idle_disconnect_override":enabled,"clear_clipboard_on_close":enabled,"allow_clear_clipboard_override":1-enabled,"session_banner":enabled,"connection_notification":enabled,"background_connection_notification":1-enabled,"connection_notification_message":"{user_name} is here","connection_approval":enabled,"connection_approval_message":"{user_name} asks","connection_approval_timeout_seconds":30,"connection_approval_lock_idle_seconds":0,"slug":"company","status":"active"});
             let company: Company = serde_json::from_value(row).unwrap();
             let company = serde_json::to_value(company).unwrap();
             assert_eq!(company["display_border"], enabled == 1);
@@ -620,6 +635,8 @@ mod company_policy_tests {
             assert_eq!(company["background_connection_notification"], enabled == 0);
             assert_eq!(company["idle_disconnect_minutes"], serde_json::Value::Null);
             assert_eq!(company["allow_idle_disconnect_override"], enabled == 1);
+            assert_eq!(company["connection_approval"], enabled == 1);
+            assert_eq!(company["connection_approval_timeout_seconds"], 30);
         }
     }
 }

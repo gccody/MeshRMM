@@ -18,6 +18,8 @@ export type ViewerLaunch = {
   agentId: string;
   agentName: string;
   background: boolean;
+  // Why the technician connected, for the device user's approval prompt.
+  reason: string;
   phase: "opening" | ViewerLaunchOutcome;
 };
 
@@ -62,18 +64,18 @@ export function useRemoteHandoff({ authorizedFetch, reportError }: Options) {
     }
   };
 
-  const connect = async (agent: Agent, startInBackground = false) => {
+  const connect = async (agent: Agent, startInBackground = false, reason = "") => {
     setSessionNotice(null);
     if (!agent.connected) return;
     stopWatching();
     const attempt = ++attempts.current;
-    setLaunch({ attempt, agentId: agent.id, agentName: agent.name, background: startInBackground, phase: "opening" });
+    setLaunch({ attempt, agentId: agent.id, agentName: agent.name, background: startInBackground, reason, phase: "opening" });
     reportError(null);
     try {
       const response = await authorizedFetch("/v1/remote/handoffs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ device_id: agent.id, start_in_background: startInBackground }),
+        body: JSON.stringify({ device_id: agent.id, start_in_background: startInBackground, reason }),
       });
       if (!response.ok) throw new Error(await errorMessage(response, "The remote session could not be started."));
       const handoff = (await response.json()) as { handoff_token: string; api_url: string; start_in_background?: boolean };
@@ -112,7 +114,7 @@ export function useRemoteHandoff({ authorizedFetch, reportError }: Options) {
       reportError(`${agent?.name ?? launch.agentName} is not online, so a remote session cannot start. Connect when it is back online.`);
       return;
     }
-    void connect(agent, launch.background);
+    void connect(agent, launch.background, launch.reason);
   };
 
   const opening = launch?.phase === "opening" ? launch : null;

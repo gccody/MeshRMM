@@ -274,6 +274,14 @@ Company administrators configure both and edit the message under **Settings →
 Connection notification**; see
 [maintenance controls](docs/maintenance-controls.md#connection-notification).
 
+Administrators can also require the endpoint's user to approve each
+connection under **Settings → Connection approval** (off by default). The
+technician may give a reason when connecting, and the Windows endpoint shows a
+prompt with the configurable message, the reason and Accept and Deny buttons.
+Nobody answering accepts the connection after a configurable time, and a
+computer that has been idle at the lock screen accepts at once; see
+[maintenance controls](docs/maintenance-controls.md#connection-approval).
+
 Company administrators use the embedded WorkOS user-management, domain, and
 SSO widgets to invite users, assign roles, verify domains, and configure a SAML
 or OIDC identity provider. The application has no company switcher; a user with

@@ -23,6 +23,11 @@ pub enum LaunchStatus {
         version: String,
     },
     WaitingForRemoteComputer,
+    /// The remote computer's user is asked to accept the connection, which
+    /// is accepted for them after `remaining_seconds`.
+    AwaitingApproval {
+        remaining_seconds: u32,
+    },
     EstablishingConnection,
     StartingDisplay,
     /// An attempt failed before the remote display appeared; `attempt` is
@@ -65,6 +70,10 @@ impl LaunchStatus {
             Self::WaitingForRemoteComputer => {
                 "Waiting for the remote computer to respond…".to_owned()
             }
+            Self::AwaitingApproval { remaining_seconds } => format!(
+                "Waiting for the person at the remote computer to accept the connection… If nobody answers, it continues in {remaining_seconds} second{}.",
+                if *remaining_seconds == 1 { "" } else { "s" }
+            ),
             Self::EstablishingConnection => "Establishing a secure connection…".to_owned(),
             Self::StartingDisplay => "Starting the remote display…".to_owned(),
             Self::Retrying { attempt, max } => format!(
@@ -207,6 +216,26 @@ mod tests {
             }
             .cancellable()
         );
+    }
+
+    #[test]
+    fn awaiting_approval_counts_down_and_can_be_cancelled() {
+        let waiting = LaunchStatus::AwaitingApproval {
+            remaining_seconds: 25,
+        };
+        assert_eq!(
+            waiting.message(),
+            "Waiting for the person at the remote computer to accept the connection… If nobody answers, it continues in 25 seconds."
+        );
+        assert!(
+            LaunchStatus::AwaitingApproval {
+                remaining_seconds: 1
+            }
+            .message()
+            .ends_with("in 1 second.")
+        );
+        assert!(waiting.cancellable());
+        assert!(progress_due(&waiting, Duration::ZERO));
     }
 
     #[test]
