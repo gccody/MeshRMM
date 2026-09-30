@@ -224,8 +224,10 @@ fn candidates(input: &str) -> Vec<(&str, &str)> {
         .collect()
 }
 
+/// Finds `name`, trying `PATHEXT` extensions before the bare name, as the Run
+/// dialog does, so an extensionless file on `PATH` cannot shadow a program.
 fn find(name: &str) -> Option<PathBuf> {
-    let mut names = vec![name.to_owned()];
+    let mut names = Vec::new();
     if Path::new(name).extension().is_none() {
         let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
         names.extend(
@@ -235,6 +237,7 @@ fn find(name: &str) -> Option<PathBuf> {
                 .map(|extension| format!("{name}{extension}")),
         );
     }
+    names.push(name.to_owned());
     if name.contains(['\\', '/', ':']) {
         return names.into_iter().find_map(|name| {
             // "C:" alone would be the drive's current folder.
