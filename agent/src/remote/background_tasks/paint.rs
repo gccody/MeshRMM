@@ -202,7 +202,7 @@ pub(super) unsafe fn header_paint(state: &State, hwnd: HWND, dc: HDC) {
 }
 // Session 0 common controls can leave nonclient scrollbar pixels unpainted.
 // Paint their actual native geometry after native list painting. Native scroll
-// commands retain the list control's range, selection, keyboard and wheel behavior.
+// tracking retains the list control's range, selection, keyboard and wheel behavior.
 
 pub(super) unsafe extern "system" fn list_paint(
     hwnd: HWND,
@@ -210,125 +210,12 @@ pub(super) unsafe extern "system" fn list_paint(
     wparam: WPARAM,
     lparam: LPARAM,
     id: usize,
-    data: usize,
+    _data: usize,
 ) -> LRESULT {
     unsafe {
-        let input = &*(data as *const Cell<Option<ScrollInput>>);
         if message == WM_NCDESTROY {
-            let _ = KillTimer(Some(hwnd), SCROLL_REPEAT);
             let _ = RemoveWindowSubclass(hwnd, Some(list_paint), id);
-            let result = DefSubclassProc(hwnd, message, wparam, lparam);
-            drop(Box::from_raw(data as *mut Cell<Option<ScrollInput>>));
-            return result;
-        }
-        if message == WM_TIMER && wparam.0 == SCROLL_REPEAT {
-            if let Some(ScrollInput::Repeat { vertical, command }) = input.get() {
-                scroll_command(hwnd, vertical, command, 0);
-                SetTimer(Some(hwnd), SCROLL_REPEAT, 60, None);
-            }
-            return LRESULT(0);
-        }
-        if message == WM_LBUTTONUP && input.take().is_some() {
-            let _ = KillTimer(Some(hwnd), SCROLL_REPEAT);
-            return LRESULT(0);
-        }
-        if message == WM_CANCELMODE {
-            input.set(None);
-            let _ = KillTimer(Some(hwnd), SCROLL_REPEAT);
-        }
-        // The isolated desktop routes client mouse messages even for nonclient
-        // scrollbar coordinates. Adapt only this list, without changing routing
-        // or invoking the native modal scrollbar loop on other applications.
-        if matches!(message, WM_LBUTTONDOWN | WM_MOUSEMOVE) {
-            let mut point = POINT {
-                x: lparam.0 as i16 as i32,
-                y: (lparam.0 >> 16) as i16 as i32,
-            };
-            let _ = ClientToScreen(hwnd, &mut point);
-            if message == WM_MOUSEMOVE {
-                if let Some(ScrollInput::Drag {
-                    vertical,
-                    start,
-                    position,
-                    travel,
-                    minimum,
-                    maximum,
-                }) = input.get()
-                {
-                    let current = if vertical { point.y } else { point.x };
-                    let delta = i64::from(current - start) * i64::from(maximum - minimum)
-                        / i64::from(travel.max(1));
-                    let position = (i64::from(position) + delta)
-                        .clamp(i64::from(minimum), i64::from(maximum))
-                        as i32;
-                    scroll_command(hwnd, vertical, SB_THUMBPOSITION, position);
-                    return LRESULT(0);
-                }
-            } else {
-                for (object, bar, vertical) in [
-                    (OBJID_VSCROLL, SB_VERT, true),
-                    (OBJID_HSCROLL, SB_HORZ, false),
-                ] {
-                    let mut info = SCROLLBARINFO {
-                        cbSize: std::mem::size_of::<SCROLLBARINFO>() as u32,
-                        ..Default::default()
-                    };
-                    if GetScrollBarInfo(hwnd, object, &mut info).is_err()
-                        || info.rgstate[0] & 0x8001 != 0
-                        || !PtInRect(&info.rcScrollBar, point).as_bool()
-                    {
-                        continue;
-                    }
-                    let current = if vertical { point.y } else { point.x };
-                    let start = if vertical {
-                        info.rcScrollBar.top
-                    } else {
-                        info.rcScrollBar.left
-                    };
-                    let end = if vertical {
-                        info.rcScrollBar.bottom
-                    } else {
-                        info.rcScrollBar.right
-                    };
-                    let command = if current < start + info.dxyLineButton {
-                        Some(SB_LINEUP)
-                    } else if current >= end - info.dxyLineButton {
-                        Some(SB_LINEDOWN)
-                    } else if current < start + info.xyThumbTop {
-                        Some(SB_PAGEUP)
-                    } else if current >= start + info.xyThumbBottom {
-                        Some(SB_PAGEDOWN)
-                    } else {
-                        None
-                    };
-                    if let Some(command) = command {
-                        input.set(Some(ScrollInput::Repeat { vertical, command }));
-                        scroll_command(hwnd, vertical, command, 0);
-                        SetTimer(Some(hwnd), SCROLL_REPEAT, 400, None);
-                    } else {
-                        let mut range = SCROLLINFO {
-                            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-                            fMask: SIF_ALL,
-                            ..Default::default()
-                        };
-                        if GetScrollInfo(hwnd, bar, &mut range).is_ok() {
-                            input.set(Some(ScrollInput::Drag {
-                                vertical,
-                                start: current,
-                                position: range.nPos,
-                                travel: end
-                                    - start
-                                    - 2 * info.dxyLineButton
-                                    - (info.xyThumbBottom - info.xyThumbTop),
-                                minimum: range.nMin,
-                                maximum: (range.nMax - range.nPage.saturating_sub(1) as i32)
-                                    .max(range.nMin),
-                            }));
-                        }
-                    }
-                    return LRESULT(0);
-                }
-            }
+            return DefSubclassProc(hwnd, message, wparam, lparam);
         }
         let result = DefSubclassProc(hwnd, message, wparam, lparam);
         if matches!(message, WM_PAINT | WM_NCPAINT | WM_HSCROLL | WM_VSCROLL) {
@@ -613,6 +500,31 @@ pub(super) unsafe fn caption(state: &State, dc: HDC) {
             },
             COLORREF(0xe8a32c),
         );
+        // Windows would draw a classic sizing frame in the resize border.
+        let border = crate::remote::background::frame_border(state.hwnd);
+        let height = window.bottom - window.top;
+        for strip in [
+            RECT {
+                left: 1,
+                top: bottom,
+                right: border,
+                bottom: height - 1,
+            },
+            RECT {
+                left: width - border,
+                top: bottom,
+                right: width - 1,
+                bottom: height - 1,
+            },
+            RECT {
+                left: 1,
+                top: height - border,
+                right: width - 1,
+                bottom: height - 1,
+            },
+        ] {
+            fill(dc, &strip, WHITE);
+        }
         SelectObject(dc, state.font.into());
         if let Ok(icon) = LoadIconW(None, IDI_APPLICATION) {
             let _ = DrawIconEx(dc, 8, (bottom - 16) / 2, icon, 16, 16, 0, None, DI_NORMAL);

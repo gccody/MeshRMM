@@ -16,7 +16,7 @@ The plan has 11 tasks. Task 1 is a short experiment that decides how Tasks 7–9
 |---|---|
 | 3, 4, 6, 10, and 5 item 1 | 2, 7, 8, 9, 11 |
 
-**Task 1 is done: "go".** See `docs/background-real-input.md` for the evidence and the sketch. The next step is implementing that sketch. Task 2 now depends on it too, because Session 0's display mode can only be changed while the background desktop is the input desktop.
+**Task 1 is done: "go".** See `docs/background-real-input.md` for the evidence and the sketch. Task 2 now depends on it too, because Session 0's display mode can only be changed while the background desktop is the input desktop. The sketch is implemented, with Tasks 7 and 8: the workspace sends real input, and the `PostMessage` emulation is gone.
 
 ---
 
@@ -168,6 +168,8 @@ With 15 pins the running-window buttons start at x = 740, so 11 fit at full widt
 
 ## Task 7 — Menus: menu-bar clicks, menu-item clicks, and focus after a menu closes
 
+**Status: done** (2026-09-30), by implementing Task 1's sketch rather than the "no-go" plan below. `Workspace::apply` sends pointer moves, buttons, the wheel, keys and text with `SendInput` (`background/inject.rs`, using the builders in `remote/input.rs`), after `DESKTOP_JOURNALPLAYBACK` and `DESKTOP_SWITCHDESKTOP` were added to the desktop rights. If Session 0 refuses input, the workspace makes its desktop the input desktop again and retries once. Presses on the taskbar still launch and restore in the workspace and aren't sent. `post`, `client_point`, the `WM_NCHITTEST` caption handling, `drag`, `pressed`, `focus`, `keyboard_target`, `AttachThreadInput`/`SetKeyboardState`, the `ToUnicodeEx` logic, the posted Apps-key `WM_CONTEXTMENU`, and `background_console.rs` are gone; consoles take real keys. The workspace thread now sends input, so a modal loop on one of its windows would wait forever for input it can't send: Run moved to a thread of its own (dragging it by its caption hung the helper before that), and the ignored tests put windows with menus on a `UiThread`. The built-in tools lost their posted-input adapters (frame resizing, caption minimize, the Task Manager scrollbar and File Explorer column-divider tracking, and File Explorer's timed double-click, now `NM_DBLCLK`). Windows' own tracking replaces them. File Explorer captures the pointer when a file drag starts, and handles its caption buttons like Task Manager does. Real input hit-tests the child window under the pointer first, so both tools' 4 px resize border became nonclient area instead of a 1 px line. A program started from the taskbar or Run, or a program it hands over to (resmon.exe to perfmon.exe), comes to the front when its first window appears, since a new process can't take the foreground itself. Without this, Services opened behind regedit. On `DESKTOP-85R6S28`: the new `input_tests::menus_open_and_run_from_clicks` (test window: menu-bar click never reaches the client, an item click runs its command, typing straight after reaches the edit, hovering switches menus, right-click requests the menu at the pointer) and `native_apps_take_real_pointer_input` pass: regedit's Edit menu opens without moving the splitter and Find… runs, MMC's Action menu, Resource Monitor's File menu, and the built-in Task Manager's File menu open on click. The installed service's helper passed the same regedit checks, Run dragged by its caption while input continued, and a right-click on a regedit value opened Modify/Delete/Rename at the pointer (Task 9's check). Task 11 wasn't rechecked.
+
 **Evidence.**
 - Clicking regedit's menu bar doesn't open a menu. The catch-all `_ => {}` at `agent/src/remote/background.rs:743` hands the click on as an ordinary client click, and regedit moves its splitter to that position.
 - Resource Monitor and the built-in Task Manager menus don't open on click either.
@@ -191,6 +193,8 @@ Add native tests using a simple test window with a menu.
 ---
 
 ## Task 8 — Double-click, scrollbars and mouse wheel
+
+**Status: done** (2026-09-30), with Task 7's real input. The workspace also sets Session 0's wheel routing to the window under the pointer (`SPI_SETMOUSEWHEELROUTING` 2, for the session only, restored on close), and rounds normalized pointer coordinates to the nearest pixel. `input_tests::double_clicks_scrollbars_and_wheel` passes on `DESKTOP-85R6S28`: a double-click, a pane with its own `WS_VSCROLL` (like Disk Management's) scrolled by its arrow, track and thumb, a list scrolled by the wheel while an edit had the focus, and a caption double-click maximized. `native_apps_take_real_pointer_input` double-clicks open regedit's value editor, a service's properties, and a device's properties after a double-click expands its category, a caption double-click maximizes Services, and Disk Management's disk pane scrolls by its arrow and thumb. The installed service's helper passed the regedit, Services and caption checks too. Event Viewer's double-click wasn't checked: it opens on a summary page, not a list of events. Disk Management's pane doesn't handle the wheel itself (Task 1), which `README.md` now says.
 
 **Evidence.**
 - Double-click never registers in native apps (no regedit value editor, service or device properties). Only the built-in File Explorer detects double-clicks itself.

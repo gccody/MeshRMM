@@ -86,75 +86,9 @@ pub(super) unsafe fn captured_scrollbars(list: HWND, dc: HDC) {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum ScrollInput {
-    Drag {
-        vertical: bool,
-        start: i32,
-        position: i32,
-        travel: i32,
-        minimum: i32,
-        maximum: i32,
-    },
-    Repeat {
-        vertical: bool,
-        command: SCROLLBAR_COMMAND,
-    },
-}
-
-pub(super) const SCROLL_REPEAT: usize = 0x4d524d54;
-
-pub(super) unsafe fn scroll_command(
-    hwnd: HWND,
-    vertical: bool,
-    command: SCROLLBAR_COMMAND,
-    position: i32,
-) {
-    unsafe {
-        if command == SB_THUMBPOSITION {
-            // Report list views consult native tracking state for thumb messages;
-            // posted background input never enters that modal tracking loop.
-            // Their vertical range is in rows, while LVM_SCROLL takes pixels.
-            let delta = position - GetScrollPos(hwnd, if vertical { SB_VERT } else { SB_HORZ });
-            let (x, y) = if vertical {
-                let top = SendMessageW(hwnd, LVM_GETTOPINDEX, None, None).0;
-                let mut rect = RECT::default();
-                SendMessageW(
-                    hwnd,
-                    LVM_GETITEMRECT,
-                    Some(WPARAM(top.max(0) as usize)),
-                    Some(LPARAM((&mut rect as *mut RECT) as isize)),
-                );
-                (0, delta.saturating_mul((rect.bottom - rect.top).max(1)))
-            } else {
-                (delta, 0)
-            };
-            SendMessageW(
-                hwnd,
-                LVM_SCROLL,
-                Some(WPARAM(x as usize)),
-                Some(LPARAM(y as isize)),
-            );
-            return;
-        }
-        SendMessageW(
-            hwnd,
-            if vertical { WM_VSCROLL } else { WM_HSCROLL },
-            Some(WPARAM(
-                command.0 as usize | ((position.clamp(0, 65535) as usize) << 16),
-            )),
-            None,
-        );
-    }
-}
-
 pub(in crate::remote) fn install_list_scrollbars(list: HWND) -> anyhow::Result<()> {
-    unsafe {
-        let scroll_input = Box::into_raw(Box::new(Cell::new(None::<ScrollInput>)));
-        if !SetWindowSubclass(list, Some(list_paint), 1, scroll_input as usize).as_bool() {
-            drop(Box::from_raw(scroll_input));
-            anyhow::bail!("Could not initialize captured list scrollbars");
-        }
+    if !unsafe { SetWindowSubclass(list, Some(list_paint), 1, 0) }.as_bool() {
+        anyhow::bail!("Could not initialize captured list scrollbars");
     }
     Ok(())
 }
@@ -297,10 +231,11 @@ pub(super) unsafe extern "system" fn window_proc(
                 &mut *(lparam.0 as *mut RECT)
             };
             let outer = crate::remote::background::frame_rect(hwnd, *rect);
+            let border = crate::remote::background::frame_border(hwnd);
             let result = DefWindowProcW(hwnd, message, wparam, lparam);
-            rect.left = outer.left + 1;
-            rect.right = outer.right - 1;
-            rect.bottom = outer.bottom - 1;
+            rect.left = outer.left + border;
+            rect.right = outer.right - border;
+            rect.bottom = outer.bottom - border;
             return result;
         }
         if message == WM_GETMINMAXINFO && lparam.0 != 0 {
@@ -323,50 +258,6 @@ pub(super) unsafe extern "system" fn window_proc(
             return LRESULT(0);
         }
         if !cell.is_null() {
-            // Background input routes caption clicks as client messages except
-            // for the workspace's move/maximize/close handling.
-            if message == WM_LBUTTONDOWN {
-                let mut point = POINT {
-                    x: lparam.0 as i16 as i32,
-                    y: (lparam.0 >> 16) as i16 as i32,
-                };
-                let _ = ClientToScreen(hwnd, &mut point);
-                let hit = SendMessageW(
-                    hwnd,
-                    WM_NCHITTEST,
-                    None,
-                    Some(LPARAM(
-                        ((point.y as u32) << 16 | (point.x as u32 & 0xffff)) as isize,
-                    )),
-                );
-                if hit.0 == HTMINBUTTON as isize {
-                    let _ = PostMessageW(
-                        Some(hwnd),
-                        WM_SYSCOMMAND,
-                        WPARAM(SC_MINIMIZE as usize),
-                        LPARAM(0),
-                    );
-                    return LRESULT(0);
-                }
-                if matches!(
-                    hit.0 as u32,
-                    HTLEFT
-                        | HTRIGHT
-                        | HTTOP
-                        | HTTOPLEFT
-                        | HTTOPRIGHT
-                        | HTBOTTOM
-                        | HTBOTTOMLEFT
-                        | HTBOTTOMRIGHT
-                ) && let Ok(mut state) = (*cell).try_borrow_mut()
-                {
-                    let mut bounds = RECT::default();
-                    if GetWindowRect(hwnd, &mut bounds).is_ok() {
-                        state.resizing = Some((hit.0 as u32, point, bounds));
-                    }
-                    return LRESULT(0);
-                }
-            }
             if message == WM_DRAWITEM
                 && lparam.0 != 0
                 && let Ok(state) = (*cell).try_borrow()
@@ -422,10 +313,11 @@ pub(super) unsafe extern "system" fn window_proc(
                 let x = lparam.0 as i16 as i32 - bounds.left;
                 let y = (lparam.0 >> 16) as i16 as i32 - bounds.top;
                 if !IsZoomed(hwnd).as_bool() {
-                    let left = x < 4;
-                    let right = x >= bounds.right - bounds.left - 4;
-                    let top = y < 4;
-                    let bottom = y >= bounds.bottom - bounds.top - 4;
+                    let border = crate::remote::background::RESIZE_BORDER;
+                    let left = x < border;
+                    let right = x >= bounds.right - bounds.left - border;
+                    let top = y < border;
+                    let bottom = y >= bounds.bottom - bounds.top - border;
                     let edge = match (left, right, top, bottom) {
                         (true, _, true, _) => HTTOPLEFT,
                         (_, true, true, _) => HTTOPRIGHT,
@@ -552,48 +444,6 @@ pub(super) unsafe extern "system" fn window_proc(
                 let old_notice = state.notice.clone();
                 let mut handled = true;
                 let result = match message {
-                    WM_MOUSEMOVE => {
-                        if let Some((edge, origin, mut bounds)) = state.resizing {
-                            let mut point = POINT {
-                                x: lparam.0 as i16 as i32,
-                                y: (lparam.0 >> 16) as i16 as i32,
-                            };
-                            let _ = ClientToScreen(hwnd, &mut point);
-                            let (dx, dy) = (point.x - origin.x, point.y - origin.y);
-                            let (min_width, min_height) = if state.compact {
-                                (280, 200)
-                            } else {
-                                (650, 390)
-                            };
-                            if matches!(edge, HTLEFT | HTTOPLEFT | HTBOTTOMLEFT) {
-                                bounds.left = (bounds.left + dx).min(bounds.right - min_width);
-                            }
-                            if matches!(edge, HTRIGHT | HTTOPRIGHT | HTBOTTOMRIGHT) {
-                                bounds.right = (bounds.right + dx).max(bounds.left + min_width);
-                            }
-                            if matches!(edge, HTTOP | HTTOPLEFT | HTTOPRIGHT) {
-                                bounds.top = (bounds.top + dy).min(bounds.bottom - min_height);
-                            }
-                            if matches!(edge, HTBOTTOM | HTBOTTOMLEFT | HTBOTTOMRIGHT) {
-                                bounds.bottom = (bounds.bottom + dy).max(bounds.top + min_height);
-                            }
-                            let _ = SetWindowPos(
-                                hwnd,
-                                None,
-                                bounds.left,
-                                bounds.top,
-                                bounds.right - bounds.left,
-                                bounds.bottom - bounds.top,
-                                SWP_NOZORDER | SWP_NOACTIVATE,
-                            );
-                            state.layout();
-                        }
-                        Ok(())
-                    }
-                    WM_LBUTTONUP | WM_CANCELMODE => {
-                        state.resizing = None;
-                        Ok(())
-                    }
                     WM_TIMER => {
                         if wparam.0 == 1 {
                             state.refresh();
@@ -945,7 +795,6 @@ pub(super) fn create_window() -> anyhow::Result<Box<RefCell<State>>> {
             notice: String::new(),
             tab: Tab::Processes,
             compact: false,
-            resizing: None,
             expanded_size: (650, 480),
             grouped: true,
             expanded: HashSet::new(),

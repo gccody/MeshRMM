@@ -630,16 +630,22 @@ open. The existing Windows and macOS viewers can use this mode without a protoco
 update.
 
 The workspace uses a fixed 1280×800 canvas, up to 20 FPS, window capture, and
-separate window-message input. While it is open, the workspace makes its desktop
-Session 0's input desktop, sets Session 0's display mode to 1280×800 (it idles at
-1024×768), and sets the work area to end above the 48-pixel taskbar, so maximized
-and newly opened windows fit the canvas. None of these changes is saved; closing
-the workspace restores the previous desktop, mode, and work area. If Windows
-refuses the mode, applications keep laying out for Session 0's smaller screen.
+real mouse and keyboard input from a separate helper. While it is open, the
+workspace makes its desktop Session 0's input desktop, which real input needs,
+sets Session 0's display mode to 1280×800 (it idles at 1024×768), sets the work
+area to end above the 48-pixel taskbar, so maximized and newly opened windows fit
+the canvas, and has the wheel scroll the window under the pointer. None of these
+changes is saved; closing the workspace restores the previous desktop, mode, work
+area, and wheel setting. If Windows refuses the mode, applications keep laying out
+for Session 0's smaller screen, and the pointer can't reach past it.
+Applications get the same input as from a local mouse and keyboard: menus open and
+run from clicks, double-clicks open items, right-click menus appear at the pointer,
+and scrollbars, caption drags, and resizing are Windows' own. A program started
+from the taskbar or Run comes to the front when its first window appears. Disk
+Management's disk pane doesn't handle the wheel itself; its scrollbar works.
 Window images are retained between captures so slow or failed repaints do not
 make already-captured windows disappear when the refresh budget expires.
-Application-specific rendering limitations can still cause flicker. Command Prompt and PowerShell receive console input
-records through disposable helpers. Session 0 has no Windows shell, so apart from
+Application-specific rendering limitations can still cause flicker. Session 0 has no Windows shell, so apart from
 Win+R, Windows-key shortcuts do nothing: the Windows key, and keys pressed while it
 is held, never reach applications. The Apps key opens the selected item's context menu. It does not switch the console desktop or move the
 console pointer. Console audio, clipboard synchronization, file-transfer UI, chat,
@@ -648,9 +654,8 @@ Operations performed inside the workspace still affect the same machine, and
 SYSTEM has a different profile and network credentials from the signed-in user.
 
 This is a prototype for traditional Win32 administration tools, not a complete
-Explorer login session. Applications that depend on the user's shell, modern
-GPU-composited UI, or physical keyboard/mouse input may not render or respond
-correctly. Session 0 has no desktop compositor, so the workspace makes each
+Explorer login session. Applications that depend on the user's shell or modern
+GPU-composited UI may not render or respond correctly. Session 0 has no desktop compositor, so the workspace makes each
 window layered and copies the image Windows keeps for it. Printing windows
 instead copied them before their controls finished painting. Composited windows,
 and windows their application already layers itself, are still printed. The
@@ -661,8 +666,10 @@ does not yet provide a separate background-only connection from the dashboard.
 
 The ignored native test `remote::background::tests::session_zero_gui` exercises
 the launcher, text input, PowerShell keyboard input, Registry Editor rendering, H.264 output, Session 0
-placement, and application cleanup. Run it in a dedicated SYSTEM process in
-Session 0 with no active background workspace. It writes
+placement, and application cleanup. The ignored tests in
+`remote::background::input_tests` check menus, double-clicks, scrollbars, and the
+wheel on test windows, Registry Editor, Services, and Disk Management. Run each in
+a dedicated SYSTEM process in Session 0 with no active background workspace. It writes
 `meshrmm-background-gui.bmp` to that process's temporary directory. The capture
 helper is disposable: a ten-second frame watchdog restarts it if a window stalls
 Windows' synchronous capture API, while input remains in a separate helper.

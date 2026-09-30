@@ -2,7 +2,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail, ensure};
-use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, SearchPathW};
+use windows::Win32::Storage::FileSystem::SearchPathW;
 use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows::Win32::System::Threading::{
     CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, CreateProcessW, PROCESS_CREATION_FLAGS,
@@ -10,7 +10,6 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Shell::{
     ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR, ASSOCSTR_COMMAND, ASSOCSTR_EXECUTABLE, AssocQueryStringW,
-    SHGFI_EXETYPE, SHGetFileInfoW,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -89,8 +88,6 @@ pub(crate) enum Target {
     Program {
         executable: PathBuf,
         command: String,
-        /// Takes keyboard input through a console input helper.
-        console: bool,
     },
     /// Shown by the built-in File Explorer. Empty for its list of drives.
     Folder(PathBuf),
@@ -135,7 +132,6 @@ pub(crate) fn start(
         Target::Program {
             executable,
             command,
-            ..
         } => launch(Launch {
             executable: Some(executable),
             command,
@@ -206,7 +202,6 @@ fn open(path: &Path, arguments: &str) -> anyhow::Result<Target> {
     }
     let (executable, command) = command_for(path, arguments)?;
     Ok(Target::Program {
-        console: is_console(&executable),
         executable,
         command,
     })
@@ -294,22 +289,6 @@ fn expand(input: &str) -> anyhow::Result<String> {
         }
         buffer.resize(length, 0);
     }
-}
-
-/// Whether `executable` uses the console subsystem.
-fn is_console(executable: &Path) -> bool {
-    let path = crate::win32::wide(executable);
-    let kind = unsafe {
-        SHGetFileInfoW(
-            PCWSTR(path.as_ptr()),
-            FILE_FLAGS_AND_ATTRIBUTES(0),
-            None,
-            0,
-            SHGFI_EXETYPE,
-        )
-    };
-    // "PE" with no Windows version.
-    kind == 0x4550
 }
 
 fn association(extension: &str, kind: ASSOCSTR) -> anyhow::Result<String> {
@@ -465,7 +444,6 @@ mod tests {
         let Target::Program {
             executable,
             command,
-            console,
         } = resolve("notepad")?
         else {
             panic!("notepad is a program");
@@ -476,11 +454,9 @@ mod tests {
             "{executable:?}"
         );
         assert_eq!(command, quote(&executable));
-        assert!(!console);
         let Target::Program {
             executable,
             command,
-            console,
         } = resolve("%SystemRoot%\\System32\\cmd /k echo  hi")?
         else {
             panic!("cmd is a program");
@@ -490,7 +466,6 @@ mod tests {
             "{executable:?}"
         );
         assert!(command.ends_with("\" /k echo  hi"), "{command}");
-        assert!(console);
         let Target::Program {
             executable,
             command,

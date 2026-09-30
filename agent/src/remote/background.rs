@@ -1,6 +1,10 @@
 //! Experimental Session 0 GUI input and application launcher.
-//! No SendInput, console hooks, or user-token launches. The workspace makes its
-//! desktop Session 0's input desktop, but never switches the console's.
+//! No console hooks or user-token launches. The workspace makes its desktop
+//! Session 0's input desktop and sends it real input, but never switches the
+//! console's. The workspace thread sends that input, so no window it owns may
+//! start a modal loop, which would wait for input the thread can't send: the
+//! taskbar handles its own presses, and Run has a thread of its own.
+mod inject;
 mod keyboard;
 pub(super) mod launch;
 mod run;
@@ -10,13 +14,13 @@ use crate::win32::wide;
 use anyhow::Context;
 use meshrmm_protocol::{PointerButton, RemoteInput};
 use meshrmm_remote_screen::background::{self, HEIGHT, WIDTH};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::JobObjects::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
@@ -26,6 +30,8 @@ const PIN_WIDTH: i32 = 48;
 const ICON_SIZE: i32 = 32;
 const TASKS_LEFT: i32 = 8 + PINS.len() as i32 * PIN_WIDTH + 12;
 const TASK_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+/// How long a started process's first window still comes to the front.
+const START_FOREGROUND: Duration = Duration::from_secs(15);
 /// An application on the background taskbar.
 struct Pin {
     label: &'static str,
@@ -40,8 +46,6 @@ struct Pin {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Program,
-    /// Runs in its own console, which takes keyboard input through a console input helper.
-    Console,
     /// Built-in tools, one window each, that replace Windows' shell-bound ones.
     TaskManager,
     FileExplorer,
@@ -51,14 +55,14 @@ enum Kind {
 const PINS: &[Pin] = &[
     Pin {
         label: "Command Prompt",
-        kind: Kind::Console,
+        kind: Kind::Program,
         program: "cmd.exe",
         arguments: "/k title MeshRMM Background Command Prompt",
         icon: ("cmd.exe", 0),
     },
     Pin {
         label: "PowerShell",
-        kind: Kind::Console,
+        kind: Kind::Program,
         program: "WindowsPowerShell\\v1.0\\powershell.exe",
         arguments: "-NoLogo -NoProfile -NoExit",
         icon: ("WindowsPowerShell\\v1.0\\powershell.exe", 0),
@@ -166,15 +170,14 @@ pub struct Workspace {
     hovered: Option<usize>,
     tasks: Vec<TaskButton>,
     last_task_refresh: Instant,
+    /// Processes started recently whose first window hasn't appeared yet.
+    starting: Vec<(u32, Instant)>,
     job: HANDLE,
-    focus: HWND,
     pointer: POINT,
-    pressed: Option<HWND>,
-    drag: Option<(HWND, POINT, RECT)>,
-    keys: [u8; 256],
+    input: inject::Injector,
+    /// Buttons pressed on the taskbar, whose releases aren't sent either.
+    taskbar_presses: HashSet<PointerButton>,
     shell_keys: keyboard::ShellKeys,
-    attached_thread: Option<u32>,
-    console_inputs: Vec<super::background_console::ConsoleInput>,
     /// Created the first time it opens.
     run: Option<run::Run>,
     /// Dropped last, after the applications and taskbar are gone.
@@ -226,15 +229,12 @@ impl Workspace {
                 hovered: None,
                 tasks: Vec::new(),
                 last_task_refresh: Instant::now(),
+                starting: Vec::new(),
                 job,
-                focus: HWND::default(),
                 pointer: POINT::default(),
-                pressed: None,
-                drag: None,
-                keys: [0; 256],
+                input: inject::Injector::default(),
+                taskbar_presses: HashSet::new(),
                 shell_keys: keyboard::ShellKeys::default(),
-                attached_thread: None,
-                console_inputs: Vec::new(),
                 run: None,
                 _screen: screen,
             };
@@ -330,9 +330,8 @@ impl Workspace {
     }
 
     fn refresh_tasks(&mut self) -> anyhow::Result<()> {
-        // A console's input helper leaves once its programs exit and the console closes.
-        self.console_inputs
-            .retain_mut(|console| !console.finished());
+        self.starting
+            .retain(|(_, started)| started.elapsed() < START_FOREGROUND);
         let visible = task_windows(self.shell, self.tooltip)?;
         unsafe {
             self.tasks.retain(|task| {
@@ -375,6 +374,14 @@ impl Workspace {
                 )?;
                 let icon = task_icon(window.window, window.process, self.shell);
                 SetWindowLongPtrW(button, GWLP_USERDATA, icon.0 as isize);
+                // Some programs hand over to another: resmon.exe starts
+                // perfmon.exe, and control.exe starts rundll32.exe.
+                if let Some(index) = self.starting.iter().position(|(process, _)| {
+                    *process == window.process || Some(*process) == parent_process(window.process)
+                }) {
+                    self.starting.swap_remove(index);
+                    self.bring_forward(window.window);
+                }
                 self.tasks.push(TaskButton {
                     window: window.window,
                     process: window.process,
@@ -428,10 +435,10 @@ impl Workspace {
         }
     }
 
-    /// Restores `window` and makes it the foreground window, as the Windows
-    /// taskbar does. `HWND_TOP` alone can't raise it above another process's
-    /// foreground window, such as a dialog that activated itself on opening.
-    fn bring_forward(&mut self, window: HWND) {
+    /// Restores `window` and makes it the foreground window, which takes
+    /// keyboard input, as the Windows taskbar does. `HWND_TOP` alone can't raise
+    /// it above another process's foreground window.
+    fn bring_forward(&self, window: HWND) {
         unsafe {
             let _ = ShowWindowAsync(
                 window,
@@ -443,7 +450,6 @@ impl Workspace {
             );
             let _ = SetForegroundWindow(window);
         }
-        self.focus = window;
     }
 
     fn launch(&mut self, index: usize) -> anyhow::Result<()> {
@@ -501,7 +507,10 @@ impl Workspace {
         .then_some(window)
     }
 
-    /// Moves a suspended process into the workspace's job, then starts it.
+    /// Moves a suspended process into the workspace's job, then starts it. Like
+    /// a program started from Windows' taskbar, its first window comes to the
+    /// front: a new process doesn't get to take the foreground from the window
+    /// the input went to.
     fn adopt(&mut self, started: launch::DesktopProcess, kind: Kind) -> anyhow::Result<()> {
         unsafe {
             let result = AssignProcessToJobObject(self.job, started.process.0);
@@ -512,6 +521,7 @@ impl Workspace {
             }
         }
         let process_id = started.id;
+        self.starting.push((process_id, Instant::now()));
         match kind {
             // Retain the process handle so its PID cannot be recycled before
             // cleaning its private telemetry session on forced job shutdown.
@@ -521,18 +531,12 @@ impl Workspace {
             Kind::FileExplorer => self
                 .file_browsers
                 .push((process_id, started.process.into_raw())),
-            Kind::Console => {
-                self.console_inputs
-                    .push(super::background_console::ConsoleInput::start(
-                        process_id, self.job,
-                    )?)
-            }
             Kind::Program | Kind::Run => {}
         }
         Ok(())
     }
 
-    /// Opens Run and moves keyboard input to it, as Win+R does.
+    /// Opens Run and makes it the foreground window, as Win+R does.
     fn open_run(&mut self) {
         if self.run.is_none() {
             let icon = self.pin_icon(Kind::Run);
@@ -548,10 +552,9 @@ impl Workspace {
             return;
         };
         if !run.visible() {
-            run.previous = self.focus;
+            run.previous = unsafe { GetForegroundWindow() };
         }
         run.show(work_area());
-        self.focus = run.edit;
     }
 
     /// Runs what Run's OK asked for, or closes it on Cancel.
@@ -578,11 +581,11 @@ impl Workspace {
         run.hide();
         // Typing goes back where it went before Run opened.
         let previous = run.previous;
-        self.focus = if unsafe { IsWindow(Some(previous)) }.as_bool() {
-            previous
-        } else {
-            HWND::default()
-        };
+        if unsafe { IsWindow(Some(previous)) }.as_bool() {
+            unsafe {
+                let _ = SetForegroundWindow(previous);
+            }
+        }
     }
 
     fn run_command(&mut self, command: &str) -> anyhow::Result<()> {
@@ -596,7 +599,6 @@ impl Workspace {
                 return self.launch(index + 1);
             }
             launch::Target::Folder(_) => Kind::FileExplorer,
-            launch::Target::Program { console: true, .. } => Kind::Console,
             launch::Target::Program { .. } => Kind::Program,
         };
         let started = launch::start(&target, &agent_executable()?, CREATE_SUSPENDED)?;
@@ -622,13 +624,6 @@ impl Workspace {
         unsafe {
             let mut message = MSG::default();
             while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
-                if self
-                    .run
-                    .as_ref()
-                    .is_some_and(|run| run.dialog_message(&message))
-                {
-                    continue;
-                }
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
@@ -642,10 +637,13 @@ impl Workspace {
         }
     }
 
-    fn move_pointer(&mut self, x: u16, y: u16) {
+    /// Moves the pointer to canvas coordinates normalized to 0..=65535, and
+    /// updates the taskbar's hover state.
+    fn move_pointer(&mut self, x: u16, y: u16) -> anyhow::Result<()> {
+        // The nearest pixel, so a pixel's own normalized coordinate maps back to it.
         self.pointer = POINT {
-            x: i32::from(x) * (WIDTH as i32 - 1) / 65535,
-            y: i32::from(y) * (HEIGHT as i32 - 1) / 65535,
+            x: (i32::from(x) * (WIDTH as i32 - 1) + 32767) / 65535,
+            y: (i32::from(y) * (HEIGHT as i32 - 1) + 32767) / 65535,
         };
         let hovered = (self.pointer.y >= HEIGHT as i32 - TASKBAR_HEIGHT + 4
             && self.pointer.y < HEIGHT as i32 - 4
@@ -709,219 +707,38 @@ impl Workspace {
             }
             self.hovered = hovered;
         }
-        if let Some((hwnd, origin, rect)) = self.drag {
-            unsafe {
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    rect.left + self.pointer.x - origin.x,
-                    rect.top + self.pointer.y - origin.y,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
-                );
-            }
-        }
+        self.input.move_to(self.pointer)
     }
 
-    fn hit(&self) -> Option<HWND> {
-        unsafe {
-            for top in background::windows().ok()? {
-                let mut rect = RECT::default();
-                if GetWindowRect(top, &mut rect).is_err()
-                    || self.pointer.x < rect.left
-                    || self.pointer.x >= rect.right
-                    || self.pointer.y < rect.top
-                    || self.pointer.y >= rect.bottom
-                {
-                    continue;
-                }
-                let mut child = top;
-                for _ in 0..32 {
-                    let mut point = self.pointer;
-                    let _ = ScreenToClient(child, &mut point);
-                    let next = ChildWindowFromPointEx(
-                        child,
-                        point,
-                        CWP_SKIPDISABLED | CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT,
-                    );
-                    if next.is_invalid() || next == child {
-                        break;
-                    }
-                    child = next;
-                }
-                return Some(child);
-            }
-        }
-        None
-    }
-
-    fn post(&self, hwnd: HWND, message: u32, wparam: usize, lparam: isize) -> anyhow::Result<()> {
-        if hwnd.is_invalid() {
+    /// Presses on the taskbar launch and restore applications here, like the
+    /// Windows shell. Everything else is real input.
+    fn button(&mut self, button: PointerButton, down: bool) -> anyhow::Result<()> {
+        if !down && self.taskbar_presses.remove(&button) {
             return Ok(());
         }
-        // All targets originate from enumeration of this helper's desktop.
-        unsafe {
-            if !IsWindow(Some(hwnd)).as_bool() {
-                return Ok(());
-            }
-            let result = PostMessageW(Some(hwnd), message, WPARAM(wparam), LPARAM(lparam));
-            // A close-button down event can destroy the target before button up.
-            if result.is_err() && !IsWindow(Some(hwnd)).as_bool() {
-                return Ok(());
-            }
-            result?;
+        let window = unsafe { WindowFromPoint(self.pointer) };
+        let taskbar_button = unsafe { GetParent(window) }
+            .ok()
+            .filter(|parent| *parent == self.shell)
+            .map(|_| unsafe { GetDlgCtrlID(window) } as usize);
+        if !down || (window != self.shell && taskbar_button.is_none()) {
+            return self.input.button(button, down);
+        }
+        self.taskbar_presses.insert(button);
+        match taskbar_button {
+            Some(id) if button == PointerButton::Left && id <= PINS.len() => self.launch(id)?,
+            Some(id) if button == PointerButton::Left => self.restore_task(id - PINS.len() - 1),
+            _ => {}
         }
         Ok(())
     }
 
-    fn client_point(&self, hwnd: HWND) -> isize {
-        let mut point = self.pointer;
-        unsafe {
-            let _ = ScreenToClient(hwnd, &mut point);
-        }
-        pack(point)
-    }
-
-    fn button(&mut self, button: PointerButton, down: bool) -> anyhow::Result<()> {
-        if !down && self.drag.take().is_some() {
-            return Ok(());
-        }
-        let Some(hwnd) = (if down {
-            self.hit()
-        } else {
-            self.pressed.take().or_else(|| self.hit())
-        }) else {
-            return Ok(());
-        };
-        unsafe {
-            if GetParent(hwnd).ok() == Some(self.shell) {
-                if down && button == PointerButton::Left {
-                    let id = GetDlgCtrlID(hwnd) as usize;
-                    if id <= PINS.len() {
-                        self.launch(id)?;
-                    } else {
-                        self.restore_task(id - PINS.len() - 1);
-                    }
-                }
-                return Ok(());
-            }
-            if down {
-                self.focus = hwnd;
-                self.pressed = Some(hwnd);
-                let top = GetAncestor(hwnd, GA_ROOT);
-                let _ = SetWindowPos(
-                    top,
-                    Some(HWND_TOP),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-                let mut hit = 0;
-                SendMessageTimeoutW(
-                    top,
-                    WM_NCHITTEST,
-                    WPARAM(0),
-                    LPARAM(pack(self.pointer)),
-                    SMTO_ABORTIFHUNG,
-                    20,
-                    Some(&mut hit),
-                );
-                if button == PointerButton::Left {
-                    match hit as u32 {
-                        HTLEFT | HTRIGHT | HTTOP | HTTOPLEFT | HTTOPRIGHT | HTBOTTOM
-                        | HTBOTTOMLEFT | HTBOTTOMRIGHT => {
-                            let mut pid = 0;
-                            GetWindowThreadProcessId(top, Some(&mut pid));
-                            let mut class = [0u16; 64];
-                            let length = GetClassNameW(top, &mut class);
-                            let browser = String::from_utf16_lossy(&class[..length as usize])
-                                == "MeshRMMBackgroundFiles";
-                            if (browser && self.owns_window(top))
-                                || self
-                                    .task_managers
-                                    .iter()
-                                    .chain(&self.file_browsers)
-                                    .any(|(owned, _)| *owned == pid)
-                            {
-                                // Task Manager owns its resize adapter. Send its
-                                // border clicks to the frame rather than an
-                                // overlapping list child; leave other apps alone.
-                                self.pressed = Some(top);
-                                self.focus = top;
-                                return self.post(top, WM_LBUTTONDOWN, 1, self.client_point(top));
-                            }
-                        }
-                        HTCAPTION => {
-                            let mut rect = RECT::default();
-                            GetWindowRect(top, &mut rect)?;
-                            self.drag = Some((top, self.pointer, rect));
-                            return Ok(());
-                        }
-                        HTCLOSE => return self.post(top, WM_CLOSE, 0, 0),
-                        HTMINBUTTON => {
-                            return self.post(top, WM_SYSCOMMAND, SC_MINIMIZE as usize, 0);
-                        }
-                        HTMAXBUTTON => {
-                            return self.post(
-                                top,
-                                WM_SYSCOMMAND,
-                                if IsZoomed(top).as_bool() {
-                                    SC_RESTORE
-                                } else {
-                                    SC_MAXIMIZE
-                                } as usize,
-                                0,
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-                let thread = GetWindowThreadProcessId(hwnd, None);
-                let ours = GetCurrentThreadId();
-                if self.attached_thread != Some(thread) {
-                    if let Some(previous) = self.attached_thread.take() {
-                        let _ = AttachThreadInput(ours, previous, false);
-                    }
-                    if thread != ours && AttachThreadInput(ours, thread, true).as_bool() {
-                        self.attached_thread = Some(thread);
-                    }
-                }
-                let _ = SetFocus(Some(hwnd));
-            }
-        }
-        let (message, mask) = match (button, down) {
-            (PointerButton::Left, true) => (WM_LBUTTONDOWN, 1),
-            (PointerButton::Left, false) => (WM_LBUTTONUP, 0),
-            (PointerButton::Right, true) => (WM_RBUTTONDOWN, 2),
-            (PointerButton::Right, false) => (WM_RBUTTONUP, 0),
-            (PointerButton::Middle, true) => (WM_MBUTTONDOWN, 16),
-            (PointerButton::Middle, false) => (WM_MBUTTONUP, 0),
-            _ => return Ok(()),
-        };
-        self.post(hwnd, message, mask, self.client_point(hwnd))
-    }
-
     pub fn release(&mut self) {
-        for console in &self.console_inputs {
-            console.release();
+        if let Err(error) = self.input.release() {
+            tracing::warn!(%error, "could not release background input");
         }
-        if let Some(hwnd) = self.pressed.take() {
-            for message in [WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP] {
-                let _ = self.post(hwnd, message, 0, self.client_point(hwnd));
-            }
-        }
-        self.keys = [0; 256];
+        self.taskbar_presses.clear();
         self.shell_keys.release();
-        unsafe {
-            let _ = SetKeyboardState(&self.keys);
-            if let Some(thread) = self.attached_thread.take() {
-                let _ = AttachThreadInput(GetCurrentThreadId(), thread, false);
-            }
-        }
-        self.drag = None;
     }
 
     pub fn apply(&mut self, event: RemoteInput) -> anyhow::Result<()> {
@@ -936,31 +753,8 @@ impl Workspace {
                 return Ok(());
             }
         }
-        if matches!(
-            event,
-            RemoteInput::Key { .. } | RemoteInput::TypeText { .. }
-        ) {
-            let root = unsafe { GetAncestor(self.keyboard_target(), GA_ROOT) };
-            if let Some(console) = self
-                .console_inputs
-                .iter()
-                .find(|console| console.window == root)
-            {
-                return console.apply(event);
-            }
-        }
         match event {
-            RemoteInput::PointerMove { x, y, .. } => {
-                self.move_pointer(x, y);
-                if let Some(hwnd) = self.pressed.or_else(|| self.hit()) {
-                    self.post(
-                        hwnd,
-                        WM_MOUSEMOVE,
-                        usize::from(self.pressed.is_some()),
-                        self.client_point(hwnd),
-                    )?;
-                }
-            }
+            RemoteInput::PointerMove { x, y, .. } => self.move_pointer(x, y),
             RemoteInput::PointerButtonAt {
                 x,
                 y,
@@ -968,12 +762,12 @@ impl Workspace {
                 pressed,
                 ..
             } => {
-                self.move_pointer(x, y);
-                self.button(button, pressed)?;
+                self.move_pointer(x, y)?;
+                self.button(button, pressed)
             }
             RemoteInput::PointerButton {
                 button, pressed, ..
-            } => self.button(button, pressed)?,
+            } => self.button(button, pressed),
             RemoteInput::WheelAt {
                 x,
                 y,
@@ -981,162 +775,28 @@ impl Workspace {
                 vertical,
                 ..
             } => {
-                self.move_pointer(x, y);
-                self.wheel(horizontal, vertical)?;
+                self.move_pointer(x, y)?;
+                self.input.wheel(horizontal, vertical)
             }
             RemoteInput::Wheel {
                 horizontal,
                 vertical,
                 ..
-            } => self.wheel(horizontal, vertical)?,
-            RemoteInput::TypeText { text, .. } => {
-                for character in text.encode_utf16() {
-                    self.post(self.keyboard_target(), WM_CHAR, character as usize, 1)?;
-                }
-            }
+            } => self.input.wheel(horizontal, vertical),
+            RemoteInput::TypeText { text, .. } => self.input.text(&text),
             RemoteInput::Key {
                 scan_code,
                 extended,
                 pressed,
                 ..
-            } => {
-                let scan = u32::from(scan_code) | if extended { 0xe000 } else { 0 };
-                let key = unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) } as usize;
-                if key == 0 || key >= 256 {
-                    return Ok(());
-                }
-                self.keys[key] = if pressed { 128 } else { 0 };
-                self.keys[VK_SHIFT.0 as usize] =
-                    self.keys[VK_LSHIFT.0 as usize] | self.keys[VK_RSHIFT.0 as usize];
-                self.keys[VK_CONTROL.0 as usize] =
-                    self.keys[VK_LCONTROL.0 as usize] | self.keys[VK_RCONTROL.0 as usize];
-                self.keys[VK_MENU.0 as usize] =
-                    self.keys[VK_LMENU.0 as usize] | self.keys[VK_RMENU.0 as usize];
-                unsafe {
-                    SetKeyboardState(&self.keys)?;
-                }
-                let target = self.keyboard_target();
-                let bits = 1
-                    | ((scan_code as isize) << 16)
-                    | (isize::from(extended) << 24)
-                    | if pressed { 0 } else { 3 << 30 };
-                unsafe {
-                    let alt = self.keys[VK_MENU.0 as usize] != 0;
-                    let mut characters = [0_u16; 8];
-                    let count = if pressed {
-                        ToUnicodeEx(
-                            key as u32,
-                            u32::from(scan_code),
-                            &self.keys,
-                            &mut characters,
-                            0,
-                            Some(GetKeyboardLayout(GetWindowThreadProcessId(target, None))),
-                        )
-                    } else {
-                        0
-                    };
-                    let literal = !alt
-                        && self.keys[VK_CONTROL.0 as usize] == 0
-                        && (count < 0
-                            || (count > 0 && characters[0] >= 32 && characters[0] != 127));
-                    if literal {
-                        // Explicit characters preserve the remote modifier state without
-                        // depending on the time an application's message loop runs.
-                        for character in characters.iter().take(count.max(0) as usize) {
-                            // Keep text in FIFO order with queued Home/Delete,
-                            // shortcuts, and key releases. A synchronous send can
-                            // overtake them or time out while the app is painting.
-                            self.post(target, WM_CHAR, *character as usize, bits)?;
-                        }
-                    } else {
-                        // Accelerators and dialog navigation are interpreted by the
-                        // application's message loop, before DispatchMessage.
-                        let message = match (alt, pressed) {
-                            (true, true) => WM_SYSKEYDOWN,
-                            (true, false) => WM_SYSKEYUP,
-                            (false, true) => WM_KEYDOWN,
-                            (false, false) => WM_KEYUP,
-                        };
-                        let message_key = match key as u16 {
-                            value if value == VK_LSHIFT.0 || value == VK_RSHIFT.0 => VK_SHIFT.0,
-                            value if value == VK_LCONTROL.0 || value == VK_RCONTROL.0 => {
-                                VK_CONTROL.0
-                            }
-                            value if value == VK_LMENU.0 || value == VK_RMENU.0 => VK_MENU.0,
-                            value => value,
-                        };
-                        self.post(
-                            target,
-                            message,
-                            message_key as usize,
-                            bits | (isize::from(alt) << 29),
-                        )?;
-                        // Windows opens the context menu from the key-up of a
-                        // real Apps key only, not from a posted one.
-                        if key == VK_APPS.0 as usize
-                            && !pressed
-                            && !alt
-                            && self.keys[VK_CONTROL.0 as usize] == 0
-                        {
-                            self.post(target, WM_CONTEXTMENU, target.0 as usize, -1)?;
-                        }
-                    }
-                }
-            }
+            } => self.input.key(scan_code, extended, pressed),
         }
-        Ok(())
-    }
-
-    fn keyboard_target(&self) -> HWND {
-        unsafe {
-            if self.focus.is_invalid() || !IsWindow(Some(self.focus)).as_bool() {
-                return HWND::default();
-            }
-            // Conhost does not expose its text input through GUI thread focus.
-            // Attached input queues may still report the previous GUI control.
-            let root = GetAncestor(self.focus, GA_ROOT);
-            if self
-                .console_inputs
-                .iter()
-                .any(|console| console.window == root)
-            {
-                return self.focus;
-            }
-            let mut info = GUITHREADINFO {
-                cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
-                ..Default::default()
-            };
-            if GetGUIThreadInfo(GetWindowThreadProcessId(self.focus, None), &mut info).is_ok()
-                && !info.hwndFocus.is_invalid()
-            {
-                info.hwndFocus
-            } else {
-                self.focus
-            }
-        }
-    }
-
-    fn wheel(&self, horizontal: i16, vertical: i16) -> anyhow::Result<()> {
-        if let Some(hwnd) = self.hit() {
-            for (message, delta) in [(WM_MOUSEWHEEL, vertical), (WM_MOUSEHWHEEL, horizontal)] {
-                if delta != 0 {
-                    self.post(
-                        hwnd,
-                        message,
-                        (delta as u16 as usize) << 16,
-                        pack(self.pointer),
-                    )?;
-                }
-            }
-        }
-        Ok(())
     }
 }
 
 impl Drop for Workspace {
     fn drop(&mut self) {
         self.release();
-        self.console_inputs.clear();
         self.run = None;
         unsafe {
             let _ = CloseHandle(self.job);
@@ -1200,6 +860,21 @@ pub(super) fn work_area() -> RECT {
     area
 }
 
+/// How far a built-in tool's resize border reaches into its window. Real input
+/// goes to the child window under the pointer before its frame, so the border
+/// is nonclient area rather than a strip of the client.
+pub(super) const RESIZE_BORDER: i32 = 4;
+
+/// A built-in tool's nonclient border beside and below its client area: the
+/// resize border, or a line while maximized.
+pub(super) fn frame_border(hwnd: HWND) -> i32 {
+    if unsafe { IsZoomed(hwnd) }.as_bool() {
+        1
+    } else {
+        RESIZE_BORDER
+    }
+}
+
 /// The part of a built-in tool's window its borderless frame occupies. Windows
 /// maximizes a sizable window to the work area plus a standard frame overhang
 /// on every side, and ignores `WM_GETMINMAXINFO` and later moves that fit the
@@ -1217,8 +892,23 @@ pub(super) fn frame_rect(hwnd: HWND, window: RECT) -> RECT {
     }
 }
 
-fn pack(point: POINT) -> isize {
-    (point.x as u16 as u32 | ((point.y as u16 as u32) << 16)) as isize
+/// The process that started `process`, while it's listed.
+fn parent_process(process: u32) -> Option<u32> {
+    use windows::Win32::System::Diagnostics::ToolHelp::*;
+    let snapshot =
+        crate::win32::OwnedHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?);
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut next = unsafe { Process32FirstW(snapshot.0, &mut entry) };
+    while next.is_ok() {
+        if entry.th32ProcessID == process {
+            return Some(entry.th32ParentProcessID);
+        }
+        next = unsafe { Process32NextW(snapshot.0, &mut entry) };
+    }
+    None
 }
 
 fn task_windows(shell: HWND, tooltip: HWND) -> windows::core::Result<Vec<TaskWindow>> {
@@ -1473,5 +1163,7 @@ unsafe extern "system" fn launcher_proc(
     }
 }
 
+#[cfg(test)]
+mod input_tests;
 #[cfg(test)]
 mod tests;

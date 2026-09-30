@@ -5,6 +5,11 @@ Task 1 of `PLAN.md`. Tested on September 30, 2026 on `DESKTOP-85R6S28`
 harness plus a set of real-input commands. The harness is not in the repo. A copy is
 at `~\bg-input-20260930\agent\src\remote\background\driver.rs` on the endpoint.
 
+The sketch below is implemented (Tasks 7 and 8 in `PLAN.md`). Two things it
+didn't foresee: the thread that sends input can't own a window with a modal
+loop, so Run has its own thread; and a newly started program doesn't take the
+foreground, so the workspace brings its first window forward.
+
 ## Result: go
 
 Once `MeshRMMBackground` is Session 0's input desktop, `SetCursorPos` and

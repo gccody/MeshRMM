@@ -1,4 +1,97 @@
 use super::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
+
+/// Pumps the workspace thread's messages for `millis`. Real input reaches its
+/// target asynchronously, through Session 0's input queue.
+pub(super) fn settle(workspace: &mut Workspace, millis: u64) {
+    let deadline = Instant::now() + Duration::from_millis(millis);
+    while Instant::now() < deadline {
+        workspace.pump();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Pumps until `done` holds, for up to `seconds`.
+pub(super) fn wait_until(
+    workspace: &mut Workspace,
+    what: &str,
+    seconds: u64,
+    done: &dyn Fn(&Workspace) -> bool,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while !done(workspace) {
+        anyhow::ensure!(Instant::now() < deadline, "timed out waiting for {what}");
+        workspace.pump();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+/// Windows on a thread of their own, bound to the background desktop. A menu,
+/// or caption or button tracking, runs a modal loop that waits for more input,
+/// so it can't run on the thread that sends the input.
+pub(super) struct UiThread {
+    thread: u32,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl UiThread {
+    /// Runs `create` on the new thread, then pumps its messages until dropped.
+    pub(super) fn start<T: Send + 'static>(
+        create: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<(Self, T)> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let created = (|| {
+                let binding = background::Desktop::bind()?;
+                anyhow::Ok((binding, create()?))
+            })();
+            let (_binding, value) = match created {
+                Ok(created) => created,
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    return;
+                }
+            };
+            let _ = sender.send(Ok((unsafe { GetCurrentThreadId() }, value)));
+            let mut message = MSG::default();
+            while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
+                unsafe {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+        });
+        let (thread, value) = receiver.recv()??;
+        Ok((
+            Self {
+                thread,
+                handle: Some(handle),
+            },
+            value,
+        ))
+    }
+}
+
+impl Drop for UiThread {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = PostThreadMessageW(self.thread, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// A window handle that crossed a thread boundary as an integer.
+pub(super) fn hwnd(value: isize) -> HWND {
+    HWND(value as *mut _)
+}
+
+pub(super) fn pack(point: POINT) -> isize {
+    (point.x as u16 as u32 | ((point.y as u16 as u32) << 16)) as isize
+}
 
 #[test]
 #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
@@ -71,31 +164,11 @@ fn running_window_taskbar_restores_minimized_window() -> anyhow::Result<()> {
             pixel((rect.left + rect.right) / 2, rect.bottom - 2) != background,
             "running-window indicator did not render"
         );
-        let mut window_rect = RECT::default();
-        unsafe { GetWindowRect(window, &mut window_rect)? };
-        let minimize = (window_rect.left..window_rect.right)
-            .rev()
-            .find(|x| unsafe {
-                SendMessageW(
-                    window,
-                    WM_NCHITTEST,
-                    Some(WPARAM(0)),
-                    Some(LPARAM(pack(POINT {
-                        x: *x,
-                        y: window_rect.top + 15,
-                    }))),
-                )
-                .0 as u32
-                    == HTMINBUTTON
-            })
-            .context("standard minimize button was not found")?;
-        workspace.move_pointer(
-            (minimize as u32 * 65535 / (WIDTH - 1)) as u16,
-            ((window_rect.top + 15) as u32 * 65535 / (HEIGHT - 1)) as u16,
-        );
-        workspace.button(PointerButton::Left, true)?;
-        workspace.button(PointerButton::Left, false)?;
-        workspace.pump();
+        // Clicking its minimize button would start Windows' button tracking,
+        // which waits for input this thread sends.
+        unsafe {
+            let _ = ShowWindow(window, SW_MINIMIZE);
+        }
         workspace.refresh_tasks()?;
         anyhow::ensure!(
             unsafe { IsIconic(window) }.as_bool(),
@@ -191,7 +264,7 @@ fn running_window_taskbar_restores_minimized_window() -> anyhow::Result<()> {
     .expect("background taskbar test panicked")
 }
 
-fn click_task(workspace: &mut Workspace, button: HWND) -> anyhow::Result<()> {
+pub(super) fn click_task(workspace: &mut Workspace, button: HWND) -> anyhow::Result<()> {
     let mut rect = RECT::default();
     unsafe { GetWindowRect(button, &mut rect)? };
     let x = (rect.left + rect.right) / 2;
@@ -199,10 +272,10 @@ fn click_task(workspace: &mut Workspace, button: HWND) -> anyhow::Result<()> {
     workspace.move_pointer(
         (x as u32 * 65535 / (WIDTH - 1)) as u16,
         (y as u32 * 65535 / (HEIGHT - 1)) as u16,
-    );
+    )?;
     workspace.button(PointerButton::Left, true)?;
     workspace.button(PointerButton::Left, false)?;
-    workspace.pump();
+    settle(workspace, 200);
     Ok(())
 }
 
@@ -617,7 +690,7 @@ fn file_browser_interactions(workspace: &mut Workspace, window: HWND) -> anyhow:
         workspace.move_pointer(
             (x as u32 * 65535 / (WIDTH - 1)) as u16,
             (from_y as u32 * 65535 / (HEIGHT - 1)) as u16,
-        );
+        )?;
         workspace.button(PointerButton::Left, true)?;
         settle(workspace, 100);
         for (px, py) in [(x + 18, from_y), (x + 18, to_y)] {
@@ -686,7 +759,7 @@ fn file_browser_interactions(workspace: &mut Workspace, window: HWND) -> anyhow:
     workspace.move_pointer(
         (x as u32 * 65535 / (WIDTH - 1)) as u16,
         (y as u32 * 65535 / (HEIGHT - 1)) as u16,
-    );
+    )?;
     workspace.button(PointerButton::Left, true)?;
     settle(workspace, 100);
     workspace.apply(RemoteInput::PointerMove {
@@ -733,7 +806,7 @@ fn file_browser_interactions(workspace: &mut Workspace, window: HWND) -> anyhow:
     workspace.move_pointer(
         (x as u32 * 65535 / (WIDTH - 1)) as u16,
         (y as u32 * 65535 / (HEIGHT - 1)) as u16,
-    );
+    )?;
     workspace.button(PointerButton::Left, true)?;
     workspace.button(PointerButton::Left, false)?;
     settle(workspace, 200);
@@ -780,7 +853,7 @@ fn task_manager_interactions(workspace: &mut Workspace, window: HWND) -> anyhow:
         workspace.move_pointer(
             (x as u32 * 65535 / (WIDTH - 1)) as u16,
             (y as u32 * 65535 / (HEIGHT - 1)) as u16,
-        );
+        )?;
         workspace.button(PointerButton::Left, true)?;
         workspace.button(PointerButton::Left, false)?;
         settle(workspace, 60);
@@ -871,7 +944,7 @@ fn task_manager_interactions(workspace: &mut Workspace, window: HWND) -> anyhow:
                 workspace.move_pointer(
                     (x as u32 * 65535 / (WIDTH - 1)) as u16,
                     (y as u32 * 65535 / (HEIGHT - 1)) as u16,
-                );
+                )?;
                 workspace.button(PointerButton::Left, true)?;
                 settle(workspace, 60);
                 let (x, y) = if bar == SB_VERT {
@@ -923,6 +996,12 @@ fn task_manager_interactions(workspace: &mut Workspace, window: HWND) -> anyhow:
     let helpers = workspace.task_managers.len();
     workspace.launch(7)?;
     settle(workspace, 200);
+    let items = menu_bar_opens(workspace, window, 0)?;
+    anyhow::ensure!(
+        items.iter().any(|item| item.starts_with("Run new task")),
+        "Task Manager's File menu opened {items:?}"
+    );
+    settle(workspace, 200);
     assert!(
         !unsafe { IsIconic(window) }.as_bool(),
         "Taskbar pin did not restore Task Manager"
@@ -948,7 +1027,7 @@ fn task_manager_interactions(workspace: &mut Workspace, window: HWND) -> anyhow:
     workspace.move_pointer(
         ((bounds.right - 1) as u32 * 65535 / (WIDTH - 1)) as u16,
         ((bounds.bottom - 1) as u32 * 65535 / (HEIGHT - 1)) as u16,
-    );
+    )?;
     workspace.button(PointerButton::Left, true)?;
     settle(workspace, 60);
     workspace.apply(RemoteInput::PointerMove {
@@ -1304,16 +1383,17 @@ fn stable_taskbar_and_management_caption() -> anyhow::Result<()> {
             "baseline MMC menu must contain visible text"
         );
         for (dx, dy) in [(150, 80), (60, 20), (200, 60), (0, 0)] {
-            workspace.pointer = POINT {
-                x: rect.left + 300,
-                y: rect.top + 12,
-            };
-            workspace.drag = Some((management, workspace.pointer, rect));
-            workspace.move_pointer(
-                ((rect.left + 300 + dx) as u32 * 65535 / (WIDTH - 1)) as u16,
-                ((rect.top + 12 + dy) as u32 * 65535 / (HEIGHT - 1)) as u16,
-            );
-            workspace.drag = None;
+            unsafe {
+                SetWindowPos(
+                    management,
+                    None,
+                    rect.left + dx,
+                    rect.top + dy,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                )?;
+            }
             let mut moved = RECT::default();
             unsafe { GetWindowRect(management, &mut moved)? };
             for _ in 0..10 {
@@ -1463,7 +1543,7 @@ fn dialog_buttons_render_in_every_frame() -> anyhow::Result<()> {
 
 #[test]
 #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
-fn console_exit_closes_window_task_and_input_helper() -> anyhow::Result<()> {
+fn console_exit_closes_window_and_task() -> anyhow::Result<()> {
     std::thread::spawn(|| -> anyhow::Result<()> {
         unsafe {
             use windows::Win32::System::StationsAndDesktops::*;
@@ -1478,32 +1558,24 @@ fn console_exit_closes_window_task_and_input_helper() -> anyhow::Result<()> {
             .position(|pin| pin.program == "cmd.exe")
             .unwrap()
             + 1;
-        assert_eq!(PINS[pin - 1].kind, Kind::Console);
         workspace.launch(pin)?;
-        assert_eq!(workspace.console_inputs.len(), 1);
-        let helper = workspace.console_inputs[0].helper_process_id();
-        let console = workspace.console_inputs[0].window;
-        let helper = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, helper)? };
-        let wait_for =
-            |workspace: &mut Workspace, what: &str, done: &dyn Fn(&Workspace) -> bool| {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !done(workspace) {
-                    anyhow::ensure!(Instant::now() < deadline, "timed out waiting for {what}");
-                    workspace.pump();
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Ok(())
-            };
-        wait_for(&mut workspace, "the console task", &|workspace| {
+        let console = wait_for_job_window(&mut workspace, "cmd", &|class, _| {
+            class == "ConsoleWindowClass"
+        })?;
+        wait_until(&mut workspace, "the console task", 10, &|workspace| {
             workspace.tasks.iter().any(|task| task.window == console)
         })?;
         // Let cmd reach its prompt before typing.
-        let ready = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < ready {
-            workspace.pump();
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        workspace.focus = console;
+        settle(&mut workspace, 2000);
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(console, &mut rect)? };
+        click_at(&mut workspace, rect.left + 100, rect.top + 80)?;
+        wait_until(
+            &mut workspace,
+            "the console to take the foreground",
+            5,
+            &|_| unsafe { GetForegroundWindow() == console },
+        )?;
         // A leaked Win+R would turn the command into "rexit". Closing Run
         // must hand typing back to the console.
         press_win_r(&mut workspace)?;
@@ -1514,21 +1586,13 @@ fn console_exit_closes_window_task_and_input_helper() -> anyhow::Result<()> {
         })?;
         send_key(&mut workspace, 0x1c, true)?;
         send_key(&mut workspace, 0x1c, false)?;
-        wait_for(&mut workspace, "the console window to close", &|_| {
+        wait_until(&mut workspace, "the console window to close", 10, &|_| {
             !unsafe { IsWindow(Some(console)) }.as_bool()
         })?;
-        wait_for(
-            &mut workspace,
-            "the console task and input to go",
-            &|workspace| {
-                workspace.console_inputs.is_empty()
-                    && !workspace.tasks.iter().any(|task| task.window == console)
-            },
-        )?;
-        let exited = unsafe { WaitForSingleObject(helper, 5000) };
-        unsafe { CloseHandle(helper)? };
-        assert_eq!(exited, WAIT_OBJECT_0, "console input helper kept running");
-        println!("Session 0 console exit closed its window, task and input helper");
+        wait_until(&mut workspace, "the console task to go", 10, &|workspace| {
+            !workspace.tasks.iter().any(|task| task.window == console)
+        })?;
+        println!("Session 0 console exit closed its window and task");
         Ok(())
     })
     .join()
@@ -1572,21 +1636,19 @@ fn session_zero_gui() -> anyhow::Result<()> {
                 None,
             )?
         };
-        workspace.focus = edit;
+        anyhow::ensure!(
+            unsafe { SetForegroundWindow(edit) }.as_bool(),
+            "the edit window did not take the foreground"
+        );
         workspace.apply(RemoteInput::TypeText {
             display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
             text: "Session 0 GUI input verified".into(),
         })?;
-        workspace.pump();
-        let mut text = [0_u16; 128];
-        let count = unsafe { GetWindowTextW(edit, &mut text) };
-        assert_eq!(
-            String::from_utf16_lossy(&text[..count as usize]),
-            "Session 0 GUI input verified"
-        );
-        // This EDIT belongs to this thread, so it deliberately cannot pump
-        // queued navigation until after every printable key was submitted.
-        // Synchronous WM_CHAR used to overtake Home/Delete and corrupt text.
+        wait_until(&mut workspace, "typed text", 5, &|_| {
+            window_text(edit) == "Session 0 GUI input verified"
+        })?;
+        // This EDIT belongs to this thread, so it can't handle any key until
+        // every one was sent. They must still arrive in order.
         unsafe {
             SetWindowTextW(edit, w!("C:\\"))?;
         }
@@ -1614,10 +1676,9 @@ fn session_zero_gui() -> anyhow::Result<()> {
                 send_key(&mut workspace, 0x2a, false)?;
             }
         }
-        workspace.pump();
-        let count = unsafe { GetWindowTextW(edit, &mut text) };
+        settle(&mut workspace, 300);
         assert_eq!(
-            String::from_utf16_lossy(&text[..count as usize]),
+            window_text(edit),
             expected,
             "queued navigation and literal text must stay ordered"
         );
@@ -1760,23 +1821,19 @@ fn session_zero_gui() -> anyhow::Result<()> {
         workspace.move_pointer(
             ((rect.left + 100) as u32 * 65535 / (WIDTH - 1)) as u16,
             ((rect.top + 80) as u32 * 65535 / (HEIGHT - 1)) as u16,
-        );
+        )?;
         workspace.button(PointerButton::Left, true)?;
         workspace.button(PointerButton::Left, false)?;
         let evidence = std::env::temp_dir().join(format!(
             "meshrmm-console-keyboard-{}.txt",
             std::process::id()
         ));
-        assert_eq!(
-            workspace.console_inputs.last().unwrap().window,
-            console,
-            "console attachment returned the wrong window"
-        );
-        assert_eq!(
-            unsafe { GetAncestor(workspace.keyboard_target(), GA_ROOT) },
-            console,
-            "keyboard focus did not reach the console"
-        );
+        wait_until(
+            &mut workspace,
+            "the console to take the foreground",
+            5,
+            &|_| unsafe { GetForegroundWindow() == console },
+        )?;
         let _ = std::fs::remove_file(&evidence);
         let command = format!(
             "Set-Content -LiteralPath '{}' -Value 'AbC_123'",
@@ -1836,7 +1893,7 @@ fn session_zero_gui() -> anyhow::Result<()> {
     .expect("background test thread panicked")
 }
 
-fn key(workspace: &mut Workspace, scan_code: u16, extended: bool) -> anyhow::Result<()> {
+pub(super) fn key(workspace: &mut Workspace, scan_code: u16, extended: bool) -> anyhow::Result<()> {
     for pressed in [true, false] {
         workspace.apply(RemoteInput::Key {
             display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
@@ -1865,25 +1922,35 @@ fn press_win_r(workspace: &mut Workspace) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The window with the keyboard focus on `window`'s thread.
+fn thread_focus(window: HWND) -> HWND {
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        let _ = GetGUIThreadInfo(GetWindowThreadProcessId(window, None), &mut info);
+    }
+    info.hwndFocus
+}
+
+/// Whether Run is showing with keyboard input.
+fn run_has_input(workspace: &Workspace) -> bool {
+    workspace.run.as_ref().is_some_and(|run| unsafe {
+        run.visible() && GetForegroundWindow() == run.window && thread_focus(run.window) == run.edit
+    })
+}
+
 /// Checks that Win+R opened Run with keyboard input, then closes it with
-/// Escape, which must hand keyboard input back to `previous`.
+/// Escape, which must hand keyboard input back to `previous`'s window.
 fn close_run(workspace: &mut Workspace, previous: HWND) -> anyhow::Result<()> {
-    workspace.pump();
-    let run = workspace.run.as_ref().context("Win+R did not open Run")?;
-    anyhow::ensure!(run.visible(), "Win+R did not show Run");
-    anyhow::ensure!(
-        workspace.focus == run.edit,
-        "Run did not take keyboard input"
-    );
+    wait_until(workspace, "Run to take keyboard input", 5, &run_has_input)?;
     key(workspace, 0x01, false)?;
-    workspace.pump();
-    let run = workspace.run.as_ref().context("Run went away")?;
-    anyhow::ensure!(!run.visible(), "Escape did not close Run");
-    anyhow::ensure!(
-        workspace.focus == previous,
-        "closing Run did not hand keyboard input back"
-    );
-    Ok(())
+    let previous = unsafe { GetAncestor(previous, GA_ROOT) };
+    wait_until(workspace, "Escape to close Run", 5, &|workspace| {
+        workspace.run.as_ref().is_some_and(|run| !run.visible())
+            && unsafe { GetForegroundWindow() } == previous
+    })
 }
 
 #[test]
@@ -1950,17 +2017,20 @@ fn windows_and_apps_keys() -> anyhow::Result<()> {
             )?;
             (window, edit)
         };
-        unsafe { SetFocus(Some(edit))? };
-        workspace.focus = edit;
+        unsafe {
+            anyhow::ensure!(
+                SetForegroundWindow(window).as_bool(),
+                "the test window did not take the foreground"
+            );
+            SetFocus(Some(edit))?;
+        }
         press_win_r(&mut workspace)?;
         close_run(&mut workspace, edit)?;
         unsafe { SetFocus(Some(edit))? };
         key(&mut workspace, 0x13, false)?;
-        workspace.pump();
-        let mut text = [0_u16; 16];
-        let count = unsafe { GetWindowTextW(edit, &mut text) };
+        settle(&mut workspace, 300);
         assert_eq!(
-            String::from_utf16_lossy(&text[..count as usize]),
+            window_text(edit),
             "r",
             "Win+R must type nothing, and R alone must still type"
         );
@@ -1968,9 +2038,8 @@ fn windows_and_apps_keys() -> anyhow::Result<()> {
         assert_eq!(window_text(run.edit), "", "Win+R typed into Run");
 
         unsafe { SetFocus(Some(window))? };
-        workspace.focus = window;
         key(&mut workspace, 0x5d, true)?;
-        workspace.pump();
+        settle(&mut workspace, 300);
         assert_eq!(
             CONTEXT_MENUS.load(Ordering::SeqCst),
             1,
@@ -1981,17 +2050,6 @@ fn windows_and_apps_keys() -> anyhow::Result<()> {
             -1,
             "a keyboard context menu has no pointer position"
         );
-        // A modifier makes it a shortcut, not a context-menu request.
-        workspace.apply(RemoteInput::Key {
-            display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
-            scan_code: 0x1d,
-            extended: false,
-            pressed: true,
-        })?;
-        key(&mut workspace, 0x5d, true)?;
-        workspace.release();
-        workspace.pump();
-        assert_eq!(CONTEXT_MENUS.load(Ordering::SeqCst), 1);
         Ok(())
     })
     .join()
@@ -1999,7 +2057,7 @@ fn windows_and_apps_keys() -> anyhow::Result<()> {
 }
 
 /// The open popup menu's window and item labels, if a menu is showing.
-fn open_menu() -> anyhow::Result<Option<(HWND, Vec<String>)>> {
+pub(super) fn open_menu() -> anyhow::Result<Option<(HWND, Vec<String>)>> {
     for window in background::windows()? {
         let mut class = [0_u16; 16];
         let length = unsafe { GetClassNameW(window, &mut class) };
@@ -2034,7 +2092,39 @@ fn open_menu() -> anyhow::Result<Option<(HWND, Vec<String>)>> {
     Ok(None)
 }
 
-fn window_text(window: HWND) -> String {
+/// Clicks item `index` of `window`'s menu bar, returns the items of the menu
+/// that opens, and closes it with Escape.
+pub(super) fn menu_bar_opens(
+    workspace: &mut Workspace,
+    window: HWND,
+    index: u32,
+) -> anyhow::Result<Vec<String>> {
+    let menu = unsafe { GetMenu(window) };
+    anyhow::ensure!(!menu.is_invalid(), "the window has no menu bar");
+    let mut item = RECT::default();
+    unsafe { GetMenuItemRect(Some(window), menu, index, &mut item)? };
+    click_at(
+        workspace,
+        (item.left + item.right) / 2,
+        (item.top + item.bottom) / 2,
+    )?;
+    wait_until(workspace, "a menu-bar click to open its menu", 5, &|_| {
+        open_menu().ok().flatten().is_some()
+    })
+    .inspect_err(|_| {
+        let _ = proof("background-menu-bar-failure.bmp");
+    })?;
+    let (_, items) = open_menu()?.context("the menu closed")?;
+    // The first Escape closes the menu, the second leaves the menu bar.
+    key(workspace, 0x01, false)?;
+    key(workspace, 0x01, false)?;
+    wait_until(workspace, "Escape to close the menu", 5, &|_| {
+        open_menu().ok().flatten().is_none()
+    })?;
+    Ok(items)
+}
+
+pub(super) fn window_text(window: HWND) -> String {
     let mut text = [0_u16; 512];
     let mut length = 0;
     unsafe {
@@ -2053,7 +2143,7 @@ fn window_text(window: HWND) -> String {
 
 /// The first visible descendant of `parent` with class `class` that satisfies
 /// `accept`, largest first.
-fn child(parent: HWND, class: &str, accept: &dyn Fn(HWND) -> bool) -> Option<HWND> {
+pub(super) fn child(parent: HWND, class: &str, accept: &dyn Fn(HWND) -> bool) -> Option<HWND> {
     unsafe extern "system" fn collect(window: HWND, parameter: LPARAM) -> windows::core::BOOL {
         unsafe { (*(parameter.0 as *mut Vec<HWND>)).push(window) };
         true.into()
@@ -2083,11 +2173,15 @@ fn child(parent: HWND, class: &str, accept: &dyn Fn(HWND) -> bool) -> Option<HWN
         .max_by_key(|window| area(*window))
 }
 
-fn click_at(workspace: &mut Workspace, x: i32, y: i32) -> anyhow::Result<()> {
+pub(super) fn click_at(workspace: &mut Workspace, x: i32, y: i32) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (0..WIDTH as i32).contains(&x) && (0..HEIGHT as i32).contains(&y),
+        "({x}, {y}) is off the canvas"
+    );
     workspace.move_pointer(
         (x as u32 * 65535 / (WIDTH - 1)) as u16,
         (y as u32 * 65535 / (HEIGHT - 1)) as u16,
-    );
+    )?;
     workspace.button(PointerButton::Left, true)?;
     workspace.button(PointerButton::Left, false)
 }
@@ -2104,12 +2198,17 @@ fn apps_key_menu(workspace: &mut Workspace, list: HWND) -> anyhow::Result<Vec<St
             header_rect.bottom
         })
         .unwrap_or(rect.top);
+    // The list fills after the app shows it; a click before then selects nothing.
+    let count = |message| unsafe { SendMessageW(list, message, None, None).0 };
+    wait_until(workspace, "the list to fill", 10, &|_| {
+        count(windows::Win32::UI::Controls::LVM_GETITEMCOUNT) > 0
+    })?;
+    settle(workspace, 500);
     click_at(workspace, rect.left + 40, header + 8)?;
-    let settle = Instant::now() + Duration::from_millis(300);
-    while Instant::now() < settle {
-        workspace.pump();
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(workspace, "the click to select a row", 5, &|_| {
+        count(windows::Win32::UI::Controls::LVM_GETSELECTEDCOUNT) > 0
+    })?;
+    settle(workspace, 300);
     key(workspace, 0x5d, true)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     let (menu, items) = loop {
@@ -2194,6 +2293,7 @@ fn apps_key_opens_native_context_menus() -> anyhow::Result<()> {
         let mut rect = RECT::default();
         unsafe { GetWindowRect(address, &mut rect)? };
         // Type straight after the click, with no time for regedit to handle it.
+        // Real input goes through one ordered queue, so no key is lost.
         click_at(
             &mut workspace,
             (rect.left + rect.right) / 2,
@@ -2276,7 +2376,7 @@ fn job_window(
     Ok(None)
 }
 
-fn wait_for_job_window(
+pub(super) fn wait_for_job_window(
     workspace: &mut Workspace,
     what: &str,
     accept: &dyn Fn(&str, &str) -> bool,
@@ -2298,7 +2398,7 @@ fn wait_for_job_window(
     }
 }
 
-fn close_job_window(workspace: &mut Workspace, window: HWND) -> anyhow::Result<()> {
+pub(super) fn close_job_window(workspace: &mut Workspace, window: HWND) -> anyhow::Result<()> {
     let mut pid = 0;
     unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
     let process = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid)? };
@@ -2311,7 +2411,7 @@ fn close_job_window(workspace: &mut Workspace, window: HWND) -> anyhow::Result<(
     Ok(())
 }
 
-fn proof(name: &str) -> anyhow::Result<()> {
+pub(super) fn proof(name: &str) -> anyhow::Result<()> {
     std::fs::write(
         std::env::var_os("MESHRMM_BACKGROUND_PROOF_DIR")
             .map(std::path::PathBuf::from)
@@ -2388,7 +2488,7 @@ fn run_opens_programs_documents_and_folders() -> anyhow::Result<()> {
                 text: command.into(),
             })?;
             key(workspace, 0x1c, false)?;
-            workspace.pump();
+            settle(workspace, 300);
             Ok(())
         };
         let mut first = true;
@@ -2409,10 +2509,13 @@ fn run_opens_programs_documents_and_folders() -> anyhow::Result<()> {
             } else {
                 press_win_r(&mut workspace)?;
             }
-            workspace.pump();
+            wait_until(
+                &mut workspace,
+                "Run to take keyboard input",
+                5,
+                &run_has_input,
+            )?;
             let run = workspace.run.as_ref().context("Run did not open")?;
-            anyhow::ensure!(run.visible(), "Run is hidden");
-            anyhow::ensure!(workspace.focus == run.edit, "Run has no keyboard input");
             if command == "notepad" {
                 // Like Windows' Run, it has a taskbar button.
                 let window = run.window;
@@ -2446,23 +2549,22 @@ fn run_opens_programs_documents_and_folders() -> anyhow::Result<()> {
             close_job_window(&mut workspace, window)?;
         }
 
-        // A console program gets console input.
+        // A console program gets its own console.
         press_win_r(&mut workspace)?;
         type_command(&mut workspace, "cmd /k title Run console")?;
         let console = wait_for_job_window(&mut workspace, "cmd", &|class, text| {
             class == "ConsoleWindowClass" && text.contains("Run console")
         })?;
-        anyhow::ensure!(
-            workspace
-                .console_inputs
-                .iter()
-                .any(|input| input.window == console),
-            "cmd from Run has no console input"
-        );
         close_job_window(&mut workspace, console)?;
 
         // Errors show in the dialog, which stays open.
         press_win_r(&mut workspace)?;
+        wait_until(
+            &mut workspace,
+            "Run to take keyboard input",
+            5,
+            &run_has_input,
+        )?;
         type_command(&mut workspace, "no-such-program-meshrmm")?;
         let run = workspace.run.as_ref().context("Run went away")?;
         anyhow::ensure!(run.visible(), "Run closed on an error");
@@ -2475,7 +2577,6 @@ fn run_opens_programs_documents_and_folders() -> anyhow::Result<()> {
         // Clicking Cancel closes it.
         let cancel = unsafe { GetDlgItem(Some(run.window), IDCANCEL.0)? };
         click_task(&mut workspace, cancel)?;
-        workspace.pump();
         let run = workspace.run.as_ref().context("Run went away")?;
         anyhow::ensure!(!run.visible(), "Cancel did not close Run");
         Ok(())

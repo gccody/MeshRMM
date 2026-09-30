@@ -1,4 +1,4 @@
-//! Flat Explorer frame, including the posted-input resize/minimize adapter.
+//! Flat Explorer frame: hit testing and painting.
 use super::*;
 
 pub(super) fn hit(hwnd: HWND, point: POINT) -> u32 {
@@ -10,8 +10,14 @@ pub(super) fn hit(hwnd: HWND, point: POINT) -> u32 {
         let y = point.y - bounds.top;
         let width = bounds.right - bounds.left;
         let height = bounds.bottom - bounds.top;
+        let border = crate::remote::background::RESIZE_BORDER;
         if !IsZoomed(hwnd).as_bool() {
-            let edge = match (x < 4, x >= width - 4, y < 4, y >= height - 4) {
+            let edge = match (
+                x < border,
+                x >= width - border,
+                y < border,
+                y >= height - border,
+            ) {
                 (true, _, true, _) => HTTOPLEFT,
                 (_, true, true, _) => HTTOPRIGHT,
                 (true, _, _, true) => HTBOTTOMLEFT,
@@ -65,6 +71,30 @@ pub(super) fn paint(hwnd: HWND, dc: HDC, font: HFONT) {
             },
             0xffffff,
         );
+        // Windows would draw a classic sizing frame in the resize border.
+        let border = crate::remote::background::frame_border(hwnd);
+        for strip in [
+            RECT {
+                left: 0,
+                top: 31,
+                right: border,
+                bottom: height,
+            },
+            RECT {
+                left: width - border,
+                top: 31,
+                right: width,
+                bottom: height,
+            },
+            RECT {
+                left: 0,
+                top: height - border,
+                right: width,
+                bottom: height,
+            },
+        ] {
+            fill(dc, &strip, 0xffffff);
+        }
         let pen = CreateSolidBrush(COLORREF(0xb4b4b4));
         FrameRect(
             dc,
@@ -133,21 +163,4 @@ pub(super) fn paint(hwnd: HWND, dc: HDC, font: HFONT) {
         let _ = DeleteObject(line.into());
         let _ = SetViewportOrgEx(dc, origin.x, origin.y, None);
     }
-}
-pub(super) fn resize(edge: u32, start: POINT, mut bounds: RECT, point: POINT) -> RECT {
-    let dx = point.x - start.x;
-    let dy = point.y - start.y;
-    if matches!(edge, HTLEFT | HTTOPLEFT | HTBOTTOMLEFT) {
-        bounds.left = (bounds.left + dx).min(bounds.right - 940);
-    }
-    if matches!(edge, HTRIGHT | HTTOPRIGHT | HTBOTTOMRIGHT) {
-        bounds.right = (bounds.right + dx).max(bounds.left + 940);
-    }
-    if matches!(edge, HTTOP | HTTOPLEFT | HTTOPRIGHT) {
-        bounds.top = (bounds.top + dy).min(bounds.bottom - 400);
-    }
-    if matches!(edge, HTBOTTOM | HTBOTTOMLEFT | HTBOTTOMRIGHT) {
-        bounds.bottom = (bounds.bottom + dy).max(bounds.top + 400);
-    }
-    bounds
 }

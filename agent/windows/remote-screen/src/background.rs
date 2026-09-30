@@ -1,5 +1,6 @@
 //! An off-screen Session 0 desktop. The input helper's workspace makes it
-//! Session 0's input desktop; the console's input desktop is never switched.
+//! Session 0's input desktop and drives it with real input; the console's input
+//! desktop is never switched.
 use windows::Win32::Foundation::{
     COLORREF, ERROR_SUCCESS, HANDLE, HWND, LPARAM, RECT, SetLastError, WPARAM,
 };
@@ -15,11 +16,15 @@ pub const DISPLAY_ID: u32 = u32::MAX - 2;
 pub const WIDTH: u32 = 1280;
 pub const HEIGHT: u32 = 800;
 pub const DESKTOP_NAME: &str = "MeshRMMBackground";
+/// `SendInput` needs `DESKTOP_JOURNALPLAYBACK` on the injecting thread's desktop
+/// handle, and a thread that owns windows can't be rebound to another handle.
 const DESKTOP_RIGHTS: u32 = DESKTOP_READOBJECTS.0
     | DESKTOP_CREATEWINDOW.0
     | DESKTOP_CREATEMENU.0
     | DESKTOP_ENUMERATE.0
-    | DESKTOP_WRITEOBJECTS.0;
+    | DESKTOP_WRITEOBJECTS.0
+    | DESKTOP_JOURNALPLAYBACK.0
+    | DESKTOP_SWITCHDESKTOP.0;
 
 pub fn display() -> crate::DisplayInfo {
     crate::DisplayInfo {

@@ -3,8 +3,6 @@ mod audio_mode;
 #[cfg(windows)]
 mod background;
 #[cfg(windows)]
-pub(crate) mod background_console;
-#[cfg(windows)]
 pub(crate) mod background_files;
 #[cfg(windows)]
 pub(crate) mod background_tasks;

@@ -14,7 +14,7 @@ pub(super) fn stop_telemetry(pid: u32) {
     telemetry::stop(pid);
 }
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
 
@@ -258,7 +258,6 @@ struct State {
     notice: String,
     tab: Tab,
     compact: bool,
-    resizing: Option<(u32, POINT, RECT)>,
     expanded_size: (i32, i32),
     grouped: bool,
     expanded: HashSet<Key>,
