@@ -605,12 +605,22 @@ user's desktop. You can also connect normally and select
 **Background (Session 0 · experimental)** in the viewer's display selector.
 The black workspace has a charcoal bottom taskbar with icon launchers and hover labels.
 Open windows appear as icons after a gap, each with a persistent underline and
-a name on hover. Minimized windows remain listed; select their icon to restore them.
-Closing a window removes its icon.
+a name on hover. As on the Windows taskbar, this includes dialogs owned by hidden
+windows, such as System Properties and Run, but not dialogs owned by a visible
+window, such as Find. Minimized windows remain listed; select an icon to restore
+its window and bring it to the front. Closing a window removes its icon.
 It pins Command Prompt, PowerShell, Registry Editor, Services,
 Event Viewer, Resource Monitor, Task Manager, Computer Management, Device Manager,
-Windows Firewall, and File Explorer. Task Manager and File Explorer launch built-in
-MeshRMM tools. The process manager lists processes and supports confirmed End Task;
+Windows Firewall, File Explorer, Disk Management, System Properties, Notepad, and
+Run. With 15 pins, 11 open windows fit at full width; more share the rest of the
+taskbar, and past 16 their icons are cut off. Task Manager, File Explorer, and Run are built-in
+MeshRMM tools. Run, also opened with Win+R, takes a program with its arguments, a
+document, or a folder. It looks them up like Windows' Run, on the system path and
+with `PATHEXT` extensions, and opens documents with their associated program
+(`diskmgmt.msc`, `sysdm.cpl`). Folders, `explorer`, and `taskmgr` open the built-in
+tools. Programs it starts stay in the workspace. Windows' own Run dialog
+(`rundll32 shell32.dll,#61`) isn't used: rundll32 passes it its own entry-point
+arguments, and the dialog then silently ignores full paths. The process manager lists processes and supports confirmed End Task;
 the file browser navigates folders, previews text, creates folders, renames entries,
 and copies individual files without overwriting existing destinations. It opens administrative applications in a private Windows desktop in
 Session 0 under SYSTEM. Select a physical monitor to return to the console.
@@ -620,30 +630,50 @@ open. The existing Windows and macOS viewers can use this mode without a protoco
 update.
 
 The workspace uses a fixed 1280×800 canvas, up to 20 FPS, window capture, and
-separate window-message input. Window images are retained between captures so
-slow or failed repaints do not make already-captured windows disappear when
-the refresh budget expires. Application-specific rendering limitations can still
-cause flicker. Command Prompt and PowerShell receive console input
-records through disposable helpers. It does not switch the console desktop or move the
+real mouse and keyboard input from a separate helper. While it is open, the
+workspace makes its desktop Session 0's input desktop, which real input needs,
+sets Session 0's display mode to 1280×800 (it idles at 1024×768), sets the work
+area to end above the 48-pixel taskbar, so maximized and newly opened windows fit
+the canvas, and has the wheel scroll the window under the pointer. None of these
+changes is saved; closing the workspace restores the previous desktop, mode, work
+area, and wheel setting. The workspace makes one lasting change to the machine:
+it creates SYSTEM's Desktop folder, `%SystemRoot%\System32\config\systemprofile\Desktop`,
+and the matching folder under `SysWOW64` on 64-bit Windows, if they're missing.
+Without them, every Open and Save dialog first reports that the Desktop is
+unavailable. If Windows refuses the mode, applications keep laying out
+for Session 0's smaller screen, and the pointer can't reach past it.
+Applications get the same input as from a local mouse and keyboard: menus open and
+run from clicks, double-clicks open items, right-click menus appear at the pointer,
+and scrollbars, caption drags, and resizing are Windows' own. A program started
+from the taskbar or Run comes to the front when its first window appears. Disk
+Management's disk pane doesn't handle the wheel itself; its scrollbar works.
+Window images are retained between captures so slow or failed repaints do not
+make already-captured windows disappear when the refresh budget expires.
+Application-specific rendering limitations can still cause flicker. Session 0 has no Windows shell, so apart from
+Win+R, Windows-key shortcuts do nothing: the Windows key, and keys pressed while it
+is held, never reach applications. The Apps key opens the selected item's context menu. It does not switch the console desktop or move the
 console pointer. Console audio, clipboard synchronization, file-transfer UI, chat,
 blackout, input blocking, and Ctrl+Alt+Del are unavailable in background mode.
 Operations performed inside the workspace still affect the same machine, and
 SYSTEM has a different profile and network credentials from the signed-in user.
 
 This is a prototype for traditional Win32 administration tools, not a complete
-Explorer login session. Applications that depend on the user's shell, modern
-GPU-composited UI, or physical keyboard/mouse input may not render or respond
-correctly. Full-content window capture is attempted before the legacy capture path to improve
-compatibility with some composited windows. The built-in tools avoid the shell
-dependencies of Windows Task Manager and Explorer. Text previews are read-only
+Explorer login session. Applications that depend on the user's shell or modern
+GPU-composited UI may not render or respond correctly. Session 0 has no desktop compositor, so the workspace makes each
+window layered and copies the image Windows keeps for it. Printing windows
+instead copied them before their controls finished painting. Composited windows,
+and windows their application already layers itself, are still printed. The
+built-in tools avoid the shell dependencies of Windows Task Manager and Explorer. Text previews are read-only
 and limited to 1 MiB; recursive folder copying and shell file associations are not
 supported. Background mode is currently entered after a normal connection; it
 does not yet provide a separate background-only connection from the dashboard.
 
 The ignored native test `remote::background::tests::session_zero_gui` exercises
 the launcher, text input, PowerShell keyboard input, Registry Editor rendering, H.264 output, Session 0
-placement, and application cleanup. Run it in a dedicated SYSTEM process in
-Session 0 with no active background workspace. It writes
+placement, and application cleanup. The ignored tests in
+`remote::background::input_tests` check menus, right-click menus, double-clicks, scrollbars, and the
+wheel on test windows, Registry Editor, Services, and Disk Management. Run each in
+a dedicated SYSTEM process in Session 0 with no active background workspace. It writes
 `meshrmm-background-gui.bmp` to that process's temporary directory. The capture
 helper is disposable: a ten-second frame watchdog restarts it if a window stalls
 Windows' synchronous capture API, while input remains in a separate helper.

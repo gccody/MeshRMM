@@ -363,7 +363,7 @@ fn send_mouse_button_at(
     ])
 }
 
-fn mouse_button_input(button: PointerButton, pressed: bool) -> INPUT {
+pub(super) fn mouse_button_input(button: PointerButton, pressed: bool) -> INPUT {
     let (flag, data) = match (button, pressed) {
         (PointerButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
         (PointerButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
@@ -414,7 +414,7 @@ fn send_wheel_at(
     send(&inputs)
 }
 
-fn mouse_input(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> INPUT {
+pub(super) fn mouse_input(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -431,6 +431,10 @@ fn mouse_input(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> INPUT {
 }
 
 fn send_key(scan_code: u16, extended: bool, pressed: bool) -> anyhow::Result<()> {
+    send(&[key_input(scan_code, extended, pressed)])
+}
+
+pub(super) fn key_input(scan_code: u16, extended: bool, pressed: bool) -> INPUT {
     let mut flags = KEYEVENTF_SCANCODE;
     if extended {
         flags |= KEYEVENTF_EXTENDEDKEY;
@@ -438,7 +442,7 @@ fn send_key(scan_code: u16, extended: bool, pressed: bool) -> anyhow::Result<()>
     if !pressed {
         flags |= KEYEVENTF_KEYUP;
     }
-    let input = INPUT {
+    INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
@@ -449,11 +453,10 @@ fn send_key(scan_code: u16, extended: bool, pressed: bool) -> anyhow::Result<()>
                 dwExtraInfo: super::input_block::INPUT_TAG,
             },
         },
-    };
-    send(&[input])
+    }
 }
 
-fn text_inputs(text: &str) -> Vec<INPUT> {
+pub(super) fn text_inputs(text: &str) -> Vec<INPUT> {
     let mut inputs = Vec::with_capacity(text.len() * 2);
     // Treat CRLF as one Enter; do not append an Enter to the clipboard.
     let mut chars = text.chars().peekable();
@@ -504,7 +507,7 @@ fn text_key(vk: VIRTUAL_KEY, unit: u16, release: bool) -> INPUT {
     }
 }
 
-fn send(inputs: &[INPUT]) -> anyhow::Result<()> {
+pub(super) fn send(inputs: &[INPUT]) -> anyhow::Result<()> {
     let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent != inputs.len() as u32 {
         return Err(windows::core::Error::from_thread()).context("Windows rejected remote input");

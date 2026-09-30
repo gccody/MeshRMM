@@ -1,6 +1,6 @@
 //! Windows 10-style file management on the isolated maintenance desktop.
 mod clipboard;
-mod controls;
+pub(super) mod controls;
 mod frame;
 mod launch;
 mod model;
@@ -24,7 +24,9 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Time::*;
 use windows::Win32::UI::Controls::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetCapture, ReleaseCapture, SetCapture, SetFocus,
+};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
@@ -364,7 +366,6 @@ struct State {
     nav: HWND,
     crumbs: Vec<(HWND, PathBuf, i32)>,
     address_edit: bool,
-    resizing: Option<(u32, POINT, RECT)>,
     dragging: Vec<PathBuf>,
     control_down: bool,
     undo_stack: Vec<Vec<UndoAction>>,
@@ -380,7 +381,6 @@ struct State {
     clipboard_sequence: u64,
     history: History,
     travel: Option<usize>,
-    last_click: Option<(std::time::Instant, i32)>,
     receiver: Option<std::sync::mpsc::Receiver<anyhow::Result<ResultData>>>,
     cancelled: Arc<AtomicBool>,
     sort: usize,
@@ -969,7 +969,6 @@ impl State {
                 self.rebuild_breadcrumbs()?;
                 self.layout();
                 self.render(rename.as_deref(), Some(restore));
-                self.last_click = None;
                 if !status.is_empty() {
                     set_text(self.status, &status);
                 }
