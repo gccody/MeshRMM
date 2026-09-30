@@ -620,10 +620,15 @@ open. The existing Windows and macOS viewers can use this mode without a protoco
 update.
 
 The workspace uses a fixed 1280×800 canvas, up to 20 FPS, window capture, and
-separate window-message input. Window images are retained between captures so
-slow or failed repaints do not make already-captured windows disappear when
-the refresh budget expires. Application-specific rendering limitations can still
-cause flicker. Command Prompt and PowerShell receive console input
+separate window-message input. While it is open, the workspace makes its desktop
+Session 0's input desktop, sets Session 0's display mode to 1280×800 (it idles at
+1024×768), and sets the work area to end above the 48-pixel taskbar, so maximized
+and newly opened windows fit the canvas. None of these changes is saved; closing
+the workspace restores the previous desktop, mode, and work area. If Windows
+refuses the mode, applications keep laying out for Session 0's smaller screen.
+Window images are retained between captures so slow or failed repaints do not
+make already-captured windows disappear when the refresh budget expires.
+Application-specific rendering limitations can still cause flicker. Command Prompt and PowerShell receive console input
 records through disposable helpers. It does not switch the console desktop or move the
 console pointer. Console audio, clipboard synchronization, file-transfer UI, chat,
 blackout, input blocking, and Ctrl+Alt+Del are unavailable in background mode.

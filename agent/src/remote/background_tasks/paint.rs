@@ -583,10 +583,18 @@ pub(super) unsafe fn performance_paint(state: &State, hwnd: HWND, dc: HDC) {
 
 pub(super) unsafe fn caption(state: &State, dc: HDC) {
     unsafe {
-        let mut window = RECT::default();
-        if GetWindowRect(state.hwnd, &mut window).is_err() {
+        let mut outer = RECT::default();
+        if GetWindowRect(state.hwnd, &mut outer).is_err() {
             return;
         }
+        let window = crate::remote::background::frame_rect(state.hwnd, outer);
+        let mut origin = POINT::default();
+        let _ = OffsetViewportOrgEx(
+            dc,
+            window.left - outer.left,
+            window.top - outer.top,
+            Some(&mut origin),
+        );
         let width = window.right - window.left;
         let mut menu_rect = RECT::default();
         let menu = GetMenu(state.hwnd);
@@ -646,5 +654,6 @@ pub(super) unsafe fn caption(state: &State, dc: HDC) {
                 draw_text(dc, label, rect, COLORREF(0x111111), DT_CENTER);
             }
         }
+        let _ = SetViewportOrgEx(dc, origin.x, origin.y, None);
     }
 }

@@ -3,8 +3,9 @@ use super::*;
 
 pub(super) fn hit(hwnd: HWND, point: POINT) -> u32 {
     unsafe {
-        let mut bounds = RECT::default();
-        let _ = GetWindowRect(hwnd, &mut bounds);
+        let mut window = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut window);
+        let bounds = crate::remote::background::frame_rect(hwnd, window);
         let x = point.x - bounds.left;
         let y = point.y - bounds.top;
         let width = bounds.right - bounds.left;
@@ -42,8 +43,16 @@ pub(super) fn hit(hwnd: HWND, point: POINT) -> u32 {
 }
 pub(super) fn paint(hwnd: HWND, dc: HDC, font: HFONT) {
     unsafe {
-        let mut bounds = RECT::default();
-        let _ = GetWindowRect(hwnd, &mut bounds);
+        let mut window = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut window);
+        let bounds = crate::remote::background::frame_rect(hwnd, window);
+        let mut origin = POINT::default();
+        let _ = OffsetViewportOrgEx(
+            dc,
+            bounds.left - window.left,
+            bounds.top - window.top,
+            Some(&mut origin),
+        );
         let width = bounds.right - bounds.left;
         let height = bounds.bottom - bounds.top;
         fill(
@@ -122,6 +131,7 @@ pub(super) fn paint(hwnd: HWND, dc: HDC, font: HFONT) {
         }
         SelectObject(dc, old);
         let _ = DeleteObject(line.into());
+        let _ = SetViewportOrgEx(dc, origin.x, origin.y, None);
     }
 }
 pub(super) fn resize(edge: u32, start: POINT, mut bounds: RECT, point: POINT) -> RECT {

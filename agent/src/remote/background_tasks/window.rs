@@ -296,7 +296,7 @@ pub(super) unsafe extern "system" fn window_proc(
             } else {
                 &mut *(lparam.0 as *mut RECT)
             };
-            let outer = *rect;
+            let outer = crate::remote::background::frame_rect(hwnd, *rect);
             let result = DefWindowProcW(hwnd, message, wparam, lparam);
             rect.left = outer.left + 1;
             rect.right = outer.right - 1;
@@ -305,13 +305,11 @@ pub(super) unsafe extern "system" fn window_proc(
         }
         if message == WM_GETMINMAXINFO && lparam.0 != 0 {
             let info = &mut *(lparam.0 as *mut MINMAXINFO);
-            info.ptMaxPosition = POINT { x: 0, y: 0 };
-            info.ptMaxSize = POINT {
-                x: meshrmm_remote_screen::background::WIDTH as i32,
-                y: meshrmm_remote_screen::background::HEIGHT as i32
-                    - crate::remote::background::TASKBAR_HEIGHT,
+            let area = crate::remote::background::work_area();
+            info.ptMaxTrackSize = POINT {
+                x: area.right - area.left,
+                y: area.bottom - area.top,
             };
-            info.ptMaxTrackSize = info.ptMaxSize;
             let compact = !cell.is_null() && (*cell).try_borrow().map_or(true, |s| s.compact);
             info.ptMinTrackSize = if compact {
                 POINT { x: 280, y: 200 }
@@ -418,8 +416,9 @@ pub(super) unsafe extern "system" fn window_proc(
             }
             if message == WM_NCHITTEST {
                 let hit = DefWindowProcW(hwnd, message, wparam, lparam);
-                let mut bounds = RECT::default();
-                let _ = GetWindowRect(hwnd, &mut bounds);
+                let mut window = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut window);
+                let bounds = crate::remote::background::frame_rect(hwnd, window);
                 let x = lparam.0 as i16 as i32 - bounds.left;
                 let y = (lparam.0 >> 16) as i16 as i32 - bounds.top;
                 if !IsZoomed(hwnd).as_bool() {

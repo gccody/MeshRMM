@@ -131,6 +131,134 @@ fn running_window_taskbar_restores_minimized_window() -> anyhow::Result<()> {
     .expect("background taskbar test panicked")
 }
 
+#[test]
+#[ignore = "Requires a dedicated Session 0 process; changes Session 0's display mode"]
+fn workspace_sizes_session_zero_screen_to_canvas() -> anyhow::Result<()> {
+    unsafe extern "system" fn test_window_proc(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        unsafe { DefWindowProcW(window, message, wparam, lparam) }
+    }
+    fn metrics() -> (i32, i32, RECT) {
+        let mut area = RECT::default();
+        unsafe {
+            let _ = SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some((&mut area as *mut RECT).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            );
+            (
+                GetSystemMetrics(SM_CXSCREEN),
+                GetSystemMetrics(SM_CYSCREEN),
+                area,
+            )
+        }
+    }
+    std::thread::spawn(|| -> anyhow::Result<()> {
+        unsafe {
+            use windows::Win32::System::StationsAndDesktops::*;
+            let station = OpenWindowStationW(w!("WinSta0"), false, 0x000f037f)?;
+            SetProcessWindowStation(station)?;
+        }
+        let _owner = background::Desktop::create()?;
+        let _binding = background::Desktop::bind()?;
+        let before = metrics();
+        let workspace = Workspace::new()?;
+        let (width, height, area) = metrics();
+        assert_eq!((width, height), (WIDTH as i32, HEIGHT as i32));
+        assert_eq!(
+            (area.left, area.top, area.right, area.bottom),
+            (0, 0, WIDTH as i32, HEIGHT as i32 - TASKBAR_HEIGHT)
+        );
+        let window = unsafe {
+            RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(test_window_proc),
+                lpszClassName: w!("MeshRMMScreenTest"),
+                ..Default::default()
+            });
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("MeshRMMScreenTest"),
+                w!("Screen size test"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                40,
+                50,
+                400,
+                250,
+                None,
+                None,
+                None,
+                None,
+            )?
+        };
+        let mut rect = RECT::default();
+        unsafe {
+            let _ = ShowWindow(window, SW_MAXIMIZE);
+            GetWindowRect(window, &mut rect)?;
+            DestroyWindow(window)?;
+        }
+        // A maximized frame overhangs the work area by its border on each side.
+        assert_eq!(rect.left + rect.right, WIDTH as i32, "{rect:?}");
+        assert_eq!(
+            rect.top + rect.bottom,
+            HEIGHT as i32 - TASKBAR_HEIGHT,
+            "{rect:?}"
+        );
+        drop(workspace);
+        let after = metrics();
+        assert_eq!((after.0, after.1), (before.0, before.1));
+        assert_eq!(
+            (after.2.right, after.2.bottom),
+            (before.2.right, before.2.bottom)
+        );
+        Ok(())
+    })
+    .join()
+    .expect("screen size test panicked")
+}
+
+/// Checks that a maximized built-in tool shows its whole frame and client area
+/// on the work area, above the taskbar, and returns the frame.
+fn maximized_frame(window: HWND) -> anyhow::Result<RECT> {
+    let mut outer = RECT::default();
+    let mut client = RECT::default();
+    let mut origin = POINT::default();
+    unsafe {
+        GetWindowRect(window, &mut outer)?;
+        GetClientRect(window, &mut client)?;
+        ClientToScreen(window, &mut origin).ok()?;
+    }
+    let client = RECT {
+        left: client.left + origin.x,
+        top: client.top + origin.y,
+        right: client.right + origin.x,
+        bottom: client.bottom + origin.y,
+    };
+    let area = RECT {
+        left: 0,
+        top: 0,
+        right: WIDTH as i32,
+        bottom: HEIGHT as i32 - TASKBAR_HEIGHT,
+    };
+    let frame = frame_rect(window, outer);
+    anyhow::ensure!(
+        frame == area,
+        "maximized frame {frame:?} (window {outer:?}) must fill the work area"
+    );
+    anyhow::ensure!(
+        client.left == area.left + 1
+            && client.right == area.right - 1
+            && client.bottom == area.bottom - 1
+            && client.top > area.top,
+        "maximized client area {client:?} must fill the frame"
+    );
+    Ok(frame)
+}
+
 fn send_key(workspace: &mut Workspace, scan_code: u16, pressed: bool) -> anyhow::Result<()> {
     workspace.apply(RemoteInput::Key {
         display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
@@ -499,15 +627,7 @@ fn file_browser_interactions(workspace: &mut Workspace, window: HWND) -> anyhow:
         )?;
     }
     settle(workspace, 200);
-    let mut maximized = RECT::default();
-    unsafe {
-        GetWindowRect(window, &mut maximized)?;
-    }
-    assert_eq!(maximized.right - maximized.left, WIDTH as i32);
-    assert_eq!(
-        maximized.bottom - maximized.top,
-        HEIGHT as i32 - TASKBAR_HEIGHT
-    );
+    maximized_frame(window)?;
     unsafe {
         PostMessageW(
             Some(window),
@@ -732,14 +852,7 @@ fn task_manager_interactions(workspace: &mut Workspace, window: HWND) -> anyhow:
         unsafe { IsZoomed(window) }.as_bool(),
         "Maximize button did not maximize"
     );
-    unsafe { GetWindowRect(window, &mut bounds)? };
-    assert!(
-        bounds.left == 0
-            && bounds.top == 0
-            && bounds.right == WIDTH as i32
-            && bounds.bottom == HEIGHT as i32 - TASKBAR_HEIGHT,
-        "Maximized Task Manager must fill the background work area: {bounds:?}"
-    );
+    bounds = maximized_frame(window)?;
     click(workspace, bounds.right - 70, bounds.top + 15)?;
     settle(workspace, 200);
     assert!(!unsafe { IsZoomed(window) }.as_bool());

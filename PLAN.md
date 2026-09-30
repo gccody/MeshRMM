@@ -54,6 +54,8 @@ Also check:
 
 ## Task 2 — Apps think the screen is 1024×768, not the 1280×800 canvas
 
+**Status: done** (2026-09-30). `Workspace::new` claims Session 0's screen (`agent/src/remote/background/screen.rs`): it makes `MeshRMMBackground` the input desktop, sets the mode to 1280×800, and sets the work area to end above the taskbar. It restores all three on drop. The canvas stays 1280×800, so step 3 wasn't needed. Maximized native windows now come out as (−8,−8)→(1288,760), Firewall opens at (40,0)→(1101,752), and Services and Event Viewer open above the taskbar. Windows forces the standard 8 px frame overhang onto any maximized sizable window that fits the work area exactly, overriding `WM_GETMINMAXINFO` and later `SetWindowPos` calls. So the built-in Task Manager and File Explorer frames now clip their non-client area to the work area while maximized.
+
 **Evidence.**
 - Maximized regedit, Event Viewer and cmd come out as (−8,−8)→(1032,776): a 256 px black strip is left on the right and the bottom sits under the taskbar.
 - Firewall opens at exactly 1024×768.

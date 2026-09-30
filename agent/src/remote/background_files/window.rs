@@ -187,6 +187,7 @@ pub(super) unsafe extern "system" fn window_proc(
             } else {
                 &mut *(lparam.0 as *mut RECT)
             };
+            *rect = crate::remote::background::frame_rect(hwnd, *rect);
             rect.left += 1;
             rect.right -= 1;
             rect.top += 31;
@@ -495,14 +496,12 @@ pub(super) unsafe extern "system" fn window_proc(
         }
         if message == WM_GETMINMAXINFO {
             let info = &mut *(lparam.0 as *mut MINMAXINFO);
+            let area = crate::remote::background::work_area();
             info.ptMinTrackSize = POINT { x: 940, y: 400 };
-            info.ptMaxPosition = POINT { x: 0, y: 0 };
-            info.ptMaxSize = POINT {
-                x: meshrmm_remote_screen::background::WIDTH as i32,
-                y: meshrmm_remote_screen::background::HEIGHT as i32
-                    - crate::remote::background::TASKBAR_HEIGHT,
+            info.ptMaxTrackSize = POINT {
+                x: area.right - area.left,
+                y: area.bottom - area.top,
             };
-            info.ptMaxTrackSize = info.ptMaxSize;
             return LRESULT(0);
         }
         if message == WM_DESTROY {

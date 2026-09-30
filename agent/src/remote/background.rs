@@ -1,6 +1,8 @@
 //! Experimental Session 0 GUI input and application launcher.
-//! No SendInput, desktop switching, console hooks, or user-token launches.
+//! No SendInput, console hooks, or user-token launches. The workspace makes its
+//! desktop Session 0's input desktop, but never switches the console's.
 pub(super) mod launch;
+mod screen;
 
 use crate::win32::wide;
 use anyhow::Context;
@@ -117,6 +119,8 @@ pub struct Workspace {
     keys: [u8; 256],
     attached_thread: Option<u32>,
     console_inputs: Vec<super::background_console::ConsoleInput>,
+    /// Dropped last, after the applications and taskbar are gone.
+    _screen: screen::Screen,
 }
 
 struct TaskButton {
@@ -136,6 +140,7 @@ struct TaskWindow {
 impl Workspace {
     pub fn new() -> anyhow::Result<Self> {
         background::require_session_zero()?;
+        let screen = screen::Screen::claim(TASKBAR_HEIGHT);
         unsafe {
             let job = CreateJobObjectW(None, PCWSTR::null())?;
             let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
@@ -171,6 +176,7 @@ impl Workspace {
                 keys: [0; 256],
                 attached_thread: None,
                 console_inputs: Vec::new(),
+                _screen: screen,
             };
             let class = WNDCLASSW {
                 lpfnWndProc: Some(launcher_proc),
@@ -1009,6 +1015,46 @@ impl Drop for Workspace {
                 let _ = DestroyIcon(icon);
             }
         }
+    }
+}
+
+/// Where Session 0 maximizes windows. The workspace sets it to end above the
+/// taskbar.
+pub(super) fn work_area() -> RECT {
+    let mut area = RECT::default();
+    let result = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some((&mut area as *mut RECT).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if result.is_err() || area.right <= area.left || area.bottom <= area.top {
+        return RECT {
+            left: 0,
+            top: 0,
+            right: WIDTH as i32,
+            bottom: HEIGHT as i32 - TASKBAR_HEIGHT,
+        };
+    }
+    area
+}
+
+/// The part of a built-in tool's window its borderless frame occupies. Windows
+/// maximizes a sizable window to the work area plus a standard frame overhang
+/// on every side, and ignores `WM_GETMINMAXINFO` and later moves that fit the
+/// work area exactly, so while maximized the frame draws inside the work area.
+pub(super) fn frame_rect(hwnd: HWND, window: RECT) -> RECT {
+    if !unsafe { IsZoomed(hwnd) }.as_bool() {
+        return window;
+    }
+    let area = work_area();
+    RECT {
+        left: window.left.max(area.left),
+        top: window.top.max(area.top),
+        right: window.right.min(area.right),
+        bottom: window.bottom.min(area.bottom),
     }
 }
 

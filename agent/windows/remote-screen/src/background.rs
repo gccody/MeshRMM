@@ -1,4 +1,5 @@
-//! An off-screen Session 0 desktop. Never switches the console input desktop.
+//! An off-screen Session 0 desktop. The input helper's workspace makes it
+//! Session 0's input desktop; the console's input desktop is never switched.
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, HWND, LPARAM, RECT, SetLastError};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
