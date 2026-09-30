@@ -631,7 +631,9 @@ refuses the mode, applications keep laying out for Session 0's smaller screen.
 Window images are retained between captures so slow or failed repaints do not
 make already-captured windows disappear when the refresh budget expires.
 Application-specific rendering limitations can still cause flicker. Command Prompt and PowerShell receive console input
-records through disposable helpers. It does not switch the console desktop or move the
+records through disposable helpers. Session 0 has no Windows shell, so Windows-key
+shortcuts such as Win+R do nothing: the Windows key, and keys pressed while it is
+held, never reach applications. The Apps key opens the selected item's context menu. It does not switch the console desktop or move the
 console pointer. Console audio, clipboard synchronization, file-transfer UI, chat,
 blackout, input blocking, and Ctrl+Alt+Del are unavailable in background mode.
 Operations performed inside the workspace still affect the same machine, and

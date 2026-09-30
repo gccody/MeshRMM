@@ -1,6 +1,7 @@
 //! Experimental Session 0 GUI input and application launcher.
 //! No SendInput, console hooks, or user-token launches. The workspace makes its
 //! desktop Session 0's input desktop, but never switches the console's.
+mod keyboard;
 pub(super) mod launch;
 mod screen;
 
@@ -117,6 +118,7 @@ pub struct Workspace {
     pressed: Option<HWND>,
     drag: Option<(HWND, POINT, RECT)>,
     keys: [u8; 256],
+    shell_keys: keyboard::ShellKeys,
     attached_thread: Option<u32>,
     console_inputs: Vec<super::background_console::ConsoleInput>,
     /// Dropped last, after the applications and taskbar are gone.
@@ -174,6 +176,7 @@ impl Workspace {
                 pressed: None,
                 drag: None,
                 keys: [0; 256],
+                shell_keys: keyboard::ShellKeys::default(),
                 attached_thread: None,
                 console_inputs: Vec::new(),
                 _screen: screen,
@@ -771,6 +774,7 @@ impl Workspace {
             }
         }
         self.keys = [0; 256];
+        self.shell_keys.release();
         unsafe {
             let _ = SetKeyboardState(&self.keys);
             if let Some(thread) = self.attached_thread.take() {
@@ -781,7 +785,7 @@ impl Workspace {
     }
 
     pub fn apply(&mut self, event: RemoteInput) -> anyhow::Result<()> {
-        if event.display_id().0 != background::DISPLAY_ID {
+        if event.display_id().0 != background::DISPLAY_ID || !self.shell_keys.deliver(&event) {
             return Ok(());
         }
         if matches!(
@@ -919,6 +923,15 @@ impl Workspace {
                             message_key as usize,
                             bits | (isize::from(alt) << 29),
                         )?;
+                        // Windows opens the context menu from the key-up of a
+                        // real Apps key only, not from a posted one.
+                        if key == VK_APPS.0 as usize
+                            && !pressed
+                            && !alt
+                            && self.keys[VK_CONTROL.0 as usize] == 0
+                        {
+                            self.post(target, WM_CONTEXTMENU, target.0 as usize, -1)?;
+                        }
                     }
                 }
             }

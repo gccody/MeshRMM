@@ -1504,6 +1504,8 @@ fn console_exit_closes_window_task_and_input_helper() -> anyhow::Result<()> {
             std::thread::sleep(Duration::from_millis(20));
         }
         workspace.focus = console;
+        // A leaked Win+R would turn the command into "rexit".
+        press_win_r(&mut workspace)?;
         workspace.apply(RemoteInput::TypeText {
             display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
             text: "exit".into(),
@@ -1830,4 +1832,400 @@ fn session_zero_gui() -> anyhow::Result<()> {
     })
     .join()
     .expect("background test thread panicked")
+}
+
+fn key(workspace: &mut Workspace, scan_code: u16, extended: bool) -> anyhow::Result<()> {
+    for pressed in [true, false] {
+        workspace.apply(RemoteInput::Key {
+            display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+            scan_code,
+            extended,
+            pressed,
+        })?;
+    }
+    Ok(())
+}
+
+fn press_win_r(workspace: &mut Workspace) -> anyhow::Result<()> {
+    for (scan_code, extended, pressed) in [
+        (0x5b, true, true),
+        (0x13, false, true),
+        (0x13, false, false),
+        (0x5b, true, false),
+    ] {
+        workspace.apply(RemoteInput::Key {
+            display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+            scan_code,
+            extended,
+            pressed,
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
+fn windows_and_apps_keys() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+    static CONTEXT_MENUS: AtomicUsize = AtomicUsize::new(0);
+    static CONTEXT_POINT: AtomicIsize = AtomicIsize::new(0);
+    unsafe extern "system" fn test_window_proc(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if message == WM_CONTEXTMENU {
+            CONTEXT_MENUS.fetch_add(1, Ordering::SeqCst);
+            CONTEXT_POINT.store(lparam.0, Ordering::SeqCst);
+            return LRESULT(0);
+        }
+        unsafe { DefWindowProcW(window, message, wparam, lparam) }
+    }
+    std::thread::spawn(|| -> anyhow::Result<()> {
+        unsafe {
+            use windows::Win32::System::StationsAndDesktops::*;
+            let station = OpenWindowStationW(w!("WinSta0"), false, 0x000f037f)?;
+            SetProcessWindowStation(station)?;
+        }
+        let _owner = background::Desktop::create()?;
+        let _binding = background::Desktop::bind()?;
+        let mut workspace = Workspace::new()?;
+        let (window, edit) = unsafe {
+            RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(test_window_proc),
+                lpszClassName: w!("MeshRMMKeyboardTest"),
+                ..Default::default()
+            });
+            let window = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("MeshRMMKeyboardTest"),
+                w!("Keyboard test"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                40,
+                50,
+                400,
+                250,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            let edit = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("EDIT"),
+                w!(""),
+                WS_CHILD | WS_VISIBLE | WS_BORDER,
+                10,
+                10,
+                300,
+                24,
+                Some(window),
+                None,
+                None,
+                None,
+            )?;
+            (window, edit)
+        };
+        unsafe { SetFocus(Some(edit))? };
+        workspace.focus = edit;
+        press_win_r(&mut workspace)?;
+        key(&mut workspace, 0x13, false)?;
+        workspace.pump();
+        let mut text = [0_u16; 16];
+        let count = unsafe { GetWindowTextW(edit, &mut text) };
+        assert_eq!(
+            String::from_utf16_lossy(&text[..count as usize]),
+            "r",
+            "Win+R must type nothing, and R alone must still type"
+        );
+
+        unsafe { SetFocus(Some(window))? };
+        workspace.focus = window;
+        key(&mut workspace, 0x5d, true)?;
+        workspace.pump();
+        assert_eq!(
+            CONTEXT_MENUS.load(Ordering::SeqCst),
+            1,
+            "the Apps key must open exactly one context menu"
+        );
+        assert_eq!(
+            CONTEXT_POINT.load(Ordering::SeqCst),
+            -1,
+            "a keyboard context menu has no pointer position"
+        );
+        // A modifier makes it a shortcut, not a context-menu request.
+        workspace.apply(RemoteInput::Key {
+            display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+            scan_code: 0x1d,
+            extended: false,
+            pressed: true,
+        })?;
+        key(&mut workspace, 0x5d, true)?;
+        workspace.release();
+        workspace.pump();
+        assert_eq!(CONTEXT_MENUS.load(Ordering::SeqCst), 1);
+        Ok(())
+    })
+    .join()
+    .expect("keyboard test panicked")
+}
+
+/// The open popup menu's window and item labels, if a menu is showing.
+fn open_menu() -> anyhow::Result<Option<(HWND, Vec<String>)>> {
+    for window in background::windows()? {
+        let mut class = [0_u16; 16];
+        let length = unsafe { GetClassNameW(window, &mut class) };
+        let visible = unsafe { GetWindowLongW(window, GWL_STYLE) } as u32 & WS_VISIBLE.0 != 0;
+        if !visible || String::from_utf16_lossy(&class[..length as usize]) != "#32768" {
+            continue;
+        }
+        let mut menu = 0;
+        unsafe {
+            SendMessageTimeoutW(
+                window,
+                MN_GETHMENU,
+                WPARAM(0),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG,
+                500,
+                Some(&mut menu),
+            );
+        }
+        let menu = HMENU(menu as *mut _);
+        let items = (0..unsafe { GetMenuItemCount(Some(menu)) }.max(0))
+            .map(|position| {
+                let mut label = [0_u16; 128];
+                let length = unsafe {
+                    GetMenuStringW(menu, position as u32, Some(&mut label), MF_BYPOSITION)
+                };
+                String::from_utf16_lossy(&label[..length.max(0) as usize]).replace('&', "")
+            })
+            .collect();
+        return Ok(Some((window, items)));
+    }
+    Ok(None)
+}
+
+fn window_text(window: HWND) -> String {
+    let mut text = [0_u16; 512];
+    let mut length = 0;
+    unsafe {
+        SendMessageTimeoutW(
+            window,
+            WM_GETTEXT,
+            WPARAM(text.len()),
+            LPARAM(text.as_mut_ptr() as isize),
+            SMTO_ABORTIFHUNG,
+            500,
+            Some(&mut length),
+        );
+    }
+    String::from_utf16_lossy(&text[..length.min(text.len())])
+}
+
+/// The first visible descendant of `parent` with class `class` that satisfies
+/// `accept`, largest first.
+fn child(parent: HWND, class: &str, accept: &dyn Fn(HWND) -> bool) -> Option<HWND> {
+    unsafe extern "system" fn collect(window: HWND, parameter: LPARAM) -> windows::core::BOOL {
+        unsafe { (*(parameter.0 as *mut Vec<HWND>)).push(window) };
+        true.into()
+    }
+    let mut children = Vec::<HWND>::new();
+    unsafe {
+        let _ = EnumChildWindows(
+            Some(parent),
+            Some(collect),
+            LPARAM(&mut children as *mut _ as isize),
+        );
+    }
+    let area = |window: HWND| {
+        let mut rect = RECT::default();
+        let _ = unsafe { GetWindowRect(window, &mut rect) };
+        (rect.right - rect.left) * (rect.bottom - rect.top)
+    };
+    children
+        .into_iter()
+        .filter(|window| {
+            let mut name = [0_u16; 64];
+            let length = unsafe { GetClassNameW(*window, &mut name) };
+            String::from_utf16_lossy(&name[..length as usize]) == class
+                && unsafe { GetWindowLongW(*window, GWL_STYLE) } as u32 & WS_VISIBLE.0 != 0
+                && accept(*window)
+        })
+        .max_by_key(|window| area(*window))
+}
+
+fn click_at(workspace: &mut Workspace, x: i32, y: i32) -> anyhow::Result<()> {
+    workspace.move_pointer(
+        (x as u32 * 65535 / (WIDTH - 1)) as u16,
+        (y as u32 * 65535 / (HEIGHT - 1)) as u16,
+    );
+    workspace.button(PointerButton::Left, true)?;
+    workspace.button(PointerButton::Left, false)
+}
+
+/// Selects the first row of `list` with a click, presses the Apps key, and
+/// returns the context menu's items. Escape then closes it for good.
+fn apps_key_menu(workspace: &mut Workspace, list: HWND) -> anyhow::Result<Vec<String>> {
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(list, &mut rect)? };
+    let header = child(list, "SysHeader32", &|_| true)
+        .map(|header| {
+            let mut header_rect = RECT::default();
+            let _ = unsafe { GetWindowRect(header, &mut header_rect) };
+            header_rect.bottom
+        })
+        .unwrap_or(rect.top);
+    click_at(workspace, rect.left + 40, header + 8)?;
+    let settle = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settle {
+        workspace.pump();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    key(workspace, 0x5d, true)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (menu, items) = loop {
+        if let Some(open) = open_menu()? {
+            break open;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the Apps key opened no context menu"
+        );
+        workspace.pump();
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut position = RECT::default();
+    unsafe { GetWindowRect(menu, &mut position)? };
+    anyhow::ensure!(
+        position.left >= rect.left
+            && position.left < rect.right
+            && position.top >= rect.top
+            && position.top < rect.bottom,
+        "context menu at {position:?} is not at the selected item in {rect:?}"
+    );
+    key(workspace, 0x01, false)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while open_menu()?.is_some() {
+        anyhow::ensure!(Instant::now() < deadline, "Escape did not close the menu");
+        workspace.pump();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // A second menu would mean the app also acted on the Apps key itself.
+    let quiet = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < quiet {
+        anyhow::ensure!(open_menu()?.is_none(), "the Apps key opened a second menu");
+        workspace.pump();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(items)
+}
+
+#[test]
+#[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
+fn apps_key_opens_native_context_menus() -> anyhow::Result<()> {
+    std::thread::spawn(|| -> anyhow::Result<()> {
+        unsafe {
+            use windows::Win32::System::StationsAndDesktops::*;
+            let station = OpenWindowStationW(w!("WinSta0"), false, 0x000f037f)?;
+            SetProcessWindowStation(station)?;
+        }
+        let _owner = background::Desktop::create()?;
+        let _binding = background::Desktop::bind()?;
+        let mut workspace = Workspace::new()?;
+        let wait = |workspace: &mut Workspace,
+                    what: &str,
+                    found: &dyn Fn() -> Option<HWND>|
+         -> anyhow::Result<HWND> {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(window) = found() {
+                    return Ok(window);
+                }
+                anyhow::ensure!(Instant::now() < deadline, "timed out waiting for {what}");
+                workspace.pump();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let pin = |program: &str, arguments: &str| {
+            PINS.iter()
+                .position(|pin| pin.program.ends_with(program) && pin.arguments == arguments)
+                .unwrap()
+                + 1
+        };
+
+        workspace.launch(pin("regedit.exe", "/m"))?;
+        let regedit = wait(&mut workspace, "Registry Editor", &|| unsafe {
+            FindWindowW(w!("RegEdit_RegEdit"), None).ok()
+        })?;
+        let address = wait(&mut workspace, "the address bar", &|| {
+            child(regedit, "Edit", &|edit| {
+                window_text(edit).starts_with("Computer")
+            })
+        })?;
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(address, &mut rect)? };
+        // Type straight after the click, with no time for regedit to handle it.
+        click_at(
+            &mut workspace,
+            (rect.left + rect.right) / 2,
+            (rect.top + rect.bottom) / 2,
+        )?;
+        key(&mut workspace, 0x47, true)?;
+        workspace.apply(RemoteInput::Key {
+            display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+            scan_code: 0x2a,
+            extended: false,
+            pressed: true,
+        })?;
+        key(&mut workspace, 0x4f, true)?;
+        workspace.apply(RemoteInput::Key {
+            display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+            scan_code: 0x2a,
+            extended: false,
+            pressed: false,
+        })?;
+        let path = "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+        workspace.apply(RemoteInput::TypeText {
+            display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+            text: path.into(),
+        })?;
+        key(&mut workspace, 0x1c, false)?;
+        let expected = format!("Computer\\{path}");
+        wait(&mut workspace, "regedit to open the typed key", &|| {
+            (window_text(address) == expected).then_some(address)
+        })
+        .with_context(|| format!("address bar shows {:?}", window_text(address)))?;
+        let list = child(regedit, "SysListView32", &|_| true).context("regedit value list")?;
+        let items = apps_key_menu(&mut workspace, list)?;
+        anyhow::ensure!(
+            items.iter().any(|item| item.starts_with("Modify")),
+            "regedit opened {items:?}, not the value's menu"
+        );
+
+        workspace.launch(pin("mmc.exe", "services.msc"))?;
+        let services = wait(&mut workspace, "Services", &|| unsafe {
+            FindWindowW(w!("MMCMainFrame"), w!("Services")).ok()
+        })?;
+        let list = wait(&mut workspace, "the service list", &|| {
+            child(services, "SysListView32", &|list| unsafe {
+                SendMessageW(
+                    list,
+                    windows::Win32::UI::Controls::LVM_GETITEMCOUNT,
+                    None,
+                    None,
+                )
+                .0 > 0
+            })
+        })?;
+        let items = apps_key_menu(&mut workspace, list)?;
+        anyhow::ensure!(
+            items.iter().any(|item| item.starts_with("Properties")),
+            "Services opened {items:?}, not the service's menu"
+        );
+        Ok(())
+    })
+    .join()
+    .expect("context menu test panicked")
 }
