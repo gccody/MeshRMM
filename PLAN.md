@@ -12,15 +12,17 @@ The plan has 11 tasks. Task 1 is a short experiment that decides how Tasks 7–9
 
 ## Order and dependencies
 
-| Start now, in parallel | Wait for Task 1's result |
+| Start now, in parallel | Wait for the real-input change (Task 1 result: go) |
 |---|---|
-| 1 (experiment), 2, 3, 4, 5, 6, 10 | 7, 8, 9, 11 |
+| 3, 4, 6, 10, and 5 item 1 | 2, 7, 8, 9, 11 |
 
-Task 1 needs approval before a thread starts it: `agent/src/remote/background.rs:2` explicitly rules out "SendInput, desktop switching". If that approach is rejected, skip Task 1 and start Tasks 7–9 now.
+**Task 1 is done: "go".** See `docs/background-real-input.md` for the evidence and the sketch. The next step is implementing that sketch. Task 2 now depends on it too, because Session 0's display mode can only be changed while the background desktop is the input desktop.
 
 ---
 
 ## Task 1 — Experiment: real mouse and keyboard input inside Session 0 (time limit: 1 day)
+
+**Status: done, "go"** (2026-09-30). With `SwitchDesktop` plus `DESKTOP_JOURNALPLAYBACK` on the injecting thread's desktop handle, every check below passes except Disk Management's wheel, which the app itself ignores. The console is unaffected. Details and the implementation sketch are in `docs/background-real-input.md`.
 
 **Why.** Most of the input bugs happen because the workspace *posts* window messages instead of producing real input. As a result, Windows never generates double-clicks, the cursor position apps read is wrong, menu loops and scrollbars never start tracking, and WinForms and custom buttons misbehave.
 
