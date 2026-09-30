@@ -230,6 +230,8 @@ Add native tests.
 
 ## Task 10 — Open/Save dialogs report the SYSTEM Desktop folder as unavailable
 
+**Status: done** (2026-09-30). `Workspace::new` calls `background/profile.rs`, which creates `Desktop` in `System32\config\systemprofile` and, where that profile exists, in `SysWOW64\config\systemprofile`. It doesn't create a missing profile, and a failure is logged without stopping the workspace. `README.md` names the change. On `DESKTOP-85R6S28`, neither folder existed. With the previous installed build, Notepad's Save As and Event Viewer's Save All Events As each opened a "Location is not available" box beside the Save As dialog. regedit's Export, an older-style dialog, showed no error even then. With the new build installed, the service's input helper created both folders when the workspace started, and all three dialogs opened with no error.
+
 **Evidence.** Every common Open/Save dialog first shows "`C:\WINDOWS\system32\config\systemprofile\Desktop` is unavailable". Notepad's Save As worked once that was dismissed.
 
 **What to do.** Before launching apps, create `%SystemRoot%\System32\config\systemprofile\Desktop` if it's missing, and the matching folder under `SysWOW64` on 64-bit Windows. This is a small, deliberate change to the machine; mention it in `README.md`.

@@ -636,7 +636,11 @@ sets Session 0's display mode to 1280×800 (it idles at 1024×768), sets the wor
 area to end above the 48-pixel taskbar, so maximized and newly opened windows fit
 the canvas, and has the wheel scroll the window under the pointer. None of these
 changes is saved; closing the workspace restores the previous desktop, mode, work
-area, and wheel setting. If Windows refuses the mode, applications keep laying out
+area, and wheel setting. The workspace makes one lasting change to the machine:
+it creates SYSTEM's Desktop folder, `%SystemRoot%\System32\config\systemprofile\Desktop`,
+and the matching folder under `SysWOW64` on 64-bit Windows, if they're missing.
+Without them, every Open and Save dialog first reports that the Desktop is
+unavailable. If Windows refuses the mode, applications keep laying out
 for Session 0's smaller screen, and the pointer can't reach past it.
 Applications get the same input as from a local mouse and keyboard: menus open and
 run from clicks, double-clicks open items, right-click menus appear at the pointer,

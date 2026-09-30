@@ -7,6 +7,7 @@
 mod inject;
 mod keyboard;
 pub(super) mod launch;
+mod profile;
 mod run;
 mod screen;
 
@@ -201,6 +202,7 @@ struct TaskWindow {
 impl Workspace {
     pub fn new() -> anyhow::Result<Self> {
         background::require_session_zero()?;
+        profile::create_desktop_folders();
         let screen = screen::Screen::claim(TASKBAR_HEIGHT);
         unsafe {
             let job = CreateJobObjectW(None, PCWSTR::null())?;
