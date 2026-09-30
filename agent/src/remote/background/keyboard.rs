@@ -3,10 +3,21 @@ use meshrmm_protocol::RemoteInput;
 
 /// Scan codes of the left and right Windows keys, both extended.
 const WINDOWS_KEYS: [u16; 2] = [0x5b, 0x5c];
+const R: u16 = 0x13;
+
+/// Where a key event goes.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Route {
+    Application,
+    Dropped,
+    /// Win+R, which the workspace handles like the Windows shell.
+    Run,
+}
 
 /// Session 0 has no shell to consume Windows-key shortcuts, so without this,
 /// Win+R would reach the app as a plain R and type "r". The Windows keys, and
 /// every key pressed while one is held, are dropped along with their releases.
+/// Win+R opens the workspace's Run dialog.
 #[derive(Default)]
 pub(super) struct ShellKeys {
     /// (scan code, extended) of each key whose press was dropped.
@@ -14,8 +25,7 @@ pub(super) struct ShellKeys {
 }
 
 impl ShellKeys {
-    /// Whether `event` should reach the application.
-    pub(super) fn deliver(&mut self, event: &RemoteInput) -> bool {
+    pub(super) fn route(&mut self, event: &RemoteInput) -> Route {
         let RemoteInput::Key {
             scan_code,
             extended,
@@ -23,7 +33,7 @@ impl ShellKeys {
             ..
         } = *event
         else {
-            return true;
+            return Route::Application;
         };
         let key = (scan_code, extended);
         if pressed {
@@ -33,17 +43,21 @@ impl ShellKeys {
                 .iter()
                 .any(|&(scan, extended)| extended && WINDOWS_KEYS.contains(&scan));
             if !windows && !held {
-                return true;
+                return Route::Application;
             }
             if !self.dropped.contains(&key) {
                 self.dropped.push(key);
             }
-            false
+            if held && key == (R, false) {
+                Route::Run
+            } else {
+                Route::Dropped
+            }
         } else if let Some(index) = self.dropped.iter().position(|dropped| *dropped == key) {
             self.dropped.swap_remove(index);
-            false
+            Route::Dropped
         } else {
-            true
+            Route::Application
         }
     }
 
@@ -68,32 +82,41 @@ mod tests {
 
     #[test]
     fn windows_shortcuts_are_dropped() {
+        use Route::*;
         let mut keys = ShellKeys::default();
         let shift = [key(0x2a, false, true), key(0x2a, false, false)];
-        assert!(keys.deliver(&shift[0]));
+        assert_eq!(keys.route(&shift[0]), Application);
         // Win+R, with auto-repeat, and R released after Win.
-        for (event, delivered) in [
-            (key(0x5b, true, true), false),
-            (key(0x13, false, true), false),
-            (key(0x5b, true, true), false),
-            (key(0x13, false, true), false),
-            (key(0x5b, true, false), false),
+        for (event, route) in [
+            (key(0x5b, true, true), Dropped),
+            (key(0x13, false, true), Run),
+            (key(0x5b, true, true), Dropped),
+            (key(0x13, false, true), Run),
+            (key(0x5b, true, false), Dropped),
             // Shift was pressed before Win, so its release still counts.
-            (shift[1].clone(), true),
-            (key(0x13, false, false), false),
-            (key(0x13, false, true), true),
-            (key(0x13, false, false), true),
+            (shift[1].clone(), Application),
+            (key(0x13, false, false), Dropped),
+            (key(0x13, false, true), Application),
+            (key(0x13, false, false), Application),
+            // Other Windows-key shortcuts do nothing.
+            (key(0x5c, true, true), Dropped),
+            (key(0x12, false, true), Dropped),
+            (key(0x12, false, false), Dropped),
+            (key(0x5c, true, false), Dropped),
         ] {
-            assert_eq!(keys.deliver(&event), delivered, "{event:?}");
+            assert_eq!(keys.route(&event), route, "{event:?}");
         }
         // Scan code 0x5b without the extended flag is not a Windows key.
-        assert!(keys.deliver(&key(0x5b, false, true)));
-        assert!(!keys.deliver(&key(0x5c, true, true)));
+        assert_eq!(keys.route(&key(0x5b, false, true)), Application);
+        assert_eq!(keys.route(&key(0x5c, true, true)), Dropped);
         keys.release();
-        assert!(keys.deliver(&key(0x13, false, true)));
-        assert!(keys.deliver(&RemoteInput::TypeText {
-            display_id: DisplayId(0),
-            text: "r".into(),
-        }));
+        assert_eq!(keys.route(&key(0x13, false, true)), Application);
+        assert_eq!(
+            keys.route(&RemoteInput::TypeText {
+                display_id: DisplayId(0),
+                text: "r".into(),
+            }),
+            Application
+        );
     }
 }

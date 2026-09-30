@@ -3,6 +3,7 @@
 //! desktop Session 0's input desktop, but never switches the console's.
 mod keyboard;
 pub(super) mod launch;
+mod run;
 mod screen;
 
 use crate::win32::wide;
@@ -28,78 +29,131 @@ const TASK_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 /// An application on the background taskbar.
 struct Pin {
     label: &'static str,
+    kind: Kind,
+    /// Relative to System32. Built-in tools run the Agent itself.
     program: &'static str,
     arguments: &'static str,
+    /// The file, relative to System32, and index `ExtractIconExW` takes the icon from.
+    icon: (&'static str, i32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Program,
     /// Runs in its own console, which takes keyboard input through a console input helper.
-    console: bool,
+    Console,
+    /// Built-in tools, one window each, that replace Windows' shell-bound ones.
+    TaskManager,
+    FileExplorer,
+    Run,
 }
 
 const PINS: &[Pin] = &[
     Pin {
         label: "Command Prompt",
+        kind: Kind::Console,
         program: "cmd.exe",
         arguments: "/k title MeshRMM Background Command Prompt",
-        console: true,
+        icon: ("cmd.exe", 0),
     },
     Pin {
         label: "PowerShell",
+        kind: Kind::Console,
         program: "WindowsPowerShell\\v1.0\\powershell.exe",
         arguments: "-NoLogo -NoProfile -NoExit",
-        console: true,
+        icon: ("WindowsPowerShell\\v1.0\\powershell.exe", 0),
     },
     Pin {
         label: "Registry Editor",
+        kind: Kind::Program,
         program: "..\\regedit.exe",
         arguments: "/m",
-        console: false,
+        icon: ("..\\regedit.exe", 0),
     },
     Pin {
         label: "Services",
+        kind: Kind::Program,
         program: "mmc.exe",
         arguments: "services.msc",
-        console: false,
+        icon: ("filemgmt.dll", 0),
     },
     Pin {
         label: "Event Viewer",
+        kind: Kind::Program,
         program: "mmc.exe",
         arguments: "eventvwr.msc",
-        console: false,
+        icon: ("miguiresource.dll", 0),
     },
     Pin {
         label: "Resource Monitor",
+        kind: Kind::Program,
         program: "resmon.exe",
         arguments: "",
-        console: false,
+        icon: ("resmon.exe", 0),
     },
     Pin {
         label: "Task Manager",
-        program: "taskmgr.exe",
+        kind: Kind::TaskManager,
+        program: "",
         arguments: "--background-task-manager",
-        console: false,
+        icon: ("taskmgr.exe", 0),
     },
     Pin {
         label: "Computer Mgmt",
+        kind: Kind::Program,
         program: "mmc.exe",
         arguments: "compmgmt.msc",
-        console: false,
+        icon: ("mycomput.dll", 2),
     },
     Pin {
         label: "Device Manager",
+        kind: Kind::Program,
         program: "mmc.exe",
         arguments: "devmgmt.msc",
-        console: false,
+        icon: ("devmgr.dll", 5),
     },
     Pin {
         label: "Firewall",
+        kind: Kind::Program,
         program: "mmc.exe",
         arguments: "wf.msc",
-        console: false,
+        icon: ("authfwgp.dll", 0),
     },
     Pin {
         label: "File Explorer",
-        program: "..\\explorer.exe",
+        kind: Kind::FileExplorer,
+        program: "",
         arguments: "--background-file-browser",
-        console: false,
+        icon: ("..\\explorer.exe", 0),
+    },
+    Pin {
+        label: "Disk Management",
+        kind: Kind::Program,
+        program: "mmc.exe",
+        arguments: "diskmgmt.msc",
+        icon: ("dmdskres.dll", 0),
+    },
+    // sysdm.cpl starts SystemPropertiesComputerName.exe; this opens the Advanced tab.
+    Pin {
+        label: "System Properties",
+        kind: Kind::Program,
+        program: "SystemPropertiesAdvanced.exe",
+        arguments: "",
+        icon: ("SystemPropertiesAdvanced.exe", 0),
+    },
+    Pin {
+        label: "Notepad",
+        kind: Kind::Program,
+        program: "notepad.exe",
+        arguments: "",
+        icon: ("notepad.exe", 0),
+    },
+    Pin {
+        label: "Run",
+        kind: Kind::Run,
+        program: "",
+        arguments: "",
+        icon: ("shell32.dll", 24),
     },
 ];
 
@@ -121,6 +175,8 @@ pub struct Workspace {
     shell_keys: keyboard::ShellKeys,
     attached_thread: Option<u32>,
     console_inputs: Vec<super::background_console::ConsoleInput>,
+    /// Created the first time it opens.
+    run: Option<run::Run>,
     /// Dropped last, after the applications and taskbar are gone.
     _screen: screen::Screen,
 }
@@ -179,6 +235,7 @@ impl Workspace {
                 shell_keys: keyboard::ShellKeys::default(),
                 attached_thread: None,
                 console_inputs: Vec::new(),
+                run: None,
                 _screen: screen,
             };
             let class = WNDCLASSW {
@@ -245,14 +302,7 @@ impl Workspace {
                     None,
                     None,
                 )?;
-                let (icon_file, icon_index) = match pin.arguments {
-                    "services.msc" => ("filemgmt.dll", 0),
-                    "eventvwr.msc" => ("miguiresource.dll", 0),
-                    "compmgmt.msc" => ("mycomput.dll", 2),
-                    "devmgmt.msc" => ("devmgr.dll", 4),
-                    "wf.msc" => ("authfwgp.dll", 0),
-                    _ => (pin.program, 0),
-                };
+                let (icon_file, icon_index) = pin.icon;
                 let path = wide(system32.join(icon_file));
                 let mut icon = HICON::default();
                 ExtractIconExW(PCWSTR(path.as_ptr()), icon_index, Some(&mut icon), None, 1);
@@ -400,59 +450,59 @@ impl Workspace {
         let pin = PINS
             .get(index.wrapping_sub(1))
             .context("unknown background application")?;
-        let (program, arguments) = (&pin.program, &pin.arguments);
-        if matches!(
-            *arguments,
-            "--background-task-manager" | "--background-file-browser"
-        ) {
-            unsafe {
-                let (class, owned) = if *arguments == "--background-task-manager" {
-                    (w!("MeshRMMBackgroundTasks"), &self.task_managers)
-                } else {
-                    (w!("MeshRMMBackgroundFiles"), &self.file_browsers)
-                };
-                if let Ok(window) = FindWindowW(class, None) {
-                    let mut pid = 0;
-                    GetWindowThreadProcessId(window, Some(&mut pid));
-                    if owned.iter().any(|(owned, _)| *owned == pid)
-                        || (*arguments == "--background-file-browser" && self.owns_window(window))
-                    {
-                        self.bring_forward(window);
-                        return Ok(());
-                    }
-                }
-            }
+        if pin.kind == Kind::Run {
+            self.open_run();
+            return Ok(());
         }
-        let system32 = crate::win32::windows_directory()?.join("System32");
-        let built_in = matches!(
-            *arguments,
-            "--background-task-manager" | "--background-file-browser"
-        );
-        let path = if built_in {
-            #[cfg(test)]
-            let executable = std::path::PathBuf::from(
-                std::env::var_os("MESHRMM_BACKGROUND_TEST_AGENT").context(
-                    "set MESHRMM_BACKGROUND_TEST_AGENT to the built Agent for GUI tests",
-                )?,
-            );
-            #[cfg(not(test))]
-            let executable = std::env::current_exe()?;
-            executable
-        } else {
-            system32.join(program)
+        if let Some(window) = self.tool_window(pin.kind) {
+            self.bring_forward(window);
+            return Ok(());
+        }
+        let executable = match pin.kind {
+            Kind::TaskManager | Kind::FileExplorer => agent_executable()?,
+            _ => crate::win32::windows_directory()?
+                .join("System32")
+                .join(pin.program),
         };
         let started = launch::launch(launch::Launch {
-            executable: Some(path.as_path()),
-            command: &format!("\"{}\" {arguments}", path.display()),
+            executable: Some(&executable),
+            command: &format!("\"{}\" {}", executable.display(), pin.arguments),
             flags: CREATE_SUSPENDED
-                | if built_in {
-                    CREATE_NO_WINDOW
-                } else {
-                    CREATE_NEW_CONSOLE
+                | match pin.kind {
+                    Kind::TaskManager | Kind::FileExplorer => CREATE_NO_WINDOW,
+                    _ => CREATE_NEW_CONSOLE,
                 },
             window: Some((40, 24, 1100, (HEIGHT as i32 - TASKBAR_HEIGHT - 48) as u32)),
             ..Default::default()
         })?;
+        let process_id = started.id;
+        self.adopt(started, pin.kind)?;
+        tracing::info!(
+            session_id = 0,
+            process_id,
+            program = pin.label,
+            "background application started"
+        );
+        Ok(())
+    }
+
+    /// The open window of a built-in tool that allows only one.
+    fn tool_window(&self, kind: Kind) -> Option<HWND> {
+        let (class, owned) = match kind {
+            Kind::TaskManager => (w!("MeshRMMBackgroundTasks"), &self.task_managers),
+            Kind::FileExplorer => (w!("MeshRMMBackgroundFiles"), &self.file_browsers),
+            _ => return None,
+        };
+        let window = unsafe { FindWindowW(class, None) }.ok()?;
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+        (owned.iter().any(|(owned, _)| *owned == pid)
+            || (kind == Kind::FileExplorer && self.owns_window(window)))
+        .then_some(window)
+    }
+
+    /// Moves a suspended process into the workspace's job, then starts it.
+    fn adopt(&mut self, started: launch::DesktopProcess, kind: Kind) -> anyhow::Result<()> {
         unsafe {
             let result = AssignProcessToJobObject(self.job, started.process.0);
             if result.is_err() || ResumeThread(started.thread.0) == u32::MAX {
@@ -462,38 +512,128 @@ impl Workspace {
             }
         }
         let process_id = started.id;
-        if *arguments == "--background-task-manager" {
+        match kind {
             // Retain the process handle so its PID cannot be recycled before
             // cleaning its private telemetry session on forced job shutdown.
-            self.task_managers
-                .push((process_id, started.process.into_raw()));
-        } else if *arguments == "--background-file-browser" {
-            self.file_browsers
-                .push((process_id, started.process.into_raw()));
+            Kind::TaskManager => self
+                .task_managers
+                .push((process_id, started.process.into_raw())),
+            Kind::FileExplorer => self
+                .file_browsers
+                .push((process_id, started.process.into_raw())),
+            Kind::Console => {
+                self.console_inputs
+                    .push(super::background_console::ConsoleInput::start(
+                        process_id, self.job,
+                    )?)
+            }
+            Kind::Program | Kind::Run => {}
         }
-        if pin.console {
-            self.console_inputs
-                .push(super::background_console::ConsoleInput::start(
-                    process_id, self.job,
-                )?);
+        Ok(())
+    }
+
+    /// Opens Run and moves keyboard input to it, as Win+R does.
+    fn open_run(&mut self) {
+        if self.run.is_none() {
+            let icon = self.pin_icon(Kind::Run);
+            match run::Run::new(icon) {
+                Ok(run) => self.run = Some(run),
+                Err(error) => {
+                    tracing::warn!(%error, "could not create the background Run dialog");
+                    return;
+                }
+            }
         }
+        let Some(run) = &mut self.run else {
+            return;
+        };
+        if !run.visible() {
+            run.previous = self.focus;
+        }
+        run.show(work_area());
+        self.focus = run.edit;
+    }
+
+    /// Runs what Run's OK asked for, or closes it on Cancel.
+    fn run_action(&mut self) {
+        let Some(run) = &self.run else {
+            return;
+        };
+        match run.take_action() {
+            run::Action::None => return,
+            run::Action::Close => {}
+            run::Action::Run => {
+                let command = run.command();
+                if let Err(error) = self.run_command(&command) {
+                    if let Some(run) = &self.run {
+                        run.set_error(&format!("{error:#}"));
+                    }
+                    return;
+                }
+            }
+        }
+        let Some(run) = &self.run else {
+            return;
+        };
+        run.hide();
+        // Typing goes back where it went before Run opened.
+        let previous = run.previous;
+        self.focus = if unsafe { IsWindow(Some(previous)) }.as_bool() {
+            previous
+        } else {
+            HWND::default()
+        };
+    }
+
+    fn run_command(&mut self, command: &str) -> anyhow::Result<()> {
+        let target = launch::resolve(command)?;
+        let kind = match target {
+            launch::Target::TaskManager => {
+                let index = PINS
+                    .iter()
+                    .position(|pin| pin.kind == Kind::TaskManager)
+                    .context("Task Manager is not pinned")?;
+                return self.launch(index + 1);
+            }
+            launch::Target::Folder(_) => Kind::FileExplorer,
+            launch::Target::Program { console: true, .. } => Kind::Console,
+            launch::Target::Program { .. } => Kind::Program,
+        };
+        let started = launch::start(&target, &agent_executable()?, CREATE_SUSPENDED)?;
+        let process_id = started.id;
+        self.adopt(started, kind)?;
         tracing::info!(
             session_id = 0,
             process_id,
-            program,
-            "background application started"
+            "background Run started a program"
         );
         Ok(())
+    }
+
+    fn pin_icon(&self, kind: Kind) -> HICON {
+        PINS.iter()
+            .position(|pin| pin.kind == kind)
+            .and_then(|index| unsafe { GetDlgItem(Some(self.shell), index as i32 + 1) }.ok())
+            .map(|button| HICON(unsafe { GetWindowLongPtrW(button, GWLP_USERDATA) } as *mut _))
+            .unwrap_or_default()
     }
 
     pub fn pump(&mut self) {
         unsafe {
             let mut message = MSG::default();
             while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                if self
+                    .run
+                    .as_ref()
+                    .is_some_and(|run| run.dialog_message(&message))
+                {
+                    continue;
+                }
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
         }
+        self.run_action();
         if self.last_task_refresh.elapsed() >= TASK_REFRESH_INTERVAL {
             if let Err(error) = self.refresh_tasks() {
                 tracing::warn!(%error, "could not refresh background taskbar");
@@ -785,8 +925,16 @@ impl Workspace {
     }
 
     pub fn apply(&mut self, event: RemoteInput) -> anyhow::Result<()> {
-        if event.display_id().0 != background::DISPLAY_ID || !self.shell_keys.deliver(&event) {
+        if event.display_id().0 != background::DISPLAY_ID {
             return Ok(());
+        }
+        match self.shell_keys.route(&event) {
+            keyboard::Route::Application => {}
+            keyboard::Route::Dropped => return Ok(()),
+            keyboard::Route::Run => {
+                self.open_run();
+                return Ok(());
+            }
         }
         if matches!(
             event,
@@ -989,6 +1137,7 @@ impl Drop for Workspace {
     fn drop(&mut self) {
         self.release();
         self.console_inputs.clear();
+        self.run = None;
         unsafe {
             let _ = CloseHandle(self.job);
             for (pid, process) in self.task_managers.drain(..) {
@@ -1016,6 +1165,16 @@ impl Drop for Workspace {
             }
         }
     }
+}
+
+/// The Agent, which runs the built-in tools.
+fn agent_executable() -> anyhow::Result<std::path::PathBuf> {
+    #[cfg(test)]
+    return Ok(std::env::var_os("MESHRMM_BACKGROUND_TEST_AGENT")
+        .context("set MESHRMM_BACKGROUND_TEST_AGENT to the built Agent for GUI tests")?
+        .into());
+    #[cfg(not(test))]
+    Ok(std::env::current_exe()?)
 }
 
 /// Where Session 0 maximizes windows. The workspace sets it to end above the
@@ -1136,12 +1295,13 @@ fn task_icon(window: HWND, process_id: u32, shell: HWND) -> HICON {
         let mut class = [0_u16; 64];
         let length = GetClassNameW(window, &mut class) as usize;
         let pinned = match String::from_utf16_lossy(&class[..length]).as_str() {
-            "MeshRMMBackgroundTasks" => Some(7),
-            "MeshRMMBackgroundFiles" => Some(11),
+            "MeshRMMBackgroundTasks" => Some(Kind::TaskManager),
+            "MeshRMMBackgroundFiles" => Some(Kind::FileExplorer),
+            "MeshRMMBackgroundRun" => Some(Kind::Run),
             _ => None,
         };
-        if let Some(index) = pinned
-            && let Ok(button) = GetDlgItem(Some(shell), index)
+        if let Some(index) = pinned.and_then(|kind| PINS.iter().position(|pin| pin.kind == kind))
+            && let Ok(button) = GetDlgItem(Some(shell), index as i32 + 1)
         {
             let source = HICON(GetWindowLongPtrW(button, GWLP_USERDATA) as *mut _);
             if !source.is_invalid()

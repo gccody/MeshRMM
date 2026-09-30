@@ -1,6 +1,6 @@
 //! Windows 10-style file management on the isolated maintenance desktop.
 mod clipboard;
-mod controls;
+pub(super) mod controls;
 mod frame;
 mod launch;
 mod model;

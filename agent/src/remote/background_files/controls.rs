@@ -207,7 +207,7 @@ pub(super) fn install(list: HWND, font: HFONT) -> anyhow::Result<()> {
 
 // Activate common-controls v6 for this helper only. Other Agent windows retain
 // their existing activation context. v5 silently ignores LVM_SETVIEW.
-pub(super) struct VisualStyles {
+pub(crate) struct VisualStyles {
     handle: HANDLE,
     cookie: usize,
     manifest: PathBuf,

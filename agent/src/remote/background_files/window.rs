@@ -591,7 +591,11 @@ pub(super) fn run_inner() -> anyhow::Result<()> {
     meshrmm_remote_screen::background::require_session_zero()?;
     let _desktop = meshrmm_remote_screen::background::Desktop::bind()?;
     let _styles = controls::VisualStyles::activate()?;
-    let path = PathBuf::new();
+    // Run opens a folder here. Without one, the browser lists the drives.
+    let path = std::env::args_os()
+        .nth(2)
+        .map(PathBuf::from)
+        .unwrap_or_default();
     unsafe {
         InitCommonControlsEx(&INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,

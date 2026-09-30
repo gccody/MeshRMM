@@ -1478,7 +1478,7 @@ fn console_exit_closes_window_task_and_input_helper() -> anyhow::Result<()> {
             .position(|pin| pin.program == "cmd.exe")
             .unwrap()
             + 1;
-        assert!(PINS[pin - 1].console);
+        assert_eq!(PINS[pin - 1].kind, Kind::Console);
         workspace.launch(pin)?;
         assert_eq!(workspace.console_inputs.len(), 1);
         let helper = workspace.console_inputs[0].helper_process_id();
@@ -1504,8 +1504,10 @@ fn console_exit_closes_window_task_and_input_helper() -> anyhow::Result<()> {
             std::thread::sleep(Duration::from_millis(20));
         }
         workspace.focus = console;
-        // A leaked Win+R would turn the command into "rexit".
+        // A leaked Win+R would turn the command into "rexit". Closing Run
+        // must hand typing back to the console.
         press_win_r(&mut workspace)?;
+        close_run(&mut workspace, console)?;
         workspace.apply(RemoteInput::TypeText {
             display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
             text: "exit".into(),
@@ -1863,6 +1865,27 @@ fn press_win_r(workspace: &mut Workspace) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Checks that Win+R opened Run with keyboard input, then closes it with
+/// Escape, which must hand keyboard input back to `previous`.
+fn close_run(workspace: &mut Workspace, previous: HWND) -> anyhow::Result<()> {
+    workspace.pump();
+    let run = workspace.run.as_ref().context("Win+R did not open Run")?;
+    anyhow::ensure!(run.visible(), "Win+R did not show Run");
+    anyhow::ensure!(
+        workspace.focus == run.edit,
+        "Run did not take keyboard input"
+    );
+    key(workspace, 0x01, false)?;
+    workspace.pump();
+    let run = workspace.run.as_ref().context("Run went away")?;
+    anyhow::ensure!(!run.visible(), "Escape did not close Run");
+    anyhow::ensure!(
+        workspace.focus == previous,
+        "closing Run did not hand keyboard input back"
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
 fn windows_and_apps_keys() -> anyhow::Result<()> {
@@ -1930,6 +1953,8 @@ fn windows_and_apps_keys() -> anyhow::Result<()> {
         unsafe { SetFocus(Some(edit))? };
         workspace.focus = edit;
         press_win_r(&mut workspace)?;
+        close_run(&mut workspace, edit)?;
+        unsafe { SetFocus(Some(edit))? };
         key(&mut workspace, 0x13, false)?;
         workspace.pump();
         let mut text = [0_u16; 16];
@@ -1939,6 +1964,8 @@ fn windows_and_apps_keys() -> anyhow::Result<()> {
             "r",
             "Win+R must type nothing, and R alone must still type"
         );
+        let run = workspace.run.as_ref().context("Win+R opened Run")?;
+        assert_eq!(window_text(run.edit), "", "Win+R typed into Run");
 
         unsafe { SetFocus(Some(window))? };
         workspace.focus = window;
@@ -2228,4 +2255,231 @@ fn apps_key_opens_native_context_menus() -> anyhow::Result<()> {
     })
     .join()
     .expect("context menu test panicked")
+}
+
+/// The top-level window a process in the workspace's job shows, if any.
+fn job_window(
+    workspace: &Workspace,
+    accept: &dyn Fn(&str, &str) -> bool,
+) -> anyhow::Result<Option<HWND>> {
+    for window in background::windows()? {
+        let mut class = [0_u16; 64];
+        let length = unsafe { GetClassNameW(window, &mut class) } as usize;
+        if accept(
+            &String::from_utf16_lossy(&class[..length]),
+            &window_text(window),
+        ) && workspace.owns_window(window)
+        {
+            return Ok(Some(window));
+        }
+    }
+    Ok(None)
+}
+
+fn wait_for_job_window(
+    workspace: &mut Workspace,
+    what: &str,
+    accept: &dyn Fn(&str, &str) -> bool,
+) -> anyhow::Result<HWND> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        workspace.pump();
+        if let Some(window) = job_window(workspace, accept)? {
+            return Ok(window);
+        }
+        if Instant::now() >= deadline {
+            let windows = background::windows()?
+                .into_iter()
+                .map(window_text)
+                .collect::<Vec<_>>();
+            anyhow::bail!("{what} did not open in the workspace's job; windows: {windows:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn close_job_window(workspace: &mut Workspace, window: HWND) -> anyhow::Result<()> {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+    let process = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid)? };
+    unsafe {
+        let _ = TerminateProcess(process, 1);
+        WaitForSingleObject(process, 5000);
+        CloseHandle(process)?;
+    }
+    workspace.pump();
+    Ok(())
+}
+
+fn proof(name: &str) -> anyhow::Result<()> {
+    std::fs::write(
+        std::env::var_os("MESHRMM_BACKGROUND_PROOF_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(name),
+        background::snapshot_bmp()?,
+    )?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
+fn new_pins_open_in_workspace_job() -> anyhow::Result<()> {
+    std::thread::spawn(|| -> anyhow::Result<()> {
+        unsafe {
+            use windows::Win32::System::StationsAndDesktops::*;
+            let station = OpenWindowStationW(w!("WinSta0"), false, 0x000f037f)?;
+            SetProcessWindowStation(station)?;
+        }
+        let _owner = background::Desktop::create()?;
+        let _binding = background::Desktop::bind()?;
+        let mut workspace = Workspace::new()?;
+        workspace.pump();
+        // Every pin has an icon.
+        for (index, pin) in PINS.iter().enumerate() {
+            let button = unsafe { GetDlgItem(Some(workspace.shell), index as i32 + 1)? };
+            let icon = unsafe { GetWindowLongPtrW(button, GWLP_USERDATA) };
+            anyhow::ensure!(icon != 0, "{} has no icon", pin.label);
+        }
+        proof("background-pins.bmp")?;
+        let pin = |label: &str| PINS.iter().position(|pin| pin.label == label).unwrap() + 1;
+        for (label, class, title) in [
+            ("Disk Management", "MMCMainFrame", "Disk Management"),
+            ("System Properties", "#32770", "System Properties"),
+            ("Notepad", "Notepad", "Untitled - Notepad"),
+        ] {
+            workspace.launch(pin(label))?;
+            let window = wait_for_job_window(&mut workspace, label, &|window_class, text| {
+                window_class == class && text == title
+            })?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !workspace.tasks.iter().any(|task| task.window == window) {
+                anyhow::ensure!(Instant::now() < deadline, "{label} got no taskbar button");
+                workspace.pump();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            proof(&format!("background-pin-{}.bmp", label.replace(' ', "-")))?;
+            close_job_window(&mut workspace, window)?;
+        }
+        Ok(())
+    })
+    .join()
+    .expect("pin test panicked")
+}
+
+#[test]
+#[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
+fn run_opens_programs_documents_and_folders() -> anyhow::Result<()> {
+    std::thread::spawn(|| -> anyhow::Result<()> {
+        unsafe {
+            use windows::Win32::System::StationsAndDesktops::*;
+            let station = OpenWindowStationW(w!("WinSta0"), false, 0x000f037f)?;
+            SetProcessWindowStation(station)?;
+        }
+        let _owner = background::Desktop::create()?;
+        let _binding = background::Desktop::bind()?;
+        let mut workspace = Workspace::new()?;
+        workspace.pump();
+        let run_pin = PINS.iter().position(|pin| pin.kind == Kind::Run).unwrap();
+        let button = unsafe { GetDlgItem(Some(workspace.shell), run_pin as i32 + 1)? };
+        let type_command = |workspace: &mut Workspace, command: &str| -> anyhow::Result<()> {
+            workspace.apply(RemoteInput::TypeText {
+                display_id: meshrmm_protocol::DisplayId(background::DISPLAY_ID),
+                text: command.into(),
+            })?;
+            key(workspace, 0x1c, false)?;
+            workspace.pump();
+            Ok(())
+        };
+        let mut first = true;
+        for (command, class, title) in [
+            ("notepad", "Notepad", "Untitled - Notepad"),
+            ("diskmgmt.msc", "MMCMainFrame", "Disk Management"),
+            ("sysdm.cpl", "#32770", "System Properties"),
+            (
+                r"%SystemRoot%\System32",
+                "MeshRMMBackgroundFiles",
+                "File Explorer",
+            ),
+        ] {
+            // The pin opens Run the first time, and Win+R after that.
+            if first {
+                click_task(&mut workspace, button)?;
+                first = false;
+            } else {
+                press_win_r(&mut workspace)?;
+            }
+            workspace.pump();
+            let run = workspace.run.as_ref().context("Run did not open")?;
+            anyhow::ensure!(run.visible(), "Run is hidden");
+            anyhow::ensure!(workspace.focus == run.edit, "Run has no keyboard input");
+            if command == "notepad" {
+                // Like Windows' Run, it has a taskbar button.
+                let window = run.window;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !workspace.tasks.iter().any(|task| task.window == window) {
+                    anyhow::ensure!(Instant::now() < deadline, "Run got no taskbar button");
+                    workspace.pump();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                proof("background-run-open.bmp")?;
+            }
+            // The previous command is selected, so typing replaces it.
+            type_command(&mut workspace, command)?;
+            let window = wait_for_job_window(&mut workspace, command, &|window_class, text| {
+                window_class == class && text.contains(title)
+            })?;
+            if class == "MeshRMMBackgroundFiles" {
+                let location = window_text(unsafe { GetDlgItem(Some(window), 201)? });
+                anyhow::ensure!(
+                    location.ends_with("System32"),
+                    "File Explorer opened {location:?}"
+                );
+            }
+            let run = workspace.run.as_ref().context("Run went away")?;
+            anyhow::ensure!(!run.visible(), "Run stayed open after starting {command}");
+            anyhow::ensure!(window_text(run.edit) == command, "Run lost {command}");
+            proof(&format!(
+                "background-run-{}.bmp",
+                command.replace(['%', '\\', '.'], "")
+            ))?;
+            close_job_window(&mut workspace, window)?;
+        }
+
+        // A console program gets console input.
+        press_win_r(&mut workspace)?;
+        type_command(&mut workspace, "cmd /k title Run console")?;
+        let console = wait_for_job_window(&mut workspace, "cmd", &|class, text| {
+            class == "ConsoleWindowClass" && text.contains("Run console")
+        })?;
+        anyhow::ensure!(
+            workspace
+                .console_inputs
+                .iter()
+                .any(|input| input.window == console),
+            "cmd from Run has no console input"
+        );
+        close_job_window(&mut workspace, console)?;
+
+        // Errors show in the dialog, which stays open.
+        press_win_r(&mut workspace)?;
+        type_command(&mut workspace, "no-such-program-meshrmm")?;
+        let run = workspace.run.as_ref().context("Run went away")?;
+        anyhow::ensure!(run.visible(), "Run closed on an error");
+        let error = window_text(unsafe { GetDlgItem(Some(run.window), 101)? });
+        anyhow::ensure!(
+            error.contains("no-such-program-meshrmm"),
+            "Run showed {error:?}"
+        );
+        proof("background-run-error.bmp")?;
+        // Clicking Cancel closes it.
+        let cancel = unsafe { GetDlgItem(Some(run.window), IDCANCEL.0)? };
+        click_task(&mut workspace, cancel)?;
+        workspace.pump();
+        let run = workspace.run.as_ref().context("Run went away")?;
+        anyhow::ensure!(!run.visible(), "Cancel did not close Run");
+        Ok(())
+    })
+    .join()
+    .expect("Run test panicked")
 }

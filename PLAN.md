@@ -135,6 +135,14 @@ Also check:
 
 ## Task 6 — Pins for the missing apps, a working Run dialog, and the taskbar icon
 
+**Status: done** (2026-09-30). Disk Management, System Properties (`SystemPropertiesAdvanced.exe`), Notepad and Run are pinned after the existing pins, so the old pin indices still hold. Each pin names its icon; Device Manager's is `devmgr.dll` index 5, since index 4 is a generic gear document. Run is a small dialog on the workspace thread (`background/run.rs`), opened by its pin or by Win+R, which now has a keyboard route of its own. Keyboard input moves to Run as soon as it opens, and Escape or Cancel hands it back. `background::launch::resolve` finds what was typed the way Windows' Run does, without ShellExecute: by path or with `SearchPath`, with `PATHEXT` extensions tried, and unquoted paths with spaces allowed. Documents open through their association (`.msc` in MMC, `.cpl` through `control.exe`), and folders, `explorer` and `taskmgr` open the built-in tools. Real `taskmgr.exe` exits at once in Session 0 with no window. What Run starts is assigned to the workspace job, and console programs get console input. Task Manager's "Run as SYSTEM" and File Explorer's Open use the same resolver. On `DESKTOP-85R6S28`, the installed service's helper ran `notepad`, `diskmgmt.msc` and `sysdm.cpl` from Run, opened the three new pins as its own children, and left no process behind when it stopped.
+
+The shell's own Run dialog does work in Session 0 as SYSTEM, but not when hosted by rundll32. Driven with `WM_COMMAND IDOK`, `rundll32 shell32.dll,#61` ran `notepad` and `cmd /c …`. It silently ignored `C:\Windows\System32\notepad.exe`: the dialog stayed open, nothing started, and no error appeared. `RunFileDlg` called from a PowerShell thread with valid arguments ran the same full path whether COM was STA, MTA, or left to the runtime. So the cause is rundll32 calling ordinal 61 with its own `(hwnd, hinstance, command line, show)` entry-point arguments, which `RunFileDlg` takes as its icon, directory, title and flags. The workspace's posted clicks also can't press the dialog's OK (`BM_CLICK` didn't), which would explain why short names failed in the original report too.
+
+With 15 pins the running-window buttons start at x = 740, so 11 fit at full width on the 1280-pixel canvas. More share the 532 remaining pixels, and past 16 their 32-pixel icons are cut off.
+
+`apps_key_opens_native_context_menus` now fails on this endpoint before and after this change, identically: regedit's address bar never takes the typed key. The other ignored background tests pass.
+
 **Evidence.**
 - Disk Management, System Properties, Notepad and Run aren't pinned.
 - `rundll32 shell32.dll,#61` shows the Run dialog, but it launches nothing, even `C:\Windows\System32\notepad.exe`, and reports no error.

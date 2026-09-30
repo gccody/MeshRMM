@@ -1566,12 +1566,20 @@ fn visible_processes() -> HashSet<u32> {
     };
     pids
 }
+/// Runs a command like the taskbar's Run. What it starts inherits this
+/// process's place in the workspace job.
 fn launch(command: &str) -> anyhow::Result<()> {
-    super::background::launch::launch(super::background::launch::Launch {
-        command,
-        flags: CREATE_NEW_CONSOLE,
-        ..Default::default()
-    })?;
+    use super::background::launch;
+    let target = launch::resolve(command)?;
+    ensure!(
+        target != launch::Target::TaskManager,
+        "Task Manager is already open."
+    );
+    launch::start(
+        &target,
+        &std::env::current_exe()?,
+        PROCESS_CREATION_FLAGS(0),
+    )?;
     Ok(())
 }
 

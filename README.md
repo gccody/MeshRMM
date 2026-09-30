@@ -611,8 +611,16 @@ window, such as Find. Minimized windows remain listed; select an icon to restore
 its window and bring it to the front. Closing a window removes its icon.
 It pins Command Prompt, PowerShell, Registry Editor, Services,
 Event Viewer, Resource Monitor, Task Manager, Computer Management, Device Manager,
-Windows Firewall, and File Explorer. Task Manager and File Explorer launch built-in
-MeshRMM tools. The process manager lists processes and supports confirmed End Task;
+Windows Firewall, File Explorer, Disk Management, System Properties, Notepad, and
+Run. With 15 pins, 11 open windows fit at full width; more share the rest of the
+taskbar, and past 16 their icons are cut off. Task Manager, File Explorer, and Run are built-in
+MeshRMM tools. Run, also opened with Win+R, takes a program with its arguments, a
+document, or a folder. It looks them up like Windows' Run, on the system path and
+with `PATHEXT` extensions, and opens documents with their associated program
+(`diskmgmt.msc`, `sysdm.cpl`). Folders, `explorer`, and `taskmgr` open the built-in
+tools. Programs it starts stay in the workspace. Windows' own Run dialog
+(`rundll32 shell32.dll,#61`) isn't used: rundll32 passes it its own entry-point
+arguments, and the dialog then silently ignores full paths. The process manager lists processes and supports confirmed End Task;
 the file browser navigates folders, previews text, creates folders, renames entries,
 and copies individual files without overwriting existing destinations. It opens administrative applications in a private Windows desktop in
 Session 0 under SYSTEM. Select a physical monitor to return to the console.
@@ -631,9 +639,9 @@ refuses the mode, applications keep laying out for Session 0's smaller screen.
 Window images are retained between captures so slow or failed repaints do not
 make already-captured windows disappear when the refresh budget expires.
 Application-specific rendering limitations can still cause flicker. Command Prompt and PowerShell receive console input
-records through disposable helpers. Session 0 has no Windows shell, so Windows-key
-shortcuts such as Win+R do nothing: the Windows key, and keys pressed while it is
-held, never reach applications. The Apps key opens the selected item's context menu. It does not switch the console desktop or move the
+records through disposable helpers. Session 0 has no Windows shell, so apart from
+Win+R, Windows-key shortcuts do nothing: the Windows key, and keys pressed while it
+is held, never reach applications. The Apps key opens the selected item's context menu. It does not switch the console desktop or move the
 console pointer. Console audio, clipboard synchronization, file-transfer UI, chat,
 blackout, input blocking, and Ctrl+Alt+Del are unavailable in background mode.
 Operations performed inside the workspace still affect the same machine, and
