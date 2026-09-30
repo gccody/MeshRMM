@@ -1249,6 +1249,133 @@ fn stable_taskbar_and_management_caption() -> anyhow::Result<()> {
 
 #[test]
 #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
+fn dialog_buttons_render_in_every_frame() -> anyhow::Result<()> {
+    fn capture(workspace: &mut Workspace) -> anyhow::Result<Vec<u8>> {
+        let worker = std::thread::spawn(|| -> anyhow::Result<Vec<u8>> {
+            let _binding = background::Desktop::bind()?;
+            Ok(background::snapshot_bmp()?)
+        });
+        while !worker.is_finished() {
+            workspace.pump();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        worker.join().expect("capture worker panicked")
+    }
+    unsafe extern "system" fn push_buttons(window: HWND, parameter: LPARAM) -> windows::core::BOOL {
+        unsafe {
+            let mut class = [0_u16; 16];
+            let count = GetClassNameW(window, &mut class);
+            let style = GetWindowLongPtrW(window, GWL_STYLE) as u32;
+            if String::from_utf16_lossy(&class[..count as usize]) == "Button"
+                && style & WS_VISIBLE.0 != 0
+                && matches!(style & 0xf, 0 | 1)
+            {
+                (*(parameter.0 as *mut Vec<HWND>)).push(window);
+            }
+        }
+        windows::core::BOOL(1)
+    }
+    std::thread::spawn(|| -> anyhow::Result<()> {
+        unsafe {
+            use windows::Win32::System::StationsAndDesktops::*;
+            let station = OpenWindowStationW(w!("WinSta0"), false, 0x000f037f)?;
+            SetProcessWindowStation(station)?;
+        }
+        let _owner = background::Desktop::create()?;
+        let _binding = background::Desktop::bind()?;
+        let mut workspace = Workspace::new()?;
+        let rundll32 = crate::win32::windows_directory()?
+            .join("System32")
+            .join("rundll32.exe");
+        let started = launch::launch(launch::Launch {
+            executable: Some(&rundll32),
+            command: &format!(
+                "\"{}\" sysdm.cpl,EditEnvironmentVariables",
+                rundll32.display()
+            ),
+            flags: CREATE_SUSPENDED,
+            ..Default::default()
+        })?;
+        unsafe {
+            AssignProcessToJobObject(workspace.job, started.process.0)?;
+            anyhow::ensure!(
+                ResumeThread(started.thread.0) != u32::MAX,
+                "resume rundll32"
+            );
+        }
+        // Environment Variables has eight push buttons. Without DWM, PrintWindow
+        // usually copied it before Cancel painted, and sometimes before any
+        // button's label or anything at all painted.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let buttons = loop {
+            workspace.pump();
+            let dialog = background::windows()?.into_iter().find(|hwnd| {
+                let mut title = [0_u16; 64];
+                let count = unsafe { GetWindowTextW(*hwnd, &mut title) };
+                String::from_utf16_lossy(&title[..count as usize]) == "Environment Variables"
+            });
+            if let Some(dialog) = dialog {
+                let mut buttons = Vec::<HWND>::new();
+                unsafe {
+                    let _ = EnumChildWindows(
+                        Some(dialog),
+                        Some(push_buttons),
+                        LPARAM((&mut buttons as *mut Vec<HWND>) as isize),
+                    );
+                }
+                if buttons.len() >= 8 {
+                    break buttons;
+                }
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "Environment Variables did not open"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        // A dialog that is still initializing may legitimately be half drawn.
+        let ready = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < ready {
+            workspace.pump();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for attempt in 0..40 {
+            let frame = capture(&mut workspace)?;
+            for button in &buttons {
+                let mut rect = RECT::default();
+                unsafe { GetWindowRect(*button, &mut rect)? };
+                // Every label draws dark text inside its button's face.
+                let mut text = 0;
+                for y in rect.top.max(0)..rect.bottom.min(HEIGHT as i32) {
+                    for x in rect.left.max(0)..rect.right.min(WIDTH as i32) {
+                        let pixel = 54 + (y as usize * WIDTH as usize + x as usize) * 4;
+                        if frame[pixel..pixel + 3].iter().all(|value| *value < 100) {
+                            text += 1;
+                        }
+                    }
+                }
+                if text < 10 {
+                    let mut label = [0_u16; 64];
+                    let count = unsafe { GetWindowTextW(*button, &mut label) };
+                    std::fs::write(
+                        std::env::temp_dir().join("dialog-buttons-failure.bmp"),
+                        &frame,
+                    )?;
+                    anyhow::bail!(
+                        "frame {attempt} is missing the {:?} button at {rect:?}",
+                        String::from_utf16_lossy(&label[..count as usize])
+                    );
+                }
+            }
+        }
+        Ok(())
+    })
+    .join()
+    .expect("dialog button test thread panicked")
+}
+
+#[test]
+#[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
 fn console_exit_closes_window_task_and_input_helper() -> anyhow::Result<()> {
     std::thread::spawn(|| -> anyhow::Result<()> {
         unsafe {

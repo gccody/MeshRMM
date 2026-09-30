@@ -638,9 +638,11 @@ SYSTEM has a different profile and network credentials from the signed-in user.
 This is a prototype for traditional Win32 administration tools, not a complete
 Explorer login session. Applications that depend on the user's shell, modern
 GPU-composited UI, or physical keyboard/mouse input may not render or respond
-correctly. Full-content window capture is attempted before the legacy capture path to improve
-compatibility with some composited windows. The built-in tools avoid the shell
-dependencies of Windows Task Manager and Explorer. Text previews are read-only
+correctly. Session 0 has no desktop compositor, so the workspace makes each
+window layered and copies the image Windows keeps for it. Printing windows
+instead copied them before their controls finished painting. Composited windows,
+and windows their application already layers itself, are still printed. The
+built-in tools avoid the shell dependencies of Windows Task Manager and Explorer. Text previews are read-only
 and limited to 1 MiB; recursive folder copying and shell file associations are not
 supported. Background mode is currently entered after a normal connection; it
 does not yet provide a separate background-only connection from the dashboard.

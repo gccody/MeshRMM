@@ -81,6 +81,8 @@ Also check:
 
 ## Task 3 — Some push buttons never draw, others start black
 
+**Status: done** (2026-09-30). The leading hypothesis was wrong: the controls do paint. Session 0 has no DWM, so `PrintWindow` repaints the window into a temporary surface. It then copies that surface before the app's thread has painted the last child controls. Repeated captures of one idle Environment Variables dialog returned four variants: Cancel missing (about 75%), complete, Cancel's frame without its label, and all black. Both flags behaved the same, and neither a prior `RedrawWindow` nor retrying helped. `Renderer` now makes each window layered (`SetLayeredWindowAttributes`, alpha 255), fills the new surface once, and copies it with `BitBlt` from the window DC, so capture no longer asks the app to paint. Composited windows (the built-in tools and the taskbar, whose children stop reaching a layered surface) and windows the app layers itself still use `PrintWindow`. `paint_mmc_toolbars` was the same race and is gone; the MMC menu-label test passes without it. On `DESKTOP-85R6S28` the four dialogs and every pinned app render in their first frames, and the new `dialog_buttons_render_in_every_frame` test fails on the old renderer and passes on the new one. Through the installed service's capture helper, the old build dropped Cancel in 36 of 108 frames and Run's Browse… entirely; the new build dropped neither.
+
 **Evidence.**
 - Environment Variables' Cancel button is invisible but clickable.
 - The MMC "error in a snap-in" dialog's OK button didn't draw, then later drew as an empty rectangle.
