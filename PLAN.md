@@ -104,6 +104,8 @@ Also check:
 
 ## Task 4 — Some dialogs have no taskbar button and can be lost
 
+**Status: done** (2026-09-30). `task_windows` now follows the taskbar rules below. On `DESKTOP-85R6S28`, the real System Properties and Run dialogs are `WS_EX_APPWINDOW` windows owned by hidden `rundll32` windows. Both now get buttons, and regedit's Find dialog doesn't. Restoring needed a second fix: Session 0 now has a foreground window, and `SetWindowPos(HWND_TOP)` from the workspace can't raise another process's window above it. The dialogs open as the foreground window, so they stayed on top of every window restored after them, and a covered dialog stayed buried. `restore_task`, and re-showing a running built-in tool, now call `SetForegroundWindow`, which Task 1's sketch already planned. The extended test fails on the old filter, and also on the new filter with the old `HWND_TOP` restore. The taskbar's hover label also repaints now when it moves between adjacent buttons. Capture copies each window's retained surface, and changing the label didn't repaint it, so it kept showing the previous button's name.
+
 **Evidence.** System Properties (`sysdm.cpl`) and the Run dialog are owned by hidden windows, so `task_windows` skips them (`agent/src/remote/background.rs:1047`). Once another window covers one, it can only be recovered by minimizing the covering window.
 
 **What to do.** Use Windows' own taskbar rules:

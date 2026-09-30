@@ -362,34 +362,35 @@ impl Workspace {
     }
 
     fn restore_task(&mut self, index: usize) {
-        let Some(task) = self.tasks.get(index) else {
+        let Some(&TaskButton {
+            window, process, ..
+        }) = self.tasks.get(index)
+        else {
             return;
         };
+        let mut current = 0;
+        unsafe { GetWindowThreadProcessId(window, Some(&mut current)) };
+        if current == process && unsafe { IsWindow(Some(window)) }.as_bool() {
+            self.bring_forward(window);
+        }
+    }
+
+    /// Restores `window` and makes it the foreground window, as the Windows
+    /// taskbar does. `HWND_TOP` alone can't raise it above another process's
+    /// foreground window, such as a dialog that activated itself on opening.
+    fn bring_forward(&mut self, window: HWND) {
         unsafe {
-            let mut process = 0;
-            GetWindowThreadProcessId(task.window, Some(&mut process));
-            if process != task.process || !IsWindow(Some(task.window)).as_bool() {
-                return;
-            }
             let _ = ShowWindowAsync(
-                task.window,
-                if IsIconic(task.window).as_bool() {
+                window,
+                if IsIconic(window).as_bool() {
                     SW_RESTORE
                 } else {
                     SW_SHOW
                 },
             );
-            let _ = SetWindowPos(
-                task.window,
-                Some(HWND_TOP),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-            self.focus = task.window;
+            let _ = SetForegroundWindow(window);
         }
+        self.focus = window;
     }
 
     fn launch(&mut self, index: usize) -> anyhow::Result<()> {
@@ -413,24 +414,7 @@ impl Workspace {
                     if owned.iter().any(|(owned, _)| *owned == pid)
                         || (*arguments == "--background-file-browser" && self.owns_window(window))
                     {
-                        let _ = ShowWindowAsync(
-                            window,
-                            if IsIconic(window).as_bool() {
-                                SW_RESTORE
-                            } else {
-                                SW_SHOW
-                            },
-                        );
-                        let _ = SetWindowPos(
-                            window,
-                            Some(HWND_TOP),
-                            0,
-                            0,
-                            0,
-                            0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                        );
-                        self.focus = window;
+                        self.bring_forward(window);
                         return Ok(());
                     }
                 }
@@ -557,6 +541,9 @@ impl Workspace {
                         &self.tasks[index - PINS.len()].title
                     });
                     let _ = SetWindowTextW(self.tooltip, PCWSTR(label.as_ptr()));
+                    // Capture copies the window's retained surface, so a label
+                    // change must repaint it.
+                    let _ = InvalidateRect(Some(self.tooltip), None, false);
                     let x = if index < PINS.len() {
                         8 + index as i32 * PIN_WIDTH
                     } else {
@@ -1083,15 +1070,7 @@ fn task_windows(shell: HWND, tooltip: HWND) -> windows::core::Result<Vec<TaskWin
         )?;
         let mut windows = Vec::new();
         for window in handles {
-            if window == shell || window == tooltip {
-                continue;
-            }
-            let style = GetWindowLongPtrW(window, GWL_STYLE) as u32;
-            let ex_style = GetWindowLongPtrW(window, GWL_EXSTYLE) as u32;
-            if (style & WS_VISIBLE.0 == 0 && !IsIconic(window).as_bool())
-                || ex_style & WS_EX_TOOLWINDOW.0 != 0
-                || GetWindow(window, GW_OWNER).is_ok()
-            {
+            if window == shell || window == tooltip || !has_taskbar_button(window) {
                 continue;
             }
             let mut title = [0_u16; 256];
@@ -1108,6 +1087,34 @@ fn task_windows(shell: HWND, tooltip: HWND) -> windows::core::Result<Vec<TaskWin
             });
         }
         Ok(windows)
+    }
+}
+
+/// Follows Windows' taskbar rules: a visible window that isn't a tool window gets
+/// a button if it has no owner, its owner is hidden, or it has `WS_EX_APPWINDOW`.
+/// Dialogs such as Run and System Properties are owned by hidden windows, and
+/// could only be recovered by moving whatever covered them.
+fn has_taskbar_button(window: HWND) -> bool {
+    unsafe {
+        let style = GetWindowLongPtrW(window, GWL_STYLE) as u32;
+        let ex_style = GetWindowLongPtrW(window, GWL_EXSTYLE) as u32;
+        if (style & WS_VISIBLE.0 == 0 && !IsIconic(window).as_bool())
+            || ex_style & WS_EX_TOOLWINDOW.0 != 0
+        {
+            return false;
+        }
+        if ex_style & WS_EX_APPWINDOW.0 == 0
+            && let Ok(owner) = GetWindow(window, GW_OWNER)
+            && GetWindowLongPtrW(owner, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0
+        {
+            return false;
+        }
+        let mut class = [0_u16; 64];
+        let length = GetClassNameW(window, &mut class) as usize;
+        !matches!(
+            String::from_utf16_lossy(&class[..length]).as_str(),
+            "#32768" | "tooltips_class32"
+        )
     }
 }
 

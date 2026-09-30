@@ -605,8 +605,10 @@ user's desktop. You can also connect normally and select
 **Background (Session 0 · experimental)** in the viewer's display selector.
 The black workspace has a charcoal bottom taskbar with icon launchers and hover labels.
 Open windows appear as icons after a gap, each with a persistent underline and
-a name on hover. Minimized windows remain listed; select their icon to restore them.
-Closing a window removes its icon.
+a name on hover. As on the Windows taskbar, this includes dialogs owned by hidden
+windows, such as System Properties and Run, but not dialogs owned by a visible
+window, such as Find. Minimized windows remain listed; select an icon to restore
+its window and bring it to the front. Closing a window removes its icon.
 It pins Command Prompt, PowerShell, Registry Editor, Services,
 Event Viewer, Resource Monitor, Task Manager, Computer Management, Device Manager,
 Windows Firewall, and File Explorer. Task Manager and File Explorer launch built-in

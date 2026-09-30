@@ -105,30 +105,117 @@ fn running_window_taskbar_restores_minimized_window() -> anyhow::Result<()> {
             workspace.tasks.iter().any(|task| task.window == window),
             "minimized window disappeared from taskbar"
         );
-        unsafe { GetWindowRect(button, &mut rect)? };
-        let x = (rect.left + rect.right) / 2;
-        let y = (rect.top + rect.bottom) / 2;
-        workspace.move_pointer(
-            (x as u32 * 65535 / (WIDTH - 1)) as u16,
-            (y as u32 * 65535 / (HEIGHT - 1)) as u16,
-        );
-        workspace.button(PointerButton::Left, true)?;
-        workspace.button(PointerButton::Left, false)?;
-        workspace.pump();
+        click_task(&mut workspace, button)?;
         anyhow::ensure!(
             !unsafe { IsIconic(window) }.as_bool(),
             "taskbar button did not restore the minimized window"
         );
+
+        // Run and System Properties are owned by hidden windows; Find and
+        // Properties dialogs are owned by the visible window they belong to.
+        let create =
+            |title: PCWSTR, ex_style: WINDOW_EX_STYLE, owner: Option<HWND>, visible: bool| unsafe {
+                CreateWindowExW(
+                    WS_EX_DLGMODALFRAME | ex_style,
+                    w!("MeshRMMTaskbarTest"),
+                    title,
+                    WS_POPUP
+                        | WS_CAPTION
+                        | WS_SYSMENU
+                        | if visible { WS_VISIBLE } else { WINDOW_STYLE(0) },
+                    80,
+                    90,
+                    300,
+                    180,
+                    owner,
+                    None,
+                    None,
+                    None,
+                )
+            };
+        let hidden_owner = create(w!("Hidden owner"), WINDOW_EX_STYLE(0), None, false)?;
+        let run = create(w!("Run"), WINDOW_EX_STYLE(0), Some(hidden_owner), true)?;
+        let hidden_tool = create(
+            w!("Hidden tool"),
+            WS_EX_TOOLWINDOW,
+            Some(hidden_owner),
+            true,
+        )?;
+        let find = create(w!("Find"), WINDOW_EX_STYLE(0), Some(window), true)?;
+        let app_window = create(w!("App window"), WS_EX_APPWINDOW, Some(window), true)?;
+        workspace.refresh_tasks()?;
+        let task = |target: HWND| workspace.tasks.iter().find(|task| task.window == target);
+        anyhow::ensure!(
+            task(run).is_some(),
+            "dialog owned by a hidden window has no taskbar button"
+        );
+        anyhow::ensure!(
+            task(app_window).is_some(),
+            "owned WS_EX_APPWINDOW window has no taskbar button"
+        );
+        anyhow::ensure!(
+            task(find).is_none(),
+            "dialog owned by a visible window got a taskbar button"
+        );
+        anyhow::ensure!(
+            task(hidden_owner).is_none() && task(hidden_tool).is_none(),
+            "hidden or tool window got a taskbar button"
+        );
+        let run_button = task(run).context("Run task disappeared")?.button;
+        // A foreground window from another process can't be covered with
+        // HWND_TOP, so restoring has to activate the dialog.
+        anyhow::ensure!(
+            unsafe { SetForegroundWindow(window) }.as_bool(),
+            "test window did not take the foreground"
+        );
+        anyhow::ensure!(above(window, run), "test window did not cover the dialog");
+        click_task(&mut workspace, run_button)?;
+        anyhow::ensure!(
+            above(run, window) && unsafe { GetForegroundWindow() } == run,
+            "taskbar button did not bring back the covered dialog"
+        );
+        unsafe { DestroyWindow(hidden_owner)? };
+
         unsafe { DestroyWindow(window)? };
         workspace.refresh_tasks()?;
         anyhow::ensure!(
-            !workspace.tasks.iter().any(|task| task.window == window),
+            !workspace
+                .tasks
+                .iter()
+                .any(|task| [window, run, app_window].contains(&task.window)),
             "closed window remained on taskbar"
         );
         Ok(())
     })
     .join()
     .expect("background taskbar test panicked")
+}
+
+fn click_task(workspace: &mut Workspace, button: HWND) -> anyhow::Result<()> {
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(button, &mut rect)? };
+    let x = (rect.left + rect.right) / 2;
+    let y = (rect.top + rect.bottom) / 2;
+    workspace.move_pointer(
+        (x as u32 * 65535 / (WIDTH - 1)) as u16,
+        (y as u32 * 65535 / (HEIGHT - 1)) as u16,
+    );
+    workspace.button(PointerButton::Left, true)?;
+    workspace.button(PointerButton::Left, false)?;
+    workspace.pump();
+    Ok(())
+}
+
+/// Whether `upper` comes before `lower` in the desktop's z-order.
+fn above(upper: HWND, lower: HWND) -> bool {
+    let mut next = unsafe { GetWindow(upper, GW_HWNDNEXT) };
+    while let Ok(window) = next {
+        if window == lower {
+            return true;
+        }
+        next = unsafe { GetWindow(window, GW_HWNDNEXT) };
+    }
+    false
 }
 
 #[test]
