@@ -1,7 +1,6 @@
 use super::*;
 struct Header {
     font: HFONT,
-    resizing: Option<(usize, i32, i32)>,
 }
 unsafe extern "system" fn header_proc(
     hwnd: HWND,
@@ -18,46 +17,6 @@ unsafe extern "system" fn header_proc(
             let result = DefSubclassProc(hwnd, message, wparam, lparam);
             drop(Box::from_raw(data as *mut Header));
             return result;
-        }
-        if message == WM_LBUTTONDOWN {
-            let x = lparam.0 as i16 as i32;
-            let mut hit = HDHITTESTINFO {
-                pt: POINT {
-                    x,
-                    y: (lparam.0 >> 16) as i16 as i32,
-                },
-                ..Default::default()
-            };
-            let index = SendMessageW(
-                hwnd,
-                HDM_HITTEST,
-                None,
-                Some(LPARAM((&mut hit as *mut HDHITTESTINFO) as isize)),
-            )
-            .0;
-            if index >= 0 && (hit.flags & (HHT_ONDIVIDER | HHT_ONDIVOPEN)).0 != 0 {
-                let list = GetParent(hwnd).unwrap_or_default();
-                let width =
-                    SendMessageW(list, LVM_GETCOLUMNWIDTH, Some(WPARAM(index as usize)), None).0
-                        as i32;
-                (*state).resizing = Some((index as usize, x, width));
-                return LRESULT(0);
-            }
-        }
-        if message == WM_MOUSEMOVE
-            && let Some((index, start, width)) = (*state).resizing
-        {
-            let width = (width + lparam.0 as i16 as i32 - start).clamp(50, 2000);
-            SendMessageW(
-                GetParent(hwnd).unwrap_or_default(),
-                LVM_SETCOLUMNWIDTH,
-                Some(WPARAM(index)),
-                Some(LPARAM(width as isize)),
-            );
-            return LRESULT(0);
-        }
-        if matches!(message, WM_LBUTTONUP | WM_CANCELMODE) && (*state).resizing.take().is_some() {
-            return LRESULT(0);
         }
         if matches!(message, WM_PAINT | WM_PRINTCLIENT) {
             let mut ps = PAINTSTRUCT::default();
@@ -169,7 +128,10 @@ unsafe extern "system" fn drag_proc(
         if message == WM_NCDESTROY {
             let _ = RemoveWindowSubclass(hwnd, Some(drag_proc), id);
         }
-        if message == WM_LBUTTONUP {
+        // File Explorer captures the pointer when a drag starts, so the drop
+        // arrives here wherever the button is released.
+        if message == WM_LBUTTONUP && GetCapture() == hwnd {
+            let _ = ReleaseCapture();
             let mut point = POINT {
                 x: lparam.0 as i16 as i32,
                 y: (lparam.0 >> 16) as i16 as i32,
@@ -193,10 +155,7 @@ pub(super) fn install(list: HWND, font: HFONT) -> anyhow::Result<()> {
             "Could not initialize file drag input"
         );
         let header = HWND(SendMessageW(list, LVM_GETHEADER, None, None).0 as *mut _);
-        let data = Box::into_raw(Box::new(Header {
-            font,
-            resizing: None,
-        }));
+        let data = Box::into_raw(Box::new(Header { font }));
         if !SetWindowSubclass(header, Some(header_proc), 1, data as usize).as_bool() {
             drop(Box::from_raw(data));
             anyhow::bail!("Could not initialize Explorer columns");
@@ -207,7 +166,7 @@ pub(super) fn install(list: HWND, font: HFONT) -> anyhow::Result<()> {
 
 // Activate common-controls v6 for this helper only. Other Agent windows retain
 // their existing activation context. v5 silently ignores LVM_SETVIEW.
-pub(super) struct VisualStyles {
+pub(crate) struct VisualStyles {
     handle: HANDLE,
     cookie: usize,
     manifest: PathBuf,

@@ -155,26 +155,14 @@ pub(super) unsafe extern "system" fn window_proc(
                             state.status,
                             "Drag to a folder to move. Hold Ctrl to copy; press Esc to cancel.",
                         );
+                        SetCapture(header.hwndFrom);
                     }
                     return LRESULT(0);
                 }
-                if header.code == NM_CLICK {
+                if header.code == NM_DBLCLK {
                     let event = &*(lparam.0 as *const NMITEMACTIVATE);
-                    let Ok(mut state) = (*pointer).try_borrow_mut() else {
-                        return LRESULT(0);
-                    };
-                    let now = std::time::Instant::now();
-                    let double = state.last_click.take().is_some_and(|(then, item)| {
-                        item == event.iItem
-                            && now.duration_since(then).as_millis()
-                                <= u128::from(GetDoubleClickTime())
-                    });
                     if event.iItem >= 0 {
-                        if double {
-                            let _ = PostMessageW(Some(hwnd), WM_COMMAND, WPARAM(OPEN), LPARAM(0));
-                        } else {
-                            state.last_click = Some((now, event.iItem));
-                        }
+                        let _ = PostMessageW(Some(hwnd), WM_COMMAND, WPARAM(OPEN), LPARAM(0));
                     }
                     return LRESULT(0);
                 }
@@ -187,10 +175,12 @@ pub(super) unsafe extern "system" fn window_proc(
             } else {
                 &mut *(lparam.0 as *mut RECT)
             };
-            rect.left += 1;
-            rect.right -= 1;
+            *rect = crate::remote::background::frame_rect(hwnd, *rect);
+            let border = crate::remote::background::frame_border(hwnd);
+            rect.left += border;
+            rect.right -= border;
             rect.top += 31;
-            rect.bottom -= 1;
+            rect.bottom -= border;
             return LRESULT(0);
         }
         if message == WM_NCHITTEST {
@@ -201,6 +191,25 @@ pub(super) unsafe extern "system" fn window_proc(
                     y: (lparam.0 >> 16) as i16 as i32,
                 },
             ) as isize);
+        }
+        // The caption buttons are drawn here, so Windows' own button tracking
+        // would draw classic ones over them.
+        if message == WM_NCLBUTTONDOWN
+            && matches!(wparam.0 as u32, HTCLOSE | HTMAXBUTTON | HTMINBUTTON)
+        {
+            let command = match wparam.0 as u32 {
+                HTCLOSE => SC_CLOSE,
+                HTMINBUTTON => SC_MINIMIZE,
+                _ if IsZoomed(hwnd).as_bool() => SC_RESTORE,
+                _ => SC_MAXIMIZE,
+            };
+            let _ = PostMessageW(
+                Some(hwnd),
+                WM_SYSCOMMAND,
+                WPARAM(command as usize),
+                LPARAM(0),
+            );
+            return LRESULT(0);
         }
         if !pointer.is_null() {
             if matches!(message, WM_NCPAINT | WM_NCACTIVATE | WM_PRINT) {
@@ -220,70 +229,6 @@ pub(super) unsafe extern "system" fn window_proc(
                 }
                 return result;
             }
-            if message == WM_LBUTTONDOWN {
-                let mut point = POINT {
-                    x: lparam.0 as i16 as i32,
-                    y: (lparam.0 >> 16) as i16 as i32,
-                };
-                let _ = ClientToScreen(hwnd, &mut point);
-                let edge = frame::hit(hwnd, point);
-                if edge == HTMINBUTTON {
-                    let _ = PostMessageW(
-                        Some(hwnd),
-                        WM_SYSCOMMAND,
-                        WPARAM(SC_MINIMIZE as usize),
-                        LPARAM(0),
-                    );
-                    return LRESULT(0);
-                }
-                if matches!(
-                    edge,
-                    HTLEFT
-                        | HTRIGHT
-                        | HTTOP
-                        | HTBOTTOM
-                        | HTTOPLEFT
-                        | HTTOPRIGHT
-                        | HTBOTTOMLEFT
-                        | HTBOTTOMRIGHT
-                ) {
-                    let mut bounds = RECT::default();
-                    let _ = GetWindowRect(hwnd, &mut bounds);
-                    if let Ok(mut state) = (*pointer).try_borrow_mut() {
-                        state.resizing = Some((edge, point, bounds));
-                    }
-                    return LRESULT(0);
-                }
-            }
-            if message == WM_MOUSEMOVE
-                && let Some((edge, start, bounds)) = (*pointer)
-                    .try_borrow()
-                    .ok()
-                    .and_then(|state| state.resizing)
-            {
-                let mut point = POINT {
-                    x: lparam.0 as i16 as i32,
-                    y: (lparam.0 >> 16) as i16 as i32,
-                };
-                let _ = ClientToScreen(hwnd, &mut point);
-                let bounds = frame::resize(edge, start, bounds, point);
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    bounds.left,
-                    bounds.top,
-                    bounds.right - bounds.left,
-                    bounds.bottom - bounds.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                return LRESULT(0);
-            }
-            if matches!(message, WM_LBUTTONUP | WM_CANCELMODE)
-                && let Ok(mut state) = (*pointer).try_borrow_mut()
-            {
-                state.resizing = None;
-            }
-
             if message == WM_PAINT {
                 if let Ok(state) = (*pointer).try_borrow() {
                     paint(hwnd, &state);
@@ -495,14 +440,12 @@ pub(super) unsafe extern "system" fn window_proc(
         }
         if message == WM_GETMINMAXINFO {
             let info = &mut *(lparam.0 as *mut MINMAXINFO);
+            let area = crate::remote::background::work_area();
             info.ptMinTrackSize = POINT { x: 940, y: 400 };
-            info.ptMaxPosition = POINT { x: 0, y: 0 };
-            info.ptMaxSize = POINT {
-                x: meshrmm_remote_screen::background::WIDTH as i32,
-                y: meshrmm_remote_screen::background::HEIGHT as i32
-                    - crate::remote::background::TASKBAR_HEIGHT,
+            info.ptMaxTrackSize = POINT {
+                x: area.right - area.left,
+                y: area.bottom - area.top,
             };
-            info.ptMaxTrackSize = info.ptMaxSize;
             return LRESULT(0);
         }
         if message == WM_DESTROY {
@@ -592,7 +535,11 @@ pub(super) fn run_inner() -> anyhow::Result<()> {
     meshrmm_remote_screen::background::require_session_zero()?;
     let _desktop = meshrmm_remote_screen::background::Desktop::bind()?;
     let _styles = controls::VisualStyles::activate()?;
-    let path = PathBuf::new();
+    // Run opens a folder here. Without one, the browser lists the drives.
+    let path = std::env::args_os()
+        .nth(2)
+        .map(PathBuf::from)
+        .unwrap_or_default();
     unsafe {
         InitCommonControlsEx(&INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -897,7 +844,6 @@ pub(super) fn run_inner() -> anyhow::Result<()> {
             nav,
             crumbs: Vec::new(),
             address_edit: false,
-            resizing: None,
             dragging: Vec::new(),
             control_down: false,
             undo_stack: Vec::new(),
@@ -923,7 +869,6 @@ pub(super) fn run_inner() -> anyhow::Result<()> {
             clipboard_sequence: 0,
             history: History::default(),
             travel: None,
-            last_click: None,
             receiver: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             sort: 0,

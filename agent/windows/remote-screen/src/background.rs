@@ -1,5 +1,9 @@
-//! An off-screen Session 0 desktop. Never switches the console input desktop.
-use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, HWND, LPARAM, RECT, SetLastError};
+//! An off-screen Session 0 desktop. The input helper's workspace makes it
+//! Session 0's input desktop and drives it with real input; the console's input
+//! desktop is never switched.
+use windows::Win32::Foundation::{
+    COLORREF, ERROR_SUCCESS, HANDLE, HWND, LPARAM, RECT, SetLastError, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
@@ -12,11 +16,15 @@ pub const DISPLAY_ID: u32 = u32::MAX - 2;
 pub const WIDTH: u32 = 1280;
 pub const HEIGHT: u32 = 800;
 pub const DESKTOP_NAME: &str = "MeshRMMBackground";
+/// `SendInput` needs `DESKTOP_JOURNALPLAYBACK` on the injecting thread's desktop
+/// handle, and a thread that owns windows can't be rebound to another handle.
 const DESKTOP_RIGHTS: u32 = DESKTOP_READOBJECTS.0
     | DESKTOP_CREATEWINDOW.0
     | DESKTOP_CREATEMENU.0
     | DESKTOP_ENUMERATE.0
-    | DESKTOP_WRITEOBJECTS.0;
+    | DESKTOP_WRITEOBJECTS.0
+    | DESKTOP_JOURNALPLAYBACK.0
+    | DESKTOP_SWITCHDESKTOP.0;
 
 pub fn display() -> crate::DisplayInfo {
     crate::DisplayInfo {
@@ -218,9 +226,10 @@ impl Drop for WindowImage {
 }
 
 impl Renderer {
-    /// PrintWindow remains synchronous; the disposable helper's watchdog handles
-    /// stalled applications. Refresh in rotating order, but composite EVERY window
-    /// in z-order, even after the refresh budget expires.
+    /// A window's first repaint and the PrintWindow fallback are synchronous; the
+    /// disposable helper's watchdog handles stalled applications. Refresh in
+    /// rotating order, but composite EVERY window in z-order, even after the
+    /// refresh budget expires.
     pub fn paint(&mut self, dc: HDC) -> windows::core::Result<()> {
         unsafe {
             let visible = windows()?;
@@ -292,11 +301,7 @@ impl Renderer {
                     // Finish queued copies before handing the bitmap to another
                     // thread/process for painting, and before reading it back.
                     GdiFlush().ok()?;
-                    if PrintWindow(image.hwnd, scratch.dc, PRINT_WINDOW_FLAGS(2)).as_bool()
-                        || PrintWindow(image.hwnd, scratch.dc, PRINT_WINDOW_FLAGS(0)).as_bool()
-                    {
-                        // A failed toolbar overlay must not discard the window.
-                        let _ = paint_mmc_toolbars(image.hwnd, scratch.dc);
+                    if capture(image.hwnd, scratch.dc, image.width, image.height) {
                         GdiFlush().ok()?;
                         BitBlt(
                             image.dc,
@@ -336,11 +341,8 @@ impl Renderer {
                     if saved != 0 {
                         let _ = SetViewportOrgEx(dc, rect.left, rect.top, None);
                         IntersectClipRect(dc, 0, 0, rect.right - rect.left, rect.bottom - rect.top);
-                        if !IsHungAppWindow(hwnd).as_bool()
-                            && (PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(2)).as_bool()
-                                || PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(0)).as_bool())
-                        {
-                            let _ = paint_mmc_toolbars(hwnd, dc);
+                        if !IsHungAppWindow(hwnd).as_bool() {
+                            capture(hwnd, dc, rect.right - rect.left, rect.bottom - rect.top);
                         }
                         let _ = RestoreDC(dc, saved);
                     }
@@ -351,74 +353,78 @@ impl Renderer {
     }
 }
 
-/// MMC's menu labels are custom-drawn toolbar buttons. Printing the whole frame
-/// can omit them after a move, even when PrintWindow reports success. Printing
-/// those controls directly preserves their normal, disabled and hot states
-/// without activating the window or synthesizing input.
-fn paint_mmc_toolbars(hwnd: HWND, dc: HDC) -> windows::core::Result<()> {
-    unsafe extern "system" fn collect(hwnd: HWND, parameter: LPARAM) -> BOOL {
-        unsafe {
-            let mut class = [0_u16; 64];
-            let count = GetClassNameW(hwnd, &mut class);
-            if String::from_utf16_lossy(&class[..count as usize]) == "ToolbarWindow32"
-                && IsWindowVisible(hwnd).as_bool()
-            {
-                let toolbars = &mut *(parameter.0 as *mut Vec<HWND>);
-                if toolbars.len() < 16 {
-                    toolbars.push(hwnd);
+/// Session 0 has no DWM, so PrintWindow repaints the window into a temporary
+/// surface and can copy it before the app's controls finish painting: push
+/// buttons came out missing, half drawn or black at random. A window layered
+/// with SetLayeredWindowAttributes keeps a persistent surface that the app's
+/// own painting updates, and a window-DC copy reads it without asking the app
+/// to paint. PrintWindow remains for composited windows, for
+/// UpdateLayeredWindow windows, whose bitmap it copies as is, and for windows
+/// that can't be layered.
+unsafe fn capture(hwnd: HWND, dc: HDC, width: i32, height: i32) -> bool {
+    unsafe {
+        if redirect(hwnd) {
+            let source = GetWindowDC(Some(hwnd));
+            if !source.is_invalid() {
+                let copied = BitBlt(dc, 0, 0, width, height, Some(source), 0, 0, SRCCOPY).is_ok();
+                ReleaseDC(Some(hwnd), source);
+                if copied {
+                    return true;
                 }
             }
         }
-        BOOL(1)
+        PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(2)).as_bool()
+            || PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(0)).as_bool()
     }
+}
+
+/// Gives the window a persistent layered surface unless it already has one.
+unsafe fn redirect(hwnd: HWND) -> bool {
     unsafe {
-        let mut class = [0_u16; 64];
-        let count = GetClassNameW(hwnd, &mut class);
-        if String::from_utf16_lossy(&class[..count as usize]) != "MMCMainFrame" {
-            return Ok(());
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        // A composited window paints its whole tree before PrintWindow copies
+        // it, while its children's own repaints never reach a layered surface.
+        if style & WS_EX_COMPOSITED.0 as isize != 0 {
+            return false;
         }
-        let mut parent = RECT::default();
-        GetWindowRect(hwnd, &mut parent)?;
-        let mut toolbars = Vec::<HWND>::new();
-        let _ = EnumChildWindows(
+        if style & WS_EX_LAYERED.0 as isize != 0 {
+            // Only SetLayeredWindowAttributes windows paint into a window DC.
+            return GetLayeredWindowAttributes(hwnd, None, None, None).is_ok();
+        }
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as isize);
+        if SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA).is_err() {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
+            return false;
+        }
+        // The new surface starts empty, so fill it before the first copy. The
+        // redraw returns once the window itself has painted, while its thread
+        // may still be painting children: paint those that are still pending,
+        // then let a round trip finish the one in progress.
+        unsafe extern "system" fn update(hwnd: HWND, _: LPARAM) -> BOOL {
+            unsafe {
+                let _ = RedrawWindow(Some(hwnd), None, None, RDW_UPDATENOW);
+            }
+            BOOL(1)
+        }
+        let painted = RedrawWindow(
             Some(hwnd),
-            Some(collect),
-            LPARAM((&mut toolbars as *mut Vec<HWND>) as isize),
+            None,
+            None,
+            RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        )
+        .as_bool();
+        let _ = EnumChildWindows(Some(hwnd), Some(update), LPARAM(0));
+        SendMessageTimeoutW(
+            hwnd,
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            100,
+            None,
         );
-        for toolbar in toolbars {
-            let mut rect = RECT::default();
-            if GetWindowRect(toolbar, &mut rect).is_err()
-                || rect.right <= rect.left
-                || rect.bottom <= rect.top
-                || rect.left < parent.left
-                || rect.top < parent.top
-                || rect.right > parent.right
-                || rect.bottom > parent.bottom
-                || rect.right - rect.left > 8192
-                || rect.bottom - rect.top > 256
-            {
-                continue;
-            }
-            let image =
-                WindowImage::new(toolbar, rect.right - rect.left, rect.bottom - rect.top, dc)?;
-            GdiFlush().ok()?;
-            if PrintWindow(toolbar, image.dc, PRINT_WINDOW_FLAGS(0)).as_bool() {
-                GdiFlush().ok()?;
-                BitBlt(
-                    dc,
-                    rect.left - parent.left,
-                    rect.top - parent.top,
-                    image.width,
-                    image.height,
-                    Some(image.dc),
-                    0,
-                    0,
-                    SRCCOPY,
-                )?;
-            }
-        }
+        painted
     }
-    Ok(())
 }
 
 /// Capture diagnostic evidence using the same renderer as the video backend.
@@ -476,7 +482,7 @@ pub fn snapshot_bmp() -> windows::core::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::Foundation::{COLORREF, LRESULT, WPARAM};
+    use windows::Win32::Foundation::LRESULT;
 
     unsafe extern "system" fn slow_window(
         hwnd: HWND,
