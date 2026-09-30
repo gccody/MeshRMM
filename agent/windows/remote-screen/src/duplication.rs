@@ -10,6 +10,7 @@ use windows_capture::monitor::Monitor;
 
 use crate::converter::BgraToYuvConverter;
 use crate::encoder::{MediaFoundationVideoEncoder, VideoEncoder};
+use crate::refinement::StaticRefinement;
 use crate::{
     ActiveFormat, ControlState, EncodedAccessUnit, EncodedFrameSink, Error, FramePacer,
     StreamConfig, monotonic_timestamp_us,
@@ -381,12 +382,19 @@ fn capture_loop_inner(
     let mut frames_encoded = 0_u64;
     let mut frames_rate_limited = 0_u64;
     let mut frames_encoder_busy = 0_u64;
+    let mut frames_refined = 0_u64;
     let mut total_encode_us = 0_u64;
     let mut encoded_bytes = 0_u64;
     let mut stats_started_us = monotonic_timestamp_us()?;
     let mut cached_yuv = None;
     let mut keyframe_input_pending = false;
     let mut frame_pacer = FramePacer::new(config.frames_per_second);
+    let mut refinement = StaticRefinement::new(
+        width,
+        height,
+        config.frames_per_second,
+        config.bitrate_bits_per_second,
+    );
     while !stop.load(Ordering::Acquire) {
         // Apply controls and drain output independently of desktop damage.
         // Media Foundation encoders are asynchronous: submit() may return no
@@ -398,20 +406,23 @@ fn capture_loop_inner(
             keyframe_input_pending = true;
         }
         let requested_bitrate = controls.requested_bitrate.swap(0, Ordering::AcqRel);
-        if requested_bitrate != 0
-            && let Err(error) = encoder.set_bitrate(requested_bitrate)
-        {
-            // A bitrate-control failure must not look like a desktop or GPU
-            // loss. Otherwise the Agent repeatedly recreates the stream,
-            // forcing a new viewer window and a large bootstrap keyframe.
-            tracing::warn!(
-                %error,
-                bits_per_second = requested_bitrate,
-                "hardware encoder rejected a runtime bitrate update; continuing at the previous bitrate"
-            );
-            controls
-                .runtime_bitrate_disabled
-                .store(true, Ordering::Release);
+        if requested_bitrate != 0 {
+            match encoder.set_bitrate(requested_bitrate) {
+                Ok(()) => refinement.set_bitrate(requested_bitrate),
+                Err(error) => {
+                    // A bitrate-control failure must not look like a desktop or GPU
+                    // loss. Otherwise the Agent repeatedly recreates the stream,
+                    // forcing a new viewer window and a large bootstrap keyframe.
+                    tracing::warn!(
+                        %error,
+                        bits_per_second = requested_bitrate,
+                        "hardware encoder rejected a runtime bitrate update; continuing at the previous bitrate"
+                    );
+                    controls
+                        .runtime_bitrate_disabled
+                        .store(true, Ordering::Release);
+                }
+            }
         }
 
         let capture_cursor = controls.capture_cursor.load(Ordering::Acquire);
@@ -505,6 +516,22 @@ fn capture_loop_inner(
             let capture_timestamp_us = monotonic_timestamp_us()?;
             access_units.extend(encoder.submit(yuv, capture_timestamp_us)?);
             keyframe_input_pending = false;
+        } else if desktop.is_none()
+            && refinement.pending()
+            && encoder.wants_input()
+            && let Some(yuv) = cached_yuv.as_ref()
+        {
+            // An idle desktop leaves a keyframe at the quality its single-frame
+            // budget allowed. Re-encode the unchanged surface at the stream
+            // rate so it sharpens as it would under motion, instead of waiting
+            // for new damage. Region capture already submits every interval;
+            // refining there would displace its captures.
+            let capture_timestamp_us = monotonic_timestamp_us()?;
+            if frame_pacer.allow(capture_timestamp_us) {
+                access_units.extend(encoder.submit(yuv, capture_timestamp_us)?);
+                refinement.refined();
+                frames_refined += 1;
+            }
         }
         drop(frame);
         for access_unit in access_units {
@@ -515,6 +542,7 @@ fn capture_loop_inner(
                     .saturating_sub(access_unit.capture_timestamp_us),
             );
             encoded_bytes = encoded_bytes.saturating_add(access_unit.data.len() as u64);
+            refinement.encoded(access_unit.keyframe);
             (sink)(EncodedAccessUnit {
                 capture_timestamp_us: access_unit.capture_timestamp_us,
                 encode_complete_timestamp_us: access_unit.encode_complete_timestamp_us,
@@ -533,6 +561,7 @@ fn capture_loop_inner(
                 bitrate_bits_per_second = encoded_bytes as f64 * 8.0 / elapsed_seconds,
                 frames_rate_limited,
                 frames_encoder_busy,
+                frames_refined,
                 mean_encode_us = total_encode_us / frames_encoded.max(1),
                 width,
                 height,
@@ -542,6 +571,7 @@ fn capture_loop_inner(
             frames_encoded = 0;
             frames_rate_limited = 0;
             frames_encoder_busy = 0;
+            frames_refined = 0;
             total_encode_us = 0;
             encoded_bytes = 0;
             stats_started_us = now_us;

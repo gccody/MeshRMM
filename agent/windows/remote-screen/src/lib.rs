@@ -13,6 +13,7 @@ mod duplication;
 mod encoder;
 mod grayscale;
 mod layout;
+mod refinement;
 
 pub use duplication::WindowsDesktopDuplicationStreamer;
 
@@ -811,6 +812,71 @@ mod tests {
                 assert!(streamer.poll_ended().is_none());
             }
             streamer.stop().unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an idle interactive Windows desktop and hardware video encoder"]
+    fn static_desktop_refines_after_keyframe_then_goes_quiet() {
+        use super::*;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let display = enumerate_displays()
+            .unwrap()
+            .into_iter()
+            .find(|display| display.primary)
+            .unwrap();
+        let config = StreamConfig {
+            // Hide the pointer so its motion cannot mask refinement.
+            capture_cursor: false,
+            ..StreamConfig::default()
+        };
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            let (tx, rx) = mpsc::channel();
+            let mut streamer = WindowsDesktopDuplicationStreamer::new();
+            streamer
+                .start(
+                    StreamConfig { codec, ..config },
+                    display.id,
+                    Arc::new(move |frame| {
+                        let _ = tx.send((Instant::now(), frame));
+                    }),
+                )
+                .unwrap();
+            let (started, first) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(first.keyframe);
+            let (mut refining, mut idle) = ((0, 0), (0, 0));
+            while let Ok((at, frame)) = rx.recv_timeout(Duration::from_secs(1)) {
+                let elapsed = at - started;
+                if elapsed > Duration::from_secs(6) {
+                    break;
+                }
+                // Refinement lasts at most 3 seconds after the keyframe.
+                let window = if elapsed < Duration::from_secs(1) {
+                    &mut refining
+                } else if elapsed > Duration::from_secs(4) {
+                    &mut idle
+                } else {
+                    continue;
+                };
+                window.0 += 1;
+                window.1 += frame.data.len();
+            }
+            streamer.stop().unwrap();
+            eprintln!(
+                "{codec:?} {}x{} keyframe_bytes={} first_second={refining:?} last_two_seconds={idle:?}",
+                display.width,
+                display.height,
+                first.data.len(),
+            );
+            // Previously an idle desktop produced only the keyframe.
+            assert!(refining.0 >= 20, "{codec:?}: keyframe was not refined");
+            // Caret blinks may still arrive, but not a stream-rate refinement.
+            assert!(
+                idle.0 < config.frames_per_second / 2,
+                "{codec:?}: refinement continued on an idle desktop"
+            );
         }
     }
 
