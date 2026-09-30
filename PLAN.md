@@ -1,0 +1,242 @@
+# Plan: fix the background-mode app issues
+
+The plan has 11 tasks. Task 1 is a short experiment that decides how Tasks 7–9 get built. Six tasks don't depend on it and can start right away in their own threads.
+
+## Things every thread needs
+
+- **Test machine.** Validate on DESKTOP-85R6S28 (`ssh 192.168.1.152`), following `~/.config/meshrmm/AGENTS.private.md`. Every item in the previous report comes with a reproduction step.
+- **Test harness.** The interactive tool used for the original testing lives at `~\bg-apps-20260929\agent\src\remote\background\driver.rs` on the endpoint. It isn't in the repo. The memory note `background-mode-app-driver` explains how to run it. Test through it, because it sends the same `RemoteInput` events the viewer sends.
+- **One test at a time on the endpoint.** Every workspace uses the same desktop name (`MeshRMMBackground`), so two harnesses running at once share one desktop and spoil each other's results. Before launching one, create `C:\bg-validation.lock` containing your thread name, and delete it afterwards.
+- **Shared file.** Tasks 7, 8, 9 and 5 all edit `Workspace::button`/`apply` in `agent/src/remote/background.rs`. Put new logic in new modules (for example `agent/src/remote/background/menus.rs`) and keep edits inside `button()` small, so merges stay easy.
+- **No compatibility work needed.** Per `AGENTS.md`, changing the protocol, display size, or constants is fine.
+
+## Order and dependencies
+
+| Start now, in parallel | Wait for Task 1's result |
+|---|---|
+| 1 (experiment), 2, 3, 4, 5, 6, 10 | 7, 8, 9, 11 |
+
+Task 1 needs approval before a thread starts it: `agent/src/remote/background.rs:2` explicitly rules out "SendInput, desktop switching". If that approach is rejected, skip Task 1 and start Tasks 7–9 now.
+
+---
+
+## Task 1 — Experiment: real mouse and keyboard input inside Session 0 (time limit: 1 day)
+
+**Why.** Most of the input bugs happen because the workspace *posts* window messages instead of producing real input. As a result, Windows never generates double-clicks, the cursor position apps read is wrong, menu loops and scrollbars never start tracking, and WinForms and custom buttons misbehave.
+
+- Session 0 isn't the console (the console is Session 1), so switching Session 0's active desktop to `MeshRMMBackground` wouldn't show anything to the signed-in user.
+- Session 0's cursor currently sits at the centre of its screen, (512,384). That matches exactly where regedit opened its wrong context menu.
+
+**What to do.** In the Session 0 helper:
+1. Call `SwitchDesktop` to make the background desktop Session 0's active desktop.
+2. Deliver a click with `SetCursorPos` plus `SendInput`, and a keystroke with `SendInput`.
+3. Check each of these:
+   - regedit menu-bar click opens the menu, and clicking a menu item runs its command
+   - double-clicking a value opens its edit dialog
+   - right-click opens the correct menu at the pointer
+   - the Disk Management graphical pane scrolls by wheel and scrollbar
+   - Resource Monitor's section arrows respond
+   - Cancel in the Firewall New Rule wizard doesn't crash
+
+Also check:
+- whether any window has to be focused or foreground first
+- the desktop access rights required
+- what happens to Session 0's own Winlogon desktop
+- that the console session is completely unaffected
+
+**Result.** Write up go/no-go with evidence. On "go", sketch the change: `Workspace::apply` maps pointer and key events to real input, and the `PostMessage` emulation is deleted. Tasks 7, 8, 9 and 11 then mostly become checks against that change. On "no-go", those tasks proceed as written below.
+
+**Files:** `agent/src/remote/background.rs`, `agent/src/remote/capture_helper/child.rs` (`run_background_input_child`), and `agent/windows/remote-screen/src/background.rs` (`Desktop`).
+
+---
+
+## Task 2 — Apps think the screen is 1024×768, not the 1280×800 canvas
+
+**Evidence.**
+- Maximized regedit, Event Viewer and cmd come out as (−8,−8)→(1032,776): a 256 px black strip is left on the right and the bottom sits under the taskbar.
+- Firewall opens at exactly 1024×768.
+- Services and Event Viewer open with their bottom edge under the taskbar.
+
+**What to do.**
+1. First, read Session 0's real screen metrics from the helper (`GetSystemMetrics`, `EnumDisplaySettings`) and try changing its display mode to 1280×800.
+2. If the mode can be changed, set it at workspace start.
+3. If it can't, make the canvas size a runtime value taken from Session 0's metrics instead of the `WIDTH`/`HEIGHT` constants.
+4. Either way, call `SystemParametersInfo(SPI_SETWORKAREA)` so that the usable area excludes the 48 px taskbar. Restore the old work area when the workspace closes.
+
+**Code.**
+- `agent/windows/remote-screen/src/background.rs:11-13` (constants, `display()`, the renderer, `snapshot_bmp`)
+- `agent/src/remote/background.rs` (taskbar geometry, `launch` window rect, pointer scaling in `move_pointer`)
+- `agent/src/remote/background_files/window.rs:501` and `agent/src/remote/background_tasks/window.rs:310` (maximize bounds)
+- `agent/windows/remote-screen/src/desktop.rs` and `duplication.rs:276`
+
+**Done when:** maximized native apps fill the canvas above the taskbar, and MMC and Firewall windows open fully visible. Update the canvas size in `README.md`, and update the existing ignored tests, which assume 1280×800.
+
+**Conflicts:** `PINS` and taskbar layout with Task 6, if the canvas shrinks.
+
+---
+
+## Task 3 — Some push buttons never draw, others start black
+
+**Evidence.**
+- Environment Variables' Cancel button is invisible but clickable.
+- The MMC "error in a snap-in" dialog's OK button didn't draw, then later drew as an empty rectangle.
+- The Run dialog's Browse… button disappeared after OK was clicked.
+- regedit's address bar and a button in Event Properties start solid black and only fix themselves after a repaint.
+
+**What to do.** Work out why the capture step doesn't pick up these controls in `Renderer::paint`, which calls `PrintWindow` with flag 2, then falls back to 0.
+- Leading hypothesis: controls that have never received a real paint have nothing for the full-content capture to copy.
+- Candidate fixes:
+  - force a synchronous `RedrawWindow` on each newly seen top-level window, including all its children, before its first capture
+  - composite child windows separately, the way `paint_mmc_toolbars` already does
+  - detect captures that come back all black and retry with the other flag
+
+**Code:** `agent/windows/remote-screen/src/background.rs` (`Renderer::paint`, `paint_mmc_toolbars`).
+
+**Done when:** those four dialogs render correctly in their first frames. Add a native regression test covering a dialog with several buttons.
+
+---
+
+## Task 4 — Some dialogs have no taskbar button and can be lost
+
+**Evidence.** System Properties (`sysdm.cpl`) and the Run dialog are owned by hidden windows, so `task_windows` skips them (`agent/src/remote/background.rs:1047`). Once another window covers one, it can only be recovered by minimizing the covering window.
+
+**What to do.** Use Windows' own taskbar rules:
+- show a window that is visible, isn't a tool window, and either has no owner, has an owner that isn't visible, or has the `WS_EX_APPWINDOW` style
+- still exclude menus (`#32768`), tooltips and the workspace's own windows
+
+**Done when:** System Properties and the Run dialog get taskbar buttons that restore them. Normal owned dialogs (Find, Properties) still don't get buttons. Extend `running_window_taskbar_restores_minimized_window` to cover this.
+
+**Conflicts:** none. The change is limited to `task_windows` and `refresh_tasks`.
+
+---
+
+## Task 5 — Keyboard fixes (independent of Task 1 unless Task 1 replaces key posting)
+
+**Evidence and what to do.**
+1. **Win-key shortcuts type their letter.** Win+R typed "r" into the console. Treat `VK_LWIN`/`VK_RWIN` as modifiers so they suppress typed characters (the `literal` check at `agent/src/remote/background.rs:893`) and are left out of `ToUnicodeEx`. In the console-input path, `background_console.rs` needs the same treatment.
+2. **The Apps/Menu key does nothing, while Shift+F10 works.** Make sure the key-up for `VK_APPS` reaches the app's default window procedure, or post `WM_CONTEXTMENU` with lParam −1 to the keyboard target. Check this in regedit and MMC.
+3. **Possible race between a click and typing that follows.** Once, typing straight after clicking regedit's address bar was lost. Try to reproduce it with zero delay between the click and the key events; if it reproduces, make keyboard focus changes settle before the following keys go out.
+
+**Done when:** Win+R types nothing, and the Apps key opens the selected item's context menu. Add unit or native tests.
+
+**Conflicts:** the key branch of `Workspace::apply`. This doesn't overlap the `button()` edits in Tasks 7 and 8.
+
+---
+
+## Task 6 — Pins for the missing apps, a working Run dialog, and the taskbar icon
+
+**Evidence.**
+- Disk Management, System Properties, Notepad and Run aren't pinned.
+- `rundll32 shell32.dll,#61` shows the Run dialog, but it launches nothing, even `C:\Windows\System32\notepad.exe`, and reports no error.
+- Win+R does nothing (there's no shell to handle it).
+- The Device Manager pin shows a generic document icon (the `devmgr.dll`, index 4 entry near `background.rs:229`).
+
+**What to do.**
+1. Add pins:
+   - Disk Management: `mmc.exe diskmgmt.msc`
+   - System Properties: launch `SystemPropertiesAdvanced.exe` (or `...ComputerName.exe`) directly, not through `control`/`rundll32`
+   - Notepad
+   - Run
+2. Implement Run as a small built-in dialog. Reuse Task Manager's "Run as SYSTEM" launch code (`background_tasks.rs:1570`, via `background::launch::launch`, so it stays on this desktop and in the job).
+3. Investigate briefly why the shell's own Run dialog fails. Most likely it depends on the Explorer shell's window or its launch mechanism. Document the result; don't try to fix Windows.
+4. Fix the Device Manager pin icon, and check every pin's icon.
+5. Recheck how many running-window buttons still fit with 15 pins (≈720 px). This depends on Task 2's final canvas width.
+
+**Done when:** each new pin launches its app in Session 0 inside the workspace job, and the built-in Run launches `notepad`, `diskmgmt.msc` and `sysdm.cpl`. Update the pin list in `README.md` and the hard-coded pin indices in the tests (`tests.rs` uses 2, 7, 8 and 11; `task_icon` uses 7 and 11).
+
+**Conflicts:** `PINS` and the icon match in `background.rs`.
+
+---
+
+## Task 7 — Menus: menu-bar clicks, menu-item clicks, and focus after a menu closes
+
+**Evidence.**
+- Clicking regedit's menu bar doesn't open a menu. The catch-all `_ => {}` at `agent/src/remote/background.rs:743` hands the click on as an ordinary client click, and regedit moves its splitter to that position.
+- Resource Monitor and the built-in Task Manager menus don't open on click either.
+- In an open popup menu (regedit and MMC), clicking an item closes the menu without running the command.
+- After a menu closes, `focus` still points at the destroyed menu window, so `keyboard_target` returns 0 and typing is lost until the next click.
+
+**What to do if Task 1 is "no-go".**
+- **Menu-bar click:** find which item was hit with `GetMenuBarInfo` and `MenuItemFromPoint`, then open that menu the keyboard way (`WM_SYSCOMMAND` with `SC_KEYMENU`, then arrow to the item). Never forward a menu-bar click as a client click.
+- **Popup-menu window (`#32768`):** get the menu with `MN_GETHMENU`, find the item at the pointer with `MenuItemFromPoint`, then select and run it with `MN_SELECTITEM` and `MN_BUTTONUP` (undocumented, but these are what accessibility tools use). Fall back to arrow keys plus Enter. Also highlight items on hover.
+- **Focus:** when the focus window has gone, fall back to the focused control of the top workspace window.
+
+**Done when:**
+- regedit's File and Edit menus open on click and Find… runs from a click, and the same works in MMC's Action menu
+- regedit's splitter doesn't move on a menu-bar click
+- typing works straight after a menu closes
+
+Add native tests using a simple test window with a menu.
+
+**Conflicts:** `button()` and `keyboard_target()`. Coordinate with Task 8.
+
+---
+
+## Task 8 — Double-click, scrollbars and mouse wheel
+
+**Evidence.**
+- Double-click never registers in native apps (no regedit value editor, service or device properties). Only the built-in File Explorer detects double-clicks itself.
+- The graphical pane in Disk Management won't scroll by wheel, arrow buttons or thumb drag. Arrow keys do scroll it. Device Manager's and Task Manager's scrollbars do work.
+
+**What to do if Task 1 is "no-go".**
+- **Double-click:** keep the previous mouse-down (window, button, time, position). If a second press comes within `GetDoubleClickTime()` and the system double-click distance, on a window class that accepts double-clicks, send the double-click message for that button (left, right or middle). A double-click on a window caption should toggle maximize.
+- **Scrollbars:** hit-test the child window under the pointer, not just the top-level window. If the click lands on a scrollbar, translate it into scroll messages using the scrollbar's layout: arrows scroll by a line, the track by a page, and a thumb drag tracks then sets the position. Figure out why the Disk Management pane differs from lists that already work: it may use separate scrollbar controls, or it may only handle the wheel when it has focus.
+- **Wheel:** follow Windows' behaviour and send the wheel to the window under the pointer, falling back to the focused window.
+
+**Done when:**
+- double-click opens the editor or properties in regedit, Services, Event Viewer and Device Manager
+- double-clicking a caption maximizes the window
+- Disk Management's graphical pane scrolls all three ways
+
+Add native tests.
+
+**Conflicts:** `button()` and `wheel()`. Coordinate with Task 7, and put the new logic in its own module.
+
+---
+
+## Task 9 — Right-click menus appear in the wrong place with the wrong items
+
+**Evidence.** Right-clicking a registry value showed regedit's empty-area "New" menu at (512,384), which is Session 0's screen centre, instead of Modify/Delete/Rename at the pointer. MMC apps put the menu in the right place.
+
+**What to do.** Apps that read the real cursor position (`GetCursorPos`/`GetMessagePos`) need Session 0's cursor to match the workspace pointer. That is Task 1's `SetCursorPos`. If Task 1 fails, test whether `SetCursorPos` alone works while the background desktop isn't Session 0's active desktop. If it doesn't, document regedit as limited to Shift+F10.
+
+**Done when:** right-clicking a value in regedit opens the value's menu at the pointer.
+
+---
+
+## Task 10 — Open/Save dialogs report the SYSTEM Desktop folder as unavailable
+
+**Evidence.** Every common Open/Save dialog first shows "`C:\WINDOWS\system32\config\systemprofile\Desktop` is unavailable". Notepad's Save As worked once that was dismissed.
+
+**What to do.** Before launching apps, create `%SystemRoot%\System32\config\systemprofile\Desktop` if it's missing, and the matching folder under `SysWOW64` on 64-bit Windows. This is a small, deliberate change to the machine; mention it in `README.md`.
+
+**Done when:** Notepad's Save As, regedit's Export, and Event Viewer's Save All Events As open without the error.
+
+**Conflicts:** none. Use a helper called from `run_background_input_child` or `Workspace::new`.
+
+---
+
+## Task 11 — Firewall New Rule wizard crashes when Cancel is clicked, and Resource Monitor's arrow buttons ignore clicks
+
+**Evidence.**
+- Clicking Cancel in the New Inbound Rule wizard gives "MMC has detected an error in a snap-in", with `ObjectDisposedException: Cannot access a disposed object 'Button'`. The stack trace runs `Button.OnMouseUp → PointToScreen`.
+- It reproduces every time; Esc cancels cleanly.
+- Resource Monitor's section arrows and ▶ graph-pane toggle take focus but never act. Clicking the section header works.
+
+**What to do.**
+1. Confirm both work with real input: on the console desktop while it's idle, or in a VM. If they work there, the problem comes from the workspace's input emulation.
+2. After Task 1:
+   - If it's "go", retest both; they're likely fixed.
+   - If it's "no-go", compare the message sequence a real click produces against the workspace's (Spy++ or a message hook). Suspects:
+     - mouse capture during the press
+     - the order of `SetFocus` and the button press in `button()`
+     - `WindowFromPoint` using the real cursor position
+3. Fix the difference in the input code, working with whichever of Tasks 7 and 8 owns `button()`.
+
+**Done when:** clicking Cancel closes the wizard without an error, and Resource Monitor's arrows expand and collapse sections.
+
+---
+
+### Out of scope, but deserves a decision
+
+Real `explorer.exe` starts in Session 0 and never shows a window. It sits hidden in the workspace job until the workspace closes. `README.md` already says Explorer isn't supported. Decide whether to leave that as documented, or to detect hidden `explorer.exe` processes in the job, end them, and show a notice pointing to the built-in File Explorer.
