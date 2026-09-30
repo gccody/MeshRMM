@@ -684,6 +684,46 @@ fn native_apps_take_real_pointer_input() -> anyhow::Result<()> {
             title.starts_with("Edit ")
         })?;
 
+        // Right-clicking a value opens the value's menu at the pointer. regedit
+        // reads the real cursor, so a stale one gets its empty-area New menu
+        // at Session 0's screen centre.
+        let (x, y) = normalized(row.x, row.y);
+        for pressed in [true, false] {
+            workspace.apply(RemoteInput::PointerButtonAt {
+                display_id: display(),
+                x,
+                y,
+                button: PointerButton::Right,
+                pressed,
+            })?;
+        }
+        wait_until(workspace, "regedit's value menu", 5, &|_| {
+            open_menu().ok().flatten().is_some()
+        })
+        .inspect_err(|_| {
+            let _ = proof("background-regedit-value-menu-failure.bmp");
+        })?;
+        let (menu, items) = open_menu()?.context("regedit's value menu closed")?;
+        anyhow::ensure!(
+            ["Modify", "Delete", "Rename"]
+                .iter()
+                .all(|name| items.iter().any(|item| item.starts_with(name))),
+            "right-clicking a value opened {items:?}"
+        );
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(menu, &mut rect)? };
+        let near = |edge: i32, pointer: i32| (edge - pointer).abs() <= 2;
+        anyhow::ensure!(
+            (near(rect.left, row.x) || near(rect.right, row.x))
+                && (near(rect.top, row.y) || near(rect.bottom, row.y)),
+            "regedit's value menu is at {rect:?}, not at the pointer {row:?}"
+        );
+        proof("background-regedit-value-menu.bmp")?;
+        key(workspace, 0x01, false)?;
+        wait_until(workspace, "Escape to close the value menu", 5, &|_| {
+            open_menu().ok().flatten().is_none()
+        })?;
+
         // Services: the Action menu opens on click, double-clicking a service
         // opens its properties, and double-clicking the caption maximizes.
         workspace.launch(pin("mmc.exe", "services.msc"))?;

@@ -667,7 +667,7 @@ does not yet provide a separate background-only connection from the dashboard.
 The ignored native test `remote::background::tests::session_zero_gui` exercises
 the launcher, text input, PowerShell keyboard input, Registry Editor rendering, H.264 output, Session 0
 placement, and application cleanup. The ignored tests in
-`remote::background::input_tests` check menus, double-clicks, scrollbars, and the
+`remote::background::input_tests` check menus, right-click menus, double-clicks, scrollbars, and the
 wheel on test windows, Registry Editor, Services, and Disk Management. Run each in
 a dedicated SYSTEM process in Session 0 with no active background workspace. It writes
 `meshrmm-background-gui.bmp` to that process's temporary directory. The capture

@@ -218,6 +218,8 @@ Add native tests.
 
 ## Task 9 — Right-click menus appear in the wrong place with the wrong items
 
+**Status: done** (2026-09-30), by Task 7's real input. Pointer moves go through `SendInput`, so Session 0's cursor follows the workspace pointer, and regedit, which reads the real cursor, opens the menu of the value under it. No code change was needed beyond Task 7. `native_apps_take_real_pointer_input` now right-clicks regedit's first value and checks that the menu has Modify, Delete and Rename and that a corner is within 2 px of the pointer. It passes on `DESKTOP-85R6S28`, with `menus_open_and_run_from_clicks` and `double_clicks_scrollbars_and_wheel`. The installed service's helper passed the same check by hand during Task 7.
+
 **Evidence.** Right-clicking a registry value showed regedit's empty-area "New" menu at (512,384), which is Session 0's screen centre, instead of Modify/Delete/Rename at the pointer. MMC apps put the menu in the right place.
 
 **What to do.** Apps that read the real cursor position (`GetCursorPos`/`GetMessagePos`) need Session 0's cursor to match the workspace pointer. That is Task 1's `SetCursorPos`. If Task 1 fails, test whether `SetCursorPos` alone works while the background desktop isn't Session 0's active desktop. If it doesn't, document regedit as limited to Shift+F10.
