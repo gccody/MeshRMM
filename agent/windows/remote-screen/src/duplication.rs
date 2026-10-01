@@ -8,9 +8,9 @@ use windows_capture::dxgi_duplication_api::{
 };
 use windows_capture::monitor::Monitor;
 
-use crate::converter::BgraToYuvConverter;
-use crate::encoder::{MediaFoundationVideoEncoder, VideoEncoder};
+use crate::encoder::VideoEncoder;
 use crate::refinement::StaticRefinement;
+use crate::software::PipelineConfig;
 use crate::{
     ActiveFormat, ControlState, EncodedAccessUnit, EncodedFrameSink, Error, FramePacer,
     StreamConfig, monotonic_timestamp_us,
@@ -54,6 +54,10 @@ impl WindowsDesktopDuplicationStreamer {
         if self.running.is_some() {
             return Err(Error::AlreadyRunning);
         }
+        let config = StreamConfig {
+            frames_per_second: crate::software::frames_per_second(config.frames_per_second),
+            ..config
+        };
         // The static media type already contains this start's bitrate. Do not
         // replay a runtime request left behind by the previous encoder.
         self.controls
@@ -356,23 +360,18 @@ fn capture_loop_inner(
         codec: config.codec,
         pixel_format: config.pixel_format,
     };
-    let mut converter = BgraToYuvConverter::new(
+    let (mut converter, mut encoder) = crate::software::pipeline(
         &device,
         &context,
-        width,
-        height,
-        config.frames_per_second,
-        config.pixel_format,
-        config.grayscale,
-    )?;
-    let mut encoder = MediaFoundationVideoEncoder::new(
-        &device,
-        width,
-        height,
-        config.frames_per_second,
-        config.bitrate_bits_per_second,
-        config.codec,
-        config.pixel_format,
+        &PipelineConfig {
+            width,
+            height,
+            frames_per_second: config.frames_per_second,
+            bitrate_bits_per_second: config.bitrate_bits_per_second,
+            codec: config.codec,
+            pixel_format: config.pixel_format,
+            grayscale: config.grayscale,
+        },
     )?;
     if let Some(started) = started.take() {
         let _ = started.send(Ok(format));

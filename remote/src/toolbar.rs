@@ -74,6 +74,9 @@ pub struct State {
     pub annotation_available: bool,
     pub chat_available: bool,
     pub chat_unread: usize,
+    /// `Some(safe_mode)` once the agent reports it can restart its computer,
+    /// with whether Windows is in Safe Mode.
+    pub power: Option<bool>,
     /// The latest file transfer's progress or result.
     pub file_status: String,
     pub recording: bool,
@@ -92,6 +95,7 @@ pub enum Action {
     Recording,
     Credentials,
     SecureAttention,
+    Power,
     TypeClipboard,
     Annotate,
     Files,
@@ -111,6 +115,7 @@ pub enum Icon {
     Record,
     Key,
     Keyboard,
+    Power,
     Clipboard,
     Pen,
     Folder,
@@ -270,6 +275,21 @@ pub fn items(state: &State) -> Vec<Item> {
     );
     secure_attention.enabled = !state.input_blocked;
     items.push(secure_attention);
+    // Not input: view-only sessions can restart too.
+    let mut power = Item::new(
+        Action::Power,
+        Icon::Power,
+        match state.power {
+            None => "Restart is unavailable until the agent connects",
+            Some(false) => "Restart the remote computer",
+            Some(true) => "Restart the remote computer, which is in Safe Mode",
+        },
+        2,
+    )
+    .with_menu();
+    power.enabled = state.power.is_some();
+    power.label = (state.power == Some(true)).then(|| "Safe Mode".to_owned());
+    items.push(power);
     let mut type_clipboard = Item::new(
         Action::TypeClipboard,
         Icon::Clipboard,
@@ -868,6 +888,10 @@ pub fn icon(icon: Icon) -> Vec<Shape> {
             }
             shapes
         }
+        Icon::Power => vec![
+            stroke(arc(10.0, 10.8, 6.6, 300.0, 600.0)),
+            stroke(polyline(&[(10.0, 2.6), (10.0, 9.6)])),
+        ],
         Icon::Clipboard => vec![
             stroke(vec![
                 Segment::Move(7.5, 4.0),
@@ -1020,6 +1044,7 @@ pub enum Command {
     ForgetCredentials,
     SendFiles,
     ReceiveFiles,
+    Restart { safe_mode: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1135,6 +1160,33 @@ pub fn menu(action: Action, state: &State) -> Vec<MenuEntry> {
                 ),
             ]
         }
+        Action::Power => {
+            let Some(safe_mode) = state.power else {
+                return Vec::new();
+            };
+            let mut entries = Vec::new();
+            if safe_mode {
+                entries.push(status("Windows is in Safe Mode"));
+                entries.push(MenuEntry::Separator);
+            }
+            entries.push(entry(
+                if safe_mode {
+                    "Restart normally…"
+                } else {
+                    "Restart…"
+                },
+                false,
+                true,
+                Command::Restart { safe_mode: false },
+            ));
+            entries.push(entry(
+                "Restart in Safe Mode with Networking…",
+                false,
+                true,
+                Command::Restart { safe_mode: true },
+            ));
+            entries
+        }
         Action::Files => {
             let mut entries = vec![
                 entry("Send files…", false, true, Command::SendFiles),
@@ -1147,6 +1199,27 @@ pub fn menu(action: Action, state: &State) -> Vec<MenuEntry> {
             entries
         }
         _ => Vec::new(),
+    }
+}
+
+/// What the viewer asks before restarting the remote computer: the title,
+/// the explanation, and the confirming button's label.
+pub fn restart_confirmation(safe_mode: bool) -> (&'static str, &'static str, &'static str) {
+    if safe_mode {
+        (
+            "Restart the remote computer in Safe Mode?",
+            "Windows restarts now in Safe Mode with Networking, closing applications without \
+             saving. The session reconnects once the agent is back online. The restart after \
+             that returns Windows to normal mode.",
+            "Restart in Safe Mode",
+        )
+    } else {
+        (
+            "Restart the remote computer?",
+            "Windows restarts now, closing applications without saving. The session \
+             reconnects once the agent is back online.",
+            "Restart",
+        )
     }
 }
 
@@ -1325,7 +1398,7 @@ mod tests {
     fn minimum_width_fits_every_item() {
         let items = items_for(|state| state.recording = true);
         let width = minimum_width(&items, 0.0, &measure);
-        assert!(width < 760.0, "{width}");
+        assert!(width < 800.0, "{width}");
         let layout = layout(&items, width, 0.0, &measure);
         let mut sorted: Vec<_> = layout.rects.clone();
         sorted.sort_by(|a, b| a.x.total_cmp(&b.x));
@@ -1336,7 +1409,7 @@ mod tests {
 
     #[test]
     fn long_labels_fit_at_both_platform_minimum_widths() {
-        for (width, inset, caption) in [(640.0, 84.0, None), (744.0, 0.0, Some(false))] {
+        for (width, inset, caption) in [(680.0, 84.0, None), (784.0, 0.0, Some(false))] {
             for session in [
                 "administrator (RDP 2)",
                 "非常に長いユーザー名".repeat(20).as_str(),
@@ -1479,6 +1552,57 @@ mod tests {
         let (placed, paint) = place(&stroke(segments), Rect::new(100.0, 10.0, 40.0, 40.0));
         assert_eq!(placed[0], Segment::Move(130.0, 30.0));
         assert_eq!(paint, Paint::Stroke(3.0));
+    }
+
+    #[test]
+    fn power_waits_for_the_agent_and_offers_both_restarts() {
+        let unavailable = items_for(|_| {});
+        let power = find(&unavailable, Action::Power).unwrap();
+        assert!(!power.enabled && power.menu && power.label.is_none());
+        assert!(menu(Action::Power, &state()).is_empty());
+
+        // Restarting is not input, so blocking the technician's input leaves it.
+        let normal = State {
+            power: Some(false),
+            input_blocked: true,
+            ..state()
+        };
+        let power = find(&items(&normal), Action::Power).cloned().unwrap();
+        assert!(power.enabled && power.label.is_none());
+        assert_eq!(power.icon, Icon::Power);
+        assert_eq!(
+            commands(&menu(Action::Power, &normal)),
+            [
+                Some(Command::Restart { safe_mode: false }),
+                Some(Command::Restart { safe_mode: true })
+            ]
+        );
+
+        let safe = State {
+            power: Some(true),
+            ..state()
+        };
+        let power = find(&items(&safe), Action::Power).cloned().unwrap();
+        assert_eq!(power.label.as_deref(), Some("Safe Mode"));
+        let entries = menu(Action::Power, &safe);
+        assert_eq!(
+            commands(&entries),
+            [
+                None,
+                None,
+                Some(Command::Restart { safe_mode: false }),
+                Some(Command::Restart { safe_mode: true })
+            ]
+        );
+        assert!(matches!(
+            &entries[2],
+            MenuEntry::Item { label, .. } if label == "Restart normally…"
+        ));
+        for safe_mode in [false, true] {
+            let (title, detail, button) = restart_confirmation(safe_mode);
+            assert!(title.ends_with('?') && !detail.contains("  ") && !button.is_empty());
+            assert_eq!(title.contains("Safe Mode"), safe_mode);
+        }
     }
 
     #[test]

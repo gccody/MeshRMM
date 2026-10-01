@@ -255,6 +255,7 @@ unsafe fn run_probe() {
             Action::Quality,
             Action::Credentials,
             Action::SecureAttention,
+            Action::Power,
             Action::TypeClipboard,
             Action::Annotate,
             Action::Files,

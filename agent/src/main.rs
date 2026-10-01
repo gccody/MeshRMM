@@ -1,6 +1,8 @@
 #[cfg(windows)]
 mod installer;
 mod logging;
+#[cfg(any(windows, test))]
+mod power;
 #[cfg(windows)]
 mod private_directory;
 mod remote;

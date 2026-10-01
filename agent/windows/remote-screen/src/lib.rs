@@ -14,6 +14,7 @@ mod encoder;
 mod grayscale;
 mod layout;
 mod refinement;
+mod software;
 
 pub use duplication::WindowsDesktopDuplicationStreamer;
 
@@ -32,8 +33,8 @@ use windows_capture::settings::{
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 
-use crate::converter::BgraToYuvConverter;
-use crate::encoder::{MediaFoundationVideoEncoder, VideoEncoder};
+use crate::encoder::VideoEncoder;
+use crate::software::{Converter, Encoder, PipelineConfig};
 
 pub type EncodedFrameSink = Arc<dyn Fn(EncodedAccessUnit) + Send + Sync + 'static>;
 
@@ -252,8 +253,8 @@ struct ControlState {
 }
 
 struct CaptureHandler {
-    converter: BgraToYuvConverter,
-    encoder: MediaFoundationVideoEncoder,
+    converter: Converter,
+    encoder: Encoder,
     sink: EncodedFrameSink,
     controls: Arc<ControlState>,
     format: ActiveFormat,
@@ -323,23 +324,18 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             sink,
             controls,
         } = context.flags;
-        let converter = BgraToYuvConverter::new(
+        let (converter, encoder) = software::pipeline(
             &context.device,
             &context.device_context,
-            format.width,
-            format.height,
-            format.frames_per_second,
-            config.pixel_format,
-            config.grayscale,
-        )?;
-        let encoder = MediaFoundationVideoEncoder::new(
-            &context.device,
-            format.width,
-            format.height,
-            format.frames_per_second,
-            config.bitrate_bits_per_second,
-            config.codec,
-            config.pixel_format,
+            &PipelineConfig {
+                width: format.width,
+                height: format.height,
+                frames_per_second: format.frames_per_second,
+                bitrate_bits_per_second: config.bitrate_bits_per_second,
+                codec: config.codec,
+                pixel_format: config.pixel_format,
+                grayscale: config.grayscale,
+            },
         )?;
         Ok(Self {
             converter,
@@ -498,6 +494,10 @@ impl WindowsScreenStreamer {
         if self.active_format.is_some() {
             return Err(Error::AlreadyRunning);
         }
+        let config = StreamConfig {
+            frames_per_second: software::frames_per_second(config.frames_per_second),
+            ..config
+        };
         if display_id == ALL_MONITORS_ID {
             let format = self.desktop.start(config, display_id, sink)?;
             self.active_format = Some(format);

@@ -150,6 +150,7 @@ pub async fn run(
 
     #[cfg(windows)]
     {
+        connection_approval::restore_after_restart();
         let link = service_link::ServiceLink::new(mode == ExecutionMode::Worker);
         // Created once, so reconnecting does not capture again before the interval ends.
         let mut thumbnails = thumbnail::Thumbnails::new(mode);

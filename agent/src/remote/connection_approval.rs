@@ -92,6 +92,69 @@ impl ConnectionApproval {
     }
 }
 
+/// How long an accepted answer kept for a restart stays valid: long enough
+/// for Windows to restart and the technician to reconnect.
+const RESTART_ANSWER_LIFETIME: Duration = Duration::from_secs(30 * 60);
+#[cfg(windows)]
+const RESTART_ANSWER_FILE: &str = "restart-approval";
+
+/// The session to keep accepted across a restart the technician requested
+/// from `session_id`, if its connection was accepted.
+fn answer_to_remember(session_id: &RemoteSessionId) -> Option<RemoteSessionId> {
+    ANSWERED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .filter(|(answered, accepted)| answered == session_id && *accepted)
+        .map(|(answered, _)| answered.clone())
+}
+
+/// Accepts the remembered session again after the restart, when the answer
+/// is recent.
+fn restore_answer(session_id: &str, age: Duration) -> bool {
+    if session_id.is_empty() || age > RESTART_ANSWER_LIFETIME {
+        return false;
+    }
+    *ANSWERED.lock().unwrap_or_else(|error| error.into_inner()) =
+        Some((RemoteSessionId::new(session_id), true));
+    true
+}
+
+/// Keeps this session's accepted answer for the Agent that starts after the
+/// restart, so resuming the session does not ask the user again. The file
+/// sits in the Agent's administrator-only configuration directory.
+#[cfg(windows)]
+pub fn remember_across_restart(session_id: &RemoteSessionId) -> anyhow::Result<()> {
+    let path = crate::installer::config_directory()?.join(RESTART_ANSWER_FILE);
+    match answer_to_remember(session_id) {
+        Some(session_id) => crate::installer::replace_file(&path, session_id.as_str().as_bytes()),
+        None => match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// Run once when the coordinator starts.
+#[cfg(windows)]
+pub fn restore_after_restart() {
+    let Ok(path) = crate::installer::config_directory().map(|d| d.join(RESTART_ANSWER_FILE)) else {
+        return;
+    };
+    let (Ok(session_id), Ok(metadata)) = (std::fs::read_to_string(&path), path.metadata()) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&path);
+    let age = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .unwrap_or(Duration::MAX);
+    if restore_answer(session_id.trim(), age) {
+        tracing::info!(%session_id, "kept the connection approval of the session that restarted Windows");
+    }
+}
+
 /// How a connection was answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -185,6 +248,33 @@ mod tests {
         }
     }
 
+    /// Tests that change the process-wide answer run one at a time.
+    static ANSWER_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn only_a_recent_accepted_answer_survives_a_restart() {
+        let _answer = ANSWER_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let approval = ConnectionApproval::for_request(&request("restarting")).unwrap();
+        let other = RemoteSessionId::new("other");
+        approval.record(false);
+        assert_eq!(answer_to_remember(&approval.session_id), None);
+        approval.record(true);
+        assert_eq!(answer_to_remember(&other), None);
+        let remembered = answer_to_remember(&approval.session_id).unwrap();
+
+        *ANSWERED.lock().unwrap() = None;
+        assert!(!restore_answer(
+            remembered.as_str(),
+            RESTART_ANSWER_LIFETIME + Duration::from_secs(1)
+        ));
+        assert_eq!(approval.previous_answer(), None);
+        assert!(restore_answer(remembered.as_str(), Duration::from_secs(90)));
+        assert_eq!(approval.previous_answer(), Some(true));
+        *ANSWERED.lock().unwrap() = None;
+    }
+
     fn prompt(timeout: u64, lock_idle: u64) -> ApprovalPrompt {
         ApprovalPrompt {
             text: String::new(),
@@ -236,6 +326,9 @@ mod tests {
 
     #[test]
     fn a_resumed_session_keeps_its_answer_and_the_next_session_asks_again() {
+        let _answer = ANSWER_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let first = ConnectionApproval::for_request(&request("approval-first")).unwrap();
         let resumed = ConnectionApproval::for_request(&request("approval-first")).unwrap();
         assert_eq!(first.previous_answer(), None);

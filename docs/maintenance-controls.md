@@ -136,6 +136,69 @@ separate LocalSystem helper on the console's desktop, which also measures the
 session's input idle time. Apply migration `0018_connection_approval.sql`
 before deploying the updated server and dashboard; `/healthz` expects it.
 
+## Restart and Safe Mode
+
+The toolbar's power button, next to **Send Ctrl+Alt+Del**, opens a menu with
+**Restart…** and **Restart in Safe Mode with Networking…**. Each asks for
+confirmation first. Windows then restarts at once and closes applications
+without saving. The button is available once the Agent has connected,
+including in view-only sessions, since restarting is not input.
+
+The session survives the restart. The viewer keeps the window open and shows
+that the remote computer is restarting, the server keeps the session, and its
+Agent coordinator hands the session back to the Agent once it reconnects.
+Connection approval is not asked again: the Agent keeps the session's accepted
+answer in its configuration directory for up to 30 minutes across the restart.
+
+In Safe Mode the toolbar shows **Safe Mode** beside the power button, and its
+menu offers **Restart normally…**. The Agent makes Safe Mode work as follows:
+
+- **The service starts.** Windows starts only services listed under
+  `HKLM\SYSTEM\CurrentControlSet\Control\SafeBoot\Network`. The installer
+  and each Safe Mode restart register `MeshRMMAgent` there; uninstalling
+  removes it.
+- **The next restart is normal.** A Safe Mode restart sets the boot option
+  with `bcdedit /set {current} safeboot network` and leaves a
+  `safe-mode-restart` marker beside `agent.json`. When the service starts
+  again, it clears the option and removes the marker. A computer that boots
+  into Safe Mode but cannot reach the network therefore returns to normal
+  mode the next time it restarts. **Restart normally** also clears a Safe
+  Mode option that something else, such as `msconfig`, set.
+- **Video works without a GPU driver.** Safe Mode has no hardware encoder,
+  and Windows disables the Media Foundation platform there (`MFStartup`
+  fails with `MF_E_DISABLED_IN_SAFEMODE`). The Agent copies frames to the
+  CPU, converts them to NV12 there, and creates Microsoft's software H.264
+  encoder transform directly through COM, which works without
+  `MFStartup`. HEVC and 4:4:4 are unavailable, so profile negotiation falls
+  back to H.264 4:2:0, and capture is capped at 30 FPS. Normal boots never
+  use this path.
+
+Other features degrade as Windows allows in Safe Mode; for example, system
+audio is unavailable because the Windows Audio service does not run.
+
+### Validation (2026-10-01)
+
+On `DESKTOP-85R6S28` (Windows 11, wired Ethernet, NVIDIA GPU), with the
+installed Agent service and the macOS viewer against production signaling:
+
+- **Restart:** Windows booted again 22 seconds after the click, and the
+  same viewer session reconnected 42 seconds after it.
+- **Restart in Safe Mode with Networking:** Windows booted into Safe Mode.
+  The service started, cleared the boot option and marker, and resumed the
+  session. H.265 failed as expected, and the stream fell back to software
+  H.264 at 1920×1080 and 30 FPS. The toolbar showed **Safe Mode**.
+- **Restart normally** from Safe Mode booted Windows normally, and the
+  session resumed with hardware H.265.
+- The opt-in software encoder test took about 9 ms per 1080p frame, both in
+  normal mode and in Safe Mode:
+
+  ```powershell
+  cargo test --release -p meshrmm-remote-screen software -- --ignored --nocapture
+  ```
+
+Connection approval was off for the test company. Unit tests cover keeping
+its answer across the restart.
+
 ## Validation
 
 Automated checks cover protocol compatibility, name/template rendering, company

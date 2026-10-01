@@ -181,8 +181,11 @@ fn remove_agent() -> anyhow::Result<()> {
     }
     drop(manager);
 
+    crate::power::finish_safe_mode_restart();
+    crate::power::unregister_safe_mode_service()?;
+
     let install_directory = program_files()?.join("MeshRMM").join("Agent");
-    let config_directory = program_data()?.join("MeshRMM").join("Agent");
+    let config_directory = config_directory()?;
     remove_directory_if_present(&config_directory)?;
     remove_directory_if_present(&install_directory)?;
     remove_empty_parent(&config_directory);
@@ -355,6 +358,7 @@ fn install() -> anyhow::Result<Option<String>> {
     service
         .set_failure_actions_on_non_crash_failures(true)
         .context("failed to enable Agent service recovery")?;
+    crate::power::register_safe_mode_service()?;
     let start_result = service
         .start::<&OsStr>(&[])
         .context("failed to start the Agent service")
@@ -662,11 +666,13 @@ fn program_files() -> anyhow::Result<PathBuf> {
 }
 
 /// Where the Agent keeps its WebRTC identity, beside its other ProgramData state.
+/// `%ProgramData%\MeshRMM\Agent`, which only administrators can change.
+pub(crate) fn config_directory() -> anyhow::Result<PathBuf> {
+    Ok(program_data()?.join("MeshRMM").join("Agent"))
+}
+
 pub(crate) fn identity_directory() -> anyhow::Result<PathBuf> {
-    Ok(program_data()?
-        .join("MeshRMM")
-        .join("Agent")
-        .join("identity"))
+    Ok(config_directory()?.join("identity"))
 }
 
 fn validate_bootstrap(config: &[u8]) -> anyhow::Result<InstallerBootstrap> {

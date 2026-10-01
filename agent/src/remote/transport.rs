@@ -456,6 +456,7 @@ async fn run_connected_sender(
     let maintenance_input = Arc::clone(&input);
     let cleanup_input = Arc::clone(&input);
     let maintenance_errors = control_tx.clone();
+    let restart_session = session_id.clone();
     let (maintenance_tx, maintenance_task) = super::native_task::command_worker(
         "meshrmm-maintenance",
         32,
@@ -487,6 +488,11 @@ async fn run_connected_sender(
                 }
                 Some(SessionMessage::SetAgentInputBlocked { blocked }) => {
                     maintenance_input.set_agent_input_blocked(blocked)
+                }
+                Some(SessionMessage::Restart { safe_mode }) => {
+                    super::connection_approval::remember_across_restart(&restart_session)
+                        .and_then(|()| crate::power::restart(safe_mode))
+                        .context("Restart")
                 }
                 _ => Ok(()),
             };
@@ -647,7 +653,8 @@ async fn run_connected_sender(
                         | SessionMessage::SetWallpaperHidden { .. }
                         | SessionMessage::SetPreventIdleLock { .. }
                         | SessionMessage::SetBlackout { .. }
-                        | SessionMessage::SetAgentInputBlocked { .. }),
+                        | SessionMessage::SetAgentInputBlocked { .. }
+                        | SessionMessage::Restart { .. }),
                     ) => maintenance_tx.try_send(message).err().map(|_| {
                         ControlCommand::MaintenanceError(
                             "maintenance command queue full or closed".into(),
@@ -1821,6 +1828,13 @@ fn spawn_control_start(
         };
         if let Err(error) = send_control_message(&channel, message).await {
             tracing::warn!(error = %error, %session_id, "failed to send stream configuration");
+            return;
+        }
+        let power = SessionMessage::PowerState {
+            safe_mode: crate::power::booted_in_safe_mode(),
+        };
+        if let Err(error) = send_control_message(&channel, power).await {
+            tracing::warn!(error = %error, %session_id, "failed to send power state");
             return;
         }
         // Viewers answer this configuration with their audio preference and

@@ -95,6 +95,7 @@ pub async fn run_receiver(
         shutting_down: Arc::new(AtomicBool::new(false)),
         progress: Arc::clone(&resume_state.progress),
         reconnect_status: Arc::clone(&resume_state.reconnect_status),
+        restarting: Arc::clone(&resume_state.restarting),
     };
     let (remote_text_tx, _services) = start_viewer_services(
         viewer_control.clone(),

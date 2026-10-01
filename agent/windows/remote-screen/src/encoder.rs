@@ -40,6 +40,8 @@ pub enum Error {
         codec: VideoCodec,
         pixel_format: VideoPixelFormat,
     },
+    #[error("Windows has no software Media Foundation H.264 encoder")]
+    SoftwareEncoderUnavailable,
     #[error("Media Foundation encoder configuration failed: {0}")]
     Configuration(#[source] windows::core::Error),
     #[error("Media Foundation encoder input failed: {0}")]
@@ -71,10 +73,10 @@ pub trait VideoEncoder {
     fn set_bitrate(&self, bits_per_second: u32) -> Result<(), Error>;
 }
 
-struct MediaFoundationRuntime;
+pub(crate) struct MediaFoundationRuntime;
 
 impl MediaFoundationRuntime {
-    fn start() -> Result<Self, Error> {
+    pub(crate) fn start() -> Result<Self, Error> {
         // Safety: MFStartup/MFShutdown are balanced by this RAII guard on the
         // capture worker thread.
         unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).map_err(Error::Startup)? };
@@ -101,10 +103,124 @@ pub struct MediaFoundationVideoEncoder {
     frame_duration_100ns: i64,
     need_input: u32,
     have_output: u32,
+    output: OutputFramer,
+}
+
+/// Turns encoded samples into access units: matches them to their capture
+/// timestamps and attaches the sequence header to keyframes.
+pub(crate) struct OutputFramer {
     sequence_header: Option<Vec<u8>>,
     sequence_header_sent: bool,
     pending_capture_timestamps: VecDeque<u64>,
     codec: VideoCodec,
+}
+
+impl OutputFramer {
+    pub(crate) fn new(transform: &IMFTransform, codec: VideoCodec) -> Self {
+        Self {
+            sequence_header: read_sequence_header(transform),
+            sequence_header_sent: false,
+            pending_capture_timestamps: VecDeque::with_capacity(SURFACE_COUNT),
+            codec,
+        }
+    }
+
+    pub(crate) fn pending(&self) -> usize {
+        self.pending_capture_timestamps.len()
+    }
+
+    pub(crate) fn submitted(&mut self, capture_timestamp_us: u64) {
+        self.pending_capture_timestamps
+            .push_back(capture_timestamp_us);
+    }
+
+    /// Reads one encoded sample from `transform`. `None` means a synchronous
+    /// transform needs more input first.
+    pub(crate) fn take(
+        &mut self,
+        transform: &IMFTransform,
+        output_info: &MFT_OUTPUT_STREAM_INFO,
+    ) -> Result<Option<EncodedAccessUnit>, Error> {
+        // Safety: samples and buffers are COM-owned for the duration of this
+        // call. Locked buffer memory is copied before Unlock.
+        unsafe {
+            let provides_samples = output_info.dwFlags
+                & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32
+                    | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32)
+                != 0;
+            let provided_sample = if provides_samples {
+                None
+            } else {
+                let sample = MFCreateSample().map_err(Error::Output)?;
+                let capacity = output_info.cbSize.max(1024 * 1024);
+                let buffer = MFCreateMemoryBuffer(capacity).map_err(Error::Output)?;
+                sample.AddBuffer(&buffer).map_err(Error::Output)?;
+                Some(sample)
+            };
+            let mut output = MFT_OUTPUT_DATA_BUFFER {
+                dwStreamID: 0,
+                pSample: ManuallyDrop::new(provided_sample),
+                ..Default::default()
+            };
+            let mut status = 0_u32;
+            let process_result =
+                transform.ProcessOutput(0, std::slice::from_mut(&mut output), &mut status);
+            let sample = ManuallyDrop::take(&mut output.pSample);
+            let _ = ManuallyDrop::take(&mut output.pEvents);
+            match process_result {
+                Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
+                result => result.map_err(Error::Output)?,
+            }
+            let sample = sample.ok_or(Error::MissingOutputSample)?;
+            let clean_point = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
+            let buffer = sample.ConvertToContiguousBuffer().map_err(Error::Output)?;
+            let mut data_ptr = ptr::null_mut();
+            let mut current_length = 0_u32;
+            buffer
+                .Lock(&mut data_ptr, None, Some(&mut current_length))
+                .map_err(Error::Output)?;
+            let data = if data_ptr.is_null() {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(data_ptr, current_length as usize).to_vec()
+            };
+            buffer.Unlock().map_err(Error::Output)?;
+            // Several hardware MFTs omit CleanPoint on forced IDRs. Inspecting
+            // the access unit prevents a valid recovery frame from being
+            // mislabeled and discarded by a decoder waiting for an IDR.
+            let keyframe = clean_point || contains_idr(self.codec, &data);
+            let mut codec_config = None;
+            // Some hardware MFTs omit MFSampleExtension_CleanPoint on their
+            // first IDR. The decoder still needs SPS/PPS before that first
+            // access unit, so attach the sequence header to the first output
+            // regardless of the optional clean-point annotation.
+            if keyframe || !self.sequence_header_sent {
+                if self.sequence_header.is_none() {
+                    self.sequence_header = read_sequence_header(transform);
+                }
+                codec_config = self.sequence_header.clone();
+                self.sequence_header_sent = codec_config.is_some();
+                tracing::info!(
+                    encoded_bytes = data.len(),
+                    codec_config_bytes = codec_config.as_ref().map_or(0, Vec::len),
+                    keyframe,
+                    annex_b = data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1]),
+                    codec = self.codec.name(),
+                    "first access unit produced by encoder"
+                );
+            }
+            Ok(Some(EncodedAccessUnit {
+                capture_timestamp_us: self
+                    .pending_capture_timestamps
+                    .pop_front()
+                    .ok_or(Error::MissingInputMetadata)?,
+                encode_complete_timestamp_us: performance_counter_us()?,
+                keyframe,
+                codec_config,
+                data,
+            }))
+        }
+    }
 }
 
 impl MediaFoundationVideoEncoder {
@@ -242,7 +358,7 @@ impl MediaFoundationVideoEncoder {
             transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
                 .map_err(Error::Configuration)?;
-            let sequence_header = read_sequence_header(&transform);
+            let output = OutputFramer::new(&transform, codec);
             let mut encoder = Self {
                 _runtime: runtime,
                 transform,
@@ -253,10 +369,7 @@ impl MediaFoundationVideoEncoder {
                 frame_duration_100ns: 10_000_000_i64 / i64::from(frames_per_second.max(1)),
                 need_input: 0,
                 have_output: 0,
-                sequence_header,
-                sequence_header_sent: false,
-                pending_capture_timestamps: VecDeque::with_capacity(SURFACE_COUNT),
-                codec,
+                output,
             };
             encoder.pump_events(false)?;
             Ok(encoder)
@@ -298,86 +411,6 @@ impl MediaFoundationVideoEncoder {
         }
         Ok(())
     }
-
-    fn take_output(&mut self) -> Result<EncodedAccessUnit, Error> {
-        // Safety: samples and buffers are COM-owned for the duration of this
-        // call. Locked buffer memory is copied before Unlock.
-        unsafe {
-            let provides_samples = self.output_info.dwFlags
-                & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32
-                    | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32)
-                != 0;
-            let provided_sample = if provides_samples {
-                None
-            } else {
-                let sample = MFCreateSample().map_err(Error::Output)?;
-                let capacity = self.output_info.cbSize.max(1024 * 1024);
-                let buffer = MFCreateMemoryBuffer(capacity).map_err(Error::Output)?;
-                sample.AddBuffer(&buffer).map_err(Error::Output)?;
-                Some(sample)
-            };
-            let mut output = MFT_OUTPUT_DATA_BUFFER {
-                dwStreamID: 0,
-                pSample: ManuallyDrop::new(provided_sample),
-                ..Default::default()
-            };
-            let mut status = 0_u32;
-            let process_result =
-                self.transform
-                    .ProcessOutput(0, std::slice::from_mut(&mut output), &mut status);
-            let sample = ManuallyDrop::take(&mut output.pSample);
-            let _ = ManuallyDrop::take(&mut output.pEvents);
-            process_result.map_err(Error::Output)?;
-            let sample = sample.ok_or(Error::MissingOutputSample)?;
-            let clean_point = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
-            let buffer = sample.ConvertToContiguousBuffer().map_err(Error::Output)?;
-            let mut data_ptr = ptr::null_mut();
-            let mut current_length = 0_u32;
-            buffer
-                .Lock(&mut data_ptr, None, Some(&mut current_length))
-                .map_err(Error::Output)?;
-            let data = if data_ptr.is_null() {
-                Vec::new()
-            } else {
-                std::slice::from_raw_parts(data_ptr, current_length as usize).to_vec()
-            };
-            buffer.Unlock().map_err(Error::Output)?;
-            // Several hardware MFTs omit CleanPoint on forced IDRs. Inspecting
-            // the access unit prevents a valid recovery frame from being
-            // mislabeled and discarded by a decoder waiting for an IDR.
-            let keyframe = clean_point || contains_idr(self.codec, &data);
-            let mut codec_config = None;
-            // Some hardware MFTs omit MFSampleExtension_CleanPoint on their
-            // first IDR. The decoder still needs SPS/PPS before that first
-            // access unit, so attach the sequence header to the first output
-            // regardless of the optional clean-point annotation.
-            if keyframe || !self.sequence_header_sent {
-                if self.sequence_header.is_none() {
-                    self.sequence_header = read_sequence_header(&self.transform);
-                }
-                codec_config = self.sequence_header.clone();
-                self.sequence_header_sent = codec_config.is_some();
-                tracing::info!(
-                    encoded_bytes = data.len(),
-                    codec_config_bytes = codec_config.as_ref().map_or(0, Vec::len),
-                    keyframe,
-                    annex_b = data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1]),
-                    codec = self.codec.name(),
-                    "first access unit produced by hardware encoder"
-                );
-            }
-            Ok(EncodedAccessUnit {
-                capture_timestamp_us: self
-                    .pending_capture_timestamps
-                    .pop_front()
-                    .ok_or(Error::MissingInputMetadata)?,
-                encode_complete_timestamp_us: performance_counter_us()?,
-                keyframe,
-                codec_config,
-                data,
-            })
-        }
-    }
 }
 
 impl VideoEncoder for MediaFoundationVideoEncoder {
@@ -387,7 +420,7 @@ impl VideoEncoder for MediaFoundationVideoEncoder {
     }
 
     fn wants_input(&self) -> bool {
-        self.need_input > 0 && self.pending_capture_timestamps.len() < SURFACE_COUNT
+        self.need_input > 0 && self.output.pending() < SURFACE_COUNT
     }
 
     fn submit(
@@ -414,8 +447,7 @@ impl VideoEncoder for MediaFoundationVideoEncoder {
                 .map_err(Error::Input)?;
         }
         self.need_input -= 1;
-        self.pending_capture_timestamps
-            .push_back(capture_timestamp_us);
+        self.output.submitted(capture_timestamp_us);
         self.pump_events(false)?;
         self.take_available_outputs()
     }
@@ -446,7 +478,11 @@ impl MediaFoundationVideoEncoder {
     fn take_available_outputs(&mut self) -> Result<Vec<EncodedAccessUnit>, Error> {
         let mut outputs = Vec::with_capacity(self.have_output as usize);
         while self.have_output > 0 {
-            outputs.push(self.take_output()?);
+            outputs.push(
+                self.output
+                    .take(&self.transform, &self.output_info)?
+                    .ok_or(Error::MissingOutputSample)?,
+            );
             self.have_output -= 1;
         }
         Ok(outputs)
@@ -469,7 +505,7 @@ impl Drop for MediaFoundationVideoEncoder {
     }
 }
 
-fn make_video_type(
+pub(crate) fn make_video_type(
     subtype: windows::core::GUID,
     width: u32,
     height: u32,
@@ -629,7 +665,7 @@ fn contains_idr(codec: VideoCodec, data: &[u8]) -> bool {
     false
 }
 
-fn set_required_runtime_codec_value(
+pub(crate) fn set_required_runtime_codec_value(
     codec_api: &ICodecAPI,
     key: &windows::core::GUID,
     value: VARIANT,
@@ -649,7 +685,7 @@ fn set_required_runtime_codec_value(
     }
 }
 
-fn set_optional_initial_codec_value(
+pub(crate) fn set_optional_initial_codec_value(
     codec_api: &ICodecAPI,
     key: &windows::core::GUID,
     value: VARIANT,

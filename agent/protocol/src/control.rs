@@ -166,6 +166,16 @@ pub enum SessionMessage {
     },
     /// The technician's drawing over the viewed display; see [`crate::Annotation`].
     Annotate(crate::Annotation),
+    /// Restart the Agent's computer, optionally into Safe Mode with
+    /// Networking. The session resumes once the Agent is back online.
+    Restart {
+        safe_mode: bool,
+    },
+    /// Sent by the Agent when the control channel opens: whether Windows
+    /// started in Safe Mode.
+    PowerState {
+        safe_mode: bool,
+    },
 }
 
 /// System-audio encodings, in the viewer's order of preference. Append new
@@ -685,6 +695,27 @@ mod tests {
         assert_eq!(QualityPreset::BestQuality.bitrate(12_000_000), 12_000_000);
         assert_eq!(QualityPreset::BestQuality.bitrate(100_000_000), 12_000_000);
         assert_eq!(QualityPreset::Balanced.bitrate(4_000_000), 4_000_000);
+    }
+}
+
+#[cfg(test)]
+mod power_tests {
+    use super::*;
+
+    #[test]
+    fn power_messages_append_after_annotations() {
+        let annotate = SessionMessage::Annotate(crate::Annotation::Clear)
+            .encode()
+            .unwrap()[0];
+        assert_eq!(annotate, 40);
+        for (message, bytes) in [
+            (SessionMessage::Restart { safe_mode: false }, vec![41, 0]),
+            (SessionMessage::Restart { safe_mode: true }, vec![41, 1]),
+            (SessionMessage::PowerState { safe_mode: true }, vec![42, 1]),
+        ] {
+            assert_eq!(message.encode().unwrap(), bytes);
+            assert_eq!(SessionMessage::decode(&bytes).unwrap(), message);
+        }
     }
 }
 

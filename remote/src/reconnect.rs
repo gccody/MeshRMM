@@ -86,6 +86,8 @@ pub enum ReconnectReason {
     ConnectionInterrupted,
     /// The remote display or this viewer's video path failed.
     VideoRestarting,
+    /// The technician restarted the remote computer.
+    Restarting { safe_mode: bool },
 }
 
 impl ReconnectReason {
@@ -95,6 +97,10 @@ impl ReconnectReason {
             Self::NetworkLost => "Network connection lost",
             Self::ConnectionInterrupted => "Connection to the remote computer was interrupted",
             Self::VideoRestarting => "Restarting the remote display…",
+            Self::Restarting { safe_mode: false } => "The remote computer is restarting…",
+            Self::Restarting { safe_mode: true } => {
+                "The remote computer is restarting in Safe Mode…"
+            }
         }
     }
 }
