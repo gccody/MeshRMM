@@ -1113,32 +1113,27 @@ pub fn menu(action: Action, state: &State) -> Vec<MenuEntry> {
         Action::Credentials => {
             let credentials = &state.credentials;
             let allowed = !state.input_blocked;
-            let mut entries = Vec::new();
-            if !credentials.message.is_empty() {
-                entries.push(status(credentials.message.clone()));
-                entries.push(MenuEntry::Separator);
-            }
-            if credentials.can_autofill {
-                entries.push(entry(
+            // Status and errors stay in the key icon's tooltip.
+            vec![
+                entry(
                     "Autofill saved credentials",
                     false,
-                    allowed,
+                    allowed && credentials.can_autofill,
                     Command::AutofillCredentials,
-                ));
-            }
-            entries.push(entry(
-                "Prompt for credentials",
-                false,
-                allowed && credentials.available && !credentials.prompt_active,
-                Command::PromptCredentials,
-            ));
-            entries.push(entry(
-                "Forget saved credentials",
-                false,
-                allowed && credentials.saved && !credentials.prompt_active,
-                Command::ForgetCredentials,
-            ));
-            entries
+                ),
+                entry(
+                    "Prompt for credentials",
+                    false,
+                    allowed && credentials.available && !credentials.prompt_active,
+                    Command::PromptCredentials,
+                ),
+                entry(
+                    "Forget saved credentials",
+                    false,
+                    allowed && credentials.saved && !credentials.prompt_active,
+                    Command::ForgetCredentials,
+                ),
+            ]
         }
         Action::Files => {
             let mut entries = vec![
@@ -1533,12 +1528,22 @@ mod tests {
         assert_eq!(
             commands(&credentials),
             [
-                None,
-                None,
                 Some(Command::AutofillCredentials),
                 Some(Command::PromptCredentials),
                 Some(Command::ForgetCredentials)
             ]
+        );
+        assert!(labels(credentials).iter().all(|(_, _, enabled)| *enabled));
+        let no_prompt = State {
+            credentials: CredentialState {
+                can_autofill: false,
+                ..state.credentials.clone()
+            },
+            ..state.clone()
+        };
+        assert_eq!(
+            labels(menu(Action::Credentials, &no_prompt))[0],
+            ("Autofill saved credentials".into(), false, false)
         );
         let blocked = State {
             input_blocked: true,

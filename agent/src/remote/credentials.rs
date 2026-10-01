@@ -1,12 +1,12 @@
 //! Credentials stay on the endpoint. Only DPAPI ciphertext crosses inherited
 //! helper pipes or reaches disk; only status crosses the authenticated remote
 //! control channel.
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
-use anyhow::{Context, ensure};
+use anyhow::{Context, anyhow, ensure};
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE, HLOCAL, HWND, LocalFree},
+        Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE, HLOCAL, HWND, LPARAM, LocalFree},
         Security::{
             Credentials::*, Cryptography::*, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT,
             LogonUserW,
@@ -20,7 +20,7 @@ use windows::{
         },
         UI::{Accessibility::*, WindowsAndMessaging::*},
     },
-    core::{BSTR, PCWSTR, PWSTR, w},
+    core::{BOOL, BSTR, PCWSTR, PWSTR, w},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -207,6 +207,82 @@ fn supported_password_id(id: &str) -> bool {
             .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit()))
 }
 
+fn process_path(pid: u32) -> anyhow::Result<String> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)?;
+        let mut path = [0u16; 32768];
+        let mut length = path.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(path.as_mut_ptr()),
+            &mut length,
+        );
+        let _ = CloseHandle(process);
+        result?;
+        Ok(String::from_utf16(&path[..length as usize])?)
+    }
+}
+
+/// Visible top-level windows of trusted prompt processes on this desktop: the
+/// foreground window first, then the rest from the top of the z-order.
+fn prompt_windows() -> anyhow::Result<Vec<(HWND, u32)>> {
+    unsafe extern "system" fn collect(hwnd: HWND, context: LPARAM) -> BOOL {
+        unsafe {
+            if IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() {
+                (*(context.0 as *mut Vec<HWND>)).push(hwnd);
+            }
+        }
+        BOOL(1)
+    }
+    let mut windows = Vec::new();
+    unsafe {
+        EnumWindows(
+            Some(collect),
+            LPARAM(&mut windows as *mut Vec<HWND> as isize),
+        )?;
+    }
+    let foreground = unsafe { GetForegroundWindow() };
+    if let Some(index) = windows.iter().position(|hwnd| *hwnd == foreground) {
+        windows[..=index].rotate_right(1);
+    }
+    let system = crate::win32::windows_directory()?
+        .to_string_lossy()
+        .to_lowercase();
+    let mut trusted = HashMap::new();
+    Ok(windows
+        .into_iter()
+        .filter_map(|hwnd| {
+            let mut pid = 0;
+            unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+            let allowed = pid != 0
+                && *trusted.entry(pid).or_insert_with(|| {
+                    process_path(pid).is_ok_and(|path| trusted_prompt_process(&path, &system))
+                });
+            allowed.then_some((hwnd, pid))
+        })
+        .collect())
+}
+
+struct PromptFields {
+    hwnd: HWND,
+    pid: u32,
+    username: Option<IUIAutomationValuePattern>,
+    password: IUIAutomationValuePattern,
+}
+impl PromptFields {
+    /// The verified prompt window still exists, is shown, and has the same owner.
+    fn present(&self) -> bool {
+        let mut pid = 0;
+        unsafe {
+            IsWindow(Some(self.hwnd)).as_bool()
+                && IsWindowVisible(self.hwnd).as_bool()
+                && GetWindowThreadProcessId(self.hwnd, Some(&mut pid)) != 0
+                && pid == self.pid
+        }
+    }
+}
+
 pub struct Detector {
     automation: std::mem::ManuallyDrop<IUIAutomation>,
 }
@@ -230,37 +306,22 @@ impl Detector {
     pub fn ready(&self) -> bool {
         self.fields().is_ok()
     }
-    fn fields(
-        &self,
-    ) -> anyhow::Result<(
-        HWND,
-        Option<IUIAutomationValuePattern>,
-        IUIAutomationValuePattern,
-    )> {
+    /// Tries each visible trusted prompt window, so a Windows prompt counts
+    /// even when another window or control has keyboard focus.
+    fn fields(&self) -> anyhow::Result<PromptFields> {
+        let mut first_error = None;
+        for (hwnd, pid) in prompt_windows()? {
+            match self.window_fields(hwnd, pid) {
+                Ok(fields) => return Ok(fields),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        Err(first_error.unwrap_or_else(|| anyhow!("No Windows credential prompt is open")))
+    }
+    fn window_fields(&self, hwnd: HWND, pid: u32) -> anyhow::Result<PromptFields> {
         unsafe {
-            let hwnd = GetForegroundWindow();
-            ensure!(!hwnd.is_invalid(), "No foreground Windows prompt");
-            let mut pid = 0;
-            GetWindowThreadProcessId(hwnd, Some(&mut pid));
-            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)?;
-            let mut path = [0u16; 32768];
-            let mut length = path.len() as u32;
-            let result = QueryFullProcessImageNameW(
-                process,
-                PROCESS_NAME_WIN32,
-                PWSTR(path.as_mut_ptr()),
-                &mut length,
-            );
-            let _ = CloseHandle(process);
-            result?;
-            let path = String::from_utf16(&path[..length as usize])?.to_lowercase();
-            let system = crate::win32::windows_directory()?
-                .to_string_lossy()
-                .to_lowercase();
-            ensure!(
-                trusted_prompt_process(&path, &system),
-                "The foreground window is not a Windows credential prompt"
-            );
             let root = self.automation.ElementFromHandle(hwnd)?;
             let all = root.FindAll(
                 TreeScope_Descendants,
@@ -307,15 +368,16 @@ impl Detector {
                     );
                 }
             }
-            Ok((
+            Ok(PromptFields {
                 hwnd,
+                pid,
                 username,
-                password.context("Select the Windows password sign-in option")?,
-            ))
+                password: password.context("Select the Windows password sign-in option")?,
+            })
         }
     }
     pub fn fill(&self, encrypted: &mut [u8]) -> anyhow::Result<()> {
-        let (hwnd, username, password) = self.fields()?;
+        let fields = self.fields()?;
         let plain = protect(encrypted, true)?;
         ensure!(
             plain.len() == (514 + 257) * 2,
@@ -331,23 +393,15 @@ impl Detector {
             chars[513] == 0 && chars[770] == 0,
             "Invalid credential terminators"
         );
-        unsafe {
-            ensure!(
-                GetForegroundWindow() == hwnd,
-                "Windows prompt changed; try again"
-            );
-            if let Some(username) = username {
-                set_value(&username, &chars[..514])?;
-            }
-            ensure!(
-                GetForegroundWindow() == hwnd,
-                "Windows prompt changed; try again"
-            );
-            // Target the verified control directly. No clipboard, global keystrokes,
-            // tab-order assumptions, or automatic submission.
-            set_value(&password, &chars[514..])
-                .context("This Windows password provider does not support autofill")?;
+        ensure!(fields.present(), "Windows prompt changed; try again");
+        if let Some(username) = &fields.username {
+            set_value(username, &chars[..514])?;
         }
+        ensure!(fields.present(), "Windows prompt changed; try again");
+        // Target the verified control directly. No focus change, clipboard, global
+        // keystrokes, tab-order assumptions, or automatic submission.
+        set_value(&fields.password, &chars[514..])
+            .context("This Windows password provider does not support autofill")?;
         Ok(())
     }
 }
