@@ -443,6 +443,15 @@ choice is saved for the current viewer user and defaults to on. When it is turne
 back on, only later copies are sent; content copied while sync was off stays local.
 **Type clipboard** (clipboard icon), **Send**/**Receive**, and drag-and-drop are unaffected.
 
+The **pen icon** turns on annotating, which works in **View only** sessions too:
+drag on the remote view to draw and right-click to erase. While annotating, the
+mouse draws instead of reaching the device, and the keyboard still does (unless
+the session is view-only). The Agent draws the red strokes in a click-through
+window above every other window on the shown monitor, so the remote user sees
+them. Screen capture includes them, so they appear in the video and in
+recordings. Clicking the pen again, switching displays, or ending the session
+erases the drawing. Annotations are unavailable on the background desktop.
+
 The **folder icon** offers **Send files…** and **Receive files…** using native multi-file/folder
 pickers on the source computer. Transfers preserve nested and empty folders and
 land in the signed-in user’s `Documents/MeshRMM Transferred Files` folder.

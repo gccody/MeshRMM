@@ -80,6 +80,7 @@ pub trait ScreenInput: Send + Sync {
     fn poll_files(&self) -> Option<meshrmm_protocol::FileMessage>;
     fn files_ready(&self) -> Arc<tokio::sync::Notify>;
     fn apply(&self, input: RemoteInput) -> anyhow::Result<()>;
+    fn annotate(&self, annotation: meshrmm_protocol::Annotation) -> anyhow::Result<()>;
     fn release_all(&self) -> anyhow::Result<()>;
     fn cursor_shape(&self) -> CursorShape;
     fn agent_pointer_display(&self) -> Option<DisplayId>;
@@ -513,6 +514,13 @@ impl ScreenInput for DirectInputController {
             .lock()
             .map_err(|_| anyhow::anyhow!("direct input controller lock was poisoned"))?
             .apply(input)
+    }
+
+    fn annotate(&self, annotation: meshrmm_protocol::Annotation) -> anyhow::Result<()> {
+        self.controller
+            .lock()
+            .map_err(|_| anyhow::anyhow!("direct input controller lock was poisoned"))?
+            .annotate(annotation)
     }
 
     fn release_all(&self) -> anyhow::Result<()> {

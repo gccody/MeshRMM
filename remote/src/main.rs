@@ -2,6 +2,8 @@
 // Fatal errors are shown in a message box, and the log is a file.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(any(windows, target_os = "macos", test))]
+mod annotation;
 mod clipboard;
 mod config;
 mod debug;

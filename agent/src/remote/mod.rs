@@ -1,4 +1,6 @@
 #[cfg(any(windows, test))]
+mod annotation;
+#[cfg(any(windows, test))]
 mod audio_mode;
 #[cfg(windows)]
 mod background;

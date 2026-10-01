@@ -446,7 +446,7 @@ impl WindowContext {
             self.release_input();
             self.control
                 .set_technician_blocked(!self.control.technician_blocked());
-            unsafe { apply_cursor(self.control.effective_cursor_shape(self.cursor_shape.get())) };
+            unsafe { apply_cursor(self.video_cursor()) };
             return true;
         }
         if control_id == SETTINGS_DIAGNOSTICS_ID {

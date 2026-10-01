@@ -100,6 +100,14 @@ pub(super) fn write_command(mut writer: impl Write, command: &ParentCommand) -> 
             write_u32(&mut writer, bytes.len() as u32)?;
             writer.write_all(&bytes)
         }
+        ParentCommand::Annotate(annotation) => {
+            let bytes = SessionMessage::Annotate(*annotation)
+                .encode()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            writer.write_all(&[COMMAND_ANNOTATE])?;
+            write_u32(&mut writer, bytes.len() as u32)?;
+            writer.write_all(&bytes)
+        }
         ParentCommand::Blackout { enabled, text } => {
             checked_len(text.len(), MAX_CONTROL_BYTES, "blackout message")?;
             writer.write_all(&[COMMAND_BLACKOUT, u8::from(*enabled)])?;
@@ -244,6 +252,19 @@ pub(super) fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
                 Ok(_) => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "desktop input contained a non-input message",
+                )),
+                Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+            }
+        }
+        COMMAND_ANNOTATE => {
+            let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "annotation")?;
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes)?;
+            match SessionMessage::decode(&bytes) {
+                Ok(SessionMessage::Annotate(annotation)) => Ok(ParentCommand::Annotate(annotation)),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "annotation contained another message",
                 )),
                 Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
             }

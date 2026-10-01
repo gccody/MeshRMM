@@ -68,6 +68,10 @@ pub struct State {
     pub credentials: CredentialState,
     /// The technician's input is blocked.
     pub input_blocked: bool,
+    /// The mouse draws on the device's screen, and whether the shown
+    /// display can show a drawing.
+    pub annotating: bool,
+    pub annotation_available: bool,
     pub chat_available: bool,
     pub chat_unread: usize,
     /// The latest file transfer's progress or result.
@@ -89,6 +93,7 @@ pub enum Action {
     Credentials,
     SecureAttention,
     TypeClipboard,
+    Annotate,
     Files,
     Chat,
     Diagnostics,
@@ -107,6 +112,7 @@ pub enum Icon {
     Key,
     Keyboard,
     Clipboard,
+    Pen,
     Folder,
     Chat,
     Pulse,
@@ -272,6 +278,23 @@ pub fn items(state: &State) -> Vec<Item> {
     );
     type_clipboard.enabled = !state.input_blocked;
     items.push(type_clipboard);
+
+    // Not input: view-only sessions annotate too.
+    let mut annotate = Item::new(
+        Action::Annotate,
+        Icon::Pen,
+        if !state.annotation_available {
+            "Annotations are unavailable on the background desktop"
+        } else if state.annotating {
+            "Stop annotating and erase the drawing"
+        } else {
+            "Annotate: drag to draw on the remote screen, right-click to erase"
+        },
+        3,
+    );
+    annotate.enabled = state.annotation_available;
+    annotate.active = state.annotating;
+    items.push(annotate);
 
     items.push(
         Item::new(
@@ -862,6 +885,16 @@ pub fn icon(icon: Icon) -> Vec<Shape> {
             stroke(polyline(&[(7.5, 9.5), (12.5, 9.5)])),
             stroke(polyline(&[(7.5, 12.8), (10.8, 12.8)])),
         ],
+        Icon::Pen => vec![
+            stroke(polygon(&[
+                (3.0, 17.0),
+                (4.0, 13.0),
+                (13.5, 3.5),
+                (16.5, 6.5),
+                (7.0, 16.0),
+            ])),
+            stroke(polyline(&[(11.5, 5.5), (14.5, 8.5)])),
+        ],
         Icon::Folder => vec![stroke(vec![
             Segment::Move(2.5, 6.0),
             Segment::Cubic(2.5, 5.2, 3.2, 4.5, 4.0, 4.5),
@@ -1152,6 +1185,7 @@ mod tests {
             pointer_display: Some(0),
             chroma: Some((ChromaMode::Yuv420, true)),
             chat_available: true,
+            annotation_available: true,
             caption: Some(false),
             ..State::default()
         }
@@ -1217,6 +1251,8 @@ mod tests {
         ] {
             assert!(!find(&items, action).unwrap().enabled, "{action:?}");
         }
+        // Annotations are not input.
+        assert!(find(&items, Action::Annotate).unwrap().enabled);
         assert!(find(&items_for(|_| {}), Action::Recording).is_none());
         let maximized = items_for(|state| state.caption = Some(true));
         assert_eq!(
@@ -1224,6 +1260,20 @@ mod tests {
             Icon::Restore
         );
         assert!(find(&items_for(|state| state.caption = None), Action::Close).is_none());
+    }
+
+    #[test]
+    fn annotating_is_a_toggle_the_background_desktop_disables() {
+        let off = items_for(|_| {});
+        let annotate = find(&off, Action::Annotate).unwrap();
+        assert!(annotate.enabled && !annotate.active && !annotate.menu);
+        assert_eq!(annotate.icon, Icon::Pen);
+        let on = items_for(|state| state.annotating = true);
+        let annotate = find(&on, Action::Annotate).unwrap();
+        assert!(annotate.active);
+        assert_eq!(annotate.tooltip, "Stop annotating and erase the drawing");
+        let background = items_for(|state| state.annotation_available = false);
+        assert!(!find(&background, Action::Annotate).unwrap().enabled);
     }
 
     #[test]
@@ -1265,7 +1315,7 @@ mod tests {
         }
         assert_eq!(layout.hit(close.x + 1.0, 1.0), Some(items.len() - 1));
         // The space between the two sides moves the window.
-        assert_eq!(layout.hit(500.0, 20.0), None);
+        assert_eq!(layout.hit(300.0, 20.0), None);
     }
 
     #[test]
@@ -1387,6 +1437,7 @@ mod tests {
             Icon::Key,
             Icon::Keyboard,
             Icon::Clipboard,
+            Icon::Pen,
             Icon::Folder,
             Icon::Chat,
             Icon::Pulse,

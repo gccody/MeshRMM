@@ -184,6 +184,7 @@ pub(super) struct RemoteViewIvars {
     chat_popup: RefCell<Option<meshrmm_chat::ChatPopup>>,
     control: ControlSink,
     held: RefCell<HeldInput>,
+    annotator: RefCell<crate::annotation::Annotator>,
     keyboard: RefCell<Keyboard>,
     /// The system's key-down count at the last `flagsChanged:` event.
     key_downs: std::cell::Cell<u32>,
@@ -281,7 +282,7 @@ define_class!(
 
         #[unsafe(method(resetCursorRects))]
         fn reset_cursor_rects(&self) {
-            let cursor = mac_cursor(self.ivars().control.effective_cursor_shape(*self.ivars().cursor_shape.borrow()));
+            let cursor = mac_cursor(self.video_cursor());
             let mut bounds = self.bounds();
             bounds.size.height = (bounds.size.height - VIEWER_TOOLBAR_HEIGHT).max(1.0);
             self.addCursorRect_cursor(bounds, &cursor);
@@ -294,6 +295,18 @@ define_class!(
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
+            if self.annotating() {
+                let display_id = self.ivars().active_display.borrow().id;
+                let message = self
+                    .ivars()
+                    .annotator
+                    .borrow_mut()
+                    .extend(display_id, self.pointer_position(event));
+                if let Some(message) = message {
+                    self.send(message);
+                }
+                return;
+            }
             self.send_pointer(event);
         }
 
@@ -309,31 +322,65 @@ define_class!(
 
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
+            if self.annotating() {
+                let display_id = self.ivars().active_display.borrow().id;
+                let message = self
+                    .ivars()
+                    .annotator
+                    .borrow_mut()
+                    .start(display_id, self.pointer_position(event));
+                if let Some(message) = message {
+                    self.send(message);
+                }
+                return;
+            }
             self.send_button(event, PointerButton::Left, true);
         }
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, event: &NSEvent) {
+            if self.annotating() {
+                self.ivars().annotator.borrow_mut().finish();
+                return;
+            }
             self.send_button(event, PointerButton::Left, false);
         }
 
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &NSEvent) {
+            if self.annotating() {
+                if self.pointer_position(event).is_some() {
+                    let message = self.ivars().annotator.borrow_mut().clear();
+                    if let Some(message) = message {
+                        self.send(message);
+                    }
+                }
+                return;
+            }
             self.send_button(event, PointerButton::Right, true);
         }
 
         #[unsafe(method(rightMouseUp:))]
         fn right_mouse_up(&self, event: &NSEvent) {
+            if self.annotating() {
+                return;
+            }
             self.send_button(event, PointerButton::Right, false);
         }
 
         #[unsafe(method(otherMouseDown:))]
         fn other_mouse_down(&self, event: &NSEvent) {
+            if self.annotating() {
+                return;
+            }
             self.send_button(event, mac_button(event), true);
         }
 
         #[unsafe(method(otherMouseUp:))]
         fn other_mouse_up(&self, event: &NSEvent) {
+            if self.annotating() {
+                return;
+            }
             self.send_button(event, mac_button(event), false);
         }
 
@@ -703,6 +750,7 @@ impl RemoteView {
             window_closed: std::cell::Cell::new(false),
             control,
             held: RefCell::new(HeldInput::default()),
+            annotator: RefCell::new(crate::annotation::Annotator::default()),
             keyboard: RefCell::new(Keyboard::new(command)),
             key_downs: std::cell::Cell::new(keyboard::system_key_downs()),
             key_up_monitor: RefCell::new(None),
@@ -849,6 +897,8 @@ impl RemoteView {
             chroma: None,
             credentials: control.credential_state(),
             input_blocked: control.technician_blocked(),
+            annotating: self.annotating(),
+            annotation_available: active.session != meshrmm_protocol::DesktopSession::Background,
             chat_available: chat.available(),
             chat_unread: chat.unread(),
             file_status: control.files().status(),
@@ -882,6 +932,7 @@ impl RemoteView {
                 self.ivars().control.set_input_enabled(true);
             }
             Action::Recording => self.ivars().control.toggle_recording(),
+            Action::Annotate => self.toggle_annotating(),
             Action::SecureAttention => {
                 self.release_input();
                 self.ivars().control.send_secure_attention();
@@ -1266,15 +1317,39 @@ impl RemoteView {
         if let Some(window) = self.window() {
             window.invalidateCursorRectsForView(self);
         }
-        mac_cursor(
+        mac_cursor(self.video_cursor()).set();
+    }
+
+    /// The cursor over the video: a crosshair while annotating.
+    fn video_cursor(&self) -> CursorShape {
+        if self.annotating() {
+            CursorShape::Crosshair
+        } else {
             self.ivars()
                 .control
-                .effective_cursor_shape(*self.ivars().cursor_shape.borrow()),
-        )
-        .set();
+                .effective_cursor_shape(*self.ivars().cursor_shape.borrow())
+        }
+    }
+
+    fn annotating(&self) -> bool {
+        self.ivars().annotator.borrow().enabled()
+    }
+
+    fn toggle_annotating(&self) {
+        // Keys and buttons held on the device stay there otherwise.
+        self.release_input();
+        let message = self.ivars().annotator.borrow_mut().toggle();
+        if let Some(message) = message {
+            self.send(message);
+        }
+        self.refresh_cursor();
     }
 
     fn send_pointer(&self, event: &NSEvent) {
+        // While annotating, the mouse draws rather than moves the device's pointer.
+        if self.annotating() {
+            return;
+        }
         let Some((x, y)) = self.pointer_position(event) else {
             return;
         };
@@ -1419,6 +1494,12 @@ impl RemoteView {
     ) {
         if self.ivars().active_display.borrow().id != display.id {
             self.release_input();
+            // A stroke belongs to the display it started on.
+            self.ivars().annotator.borrow_mut().finish();
+        }
+        if display.session == meshrmm_protocol::DesktopSession::Background {
+            self.ivars().annotator.borrow_mut().disable();
+            self.refresh_cursor();
         }
         *self.ivars().active_display.borrow_mut() = display;
         *self.ivars().displays.borrow_mut() = displays;
@@ -1437,6 +1518,7 @@ impl RemoteView {
     }
 
     pub(super) fn disable_input(&self) {
+        self.ivars().annotator.borrow_mut().finish();
         self.release_input();
         self.ivars().control.set_input_enabled(false);
     }
