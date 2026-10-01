@@ -1,7 +1,16 @@
 //! Credentials stay on the endpoint. Only DPAPI ciphertext crosses inherited
 //! helper pipes or reaches disk; only status crosses the authenticated remote
 //! control channel.
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, anyhow, ensure};
 use windows::{
@@ -18,7 +27,7 @@ use windows::{
             },
             Threading::*,
         },
-        UI::{Accessibility::*, WindowsAndMessaging::*},
+        UI::{Accessibility::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
     },
     core::{BOOL, BSTR, PCWSTR, PWSTR, w},
 };
@@ -104,6 +113,102 @@ pub fn forget(store: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// The helper runs in the background without foreground rights, so Windows
+/// would open the credential dialog behind the user's windows. Watches for the
+/// dialog on the prompting thread and brings it to the front with keyboard focus.
+struct RaisePrompt {
+    done: Arc<AtomicBool>,
+    watcher: Option<JoinHandle<()>>,
+}
+impl RaisePrompt {
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    const POLL: Duration = Duration::from_millis(20);
+
+    fn start() -> Self {
+        let owner = unsafe { GetCurrentThreadId() };
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let done = done.clone();
+            thread::Builder::new()
+                .name("meshrmm-credential-raise".into())
+                .spawn(move || {
+                    let deadline = Instant::now() + Self::TIMEOUT;
+                    while !done.load(Ordering::Acquire) && Instant::now() < deadline {
+                        if let Some(window) = shown_window(owner) {
+                            bring_to_front(window);
+                            return;
+                        }
+                        thread::sleep(Self::POLL);
+                    }
+                })
+                .inspect_err(
+                    |error| tracing::warn!(%error, "could not raise the credential dialog"),
+                )
+                .ok()
+        };
+        Self { done, watcher }
+    }
+}
+impl Drop for RaisePrompt {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(watcher) = self.watcher.take() {
+            let _ = watcher.join();
+        }
+    }
+}
+
+/// The first shown top-level window of `thread`.
+fn shown_window(thread: u32) -> Option<HWND> {
+    unsafe extern "system" fn find(hwnd: HWND, context: LPARAM) -> BOOL {
+        unsafe {
+            if IsWindowVisible(hwnd).as_bool() {
+                *(context.0 as *mut Option<HWND>) = Some(hwnd);
+                return BOOL(0);
+            }
+        }
+        BOOL(1)
+    }
+    let mut window = None;
+    unsafe {
+        let _ = EnumThreadWindows(
+            thread,
+            Some(find),
+            LPARAM(&mut window as *mut Option<HWND> as isize),
+        );
+    }
+    window
+}
+
+/// Keeps `window` above other windows and makes it the foreground window.
+/// Windows lets the process that sent the last input take the foreground, so
+/// send a mouse move that doesn't move the cursor first.
+fn bring_to_front(window: HWND) {
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dwFlags: MOUSEEVENTF_MOVE,
+                dwExtraInfo: super::input_block::NEUTRAL_TAG,
+                ..Default::default()
+            },
+        },
+    };
+    unsafe {
+        let _ = SetWindowPos(
+            window,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        );
+        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+        let _ = SetForegroundWindow(window);
+    }
+}
+
 /// Cancel and failed validation preserve any previously validated credentials.
 /// One logon attempt per explicit dialog submission; never retry automatically.
 pub fn prompt() -> anyhow::Result<Option<(Vec<u8>, String)>> {
@@ -117,6 +222,7 @@ pub fn prompt() -> anyhow::Result<Option<(Vec<u8>, String)>> {
         ),
         ..Default::default()
     };
+    let _raise = RaisePrompt::start();
     let result = unsafe {
         CredUIPromptForCredentialsW(
             Some(&info),

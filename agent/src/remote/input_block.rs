@@ -15,7 +15,9 @@ use windows::Win32::{
     UI::WindowsAndMessaging::*,
 };
 
-pub const KEEP_AWAKE_TAG: usize = 0x4d524d4b;
+/// Agent input that is neither the local user's nor the viewer's, like the
+/// keep-awake pulse. The hooks let it through and ignore it.
+pub const NEUTRAL_TAG: usize = 0x4d524d4b;
 pub const INPUT_TAG: usize = 0x4d524d4d;
 
 enum HookMode {
@@ -165,7 +167,7 @@ impl Drop for InputBlock {
 // cleanup also inject tagged releases. Blocked local events never reach the
 // ownership hooks, which were installed before the blocking hooks.
 fn handle_input(mode: &HookMode, tag: usize, takes_control: bool) -> bool {
-    if tag == KEEP_AWAKE_TAG {
+    if tag == NEUTRAL_TAG {
         return false;
     }
     match mode {
@@ -213,17 +215,17 @@ unsafe extern "system" fn mouse_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT
 mod tests {
     use super::*;
     #[test]
-    fn keep_awake_does_not_claim_or_release_input_ownership() {
+    fn neutral_input_does_not_claim_or_release_input_ownership() {
         for initial in [false, true] {
             let owner = Arc::new(AtomicBool::new(initial));
             assert!(!handle_input(
                 &HookMode::Track(owner.clone()),
-                KEEP_AWAKE_TAG,
+                NEUTRAL_TAG,
                 true
             ));
             assert_eq!(owner.load(Ordering::SeqCst), initial);
         }
-        assert!(!handle_input(&HookMode::Block, KEEP_AWAKE_TAG, true));
+        assert!(!handle_input(&HookMode::Block, NEUTRAL_TAG, true));
     }
 
     #[test]
