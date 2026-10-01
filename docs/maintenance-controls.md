@@ -170,8 +170,8 @@ menu offers **Restart normally…**. The Agent makes Safe Mode work as follows:
   CPU, converts them to NV12 there, and creates Microsoft's software H.264
   encoder transform directly through COM, which works without
   `MFStartup`. HEVC and 4:4:4 are unavailable, so profile negotiation falls
-  back to H.264 4:2:0, and capture is capped at 30 FPS. Normal boots never
-  use this path.
+  back to H.264 4:2:0, and capture is capped at 30 FPS. Normal boots use
+  the same path only as the final fallback, when the GPU cannot encode.
 
 Other features degrade as Windows allows in Safe Mode; for example, system
 audio is unavailable because the Windows Audio service does not run.

@@ -1,6 +1,7 @@
 #![cfg(windows)]
 
-//! Windows.Graphics.Capture + D3D11 + Media Foundation hardware video implementation.
+//! Windows.Graphics.Capture + D3D11 + Media Foundation video implementation:
+//! hardware encoding, with software H.264 as the final fallback.
 //!
 //! COM and GPU objects remain on the capture worker thread. Only compressed
 //! encoded access units cross the callback boundary.
@@ -34,7 +35,7 @@ use windows_capture::settings::{
 };
 
 use crate::encoder::VideoEncoder;
-use crate::software::{Converter, Encoder, PipelineConfig};
+use crate::software::{Converter, Encoder, Pipeline, PipelineConfig};
 
 pub type EncodedFrameSink = Arc<dyn Fn(EncodedAccessUnit) + Send + Sync + 'static>;
 
@@ -224,7 +225,7 @@ pub enum Error {
     CaptureInitialization(String),
     #[error("D3D11 video conversion failed: {0}")]
     ColorConversion(#[from] converter::Error),
-    #[error("Media Foundation hardware encoder failed: {0}")]
+    #[error("Media Foundation video encoder failed: {0}")]
     Encoder(#[from] encoder::Error),
     #[error("captured display dimensions must be at least 2x2")]
     InvalidDisplayDimensions,
@@ -324,7 +325,11 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             sink,
             controls,
         } = context.flags;
-        let (converter, encoder) = software::pipeline(
+        let Pipeline {
+            converter,
+            encoder,
+            frames_per_second,
+        } = software::pipeline(
             &context.device,
             &context.device_context,
             &PipelineConfig {
@@ -351,7 +356,9 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             logged_first_capture: false,
             logged_first_conversion: false,
             logged_first_submission: false,
-            frame_pacer: FramePacer::new(format.frames_per_second),
+            // The format already went out with the requested rate. A
+            // software encoder still paces itself to its lower one.
+            frame_pacer: FramePacer::new(frames_per_second),
         })
     }
 
@@ -374,7 +381,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             tracing::warn!(
                 %error,
                 bits_per_second = requested_bitrate,
-                "hardware encoder rejected a runtime bitrate update; continuing at the previous bitrate"
+                "encoder rejected a runtime bitrate update; continuing at the previous bitrate"
             );
             self.controls
                 .runtime_bitrate_disabled
@@ -399,7 +406,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
                 self.logged_first_conversion = true;
                 tracing::info!(
                     pixel_format = %self.format.pixel_format,
-                    "first desktop frame converted to YUV on GPU"
+                    "first desktop frame prepared for the encoder"
                 );
             }
             let submitted = self.encoder.submit(yuv, capture_timestamp_us)?;
@@ -408,7 +415,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
                 tracing::info!(
                     immediate_access_units = submitted.len(),
                     codec = self.format.codec.name(),
-                    "first desktop frame submitted to hardware encoder"
+                    "first desktop frame submitted to the encoder"
                 );
             }
             access_units.extend(submitted);
@@ -427,7 +434,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
                     .saturating_sub(encode_start_us),
                 encoded_bytes = access_unit.data.len(),
                 keyframe = access_unit.keyframe,
-                "desktop frame hardware encoded"
+                "desktop frame encoded"
             );
             (self.sink)(access_unit);
         }
@@ -494,10 +501,6 @@ impl WindowsScreenStreamer {
         if self.active_format.is_some() {
             return Err(Error::AlreadyRunning);
         }
-        let config = StreamConfig {
-            frames_per_second: software::frames_per_second(config.frames_per_second),
-            ..config
-        };
         if display_id == ALL_MONITORS_ID {
             let format = self.desktop.start(config, display_id, sink)?;
             self.active_format = Some(format);
@@ -924,6 +927,71 @@ mod tests {
             );
         }
         streamer.stop().unwrap();
+    }
+
+    /// Run with the GPU's display adapter disabled, so Windows renders with
+    /// the Microsoft Basic Display Adapter.
+    #[test]
+    #[ignore = "requires an interactive Windows desktop without a GPU video encoder"]
+    fn without_a_gpu_encoder_h264_falls_back_to_the_cpu() {
+        use super::*;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let display = enumerate_displays()
+            .unwrap()
+            .into_iter()
+            .find(|display| display.primary)
+            .unwrap();
+        let mut streamer = WindowsDesktopDuplicationStreamer::new();
+        // Only H.264 4:2:0 has the software fallback. A disabled GPU's
+        // encoder can still be registered, so the error varies.
+        let error = streamer
+            .start(
+                StreamConfig {
+                    codec: VideoCodec::H265,
+                    ..StreamConfig::default()
+                },
+                display.id,
+                Arc::new(|_| {}),
+            )
+            .unwrap_err();
+        eprintln!("H.265 failed as expected: {error}");
+        let (tx, rx) = mpsc::channel();
+        let format = streamer
+            .start(
+                StreamConfig::default(),
+                display.id,
+                Arc::new(move |frame| {
+                    let _ = tx.send(frame);
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            format.frames_per_second,
+            software::MAX_FRAMES_PER_SECOND,
+            "the stream did not fall back to the software encoder"
+        );
+        let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(first.keyframe && first.codec_config.is_some());
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(500));
+            while rx.try_recv().is_ok() {}
+            streamer.request_keyframe().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+                .keyframe
+            {}
+            assert!(streamer.poll_ended().is_none());
+        }
+        streamer.stop().unwrap();
+        eprintln!(
+            "software H.264 {}x{} at {} FPS",
+            format.width, format.height, format.frames_per_second
+        );
     }
 
     #[test]

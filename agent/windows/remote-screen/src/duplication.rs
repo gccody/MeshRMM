@@ -10,7 +10,7 @@ use windows_capture::monitor::Monitor;
 
 use crate::encoder::VideoEncoder;
 use crate::refinement::StaticRefinement;
-use crate::software::PipelineConfig;
+use crate::software::{Pipeline, PipelineConfig};
 use crate::{
     ActiveFormat, ControlState, EncodedAccessUnit, EncodedFrameSink, Error, FramePacer,
     StreamConfig, monotonic_timestamp_us,
@@ -54,10 +54,6 @@ impl WindowsDesktopDuplicationStreamer {
         if self.running.is_some() {
             return Err(Error::AlreadyRunning);
         }
-        let config = StreamConfig {
-            frames_per_second: crate::software::frames_per_second(config.frames_per_second),
-            ..config
-        };
         // The static media type already contains this start's bitrate. Do not
         // replay a runtime request left behind by the previous encoder.
         self.controls
@@ -352,15 +348,11 @@ fn capture_loop_inner(
     let mut desktop_cached = false;
     let mut desktop_pending = false;
     let mut encoded_cursor = None;
-    let format = ActiveFormat {
-        width,
-        height,
-        frames_per_second: config.frames_per_second,
-        bitrate_bits_per_second: config.bitrate_bits_per_second,
-        codec: config.codec,
-        pixel_format: config.pixel_format,
-    };
-    let (mut converter, mut encoder) = crate::software::pipeline(
+    let Pipeline {
+        mut converter,
+        mut encoder,
+        frames_per_second,
+    } = crate::software::pipeline(
         &device,
         &context,
         &PipelineConfig {
@@ -373,6 +365,17 @@ fn capture_loop_inner(
             grayscale: config.grayscale,
         },
     )?;
+    if let Some(desktop) = desktop.as_mut() {
+        desktop.set_frames_per_second(frames_per_second);
+    }
+    let format = ActiveFormat {
+        width,
+        height,
+        frames_per_second,
+        bitrate_bits_per_second: config.bitrate_bits_per_second,
+        codec: config.codec,
+        pixel_format: config.pixel_format,
+    };
     if let Some(started) = started.take() {
         let _ = started.send(Ok(format));
     }
@@ -387,11 +390,11 @@ fn capture_loop_inner(
     let mut stats_started_us = monotonic_timestamp_us()?;
     let mut cached_yuv = None;
     let mut keyframe_input_pending = false;
-    let mut frame_pacer = FramePacer::new(config.frames_per_second);
+    let mut frame_pacer = FramePacer::new(frames_per_second);
     let mut refinement = StaticRefinement::new(
         width,
         height,
-        config.frames_per_second,
+        frames_per_second,
         config.bitrate_bits_per_second,
     );
     while !stop.load(Ordering::Acquire) {
@@ -415,7 +418,7 @@ fn capture_loop_inner(
                     tracing::warn!(
                         %error,
                         bits_per_second = requested_bitrate,
-                        "hardware encoder rejected a runtime bitrate update; continuing at the previous bitrate"
+                        "encoder rejected a runtime bitrate update; continuing at the previous bitrate"
                     );
                     controls
                         .runtime_bitrate_disabled

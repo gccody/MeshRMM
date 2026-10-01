@@ -55,7 +55,7 @@ pub fn disposition(
     }
     if matches!(
         code,
-        Some(SignalErrorCode::HardwareEncoderUnavailable | SignalErrorCode::NoMutualProfile)
+        Some(SignalErrorCode::VideoEncoderUnavailable | SignalErrorCode::NoMutualProfile)
     ) {
         return Disposition::Terminal;
     }
@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn terminal_codes_end_startup_but_not_an_established_session() {
         for code in [
-            SignalErrorCode::HardwareEncoderUnavailable,
+            SignalErrorCode::VideoEncoderUnavailable,
             SignalErrorCode::NoMutualProfile,
         ] {
             assert_eq!(

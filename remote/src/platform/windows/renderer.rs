@@ -3,21 +3,38 @@ use crate::stream_reset::ResetPlan;
 use crate::video_layout::VideoRect;
 use window::ClientLayout;
 
+pub(super) mod shader;
+
+use shader::ShaderConversion;
+
 const SWAP_CHAIN_FLAGS: DXGI_SWAP_CHAIN_FLAG = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
 pub(super) struct D3d11Renderer {
     window: HWND,
     context: ID3D11DeviceContext,
+    conversion: Conversion,
+    /// The stream the conversion was set up for.
+    format: VideoFormat,
+    swap_chain: IDXGISwapChain2,
+    /// Redrawn after a resize, since a static desktop sends no new frames.
+    last_frame: Option<(ID3D11Texture2D, u32)>,
+}
+
+/// How decoded YUV surfaces become the swap chain's BGRA.
+enum Conversion {
+    /// The GPU's D3D11 video processor converts and scales.
+    VideoProcessor(VideoProcessor),
+    /// A device without video support, such as WARP on a machine with no
+    /// GPU, converts NV12 with a pixel shader.
+    Shader(ShaderConversion),
+}
+
+struct VideoProcessor {
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
-    /// The stream the video processor was created for.
-    format: VideoFormat,
     output_view: Option<ID3D11VideoProcessorOutputView>,
-    swap_chain: IDXGISwapChain2,
-    /// Redrawn after a resize, since a static desktop sends no new frames.
-    last_frame: Option<(ID3D11Texture2D, u32)>,
 }
 
 impl D3d11Renderer {
@@ -70,19 +87,30 @@ impl D3d11Renderer {
         unsafe { swap_chain.SetMaximumFrameLatency(1) }
             .context("DXGI maximum frame latency configuration failed")?;
 
-        let video_device: ID3D11VideoDevice = device.cast()?;
-        let video_context: ID3D11VideoContext = context.cast()?;
-        let (enumerator, processor) =
-            unsafe { configure_stream(&video_device, &video_context, format, &layout)? };
+        let conversion = match (device.cast::<ID3D11VideoDevice>(), context.cast()) {
+            (Ok(video_device), Ok(video_context)) => {
+                let (enumerator, processor) =
+                    unsafe { configure_stream(&video_device, &video_context, format, &layout)? };
+                Conversion::VideoProcessor(VideoProcessor {
+                    video_device,
+                    video_context,
+                    enumerator,
+                    processor,
+                    output_view: None,
+                })
+            }
+            _ => {
+                tracing::info!(
+                    "the D3D11 device has no video processor; converting video with a shader"
+                );
+                Conversion::Shader(unsafe { ShaderConversion::new(device, format)? })
+            }
+        };
         let mut renderer = Self {
             window,
             context: context.clone(),
-            video_device,
-            video_context,
-            enumerator,
-            processor,
+            conversion,
             format,
-            output_view: None,
             swap_chain,
             last_frame: None,
         };
@@ -90,49 +118,17 @@ impl D3d11Renderer {
         Ok(renderer)
     }
 
-    /// Points the video processor at the current back buffer and places the
+    /// Points the conversion at the current back buffer and places the
     /// video in the letterboxed rectangle that pointer mapping also uses.
     unsafe fn configure_output(&mut self, layout: &ClientLayout) -> anyhow::Result<()> {
         let back_buffer: ID3D11Texture2D = unsafe { self.swap_chain.GetBuffer(0) }
             .context("DXGI swap chain returned no back buffer")?;
-        let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
-            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+        match &mut self.conversion {
+            Conversion::VideoProcessor(processor) => unsafe {
+                processor.configure_output(&back_buffer, layout)
             },
-        };
-        let mut output_view = None;
-        unsafe {
-            self.video_device.CreateVideoProcessorOutputView(
-                &back_buffer,
-                &self.enumerator,
-                &output_desc,
-                Some(&mut output_view),
-            )
+            Conversion::Shader(shader) => unsafe { shader.configure_output(&back_buffer, layout) },
         }
-        .context("swap-chain video output view creation failed")?;
-        self.output_view = Some(output_view.context("D3D11 returned no video output view")?);
-        let target = RECT {
-            left: 0,
-            top: 0,
-            right: layout.width as i32,
-            bottom: layout.height as i32,
-        };
-        let destination = rect(layout.video);
-        unsafe {
-            self.video_context.VideoProcessorSetOutputTargetRect(
-                &self.processor,
-                true,
-                Some(&target),
-            );
-            self.video_context.VideoProcessorSetStreamDestRect(
-                &self.processor,
-                0,
-                true,
-                Some(&destination),
-            );
-        }
-        Ok(())
     }
 
     /// Switches the video processor to a replacement stream. A new processor
@@ -146,13 +142,23 @@ impl D3d11Renderer {
     ) -> anyhow::Result<()> {
         if plan.recreate_processor {
             let layout = unsafe { self.buffer_layout(format)? };
-            let (enumerator, processor) = unsafe {
-                configure_stream(&self.video_device, &self.video_context, format, &layout)?
-            };
-            // Views from the old enumerator cannot be used with the new one.
-            self.output_view = None;
-            self.enumerator = enumerator;
-            self.processor = processor;
+            match &mut self.conversion {
+                Conversion::VideoProcessor(current) => {
+                    let (enumerator, processor) = unsafe {
+                        configure_stream(
+                            &current.video_device,
+                            &current.video_context,
+                            format,
+                            &layout,
+                        )?
+                    };
+                    // Views from the old enumerator cannot be used with the new one.
+                    current.output_view = None;
+                    current.enumerator = enumerator;
+                    current.processor = processor;
+                }
+                Conversion::Shader(_) => ShaderConversion::check_format(format)?,
+            }
         }
         if plan.drop_last_frame {
             // The flip-model swap chain keeps showing the last image until
@@ -203,7 +209,10 @@ impl D3d11Renderer {
             return Ok(());
         }
         // DXGI requires every reference to the old buffers to be released.
-        self.output_view = None;
+        match &mut self.conversion {
+            Conversion::VideoProcessor(processor) => processor.output_view = None,
+            Conversion::Shader(shader) => shader.release_output(),
+        }
         unsafe { self.context.Flush() };
         unsafe {
             self.swap_chain.ResizeBuffers(
@@ -236,9 +245,73 @@ impl D3d11Renderer {
         texture: &ID3D11Texture2D,
         subresource: u32,
     ) -> anyhow::Result<()> {
+        match &mut self.conversion {
+            Conversion::VideoProcessor(processor) => unsafe {
+                processor.convert(texture, subresource)?
+            },
+            Conversion::Shader(shader) => unsafe {
+                shader.convert(&self.context, texture, subresource, self.format)?
+            },
+        }
+        self.last_frame = Some((texture.clone(), subresource));
+        // One-interval presentation avoids tearing. Flip-discard plus maximum
+        // frame latency 1 prevents an additional multi-frame swap-chain queue.
+        unsafe { self.swap_chain.Present(1, DXGI_PRESENT(0)) }
+            .ok()
+            .context("DXGI presentation failed")
+    }
+}
+
+impl VideoProcessor {
+    unsafe fn configure_output(
+        &mut self,
+        back_buffer: &ID3D11Texture2D,
+        layout: &ClientLayout,
+    ) -> anyhow::Result<()> {
+        let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+            },
+        };
+        let mut output_view = None;
+        unsafe {
+            self.video_device.CreateVideoProcessorOutputView(
+                back_buffer,
+                &self.enumerator,
+                &output_desc,
+                Some(&mut output_view),
+            )
+        }
+        .context("swap-chain video output view creation failed")?;
+        self.output_view = Some(output_view.context("D3D11 returned no video output view")?);
+        let target = RECT {
+            left: 0,
+            top: 0,
+            right: layout.width as i32,
+            bottom: layout.height as i32,
+        };
+        let destination = rect(layout.video);
+        unsafe {
+            self.video_context.VideoProcessorSetOutputTargetRect(
+                &self.processor,
+                true,
+                Some(&target),
+            );
+            self.video_context.VideoProcessorSetStreamDestRect(
+                &self.processor,
+                0,
+                true,
+                Some(&destination),
+            );
+        }
+        Ok(())
+    }
+
+    unsafe fn convert(&self, texture: &ID3D11Texture2D, subresource: u32) -> anyhow::Result<()> {
         let output_view = self
             .output_view
-            .clone()
+            .as_ref()
             .context("swap-chain video output view is unavailable")?;
         let mut texture_desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut texture_desc) };
@@ -271,19 +344,13 @@ impl D3d11Renderer {
         let result = unsafe {
             self.video_context.VideoProcessorBlt(
                 &self.processor,
-                &output_view,
+                output_view,
                 0,
                 std::slice::from_ref(&stream),
             )
         };
         let _ = unsafe { ManuallyDrop::take(&mut stream.pInputSurface) };
-        result.context("GPU YUV-to-BGRA presentation blit failed")?;
-        self.last_frame = Some((texture.clone(), subresource));
-        // One-interval presentation avoids tearing. Flip-discard plus maximum
-        // frame latency 1 prevents an additional multi-frame swap-chain queue.
-        unsafe { self.swap_chain.Present(1, DXGI_PRESENT(0)) }
-            .ok()
-            .context("DXGI presentation failed")
+        result.context("GPU YUV-to-BGRA presentation blit failed")
     }
 }
 

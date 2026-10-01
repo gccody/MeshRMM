@@ -15,7 +15,9 @@ use meshrmm_protocol::{
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP,
+};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -24,7 +26,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{
-    COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -475,7 +478,7 @@ fn run_worker(
         }
         if let Err(error) = unsafe { pipeline.poll(shared.replaced_frames.load(Ordering::Relaxed)) }
         {
-            tracing::error!(error = %error, "hardware decoder polling failed");
+            tracing::error!(error = %error, "video decoder polling failed");
             if let Ok(mut failure) = shared.failure.lock() {
                 *failure = Some(error.to_string());
             }
@@ -488,10 +491,10 @@ fn run_worker(
                     decoder_blocked_since.get_or_insert_with(std::time::Instant::now);
                 if blocked_since.elapsed() >= DECODER_INPUT_STALL_TIMEOUT {
                     let message = format!(
-                        "hardware decoder stopped requesting input for {} seconds while video frames were queued",
+                        "video decoder stopped requesting input for {} seconds while video frames were queued",
                         DECODER_INPUT_STALL_TIMEOUT.as_secs()
                     );
-                    tracing::error!(message, "hardware decoder input watchdog expired");
+                    tracing::error!(message, "video decoder input watchdog expired");
                     if let Ok(mut failure) = shared.failure.lock() {
                         *failure = Some(message);
                     }
@@ -532,14 +535,14 @@ fn run_worker(
             Ok(Some(queued)) => {
                 tracing::warn!(
                     frame_id,
-                    "hardware decoder readiness changed before frame submission"
+                    "video decoder readiness changed before frame submission"
                 );
                 if let Ok(mut pending) = shared.queued.lock() {
                     pending.push_front(queued);
                 }
             }
             Err(error) => {
-                tracing::error!(error = %error, frame_id, "hardware decode/presentation failed");
+                tracing::error!(error = %error, frame_id, "video decode/presentation failed");
                 if let Ok(mut failure) = shared.failure.lock() {
                     *failure = Some(error.to_string());
                 }

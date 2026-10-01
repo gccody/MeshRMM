@@ -18,18 +18,22 @@ workspace with platform and transport responsibilities kept in focused crates:
 Windows.Graphics.Capture (BGRA ID3D11Texture2D)
   -> D3D11 video processor (pooled NV12 4:2:0 or AYUV 4:4:4 texture)
   -> Media Foundation hardware H.265/H.264 encoder
+     (final fallback: CPU NV12 conversion -> Microsoft software H.264 encoder)
   -> latest encoded frame slot
   -> unordered/unreliable WebRTC DataChannel (12 KiB fragments)
   -> latest-only reassembly
   -> platform-native video presentation
        Windows: Media Foundation H.265/H.264 decoder (DXGI surface) -> D3D11
+         (H.264 fallback: Microsoft's decoder, DXVA or software -> D3D11)
        macOS: AVSampleBufferDisplayLayer -> Core Animation/AppKit window
 ```
 
-The viewer advertises only codec/chroma profiles for which it can initialize a
-hardware decoder. The Agent prefers H.265/HEVC within the selected chroma mode,
-then falls back through the mutually supported hardware profiles if encoder or
-playback initialization fails. Windows viewers can select bandwidth-efficient
+The viewer advertises the codec/chroma profiles it can decode: those with a
+hardware decoder, plus H.264 4:2:0, which it can always decode in software.
+The Agent prefers H.265/HEVC within the selected chroma mode, then falls back
+through the mutually supported profiles if encoder or playback initialization
+fails. H.264 4:2:0 comes last, and encodes in software when the Agent has no
+GPU path for it. Windows viewers can select bandwidth-efficient
 4:2:0 or crisp-text 4:4:4 when the GPU driver exposes the required AYUV and
 High 4:4:4/RExt hardware path. Unsupported 4:4:4 controls are disabled and
 macOS currently advertises 4:2:0 only. Quality remains independently
@@ -65,21 +69,30 @@ and are used by ICE only when a direct candidate pair cannot connect.
   "C++ CMake tools for Windows" component provides CMake:
   `scripts\use-cmake.ps1`, which the build scripts dot-source, finds it with
   `vswhere` when `cmake` isn't on `PATH`.
-- A GPU/driver exposing Media Foundation hardware H.264 encode and decode
-  transforms plus D3D11 NV12 video processing. Hardware H.265/HEVC and AYUV
-  4:4:4 support are optional and negotiated only when available at both ends.
+- Ideally, a GPU/driver exposing Media Foundation hardware H.264 encode and
+  decode plus D3D11 NV12 video processing. Without one, video falls back to
+  software H.264 (see below). Hardware H.265/HEVC and AYUV 4:4:4 support are
+  optional and negotiated only when available at both ends.
 - Node.js/npm and a Cloudflare account for the one-time server deployment.
 
 A `cargo` that rustup does not manage, such as Homebrew's, ignores
 `rust-toolchain.toml` and has no wasm32 target. Put rustup's `cargo` first in
 `PATH`.
 
-There is deliberately no software codec fallback. Startup fails with a
-contextual error if the required hardware path is unavailable. The one
-exception is Safe Mode, where Windows loads no GPU vendor driver and disables
-Media Foundation: there the Agent encodes H.264 4:2:0 with Microsoft's
-software encoder transform at up to 30 FPS
+Software H.264 4:2:0 is the final fallback at both ends. An Agent whose GPU
+cannot convert or encode the stream, or that has no GPU, copies frames to the
+CPU, converts them to NV12 there, and encodes them with Microsoft's software
+H.264 encoder transform at up to 30 FPS. Safe Mode, where Windows loads no GPU
+vendor driver and disables Media Foundation, always uses this path
 (see [restart and Safe Mode](docs/maintenance-controls.md#restart-and-safe-mode)).
+A Windows viewer without an H.264 hardware decoder transform uses Microsoft's
+H.264 decoder, which decodes with DXVA when the GPU can (NVIDIA drivers
+register no hardware decoder transform, so this is their GPU path) and in
+software otherwise; without a D3D11 hardware video device it renders with
+WARP. A macOS viewer lets VideoToolbox decode H.264 in software when there is
+no hardware decoder. Startup still fails with a contextual error when neither
+path exists, for example on a Windows N edition without the Media Feature
+Pack.
 
 ## Preconfigured deployment
 
@@ -529,10 +542,10 @@ The combined view preserves monitor positions, including negative coordinates,
 with black space between monitors. Select an individual monitor to return to
 its full-resolution view. This option requires an updated Windows Agent and
 appears automatically in both native viewers; the primary monitor remains the
-default. Combined capture uses GDI with a CPU-to-GPU upload and hardware video
-encoding, so frame rate can be lower than individual-monitor GPU capture.
-The combined resolution must be supported by the agent's hardware encoder and
-the viewer's decoder. The active display name is shown in the
+default. Combined capture uses GDI with a CPU-to-GPU upload and the usual video
+encoder, so frame rate can be lower than individual-monitor GPU capture.
+The combined resolution must be supported by the agent's encoder and the
+viewer's decoder. The active display name is shown in the
 viewer title. The viewer sends input only while its remote-desktop window is in
 the foreground. The click that activates an inactive macOS viewer is not
 forwarded. Unfocusing the viewer, switching displays, or ending a session

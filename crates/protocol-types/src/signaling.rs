@@ -164,9 +164,9 @@ pub enum SignalMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalErrorCode {
-    /// The remote computer has no usable hardware encoder. Terminal before
-    /// the first frame.
-    HardwareEncoderUnavailable,
+    /// The remote computer has no usable video encoder, hardware or
+    /// software. Terminal before the first frame.
+    VideoEncoderUnavailable,
     /// The peers share no video profile. Terminal before the first frame.
     NoMutualProfile,
     /// A peer's identity did not match the one trusted. Always terminal.
@@ -284,12 +284,12 @@ mod tests {
     fn signal_error_codes_round_trip_and_unknown_codes_decode() {
         let coded = SignalMessage::Error {
             message: "no encoder".into(),
-            code: Some(SignalErrorCode::HardwareEncoderUnavailable),
+            code: Some(SignalErrorCode::VideoEncoderUnavailable),
         };
         let json = serde_json::to_string(&coded).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"error","message":"no encoder","code":"hardware_encoder_unavailable"}"#
+            r#"{"type":"error","message":"no encoder","code":"video_encoder_unavailable"}"#
         );
         assert_eq!(serde_json::from_str::<SignalMessage>(&json).unwrap(), coded);
         for code in [
@@ -328,7 +328,7 @@ mod tests {
         }
         let json = serde_json::to_string(&SignalMessage::Error {
             message: "no encoder".into(),
-            code: Some(SignalErrorCode::HardwareEncoderUnavailable),
+            code: Some(SignalErrorCode::VideoEncoderUnavailable),
         })
         .unwrap();
         assert_eq!(

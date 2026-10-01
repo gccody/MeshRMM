@@ -16,3 +16,9 @@ Run independent MKV demux/decode and timestamp verification with:
 ```sh
 FFMPEG=/path/to/ffmpeg cargo test -p meshrmm-remote ffmpeg_decodes -- --ignored
 ```
+
+`yuv420p-software.h264` is one 64×48 blue frame from the Agent's software
+H.264 encoder (Microsoft's encoder transform, low latency, no B-frames), so a
+decoder outputs it without waiting for more input. It was written by
+encoding a blue texture with `SoftwareH264Encoder` on Windows and saving the
+access unit with its sequence header.

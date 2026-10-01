@@ -62,7 +62,7 @@ impl Presenter {
         control: ControlSink,
         debug: DebugInfo,
     ) -> anyhow::Result<Self> {
-        if !hardware_decode_supported(format.codec) {
+        if !decode_supported(format.codec) {
             bail!("macOS has no hardware decoder for {:?}", format.codec);
         }
         let id = NEXT_PRESENTER_ID.fetch_add(1, Ordering::Relaxed);
@@ -74,6 +74,7 @@ impl Presenter {
             fps = format.frames_per_second,
             bitrate_bits_per_second = format.bitrate_bits_per_second,
             codec = ?format.codec,
+            hardware_decode = hardware_decode_supported(format.codec),
             "starting macOS video presenter"
         );
         let shared = Arc::new(Shared {

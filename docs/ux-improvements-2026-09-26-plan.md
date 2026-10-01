@@ -64,9 +64,10 @@ the task section.
   non-`main` build installed at a time. Record who installed what in
   [Endpoint state](#endpoint-state) before and after installing, and restore the previous
   working build when you're done unless the next thread takes over.
-- The endpoint has **no hardware H.264 decoder** (see the 2026-09-23 plan, T12). A Windows viewer
-  on it cannot show live video; use synthetic-frame probes or a second Windows machine for live
-  viewer checks, and state which you used.
+- The endpoint has **no hardware H.264 decoder MFT** (see the 2026-09-23 plan, T12): its NVIDIA
+  driver registers none. Before the software fallback (2026-10-01) a Windows viewer on it could not
+  show live video; it now decodes H.264 with Microsoft's decoder through DXVA. State which viewer
+  host you used for live checks.
 - Validate macOS viewer behavior on macOS. Report the host used for server and dashboard checks.
 
 ## Merge order
