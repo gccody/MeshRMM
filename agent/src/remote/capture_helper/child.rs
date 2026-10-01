@@ -51,9 +51,11 @@ pub fn run_child() -> anyhow::Result<()> {
             pixel_format,
             capture_cursor,
             grayscale,
+            headless,
         } => run_capture_child(
             command_rx,
             display_id,
+            headless,
             StreamConfig {
                 frames_per_second,
                 bitrate_bits_per_second,
@@ -117,6 +119,7 @@ pub fn run_child() -> anyhow::Result<()> {
 pub(super) fn run_capture_child(
     command_rx: mpsc::Receiver<io::Result<ParentCommand>>,
     mut display_id: Option<DisplayId>,
+    mut headless: Option<HeadlessTarget>,
     mut config: StreamConfig,
 ) -> anyhow::Result<()> {
     let background = is_background_child();
@@ -124,6 +127,16 @@ pub(super) fn run_capture_child(
     'capture: loop {
         if config.frames_per_second == 0 || config.bitrate_bits_per_second == 0 {
             anyhow::bail!("desktop-helper frame rate and bitrate must be positive");
+        }
+        if let Some(target) = &headless
+            && let Err(error) = crate::remote::virtual_display::show(target, HEADLESS_ARRIVAL)
+        {
+            tracing::warn!(error = format!("{error:#}"), "virtual display is not ready");
+        }
+        if !background && !crate::remote::virtual_display::console_has_display() {
+            let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+            emit_child_event(&output, ChildEvent::NoDisplays)?;
+            return Ok(());
         }
         let displays = enumerate_displays()?;
         let active_display = display_id
@@ -222,9 +235,11 @@ pub(super) fn run_capture_child(
                     pixel_format: next_pixel_format,
                     capture_cursor: next_capture_cursor,
                     grayscale: next_grayscale,
+                    headless: next_headless,
                 })) => {
                     streamer.stop()?;
                     display_id = next_display;
+                    headless = next_headless;
                     config.frames_per_second = next_fps;
                     config.bitrate_bits_per_second = next_bitrate;
                     config.codec = next_codec;

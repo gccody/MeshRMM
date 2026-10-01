@@ -5,8 +5,9 @@ use anyhow::Context;
 use bytes::Bytes;
 use meshrmm_protocol::{
     AudioFormat, CONTROL_CHANNEL_LABEL, CONTROL_CHANNEL_PROTOCOL, ChromaMode, Codec,
-    DEFAULT_FRAGMENT_PAYLOAD, Display, DisplayId, IceServer, QualityPreset, RemoteSessionId,
-    SessionMessage, SessionState, SignalMessage, VideoProfile, VideoStreamId, fragment_frame,
+    DEFAULT_FRAGMENT_PAYLOAD, Display, DisplayId, HeadlessResolution, IceServer, QualityPreset,
+    RemoteSessionId, SessionMessage, SessionState, SignalMessage, VideoProfile, VideoStreamId,
+    fragment_frame,
 };
 use meshrmm_session_transport::{
     CHAT_CHANNEL, CLIPBOARD_CHANNEL, FILE_CHANNEL, ServiceChannel, ServiceRoute,
@@ -80,8 +81,10 @@ enum ControlCommand {
         profiles: Vec<VideoProfile>,
         quality: QualityPreset,
         chroma: ChromaMode,
+        headless_resolution: HeadlessResolution,
     },
     Quality(QualityPreset),
+    HeadlessResolution(HeadlessResolution),
     Chroma(ChromaMode),
     CursorCapture(bool),
     Recording(bool),
@@ -608,13 +611,18 @@ async fn run_connected_sender(
                         profiles,
                         quality,
                         chroma,
+                        headless_resolution,
                     }) => {
                         apply_audio_event(&audio_mode, AudioEvent::ViewerCapabilities);
                         Some(ControlCommand::ViewerCapabilities {
                             profiles,
                             quality,
                             chroma,
+                            headless_resolution,
                         })
+                    }
+                    Ok(SessionMessage::SetHeadlessResolution { resolution }) => {
+                        Some(ControlCommand::HeadlessResolution(resolution))
                     }
                     Ok(SessionMessage::SetAudio { enabled, formats }) => {
                         apply_audio_event(
@@ -909,7 +917,7 @@ async fn run_connected_sender(
             Some(command) = control_rx.recv() => {
                 match command {
                     command @ (ControlCommand::Keyframe | ControlCommand::Bitrate(_) | ControlCommand::RestartBitrate(_)
-                        | ControlCommand::Quality(_) | ControlCommand::ViewerCapabilities { .. }
+                        | ControlCommand::Quality(_) | ControlCommand::ViewerCapabilities { .. } | ControlCommand::HeadlessResolution(_)
                         | ControlCommand::DisplayBorder(_) | ControlCommand::Chroma(_) | ControlCommand::CursorCapture(_) | ControlCommand::InputOwnership(_) | ControlCommand::Recording(_) | ControlCommand::VideoProfileRejected { .. }
                         | ControlCommand::SelectDisplay(_)) => {
                         capture_tx.try_send(command).map_err(|_| anyhow::anyhow!("capture command queue full or closed"))?;
@@ -1371,17 +1379,22 @@ async fn run_capture_control(
                     ControlCommand::Quality(quality)
                     | ControlCommand::ViewerCapabilities { quality, .. } => {
                         let value = quality.bitrate(configured_maximum_bitrate);
-                        if let ControlCommand::ViewerCapabilities { profiles, chroma, .. } = command {
+                        let mut headless_resolution = None;
+                        if let ControlCommand::ViewerCapabilities { profiles, chroma, headless_resolution: resolution, .. } = command {
                             viewer_profiles = profiles;
                             requested_chroma = chroma;
                             rejected_profiles.clear();
+                            headless_resolution = Some(resolution);
                         }
                         quality_ceiling.store(value, Ordering::Release);
                         // Recreate the encoder with its static bitrate settings.
                         // Live CodecAPI updates may be ignored, rejected, or even
                         // terminate HEVC encoders after the call reports success.
                         lock_streamer(&streamer)?.set_bitrate(value);
-                        let capture_changed = lock_streamer(&streamer)?.set_quality(quality);
+                        let mut capture_changed = lock_streamer(&streamer)?.set_quality(quality);
+                        if let Some(resolution) = headless_resolution {
+                            capture_changed |= lock_streamer(&streamer)?.set_headless_resolution(resolution);
+                        }
                         let candidates = profile_candidates(
                             &viewer_profiles,
                             requested_chroma,
@@ -1437,6 +1450,39 @@ async fn run_capture_control(
                             },
                         ).await?;
                         tracing::info!(?active_profile, ?quality, bits_per_second = value, "video quality/profile selection applied");
+                    }
+                    ControlCommand::HeadlessResolution(resolution) => {
+                        let restart = lock_streamer(&streamer)?.set_headless_resolution(resolution);
+                        tracing::info!(width = resolution.width, height = resolution.height, restart, "viewer headless resolution applied");
+                        if !restart || !capture_running {
+                            continue;
+                        }
+                        lock_streamer(&streamer)?.stop()?;
+                        slot.clear();
+                        stream_id = VideoStreamId(stream_id.0.wrapping_add(1).max(1));
+                        let candidates = profile_candidates(&viewer_profiles, requested_chroma, &rejected_profiles);
+                        match start_first_profile(&streamer, active_display.id, stream_id, &slot, &candidates) {
+                            Ok(started) => {
+                                displays = started.displays;
+                                active_display = started.active_display;
+                                active_profile = started.format.profile();
+                                format = started.format;
+                                capture_unavailable_since = None;
+                                send_control_message(&control_channel, SessionMessage::DisplayConfiguration {
+                                    displays: displays.clone(),
+                                    active_display_id: active_display.id,
+                                    stream_id,
+                                    format,
+                                }).await?;
+                            }
+                            Err(error) => {
+                                // The desktop lifecycle retries the start.
+                                capture_running = false;
+                                capture_unavailable_since = Some(std::time::Instant::now());
+                                capture_retry_after = std::time::Instant::now();
+                                tracing::warn!(error = ?error, "capture did not restart on the resized virtual display; retrying");
+                            }
+                        }
                     }
                     ControlCommand::DisplayBorder(enabled) => {
                         let result = lock_streamer(&streamer)?.set_display_border(enabled);

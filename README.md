@@ -94,6 +94,24 @@ no hardware decoder. Startup still fails with a contextual error when neither
 path exists, for example on a Windows N edition without the Media Feature
 Pack.
 
+## Computers without a monitor
+
+Windows has no desktop to capture when no monitor is connected. When a session
+finds the console in that state, the Agent adds a virtual monitor through
+[SudoVDA](https://github.com/SudoMaker/SudoVDA), an Indirect Display Driver
+bundled in the Agent executable. It installs the driver the first time a
+computer needs it, trusting SudoMaker's code-signing certificate in the
+machine's `Root` and `TrustedPublisher` stores. If another application already
+installed SudoVDA, the Agent uses that copy instead. Uninstalling the Agent
+removes only what the Agent installed.
+
+The virtual monitor lasts until the session ends. Its size is a viewer
+preference, 1280 × 720 by default, chosen under **Display** in the Windows
+viewer's settings or **Remote computer** in the macOS viewer's session menu.
+The viewer remembers the choice for later sessions and changes the size of a
+connected computer's virtual monitor right away. The setting does nothing
+while a real monitor is connected.
+
 ## Preconfigured deployment
 
 The viewer loads sidecar JSON next to its executable. The installed Agent reads

@@ -40,12 +40,15 @@ meshrmm-remote-screen = { version = "0.2.0", path = "windows/remote-screen" }
 ureq = { version = "3.4.0", features = ["json", "platform-verifier"] }
 windows-service = "0.8.1"
 windows = { version = "0.62.2", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Display",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",
     "Win32_System_LibraryLoader",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
     "Win32_System_ProcessStatus",
     "Win32_System_Services",
     "Win32_System_Shutdown",

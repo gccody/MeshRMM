@@ -373,6 +373,7 @@ pub(super) fn install_control_handler(
                             profiles: profiles.as_ref().clone(),
                             quality: sink.quality_preset(),
                             chroma: sink.chroma_mode(),
+                            headless_resolution: crate::preferences::headless_resolution(),
                         });
                         tracing::info!(
                             configuration_sequence,

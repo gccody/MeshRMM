@@ -1,6 +1,7 @@
 //! Viewer-wide preferences for the current OS user, independent of agent/session IDs.
 use crate::shortcuts::{ShortcutKey, ViewerShortcut};
 use anyhow::Context;
+use meshrmm_protocol::HeadlessResolution;
 use serde::{Deserialize, Serialize};
 use std::{
     io::Write,
@@ -25,6 +26,9 @@ struct Preferences {
     next_display_key: ShortcutKey,
     /// Remote system audio starts muted, and the Agent sends none while muted.
     audio_muted: bool,
+    /// Size of the virtual display a Windows Agent adds when its computer
+    /// has no monitor.
+    headless_resolution: HeadlessResolution,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -36,6 +40,7 @@ impl Default for Preferences {
             diagnostics_key: ShortcutKey::F12,
             next_display_key: ShortcutKey::F8,
             audio_muted: true,
+            headless_resolution: HeadlessResolution::default(),
         }
     }
 }
@@ -118,6 +123,15 @@ pub fn audio_muted() -> bool {
 }
 pub fn set_audio_muted(muted: bool) -> anyhow::Result<()> {
     update(|p| p.audio_muted = muted)
+}
+/// A size edited out of the supported range falls back to the default.
+pub fn headless_resolution() -> HeadlessResolution {
+    Some(get(|p| p.headless_resolution))
+        .filter(|resolution| resolution.valid())
+        .unwrap_or_default()
+}
+pub fn set_headless_resolution(resolution: HeadlessResolution) -> anyhow::Result<()> {
+    update(|p| p.headless_resolution = resolution)
 }
 pub fn shortcut_key(shortcut: ViewerShortcut) -> ShortcutKey {
     let (diagnostics, next_display) = get(|p| (p.diagnostics_key, p.next_display_key));
@@ -207,6 +221,22 @@ mod tests {
         )
         .unwrap();
         assert!(!load(&path).audio_muted);
+        assert_eq!(
+            load(&path).headless_resolution,
+            HeadlessResolution::new(1280, 720)
+        );
+        save(
+            &path,
+            &Preferences {
+                headless_resolution: HeadlessResolution::new(1920, 1080),
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            load(&path).headless_resolution,
+            HeadlessResolution::new(1920, 1080)
+        );
         save(&path, &Preferences::default()).unwrap();
         assert!(load(&path).disconnect_confirmation);
         assert!(load(&path).clipboard_sync);
@@ -219,6 +249,10 @@ mod tests {
         assert_eq!(load(&path).diagnostics_key, ShortcutKey::F12);
         assert_eq!(load(&path).next_display_key, ShortcutKey::F8);
         assert!(load(&path).audio_muted);
+        assert_eq!(
+            load(&path).headless_resolution,
+            HeadlessResolution::default()
+        );
         // The session close action used to be saved here; it is now per session.
         std::fs::write(
             &path,

@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use meshrmm_protocol::{
-    ChromaMode, Codec, CursorShape, Display, DisplayId, EncodedFrame, PixelFormat, QualityPreset,
-    RemoteInput, VideoFormat, VideoStreamId,
+    ChromaMode, Codec, CursorShape, Display, DisplayId, EncodedFrame, HeadlessResolution,
+    PixelFormat, QualityPreset, RemoteInput, VideoFormat, VideoStreamId,
 };
 
 use super::video::LatestFrameSlot;
@@ -52,6 +52,9 @@ pub trait ScreenStreamer: Send {
     /// Returns true when the backend requires capture to be restarted.
     fn set_cursor_capture(&mut self, enabled: bool) -> anyhow::Result<bool>;
     fn set_display_border(&mut self, enabled: bool) -> anyhow::Result<()>;
+    /// Size of the virtual display added while the console has no monitor.
+    /// Returns true when capture must restart to show the new size.
+    fn set_headless_resolution(&mut self, resolution: HeadlessResolution) -> bool;
     fn input_controller(&self) -> Arc<dyn ScreenInput>;
 }
 
@@ -406,6 +409,14 @@ impl ScreenStreamer for PlatformScreenStreamer {
                 streamer.set_cursor_capture(enabled)?;
                 Ok(false)
             }
+        }
+    }
+
+    fn set_headless_resolution(&mut self, resolution: HeadlessResolution) -> bool {
+        match &mut self.inner {
+            // Only the service adds virtual displays.
+            CaptureBackend::Direct(_) => false,
+            CaptureBackend::Desktop(streamer) => streamer.set_headless_resolution(resolution),
         }
     }
 
