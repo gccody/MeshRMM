@@ -22,7 +22,7 @@ use meshrmm_protocol::HeadlessResolution;
 use windows::Win32::Devices::DeviceAndDriverInstallation::*;
 use windows::Win32::Devices::Display::*;
 use windows::Win32::Foundation::{
-    CRYPT_E_EXISTS, ERROR_FILE_EXISTS, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, HANDLE, LUID,
+    CRYPT_E_EXISTS, ERROR_FILE_EXISTS, GENERIC_READ, GENERIC_WRITE, HANDLE, LUID,
 };
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Security::Cryptography::*;
@@ -678,14 +678,55 @@ fn remove_device(instance_id: &str) -> anyhow::Result<()> {
         .context("could not remove the virtual display device")
 }
 
-/// Whether the console has an active display, from the console session. An
-/// unreadable configuration counts as having one, so capture proceeds as
-/// before.
+/// `DISPLAYCONFIG_TARGET_FORCED_AVAILABILITY_BOOT`, `_PATH` and `_SYSTEM`:
+/// Windows keeps the target active although nothing is connected to it.
+const FORCED_AVAILABILITY: u32 = 0x4 | 0x8 | 0x10;
+
+/// Whether the console shows its desktop on a monitor, from the console
+/// session. When the last monitor is unplugged, Windows keeps its output
+/// active and the desktop keeps its size, but marks the target as forced
+/// available; such a path doesn't count. An unreadable configuration counts
+/// as having a monitor, so capture proceeds as before.
 pub(crate) fn console_has_display() -> bool {
-    let (mut paths, mut modes) = (0, 0);
-    let result =
-        unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes) };
-    result != ERROR_SUCCESS || paths > 0
+    match active_paths() {
+        Ok(paths) => paths
+            .iter()
+            .any(|path| connected(path.targetInfo.statusFlags)),
+        Err(error) => {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "could not check the console's monitors"
+            );
+            true
+        }
+    }
+}
+
+fn connected(target_status: u32) -> bool {
+    target_status & FORCED_AVAILABILITY == 0
+}
+
+fn active_paths() -> anyhow::Result<Vec<DISPLAYCONFIG_PATH_INFO>> {
+    let (mut path_count, mut mode_count) = (0, 0);
+    unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count) }
+        .ok()
+        .context("could not read the console's display configuration")?;
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+    unsafe {
+        QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut path_count,
+            paths.as_mut_ptr(),
+            &mut mode_count,
+            modes.as_mut_ptr(),
+            None,
+        )
+    }
+    .ok()
+    .context("could not read the console's display configuration")?;
+    paths.truncate(path_count as usize);
+    Ok(paths)
 }
 
 /// Waits up to `timeout` for the virtual monitor to become active in the
@@ -745,25 +786,7 @@ pub(crate) fn show(target: &HeadlessTarget, timeout: Duration) -> anyhow::Result
 /// The GDI device name (`\\.\DISPLAYn`) of the active path that shows
 /// `target`, as a NUL-terminated string.
 fn active_source(target: &HeadlessTarget) -> anyhow::Result<Option<Vec<u16>>> {
-    let (mut path_count, mut mode_count) = (0, 0);
-    unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count) }
-        .ok()
-        .context("could not read the console's display configuration")?;
-    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
-    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
-    unsafe {
-        QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut path_count,
-            paths.as_mut_ptr(),
-            &mut mode_count,
-            modes.as_mut_ptr(),
-            None,
-        )
-    }
-    .ok()
-    .context("could not read the console's display configuration")?;
-    paths.truncate(path_count as usize);
+    let paths = active_paths()?;
     let Some(path) = paths.iter().find(|path| {
         path.targetInfo.adapterId.LowPart == target.adapter_low
             && path.targetInfo.adapterId.HighPart == target.adapter_high
@@ -843,6 +866,18 @@ mod tests {
             );
             remove_certificate(&store).unwrap();
         }
+    }
+
+    #[test]
+    fn only_targets_windows_keeps_alive_count_as_disconnected() {
+        // IN_USE alone is a connected monitor.
+        assert!(connected(0x1));
+        // An unplugged last monitor: IN_USE | FORCED_AVAILABILITY_SYSTEM.
+        assert!(!connected(0x11));
+        assert!(!connected(0x1 | 0x4));
+        assert!(!connected(0x1 | 0x8));
+        // FORCIBLE says what may be forced, not that it was.
+        assert!(connected(0x1 | 0x2));
     }
 
     #[test]
