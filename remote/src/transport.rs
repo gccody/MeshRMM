@@ -37,6 +37,7 @@ struct ReceiverLifecycle {
     shutting_down: Arc<AtomicBool>,
     progress: Arc<Mutex<AttemptProgress>>,
     reconnect_status: Arc<Mutex<Option<ReconnectStatus>>>,
+    restarting: Arc<Mutex<Option<bool>>>,
 }
 
 impl ReceiverLifecycle {
@@ -51,6 +52,11 @@ impl ReceiverLifecycle {
             .mark_frame_presented(at);
         if first {
             self.reconnect_status
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            // A connection that shows the display again is past any restart.
+            self.restarting
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .take();
@@ -91,6 +97,9 @@ pub struct ViewerResumeState {
     /// How long the remote computer's user took to accept the connection,
     /// which does not count against the startup retry window.
     approval_wait: Arc<Mutex<std::time::Duration>>,
+    /// `Some(safe_mode)` from the technician's restart of the remote computer
+    /// until the remote display appears again.
+    restarting: Arc<Mutex<Option<bool>>>,
 }
 
 impl Default for ViewerResumeState {
@@ -125,6 +134,7 @@ impl Default for ViewerResumeState {
             progress: Default::default(),
             reconnect_status: Default::default(),
             approval_wait: Default::default(),
+            restarting: Default::default(),
         }
     }
 }
@@ -172,11 +182,23 @@ impl ViewerResumeState {
         error: &anyhow::Error,
         now: std::time::Instant,
     ) -> ReconnectStatus {
-        let reason = crate::reconnect::classify(error);
+        let reason = match self.restarting() {
+            Some(safe_mode) => crate::reconnect::ReconnectReason::Restarting { safe_mode },
+            None => crate::reconnect::classify(error),
+        };
         let mut current = self.reconnect_status();
         let status = ReconnectStatus::after_failure(*current, reason, now);
         *current = Some(status);
         status
+    }
+
+    /// Whether the technician restarted the remote computer, into Safe Mode
+    /// or not, and it has not shown its display since.
+    pub fn restarting(&self) -> Option<bool> {
+        *self
+            .restarting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     /// Changes the reconnect status, if there is one, and shows it in the
@@ -315,6 +337,7 @@ mod presentation_progress_tests {
             shutting_down: Default::default(),
             progress: Arc::clone(&progress),
             reconnect_status: Arc::clone(&reconnect_status),
+            restarting: Default::default(),
         };
         let error =
             SessionFailure::new(FailureKind::PresentationFailed, "decoder rejected input").into();
@@ -368,6 +391,41 @@ mod presentation_progress_tests {
 mod idle_disconnect_tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_requested_restart_explains_disconnects_until_the_display_returns() {
+        let state = ViewerResumeState::default();
+        let (presentation_failure, _) = mpsc::unbounded_channel();
+        let lifecycle = ReceiverLifecycle {
+            presentation_failure,
+            shutting_down: Default::default(),
+            progress: Arc::clone(&state.progress),
+            reconnect_status: Arc::clone(&state.reconnect_status),
+            restarting: Arc::clone(&state.restarting),
+        };
+        let start = Instant::now();
+        state.begin_attempt();
+        lifecycle.observe_presentation(Some(start));
+        *state.restarting.lock().unwrap() = Some(true);
+        // Frames still arriving before Windows stops do not end the restart.
+        lifecycle.observe_presentation(Some(start + Duration::from_secs(1)));
+        let lost = anyhow::anyhow!("connection lost");
+        assert_eq!(
+            state
+                .record_failure(&lost, start + Duration::from_secs(2))
+                .reason,
+            crate::reconnect::ReconnectReason::Restarting { safe_mode: true }
+        );
+        state.begin_attempt();
+        lifecycle.observe_presentation(Some(start + Duration::from_secs(90)));
+        assert_eq!(state.restarting(), None);
+        assert_eq!(
+            state
+                .record_failure(&lost, start + Duration::from_secs(91))
+                .reason,
+            crate::reconnect::classify(&lost)
+        );
+    }
 
     #[test]
     fn idle_time_counts_only_while_the_remote_display_is_up() {

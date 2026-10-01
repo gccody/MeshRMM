@@ -128,6 +128,7 @@ impl WindowContext {
             annotation_available: active.session != meshrmm_protocol::DesktopSession::Background,
             chat_available: chat.available(),
             chat_unread: chat.unread(),
+            power: self.control.power_state(),
             file_status: self.control.files().status(),
             recording: self.control.recording().active(),
             diagnostics: self.debug_visible.get(),
@@ -514,7 +515,11 @@ impl WindowContext {
     fn toolbar_action(&self, action: Action, rect: Rect) {
         let window = self.window.get();
         match action {
-            Action::User | Action::Display | Action::Quality | Action::Credentials => {
+            Action::User
+            | Action::Display
+            | Action::Quality
+            | Action::Credentials
+            | Action::Power => {
                 self.release_input();
                 let entries = toolbar::menu(action, &self.toolbar.borrow().state);
                 if let Some(command) = unsafe { self.show_menu(window, &entries, rect) } {
@@ -618,6 +623,24 @@ impl WindowContext {
         toolbar::commands(entries).get(index).copied().flatten()
     }
 
+    /// Asks before restarting the remote computer. Input stays off while the
+    /// box is up, like the disconnect confirmation.
+    fn confirm_restart(&self, safe_mode: bool) -> bool {
+        self.control.set_input_enabled(false);
+        let (title, detail, _) = toolbar::restart_confirmation(safe_mode);
+        let text = HSTRING::from(format!("{title}\n\n{detail}"));
+        let confirmed = unsafe {
+            MessageBoxW(
+                Some(self.window.get()),
+                &text,
+                w!("Restart remote computer"),
+                MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2,
+            )
+        } == IDOK;
+        self.control.set_input_enabled(true);
+        confirmed
+    }
+
     /// A choice from a toolbar menu.
     fn toolbar_command(&self, command: Command) {
         match command {
@@ -639,6 +662,11 @@ impl WindowContext {
             Command::ForgetCredentials => self.control.send(SessionMessage::ForgetCredentials),
             Command::SendFiles => self.control.files().pick(),
             Command::ReceiveFiles => self.control.files().request_peer_pick(),
+            Command::Restart { safe_mode } => {
+                if self.confirm_restart(safe_mode) {
+                    self.control.restart(safe_mode);
+                }
+            }
         }
         self.refresh_toolbar();
     }

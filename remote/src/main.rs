@@ -335,7 +335,9 @@ async fn run_resumable_session(
                 return Err(error).context("remote viewer session can no longer be resumed");
             }
             Err(error) => {
-                let reason = reconnect::classify_resume_failure(&error);
+                // A restart explains an offline Agent better than the failure does.
+                let reason = reconnect::classify_resume_failure(&error)
+                    .filter(|_| resume_state.restarting().is_none());
                 if let Some(reason) = reason {
                     resume_state.update_reconnect_status(|status| status.reason = reason);
                 }

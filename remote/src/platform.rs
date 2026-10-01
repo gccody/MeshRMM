@@ -50,6 +50,8 @@ pub struct MaintenanceState {
     pub error: Option<String>,
     pub agent_input_blocked: bool,
     pub blacked_out: bool,
+    /// `Some(safe_mode)` once the agent reports it can restart its computer.
+    pub power: Option<bool>,
 }
 
 /// Sends viewer control messages and keeps the transport's input gate in sync
@@ -72,6 +74,7 @@ pub struct ControlSink {
     wallpaper_hidden: Arc<std::sync::atomic::AtomicBool>,
     remote_cursor_hidden: Arc<std::sync::atomic::AtomicBool>,
     session_close_action: Arc<Mutex<meshrmm_protocol::SessionCloseAction>>,
+    restarting: Arc<Mutex<Option<bool>>>,
     quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
     chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
     #[cfg(windows)]
@@ -97,6 +100,8 @@ pub struct ControlSinkParts {
     pub wallpaper_hidden: Arc<std::sync::atomic::AtomicBool>,
     pub remote_cursor_hidden: Arc<std::sync::atomic::AtomicBool>,
     pub session_close_action: Arc<Mutex<meshrmm_protocol::SessionCloseAction>>,
+    /// Survives reconnects, so the window says the computer is restarting.
+    pub restarting: Arc<Mutex<Option<bool>>>,
     pub quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
     pub chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
     #[cfg(windows)]
@@ -122,6 +127,7 @@ impl ControlSink {
             wallpaper_hidden,
             remote_cursor_hidden,
             session_close_action,
+            restarting,
             quality,
             chroma,
             #[cfg(windows)]
@@ -144,6 +150,7 @@ impl ControlSink {
             wallpaper_hidden,
             remote_cursor_hidden,
             session_close_action,
+            restarting,
             quality,
             chroma,
             #[cfg(windows)]
@@ -243,6 +250,22 @@ impl ControlSink {
 
     pub fn send_secure_attention(&self) {
         self.send(meshrmm_protocol::SessionMessage::SendSecureAttention);
+    }
+
+    /// Whether the agent can restart its computer, and whether Windows is in
+    /// Safe Mode.
+    pub fn power_state(&self) -> Option<bool> {
+        self.maintenance_state().power
+    }
+
+    /// Restarts the remote computer. The platform asks the technician first.
+    pub fn restart(&self, safe_mode: bool) {
+        if self.power_state().is_some() {
+            self.send(meshrmm_protocol::SessionMessage::Restart { safe_mode });
+            if let Ok(mut restarting) = self.restarting.lock() {
+                *restarting = Some(safe_mode);
+            }
+        }
     }
 
     pub fn files(&self) -> meshrmm_file_transfer::TransferSession {

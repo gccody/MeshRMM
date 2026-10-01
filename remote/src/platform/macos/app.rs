@@ -901,6 +901,7 @@ impl RemoteView {
             annotation_available: active.session != meshrmm_protocol::DesktopSession::Background,
             chat_available: chat.available(),
             chat_unread: chat.unread(),
+            power: control.power_state(),
             file_status: control.files().status(),
             recording: control.recording().active(),
             diagnostics: *self.ivars().debug_visible.borrow(),
@@ -922,7 +923,11 @@ impl RemoteView {
             return;
         };
         match action {
-            Action::User | Action::Display | Action::Quality | Action::Credentials => {
+            Action::User
+            | Action::Display
+            | Action::Quality
+            | Action::Credentials
+            | Action::Power => {
                 self.release_input();
                 toolbar_view.show_menu(&toolbar::menu(action, &toolbar_view.state()), rect);
             }
@@ -1016,8 +1021,30 @@ impl RemoteView {
             Command::ForgetCredentials => self.send(SessionMessage::ForgetCredentials),
             Command::SendFiles => self.ivars().control.files().pick(),
             Command::ReceiveFiles => self.ivars().control.files().request_peer_pick(),
+            Command::Restart { safe_mode } => {
+                if self.confirm_restart(safe_mode) {
+                    self.ivars().control.restart(safe_mode);
+                }
+            }
         }
         self.refresh_toolbar();
+    }
+
+    /// Asks before restarting the remote computer. Input stays off while the
+    /// alert is up, like the disconnect confirmation.
+    fn confirm_restart(&self, safe_mode: bool) -> bool {
+        self.disable_input();
+        let (title, detail, button) = toolbar::restart_confirmation(safe_mode);
+        let alert = NSAlert::new(self.mtm());
+        alert.setMessageText(&NSString::from_str(title));
+        alert.setInformativeText(&NSString::from_str(detail));
+        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+        alert.addButtonWithTitle(&NSString::from_str(button));
+        let confirmed = alert.runModal() == 1001;
+        if self.window().is_some_and(|window| window.isKeyWindow()) {
+            self.ivars().control.set_input_enabled(true);
+        }
+        confirmed
     }
 
     /// The session controls, which the toolbar's settings item opens: labeled
