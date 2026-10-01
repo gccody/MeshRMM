@@ -503,6 +503,28 @@ async fn run_connected_sender(
         },
     )?;
     cleanup.workers.push(maintenance_task);
+    let annotation_input = Arc::clone(&input);
+    let cleanup_annotations = Arc::clone(&input);
+    let annotation_errors = control_tx.clone();
+    // Its own queue: a slow overlay never holds up input or maintenance.
+    let (annotation_tx, annotation_task) = super::native_task::command_worker(
+        "meshrmm-annotation",
+        1024,
+        std::time::Duration::from_secs(3600),
+        move |annotation| {
+            if let Some(annotation) = annotation
+                && let Err(error) = annotation_input.annotate(annotation)
+            {
+                let _ = annotation_errors.send(ControlCommand::MaintenanceError(format!(
+                    "Annotate: {error:#}"
+                )));
+            }
+        },
+        move || {
+            let _ = cleanup_annotations.annotate(meshrmm_protocol::Annotation::Clear);
+        },
+    )?;
+    cleanup.workers.push(annotation_task);
     let control_service = ServiceChannel::new(control_channel.clone()).await;
     let clipboard_route = Arc::new(ServiceRoute::default());
     let file_route = Arc::new(ServiceRoute::default());
@@ -553,6 +575,7 @@ async fn run_connected_sender(
         let chat_tx = chat_tx.clone();
         let clipboard_tx = clipboard_tx.clone();
         let maintenance_tx = maintenance_tx.clone();
+        let annotation_tx = annotation_tx.clone();
         let message_session_close = Arc::clone(&session_close);
         let message_audio_mode = Arc::clone(&audio_mode);
         control_channel.on_message(Box::new(move |message| {
@@ -565,6 +588,7 @@ async fn run_connected_sender(
             let chat_tx = chat_tx.clone();
             let clipboard_tx = clipboard_tx.clone();
             let maintenance_tx = maintenance_tx.clone();
+            let annotation_tx = annotation_tx.clone();
             Box::pin(async move {
                 let command = match SessionMessage::decode(&message.data) {
                     Ok(SessionMessage::RequestKeyframe { .. }) => {
@@ -629,6 +653,13 @@ async fn run_connected_sender(
                             "maintenance command queue full or closed".into(),
                         )
                     }),
+                    Ok(SessionMessage::Annotate(annotation)) => {
+                        annotation_tx.try_send(annotation).err().map(|_| {
+                            ControlCommand::MaintenanceError(
+                                "annotation queue full or closed".into(),
+                            )
+                        })
+                    }
                     Ok(SessionMessage::Input(event)) => {
                         if input_tx.try_send(event).is_err() {
                             // Never silently drop a key-up. End the session so
@@ -2173,6 +2204,9 @@ mod service_isolation_tests {
         }
         fn apply(&self, _: RemoteInput) -> anyhow::Result<()> {
             self.events.send("input")?;
+            Ok(())
+        }
+        fn annotate(&self, _: meshrmm_protocol::Annotation) -> anyhow::Result<()> {
             Ok(())
         }
         fn apply_chat(&self, _: String) -> anyhow::Result<()> {

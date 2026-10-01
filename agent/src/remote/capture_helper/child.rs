@@ -243,6 +243,7 @@ pub(super) fn run_capture_child(
                     | ParentCommand::PromptConnectionApproval { .. }
                     | ParentCommand::StartInput { .. }
                     | ParentCommand::Input(_)
+                    | ParentCommand::Annotate(_)
                     | ParentCommand::SetWallpaperHidden(_)
                     | ParentCommand::SetPreventIdleLock(_)
                     | ParentCommand::Blackout { .. }
@@ -403,6 +404,14 @@ pub(super) fn run_input_child(
                     tracing::warn!(%error, "desktop input helper discarded invalid input");
                 }
             }
+            Ok(Ok(ParentCommand::Annotate(annotation))) => {
+                if let Err(error) = input.annotate(annotation) {
+                    emit_child_event(
+                        &output,
+                        ChildEvent::MaintenanceError(format!("Annotate: {error:#}")),
+                    )?;
+                }
+            }
             Ok(Ok(ParentCommand::Blackout { enabled, text })) => {
                 if let Err(error) = input.set_blackout(enabled, &text) {
                     emit_child_event(&output, ChildEvent::MaintenanceError(error.to_string()))?;
@@ -500,8 +509,12 @@ pub(super) fn run_background_input_child(
             )) => Err(anyhow::anyhow!(
                 "Console blackout and input blocking are unavailable in background mode"
             )),
+            Ok(Ok(ParentCommand::Annotate(meshrmm_protocol::Annotation::Start { .. }))) => Err(
+                anyhow::anyhow!("Annotations are unavailable in background mode"),
+            ),
             Ok(Ok(
                 ParentCommand::StartInput { .. }
+                | ParentCommand::Annotate(_)
                 | ParentCommand::SetPreventIdleLock(_)
                 | ParentCommand::Blackout { enabled: false, .. }
                 | ParentCommand::BlockInput(false),

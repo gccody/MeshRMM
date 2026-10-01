@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use meshrmm_protocol::{CursorShape, Display, PointerButton, RemoteInput};
+use meshrmm_protocol::{Annotation, CursorShape, Display, PointerButton, RemoteInput};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, GetCursorInfo, GetSystemMetrics, IDC_APPSTARTING, IDC_ARROW,
@@ -23,6 +23,7 @@ pub struct WindowsInputController {
     viewer_cursor: Cell<CursorShape>,
     block: Option<super::input_block::InputBlock>,
     blackout: Option<super::blackout::Blackout>,
+    annotations: Option<super::annotation::AnnotationOverlay>,
     manually_blocked: bool,
     active_display: Option<Display>,
     displays: Vec<Display>,
@@ -44,6 +45,7 @@ impl WindowsInputController {
             viewer_cursor: Cell::new(CursorShape::Default),
             block: None,
             blackout: None,
+            annotations: None,
             manually_blocked: false,
             active_display: None,
             displays: Vec::new(),
@@ -148,9 +150,42 @@ impl WindowsInputController {
             .is_some_and(|active| active.id != display.id)
         {
             self.release_all()?;
+            // The drawing belongs to the display it was drawn on.
+            self.annotations = None;
         }
         self.displays = super::platform::enumerate_displays()?;
         self.active_display = Some(display);
+        Ok(())
+    }
+
+    /// Draws over the active display. Points for another display are
+    /// discarded: they were drawn before a display switch.
+    pub fn annotate(&mut self, annotation: Annotation) -> anyhow::Result<()> {
+        let (x, y, start) = match annotation {
+            Annotation::Start { x, y, .. } => (x, y, true),
+            Annotation::Extend { x, y, .. } => (x, y, false),
+            Annotation::Clear => {
+                self.annotations = None;
+                return Ok(());
+            }
+        };
+        let display = self
+            .active_display
+            .as_ref()
+            .context("an annotation arrived before a display was selected")?;
+        if annotation.display_id() != Some(display.id) {
+            return Ok(());
+        }
+        let overlay = match &mut self.annotations {
+            Some(overlay) => overlay,
+            // Only a new stroke shows the overlay, so one that failed to
+            // show is reported once per stroke rather than once per point.
+            None if !start => return Ok(()),
+            None => self
+                .annotations
+                .insert(super::annotation::AnnotationOverlay::show(display)?),
+        };
+        overlay.draw(x, y, start);
         Ok(())
     }
 

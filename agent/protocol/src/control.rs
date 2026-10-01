@@ -164,6 +164,8 @@ pub enum SessionMessage {
         enabled: bool,
         formats: Vec<AudioFormat>,
     },
+    /// The technician's drawing over the viewed display; see [`crate::Annotation`].
+    Annotate(crate::Annotation),
 }
 
 /// System-audio encodings, in the viewer's order of preference. Append new

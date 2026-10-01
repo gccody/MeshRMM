@@ -18,3 +18,6 @@ pub use files::*;
 
 mod clipboard;
 pub use clipboard::*;
+
+mod annotation;
+pub use annotation::*;
