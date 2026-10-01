@@ -561,6 +561,8 @@ pub(super) fn emit_child_event(
     output.flush()
 }
 
+const WALLPAPER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
 pub(super) fn run_file_child(
     commands: mpsc::Receiver<io::Result<ParentCommand>>,
 ) -> anyhow::Result<()> {
@@ -571,23 +573,32 @@ pub(super) fn run_file_child(
             tracing::warn!(%error, "could not disable window contents while dragging");
         })
         .ok();
-    let mut wallpaper = None;
+    let mut wallpaper = crate::remote::wallpaper::Wallpaper::default();
     meshrmm_file_transfer::windows::set_displays(enumerate_displays()?);
     meshrmm_file_transfer::TransferSession::run_on_current_thread(move |files| {
         let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
         emit_child_event(&output, ChildEvent::InputStarted)?;
         let mut commands = async_helper_commands(commands)?;
         let ready = files.outgoing_ready();
+        let wallpaper_error = |error: anyhow::Error| {
+            tracing::warn!(%error, "wallpaper update failed");
+            emit_child_event(
+                &output,
+                ChildEvent::MaintenanceError(format!("Wallpaper: {error:#}")),
+            )
+        };
         tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()?
             .block_on(async {
+                let mut wallpaper_retry = tokio::time::interval(WALLPAPER_RETRY_INTERVAL);
+                wallpaper_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
                         command = commands.recv() => match command {
                             Some(Ok(ParentCommand::SetWallpaperHidden(hidden))) => {
-                                if let Err(error) = crate::remote::wallpaper::set_hidden(&mut wallpaper, hidden) {
-                                    tracing::warn!(%error, "wallpaper update failed");
-                                    emit_child_event(&output, ChildEvent::MaintenanceError(format!("Wallpaper: {error:#}")))?;
+                                if let Err(error) = wallpaper.set_hidden(hidden) {
+                                    wallpaper_error(error)?;
                                 }
                             }
                             Some(Ok(ParentCommand::Files(message))) => files.receive(message),
@@ -597,6 +608,12 @@ pub(super) fn run_file_child(
                         _ = ready.notified() => {
                             while let Some(message) = files.poll() {
                                 emit_child_event(&output, ChildEvent::Files(message))?;
+                            }
+                        }
+                        // Explorer starts shortly after this helper at sign-in.
+                        _ = wallpaper_retry.tick(), if wallpaper.pending() => {
+                            if let Err(error) = wallpaper.retry() {
+                                wallpaper_error(error)?;
                             }
                         }
                     }
