@@ -8,7 +8,8 @@ use std::{sync::mpsc, thread};
 use windows::{
     Win32::{
         Foundation::{
-            COLORREF, CloseHandle, ERROR_FILE_NOT_FOUND, S_FALSE, WAIT_ABANDONED, WAIT_OBJECT_0,
+            CO_E_SERVER_EXEC_FAILURE, COLORREF, CloseHandle, ERROR_FILE_NOT_FOUND,
+            REGDB_E_CLASSNOTREG, RPC_E_DISCONNECTED, S_FALSE, WAIT_ABANDONED, WAIT_OBJECT_0,
         },
         System::{
             Com::{
@@ -29,16 +30,67 @@ use windows::{
 const JOURNAL_KEY: PCWSTR = w!("Software\\MeshRMM\\Agent");
 const JOURNAL_VALUE: PCWSTR = w!("HiddenWallpaper");
 
-pub fn set_hidden(current: &mut Option<HiddenWallpaper>, hidden: bool) -> anyhow::Result<()> {
-    if hidden && current.is_none() {
-        *current = Some(HiddenWallpaper::new()?);
-    } else if !hidden && current.take().is_none() {
-        // Restoration here is housekeeping for an earlier helper, not the viewer's request.
-        if let Err(error) = restore_interrupted() {
-            tracing::warn!(error = %format!("{error:#}"), "could not restore interrupted wallpaper");
+/// The viewer's wallpaper request for the interactive user's desktop.
+#[derive(Default)]
+pub struct Wallpaper {
+    hidden: Option<HiddenWallpaper>,
+    /// Hiding waits for Explorer, which serves `DesktopWallpaper` and is absent
+    /// while the user is still signing in or already signing out.
+    pending: bool,
+}
+
+impl Wallpaper {
+    pub fn set_hidden(&mut self, hidden: bool) -> anyhow::Result<()> {
+        let retrying = std::mem::take(&mut self.pending);
+        if hidden && self.hidden.is_none() {
+            match HiddenWallpaper::new() {
+                Ok(wallpaper) => self.hidden = Some(wallpaper),
+                Err(error) if shell_unavailable(&error) => {
+                    if !retrying {
+                        tracing::info!(
+                            "deferring wallpaper hiding until the user's shell is running"
+                        );
+                    }
+                    self.pending = true;
+                }
+                Err(error) => return Err(error),
+            }
+        } else if !hidden && self.hidden.take().is_none() {
+            // Restoration here is housekeeping for an earlier helper, not the viewer's request.
+            if let Err(error) = restore_interrupted() {
+                tracing::warn!(error = %format!("{error:#}"), "could not restore interrupted wallpaper");
+            }
         }
+        Ok(())
     }
-    Ok(())
+
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Retries a deferred hide; a no-op unless [`Self::pending`].
+    pub fn retry(&mut self) -> anyhow::Result<()> {
+        if self.pending {
+            self.set_hidden(true)?;
+        }
+        Ok(())
+    }
+}
+
+/// Explorer has not started yet or has exited, so it cannot serve the wallpaper.
+fn shell_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<windows::core::Error>()
+            .is_some_and(|error| {
+                [
+                    REGDB_E_CLASSNOTREG,
+                    CO_E_SERVER_EXEC_FAILURE,
+                    RPC_E_DISCONNECTED,
+                ]
+                .contains(&error.code())
+            })
+    })
 }
 
 /// Restores wallpaper left hidden by a helper that exited without restoring it.
@@ -72,7 +124,7 @@ pub fn restore_interrupted() -> anyhow::Result<()> {
     })
 }
 
-pub struct HiddenWallpaper {
+struct HiddenWallpaper {
     stop: Option<mpsc::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -298,6 +350,21 @@ mod tests {
     }
 
     #[test]
+    fn missing_shell_errors_defer_hiding() {
+        let error = |code| anyhow::Error::from(windows::core::Error::from_hresult(code));
+        assert!(shell_unavailable(&error(REGDB_E_CLASSNOTREG)));
+        assert!(shell_unavailable(
+            &error(REGDB_E_CLASSNOTREG).context("hide")
+        ));
+        assert!(!shell_unavailable(&error(
+            windows::Win32::Foundation::E_ACCESSDENIED
+        )));
+        assert!(!shell_unavailable(&anyhow::anyhow!(
+            "another session is still restoring"
+        )));
+    }
+
+    #[test]
     #[ignore = "changes the interactive user's wallpaper; run on an unlocked desktop"]
     fn live_wallpaper_toggle_and_disconnect_restore_original() {
         unsafe {
@@ -307,22 +374,23 @@ mod tests {
                 CoCreateInstance(&DesktopWallpaper, None, CLSCTX_ALL).unwrap();
             let color = desktop.GetBackgroundColor().unwrap();
             let status = desktop.GetStatus().unwrap();
-            let mut guard = None;
-            set_hidden(&mut guard, false).unwrap();
+            let mut guard = Wallpaper::default();
+            guard.set_hidden(false).unwrap();
             for _ in 0..2 {
-                set_hidden(&mut guard, true).unwrap();
-                set_hidden(&mut guard, true).unwrap();
+                guard.set_hidden(true).unwrap();
+                guard.set_hidden(true).unwrap();
+                assert!(!guard.pending());
                 assert_eq!(desktop.GetBackgroundColor().unwrap(), COLORREF(0));
                 // S_FALSE confirms the wallpaper was already disabled by us.
                 assert_eq!(
                     (desktop.vtable().Enable)(desktop.as_raw(), false.into()),
                     S_FALSE
                 );
-                set_hidden(&mut guard, false).unwrap();
+                guard.set_hidden(false).unwrap();
                 assert_eq!(desktop.GetBackgroundColor().unwrap(), color);
                 assert_eq!(desktop.GetStatus().unwrap(), status);
             }
-            set_hidden(&mut guard, true).unwrap();
+            guard.set_hidden(true).unwrap();
             drop(guard); // Connection/helper EOF cleanup, without a toggle command.
             assert_eq!(desktop.GetBackgroundColor().unwrap(), color);
             assert_eq!(desktop.GetStatus().unwrap(), status);
@@ -343,15 +411,15 @@ mod tests {
             std::mem::forget(OriginalWallpaper::hide().unwrap());
             assert!(Journal::load().unwrap().is_some());
             // A replacement helper must restore the journaled state, not black.
-            let mut guard = None;
-            set_hidden(&mut guard, true).unwrap();
-            set_hidden(&mut guard, false).unwrap();
+            let mut guard = Wallpaper::default();
+            guard.set_hidden(true).unwrap();
+            guard.set_hidden(false).unwrap();
             assert_eq!(desktop.GetBackgroundColor().unwrap(), color);
             assert_eq!(desktop.GetStatus().unwrap(), status);
             assert!(Journal::load().unwrap().is_none());
             // Sign-in recovery and a helper told "not hidden" restore without hiding.
             std::mem::forget(OriginalWallpaper::hide().unwrap());
-            set_hidden(&mut None, false).unwrap();
+            Wallpaper::default().set_hidden(false).unwrap();
             assert_eq!(desktop.GetBackgroundColor().unwrap(), color);
             assert!(Journal::load().unwrap().is_none());
             std::mem::forget(OriginalWallpaper::hide().unwrap());

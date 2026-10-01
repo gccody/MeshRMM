@@ -426,7 +426,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
     fn input_controller(&self) -> Arc<dyn ScreenInput> {
         match &self.inner {
             CaptureBackend::Direct(_) => Arc::new(DirectInputController {
-                wallpaper: Mutex::new(None),
+                wallpaper: Mutex::default(),
                 keep_awake: Mutex::new(None),
                 blackout_message: self.blackout_message.clone(),
                 controller: Arc::clone(&self.direct_input),
@@ -445,7 +445,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
 #[cfg(windows)]
 struct DirectInputController {
     keep_awake: Mutex<Option<super::keep_awake::KeepAwake>>,
-    wallpaper: Mutex<Option<super::wallpaper::HiddenWallpaper>>,
+    wallpaper: Mutex<super::wallpaper::Wallpaper>,
     blackout_message: String,
     files: meshrmm_file_transfer::TransferSession,
     chat: meshrmm_chat::ChatSession,
@@ -462,13 +462,10 @@ impl ScreenInput for DirectInputController {
         )
     }
     fn set_wallpaper_hidden(&self, hidden: bool) -> anyhow::Result<()> {
-        super::wallpaper::set_hidden(
-            &mut *self
-                .wallpaper
-                .lock()
-                .map_err(|_| anyhow::anyhow!("wallpaper lock poisoned"))?,
-            hidden,
-        )
+        self.wallpaper
+            .lock()
+            .map_err(|_| anyhow::anyhow!("wallpaper lock poisoned"))?
+            .set_hidden(hidden)
     }
     fn set_blackout(&self, enabled: bool) -> anyhow::Result<()> {
         self.controller
