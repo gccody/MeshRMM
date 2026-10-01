@@ -7,8 +7,8 @@ and their Windows password (not a Hello PIN). The dialog explains how the
 credentials will be used. Cancel leaves any previous saved credentials intact.
 
 Windows performs one interactive `LogonUserW` validation per submission. Failed
-validation never replaces the saved credential, and its error appears as the
-first line of the credentials menu and in the key icon's tooltip. There are no
+validation never replaces the saved credential, and its error appears in the key
+icon's tooltip. There are no
 automatic authentication retries. Local/domain logon policies, account restrictions, and domain availability still apply.
 
 After successful validation, the endpoint encrypts the credential using
@@ -25,11 +25,15 @@ credential per endpoint; a new successful prompt replaces it. Only **Forget save
 credentials** (available in any session mode) or uninstalling the agent deletes
 it.
 
-When a supported Windows login or UAC password field is visible, the key icon
-shows a blue dot and its menu offers **Autofill saved credentials**. Each fill requires a click and rechecks the foreground
-process and fields. Only `System32\LogonUI.exe` and `System32\consent.exe` are
-accepted, with visible, enabled, unambiguous password controls belonging to that
-process. Hello PINs, arbitrary application password boxes, consent-only UAC
+The menu always lists **Autofill saved credentials**. It is enabled, and the key
+icon shows a blue dot, while credentials are saved and a supported Windows login
+or UAC password field is visible. The prompt does not need focus: detection
+checks every visible top-level window of `System32\LogonUI.exe` and
+`System32\consent.exe` on the session's desktop, foreground window first, so a
+UAC prompt left behind another window still qualifies. Each fill requires a click
+and rechecks that the prompt window still exists, is shown, and belongs to the
+same process. Only visible, enabled, unambiguous password controls belonging to
+that process are accepted. Hello PINs, arbitrary application password boxes, consent-only UAC
 prompts, and unsupported credential providers do not offer autofill. Detection
 runs separately from mouse/keyboard input.
 
@@ -41,6 +45,21 @@ fail without a keystroke fallback. Passwordless/MFA workflows remain interactive
 
 Older agents and foreground/background modes that do not support the credential
 broker leave the controls disabled. No server/dashboard deployment is required.
+
+## Validation — September 30, 2026 (unfocused prompts)
+
+- macOS: 14 toolbar tests, including the always-listed, disabled autofill entry.
+- Windows `DESKTOP-85R6S28`: source synchronized and SHA-256 verified. Native
+  Clippy for the Agent and viewer with warnings denied, credential tests, and
+  viewer toolbar tests passed. The release Agent was installed with
+  `install-agent-local.ps1` (signaling connected).
+- With UAC temporarily set to request credentials (`ConsentPromptBehaviorAdmin`
+  3, restored to 5), a UAC prompt was opened from the console user's logon token
+  and Explorer kept the foreground. A LocalSystem input helper in the console
+  session received fake DPAPI-protected credentials. The previous build reported
+  no prompt and failed with "The foreground window is not a Windows credential
+  prompt". The installed build reported the prompt and filled the masked
+  password. Then the prompt was cancelled. The lock screen was not retested.
 
 ## Validation — September 23, 2026
 
