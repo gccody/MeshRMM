@@ -1,7 +1,8 @@
-//! Video for Safe Mode. Windows loads no GPU vendor driver there, so there is
-//! no hardware encoder and the D3D11 video processor may be missing too.
-//! Frames are copied to the CPU, converted to NV12, and encoded with
-//! Microsoft's software H.264 encoder. Normal boots never use this path.
+//! Video without a GPU encoder: in Safe Mode, where Windows loads no GPU
+//! vendor driver, and as the final fallback on machines whose GPU cannot
+//! encode or convert video (or that have no GPU). There may be no hardware
+//! encoder and no D3D11 video processor, so frames are copied to the CPU,
+//! converted to NV12, and encoded with Microsoft's software H.264 encoder.
 
 use std::ptr;
 
@@ -25,12 +26,13 @@ use crate::encoder::{
 };
 use crate::{EncodedAccessUnit, VideoCodec, VideoPixelFormat};
 
-/// Software encoding is only for Safe Mode.
-pub(crate) fn required() -> bool {
+/// Safe Mode has no GPU drivers and disables Media Foundation's hardware
+/// encoders, so it skips straight to software encoding.
+fn safe_mode() -> bool {
     unsafe { GetSystemMetrics(SM_CLEANBOOT) != 0 }
 }
 
-/// Keeps the CPU encoder from starving the rest of a Safe Mode session.
+/// Keeps the CPU encoder from starving the rest of the machine.
 pub(crate) const MAX_FRAMES_PER_SECOND: u32 = 30;
 
 /// CPU-readable copies of captured frames. Like the GPU converter's pool, a
@@ -265,7 +267,8 @@ impl SoftwareH264Encoder {
                 height,
                 frames_per_second,
                 bitrate_bits_per_second,
-                "Windows is in Safe Mode; encoding video in software"
+                safe_mode = safe_mode(),
+                "encoding video in software"
             );
             let output = OutputFramer::new(&transform, VideoCodec::H264);
             Ok(Self {
@@ -457,7 +460,7 @@ fn bgra_to_nv12(
     }
 }
 
-/// The hardware converter and encoder, or their Safe Mode replacements.
+/// The hardware converter and encoder, or their software replacements.
 pub(crate) enum Converter {
     Gpu(converter::BgraToYuvConverter),
     Software(StagingPool),
@@ -532,42 +535,54 @@ pub(crate) struct PipelineConfig {
     pub grayscale: bool,
 }
 
-/// The converter and encoder for a stream. In Safe Mode only H.264 4:2:0 is
-/// available, so other profiles fail like a missing hardware encoder and the
-/// Agent falls back to it.
+/// The converter and encoder for a stream.
+pub(crate) struct Pipeline {
+    pub converter: Converter,
+    pub encoder: Encoder,
+    /// The stream rate: the requested one, capped for the software encoder.
+    pub frames_per_second: u32,
+}
+
+/// The converter and encoder for a stream. The GPU pipeline comes first.
+/// Software H.264 4:2:0 is the final fallback, so other profiles fail like
+/// a missing hardware encoder and the Agent moves on to that profile. Safe
+/// Mode has no GPU pipeline and goes straight to software.
 pub(crate) fn pipeline(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     config: &PipelineConfig,
-) -> Result<(Converter, Encoder), crate::Error> {
-    if required() {
-        if config.codec != VideoCodec::H264 || config.pixel_format != VideoPixelFormat::Yuv420 {
+) -> Result<Pipeline, crate::Error> {
+    let software_profile =
+        config.codec == VideoCodec::H264 && config.pixel_format == VideoPixelFormat::Yuv420;
+    if safe_mode() {
+        if !software_profile {
             return Err(Error::HardwareEncoderUnavailable {
                 codec: config.codec,
                 pixel_format: config.pixel_format,
             }
             .into());
         }
-        let encoder = SoftwareH264Encoder::new(
-            device,
-            config.width,
-            config.height,
-            config.frames_per_second,
-            config.bitrate_bits_per_second,
-            config.grayscale,
-        )?;
-        let pool = StagingPool::new(device, context, config.width, config.height);
-        return Ok((Converter::Software(pool), Encoder::Software(encoder)));
+        return software_pipeline(device, context, config);
     }
-    let converter = converter::BgraToYuvConverter::new(
-        device,
-        context,
-        config.width,
-        config.height,
-        config.frames_per_second,
-        config.pixel_format,
-        config.grayscale,
-    )?;
+    match hardware_pipeline(device, context, config) {
+        Err(error) if software_profile => {
+            tracing::warn!(
+                %error,
+                "no GPU video pipeline for H.264 4:2:0; falling back to software encoding"
+            );
+            software_pipeline(device, context, config)
+        }
+        result => result,
+    }
+}
+
+fn hardware_pipeline(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    config: &PipelineConfig,
+) -> Result<Pipeline, crate::Error> {
+    // The encoder first: without a GPU, its absence is the error to report,
+    // not the missing video processor.
     let encoder = encoder::MediaFoundationVideoEncoder::new(
         device,
         config.width,
@@ -577,16 +592,42 @@ pub(crate) fn pipeline(
         config.codec,
         config.pixel_format,
     )?;
-    Ok((Converter::Gpu(converter), Encoder::Hardware(encoder)))
+    let converter = converter::BgraToYuvConverter::new(
+        device,
+        context,
+        config.width,
+        config.height,
+        config.frames_per_second,
+        config.pixel_format,
+        config.grayscale,
+    )?;
+    Ok(Pipeline {
+        converter: Converter::Gpu(converter),
+        encoder: Encoder::Hardware(encoder),
+        frames_per_second: config.frames_per_second,
+    })
 }
 
-/// The capture rate for a stream: Safe Mode caps it for the CPU encoder.
-pub(crate) fn frames_per_second(requested: u32) -> u32 {
-    if required() {
-        requested.min(MAX_FRAMES_PER_SECOND)
-    } else {
-        requested
-    }
+fn software_pipeline(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    config: &PipelineConfig,
+) -> Result<Pipeline, crate::Error> {
+    let frames_per_second = config.frames_per_second.min(MAX_FRAMES_PER_SECOND);
+    let encoder = SoftwareH264Encoder::new(
+        device,
+        config.width,
+        config.height,
+        frames_per_second,
+        config.bitrate_bits_per_second,
+        config.grayscale,
+    )?;
+    let pool = StagingPool::new(device, context, config.width, config.height);
+    Ok(Pipeline {
+        converter: Converter::Software(pool),
+        encoder: Encoder::Software(encoder),
+        frames_per_second,
+    })
 }
 
 #[cfg(test)]

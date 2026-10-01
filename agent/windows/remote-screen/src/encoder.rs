@@ -40,7 +40,7 @@ pub enum Error {
         codec: VideoCodec,
         pixel_format: VideoPixelFormat,
     },
-    #[error("Windows has no software Media Foundation H.264 encoder")]
+    #[error("no software Media Foundation H.264 encoder is installed")]
     SoftwareEncoderUnavailable,
     #[error("Media Foundation encoder configuration failed: {0}")]
     Configuration(#[source] windows::core::Error),

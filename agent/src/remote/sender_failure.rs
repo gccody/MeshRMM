@@ -10,10 +10,15 @@ use std::fmt;
 
 use meshrmm_protocol::{SignalErrorCode, SignalMessage, VideoProfile};
 
-/// The encoder's "no hardware encoder" failure. The desktop helper reports it
-/// as text, and `meshrmm_remote_screen`'s encoder error type is private, so the
-/// message is the only thing both capture paths share.
-const HARDWARE_ENCODER_UNAVAILABLE: &str = "no hardware Media Foundation";
+/// The encoder's "no hardware encoder" and "no software encoder" failures.
+/// The desktop helper reports them as text, and `meshrmm_remote_screen`'s
+/// encoder error type is private, so the message is the only thing both
+/// capture paths share. Software H.264 is the final fallback, so a profile
+/// fails with the first only when it has no software encoder at all.
+const ENCODER_UNAVAILABLE: [&str; 2] = [
+    "no hardware Media Foundation",
+    "no software Media Foundation",
+];
 
 /// A failure with a code the viewer acts on.
 #[derive(Debug)]
@@ -62,17 +67,20 @@ fn coded(code: SignalErrorCode, error: &anyhow::Error) -> anyhow::Error {
     .into()
 }
 
-fn is_hardware_encoder_unavailable(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().contains(HARDWARE_ENCODER_UNAVAILABLE))
+fn is_encoder_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let cause = cause.to_string();
+        ENCODER_UNAVAILABLE
+            .iter()
+            .any(|marker| cause.contains(marker))
+    })
 }
 
-/// The session's first capture start failed. A missing hardware encoder will
-/// not change; anything else may (UAC, the lock screen, RDP switches).
+/// The session's first capture start failed. A missing encoder will not
+/// change; anything else may (UAC, the lock screen, RDP switches).
 pub fn initial_start_error(error: anyhow::Error) -> anyhow::Error {
-    let code = if is_hardware_encoder_unavailable(&error) {
-        SignalErrorCode::HardwareEncoderUnavailable
+    let code = if is_encoder_unavailable(&error) {
+        SignalErrorCode::VideoEncoderUnavailable
     } else {
         SignalErrorCode::CaptureUnavailable
     };
@@ -86,15 +94,14 @@ pub fn profile_start_error(failures: Vec<(VideoProfile, anyhow::Error)>) -> anyh
         .map(|(profile, error)| format!("{profile:?}: {error:#}"))
         .collect::<Vec<_>>()
         .join("; ");
-    let error =
-        anyhow::anyhow!("no mutually supported hardware video profile could start: {detail}");
+    let error = anyhow::anyhow!("no mutually supported video profile could start: {detail}");
     if failures.is_empty() {
         coded(SignalErrorCode::NoMutualProfile, &error)
     } else if failures
         .iter()
-        .all(|(_, error)| is_hardware_encoder_unavailable(error))
+        .all(|(_, error)| is_encoder_unavailable(error))
     {
-        coded(SignalErrorCode::HardwareEncoderUnavailable, &error)
+        coded(SignalErrorCode::VideoEncoderUnavailable, &error)
     } else {
         error
     }
@@ -149,7 +156,14 @@ mod tests {
     /// The text the desktop helper reports when no hardware encoder exists.
     fn helper_encoder_failure(codec: &str) -> anyhow::Error {
         anyhow::anyhow!(
-            "desktop helper failed: Media Foundation hardware encoder failed: no hardware Media Foundation {codec} encoder accepts NV12"
+            "desktop helper failed: Media Foundation video encoder failed: no hardware Media Foundation {codec} encoder accepts NV12"
+        )
+    }
+
+    /// The text it reports when H.264 has no software fallback either.
+    fn helper_software_encoder_failure() -> anyhow::Error {
+        anyhow::anyhow!(
+            "desktop helper failed: Media Foundation video encoder failed: no software Media Foundation H.264 encoder is installed"
         )
     }
 
@@ -160,23 +174,20 @@ mod tests {
     }
 
     #[test]
-    fn every_candidate_lacking_a_hardware_encoder_is_coded() {
+    fn every_candidate_lacking_an_encoder_is_coded() {
         let error = profile_start_error(vec![
             (HEVC, helper_encoder_failure("H265")),
             (
                 H264,
-                helper_encoder_failure("H264").context("could not start capture"),
+                helper_software_encoder_failure().context("could not start capture"),
             ),
         ])
         .context("capture worker");
-        assert_eq!(
-            code(&error),
-            Some(SignalErrorCode::HardwareEncoderUnavailable)
-        );
+        assert_eq!(code(&error), Some(SignalErrorCode::VideoEncoderUnavailable));
         let Some(SignalMessage::Error { message, .. }) = failure_signal(&error) else {
             unreachable!()
         };
-        assert!(message.starts_with("capture worker: no mutually supported"));
+        assert!(message.starts_with("capture worker: no mutually supported video profile"));
         assert!(message.contains("H265 encoder accepts NV12"));
 
         let mixed = profile_start_error(vec![
@@ -192,8 +203,8 @@ mod tests {
     #[test]
     fn initial_start_failures_are_coded() {
         assert_eq!(
-            code(&initial_start_error(helper_encoder_failure("H264"))),
-            Some(SignalErrorCode::HardwareEncoderUnavailable)
+            code(&initial_start_error(helper_software_encoder_failure())),
+            Some(SignalErrorCode::VideoEncoderUnavailable)
         );
         assert_eq!(
             code(&initial_start_error(anyhow::anyhow!(

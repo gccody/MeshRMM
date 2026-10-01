@@ -167,7 +167,7 @@ fn start_first_profile(
         match result {
             Ok(started) => return Ok(started),
             Err(error) => {
-                tracing::warn!(?profile, error = ?error, "hardware encoder profile unavailable");
+                tracing::warn!(?profile, error = ?error, "encoder profile unavailable");
                 failures.push((*profile, error));
             }
         }
@@ -1526,7 +1526,7 @@ async fn run_capture_control(
                             continue;
                         }
                         rejected_profiles.push(profile);
-                        tracing::warn!(?profile, reason, "viewer rejected hardware video profile; trying fallback");
+                        tracing::warn!(?profile, reason, "viewer rejected video profile; trying fallback");
                         let candidates = profile_candidates(
                             &viewer_profiles,
                             requested_chroma,
