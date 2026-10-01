@@ -44,7 +44,7 @@ static LAST_PLACEMENT: std::sync::Mutex<Option<WINDOWPLACEMENT>> = std::sync::Mu
 pub(super) const STATIC_CENTER: u32 = 0x0001;
 
 /// The minimum outer window size, in 96-DPI pixels, that fits the toolbar.
-const MINIMUM_WINDOW_WIDTH: i32 = 760;
+const MINIMUM_WINDOW_WIDTH: i32 = 800;
 const MINIMUM_WINDOW_HEIGHT: i32 = 300;
 
 /// The video window's size and the letterboxed video inside it, in physical pixels.

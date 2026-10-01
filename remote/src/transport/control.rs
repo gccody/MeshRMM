@@ -293,6 +293,7 @@ pub(super) fn install_control_handler(
                         wallpaper_hidden: Arc::clone(&viewer_control.resume_state.wallpaper_hidden),
                         remote_cursor_hidden: Arc::clone(&viewer_control.resume_state.remote_cursor_hidden),
                         session_close_action: Arc::clone(&viewer_control.resume_state.session_close_action),
+                        restarting: Arc::clone(&viewer_control.resume_state.restarting),
                         quality: Arc::clone(&quality_preset),
                         chroma: Arc::clone(&chroma_mode),
                         #[cfg(windows)]
@@ -452,13 +453,19 @@ pub(super) fn install_control_handler(
                     if let Ok(guard) = presenter.lock() && let Some(active) = guard.as_ref() { active.presenter.refresh_controls(); }
                 }
                 Ok(SessionMessage::MaintenanceError { reason }) => {
+                    // A failed restart leaves the computer running.
+                    if let Ok(mut restarting) = viewer_control.resume_state.restarting.lock() { restarting.take(); }
                     if let Ok(mut state) = viewer_control.maintenance.lock() { state.error = Some(reason); }
                     if let Ok(guard) = presenter.lock() && let Some(active) = guard.as_ref() { active.presenter.refresh_controls(); }
                 }
                 Ok(SessionMessage::MaintenanceState { agent_input_blocked, blacked_out }) => {
                     if let Ok(mut state) = viewer_control.maintenance.lock() {
-                        *state = crate::platform::MaintenanceState { available: true, agent_input_blocked, blacked_out, error: None };
+                        *state = crate::platform::MaintenanceState { available: true, agent_input_blocked, blacked_out, error: None, power: state.power };
                     }
+                }
+                Ok(SessionMessage::PowerState { safe_mode }) => {
+                    if let Ok(mut state) = viewer_control.maintenance.lock() { state.power = Some(safe_mode); }
+                    if let Ok(guard) = presenter.lock() && let Some(active) = guard.as_ref() { active.presenter.refresh_controls(); }
                 }
                 Ok(SessionMessage::Stop { reason }) => tracing::info!(reason, "Agent stopped stream"),
                 Ok(SessionMessage::AgentPointerDisplay { display_id }) => {

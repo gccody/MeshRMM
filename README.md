@@ -75,7 +75,11 @@ A `cargo` that rustup does not manage, such as Homebrew's, ignores
 `PATH`.
 
 There is deliberately no software codec fallback. Startup fails with a
-contextual error if the required hardware path is unavailable.
+contextual error if the required hardware path is unavailable. The one
+exception is Safe Mode, where Windows loads no GPU vendor driver and disables
+Media Foundation: there the Agent encodes H.264 4:2:0 with Microsoft's
+software encoder transform at up to 30 FPS
+(see [restart and Safe Mode](docs/maintenance-controls.md#restart-and-safe-mode)).
 
 ## Preconfigured deployment
 

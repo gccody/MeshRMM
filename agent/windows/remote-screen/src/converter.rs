@@ -24,6 +24,8 @@ pub enum Error {
     MissingTexture,
     #[error("D3D11 video processor view creation returned no view")]
     MissingView,
+    #[error("captured frames have unsupported DXGI format {0}")]
+    UnsupportedCaptureFormat(i32),
     #[error("D3D11 returned no grayscale shader or surface")]
     MissingGrayscaleResource,
 }

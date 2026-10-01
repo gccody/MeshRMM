@@ -126,6 +126,7 @@ fn run_service() -> anyhow::Result<()> {
     if let Some(config_directory) = config.config_path.parent() {
         crate::updater::remove_stale_files(config_directory);
     }
+    crate::power::finish_safe_mode_restart();
 
     let mut worker: Option<Coordinator> = None;
     let mut trays = trays::Trays::default();
