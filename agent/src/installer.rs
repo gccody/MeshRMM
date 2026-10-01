@@ -183,6 +183,13 @@ fn remove_agent() -> anyhow::Result<()> {
 
     crate::power::finish_safe_mode_restart();
     crate::power::unregister_safe_mode_service()?;
+    // Its record lives in the configuration directory removed below.
+    if let Err(error) = crate::remote::virtual_display::uninstall_driver() {
+        tracing::warn!(
+            error = format!("{error:#}"),
+            "virtual display driver cleanup failed"
+        );
+    }
 
     let install_directory = program_files()?.join("MeshRMM").join("Agent");
     let config_directory = config_directory()?;

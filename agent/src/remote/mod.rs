@@ -57,6 +57,8 @@ mod signaling;
 mod thumbnail;
 #[cfg(windows)]
 mod transport;
+#[cfg(windows)]
+pub(crate) mod virtual_display;
 // The bitrate controller's tests share the encoded-frame queue bound.
 #[cfg(any(windows, test))]
 #[cfg_attr(not(windows), allow(dead_code))]

@@ -2,6 +2,7 @@
 //! maintenance state they and the toolbar show.
 
 use super::*;
+use meshrmm_protocol::HeadlessResolution;
 
 /// The settings window's outer size, in 96-DPI pixels.
 pub(super) const SETTINGS_WINDOW_WIDTH: i32 = 560;
@@ -23,6 +24,8 @@ const SETTINGS_DIAGNOSTICS_KEY_ID: usize = 4244;
 const SETTINGS_DISPLAY_KEY_TITLE_ID: i32 = 4245;
 const SETTINGS_DISPLAY_KEY_ID: usize = 4246;
 const SETTINGS_KEYBOARD_NOTE_ID: i32 = 4247;
+const SETTINGS_HEADLESS_TITLE_ID: i32 = 4248;
+const SETTINGS_HEADLESS_ID: usize = 4249;
 const SETTINGS_DISPLAY_TITLE_ID: i32 = 4211;
 const SETTINGS_QUALITY_TITLE_ID: i32 = 4212;
 const SETTINGS_CHROMA_TITLE_ID: i32 = 4213;
@@ -61,6 +64,7 @@ impl WindowContext {
     pub(super) fn refresh_maintenance_controls(&self) {
         self.refresh_shortcut_keys();
         self.refresh_idle_disconnect();
+        self.refresh_headless_resolution();
         self.refresh_toolbar();
         let controls = self.controls();
         let close_action = self.control.session_close_action();
@@ -214,6 +218,23 @@ impl WindowContext {
         }
     }
 
+    fn refresh_headless_resolution(&self) {
+        let resolution = crate::preferences::headless_resolution();
+        // A size outside the offered choices shows no selection.
+        let index = HeadlessResolution::PRESETS
+            .iter()
+            .position(|choice| *choice == resolution)
+            .unwrap_or(usize::MAX);
+        if let Ok(combo) = unsafe {
+            GetDlgItem(
+                Some(self.controls().settings_window),
+                SETTINGS_HEADLESS_ID as i32,
+            )
+        } {
+            unsafe { SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(index)), None) };
+        }
+    }
+
     pub(super) fn show_settings(&self) {
         self.refresh_maintenance_controls();
         let settings_window = self.controls().settings_window;
@@ -245,6 +266,8 @@ unsafe fn show_settings_category(window: HWND, category: SettingsCategory) {
         SETTINGS_DISPLAY_BORDER_ID as i32,
         SETTINGS_IDLE_ID as i32,
         SETTINGS_DISCONNECT_ID as i32,
+        SETTINGS_HEADLESS_TITLE_ID,
+        SETTINGS_HEADLESS_ID as i32,
     ];
     let advanced: Vec<i32> = [
         SETTINGS_ADVANCED_TITLE_ID,
@@ -451,6 +474,21 @@ impl WindowContext {
         }
         if control_id == SETTINGS_DIAGNOSTICS_ID {
             self.toggle_debug();
+            return true;
+        }
+        if control_id == SETTINGS_HEADLESS_ID {
+            if notification == CBN_SELCHANGE as usize {
+                let selected = unsafe {
+                    SendMessageW(HWND(lparam.0 as *mut c_void), CB_GETCURSEL, None, None).0
+                };
+                if let Some(resolution) = usize::try_from(selected)
+                    .ok()
+                    .and_then(|index| HeadlessResolution::PRESETS.get(index))
+                {
+                    self.control.set_headless_resolution(*resolution);
+                }
+                self.refresh_maintenance_controls();
+            }
             return true;
         }
         if control_id == SETTINGS_IDLE_DISCONNECT_ID {
@@ -886,6 +924,39 @@ pub(super) unsafe fn create_settings_window(
         28,
         SETTINGS_DISCONNECT_ID,
     )?;
+    let _ = make_control(
+        w!("STATIC"),
+        w!("Display size when the computer has no monitor"),
+        static_style,
+        162,
+        562,
+        370,
+        24,
+        SETTINGS_HEADLESS_TITLE_ID as usize,
+    )?;
+    let headless = make_control(
+        w!("COMBOBOX"),
+        w!(""),
+        WINDOW_STYLE(
+            WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
+        ),
+        162,
+        590,
+        280,
+        240,
+        SETTINGS_HEADLESS_ID,
+    )?;
+    for resolution in HeadlessResolution::PRESETS {
+        let label = HSTRING::from(resolution.label());
+        unsafe {
+            SendMessageW(
+                headless,
+                CB_ADDSTRING,
+                None,
+                Some(LPARAM(label.as_ptr() as isize)),
+            );
+        }
+    }
     let _ = make_control(
         w!("STATIC"),
         w!("Keyboard"),
