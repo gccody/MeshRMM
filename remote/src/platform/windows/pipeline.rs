@@ -4,7 +4,7 @@ use crate::stream_reset::ResetPlan;
 pub(super) struct WorkerPipeline {
     // Fields drop in order: the decoder before the device and runtimes it
     // uses.
-    decoder: HardwareDecoder,
+    decoder: Decoder,
     first_presented: Arc<OnceLock<std::time::Instant>>,
     presentation: Presentation,
     decoded: u64,
@@ -20,7 +20,7 @@ pub(super) struct WorkerPipeline {
 /// Everything the worker owns apart from the decoder: the COM and Media
 /// Foundation runtimes, the D3D11 device, and the window with its renderer.
 /// It is built as a separate step so a probe can present synthetic frames
-/// on a GPU without hardware decoders.
+/// without a decoder.
 pub(super) struct Presentation {
     renderer: D3d11Renderer,
     device: ID3D11Device,
@@ -80,8 +80,8 @@ impl Presentation {
         format: VideoFormat,
         display: Display,
         displays: Vec<Display>,
-    ) -> anyhow::Result<HardwareDecoder> {
-        let decoder = unsafe { HardwareDecoder::new(&self.device, format)? };
+    ) -> anyhow::Result<Decoder> {
+        let decoder = unsafe { Decoder::new(&self.device, format)? };
         unsafe { self.reset_presentation(format, display, displays)? };
         Ok(decoder)
     }
@@ -136,7 +136,7 @@ impl WorkerPipeline {
     ) -> anyhow::Result<Self> {
         let presentation =
             unsafe { Presentation::new(format, active_display, displays, control, debug.clone())? };
-        let decoder = unsafe { HardwareDecoder::new(&presentation.device, format)? };
+        let decoder = unsafe { Decoder::new(&presentation.device, format)? };
         Ok(Self {
             decoder,
             first_presented,
@@ -291,17 +291,49 @@ impl Drop for MediaFoundationRuntime {
     }
 }
 
+/// The GPU's device with video support. Without one, such as on a machine
+/// with no GPU, a device without it: the renderer then converts video with
+/// a shader, and only software decoding works.
 unsafe fn create_device() -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext)> {
+    let mut failures = Vec::new();
+    for (driver_type, video) in [
+        (D3D_DRIVER_TYPE_HARDWARE, true),
+        (D3D_DRIVER_TYPE_HARDWARE, false),
+        (D3D_DRIVER_TYPE_WARP, false),
+    ] {
+        match unsafe { create_device_of(driver_type, video) } {
+            Ok(device) => {
+                if !failures.is_empty() {
+                    tracing::warn!(
+                        ?driver_type,
+                        failures = failures.join("; "),
+                        "no D3D11 hardware video device; presenting without GPU video support"
+                    );
+                }
+                return Ok(device);
+            }
+            Err(error) => failures.push(format!("{error:#}")),
+        }
+    }
+    bail!("D3D11 device creation failed: {}", failures.join("; "))
+}
+
+unsafe fn create_device_of(
+    driver_type: D3D_DRIVER_TYPE,
+    video: bool,
+) -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext)> {
+    let mut flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    if video {
+        flags |= D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+    }
     let mut device = None;
     let mut context = None;
     unsafe {
         D3D11CreateDevice(
             None,
-            D3D_DRIVER_TYPE_HARDWARE,
+            driver_type,
             HMODULE::default(),
-            D3D11_CREATE_DEVICE_FLAG(
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT.0 | D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0,
-            ),
+            flags,
             None,
             D3D11_SDK_VERSION,
             Some(&mut device),
@@ -309,7 +341,7 @@ unsafe fn create_device() -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext)>
             Some(&mut context),
         )
     }
-    .context("D3D11 hardware video device creation failed")?;
+    .with_context(|| format!("D3D11 {driver_type:?} device creation (video: {video}) failed"))?;
     Ok((
         device.context("D3D11 returned no device")?,
         context.context("D3D11 returned no immediate context")?,
@@ -323,8 +355,8 @@ fn codec_subtype(codec: Codec) -> windows::core::GUID {
     }
 }
 
-fn decoded_subtype(format: VideoFormat) -> windows::core::GUID {
-    match format.pixel_format {
+fn decoded_subtype(pixel_format: meshrmm_protocol::PixelFormat) -> windows::core::GUID {
+    match pixel_format {
         meshrmm_protocol::PixelFormat::Nv12 => MFVideoFormat_NV12,
         meshrmm_protocol::PixelFormat::Ayuv => MFVideoFormat_AYUV,
     }
@@ -358,13 +390,13 @@ pub(super) unsafe fn supported_video_profiles(format: VideoFormat) -> Vec<VideoP
                 ChromaMode::Yuv420 => meshrmm_protocol::PixelFormat::Nv12,
                 ChromaMode::Yuv444 => meshrmm_protocol::PixelFormat::Ayuv,
             };
-            match unsafe { HardwareDecoder::new(&device, candidate) } {
+            match unsafe { Decoder::new(&device, candidate) } {
                 Ok(_) => supported.push(VideoProfile { codec, chroma }),
                 Err(error) => tracing::info!(
                     ?codec,
                     ?chroma,
                     error = %error,
-                    "hardware decoder profile unavailable"
+                    "video decoder profile unavailable"
                 ),
             }
         }
@@ -374,7 +406,7 @@ pub(super) unsafe fn supported_video_profiles(format: VideoFormat) -> Vec<VideoP
         chroma: ChromaMode::Yuv420,
     };
     if !supported.contains(&mandatory) {
-        // The active presenter has already proven the mandatory H.264 GPU path.
+        // The active presenter has already proven the mandatory H.264 path.
         supported.push(mandatory);
     }
     supported
@@ -400,12 +432,31 @@ struct DecodeResult {
     frames: Vec<DecodedFrame>,
 }
 
-pub(super) struct HardwareDecoder {
+/// Which transform decodes the stream, and where its pictures land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecoderKind {
+    /// A GPU vendor's hardware MFT.
+    Hardware,
+    /// Microsoft's H.264 decoder with the D3D11 device: it decodes with
+    /// DXVA where the GPU can. NVIDIA drivers register no H.264 hardware
+    /// MFT, so this is their GPU decoder.
+    MicrosoftGpu,
+    /// Microsoft's H.264 decoder in software, for a machine whose GPU
+    /// cannot decode, or that has none.
+    MicrosoftSoftware,
+}
+
+pub(super) struct Decoder {
     transform: IMFTransform,
     events: Option<IMFMediaEventGenerator>,
     asynchronous: bool,
-    _device_manager: IMFDXGIDeviceManager,
+    _device_manager: Option<IMFDXGIDeviceManager>,
+    kind: DecoderKind,
     output_info: MFT_OUTPUT_STREAM_INFO,
+    /// The decoder's picture size, which can be padded beyond the stream's.
+    output_size: (u32, u32),
+    /// Uploads pictures that a software decoder leaves in system memory.
+    upload: CpuUpload,
     frame_duration_100ns: i64,
     need_input: u32,
     have_output: u32,
@@ -415,16 +466,44 @@ pub(super) struct HardwareDecoder {
     pixel_format: meshrmm_protocol::PixelFormat,
 }
 
-impl HardwareDecoder {
+impl Decoder {
+    /// A hardware decoder for `format`. H.264 4:2:0 without one falls back
+    /// to Microsoft's decoder: on the GPU through DXVA, else in software.
+    /// A device without video support gets software decoding only: its
+    /// renderer's shader cannot read GPU decoder surfaces.
     pub(super) unsafe fn new(device: &ID3D11Device, format: VideoFormat) -> anyhow::Result<Self> {
-        // The renderer and asynchronous decoder use the same immediate
-        // context. Protect it before the MFT receives the D3D device manager.
-        let context = unsafe { device.GetImmediateContext() }
-            .context("decoder immediate context unavailable")?;
-        let multithread: ID3D11Multithread = context
-            .cast()
-            .context("decoder D3D multithread protection unavailable")?;
-        let _ = unsafe { multithread.SetMultithreadProtected(true) };
+        let software_profile = format.codec == Codec::H264
+            && format.pixel_format == meshrmm_protocol::PixelFormat::Nv12;
+        if device.cast::<ID3D11VideoDevice>().is_err() {
+            if !software_profile {
+                bail!(
+                    "without GPU video support only H.264 4:2:0 can be decoded, not {:?} {:?}",
+                    format.codec,
+                    format.pixel_format
+                );
+            }
+            return unsafe { Self::microsoft_h264(device, format, false) }
+                .context("Microsoft's software H.264 decoder is unavailable");
+        }
+        let hardware = match unsafe { Self::hardware(device, format) } {
+            Ok(decoder) => return Ok(decoder),
+            Err(error) => error,
+        };
+        if !software_profile {
+            return Err(hardware);
+        }
+        tracing::info!(error = %format!("{hardware:#}"), "no H.264 hardware decoder MFT; trying Microsoft's H.264 decoder");
+        match unsafe { Self::microsoft_h264(device, format, true) } {
+            Ok(decoder) => Ok(decoder),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "Microsoft's H.264 decoder cannot use the GPU; decoding in software");
+                unsafe { Self::microsoft_h264(device, format, false) }
+                    .context("Microsoft's software H.264 decoder is unavailable")
+            }
+        }
+    }
+
+    unsafe fn hardware(device: &ID3D11Device, format: VideoFormat) -> anyhow::Result<Self> {
         let subtype = codec_subtype(format.codec);
         let input_info = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
@@ -478,24 +557,10 @@ impl HardwareDecoder {
             );
         }
         let _ = unsafe { attributes.SetUINT32(&MF_LOW_LATENCY, 1) };
-
-        let mut reset_token = 0;
-        let mut manager = None;
-        unsafe { MFCreateDXGIDeviceManager(&mut reset_token, &mut manager) }
-            .context("decoder D3D manager creation failed")?;
-        let manager = manager.context("Media Foundation returned no decoder D3D manager")?;
-        unsafe { manager.ResetDevice(device, reset_token) }
-            .context("decoder D3D manager reset failed")?;
-        unsafe {
-            transform.ProcessMessage(
-                MFT_MESSAGE_SET_D3D_MANAGER,
-                Interface::as_raw(&manager) as usize,
-            )
-        }
-        .context("failed to attach D3D manager to decoder")?;
+        let manager = unsafe { attach_device(&transform, device)? };
 
         let input_type = unsafe { video_type(subtype, format)? };
-        let output_type = unsafe { video_type(decoded_subtype(format), format)? };
+        let output_type = unsafe { video_type(decoded_subtype(format.pixel_format), format)? };
         unsafe { transform.SetInputType(0, &input_type, 0) }
             .with_context(|| format!("decoder rejected {:?} input type", format.codec))?;
         unsafe { transform.SetOutputType(0, &output_type, 0) }.with_context(|| {
@@ -503,13 +568,68 @@ impl HardwareDecoder {
         })?;
         let output_info = unsafe { transform.GetOutputStreamInfo(0) }
             .context("decoder output stream info unavailable")?;
-        let provides_samples = output_info.dwFlags
-            & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32
-                | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32)
-            != 0;
-        if !provides_samples {
+        if !provides_samples(&output_info) {
             bail!("hardware decoder requires caller-allocated output surfaces");
         }
+        unsafe {
+            Self::start(
+                transform,
+                Some(manager),
+                DecoderKind::Hardware,
+                asynchronous,
+                device,
+                format,
+            )
+        }
+    }
+
+    /// Microsoft's H.264 decoder. With `gpu`, it gets the D3D11 device and
+    /// decodes with DXVA where it can; otherwise it decodes in software.
+    unsafe fn microsoft_h264(
+        device: &ID3D11Device,
+        format: VideoFormat,
+        gpu: bool,
+    ) -> anyhow::Result<Self> {
+        let transform: IMFTransform =
+            unsafe { CoCreateInstance(&CLSID_MSH264DecoderMFT, None, CLSCTX_INPROC_SERVER) }
+                .context("Microsoft's H.264 decoder is not installed")?;
+        let attributes =
+            unsafe { transform.GetAttributes() }.context("decoder attributes unavailable")?;
+        // Without it, the decoder holds frames back for reordering.
+        unsafe { attributes.SetUINT32(&MF_LOW_LATENCY, 1) }
+            .context("decoder low-latency mode failed")?;
+        let manager = if gpu {
+            if unsafe { attributes.GetUINT32(&MF_SA_D3D11_AWARE) }.unwrap_or(0) == 0 {
+                bail!("Microsoft's H.264 decoder is not D3D11-aware");
+            }
+            Some(unsafe { attach_device(&transform, device)? })
+        } else {
+            None
+        };
+        let input_type = unsafe { video_type(MFVideoFormat_H264, format)? };
+        unsafe { transform.SetInputType(0, &input_type, 0) }
+            .context("decoder rejected H264 input type")?;
+        // Its output types follow from the input; take its NV12 one.
+        unsafe { select_output_type(&transform, MFVideoFormat_NV12)? };
+        let kind = if gpu {
+            DecoderKind::MicrosoftGpu
+        } else {
+            DecoderKind::MicrosoftSoftware
+        };
+        unsafe { Self::start(transform, manager, kind, false, device, format) }
+    }
+
+    unsafe fn start(
+        transform: IMFTransform,
+        device_manager: Option<IMFDXGIDeviceManager>,
+        kind: DecoderKind,
+        asynchronous: bool,
+        device: &ID3D11Device,
+        format: VideoFormat,
+    ) -> anyhow::Result<Self> {
+        let output_info = unsafe { transform.GetOutputStreamInfo(0) }
+            .context("decoder output stream info unavailable")?;
+        let output_size = unsafe { output_size(&transform)? };
         unsafe { transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0) }
             .context("decoder begin-streaming failed")?;
         unsafe { transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0) }
@@ -527,8 +647,11 @@ impl HardwareDecoder {
             transform,
             events,
             asynchronous,
-            _device_manager: manager,
+            _device_manager: device_manager,
+            kind,
             output_info,
+            output_size,
+            upload: CpuUpload::new(device),
             frame_duration_100ns: 10_000_000 / i64::from(format.frames_per_second.max(1)),
             need_input: 0,
             have_output: 0,
@@ -538,6 +661,12 @@ impl HardwareDecoder {
             pixel_format: format.pixel_format,
         };
         unsafe { decoder.pump_events()? };
+        tracing::info!(
+            kind = ?kind,
+            codec = ?format.codec,
+            pixel_format = ?format.pixel_format,
+            "video decoder created"
+        );
         Ok(decoder)
     }
 
@@ -601,7 +730,7 @@ impl HardwareDecoder {
         }
         if self.pending.len() >= MAX_DECODER_PENDING_FRAMES {
             bail!(
-                "hardware decoder buffered more than {MAX_DECODER_PENDING_FRAMES} frames; stopping instead of accumulating latency"
+                "video decoder buffered more than {MAX_DECODER_PENDING_FRAMES} frames; stopping instead of accumulating latency"
             );
         }
         let decode_start_us = monotonic_timestamp_us();
@@ -613,7 +742,8 @@ impl HardwareDecoder {
                 annex_b = queued.frame.data.starts_with(&[0, 0, 1])
                     || queued.frame.data.starts_with(&[0, 0, 0, 1]),
                 codec = ?self.codec,
-                "first access unit submitted to hardware decoder"
+                kind = ?self.kind,
+                "first access unit submitted to the video decoder"
             );
             self.first_input_logged = true;
         }
@@ -655,7 +785,7 @@ impl HardwareDecoder {
         unsafe { sample.SetSampleDuration(self.frame_duration_100ns) }
             .context("decoder input duration failed")?;
         unsafe { self.transform.ProcessInput(0, &sample, 0) }
-            .with_context(|| format!("hardware {:?} decoder rejected input", self.codec))?;
+            .with_context(|| format!("{:?} {:?} decoder rejected input", self.kind, self.codec))?;
         if self.asynchronous {
             self.need_input -= 1;
         }
@@ -678,9 +808,19 @@ impl HardwareDecoder {
     }
 
     unsafe fn take_output(&mut self) -> anyhow::Result<Option<DecodedFrame>> {
+        // Software decoders write into a sample the caller provides.
+        let provided = if provides_samples(&self.output_info) {
+            None
+        } else {
+            let sample = unsafe { MFCreateSample() }.context("decoder output sample failed")?;
+            let buffer = unsafe { MFCreateMemoryBuffer(self.output_info.cbSize.max(1)) }
+                .context("decoder output buffer allocation failed")?;
+            unsafe { sample.AddBuffer(&buffer) }.context("decoder output sample buffer failed")?;
+            Some(sample)
+        };
         let mut output = MFT_OUTPUT_DATA_BUFFER {
             dwStreamID: 0,
-            pSample: ManuallyDrop::new(None),
+            pSample: ManuallyDrop::new(provided),
             ..Default::default()
         };
         let mut status = 0;
@@ -692,29 +832,45 @@ impl HardwareDecoder {
         let _ = unsafe { ManuallyDrop::take(&mut output.pEvents) };
         if let Err(error) = result {
             if error.code() == MF_E_TRANSFORM_STREAM_CHANGE {
-                unsafe { self.select_output_type()? };
+                let wanted = decoded_subtype(self.pixel_format);
+                unsafe { select_output_type(&self.transform, wanted)? };
+                self.output_info = unsafe { self.transform.GetOutputStreamInfo(0) }
+                    .context("decoder output stream info unavailable")?;
+                self.output_size = unsafe { output_size(&self.transform)? };
+                tracing::info!(
+                    codec = ?self.codec,
+                    pixel_format = ?self.pixel_format,
+                    kind = ?self.kind,
+                    width = self.output_size.0,
+                    height = self.output_size.1,
+                    "video decoder applied a stream format change"
+                );
                 return unsafe { self.take_output() };
             }
             if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
                 return Ok(None);
             }
-            return Err(error).context("hardware decoder output failed");
+            return Err(error).context("video decoder output failed");
         }
-        let sample = sample.context("hardware decoder returned no GPU sample")?;
+        let sample = sample.context("video decoder returned no sample")?;
         let buffer = unsafe { sample.GetBufferByIndex(0) }
             .context("decoded sample has no surface buffer")?;
-        let dxgi: IMFDXGIBuffer = buffer
-            .cast()
-            .context("decoded sample is not a DXGI surface")?;
-        let mut raw: *mut c_void = ptr::null_mut();
-        unsafe { dxgi.GetResource(&ID3D11Texture2D::IID, &mut raw) }
-            .context("decoded DXGI texture lookup failed")?;
-        if raw.is_null() {
-            bail!("decoded DXGI texture was null");
-        }
-        let texture = unsafe { ID3D11Texture2D::from_raw(raw) };
-        let subresource = unsafe { dxgi.GetSubresourceIndex() }
-            .context("decoded texture subresource unavailable")?;
+        let (texture, subresource) = match buffer.cast::<IMFDXGIBuffer>() {
+            Ok(dxgi) => {
+                let mut raw: *mut c_void = ptr::null_mut();
+                unsafe { dxgi.GetResource(&ID3D11Texture2D::IID, &mut raw) }
+                    .context("decoded DXGI texture lookup failed")?;
+                if raw.is_null() {
+                    bail!("decoded DXGI texture was null");
+                }
+                let texture = unsafe { ID3D11Texture2D::from_raw(raw) };
+                let subresource = unsafe { dxgi.GetSubresourceIndex() }
+                    .context("decoded texture subresource unavailable")?;
+                (texture, subresource)
+            }
+            // A software decoder's picture is in system memory.
+            Err(_) => (unsafe { self.upload.upload(&buffer, self.output_size)? }, 0),
+        };
         let metadata = self
             .pending
             .pop_front()
@@ -728,32 +884,9 @@ impl HardwareDecoder {
             decode_complete_us: monotonic_timestamp_us(),
         }))
     }
-
-    unsafe fn select_output_type(&self) -> anyhow::Result<()> {
-        let wanted = match self.pixel_format {
-            meshrmm_protocol::PixelFormat::Nv12 => MFVideoFormat_NV12,
-            meshrmm_protocol::PixelFormat::Ayuv => MFVideoFormat_AYUV,
-        };
-        for index in 0.. {
-            let media_type = match unsafe { self.transform.GetOutputAvailableType(0, index) } {
-                Ok(media_type) => media_type,
-                Err(error) if error.code() == MF_E_NO_MORE_TYPES => break,
-                Err(error) => {
-                    return Err(error).context("decoder output-type enumeration failed");
-                }
-            };
-            if unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }.ok() == Some(wanted) {
-                unsafe { self.transform.SetOutputType(0, &media_type, 0) }
-                    .context("decoder rejected its available GPU output type")?;
-                tracing::info!(codec = ?self.codec, pixel_format = ?self.pixel_format, "hardware decoder applied a stream format change");
-                return Ok(());
-            }
-        }
-        bail!("hardware decoder stream changed without the requested GPU output type")
-    }
 }
 
-impl Drop for HardwareDecoder {
+impl Drop for Decoder {
     fn drop(&mut self) {
         unsafe {
             let _ = self
@@ -764,8 +897,155 @@ impl Drop for HardwareDecoder {
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
             let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
         }
-        let _ = self.output_info;
     }
+}
+
+/// Copies NV12 pictures from system memory into a texture the renderer's
+/// video processor can read.
+struct CpuUpload {
+    device: ID3D11Device,
+    texture: Option<(ID3D11Texture2D, (u32, u32))>,
+}
+
+impl CpuUpload {
+    fn new(device: &ID3D11Device) -> Self {
+        Self {
+            device: device.clone(),
+            texture: None,
+        }
+    }
+
+    /// `size` is the decoder's padded picture size. The texture has the same
+    /// size; the renderer crops it to the stream's, as it does GPU surfaces.
+    unsafe fn upload(
+        &mut self,
+        buffer: &IMFMediaBuffer,
+        size: (u32, u32),
+    ) -> anyhow::Result<ID3D11Texture2D> {
+        let (width, height) = size;
+        let texture = match &self.texture {
+            Some((texture, current)) if *current == size => texture.clone(),
+            _ => {
+                let texture = unsafe { nv12_texture(&self.device, width, height)? };
+                self.texture = Some((texture.clone(), size));
+                texture
+            }
+        };
+        // Lock returns the picture contiguously: the chroma plane follows
+        // the padded luma plane, with the same pitch.
+        let mut data = ptr::null_mut();
+        let mut length = 0;
+        unsafe { buffer.Lock(&mut data, None, Some(&mut length)) }
+            .context("decoded picture lock failed")?;
+        let required = width as usize * height as usize * 3 / 2;
+        if data.is_null() || (length as usize) < required {
+            let _ = unsafe { buffer.Unlock() };
+            bail!("decoded picture holds {length} bytes; {width}x{height} NV12 needs {required}");
+        }
+        let context = unsafe { self.device.GetImmediateContext() };
+        let result = context.map(|context| unsafe {
+            context.UpdateSubresource(&texture, 0, None, data.cast(), width, 0)
+        });
+        let _ = unsafe { buffer.Unlock() };
+        result.context("D3D11 immediate context unavailable")?;
+        Ok(texture)
+    }
+}
+
+unsafe fn nv12_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<ID3D11Texture2D> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_NV12,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        // The shader conversion reads its planes. NVIDIA's video processor
+        // rejects a shader-resource-only NV12 input, as it does BGRA.
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut texture = None;
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+        .with_context(|| format!("{width}x{height} NV12 upload texture creation failed"))?;
+    texture.context("D3D11 returned no NV12 upload texture")
+}
+
+fn provides_samples(info: &MFT_OUTPUT_STREAM_INFO) -> bool {
+    info.dwFlags
+        & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32
+            | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32)
+        != 0
+}
+
+/// Gives `transform` the D3D11 device so it decodes into GPU surfaces.
+unsafe fn attach_device(
+    transform: &IMFTransform,
+    device: &ID3D11Device,
+) -> anyhow::Result<IMFDXGIDeviceManager> {
+    // The renderer and asynchronous decoder use the same immediate
+    // context. Protect it before the MFT receives the D3D device manager.
+    let context =
+        unsafe { device.GetImmediateContext() }.context("decoder immediate context unavailable")?;
+    let multithread: ID3D11Multithread = context
+        .cast()
+        .context("decoder D3D multithread protection unavailable")?;
+    let _ = unsafe { multithread.SetMultithreadProtected(true) };
+    let mut reset_token = 0;
+    let mut manager = None;
+    unsafe { MFCreateDXGIDeviceManager(&mut reset_token, &mut manager) }
+        .context("decoder D3D manager creation failed")?;
+    let manager = manager.context("Media Foundation returned no decoder D3D manager")?;
+    unsafe { manager.ResetDevice(device, reset_token) }
+        .context("decoder D3D manager reset failed")?;
+    unsafe {
+        transform.ProcessMessage(
+            MFT_MESSAGE_SET_D3D_MANAGER,
+            Interface::as_raw(&manager) as usize,
+        )
+    }
+    .context("failed to attach D3D manager to decoder")?;
+    Ok(manager)
+}
+
+/// Sets the first output type `transform` offers with subtype `wanted`.
+unsafe fn select_output_type(
+    transform: &IMFTransform,
+    wanted: windows::core::GUID,
+) -> anyhow::Result<()> {
+    for index in 0.. {
+        let media_type = match unsafe { transform.GetOutputAvailableType(0, index) } {
+            Ok(media_type) => media_type,
+            Err(error) if error.code() == MF_E_NO_MORE_TYPES => break,
+            Err(error) => {
+                return Err(error).context("decoder output-type enumeration failed");
+            }
+        };
+        if unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }.ok() == Some(wanted) {
+            unsafe { transform.SetOutputType(0, &media_type, 0) }
+                .context("decoder rejected its available output type")?;
+            return Ok(());
+        }
+    }
+    bail!("video decoder offers no output type with the requested YUV format")
+}
+
+/// The picture size of `transform`'s current output type.
+unsafe fn output_size(transform: &IMFTransform) -> anyhow::Result<(u32, u32)> {
+    let media_type =
+        unsafe { transform.GetOutputCurrentType(0) }.context("decoder output type unavailable")?;
+    let size = unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }
+        .context("decoder output type has no frame size")?;
+    Ok(((size >> 32) as u32, size as u32))
 }
 
 unsafe fn video_type(
@@ -810,4 +1090,290 @@ unsafe fn video_type(
     unsafe { media_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32) }?;
     unsafe { media_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32) }?;
     Ok(media_type)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::renderer::shader::ShaderConversion;
+    use super::*;
+    use crate::video_layout::VideoRect;
+
+    /// A blue frame from the Agent's software encoder, which never holds
+    /// frames back for reordering.
+    const FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/yuv420p-software.h264");
+
+    fn fixture_format() -> VideoFormat {
+        VideoFormat {
+            width: 64,
+            height: 48,
+            frames_per_second: 30,
+            codec: Codec::H264,
+            pixel_format: meshrmm_protocol::PixelFormat::Nv12,
+            bitrate_bits_per_second: 1_000_000,
+        }
+    }
+
+    unsafe fn bgra_target(device: &ID3D11Device, format: VideoFormat) -> ID3D11Texture2D {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: format.width,
+            Height: format.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }.unwrap();
+        texture.unwrap()
+    }
+
+    /// The top-left pixel of `target`.
+    unsafe fn first_pixel(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        target: &ID3D11Texture2D,
+    ) -> [u8; 4] {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { target.GetDesc(&mut desc) };
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        let mut staging = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging)) }.unwrap();
+        let staging = staging.unwrap();
+        unsafe { context.CopyResource(&staging, target) };
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.unwrap();
+        let mut pixel = [0; 4];
+        unsafe { ptr::copy_nonoverlapping(mapped.pData.cast::<u8>(), pixel.as_mut_ptr(), 4) };
+        unsafe { context.Unmap(&staging, 0) };
+        pixel
+    }
+
+    /// Converts `texture` with a video processor, as the renderer does on
+    /// a GPU.
+    unsafe fn processor_pixel(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        texture: &ID3D11Texture2D,
+        subresource: u32,
+        format: VideoFormat,
+    ) -> anyhow::Result<[u8; 4]> {
+        let video_device: ID3D11VideoDevice = device.cast()?;
+        let video_context: ID3D11VideoContext = context.cast()?;
+        let rate = DXGI_RATIONAL {
+            Numerator: 30,
+            Denominator: 1,
+        };
+        let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+            InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+            InputFrameRate: rate,
+            InputWidth: format.width,
+            InputHeight: format.height,
+            OutputFrameRate: rate,
+            OutputWidth: format.width,
+            OutputHeight: format.height,
+            Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+        };
+        let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&content) }
+            .context("video processor enumeration")?;
+        let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
+            .context("video processor creation")?;
+        let output = unsafe { bgra_target(device, format) };
+        let mut output_view = None;
+        unsafe {
+            video_device.CreateVideoProcessorOutputView(
+                &output,
+                &enumerator,
+                &D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                    ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                        Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+                    },
+                },
+                Some(&mut output_view),
+            )
+        }
+        .context("output view")?;
+        let mut input_view = None;
+        unsafe {
+            video_device.CreateVideoProcessorInputView(
+                texture,
+                &enumerator,
+                &D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                    FourCC: 0,
+                    ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                        Texture2D: D3D11_TEX2D_VPIV {
+                            MipSlice: 0,
+                            ArraySlice: subresource,
+                        },
+                    },
+                },
+                Some(&mut input_view),
+            )
+        }
+        .context("decoded texture input view")?;
+        let source = RECT {
+            left: 0,
+            top: 0,
+            right: format.width as i32,
+            bottom: format.height as i32,
+        };
+        unsafe {
+            video_context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&source))
+        };
+        let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
+            Enable: true.into(),
+            pInputSurface: ManuallyDrop::new(input_view),
+            ..Default::default()
+        };
+        let result = unsafe {
+            video_context.VideoProcessorBlt(
+                &processor,
+                output_view.as_ref().context("no output view")?,
+                0,
+                std::slice::from_ref(&stream),
+            )
+        };
+        let _ = unsafe { ManuallyDrop::take(&mut stream.pInputSurface) };
+        result.context("YUV-to-BGRA blit")?;
+        Ok(unsafe { first_pixel(device, context, &output) })
+    }
+
+    /// Converts `texture` with the shader the renderer uses without one.
+    unsafe fn shader_pixel(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        texture: &ID3D11Texture2D,
+        subresource: u32,
+        format: VideoFormat,
+    ) -> anyhow::Result<[u8; 4]> {
+        let output = unsafe { bgra_target(device, format) };
+        let mut shader = unsafe { ShaderConversion::new(device, format)? };
+        let layout = window::ClientLayout {
+            width: format.width,
+            height: format.height,
+            video: VideoRect {
+                left: 0,
+                top: 0,
+                width: format.width as i32,
+                height: format.height as i32,
+            },
+        };
+        unsafe { shader.configure_output(&output, &layout)? };
+        unsafe { shader.convert(context, texture, subresource, format)? };
+        Ok(unsafe { first_pixel(device, context, &output) })
+    }
+
+    fn assert_blue(case: &str, pixel: [u8; 4]) {
+        let [blue, green, red, _] = pixel;
+        assert!(
+            blue > 200 && green < 60 && red < 60,
+            "{case}: {pixel:?} is not blue"
+        );
+    }
+
+    /// Microsoft's decoder, on the GPU and in software, on every device the
+    /// viewer can get: each decodes the frame without waiting for more
+    /// input, and both conversions show it blue.
+    #[test]
+    #[ignore = "requires Windows Media Foundation"]
+    fn microsoft_h264_decoder_shows_the_fixture_on_every_device() {
+        let _com = unsafe { ComRuntime::start() }.unwrap();
+        let _mf = unsafe { MediaFoundationRuntime::start() }.unwrap();
+        let format = fixture_format();
+        let mut software = 0;
+        for (driver_type, video) in [
+            (D3D_DRIVER_TYPE_HARDWARE, true),
+            (D3D_DRIVER_TYPE_HARDWARE, false),
+            (D3D_DRIVER_TYPE_WARP, false),
+        ] {
+            let (device, context) = unsafe { create_device_of(driver_type, video) }
+                .unwrap_or_else(|error| panic!("{error:#}"));
+            for gpu in [true, false] {
+                let case = format!("{driver_type:?} video={video} gpu={gpu}");
+                let mut decoder = match unsafe { Decoder::microsoft_h264(&device, format, gpu) } {
+                    Ok(decoder) => decoder,
+                    Err(error) if gpu => {
+                        println!("{case}: no DXVA decoder: {error:#}");
+                        continue;
+                    }
+                    Err(error) => panic!("{case}: software decoder: {error:#}"),
+                };
+                let queued = QueuedFrame {
+                    frame: EncodedFrame {
+                        stream_id: meshrmm_protocol::VideoStreamId(1),
+                        frame_id: 1,
+                        capture_timestamp_us: 0,
+                        encode_complete_timestamp_us: 0,
+                        send_timestamp_us: 0,
+                        keyframe: true,
+                        data: FIXTURE.to_vec(),
+                    },
+                    received_at_us: 0,
+                };
+                let decoded = unsafe { decoder.decode(&queued) }.unwrap();
+                assert!(decoded.accepted);
+                let frame = decoded
+                    .frames
+                    .last()
+                    .unwrap_or_else(|| panic!("{case}: the decoder held the frame back"));
+                // Basic Render Driver accepts the video flag without
+                // offering a video device.
+                if device.cast::<ID3D11VideoDevice>().is_ok() {
+                    let pixel = unsafe {
+                        processor_pixel(
+                            &device,
+                            &context,
+                            &frame.texture,
+                            frame.subresource,
+                            format,
+                        )
+                    }
+                    .unwrap_or_else(|error| panic!("{case}: video processor: {error:#}"));
+                    assert_blue(&format!("{case} video processor"), pixel);
+                }
+                // Only devices without a video processor use the shader,
+                // and their pictures always come from software decoding.
+                if decoder.kind == DecoderKind::MicrosoftSoftware {
+                    let pixel = unsafe {
+                        shader_pixel(&device, &context, &frame.texture, frame.subresource, format)
+                    }
+                    .unwrap_or_else(|error| panic!("{case}: shader: {error:#}"));
+                    assert_blue(&format!("{case} shader"), pixel);
+                }
+                println!(
+                    "{case}: {:?} decoder, output {:?}, subresource {}",
+                    decoder.kind, decoder.output_size, frame.subresource
+                );
+                if !gpu {
+                    software += 1;
+                }
+            }
+        }
+        assert_eq!(software, 3, "software decoding failed on a device");
+    }
+
+    /// The device the viewer gets on this machine, and that it decodes.
+    #[test]
+    #[ignore = "requires Windows Media Foundation"]
+    fn the_viewer_device_decodes_h264() {
+        let _com = unsafe { ComRuntime::start() }.unwrap();
+        let _mf = unsafe { MediaFoundationRuntime::start() }.unwrap();
+        let (device, _context) = unsafe { create_device() }.unwrap();
+        let decoder = unsafe { Decoder::new(&device, fixture_format()) }.unwrap();
+        println!(
+            "video device: {}, decoder: {:?}",
+            device.cast::<ID3D11VideoDevice>().is_ok(),
+            decoder.kind
+        );
+    }
 }

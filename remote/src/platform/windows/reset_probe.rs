@@ -1,5 +1,5 @@
 //! An interactive check of the in-place stream reset on a real window and
-//! D3D11 device. Synthetic frames stand in for a hardware decoder, so it runs
+//! D3D11 device. Synthetic frames stand in for a decoder, so it runs
 //! on GPUs without decoder MFTs too. It needs an interactive desktop:
 //!
 //! ```text
@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 
-use super::pipeline::{HardwareDecoder, Presentation};
+use super::pipeline::{Decoder, Presentation};
 use super::window::{ProbeState, probe_state, probe_toggle_chat};
 use super::*;
 use meshrmm_protocol::{DesktopSession, DisplayId, PixelFormat};
@@ -564,7 +564,7 @@ unsafe fn run_probe() {
     );
     assert_same_family(window, &family);
 
-    // A profile without a hardware decoder is refused before anything
+    // A profile without a decoder is refused before anything
     // changes; the caller then reports it with VideoProfileRejected.
     let before_refusal = unsafe { probe_state(window) }.unwrap();
     let mut refused = 0;
@@ -575,10 +575,10 @@ unsafe fn run_probe() {
         (Codec::H265, PixelFormat::Ayuv),
     ] {
         let candidate = format(2560, 1440, codec, pixel_format);
-        match unsafe { HardwareDecoder::new(&device, candidate) } {
-            Ok(_) => println!("{codec:?} {pixel_format:?}: hardware decoder available"),
+        match unsafe { Decoder::new(&device, candidate) } {
+            Ok(_) => println!("{codec:?} {pixel_format:?}: decoder available"),
             Err(error) => {
-                println!("{codec:?} {pixel_format:?}: no hardware decoder: {error:#}");
+                println!("{codec:?} {pixel_format:?}: no decoder: {error:#}");
                 let result = unsafe {
                     presentation.reset_stream(
                         candidate,

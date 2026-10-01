@@ -144,9 +144,9 @@ pub fn user_message(error: &anyhow::Error) -> String {
             "The connection to the remote computer was lost and could not be restored."
         }
         Cause::Session(FailureKind::AgentReported(Some(
-            SignalErrorCode::HardwareEncoderUnavailable,
+            SignalErrorCode::VideoEncoderUnavailable,
         ))) => {
-            "The remote computer has no hardware video encoder MeshRMM can use, so its screen cannot be streamed. Updating its display driver may help."
+            "The remote computer has no video encoder MeshRMM can use, so its screen cannot be streamed. On a Windows N edition, installing the Media Feature Pack adds one."
         }
         Cause::Session(FailureKind::AgentReported(Some(SignalErrorCode::NoMutualProfile))) => {
             "The remote computer and this viewer have no video format in common. Update the MeshRMM Agent and viewer."
@@ -253,7 +253,7 @@ mod tests {
             FailureKind::PresentationFailed,
             FailureKind::AgentLeft,
             FailureKind::AgentReported(None),
-            FailureKind::AgentReported(Some(SignalErrorCode::HardwareEncoderUnavailable)),
+            FailureKind::AgentReported(Some(SignalErrorCode::VideoEncoderUnavailable)),
             FailureKind::AgentReported(Some(SignalErrorCode::NoMutualProfile)),
             FailureKind::AgentReported(Some(SignalErrorCode::IdentityMismatch)),
             FailureKind::AgentReported(Some(SignalErrorCode::CaptureUnavailable)),
@@ -274,8 +274,8 @@ mod tests {
             (FailureKind::PeerNeverConnected, "allow UDP"),
             (FailureKind::PeerConnectionLost, "could not be restored"),
             (
-                FailureKind::AgentReported(Some(SignalErrorCode::HardwareEncoderUnavailable)),
-                "no hardware video encoder",
+                FailureKind::AgentReported(Some(SignalErrorCode::VideoEncoderUnavailable)),
+                "no video encoder",
             ),
             (
                 FailureKind::AgentReported(Some(SignalErrorCode::NoMutualProfile)),

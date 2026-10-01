@@ -1,5 +1,5 @@
 //! Desktop-region capture uses GDI so rotated monitors and displays on different GPUs
-//! share one physical desktop coordinate space. Encoding remains hardware based.
+//! share one physical desktop coordinate space. Encoding is unaffected.
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
@@ -126,6 +126,12 @@ impl DesktopCapture {
             }
         }
         Ok(capture)
+    }
+
+    /// Matches the capture rate to the encoder's, which a software encoder
+    /// caps below the requested one.
+    pub fn set_frames_per_second(&mut self, fps: u32) {
+        self.interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
     }
 
     pub fn width(&self) -> u32 {

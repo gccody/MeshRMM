@@ -66,10 +66,17 @@ fn hardware_decode_supported(codec: Codec) -> bool {
     unsafe { VTIsHardwareDecodeSupported(codec_type) != 0 }
 }
 
+/// Whether the viewer decodes `codec` at all. VideoToolbox decodes H.264 in
+/// software when the GPU cannot, so H.264 is the final fallback. Software
+/// HEVC is too slow to offer.
+fn decode_supported(codec: Codec) -> bool {
+    codec == Codec::H264 || hardware_decode_supported(codec)
+}
+
 pub fn supported_video_profiles(_format: VideoFormat) -> Vec<VideoProfile> {
     [Codec::H265, Codec::H264]
         .into_iter()
-        .filter(|codec| hardware_decode_supported(*codec))
+        .filter(|codec| decode_supported(*codec))
         .map(|codec| VideoProfile {
             codec,
             chroma: ChromaMode::Yuv420,
