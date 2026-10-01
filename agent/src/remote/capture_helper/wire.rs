@@ -59,6 +59,7 @@ pub(super) fn write_command(mut writer: impl Write, command: &ParentCommand) -> 
             pixel_format,
             capture_cursor,
             grayscale,
+            headless,
         } => {
             writer.write_all(&[COMMAND_START])?;
             checked_len(viewer_name.len(), MAX_DISPLAY_NAME_BYTES, "viewer name")?;
@@ -70,7 +71,8 @@ pub(super) fn write_command(mut writer: impl Write, command: &ParentCommand) -> 
                 .and_then(|()| writer.write_all(&[codec_byte(*codec)]))
                 .and_then(|()| writer.write_all(&[pixel_format_byte(*pixel_format)]))
                 .and_then(|()| writer.write_all(&[u8::from(*capture_cursor)]))
-                .and_then(|()| writer.write_all(&[u8::from(*grayscale)]))
+                .and_then(|()| writer.write_all(&[u8::from(*grayscale)]))?;
+            write_headless_target(&mut writer, headless.as_ref())
         }
         ParentCommand::SetWallpaperHidden(hidden) => writer.write_all(&[19, u8::from(*hidden)]),
         ParentCommand::SetPreventIdleLock(enabled) => writer.write_all(&[21, u8::from(*enabled)]),
@@ -219,6 +221,7 @@ pub(super) fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
                 pixel_format: read_pixel_format(&mut reader)?,
                 capture_cursor: read_bool(&mut reader)?,
                 grayscale: read_bool(&mut reader)?,
+                headless: read_headless_target(&mut reader)?,
             })
         }
         19 => Ok(ParentCommand::SetWallpaperHidden(read_bool(&mut reader)?)),
@@ -346,6 +349,39 @@ pub(super) fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
     }
 }
 
+fn write_headless_target(
+    mut writer: impl Write,
+    target: Option<&HeadlessTarget>,
+) -> io::Result<()> {
+    let Some(target) = target else {
+        return writer.write_all(&[0]);
+    };
+    writer.write_all(&[1])?;
+    write_u32(&mut writer, target.adapter_low)?;
+    writer.write_all(&target.adapter_high.to_le_bytes())?;
+    write_u32(&mut writer, target.target_id)?;
+    write_u32(&mut writer, target.resolution.width)?;
+    write_u32(&mut writer, target.resolution.height)
+}
+
+fn read_headless_target(mut reader: impl Read) -> io::Result<Option<HeadlessTarget>> {
+    if !read_bool(&mut reader)? {
+        return Ok(None);
+    }
+    let adapter_low = read_u32(&mut reader)?;
+    let mut adapter_high = [0; 4];
+    reader.read_exact(&mut adapter_high)?;
+    Ok(Some(HeadlessTarget {
+        adapter_low,
+        adapter_high: i32::from_le_bytes(adapter_high),
+        target_id: read_u32(&mut reader)?,
+        resolution: meshrmm_protocol::HeadlessResolution::new(
+            read_u32(&mut reader)?,
+            read_u32(&mut reader)?,
+        ),
+    }))
+}
+
 pub(super) fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Result<()> {
     match event {
         ChildEvent::CredentialPrompt(ready) => writer.write_all(&[13, u8::from(*ready)]),
@@ -444,6 +480,7 @@ pub(super) fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Res
             write_u32(&mut writer, message.len() as u32)?;
             writer.write_all(message)
         }
+        ChildEvent::NoDisplays => writer.write_all(&[EVENT_NO_DISPLAYS]),
         ChildEvent::Stopped => writer.write_all(&[EVENT_STOPPED]),
     }
 }
@@ -613,6 +650,7 @@ pub(super) fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
         }
         EVENT_STOPPED => Ok(ChildEvent::Stopped),
+        EVENT_NO_DISPLAYS => Ok(ChildEvent::NoDisplays),
         EVENT_APPROVAL_DECISION => Decision::from_byte(read_u8(&mut reader)?)
             .map(ChildEvent::ApprovalDecision)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid approval decision")),

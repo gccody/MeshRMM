@@ -219,6 +219,17 @@ impl ControlSink {
         }
     }
 
+    /// Changes the size of the virtual display that an Agent without a
+    /// monitor shows, and remembers it for later sessions.
+    pub fn set_headless_resolution(&self, resolution: meshrmm_protocol::HeadlessResolution) {
+        self.send(meshrmm_protocol::SessionMessage::SetHeadlessResolution { resolution });
+        if let Err(error) = crate::preferences::set_headless_resolution(resolution)
+            && let Ok(mut state) = self.maintenance.lock()
+        {
+            state.error = Some(error.to_string());
+        }
+    }
+
     pub fn type_clipboard(&self, display_id: meshrmm_protocol::DisplayId) {
         if self.technician_blocked() {
             return;
