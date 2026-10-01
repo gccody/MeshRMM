@@ -11,3 +11,11 @@ put the icon in the notification-area overflow. This indicates the installed age
 service is running, not that the server is reachable. The service owns the helper's
 lifetime, restarts it after failure, and removes it on stop; Explorer restarts are
 handled by re-registering the icon. No configuration or credentials enter the helper.
+
+# Virtual display driver
+
+`sudovda/` holds SudoVDA 1.10.9.289, the signed Indirect Display Driver the
+Agent installs on computers without a monitor (see the root README). The
+files are copied unchanged from Apollo's release package, whose catalog is
+signed by `CN=sudovda@su.mk`; changing any of them breaks the signature. The
+Agent embeds them, so there is no separate copy step.

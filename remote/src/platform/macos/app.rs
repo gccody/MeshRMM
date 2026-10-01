@@ -4,7 +4,7 @@ use super::*;
 use crate::input::HeldInput;
 use crate::reconnect::ReconnectStatus;
 use crate::toolbar::{self, Action, Command};
-use meshrmm_protocol::SessionCloseAction;
+use meshrmm_protocol::{HeadlessResolution, SessionCloseAction};
 use objc2::ClassType;
 use objc2::runtime::{AnyObject, Sel};
 use objc2_app_kit::{
@@ -499,6 +499,13 @@ define_class!(
         fn select_session_close_action(&self, sender: &NSMenuItem) {
             if let Some(action) = usize::try_from(sender.tag()).ok().and_then(|index| SessionCloseAction::ALL.get(index)) {
                 self.ivars().control.set_session_close_action(*action);
+            }
+        }
+
+        #[unsafe(method(selectHeadlessResolution:))]
+        fn select_headless_resolution(&self, sender: &NSMenuItem) {
+            if let Some(resolution) = usize::try_from(sender.tag()).ok().and_then(|index| HeadlessResolution::PRESETS.get(index)) {
+                self.ivars().control.set_headless_resolution(*resolution);
             }
         }
 
@@ -1150,6 +1157,20 @@ impl RemoteView {
             sel!(toggleWallpaper:),
             Some(control.wallpaper_hidden()),
         ));
+        let headless = crate::preferences::headless_resolution();
+        let headless_labels = HeadlessResolution::PRESETS.map(HeadlessResolution::label);
+        let headless_item = self.menu_choices(
+            &format!("Size without a monitor: {}", headless.label()),
+            headless_labels
+                .iter()
+                .zip(HeadlessResolution::PRESETS)
+                .map(|(label, choice)| (label.as_str(), choice == headless)),
+            sel!(selectHeadlessResolution:),
+        );
+        headless_item.setToolTip(Some(&NSString::from_str(
+            "The size of the virtual display the remote computer shows when no monitor is connected to it.",
+        )));
+        menu.addItem(&headless_item);
 
         menu.addItem(&NSMenuItem::separatorItem(self.mtm()));
         self.add_menu_header(&menu, "This viewer");
