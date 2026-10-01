@@ -98,7 +98,7 @@ fn pulse() -> bool {
         Anonymous: INPUT_0 {
             mi: MOUSEINPUT {
                 dwFlags: MOUSEEVENTF_MOVE,
-                dwExtraInfo: super::input_block::KEEP_AWAKE_TAG,
+                dwExtraInfo: super::input_block::NEUTRAL_TAG,
                 ..Default::default()
             },
         },
