@@ -73,6 +73,7 @@ const EVENT_CHAT: u8 = 8;
 const EVENT_APPROVAL_DECISION: u8 = 14;
 const COMMAND_PROMPT_CONNECTION_APPROVAL: u8 = 26;
 const COMMAND_CAPTURE_THUMBNAIL: u8 = 27;
+const COMMAND_ANNOTATE: u8 = 28;
 const MAX_CODEC_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
@@ -160,6 +161,7 @@ enum ParentCommand {
         display_id: DisplayId,
     },
     Input(RemoteInput),
+    Annotate(meshrmm_protocol::Annotation),
     ReleaseInput,
     BlockInput(bool),
     Blackout {
@@ -1364,6 +1366,29 @@ impl ScreenInput for DesktopInputController {
         };
         send_command(&writer, &ParentCommand::Input(input))
             .context("failed to send input to the active desktop")
+    }
+
+    fn annotate(&self, mut annotation: meshrmm_protocol::Annotation) -> anyhow::Result<()> {
+        if let Some(display_id) = annotation.display_id() {
+            let routes = self.display_routes.lock().unwrap();
+            if !routes.is_empty() {
+                let Some((_, local)) = routes.iter().find(|(wire, _)| *wire == display_id) else {
+                    return Ok(());
+                };
+                annotation.set_display_id(*local);
+            }
+        }
+        // A desktop switch replaces the helper, and its drawing with it.
+        let Some(writer) = self
+            .route
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        else {
+            return Ok(());
+        };
+        send_command(&writer, &ParentCommand::Annotate(annotation))
+            .context("failed to send the annotation to the active desktop")
     }
 
     fn release_all(&self) -> anyhow::Result<()> {

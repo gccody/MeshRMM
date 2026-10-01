@@ -3,7 +3,67 @@
 use super::*;
 
 impl WindowContext {
+    pub(super) fn annotating(&self) -> bool {
+        self.annotator.borrow().enabled()
+    }
+
+    pub(super) fn toggle_annotating(&self) {
+        // Keys and buttons held on the device stay there otherwise.
+        self.release_input();
+        let message = self.annotator.borrow_mut().toggle();
+        if let Some(message) = message {
+            self.send(message);
+        }
+        unsafe { apply_cursor(self.video_cursor()) };
+    }
+
+    /// The mouse while annotating: the left button draws and the right
+    /// button erases. Nothing reaches the device's pointer.
+    fn annotate_mouse(&self, window: HWND, message: u32, lparam: LPARAM) {
+        let display_id = self.active_display_id();
+        let annotation = match message {
+            WM_LBUTTONDOWN => {
+                let annotation = self
+                    .annotator
+                    .borrow_mut()
+                    .start(display_id, self.pointer_position(window, lparam));
+                if annotation.is_some() {
+                    let _ = unsafe { SetCapture(window) };
+                }
+                annotation
+            }
+            WM_MOUSEMOVE => {
+                // Like a drag on the device, a stroke that leaves the video
+                // follows its edge.
+                let position = self.video_rect(window).map(|video| {
+                    video_layout::normalize_clamped(
+                        video,
+                        signed_low_word(lparam.0),
+                        signed_high_word(lparam.0),
+                    )
+                });
+                self.annotator.borrow_mut().extend(display_id, position)
+            }
+            WM_LBUTTONUP => {
+                self.annotator.borrow_mut().finish();
+                let _ = unsafe { ReleaseCapture() };
+                None
+            }
+            WM_RBUTTONDOWN if self.pointer_position(window, lparam).is_some() => {
+                self.annotator.borrow_mut().clear()
+            }
+            _ => None,
+        };
+        if let Some(annotation) = annotation {
+            self.send(annotation);
+        }
+    }
+
     pub(super) fn move_pointer(&self, window: HWND, lparam: LPARAM) {
+        if self.annotating() {
+            self.annotate_mouse(window, WM_MOUSEMOVE, lparam);
+            return;
+        }
         let dragging = self.held.borrow().buttons_held();
         let position = if !dragging {
             self.pointer_position(window, lparam)
@@ -28,6 +88,10 @@ impl WindowContext {
     }
 
     pub(super) fn mouse_button(&self, window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
+        if self.annotating() {
+            self.annotate_mouse(window, message, lparam);
+            return;
+        }
         let button = match message {
             WM_LBUTTONDOWN | WM_LBUTTONUP => PointerButton::Left,
             WM_RBUTTONDOWN | WM_RBUTTONUP => PointerButton::Right,

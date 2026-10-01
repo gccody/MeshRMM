@@ -531,6 +531,24 @@ mod tests {
         assert!(rx.try_recv().is_ok());
     }
 
+    #[test]
+    fn annotations_are_not_input_so_view_only_still_sends_them() {
+        let state = ViewerResumeState::default();
+        state.technician_blocked.store(true, Ordering::SeqCst);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Input is also disabled, as it is before the window has focus.
+        let queue = ViewerControlQueue::new(tx, state);
+        queue.send(pointer(1, 2));
+        let annotation = SessionMessage::Annotate(meshrmm_protocol::Annotation::Start {
+            display_id: DisplayId(1),
+            x: 1,
+            y: 2,
+        });
+        queue.send(annotation.clone());
+        assert_eq!(rx.try_recv().ok(), Some(annotation));
+        assert!(rx.try_recv().is_err());
+    }
+
     const CURRENT_FORMAT: meshrmm_protocol::VideoFormat = meshrmm_protocol::VideoFormat {
         width: 1920,
         height: 1080,

@@ -18,7 +18,7 @@ use windows::Win32::UI::Controls::TTM_GETTOOLCOUNT;
 
 use super::pipeline::Presentation;
 use super::reset_probe::{present_synthetic, pump};
-use super::window::{probe_toolbar, probe_toolbar_state};
+use super::window::{probe_state, probe_toolbar, probe_toolbar_state};
 use super::*;
 use crate::toolbar::{Action, Icon};
 use meshrmm_protocol::{DesktopSession, DisplayId, PixelFormat};
@@ -228,12 +228,13 @@ unsafe fn run_probe() {
         pixel_format: PixelFormat::Nv12,
         bitrate_bits_per_second: 12_000_000,
     };
+    let control = test_sink(Arc::clone(&sent), chat.clone());
     let mut presentation = unsafe {
         Presentation::new(
             format,
             first,
             displays,
-            test_sink(Arc::clone(&sent), chat.clone()),
+            control.clone(),
             DebugInfo::new("toolbar-probe"),
         )
     }
@@ -255,6 +256,7 @@ unsafe fn run_probe() {
             Action::Credentials,
             Action::SecureAttention,
             Action::TypeClipboard,
+            Action::Annotate,
             Action::Files,
             Action::Chat,
             Action::Diagnostics,
@@ -341,6 +343,64 @@ unsafe fn run_probe() {
     assert!(chat.visible(), "the chat item opens the chat popup");
     unsafe { click(window, Action::Chat, None) };
     assert!(!chat.visible(), "the chat item closes the chat popup");
+
+    // View-only sessions annotate: the mouse draws and erases, and sends
+    // no input.
+    control.set_technician_blocked(true);
+    sent.lock().unwrap().clear();
+    unsafe { click(window, Action::Annotate, None) };
+    assert!(unsafe { probe_toolbar_state(window) }.unwrap().annotating);
+    let video = unsafe { probe_state(window) }.unwrap().video.unwrap();
+    let at = |x: i32, y: i32| {
+        lparam_at(
+            video.left + video.width * x / 4,
+            video.top + video.height * y / 4,
+        )
+    };
+    unsafe {
+        SendMessageW(window, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(at(1, 1)));
+        SendMessageW(window, WM_MOUSEMOVE, Some(WPARAM(1)), Some(at(3, 1)));
+        SendMessageW(window, WM_LBUTTONUP, Some(WPARAM(0)), Some(at(3, 1)));
+        // Moving without the button draws nothing.
+        SendMessageW(window, WM_MOUSEMOVE, Some(WPARAM(0)), Some(at(3, 3)));
+        SendMessageW(window, WM_RBUTTONDOWN, Some(WPARAM(2)), Some(at(2, 2)));
+        SendMessageW(window, WM_RBUTTONUP, Some(WPARAM(0)), Some(at(2, 2)));
+        pump(window, Duration::from_millis(100));
+        save_window(window, "toolbar_annotating");
+    }
+    unsafe { click(window, Action::Annotate, None) };
+    assert!(!unsafe { probe_toolbar_state(window) }.unwrap().annotating);
+    let annotations = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|message| match message {
+            SessionMessage::Annotate(annotation) => *annotation,
+            other => panic!("annotating sent {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    use meshrmm_protocol::Annotation;
+    assert!(
+        matches!(
+            annotations.as_slice(),
+            [
+                Annotation::Start {
+                    display_id: DisplayId(1),
+                    x: 16_200..=16_600,
+                    y: 16_200..=16_600
+                },
+                Annotation::Extend {
+                    display_id: DisplayId(1),
+                    x: 49_000..=49_400,
+                    ..
+                },
+                Annotation::Clear,
+                Annotation::Clear,
+            ]
+        ),
+        "{annotations:?}"
+    );
+    control.set_technician_blocked(false);
 
     // Unread messages badge the chat item.
     chat.receive("Hello from the probe".into());

@@ -124,6 +124,8 @@ impl WindowContext {
             )),
             credentials: self.control.credential_state(),
             input_blocked: self.control.technician_blocked(),
+            annotating: self.annotating(),
+            annotation_available: active.session != meshrmm_protocol::DesktopSession::Background,
             chat_available: chat.available(),
             chat_unread: chat.unread(),
             file_status: self.control.files().status(),
@@ -529,6 +531,7 @@ impl WindowContext {
                 self.control.set_input_enabled(true);
             }
             Action::Recording => self.control.toggle_recording(),
+            Action::Annotate => self.toggle_annotating(),
             Action::SecureAttention => {
                 self.release_input();
                 self.control.send_secure_attention();

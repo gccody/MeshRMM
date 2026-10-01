@@ -127,13 +127,7 @@ pub(super) unsafe extern "system" fn window_proc(
                 && (lparam.0 as u32 & 0xffff) == HTCLIENT
                 && wparam.0 != context.controls().toolbar.0 as usize
             {
-                unsafe {
-                    apply_cursor(
-                        context
-                            .control
-                            .effective_cursor_shape(context.cursor_shape.get()),
-                    )
-                };
+                unsafe { apply_cursor(context.video_cursor()) };
                 return LRESULT(1);
             }
             unsafe { DefWindowProcW(window, message, wparam, lparam) }
@@ -177,6 +171,7 @@ pub(super) unsafe extern "system" fn window_proc(
         WM_KILLFOCUS => {
             keyboard_hook::remove();
             if let Some(context) = context {
+                context.annotator.borrow_mut().finish();
                 context.release_input();
                 context.control.set_input_enabled(false);
             }

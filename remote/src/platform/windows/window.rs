@@ -127,6 +127,7 @@ struct WindowContext {
     settings_font: Cell<HFONT>,
     resize_pending: Cell<bool>,
     held: RefCell<HeldInput>,
+    annotator: RefCell<crate::annotation::Annotator>,
     cursor_shape: Cell<CursorShape>,
     title: RefCell<HSTRING>,
     debug_visible: Cell<bool>,
@@ -279,10 +280,16 @@ impl WindowContext {
         if plan.display_changed {
             // Key-ups and button-ups name the display they were pressed on.
             self.release_input();
+            // A stroke belongs to the display it started on.
+            self.annotator.borrow_mut().finish();
             // A drag on the old display has ended with its button-up.
             if unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() } == window {
                 let _ = unsafe { ReleaseCapture() };
             }
+        }
+        if display.session == meshrmm_protocol::DesktopSession::Background {
+            self.annotator.borrow_mut().disable();
+            unsafe { apply_cursor(self.video_cursor()) };
         }
         self.video_width.set(format.width);
         self.video_height.set(format.height);
@@ -295,6 +302,15 @@ impl WindowContext {
         self.show_quality(self.control.quality_preset());
         self.show_chroma(self.control.chroma_mode());
         self.place_popups(window);
+    }
+
+    /// The cursor over the video: a crosshair while annotating.
+    fn video_cursor(&self) -> CursorShape {
+        if self.annotating() {
+            CursorShape::Crosshair
+        } else {
+            self.control.effective_cursor_shape(self.cursor_shape.get())
+        }
     }
 
     fn toggle_debug(&self) {
@@ -608,6 +624,7 @@ pub(super) unsafe fn create_window(
         settings_font: Cell::new(HFONT::default()),
         resize_pending: Cell::new(false),
         held: RefCell::new(HeldInput::default()),
+        annotator: RefCell::new(crate::annotation::Annotator::default()),
         cursor_shape: Cell::new(CursorShape::Default),
         title: RefCell::new(title.clone()),
         debug_visible: Cell::new(false),
@@ -748,7 +765,7 @@ pub(super) unsafe fn set_reconnect_text(window: HWND, text: Option<&ReconnectTex
 pub(super) unsafe fn set_window_cursor(window: HWND, shape: CursorShape) {
     if let Some(context) = unsafe { window_context(window) } {
         context.cursor_shape.set(shape);
-        unsafe { apply_cursor(context.control.effective_cursor_shape(shape)) };
+        unsafe { apply_cursor(context.video_cursor()) };
     }
 }
 
