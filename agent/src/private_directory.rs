@@ -101,6 +101,27 @@ pub fn create_new(path: &Path) -> anyhow::Result<()> {
     verify(&handle, path, PRIVATE_DIRECTORY_SDDL)
 }
 
+/// Creates a new private directory that `reader_sid`'s account can also read and execute in,
+/// but not change, failing if anything already exists at `path`. A toolbox script that runs as
+/// the signed-in user lives in one, so the user can run it but not replace it.
+pub fn create_new_readable_by(path: &Path, reader_sid: &str) -> anyhow::Result<()> {
+    let valid_sid = reader_sid.starts_with("S-1-")
+        && reader_sid.len() <= 184
+        && reader_sid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-' || byte == b'S');
+    if !valid_sid {
+        bail!("{reader_sid} is not a SID");
+    }
+    let _privileges = Privileges::enable()?;
+    // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, inherited by the script file.
+    let sddl = format!("{}(A;OICI;0x1200a9;;;{reader_sid})", PRIVATE_DIRECTORY_SDDL);
+    create_with(path, &sddl)
+        .with_context(|| format!("failed to create private directory {}", path.display()))?;
+    let (_handle, information) = open_without_following(path)?;
+    ensure_plain_directory(path, &information)
+}
+
 /// Resets the owner and DACL of every entry below a directory already passed to [`secure`], so
 /// files planted before it was protected cannot keep an owner or explicit ACEs. Refuses to walk
 /// through reparse points rather than changing security on their targets.
@@ -419,7 +440,11 @@ fn ensure_protected(handle: &OwnedHandle, path: &Path, forbidden: u32) -> anyhow
 }
 
 fn create(path: &Path) -> windows::core::Result<()> {
-    let descriptor = LocalDescriptor::parse(PRIVATE_DIRECTORY_SDDL)?;
+    create_with(path, PRIVATE_DIRECTORY_SDDL)
+}
+
+fn create_with(path: &Path, sddl: &str) -> windows::core::Result<()> {
+    let descriptor = LocalDescriptor::parse(sddl)?;
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0.0,

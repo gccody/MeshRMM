@@ -31,6 +31,7 @@ use windows::Win32::UI::HiDpi::{
 
 mod input;
 mod messages;
+mod script_output;
 mod settings;
 mod toolbar;
 
@@ -44,7 +45,7 @@ static LAST_PLACEMENT: std::sync::Mutex<Option<WINDOWPLACEMENT>> = std::sync::Mu
 pub(super) const STATIC_CENTER: u32 = 0x0001;
 
 /// The minimum outer window size, in 96-DPI pixels, that fits the toolbar.
-const MINIMUM_WINDOW_WIDTH: i32 = 800;
+const MINIMUM_WINDOW_WIDTH: i32 = 850;
 const MINIMUM_WINDOW_HEIGHT: i32 = 300;
 
 /// The video window's size and the letterboxed video inside it, in physical pixels.
@@ -820,6 +821,24 @@ pub(super) unsafe fn pump_window_messages(window: HWND) -> bool {
                 );
             }
         }
+        while let Some(event) = context.control.toolbox().take_event() {
+            match event {
+                crate::toolbox::Event::RunFinished(run) => {
+                    let (title, text) = crate::toolbox::run_report(&run);
+                    if let Err(error) = unsafe { script_output::show(window, &title, &text) } {
+                        tracing::warn!(error = ?error, "could not show a toolbox run's output");
+                    }
+                }
+                crate::toolbox::Event::Failed { title, message } => unsafe {
+                    MessageBoxW(
+                        Some(window),
+                        &HSTRING::from(message),
+                        &HSTRING::from(title),
+                        MB_OK | MB_ICONERROR,
+                    );
+                },
+            }
+        }
         context.refresh_debug(false);
         if let Some(chat) = context.chat_popup.get() {
             chat.refresh();
@@ -874,7 +893,9 @@ pub(super) unsafe fn probe_state(window: HWND) -> Option<ProbeState> {
         .into_iter()
         .filter_map(|entry| match entry {
             crate::toolbar::MenuEntry::Item { label, .. } => Some(label),
-            crate::toolbar::MenuEntry::Separator => None,
+            crate::toolbar::MenuEntry::Separator | crate::toolbar::MenuEntry::Submenu { .. } => {
+                None
+            }
         })
         .collect::<Vec<_>>();
     Some(ProbeState {
