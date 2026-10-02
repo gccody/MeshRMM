@@ -10,6 +10,7 @@ import {
   Monitor,
   Square,
   Search,
+  SquareTerminal,
   Trash2,
   Wifi,
   WifiOff,
@@ -46,6 +47,7 @@ type Props = {
   onRemoteBackground: (agent: Agent) => void;
   onCloseSession: (agent: Agent) => void;
   onDelete: (agent: Agent) => void;
+  onRunScript: (agent: Agent, opener: HTMLElement) => void;
 };
 
 const formatTime = (date: Date | null) =>
@@ -166,6 +168,7 @@ export function AgentOverview({
   onRemoteBackground,
   onCloseSession,
   onDelete,
+  onRunScript,
 }: Props) {
   const online = agents.filter((agent) => agent.connected).length;
   const offline = agents.length - online;
@@ -217,6 +220,7 @@ export function AgentOverview({
                 <td className="device-status"><StatusBadge agent={agent} stale={stale} /></td>
                 <td className="row-actions">
                   <ConnectMenu agent={agent} disabled={!agent.connected || isOffline || connectingId === agent.id || deletingId === agent.id || closingId === agent.id} title={agent.connected ? connectTitle : undefined} connecting={connectingId === agent.id} background={connectingBackgroundId === agent.id} onRemote={onRemote} onRemoteBackground={onRemoteBackground} />
+                  <button className="close-session-button" disabled={!agent.connected || isOffline || deletingId === agent.id} onClick={(event) => onRunScript(agent, event.currentTarget)} aria-label={`Run a script on ${agent.name}`} aria-haspopup="dialog" title="Run a script"><SquareTerminal size={16} /><span className="sr-only">Run a script</span></button>
                   {canDelete && <button className="close-session-button" disabled={closingId !== null || connectingId === agent.id || deletingId === agent.id} onClick={() => onCloseSession(agent)} aria-label={`Close active session for ${agent.name}`} title="Close active session">{closingId === agent.id ? <LoaderCircle size={16} className="spin" /> : <Square size={16} />}<span className="sr-only">Close session</span></button>}
                   {canDelete && <button className="agent-delete-button" disabled={deletingId === agent.id || closingId === agent.id} onClick={() => onDelete(agent)} aria-label={`Delete ${agent.name}`} title="Delete device">{deletingId === agent.id ? <LoaderCircle size={16} className="spin" /> : <Trash2 size={16} />}</button>}
                 </td>

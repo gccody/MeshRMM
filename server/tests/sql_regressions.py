@@ -431,5 +431,91 @@ class UsageMeteringTests(unittest.TestCase):
         # The Agent's row and its usage owner row.
         self.assertEqual(sorted(self.db.execute(rows).fetchall()), [("a", 2), ("b", 1)])
 
+class ToolboxTests(unittest.TestCase):
+    """Who may see and change toolbox scripts and files, and how runs and deliveries are
+    reported."""
+
+    ROUTES = "server/src/routes/toolbox.rs"
+
+    def setUp(self):
+        self.db = migrated_database()
+        self.db.execute("INSERT INTO companies (id,name,created_at,slug,status) VALUES ('co','Company',0,'acme','active'), ('other','Other',0,'other','active')")
+        for device, company, deleted in [("pc", "co", None), ("gone", "co", 5), ("foreign", "other", None)]:
+            self.db.execute("INSERT INTO agents (id,company_id,name,auth_token_hash,created_by_user_id,created_at,updated_at,deletion_requested_at) VALUES (?,?,'PC',?,'user',0,0,?)", (device, company, "a" * 64, deleted))
+        insert = sql(self.ROUTES, "INSERT INTO toolbox_scripts")
+        for script, company, owner, shared in [("mine", "co", "me", 0), ("teammate", "co", "them", 0), ("team", "co", "them", 1), ("elsewhere", "other", "me", 1)]:
+            self.db.execute(insert, (script, company, owner, shared, "", script, "", "powershell", "Get-Date", 300, 1))
+        insert = sql(self.ROUTES, "INSERT INTO toolbox_files")
+        for file, owner, shared in [("my-file", "me", 0), ("their-file", "them", 0), ("team-file", "them", 1)]:
+            self.db.execute(insert, (file, "co", owner, shared, "", f"{file}.exe", 3, "b" * 64, 1))
+
+    def visible(self, prefix, user="me"):
+        return sorted(row[0] for row in self.db.execute(sql(self.ROUTES, prefix), ("co", user)).fetchall())
+
+    def test_users_see_their_own_and_shared_items_of_their_company(self):
+        self.assertEqual(self.visible("SELECT id, owner_user_id, shared, folder, name, description, language, timeout_seconds, created_at, updated_at FROM toolbox_scripts WHERE company_id"), ["mine", "team"])
+        self.assertEqual(self.visible("SELECT id, owner_user_id, shared, folder, name, size_bytes, sha256, created_at, updated_at FROM toolbox_files WHERE company_id"), ["my-file", "team-file"])
+        script = sql(self.ROUTES, "SELECT id, owner_user_id, shared, folder, name, description, language, timeout_seconds, created_at, updated_at, body FROM toolbox_scripts WHERE id")
+        self.assertIsNotNone(self.db.execute(script, ("team", "co", "me")).fetchone())
+        self.assertIsNone(self.db.execute(script, ("teammate", "co", "me")).fetchone(), "private scripts stay private")
+        self.assertIsNone(self.db.execute(script, ("elsewhere", "co", "me")).fetchone(), "other companies' scripts stay hidden")
+
+    def test_owners_change_their_items_and_administrators_change_shared_ones(self):
+        update = sql(self.ROUTES, "UPDATE toolbox_scripts SET")
+        change = lambda script, user, admin: self.db.execute(update, (1, "", "Renamed", "", "cmd", "dir", 60, 2, user, script, "co", admin)).rowcount
+        self.assertEqual(change("mine", "me", 0), 1)
+        self.assertEqual(change("team", "me", 0), 0, "a member cannot change a teammate's shared script")
+        self.assertEqual(change("team", "me", 1), 1, "an administrator can")
+        self.assertEqual(change("teammate", "me", 1), 0, "not even an administrator can change a private script")
+        self.assertEqual(change("elsewhere", "me", 1), 0)
+        delete = sql(self.ROUTES, "DELETE FROM toolbox_files")
+        self.assertEqual(self.db.execute(delete, ("their-file", "co", "me", 1)).rowcount, 0)
+        self.assertEqual(self.db.execute(delete, ("team-file", "co", "me", 0)).rowcount, 0)
+        self.assertEqual(self.db.execute(delete, ("team-file", "co", "me", 1)).rowcount, 1)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("UPDATE toolbox_scripts SET language = 'bash' WHERE id = 'mine'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("UPDATE toolbox_scripts SET timeout_seconds = 3601 WHERE id = 'mine'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("UPDATE toolbox_scripts SET body = '' WHERE id = 'mine'")
+
+    def test_runs_start_only_on_the_company_devices_and_take_one_report(self):
+        start = sql(self.ROUTES, "INSERT INTO script_runs")
+        audit = sql(self.ROUTES, "INSERT INTO audit_events (id, company_id, actor_user_id, action, target_type, target_id, metadata_json, created_at) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 WHERE EXISTS (SELECT 1 FROM script_runs")
+        for run, device, created in [("run", "pc", 1), ("deleted", "gone", 0), ("foreign", "foreign", 0)]:
+            self.assertEqual(self.db.execute(start, (run, "co", device, "mine", "Mine", "powershell", "me", "dashboard", "user", 300, 10)).rowcount, created, device)
+            self.db.execute(audit, (f"audit-{run}", "co", "me", "script.run", "agent", device, "{}", 10, run))
+        self.assertEqual([row[0] for row in self.db.execute("SELECT id FROM audit_events")], ["audit-run"], "only a started run is audited")
+        report = sql(self.ROUTES, "UPDATE script_runs SET status = ?1")
+        self.assertEqual(self.db.execute(report, ("completed", "PC\\me", 0, "out", "", 0, None, 20, "run", "foreign", "co")).rowcount, 0, "another device cannot report the run")
+        self.assertEqual(self.db.execute(report, ("completed", "PC\\me", 0, "out", "", 0, None, 20, "run", "pc", "co")).rowcount, 1)
+        self.assertEqual(self.db.execute(report, ("failed", "SYSTEM", None, "", "", 0, "late", 30, "run", "pc", "co")).rowcount, 0, "a run is reported once")
+        offline = sql(self.ROUTES, "UPDATE script_runs SET status = 'failed'")
+        self.assertEqual(self.db.execute(offline, ("offline", 20, "run")).rowcount, 0, "a finished run keeps its result")
+        listed = sql(self.ROUTES, "SELECT id, device_id, script_id, script_name, language, run_as, status, ran_as, exit_code, '' AS stdout")
+        self.assertEqual(len(self.db.execute(listed, ("co", "", 0, "me", 50)).fetchall()), 1)
+        self.assertEqual(len(self.db.execute(listed, ("co", "", 0, "them", 50)).fetchall()), 0, "members see only their own runs")
+        self.assertEqual(len(self.db.execute(listed, ("co", "", 1, "them", 50)).fetchall()), 1, "administrators see everyone's")
+        self.assertEqual(len(self.db.execute(listed, ("co", "other-pc", 1, "them", 50)).fetchall()), 0)
+        purge = sql("server/src/maintenance.rs", "DELETE FROM script_runs")
+        self.db.execute(purge, (10,))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM script_runs").fetchone()[0], 0)
+
+    def test_agents_download_only_their_own_pending_recent_deliveries(self):
+        start = sql(self.ROUTES, "INSERT INTO file_deliveries")
+        self.db.execute(start, ("delivery", "co", "pc", "team-file", "team-file.exe", 3, "me", "user", 1000))
+        self.assertEqual(self.db.execute(start, ("foreign", "co", "foreign", "team-file", "team-file.exe", 3, "me", "user", 1000)).rowcount, 0)
+        content = sql(self.ROUTES, "SELECT d.file_id AS file_id FROM file_deliveries d")
+        self.assertEqual(self.db.execute(content, ("delivery", "pc", "co", 0)).fetchone(), ("team-file",))
+        self.assertIsNone(self.db.execute(content, ("delivery", "foreign", "co", 0)).fetchone())
+        self.assertIsNone(self.db.execute(content, ("delivery", "pc", "co", 1000)).fetchone(), "an old delivery cannot be downloaded")
+        report = sql(self.ROUTES, "UPDATE file_deliveries SET status = ?1")
+        self.assertEqual(self.db.execute(report, ("delivered", "C:\\x", None, 2000, "delivery", "pc", "co")).rowcount, 1)
+        self.assertIsNone(self.db.execute(content, ("delivery", "pc", "co", 0)).fetchone(), "a finished delivery cannot be downloaded")
+        self.db.execute("UPDATE file_deliveries SET status = 'pending'")
+        self.db.execute("DELETE FROM toolbox_files WHERE id = 'team-file'")
+        self.assertIsNone(self.db.execute(content, ("delivery", "pc", "co", 0)).fetchone(), "a deleted file cannot be downloaded")
+
+
 if __name__ == "__main__":
     unittest.main()

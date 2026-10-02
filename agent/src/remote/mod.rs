@@ -55,6 +55,8 @@ pub(crate) mod session_close;
 mod signaling;
 #[cfg(any(windows, test))]
 mod thumbnail;
+#[cfg(any(windows, test))]
+mod toolbox;
 #[cfg(windows)]
 mod transport;
 #[cfg(windows)]
@@ -229,6 +231,16 @@ pub async fn run(
                                                         continue;
                                                     }
                                                     AgentCommand::StartBackgroundSession { request } => Some(request),
+                                                    AgentCommand::RunScript { run } => {
+                                                        tracing::info!(run_id = %run.run_id, language = run.language.as_str(), run_as = run.run_as.as_str(), "running a toolbox script");
+                                                        toolbox::run_script(&config, mode, run);
+                                                        continue;
+                                                    }
+                                                    AgentCommand::DeliverFile { delivery } => {
+                                                        tracing::info!(delivery_id = %delivery.delivery_id, size_bytes = delivery.size_bytes, "receiving a toolbox file");
+                                                        toolbox::deliver_file(&config, mode, delivery);
+                                                        continue;
+                                                    }
                                                 }
                                             } else { None };
                                             let request: AgentSessionRequest = match background_request.map(Ok).unwrap_or_else(|| serde_json::from_str(text.as_str())) {

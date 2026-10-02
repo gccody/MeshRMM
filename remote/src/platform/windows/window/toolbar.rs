@@ -98,6 +98,7 @@ impl WindowContext {
         let sessions = Display::sessions(&displays);
         let visible = active.session_displays(&displays);
         let chat = self.control.chat();
+        let toolbox = self.control.toolbox().snapshot();
         toolbar::State {
             sessions: sessions.iter().map(|session| session.label()).collect(),
             session: sessions
@@ -130,6 +131,9 @@ impl WindowContext {
             chat_unread: chat.unread(),
             power: self.control.power_state(),
             file_status: self.control.files().status(),
+            toolbox_available: toolbox.available,
+            toolbox_busy: toolbox.busy,
+            toolbox_status: toolbox.status,
             recording: self.control.recording().active(),
             diagnostics: self.debug_visible.get(),
             settings_menu: false,
@@ -535,6 +539,16 @@ impl WindowContext {
                 }
                 self.control.set_input_enabled(true);
             }
+            Action::Toolbox => {
+                self.release_input();
+                self.control.set_input_enabled(false);
+                let offered = self.control.toolbox().offer();
+                let entries = toolbar::toolbox_menu(&offered);
+                if let Some(command) = unsafe { self.show_menu(window, &entries, rect) } {
+                    self.toolbar_command(command);
+                }
+                self.control.set_input_enabled(true);
+            }
             Action::Recording => self.control.toggle_recording(),
             Action::Annotate => self.toggle_annotating(),
             Action::SecureAttention => {
@@ -578,28 +592,8 @@ impl WindowContext {
     /// command.
     unsafe fn show_menu(&self, window: HWND, entries: &[MenuEntry], rect: Rect) -> Option<Command> {
         let menu = unsafe { CreatePopupMenu() }.ok()?;
-        for (index, entry) in entries.iter().enumerate() {
-            unsafe {
-                let _ = match entry {
-                    MenuEntry::Separator => AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()),
-                    MenuEntry::Item {
-                        label,
-                        checked,
-                        enabled,
-                        command,
-                    } => {
-                        let mut flags = MF_STRING;
-                        if *checked {
-                            flags |= MF_CHECKED;
-                        }
-                        if !*enabled || command.is_none() {
-                            flags |= MF_GRAYED;
-                        }
-                        AppendMenuW(menu, flags, index + 1, &HSTRING::from(label))
-                    }
-                };
-            }
-        }
+        let mut next = 0;
+        unsafe { append_entries(menu, entries, &mut next) };
         let anchor = self.device_rect(rect);
         let mut point = POINT {
             x: anchor.left,
@@ -667,6 +661,16 @@ impl WindowContext {
                     self.control.restart(safe_mode);
                 }
             }
+            Command::RunScript { index, run_as } => {
+                self.control.toolbox().run_script(index, run_as)
+            }
+            Command::SendToolboxFile(index) => {
+                // The background desktop shows Public Documents as Documents.
+                let background = self.active_display.borrow().session
+                    == meshrmm_protocol::DesktopSession::Background;
+                self.control.toolbox().send_file(index, background);
+            }
+            Command::RefreshToolbox => self.control.toolbox().refresh(),
         }
         self.refresh_toolbar();
     }
@@ -1254,4 +1258,51 @@ pub(in crate::platform::windows) unsafe fn set_agent_pointer_display(
         context.agent_pointer_display.set(display_id);
         context.refresh_toolbar();
     }
+}
+
+/// Appends `entries` to `menu`. Each gets the ID one past its place in
+/// [`toolbar::commands`], which counts submenus and their entries in order;
+/// zero is no choice. Destroying `menu` destroys its submenus.
+unsafe fn append_entries(menu: HMENU, entries: &[MenuEntry], next: &mut usize) {
+    for entry in entries {
+        let id = *next + 1;
+        *next += 1;
+        unsafe {
+            let _ = match entry {
+                MenuEntry::Separator => AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()),
+                MenuEntry::Item {
+                    label,
+                    checked,
+                    enabled,
+                    command,
+                } => {
+                    let mut flags = MF_STRING;
+                    if *checked {
+                        flags |= MF_CHECKED;
+                    }
+                    if !*enabled || command.is_none() {
+                        flags |= MF_GRAYED;
+                    }
+                    AppendMenuW(menu, flags, id, &HSTRING::from(menu_label(label)))
+                }
+                MenuEntry::Submenu { label, entries } => match CreatePopupMenu() {
+                    Ok(submenu) => {
+                        append_entries(submenu, entries, next);
+                        AppendMenuW(
+                            menu,
+                            MF_POPUP | MF_STRING,
+                            submenu.0 as usize,
+                            &HSTRING::from(menu_label(label)),
+                        )
+                    }
+                    Err(error) => Err(error),
+                },
+            };
+        }
+    }
+}
+
+/// A label shown as written: `&` marks a menu's access key otherwise.
+fn menu_label(label: &str) -> String {
+    label.replace('&', "&&")
 }

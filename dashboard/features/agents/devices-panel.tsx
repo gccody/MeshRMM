@@ -2,9 +2,10 @@
 
 import { CircleAlert, X } from "lucide-react";
 import { useSearchParams } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ConnectionReasonModal } from "../session/connection-reason-modal";
 import { ViewerLaunchNotice } from "../session/viewer-launch-notice";
+import { RunScriptModal } from "../toolbox/run-script-modal";
 import { type ActionErrorSource, listActionErrors } from "../workspace/action-errors";
 import { useWorkspace } from "../workspace/workspace-context";
 import { AgentOverview } from "./agent-overview";
@@ -37,6 +38,9 @@ export function DevicesPanel() {
   const { inventory, remote, company, deleteAgent, deletingId, isAdmin, setDevicesSearch, actionErrors, reportActionError } = useWorkspace();
   // A connection the device's user must approve, waiting for its reason.
   const [pendingConnect, setPendingConnect] = useState<{ agent: Agent; background: boolean } | null>(null);
+  // The device a script is about to run on, and the button that asked.
+  const [runScriptOn, setRunScriptOn] = useState<Agent | null>(null);
+  const runScriptOpener = useRef<HTMLElement | null>(null);
   const requestConnect = (agent: Agent, background: boolean) => {
     if (company?.connection_approval) setPendingConnect({ agent, background });
     else void remote.connect(agent, background);
@@ -100,7 +104,14 @@ export function DevicesPanel() {
         onRemoteBackground={(agent) => requestConnect(agent, true)}
         onCloseSession={(agent) => void remote.closeSession(agent)}
         onDelete={(agent) => void deleteAgent(agent)}
+        onRunScript={(agent, opener) => { runScriptOpener.current = opener; setRunScriptOn(agent); }}
       />
+      {runScriptOn && <RunScriptModal
+        agents={inventory.agents}
+        initialAgentId={runScriptOn.id}
+        onClose={() => setRunScriptOn(null)}
+        returnFocus={runScriptOpener}
+      />}
       {pendingConnect && <ConnectionReasonModal
         agentName={pendingConnect.agent.name}
         background={pendingConnect.background}

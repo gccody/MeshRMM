@@ -15,6 +15,7 @@ import {
   Settings,
   ShieldCheck,
   Users,
+  Wrench,
   X,
 } from "lucide-react";
 import Link from "next/link";
@@ -299,6 +300,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
           <nav aria-label="Primary navigation">
             <p className="nav-label">Company</p>
             <NavItem view="agents" search={devicesSearch} current={view} disabled={Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Monitor size={18} /><span>Devices</span>{hasData ? <em>{agents.length}</em> : null}</NavItem>
+            <NavItem view="toolbox" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Wrench size={18} /><span>Toolbox</span></NavItem>
             {isAdmin && <NavItem view="team" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Users size={18} /><span>Users</span></NavItem>}
             {isAdmin && <NavItem view="sso" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><KeyRound size={18} /><span>Authentication</span></NavItem>}
             <NavItem view="settings" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Settings size={18} /><span>Settings</span></NavItem>
