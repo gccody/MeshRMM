@@ -100,6 +100,8 @@ pub struct ViewerResumeState {
     /// `Some(safe_mode)` from the technician's restart of the remote computer
     /// until the remote display appears again.
     restarting: Arc<Mutex<Option<bool>>>,
+    /// The technician's toolbox, with runs and files followed across reconnects.
+    toolbox: crate::toolbox::Toolbox,
 }
 
 impl Default for ViewerResumeState {
@@ -135,6 +137,7 @@ impl Default for ViewerResumeState {
             reconnect_status: Default::default(),
             approval_wait: Default::default(),
             restarting: Default::default(),
+            toolbox: Default::default(),
         }
     }
 }

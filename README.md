@@ -94,6 +94,35 @@ no hardware decoder. Startup still fails with a contextual error when neither
 path exists, for example on a Windows N edition without the Media Feature
 Pack.
 
+## Computers without a monitor
+
+Windows has no desktop to capture when no monitor is connected. When a session
+finds the console in that state, the Agent adds a virtual monitor through
+[SudoVDA](https://github.com/SudoMaker/SudoVDA), an Indirect Display Driver
+bundled in the Agent executable. It installs the driver the first time a
+computer needs it, trusting SudoMaker's code-signing certificate in the
+machine's `Root` and `TrustedPublisher` stores. If another application already
+installed SudoVDA, the Agent uses that copy instead. Uninstalling the Agent
+removes only what the Agent installed.
+
+The virtual monitor lasts until the session ends. Its size is a viewer
+preference, 1280 × 720 by default, chosen under **Display** in the Windows
+viewer's settings or **Remote computer** in the macOS viewer's session menu.
+The viewer remembers the choice for later sessions and changes the size of a
+connected computer's virtual monitor right away. The setting does nothing
+while a real monitor is connected.
+
+## Toolbox
+
+The dashboard's **Toolbox** page keeps PowerShell and Command Prompt scripts and
+a library of files, each private to the user who added it or shared with the
+company. Scripts run on a device from the dashboard or from the viewer's
+toolbox button, as the signed-in user or as SYSTEM; with nobody signed in they
+run as SYSTEM. The viewer's toolbox also sends library files to the connected
+device's Documents transfer folder, or to Public Documents from the background
+desktop. The server hands both to the Agent, so they work in background mode
+too. See [the toolbox](docs/toolbox.md).
+
 ## Preconfigured deployment
 
 The viewer loads sidecar JSON next to its executable. The installed Agent reads
@@ -679,7 +708,8 @@ Application-specific rendering limitations can still cause flicker. Session 0 ha
 Win+R, Windows-key shortcuts do nothing: the Windows key, and keys pressed while it
 is held, never reach applications. The Apps key opens the selected item's context menu. It does not switch the console desktop or move the
 console pointer. Console audio, clipboard synchronization, file-transfer UI, chat,
-blackout, input blocking, and Ctrl+Alt+Del are unavailable in background mode.
+blackout, input blocking, and Ctrl+Alt+Del are unavailable in background mode;
+the toolbox's scripts and files work there.
 Operations performed inside the workspace still affect the same machine, and
 SYSTEM has a different profile and network credentials from the signed-in user.
 

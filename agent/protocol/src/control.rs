@@ -71,6 +71,7 @@ pub enum SessionMessage {
         profiles: Vec<VideoProfile>,
         quality: QualityPreset,
         chroma: ChromaMode,
+        headless_resolution: HeadlessResolution,
     },
     /// Changes the encoder quality ceiling without changing the network path.
     SetQuality {
@@ -176,6 +177,52 @@ pub enum SessionMessage {
     PowerState {
         safe_mode: bool,
     },
+    /// Size of the virtual display the Agent adds while its console has no
+    /// monitor; see [`HeadlessResolution`].
+    SetHeadlessResolution {
+        resolution: HeadlessResolution,
+    },
+}
+
+/// Size of the virtual monitor a Windows Agent adds to a console that has no
+/// display attached, so there is a desktop to view. The viewer chooses it;
+/// the Agent ignores it while a real monitor is connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct HeadlessResolution {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl HeadlessResolution {
+    pub const HD: Self = Self::new(1280, 720);
+    /// The sizes viewers offer, smallest first.
+    pub const PRESETS: [Self; 6] = [
+        Self::HD,
+        Self::new(1366, 768),
+        Self::new(1600, 900),
+        Self::new(1920, 1080),
+        Self::new(2560, 1440),
+        Self::new(3840, 2160),
+    ];
+
+    pub const fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+
+    /// Whether the virtual display driver can create a monitor of this size.
+    pub fn valid(self) -> bool {
+        (640..=7680).contains(&self.width) && (480..=4320).contains(&self.height)
+    }
+
+    pub fn label(self) -> String {
+        format!("{} × {}", self.width, self.height)
+    }
+}
+
+impl Default for HeadlessResolution {
+    fn default() -> Self {
+        Self::HD
+    }
 }
 
 /// System-audio encodings, in the viewer's order of preference. Append new
@@ -683,6 +730,7 @@ mod tests {
             ],
             quality: QualityPreset::Balanced,
             chroma: ChromaMode::Yuv444,
+            headless_resolution: HeadlessResolution::new(1920, 1080),
         };
         let encoded = message.encode().unwrap();
         assert_eq!(SessionMessage::decode(&encoded).unwrap(), message);
@@ -715,6 +763,49 @@ mod power_tests {
         ] {
             assert_eq!(message.encode().unwrap(), bytes);
             assert_eq!(SessionMessage::decode(&bytes).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn headless_resolution_appends_after_power_messages() {
+        let message = SessionMessage::SetHeadlessResolution {
+            resolution: HeadlessResolution::default(),
+        };
+        // Postcard varints: 1280 = 0x80 0x0a, 720 = 0xd0 0x05.
+        let bytes = vec![43, 0x80, 0x0a, 0xd0, 0x05];
+        assert_eq!(message.encode().unwrap(), bytes);
+        assert_eq!(SessionMessage::decode(&bytes).unwrap(), message);
+    }
+
+    #[test]
+    fn headless_resolutions_default_to_720p_and_offer_valid_presets() {
+        assert_eq!(
+            HeadlessResolution::default(),
+            HeadlessResolution::new(1280, 720)
+        );
+        assert_eq!(
+            HeadlessResolution::PRESETS[0],
+            HeadlessResolution::default()
+        );
+        assert!(
+            HeadlessResolution::PRESETS
+                .iter()
+                .all(|preset| preset.valid())
+        );
+        assert!(
+            HeadlessResolution::PRESETS
+                .windows(2)
+                .all(|pair| pair[0].width < pair[1].width)
+        );
+        assert_eq!(HeadlessResolution::HD.label(), "1280 × 720");
+        for invalid in [
+            HeadlessResolution::new(0, 720),
+            HeadlessResolution::new(639, 480),
+            HeadlessResolution::new(1280, 479),
+            HeadlessResolution::new(7681, 4320),
+            HeadlessResolution::new(7680, 4321),
+        ] {
+            assert!(!invalid.valid(), "{invalid:?}");
         }
     }
 }

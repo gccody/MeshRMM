@@ -294,6 +294,7 @@ pub(super) fn install_control_handler(
                         remote_cursor_hidden: Arc::clone(&viewer_control.resume_state.remote_cursor_hidden),
                         session_close_action: Arc::clone(&viewer_control.resume_state.session_close_action),
                         restarting: Arc::clone(&viewer_control.resume_state.restarting),
+                        toolbox: viewer_control.resume_state.toolbox.clone(),
                         quality: Arc::clone(&quality_preset),
                         chroma: Arc::clone(&chroma_mode),
                         #[cfg(windows)]
@@ -373,6 +374,7 @@ pub(super) fn install_control_handler(
                             profiles: profiles.as_ref().clone(),
                             quality: sink.quality_preset(),
                             chroma: sink.chroma_mode(),
+                            headless_resolution: crate::preferences::headless_resolution(),
                         });
                         tracing::info!(
                             configuration_sequence,

@@ -4,7 +4,7 @@ use super::*;
 use crate::input::HeldInput;
 use crate::reconnect::ReconnectStatus;
 use crate::toolbar::{self, Action, Command};
-use meshrmm_protocol::SessionCloseAction;
+use meshrmm_protocol::{HeadlessResolution, SessionCloseAction};
 use objc2::ClassType;
 use objc2::runtime::{AnyObject, Sel};
 use objc2_app_kit::{
@@ -502,6 +502,13 @@ define_class!(
             }
         }
 
+        #[unsafe(method(selectHeadlessResolution:))]
+        fn select_headless_resolution(&self, sender: &NSMenuItem) {
+            if let Some(resolution) = usize::try_from(sender.tag()).ok().and_then(|index| HeadlessResolution::PRESETS.get(index)) {
+                self.ivars().control.set_headless_resolution(*resolution);
+            }
+        }
+
         #[unsafe(method(selectIdleDisconnect:))]
         fn select_idle_disconnect(&self, sender: &NSMenuItem) {
             if let Some(minutes) = usize::try_from(sender.tag()).ok().and_then(|index| crate::idle_disconnect::choices().nth(index)) {
@@ -873,6 +880,7 @@ impl RemoteView {
         let visible = active.session_displays(&displays);
         let control = &self.ivars().control;
         let chat = control.chat();
+        let toolbox = control.toolbox().snapshot();
         toolbar::State {
             sessions: sessions.iter().map(|session| session.label()).collect(),
             session: sessions
@@ -903,6 +911,9 @@ impl RemoteView {
             chat_unread: chat.unread(),
             power: control.power_state(),
             file_status: control.files().status(),
+            toolbox_available: toolbox.available,
+            toolbox_busy: toolbox.busy,
+            toolbox_status: toolbox.status,
             recording: control.recording().active(),
             diagnostics: *self.ivars().debug_visible.borrow(),
             settings_menu: true,
@@ -934,6 +945,12 @@ impl RemoteView {
             Action::Files => {
                 self.disable_input();
                 toolbar_view.show_menu(&toolbar::menu(action, &toolbar_view.state()), rect);
+                self.ivars().control.set_input_enabled(true);
+            }
+            Action::Toolbox => {
+                self.disable_input();
+                let offered = self.ivars().control.toolbox().offer();
+                toolbar_view.show_menu(&toolbar::toolbox_menu(&offered), rect);
                 self.ivars().control.set_input_enabled(true);
             }
             Action::Recording => self.ivars().control.toggle_recording(),
@@ -1026,6 +1043,16 @@ impl RemoteView {
                     self.ivars().control.restart(safe_mode);
                 }
             }
+            Command::RunScript { index, run_as } => {
+                self.ivars().control.toolbox().run_script(index, run_as);
+            }
+            Command::SendToolboxFile(index) => {
+                // The background desktop shows Public Documents as Documents.
+                let background = self.ivars().active_display.borrow().session
+                    == meshrmm_protocol::DesktopSession::Background;
+                self.ivars().control.toolbox().send_file(index, background);
+            }
+            Command::RefreshToolbox => self.ivars().control.toolbox().refresh(),
         }
         self.refresh_toolbar();
     }
@@ -1150,6 +1177,20 @@ impl RemoteView {
             sel!(toggleWallpaper:),
             Some(control.wallpaper_hidden()),
         ));
+        let headless = crate::preferences::headless_resolution();
+        let headless_labels = HeadlessResolution::PRESETS.map(HeadlessResolution::label);
+        let headless_item = self.menu_choices(
+            &format!("Size without a monitor: {}", headless.label()),
+            headless_labels
+                .iter()
+                .zip(HeadlessResolution::PRESETS)
+                .map(|(label, choice)| (label.as_str(), choice == headless)),
+            sel!(selectHeadlessResolution:),
+        );
+        headless_item.setToolTip(Some(&NSString::from_str(
+            "The size of the virtual display the remote computer shows when no monitor is connected to it.",
+        )));
+        menu.addItem(&headless_item);
 
         menu.addItem(&NSMenuItem::separatorItem(self.mtm()));
         self.add_menu_header(&menu, "This viewer");
@@ -1500,6 +1541,17 @@ impl RemoteView {
         if let Some(error) = self.ivars().control.take_maintenance_error() {
             queue_alert("Maintenance control failed", error);
         }
+        while let Some(event) = self.ivars().control.toolbox().take_event() {
+            match event {
+                crate::toolbox::Event::RunFinished(run) => {
+                    let (title, text) = crate::toolbox::run_report(&run);
+                    super::script_output::show(self.mtm(), &title, &text);
+                }
+                crate::toolbox::Event::Failed { title, message } => {
+                    queue_alert(title, message);
+                }
+            }
+        }
         if !*self.ivars().debug_visible.borrow()
             || (!force
                 && self.ivars().debug_refreshed.borrow().elapsed() < Duration::from_millis(250))
@@ -1638,7 +1690,7 @@ thread_local! {
 /// pumps the main queue, whose blocks borrow that state, so alerts are shown
 /// one at a time from a separate main-queue block instead.
 struct AlertQueue {
-    pending: VecDeque<(&'static str, String)>,
+    pending: VecDeque<(String, String)>,
     scheduled: bool,
 }
 
@@ -1651,20 +1703,20 @@ impl AlertQueue {
     }
 
     /// Returns whether the caller must schedule a presentation block.
-    fn push(&mut self, title: &'static str, message: String) -> bool {
-        self.pending.push_back((title, message));
+    fn push(&mut self, title: impl Into<String>, message: String) -> bool {
+        self.pending.push_back((title.into(), message));
         !std::mem::replace(&mut self.scheduled, true)
     }
 
     /// Alerts raised while one is open are shown after it by the same block.
-    fn next(&mut self) -> Option<(&'static str, String)> {
+    fn next(&mut self) -> Option<(String, String)> {
         let next = self.pending.pop_front();
         self.scheduled = next.is_some();
         next
     }
 }
 
-fn queue_alert(title: &'static str, message: String) {
+fn queue_alert(title: impl Into<String>, message: String) {
     if PENDING_ALERTS.with(|alerts| alerts.borrow_mut().push(title, message)) {
         DispatchQueue::main().exec_async(present_queued_alerts);
     }
@@ -1676,7 +1728,7 @@ fn present_queued_alerts() {
     };
     while let Some((title, message)) = PENDING_ALERTS.with(|alerts| alerts.borrow_mut().next()) {
         let alert = NSAlert::new(mtm);
-        alert.setMessageText(&NSString::from_str(title));
+        alert.setMessageText(&NSString::from_str(&title));
         alert.setInformativeText(&NSString::from_str(&message));
         alert.runModal();
     }
@@ -2066,11 +2118,11 @@ mod alert_tests {
         let mut alerts = AlertQueue::new();
         assert!(alerts.push("first", "one".into()));
         assert!(!alerts.push("second", "two".into()));
-        assert_eq!(alerts.next(), Some(("first", "one".into())));
+        assert_eq!(alerts.next(), Some(("first".into(), "one".into())));
         // Raised while the first modal pumps the main queue.
         assert!(!alerts.push("third", "three".into()));
-        assert_eq!(alerts.next(), Some(("second", "two".into())));
-        assert_eq!(alerts.next(), Some(("third", "three".into())));
+        assert_eq!(alerts.next(), Some(("second".into(), "two".into())));
+        assert_eq!(alerts.next(), Some(("third".into(), "three".into())));
         assert_eq!(alerts.next(), None);
         assert!(alerts.push("fourth", "four".into()));
     }

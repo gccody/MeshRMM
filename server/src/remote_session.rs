@@ -43,6 +43,10 @@ struct SessionRecord {
     blackout_message: String,
     #[serde(default)]
     viewer_name: String,
+    /// The dashboard user who started the session. The viewer uses their
+    /// toolbox with the session's client token.
+    #[serde(default)]
+    user_id: String,
     #[serde(default)]
     session_id: String,
     #[serde(default)]
@@ -56,6 +60,14 @@ struct SessionRecord {
     // Keep existing Durable Object records readable during a rolling deploy.
     #[serde(default = "default_idle_timeout_ms")]
     idle_timeout_ms: u64,
+}
+
+/// Who a live session's viewer acts for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SessionIdentity {
+    pub(crate) company_id: String,
+    pub(crate) device_id: String,
+    pub(crate) user_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -106,6 +118,7 @@ impl RemoteSession {
                 Response::ok("expired")
             }
             (Method::Post, "/end") => self.end(&request).await,
+            (Method::Get, "/identity") => self.identity(&request).await,
             (Method::Post, "/resume") => self.resume(&request).await,
             (Method::Get, "/signal") => self.accept_peer(&request).await,
             _ => Response::error("not found", 404),
@@ -307,6 +320,35 @@ impl RemoteSession {
         }
         self.expire("session ended by client").await?;
         Response::empty()
+    }
+
+    /// Who the session's viewer acts for, so the Worker can serve it the
+    /// technician's toolbox. Only the session's client may ask, and only
+    /// while the session is live.
+    async fn identity(&self, request: &Request) -> Result<Response> {
+        let Some(record) = self.state.storage().get::<SessionRecord>("session").await? else {
+            return Response::error("session expired or unknown", 410);
+        };
+        let supplied = request
+            .headers()
+            .get("Authorization")?
+            .and_then(|value| value.strip_prefix("Bearer ").map(str::to_owned))
+            .unwrap_or_default();
+        if !token_eq(supplied.as_bytes(), record.client_token.as_bytes()) {
+            return Response::error("unauthorized", 401);
+        }
+        if record.user_id.is_empty()
+            || record.company_id.is_empty()
+            || record.device_id.is_empty()
+            || record.expires_at_unix_ms <= Date::now().as_millis()
+        {
+            return Response::error("session expired", 410);
+        }
+        Response::from_json(&SessionIdentity {
+            company_id: record.company_id,
+            device_id: record.device_id,
+            user_id: record.user_id,
+        })
     }
 
     async fn advance_deadline(&self, proposed: &SessionRecord) -> Result<bool> {

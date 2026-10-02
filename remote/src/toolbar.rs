@@ -10,7 +10,7 @@
 // Linux builds only the tests of the viewer's shared code.
 #![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 
-use meshrmm_protocol::{ChromaMode, CredentialState, QualityPreset};
+use meshrmm_protocol::{ChromaMode, CredentialState, QualityPreset, RunAs};
 
 /// The toolbar's height.
 pub const HEIGHT: f64 = 40.0;
@@ -79,6 +79,11 @@ pub struct State {
     pub power: Option<bool>,
     /// The latest file transfer's progress or result.
     pub file_status: String,
+    /// The session can use the technician's toolbox, whether a run or file
+    /// is in progress, and the latest one's progress or result.
+    pub toolbox_available: bool,
+    pub toolbox_busy: bool,
+    pub toolbox_status: String,
     pub recording: bool,
     pub diagnostics: bool,
     /// Whether the settings item opens a menu rather than a window.
@@ -99,6 +104,7 @@ pub enum Action {
     TypeClipboard,
     Annotate,
     Files,
+    Toolbox,
     Chat,
     Diagnostics,
     Settings,
@@ -119,6 +125,7 @@ pub enum Icon {
     Clipboard,
     Pen,
     Folder,
+    Toolbox,
     Chat,
     Pulse,
     Gear,
@@ -329,6 +336,22 @@ pub fn items(state: &State) -> Vec<Item> {
         )
         .with_menu(),
     );
+    let mut toolbox = Item::new(
+        Action::Toolbox,
+        Icon::Toolbox,
+        if !state.toolbox_available {
+            "The toolbox is unavailable until the session connects".to_owned()
+        } else if state.toolbox_status.is_empty() {
+            "Toolbox: run scripts and send files".to_owned()
+        } else {
+            format!("Toolbox: {}", state.toolbox_status)
+        },
+        3,
+    )
+    .with_menu();
+    toolbox.enabled = state.toolbox_available;
+    toolbox.active = state.toolbox_busy;
+    items.push(toolbox);
     let mut chat = Item::new(
         Action::Chat,
         Icon::Chat,
@@ -932,6 +955,17 @@ pub fn icon(icon: Icon) -> Vec<Shape> {
             Segment::Cubic(3.2, 16.0, 2.5, 15.3, 2.5, 14.5),
             Segment::Close,
         ])],
+        Icon::Toolbox => vec![
+            stroke(grid_rounded_rect(2.5, 7.0, 15.0, 9.5, 1.8)),
+            stroke(polyline(&[
+                (7.0, 7.0),
+                (7.0, 4.0),
+                (13.0, 4.0),
+                (13.0, 7.0),
+            ])),
+            stroke(polyline(&[(2.5, 11.0), (17.5, 11.0)])),
+            stroke(polyline(&[(10.0, 10.0), (10.0, 12.5)])),
+        ],
         Icon::Chat => vec![stroke(vec![
             Segment::Move(4.5, 3.5),
             Segment::Line(15.5, 3.5),
@@ -1044,7 +1078,17 @@ pub enum Command {
     ForgetCredentials,
     SendFiles,
     ReceiveFiles,
-    Restart { safe_mode: bool },
+    Restart {
+        safe_mode: bool,
+    },
+    /// Runs the toolbox script at this place in the offered listing.
+    RunScript {
+        index: usize,
+        run_as: RunAs,
+    },
+    /// Sends the toolbox file at this place in the offered listing.
+    SendToolboxFile(usize),
+    RefreshToolbox,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1057,6 +1101,11 @@ pub enum MenuEntry {
         command: Option<Command>,
     },
     Separator,
+    /// A nested menu.
+    Submenu {
+        label: String,
+        entries: Vec<MenuEntry>,
+    },
 }
 
 fn entry(label: impl Into<String>, checked: bool, enabled: bool, command: Command) -> MenuEntry {
@@ -1224,15 +1273,164 @@ pub fn restart_confirmation(safe_mode: bool) -> (&'static str, &'static str, &'s
 }
 
 /// The commands of `entries`, in order, for platforms that number menu
-/// items. Status lines and separators have none.
+/// items. A submenu takes a place itself, followed by its entries. Status
+/// lines, separators and submenus have no command.
 pub fn commands(entries: &[MenuEntry]) -> Vec<Option<Command>> {
+    fn collect(entries: &[MenuEntry], commands: &mut Vec<Option<Command>>) {
+        for entry in entries {
+            match entry {
+                MenuEntry::Item { command, .. } => commands.push(*command),
+                MenuEntry::Separator => commands.push(None),
+                MenuEntry::Submenu { entries, .. } => {
+                    commands.push(None);
+                    collect(entries, commands);
+                }
+            }
+        }
+    }
+    let mut commands = Vec::new();
+    collect(entries, &mut commands);
+    commands
+}
+
+/// Menu entries in nested folders: the folders first, as submenus, then
+/// the entries at that level.
+#[derive(Default)]
+struct FolderTree {
+    folders: Vec<(String, FolderTree)>,
+    entries: Vec<MenuEntry>,
+}
+
+impl FolderTree {
+    fn insert(&mut self, folder: &str, entry: MenuEntry) {
+        let mut node = self;
+        for name in folder.split('/').filter(|name| !name.is_empty()) {
+            let position = match node.folders.iter().position(|(folder, _)| folder == name) {
+                Some(position) => position,
+                None => {
+                    node.folders.push((name.to_owned(), FolderTree::default()));
+                    node.folders.len() - 1
+                }
+            };
+            node = &mut node.folders[position].1;
+        }
+        node.entries.push(entry);
+    }
+
+    fn into_entries(self) -> Vec<MenuEntry> {
+        let mut entries: Vec<MenuEntry> = self
+            .folders
+            .into_iter()
+            .map(|(label, tree)| MenuEntry::Submenu {
+                label,
+                entries: tree.into_entries(),
+            })
+            .collect();
+        entries.extend(self.entries);
+        entries
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 3] = ["KiB", "MiB", "GiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// The toolbox's menu: each script, in its folders, with a choice of
+/// account, then each library file, then a refresh and the latest status.
+pub fn toolbox_menu(snapshot: &crate::toolbox::Snapshot) -> Vec<MenuEntry> {
+    let mut entries = Vec::new();
+    match &snapshot.listing {
+        None if snapshot.loading || snapshot.error.is_none() => {
+            entries.push(status("Loading the toolbox…"));
+        }
+        None => entries.push(status(format!(
+            "The toolbox could not be loaded: {}",
+            snapshot.error.as_deref().unwrap_or_default()
+        ))),
+        Some(listing) => {
+            entries.push(status("Run a script"));
+            if listing.scripts.is_empty() {
+                entries.push(status(
+                    "No scripts yet. Add them in the dashboard's Toolbox.",
+                ));
+            }
+            let mut scripts = FolderTree::default();
+            for (index, script) in listing.scripts.iter().enumerate() {
+                scripts.insert(
+                    &script.folder,
+                    MenuEntry::Submenu {
+                        label: script.name.clone(),
+                        entries: vec![
+                            entry(
+                                "As the signed-in user",
+                                false,
+                                true,
+                                Command::RunScript {
+                                    index,
+                                    run_as: RunAs::User,
+                                },
+                            ),
+                            entry(
+                                "As SYSTEM",
+                                false,
+                                true,
+                                Command::RunScript {
+                                    index,
+                                    run_as: RunAs::System,
+                                },
+                            ),
+                        ],
+                    },
+                );
+            }
+            entries.extend(scripts.into_entries());
+            entries.push(MenuEntry::Separator);
+            entries.push(status("Send a file to Documents"));
+            if listing.files.is_empty() {
+                entries.push(status(
+                    "No files yet. Upload them in the dashboard's Toolbox.",
+                ));
+            }
+            let mut files = FolderTree::default();
+            for (index, file) in listing.files.iter().enumerate() {
+                files.insert(
+                    &file.folder,
+                    entry(
+                        format!("{} ({})", file.name, format_size(file.size_bytes)),
+                        false,
+                        true,
+                        Command::SendToolboxFile(index),
+                    ),
+                );
+            }
+            entries.extend(files.into_entries());
+        }
+    }
+    entries.push(MenuEntry::Separator);
+    entries.push(entry(
+        "Refresh the toolbox",
+        false,
+        snapshot.available && !snapshot.loading,
+        Command::RefreshToolbox,
+    ));
+    if !snapshot.status.is_empty() {
+        entries.push(status(snapshot.status.clone()));
+    }
     entries
-        .iter()
-        .map(|entry| match entry {
-            MenuEntry::Item { command, .. } => *command,
-            MenuEntry::Separator => None,
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1398,7 +1596,7 @@ mod tests {
     fn minimum_width_fits_every_item() {
         let items = items_for(|state| state.recording = true);
         let width = minimum_width(&items, 0.0, &measure);
-        assert!(width < 800.0, "{width}");
+        assert!(width < 850.0, "{width}");
         let layout = layout(&items, width, 0.0, &measure);
         let mut sorted: Vec<_> = layout.rects.clone();
         sorted.sort_by(|a, b| a.x.total_cmp(&b.x));
@@ -1409,7 +1607,7 @@ mod tests {
 
     #[test]
     fn long_labels_fit_at_both_platform_minimum_widths() {
-        for (width, inset, caption) in [(680.0, 84.0, None), (784.0, 0.0, Some(false))] {
+        for (width, inset, caption) in [(730.0, 84.0, None), (834.0, 0.0, Some(false))] {
             for session in [
                 "administrator (RDP 2)",
                 "非常に長いユーザー名".repeat(20).as_str(),
@@ -1630,6 +1828,7 @@ mod tests {
                         ..
                     } => (label, checked, enabled),
                     MenuEntry::Separator => ("-".into(), false, false),
+                    MenuEntry::Submenu { label, .. } => (format!("{label} ▸"), false, true),
                 })
                 .collect()
         };
@@ -1683,5 +1882,184 @@ mod tests {
             "Sent 2 files"
         );
         assert!(menu(Action::Settings, &state).is_empty());
+    }
+
+    fn listing() -> crate::toolbox::Snapshot {
+        use meshrmm_protocol::{ScriptLanguage, ToolboxFile, ToolboxListing, ToolboxScript};
+        let script = |id: &str, name: &str, folder: &str| ToolboxScript {
+            id: id.into(),
+            name: name.into(),
+            folder: folder.into(),
+            language: ScriptLanguage::Powershell,
+            description: String::new(),
+            shared: true,
+        };
+        crate::toolbox::Snapshot {
+            available: true,
+            listing: Some(ToolboxListing {
+                scripts: vec![
+                    script("top", "Top level", ""),
+                    script("disk", "Disk report", "Maintenance/Disk"),
+                    script("temp", "Clear temp", "Maintenance"),
+                ],
+                files: vec![ToolboxFile {
+                    id: "setup".into(),
+                    name: "setup.exe".into(),
+                    folder: "Installers".into(),
+                    size_bytes: 3 * 1024 * 1024 / 2,
+                    shared: false,
+                }],
+            }),
+            status: "Saved C:\\Users\\ada\\Documents\\setup.exe".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The labels of `entries`, with submenus' entries indented below them.
+    fn outline(entries: &[MenuEntry], depth: usize, lines: &mut Vec<String>) {
+        for entry in entries {
+            let indent = "  ".repeat(depth);
+            match entry {
+                MenuEntry::Item { label, command, .. } => lines.push(format!(
+                    "{indent}{label}{}",
+                    if command.is_some() { "" } else { " (status)" }
+                )),
+                MenuEntry::Separator => lines.push(format!("{indent}-")),
+                MenuEntry::Submenu { label, entries } => {
+                    lines.push(format!("{indent}{label} >"));
+                    outline(entries, depth + 1, lines);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_toolbox_menu_nests_folders_and_offers_both_accounts() {
+        let entries = toolbox_menu(&listing());
+        let mut lines = Vec::new();
+        outline(&entries, 0, &mut lines);
+        assert_eq!(
+            lines,
+            [
+                "Run a script (status)",
+                "Maintenance >",
+                "  Disk >",
+                "    Disk report >",
+                "      As the signed-in user",
+                "      As SYSTEM",
+                "  Clear temp >",
+                "    As the signed-in user",
+                "    As SYSTEM",
+                "Top level >",
+                "  As the signed-in user",
+                "  As SYSTEM",
+                "-",
+                "Send a file to Documents (status)",
+                "Installers >",
+                "  setup.exe (1.5 MiB)",
+                "-",
+                "Refresh the toolbox",
+                "Saved C:\\Users\\ada\\Documents\\setup.exe (status)",
+            ]
+        );
+        // Commands are numbered in that order, submenus included, and name
+        // items by their place in the listing.
+        let commands = commands(&entries);
+        assert_eq!(commands.len(), lines.len());
+        assert_eq!(
+            commands[4],
+            Some(Command::RunScript {
+                index: 1,
+                run_as: RunAs::User
+            })
+        );
+        assert_eq!(
+            commands[8],
+            Some(Command::RunScript {
+                index: 2,
+                run_as: RunAs::System
+            })
+        );
+        assert_eq!(
+            commands[11],
+            Some(Command::RunScript {
+                index: 0,
+                run_as: RunAs::System
+            })
+        );
+        assert_eq!(commands[15], Some(Command::SendToolboxFile(0)));
+        assert_eq!(commands[17], Some(Command::RefreshToolbox));
+        assert_eq!(commands[3], None, "a submenu is not a command");
+    }
+
+    #[test]
+    fn the_toolbox_menu_explains_an_empty_or_missing_toolbox() {
+        let mut empty = listing();
+        empty.listing = Some(Default::default());
+        empty.status.clear();
+        let mut lines = Vec::new();
+        outline(&toolbox_menu(&empty), 0, &mut lines);
+        assert_eq!(
+            lines,
+            [
+                "Run a script (status)",
+                "No scripts yet. Add them in the dashboard's Toolbox. (status)",
+                "-",
+                "Send a file to Documents (status)",
+                "No files yet. Upload them in the dashboard's Toolbox. (status)",
+                "-",
+                "Refresh the toolbox",
+            ]
+        );
+        let failed = crate::toolbox::Snapshot {
+            available: true,
+            error: Some("the remote session has ended".into()),
+            ..Default::default()
+        };
+        let mut lines = Vec::new();
+        outline(&toolbox_menu(&failed), 0, &mut lines);
+        assert_eq!(
+            lines[0],
+            "The toolbox could not be loaded: the remote session has ended (status)"
+        );
+        let loading = crate::toolbox::Snapshot {
+            available: true,
+            loading: true,
+            ..Default::default()
+        };
+        let entries = toolbox_menu(&loading);
+        assert!(
+            matches!(&entries[0], MenuEntry::Item { label, .. } if label == "Loading the toolbox…")
+        );
+        assert!(
+            matches!(entries.last(), Some(MenuEntry::Item { enabled: false, .. })),
+            "a refresh waits for the one running"
+        );
+    }
+
+    #[test]
+    fn the_toolbox_item_shows_progress_and_waits_for_the_session() {
+        let item = |state: &State| {
+            items(state)
+                .into_iter()
+                .find(|item| item.action == Action::Toolbox)
+                .unwrap()
+        };
+        let mut state = state();
+        let unavailable = item(&state);
+        assert!(!unavailable.enabled);
+        state.toolbox_available = true;
+        state.toolbox_busy = true;
+        state.toolbox_status = "Running Disk report…".into();
+        let busy = item(&state);
+        assert!(busy.enabled && busy.active && busy.menu);
+        assert_eq!(busy.tooltip, "Toolbox: Running Disk report…");
+    }
+
+    #[test]
+    fn sizes_read_in_binary_units() {
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(1536), "1.5 KiB");
+        assert_eq!(format_size(95 * 1024 * 1024), "95 MiB");
     }
 }

@@ -10,21 +10,19 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use meshrmm_protocol::{
-    CursorShape, Display, DisplayId, MAX_CLIPBOARD_WIRE_BYTES, RemoteInput, SessionMessage,
+    CursorShape, Display, DisplayId, HeadlessResolution, MAX_CLIPBOARD_WIRE_BYTES, RemoteInput,
+    SessionMessage,
 };
 use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_TIMEOUT};
 use windows::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TokenPrimary,
     TokenSessionId,
 };
-use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::RemoteDesktop::*;
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessAsUserW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_NO_WINDOW, CreateProcessAsUserW, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    OpenProcessToken, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    TerminateProcess, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -37,7 +35,8 @@ use super::connection_approval::{ApprovalPrompt, Decision};
 use super::connection_notification::ConnectionNotification;
 use super::input::WindowsInputController;
 use super::platform::ScreenInput;
-use crate::win32::{OwnedHandle, wide};
+use super::virtual_display::{HeadlessTarget, VirtualDisplay};
+use crate::win32::{HandleListAttribute, OwnedHandle, create_pipe, wide};
 
 mod child;
 #[cfg(test)]
@@ -71,6 +70,7 @@ const EVENT_INPUT_STARTED: u8 = 6;
 const EVENT_CLIPBOARD: u8 = 7;
 const EVENT_CHAT: u8 = 8;
 const EVENT_APPROVAL_DECISION: u8 = 14;
+const EVENT_NO_DISPLAYS: u8 = 15;
 const COMMAND_PROMPT_CONNECTION_APPROVAL: u8 = 26;
 const COMMAND_CAPTURE_THUMBNAIL: u8 = 27;
 const COMMAND_ANNOTATE: u8 = 28;
@@ -81,6 +81,9 @@ const MAX_CONTROL_BYTES: usize = 64 * 1024;
 const MAX_DISPLAY_NAME_BYTES: usize = 4 * 1024;
 const MAX_DISPLAYS: usize = 64;
 const START_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a capture helper waits for a newly added virtual display to
+/// become active, on top of `START_TIMEOUT`.
+const HEADLESS_ARRIVAL: Duration = Duration::from_secs(5);
 /// Covers the helper's start, the capture and the JPEG encoding.
 const THUMBNAIL_TIMEOUT: Duration = Duration::from_secs(15);
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -149,6 +152,8 @@ enum ParentCommand {
         pixel_format: VideoPixelFormat,
         capture_cursor: bool,
         grayscale: bool,
+        /// The virtual monitor the service added to a console without one.
+        headless: Option<HeadlessTarget>,
     },
     RequestKeyframe,
     SetBitrate(u32),
@@ -197,9 +202,39 @@ enum ChildEvent {
     Clipboard(ClipboardContent),
     Chat(String),
     ApprovalDecision(Decision),
+    /// The console has no active display, so there is nothing to capture
+    /// until the service adds a virtual one.
+    NoDisplays,
     Error(String),
     Stopped,
 }
+
+/// Why a capture helper did not start.
+#[derive(Debug)]
+enum StartFailure {
+    NoDisplays,
+    Failed(String),
+}
+
+impl From<StartFailure> for anyhow::Error {
+    fn from(failure: StartFailure) -> Self {
+        match failure {
+            StartFailure::NoDisplays => NoDisplays.into(),
+            StartFailure::Failed(message) => anyhow::Error::msg(message),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NoDisplays;
+
+impl std::fmt::Display for NoDisplays {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the console has no active display")
+    }
+}
+
+impl std::error::Error for NoDisplays {}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CredentialResult {
@@ -286,6 +321,10 @@ pub struct DesktopCaptureStreamer {
     wallpaper_hidden: Arc<AtomicBool>,
     prevent_idle_lock: Arc<AtomicBool>,
     chat_enabled: Arc<AtomicBool>,
+    headless_resolution: HeadlessResolution,
+    /// Added while the console has no monitor, and kept until the remote
+    /// session ends. Declared last so it is removed after the helpers stop.
+    virtual_display: Option<VirtualDisplay>,
 }
 
 impl DesktopCaptureStreamer {
@@ -328,7 +367,43 @@ impl DesktopCaptureStreamer {
             wallpaper_hidden: Arc::new(AtomicBool::new(false)),
             prevent_idle_lock: Arc::new(AtomicBool::new(false)),
             chat_enabled: Arc::new(AtomicBool::new(false)),
+            headless_resolution: super::virtual_display::last_resolution(),
+            virtual_display: None,
         }
+    }
+
+    /// Sets the size of the virtual display for a console without a monitor.
+    /// Replaces a virtual display of another size and returns true; capture
+    /// must then restart.
+    pub fn set_headless_resolution(&mut self, resolution: HeadlessResolution) -> bool {
+        if !resolution.valid() {
+            tracing::warn!(
+                width = resolution.width,
+                height = resolution.height,
+                "ignoring an unsupported virtual display size"
+            );
+            return false;
+        }
+        self.headless_resolution = resolution;
+        super::virtual_display::remember_resolution(resolution);
+        if self
+            .virtual_display
+            .as_ref()
+            .is_none_or(|display| display.target().resolution == resolution)
+        {
+            return false;
+        }
+        // The old monitor goes first so that Windows never shows both.
+        self.virtual_display = None;
+        match VirtualDisplay::add(resolution) {
+            Ok(display) => self.virtual_display = Some(display),
+            // The next start adds one again if the console is still headless.
+            Err(error) => tracing::warn!(
+                error = format!("{error:#}"),
+                "could not resize the virtual display"
+            ),
+        }
+        true
     }
 
     pub fn start(
@@ -463,7 +538,7 @@ impl DesktopCaptureStreamer {
             .take(if background { 1 } else { 2 })
         {
             let attempt_started = Instant::now();
-            match self.start_on_desktop(target, config, display_id, Arc::clone(&sink)) {
+            match self.start_or_add_display(target, config, display_id, &sink) {
                 Ok(started) => {
                     tracing::info!(
                         desktop = target.name(),
@@ -524,13 +599,13 @@ impl DesktopCaptureStreamer {
                 pixel_format: config.pixel_format,
                 capture_cursor: config.capture_cursor,
                 grayscale: config.grayscale,
+                headless: self.virtual_display.as_ref().map(VirtualDisplay::target),
             },
         )?;
         let started = running
             .started
-            .recv_timeout(START_TIMEOUT)
-            .context("capture helper did not reconfigure promptly")?
-            .map_err(anyhow::Error::msg)?;
+            .recv_timeout(self.start_timeout())
+            .context("capture helper did not reconfigure promptly")??;
         let target = running.target;
         self.ensure_input_helper(target, started.active_display.id)?;
         let running = self
@@ -625,6 +700,44 @@ impl DesktopCaptureStreamer {
         started
     }
 
+    /// Starts capture on `target`, first adding a virtual display when the
+    /// console has no monitor.
+    fn start_or_add_display(
+        &mut self,
+        target: DesktopTarget,
+        config: StreamConfig,
+        display_id: Option<DisplayId>,
+        sink: &EncodedFrameSink,
+    ) -> anyhow::Result<StartedDesktop> {
+        let error = match self.start_on_desktop(target, config, display_id, Arc::clone(sink)) {
+            Err(error) if error.is::<NoDisplays>() => error,
+            result => return result,
+        };
+        if self.virtual_display.is_some() {
+            return Err(error.context("the virtual display did not become active"));
+        }
+        if !matches!(target, DesktopTarget::Default | DesktopTarget::Winlogon) {
+            return Err(error);
+        }
+        tracing::info!(
+            width = self.headless_resolution.width,
+            height = self.headless_resolution.height,
+            "the console has no monitor; adding a virtual display"
+        );
+        let display = VirtualDisplay::add(self.headless_resolution)
+            .context("the computer has no monitor, and a virtual display could not be added")?;
+        self.virtual_display = Some(display);
+        self.start_on_desktop(target, config, display_id, Arc::clone(sink))
+    }
+
+    fn start_timeout(&self) -> Duration {
+        if self.virtual_display.is_some() {
+            START_TIMEOUT + HEADLESS_ARRIVAL
+        } else {
+            START_TIMEOUT
+        }
+    }
+
     fn start_on_desktop(
         &mut self,
         target: DesktopTarget,
@@ -670,6 +783,7 @@ impl DesktopCaptureStreamer {
             pixel_format: config.pixel_format,
             capture_cursor: config.capture_cursor,
             grayscale: config.grayscale,
+            headless: self.virtual_display.as_ref().map(VirtualDisplay::target),
         };
         if let Err(error) = send_command(&input, &start) {
             terminate_and_wait(&launched.process);
@@ -677,13 +791,18 @@ impl DesktopCaptureStreamer {
             let _ = stderr.join();
             return Err(error).context("failed to start the desktop helper");
         }
-        let started = match started_rx.recv_timeout(START_TIMEOUT) {
+        let started = match started_rx.recv_timeout(self.start_timeout()) {
             Ok(Ok(started)) => started,
-            Ok(Err(message)) => {
+            Ok(Err(failure)) => {
                 terminate_and_wait(&launched.process);
                 let _ = reader.join();
                 let _ = stderr.join();
-                anyhow::bail!("desktop helper failed: {message}");
+                return Err(match failure {
+                    StartFailure::NoDisplays => NoDisplays.into(),
+                    StartFailure::Failed(message) => {
+                        anyhow::anyhow!("desktop helper failed: {message}")
+                    }
+                });
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 terminate_and_wait(&launched.process);
@@ -1096,7 +1215,7 @@ impl Drop for DesktopCaptureStreamer {
 struct RunningHelper {
     last_frame: Arc<Mutex<Instant>>,
     sink: Arc<Mutex<Option<EncodedFrameSink>>>,
-    started: mpsc::Receiver<Result<StartedDesktop, String>>,
+    started: mpsc::Receiver<Result<StartedDesktop, StartFailure>>,
     process: OwnedHandle,
     process_id: u32,
     target: DesktopTarget,
@@ -1640,6 +1759,10 @@ fn launch_system_helper(target: DesktopTarget) -> anyhow::Result<LaunchedHelper>
 }
 fn launch_helper(target: DesktopTarget, as_user: bool) -> anyhow::Result<LaunchedHelper> {
     let executable = std::env::current_exe().context("could not locate the Agent executable")?;
+    // A test binary can't be a helper, so ignored end-to-end tests name a
+    // built Agent instead.
+    #[cfg(test)]
+    let executable = std::env::var_os("MESHRMM_TEST_HELPER").map_or(executable, PathBuf::from);
     let working_directory = executable
         .parent()
         .context("Agent executable has no parent directory")?;
@@ -1830,7 +1953,10 @@ fn helper_sends(kind: HelperKind, event: &ChildEvent) -> bool {
         ChildEvent::Clipboard(_) => kind == HelperKind::Clipboard,
         ChildEvent::Chat(_) => kind == HelperKind::Chat,
         // Only the approval helper sends it, and it has its own reader.
-        ChildEvent::Started(_) | ChildEvent::Frame(_) | ChildEvent::ApprovalDecision(_) => false,
+        ChildEvent::Started(_)
+        | ChildEvent::Frame(_)
+        | ChildEvent::NoDisplays
+        | ChildEvent::ApprovalDecision(_) => false,
     }
 }
 
@@ -1848,6 +1974,7 @@ fn child_event_name(event: &ChildEvent) -> &'static str {
         ChildEvent::Clipboard(_) => "clipboard",
         ChildEvent::Chat(_) => "chat",
         ChildEvent::ApprovalDecision(_) => "approval decision",
+        ChildEvent::NoDisplays => "no displays",
         ChildEvent::Error(_) => "error",
         ChildEvent::Stopped => "stop",
     }
@@ -2059,67 +2186,10 @@ fn read_approval_events(
     }
 }
 
-/// Creates a non-inheritable pipe and returns its (read, write) ends.
-fn create_pipe() -> anyhow::Result<(OwnedHandle, OwnedHandle)> {
-    let mut read = HANDLE::default();
-    let mut write = HANDLE::default();
-    unsafe { CreatePipe(&mut read, &mut write, None, 0) }
-        .context("failed to create desktop-helper IPC pipe")?;
-    Ok((OwnedHandle(read), OwnedHandle(write)))
-}
-
-/// A PROC_THREAD_ATTRIBUTE_HANDLE_LIST that limits what a child inherits to
-/// the listed handles. The handle array must outlive the process launch.
-struct HandleListAttribute<'a> {
-    // u64 storage keeps the opaque attribute list pointer-aligned.
-    buffer: Vec<u64>,
-    _handles: std::marker::PhantomData<&'a [HANDLE]>,
-}
-
-impl<'a> HandleListAttribute<'a> {
-    fn new(handles: &'a [HANDLE]) -> anyhow::Result<Self> {
-        let mut size = 0;
-        // The sizing call reports ERROR_INSUFFICIENT_BUFFER by design.
-        let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
-        anyhow::ensure!(size > 0, "Windows reported no process attribute list size");
-        let mut buffer = vec![0u64; size.div_ceil(std::mem::size_of::<u64>())];
-        let list = LPPROC_THREAD_ATTRIBUTE_LIST(buffer.as_mut_ptr().cast());
-        unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut size) }
-            .context("failed to create the desktop-helper process attribute list")?;
-        let attribute = Self {
-            buffer,
-            _handles: std::marker::PhantomData,
-        };
-        unsafe {
-            UpdateProcThreadAttribute(
-                attribute.list(),
-                0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                Some(handles.as_ptr().cast()),
-                std::mem::size_of_val(handles),
-                None,
-                None,
-            )
-        }
-        .context("failed to limit the handles a desktop helper inherits")?;
-        Ok(attribute)
-    }
-
-    fn list(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
-        LPPROC_THREAD_ATTRIBUTE_LIST(self.buffer.as_ptr().cast_mut().cast())
-    }
-}
-
-impl Drop for HandleListAttribute<'_> {
-    fn drop(&mut self) {
-        unsafe { DeleteProcThreadAttributeList(self.list()) };
-    }
-}
-
 fn dispatch_child_events(
     output: impl Read,
     sink: Arc<Mutex<Option<EncodedFrameSink>>>,
-    started_tx: mpsc::Sender<Result<StartedDesktop, String>>,
+    started_tx: mpsc::Sender<Result<StartedDesktop, StartFailure>>,
     status: HelperStatus,
     cursor: HelperCursor,
     maintenance: HelperMaintenance,
@@ -2136,7 +2206,7 @@ fn dispatch_child_events(
             }
             Ok(ChildEvent::InputStarted) => {
                 let message = "capture helper reported input-only startup".to_string();
-                let _ = started_tx.send(Err(message.clone()));
+                let _ = started_tx.send(Err(StartFailure::Failed(message.clone())));
                 set_status(&status, Err(message));
                 break;
             }
@@ -2173,19 +2243,24 @@ fn dispatch_child_events(
                 );
                 break;
             }
+            Ok(ChildEvent::NoDisplays) => {
+                let _ = started_tx.send(Err(StartFailure::NoDisplays));
+                set_status(&status, Err(NoDisplays.to_string()));
+                break;
+            }
             Ok(ChildEvent::Error(message)) => {
-                let _ = started_tx.send(Err(message.clone()));
+                let _ = started_tx.send(Err(StartFailure::Failed(message.clone())));
                 set_status(&status, Err(message));
                 break;
             }
             Ok(ChildEvent::Stopped) => {
-                let _ = started_tx.send(Err("desktop helper stopped".into()));
+                let _ = started_tx.send(Err(StartFailure::Failed("desktop helper stopped".into())));
                 set_status(&status, Ok(()));
                 break;
             }
             Err(error) => {
                 let message = format!("desktop-helper IPC failed: {error}");
-                let _ = started_tx.send(Err(message.clone()));
+                let _ = started_tx.send(Err(StartFailure::Failed(message.clone())));
                 set_status(&status, Err(message));
                 break;
             }
@@ -2333,7 +2408,10 @@ fn dispatch_input_events(
                 break;
             }
             // helper_sends rejects video and approval events before this match.
-            ChildEvent::Started(_) | ChildEvent::Frame(_) | ChildEvent::ApprovalDecision(_) => {
+            ChildEvent::Started(_)
+            | ChildEvent::Frame(_)
+            | ChildEvent::NoDisplays
+            | ChildEvent::ApprovalDecision(_) => {
                 fail(
                     &mut started_tx,
                     "desktop input helper reported a video event".into(),

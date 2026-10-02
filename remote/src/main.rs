@@ -29,6 +29,7 @@ mod single_instance;
 mod stream_reset;
 #[cfg(any(windows, target_os = "macos", test))]
 mod toolbar;
+mod toolbox;
 mod transport;
 #[cfg(any(windows, target_os = "macos"))]
 mod updater;

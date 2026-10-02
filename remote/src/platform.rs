@@ -75,6 +75,7 @@ pub struct ControlSink {
     remote_cursor_hidden: Arc<std::sync::atomic::AtomicBool>,
     session_close_action: Arc<Mutex<meshrmm_protocol::SessionCloseAction>>,
     restarting: Arc<Mutex<Option<bool>>>,
+    toolbox: crate::toolbox::Toolbox,
     quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
     chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
     #[cfg(windows)]
@@ -102,6 +103,8 @@ pub struct ControlSinkParts {
     pub session_close_action: Arc<Mutex<meshrmm_protocol::SessionCloseAction>>,
     /// Survives reconnects, so the window says the computer is restarting.
     pub restarting: Arc<Mutex<Option<bool>>>,
+    /// The technician's toolbox, which outlives reconnects.
+    pub toolbox: crate::toolbox::Toolbox,
     pub quality: Arc<Mutex<meshrmm_protocol::QualityPreset>>,
     pub chroma: Arc<Mutex<meshrmm_protocol::ChromaMode>>,
     #[cfg(windows)]
@@ -128,6 +131,7 @@ impl ControlSink {
             remote_cursor_hidden,
             session_close_action,
             restarting,
+            toolbox,
             quality,
             chroma,
             #[cfg(windows)]
@@ -151,6 +155,7 @@ impl ControlSink {
             remote_cursor_hidden,
             session_close_action,
             restarting,
+            toolbox,
             quality,
             chroma,
             #[cfg(windows)]
@@ -219,6 +224,17 @@ impl ControlSink {
         }
     }
 
+    /// Changes the size of the virtual display that an Agent without a
+    /// monitor shows, and remembers it for later sessions.
+    pub fn set_headless_resolution(&self, resolution: meshrmm_protocol::HeadlessResolution) {
+        self.send(meshrmm_protocol::SessionMessage::SetHeadlessResolution { resolution });
+        if let Err(error) = crate::preferences::set_headless_resolution(resolution)
+            && let Ok(mut state) = self.maintenance.lock()
+        {
+            state.error = Some(error.to_string());
+        }
+    }
+
     pub fn type_clipboard(&self, display_id: meshrmm_protocol::DisplayId) {
         if self.technician_blocked() {
             return;
@@ -274,6 +290,10 @@ impl ControlSink {
 
     pub fn chat(&self) -> meshrmm_chat::ChatSession {
         self.chat.clone()
+    }
+
+    pub fn toolbox(&self) -> &crate::toolbox::Toolbox {
+        &self.toolbox
     }
 
     pub fn maintenance_state(&self) -> MaintenanceState {
@@ -579,9 +599,14 @@ pub use windows::{
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    Presenter, monotonic_timestamp_us, run_application, show_launch_status, show_notice,
-    supported_video_profiles,
+    Presenter, monotonic_timestamp_us, refresh_open_controls, run_application, show_launch_status,
+    show_notice, supported_video_profiles,
 };
+
+/// Windows pumps its window's messages every few milliseconds, which shows
+/// any change.
+#[cfg(not(target_os = "macos"))]
+pub fn refresh_open_controls() {}
 
 #[cfg(test)]
 mod tests {
