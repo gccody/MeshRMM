@@ -273,7 +273,18 @@ impl ToolbarView {
     pub(super) fn show_menu(&self, entries: &[MenuEntry], rect: Rect) {
         let menu = NSMenu::new(self.mtm());
         menu.setAutoenablesItems(false);
-        for (index, entry) in entries.iter().enumerate() {
+        let mut tag = 0;
+        self.add_entries(&menu, entries, &mut tag);
+        self.ivars().menu.replace(toolbar::commands(entries));
+        self.pop_up(&menu, rect);
+    }
+
+    /// Adds `entries` to `menu`, tagging each with its place in
+    /// [`toolbar::commands`], which counts submenus and their entries in order.
+    fn add_entries(&self, menu: &NSMenu, entries: &[MenuEntry], tag: &mut isize) {
+        for entry in entries {
+            let index = *tag;
+            *tag += 1;
             match entry {
                 MenuEntry::Separator => menu.addItem(&NSMenuItem::separatorItem(self.mtm())),
                 MenuEntry::Item {
@@ -292,15 +303,22 @@ impl ToolbarView {
                         )
                     };
                     unsafe { item.setTarget(Some(self)) };
-                    item.setTag(index as isize);
+                    item.setTag(index);
                     item.setEnabled(*enabled && command.is_some());
                     item.setState(isize::from(*checked));
                     menu.addItem(&item);
                 }
+                MenuEntry::Submenu { label, entries } => {
+                    let submenu = NSMenu::new(self.mtm());
+                    submenu.setAutoenablesItems(false);
+                    self.add_entries(&submenu, entries, tag);
+                    let item = NSMenuItem::new(self.mtm());
+                    item.setTitle(&NSString::from_str(label));
+                    item.setSubmenu(Some(&submenu));
+                    menu.addItem(&item);
+                }
             }
         }
-        self.ivars().menu.replace(toolbar::commands(entries));
-        self.pop_up(&menu, rect);
     }
 
     /// Opens a menu under the item at `rect`.

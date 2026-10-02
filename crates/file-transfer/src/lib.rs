@@ -29,7 +29,7 @@ pub fn clipboard_has_files() -> bool {
 }
 
 /// Folder, under Documents or the cache, that receives transferred files.
-const TRANSFER_FOLDER: &str = "MeshRMM Transferred Files";
+pub const TRANSFER_FOLDER: &str = "MeshRMM Transferred Files";
 /// Clipboard copies (automatic sync and explicit paste) stay small; larger
 /// files go through Send/Receive files or a drop instead.
 pub const CLIPBOARD_LIMIT_BYTES: u64 = 512 * 1024 * 1024;

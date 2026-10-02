@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::RemoteSessionId;
+use crate::{FileDeliveryRequest, RemoteSessionId, ScriptRunRequest};
 
 pub fn default_enabled() -> bool {
     true
@@ -95,9 +95,23 @@ pub struct ConnectionApproval {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentCommand {
     Uninstall,
-    RotateToken { token: String },
-    EndSession { session_id: RemoteSessionId },
-    StartBackgroundSession { request: AgentSessionRequest },
+    RotateToken {
+        token: String,
+    },
+    EndSession {
+        session_id: RemoteSessionId,
+    },
+    StartBackgroundSession {
+        request: AgentSessionRequest,
+    },
+    /// Runs a toolbox script and reports the outcome over HTTPS.
+    RunScript {
+        run: ScriptRunRequest,
+    },
+    /// Downloads a toolbox file from the server and saves it.
+    DeliverFile {
+        delivery: FileDeliveryRequest,
+    },
 }
 
 /// Agent-to-coordinator lifecycle notifications.
@@ -260,6 +274,43 @@ mod tests {
             })
             .unwrap(),
             r#"{"type":"updating","version":"0.3.1"}"#
+        );
+    }
+
+    #[test]
+    fn toolbox_commands_use_tagged_json() {
+        let run = AgentCommand::RunScript {
+            run: ScriptRunRequest {
+                run_id: "run-1".into(),
+                language: crate::ScriptLanguage::Powershell,
+                body: "Get-Date".into(),
+                run_as: crate::RunAs::User,
+                timeout_seconds: 300,
+            },
+        };
+        let json = serde_json::to_string(&run).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"run_script","run":{"run_id":"run-1","language":"powershell","body":"Get-Date","run_as":"user","timeout_seconds":300}}"#
+        );
+        assert_eq!(serde_json::from_str::<AgentCommand>(&json).unwrap(), run);
+        let delivery = AgentCommand::DeliverFile {
+            delivery: FileDeliveryRequest {
+                delivery_id: "delivery-1".into(),
+                file_name: "setup.exe".into(),
+                size_bytes: 3,
+                sha256: "a".repeat(64),
+                destination: crate::FileDeliveryDestination::Public,
+            },
+        };
+        let json = serde_json::to_string(&delivery).unwrap();
+        assert!(
+            json.starts_with(r#"{"type":"deliver_file","delivery":{"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentCommand>(&json).unwrap(),
+            delivery
         );
     }
 

@@ -318,6 +318,21 @@ impl Drop for Presenter {
 
 /// Retries `work` on the main queue until the UI state can be borrowed. Work
 /// for a replaced or closed presenter is discarded.
+/// Refreshes the open session window's controls, from any thread. Unlike
+/// [`Presenter::refresh_controls`] it needs no presenter, so state that
+/// outlives reconnects can show its changes without a frame arriving.
+pub fn refresh_open_controls() {
+    DispatchQueue::main().exec_async(|| {
+        UI.with(|state| {
+            if let Ok(state) = state.try_borrow()
+                && let Some(ui) = state.as_ref()
+            {
+                ui.input_view.refresh_debug(false);
+            }
+        });
+    });
+}
+
 fn exec_with_ui(id: u64, work: impl Fn(&MacUi) + Send + 'static) {
     DispatchQueue::main().exec_async(move || run_with_ui(id, work));
 }
@@ -538,7 +553,7 @@ impl MacUi {
             control,
             debug.clone(),
         );
-        window.setContentMinSize(NSSize::new(680., 240.));
+        window.setContentMinSize(NSSize::new(730., 240.));
         window.setContentView(Some(&view));
         window.setDelegate(Some(ProtocolObject::from_ref(&*view)));
         let layer = unsafe { AVSampleBufferDisplayLayer::new() };

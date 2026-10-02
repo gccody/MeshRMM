@@ -22,11 +22,16 @@
       "database_id": "4650d279-149e-4a0b-8ec9-3058711885ea"
     }
   ],
-  // The latest screen thumbnail of each Agent; see docs/screen-thumbnails.md.
+  // The latest screen thumbnail of each Agent (docs/screen-thumbnails.md) and
+  // the toolbox's library files (docs/toolbox.md).
   "r2_buckets": [
     {
       "binding": "THUMBNAILS",
       "bucket_name": "meshrmm-thumbnails"
+    },
+    {
+      "binding": "TOOLBOX",
+      "bucket_name": "meshrmm-toolbox"
     }
   ],
   // Per-company usage for the platform cost report; see docs/cost-tracking.md.

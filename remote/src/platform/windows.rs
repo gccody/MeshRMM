@@ -662,6 +662,7 @@ fn test_sink(
         remote_cursor_hidden: Default::default(),
         session_close_action: Default::default(),
         restarting: Default::default(),
+        toolbox: Default::default(),
         quality: Default::default(),
         chroma: Default::default(),
         profiles: Arc::new(vec![

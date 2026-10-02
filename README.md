@@ -112,6 +112,17 @@ The viewer remembers the choice for later sessions and changes the size of a
 connected computer's virtual monitor right away. The setting does nothing
 while a real monitor is connected.
 
+## Toolbox
+
+The dashboard's **Toolbox** page keeps PowerShell and Command Prompt scripts and
+a library of files, each private to the user who added it or shared with the
+company. Scripts run on a device from the dashboard or from the viewer's
+toolbox button, as the signed-in user or as SYSTEM; with nobody signed in they
+run as SYSTEM. The viewer's toolbox also sends library files to the connected
+device's Documents transfer folder, or to Public Documents from the background
+desktop. The server hands both to the Agent, so they work in background mode
+too. See [the toolbox](docs/toolbox.md).
+
 ## Preconfigured deployment
 
 The viewer loads sidecar JSON next to its executable. The installed Agent reads
@@ -697,7 +708,8 @@ Application-specific rendering limitations can still cause flicker. Session 0 ha
 Win+R, Windows-key shortcuts do nothing: the Windows key, and keys pressed while it
 is held, never reach applications. The Apps key opens the selected item's context menu. It does not switch the console desktop or move the
 console pointer. Console audio, clipboard synchronization, file-transfer UI, chat,
-blackout, input blocking, and Ctrl+Alt+Del are unavailable in background mode.
+blackout, input blocking, and Ctrl+Alt+Del are unavailable in background mode;
+the toolbox's scripts and files work there.
 Operations performed inside the workspace still affect the same machine, and
 SYSTEM has a different profile and network credentials from the signed-in user.
 

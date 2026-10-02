@@ -119,6 +119,7 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
     let response = create_session_for_device(
         environment,
         &handoff.device_id,
+        &handoff.user_id,
         &viewer_name,
         handoff.start_in_background,
         &handoff.reason,
@@ -146,6 +147,7 @@ pub(crate) async fn redeem_handoff(request: &Request, environment: &Env) -> Resu
 pub(crate) async fn create_session_for_device(
     environment: &Env,
     device_id: &str,
+    user_id: &str,
     viewer_name: &str,
     start_in_background: bool,
     connection_reason: &str,
@@ -244,6 +246,7 @@ pub(crate) async fn create_session_for_device(
         connection_reason,
         blackout_message: &policy.blackout_message,
         viewer_name,
+        user_id,
         session_id: &session_id,
         device_id,
         company_id: &policy.company_id,

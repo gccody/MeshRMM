@@ -259,6 +259,9 @@ struct SessionInit<'a> {
     connection_approval: Option<&'a meshrmm_protocol_types::ConnectionApproval>,
     connection_reason: &'a str,
     viewer_name: &'a str,
+    /// The dashboard user who started the session, whose toolbox the
+    /// viewer may use.
+    user_id: &'a str,
     session_id: &'a str,
     device_id: &'a str,
     company_id: &'a str,
@@ -364,6 +367,94 @@ async fn route(mut request: Request, environment: Env) -> Result<Response> {
         (Method::Get, ["v1", "agents", device_id, "thumbnail"]) => {
             get_agent_thumbnail(&request, &environment, device_id).await
         }
+        (Method::Post, ["v1", "agents", device_id, "script-runs"]) => {
+            run_script_on_agent(&mut request, &environment, device_id).await
+        }
+        (Method::Post, ["v1", "agents", device_id, "script-runs", run_id, "result"]) => {
+            report_script_run(&mut request, &environment, device_id, run_id).await
+        }
+        (
+            Method::Get,
+            [
+                "v1",
+                "agents",
+                device_id,
+                "file-deliveries",
+                delivery_id,
+                "content",
+            ],
+        ) => agent_delivery_content(&request, &environment, device_id, delivery_id).await,
+        (
+            Method::Post,
+            [
+                "v1",
+                "agents",
+                device_id,
+                "file-deliveries",
+                delivery_id,
+                "result",
+            ],
+        ) => report_file_delivery(&mut request, &environment, device_id, delivery_id).await,
+        (Method::Get, ["v1", "toolbox"]) => list_toolbox(&request, &environment).await,
+        (Method::Post, ["v1", "toolbox", "scripts"]) => {
+            create_toolbox_script(&mut request, &environment).await
+        }
+        (Method::Get, ["v1", "toolbox", "scripts", script_id]) => {
+            get_toolbox_script(&request, &environment, script_id).await
+        }
+        (Method::Put, ["v1", "toolbox", "scripts", script_id]) => {
+            update_toolbox_script(&mut request, &environment, script_id).await
+        }
+        (Method::Delete, ["v1", "toolbox", "scripts", script_id]) => {
+            delete_toolbox_script(&request, &environment, script_id).await
+        }
+        (Method::Post, ["v1", "toolbox", "files"]) => {
+            upload_toolbox_file(&mut request, &environment).await
+        }
+        (Method::Put, ["v1", "toolbox", "files", file_id]) => {
+            update_toolbox_file(&mut request, &environment, file_id).await
+        }
+        (Method::Delete, ["v1", "toolbox", "files", file_id]) => {
+            delete_toolbox_file(&request, &environment, file_id).await
+        }
+        (Method::Get, ["v1", "toolbox", "files", file_id, "content"]) => {
+            download_toolbox_file(&request, &environment, file_id).await
+        }
+        (Method::Get, ["v1", "script-runs"]) => list_script_runs(&request, &environment).await,
+        (Method::Get, ["v1", "script-runs", run_id]) => {
+            get_script_run(&request, &environment, run_id).await
+        }
+        (Method::Get, ["v1", "remote", "sessions", session_id, "toolbox"]) => {
+            session_toolbox(&request, &environment, session_id).await
+        }
+        (Method::Post, ["v1", "remote", "sessions", session_id, "script-runs"]) => {
+            session_run_script(&mut request, &environment, session_id).await
+        }
+        (
+            Method::Get,
+            [
+                "v1",
+                "remote",
+                "sessions",
+                session_id,
+                "script-runs",
+                run_id,
+            ],
+        ) => session_script_run(&request, &environment, session_id, run_id).await,
+        (Method::Post, ["v1", "remote", "sessions", session_id, "file-deliveries"]) => {
+            session_deliver_file(&mut request, &environment, session_id).await
+        }
+        (
+            Method::Get,
+            [
+                "v1",
+                "remote",
+                "sessions",
+                session_id,
+                "file-deliveries",
+                delivery_id,
+            ],
+        ) => session_file_delivery(&request, &environment, session_id, delivery_id).await,
         (Method::Get, ["v1", "agents", device_id, "connect"]) => {
             let authorization = match authorize_agent(&request, &environment, device_id).await {
                 Ok(authorization) => authorization,

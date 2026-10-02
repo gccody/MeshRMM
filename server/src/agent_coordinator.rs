@@ -214,6 +214,29 @@ impl AgentCoordinator {
                 );
                 Response::ok("notified")
             }
+            (Method::Post, "/command") => {
+                let command: AgentCommand = request.json().await?;
+                if !matches!(
+                    command,
+                    AgentCommand::RunScript { .. } | AgentCommand::DeliverFile { .. }
+                ) {
+                    return Response::error("unsupported Agent command", 400);
+                }
+                if self.revoke_if_company_inactive().await? {
+                    return Response::error("company is not active", 403);
+                }
+                let payload = serde_json::to_string(&command)?;
+                for agent in self.state.get_websockets_with_tag(AGENT_TAG) {
+                    match agent.send_with_str(&payload) {
+                        Ok(()) => return Response::ok("sent"),
+                        Err(error) => {
+                            console_error!("event=agent_command_send_failed error={}", error);
+                            let _ = agent.close(Some(1011), Some("stale Agent connection"));
+                        }
+                    }
+                }
+                Response::error("Agent is offline", 409)
+            }
             (Method::Post, "/resume-request") => {
                 let session: AgentSessionRequest = request.json().await?;
                 if self.revoke_if_company_inactive().await? {
@@ -893,6 +916,27 @@ pub async fn request_uninstall(environment: &Env, device_id: &str) -> Result<()>
         .fetch_with_request(request)
         .await?;
     crate::ensure_success(response, "notify Agent uninstall").await
+}
+
+/// Sends a toolbox command to the Agent if it is connected. Returns whether
+/// the Agent received it; an offline Agent or inactive company did not.
+pub async fn send_command(
+    environment: &Env,
+    device_id: &str,
+    command: &AgentCommand,
+) -> Result<bool> {
+    let request = crate::internal_json_request("https://agent.internal/command", command)?;
+    let mut response = crate::object_stub(environment, "AGENT_COORDINATOR", device_id)?
+        .fetch_with_request(request)
+        .await?;
+    match response.status_code() {
+        200..=299 => Ok(true),
+        403 | 409 => Ok(false),
+        status => Err(Error::RustError(format!(
+            "failed to send the Agent command: HTTP {status}: {}",
+            response.text().await.unwrap_or_default()
+        ))),
+    }
 }
 
 fn lease_matches(
