@@ -1,0 +1,12 @@
+#!/bin/sh
+# Removes Claude attribution (co-author trailers and "Generated with Claude
+# Code" footers) from the commit message in "$1". CI runs this hook against each
+# commit in the repository owner's pull requests and fails when it would change
+# one.
+#
+# Enable it once per clone with: git config core.hooksPath .githooks
+pattern='^[[:space:]]*(co-authored-by:.*(claude|anthropic\.com)|.*generated with \[claude code\])'
+if grep -qiE "$pattern" "$1"; then
+  { grep -viE "$pattern" "$1" || true; } > "$1.tmp"
+  mv "$1.tmp" "$1"
+fi

@@ -81,6 +81,34 @@ jobs:
               - 'server/wrangler.jsonc'
               - 'server/migrations/**'
 
+  # Only the repository owner's pull requests are checked; other contributors
+  # may credit whomever they like. Skipped required checks count as passing.
+  commit-messages:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.user.login == github.repository_owner }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # Squash merges keep the branch's commit messages, so a trailer on any
+      # commit in the pull request would land on main.
+      - name: Reject Claude attribution
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          status=0
+          for commit in $(git rev-list "$BASE..$HEAD"); do
+            git log -1 --format=%B "$commit" > "$RUNNER_TEMP/msg"
+            cp "$RUNNER_TEMP/msg" "$RUNNER_TEMP/orig"
+            .githooks/commit-msg "$RUNNER_TEMP/msg"
+            if ! cmp -s "$RUNNER_TEMP/msg" "$RUNNER_TEMP/orig"; then
+              echo "::error::$commit credits Claude; remove the attribution and force-push."
+              status=1
+            fi
+          done
+          exit $status
+
   rust-windows:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
