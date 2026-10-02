@@ -18,14 +18,11 @@ use windows::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TokenPrimary,
     TokenSessionId,
 };
-use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::RemoteDesktop::*;
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessAsUserW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_NO_WINDOW, CreateProcessAsUserW, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    OpenProcessToken, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    TerminateProcess, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -39,7 +36,7 @@ use super::connection_notification::ConnectionNotification;
 use super::input::WindowsInputController;
 use super::platform::ScreenInput;
 use super::virtual_display::{HeadlessTarget, VirtualDisplay};
-use crate::win32::{OwnedHandle, wide};
+use crate::win32::{HandleListAttribute, OwnedHandle, create_pipe, wide};
 
 mod child;
 #[cfg(test)]
@@ -2186,63 +2183,6 @@ fn read_approval_events(
     };
     if let (Some(answer), Err(message)) = (answer, result) {
         let _ = answer.send(Err(message));
-    }
-}
-
-/// Creates a non-inheritable pipe and returns its (read, write) ends.
-fn create_pipe() -> anyhow::Result<(OwnedHandle, OwnedHandle)> {
-    let mut read = HANDLE::default();
-    let mut write = HANDLE::default();
-    unsafe { CreatePipe(&mut read, &mut write, None, 0) }
-        .context("failed to create desktop-helper IPC pipe")?;
-    Ok((OwnedHandle(read), OwnedHandle(write)))
-}
-
-/// A PROC_THREAD_ATTRIBUTE_HANDLE_LIST that limits what a child inherits to
-/// the listed handles. The handle array must outlive the process launch.
-struct HandleListAttribute<'a> {
-    // u64 storage keeps the opaque attribute list pointer-aligned.
-    buffer: Vec<u64>,
-    _handles: std::marker::PhantomData<&'a [HANDLE]>,
-}
-
-impl<'a> HandleListAttribute<'a> {
-    fn new(handles: &'a [HANDLE]) -> anyhow::Result<Self> {
-        let mut size = 0;
-        // The sizing call reports ERROR_INSUFFICIENT_BUFFER by design.
-        let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
-        anyhow::ensure!(size > 0, "Windows reported no process attribute list size");
-        let mut buffer = vec![0u64; size.div_ceil(std::mem::size_of::<u64>())];
-        let list = LPPROC_THREAD_ATTRIBUTE_LIST(buffer.as_mut_ptr().cast());
-        unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut size) }
-            .context("failed to create the desktop-helper process attribute list")?;
-        let attribute = Self {
-            buffer,
-            _handles: std::marker::PhantomData,
-        };
-        unsafe {
-            UpdateProcThreadAttribute(
-                attribute.list(),
-                0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                Some(handles.as_ptr().cast()),
-                std::mem::size_of_val(handles),
-                None,
-                None,
-            )
-        }
-        .context("failed to limit the handles a desktop helper inherits")?;
-        Ok(attribute)
-    }
-
-    fn list(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
-        LPPROC_THREAD_ATTRIBUTE_LIST(self.buffer.as_ptr().cast_mut().cast())
-    }
-}
-
-impl Drop for HandleListAttribute<'_> {
-    fn drop(&mut self) {
-        unsafe { DeleteProcThreadAttributeList(self.list()) };
     }
 }
 

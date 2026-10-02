@@ -64,6 +64,12 @@ pub async fn run_receiver(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .policy = bootstrap.clear_clipboard_policy;
+    // Resumes keep the session and its client token.
+    resume_state.toolbox.connect(
+        &config.server,
+        bootstrap.session_id.as_str(),
+        &bootstrap.signaling_token,
+    );
     let identity = meshrmm_session_transport::identity::PeerIdentity::load(
         &meshrmm_session_transport::identity::viewer_directory()?,
     )?;

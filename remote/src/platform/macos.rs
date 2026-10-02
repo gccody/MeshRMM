@@ -45,13 +45,14 @@ use crate::h264::annex_b_to_length_prefixed;
 mod app;
 mod keyboard;
 mod presenter;
+mod script_output;
 mod toolbar;
 
 use app::close_connecting_window;
 #[cfg(test)]
 use app::{WheelNormalizer, normalized_video_position};
 pub use app::{monotonic_timestamp_us, run_application, show_launch_status, show_notice};
-pub use presenter::Presenter;
+pub use presenter::{Presenter, refresh_open_controls};
 
 #[link(name = "VideoToolbox", kind = "framework")]
 unsafe extern "C" {
