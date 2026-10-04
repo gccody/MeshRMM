@@ -4,6 +4,7 @@
 //! uses the session helper of whichever session is on the console.
 pub(crate) mod approval;
 mod capture;
+mod cursor;
 pub(crate) mod display;
 mod encoder;
 pub(crate) mod helper;
@@ -11,6 +12,7 @@ mod input;
 mod keep_awake;
 mod keymap;
 pub(crate) mod local;
+pub(crate) mod session_close;
 pub(crate) mod ui;
 mod wallpaper;
 

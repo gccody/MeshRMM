@@ -1,7 +1,9 @@
 //! The screen and input of the session this process runs in. A console Agent
 //! uses them directly; the installed Agent's session helpers serve them to the
 //! coordinator.
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::Context;
 use meshrmm_protocol::{
@@ -20,9 +22,50 @@ pub(crate) struct Started {
     pub format: VideoFormat,
 }
 
+/// Windows the capture leaves out: the display border and the blackout,
+/// which only the Mac's user sees.
+#[derive(Default)]
+pub(crate) struct Excluded {
+    windows: Mutex<BTreeMap<&'static str, Vec<u32>>>,
+    capture: Mutex<Weak<Capture>>,
+}
+
+impl Excluded {
+    fn all(&self) -> Vec<u32> {
+        self.windows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    /// Replaces `owner`'s windows and updates the running capture.
+    fn set(&self, owner: &'static str, windows: Vec<u32>) -> anyhow::Result<()> {
+        self.windows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(owner, windows);
+        let capture = self
+            .capture
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade();
+        match capture {
+            Some(capture) => capture.exclude_windows(&self.all()),
+            None => Ok(()),
+        }
+    }
+
+    fn attach(&self, capture: &Arc<Capture>) {
+        *self.capture.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(capture);
+    }
+}
+
 /// Captures and encodes one display at a time.
 pub(crate) struct LocalScreen {
-    capture: Option<Capture>,
+    capture: Option<Arc<Capture>>,
     input: Arc<LocalInput>,
     border_enabled: bool,
     /// The border around the captured display, which capture leaves out.
@@ -45,14 +88,13 @@ impl LocalScreen {
     pub(crate) fn set_display_border(&mut self, enabled: bool) -> anyhow::Result<()> {
         self.border_enabled = enabled;
         self.border = None;
+        let mut windows = Vec::new();
         if enabled && let Some(display) = &self.active_display {
             let border = ui::DisplayBorder::show(display)?;
-            if let Some(capture) = &self.capture {
-                capture.exclude_windows(border.window_ids())?;
-            }
+            windows = border.window_ids().to_vec();
             self.border = Some(border);
         }
-        Ok(())
+        self.input.excluded.set("border", windows)
     }
 
     pub(crate) fn start(
@@ -69,15 +111,15 @@ impl LocalScreen {
             .controller()?
             .set_active_display(active_display.clone())?;
         self.input.clear_annotations_unless(active_display.id);
+        let mut border_windows = Vec::new();
         if self.border_enabled {
-            self.border = Some(ui::DisplayBorder::show(&active_display)?);
+            let border = ui::DisplayBorder::show(&active_display)?;
+            border_windows = border.window_ids().to_vec();
+            self.border = Some(border);
         }
+        self.input.excluded.set("border", border_windows)?;
         self.active_display = Some(active_display.clone());
-        let excluded = self
-            .border
-            .as_ref()
-            .map(|border| border.window_ids().to_vec())
-            .unwrap_or_default();
+        let excluded = self.input.excluded.all();
         let capture = Capture::start(
             &active_display,
             CaptureConfig {
@@ -91,6 +133,8 @@ impl LocalScreen {
             sink,
         )?;
         let format = capture.format();
+        let capture = Arc::new(capture);
+        self.input.excluded.attach(&capture);
         self.capture = Some(capture);
         Ok(Started {
             displays,
@@ -149,6 +193,11 @@ pub(crate) struct LocalInput {
     wallpaper: Mutex<wallpaper::Wallpaper>,
     clipboard: Option<Mutex<meshrmm_clipboard::ClipboardSync>>,
     indicator: Mutex<Option<ui::SessionIndicator>>,
+    excluded: Arc<Excluded>,
+    blackout: Mutex<Option<ui::Blackout>>,
+    blackout_message: Mutex<String>,
+    /// Whether the technician blocked local input, apart from the blackout.
+    manually_blocked: AtomicBool,
     notification: Mutex<Option<ui::ConnectionNotification>>,
     annotations: Mutex<Option<(meshrmm_protocol::DisplayId, ui::AnnotationOverlay)>>,
 }
@@ -167,6 +216,10 @@ impl LocalInput {
                 .ok()
                 .map(Mutex::new),
             indicator: Mutex::default(),
+            excluded: Arc::default(),
+            blackout: Mutex::default(),
+            blackout_message: Mutex::default(),
+            manually_blocked: AtomicBool::new(false),
             notification: Mutex::default(),
             annotations: Mutex::default(),
         })
@@ -176,6 +229,10 @@ impl LocalInput {
     /// chat, the banner when company policy shows it, and the connection
     /// notification once.
     pub(crate) fn begin_session(&self, session: &SessionUi) {
+        *self
+            .blackout_message
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = session.blackout_message.clone();
         match ui::SessionIndicator::show(
             &session.viewer_name,
             self.chat.clone(),
@@ -233,12 +290,23 @@ impl LocalInput {
                 cursor: input.cursor_shape(),
                 viewer_controls_input: input.viewer_controls_input(),
                 agent_pointer_display: input.agent_pointer_display(),
+                agent_input_blocked: input.blocked(),
+                blacked_out: self.blacked_out(),
             },
         )
     }
 
     /// Undoes everything a session changed, for a helper the session left.
+    fn blacked_out(&self) -> bool {
+        self.blackout
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     pub(crate) fn end_session(&self) {
+        let _ = self.set_blackout(false);
+        let _ = self.set_agent_input_blocked(false);
         let _ = self.release_all();
         let _ = self.set_prevent_idle_lock(false);
         let _ = self.set_wallpaper_hidden(false);
@@ -271,21 +339,48 @@ impl ScreenInput for LocalInput {
             enabled,
         )
     }
+    /// Blacks out every screen for the Mac's user, and blocks their input,
+    /// while the technician keeps seeing and controlling the Mac.
     fn set_blackout(&self, enabled: bool) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !enabled,
-            "blacking out the screen is not available on macOS yet"
-        );
+        let mut blackout = self.blackout.lock().unwrap_or_else(|e| e.into_inner());
+        if enabled && blackout.is_none() {
+            // Block input before hiding the screens; undo it if that fails.
+            self.controller()?.set_blocked(true)?;
+            let message = self
+                .blackout_message
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let shown = ui::Blackout::show(&message).and_then(|shown| {
+                self.excluded.set("blackout", shown.window_ids().to_vec())?;
+                Ok(shown)
+            });
+            match shown {
+                Ok(shown) => *blackout = Some(shown),
+                Err(error) => {
+                    let _ = self
+                        .controller()?
+                        .set_blocked(self.manually_blocked.load(Ordering::SeqCst));
+                    return Err(error);
+                }
+            }
+        } else if !enabled && blackout.take().is_some() {
+            self.excluded.set("blackout", Vec::new())?;
+            self.controller()?
+                .set_blocked(self.manually_blocked.load(Ordering::SeqCst))?;
+        }
         Ok(())
     }
     fn maintenance_state(&self) -> Option<meshrmm_protocol::SessionMessage> {
-        None
+        Some(meshrmm_protocol::SessionMessage::MaintenanceState {
+            agent_input_blocked: self.controller().ok()?.blocked(),
+            blacked_out: self.blacked_out(),
+        })
     }
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !blocked,
-            "blocking local input is not available on macOS yet"
-        );
+        self.controller()?
+            .set_blocked(blocked || self.blacked_out())?;
+        self.manually_blocked.store(blocked, Ordering::SeqCst);
         Ok(())
     }
     fn apply_files(&self, message: meshrmm_protocol::FileMessage) -> anyhow::Result<()> {

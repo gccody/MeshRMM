@@ -1,6 +1,4 @@
-//! Viewer-selected cleanup for the viewed Windows session once a remote session ends.
-// The macOS Agent records the choices but has no close actions yet.
-#![cfg_attr(target_os = "macos", allow(dead_code))]
+//! Viewer-selected cleanup for the viewed session once a remote session ends.
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -87,7 +85,7 @@ impl SessionClose {
     /// signed in to it. Resolving the user queries Terminal Services, which can
     /// stall during a sign-in, so the periodic check of an unchanged session runs
     /// on a blocking thread instead of the caller's runtime worker.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub fn set_target(self: &std::sync::Arc<Self>, session: &DesktopSession) {
         let now = Instant::now();
         match self.refresh(session, now) {
@@ -106,9 +104,6 @@ impl SessionClose {
             }
         }
     }
-
-    #[cfg(target_os = "macos")]
-    pub fn set_target(self: &std::sync::Arc<Self>, _session: &DesktopSession) {}
 
     /// Resolves the target on the calling thread, as [`Self::set_target`] does after a switch.
     #[cfg(test)]
@@ -167,7 +162,7 @@ impl SessionClose {
         if state.target.as_ref().map(|target| &target.logon) != Some(&logon) {
             match &logon {
                 Some(logon) => {
-                    tracing::info!(session = %session.label(), windows_session = logon.session, user = %logon.user, "viewed Windows logon recorded for session close")
+                    tracing::info!(session = %session.label(), logon_session = logon.session, user = %logon.user, "viewed sign-in recorded for session close")
                 }
                 None => {
                     tracing::info!(session = %session.label(), "viewed session has no signed-in user for session close")
@@ -200,20 +195,14 @@ impl SessionClose {
             })
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub fn run(&self, session_id: &meshrmm_protocol::RemoteSessionId) {
         self.spawn(session_id);
     }
 
-    #[cfg(target_os = "macos")]
-    pub fn run(&self, _session_id: &meshrmm_protocol::RemoteSessionId) {}
-
-    #[cfg(target_os = "macos")]
-    pub async fn finish(&self, _session_id: &meshrmm_protocol::RemoteSessionId) {}
-
     /// Runs the pending work like [`Self::run`] and waits for it, for a coordinator that is
     /// about to exit.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub async fn finish(&self, session_id: &meshrmm_protocol::RemoteSessionId) {
         if let Some(task) = self.spawn(session_id) {
             let _ = task.await;
@@ -268,6 +257,76 @@ impl SessionClose {
             }
         }))
     }
+}
+
+/// The pending work, for the Mac user still signed in on the console.
+#[cfg(target_os = "macos")]
+impl SessionClose {
+    fn spawn(
+        &self,
+        session_id: &meshrmm_protocol::RemoteSessionId,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let pending = self.take()?;
+        let session_id = session_id.clone();
+        Some(tokio::task::spawn_blocking(move || {
+            let Pending {
+                action,
+                clear_clipboard,
+                target,
+                logon,
+            } = pending;
+            let current = match resolve_logon(&target)
+                .and_then(|current| same_logon(logon.as_ref(), &current).map(|()| current))
+            {
+                Ok(current) => current,
+                Err(error) => {
+                    tracing::warn!(%session_id, ?action, clear_clipboard, uid = logon.as_ref().map(|logon| logon.session), error = ?error, "session close cleanup skipped");
+                    return;
+                }
+            };
+            let (uid, user) = (current.session, current.user);
+            // Clear first so a locked session does not keep the copied data.
+            if clear_clipboard {
+                match crate::remote::macos::session_close::clear_clipboard(uid) {
+                    Ok(()) => {
+                        tracing::info!(%session_id, uid, %user, "cleared clipboard on session close")
+                    }
+                    Err(error) => {
+                        tracing::warn!(%session_id, uid, %user, error = ?error, "could not clear clipboard on session close")
+                    }
+                }
+            }
+            let result = match action {
+                SessionCloseAction::NoAction => return,
+                SessionCloseAction::Lock => crate::remote::macos::session_close::lock(uid),
+                SessionCloseAction::Logout => crate::remote::macos::session_close::log_out(uid),
+            };
+            match result {
+                Ok(()) => {
+                    tracing::info!(%session_id, ?action, uid, %user, "ran session close action")
+                }
+                Err(error) => {
+                    tracing::warn!(%session_id, ?action, uid, %user, error = ?error, "session close action failed")
+                }
+            }
+        }))
+    }
+}
+
+/// The Mac user signed in on the console. A sign-in is told apart by the
+/// start of the user's loginwindow process.
+#[cfg(target_os = "macos")]
+fn resolve_logon(target: &DesktopSession) -> anyhow::Result<Logon> {
+    anyhow::ensure!(
+        *target == DesktopSession::Console,
+        "only the console has a Mac user"
+    );
+    let (uid, logon_id, user) = crate::remote::macos::session_close::console_logon()?;
+    Ok(Logon {
+        session: uid,
+        logon_id,
+        user,
+    })
 }
 
 /// Succeeds when `current` is the same sign-in the viewer was shown.

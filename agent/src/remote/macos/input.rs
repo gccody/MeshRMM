@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use meshrmm_protocol::{CursorShape, Display, DisplayId, PointerButton, RemoteInput};
-use objc2_core_foundation::{CFMachPort, CFRetained, CFRunLoop, CGPoint, kCFRunLoopCommonModes};
+use objc2_core_foundation::{
+    CFMachPort, CFRetained, CFRunLoop, CGPoint, kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
+};
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
     CGEventTapOptions, CGEventTapPlacement, CGEventTapProxy, CGEventType, CGMouseButton,
@@ -50,8 +52,9 @@ pub(crate) struct InputController {
     caps_lock: bool,
     position: CGPoint,
     last_click: Option<Click>,
-    ownership: Option<OwnershipTap>,
-    viewer_controls_input: Arc<AtomicBool>,
+    tap: Option<InputTap>,
+    tap_state: Arc<TapState>,
+    viewer_cursor: std::cell::Cell<CursorShape>,
 }
 
 // SAFETY: the event source is only used behind the controller's lock, and
@@ -69,8 +72,8 @@ impl InputController {
         // events; each event carries the viewer's own.
         let source = CGEventSource::new(CGEventSourceStateID::Private)
             .context("Quartz could not create an event source")?;
-        let viewer_controls_input = Arc::new(AtomicBool::new(false));
-        let ownership = OwnershipTap::start(Arc::clone(&viewer_controls_input))
+        let tap_state = Arc::new(TapState::default());
+        let tap = InputTap::start(Arc::clone(&tap_state))
             .inspect_err(
                 |error| tracing::warn!(%error, "could not follow who controls the pointer"),
             )
@@ -86,8 +89,9 @@ impl InputController {
             caps_lock: false,
             position: current_pointer(),
             last_click: None,
-            ownership,
-            viewer_controls_input,
+            tap,
+            tap_state,
+            viewer_cursor: std::cell::Cell::new(CursorShape::Default),
         })
     }
 
@@ -109,16 +113,18 @@ impl InputController {
     }
 
     pub(crate) fn viewer_controls_input(&self) -> bool {
-        if self.ownership.is_none() {
+        if self.tap.is_none() {
             // Without the tap, only a pointer the user moved away shows local use.
             let pointer = current_pointer();
             if (pointer.x - self.position.x).abs() > 1.0
                 || (pointer.y - self.position.y).abs() > 1.0
             {
-                self.viewer_controls_input.store(false, Ordering::SeqCst);
+                self.tap_state
+                    .viewer_controls_input
+                    .store(false, Ordering::SeqCst);
             }
         }
-        self.viewer_controls_input.load(Ordering::SeqCst)
+        self.tap_state.viewer_controls_input.load(Ordering::SeqCst)
     }
 
     pub(crate) fn agent_pointer_display(&self) -> Option<DisplayId> {
@@ -129,8 +135,13 @@ impl InputController {
         super::display::at(&self.displays, pointer.x, pointer.y)
     }
 
+    /// The cursor's shape while the viewer controls input; otherwise the
+    /// viewer shows the video's cursor and keeps the last shape.
     pub(crate) fn cursor_shape(&self) -> CursorShape {
-        CursorShape::Default
+        if self.viewer_controls_input() {
+            self.viewer_cursor.set(super::cursor::current());
+        }
+        self.viewer_cursor.get()
     }
 
     pub(crate) fn apply(&mut self, input: RemoteInput) -> anyhow::Result<()> {
@@ -145,8 +156,10 @@ impl InputController {
                 display.id.0
             );
         }
-        if self.ownership.is_none() {
-            self.viewer_controls_input.store(true, Ordering::SeqCst);
+        if self.tap.is_none() {
+            self.tap_state
+                .viewer_controls_input
+                .store(true, Ordering::SeqCst);
         }
         match input {
             RemoteInput::TypeText { text, .. } => {
@@ -199,6 +212,24 @@ impl InputController {
                 self.key(scan_code, extended, pressed)
             }
         }
+    }
+
+    pub(crate) fn blocked(&self) -> bool {
+        self.tap_state.block.load(Ordering::SeqCst)
+    }
+
+    /// Blocks or unblocks the local user's keyboard and pointer; the viewer's
+    /// input still passes.
+    pub(crate) fn set_blocked(&mut self, blocked: bool) -> anyhow::Result<()> {
+        if blocked {
+            anyhow::ensure!(
+                self.tap.as_ref().is_some_and(|tap| tap.blocks),
+                "blocking local input needs the Accessibility permission for the MeshRMM Agent"
+            );
+            self.release_all()?;
+        }
+        self.tap_state.block.store(blocked, Ordering::SeqCst);
+        Ok(())
     }
 
     pub(crate) fn release_all(&mut self) -> anyhow::Result<()> {
@@ -442,6 +473,7 @@ impl InputController {
 
 impl Drop for InputController {
     fn drop(&mut self) {
+        self.tap_state.block.store(false, Ordering::SeqCst);
         let _ = self.release_all();
     }
 }
@@ -482,24 +514,37 @@ fn current_pointer() -> CGPoint {
     CGEvent::location(CGEvent::new(None).as_deref())
 }
 
-/// Follows who last used the keyboard or pointer, from a listen-only event
-/// tap, which needs the Input Monitoring permission.
-struct OwnershipTap {
-    run_loop: SendRunLoop,
+/// What the event tap shares with the input controller.
+#[derive(Default)]
+struct TapState {
+    viewer_controls_input: AtomicBool,
+    /// Drops the local user's keyboard and pointer input.
+    block: AtomicBool,
+    /// The tap itself, to turn it back on when macOS disables it.
+    port: std::sync::atomic::AtomicPtr<CFMachPort>,
+}
+
+/// An event tap that follows who last used the keyboard or pointer and can
+/// block the local user's input. Blocking needs an active tap, which needs
+/// the Accessibility permission; without one the tap only listens, which
+/// needs Input Monitoring.
+struct InputTap {
+    state: Arc<TapState>,
+    blocks: bool,
+    stopping: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-struct SendRunLoop(CFRetained<CFRunLoop>);
-// SAFETY: CFRunLoopStop may be called from any thread.
-unsafe impl Send for SendRunLoop {}
-
-impl OwnershipTap {
-    fn start(viewer_controls_input: Arc<AtomicBool>) -> anyhow::Result<Self> {
+impl InputTap {
+    fn start(state: Arc<TapState>) -> anyhow::Result<Self> {
         let (started, result) = std::sync::mpsc::channel();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stopping);
+        let tap_state = Arc::clone(&state);
         let thread = std::thread::Builder::new()
-            .name("meshrmm-input-ownership".into())
+            .name("meshrmm-input-tap".into())
             .spawn(move || {
-                let state = Arc::into_raw(viewer_controls_input);
+                let raw = Arc::into_raw(tap_state);
                 let mask = [
                     CGEventType::MouseMoved,
                     CGEventType::LeftMouseDown,
@@ -518,73 +563,107 @@ impl OwnershipTap {
                 ]
                 .into_iter()
                 .fold(0_u64, |mask, kind| mask | (1 << kind.0));
-                // SAFETY: the callback matches CGEventTapCallBack and `state`
-                // outlives the tap, which is disabled before it is released.
-                let tap = unsafe {
-                    CGEvent::tap_create(
-                        CGEventTapLocation::HIDEventTap,
-                        CGEventTapPlacement::TailAppendEventTap,
-                        CGEventTapOptions::ListenOnly,
-                        mask,
-                        Some(track_ownership),
-                        state.cast_mut().cast(),
-                    )
+                let create = |options| {
+                    // SAFETY: the callback matches CGEventTapCallBack and the
+                    // state outlives the tap, which is disabled before it is
+                    // released.
+                    unsafe {
+                        CGEvent::tap_create(
+                            CGEventTapLocation::HIDEventTap,
+                            CGEventTapPlacement::HeadInsertEventTap,
+                            options,
+                            mask,
+                            Some(filter_input),
+                            raw.cast_mut().cast(),
+                        )
+                    }
+                };
+                let (tap, blocks) = match create(CGEventTapOptions::Default) {
+                    Some(tap) => (Some(tap), true),
+                    None => (create(CGEventTapOptions::ListenOnly), false),
                 };
                 let Some(tap) = tap else {
-                    // SAFETY: the tap never took the reference.
-                    drop(unsafe { Arc::from_raw(state) });
+                    // SAFETY: no tap took the reference.
+                    drop(unsafe { Arc::from_raw(raw) });
                     let _ = started.send(Err(anyhow::anyhow!(
-                        "macOS refused an input event tap; allow the MeshRMM Agent under Input Monitoring in System Settings"
+                        "macOS refused an input event tap; allow the MeshRMM Agent under Accessibility and Input Monitoring in System Settings"
                     )));
                     return;
                 };
+                // SAFETY: `raw` is the live state.
+                unsafe { &*raw }
+                    .port
+                    .store(CFRetained::as_ptr(&tap).as_ptr(), Ordering::SeqCst);
                 let source = CFMachPort::new_run_loop_source(None, Some(&tap), 0);
                 let run_loop = CFRunLoop::current().expect("every thread has a run loop");
                 // SAFETY: kCFRunLoopCommonModes is a valid static mode.
                 run_loop.add_source(source.as_deref(), unsafe { kCFRunLoopCommonModes });
-                let _ = started.send(Ok(SendRunLoop(run_loop)));
-                CFRunLoop::run();
+                let _ = started.send(Ok(blocks));
+                while !stop.load(Ordering::SeqCst) {
+                    // SAFETY: kCFRunLoopDefaultMode is a valid static mode.
+                    CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.25, false);
+                }
                 CGEvent::tap_enable(&tap, false);
+                // SAFETY: `raw` is the live state.
+                unsafe { &*raw }
+                    .port
+                    .store(std::ptr::null_mut(), Ordering::SeqCst);
                 drop(tap);
                 // SAFETY: the disabled tap no longer calls back.
-                drop(unsafe { Arc::from_raw(state) });
+                drop(unsafe { Arc::from_raw(raw) });
             })
-            .context("could not start the input ownership thread")?;
-        let run_loop = result
-            .recv()
-            .context("the input ownership thread stopped")??;
+            .context("could not start the input tap thread")?;
+        let blocks = result.recv().context("the input tap thread stopped")??;
+        if !blocks {
+            tracing::warn!(
+                "the MeshRMM Agent cannot block local input until it is allowed under Accessibility in System Settings"
+            );
+        }
         Ok(Self {
-            run_loop,
+            state,
+            blocks,
+            stopping,
             thread: Some(thread),
         })
     }
 }
 
-impl Drop for OwnershipTap {
+impl Drop for InputTap {
     fn drop(&mut self) {
-        self.run_loop.0.stop();
+        self.state.block.store(false, Ordering::SeqCst);
+        self.stopping.store(true, Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
 
-unsafe extern "C-unwind" fn track_ownership(
+unsafe extern "C-unwind" fn filter_input(
     _proxy: CGEventTapProxy,
     kind: CGEventType,
     event: NonNull<CGEvent>,
     state: *mut c_void,
 ) -> *mut CGEvent {
-    // SAFETY: the tap was created with a live `AtomicBool` reference.
-    let viewer_controls_input = unsafe { &*state.cast::<AtomicBool>() };
-    if kind != CGEventType::TapDisabledByTimeout && kind != CGEventType::TapDisabledByUserInput {
-        // SAFETY: the event is valid for the duration of the callback.
-        let tag = CGEvent::integer_value_field(
-            Some(unsafe { event.as_ref() }),
-            CGEventField::EventSourceUserData,
-        );
-        viewer_controls_input.store(tag == INPUT_TAG, Ordering::SeqCst);
+    // SAFETY: the tap was created with a live `TapState` reference.
+    let state = unsafe { &*state.cast::<TapState>() };
+    if kind == CGEventType::TapDisabledByTimeout || kind == CGEventType::TapDisabledByUserInput {
+        let port = state.port.load(Ordering::SeqCst);
+        // SAFETY: the port is the live tap whenever it is set.
+        if let Some(port) = unsafe { port.as_ref() } {
+            CGEvent::tap_enable(port, true);
+        }
+        return event.as_ptr();
     }
+    // SAFETY: the event is valid for the duration of the callback.
+    let tag = CGEvent::integer_value_field(
+        Some(unsafe { event.as_ref() }),
+        CGEventField::EventSourceUserData,
+    );
+    let remote = tag == INPUT_TAG;
+    if !remote && state.block.load(Ordering::SeqCst) {
+        return std::ptr::null_mut();
+    }
+    state.viewer_controls_input.store(remote, Ordering::SeqCst);
     event.as_ptr()
 }
 

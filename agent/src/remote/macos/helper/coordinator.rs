@@ -134,9 +134,21 @@ impl Registry {
         Ok(())
     }
 
+    /// The helper of `uid`'s graphical session.
+    pub(crate) fn user_helper(&self, uid: u32) -> anyhow::Result<Arc<Connection>> {
+        self.helpers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .find(|helper| helper.uid == uid && !helper.login_window)
+            .cloned()
+            .with_context(|| format!("no session helper is running for user {uid}"))
+    }
+
     /// The helper of the session on the console.
     fn console_helper(&self) -> anyhow::Result<Arc<Connection>> {
-        let console = console_user();
+        let console = crate::remote::macos::session_close::console_user();
         self.helpers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -152,25 +164,6 @@ impl Registry {
                 None => "no session helper is running at the login window".to_owned(),
             })
     }
-}
-
-/// The signed-in user on the console, or `None` at the login window.
-fn console_user() -> Option<u32> {
-    #[link(name = "SystemConfiguration", kind = "framework")]
-    unsafe extern "C" {
-        fn SCDynamicStoreCopyConsoleUser(
-            store: *const std::ffi::c_void,
-            uid: *mut u32,
-            gid: *mut u32,
-        ) -> Option<std::ptr::NonNull<objc2_core_foundation::CFString>>;
-    }
-    let mut uid = 0;
-    // SAFETY: a null store is allowed and both out pointers are valid.
-    let name =
-        unsafe { SCDynamicStoreCopyConsoleUser(std::ptr::null(), &mut uid, std::ptr::null_mut()) }?;
-    // SAFETY: the function returns a +1 reference.
-    let name = unsafe { objc2_core_foundation::CFRetained::from_raw(name) };
-    (name.to_string() != "loginwindow" && uid != 0).then_some(uid)
 }
 
 /// The peer's user ID and process ID.
@@ -282,6 +275,11 @@ impl Connection {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    /// Runs `request` and waits for the helper to finish it.
+    pub(crate) fn run(&self, request: Request) -> anyhow::Result<()> {
+        self.call(request).map(|_| ())
     }
 
     /// Sends `request` without waiting for the helper's reply.
@@ -757,7 +755,16 @@ impl ScreenInput for HelperInput {
         self.0.done(Request::SetBlackout(enabled))
     }
     fn maintenance_state(&self) -> Option<meshrmm_protocol::SessionMessage> {
-        None
+        let state = *self
+            .0
+            .events
+            .input_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Some(meshrmm_protocol::SessionMessage::MaintenanceState {
+            agent_input_blocked: state.agent_input_blocked,
+            blacked_out: state.blacked_out,
+        })
     }
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()> {
         self.0.done(Request::SetAgentInputBlocked(blocked))

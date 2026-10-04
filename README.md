@@ -106,8 +106,13 @@ work too. During a session a menu bar item opens the chat, which also opens
 by itself for the technician's messages; the session banner, the connection
 notification and the connection approval prompt follow company policy as on
 Windows, the display border is left out of the capture, and the technician's
-annotations are drawn over the shared display. VideoToolbox has no 4:4:4
-encoder, so Mac Agents always stream 4:2:0.
+annotations are drawn over the shared display. The maintenance controls work
+too: blocking the user's keyboard and mouse uses an event tap that lets only
+the technician's tagged input through, the blackout shows the company's
+message on every screen while the capture leaves it out, and the session close
+actions lock the screen, log out or clear the clipboard of the same sign-in
+the technician saw. VideoToolbox has no 4:4:4 encoder, so Mac Agents always
+stream 4:2:0.
 
 The dashboard's **Add a device** dialog creates a one-time Terminal command
 for Macs. It runs `install-agent-macos.sh` from the dashboard, which downloads
