@@ -418,6 +418,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
             error={installer.error}
             isDownloading={installer.isDownloading}
             downloaded={installer.downloaded}
+            command={installer.command}
             onClose={() => setIsAgentOpen(false)}
             onPlatformChange={installer.setPlatform}
             onSubmit={(event) => void installer.download(event)}

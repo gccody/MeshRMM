@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   ENROLLMENT_MAGIC,
   enrolledInstaller,
+  macInstallCommand,
   publishedChecksum,
   sha256Hex,
 } from "../features/enrollment/installer.ts";
@@ -41,4 +42,12 @@ test("the enrollment follows the binary with its length and magic at the end", a
   assert.equal(configLength, BigInt(config.length));
   const configBytes = bytes.subarray(lengthOffset - config.length, lengthOffset);
   assert.deepEqual(JSON.parse(new TextDecoder().decode(configBytes)), bootstrap);
+});
+
+test("the Mac install command passes the enrollment as hex JSON", () => {
+  const bootstrap = { server: "https://acme.meshrmm.com", install_token: "ab".repeat(32), expires_at_unix_ms: 1 };
+  const command = macInstallCommand("https://acme.meshrmm.com/", bootstrap);
+  const match = command.match(/^curl -fsSL https:\/\/acme\.meshrmm\.com\/install-agent-macos\.sh \| sudo \/bin\/sh -s -- https:\/\/acme\.meshrmm\.com ([0-9a-f]+)$/);
+  assert.ok(match, command);
+  assert.deepEqual(JSON.parse(Buffer.from(match[1], "hex").toString("utf8")), bootstrap);
 });

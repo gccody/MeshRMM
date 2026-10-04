@@ -13,7 +13,7 @@ pub(crate) async fn create_agent_installer(
         .json()
         .await
         .map_err(|_| Error::RustError("invalid Agent installer request".into()))?;
-    if body.platform != "windows-x64" {
+    if !matches!(body.platform.as_str(), "windows-x64" | "macos") {
         return api_error(400, "unsupported Agent installer platform");
     }
 

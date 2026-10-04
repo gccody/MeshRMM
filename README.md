@@ -104,8 +104,12 @@ keyboard and pointer input. Clipboard, file transfer, chat, Prevent idle lock
 and Hide wallpaper work too. VideoToolbox has no 4:4:4 encoder, so Mac Agents
 always stream 4:2:0.
 
-`sudo meshrmm-agent --install <authorization>` enrolls the Mac with a
-hex-encoded installer authorization and installs the app bundle in
+The dashboard's **Add a device** dialog creates a one-time Terminal command
+for Macs. It runs `install-agent-macos.sh` from the dashboard, which downloads
+the universal (Apple silicon and Intel) Agent named in the release manifest,
+checks its SHA-256, and runs `sudo meshrmm-agent --install <authorization>`.
+That enrolls the Mac with the hex-encoded installer authorization and installs
+the app bundle in
 `/Library/Application Support/MeshRMM`. A launchd daemon runs the root
 coordinator, which keeps the signaling connection and the WebRTC session.
 Capture and input need a graphical session, so a launchd agent runs a session

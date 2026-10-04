@@ -7,23 +7,34 @@ import {
   type AgentPlatform,
   INSTALLER_ASSETS,
   enrolledInstaller,
+  macInstallCommand,
   publishedChecksum,
   sha256Hex,
 } from "./installer";
 
-// Authorizes a one-time enrollment, verifies the published installer and
-// downloads it with the enrollment appended.
+// Authorizes a one-time enrollment. For Windows it verifies the published
+// installer and downloads it with the enrollment appended; for macOS it shows
+// the Terminal command that installs the Agent.
 export function useInstallerDownload(authorizedFetch: AuthorizedFetch) {
   const [platform, setPlatform] = useState<AgentPlatform>("windows-x64");
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloaded, setDownloaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [command, setCommand] = useState<string | null>(null);
 
   // Starts a fresh "Add device" flow.
   const reset = useCallback(() => {
     setPlatform("windows-x64");
     setDownloaded(false);
     setError(null);
+    setCommand(null);
+  }, []);
+
+  const changePlatform = useCallback((next: AgentPlatform) => {
+    setPlatform(next);
+    setDownloaded(false);
+    setError(null);
+    setCommand(null);
   }, []);
 
   const download = async (event: FormEvent) => {
@@ -40,6 +51,11 @@ export function useInstallerDownload(authorizedFetch: AuthorizedFetch) {
         throw new Error(await errorMessage(bootstrapResponse, "The Agent installer could not be authorized."));
       }
       const bootstrap = (await bootstrapResponse.json()) as AgentInstallerBootstrap;
+      if (platform === "macos") {
+        setCommand(macInstallCommand(window.location.origin, bootstrap));
+        setDownloaded(true);
+        return;
+      }
       const asset = INSTALLER_ASSETS[platform];
       const [binaryResponse, checksumResponse] = await Promise.all([
         fetch(asset.binary, { cache: "no-store" }),
@@ -73,5 +89,5 @@ export function useInstallerDownload(authorizedFetch: AuthorizedFetch) {
     }
   };
 
-  return { platform, setPlatform, isDownloading, downloaded, error, reset, download };
+  return { platform, setPlatform: changePlatform, isDownloading, downloaded, error, command, reset, download };
 }
