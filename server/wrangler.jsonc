@@ -1,96 +1,105 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  // Preserve the original script identity so existing Durable Object state and
-  // encrypted TURN credentials remain attached during the public rebrand.
-  "name": "pulsermm-server",
-  "account_id": "023f5fc9ffca88a15dac8e9f27b8d21f",
-  "main": "build/index.js",
-  "compatibility_date": "2026-08-22",
-  "compatibility_flags": ["nodejs_compat"],
-  "routes": [
-    {
-      "pattern": "api.meshrmm.com",
-      "custom_domain": true
-    }
-  ],
-  "d1_databases": [
-    {
-      "binding": "DB",
-      // D1 database names are immutable. Keep the existing production database
-      // bound by its stable UUID while the application and Worker are rebranded.
-      "database_name": "pulsermm-production",
-      "database_id": "4650d279-149e-4a0b-8ec9-3058711885ea"
-    }
-  ],
-  // The latest screen thumbnail of each Agent (docs/screen-thumbnails.md) and
-  // the toolbox's library files (docs/toolbox.md).
-  "r2_buckets": [
-    {
-      "binding": "THUMBNAILS",
-      "bucket_name": "meshrmm-thumbnails"
-    },
-    {
-      "binding": "TOOLBOX",
-      "bucket_name": "meshrmm-toolbox"
-    }
-  ],
-  // Per-company usage for the platform cost report; see docs/cost-tracking.md.
-  "analytics_engine_datasets": [
-    {
-      "binding": "USAGE",
-      "dataset": "meshrmm_usage"
-    }
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "AGENT_COORDINATOR",
-        "class_name": "AgentCoordinator"
-      },
-      {
-        "name": "REMOTE_SESSION",
-        "class_name": "RemoteSession"
-      },
-      {
-        "name": "COMPANY_PRESENCE",
-        "class_name": "CompanyPresence"
-      }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["AgentCoordinator", "RemoteSession"]
-    },
-    {
-      "tag": "v2",
-      "new_sqlite_classes": ["CompanyPresence"]
-    }
-  ],
-  "vars": {
-    "REMOTE_SESSION_IDLE_TIMEOUT_SECONDS": "900",
-    "DASHBOARD_ORIGIN": "https://meshrmm.com",
-    "PUBLIC_API_URL": "https://api.meshrmm.com",
-    "TENANT_ROOT_DOMAIN": "meshrmm.com",
-    // Set this to the immutable WorkOS user ID allowed to use admin.meshrmm.com.
-    // Multiple emergency owner IDs may be comma-separated.
-    "PLATFORM_OWNER_USER_IDS": "user_01M0FX7EVSBWF41FK70SW36N4P",
-    "WORKOS_CLIENT_ID": "client_01M0FT1AN01PAT37N98EMRSNVW",
-    "WORKOS_ISSUER": "https://api.workos.com/user_management/client_01M0FT1AN01PAT37N98EMRSNVW",
-    // The account whose analytics the platform cost report reads, with the
-    // CLOUDFLARE_ANALYTICS_API_TOKEN secret (Account Analytics: Read).
-    "CLOUDFLARE_ACCOUNT_ID": "023f5fc9ffca88a15dac8e9f27b8d21f"
-  },
-  // Purges expired event subscriptions, remote handoffs and installer tokens;
-  // see server/src/maintenance.rs.
-  "triggers": {
-    "crons": ["*/30 * * * *"]
-  },
-  "observability": {
-    "enabled": true,
-    "head_sampling_rate": 1
-  },
-  "build": {
-    "command": "worker-build --profile server-release"
-  }
+	"$schema": "node_modules/wrangler/config-schema.json",
+	// Preserve the original script identity so existing Durable Object state and
+	// encrypted TURN credentials remain attached during the public rebrand.
+	"name": "pulsermm-server",
+	"account_id": "023f5fc9ffca88a15dac8e9f27b8d21f",
+	"main": "build/index.js",
+	"compatibility_date": "2026-08-22",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"routes": [
+		{
+			"pattern": "api.meshrmm.com",
+			"custom_domain": true
+		}
+	],
+	"d1_databases": [
+		{
+			"binding": "DB",
+			// D1 database names are immutable. Keep the existing production database
+			// bound by its stable UUID while the application and Worker are rebranded.
+			"database_name": "pulsermm-production",
+			"database_id": "4650d279-149e-4a0b-8ec9-3058711885ea"
+		}
+	],
+	// The latest screen thumbnail of each Agent (docs/screen-thumbnails.md) and
+	// the toolbox's library files (docs/toolbox.md).
+	"r2_buckets": [
+		{
+			"binding": "THUMBNAILS",
+			"bucket_name": "meshrmm-thumbnails"
+		},
+		{
+			"binding": "TOOLBOX",
+			"bucket_name": "meshrmm-toolbox"
+		}
+	],
+	// Per-company usage for the platform cost report; see docs/cost-tracking.md.
+	"analytics_engine_datasets": [
+		{
+			"binding": "USAGE",
+			"dataset": "meshrmm_usage"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "AGENT_COORDINATOR",
+				"class_name": "AgentCoordinator"
+			},
+			{
+				"name": "REMOTE_SESSION",
+				"class_name": "RemoteSession"
+			},
+			{
+				"name": "COMPANY_PRESENCE",
+				"class_name": "CompanyPresence"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"AgentCoordinator",
+				"RemoteSession"
+			]
+		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": [
+				"CompanyPresence"
+			]
+		}
+	],
+	"vars": {
+		"REMOTE_SESSION_IDLE_TIMEOUT_SECONDS": "900",
+		"DASHBOARD_ORIGIN": "https://meshrmm.com",
+		"PUBLIC_API_URL": "https://api.meshrmm.com",
+		"TENANT_ROOT_DOMAIN": "meshrmm.com",
+		// Set this to the immutable WorkOS user ID allowed to use admin.meshrmm.com.
+		// Multiple emergency owner IDs may be comma-separated.
+		"PLATFORM_OWNER_USER_IDS": "user_01M0FX7EVSBWF41FK70SW36N4P",
+		"WORKOS_CLIENT_ID": "client_01M0FT1AN01PAT37N98EMRSNVW",
+		"WORKOS_ISSUER": "https://api.workos.com/user_management/client_01M0FT1AN01PAT37N98EMRSNVW",
+		// The account whose analytics the platform cost report reads, with the
+		// CLOUDFLARE_ANALYTICS_API_TOKEN secret (Account Analytics: Read).
+		"CLOUDFLARE_ACCOUNT_ID": "023f5fc9ffca88a15dac8e9f27b8d21f"
+	},
+	// Purges expired event subscriptions, remote handoffs and installer tokens;
+	// see server/src/maintenance.rs.
+	"triggers": {
+		"crons": [
+			"*/30 * * * *"
+		]
+	},
+	"observability": {
+		"enabled": true,
+		"head_sampling_rate": 1
+	},
+	"build": {
+		"command": "worker-build --profile server-release"
+	}
 }
