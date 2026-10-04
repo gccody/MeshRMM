@@ -64,6 +64,9 @@ pub(crate) const DAEMON_LABEL: &str = "com.meshrmm.agent";
 const DAEMON_PLIST: &str = "/Library/LaunchDaemons/com.meshrmm.agent.plist";
 pub(crate) const HELPER_LABEL: &str = "com.meshrmm.agent.session";
 const HELPER_PLIST: &str = "/Library/LaunchAgents/com.meshrmm.agent.session.plist";
+/// Where the root coordinator accepts session helpers. Only root can create
+/// files in `/var/run`, so no other process can take the name first.
+pub(crate) const HELPER_SOCKET: &str = "/var/run/com.meshrmm.agent.sock";
 const BUNDLE_IDENTIFIER: &str = "com.meshrmm.agent";
 
 /// Installs or repairs the Agent from the running copy, enrolling it with the
@@ -148,6 +151,7 @@ pub fn uninstall() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(SUPPORT_DIRECTORY);
     let _ = std::fs::remove_dir_all("/Library/Logs/MeshRMM");
     let _ = launchctl(&["bootout", &format!("system/{DAEMON_LABEL}")]);
+    let _ = std::fs::remove_file(HELPER_SOCKET);
     Ok(())
 }
 
@@ -227,7 +231,7 @@ fn install_app() -> anyhow::Result<()> {
             anyhow::ensure!(status.success(), "could not copy {}", bundle.display());
         }
         // Reinstalling from the installed copy keeps it.
-        Some(_) => return Ok(()),
+        Some(_) => return secure_bundle(Path::new(APP)),
         None => {
             let contents = staged.join("Contents");
             create_directory(&contents.join("MacOS"), 0o755)?;
@@ -235,8 +239,35 @@ fn install_app() -> anyhow::Result<()> {
             std::fs::write(contents.join("Info.plist"), info_plist())?;
         }
     }
+    secure_bundle(&staged)?;
     let _ = std::fs::remove_dir_all(APP);
     std::fs::rename(&staged, APP).with_context(|| format!("could not install {APP}"))
+}
+
+/// Gives root everything in an app bundle and takes write access away from
+/// everyone else, since the root coordinator runs its code. `ditto` keeps the
+/// owner an archive or copy came with: the account that built the release.
+pub(crate) fn secure_bundle(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("could not inspect {}", path.display()))?;
+    std::os::unix::fs::lchown(path, Some(0), Some(0))
+        .with_context(|| format!("could not give root {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    std::fs::set_permissions(
+        path,
+        std::fs::Permissions::from_mode(metadata.permissions().mode() & 0o755),
+    )
+    .with_context(|| format!("could not protect {}", path.display()))?;
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            secure_bundle(&entry?.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn stop_services() {

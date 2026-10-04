@@ -202,6 +202,9 @@ pub fn apply(staged: &Path, coordinator: libc::pid_t) -> anyhow::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+    // The new Agent secures its own bundle, whatever the Agent that staged
+    // it did.
+    super::installer::secure_bundle(staged)?;
     let previous = Path::new(SUPPORT_DIRECTORY).join("MeshRMM Agent.app.previous");
     let _ = std::fs::remove_dir_all(&previous);
     std::fs::rename(APP, &previous).context("could not set the installed Agent aside")?;
