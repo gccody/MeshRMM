@@ -105,7 +105,7 @@ jobs:
           retention-days: 14
 
   macos:
-    name: Build macOS viewer (Apple Silicon)
+    name: Build macOS viewer (Apple Silicon) and universal Agent
     needs: validate
     runs-on: macos-latest
     steps:
@@ -149,41 +149,46 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain_path"
           security list-keychain -d user -s "$keychain_path"
           echo "MESHRMM_CODESIGN_IDENTITY=$CODESIGN_IDENTITY" >> "$GITHUB_ENV"
+      - name: Add the Intel macOS target for the universal Agent
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Build signed viewer archive
         shell: bash
         run: sh scripts/build-remote-macos.sh
-      - name: Notarize and staple viewer when credentials are configured
+      - name: Build signed universal Agent archive
+        shell: bash
+        run: sh scripts/build-agent-macos.sh
+      - name: Notarize and staple the viewer and Agent when credentials are configured
         env:
           NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
           NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
           NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
-          ARCHIVE: dashboard/public/downloads/meshrmm-remote-macos-arm64.zip
-          APP_DIRECTORY: dist/remote-macos/MeshRMM Remote.app
         shell: bash
         run: |
           if [ -z "$NOTARY_APPLE_ID" ] && [ -z "$NOTARY_TEAM_ID" ] && [ -z "$NOTARY_PASSWORD" ]; then
-            echo "::warning::No Apple notarization credentials are configured; publishing the signed archive without notarization."
+            echo "::warning::No Apple notarization credentials are configured; publishing the signed archives without notarization."
             exit 0
           fi
           if [ -z "$NOTARY_APPLE_ID" ] || [ -z "$NOTARY_TEAM_ID" ] || [ -z "$NOTARY_PASSWORD" ]; then
             echo "::error::All three macOS notarization secrets must be configured together."
             exit 1
           fi
-          xcrun notarytool submit "$ARCHIVE" \
-            --apple-id "$NOTARY_APPLE_ID" \
-            --team-id "$NOTARY_TEAM_ID" \
-            --password "$NOTARY_PASSWORD" \
-            --wait
-          xcrun stapler staple "$APP_DIRECTORY"
-          rm -f -- "$ARCHIVE"
-          ditto -c -k --sequesterRsrc --keepParent "$APP_DIRECTORY" "$ARCHIVE"
-      - name: Collect release artifact
-        env:
-          ARCHIVE: dashboard/public/downloads/meshrmm-remote-macos-arm64.zip
+          for pair in "dashboard/public/downloads/meshrmm-remote-macos-arm64.zip=dist/remote-macos/MeshRMM Remote.app" "dashboard/public/downloads/meshrmm-agent-macos.zip=dist/agent-macos/MeshRMM Agent.app"; do
+            archive=${pair%%=*}
+            app_directory=${pair#*=}
+            xcrun notarytool submit "$archive" \
+              --apple-id "$NOTARY_APPLE_ID" \
+              --team-id "$NOTARY_TEAM_ID" \
+              --password "$NOTARY_PASSWORD" \
+              --wait
+            xcrun stapler staple "$app_directory"
+            rm -f -- "$archive"
+            ditto -c -k --sequesterRsrc --keepParent "$app_directory" "$archive"
+          done
+      - name: Collect release artifacts
         shell: bash
         run: |
           mkdir -p release-output
-          cp "$ARCHIVE" release-output/
+          cp dashboard/public/downloads/meshrmm-remote-macos-arm64.zip dashboard/public/downloads/meshrmm-agent-macos.zip release-output/
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-macos-arm64-${{ needs.validate.outputs.version }}
@@ -224,6 +229,7 @@ jobs:
           node scripts/update-release-manifest.mjs "$manifest" agent-windows-x64 "$version" "$origin/downloads/meshrmm-agent-windows-x64.exe" dashboard/public/downloads/meshrmm-agent-windows-x64.exe
           node scripts/update-release-manifest.mjs "$manifest" client-windows-x64 "$version" "$origin/downloads/meshrmm-remote-windows-x64.exe" dashboard/public/downloads/meshrmm-remote-windows-x64.exe
           node scripts/update-release-manifest.mjs "$manifest" client-macos-arm64 "$version" "$origin/downloads/meshrmm-remote-macos-arm64.zip" dashboard/public/downloads/meshrmm-remote-macos-arm64.zip
+          node scripts/update-release-manifest.mjs "$manifest" agent-macos "$version" "$origin/downloads/meshrmm-agent-macos.zip" dashboard/public/downloads/meshrmm-agent-macos.zip
           node scripts/verify-release-assets.mjs "$manifest"
       - name: Upload assembled release for recovery
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

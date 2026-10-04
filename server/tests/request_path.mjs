@@ -195,6 +195,12 @@ try {
   assert.equal(result.roundTrips, 2, 'installer round trips');
   assert.equal(await count('agent_install_tokens', `token_hash = '${hash(installer.install_token)}'`), 1);
   assert.equal(await count('audit_events', "action = 'agent_installer.issue'"), 1);
+  // Macs enroll the same way; other platforms are refused.
+  result = await post('acme.meshrmm.com', '/v1/agent-installers', token('org-acme', ['agents:manage']), { platform: 'macos' });
+  assert.equal(result.status, 200);
+  assert.equal(await count('agent_install_tokens', `token_hash = '${hash(result.body.install_token)}' AND platform = 'macos'`), 1);
+  result = await post('acme.meshrmm.com', '/v1/agent-installers', token('org-acme', ['agents:manage']), { platform: 'linux' });
+  assert.equal(result.status, 400);
 
   // The requests above purged nothing. The cron purges rows past the grace
   // period from all three tables in one batch and keeps the rest.
