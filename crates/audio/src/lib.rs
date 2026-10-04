@@ -27,21 +27,10 @@ mod capture;
 #[cfg(windows)]
 pub use capture::{Capture, capture};
 
-/// System audio capture is Windows-only for now.
 #[cfg(target_os = "macos")]
-pub struct Capture;
-
+mod capture_macos;
 #[cfg(target_os = "macos")]
-impl Capture {
-    pub fn healthy(&self) -> bool {
-        false
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub fn capture(_send: impl Fn(Vec<u8>) + Send + 'static) -> anyhow::Result<Capture> {
-    anyhow::bail!("system audio capture is not available on macOS yet")
-}
+pub use capture_macos::{Capture, capture};
 
 struct Packet<'a> {
     rate: u32,

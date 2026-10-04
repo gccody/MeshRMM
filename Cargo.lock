@@ -1900,7 +1900,15 @@ name = "meshrmm-audio"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "block2",
  "cpal",
+ "dispatch2",
+ "objc2",
+ "objc2-core-audio-types",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-foundation",
+ "objc2-screen-capture-kit",
  "opus",
  "tracing",
 ]

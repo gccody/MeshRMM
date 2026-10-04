@@ -97,11 +97,13 @@ fn serve(stream: UnixStream, input: &Arc<LocalInput>, login_window: bool) -> any
             }
         })?;
     let screen = Arc::new(Mutex::new(LocalScreen::new(Arc::clone(input))));
+    let audio = Arc::new(Mutex::new(None::<meshrmm_audio::Capture>));
     let active = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
     let pump = spawn_pump(
         Arc::clone(input),
         Arc::clone(&screen),
+        Arc::clone(&audio),
         Arc::clone(&active),
         Arc::clone(&stopped),
         events.clone(),
@@ -114,8 +116,16 @@ fn serve(stream: UnixStream, input: &Arc<LocalInput>, login_window: bool) -> any
             Ok(None) => break Ok(()),
             Err(error) => break Err(error),
         };
-        let result = handle(call.request, input, &screen, &active, &sequence, &events)
-            .map_err(|error| format!("{error:#}"));
+        let result = handle(
+            call.request,
+            input,
+            &screen,
+            &audio,
+            &active,
+            &sequence,
+            &events,
+        )
+        .map_err(|error| format!("{error:#}"));
         if events
             .send(Event::Reply {
                 id: call.id,
@@ -128,6 +138,7 @@ fn serve(stream: UnixStream, input: &Arc<LocalInput>, login_window: bool) -> any
     };
     stopped.store(true, Ordering::SeqCst);
     let _ = pump.join();
+    audio.lock().unwrap_or_else(|e| e.into_inner()).take();
     screen.lock().unwrap_or_else(|e| e.into_inner()).stop();
     drop(events);
     let _ = writer_thread.join();
@@ -138,6 +149,7 @@ fn handle(
     request: Request,
     input: &Arc<LocalInput>,
     screen: &Mutex<LocalScreen>,
+    audio: &Mutex<Option<meshrmm_audio::Capture>>,
     active: &AtomicBool,
     sequence: &Arc<AtomicU64>,
     events: &mpsc::SyncSender<Event>,
@@ -146,6 +158,7 @@ fn handle(
         Request::BeginSession => active.store(true, Ordering::SeqCst),
         Request::EndSession => {
             active.store(false, Ordering::SeqCst);
+            audio.lock().unwrap_or_else(|e| e.into_inner()).take();
             screen.lock().unwrap_or_else(|e| e.into_inner()).stop();
             input.end_session();
         }
@@ -206,6 +219,17 @@ fn handle(
         Request::StartChat => input.start_chat()?,
         Request::StopChat => input.stop_chat(),
         Request::Chat(text) => input.apply_chat(text)?,
+        Request::StartAudio => {
+            let events = events.clone();
+            let capture = meshrmm_audio::capture(move |packet| {
+                // Late audio is useless; a full queue drops it.
+                let _ = events.try_send(Event::Audio(packet));
+            })?;
+            *audio.lock().unwrap_or_else(|e| e.into_inner()) = Some(capture);
+        }
+        Request::StopAudio => {
+            audio.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
     }
     Ok(Reply::Done)
 }
@@ -215,6 +239,7 @@ fn handle(
 fn spawn_pump(
     input: Arc<LocalInput>,
     screen: Arc<Mutex<LocalScreen>>,
+    audio: Arc<Mutex<Option<meshrmm_audio::Capture>>>,
     active: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     events: mpsc::SyncSender<Event>,
@@ -253,6 +278,12 @@ fn spawn_pump(
                 {
                     outgoing.push(Event::CaptureEnded(format!("{error:#}")));
                 }
+                let mut capturing = audio.lock().unwrap_or_else(|e| e.into_inner());
+                if capturing.as_ref().is_some_and(|capture| !capture.healthy()) {
+                    capturing.take();
+                    outgoing.push(Event::AudioEnded);
+                }
+                drop(capturing);
                 for event in outgoing {
                     if events.send(event).is_err() {
                         return;

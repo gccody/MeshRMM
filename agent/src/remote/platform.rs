@@ -64,7 +64,26 @@ pub trait ScreenStreamer: Send {
     fn input_controller(&self) -> Arc<dyn ScreenInput>;
 }
 
+/// Receives captured PCM16 system audio packets.
+pub type AudioSink = Box<dyn Fn(Vec<u8>) + Send>;
+
+/// System audio being captured; capture stops when it is dropped.
+pub trait AudioStream: Send {
+    fn healthy(&self) -> bool;
+}
+
+impl AudioStream for meshrmm_audio::Capture {
+    fn healthy(&self) -> bool {
+        meshrmm_audio::Capture::healthy(self)
+    }
+}
+
 pub trait ScreenInput: Send + Sync {
+    /// Captures the system audio of the session the viewer sees.
+    fn start_audio(&self, send: AudioSink) -> anyhow::Result<Box<dyn AudioStream>> {
+        Ok(Box::new(meshrmm_audio::capture(send)?))
+    }
+
     fn credential_command(&self, _message: meshrmm_protocol::SessionMessage) -> anyhow::Result<()> {
         anyhow::bail!("Credentials require the installed Windows service")
     }

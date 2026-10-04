@@ -283,7 +283,7 @@ async fn run_connected_sender(
     let audio_capture = super::native_task::NativeTask::spawn(
         "meshrmm-audio-capture",
         move |mut stop| async move {
-            let mut stream = None;
+            let mut stream: Option<Box<dyn super::platform::AudioStream>> = None;
             let mut retry = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 tokio::select! {
@@ -299,14 +299,14 @@ async fn run_connected_sender(
                     }
                     continue;
                 }
-                if stream.as_ref().is_some_and(meshrmm_audio::Capture::healthy) {
+                if stream.as_ref().is_some_and(|stream| stream.healthy()) {
                     continue;
                 }
                 stream = None;
                 let sender = audio_tx.clone();
-                match meshrmm_audio::capture(move |packet| {
+                match audio_input.start_audio(Box::new(move |packet| {
                     let _ = sender.try_send(packet);
-                }) {
+                })) {
                     Ok(capture) => stream = Some(capture),
                     Err(error) => tracing::debug!(%error, "system audio unavailable; retrying"),
                 }
