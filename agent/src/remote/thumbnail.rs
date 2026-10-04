@@ -6,19 +6,20 @@
 //! input desktop, so the sign-in and lock screens are captured too. The
 //! coordinator sends the image straight to the control plane over HTTPS; it
 //! never crosses the signaling WebSocket.
-// The macOS Agent does not capture thumbnails yet.
-#![cfg_attr(target_os = "macos", allow(dead_code))]
+//!
+//! On a Mac, the console's session helper captures the image for the root
+//! coordinator; see docs/screen-thumbnails.md.
 use std::time::Duration;
 
 /// How often the dashboard's image is refreshed.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub const INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// The image fits in this box. It is sharp at the dashboard's preview size
 /// and small enough to be a few dozen KiB as a JPEG.
 pub const MAX_WIDTH: u32 = 640;
 pub const MAX_HEIGHT: u32 = 400;
 /// The server refuses anything larger.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub const MAX_BYTES: usize = 512 * 1024;
 
 /// The thumbnail size for a `width` by `height` display: its aspect ratio,
@@ -39,34 +40,18 @@ pub fn scaled_size(width: u32, height: u32) -> (u32, u32) {
     (scaled_width.max(1) as u32, scaled_height.max(1) as u32)
 }
 
+#[cfg(target_os = "macos")]
+use self::macos as platform;
+#[cfg(any(windows, target_os = "macos"))]
+pub use self::schedule::Thumbnails;
 #[cfg(windows)]
-pub use self::windows::{Thumbnails, capture_primary_display, follow_input_desktop};
-
-/// The macOS Agent does not upload screen thumbnails yet.
-#[cfg(target_os = "macos")]
-pub struct Thumbnails;
-
-#[cfg(target_os = "macos")]
-impl Thumbnails {
-    pub fn new(_mode: crate::remote::config::ExecutionMode) -> Self {
-        Self
-    }
-
-    pub async fn due(&mut self) {
-        std::future::pending().await
-    }
-
-    pub fn refresh(&mut self, _config: &crate::remote::config::Config) {}
-}
+use self::windows as platform;
+#[cfg(windows)]
+pub use self::windows::{capture_primary_display, follow_input_desktop};
 
 #[cfg(windows)]
 mod windows {
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
     use anyhow::Context;
-    use tokio::task::JoinHandle;
-    use tokio::time::{Interval, MissedTickBehavior, interval};
     use windows::Win32::Foundation::{GENERIC_ALL, POINT};
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
@@ -93,11 +78,10 @@ mod windows {
     use windows::Win32::UI::Shell::SHCreateMemStream;
     use windows::core::w;
 
-    use super::{INTERVAL, MAX_BYTES, scaled_size};
-    use crate::remote::config::{Config, ExecutionMode};
+    use super::{MAX_BYTES, scaled_size};
+    use crate::remote::config::ExecutionMode;
 
     const JPEG_QUALITY: f32 = 0.7;
-    const UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// Moves the calling thread to the desktop that currently receives input,
     /// such as the lock screen while the user's desktop is launched but
@@ -303,6 +287,35 @@ mod windows {
         result
     }
 
+    pub(super) fn capture_for(mode: ExecutionMode) -> anyhow::Result<Vec<u8>> {
+        match mode {
+            // Local development runs on the developer's own desktop.
+            ExecutionMode::Console => capture_primary_display(),
+            _ => crate::remote::capture_helper::capture_thumbnail(),
+        }
+    }
+}
+
+/// The schedule and upload, around each platform's capture.
+#[cfg(any(windows, target_os = "macos"))]
+mod schedule {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use anyhow::Context;
+    use tokio::task::JoinHandle;
+    use tokio::time::{Interval, MissedTickBehavior, interval};
+
+    use super::INTERVAL;
+    use super::platform::capture_for;
+    use crate::remote::config::{Config, ExecutionMode};
+
+    const UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+    /// After a failure, such as when the Agent starts before the session it
+    /// captures, the next few attempts come sooner than [`INTERVAL`].
+    const RETRY: Duration = Duration::from_secs(30);
+    const QUICK_RETRIES: u32 = 4;
+
     /// Refreshes the device's thumbnail every [`INTERVAL`] while the Agent is
     /// connected. One capture and upload runs at a time, off the signaling task.
     pub struct Thumbnails {
@@ -318,6 +331,19 @@ mod windows {
         uploaded: Option<Vec<u8>>,
         /// Repeated failures, such as while no display is attached, are logged once.
         failing: bool,
+        /// Failures in a row, and when the last one happened.
+        failures: u32,
+        failed_at: Option<Instant>,
+    }
+
+    impl State {
+        /// When a quick retry is due, if one is.
+        fn retry_at(&self) -> Option<Instant> {
+            (self.failures <= QUICK_RETRIES)
+                .then_some(self.failed_at)
+                .flatten()
+                .map(|failed| failed + RETRY)
+        }
     }
 
     impl Thumbnails {
@@ -336,7 +362,29 @@ mod windows {
 
         /// Completes when the next thumbnail is due.
         pub async fn due(&mut self) {
-            self.timer.tick().await;
+            loop {
+                let retry_at = {
+                    let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                    state.retry_at()
+                };
+                if retry_at.is_some_and(|at| at <= Instant::now()) {
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .failed_at = None;
+                    return;
+                }
+                // A capture still running can fail and ask for a retry, so
+                // this looks again at least once a second.
+                let wake = retry_at.map_or(Duration::from_secs(1), |at| {
+                    at.saturating_duration_since(Instant::now())
+                        .min(Duration::from_secs(1))
+                });
+                tokio::select! {
+                    _ = self.timer.tick() => return,
+                    () = tokio::time::sleep(wake) => {}
+                }
+            }
         }
 
         /// Starts a capture and upload unless one is still running.
@@ -349,20 +397,22 @@ mod windows {
                 let result =
                     capture_for(mode).and_then(|jpeg| upload_if_changed(&config, &state, jpeg));
                 let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-                match result {
-                    Ok(sent) => {
-                        if std::mem::take(&mut state.failing) {
-                            tracing::info!("screen thumbnails are updating again");
-                        }
-                        tracing::debug!(sent, "refreshed the screen thumbnail");
+                let Err(error) = result.map(|sent| {
+                    tracing::debug!(sent, "refreshed the screen thumbnail");
+                }) else {
+                    state.failures = 0;
+                    state.failed_at = None;
+                    if std::mem::take(&mut state.failing) {
+                        tracing::info!("screen thumbnails are updating again");
                     }
-                    Err(error) if !state.failing => {
-                        state.failing = true;
-                        tracing::warn!(error = ?error, "could not refresh the screen thumbnail; retrying every {} minutes", INTERVAL.as_secs() / 60);
-                    }
-                    Err(error) => {
-                        tracing::debug!(error = ?error, "screen thumbnail still unavailable")
-                    }
+                    return;
+                };
+                state.failures = state.failures.saturating_add(1);
+                state.failed_at = Some(Instant::now());
+                if std::mem::replace(&mut state.failing, true) {
+                    tracing::debug!(error = ?error, "screen thumbnail still unavailable");
+                } else {
+                    tracing::warn!(error = ?error, "could not refresh the screen thumbnail; retrying");
                 }
             }));
         }
@@ -373,14 +423,6 @@ mod windows {
             if let Some(task) = self.task.take() {
                 task.abort();
             }
-        }
-    }
-
-    fn capture_for(mode: ExecutionMode) -> anyhow::Result<Vec<u8>> {
-        match mode {
-            // Local development runs on the developer's own desktop.
-            ExecutionMode::Console => capture_primary_display(),
-            _ => crate::remote::capture_helper::capture_thumbnail(),
         }
     }
 
@@ -417,7 +459,7 @@ mod windows {
         let http = ureq::Agent::config_builder()
             .timeout_global(Some(UPLOAD_TIMEOUT))
             .http_status_as_error(true)
-            .tls_config(crate::updater::https_tls_config())
+            .tls_config(crate::enrollment::https_tls_config())
             .build()
             .new_agent();
         http.put(url.as_str())
@@ -426,6 +468,39 @@ mod windows {
             .send(jpeg)
             .context("the server did not accept the screen thumbnail")?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn failures_retry_soon_a_few_times_then_wait_for_the_interval() {
+            let failed = Instant::now();
+            let mut state = State::default();
+            assert_eq!(state.retry_at(), None);
+            state.failed_at = Some(failed);
+            for failures in 1..=QUICK_RETRIES {
+                state.failures = failures;
+                assert_eq!(state.retry_at(), Some(failed + RETRY));
+            }
+            state.failures = QUICK_RETRIES + 1;
+            assert_eq!(state.retry_at(), None);
+        }
+    }
+}
+
+/// A console Agent captures its own session; the installed coordinator asks
+/// the console's session helper, which captures the login window too.
+#[cfg(target_os = "macos")]
+mod macos {
+    use crate::remote::config::ExecutionMode;
+
+    pub(super) fn capture_for(mode: ExecutionMode) -> anyhow::Result<Vec<u8>> {
+        match mode {
+            ExecutionMode::Console => crate::remote::macos::snapshot::main_display_jpeg(),
+            _ => crate::remote::macos::helper::coordinator::registry()?.thumbnail(),
+        }
     }
 }
 
