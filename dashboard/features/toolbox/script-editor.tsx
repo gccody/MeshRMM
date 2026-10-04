@@ -33,6 +33,7 @@ type Props = {
 const PLACEHOLDERS: Record<ScriptDraft["language"], string> = {
   powershell: "Get-Service -Name Spooler | Restart-Service -PassThru",
   cmd: "@echo off\nipconfig /flushdns",
+  shell: "dscacheutil -flushcache\nkillall -HUP mDNSResponder",
 };
 
 /** Writes a new script, or edits or views one. */
@@ -101,7 +102,7 @@ export function ScriptEditor({ script, folders, initialFolder = "", onClose, onS
           <div className="script-editor-row">
             <label htmlFor="script-language">Interpreter
               <select id="script-language" value={draft.language} onChange={(event) => update({ language: event.target.value as ScriptDraft["language"] })}>
-                {(["powershell", "cmd"] as const).map((language) => <option key={language} value={language}>{LANGUAGE_LABELS[language]}</option>)}
+                {(["powershell", "cmd", "shell"] as const).map((language) => <option key={language} value={language}>{LANGUAGE_LABELS[language]}</option>)}
               </select>
             </label>
             <label htmlFor="script-timeout">Stop after (seconds)<input id="script-timeout" type="number" inputMode="numeric" min={MIN_SCRIPT_TIMEOUT_SECONDS} max={MAX_SCRIPT_TIMEOUT_SECONDS} value={draft.timeoutSeconds} onChange={(event) => update({ timeoutSeconds: event.target.value })} /></label>

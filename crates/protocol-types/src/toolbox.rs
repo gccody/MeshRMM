@@ -36,6 +36,8 @@ pub const MAX_TOOLBOX_FILE_BYTES: u64 = 95 * 1024 * 1024;
 pub enum ScriptLanguage {
     Powershell,
     Cmd,
+    /// A zsh script, for Macs.
+    Shell,
 }
 
 impl ScriptLanguage {
@@ -43,6 +45,7 @@ impl ScriptLanguage {
         match self {
             Self::Powershell => "powershell",
             Self::Cmd => "cmd",
+            Self::Shell => "shell",
         }
     }
 
@@ -50,6 +53,7 @@ impl ScriptLanguage {
         match value {
             "powershell" => Some(Self::Powershell),
             "cmd" => Some(Self::Cmd),
+            "shell" => Some(Self::Shell),
             _ => None,
         }
     }
@@ -58,6 +62,7 @@ impl ScriptLanguage {
         match self {
             Self::Powershell => "PowerShell",
             Self::Cmd => "Command Prompt",
+            Self::Shell => "Shell (zsh)",
         }
     }
 }

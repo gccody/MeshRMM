@@ -11,13 +11,14 @@
 //! Public Documents for the background desktop or when nobody is signed in.
 //! While a user is signed in, files are written with their token, so they
 //! own them and a folder they control cannot redirect a SYSTEM write.
+//! On a Mac, root takes SYSTEM's place and `/Users/Shared` Public Documents'.
 
 use meshrmm_protocol::ScriptLanguage;
 
 /// Runs past this many at once are refused rather than queued.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 const MAX_RUNNING_SCRIPTS: usize = 8;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 const MAX_RUNNING_DELIVERIES: usize = 4;
 
 /// The script file's name and its bytes as the interpreter reads them.
@@ -25,7 +26,7 @@ const MAX_RUNNING_DELIVERIES: usize = 4;
 /// without a byte-order mark in the ANSI code page, so the file gets one.
 /// `cmd` reads a batch file a line at a time in the console code page, so a
 /// first line switches it to UTF-8, which also makes the output UTF-8.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn script_file(language: ScriptLanguage, body: &str) -> (&'static str, Vec<u8>) {
     let body = body.replace("\r\n", "\n").replace('\n', "\r\n");
     match language {
@@ -39,6 +40,7 @@ fn script_file(language: ScriptLanguage, body: &str) -> (&'static str, Vec<u8>) 
             bytes.extend_from_slice(body.as_bytes());
             ("script.cmd", bytes)
         }
+        ScriptLanguage::Shell => ("script.sh", body.replace("\r\n", "\n").into_bytes()),
     }
 }
 
@@ -52,18 +54,19 @@ fn interpreter_arguments(language: ScriptLanguage, script: &str) -> String {
             script.replace('\'', "''")
         ),
         ScriptLanguage::Cmd => format!("/D /S /C \"\"{script}\"\""),
+        ScriptLanguage::Shell => format!("\"{script}\""),
     }
 }
 
 /// Output a script wrote, up to the limit the server keeps.
 #[derive(Debug, Default)]
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 struct Output {
     bytes: Vec<u8>,
     truncated: bool,
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 impl Output {
     fn push(&mut self, chunk: &[u8]) {
         let room = meshrmm_protocol::MAX_SCRIPT_OUTPUT_BYTES.saturating_sub(self.bytes.len());
@@ -78,7 +81,7 @@ impl Output {
 /// Output bytes as text: UTF-8, which both interpreters are asked to write,
 /// else `fallback`'s decoding, for programs that write the OEM code page.
 /// A character cut at the end by the output limit is dropped.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn decode_output(bytes: &[u8], fallback: impl Fn(&[u8]) -> String) -> String {
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     match std::str::from_utf8(bytes) {
@@ -92,7 +95,7 @@ fn decode_output(bytes: &[u8], fallback: impl Fn(&[u8]) -> String) -> String {
 
 /// `name`, or `name (2)`, `name (3)`… before its extension, whichever
 /// `taken` says is free.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn unique_name(name: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
     if !taken(name) {
         return Some(name.to_owned());
@@ -107,7 +110,7 @@ fn unique_name(name: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
 }
 
 /// Run IDs name a directory, so they must be plain.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
@@ -117,7 +120,276 @@ fn valid_id(id: &str) -> bool {
 }
 
 #[cfg(windows)]
-pub(crate) use self::windows::{deliver_file, run_script};
+use self::windows as platform;
+
+#[cfg(any(windows, target_os = "macos"))]
+mod shared {
+    use std::io::{Read, Write};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use anyhow::Context;
+    use meshrmm_protocol::{
+        FileDeliveryReport, FileDeliveryRequest, FileDeliveryStatus, ScriptRunReport,
+        ScriptRunRequest, ScriptRunStatus,
+    };
+    use sha2::{Digest, Sha256};
+
+    use super::{MAX_RUNNING_DELIVERIES, MAX_RUNNING_SCRIPTS, platform};
+    use crate::remote::config::{Config, ExecutionMode};
+
+    static RUNNING_SCRIPTS: AtomicUsize = AtomicUsize::new(0);
+    static RUNNING_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
+    /// Reports are retried this many times, a little longer apart each time.
+    const REPORT_ATTEMPTS: u32 = 6;
+    const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+    /// A place among a limited number of concurrent jobs, given back on drop.
+    struct Slot(&'static AtomicUsize);
+
+    impl Slot {
+        fn take(counter: &'static AtomicUsize, limit: usize) -> Option<Self> {
+            counter
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |running| {
+                    (running < limit).then_some(running + 1)
+                })
+                .ok()
+                .map(|_| Self(counter))
+        }
+    }
+
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Runs `run` on its own thread and reports how it went.
+    pub(crate) fn run_script(config: &Config, mode: ExecutionMode, run: ScriptRunRequest) {
+        let config = config.clone();
+        let slot = Slot::take(&RUNNING_SCRIPTS, MAX_RUNNING_SCRIPTS);
+        let spawned = std::thread::Builder::new()
+            .name("meshrmm-toolbox-script".into())
+            .spawn(move || {
+                let report = match slot {
+                    _ if !platform::runs(run.language) => failed(
+                        platform::own_account(),
+                        format!(
+                            "{} scripts do not run on this device's operating system.",
+                            run.language.label()
+                        ),
+                    ),
+                    Some(_slot) => platform::execute_script(mode, &run),
+                    None => failed(
+                        platform::own_account(),
+                        format!(
+                            "The device is already running {MAX_RUNNING_SCRIPTS} toolbox scripts. Try again when one finishes."
+                        ),
+                    ),
+                };
+                tracing::info!(
+                    run_id = %run.run_id,
+                    status = report.status.as_str(),
+                    exit_code = ?report.exit_code,
+                    ran_as = %report.ran_as,
+                    error = ?report.error,
+                    "toolbox script finished"
+                );
+                send_report(&config, &["script-runs", &run.run_id, "result"], &report);
+            });
+        if let Err(error) = spawned {
+            tracing::error!(%error, "could not start a thread for a toolbox script");
+        }
+    }
+
+    /// Saves `delivery`'s file on its own thread and reports how it went.
+    pub(crate) fn deliver_file(
+        config: &Config,
+        mode: ExecutionMode,
+        delivery: FileDeliveryRequest,
+    ) {
+        let config = config.clone();
+        let slot = Slot::take(&RUNNING_DELIVERIES, MAX_RUNNING_DELIVERIES);
+        let spawned = std::thread::Builder::new()
+            .name("meshrmm-toolbox-file".into())
+            .spawn(move || {
+                let result = match slot {
+                    Some(_slot) => platform::save_delivery(&config, mode, &delivery),
+                    None => Err(anyhow::anyhow!(
+                        "The device is already receiving {MAX_RUNNING_DELIVERIES} toolbox files. Try again when one finishes."
+                    )),
+                };
+                let report = match result {
+                    Ok(path) => {
+                        tracing::info!(delivery_id = %delivery.delivery_id, path = %path.display(), "saved a toolbox file");
+                        FileDeliveryReport {
+                            status: FileDeliveryStatus::Delivered,
+                            path: Some(path.display().to_string()),
+                            error: None,
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(delivery_id = %delivery.delivery_id, error = ?error, "could not save a toolbox file");
+                        FileDeliveryReport {
+                            status: FileDeliveryStatus::Failed,
+                            path: None,
+                            error: Some(format!("{error:#}")),
+                        }
+                    }
+                };
+                send_report(
+                    &config,
+                    &["file-deliveries", &delivery.delivery_id, "result"],
+                    &report,
+                );
+            });
+        if let Err(error) = spawned {
+            tracing::error!(%error, "could not start a thread for a toolbox file");
+        }
+    }
+
+    pub(super) fn failed(ran_as: String, error: impl Into<String>) -> ScriptRunReport {
+        ScriptRunReport {
+            status: ScriptRunStatus::Failed,
+            ran_as,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            output_truncated: false,
+            error: Some(error.into()),
+        }
+    }
+
+    /// A downloaded file waiting to be saved, removed with it.
+    pub(super) struct Staged(pub(super) PathBuf);
+
+    impl Drop for Staged {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Downloads the file into an administrator-only folder, checking its
+    /// size and SHA-256 on the way.
+    pub(super) fn download(
+        config: &Config,
+        mode: ExecutionMode,
+        delivery: &FileDeliveryRequest,
+    ) -> anyhow::Result<Staged> {
+        let folder = platform::staging_folder(mode)?;
+        let staged = Staged(folder.join(format!("{}.partial", delivery.delivery_id)));
+        let url = meshrmm_signaling_client::endpoint_url(
+            &config.server,
+            &[
+                "v1",
+                "agents",
+                &config.device_id,
+                "file-deliveries",
+                &delivery.delivery_id,
+                "content",
+            ],
+            &[],
+            false,
+        )?;
+        let response = http(DOWNLOAD_TIMEOUT)
+            .get(url.as_str())
+            .header("Authorization", &format!("Bearer {}", config.agent_token))
+            .call()
+            .context("the server did not provide the file")?;
+        let mut body = response
+            .into_body()
+            .into_with_config()
+            .limit(delivery.size_bytes.saturating_add(1))
+            .reader();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged.0)
+            .with_context(|| format!("could not create {}", staged.0.display()))?;
+        let mut digest = Sha256::new();
+        let mut size = 0_u64;
+        let mut chunk = vec![0; 64 * 1024];
+        loop {
+            let read = body
+                .read(&mut chunk)
+                .context("the download was interrupted")?;
+            if read == 0 {
+                break;
+            }
+            size += read as u64;
+            anyhow::ensure!(
+                size <= delivery.size_bytes,
+                "the server sent more than the file's size"
+            );
+            digest.update(&chunk[..read]);
+            file.write_all(&chunk[..read])
+                .with_context(|| format!("could not write {}", staged.0.display()))?;
+        }
+        file.flush()?;
+        anyhow::ensure!(size == delivery.size_bytes, "the download was incomplete");
+        let actual: String = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        anyhow::ensure!(
+            actual == delivery.sha256,
+            "the download did not match the file's SHA-256"
+        );
+        Ok(staged)
+    }
+
+    fn http(timeout: Duration) -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .http_status_as_error(true)
+            .tls_config(crate::enrollment::https_tls_config())
+            .build()
+            .new_agent()
+    }
+
+    /// Posts a result to `/v1/agents/{device}/{path}`, retrying while the
+    /// server cannot be reached. A refusal is final.
+    fn send_report(config: &Config, path: &[&str], report: &impl serde::Serialize) {
+        let mut segments = vec!["v1", "agents", config.device_id.as_str()];
+        segments.extend_from_slice(path);
+        let url =
+            match meshrmm_signaling_client::endpoint_url(&config.server, &segments, &[], false) {
+                Ok(url) => url,
+                Err(error) => {
+                    tracing::error!(%error, "could not build the toolbox report URL");
+                    return;
+                }
+            };
+        let http = http(Duration::from_secs(60));
+        for attempt in 1..=REPORT_ATTEMPTS {
+            match http
+                .post(url.as_str())
+                .header("Authorization", &format!("Bearer {}", config.agent_token))
+                .send_json(report)
+            {
+                Ok(_) => return,
+                Err(ureq::Error::StatusCode(status)) => {
+                    tracing::warn!(status, url = %url, "the server refused a toolbox report");
+                    return;
+                }
+                Err(error) if attempt < REPORT_ATTEMPTS => {
+                    tracing::warn!(%error, attempt, "could not send a toolbox report; retrying");
+                    std::thread::sleep(Duration::from_secs(2_u64.pow(attempt)));
+                }
+                Err(error) => {
+                    tracing::error!(%error, url = %url, "could not send a toolbox report");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) use self::shared::{deliver_file, run_script};
+#[cfg(any(windows, target_os = "macos"))]
+use self::shared::{download, failed};
 
 #[cfg(windows)]
 mod windows {
@@ -126,16 +398,14 @@ mod windows {
     use std::io::{Read, Write};
     use std::os::windows::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
     use anyhow::Context;
     use meshrmm_protocol::{
-        FileDeliveryDestination, FileDeliveryReport, FileDeliveryRequest, FileDeliveryStatus,
-        RunAs, ScriptRunReport, ScriptRunRequest, ScriptRunStatus,
+        FileDeliveryDestination, FileDeliveryRequest, RunAs, ScriptRunReport, ScriptRunRequest,
+        ScriptRunStatus,
     };
-    use sha2::{Digest, Sha256};
     use windows::Win32::Foundation::{
         HANDLE, HANDLE_FLAG_INHERIT, HLOCAL, LocalFree, SetHandleInformation, WAIT_TIMEOUT,
     };
@@ -170,131 +440,17 @@ mod windows {
     use windows::core::{GUID, PCWSTR, PWSTR};
 
     use super::{
-        MAX_RUNNING_DELIVERIES, MAX_RUNNING_SCRIPTS, Output, decode_output, interpreter_arguments,
-        script_file, unique_name, valid_id,
+        Output, decode_output, download, failed, interpreter_arguments, script_file, unique_name,
+        valid_id,
     };
     use crate::remote::config::{Config, ExecutionMode};
     use crate::win32::{HandleListAttribute, OwnedHandle, create_pipe, wide};
 
-    static RUNNING_SCRIPTS: AtomicUsize = AtomicUsize::new(0);
-    static RUNNING_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
     /// How long output readers may outlast the script. Programs the script
     /// started in the background can hold its output open indefinitely.
     const OUTPUT_DRAIN: Duration = Duration::from_secs(2);
-    /// Reports are retried this many times, a little longer apart each time.
-    const REPORT_ATTEMPTS: u32 = 6;
-    const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-    /// A place among a limited number of concurrent jobs, given back on drop.
-    struct Slot(&'static AtomicUsize);
-
-    impl Slot {
-        fn take(counter: &'static AtomicUsize, limit: usize) -> Option<Self> {
-            counter
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |running| {
-                    (running < limit).then_some(running + 1)
-                })
-                .ok()
-                .map(|_| Self(counter))
-        }
-    }
-
-    impl Drop for Slot {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-
-    /// Runs `run` on its own thread and reports how it went.
-    pub(crate) fn run_script(config: &Config, mode: ExecutionMode, run: ScriptRunRequest) {
-        let config = config.clone();
-        let slot = Slot::take(&RUNNING_SCRIPTS, MAX_RUNNING_SCRIPTS);
-        let spawned = std::thread::Builder::new()
-            .name("meshrmm-toolbox-script".into())
-            .spawn(move || {
-                let report = match slot {
-                    Some(_slot) => execute_script(mode, &run),
-                    None => failed(
-                        own_account(),
-                        format!(
-                            "The device is already running {MAX_RUNNING_SCRIPTS} toolbox scripts. Try again when one finishes."
-                        ),
-                    ),
-                };
-                tracing::info!(
-                    run_id = %run.run_id,
-                    status = report.status.as_str(),
-                    exit_code = ?report.exit_code,
-                    ran_as = %report.ran_as,
-                    error = ?report.error,
-                    "toolbox script finished"
-                );
-                send_report(&config, &["script-runs", &run.run_id, "result"], &report);
-            });
-        if let Err(error) = spawned {
-            tracing::error!(%error, "could not start a thread for a toolbox script");
-        }
-    }
-
-    /// Saves `delivery`'s file on its own thread and reports how it went.
-    pub(crate) fn deliver_file(
-        config: &Config,
-        mode: ExecutionMode,
-        delivery: FileDeliveryRequest,
-    ) {
-        let config = config.clone();
-        let slot = Slot::take(&RUNNING_DELIVERIES, MAX_RUNNING_DELIVERIES);
-        let spawned = std::thread::Builder::new()
-            .name("meshrmm-toolbox-file".into())
-            .spawn(move || {
-                let result = match slot {
-                    Some(_slot) => save_delivery(&config, mode, &delivery),
-                    None => Err(anyhow::anyhow!(
-                        "The device is already receiving {MAX_RUNNING_DELIVERIES} toolbox files. Try again when one finishes."
-                    )),
-                };
-                let report = match result {
-                    Ok(path) => {
-                        tracing::info!(delivery_id = %delivery.delivery_id, path = %path.display(), "saved a toolbox file");
-                        FileDeliveryReport {
-                            status: FileDeliveryStatus::Delivered,
-                            path: Some(path.display().to_string()),
-                            error: None,
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(delivery_id = %delivery.delivery_id, error = ?error, "could not save a toolbox file");
-                        FileDeliveryReport {
-                            status: FileDeliveryStatus::Failed,
-                            path: None,
-                            error: Some(format!("{error:#}")),
-                        }
-                    }
-                };
-                send_report(
-                    &config,
-                    &["file-deliveries", &delivery.delivery_id, "result"],
-                    &report,
-                );
-            });
-        if let Err(error) = spawned {
-            tracing::error!(%error, "could not start a thread for a toolbox file");
-        }
-    }
-
-    fn failed(ran_as: String, error: impl Into<String>) -> ScriptRunReport {
-        ScriptRunReport {
-            status: ScriptRunStatus::Failed,
-            ran_as,
-            exit_code: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            output_truncated: false,
-            error: Some(error.into()),
-        }
-    }
-
-    fn execute_script(mode: ExecutionMode, run: &ScriptRunRequest) -> ScriptRunReport {
+    pub(super) fn execute_script(mode: ExecutionMode, run: &ScriptRunRequest) -> ScriptRunReport {
         let user = match run.run_as {
             RunAs::User => signed_in_user(mode),
             RunAs::System => None,
@@ -373,6 +529,9 @@ mod windows {
                 .join("v1.0")
                 .join("powershell.exe"),
             meshrmm_protocol::ScriptLanguage::Cmd => system.join("cmd.exe"),
+            meshrmm_protocol::ScriptLanguage::Shell => {
+                anyhow::bail!("shell scripts run only on Macs")
+            }
         })
     }
 
@@ -516,7 +675,7 @@ mod windows {
     }
 
     /// The Agent's own account, which SYSTEM scripts run as.
-    fn own_account() -> String {
+    pub(super) fn own_account() -> String {
         let mut token = HANDLE::default();
         let account = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
             .map_err(anyhow::Error::from)
@@ -727,7 +886,7 @@ mod windows {
     }
 
     /// Downloads, checks and saves `delivery`'s file, and returns where it went.
-    fn save_delivery(
+    pub(super) fn save_delivery(
         config: &Config,
         mode: ExecutionMode,
         delivery: &FileDeliveryRequest,
@@ -837,6 +996,26 @@ mod windows {
         metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
 
+    /// Whether this device runs `language`'s scripts.
+    pub(super) fn runs(language: meshrmm_protocol::ScriptLanguage) -> bool {
+        matches!(
+            language,
+            meshrmm_protocol::ScriptLanguage::Powershell | meshrmm_protocol::ScriptLanguage::Cmd
+        )
+    }
+
+    /// Where downloads wait to be saved: an administrator-only folder.
+    pub(super) fn staging_folder(mode: ExecutionMode) -> anyhow::Result<PathBuf> {
+        if mode == ExecutionMode::Console {
+            let folder = std::env::temp_dir().join("meshrmm-deliveries");
+            std::fs::create_dir_all(&folder)?;
+            return Ok(folder);
+        }
+        let folder = crate::installer::config_directory()?.join("deliveries");
+        crate::private_directory::secure(&folder)?;
+        Ok(folder)
+    }
+
     /// A known folder, for `token`'s user or for the computer.
     fn known_folder(folder: &GUID, token: Option<&OwnedHandle>) -> anyhow::Result<PathBuf> {
         let path =
@@ -872,143 +1051,435 @@ mod windows {
             }
         }
     }
+}
 
-    /// A downloaded file waiting to be saved, removed with it.
-    struct Staged(PathBuf);
+/// Scripts and files on a Mac. Scripts run with zsh, as root or as the user
+/// signed in on the console, in their own process group so a timeout stops
+/// everything they started. Files go to the user's Documents transfer folder,
+/// written as the user, or to the shared folder when nobody is signed in.
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::{Duration, Instant};
 
-    impl Drop for Staged {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+    use anyhow::Context;
+    use meshrmm_protocol::{
+        FileDeliveryDestination, FileDeliveryRequest, RunAs, ScriptLanguage, ScriptRunReport,
+        ScriptRunRequest, ScriptRunStatus,
+    };
+
+    use super::{Output, decode_output, download, failed, script_file, unique_name, valid_id};
+    use crate::remote::config::{Config, ExecutionMode};
+
+    /// How long output readers may outlast the script. Programs the script
+    /// started in the background can hold its output open indefinitely.
+    const OUTPUT_DRAIN: Duration = Duration::from_secs(2);
+    const PATH: &str = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+    const SHARED_FOLDER: &str = "/Users/Shared";
+
+    /// The user signed in on the console, for an Agent running as root.
+    struct User {
+        uid: u32,
+        gid: u32,
+        name: String,
+        home: PathBuf,
+    }
+
+    /// A new folder holding one run's script, readable only by the account
+    /// the script runs as, and removed with it.
+    struct ScriptDirectory(PathBuf);
+
+    impl ScriptDirectory {
+        fn create(run_id: &str, user: Option<&User>) -> anyhow::Result<Self> {
+            let path = std::env::temp_dir().join(format!("meshrmm-script-{run_id}"));
+            // A folder that already exists could be anyone's.
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .with_context(|| format!("could not create {}", path.display()))?;
+            let directory = Self(path);
+            if let Some(user) = user {
+                std::os::unix::fs::chown(&directory.0, Some(user.uid), Some(user.gid))?;
+            }
+            Ok(directory)
+        }
+
+        /// Writes the script. The folder is new and private, so the file
+        /// cannot already exist; it is the user's own if the folder is.
+        fn write(&self, run: &ScriptRunRequest) -> anyhow::Result<PathBuf> {
+            let (name, contents) = script_file(run.language, &run.body);
+            let path = self.0.join(name);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)?;
+            file.write_all(&contents)?;
+            let metadata = std::fs::metadata(&self.0)?;
+            std::os::unix::fs::fchown(&file, Some(metadata.uid()), Some(metadata.gid()))?;
+            Ok(path)
         }
     }
 
-    /// Downloads the file into an administrator-only folder, checking its
-    /// size and SHA-256 on the way.
-    fn download(
+    impl Drop for ScriptDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    pub(super) fn runs(language: ScriptLanguage) -> bool {
+        language == ScriptLanguage::Shell
+    }
+
+    fn running_as_root() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn signed_in_user(mode: ExecutionMode) -> Option<User> {
+        // A console Agent already runs as the user.
+        if mode == ExecutionMode::Console || !running_as_root() {
+            return None;
+        }
+        let uid = crate::remote::macos::session_close::console_user()?;
+        // SAFETY: getpwuid returns static storage or null.
+        let entry = unsafe { libc::getpwuid(uid).as_ref() }?;
+        // SAFETY: a password entry's name and home are NUL-terminated.
+        let text = |field| {
+            unsafe { std::ffi::CStr::from_ptr(field) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        Some(User {
+            uid,
+            gid: entry.pw_gid,
+            name: text(entry.pw_name),
+            home: PathBuf::from(text(entry.pw_dir)),
+        })
+    }
+
+    fn user_name(uid: u32) -> String {
+        // SAFETY: getpwuid returns static storage or null.
+        let entry = unsafe { libc::getpwuid(uid) };
+        // SAFETY: a non-null entry has a NUL-terminated name.
+        unsafe { entry.as_ref() }
+            .map(|entry| {
+                unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_else(|| format!("user {uid}"))
+    }
+
+    pub(super) fn own_account() -> String {
+        // SAFETY: geteuid has no preconditions.
+        user_name(unsafe { libc::geteuid() })
+    }
+
+    /// A command that runs as `user` in their login session.
+    fn as_user(user: &User, program: &str) -> Command {
+        let mut command = Command::new("/bin/launchctl");
+        command.args([
+            "asuser",
+            &user.uid.to_string(),
+            "/usr/bin/sudo",
+            "-u",
+            &format!("#{}", user.uid),
+            "-H",
+            program,
+        ]);
+        command
+    }
+
+    pub(super) fn execute_script(mode: ExecutionMode, run: &ScriptRunRequest) -> ScriptRunReport {
+        let user = match run.run_as {
+            RunAs::User => signed_in_user(mode),
+            RunAs::System => None,
+        };
+        let ran_as = user
+            .as_ref()
+            .map_or_else(own_account, |user| user.name.clone());
+        if !valid_id(&run.run_id) {
+            return failed(ran_as, "The run has an invalid ID.");
+        }
+        let directory = match ScriptDirectory::create(&run.run_id, user.as_ref()) {
+            Ok(directory) => directory,
+            Err(error) => {
+                return failed(ran_as, format!("Could not prepare the script: {error:#}"));
+            }
+        };
+        let script = match directory.write(run) {
+            Ok(script) => script,
+            Err(error) => return failed(ran_as, format!("Could not write the script: {error:#}")),
+        };
+        let (mut command, working_directory) = match &user {
+            Some(user) => (as_user(user, "/bin/zsh"), user.home.clone()),
+            None => (Command::new("/bin/zsh"), PathBuf::from("/")),
+        };
+        command
+            .arg(&script)
+            .current_dir(working_directory)
+            .env("PATH", PATH)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        match execute(command, run) {
+            Ok((status, exit_code, stdout, stderr, truncated)) => ScriptRunReport {
+                status,
+                ran_as,
+                exit_code,
+                stdout,
+                stderr,
+                output_truncated: truncated,
+                error: (status == ScriptRunStatus::TimedOut).then(|| {
+                    format!(
+                        "The script was stopped after {} seconds.",
+                        run.timeout_seconds
+                    )
+                }),
+            },
+            Err(error) => failed(ran_as, format!("Could not run the script: {error:#}")),
+        }
+    }
+
+    type Outcome = (ScriptRunStatus, Option<i32>, String, String, bool);
+
+    fn execute(mut command: Command, run: &ScriptRunRequest) -> anyhow::Result<Outcome> {
+        let mut child = command.spawn().context("could not start zsh")?;
+        let stdout = Arc::new(Mutex::new(Output::default()));
+        let stderr = Arc::new(Mutex::new(Output::default()));
+        let (drained_tx, drained) = mpsc::channel();
+        for (pipe, output) in [
+            (
+                child
+                    .stdout
+                    .take()
+                    .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+                &stdout,
+            ),
+            (
+                child
+                    .stderr
+                    .take()
+                    .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+                &stderr,
+            ),
+        ] {
+            let Some(mut pipe) = pipe else { continue };
+            let output = Arc::clone(output);
+            let drained_tx = drained_tx.clone();
+            std::thread::spawn(move || {
+                let mut chunk = [0; 16 * 1024];
+                while let Ok(read) = pipe.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    output
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(&chunk[..read]);
+                }
+                let _ = drained_tx.send(());
+            });
+        }
+        drop(drained_tx);
+        let deadline = Instant::now() + Duration::from_secs(run.timeout_seconds.into());
+        let pid = child.id() as libc::pid_t;
+        let (status, exit_code) = loop {
+            if let Some(exit) = child.try_wait()? {
+                break (ScriptRunStatus::Completed, exit.code());
+            }
+            if Instant::now() >= deadline {
+                // SAFETY: the script leads its own process group.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+                let _ = child.wait();
+                break (ScriptRunStatus::TimedOut, None);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // Background programs the script left behind can keep its output open.
+        for _ in 0..2 {
+            if drained.recv_timeout(OUTPUT_DRAIN).is_err() {
+                break;
+            }
+        }
+        let take = |output: &Arc<Mutex<Output>>| {
+            let output = std::mem::take(&mut *output.lock().unwrap_or_else(|e| e.into_inner()));
+            let text = decode_output(&output.bytes, |bytes| {
+                String::from_utf8_lossy(bytes).into_owned()
+            });
+            (text, output.truncated)
+        };
+        let (stdout, stdout_truncated) = take(&stdout);
+        let (stderr, stderr_truncated) = take(&stderr);
+        Ok((
+            status,
+            exit_code,
+            stdout,
+            stderr,
+            stdout_truncated || stderr_truncated,
+        ))
+    }
+
+    /// Where downloads wait to be saved: a folder only the Agent's account can read.
+    pub(super) fn staging_folder(mode: ExecutionMode) -> anyhow::Result<PathBuf> {
+        let folder = if mode == ExecutionMode::Console {
+            std::env::temp_dir().join("meshrmm-deliveries")
+        } else {
+            crate::installer::config_directory()?.join("deliveries")
+        };
+        std::fs::create_dir_all(&folder)?;
+        Ok(folder)
+    }
+
+    pub(super) fn save_delivery(
         config: &Config,
         mode: ExecutionMode,
         delivery: &FileDeliveryRequest,
-    ) -> anyhow::Result<Staged> {
-        let folder = if mode == ExecutionMode::Console {
-            let folder = std::env::temp_dir().join("meshrmm-deliveries");
-            std::fs::create_dir_all(&folder)?;
-            folder
-        } else {
-            let folder = crate::installer::config_directory()?.join("deliveries");
-            crate::private_directory::secure(&folder)?;
-            folder
-        };
-        let staged = Staged(folder.join(format!("{}.partial", delivery.delivery_id)));
-        let url = meshrmm_signaling_client::endpoint_url(
-            &config.server,
-            &[
-                "v1",
-                "agents",
-                &config.device_id,
-                "file-deliveries",
-                &delivery.delivery_id,
-                "content",
-            ],
-            &[],
-            false,
-        )?;
-        let response = http(DOWNLOAD_TIMEOUT)
-            .get(url.as_str())
-            .header("Authorization", &format!("Bearer {}", config.agent_token))
-            .call()
-            .context("the server did not provide the file")?;
-        let mut body = response
-            .into_body()
-            .into_with_config()
-            .limit(delivery.size_bytes.saturating_add(1))
-            .reader();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staged.0)
-            .with_context(|| format!("could not create {}", staged.0.display()))?;
-        let mut digest = Sha256::new();
-        let mut size = 0_u64;
-        let mut chunk = vec![0; 64 * 1024];
-        loop {
-            let read = body
-                .read(&mut chunk)
-                .context("the download was interrupted")?;
-            if read == 0 {
-                break;
-            }
-            size += read as u64;
-            anyhow::ensure!(
-                size <= delivery.size_bytes,
-                "the server sent more than the file's size"
-            );
-            digest.update(&chunk[..read]);
-            file.write_all(&chunk[..read])
-                .with_context(|| format!("could not write {}", staged.0.display()))?;
-        }
-        file.flush()?;
-        anyhow::ensure!(size == delivery.size_bytes, "the download was incomplete");
-        let actual: String = digest
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+    ) -> anyhow::Result<PathBuf> {
         anyhow::ensure!(
-            actual == delivery.sha256,
-            "the download did not match the file's SHA-256"
+            valid_id(&delivery.delivery_id),
+            "the delivery has an invalid ID"
         );
-        Ok(staged)
-    }
-
-    fn http(timeout: Duration) -> ureq::Agent {
-        ureq::Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .http_status_as_error(true)
-            .tls_config(crate::updater::https_tls_config())
-            .build()
-            .new_agent()
-    }
-
-    /// Posts a result to `/v1/agents/{device}/{path}`, retrying while the
-    /// server cannot be reached. A refusal is final.
-    fn send_report(config: &Config, path: &[&str], report: &impl serde::Serialize) {
-        let mut segments = vec!["v1", "agents", config.device_id.as_str()];
-        segments.extend_from_slice(path);
-        let url =
-            match meshrmm_signaling_client::endpoint_url(&config.server, &segments, &[], false) {
-                Ok(url) => url,
-                Err(error) => {
-                    tracing::error!(%error, "could not build the toolbox report URL");
-                    return;
+        anyhow::ensure!(
+            meshrmm_protocol::valid_file_name(&delivery.file_name),
+            "the file name is not one the dashboard allows"
+        );
+        let staged = download(config, mode, delivery)?;
+        let user = signed_in_user(mode);
+        let documents = match (&user, delivery.destination) {
+            (Some(user), FileDeliveryDestination::User) => user.home.join("Documents"),
+            (None, FileDeliveryDestination::User) if !running_as_root() => {
+                PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
+                    .join("Documents")
+            }
+            _ => PathBuf::from(SHARED_FOLDER),
+        };
+        let folder = documents.join(meshrmm_file_transfer::TRANSFER_FOLDER);
+        match &user {
+            // Written as the user, so a link they control cannot redirect a
+            // root write.
+            Some(user) if delivery.destination == FileDeliveryDestination::User => {
+                let status = as_user(user, "/bin/mkdir")
+                    .arg("-p")
+                    .arg(&folder)
+                    .status()
+                    .context("could not create the transfer folder")?;
+                anyhow::ensure!(status.success(), "could not create {}", folder.display());
+                let path = free_path(&folder, &delivery.file_name)?;
+                let mut writer = as_user(user, "/bin/sh")
+                    .args(["-c", "set -C && cat > \"$1\"", "sh"])
+                    .arg(&path)
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .context("could not save the file as the signed-in user")?;
+                let mut source = std::fs::File::open(&staged.0)?;
+                let copied = std::io::copy(&mut source, writer.stdin.as_mut().context("no input")?);
+                drop(writer.stdin.take());
+                let status = writer.wait()?;
+                anyhow::ensure!(
+                    copied.is_ok() && status.success(),
+                    "could not write {}",
+                    path.display()
+                );
+                Ok(path)
+            }
+            _ => {
+                std::fs::create_dir_all(&folder)
+                    .with_context(|| format!("could not create {}", folder.display()))?;
+                // /Users/Shared is open to everyone, but its sticky bit keeps
+                // others from replacing a folder this account owns there.
+                let metadata = std::fs::symlink_metadata(&folder)?;
+                // SAFETY: geteuid has no preconditions.
+                let owner = unsafe { libc::geteuid() };
+                anyhow::ensure!(
+                    metadata.is_dir()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.uid() == owner,
+                    "{} is not a plain folder",
+                    folder.display()
+                );
+                let path = free_path(&folder, &delivery.file_name)?;
+                let mut destination = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&path)
+                    .with_context(|| format!("could not create {}", path.display()))?;
+                let mut source = std::fs::File::open(&staged.0)?;
+                if let Err(error) = std::io::copy(&mut source, &mut destination) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error)
+                        .with_context(|| format!("could not write {}", path.display()));
                 }
-            };
-        let http = http(Duration::from_secs(60));
-        for attempt in 1..=REPORT_ATTEMPTS {
-            match http
-                .post(url.as_str())
-                .header("Authorization", &format!("Bearer {}", config.agent_token))
-                .send_json(report)
-            {
-                Ok(_) => return,
-                Err(ureq::Error::StatusCode(status)) => {
-                    tracing::warn!(status, url = %url, "the server refused a toolbox report");
-                    return;
-                }
-                Err(error) if attempt < REPORT_ATTEMPTS => {
-                    tracing::warn!(%error, attempt, "could not send a toolbox report; retrying");
-                    std::thread::sleep(Duration::from_secs(2_u64.pow(attempt)));
-                }
-                Err(error) => {
-                    tracing::error!(%error, url = %url, "could not send a toolbox report");
-                }
+                Ok(path)
             }
         }
+    }
+
+    fn free_path(folder: &Path, name: &str) -> anyhow::Result<PathBuf> {
+        let name = unique_name(name, |candidate| {
+            std::fs::symlink_metadata(folder.join(candidate)).is_ok()
+        })
+        .context("the transfer folder already has too many files with this name")?;
+        Ok(folder.join(name))
     }
 }
+
+#[cfg(target_os = "macos")]
+use self::macos as platform;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    fn run_here(body: &str, timeout_seconds: u32) -> meshrmm_protocol::ScriptRunReport {
+        macos::execute_script(
+            crate::remote::config::ExecutionMode::Console,
+            &meshrmm_protocol::ScriptRunRequest {
+                run_id: format!("test-{}-{timeout_seconds}", std::process::id()),
+                language: ScriptLanguage::Shell,
+                body: body.into(),
+                run_as: meshrmm_protocol::RunAs::User,
+                timeout_seconds,
+            },
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_scripts_run_in_zsh_and_report_their_output() {
+        let report = run_here(
+            "print -r -- héllo\r\nread line || echo no input >&2\nexit 3\n",
+            30,
+        );
+        assert_eq!(report.status, meshrmm_protocol::ScriptRunStatus::Completed);
+        assert_eq!(report.exit_code, Some(3));
+        assert_eq!(report.stdout, "héllo\n");
+        assert_eq!(report.stderr, "no input\n", "the script gets no input");
+        assert!(!report.ran_as.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_scripts_that_overrun_are_stopped_with_what_they_started() {
+        let started = std::time::Instant::now();
+        let report = run_here("sleep 60 &\necho started\nsleep 60\n", 1);
+        assert_eq!(report.status, meshrmm_protocol::ScriptRunStatus::TimedOut);
+        assert_eq!(report.stdout, "started\n");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the background sleep does not hold the output open"
+        );
+    }
 
     #[test]
     fn script_files_use_crlf_and_the_interpreters_encoding() {
