@@ -462,11 +462,14 @@ pub(super) fn install_control_handler(
                 }
                 Ok(SessionMessage::MaintenanceState { agent_input_blocked, blacked_out }) => {
                     if let Ok(mut state) = viewer_control.maintenance.lock() {
-                        *state = crate::platform::MaintenanceState { available: true, agent_input_blocked, blacked_out, error: None, power: state.power };
+                        *state = crate::platform::MaintenanceState { available: true, agent_input_blocked, blacked_out, error: None, power: state.power, platform: state.platform };
                     }
                 }
-                Ok(SessionMessage::PowerState { safe_mode }) => {
-                    if let Ok(mut state) = viewer_control.maintenance.lock() { state.power = Some(safe_mode); }
+                Ok(SessionMessage::DeviceState { platform, safe_mode }) => {
+                    if let Ok(mut state) = viewer_control.maintenance.lock() {
+                        state.power = Some(safe_mode);
+                        state.platform = Some(platform);
+                    }
                     if let Ok(guard) = presenter.lock() && let Some(active) = guard.as_ref() { active.presenter.refresh_controls(); }
                 }
                 Ok(SessionMessage::Stop { reason }) => tracing::info!(reason, "Agent stopped stream"),
