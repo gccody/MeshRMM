@@ -1096,7 +1096,14 @@ mod macos {
 
     impl ScriptDirectory {
         fn create(run_id: &str, user: Option<&User>) -> anyhow::Result<Self> {
-            let path = std::env::temp_dir().join(format!("meshrmm-script-{run_id}"));
+            // Only root can reach into root's own temporary folder. In the
+            // shared one, the sticky bit keeps others from replacing the
+            // root-created folder before it is given to the user.
+            let parent = match user {
+                Some(_) => PathBuf::from("/private/tmp"),
+                None => std::env::temp_dir(),
+            };
+            let path = parent.join(format!("meshrmm-script-{run_id}"));
             // A folder that already exists could be anyone's.
             std::fs::DirBuilder::new()
                 .mode(0o700)
