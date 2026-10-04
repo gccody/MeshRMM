@@ -57,12 +57,12 @@ pub(crate) fn identity_directory() -> anyhow::Result<PathBuf> {
     Ok(config_directory()?.join("identity"))
 }
 
-const SUPPORT_DIRECTORY: &str = "/Library/Application Support/MeshRMM";
-const APP: &str = "/Library/Application Support/MeshRMM/MeshRMM Agent.app";
+pub(crate) const SUPPORT_DIRECTORY: &str = "/Library/Application Support/MeshRMM";
+pub(crate) const APP: &str = "/Library/Application Support/MeshRMM/MeshRMM Agent.app";
 const EXECUTABLE: &str = "Contents/MacOS/meshrmm-agent";
-const DAEMON_LABEL: &str = "com.meshrmm.agent";
+pub(crate) const DAEMON_LABEL: &str = "com.meshrmm.agent";
 const DAEMON_PLIST: &str = "/Library/LaunchDaemons/com.meshrmm.agent.plist";
-const HELPER_LABEL: &str = "com.meshrmm.agent.session";
+pub(crate) const HELPER_LABEL: &str = "com.meshrmm.agent.session";
 const HELPER_PLIST: &str = "/Library/LaunchAgents/com.meshrmm.agent.session.plist";
 const BUNDLE_IDENTIFIER: &str = "com.meshrmm.agent";
 
@@ -261,7 +261,7 @@ fn launchctl(arguments: &[&str]) -> anyhow::Result<()> {
 }
 
 /// Users with a graphical login session, from their loginwindow processes.
-fn graphical_users() -> Vec<u32> {
+pub(crate) fn graphical_users() -> Vec<u32> {
     let Ok(output) = std::process::Command::new("/bin/ps")
         .args(["-axo", "uid=,comm="])
         .output()
@@ -335,6 +335,8 @@ fn daemon_plist(executable: &Path, config: &Path) -> String {
     <true/>
     <key>ThrottleInterval</key>
     <integer>5</integer>
+    <key>AbandonProcessGroup</key>
+    <true/>
 </dict>
 </plist>
 "#,
@@ -376,7 +378,7 @@ fn helper_plist(executable: &Path) -> String {
     )
 }
 
-fn info_plist() -> String {
+pub(crate) fn info_plist() -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

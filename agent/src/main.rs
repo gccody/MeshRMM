@@ -9,6 +9,9 @@ mod logging;
 #[cfg(target_os = "macos")]
 #[path = "macos/app.rs"]
 mod macos_app;
+#[cfg(target_os = "macos")]
+#[path = "macos/updater.rs"]
+mod macos_updater;
 #[cfg(any(windows, target_os = "macos", test))]
 mod power;
 #[cfg(windows)]
@@ -18,6 +21,8 @@ mod remote;
 mod service;
 #[cfg(windows)]
 mod tray;
+#[cfg(any(windows, target_os = "macos"))]
+mod update_policy;
 #[cfg(windows)]
 mod updater;
 #[cfg(windows)]
@@ -60,6 +65,20 @@ fn main() -> anyhow::Result<()> {
         {
             ["--install", authorization] => return installer::install(authorization),
             ["--uninstall"] => return installer::uninstall(),
+            ["--apply-update", app, coordinator] => {
+                logging::initialize_helper("agent-update.log")?;
+                let result = macos_updater::apply(
+                    std::path::Path::new(app),
+                    coordinator
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("invalid coordinator process ID"))?,
+                );
+                if let Err(error) = &result {
+                    tracing::error!(error = ?error, "Agent update failed");
+                }
+                logging::flush();
+                return result;
+            }
             _ => {}
         }
     }

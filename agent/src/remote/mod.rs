@@ -169,7 +169,16 @@ pub async fn run(
         if mode == ExecutionMode::Service {
             macos::helper::coordinator::listen(&macos::helper::socket_path())?;
         }
-        let link = service_link::ServiceLink::new(mode == ExecutionMode::Worker);
+        let link = std::sync::Arc::new(service_link::ServiceLink::new(
+            mode == ExecutionMode::Worker,
+        ));
+        #[cfg(target_os = "macos")]
+        if mode == ExecutionMode::Service {
+            tokio::spawn(crate::macos_updater::run(
+                config.clone(),
+                std::sync::Arc::clone(&link),
+            ));
+        }
         // Created once, so reconnecting does not capture again before the interval ends.
         let mut thumbnails = thumbnail::Thumbnails::new(mode);
         let mut retry_delay = Duration::from_secs(1);
