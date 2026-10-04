@@ -114,7 +114,7 @@ export function RunScriptModal({ agents, scripts: givenScripts, initialAgentId, 
               {(["user", "system"] as const).map((choice) => (
                 <label key={choice}>
                   <input type="radio" name="run-as" value={choice} checked={runAs === choice} onChange={() => setRunAs(choice)} />
-                  <span><strong>{RUN_AS_LABELS[choice]}</strong>{choice === "user" ? "The person signed in to the device. If nobody is, the script runs as SYSTEM." : "The device's system account, with full control of the computer."}</span>
+                  <span><strong>{RUN_AS_LABELS[choice]}</strong>{choice === "user" ? "The person signed in to the device. If nobody is, the script runs as the system account." : "SYSTEM on Windows or root on a Mac, with full control of the computer."}</span>
                 </label>
               ))}
             </fieldset>

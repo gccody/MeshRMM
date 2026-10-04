@@ -1,6 +1,6 @@
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod annotation;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod audio_mode;
 #[cfg(windows)]
 mod background;
@@ -8,7 +8,7 @@ mod background;
 pub(crate) mod background_files;
 #[cfg(windows)]
 pub(crate) mod background_tasks;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod bitrate;
 #[cfg(windows)]
 mod blackout;
@@ -17,9 +17,9 @@ pub(crate) mod capture_helper;
 #[cfg(windows)]
 mod clipboard;
 pub mod config;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod connection_approval;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod connection_notification;
 #[cfg(windows)]
 mod credentials;
@@ -35,56 +35,58 @@ mod input;
 mod input_block;
 #[cfg(windows)]
 mod keep_awake;
-#[cfg(any(windows, test))]
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(any(windows, target_os = "macos", test))]
 mod native_task;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod platform;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod secure_attention;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod sender_failure;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod sender_progress;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) mod service_link;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod session;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) mod session_close;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod signaling;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod thumbnail;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod toolbox;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod transport;
 #[cfg(windows)]
 pub(crate) mod virtual_display;
 // The bitrate controller's tests share the encoded-frame queue bound.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod video;
 #[cfg(windows)]
 pub(crate) mod wallpaper;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use std::time::Duration;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use anyhow::Context;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use meshrmm_protocol::{AgentCommand, AgentSessionRequest, AgentStatusMessage};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use tokio::time::sleep;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use tokio_tungstenite::tungstenite::Message;
 
 use self::config::{Config, ExecutionMode};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use self::signaling::{agent_connection_url, authenticated_websocket};
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 struct ActiveSession {
     session_id: meshrmm_protocol::RemoteSessionId,
     request: AgentSessionRequest,
@@ -95,7 +97,7 @@ struct ActiveSession {
 /// Agent reconnects. Servers that renew the session's lease rewrite the expiry of the request they
 /// replay, so the expiry is ignored. A resume carries new TURN credentials, so it still restarts
 /// the session.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 fn replays_session(
     active: &meshrmm_protocol::AgentSessionRequest,
     request: &meshrmm_protocol::AgentSessionRequest,
@@ -111,7 +113,7 @@ fn replays_session(
 /// session cannot outlive it and nothing else would run them.
 /// Tells the server the Agent is going offline to install `version`, so the dashboard shows
 /// the update instead of an unexplained outage. The stop goes ahead if this fails.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn announce_update(socket: &meshrmm_signaling_client::SignalingConnection, version: String) {
     let status = AgentStatusMessage::Updating { version };
     let sent = match serde_json::to_string(&status) {
@@ -126,7 +128,7 @@ async fn announce_update(socket: &meshrmm_signaling_client::SignalingConnection,
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn end_sessions(
     active_session: &mut Option<ActiveSession>,
     session_close: &mut Option<(
@@ -144,18 +146,39 @@ async fn end_sessions(
     }
 }
 
-#[cfg_attr(not(windows), allow(unused_variables))]
+/// Entry point of `--session-helper`, which launchd runs in each graphical
+/// session of an installed macOS Agent.
+#[cfg(target_os = "macos")]
+pub fn run_session_helper() -> anyhow::Result<()> {
+    crate::logging::initialize_helper("agent-session-helper.log")?;
+    macos::helper::host::run(&macos::helper::socket_path())
+}
+
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(unused_variables))]
 pub async fn run(
     #[allow(unused_mut)] mut config: Config,
     mode: ExecutionMode,
 ) -> anyhow::Result<()> {
-    #[cfg(not(windows))]
-    anyhow::bail!("the first MeshRMM remote-screen MVP requires Windows");
+    #[cfg(not(any(windows, target_os = "macos")))]
+    anyhow::bail!("the MeshRMM Agent requires Windows or macOS");
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         connection_approval::restore_after_restart();
-        let link = service_link::ServiceLink::new(mode == ExecutionMode::Worker);
+        #[cfg(target_os = "macos")]
+        if mode == ExecutionMode::Service {
+            macos::helper::coordinator::listen(&macos::helper::socket_path())?;
+        }
+        let link = std::sync::Arc::new(service_link::ServiceLink::new(
+            mode == ExecutionMode::Worker,
+        ));
+        #[cfg(target_os = "macos")]
+        if mode == ExecutionMode::Service {
+            tokio::spawn(crate::macos_updater::run(
+                config.clone(),
+                std::sync::Arc::clone(&link),
+            ));
+        }
         // Created once, so reconnecting does not capture again before the interval ends.
         let mut thumbnails = thumbnail::Thumbnails::new(mode);
         let mut retry_delay = Duration::from_secs(1);
@@ -202,6 +225,7 @@ pub async fn run(
                                                         break Ok(false);
                                                     }
                                                     AgentCommand::Uninstall => {
+                                                        {
                                                         crate::installer::schedule_uninstall()
                                                             .context("failed to schedule Agent self-uninstall")?;
                                                         socket
@@ -213,6 +237,7 @@ pub async fn run(
                                                             .context("failed to acknowledge Agent self-uninstall")?;
                                                         sleep(Duration::from_millis(250)).await;
                                                         break Ok(true);
+                                                        }
                                                     }
                                                     AgentCommand::EndSession { session_id } => {
                                                         if active_session.as_ref().is_some_and(

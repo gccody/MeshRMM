@@ -1,7 +1,7 @@
 // The toolbox's data and the rules the server enforces, so forms can explain
 // a problem before saving. See docs/toolbox.md.
 
-export type ScriptLanguage = "powershell" | "cmd";
+export type ScriptLanguage = "powershell" | "cmd" | "shell";
 export type RunAs = "user" | "system";
 
 export type ToolboxScript = {
@@ -88,11 +88,12 @@ export const MAX_TOOLBOX_FILE_BYTES = 95 * 1024 * 1024;
 export const LANGUAGE_LABELS: Record<ScriptLanguage, string> = {
   powershell: "PowerShell",
   cmd: "Command Prompt",
+  shell: "Shell (zsh)",
 };
 
 export const RUN_AS_LABELS: Record<RunAs, string> = {
   user: "Signed-in user",
-  system: "SYSTEM",
+  system: "System account",
 };
 
 const encoder = new TextEncoder();
@@ -253,7 +254,8 @@ export function runTone(run: Pick<ScriptRun, "status" | "exit_code">): "pending"
   return run.status === "completed" && run.exit_code === 0 ? "success" : "problem";
 }
 
-const SYSTEM_ACCOUNT = /\\SYSTEM$/iu;
+/** SYSTEM on Windows, root on a Mac. */
+const SYSTEM_ACCOUNT = /(?:\\SYSTEM|^root)$/iu;
 
 /** The account a run used, noting when nobody was signed in to run it as. */
 export function ranAsLabel(run: Pick<ScriptRun, "run_as" | "ran_as">) {

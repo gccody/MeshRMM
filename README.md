@@ -61,6 +61,7 @@ and are used by ICE only when a direct candidate pair cannot connect.
 - Windows 10 version 1903 or newer for the Agent and Windows viewer.
 - Local administrator approval to install the Agent as a Windows service.
 - macOS 12 or newer for the macOS viewer.
+- macOS 12.3 or newer for the macOS Agent, which is in development (see below).
 - rustup. The first `cargo` command in the repository installs the toolchain
   pinned in `rust-toolchain.toml` (the MSVC host toolchain on Windows) with
   Clippy, rustfmt and the `wasm32-unknown-unknown` target.
@@ -94,6 +95,55 @@ no hardware decoder. Startup still fails with a contextual error when neither
 path exists, for example on a Windows N edition without the Media Feature
 Pack.
 
+## macOS Agent
+
+The Agent also runs on macOS 12.3 or newer, and is still being ported.
+ScreenCaptureKit captures 4:2:0 frames, VideoToolbox encodes them as H.265 or
+H.264 (in hardware where the Mac has it), and Quartz events carry the viewer's
+keyboard and pointer input; ScreenCaptureKit also captures the Mac's system
+audio. Clipboard, file transfer, chat, Prevent idle lock and Hide wallpaper
+work too. During a session a menu bar item opens the chat, which also opens
+by itself for the technician's messages; the session banner, the connection
+notification and the connection approval prompt follow company policy as on
+Windows, the display border is left out of the capture, and the technician's
+annotations are drawn over the shared display. The maintenance controls work
+too: blocking the user's keyboard and mouse uses an event tap that lets only
+the technician's tagged input through, the blackout shows the company's
+message on every screen while the capture leaves it out, and the session close
+actions lock the screen, log out or clear the clipboard of the same sign-in
+the technician saw. The Devices page shows the Mac's screen thumbnail, and
+the toolbox runs Shell (zsh) scripts as the console user or root and
+delivers files to the user's Documents transfer folder.
+VideoToolbox has no 4:4:4 encoder, so Mac Agents always stream 4:2:0.
+
+The dashboard's **Add a device** dialog creates a one-time Terminal command
+for Macs. It runs `install-agent-macos.sh` from the dashboard, which downloads
+the universal (Apple silicon and Intel) Agent named in the release manifest,
+checks its SHA-256, and runs `sudo meshrmm-agent --install <authorization>`.
+That enrolls the Mac with the hex-encoded installer authorization and installs
+the app bundle in
+`/Library/Application Support/MeshRMM`. A launchd daemon runs the root
+coordinator, which keeps the signaling connection and the WebRTC session.
+Capture and input need a graphical session, so a launchd agent runs a session
+helper in each one, the login window's included; helpers connect to the
+coordinator's socket at `/var/run/com.meshrmm.agent.sock`, which admits only
+processes running the Agent's own executable. A session follows the console:
+when another user takes it, capture moves to that user's helper.
+The coordinator updates the Agent like the Windows service does: every six
+hours, postponed while a remote session is live, it stages a newer
+`agent-macos` release once its SHA-256 and code signature (by the installed
+Agent's developer team) check out. The new Agent waits for the coordinator to
+stop, swaps the app bundle, restarts the launchd jobs, and puts the previous
+bundle back if the new coordinator does not keep running.
+`sudo meshrmm-agent --uninstall` removes everything. The configuration and
+WebRTC identity live in `/Library/Application Support/MeshRMM/Agent`, which
+only root can read.
+
+macOS lets only the user grant the Screen & System Audio Recording,
+Accessibility and Input Monitoring permissions the helpers need; the first
+helper asks for them. `meshrmm-agent --console --config agent.json` runs the
+Agent in the current session for development.
+
 ## Computers without a monitor
 
 Windows has no desktop to capture when no monitor is connected. When a session
@@ -114,7 +164,7 @@ while a real monitor is connected.
 
 ## Toolbox
 
-The dashboard's **Toolbox** page keeps PowerShell and Command Prompt scripts and
+The dashboard's **Toolbox** page keeps PowerShell, Command Prompt and Shell (zsh) scripts and
 a library of files, each private to the user who added it or shared with the
 company. Scripts run on a device from the dashboard or from the viewer's
 toolbox button, as the signed-in user or as SYSTEM; with nobody signed in they
@@ -564,7 +614,9 @@ device: on Windows under **Settings → Keyboard**, on macOS (diagnostics only)
 under the gear menu's **Diagnostics shortcut**. While the Windows viewer has
 keyboard focus it also sends the Windows key, Alt+Tab, Alt+Esc and Ctrl+Esc to
 the device instead of acting on them locally; turn this off under
-**Settings → Keyboard**. Ctrl+Alt+Del and Windows+L always stay local. On endpoints with multiple monitors,
+**Settings → Keyboard**. Ctrl+Alt+Del and Windows+L always stay local. When the
+device is a Mac, the macOS viewer's Command key is always Command, and the
+Windows viewer's Windows key is Command too. On endpoints with multiple monitors,
 select **All displays** from the viewer's monitor menu (also included in
 keyboard cycling) to view and control the complete desktop in one window.
 The combined view preserves monitor positions, including negative coordinates,
@@ -737,7 +789,8 @@ Windows' synchronous capture API, while input remains in a separate helper.
 ### Sending Ctrl+Alt+Del
 
 Use the keyboard icon (**Send Ctrl+Alt+Del**) in the Windows or macOS remote client's toolbar to send the
-secure attention sequence to the Windows agent. Update both the client and agent
+secure attention sequence to the Windows agent. Macs have no such sequence, so
+the viewer leaves the button out when the device is a Mac. Update both the client and agent
 for this command. The agent must run through its installed Windows service.
 
 When Windows policy blocks service-generated secure attention, the agent temporarily

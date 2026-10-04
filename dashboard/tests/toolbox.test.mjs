@@ -86,6 +86,8 @@ test("runs read as their outcome and the account they used", () => {
   assert.equal(ranAsLabel({ run_as: "user", ran_as: "PC\\ada" }), "PC\\ada");
   assert.equal(ranAsLabel({ run_as: "user", ran_as: "NT AUTHORITY\\SYSTEM" }), "NT AUTHORITY\\SYSTEM (nobody was signed in)");
   assert.equal(ranAsLabel({ run_as: "system", ran_as: "NT AUTHORITY\\SYSTEM" }), "NT AUTHORITY\\SYSTEM");
+  assert.equal(ranAsLabel({ run_as: "user", ran_as: "root" }), "root (nobody was signed in)");
+  assert.equal(ranAsLabel({ run_as: "user", ran_as: "rooter" }), "rooter");
 });
 
 test("sizes read in binary units", () => {

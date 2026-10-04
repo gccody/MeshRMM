@@ -1,7 +1,18 @@
+#[cfg(any(windows, target_os = "macos"))]
+mod enrollment;
 #[cfg(windows)]
 mod installer;
+#[cfg(target_os = "macos")]
+#[path = "macos/installer.rs"]
+mod installer;
 mod logging;
-#[cfg(any(windows, test))]
+#[cfg(target_os = "macos")]
+#[path = "macos/app.rs"]
+mod macos_app;
+#[cfg(target_os = "macos")]
+#[path = "macos/updater.rs"]
+mod macos_updater;
+#[cfg(any(windows, target_os = "macos", test))]
 mod power;
 #[cfg(windows)]
 mod private_directory;
@@ -10,6 +21,8 @@ mod remote;
 mod service;
 #[cfg(windows)]
 mod tray;
+#[cfg(any(windows, target_os = "macos"))]
+mod update_policy;
 #[cfg(windows)]
 mod updater;
 #[cfg(windows)]
@@ -36,9 +49,46 @@ fn main() -> anyhow::Result<()> {
         return tray::run();
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     if meshrmm_session_transport::identity::handle_command(installer::identity_directory)? {
         return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+        match arguments
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            ["--install", authorization] => return installer::install(authorization),
+            ["--uninstall"] => return installer::uninstall(),
+            ["--apply-update", app, coordinator] => {
+                logging::initialize_helper("agent-update.log")?;
+                let result = macos_updater::apply(
+                    std::path::Path::new(app),
+                    coordinator
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("invalid coordinator process ID"))?,
+                );
+                if let Err(error) = &result {
+                    tracing::error!(error = ?error, "Agent update failed");
+                }
+                logging::flush();
+                return result;
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--session-helper")
+    {
+        return macos_app::run_main_loop(true, remote::run_session_helper);
     }
 
     #[cfg(windows)]
@@ -83,17 +133,28 @@ fn main() -> anyhow::Result<()> {
 
     // Native helpers own their threads and optional service runtime. Dispatch
     // them before entering Tokio so a helper never nests block_on inside it.
-    let result = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run_agent());
-    if let Err(error) = &result
-        && logging::has_process_log()
-    {
-        tracing::error!(error = ?error, "MeshRMM Agent process stopped with an error");
-    }
-    logging::flush();
-    result
+    let agent = || {
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_agent());
+        if let Err(error) = &result
+            && logging::has_process_log()
+        {
+            tracing::error!(error = ?error, "MeshRMM Agent process stopped with an error");
+        }
+        logging::flush();
+        result
+    };
+    // The root coordinator has no window server connection; everything that
+    // needs one runs in the session helpers.
+    #[cfg(target_os = "macos")]
+    return macos_app::run_main_loop(
+        !std::env::args_os().any(|argument| argument == "--service"),
+        agent,
+    );
+    #[cfg(not(target_os = "macos"))]
+    agent()
 }
 
 async fn run_agent() -> anyhow::Result<()> {
@@ -144,9 +205,14 @@ async fn run_agent() -> anyhow::Result<()> {
     match mode {
         #[cfg(windows)]
         ExecutionMode::Service => service::run(config),
+        // launchd supervises the macOS coordinator directly.
+        #[cfg(target_os = "macos")]
+        ExecutionMode::Service => remote::run(config, mode).await,
         ExecutionMode::Worker | ExecutionMode::Console => remote::run(config, mode).await,
-        #[cfg(not(windows))]
-        ExecutionMode::Service => anyhow::bail!("the MeshRMM Agent service requires Windows"),
+        #[cfg(not(any(windows, target_os = "macos")))]
+        ExecutionMode::Service => {
+            anyhow::bail!("the MeshRMM Agent service requires Windows or macOS")
+        }
     }
 }
 

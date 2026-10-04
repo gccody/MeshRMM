@@ -5,11 +5,10 @@
 //! writes the release version to that stdin, so the coordinator can tell the server why the
 //! Agent is going offline.
 use std::io::{BufRead, Write};
-use std::os::windows::io::AsRawHandle;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
-use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation};
 
 /// Written when the first remote session starts.
 pub const SESSION_ACTIVE: &str = "session-active";
@@ -20,34 +19,48 @@ pub const SESSION_IDLE: &str = "session-idle";
 pub const UPDATING_PREFIX: &str = "updating ";
 
 pub struct ServiceLink {
-    stop: watch::Receiver<bool>,
+    stop: Arc<watch::Sender<bool>>,
     activity: Option<Arc<Activity>>,
     update: Arc<Mutex<Option<String>>>,
+    sessions: Arc<AtomicUsize>,
 }
 
 impl ServiceLink {
     /// Follows the service's pipes for a coordinator it launched; otherwise the coordinator only
     /// stops on Ctrl+C and reports nothing.
     pub fn new(attached: bool) -> Self {
-        let (sender, stop) = watch::channel(false);
+        let stop = Arc::new(watch::Sender::new(false));
         let update = Arc::new(Mutex::new(None));
+        let sessions = Arc::default();
         if !attached {
             return Self {
                 stop,
                 activity: None,
                 update,
+                sessions,
             };
         }
+        let sender = Arc::clone(&stop);
         // Helpers launched with inherited handles, some as the signed-in user, must not
-        // receive the service's pipes.
-        for handle in [
-            std::io::stdin().as_raw_handle(),
-            std::io::stdout().as_raw_handle(),
-        ] {
-            if let Err(error) = unsafe {
-                SetHandleInformation(HANDLE(handle), HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))
-            } {
-                tracing::warn!(%error, "could not keep the Agent service pipes from helpers");
+        // receive the service's pipes. Unix children inherit stdio only as their own
+        // stdio, which every helper launch replaces.
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+
+            use windows::Win32::Foundation::{
+                HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation,
+            };
+
+            for handle in [
+                std::io::stdin().as_raw_handle(),
+                std::io::stdout().as_raw_handle(),
+            ] {
+                if let Err(error) = unsafe {
+                    SetHandleInformation(HANDLE(handle), HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))
+                } {
+                    tracing::warn!(%error, "could not keep the Agent service pipes from helpers");
+                }
             }
         }
         let announced = Arc::clone(&update);
@@ -79,7 +92,7 @@ impl ServiceLink {
                         }
                     }
                 }
-                let _ = sender.send(true);
+                sender.send_replace(true);
             });
         if let Err(error) = watcher {
             tracing::warn!(%error, "could not follow Agent service stop requests");
@@ -88,7 +101,22 @@ impl ServiceLink {
             stop,
             activity: Some(Arc::new(Activity::new(Box::new(std::io::stdout())))),
             update,
+            sessions,
         }
+    }
+
+    /// Stops the coordinator so a staged update can replace it, as the
+    /// Windows service does through the pipe.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn stop_for_update(&self, version: String) {
+        *self.update.lock().unwrap_or_else(|e| e.into_inner()) = Some(version);
+        self.stop.send_replace(true);
+    }
+
+    /// Whether a remote session is running.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn session_active(&self) -> bool {
+        self.sessions.load(Ordering::SeqCst) > 0
     }
 
     /// The release the service announced it is stopping the coordinator to install.
@@ -101,25 +129,39 @@ impl ServiceLink {
 
     /// Resolves once the service or Ctrl+C asks the coordinator to stop.
     pub async fn stopped(&self) {
-        let mut stop = self.stop.clone();
+        let mut stop = self.stop.subscribe();
         let service = async move {
-            // Without a watcher thread the service can only stop the coordinator by terminating it.
-            if stop.wait_for(|stopped| *stopped).await.is_err() {
-                std::future::pending::<()>().await;
+            let _ = stop.wait_for(|stopped| *stopped).await;
+        };
+        // launchd stops the macOS coordinator with SIGTERM.
+        let terminate = async {
+            #[cfg(unix)]
+            if let Ok(mut terminate) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                terminate.recv().await;
+                return;
             }
+            std::future::pending::<()>().await
         };
         tokio::select! {
             () = service => {}
             _ = tokio::signal::ctrl_c() => {}
+            () = terminate => {}
         }
     }
 
-    /// Reports a live remote session to the service until the returned guard is dropped.
-    pub fn session_started(&self) -> Option<SessionGuard> {
-        self.activity.as_ref().map(|activity| {
+    /// Counts a live remote session, and reports it to the service, until the
+    /// returned guard is dropped.
+    pub fn session_started(&self) -> SessionGuard {
+        self.sessions.fetch_add(1, Ordering::SeqCst);
+        if let Some(activity) = &self.activity {
             activity.change(true);
-            SessionGuard(Arc::clone(activity))
-        })
+        }
+        SessionGuard {
+            activity: self.activity.clone(),
+            sessions: Arc::clone(&self.sessions),
+        }
     }
 }
 
@@ -133,11 +175,17 @@ fn update_announcement(line: &[u8]) -> Option<String> {
     meshrmm_protocol::is_release_version(version).then(|| version.to_owned())
 }
 
-pub struct SessionGuard(Arc<Activity>);
+pub struct SessionGuard {
+    activity: Option<Arc<Activity>>,
+    sessions: Arc<AtomicUsize>,
+}
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.0.change(false);
+        self.sessions.fetch_sub(1, Ordering::SeqCst);
+        if let Some(activity) = &self.activity {
+            activity.change(false);
+        }
     }
 }
 
@@ -198,9 +246,10 @@ mod tests {
         let output = Output::default();
         let activity = Arc::new(Activity::new(Box::new(output.clone())));
         let link = ServiceLink {
-            stop: watch::channel(false).1,
+            stop: Arc::new(watch::Sender::new(false)),
             activity: Some(activity),
             update: Arc::default(),
+            sessions: Arc::default(),
         };
         let first = link.session_started();
         let replacement = link.session_started();
@@ -226,7 +275,22 @@ mod tests {
     }
 
     #[test]
-    fn an_unattached_coordinator_reports_nothing() {
-        assert!(ServiceLink::new(false).session_started().is_none());
+    fn an_unattached_coordinator_still_counts_sessions() {
+        let link = ServiceLink::new(false);
+        assert!(!link.session_active());
+        let session = link.session_started();
+        assert!(link.session_active());
+        drop(session);
+        assert!(!link.session_active());
+    }
+
+    #[tokio::test]
+    async fn stopping_for_an_update_ends_the_coordinator_with_the_version() {
+        let link = ServiceLink::new(false);
+        link.stop_for_update("1.2.3".into());
+        tokio::time::timeout(std::time::Duration::from_secs(1), link.stopped())
+            .await
+            .unwrap();
+        assert_eq!(link.update_version().as_deref(), Some("1.2.3"));
     }
 }

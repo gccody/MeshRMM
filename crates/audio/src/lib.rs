@@ -27,6 +27,11 @@ mod capture;
 #[cfg(windows)]
 pub use capture::{Capture, capture};
 
+#[cfg(target_os = "macos")]
+mod capture_macos;
+#[cfg(target_os = "macos")]
+pub use capture_macos::{Capture, capture};
+
 struct Packet<'a> {
     rate: u32,
     channels: usize,

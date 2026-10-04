@@ -147,7 +147,10 @@ async fn report_declined(socket: Option<SignalingConnection>, signal_url: &Url, 
 /// Where the prompt runs: a helper on the console for the service, or this
 /// process in console mode.
 enum Prompt {
+    #[cfg(windows)]
     Helper(crate::remote::capture_helper::ApprovalHelper),
+    #[cfg(target_os = "macos")]
+    Helper(crate::remote::macos::helper::coordinator::ApprovalRequest),
     InProcess {
         answer: tokio::task::JoinHandle<Option<Decision>>,
         cancelled: Arc<AtomicBool>,
@@ -158,8 +161,15 @@ enum Prompt {
 
 impl Prompt {
     fn start(prompt: &ApprovalPrompt, mode: ExecutionMode) -> Self {
-        if mode == ExecutionMode::Worker {
-            return match crate::remote::capture_helper::ApprovalHelper::start(prompt) {
+        // The installed Agent asks through the helper in the console's session.
+        #[cfg(windows)]
+        let helper = (mode == ExecutionMode::Worker)
+            .then(|| crate::remote::capture_helper::ApprovalHelper::start(prompt));
+        #[cfg(target_os = "macos")]
+        let helper = (mode == ExecutionMode::Service)
+            .then(|| crate::remote::macos::helper::coordinator::ApprovalRequest::start(prompt));
+        if let Some(helper) = helper {
+            return match helper {
                 Ok(helper) => Self::Helper(helper),
                 Err(error) => {
                     tracing::warn!(error = ?error, "could not start the connection approval prompt");

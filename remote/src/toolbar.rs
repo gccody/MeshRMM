@@ -77,6 +77,8 @@ pub struct State {
     /// `Some(safe_mode)` once the agent reports it can restart its computer,
     /// with whether Windows is in Safe Mode.
     pub power: Option<bool>,
+    /// The agent runs on a Mac: no Ctrl+Alt+Del and no Safe Mode.
+    pub device_is_mac: bool,
     /// The latest file transfer's progress or result.
     pub file_status: String,
     /// The session can use the technician's toolbox, whether a run or file
@@ -274,20 +276,23 @@ pub fn items(state: &State) -> Vec<Item> {
     key.active = credentials.prompt_active;
     key.badge = credentials.can_autofill.then_some(Badge::Attention);
     items.push(key);
-    let mut secure_attention = Item::new(
-        Action::SecureAttention,
-        Icon::Keyboard,
-        "Send Ctrl+Alt+Del",
-        2,
-    );
-    secure_attention.enabled = !state.input_blocked;
-    items.push(secure_attention);
+    if !state.device_is_mac {
+        let mut secure_attention = Item::new(
+            Action::SecureAttention,
+            Icon::Keyboard,
+            "Send Ctrl+Alt+Del",
+            2,
+        );
+        secure_attention.enabled = !state.input_blocked;
+        items.push(secure_attention);
+    }
     // Not input: view-only sessions can restart too.
     let mut power = Item::new(
         Action::Power,
         Icon::Power,
         match state.power {
             None => "Restart is unavailable until the agent connects",
+            Some(false) if state.device_is_mac => "Restart the remote Mac",
             Some(false) => "Restart the remote computer",
             Some(true) => "Restart the remote computer, which is in Safe Mode",
         },
@@ -1228,12 +1233,15 @@ pub fn menu(action: Action, state: &State) -> Vec<MenuEntry> {
                 true,
                 Command::Restart { safe_mode: false },
             ));
-            entries.push(entry(
-                "Restart in Safe Mode with Networking…",
-                false,
-                true,
-                Command::Restart { safe_mode: true },
-            ));
+            // Apple silicon Macs start in Safe Mode only from the power button.
+            if !state.device_is_mac {
+                entries.push(entry(
+                    "Restart in Safe Mode with Networking…",
+                    false,
+                    true,
+                    Command::Restart { safe_mode: true },
+                ));
+            }
             entries
         }
         Action::Files => {
@@ -1265,8 +1273,8 @@ pub fn restart_confirmation(safe_mode: bool) -> (&'static str, &'static str, &'s
     } else {
         (
             "Restart the remote computer?",
-            "Windows restarts now, closing applications without saving. The session \
-             reconnects once the agent is back online.",
+            "The remote computer restarts now, closing applications without saving. The \
+             session reconnects once the agent is back online.",
             "Restart",
         )
     }
@@ -1801,6 +1809,30 @@ mod tests {
             assert!(title.ends_with('?') && !detail.contains("  ") && !button.is_empty());
             assert_eq!(title.contains("Safe Mode"), safe_mode);
         }
+    }
+
+    #[test]
+    fn macs_have_no_ctrl_alt_del_or_safe_mode() {
+        let windows = State {
+            power: Some(false),
+            ..state()
+        };
+        assert!(find(&items(&windows), Action::SecureAttention).is_some());
+        let mac = State {
+            power: Some(false),
+            device_is_mac: true,
+            ..state()
+        };
+        let items = items(&mac);
+        assert!(find(&items, Action::SecureAttention).is_none());
+        assert_eq!(
+            find(&items, Action::Power).unwrap().tooltip,
+            "Restart the remote Mac"
+        );
+        assert_eq!(
+            commands(&menu(Action::Power, &mac)),
+            [Some(Command::Restart { safe_mode: false })]
+        );
     }
 
     #[test]

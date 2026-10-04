@@ -1,5 +1,7 @@
 //! Secure attention originates in the Session 0 coordinator, never the desktop
 //! helper. Temporarily allow service SAS generation and restore the local policy.
+// The policy override exists only on Windows; its tests run everywhere.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use anyhow::Context;
 
@@ -86,6 +88,12 @@ pub(super) fn send() -> anyhow::Result<()> {
     // FALSE identifies the service caller and targets the active console. SendSAS
     // returns no status, so success means the request was issued, not observed.
     with_service_policy(&policy, || unsafe { SendSAS(false) })
+}
+
+/// macOS has no secure attention sequence; its login window needs none.
+#[cfg(target_os = "macos")]
+pub(super) fn send() -> anyhow::Result<()> {
+    anyhow::bail!("Ctrl+Alt+Del is not available on macOS")
 }
 
 #[cfg(windows)]

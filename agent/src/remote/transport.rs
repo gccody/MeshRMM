@@ -283,7 +283,7 @@ async fn run_connected_sender(
     let audio_capture = super::native_task::NativeTask::spawn(
         "meshrmm-audio-capture",
         move |mut stop| async move {
-            let mut stream = None;
+            let mut stream: Option<Box<dyn super::platform::AudioStream>> = None;
             let mut retry = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 tokio::select! {
@@ -299,14 +299,14 @@ async fn run_connected_sender(
                     }
                     continue;
                 }
-                if stream.as_ref().is_some_and(meshrmm_audio::Capture::healthy) {
+                if stream.as_ref().is_some_and(|stream| stream.healthy()) {
                     continue;
                 }
                 stream = None;
                 let sender = audio_tx.clone();
-                match meshrmm_audio::capture(move |packet| {
+                match audio_input.start_audio(Box::new(move |packet| {
                     let _ = sender.try_send(packet);
-                }) {
+                })) {
                     Ok(capture) => stream = Some(capture),
                     Err(error) => tracing::debug!(%error, "system audio unavailable; retrying"),
                 }
@@ -800,7 +800,7 @@ async fn run_connected_sender(
                     quality_ceiling: capture_ceiling,
                     encoder_status: capture_encoder_status,
                     initial_display: start_in_background
-                        .then_some(DisplayId(meshrmm_remote_screen::background::DISPLAY_ID)),
+                        .then_some(DisplayId(meshrmm_protocol::BACKGROUND_DISPLAY_ID.0)),
                     session_close,
                 },
                 capture_rx,
@@ -1689,7 +1689,7 @@ async fn run_capture_control(
                     let capture_ended = lock_streamer(&streamer)?.poll_ended();
                     if let Some(capture_result) = capture_ended {
                         if let Err(error) = capture_result {
-                            tracing::warn!(error = ?error, stream_id = stream_id.0, ?active_profile, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "visible Windows desktop changed; replacing capture helper");
+                            tracing::warn!(error = ?error, stream_id = stream_id.0, ?active_profile, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "visible desktop changed; restarting capture");
                         } else {
                             tracing::warn!(stream_id = stream_id.0, ?active_profile, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "desktop capture helper stopped; replacing it");
                         }
@@ -1734,11 +1734,11 @@ async fn run_capture_control(
                                     format: started.format,
                                 },
                             ).await?;
-                            tracing::info!(stream_id = stream_id.0, display_id = active_display.id.0, recovery_ms, "remote session moved to the visible Windows desktop");
+                            tracing::info!(stream_id = stream_id.0, display_id = active_display.id.0, recovery_ms, "remote session moved to the visible desktop");
                         }
                         Err(error) => {
                             capture_retry_after = std::time::Instant::now() + DESKTOP_RETRY_INTERVAL;
-                            tracing::warn!(error = ?error, "waiting for a Windows login or application desktop");
+                            tracing::warn!(error = ?error, "waiting for a login or application desktop");
                         }
                     }
                 }
@@ -1876,11 +1876,12 @@ fn spawn_control_start(
             tracing::warn!(error = %error, %session_id, "failed to send stream configuration");
             return;
         }
-        let power = SessionMessage::PowerState {
+        let device = SessionMessage::DeviceState {
+            platform: meshrmm_protocol::DevicePlatform::current(),
             safe_mode: crate::power::booted_in_safe_mode(),
         };
-        if let Err(error) = send_control_message(&channel, power).await {
-            tracing::warn!(error = %error, %session_id, "failed to send power state");
+        if let Err(error) = send_control_message(&channel, device).await {
+            tracing::warn!(error = %error, %session_id, "failed to send the device state");
             return;
         }
         // Viewers answer this configuration with their audio preference and
