@@ -13,6 +13,7 @@ mod keep_awake;
 mod keymap;
 pub(crate) mod local;
 pub(crate) mod session_close;
+pub(crate) mod snapshot;
 pub(crate) mod ui;
 mod wallpaper;
 

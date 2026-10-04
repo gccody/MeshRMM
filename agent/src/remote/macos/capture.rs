@@ -418,7 +418,10 @@ impl Drop for Capture {
 }
 
 /// A content filter for a Quartz display without the given windows.
-fn content_filter(display_id: u32, excluded: &[u32]) -> anyhow::Result<Retained<SCContentFilter>> {
+pub(crate) fn content_filter(
+    display_id: u32,
+    excluded: &[u32],
+) -> anyhow::Result<Retained<SCContentFilter>> {
     let excluded = excluded.to_vec();
     let (sender, receiver) = mpsc::channel();
     let handler = RcBlock::new(

@@ -117,19 +117,33 @@ fn serve(stream: UnixStream, input: &Arc<LocalInput>, login_window: bool) -> any
             Ok(None) => break Ok(()),
             Err(error) => break Err(error),
         };
-        let result = handle(
-            call.request,
-            &Served {
-                input: Arc::clone(input),
-                screen: Arc::clone(&screen),
-                audio: Arc::clone(&audio),
-                active: Arc::clone(&active),
-                approval: Arc::clone(&approval),
-                sequence: Arc::clone(&sequence),
-                events: events.clone(),
-            },
-        )
-        .map_err(|error| format!("{error:#}"));
+        let served = Served {
+            input: Arc::clone(input),
+            screen: Arc::clone(&screen),
+            audio: Arc::clone(&audio),
+            active: Arc::clone(&active),
+            approval: Arc::clone(&approval),
+            sequence: Arc::clone(&sequence),
+            events: events.clone(),
+        };
+        if matches!(call.request, Request::Thumbnail) {
+            // A capture takes a moment; a session's requests keep flowing.
+            let spawned = std::thread::Builder::new()
+                .name("meshrmm-thumbnail".into())
+                .spawn(move || {
+                    let result =
+                        handle(call.request, &served).map_err(|error| format!("{error:#}"));
+                    let _ = served.events.send(Event::Reply {
+                        id: call.id,
+                        result,
+                    });
+                });
+            if let Err(error) = spawned {
+                break Err(error.into());
+            }
+            continue;
+        }
+        let result = handle(call.request, &served).map_err(|error| format!("{error:#}"));
         if events
             .send(Event::Reply {
                 id: call.id,
@@ -217,6 +231,11 @@ fn handle(request: Request, served: &Served) -> anyhow::Result<Reply> {
         Request::ClearClipboard => crate::remote::macos::session_close::clear_clipboard_here()?,
         Request::LockScreen => crate::remote::macos::session_close::lock_here()?,
         Request::LogOut => crate::remote::macos::session_close::log_out_here()?,
+        Request::Thumbnail => {
+            return Ok(Reply::Thumbnail(
+                crate::remote::macos::snapshot::main_display_jpeg()?,
+            ));
+        }
         Request::CancelApproval => approval
             .lock()
             .unwrap_or_else(|e| e.into_inner())
