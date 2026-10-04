@@ -20,6 +20,18 @@ pub use prompt::ask;
 #[cfg(windows)]
 pub use signaling::obtain;
 
+/// Refuses sessions that need the user's approval until the macOS Agent can
+/// ask for it, rather than streaming without it.
+#[cfg(target_os = "macos")]
+pub async fn obtain(
+    _approval: &ConnectionApproval,
+    _signal_url: &url::Url,
+    _signaling_token: &str,
+    _mode: super::config::ExecutionMode,
+) -> anyhow::Result<bool> {
+    anyhow::bail!("the macOS Agent cannot ask the user to approve connections yet")
+}
+
 /// The last session whose connection was answered, and whether it was
 /// accepted. A viewer resume restarts the session with a new streamer, which
 /// must not ask the user again, and a declined session stays declined.
@@ -95,7 +107,7 @@ impl ConnectionApproval {
 /// How long an accepted answer kept for a restart stays valid: long enough
 /// for Windows to restart and the technician to reconnect.
 const RESTART_ANSWER_LIFETIME: Duration = Duration::from_secs(30 * 60);
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 const RESTART_ANSWER_FILE: &str = "restart-approval";
 
 /// The session to keep accepted across a restart the technician requested
@@ -123,7 +135,7 @@ fn restore_answer(session_id: &str, age: Duration) -> bool {
 /// Keeps this session's accepted answer for the Agent that starts after the
 /// restart, so resuming the session does not ask the user again. The file
 /// sits in the Agent's administrator-only configuration directory.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn remember_across_restart(session_id: &RemoteSessionId) -> anyhow::Result<()> {
     let path = crate::installer::config_directory()?.join(RESTART_ANSWER_FILE);
     match answer_to_remember(session_id) {
@@ -136,7 +148,7 @@ pub fn remember_across_restart(session_id: &RemoteSessionId) -> anyhow::Result<(
 }
 
 /// Run once when the coordinator starts.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn restore_after_restart() {
     let Ok(path) = crate::installer::config_directory().map(|d| d.join(RESTART_ANSWER_FILE)) else {
         return;
@@ -151,7 +163,7 @@ pub fn restore_after_restart() {
         .and_then(|modified| modified.elapsed().ok())
         .unwrap_or(Duration::MAX);
     if restore_answer(session_id.trim(), age) {
-        tracing::info!(%session_id, "kept the connection approval of the session that restarted Windows");
+        tracing::info!(%session_id, "kept the connection approval of the session that restarted the computer");
     }
 }
 
@@ -167,6 +179,7 @@ pub enum Decision {
 }
 
 impl Decision {
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn accepted(self) -> bool {
         self != Self::Declined
     }

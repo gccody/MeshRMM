@@ -1,7 +1,13 @@
 #[cfg(windows)]
 mod installer;
+#[cfg(target_os = "macos")]
+#[path = "macos/installer.rs"]
+mod installer;
 mod logging;
-#[cfg(any(windows, test))]
+#[cfg(target_os = "macos")]
+#[path = "macos/app.rs"]
+mod macos_app;
+#[cfg(any(windows, target_os = "macos", test))]
 mod power;
 #[cfg(windows)]
 mod private_directory;
@@ -36,7 +42,7 @@ fn main() -> anyhow::Result<()> {
         return tray::run();
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     if meshrmm_session_transport::identity::handle_command(installer::identity_directory)? {
         return Ok(());
     }
@@ -83,17 +89,23 @@ fn main() -> anyhow::Result<()> {
 
     // Native helpers own their threads and optional service runtime. Dispatch
     // them before entering Tokio so a helper never nests block_on inside it.
-    let result = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run_agent());
-    if let Err(error) = &result
-        && logging::has_process_log()
-    {
-        tracing::error!(error = ?error, "MeshRMM Agent process stopped with an error");
-    }
-    logging::flush();
-    result
+    let agent = || {
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_agent());
+        if let Err(error) = &result
+            && logging::has_process_log()
+        {
+            tracing::error!(error = ?error, "MeshRMM Agent process stopped with an error");
+        }
+        logging::flush();
+        result
+    };
+    #[cfg(target_os = "macos")]
+    return macos_app::run_main_loop(true, agent);
+    #[cfg(not(target_os = "macos"))]
+    agent()
 }
 
 async fn run_agent() -> anyhow::Result<()> {

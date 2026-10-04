@@ -33,6 +33,19 @@ pub async fn run(
     }
     let bitrate_bits_per_second =
         QualityPreset::BestQuality.bitrate(config.bitrate_bits_per_second);
+    #[cfg(target_os = "macos")]
+    let streamer: Arc<Mutex<Box<dyn ScreenStreamer>>> = {
+        // A Mac has no private desktop to work on without the user seeing it.
+        anyhow::ensure!(
+            !request.start_in_background,
+            "background sessions are not available on macOS"
+        );
+        Arc::new(Mutex::new(Box::new(PlatformScreenStreamer::new(
+            config.frames_per_second,
+            bitrate_bits_per_second,
+        )?)))
+    };
+    #[cfg(windows)]
     let streamer: Arc<Mutex<Box<dyn ScreenStreamer>>> =
         Arc::new(Mutex::new(Box::new(PlatformScreenStreamer::new(
             config.frames_per_second,

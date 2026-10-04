@@ -19,6 +19,61 @@ fn lists_safe_boot(output: &str) -> bool {
 #[cfg(windows)]
 pub use windows_impl::*;
 
+#[cfg(target_os = "macos")]
+pub use macos_impl::*;
+
+#[cfg(target_os = "macos")]
+mod macos_impl {
+    use std::process::Command;
+
+    use anyhow::{Context, bail};
+
+    /// Whether macOS started in Safe Mode.
+    pub fn booted_in_safe_mode() -> bool {
+        let mut value: libc::c_int = 0;
+        let mut size = std::mem::size_of_val(&value);
+        // SAFETY: the name is NUL-terminated and `value` is as large as `size` says.
+        let result = unsafe {
+            libc::sysctlbyname(
+                c"kern.safeboot".as_ptr(),
+                (&raw mut value).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        result == 0 && value != 0
+    }
+
+    /// Restarts the Mac at once. Apple silicon Macs enter Safe Mode only from
+    /// the startup options a person holds the power button for, and the Agent
+    /// would not run there, so `safe_mode` is refused rather than ignored.
+    pub fn restart(safe_mode: bool) -> anyhow::Result<()> {
+        if safe_mode {
+            bail!("Safe Mode restarts are not available on macOS");
+        }
+        // SAFETY: geteuid has no preconditions.
+        let output = if unsafe { libc::geteuid() } == 0 {
+            Command::new("/sbin/shutdown").args(["-r", "now"]).output()
+        } else {
+            // A console Agent is not root; ask loginwindow to restart without
+            // its confirmation dialog, as the Apple menu's Option-Restart does.
+            Command::new("/usr/bin/osascript")
+                .args(["-e", "tell application \"loginwindow\" to «event aevtrrst»"])
+                .output()
+        }
+        .context("could not start the restart command")?;
+        if !output.status.success() {
+            bail!(
+                "the restart command failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        tracing::info!("macOS is restarting for the technician");
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 mod windows_impl {
     use std::os::windows::process::CommandExt;

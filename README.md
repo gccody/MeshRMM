@@ -61,6 +61,7 @@ and are used by ICE only when a direct candidate pair cannot connect.
 - Windows 10 version 1903 or newer for the Agent and Windows viewer.
 - Local administrator approval to install the Agent as a Windows service.
 - macOS 12 or newer for the macOS viewer.
+- macOS 12.3 or newer for the macOS Agent, which is in development (see below).
 - rustup. The first `cargo` command in the repository installs the toolchain
   pinned in `rust-toolchain.toml` (the MSVC host toolchain on Windows) with
   Clippy, rustfmt and the `wasm32-unknown-unknown` target.
@@ -93,6 +94,18 @@ WARP. A macOS viewer lets VideoToolbox decode H.264 in software when there is
 no hardware decoder. Startup still fails with a contextual error when neither
 path exists, for example on a Windows N edition without the Media Feature
 Pack.
+
+## macOS Agent
+
+The Agent also runs on macOS, which is still being ported. So far it runs
+only interactively, with `meshrmm-agent --console --config agent.json`, and
+streams the signed-in user's displays: ScreenCaptureKit captures 4:2:0 frames,
+VideoToolbox encodes them as H.265 or H.264 (in hardware where the Mac has it),
+and Quartz events carry the viewer's keyboard and pointer input. Clipboard,
+file transfer, chat, Prevent idle lock and Hide wallpaper work too. The Agent
+needs the Screen Recording, Accessibility and Input Monitoring permissions in
+System Settings → Privacy & Security. VideoToolbox has no 4:4:4 encoder, so
+Mac Agents always stream 4:2:0.
 
 ## Computers without a monitor
 

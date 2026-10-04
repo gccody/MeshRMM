@@ -1,4 +1,6 @@
 //! Viewer-selected cleanup for the viewed Windows session once a remote session ends.
+// The macOS Agent records the choices but has no close actions yet.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -105,6 +107,9 @@ impl SessionClose {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn set_target(self: &std::sync::Arc<Self>, _session: &DesktopSession) {}
+
     /// Resolves the target on the calling thread, as [`Self::set_target`] does after a switch.
     #[cfg(test)]
     fn set_target_with(
@@ -199,6 +204,12 @@ impl SessionClose {
     pub fn run(&self, session_id: &meshrmm_protocol::RemoteSessionId) {
         self.spawn(session_id);
     }
+
+    #[cfg(target_os = "macos")]
+    pub fn run(&self, _session_id: &meshrmm_protocol::RemoteSessionId) {}
+
+    #[cfg(target_os = "macos")]
+    pub async fn finish(&self, _session_id: &meshrmm_protocol::RemoteSessionId) {}
 
     /// Runs the pending work like [`Self::run`] and waits for it, for a coordinator that is
     /// about to exit.

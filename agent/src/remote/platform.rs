@@ -1,12 +1,18 @@
 use meshrmm_protocol::ClipboardContent;
+use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::Mutex;
+#[cfg(windows)]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
+#[cfg(windows)]
 use anyhow::Context;
 use meshrmm_protocol::{
-    ChromaMode, Codec, CursorShape, Display, DisplayId, EncodedFrame, HeadlessResolution,
-    PixelFormat, QualityPreset, RemoteInput, VideoFormat, VideoStreamId,
+    ChromaMode, Codec, CursorShape, Display, DisplayId, HeadlessResolution, QualityPreset,
+    RemoteInput, VideoFormat, VideoStreamId,
 };
+#[cfg(windows)]
+use meshrmm_protocol::{EncodedFrame, PixelFormat};
 
 use super::video::LatestFrameSlot;
 
@@ -100,6 +106,9 @@ pub trait ScreenInput: Send + Sync {
     fn poll_chat(&self) -> anyhow::Result<Option<String>>;
     fn chat_ready(&self) -> Arc<tokio::sync::Notify>;
 }
+
+#[cfg(target_os = "macos")]
+pub use super::macos::{PlatformScreenStreamer, monotonic_timestamp_us};
 
 #[cfg(windows)]
 pub struct PlatformScreenStreamer {
