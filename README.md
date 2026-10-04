@@ -111,8 +111,9 @@ too: blocking the user's keyboard and mouse uses an event tap that lets only
 the technician's tagged input through, the blackout shows the company's
 message on every screen while the capture leaves it out, and the session close
 actions lock the screen, log out or clear the clipboard of the same sign-in
-the technician saw. The toolbox runs Shell (zsh) scripts as the console user
-or root and delivers files to the user's Documents transfer folder.
+the technician saw. The Devices page shows the Mac's screen thumbnail, and
+the toolbox runs Shell (zsh) scripts as the console user or root and
+delivers files to the user's Documents transfer folder.
 VideoToolbox has no 4:4:4 encoder, so Mac Agents always stream 4:2:0.
 
 The dashboard's **Add a device** dialog creates a one-time Terminal command

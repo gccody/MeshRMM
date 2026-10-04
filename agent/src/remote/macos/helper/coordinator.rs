@@ -146,6 +146,14 @@ impl Registry {
             .with_context(|| format!("no session helper is running for user {uid}"))
     }
 
+    /// A JPEG of the console's main display, from its session helper.
+    pub(crate) fn thumbnail(&self) -> anyhow::Result<Vec<u8>> {
+        match self.console_helper()?.call(Request::Thumbnail)? {
+            Reply::Thumbnail(jpeg) => Ok(jpeg),
+            reply => bail!("the session helper answered a thumbnail with {reply:?}"),
+        }
+    }
+
     /// The helper of the session on the console.
     fn console_helper(&self) -> anyhow::Result<Arc<Connection>> {
         let console = crate::remote::macos::session_close::console_user();
@@ -556,7 +564,7 @@ impl Remote {
                 active_display,
                 format,
             }),
-            Reply::Done => bail!("the session helper did not start capture"),
+            _ => bail!("the session helper did not start capture"),
         }
     }
 

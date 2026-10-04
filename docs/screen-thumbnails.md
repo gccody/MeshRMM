@@ -42,6 +42,14 @@ screen and UAC prompts are captured as the person at the device sees them.
 Deleting a device removes its image, and a device being deleted cannot upload
 another.
 
+On a Mac, the root coordinator asks the session helper on the console for the
+image: the signed-in user's, or the login window's. The helper captures one
+frame of the main display with ScreenCaptureKit, already scaled to at most
+640x400, and AppKit encodes it as a JPEG at quality 0.7. A capture that
+fails, as when the coordinator starts before the session helper connects, is
+tried again after 30 seconds, up to four times, before waiting for the next
+five-minute refresh; Windows Agents retry the same way.
+
 ## Setup
 
 Create the bucket once before deploying the server:
