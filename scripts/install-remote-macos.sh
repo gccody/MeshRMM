@@ -25,7 +25,7 @@ fi
 # Always build for this Mac, even when the shell was configured for a release
 # cross-build. Let the build wrapper select the host architecture and toolchain.
 cd "$ROOT_DIR"
-MESHRMM_BUILD_TARGET= MESHRMM_CODESIGN_IDENTITY=- \
+MESHRMM_BUILD_TARGET= \
     sh "$SCRIPT_DIR/build-remote-macos.sh" --local "$@"
 
 SOURCE_APP="$ROOT_DIR/dist/remote-macos/MeshRMM Remote.app"

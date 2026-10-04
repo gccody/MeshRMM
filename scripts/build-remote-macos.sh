@@ -22,7 +22,8 @@ DASHBOARD_DOWNLOAD_DIR="$ROOT_DIR/dashboard/public/downloads"
 UPDATE_MANIFEST="$DASHBOARD_DOWNLOAD_DIR/update-manifest.json"
 CONFIGURED_DOWNLOAD_ORIGIN=$(node "$ROOT_DIR/scripts/release-config.mjs" download-origin)
 DOWNLOAD_ORIGIN=${MESHRMM_DOWNLOAD_ORIGIN:-$CONFIGURED_DOWNLOAD_ORIGIN}
-CODESIGN_IDENTITY=${MESHRMM_CODESIGN_IDENTITY:--}
+. "$SCRIPT_DIR/macos-signing.sh"
+CODESIGN_IDENTITY=$(meshrmm_codesign_identity)
 BUILD_TARGET=${MESHRMM_BUILD_TARGET:-}
 VERSION=$(node "$ROOT_DIR/scripts/release-config.mjs" version)
 
@@ -111,12 +112,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 </plist>
 PLIST
 
-if [ "$CODESIGN_IDENTITY" = "-" ]; then
-    # Ad-hoc signing makes a local development bundle internally consistent.
-    codesign --force --deep --sign - "$APP_DIR"
-else
-    codesign --force --deep --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP_DIR"
-fi
+meshrmm_sign_app "$CODESIGN_IDENTITY" "$APP_DIR" --deep
 
 if [ "$LOCAL_BUILD" = true ]; then
     echo "Built local viewer (automatic updates disabled): $APP_DIR"

@@ -203,9 +203,8 @@ change, and push it to `main`:
 The **Publish native release** GitHub Actions workflow validates that the
 version increased, builds the Windows Agent plus Windows and Apple Silicon
 macOS viewers, generates one verified release manifest, and deploys the
-dashboard containing all update assets. The only required GitHub Actions secret is
-`CLOUDFLARE_API_TOKEN`; configure the optional Apple signing and notarization
-secrets before distributing production macOS builds. See
+dashboard containing all update assets. It requires the `CLOUDFLARE_API_TOKEN`
+secret plus the Apple Developer ID signing and notarization secrets. See
 [automated native releases](docs/native-releases.md) for the one-time setup and
 recovery procedure.
 
@@ -251,7 +250,7 @@ release, run:
 sh scripts/install-remote-macos.sh
 ```
 
-This builds a release-mode viewer with ad-hoc signing, closes any running viewer,
+This builds and signs a release-mode viewer, closes any running viewer,
 installs it in `~/Applications/MeshRMM Remote.app`, and registers dashboard links.
 Use a fresh **Connect** link to start a session. Existing installs
 are retained in a `.meshrmm-backup.*` folder under `~/Applications`.
@@ -269,11 +268,12 @@ you distribute. A browser deep link supplies a 60-second, single-use handoff
 token. The viewer redeems it before checking for updates and carries the resulting
 session through an update relaunch. A session awaiting its first viewer has a
 15-minute startup window; connected sessions use the configured sliding timeout.
-Developer ID signing and notarization are still required before distributing
-the app through normal Gatekeeper-protected download channels.
-Set `MESHRMM_CODESIGN_IDENTITY` to the Developer ID Application certificate
-name before running the script for a production archive; the default is an
-ad-hoc development signature.
+The macOS build scripts sign with the keychain's Developer ID Application
+certificate, which keeps the Agent's privacy permissions across rebuilds.
+If the keychain holds several, set `MESHRMM_CODESIGN_IDENTITY` to the one to
+use. Set it to `-` for an ad-hoc development signature; an installed Agent
+signed by a team refuses to update to an ad-hoc build. Only the release
+workflow notarizes, because locally built apps aren't quarantined.
 
 The native update version is compiled from `release.json`; Cargo package
 metadata is not used to decide whether an update is newer. Manifest and release
