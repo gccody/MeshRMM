@@ -19,8 +19,9 @@ use meshrmm_protocol::{
 use tokio::sync::Notify;
 
 use super::protocol::{
-    self, Call, Event, Frame, Hello, InputState, Reply, Request, StreamSettings,
+    self, Call, Event, Frame, Hello, InputState, Reply, Request, SessionUi, StreamSettings,
 };
+use crate::remote::connection_approval::{ApprovalPrompt, Decision};
 use crate::remote::macos::local::Started;
 use crate::remote::platform::ScreenInput;
 
@@ -102,6 +103,7 @@ impl Registry {
             pending: Mutex::default(),
             closed: AtomicBool::new(false),
             session: Mutex::default(),
+            approval: Mutex::default(),
         });
         tracing::info!(
             uid,
@@ -220,6 +222,8 @@ pub(crate) struct Connection {
     closed: AtomicBool,
     /// The session using this helper, which receives its events.
     session: Mutex<Option<Arc<SessionEvents>>>,
+    /// Where an approval prompt's answer goes.
+    approval: Mutex<Option<tokio::sync::oneshot::Sender<Decision>>>,
 }
 
 impl Connection {
@@ -244,6 +248,17 @@ impl Connection {
                         let _ = reply.send(result);
                     }
                 }
+                Event::ApprovalDecision(byte) => {
+                    if let (Some(answer), Some(decision)) = (
+                        self.approval
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take(),
+                        Decision::from_byte(byte),
+                    ) {
+                        let _ = answer.send(decision);
+                    }
+                }
                 event => {
                     let session = self
                         .session
@@ -257,11 +272,27 @@ impl Connection {
             }
         }
         self.closed.store(true, Ordering::SeqCst);
+        // A prompt nobody can answer any more falls back to the policy.
+        self.approval
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         // Waiting calls fail at once.
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    /// Sends `request` without waiting for the helper's reply.
+    fn notify(&self, request: Request) {
+        let _ = protocol::write(
+            &mut *self.writer.lock().unwrap_or_else(|e| e.into_inner()),
+            &Call {
+                id: self.next_id.fetch_add(1, Ordering::Relaxed),
+                request,
+            },
+        );
     }
 
     fn call(&self, request: Request) -> anyhow::Result<Reply> {
@@ -387,7 +418,7 @@ impl SessionEvents {
                 }
             }
             Event::AudioEnded => self.audio_ended.store(true, Ordering::SeqCst),
-            Event::Reply { .. } => {}
+            Event::Reply { .. } | Event::ApprovalDecision(_) => {}
         }
     }
 }
@@ -398,6 +429,7 @@ struct Desired {
     wallpaper_hidden: bool,
     prevent_idle_lock: bool,
     chat: bool,
+    display_border: bool,
 }
 
 /// A remote session's view of the console's helper.
@@ -406,15 +438,18 @@ pub(crate) struct Remote {
     current: Mutex<Option<Arc<Connection>>>,
     events: Arc<SessionEvents>,
     desired: Mutex<Desired>,
+    /// What every helper the session uses shows; the notification only once.
+    ui: Mutex<SessionUi>,
 }
 
 impl Remote {
-    pub(crate) fn new() -> anyhow::Result<Arc<Self>> {
+    pub(crate) fn new(ui: SessionUi) -> anyhow::Result<Arc<Self>> {
         Ok(Arc::new(Self {
             registry: registry()?,
             current: Mutex::default(),
             events: Arc::default(),
             desired: Mutex::default(),
+            ui: Mutex::new(ui),
         }))
     }
 
@@ -430,7 +465,13 @@ impl Remote {
         let helper = self.registry.console_helper()?;
         self.detach(current.take());
         *helper.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&self.events));
-        helper.call(Request::BeginSession)?;
+        let ui = {
+            let mut ui = self.ui.lock().unwrap_or_else(|e| e.into_inner());
+            let shown = ui.clone();
+            ui.notification = None;
+            shown
+        };
+        helper.call(Request::BeginSession(ui))?;
         let desired = *self.desired.lock().unwrap_or_else(|e| e.into_inner());
         for request in [
             desired
@@ -440,6 +481,9 @@ impl Remote {
                 .prevent_idle_lock
                 .then_some(Request::SetPreventIdleLock(true)),
             desired.chat.then_some(Request::StartChat),
+            desired
+                .display_border
+                .then_some(Request::SetDisplayBorder(true)),
         ]
         .into_iter()
         .flatten()
@@ -560,6 +604,14 @@ impl Remote {
         None
     }
 
+    pub(crate) fn set_display_border(&self, enabled: bool) -> anyhow::Result<()> {
+        self.desired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .display_border = enabled;
+        self.done(Request::SetDisplayBorder(enabled))
+    }
+
     pub(crate) fn request_keyframe(&self) -> anyhow::Result<()> {
         self.done(Request::Keyframe)
     }
@@ -586,6 +638,41 @@ impl Drop for Remote {
 
 /// The session's input, routed to whichever helper it uses.
 pub(crate) struct HelperInput(pub(crate) Arc<Remote>);
+
+/// A connection approval prompt shown by the console's helper.
+pub(crate) struct ApprovalRequest {
+    helper: Arc<Connection>,
+    answer: tokio::sync::oneshot::Receiver<Decision>,
+}
+
+impl ApprovalRequest {
+    pub(crate) fn start(prompt: &ApprovalPrompt) -> anyhow::Result<Self> {
+        let helper = registry()?.console_helper()?;
+        let (sender, answer) = tokio::sync::oneshot::channel();
+        *helper.approval.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
+        helper.call(Request::PromptApproval {
+            text: prompt.text.clone(),
+            reason: prompt.reason.clone(),
+            timeout_seconds: prompt.timeout.as_secs() as u32,
+            lock_idle_seconds: prompt.lock_idle.as_secs() as u32,
+        })?;
+        Ok(Self { helper, answer })
+    }
+
+    pub(crate) async fn answer(&mut self) -> anyhow::Result<Decision> {
+        (&mut self.answer)
+            .await
+            .map_err(|_| anyhow::anyhow!("the session helper left before the user answered"))
+    }
+}
+
+impl Drop for ApprovalRequest {
+    fn drop(&mut self) {
+        if !self.helper.closed.load(Ordering::SeqCst) {
+            self.helper.notify(Request::CancelApproval);
+        }
+    }
+}
 
 /// System audio a helper captures. It stops being healthy when the session
 /// moves to another helper, which makes the transport start it there.
@@ -784,7 +871,7 @@ mod tests {
         listen(&socket).unwrap();
         let helper_socket = socket.clone();
         std::thread::spawn(move || super::super::host::run(&helper_socket));
-        let remote = Remote::new().unwrap();
+        let remote = Remote::new(SessionUi::default()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while remote.registry.console_helper().is_err() {
             assert!(
