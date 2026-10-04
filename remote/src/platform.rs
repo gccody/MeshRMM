@@ -52,6 +52,8 @@ pub struct MaintenanceState {
     pub blacked_out: bool,
     /// `Some(safe_mode)` once the agent reports it can restart its computer.
     pub power: Option<bool>,
+    /// The agent's operating system, once it reports it.
+    pub platform: Option<meshrmm_protocol::DevicePlatform>,
 }
 
 /// Sends viewer control messages and keeps the transport's input gate in sync
@@ -272,6 +274,12 @@ impl ControlSink {
     /// Safe Mode.
     pub fn power_state(&self) -> Option<bool> {
         self.maintenance_state().power
+    }
+
+    /// Whether the agent runs on a Mac, which has no Ctrl+Alt+Del or Safe
+    /// Mode and uses Command where Windows uses the Windows key.
+    pub fn device_is_mac(&self) -> bool {
+        self.maintenance_state().platform == Some(meshrmm_protocol::DevicePlatform::Macos)
     }
 
     /// Restarts the remote computer. The platform asks the technician first.

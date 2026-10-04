@@ -172,9 +172,10 @@ pub enum SessionMessage {
     Restart {
         safe_mode: bool,
     },
-    /// Sent by the Agent when the control channel opens: whether Windows
-    /// started in Safe Mode.
-    PowerState {
+    /// Sent by the Agent when the control channel opens: its operating
+    /// system, and whether Windows started in Safe Mode.
+    DeviceState {
+        platform: DevicePlatform,
         safe_mode: bool,
     },
     /// Size of the virtual display the Agent adds while its console has no
@@ -287,6 +288,25 @@ impl SessionMessage {
             return Err(postcard::Error::DeserializeBadEncoding);
         }
         Ok(message)
+    }
+}
+
+/// The operating system an Agent runs on, which decides the controls a
+/// viewer offers, such as Ctrl+Alt+Del and Safe Mode on Windows only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DevicePlatform {
+    Windows,
+    Macos,
+}
+
+impl DevicePlatform {
+    /// The platform this Agent is built for.
+    pub const fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Macos
+        } else {
+            Self::Windows
+        }
     }
 }
 
@@ -759,7 +779,20 @@ mod power_tests {
         for (message, bytes) in [
             (SessionMessage::Restart { safe_mode: false }, vec![41, 0]),
             (SessionMessage::Restart { safe_mode: true }, vec![41, 1]),
-            (SessionMessage::PowerState { safe_mode: true }, vec![42, 1]),
+            (
+                SessionMessage::DeviceState {
+                    platform: DevicePlatform::Windows,
+                    safe_mode: true,
+                },
+                vec![42, 0, 1],
+            ),
+            (
+                SessionMessage::DeviceState {
+                    platform: DevicePlatform::Macos,
+                    safe_mode: false,
+                },
+                vec![42, 1, 0],
+            ),
         ] {
             assert_eq!(message.encode().unwrap(), bytes);
             assert_eq!(SessionMessage::decode(&bytes).unwrap(), message);

@@ -614,7 +614,9 @@ device: on Windows under **Settings → Keyboard**, on macOS (diagnostics only)
 under the gear menu's **Diagnostics shortcut**. While the Windows viewer has
 keyboard focus it also sends the Windows key, Alt+Tab, Alt+Esc and Ctrl+Esc to
 the device instead of acting on them locally; turn this off under
-**Settings → Keyboard**. Ctrl+Alt+Del and Windows+L always stay local. On endpoints with multiple monitors,
+**Settings → Keyboard**. Ctrl+Alt+Del and Windows+L always stay local. When the
+device is a Mac, the macOS viewer's Command key is always Command, and the
+Windows viewer's Windows key is Command too. On endpoints with multiple monitors,
 select **All displays** from the viewer's monitor menu (also included in
 keyboard cycling) to view and control the complete desktop in one window.
 The combined view preserves monitor positions, including negative coordinates,
@@ -787,7 +789,8 @@ Windows' synchronous capture API, while input remains in a separate helper.
 ### Sending Ctrl+Alt+Del
 
 Use the keyboard icon (**Send Ctrl+Alt+Del**) in the Windows or macOS remote client's toolbar to send the
-secure attention sequence to the Windows agent. Update both the client and agent
+secure attention sequence to the Windows agent. Macs have no such sequence, so
+the viewer leaves the button out when the device is a Mac. Update both the client and agent
 for this command. The agent must run through its installed Windows service.
 
 When Windows policy blocks service-generated secure attention, the agent temporarily

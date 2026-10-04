@@ -1876,11 +1876,12 @@ fn spawn_control_start(
             tracing::warn!(error = %error, %session_id, "failed to send stream configuration");
             return;
         }
-        let power = SessionMessage::PowerState {
+        let device = SessionMessage::DeviceState {
+            platform: meshrmm_protocol::DevicePlatform::current(),
             safe_mode: crate::power::booted_in_safe_mode(),
         };
-        if let Err(error) = send_control_message(&channel, power).await {
-            tracing::warn!(error = %error, %session_id, "failed to send power state");
+        if let Err(error) = send_control_message(&channel, device).await {
+            tracing::warn!(error = %error, %session_id, "failed to send the device state");
             return;
         }
         // Viewers answer this configuration with their audio preference and
