@@ -79,6 +79,9 @@ try {
   assert.equal(result.status, 201);
   const sharedScript = result.data;
   assert.deepEqual([sharedScript.name, sharedScript.folder], ['Ada shared', 'Disk/Cleanup'], 'names and folders are normalized');
+  result = await api('/v1/toolbox/scripts', { method: 'POST', body: script('Mac', { language: 'shell', body: 'sw_vers' }) });
+  assert.deepEqual([result.status, result.data.language], [201, 'shell'], 'Macs run shell scripts');
+  assert.equal((await api(`/v1/toolbox/scripts/${result.data.id}`, { method: 'DELETE' })).status, 204);
   for (const invalid of [script(''), script('x', { body: '  ' }), script('x', { timeout_seconds: 5 }), script('x', { language: 'bash' }), script('x', { folder: 'a/'.repeat(9) })]) {
     assert.equal((await api('/v1/toolbox/scripts', { method: 'POST', body: invalid })).status, 400, JSON.stringify(invalid));
   }

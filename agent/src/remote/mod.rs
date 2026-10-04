@@ -57,7 +57,7 @@ pub(crate) mod session_close;
 mod signaling;
 #[cfg(any(windows, target_os = "macos", test))]
 mod thumbnail;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod toolbox;
 #[cfg(any(windows, target_os = "macos"))]
 mod transport;
@@ -258,18 +258,12 @@ pub async fn run(
                                                     AgentCommand::StartBackgroundSession { request } => Some(request),
                                                     AgentCommand::RunScript { run } => {
                                                         tracing::info!(run_id = %run.run_id, language = run.language.as_str(), run_as = run.run_as.as_str(), "running a toolbox script");
-                                                        #[cfg(windows)]
                                                         toolbox::run_script(&config, mode, run);
-                                                        #[cfg(target_os = "macos")]
-                                                        tracing::warn!("toolbox scripts are not available on macOS yet");
                                                         continue;
                                                     }
                                                     AgentCommand::DeliverFile { delivery } => {
                                                         tracing::info!(delivery_id = %delivery.delivery_id, size_bytes = delivery.size_bytes, "receiving a toolbox file");
-                                                        #[cfg(windows)]
                                                         toolbox::deliver_file(&config, mode, delivery);
-                                                        #[cfg(target_os = "macos")]
-                                                        tracing::warn!("toolbox files are not available on macOS yet");
                                                         continue;
                                                     }
                                                 }
