@@ -6,6 +6,8 @@
 //! input desktop, so the sign-in and lock screens are captured too. The
 //! coordinator sends the image straight to the control plane over HTTPS; it
 //! never crosses the signaling WebSocket.
+// The macOS Agent does not capture thumbnails yet.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
 use std::time::Duration;
 
 /// How often the dashboard's image is refreshed.
@@ -39,6 +41,23 @@ pub fn scaled_size(width: u32, height: u32) -> (u32, u32) {
 
 #[cfg(windows)]
 pub use self::windows::{Thumbnails, capture_primary_display, follow_input_desktop};
+
+/// The macOS Agent does not upload screen thumbnails yet.
+#[cfg(target_os = "macos")]
+pub struct Thumbnails;
+
+#[cfg(target_os = "macos")]
+impl Thumbnails {
+    pub fn new(_mode: crate::remote::config::ExecutionMode) -> Self {
+        Self
+    }
+
+    pub async fn due(&mut self) {
+        std::future::pending().await
+    }
+
+    pub fn refresh(&mut self, _config: &crate::remote::config::Config) {}
+}
 
 #[cfg(windows)]
 mod windows {

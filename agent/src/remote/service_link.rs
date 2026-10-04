@@ -5,11 +5,9 @@
 //! writes the release version to that stdin, so the coordinator can tell the server why the
 //! Agent is going offline.
 use std::io::{BufRead, Write};
-use std::os::windows::io::AsRawHandle;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
-use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation};
 
 /// Written when the first remote session starts.
 pub const SESSION_ACTIVE: &str = "session-active";
@@ -39,15 +37,25 @@ impl ServiceLink {
             };
         }
         // Helpers launched with inherited handles, some as the signed-in user, must not
-        // receive the service's pipes.
-        for handle in [
-            std::io::stdin().as_raw_handle(),
-            std::io::stdout().as_raw_handle(),
-        ] {
-            if let Err(error) = unsafe {
-                SetHandleInformation(HANDLE(handle), HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))
-            } {
-                tracing::warn!(%error, "could not keep the Agent service pipes from helpers");
+        // receive the service's pipes. Unix children inherit stdio only as their own
+        // stdio, which every helper launch replaces.
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+
+            use windows::Win32::Foundation::{
+                HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation,
+            };
+
+            for handle in [
+                std::io::stdin().as_raw_handle(),
+                std::io::stdout().as_raw_handle(),
+            ] {
+                if let Err(error) = unsafe {
+                    SetHandleInformation(HANDLE(handle), HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))
+                } {
+                    tracing::warn!(%error, "could not keep the Agent service pipes from helpers");
+                }
             }
         }
         let announced = Arc::clone(&update);

@@ -25,7 +25,7 @@ pub enum ExecutionMode {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "meshrmm-agent", about = "MeshRMM Windows endpoint Agent")]
+#[command(name = "meshrmm-agent", about = "MeshRMM endpoint Agent")]
 struct Arguments {
     /// Run as the Windows Service Control Manager entry point.
     #[arg(long, hide = true, conflicts_with_all = ["worker", "console"])]
@@ -91,7 +91,7 @@ impl Config {
             ExecutionMode::Console
         } else {
             anyhow::bail!(
-                "this Agent must be installed as a Windows service from the MeshRMM dashboard; use --console only for local development"
+                "this Agent must be installed from the MeshRMM dashboard; use --console only for local development"
             );
         };
         let config_path = resolve_path(arguments.config.as_deref(), "agent.json")?;

@@ -800,7 +800,7 @@ async fn run_connected_sender(
                     quality_ceiling: capture_ceiling,
                     encoder_status: capture_encoder_status,
                     initial_display: start_in_background
-                        .then_some(DisplayId(meshrmm_remote_screen::background::DISPLAY_ID)),
+                        .then_some(DisplayId(meshrmm_protocol::BACKGROUND_DISPLAY_ID.0)),
                     session_close,
                 },
                 capture_rx,
