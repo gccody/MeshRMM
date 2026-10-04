@@ -521,14 +521,7 @@ fn prepare_update_directory(config_directory: &Path) -> anyhow::Result<PathBuf> 
     Ok(update_directory)
 }
 
-/// Verifies certificates with the operating system and offers only TLS 1.3,
-/// which every MeshRMM host requires. Used for updates and enrollment.
-pub(crate) fn https_tls_config() -> ureq::tls::TlsConfig {
-    ureq::tls::TlsConfig::builder()
-        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-        .unversioned_rustls_crypto_provider(meshrmm_signaling_client::tls::tls13_crypto_provider())
-        .build()
-}
+pub(crate) use crate::enrollment::https_tls_config;
 
 fn http_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
