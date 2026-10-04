@@ -17,9 +17,9 @@ and add this repository or `production` environment secret:
 The Cloudflare account ID is already non-secret deployment configuration in the
 repository. The workflow passes it to Wrangler automatically.
 
-For production macOS signing, export the Developer ID Application certificate
-and add all three secrets below. If they are omitted, CI still produces an
-ad-hoc signed development archive and emits a warning:
+Export the Developer ID Application certificate and add all three secrets
+below. The workflow fails without them rather than publishing an ad-hoc build,
+because installed Agents accept only updates signed by their own team:
 
 - `MACOS_CERTIFICATE_P12_BASE64` — the exported `.p12`, base64 encoded as one
   line.
@@ -27,8 +27,7 @@ ad-hoc signed development archive and emits a warning:
 - `MACOS_CODESIGN_IDENTITY` — the full certificate name, such as
   `Developer ID Application: Example Company (TEAMID)`.
 
-To notarize the macOS viewers, also add all three of these secrets. They must be
-configured together:
+To notarize the macOS viewer and Agent, also add all three of these secrets:
 
 - `MACOS_NOTARY_APPLE_ID`
 - `MACOS_NOTARY_TEAM_ID`

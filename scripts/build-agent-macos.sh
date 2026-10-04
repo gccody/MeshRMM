@@ -13,7 +13,8 @@ DASHBOARD_DOWNLOAD_DIR="$ROOT_DIR/dashboard/public/downloads"
 UPDATE_MANIFEST="$DASHBOARD_DOWNLOAD_DIR/update-manifest.json"
 CONFIGURED_DOWNLOAD_ORIGIN=$(node "$ROOT_DIR/scripts/release-config.mjs" download-origin)
 DOWNLOAD_ORIGIN=${MESHRMM_DOWNLOAD_ORIGIN:-$CONFIGURED_DOWNLOAD_ORIGIN}
-CODESIGN_IDENTITY=${MESHRMM_CODESIGN_IDENTITY:--}
+. "$SCRIPT_DIR/macos-signing.sh"
+CODESIGN_IDENTITY=$(meshrmm_codesign_identity)
 VERSION=$(node "$ROOT_DIR/scripts/release-config.mjs" version)
 
 for TARGET in aarch64-apple-darwin x86_64-apple-darwin; do
@@ -60,13 +61,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 </plist>
 PLIST
 
-if [ "$CODESIGN_IDENTITY" = "-" ]; then
-    # Ad-hoc signing makes a development bundle internally consistent, but
-    # macOS forgets the Agent's privacy permissions whenever it changes.
-    codesign --force --sign - "$APP_DIR"
-else
-    codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP_DIR"
-fi
+meshrmm_sign_app "$CODESIGN_IDENTITY" "$APP_DIR"
 
 mkdir -p -- "$DASHBOARD_DOWNLOAD_DIR"
 ARCHIVE_PATH="$DASHBOARD_DOWNLOAD_DIR/meshrmm-agent-macos.zip"
