@@ -10,9 +10,9 @@ use meshrmm_protocol::{
 
 use super::capture::{Capture, CaptureConfig};
 use super::encoder::EncodedAccessUnit;
-use super::helper::protocol::{InputState, StreamSettings};
+use super::helper::protocol::{InputState, SessionUi, StreamSettings};
 use super::platform::ScreenInput;
-use super::{display, input, keep_awake, wallpaper};
+use super::{display, input, keep_awake, ui, wallpaper};
 
 pub(crate) struct Started {
     pub displays: Vec<Display>,
@@ -24,6 +24,10 @@ pub(crate) struct Started {
 pub(crate) struct LocalScreen {
     capture: Option<Capture>,
     input: Arc<LocalInput>,
+    border_enabled: bool,
+    /// The border around the captured display, which capture leaves out.
+    border: Option<ui::DisplayBorder>,
+    active_display: Option<meshrmm_protocol::Display>,
 }
 
 impl LocalScreen {
@@ -31,7 +35,24 @@ impl LocalScreen {
         Self {
             capture: None,
             input,
+            border_enabled: false,
+            border: None,
+            active_display: None,
         }
+    }
+
+    /// Shows or hides the outline around the shared display.
+    pub(crate) fn set_display_border(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.border_enabled = enabled;
+        self.border = None;
+        if enabled && let Some(display) = &self.active_display {
+            let border = ui::DisplayBorder::show(display)?;
+            if let Some(capture) = &self.capture {
+                capture.exclude_windows(border.window_ids())?;
+            }
+            self.border = Some(border);
+        }
+        Ok(())
     }
 
     pub(crate) fn start(
@@ -41,11 +62,22 @@ impl LocalScreen {
         sink: impl Fn(EncodedAccessUnit) + Send + Sync + 'static,
     ) -> anyhow::Result<Started> {
         self.capture = None;
+        self.border = None;
         let displays = display::enumerate()?;
         let active_display = display::choose(&displays, display_id)?;
         self.input
             .controller()?
             .set_active_display(active_display.clone())?;
+        self.input.clear_annotations_unless(active_display.id);
+        if self.border_enabled {
+            self.border = Some(ui::DisplayBorder::show(&active_display)?);
+        }
+        self.active_display = Some(active_display.clone());
+        let excluded = self
+            .border
+            .as_ref()
+            .map(|border| border.window_ids().to_vec())
+            .unwrap_or_default();
         let capture = Capture::start(
             &active_display,
             CaptureConfig {
@@ -55,6 +87,7 @@ impl LocalScreen {
                 capture_cursor: settings.capture_cursor,
                 grayscale: settings.grayscale,
             },
+            &excluded,
             sink,
         )?;
         let format = capture.format();
@@ -75,6 +108,7 @@ impl LocalScreen {
 
     pub(crate) fn stop(&mut self) {
         self.capture = None;
+        self.border = None;
     }
 
     pub(crate) fn poll_ended(&mut self) -> Option<anyhow::Error> {
@@ -114,6 +148,9 @@ pub(crate) struct LocalInput {
     keep_awake: Mutex<Option<keep_awake::KeepAwake>>,
     wallpaper: Mutex<wallpaper::Wallpaper>,
     clipboard: Option<Mutex<meshrmm_clipboard::ClipboardSync>>,
+    indicator: Mutex<Option<ui::SessionIndicator>>,
+    notification: Mutex<Option<ui::ConnectionNotification>>,
+    annotations: Mutex<Option<(meshrmm_protocol::DisplayId, ui::AnnotationOverlay)>>,
 }
 
 impl LocalInput {
@@ -129,7 +166,48 @@ impl LocalInput {
                 .inspect_err(|error| tracing::warn!(%error, "the clipboard is unavailable"))
                 .ok()
                 .map(Mutex::new),
+            indicator: Mutex::default(),
+            notification: Mutex::default(),
+            annotations: Mutex::default(),
         })
+    }
+
+    /// Shows the user that a technician connected: the menu bar item with the
+    /// chat, the banner when company policy shows it, and the connection
+    /// notification once.
+    pub(crate) fn begin_session(&self, session: &SessionUi) {
+        match ui::SessionIndicator::show(
+            &session.viewer_name,
+            self.chat.clone(),
+            session.show_banner,
+        ) {
+            Ok(indicator) => {
+                *self.indicator.lock().unwrap_or_else(|e| e.into_inner()) = Some(indicator)
+            }
+            Err(error) => tracing::warn!(error = ?error, "could not show the session indicator"),
+        }
+        if let Some(text) = &session.notification {
+            match ui::ConnectionNotification::show(text) {
+                Ok(notification) => {
+                    *self.notification.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(notification)
+                }
+                Err(error) => {
+                    tracing::warn!(error = ?error, "could not show the connection notification")
+                }
+            }
+        }
+    }
+
+    /// Erases the drawing when the session shows another display.
+    fn clear_annotations_unless(&self, display: meshrmm_protocol::DisplayId) {
+        let mut annotations = self.annotations.lock().unwrap_or_else(|e| e.into_inner());
+        if annotations
+            .as_ref()
+            .is_some_and(|(shown, _)| *shown != display)
+        {
+            annotations.take();
+        }
     }
 
     fn controller(&self) -> anyhow::Result<std::sync::MutexGuard<'_, input::InputController>> {
@@ -165,6 +243,18 @@ impl LocalInput {
         let _ = self.set_prevent_idle_lock(false);
         let _ = self.set_wallpaper_hidden(false);
         self.stop_chat();
+        self.indicator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        self.notification
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        self.annotations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 }
 
@@ -211,8 +301,43 @@ impl ScreenInput for LocalInput {
     fn apply(&self, input: RemoteInput) -> anyhow::Result<()> {
         self.controller()?.apply(input)
     }
-    fn annotate(&self, _annotation: meshrmm_protocol::Annotation) -> anyhow::Result<()> {
-        anyhow::bail!("annotation is not available on macOS yet")
+    /// Draws over the active display. Points for another display are
+    /// discarded: they were drawn before a display switch.
+    fn annotate(&self, annotation: meshrmm_protocol::Annotation) -> anyhow::Result<()> {
+        use meshrmm_protocol::Annotation;
+
+        let (x, y, start) = match annotation {
+            Annotation::Start { x, y, .. } => (x, y, true),
+            Annotation::Extend { x, y, .. } => (x, y, false),
+            Annotation::Clear => {
+                self.annotations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                return Ok(());
+            }
+        };
+        let display = self
+            .controller()?
+            .active_display()
+            .context("an annotation arrived before a display was selected")?;
+        if annotation.display_id() != Some(display.id) {
+            return Ok(());
+        }
+        let mut annotations = self.annotations.lock().unwrap_or_else(|e| e.into_inner());
+        let overlay = match &mut *annotations {
+            Some((_, overlay)) => overlay,
+            // Only a new stroke shows the overlay, so one that failed to show
+            // is reported once per stroke rather than once per point.
+            None if !start => return Ok(()),
+            None => {
+                &mut annotations
+                    .insert((display.id, ui::AnnotationOverlay::show(&display)?))
+                    .1
+            }
+        };
+        overlay.draw(x, y, start);
+        Ok(())
     }
     fn release_all(&self) -> anyhow::Result<()> {
         self.controller()?.release_all()

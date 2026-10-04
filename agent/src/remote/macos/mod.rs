@@ -2,6 +2,7 @@
 //! encoding and Quartz input. A console Agent captures its own session; the
 //! installed coordinator, which runs as root outside any graphical session,
 //! uses the session helper of whichever session is on the console.
+pub(crate) mod approval;
 mod capture;
 pub(crate) mod display;
 mod encoder;
@@ -10,6 +11,7 @@ mod input;
 mod keep_awake;
 mod keymap;
 pub(crate) mod local;
+pub(crate) mod ui;
 mod wallpaper;
 
 use std::sync::Arc;
@@ -19,6 +21,7 @@ use meshrmm_protocol::{
     ChromaMode, Codec, DisplayId, EncodedFrame, HeadlessResolution, QualityPreset, VideoStreamId,
 };
 
+pub(crate) use self::helper::protocol::SessionUi;
 use self::helper::protocol::StreamSettings;
 use super::platform;
 use super::platform::{ScreenInput, ScreenStreamer, StartedScreen};
@@ -66,7 +69,7 @@ pub struct PlatformScreenStreamer {
 
 enum Backend {
     Direct {
-        screen: local::LocalScreen,
+        screen: Box<local::LocalScreen>,
         input: Arc<local::LocalInput>,
     },
     Helper(Arc<helper::coordinator::Remote>),
@@ -79,13 +82,15 @@ impl PlatformScreenStreamer {
         frames_per_second: u32,
         bitrate_bits_per_second: u32,
         use_helpers: bool,
+        ui: SessionUi,
     ) -> anyhow::Result<Self> {
         let backend = if use_helpers {
-            Backend::Helper(helper::coordinator::Remote::new()?)
+            Backend::Helper(helper::coordinator::Remote::new(ui)?)
         } else {
             let input = Arc::new(local::LocalInput::new()?);
+            input.begin_session(&ui);
             Backend::Direct {
-                screen: local::LocalScreen::new(Arc::clone(&input)),
+                screen: Box::new(local::LocalScreen::new(Arc::clone(&input))),
                 input,
             }
         };
@@ -231,8 +236,11 @@ impl ScreenStreamer for PlatformScreenStreamer {
         Ok(false)
     }
 
-    fn set_display_border(&mut self, _enabled: bool) -> anyhow::Result<()> {
-        Ok(())
+    fn set_display_border(&mut self, enabled: bool) -> anyhow::Result<()> {
+        match &mut self.backend {
+            Backend::Direct { screen, .. } => screen.set_display_border(enabled),
+            Backend::Helper(remote) => remote.set_display_border(enabled),
+        }
     }
 
     fn set_headless_resolution(&mut self, _resolution: HeadlessResolution) -> bool {
@@ -245,6 +253,15 @@ impl ScreenStreamer for PlatformScreenStreamer {
             Backend::Helper(remote) => {
                 Arc::new(helper::coordinator::HelperInput(Arc::clone(remote)))
             }
+        }
+    }
+}
+
+impl Drop for PlatformScreenStreamer {
+    fn drop(&mut self) {
+        // A session helper ends its own session when the coordinator leaves it.
+        if let Backend::Direct { input, .. } = &self.backend {
+            input.end_session();
         }
     }
 }

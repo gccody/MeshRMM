@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 const MAX_POINTS: usize = 32_768;
 
 /// Maps a normalized point to pixels from the display's top-left corner.
-fn display_pixel(width: u32, height: u32, x: u16, y: u16) -> (i32, i32) {
+pub(crate) fn display_pixel(width: u32, height: u32, x: u16, y: u16) -> (i32, i32) {
     let scale = |value: u16, extent: u32| {
         (i64::from(value) * i64::from(extent.saturating_sub(1)) / 65_535) as i32
     };
@@ -17,7 +17,7 @@ fn display_pixel(width: u32, height: u32, x: u16, y: u16) -> (i32, i32) {
 
 /// Which part of the overlay a change repaints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Dirty {
+pub(crate) enum Dirty {
     /// Left, top, right and bottom, in overlay pixels.
     Rect(i32, i32, i32, i32),
     All,
@@ -25,14 +25,14 @@ enum Dirty {
 
 /// Strokes in overlay pixels.
 #[derive(Debug)]
-struct Strokes {
-    strokes: VecDeque<Vec<(i32, i32)>>,
+pub(crate) struct Strokes {
+    pub(crate) strokes: VecDeque<Vec<(i32, i32)>>,
     points: usize,
-    pen_width: i32,
+    pub(crate) pen_width: i32,
 }
 
 impl Strokes {
-    fn new(pen_width: i32) -> Self {
+    pub(crate) fn new(pen_width: i32) -> Self {
         Self {
             strokes: VecDeque::new(),
             points: 0,
@@ -42,7 +42,7 @@ impl Strokes {
 
     /// Adds a point, to a new stroke or the latest one, and returns what to
     /// repaint.
-    fn add(&mut self, point: (i32, i32), start: bool) -> Option<Dirty> {
+    pub(crate) fn add(&mut self, point: (i32, i32), start: bool) -> Option<Dirty> {
         let from = match self.strokes.back_mut() {
             Some(stroke) if !start => {
                 let last = *stroke.last()?;

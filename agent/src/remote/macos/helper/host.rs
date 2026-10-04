@@ -98,6 +98,7 @@ fn serve(stream: UnixStream, input: &Arc<LocalInput>, login_window: bool) -> any
         })?;
     let screen = Arc::new(Mutex::new(LocalScreen::new(Arc::clone(input))));
     let audio = Arc::new(Mutex::new(None::<meshrmm_audio::Capture>));
+    let approval = Arc::new(Mutex::new(Arc::new(AtomicBool::new(false))));
     let active = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
     let pump = spawn_pump(
@@ -118,12 +119,15 @@ fn serve(stream: UnixStream, input: &Arc<LocalInput>, login_window: bool) -> any
         };
         let result = handle(
             call.request,
-            input,
-            &screen,
-            &audio,
-            &active,
-            &sequence,
-            &events,
+            &Served {
+                input: Arc::clone(input),
+                screen: Arc::clone(&screen),
+                audio: Arc::clone(&audio),
+                active: Arc::clone(&active),
+                approval: Arc::clone(&approval),
+                sequence: Arc::clone(&sequence),
+                events: events.clone(),
+            },
         )
         .map_err(|error| format!("{error:#}"));
         if events
@@ -137,6 +141,10 @@ fn serve(stream: UnixStream, input: &Arc<LocalInput>, login_window: bool) -> any
         }
     };
     stopped.store(true, Ordering::SeqCst);
+    approval
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .store(true, Ordering::SeqCst);
     let _ = pump.join();
     audio.lock().unwrap_or_else(|e| e.into_inner()).take();
     screen.lock().unwrap_or_else(|e| e.into_inner()).stop();
@@ -145,17 +153,71 @@ fn serve(stream: UnixStream, input: &Arc<LocalInput>, login_window: bool) -> any
     result
 }
 
-fn handle(
-    request: Request,
-    input: &Arc<LocalInput>,
-    screen: &Mutex<LocalScreen>,
-    audio: &Mutex<Option<meshrmm_audio::Capture>>,
-    active: &AtomicBool,
-    sequence: &Arc<AtomicU64>,
-    events: &mpsc::SyncSender<Event>,
-) -> anyhow::Result<Reply> {
+/// What a coordinator connection's requests act on.
+struct Served {
+    input: Arc<LocalInput>,
+    screen: Arc<Mutex<LocalScreen>>,
+    audio: Arc<Mutex<Option<meshrmm_audio::Capture>>>,
+    active: Arc<AtomicBool>,
+    /// Set to cancel the approval prompt that is showing.
+    approval: Arc<Mutex<Arc<AtomicBool>>>,
+    sequence: Arc<AtomicU64>,
+    events: mpsc::SyncSender<Event>,
+}
+
+fn handle(request: Request, served: &Served) -> anyhow::Result<Reply> {
+    let Served {
+        input,
+        screen,
+        audio,
+        active,
+        approval,
+        sequence,
+        events,
+    } = served;
     match request {
-        Request::BeginSession => active.store(true, Ordering::SeqCst),
+        Request::BeginSession(session) => {
+            active.store(true, Ordering::SeqCst);
+            input.begin_session(&session);
+        }
+        Request::SetDisplayBorder(enabled) => screen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_display_border(enabled)?,
+        Request::PromptApproval {
+            text,
+            reason,
+            timeout_seconds,
+            lock_idle_seconds,
+        } => {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let previous = std::mem::replace(
+                &mut *approval.lock().unwrap_or_else(|e| e.into_inner()),
+                Arc::clone(&cancelled),
+            );
+            previous.store(true, Ordering::SeqCst);
+            let prompt = crate::remote::connection_approval::ApprovalPrompt {
+                text,
+                reason,
+                timeout: Duration::from_secs(timeout_seconds.into()),
+                lock_idle: Duration::from_secs(lock_idle_seconds.into()),
+            };
+            let events = events.clone();
+            std::thread::Builder::new()
+                .name("meshrmm-approval-prompt".into())
+                .spawn(move || {
+                    let answer = crate::remote::connection_approval::ask(&prompt, || {
+                        cancelled.load(Ordering::SeqCst)
+                    });
+                    if let Some(decision) = answer {
+                        let _ = events.send(Event::ApprovalDecision(decision.to_byte()));
+                    }
+                })?;
+        }
+        Request::CancelApproval => approval
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .store(true, Ordering::SeqCst),
         Request::EndSession => {
             active.store(false, Ordering::SeqCst);
             audio.lock().unwrap_or_else(|e| e.into_inner()).take();
