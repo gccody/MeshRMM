@@ -43,6 +43,7 @@ pub async fn run(
         Arc::new(Mutex::new(Box::new(PlatformScreenStreamer::new(
             config.frames_per_second,
             bitrate_bits_per_second,
+            mode == ExecutionMode::Service,
         )?)))
     };
     #[cfg(windows)]

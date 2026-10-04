@@ -146,6 +146,14 @@ async fn end_sessions(
     }
 }
 
+/// Entry point of `--session-helper`, which launchd runs in each graphical
+/// session of an installed macOS Agent.
+#[cfg(target_os = "macos")]
+pub fn run_session_helper() -> anyhow::Result<()> {
+    crate::logging::initialize_helper("agent-session-helper.log")?;
+    macos::helper::host::run(&macos::helper::socket_path())
+}
+
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(unused_variables))]
 pub async fn run(
     #[allow(unused_mut)] mut config: Config,
@@ -157,6 +165,10 @@ pub async fn run(
     #[cfg(any(windows, target_os = "macos"))]
     {
         connection_approval::restore_after_restart();
+        #[cfg(target_os = "macos")]
+        if mode == ExecutionMode::Service {
+            macos::helper::coordinator::listen(&macos::helper::socket_path())?;
+        }
         let link = service_link::ServiceLink::new(mode == ExecutionMode::Worker);
         // Created once, so reconnecting does not capture again before the interval ends.
         let mut thumbnails = thumbnail::Thumbnails::new(mode);
@@ -204,9 +216,6 @@ pub async fn run(
                                                         break Ok(false);
                                                     }
                                                     AgentCommand::Uninstall => {
-                                                        #[cfg(target_os = "macos")]
-                                                        anyhow::bail!("the macOS Agent cannot uninstall itself yet");
-                                                        #[cfg(windows)]
                                                         {
                                                         crate::installer::schedule_uninstall()
                                                             .context("failed to schedule Agent self-uninstall")?;

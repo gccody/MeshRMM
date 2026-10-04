@@ -85,6 +85,34 @@ pub fn set_process_log(log: AsyncLog) {
 }
 
 /// Whether this process writes its log through [`AsyncLog`].
+/// Logs a macOS session helper to `~/Library/Logs/MeshRMM/<file_name>`, or
+/// to `/Library/Logs/MeshRMM` for the login window's helper, which runs as root.
+#[cfg(target_os = "macos")]
+pub fn initialize_helper(file_name: &str) -> anyhow::Result<()> {
+    // SAFETY: geteuid has no preconditions.
+    let directory = if unsafe { libc::geteuid() } == 0 {
+        std::path::PathBuf::from("/Library/Logs/MeshRMM")
+    } else {
+        std::path::Path::new(
+            &std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?,
+        )
+        .join("Library/Logs/MeshRMM")
+    };
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(file_name);
+    let writer = AsyncLog::new(move || meshrmm_log_file::RotatingFile::open(&path))?;
+    set_process_log(writer.clone());
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(writer)
+        .with_ansi(false)
+        .init();
+    Ok(())
+}
+
 pub fn has_process_log() -> bool {
     PROCESS_LOG.get().is_some()
 }
