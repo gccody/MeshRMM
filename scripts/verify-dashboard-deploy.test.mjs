@@ -13,6 +13,7 @@ const artifacts = {
   "agent-windows-x64": "meshrmm-agent-windows-x64.exe",
   "client-windows-x64": "meshrmm-remote-windows-x64.exe",
   "client-macos-arm64": "meshrmm-remote-macos-arm64.zip",
+  "agent-macos": "meshrmm-agent-macos.zip",
 };
 
 // Writes a complete release like the one the release workflow assembles.
