@@ -102,8 +102,12 @@ ScreenCaptureKit captures 4:2:0 frames, VideoToolbox encodes them as H.265 or
 H.264 (in hardware where the Mac has it), and Quartz events carry the viewer's
 keyboard and pointer input; ScreenCaptureKit also captures the Mac's system
 audio. Clipboard, file transfer, chat, Prevent idle lock and Hide wallpaper
-work too. VideoToolbox has no 4:4:4 encoder, so Mac Agents always stream
-4:2:0.
+work too. During a session a menu bar item opens the chat, which also opens
+by itself for the technician's messages; the session banner, the connection
+notification and the connection approval prompt follow company policy as on
+Windows, the display border is left out of the capture, and the technician's
+annotations are drawn over the shared display. VideoToolbox has no 4:4:4
+encoder, so Mac Agents always stream 4:2:0.
 
 The dashboard's **Add a device** dialog creates a one-time Terminal command
 for Macs. It runs `install-agent-macos.sh` from the dashboard, which downloads

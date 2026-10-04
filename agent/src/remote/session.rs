@@ -40,10 +40,21 @@ pub async fn run(
             !request.start_in_background,
             "background sessions are not available on macOS"
         );
+        let notification =
+            super::connection_notification::ConnectionNotification::for_request(&request)
+                .filter(|notification| notification.allowed(false) && notification.pending());
+        if let Some(notification) = &notification {
+            notification.mark_shown();
+        }
         Arc::new(Mutex::new(Box::new(PlatformScreenStreamer::new(
             config.frames_per_second,
             bitrate_bits_per_second,
             mode == ExecutionMode::Service,
+            super::macos::SessionUi {
+                viewer_name: request.viewer_name.clone(),
+                show_banner: request.session_banner,
+                notification: notification.map(|notification| notification.text().to_owned()),
+            },
         )?)))
     };
     #[cfg(windows)]

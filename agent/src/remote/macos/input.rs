@@ -104,6 +104,10 @@ impl InputController {
         Ok(())
     }
 
+    pub(crate) fn active_display(&self) -> Option<Display> {
+        self.active_display.clone()
+    }
+
     pub(crate) fn viewer_controls_input(&self) -> bool {
         if self.ownership.is_none() {
             // Without the tap, only a pointer the user moved away shows local use.

@@ -1,4 +1,4 @@
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod annotation;
 #[cfg(any(windows, target_os = "macos", test))]
 mod audio_mode;
@@ -19,7 +19,7 @@ mod clipboard;
 pub mod config;
 #[cfg(any(windows, target_os = "macos", test))]
 mod connection_approval;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod connection_notification;
 #[cfg(windows)]
 mod credentials;

@@ -10,7 +10,7 @@ use meshrmm_protocol::{
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever a message changes; the coordinator refuses other helpers.
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 /// A 2560x1600 keyframe is well under this.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -32,10 +32,20 @@ pub(crate) struct StreamSettings {
     pub grayscale: bool,
 }
 
+/// What the session shows the Mac's user.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SessionUi {
+    pub viewer_name: String,
+    /// Whether company policy shows the "connected remotely" banner.
+    pub show_banner: bool,
+    /// The connection notification, when the session has not shown it yet.
+    pub notification: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Request {
     /// A remote session starts using this helper.
-    BeginSession,
+    BeginSession(SessionUi),
     /// The session no longer uses this helper: undo everything it changed.
     EndSession,
     Start {
@@ -60,6 +70,16 @@ pub(crate) enum Request {
     Chat(String),
     StartAudio,
     StopAudio,
+    SetDisplayBorder(bool),
+    /// Asks the user to accept a connection; the answer arrives as
+    /// `Event::ApprovalDecision`.
+    PromptApproval {
+        text: String,
+        reason: String,
+        timeout_seconds: u32,
+        lock_idle_seconds: u32,
+    },
+    CancelApproval,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +143,8 @@ pub(crate) enum Event {
     Audio(Vec<u8>),
     /// System audio capture stopped on its own.
     AudioEnded,
+    /// The answer to `Request::PromptApproval`, as `Decision::to_byte`.
+    ApprovalDecision(u8),
 }
 
 pub(crate) fn write<T: Serialize>(writer: &mut impl Write, message: &T) -> anyhow::Result<()> {

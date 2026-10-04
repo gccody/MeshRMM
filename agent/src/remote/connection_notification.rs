@@ -43,7 +43,7 @@ impl ConnectionNotification {
     /// Whether the company notifies the user when the technician views the
     /// background desktop, or otherwise a user's desktop. A session that is
     /// not allowed to notify yet may be later, after switching desktops.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     pub fn allowed(&self, background: bool) -> bool {
         if background {
             self.on_background_desktop
@@ -52,13 +52,13 @@ impl ConnectionNotification {
         }
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     pub fn text(&self) -> &str {
         &self.text
     }
 
     /// Whether this session's user has yet to see the notification.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     pub fn pending(&self) -> bool {
         NOTIFIED_SESSION
             .lock()
@@ -67,7 +67,7 @@ impl ConnectionNotification {
             != Some(&self.session_id)
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     pub fn mark_shown(&self) {
         *NOTIFIED_SESSION
             .lock()

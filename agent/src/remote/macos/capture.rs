@@ -25,8 +25,8 @@ use objc2_core_video::{
 };
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCDisplay, SCShareableContent, SCStream, SCStreamConfiguration,
-    SCStreamDelegate, SCStreamOutput, SCStreamOutputType,
+    SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamDelegate,
+    SCStreamOutput, SCStreamOutputType,
 };
 
 use super::encoder::{EncodedAccessUnit, Encoder, FrameSink};
@@ -211,6 +211,7 @@ impl ScreenOutput {
 }
 
 pub(crate) struct Capture {
+    display_id: u32,
     stream: Retained<SCStream>,
     configuration: Retained<SCStreamConfiguration>,
     _output: Retained<ScreenOutput>,
@@ -228,9 +229,10 @@ impl Capture {
     pub(crate) fn start(
         display: &Display,
         config: CaptureConfig,
+        excluded: &[u32],
         sink: impl Fn(EncodedAccessUnit) + Send + Sync + 'static,
     ) -> anyhow::Result<Self> {
-        let sc_display = shareable_display(display.id.0)?;
+        let filter = content_filter(display.id.0, excluded)?;
         let (width, height) = super::display::pixel_size(display);
         // 4:2:0 needs even dimensions.
         let (width, height) = (width & !1, height & !1);
@@ -267,11 +269,6 @@ impl Capture {
         // SAFETY: all ScreenCaptureKit objects are created and configured
         // before the stream starts, with valid arguments.
         let (stream, configuration, output, queue) = unsafe {
-            let filter = SCContentFilter::initWithDisplay_excludingWindows(
-                SCContentFilter::alloc(),
-                &sc_display,
-                &NSArray::new(),
-            );
             let configuration = SCStreamConfiguration::new();
             configuration.setWidth(width as usize);
             configuration.setHeight(height as usize);
@@ -328,6 +325,7 @@ impl Capture {
             })
             .context("could not start the screen pacer thread")?;
         Ok(Self {
+            display_id: display.id.0,
             stream,
             configuration,
             _output: output,
@@ -363,6 +361,17 @@ impl Capture {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         state.encoder.set_bitrate(bits_per_second)?;
         state.refinement.set_bitrate(bits_per_second);
+        Ok(())
+    }
+
+    /// Leaves the given windows out of the capture from now on.
+    pub(crate) fn exclude_windows(&self, excluded: &[u32]) -> anyhow::Result<()> {
+        let filter = content_filter(self.display_id, excluded)?;
+        // SAFETY: updating a live stream's filter is supported.
+        unsafe {
+            self.stream
+                .updateContentFilter_completionHandler(&filter, None)
+        };
         Ok(())
     }
 
@@ -405,8 +414,9 @@ impl Drop for Capture {
     }
 }
 
-/// The ScreenCaptureKit display for a Quartz display ID.
-fn shareable_display(display_id: u32) -> anyhow::Result<Retained<SCDisplay>> {
+/// A content filter for a Quartz display without the given windows.
+fn content_filter(display_id: u32, excluded: &[u32]) -> anyhow::Result<Retained<SCContentFilter>> {
+    let excluded = excluded.to_vec();
     let (sender, receiver) = mpsc::channel();
     let handler = RcBlock::new(
         move |content: *mut SCShareableContent, error: *mut NSError| {
@@ -414,21 +424,36 @@ fn shareable_display(display_id: u32) -> anyhow::Result<Retained<SCDisplay>> {
             let result = match unsafe { (content.as_ref(), error.as_ref()) } {
                 (Some(content), _) => Ok(unsafe { content.displays() }
                     .iter()
-                    .find(|display| unsafe { display.displayID() } == display_id)),
+                    .find(|display| unsafe { display.displayID() } == display_id)
+                    .map(|display| {
+                        let windows = unsafe { content.windows() }
+                            .iter()
+                            .filter(|window| excluded.contains(&unsafe { window.windowID() }))
+                            .collect::<Vec<_>>();
+                        // SAFETY: the display and windows come from this content.
+                        unsafe {
+                            SCContentFilter::initWithDisplay_excludingWindows(
+                                SCContentFilter::alloc(),
+                                &display,
+                                &NSArray::from_retained_slice(&windows),
+                            )
+                        }
+                    })),
                 (None, Some(error)) => Err(error.localizedDescription().to_string()),
                 (None, None) => Err("no shareable content".to_owned()),
             };
             let _ = sender.send(result);
         },
     );
+    // Windows the Agent has just opened may not count as on screen yet.
     // SAFETY: the handler matches the expected block signature.
     unsafe {
         SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
-            false, true, &handler,
+            false, false, &handler,
         )
     };
     match receiver.recv_timeout(CAPTURE_TIMEOUT) {
-        Ok(Ok(Some(display))) => Ok(display),
+        Ok(Ok(Some(filter))) => Ok(filter),
         Ok(Ok(None)) => bail!("ScreenCaptureKit cannot capture display {display_id}"),
         Ok(Err(error)) => bail!(
             "ScreenCaptureKit cannot capture the screen; allow Screen Recording for the MeshRMM Agent in System Settings ({error})"
@@ -455,6 +480,7 @@ mod tests {
                 capture_cursor: true,
                 grayscale,
             },
+            &[],
             move |unit| {
                 let _ = sender.send(unit);
             },
