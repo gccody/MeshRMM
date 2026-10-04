@@ -386,8 +386,6 @@ mod shared {
     }
 }
 
-#[cfg(windows)]
-use self::shared::Staged;
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) use self::shared::{deliver_file, run_script};
 #[cfg(any(windows, target_os = "macos"))]
