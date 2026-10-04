@@ -10,7 +10,7 @@ use meshrmm_protocol::{
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever a message changes; the coordinator refuses other helpers.
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 2;
 /// A 2560x1600 keyframe is well under this.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -58,6 +58,8 @@ pub(crate) enum Request {
     StartChat,
     StopChat,
     Chat(String),
+    StartAudio,
+    StopAudio,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +119,10 @@ pub(crate) enum Event {
     Clipboard(ClipboardContent),
     Files(FileMessage),
     Chat(String),
+    /// A PCM16 system audio packet.
+    Audio(Vec<u8>),
+    /// System audio capture stopped on its own.
+    AudioEnded,
 }
 
 pub(crate) fn write<T: Serialize>(writer: &mut impl Write, message: &T) -> anyhow::Result<()> {

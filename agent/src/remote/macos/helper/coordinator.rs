@@ -311,6 +311,8 @@ struct SessionEvents {
     files_ready: Arc<Notify>,
     chat: Mutex<VecDeque<String>>,
     chat_ready: Arc<Notify>,
+    audio: Mutex<Option<crate::remote::platform::AudioSink>>,
+    audio_ended: AtomicBool,
 }
 
 /// Publishes a capture's frames, resynchronizing on a keyframe when the
@@ -374,6 +376,17 @@ impl SessionEvents {
                     .push_back(text);
                 self.chat_ready.notify_one();
             }
+            Event::Audio(packet) => {
+                if let Some(send) = self
+                    .audio
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                {
+                    send(packet);
+                }
+            }
+            Event::AudioEnded => self.audio_ended.store(true, Ordering::SeqCst),
             Event::Reply { .. } => {}
         }
     }
@@ -574,7 +587,69 @@ impl Drop for Remote {
 /// The session's input, routed to whichever helper it uses.
 pub(crate) struct HelperInput(pub(crate) Arc<Remote>);
 
+/// System audio a helper captures. It stops being healthy when the session
+/// moves to another helper, which makes the transport start it there.
+struct HelperAudio {
+    remote: Arc<Remote>,
+    helper: Arc<Connection>,
+}
+
+impl crate::remote::platform::AudioStream for HelperAudio {
+    fn healthy(&self) -> bool {
+        !self.helper.closed.load(Ordering::SeqCst)
+            && !self.remote.events.audio_ended.load(Ordering::SeqCst)
+            && self
+                .remote
+                .current
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.helper))
+    }
+}
+
+impl Drop for HelperAudio {
+    fn drop(&mut self) {
+        self.remote
+            .events
+            .audio
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if !self.helper.closed.load(Ordering::SeqCst) {
+            let _ = self.helper.call(Request::StopAudio);
+        }
+    }
+}
+
 impl ScreenInput for HelperInput {
+    fn start_audio(
+        &self,
+        send: crate::remote::platform::AudioSink,
+    ) -> anyhow::Result<Box<dyn crate::remote::platform::AudioStream>> {
+        let helper = self.0.helper()?;
+        *self
+            .0
+            .events
+            .audio
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(send);
+        self.0.events.audio_ended.store(false, Ordering::SeqCst);
+        if let Err(error) = helper.call(Request::StartAudio) {
+            self.0
+                .events
+                .audio
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            return Err(error);
+        }
+        Ok(Box::new(HelperAudio {
+            remote: Arc::clone(&self.0),
+            helper,
+        }))
+    }
+
     fn set_wallpaper_hidden(&self, hidden: bool) -> anyhow::Result<()> {
         self.0
             .desired
@@ -750,6 +825,28 @@ mod tests {
         HelperInput(Arc::clone(&remote))
             .set_prevent_idle_lock(true)
             .unwrap();
+        let (sender, packets) = mpsc::channel();
+        let audio = HelperInput(Arc::clone(&remote))
+            .start_audio(Box::new(move |packet| {
+                let _ = sender.send(packet);
+            }))
+            .unwrap();
+        std::process::Command::new("/usr/bin/afplay")
+            .args(["-v", "0.3", "/System/Library/Sounds/Ping.aiff"])
+            .status()
+            .unwrap();
+        let mut loudest = 0_i16;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while let Ok(packet) =
+            packets.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
+            for sample in packet[6..].chunks_exact(2) {
+                loudest = loudest.max(i16::from_le_bytes([sample[0], sample[1]]).saturating_abs());
+            }
+        }
+        assert!(audio.healthy());
+        assert!(loudest > 100, "the helper's system audio is silent");
+        drop(audio);
         remote.stop().unwrap();
         drop(remote);
         let _ = std::fs::remove_file(socket);

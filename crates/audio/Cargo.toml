@@ -12,6 +12,16 @@ workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+objc2 = "0.6.3"
+objc2-core-audio-types = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-core-media = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-screen-capture-kit = "0.3.2"
+
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 cpal = "0.16.0"
 # Builds the bundled libopus (BSD-3-Clause) with CMake.

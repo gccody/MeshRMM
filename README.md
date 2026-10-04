@@ -100,7 +100,8 @@ Pack.
 The Agent also runs on macOS 12.3 or newer, and is still being ported.
 ScreenCaptureKit captures 4:2:0 frames, VideoToolbox encodes them as H.265 or
 H.264 (in hardware where the Mac has it), and Quartz events carry the viewer's
-keyboard and pointer input. Clipboard, file transfer, chat, Prevent idle lock
+keyboard and pointer input. ScreenCaptureKit also captures system audio. Clipboard,
+file transfer, chat, Prevent idle lock
 and Hide wallpaper work too. VideoToolbox has no 4:4:4 encoder, so Mac Agents
 always stream 4:2:0.
 
