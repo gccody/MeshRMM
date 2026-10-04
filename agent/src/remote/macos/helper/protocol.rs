@@ -10,7 +10,7 @@ use meshrmm_protocol::{
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever a message changes; the coordinator refuses other helpers.
-pub(crate) const VERSION: u32 = 3;
+pub(crate) const VERSION: u32 = 4;
 /// A 2560x1600 keyframe is well under this.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -40,6 +40,8 @@ pub(crate) struct SessionUi {
     pub show_banner: bool,
     /// The connection notification, when the session has not shown it yet.
     pub notification: Option<String>,
+    /// What the blackout shows the Mac's user.
+    pub blackout_message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +82,9 @@ pub(crate) enum Request {
         lock_idle_seconds: u32,
     },
     CancelApproval,
+    ClearClipboard,
+    LockScreen,
+    LogOut,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +117,8 @@ pub(crate) struct InputState {
     pub cursor: CursorShape,
     pub viewer_controls_input: bool,
     pub agent_pointer_display: Option<DisplayId>,
+    pub agent_input_blocked: bool,
+    pub blacked_out: bool,
 }
 
 impl Default for InputState {
@@ -120,6 +127,8 @@ impl Default for InputState {
             cursor: CursorShape::Default,
             viewer_controls_input: false,
             agent_pointer_display: None,
+            agent_input_blocked: false,
+            blacked_out: false,
         }
     }
 }

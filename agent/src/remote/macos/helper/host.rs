@@ -214,6 +214,9 @@ fn handle(request: Request, served: &Served) -> anyhow::Result<Reply> {
                     }
                 })?;
         }
+        Request::ClearClipboard => crate::remote::macos::session_close::clear_clipboard_here()?,
+        Request::LockScreen => crate::remote::macos::session_close::lock_here()?,
+        Request::LogOut => crate::remote::macos::session_close::log_out_here()?,
         Request::CancelApproval => approval
             .lock()
             .unwrap_or_else(|e| e.into_inner())

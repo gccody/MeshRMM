@@ -54,6 +54,10 @@ pub async fn run(
                 viewer_name: request.viewer_name.clone(),
                 show_banner: request.session_banner,
                 notification: notification.map(|notification| notification.text().to_owned()),
+                blackout_message: meshrmm_protocol::render_blackout_message(
+                    &request.blackout_message,
+                    &request.viewer_name,
+                ),
             },
         )?)))
     };
