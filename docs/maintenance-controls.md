@@ -144,6 +144,11 @@ confirmation first. Windows then restarts at once and closes applications
 without saving. The button is available once the Agent has connected,
 including in view-only sessions, since restarting is not input.
 
+The Agent tells the viewer its operating system when the session starts. A
+Mac offers only **Restart…**: Apple silicon Macs enter Safe Mode only from the
+power button at startup, and Macs have no Ctrl+Alt+Del, so that button is left
+out too.
+
 The session survives the restart. The viewer keeps the window open and shows
 that the remote computer is restarting, the server keeps the session, and its
 Agent coordinator hands the session back to the Agent once it reconnects.

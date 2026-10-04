@@ -910,6 +910,7 @@ impl RemoteView {
             chat_available: chat.available(),
             chat_unread: chat.unread(),
             power: control.power_state(),
+            device_is_mac: control.device_is_mac(),
             file_status: control.files().status(),
             toolbox_available: toolbox.available,
             toolbox_busy: toolbox.busy,
@@ -922,6 +923,16 @@ impl RemoteView {
     }
 
     fn refresh_toolbar(&self) {
+        // The device's platform, which decides what Command sends, arrives
+        // after the window opens.
+        let command = command_key(&self.ivars().control);
+        let released = {
+            let mut keyboard = self.ivars().keyboard.borrow_mut();
+            (keyboard.command_key() != command).then(|| keyboard.set_command_key(command))
+        };
+        if let Some(keys) = released {
+            self.send_keys(keys);
+        }
         let state = self.toolbar_state();
         if let Some(toolbar) = self.ivars().toolbar.borrow().as_ref() {
             toolbar.set_state(state);
@@ -1199,11 +1210,14 @@ impl RemoteView {
             sel!(toggleRemoteCursor:),
             Some(control.show_remote_cursor()),
         ));
-        menu.addItem(&self.menu_item(
-            "Command key sends Ctrl",
-            sel!(toggleCommandAsControl:),
-            Some(control.command_as_control()),
-        ));
+        // A Mac's Command key is Command's own.
+        if !control.device_is_mac() {
+            menu.addItem(&self.menu_item(
+                "Command key sends Ctrl",
+                sel!(toggleCommandAsControl:),
+                Some(control.command_as_control()),
+            ));
+        }
         let diagnostics_key = control.shortcut_key(crate::shortcuts::ViewerShortcut::Diagnostics);
         menu.addItem(&self.menu_choices(
             &format!(
@@ -1673,8 +1687,10 @@ fn diagnostics_key_title(key: crate::shortcuts::ShortcutKey) -> &'static str {
     }
 }
 
+/// What Command sends: Command itself to a Mac, and to Windows the Windows
+/// key unless the technician prefers Ctrl.
 fn command_key(control: &ControlSink) -> CommandKey {
-    if control.command_as_control() {
+    if control.command_as_control() && !control.device_is_mac() {
         CommandKey::Control
     } else {
         CommandKey::Windows
@@ -1722,6 +1738,10 @@ fn queue_alert(title: impl Into<String>, message: String) {
     }
 }
 
+/// Shows the next queued alert as a sheet on the session window, then the
+/// one after it once that is dismissed. A sheet leaves the run loop in its
+/// default mode, so the remote screen keeps updating behind it; `runModal`
+/// would stop it.
 fn present_queued_alerts() {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
@@ -1730,7 +1750,18 @@ fn present_queued_alerts() {
         let alert = NSAlert::new(mtm);
         alert.setMessageText(&NSString::from_str(&title));
         alert.setInformativeText(&NSString::from_str(&message));
-        alert.runModal();
+        let window = NSApplication::sharedApplication(mtm)
+            .mainWindow()
+            .filter(|window| window.attachedSheet().is_none());
+        let Some(window) = window else {
+            alert.runModal();
+            continue;
+        };
+        let next = block2::RcBlock::new(|_response: objc2_app_kit::NSModalResponse| {
+            present_queued_alerts()
+        });
+        alert.beginSheetModalForWindow_completionHandler(&window, Some(&next));
+        return;
     }
 }
 

@@ -136,6 +136,10 @@ impl Keyboard {
         }
     }
 
+    pub(super) fn command_key(&self) -> CommandKey {
+        self.command
+    }
+
     /// Changes the Command mapping. Returns releases for anything it had down.
     pub(super) fn set_command_key(&mut self, command: CommandKey) -> Vec<RemoteKey> {
         let released = self.release_all();

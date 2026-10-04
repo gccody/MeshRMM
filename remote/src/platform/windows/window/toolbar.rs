@@ -130,6 +130,7 @@ impl WindowContext {
             chat_available: chat.available(),
             chat_unread: chat.unread(),
             power: self.control.power_state(),
+            device_is_mac: self.control.device_is_mac(),
             file_status: self.control.files().status(),
             toolbox_available: toolbox.available,
             toolbox_busy: toolbox.busy,
