@@ -117,6 +117,12 @@ helper in each one, the login window's included; helpers connect to the
 coordinator's socket at `/var/run/com.meshrmm.agent.sock`, which admits only
 processes running the Agent's own executable. A session follows the console:
 when another user takes it, capture moves to that user's helper.
+The coordinator updates the Agent like the Windows service does: every six
+hours, postponed while a remote session is live, it stages a newer
+`agent-macos` release once its SHA-256 and code signature (by the installed
+Agent's developer team) check out. The new Agent waits for the coordinator to
+stop, swaps the app bundle, restarts the launchd jobs, and puts the previous
+bundle back if the new coordinator does not keep running.
 `sudo meshrmm-agent --uninstall` removes everything. The configuration and
 WebRTC identity live in `/Library/Application Support/MeshRMM/Agent`, which
 only root can read.
