@@ -596,3 +596,72 @@ fn banner(mtm: MainThreadMarker, name: &str) -> Retained<NSPanel> {
     panel.orderFrontRegardless();
     panel
 }
+
+/// Black screens with the company's maintenance message, which the
+/// technician does not see: capture leaves them out.
+pub(crate) struct Blackout {
+    windows: MainThreadBox,
+    window_ids: Vec<u32>,
+}
+
+impl Blackout {
+    pub(crate) fn show(message: &str) -> anyhow::Result<Self> {
+        let message = message.to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let windows = MainThreadBox::new(move |mtm| {
+            let windows = objc2_app_kit::NSScreen::screens(mtm)
+                .iter()
+                .map(|screen| {
+                    let frame = screen.frame();
+                    let window = overlay_window(mtm, frame);
+                    window.setBackgroundColor(Some(&NSColor::blackColor()));
+                    window.setOpaque(true);
+                    // Clicks land on the black screen, not the apps under it.
+                    window.setIgnoresMouseEvents(false);
+                    let text = label(mtm, &message, 22.0, false, &NSColor::whiteColor());
+                    text.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+                    let width = (frame.size.width - 160.0).max(200.0);
+                    text.setPreferredMaxLayoutWidth(width);
+                    let height = text.fittingSize().height;
+                    text.setFrame(NSRect::new(
+                        NSPoint::new(
+                            (frame.size.width - width) / 2.0,
+                            (frame.size.height - height) / 2.0,
+                        ),
+                        NSSize::new(width, height),
+                    ));
+                    if let Some(content) = window.contentView() {
+                        content.addSubview(&text);
+                    }
+                    window.orderFrontRegardless();
+                    window
+                })
+                .collect::<Vec<_>>();
+            let _ = sender.send(
+                windows
+                    .iter()
+                    .map(|window| window.windowNumber() as u32)
+                    .collect::<Vec<_>>(),
+            );
+            Ok(windows)
+        })?;
+        Ok(Self {
+            windows,
+            window_ids: receiver.recv().unwrap_or_default(),
+        })
+    }
+
+    pub(crate) fn window_ids(&self) -> &[u32] {
+        &self.window_ids
+    }
+}
+
+impl Drop for Blackout {
+    fn drop(&mut self) {
+        self.windows.with(|windows: &mut Vec<Retained<NSWindow>>| {
+            for window in windows {
+                window.close();
+            }
+        });
+    }
+}

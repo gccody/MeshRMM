@@ -224,6 +224,9 @@ pub(crate) struct Capture {
 // SAFETY: SCStream and SCStreamConfiguration are thread-safe Objective-C
 // objects; the rest is synchronized.
 unsafe impl Send for Capture {}
+// SAFETY: as above; every method takes `&self` and only calls thread-safe
+// ScreenCaptureKit methods or locks the shared state.
+unsafe impl Sync for Capture {}
 
 impl Capture {
     pub(crate) fn start(
