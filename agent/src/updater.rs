@@ -10,7 +10,6 @@ use meshrmm_self_update::windows::{
     PreviousProcess, current_process_created, helper_cleanup_command,
 };
 use meshrmm_self_update::{AGENT_WINDOWS_X64, CURRENT_VERSION, UpdateManifest};
-use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 use windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
 use windows_service::service::{Service, ServiceAccess, ServiceState};
@@ -19,15 +18,12 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use crate::private_directory;
 use crate::remote::config::Config;
 use crate::service::service_name_for_path;
+use crate::update_policy::{MAX_ATTEMPTS_PER_VERSION, UpdateAttempts, read_attempts};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
-/// A failed update restarts the previous Agent, which checks for updates again at once, so a
-/// release that cannot be installed is only retried this many times per window.
-const MAX_ATTEMPTS_PER_VERSION: u32 = 3;
-const ATTEMPT_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 const ATTEMPTS_FILE: &str = "update-attempts.json";
 /// The stopping service waits up to 5 seconds for each tray and 25 seconds for its coordinator to
 /// end remote sessions and run their close actions.
@@ -434,44 +430,6 @@ fn start_and_confirm(service_name: &str, grace: Duration) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Update attempts for the release most recently offered, kept in the private update directory.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct UpdateAttempts {
-    version: String,
-    attempts: u32,
-    first_attempt_unix: u64,
-}
-
-impl UpdateAttempts {
-    /// The record to store before trying `version`, or `None` once it has used its attempts in
-    /// the current window.
-    fn next(previous: Option<&Self>, version: &str, now: u64) -> Option<Self> {
-        match previous {
-            Some(previous)
-                if previous.version == version
-                    && now
-                        .checked_sub(previous.first_attempt_unix)
-                        .is_some_and(|elapsed| elapsed < ATTEMPT_WINDOW.as_secs()) =>
-            {
-                (previous.attempts < MAX_ATTEMPTS_PER_VERSION).then(|| Self {
-                    version: version.to_owned(),
-                    attempts: previous.attempts + 1,
-                    first_attempt_unix: previous.first_attempt_unix,
-                })
-            }
-            _ => Some(Self {
-                version: version.to_owned(),
-                attempts: 1,
-                first_attempt_unix: now,
-            }),
-        }
-    }
-}
-
-fn read_attempts(path: &Path) -> Option<UpdateAttempts> {
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
-}
-
 /// The helper starts before the Agent's logging and exits right after its last step, so it
 /// appends to the Agent log synchronously rather than through the bounded asynchronous writer.
 fn initialize_helper_log(helper_directory: &Path, json: bool) {
@@ -588,8 +546,6 @@ mod tests {
     use meshrmm_signaling_client::test_support::TlsServer;
     use rustls::version::{TLS12, TLS13};
 
-    const DAY: u64 = 24 * 60 * 60;
-
     #[test]
     fn downloads_offer_only_tls_13() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -608,36 +564,6 @@ mod tests {
         // test server's self-signed certificate.
         let untrusted = format!("{:?}", http.get(url(&tls13)).call().unwrap_err());
         assert!(untrusted.contains("InvalidCertificate"), "{untrusted}");
-    }
-
-    #[test]
-    fn limits_attempts_for_the_same_release() {
-        let first = UpdateAttempts::next(None, "1.2.0", 1_000).unwrap();
-        assert_eq!(first.attempts, 1);
-        let second = UpdateAttempts::next(Some(&first), "1.2.0", 1_060).unwrap();
-        let third = UpdateAttempts::next(Some(&second), "1.2.0", 1_120).unwrap();
-        assert_eq!((third.attempts, third.first_attempt_unix), (3, 1_000));
-        assert_eq!(UpdateAttempts::next(Some(&third), "1.2.0", 1_180), None);
-        assert_eq!(
-            UpdateAttempts::next(Some(&third), "1.2.0", 1_000 + DAY - 1),
-            None
-        );
-    }
-
-    #[test]
-    fn retries_after_the_window_or_for_another_release() {
-        let exhausted = UpdateAttempts {
-            version: "1.2.0".to_owned(),
-            attempts: MAX_ATTEMPTS_PER_VERSION,
-            first_attempt_unix: 1_000,
-        };
-        let later = UpdateAttempts::next(Some(&exhausted), "1.2.0", 1_000 + DAY).unwrap();
-        assert_eq!((later.attempts, later.first_attempt_unix), (1, 1_000 + DAY));
-        let newer = UpdateAttempts::next(Some(&exhausted), "1.2.1", 1_100).unwrap();
-        assert_eq!((newer.attempts, newer.version.as_str()), (1, "1.2.1"));
-        // A clock set back before the recorded attempt must not block updates until it catches up.
-        let rewound = UpdateAttempts::next(Some(&exhausted), "1.2.0", 10).unwrap();
-        assert_eq!(rewound.attempts, 1);
     }
 
     #[test]

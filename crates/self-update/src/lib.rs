@@ -12,6 +12,8 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const CURRENT_VERSION: &str = env!("MESHRMM_RELEASE_VERSION");
 pub const DEFAULT_MANIFEST_URL: &str = env!("MESHRMM_UPDATE_MANIFEST_URL");
 pub const AGENT_WINDOWS_X64: &str = "agent-windows-x64";
+/// The universal (Apple silicon and Intel) macOS Agent.
+pub const AGENT_MACOS: &str = "agent-macos";
 pub const CLIENT_WINDOWS_X64: &str = "client-windows-x64";
 pub const CLIENT_MACOS_X64: &str = "client-macos-x64";
 pub const CLIENT_MACOS_ARM64: &str = "client-macos-arm64";

@@ -25,14 +25,9 @@ use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::remote::config::Config;
 use crate::remote::service_link::{SESSION_ACTIVE, SESSION_IDLE, UPDATING_PREFIX};
+use crate::update_policy::UpdateSchedule;
 use crate::win32::{OwnedHandle, wide};
 
-const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
-/// An update check that falls due during a remote session is retried this often until the
-/// session ends, so the update does not interrupt it.
-const DEFERRED_UPDATE_RETRY: Duration = Duration::from_secs(5 * 60);
-/// A session that never ends does not keep the Agent from updating for longer than this.
-const MAX_UPDATE_DEFERRAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Covers the coordinator's session close helpers, which may each take 10 seconds.
 const COORDINATOR_STOP_TIMEOUT: Duration = Duration::from_secs(25);
 
@@ -223,51 +218,6 @@ fn run_service() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Schedules automatic update checks and postpones them while a remote session is live.
-struct UpdateSchedule {
-    next_check: Instant,
-    deferred_since: Option<Instant>,
-}
-
-impl UpdateSchedule {
-    fn new(now: Instant) -> Self {
-        Self {
-            next_check: now,
-            deferred_since: None,
-        }
-    }
-
-    /// Whether to check for an update now. Staging an update stops the service and ends the
-    /// session, so a check waits for the session to end, but not beyond the maximum deferral.
-    fn due(&mut self, now: Instant, session_active: bool) -> bool {
-        if now < self.next_check {
-            return false;
-        }
-        if session_active {
-            let since = *self.deferred_since.get_or_insert(now);
-            let deferred = now.duration_since(since);
-            if deferred < MAX_UPDATE_DEFERRAL {
-                if deferred.is_zero() {
-                    tracing::info!(
-                        "postponing the automatic Agent update check until the remote session ends"
-                    );
-                }
-                self.next_check = now + DEFERRED_UPDATE_RETRY;
-                return false;
-            }
-            tracing::warn!(
-                deferred_hours = deferred.as_secs() / 3600,
-                "checking for an Agent update although a remote session is still active"
-            );
-        } else if self.deferred_since.is_some() {
-            tracing::info!("the remote session ended; running the postponed Agent update check");
-        }
-        self.deferred_since = None;
-        self.next_check = now + UPDATE_CHECK_INTERVAL;
-        true
-    }
-}
-
 fn service_status(state: ServiceState, accepted: ServiceControlAccept) -> ServiceStatus {
     ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -433,36 +383,6 @@ mod tests {
         assert_eq!(session_activity(b"session-idle\r"), Some(false));
         assert_eq!(session_activity(b""), None);
         assert_eq!(session_activity(b"session-active-ish"), None);
-    }
-
-    #[test]
-    fn checks_for_updates_on_schedule_without_a_session() {
-        let start = Instant::now();
-        let mut updates = UpdateSchedule::new(start);
-        assert!(updates.due(start, false));
-        assert!(!updates.due(start + UPDATE_CHECK_INTERVAL / 2, false));
-        assert!(updates.due(start + UPDATE_CHECK_INTERVAL, false));
-    }
-
-    #[test]
-    fn postpones_update_checks_during_a_session_up_to_the_limit() {
-        let start = Instant::now();
-        let mut updates = UpdateSchedule::new(start);
-        assert!(!updates.due(start, true));
-        assert!(!updates.due(start + DEFERRED_UPDATE_RETRY / 2, false));
-        assert!(!updates.due(start + DEFERRED_UPDATE_RETRY, true));
-        // The check runs soon after the session ends, not a full interval later.
-        assert!(updates.due(start + DEFERRED_UPDATE_RETRY * 2, false));
-
-        let mut updates = UpdateSchedule::new(start);
-        let mut now = start;
-        while !updates.due(now, true) {
-            now += DEFERRED_UPDATE_RETRY;
-            assert!(now <= start + MAX_UPDATE_DEFERRAL);
-        }
-        assert_eq!(now, start + MAX_UPDATE_DEFERRAL);
-        // A later session gets the full deferral again.
-        assert!(!updates.due(now + UPDATE_CHECK_INTERVAL, true));
     }
 
     #[test]
