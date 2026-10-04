@@ -129,13 +129,10 @@ jobs:
           CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
         shell: bash
         run: |
-          if [ -z "$CERTIFICATE_P12_BASE64" ]; then
-            echo "::warning::No macOS signing certificate is configured; using an ad-hoc signature."
-            echo "MESHRMM_CODESIGN_IDENTITY=-" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          if [ -z "$CERTIFICATE_PASSWORD" ] || [ -z "$CODESIGN_IDENTITY" ]; then
-            echo "::error::The macOS certificate password and signing identity secrets are required with the certificate."
+          # Installed Agents accept only updates signed by their own team, so
+          # a release must never fall back to an ad-hoc signature.
+          if [ -z "$CERTIFICATE_P12_BASE64" ] || [ -z "$CERTIFICATE_PASSWORD" ] || [ -z "$CODESIGN_IDENTITY" ]; then
+            echo "::error::Configure the macOS Developer ID certificate, its password, and the signing identity secrets."
             exit 1
           fi
           certificate_path="$RUNNER_TEMP/meshrmm-release.p12"
@@ -157,19 +154,15 @@ jobs:
       - name: Build signed universal Agent archive
         shell: bash
         run: sh scripts/build-agent-macos.sh
-      - name: Notarize and staple the viewer and Agent when credentials are configured
+      - name: Notarize and staple the viewer and Agent
         env:
           NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
           NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
           NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
         shell: bash
         run: |
-          if [ -z "$NOTARY_APPLE_ID" ] && [ -z "$NOTARY_TEAM_ID" ] && [ -z "$NOTARY_PASSWORD" ]; then
-            echo "::warning::No Apple notarization credentials are configured; publishing the signed archives without notarization."
-            exit 0
-          fi
           if [ -z "$NOTARY_APPLE_ID" ] || [ -z "$NOTARY_TEAM_ID" ] || [ -z "$NOTARY_PASSWORD" ]; then
-            echo "::error::All three macOS notarization secrets must be configured together."
+            echo "::error::Configure all three macOS notarization secrets."
             exit 1
           fi
           for pair in "dashboard/public/downloads/meshrmm-remote-macos-arm64.zip=dist/remote-macos/MeshRMM Remote.app" "dashboard/public/downloads/meshrmm-agent-macos.zip=dist/agent-macos/MeshRMM Agent.app"; do
