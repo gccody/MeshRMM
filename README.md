@@ -97,15 +97,30 @@ Pack.
 
 ## macOS Agent
 
-The Agent also runs on macOS, which is still being ported. So far it runs
-only interactively, with `meshrmm-agent --console --config agent.json`, and
-streams the signed-in user's displays: ScreenCaptureKit captures 4:2:0 frames,
-VideoToolbox encodes them as H.265 or H.264 (in hardware where the Mac has it),
-and Quartz events carry the viewer's keyboard and pointer input. Clipboard,
-file transfer, chat, Prevent idle lock and Hide wallpaper work too. The Agent
-needs the Screen Recording, Accessibility and Input Monitoring permissions in
-System Settings → Privacy & Security. VideoToolbox has no 4:4:4 encoder, so
-Mac Agents always stream 4:2:0.
+The Agent also runs on macOS 12.3 or newer, and is still being ported.
+ScreenCaptureKit captures 4:2:0 frames, VideoToolbox encodes them as H.265 or
+H.264 (in hardware where the Mac has it), and Quartz events carry the viewer's
+keyboard and pointer input. Clipboard, file transfer, chat, Prevent idle lock
+and Hide wallpaper work too. VideoToolbox has no 4:4:4 encoder, so Mac Agents
+always stream 4:2:0.
+
+`sudo meshrmm-agent --install <authorization>` enrolls the Mac with a
+hex-encoded installer authorization and installs the app bundle in
+`/Library/Application Support/MeshRMM`. A launchd daemon runs the root
+coordinator, which keeps the signaling connection and the WebRTC session.
+Capture and input need a graphical session, so a launchd agent runs a session
+helper in each one, the login window's included; helpers connect to the
+coordinator's socket at `/var/run/com.meshrmm.agent.sock`, which admits only
+processes running the Agent's own executable. A session follows the console:
+when another user takes it, capture moves to that user's helper.
+`sudo meshrmm-agent --uninstall` removes everything. The configuration and
+WebRTC identity live in `/Library/Application Support/MeshRMM/Agent`, which
+only root can read.
+
+macOS lets only the user grant the Screen & System Audio Recording,
+Accessibility and Input Monitoring permissions the helpers need; the first
+helper asks for them. `meshrmm-agent --console --config agent.json` runs the
+Agent in the current session for development.
 
 ## Computers without a monitor
 

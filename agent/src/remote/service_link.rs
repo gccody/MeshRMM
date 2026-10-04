@@ -116,9 +116,21 @@ impl ServiceLink {
                 std::future::pending::<()>().await;
             }
         };
+        // launchd stops the macOS coordinator with SIGTERM.
+        let terminate = async {
+            #[cfg(unix)]
+            if let Ok(mut terminate) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                terminate.recv().await;
+                return;
+            }
+            std::future::pending::<()>().await
+        };
         tokio::select! {
             () = service => {}
             _ = tokio::signal::ctrl_c() => {}
+            () = terminate => {}
         }
     }
 

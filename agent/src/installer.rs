@@ -7,7 +7,6 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use serde::{Deserialize, Serialize};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Registry::{
     HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
@@ -26,6 +25,7 @@ use windows_service::service::{
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use crate::enrollment;
 use crate::private_directory;
 use crate::service::{LEGACY_SERVICE_NAME, SERVICE_NAME};
 use crate::win32::wide;
@@ -34,40 +34,6 @@ const ENROLLMENT_MAGIC: &[u8] = b"MESHRMM-BOOTSTRAP-V1";
 const CONFIG_LENGTH_BYTES: usize = 8;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
-
-#[derive(Debug, Deserialize)]
-struct InstallerBootstrap {
-    server: String,
-    install_token: String,
-    expires_at_unix_ms: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct RedeemInstallerRequest {
-    name: String,
-    redemption_key: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct ProvisionedAgentConfig {
-    server: String,
-    device_id: String,
-    agent_token: String,
-    #[serde(default = "default_update_manifest_url")]
-    update_manifest_url: String,
-    frames_per_second: u32,
-    bitrate_bits_per_second: u32,
-    json_logs: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiError {
-    error: String,
-}
-
-fn default_update_manifest_url() -> String {
-    meshrmm_self_update::DEFAULT_MANIFEST_URL.to_owned()
-}
 
 pub fn launch_if_embedded() -> anyhow::Result<bool> {
     let executable = std::env::current_exe().context("could not locate the Agent installer")?;
@@ -206,7 +172,7 @@ fn install() -> anyhow::Result<Option<String>> {
     let source_bytes = std::fs::read(&source_path).context("could not read the Agent installer")?;
     let embedded = parse_embedded(&source_bytes)?
         .context("this executable does not contain a MeshRMM Agent enrollment")?;
-    let bootstrap = validate_bootstrap(embedded.bootstrap)?;
+    let bootstrap = enrollment::validate_bootstrap(embedded.bootstrap)?;
 
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -236,20 +202,7 @@ fn install() -> anyhow::Result<Option<String>> {
     private_directory::secure_contents(&config_directory)?;
 
     let machine_name = machine_name()?;
-    let recovery_path = config_directory.join("enrollment-recovery.json");
-    let recovery_key = match std::fs::read_to_string(&recovery_path) {
-        Ok(key) => key,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let key = format!(
-                "{}{}",
-                uuid::Uuid::new_v4().simple(),
-                uuid::Uuid::new_v4().simple()
-            );
-            std::fs::write(&recovery_path, &key)?;
-            key
-        }
-        Err(error) => return Err(error).context("could not read enrollment recovery key"),
-    };
+    let recovery_key = enrollment::recovery_key(&config_directory)?;
     let config_path = config_directory.join("agent.json");
     // Repair preserves the installed identity, including legacy installations.
     let mut notice = None;
@@ -275,16 +228,9 @@ fn install() -> anyhow::Result<Option<String>> {
         }
     };
     let provisioned_config = if let Some(config) = previous_config {
-        serde_json::from_slice::<ProvisionedAgentConfig>(&config)?
+        serde_json::from_slice::<enrollment::ProvisionedAgentConfig>(&config)?
     } else {
-        let pending = config_directory.join("enrollment-pending.json");
-        if pending.exists() {
-            serde_json::from_slice::<ProvisionedAgentConfig>(&std::fs::read(&pending)?)?
-        } else {
-            let config = redeem_installer(&bootstrap, machine_name, recovery_key)?;
-            replace_file(&pending, &serde_json::to_vec(&config)?)?;
-            config
-        }
+        enrollment::redeem_once(&config_directory, &bootstrap, machine_name, recovery_key)?
     };
     if provisioned_config.server.trim_end_matches('/') != bootstrap.server.trim_end_matches('/') {
         bail!(
@@ -377,8 +323,7 @@ fn install() -> anyhow::Result<Option<String>> {
         return Err(error);
     }
     rollback.committed = true;
-    let _ = std::fs::remove_file(config_directory.join("enrollment-pending.json"));
-    let _ = std::fs::remove_file(&recovery_path);
+    enrollment::finish(&config_directory);
     if let Some(legacy_service) = legacy_service {
         legacy_service
             .delete()
@@ -682,32 +627,6 @@ pub(crate) fn identity_directory() -> anyhow::Result<PathBuf> {
     Ok(config_directory()?.join("identity"))
 }
 
-fn validate_bootstrap(config: &[u8]) -> anyhow::Result<InstallerBootstrap> {
-    let bootstrap: InstallerBootstrap = serde_json::from_slice(config)
-        .context("the embedded Agent installer authorization is invalid JSON")?;
-    let server = url::Url::parse(&bootstrap.server)
-        .context("the embedded Agent installer server URL is invalid")?;
-    if server.scheme() != "https" || server.host_str().is_none() {
-        bail!("the Agent installer requires an HTTPS server URL");
-    }
-    if bootstrap.install_token.len() < 32
-        || !bootstrap
-            .install_token
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
-        bail!("the embedded Agent installer authorization is invalid");
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("the Windows system clock is before the Unix epoch")?
-        .as_millis() as u64;
-    if bootstrap.expires_at_unix_ms <= now {
-        bail!("this Agent installer authorization has expired; download a new installer");
-    }
-    Ok(bootstrap)
-}
-
 fn machine_name() -> anyhow::Result<String> {
     let mut buffer = vec![0_u16; 256];
     let mut length = buffer.len() as u32;
@@ -726,54 +645,6 @@ fn machine_name() -> anyhow::Result<String> {
         bail!("the Windows computer name must contain between 1 and 120 characters");
     }
     Ok(name)
-}
-
-fn redeem_installer(
-    bootstrap: &InstallerBootstrap,
-    machine_name: String,
-    redemption_key: String,
-) -> anyhow::Result<ProvisionedAgentConfig> {
-    let endpoint = format!(
-        "{}/v1/agent-installers/redeem",
-        bootstrap.server.trim_end_matches('/')
-    );
-    let http = ureq::Agent::config_builder()
-        .https_only(true)
-        .timeout_global(Some(Duration::from_secs(30)))
-        .http_status_as_error(false)
-        .tls_config(crate::updater::https_tls_config())
-        .build()
-        .new_agent();
-    let mut response = http
-        .post(&endpoint)
-        .header(
-            "Authorization",
-            &format!("Bearer {}", bootstrap.install_token),
-        )
-        .send_json(&RedeemInstallerRequest {
-            name: machine_name,
-            redemption_key,
-        })
-        .context("failed to contact the MeshRMM Agent enrollment service")?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let detail = response
-            .body_mut()
-            .read_json::<ApiError>()
-            .map(|body| body.error)
-            .unwrap_or_else(|_| "the Agent enrollment service rejected the installer".to_owned());
-        bail!("Agent enrollment failed with HTTP {status}: {detail}");
-    }
-    let config = response
-        .body_mut()
-        .read_json::<ProvisionedAgentConfig>()
-        .context("the Agent enrollment service returned an invalid configuration")?;
-    if config.device_id.is_empty() || config.agent_token.is_empty() || config.server.is_empty() {
-        bail!("the Agent enrollment service returned an incomplete configuration");
-    }
-    meshrmm_self_update::validate_manifest_url(&config.update_manifest_url)
-        .context("the Agent enrollment service returned an invalid update manifest URL")?;
-    Ok(config)
 }
 
 struct EmbeddedInstaller<'a> {
@@ -834,7 +705,7 @@ mod tests {
         let parsed = parse_embedded(&bytes).unwrap().unwrap();
         assert_eq!(parsed.executable, executable);
         assert_eq!(parsed.bootstrap, config);
-        let bootstrap = validate_bootstrap(parsed.bootstrap).unwrap();
+        let bootstrap = crate::enrollment::validate_bootstrap(parsed.bootstrap).unwrap();
         assert_eq!(bootstrap.server, "https://example.com");
     }
 

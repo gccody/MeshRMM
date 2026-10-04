@@ -1689,7 +1689,7 @@ async fn run_capture_control(
                     let capture_ended = lock_streamer(&streamer)?.poll_ended();
                     if let Some(capture_result) = capture_ended {
                         if let Err(error) = capture_result {
-                            tracing::warn!(error = ?error, stream_id = stream_id.0, ?active_profile, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "visible Windows desktop changed; replacing capture helper");
+                            tracing::warn!(error = ?error, stream_id = stream_id.0, ?active_profile, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "visible desktop changed; restarting capture");
                         } else {
                             tracing::warn!(stream_id = stream_id.0, ?active_profile, configured_bitrate_bits_per_second = quality_ceiling.load(Ordering::Acquire), "desktop capture helper stopped; replacing it");
                         }
@@ -1734,11 +1734,11 @@ async fn run_capture_control(
                                     format: started.format,
                                 },
                             ).await?;
-                            tracing::info!(stream_id = stream_id.0, display_id = active_display.id.0, recovery_ms, "remote session moved to the visible Windows desktop");
+                            tracing::info!(stream_id = stream_id.0, display_id = active_display.id.0, recovery_ms, "remote session moved to the visible desktop");
                         }
                         Err(error) => {
                             capture_retry_after = std::time::Instant::now() + DESKTOP_RETRY_INTERVAL;
-                            tracing::warn!(error = ?error, "waiting for a Windows login or application desktop");
+                            tracing::warn!(error = ?error, "waiting for a login or application desktop");
                         }
                     }
                 }
