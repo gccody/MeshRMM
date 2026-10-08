@@ -21,7 +21,7 @@ pub async fn create_session(config: &Config) -> anyhow::Result<SessionBootstrap>
         .bearer_auth(&config.handoff_token)
         .send()
         .await
-        .context("Cloudflare session API request failed")?;
+        .context("session API request failed")?;
     if !response.status().is_success() {
         return Err(crate::errors::ApiError::from_response(response)
             .await

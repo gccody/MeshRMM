@@ -120,7 +120,8 @@ pub struct HttpConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DownloadsConfig {
-    /// The Agent and viewer builds shipped with this server release.
+    /// The Agent and viewer builds shipped with this server release, and the
+    /// `artifacts.json` that lists them.
     #[serde(default = "default_downloads_dir")]
     pub dir: PathBuf,
 }

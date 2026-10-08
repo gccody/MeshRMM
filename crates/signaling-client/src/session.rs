@@ -1,6 +1,6 @@
 //! A remote session's signaling socket. Signaling only negotiates the peer
 //! connection, so once the peers are connected, losing the socket must not
-//! end the session: Cloudflare routinely drops long-lived WebSockets. The
+//! end the session: proxies and networks routinely drop long-lived WebSockets. The
 //! socket then reconnects in the background while the session streams.
 
 use std::collections::VecDeque;
@@ -248,7 +248,7 @@ mod tests {
         let mut signaling = SessionSignaling::open(connect).await.unwrap();
         signaling.peer_connected();
         let first = accepted.recv().await.unwrap();
-        // An abrupt reset, as Cloudflare does, without a close handshake.
+        // An abrupt reset, as a proxy may do, without a close handshake.
         drop(first);
 
         let receive = tokio::spawn(async move {

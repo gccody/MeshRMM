@@ -1,34 +1,24 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const configPath = resolve(repositoryRoot, "release.json");
 
-export async function readReleaseConfig() {
+const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+
+export async function readReleaseConfig(environment = process.env) {
   const config = JSON.parse(await readFile(configPath, "utf8"));
-  if (
-    typeof config.version !== "string" ||
-    !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(config.version)
-  ) {
+  if (typeof config.version !== "string" || !SEMVER.test(config.version)) {
     throw new Error("release.json version must be a semantic version");
   }
-
-  for (const field of ["download_origin", "viewer_server"]) {
-    if (typeof config[field] !== "string") {
-      throw new Error(`release.json ${field} must be a URL`);
-    }
-    const url = new URL(config[field]);
-    if (url.protocol !== "https:" || !url.hostname) {
-      throw new Error(`release.json ${field} must use HTTPS`);
-    }
+  // Development builds embed their own key in place of the release key; see
+  // docs/releases.md. The Rust build script honors the same variable.
+  const publicKey = environment.MESHRMM_RELEASE_PUBLIC_KEY || config.signing_public_key;
+  if (typeof publicKey !== "string" || !/^[0-9a-fA-F]{64}$/.test(publicKey)) {
+    throw new Error("the release signing public key must be 32 bytes in hexadecimal");
   }
-
-  return {
-    version: config.version,
-    downloadOrigin: config.download_origin.replace(/\/$/, ""),
-    viewerServer: config.viewer_server.replace(/\/$/, ""),
-  };
+  return { version: config.version, publicKey: publicKey.toLowerCase() };
 }
 
 function parseVersion(value) {
@@ -72,22 +62,11 @@ export function compareVersions(leftValue, rightValue) {
   return 0;
 }
 
-// Throws unless `version` is at least every release in a published update
-// manifest, so a republish cannot roll installed Agents and viewers back.
-export function assertNotOlderThanManifest(version, manifest) {
-  const releases = Object.entries(manifest?.releases ?? {});
-  if (manifest?.schema_version !== 1 || releases.length === 0) {
-    throw new Error("the published update manifest has no releases");
-  }
-  for (const [target, release] of releases) {
-    if (typeof release?.version !== "string") {
-      throw new Error(`the published update manifest has no version for ${target}`);
-    }
-    if (compareVersions(version, release.version) < 0) {
-      throw new Error(
-        `release version ${version} is older than the published ${target} ${release.version}`,
-      );
-    }
+// Throws unless `version` is at least the latest published release, so a
+// republish cannot roll installed Agents and viewers back.
+export function assertNotOlder(version, published) {
+  if (compareVersions(version, published) < 0) {
+    throw new Error(`release version ${version} is older than the published ${published}`);
   }
 }
 
@@ -99,27 +78,8 @@ async function main() {
     console.log(config.version);
     return;
   }
-  if (command === "download-origin") {
-    console.log(config.downloadOrigin);
-    return;
-  }
-  if (command === "viewer-config") {
-    if (!argument) throw new Error("viewer-config requires an output path");
-    const outputPath = resolve(process.cwd(), argument);
-    await mkdir(dirname(outputPath), { recursive: true });
-    await writeFile(
-      outputPath,
-      `${JSON.stringify(
-        {
-          server: config.viewerServer,
-          update_manifest_url: `${config.downloadOrigin}/downloads/update-manifest.json`,
-        },
-        null,
-        2,
-      )}\n`,
-      "utf8",
-    );
-    console.log(`Wrote release viewer configuration to ${outputPath}`);
+  if (command === "public-key") {
+    console.log(config.publicKey);
     return;
   }
   if (command === "assert-newer") {
@@ -138,15 +98,14 @@ async function main() {
   }
 
   if (command === "assert-not-older") {
-    if (!argument) throw new Error("assert-not-older requires the published update manifest path");
-    const manifest = JSON.parse(await readFile(resolve(process.cwd(), argument), "utf8"));
-    assertNotOlderThanManifest(config.version, manifest);
+    if (!argument) throw new Error("assert-not-older requires the published version");
+    assertNotOlder(config.version, argument.replace(/^v/, ""));
     console.log(`Release version ${config.version} is not older than the published release`);
     return;
   }
 
   throw new Error(
-    "usage: node scripts/release-config.mjs <version|download-origin|viewer-config|assert-newer|assert-not-older> [argument]",
+    "usage: node scripts/release-config.mjs <version|public-key|assert-newer|assert-not-older> [argument]",
   );
 }
 

@@ -24,7 +24,6 @@ pub(crate) struct ProvisionedAgentConfig {
     pub server: String,
     pub device_id: String,
     pub agent_token: String,
-    #[serde(default = "default_update_manifest_url")]
     pub update_manifest_url: String,
     pub frames_per_second: u32,
     pub bitrate_bits_per_second: u32,
@@ -34,10 +33,6 @@ pub(crate) struct ProvisionedAgentConfig {
 #[derive(Debug, Deserialize)]
 struct ApiError {
     error: String,
-}
-
-fn default_update_manifest_url() -> String {
-    meshrmm_self_update::DEFAULT_MANIFEST_URL.to_owned()
 }
 
 /// The key that lets a retried installation recover its enrollment, kept

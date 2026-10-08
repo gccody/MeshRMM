@@ -191,7 +191,7 @@ pub async fn run(
         )>;
         loop {
             let url = agent_connection_url(&config.server, &config.device_id)?;
-            tracing::info!(device_id = %config.device_id, url = %url, "connecting Agent to Cloudflare signaling");
+            tracing::info!(device_id = %config.device_id, url = %url, "connecting Agent to the server");
             match authenticated_websocket(url, &config.agent_token).await {
                 Ok((socket, _response)) => {
                     let mut socket = meshrmm_signaling_client::SignalingConnection::new(socket);
@@ -400,7 +400,7 @@ mod tests {
             signaling_token: "token".into(),
             expires_at_unix_ms: 1_000,
             ice_servers: vec![IceServer {
-                urls: vec!["turn:turn.cloudflare.com:3478?transport=udp".into()],
+                urls: vec!["turn:rmm.example.com:3478?transport=udp".into()],
                 username: Some("first".into()),
                 credential: Some("secret".into()),
             }],

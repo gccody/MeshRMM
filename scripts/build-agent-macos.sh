@@ -1,6 +1,8 @@
 #!/bin/sh
 # Builds the universal (Apple silicon and Intel) macOS Agent as a signed app
-# bundle and publishes it as dashboard/public/downloads/meshrmm-agent-macos.zip.
+# bundle, archives it as dist/downloads/meshrmm-agent-macos.zip and describes it
+# in dist/downloads/artifacts.json (signed when MESHRMM_RELEASE_SIGNING_KEY
+# holds the signing key).
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -9,10 +11,7 @@ if [ "$#" -gt 0 ]; then
     echo "Usage: $0" >&2
     exit 1
 fi
-DASHBOARD_DOWNLOAD_DIR="$ROOT_DIR/dashboard/public/downloads"
-UPDATE_MANIFEST="$DASHBOARD_DOWNLOAD_DIR/update-manifest.json"
-CONFIGURED_DOWNLOAD_ORIGIN=$(node "$ROOT_DIR/scripts/release-config.mjs" download-origin)
-DOWNLOAD_ORIGIN=${MESHRMM_DOWNLOAD_ORIGIN:-$CONFIGURED_DOWNLOAD_ORIGIN}
+DOWNLOAD_DIR="$ROOT_DIR/dist/downloads"
 . "$SCRIPT_DIR/macos-signing.sh"
 CODESIGN_IDENTITY=$(meshrmm_codesign_identity)
 VERSION=$(node "$ROOT_DIR/scripts/release-config.mjs" version)
@@ -63,16 +62,11 @@ PLIST
 
 meshrmm_sign_app "$CODESIGN_IDENTITY" "$APP_DIR"
 
-mkdir -p -- "$DASHBOARD_DOWNLOAD_DIR"
-ARCHIVE_PATH="$DASHBOARD_DOWNLOAD_DIR/meshrmm-agent-macos.zip"
+mkdir -p -- "$DOWNLOAD_DIR"
+ARCHIVE_PATH="$DOWNLOAD_DIR/meshrmm-agent-macos.zip"
 rm -f -- "$ARCHIVE_PATH"
 ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ARCHIVE_PATH"
-node "$ROOT_DIR/scripts/update-release-manifest.mjs" \
-    "$UPDATE_MANIFEST" \
-    agent-macos \
-    "$VERSION" \
-    "${DOWNLOAD_ORIGIN%/}/downloads/$(basename "$ARCHIVE_PATH")" \
-    "$ARCHIVE_PATH"
+node "$ROOT_DIR/scripts/release-artifacts.mjs" write "$DOWNLOAD_DIR"
 
 echo "Built the macOS Agent: $APP_DIR"
-echo "Published update archive: $ARCHIVE_PATH"
+echo "Download archive: $ARCHIVE_PATH"

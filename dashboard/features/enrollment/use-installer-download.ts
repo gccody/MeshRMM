@@ -9,6 +9,7 @@ import {
   macInstallCommand,
   publishedChecksum,
   sha256Hex,
+  UPDATE_MANIFEST,
 } from "./installer";
 
 // Authorizes a one-time enrollment. For Windows it verifies the published
@@ -56,15 +57,15 @@ export function useInstallerDownload(authorizedFetch: AuthorizedFetch) {
         return;
       }
       const asset = INSTALLER_ASSETS[platform];
-      const [binaryResponse, checksumResponse] = await Promise.all([
+      const [binaryResponse, manifestResponse] = await Promise.all([
         fetch(asset.binary, { cache: "no-store" }),
-        fetch(asset.checksum, { cache: "no-store" }),
+        fetch(UPDATE_MANIFEST, { cache: "no-store" }),
       ]);
-      if (!binaryResponse.ok || !checksumResponse.ok) {
+      if (!binaryResponse.ok || !manifestResponse.ok) {
         throw new Error("The selected Agent installer has not been published yet.");
       }
       const binary = await binaryResponse.arrayBuffer();
-      const expectedChecksum = publishedChecksum(await checksumResponse.text());
+      const expectedChecksum = publishedChecksum(await manifestResponse.json(), asset.target);
       if (!expectedChecksum) {
         throw new Error("The published Agent installer checksum is invalid.");
       }

@@ -281,10 +281,7 @@ pub async fn redeem(
     state.presence.refresh(&claim.device_id).await;
     Ok(Json(AgentConfig {
         server: state.config.public_origin(),
-        update_manifest_url: format!(
-            "{}/downloads/update-manifest.json",
-            state.config.public_origin()
-        ),
+        update_manifest_url: meshrmm_self_update::manifest_url(&state.config.public_origin()),
         device_id: claim.device_id,
         agent_token,
         frames_per_second: FRAMES_PER_SECOND,

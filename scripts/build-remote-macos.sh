@@ -1,4 +1,10 @@
 #!/bin/sh
+# Builds the macOS viewer as a signed app bundle, archives it in dist/downloads
+# and describes it in dist/downloads/artifacts.json (signed when
+# MESHRMM_RELEASE_SIGNING_KEY holds the signing key). The viewer learns its
+# server from each dashboard link; an optional JSON file becomes the bundle's
+# Contents/MacOS/remote.json for local settings. --local builds a viewer with
+# automatic updates off and archives nothing.
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -12,23 +18,15 @@ if [ "$#" -gt 1 ]; then
     echo "Usage: $0 [--local] [viewer-config.json]" >&2
     exit 1
 fi
-if [ "$#" -gt 0 ]; then
-    CONFIG_PATH=$1
-else
-    CONFIG_PATH="$ROOT_DIR/dist/remote/remote.json"
-    node "$ROOT_DIR/scripts/release-config.mjs" viewer-config "$CONFIG_PATH"
-fi
-DASHBOARD_DOWNLOAD_DIR="$ROOT_DIR/dashboard/public/downloads"
-UPDATE_MANIFEST="$DASHBOARD_DOWNLOAD_DIR/update-manifest.json"
-CONFIGURED_DOWNLOAD_ORIGIN=$(node "$ROOT_DIR/scripts/release-config.mjs" download-origin)
-DOWNLOAD_ORIGIN=${MESHRMM_DOWNLOAD_ORIGIN:-$CONFIGURED_DOWNLOAD_ORIGIN}
+CONFIG_PATH=${1:-}
+DOWNLOAD_DIR="$ROOT_DIR/dist/downloads"
 . "$SCRIPT_DIR/macos-signing.sh"
 CODESIGN_IDENTITY=$(meshrmm_codesign_identity)
 BUILD_TARGET=${MESHRMM_BUILD_TARGET:-}
 VERSION=$(node "$ROOT_DIR/scripts/release-config.mjs" version)
 
-if [ ! -f "$CONFIG_PATH" ]; then
-    echo "Missing preconfigured viewer settings: $CONFIG_PATH" >&2
+if [ -n "$CONFIG_PATH" ] && [ ! -f "$CONFIG_PATH" ]; then
+    echo "Missing viewer settings: $CONFIG_PATH" >&2
     exit 1
 fi
 
@@ -59,12 +57,14 @@ rm -rf -- "$APP_DIR"
 mkdir -p -- "$MACOS_DIR" "$CONTENTS_DIR/Resources"
 cp -- "$SOURCE_EXECUTABLE" "$MACOS_DIR/meshrmm-remote"
 cp -- "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$CONTENTS_DIR/Resources/THIRD_PARTY_NOTICES.txt"
-cp -- "$CONFIG_PATH" "$MACOS_DIR/remote.json"
+if [ -n "$CONFIG_PATH" ]; then
+    cp -- "$CONFIG_PATH" "$MACOS_DIR/remote.json"
+fi
 if [ "$LOCAL_BUILD" = true ]; then
     node - "$MACOS_DIR/remote.json" <<'JS'
 const fs = require('node:fs');
 const path = process.argv[2];
-const config = JSON.parse(fs.readFileSync(path, 'utf8'));
+const config = fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, 'utf8')) : {};
 config.auto_update = false;
 fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
 JS
@@ -119,17 +119,11 @@ if [ "$LOCAL_BUILD" = true ]; then
     exit 0
 fi
 
-mkdir -p -- "$DASHBOARD_DOWNLOAD_DIR"
-ARCHIVE_PATH="$DASHBOARD_DOWNLOAD_DIR/meshrmm-remote-${UPDATE_TARGET#client-}.zip"
+mkdir -p -- "$DOWNLOAD_DIR"
+ARCHIVE_PATH="$DOWNLOAD_DIR/meshrmm-remote-${UPDATE_TARGET#client-}.zip"
 rm -f -- "$ARCHIVE_PATH"
 ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ARCHIVE_PATH"
-node "$ROOT_DIR/scripts/update-release-manifest.mjs" \
-    "$UPDATE_MANIFEST" \
-    "$UPDATE_TARGET" \
-    "$VERSION" \
-    "${DOWNLOAD_ORIGIN%/}/downloads/$(basename "$ARCHIVE_PATH")" \
-    "$ARCHIVE_PATH"
+node "$ROOT_DIR/scripts/release-artifacts.mjs" write "$DOWNLOAD_DIR"
 
-echo "Built preconfigured viewer: $APP_DIR"
-echo "Cloudflare and device settings are embedded in Contents/MacOS/remote.json."
-echo "Published update archive: $ARCHIVE_PATH"
+echo "Built the viewer: $APP_DIR"
+echo "Download archive: $ARCHIVE_PATH"

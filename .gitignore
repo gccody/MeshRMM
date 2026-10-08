@@ -2,21 +2,12 @@
 target/
 *.rs.bk
 
-# Cloudflare Worker build output and local state
-server/build/
-server/build-*/
-.wrangler/
-
 # JavaScript dependencies and generated output
 node_modules/
 *.tsbuildinfo
 
-# Locally provisioned binaries and credentials
+# Local builds, downloads and release packages
 dist/
-dashboard/public/downloads/*.exe
-dashboard/public/downloads/*.sha256
-dashboard/public/downloads/*.zip
-dashboard/public/downloads/update-manifest.json
 
 # Local environment files and credentials
 .env

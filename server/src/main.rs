@@ -5,7 +5,10 @@ use meshrmm_server::config::{self, Config, LogFormat};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(version, about = "The self-hosted MeshRMM server")]
+#[command(
+    version = meshrmm_self_update::CURRENT_VERSION,
+    about = "The self-hosted MeshRMM server"
+)]
 struct Cli {
     /// The configuration file. Settings can also come from MESHRMM_*
     /// environment variables, e.g. MESHRMM_TLS__MODE=proxy.

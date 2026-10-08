@@ -37,6 +37,7 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       remote: ${{ steps.filter.outputs.remote }}
       server: ${{ steps.filter.outputs.server }}
+      package: ${{ steps.filter.outputs.package }}
       dashboard: ${{ steps.filter.outputs.dashboard }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -72,10 +73,20 @@ jobs:
               - 'server/**/!(*.md)'
               - 'scripts/**/!(*.md)'
               - 'release.json'
+            package:
+              - *workflow
+              - *cargo
+              - 'crates/**/!(*.md)'
+              - 'server/**/!(*.md)'
+              - 'packaging/**'
+              - 'scripts/package-server.sh'
+              - 'scripts/test-server-package.sh'
+              - 'scripts/release-artifacts.mjs'
+              - 'release.json'
             dashboard:
               - *workflow
               - 'dashboard/**/!(*.md)'
-              - 'scripts/verify-release-assets.mjs'
+              - 'scripts/release-artifacts.mjs'
 
   rust-windows:
     needs: changes
@@ -128,6 +139,46 @@ jobs:
         with:
           node-version: 22
       - run: node --test scripts/*.test.mjs
+
+  # Builds the static Linux server, packs it with stand-ins for the Agent and
+  # viewer builds, and installs and runs the tarball and the Docker image.
+  # Release runs test their own packages instead.
+  package:
+    needs: changes
+    if: ${{ !cancelled() && !inputs.run-all && needs.changes.outputs.package == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - name: Build the website
+        working-directory: dashboard
+        run: |
+          npm ci
+          npm run build
+      - name: Install the musl cross-compiler
+        run: |
+          pip install --user ziglang==0.16.0 cargo-zigbuild==0.23.4
+          rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: server-x86_64-musl
+      - run: cargo zigbuild --locked --release -p meshrmm-server --target x86_64-unknown-linux-musl
+      - name: Stand in for the Agent and viewer builds
+        run: |
+          mkdir downloads
+          node --input-type=module -e '
+            import { writeFileSync } from "node:fs";
+            import { ARTIFACTS } from "./scripts/release-artifacts.mjs";
+            for (const file of Object.values(ARTIFACTS)) writeFileSync(`downloads/${file}`, `${file} stand-in`);
+          '
+          node scripts/release-artifacts.mjs write downloads
+      - run: sh scripts/package-server.sh x86_64 target/x86_64-unknown-linux-musl/release/meshrmm-server downloads dist/release
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - run: sudo sh scripts/test-server-package.sh dist/release
 
   dashboard:
     needs: changes
