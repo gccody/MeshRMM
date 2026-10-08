@@ -10,7 +10,7 @@ use sea_query::{Expr, ExprTrait, Order, Query};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{RoleRef, confirm_password};
+use super::{RoleRef, confirm_password, second_factor_removed};
 use crate::{
     audit::{self, Target},
     auth::{
@@ -18,7 +18,7 @@ use crate::{
         second_factor::{self, TotpState},
         session,
     },
-    db::tables::{UserSessions, Users},
+    db::tables::{UserSessions, UserTotp, Users},
     http::{ApiError, AppState, JsonBody},
     rbac::Permissions,
     settings,
@@ -53,7 +53,10 @@ struct AccountUser {
 
 #[derive(Debug, Serialize)]
 struct TwoFactorStatus {
+    /// An authenticator app or a passkey is set up.
     enabled: bool,
+    totp: bool,
+    passkeys: i64,
     /// The instance requires it of password sign-ins.
     required: bool,
     /// Set up is required before anything else works.
@@ -84,6 +87,8 @@ pub async fn get(
     Ok(Json(Account {
         two_factor: TwoFactorStatus {
             enabled: signed_in.two_factor_enabled,
+            totp: signed_in.second_factors.totp,
+            passkeys: signed_in.second_factors.passkeys,
             required: settings.require_two_factor,
             enrollment_required: signed_in.must_enroll_two_factor,
             recovery_codes_remaining,
@@ -208,9 +213,9 @@ pub async fn start_totp(
     signed_in: SignedIn,
     JsonBody(request): JsonBody<PasswordConfirmation>,
 ) -> Result<Json<TotpSetup>, ApiError> {
-    if signed_in.two_factor_enabled {
+    if signed_in.second_factors.totp {
         return Err(ApiError::conflict(
-            "two-factor authentication is already on; turn it off first to replace the authenticator",
+            "an authenticator app is already set up; remove it first to replace it",
         ));
     }
     confirm_password(&state, &signed_in.user, &request.password).await?;
@@ -243,18 +248,22 @@ pub struct RecoveryCodes {
     recovery_codes: Vec<String>,
 }
 
-/// `POST /v1/account/two-factor/totp/confirm`: turns two-factor
-/// authentication on once the app produces a valid code, and returns the
-/// recovery codes.
+#[derive(Debug, Serialize)]
+pub struct TotpConfirmed {
+    /// New recovery codes, when the app turned two-factor authentication
+    /// on. Shown once.
+    recovery_codes: Option<Vec<String>>,
+}
+
+/// `POST /v1/account/two-factor/totp/confirm`: turns the authenticator app
+/// on once it produces a valid code.
 pub async fn confirm_totp(
     State(state): State<AppState>,
     signed_in: SignedIn,
     JsonBody(request): JsonBody<TotpConfirmation>,
-) -> Result<Json<RecoveryCodes>, ApiError> {
-    if signed_in.two_factor_enabled {
-        return Err(ApiError::conflict(
-            "two-factor authentication is already on",
-        ));
+) -> Result<Json<TotpConfirmed>, ApiError> {
+    if signed_in.second_factors.totp {
+        return Err(ApiError::conflict("an authenticator app is already set up"));
     }
     state
         .auth
@@ -278,8 +287,11 @@ pub async fn confirm_totp(
     }
     state.auth.password_confirmations.refund(&signed_in.user.id);
     second_factor::confirm_totp(&mut transaction, &signed_in.user.id).await?;
-    let recovery_codes =
-        second_factor::replace_recovery_codes(&mut transaction, &signed_in.user.id).await?;
+    let recovery_codes = if signed_in.two_factor_enabled {
+        None
+    } else {
+        Some(second_factor::replace_recovery_codes(&mut transaction, &signed_in.user.id).await?)
+    };
     transaction
         .execute(
             &Query::update()
@@ -298,32 +310,37 @@ pub async fn confirm_totp(
     )
     .await?;
     transaction.commit().await?;
-    Ok(Json(RecoveryCodes { recovery_codes }))
+    Ok(Json(TotpConfirmed { recovery_codes }))
 }
 
-/// `POST /v1/account/two-factor/totp/disable`: turns two-factor
-/// authentication off, unless the instance requires it.
+/// `POST /v1/account/two-factor/totp/disable`: removes the authenticator
+/// app, unless it is the last second factor and the instance requires one.
 pub async fn disable_totp(
     State(state): State<AppState>,
     signed_in: Authorized,
     JsonBody(request): JsonBody<PasswordConfirmation>,
 ) -> Result<StatusCode, ApiError> {
-    let settings = settings::load(&mut &state.database).await?;
-    if settings.require_two_factor {
-        return Err(ApiError::forbidden(
-            "this server requires two-factor authentication, so it can't be turned off",
-        )
-        .with_code("two_factor_required"));
+    if !signed_in.second_factors.totp {
+        return Err(ApiError::conflict("no authenticator app is set up"));
     }
     confirm_password(&state, &signed_in.user, &request.password).await?;
     let mut transaction = state.database.begin().await?;
-    users::remove_two_factor(&mut transaction, &signed_in.user.id).await?;
+    users::lock(&mut transaction, &signed_in.user.id).await?;
+    transaction
+        .execute(
+            &Query::delete()
+                .from_table(UserTotp::Table)
+                .and_where(Expr::col(UserTotp::UserId).eq(signed_in.user.id.as_str()))
+                .to_owned(),
+        )
+        .await?;
+    second_factor_removed(&mut transaction, &signed_in.user.id).await?;
     audit::record(
         &mut transaction,
         &signed_in.actor(),
         "account.two_factor_disable",
         Target::user(&signed_in.user.id),
-        json!({}),
+        json!({ "method": "totp" }),
     )
     .await?;
     transaction.commit().await?;

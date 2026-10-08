@@ -3,6 +3,8 @@ import { type FormEvent, useCallback, useState } from "react";
 import { AuthenticationRequired, errorText, expectJson, expectOk, jsonBody } from "../../lib/http";
 import { useResource } from "../../lib/use-resource";
 import { useWorkspace } from "../workspace/workspace-context";
+import { ScimSettingsSection } from "./scim-settings";
+import { SsoSettingsSection } from "./sso-settings";
 
 // GET /v1/settings/authentication
 type AuthenticationSettings = {
@@ -35,12 +37,15 @@ const SECURITY_LABELS: Record<SmtpSecurity, string> = {
   none: "None: unencrypted, for a relay on a trusted network",
 };
 
-// The sign-in policy, and how the server sends email.
+// The sign-in policy, and for administrators, single sign-on, directory
+// sync and how the server sends email.
 export function AuthenticationPanel() {
   const { account, can } = useWorkspace();
   return (
     <div className="management-stack">
       {can("authentication.manage") && <SignInPolicy />}
+      {account.is_administrator && <SsoSettingsSection />}
+      {account.is_administrator && <ScimSettingsSection />}
       {account.is_administrator && <EmailSettings />}
     </div>
   );
@@ -118,7 +123,7 @@ function SignInPolicy() {
         <form className="form-stack form-narrow" onSubmit={(event) => void submit(event)}>
           <label className="checkbox-row">
             <input type="checkbox" checked={requireTwoFactor} onChange={(event) => setRequireTwoFactor(event.target.checked)} />
-            <span><strong>Require two-factor authentication</strong>Users without an authenticator app must set one up the next time they sign in, before anything else.</span>
+            <span><strong>Require two-factor authentication</strong>Users without an authenticator app or passkey must add one the next time they sign in, before anything else. Single sign-on leaves two-factor to the identity provider.</span>
           </label>
           <label htmlFor="password-min-length">Minimum password length
             <input id="password-min-length" type="number" inputMode="numeric" min={MIN_PASSWORD_LENGTH} max={MAX_PASSWORD_LENGTH} step={1} required value={minLength} onChange={(event) => setMinLength(event.target.value)} aria-invalid={!minLengthValid} aria-describedby="password-min-length-help" />

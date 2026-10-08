@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { loginPath, safeNextPath, tokenFromHash } from "../features/auth/next-path.ts";
 import { newPasswordProblem } from "../features/auth/passwords.ts";
+import { firstSecondFactor, signInMethodLabel, ssoErrorMessage, ssoStartPath } from "../features/auth/sign-in.ts";
 import { asSentence } from "../lib/http.ts";
 
 test("after sign-in, only paths on this site are followed", () => {
@@ -45,4 +46,38 @@ test("server errors read as sentences", () => {
   assert.equal(asSentence("too many attempts; wait a few minutes and try again"), "Too many attempts; wait a few minutes and try again.");
   assert.equal(asSentence("Done!"), "Done!");
   assert.equal(asSentence("  "), "");
+});
+
+test("single sign-on starts as a page load that returns to a safe path", () => {
+  assert.equal(ssoStartPath("/users?q=ada"), "/v1/auth/sso/start?next=%2Fusers%3Fq%3Dada");
+  assert.equal(ssoStartPath(null), "/v1/auth/sso/start?next=%2F");
+  assert.equal(ssoStartPath("//evil.example"), "/v1/auth/sso/start?next=%2F");
+  assert.equal(ssoStartPath("https://evil.example/"), "/v1/auth/sso/start?next=%2F");
+});
+
+test("every single sign-on failure has its own message, and unknown ones read as failed", () => {
+  const codes = ["unavailable", "failed", "expired", "denied", "no_account", "no_email", "email_unverified", "conflict", "account_disabled", "rate_limited"];
+  const messages = codes.map(ssoErrorMessage);
+  assert.equal(new Set(messages).size, codes.length);
+  for (const message of messages) assert.match(message, /^[A-Z].*\.$/);
+  assert.match(ssoErrorMessage("no_account"), /invite/);
+  assert.match(ssoErrorMessage("conflict"), /unlink/);
+  assert.equal(ssoErrorMessage("something_new"), ssoErrorMessage("failed"));
+  assert.equal(ssoErrorMessage(null), null);
+  assert.equal(ssoErrorMessage(""), null);
+});
+
+test("the second step starts with the authenticator app, else a usable passkey", () => {
+  assert.equal(firstSecondFactor(["totp", "passkey", "recovery_code"], true), "totp");
+  assert.equal(firstSecondFactor(["passkey", "recovery_code"], true), "passkey");
+  // Without passkey support in this browser, or once the prompt is spent.
+  assert.equal(firstSecondFactor(["passkey", "recovery_code"], false), "recovery_code");
+  assert.equal(firstSecondFactor(["recovery_code"], true), "recovery_code");
+});
+
+test("sessions name how they signed in", () => {
+  assert.equal(signInMethodLabel("password"), "Password");
+  assert.equal(signInMethodLabel("passkey"), "Passkey");
+  assert.equal(signInMethodLabel("oidc"), "SSO");
+  assert.equal(signInMethodLabel("future"), "future");
 });

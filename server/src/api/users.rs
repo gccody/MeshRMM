@@ -20,7 +20,10 @@ use crate::{
     auth::Authorized,
     db::{
         self, Executor,
-        tables::{Settings as SettingsTable, UserRoles, UserTotp, Users},
+        tables::{
+            EffectiveUserRoles, OidcGroupRoles, ScimGroupMembers, ScimGroups,
+            Settings as SettingsTable, UserOidcGroups, UserPasskeys, UserRoles, UserTotp, Users,
+        },
     },
     http::{ApiError, AppState, JsonBody},
     mail::{self, Delivery},
@@ -38,9 +41,27 @@ pub struct UserView {
     disabled: bool,
     has_password: bool,
     two_factor_enabled: bool,
+    passkeys: i64,
+    /// The user has signed in with SSO, which linked the account.
+    sso_linked: bool,
+    /// SCIM created or changed the account.
+    scim_managed: bool,
+    /// Roles assigned to the user.
     roles: Vec<RoleRef>,
+    /// Roles the user holds through an identity provider group, which only
+    /// the provider changes.
+    group_roles: Vec<GroupRoleRef>,
     created_at: i64,
     last_sign_in_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GroupRoleRef {
+    id: String,
+    name: String,
+    /// `scim` or `sso`.
+    source: &'static str,
+    group: String,
 }
 
 /// Users with their roles and two-factor status: everyone, or one user.
@@ -60,6 +81,41 @@ async fn views(executor: &mut impl Executor, id: Option<&str>) -> db::Result<Vec
         memberships.and_where(Expr::col(UserRoles::UserId).eq(id));
         totp.and_where(Expr::col(UserTotp::UserId).eq(id));
     }
+    let mut passkeys = Query::select();
+    passkeys
+        .column(UserPasskeys::UserId)
+        .expr(Func::count(Expr::col(UserPasskeys::Id)))
+        .from(UserPasskeys::Table)
+        .group_by_col(UserPasskeys::UserId);
+    let mut scim_groups = Query::select();
+    scim_groups
+        .column((ScimGroupMembers::Table, ScimGroupMembers::UserId))
+        .column((ScimGroups::Table, ScimGroups::RoleId))
+        .column((ScimGroups::Table, ScimGroups::DisplayName))
+        .from(ScimGroupMembers::Table)
+        .inner_join(
+            ScimGroups::Table,
+            Expr::col((ScimGroups::Table, ScimGroups::Id))
+                .equals((ScimGroupMembers::Table, ScimGroupMembers::GroupId)),
+        )
+        .and_where(Expr::col((ScimGroups::Table, ScimGroups::RoleId)).is_not_null());
+    let mut sso_groups = Query::select();
+    sso_groups
+        .column((UserOidcGroups::Table, UserOidcGroups::UserId))
+        .column((OidcGroupRoles::Table, OidcGroupRoles::RoleId))
+        .column((UserOidcGroups::Table, UserOidcGroups::GroupName))
+        .from(UserOidcGroups::Table)
+        .inner_join(
+            OidcGroupRoles::Table,
+            Expr::col((OidcGroupRoles::Table, OidcGroupRoles::GroupName))
+                .equals((UserOidcGroups::Table, UserOidcGroups::GroupName)),
+        );
+    if let Some(id) = id {
+        passkeys.and_where(Expr::col(UserPasskeys::UserId).eq(id));
+        scim_groups
+            .and_where(Expr::col((ScimGroupMembers::Table, ScimGroupMembers::UserId)).eq(id));
+        sso_groups.and_where(Expr::col((UserOidcGroups::Table, UserOidcGroups::UserId)).eq(id));
+    }
     let found: Vec<User> = executor.fetch_all(&select).await?;
     let memberships: Vec<(String, String)> = executor.fetch_all(&memberships).await?;
     let with_totp: Vec<(String,)> = executor.fetch_all(&totp).await?;
@@ -67,6 +123,15 @@ async fn views(executor: &mut impl Executor, id: Option<&str>) -> db::Result<Vec
         .into_iter()
         .map(|(id,)| id)
         .collect::<BTreeSet<_>>();
+    let passkeys: Vec<(String, i64)> = executor.fetch_all(&passkeys).await?;
+    let passkeys = passkeys.into_iter().collect::<HashMap<_, _>>();
+    let scim_groups: Vec<(String, String, String)> = executor.fetch_all(&scim_groups).await?;
+    let sso_groups: Vec<(String, String, String)> = executor.fetch_all(&sso_groups).await?;
+    let group_memberships = scim_groups
+        .into_iter()
+        .map(|row| ("scim", row))
+        .chain(sso_groups.into_iter().map(|row| ("sso", row)))
+        .collect::<Vec<_>>();
     let roles = rbac::load_roles(executor, None)
         .await?
         .into_iter()
@@ -80,7 +145,22 @@ async fn views(executor: &mut impl Executor, id: Option<&str>) -> db::Result<Vec
                 .filter(|(user_id, _)| *user_id == user.id)
                 .filter_map(|(_, role_id)| roles.get(role_id).map(RoleRef::from))
                 .collect(),
-            two_factor_enabled: with_totp.contains(&user.id),
+            group_roles: group_memberships
+                .iter()
+                .filter(|(_, (user_id, _, _))| *user_id == user.id)
+                .filter_map(|(source, (_, role_id, group))| {
+                    roles.get(role_id).map(|role| GroupRoleRef {
+                        id: role.id.clone(),
+                        name: role.name.clone(),
+                        source,
+                        group: group.clone(),
+                    })
+                })
+                .collect(),
+            passkeys: passkeys.get(&user.id).copied().unwrap_or_default(),
+            two_factor_enabled: with_totp.contains(&user.id) || passkeys.contains_key(&user.id),
+            sso_linked: user.oidc_subject.is_some(),
+            scim_managed: user.scim_managed,
             has_password: user.password_hash.is_some(),
             id: user.id,
             email: user.email,
@@ -152,7 +232,9 @@ fn not_self(actor: &Authorized, user: &User) -> Result<(), ApiError> {
 
 /// Fails unless an enabled administrator would remain. Call inside the
 /// transaction that removes one, before committing.
-async fn ensure_administrator_remains(executor: &mut impl Executor) -> Result<(), ApiError> {
+pub(crate) async fn ensure_administrator_remains(
+    executor: &mut impl Executor,
+) -> Result<(), ApiError> {
     // Two transactions removing different administrators would each still
     // count the other. Locking one shared row first makes the second wait
     // and then count what the first committed. (SQLite's write lock already
@@ -173,12 +255,13 @@ async fn ensure_administrator_remains(executor: &mut impl Executor) -> Result<()
                 .expr(Func::count(Expr::col((Users::Table, Users::Id))))
                 .from(Users::Table)
                 .inner_join(
-                    UserRoles::Table,
-                    Expr::col((UserRoles::Table, UserRoles::UserId))
+                    EffectiveUserRoles::Table,
+                    Expr::col((EffectiveUserRoles::Table, EffectiveUserRoles::UserId))
                         .equals((Users::Table, Users::Id)),
                 )
                 .and_where(
-                    Expr::col((UserRoles::Table, UserRoles::RoleId)).eq(ADMINISTRATOR_ROLE_ID),
+                    Expr::col((EffectiveUserRoles::Table, EffectiveUserRoles::RoleId))
+                        .eq(ADMINISTRATOR_ROLE_ID),
                 )
                 .and_where(Expr::col((Users::Table, Users::Disabled)).eq(false))
                 .to_owned(),
@@ -324,7 +407,8 @@ pub async fn delete(
 }
 
 /// `POST /v1/users/{id}/reset-two-factor`: removes the user's authenticator
-/// and recovery codes and signs them out, for a user who lost their device.
+/// app, passkeys and recovery codes and signs them out, for a user who lost
+/// their device.
 pub async fn reset_two_factor(
     State(state): State<AppState>,
     actor: Authorized,
@@ -411,6 +495,49 @@ pub async fn sign_out(
         "user.sign_out",
         Target::user(&user.id),
         json!({ "sessions": ended }),
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/users/{id}/unlink-sso`: forgets the user's SSO identity, so
+/// their next SSO sign-in links the account again by email. For a user
+/// recreated at the provider, who has a new identity there.
+pub async fn unlink_sso(
+    State(state): State<AppState>,
+    actor: Authorized,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let mut transaction = state.database.begin().await?;
+    let (user, _) = manageable(&mut transaction, &actor, &id).await?;
+    if user.oidc_subject.is_none() {
+        return Err(ApiError::conflict("the user hasn't signed in with SSO"));
+    }
+    transaction
+        .execute(
+            &Query::update()
+                .table(Users::Table)
+                .value(Users::OidcSubject, Option::<String>::None)
+                .and_where(Expr::col(Users::Id).eq(user.id.as_str()))
+                .to_owned(),
+        )
+        .await?;
+    transaction
+        .execute(
+            &Query::delete()
+                .from_table(UserOidcGroups::Table)
+                .and_where(Expr::col(UserOidcGroups::UserId).eq(user.id.as_str()))
+                .to_owned(),
+        )
+        .await?;
+    ensure_administrator_remains(&mut transaction).await?;
+    audit::record(
+        &mut transaction,
+        &actor.actor(),
+        "user.sso_unlink",
+        Target::user(&user.id),
+        json!({}),
     )
     .await?;
     transaction.commit().await?;
