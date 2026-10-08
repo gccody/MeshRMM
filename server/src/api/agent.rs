@@ -1,8 +1,8 @@
-//! Routes the Agent calls with its own credential: its screen thumbnail,
-//! and the outcome of toolbox runs and deliveries.
+//! Routes the Agent calls with its own credential: its control connection,
+//! its screen thumbnail, and the outcome of toolbox runs and deliveries.
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, State},
+    extract::{Path, State, WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -17,6 +17,7 @@ use crate::{
     agents::{self, AuthenticatedAgent, parse_id},
     db::tables::{FileDeliveries, ScriptRuns},
     http::{ApiError, AppState},
+    realtime::coordinator,
     time::now_ms,
     toolbox::{self, DELIVERY_WINDOW_MS},
 };
@@ -86,6 +87,25 @@ async fn read_report<T: serde::de::DeserializeOwned>(
 /// hold NUL, which program output sometimes contains.
 fn storable(text: &str) -> String {
     text.replace('\0', "\u{fffd}")
+}
+
+/// The largest message an Agent sends on its control connection.
+const MAX_CONTROL_MESSAGE_BYTES: usize = 4096;
+
+/// `GET /v1/agents/{id}/connect`: the Agent's control connection, which it
+/// keeps open while it runs. See [`coordinator`].
+pub async fn connect(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let agent = agents::authenticate(&state, &headers, &id).await?;
+    Ok(upgrade
+        .max_message_size(MAX_CONTROL_MESSAGE_BYTES)
+        .on_upgrade(move |socket| {
+            coordinator::serve(state, agent.device_id, agent.deletion_requested, socket)
+        }))
 }
 
 /// `PUT /v1/agents/{id}/thumbnail`: replaces the device's screen thumbnail.

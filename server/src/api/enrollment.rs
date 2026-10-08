@@ -278,6 +278,7 @@ pub async fn redeem(
     transaction.commit().await?;
     state.auth.token_attempts.refund(&ip_key(ip));
     tracing::info!(device_id = claim.device_id, recovered, "Agent enrolled");
+    state.presence.refresh(&claim.device_id).await;
     Ok(Json(AgentConfig {
         server: state.config.public_origin(),
         update_manifest_url: format!(
