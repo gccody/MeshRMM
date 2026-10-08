@@ -2,7 +2,7 @@
 //! restarts and the session's toolbox, over real WebSockets.
 mod common;
 
-use std::time::Duration;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -13,8 +13,13 @@ use common::{
     receive_json, send_json, send_text, set_up, user_with,
 };
 use futures_util::SinkExt;
-use meshrmm_server::realtime::{Sessions, sessions::Timeouts};
+use meshrmm_server::{
+    config::Config,
+    realtime::{Sessions, sessions::Timeouts},
+};
 use serde_json::{Value, json};
+use turn::client::{Client, ClientConfig};
+use webrtc_util::Conn;
 
 const TECHNICIAN: &[&str] = &["devices.view", "sessions.connect", "scripts.run"];
 
@@ -744,6 +749,145 @@ async fn ending_a_session_needs_no_websocket() {
             app.name
         );
         assert_eq!(receive_json(&mut control).await, live.ended());
+        app.finish().await;
+    }
+}
+
+/// A TURN client with a session's credentials, on a loopback socket.
+async fn turn_client(server: SocketAddr, username: &str, password: &str) -> Client {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = Client::new(ClientConfig {
+        stun_serv_addr: server.to_string(),
+        turn_serv_addr: server.to_string(),
+        username: username.to_owned(),
+        password: password.to_owned(),
+        realm: String::new(),
+        software: String::new(),
+        rto_in_ms: 0,
+        conn: Arc::new(socket),
+        vnet: None,
+    })
+    .await
+    .unwrap();
+    client.listen().await.unwrap();
+    client
+}
+
+/// Whether a datagram gets from one relay to the other. Each side keeps
+/// sending, so both have the permission the other's packets need.
+async fn relays_between(one: &impl Conn, two: &impl Conn) -> bool {
+    let (one_address, two_address) = (one.local_addr().unwrap(), two.local_addr().unwrap());
+    let mut buffer = [0; 64];
+    for _ in 0..10 {
+        let _ = two.send_to(b"knock", one_address).await;
+        let _ = one.send_to(b"hello", two_address).await;
+        if let Ok(Ok((length, from))) =
+            tokio::time::timeout(Duration::from_millis(200), two.recv_from(&mut buffer)).await
+        {
+            assert_eq!(&buffer[..length], b"hello");
+            assert_eq!(from, one_address);
+            return true;
+        }
+    }
+    false
+}
+
+fn turn_config() -> Config {
+    Config::from_toml(
+        r#"
+        public_url = "https://rmm.example.com"
+        tls.mode = "proxy"
+        turn = { host = "127.0.0.1", listen = "127.0.0.1:0", relay_port_min = 42000, relay_port_max = 42999 }
+    "#,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn sessions_relay_through_the_built_in_turn_server() {
+    for app in apps().await {
+        let address = app.state.turn.start(&turn_config()).await.unwrap().unwrap();
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let agent = app.enroll(&mut admin, "Desk").await;
+        let mut control = agent.connect(&server).await.unwrap();
+        let live = start(&app, &mut admin, &agent, &mut control).await;
+
+        let ice = &live.bootstrap["ice_servers"];
+        let port = address.port();
+        assert_eq!(
+            ice[0],
+            json!({ "urls": [format!("stun:127.0.0.1:{port}")] })
+        );
+        assert_eq!(
+            ice[1]["urls"],
+            json!([format!("turn:127.0.0.1:{port}?transport=udp")])
+        );
+        assert_eq!(ice[1]["username"], live.id.as_str());
+        assert_eq!(live.request["ice_servers"], *ice, "{}", app.name);
+        let password = ice[1]["credential"].as_str().unwrap().to_owned();
+
+        // STUN tells a peer its address; TURN relays between the two peers.
+        let viewer = turn_client(address, &live.id, &password).await;
+        let peer = turn_client(address, &live.id, &password).await;
+        let mapped = viewer.send_binding_request().await.unwrap();
+        assert_eq!(mapped.ip(), std::net::Ipv4Addr::LOCALHOST);
+        let viewer_relay = viewer.allocate().await.unwrap();
+        let peer_relay = peer.allocate().await.unwrap();
+        let relayed = viewer_relay.local_addr().unwrap();
+        assert!((42000..=42999).contains(&relayed.port()), "{relayed}");
+        assert!(
+            relays_between(&viewer_relay, &peer_relay).await,
+            "{}",
+            app.name
+        );
+
+        // Wrong or someone else's credentials open no relay.
+        let wrong = turn_client(address, &live.id, "not-the-password").await;
+        assert!(wrong.allocate().await.is_err(), "{}", app.name);
+        wrong.close().await.unwrap();
+        let other = turn_client(address, "another-session", &password).await;
+        assert!(other.allocate().await.is_err(), "{}", app.name);
+        other.close().await.unwrap();
+
+        // Resuming keeps the same servers and credentials.
+        let resumed = live.post(&mut admin, "resume").await;
+        assert_eq!(resumed.status, 200, "{:?}", resumed.body);
+        assert_eq!(resumed.body["ice_servers"], *ice);
+        let refreshed = receive_json(&mut control).await;
+        assert_eq!(refreshed["ice_servers"], *ice);
+
+        // The credentials survive a restart: they derive from the instance
+        // key, and the restored session is live.
+        let restarted = app.restarted().await;
+        let restarted_address = restarted
+            .state
+            .turn
+            .start(&turn_config())
+            .await
+            .unwrap()
+            .unwrap();
+        let after_restart = turn_client(restarted_address, &live.id, &password).await;
+        assert!(after_restart.allocate().await.is_ok(), "{}", app.name);
+        after_restart.close().await.unwrap();
+        restarted.state.turn.stop().await;
+        restarted.finish().await;
+
+        // Ending the session closes its relays and refuses its credentials.
+        assert_eq!(live.post(&mut admin, "end").await.status, 204);
+        assert_eq!(receive_json(&mut control).await, live.ended());
+        assert!(
+            !relays_between(&viewer_relay, &peer_relay).await,
+            "{}",
+            app.name
+        );
+        let late = turn_client(address, &live.id, &password).await;
+        assert!(late.allocate().await.is_err(), "{}", app.name);
+
+        for client in [viewer, peer, late] {
+            client.close().await.unwrap();
+        }
+        app.state.turn.stop().await;
         app.finish().await;
     }
 }

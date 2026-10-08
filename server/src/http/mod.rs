@@ -24,6 +24,7 @@ use crate::{
     realtime::{AgentHub, Presence, Sessions},
     secrets::InstanceKey,
     storage::Storage,
+    turn::Turn,
 };
 
 /// What every request handler can reach.
@@ -37,6 +38,7 @@ pub struct AppState {
     pub agents: AgentHub,
     pub presence: Presence,
     pub sessions: Sessions,
+    pub turn: Turn,
 }
 
 pub fn router(state: AppState) -> Router {

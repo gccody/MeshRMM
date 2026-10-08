@@ -8,7 +8,9 @@
 use std::time::Instant;
 
 use axum::extract::ws::{Message, WebSocket};
-use meshrmm_protocol_types::{AgentCommand, AgentStatusMessage, is_release_version};
+use meshrmm_protocol_types::{
+    AgentCommand, AgentSessionRequest, AgentStatusMessage, is_release_version,
+};
 
 use super::{LIVENESS, ToAgent, close_frame, send};
 use crate::{agents, http::AppState};
@@ -29,7 +31,8 @@ pub async fn serve(
     let mut connection = state.agents.connect(&device_id);
     state.presence.connected(&device_id).await;
     tracing::info!(device_id, "Agent connected");
-    if greet(&state, &device_id, &mut socket).await.is_ok() {
+    if let Ok(replayed) = greet(&state, &device_id, &mut socket).await {
+        let mut last_session = replayed;
         let mut last_heard = Instant::now();
         loop {
             tokio::select! {
@@ -38,6 +41,9 @@ pub async fn serve(
                         send(&mut socket, close_frame(4000, "superseded Agent connection")).await;
                         break;
                     };
+                    if repeats_session(&mut last_session, &outgoing) {
+                        continue;
+                    }
                     if !send(&mut socket, Message::Text(outgoing.to_json().into())).await {
                         break;
                     }
@@ -82,10 +88,15 @@ pub async fn serve(
 }
 
 /// What a newly connected Agent is owed: the session it should be in, and
-/// a rotated credential it hasn't used yet.
-async fn greet(state: &AppState, device_id: &str, socket: &mut WebSocket) -> Result<(), ()> {
-    if let Some(request) = state.sessions.replay(state, device_id).await {
-        let message = ToAgent::Session(request).to_json();
+/// a rotated credential it hasn't used yet. Returns the session it replayed.
+async fn greet(
+    state: &AppState,
+    device_id: &str,
+    socket: &mut WebSocket,
+) -> Result<Option<AgentSessionRequest>, ()> {
+    let replayed = state.sessions.replay(state, device_id).await;
+    if let Some(request) = &replayed {
+        let message = ToAgent::Session(request.clone()).to_json();
         socket
             .send(Message::Text(message.into()))
             .await
@@ -114,7 +125,24 @@ async fn greet(state: &AppState, device_id: &str, socket: &mut WebSocket) -> Res
             "could not read the Agent's rotated credential"
         ),
     }
-    Ok(())
+    Ok(replayed)
+}
+
+/// Whether `outgoing` is the session request the Agent was last sent, which
+/// it needn't get again. A session created or resumed while the Agent
+/// connects is both queued for the connection and replayed to it, and an
+/// Agent whose side of the session has finished would start it again on
+/// getting the same request twice. A resume always carries a new token, so
+/// it is never a repeat.
+fn repeats_session(last: &mut Option<AgentSessionRequest>, outgoing: &ToAgent) -> bool {
+    let ToAgent::Session(request) = outgoing else {
+        return false;
+    };
+    if last.as_ref() == Some(request) {
+        return true;
+    }
+    *last = Some(request.clone());
+    false
 }
 
 /// A deleted device's Agent is told to uninstall itself. It says when it has
@@ -145,5 +173,64 @@ async fn uninstall(mut socket: WebSocket) {
             Message::Close(_) => return,
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use meshrmm_protocol_types::RemoteSessionId;
+
+    use super::*;
+
+    fn request(token: &str) -> AgentSessionRequest {
+        AgentSessionRequest {
+            start_in_background: false,
+            idle_policy: Default::default(),
+            clear_clipboard_policy: Default::default(),
+            blackout_message: String::new(),
+            session_banner: true,
+            connection_notification: true,
+            background_connection_notification: false,
+            connection_notification_message: String::new(),
+            connection_approval: None,
+            connection_reason: String::new(),
+            viewer_name: "Ada Lovelace".into(),
+            session_id: RemoteSessionId::new("one"),
+            signaling_token: token.into(),
+            expires_at_unix_ms: 100,
+            ice_servers: vec![],
+        }
+    }
+
+    #[test]
+    fn a_replayed_session_is_not_sent_again() {
+        let mut last = Some(request("first"));
+        assert!(repeats_session(
+            &mut last,
+            &ToAgent::Session(request("first"))
+        ));
+        // A resume's new token goes through, and then is the one not repeated.
+        assert!(!repeats_session(
+            &mut last,
+            &ToAgent::Session(request("second"))
+        ));
+        assert!(repeats_session(
+            &mut last,
+            &ToAgent::Session(request("second"))
+        ));
+        assert!(!repeats_session(
+            &mut last,
+            &ToAgent::Command(AgentCommand::Uninstall)
+        ));
+
+        let mut none = None;
+        assert!(!repeats_session(
+            &mut none,
+            &ToAgent::Session(request("first"))
+        ));
+        assert!(repeats_session(
+            &mut none,
+            &ToAgent::Session(request("first"))
+        ));
     }
 }
