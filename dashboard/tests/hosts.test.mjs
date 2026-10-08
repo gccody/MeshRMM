@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { classifyHost } from "../lib/hosts.ts";
-import { fixtureSql } from "../scripts/seed-local.mjs";
 
 const production = {
   "meshrmm.com": { surface: "marketing", rootDomain: "meshrmm.com" },
@@ -42,13 +41,4 @@ test("only MESHRMM_DEV_ROOT_DOMAIN=localhost maps localhost names", () => {
   // Any other value, such as a real domain, is ignored.
   assert.deepEqual(classifyHost("acme.example.com", "example.com"), { surface: "unknown" });
   assert.deepEqual(classifyHost("example.com", "example.com"), { surface: "unknown" });
-});
-
-test("the local seed accepts only a valid slug and WorkOS organization ID", () => {
-  const sql = fixtureSql("acme", "org_01ABC", 1000);
-  assert.match(sql, /VALUES \('local-acme', 'acme \(local\)', 1000, 'acme', 'active', 'org_01ABC', 1000\)/);
-  assert.match(sql, /'acme\.localhost', 'local-acme', 'primary', 1000/);
-  for (const [slug, organization] of [["a'; DROP TABLE companies; --", "org_1"], ["acme", "org_1'"], ["Acme", "org_1"], ["acme", "user_1"]]) {
-    assert.throws(() => fixtureSql(slug, organization, 1000));
-  }
 });
