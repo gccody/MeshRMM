@@ -3,11 +3,11 @@ import test from "node:test";
 import { remoteViewerLink } from "../features/session/remote-link.ts";
 
 test("the viewer link carries the handoff, server and device", () => {
-  const link = new URL(remoteViewerLink("ab".repeat(32), "https://acme.meshrmm.com", "3f2a9c1e-0b7d"));
+  const link = new URL(remoteViewerLink("ab".repeat(32), "https://rmm.example.com", "3f2a9c1e-0b7d"));
   assert.equal(link.protocol, "meshrmm:");
   assert.equal(link.host, "connect");
   assert.equal(link.searchParams.get("handoff"), "ab".repeat(32));
-  assert.equal(link.searchParams.get("server"), "https://acme.meshrmm.com");
+  assert.equal(link.searchParams.get("server"), "https://rmm.example.com");
   assert.equal(link.searchParams.get("device"), "3f2a9c1e-0b7d");
 });
 

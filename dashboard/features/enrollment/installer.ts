@@ -21,7 +21,7 @@ export const INSTALLER_ASSETS: Record<"windows-x64", { label: string; binary: st
 
 export const ENROLLMENT_MAGIC = "MESHRMM-BOOTSTRAP-V1";
 
-// The command that installs the Mac Agent from this dashboard's origin. The
+// The command that installs the Mac Agent from the server at `origin`. The
 // Agent reads the authorization as hexadecimal JSON, which needs no quoting.
 export function macInstallCommand(origin: string, bootstrap: AgentInstallerBootstrap): string {
   const authorization = Array.from(new TextEncoder().encode(JSON.stringify(bootstrap)), (byte) =>

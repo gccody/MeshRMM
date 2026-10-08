@@ -21,6 +21,7 @@ pub mod time;
 pub mod toolbox;
 pub mod turn;
 pub mod users;
+pub mod website;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -36,6 +37,7 @@ use crate::{
     secrets::InstanceKey,
     storage::Storage,
     turn::Turn,
+    website::Website,
 };
 
 /// How long in-flight requests get to finish after a shutdown signal.
@@ -72,6 +74,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         auth: Arc::new(AuthState::default()),
         storage,
         agents,
+        website: Website::embedded(),
     })
 }
 
@@ -93,6 +96,11 @@ pub async fn announce_setup(state: &AppState) -> anyhow::Result<Option<String>> 
 /// Runs the server until SIGINT or SIGTERM, then drains connections.
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let state = prepare(config).await?;
+    if state.website.is_empty() {
+        tracing::warn!(
+            "this server was built without its website; run `npm run build` in dashboard/ and rebuild the server"
+        );
+    }
     announce_setup(&state).await?;
     let restored = state.sessions.restore(&state).await?;
     if restored > 0 {

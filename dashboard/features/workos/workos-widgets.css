@@ -1,9 +1,0 @@
-/* Radix Themes and the WorkOS widget styles, loaded only with the widgets.
-   vinext's client build treats CSS imported straight from a package as free of
-   side effects and drops it, so the widgets import this local file instead. */
-@import "@radix-ui/themes/styles.css";
-@import "@workos-inc/widgets/styles.css";
-
-/* The scope is the only Radix Theme on the page, which makes it the root theme,
-   and Radix stretches a root theme to the viewport height. */
-.workos-widgets-scope { min-height: 0; }

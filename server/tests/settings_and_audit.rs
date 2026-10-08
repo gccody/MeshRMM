@@ -144,7 +144,18 @@ async fn settings_need_their_permissions() {
     assert_eq!(patch.status, StatusCode::FORBIDDEN);
     // Everyone may see the permission list and their own account.
     assert_eq!(tech.get("/v1/permissions").await.status, StatusCode::OK);
-    assert_eq!(tech.get("/v1/account").await.status, StatusCode::OK);
+    let account = tech.get("/v1/account").await;
+    assert_eq!(account.status, StatusCode::OK);
+    assert_eq!(account.body["connection_approval"], false);
+    // The account carries the one policy the website needs to connect:
+    // whether to ask for a reason the device user sees.
+    admin
+        .patch("/v1/settings", json!({ "connection_approval": true }))
+        .await;
+    assert_eq!(
+        tech.get("/v1/account").await.body["connection_approval"],
+        true
+    );
     app.finish().await;
 }
 

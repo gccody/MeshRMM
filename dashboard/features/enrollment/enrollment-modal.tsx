@@ -1,4 +1,3 @@
-"use client";
 
 import { type FormEventHandler, type RefObject, useState } from "react";
 import { Check, Copy, Download, LoaderCircle, Monitor, ShieldCheck, Terminal, X } from "lucide-react";
@@ -6,7 +5,7 @@ import { ModalDialog } from "../../lib/modal-dialog";
 import type { AgentPlatform } from "./installer";
 
 type Props = {
-  companyName?: string;
+  instanceName: string;
   platform: AgentPlatform;
   error: string | null;
   isDownloading: boolean;
@@ -20,7 +19,7 @@ type Props = {
 };
 
 export function EnrollmentModal({
-  companyName,
+  instanceName,
   platform,
   error,
   isDownloading,
@@ -42,11 +41,11 @@ export function EnrollmentModal({
     <ModalDialog className="settings-modal enrollment-modal" labelledBy="agent-title" onClose={onClose} returnFocus={returnFocus}>
       <button className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>
       <div className="modal-icon"><Monitor size={22} /></div>
-      <p className="eyebrow">{companyName}</p>
+      <p className="eyebrow">{instanceName}</p>
       <h2 id="agent-title">Add a device</h2>
       <p>{mac
-        ? "Create an install command and run it in Terminal on the Mac you want to manage. The Mac will appear in this workspace after setup."
-        : "Download the installer and run it on the device you want to manage. The device will appear in this workspace after setup."}</p>
+        ? "Create an install command and run it in Terminal on the Mac you want to manage. The Mac will appear here after setup."
+        : "Download the installer and run it on the device you want to manage. The device will appear here after setup."}</p>
       <form onSubmit={onSubmit}>
         <label>Operating system<select required value={platform} onChange={(event) => { setCopied(false); onPlatformChange(event.target.value as AgentPlatform); }}><option value="windows-x64">Windows 10/11 (x64)</option><option value="macos">macOS 12.3 or newer</option></select><small className="field-help">{mac ? "Supports Apple silicon and Intel Macs." : "Supports 64-bit Windows 10 and 11."}</small></label>
         <div className="installer-summary">

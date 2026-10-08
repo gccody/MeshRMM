@@ -1,4 +1,3 @@
-"use client";
 
 import { useEffect, useRef } from "react";
 import {
@@ -19,14 +18,14 @@ const ACTIVITY_EVENTS: (keyof WindowEventMap)[] = [
 
 type Options = {
   enabled: boolean;
-  organizationId?: string | null;
+  userId?: string | null;
   timeoutMinutes: number;
   onTimeout: () => void;
 };
 
 export function useIdleSession({
   enabled,
-  organizationId,
+  userId,
   timeoutMinutes,
   onTimeout,
 }: Options) {
@@ -37,10 +36,10 @@ export function useIdleSession({
   }, [onTimeout]);
 
   useEffect(() => {
-    if (!enabled || !organizationId) return;
+    if (!enabled || !userId) return;
 
-    const storageKey = activityStorageKey(organizationId);
-    let lastActivityAt = readLastActivity(organizationId);
+    const storageKey = activityStorageKey(userId);
+    let lastActivityAt = readLastActivity(userId);
     let lastStorageWriteAt = lastActivityAt;
     let expired = false;
     let timer: number | undefined;
@@ -112,5 +111,5 @@ export function useIdleSession({
       document.removeEventListener("visibilitychange", handleVisibility);
       window.removeEventListener("storage", handleStorage);
     };
-  }, [enabled, organizationId, timeoutMinutes]);
+  }, [enabled, userId, timeoutMinutes]);
 }

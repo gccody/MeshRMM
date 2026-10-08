@@ -1,4 +1,3 @@
-"use client";
 
 import { useSyncExternalStore } from "react";
 import { type ViewerPlatform, detectViewerPlatform } from "./viewer-downloads";

@@ -1,4 +1,3 @@
-"use client";
 
 import { type MouseEvent, type ReactNode, type RefObject, useEffect, useEffectEvent, useRef } from "react";
 import { focusTrapTarget, isDialogDismissal, tabbableElements } from "./focus-trap";

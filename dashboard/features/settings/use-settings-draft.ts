@@ -1,36 +1,33 @@
-"use client";
-
 import { useCallback, useEffect, useState } from "react";
 import { isOpeningExternalLink } from "../session/viewer-launch";
-import type { Company } from "../workspace/types";
 import {
-  type CompanySettingsDraft,
+  type GeneralSettings,
+  type SettingsDraft as Draft,
   type SettingsTab,
-  draftFromCompany,
-  draftMatchesCompany,
-} from "./company-settings";
+  draftFromSettings,
+  draftMatchesSettings,
+} from "./general-settings";
 
 export type SettingsDraft = ReturnType<typeof useSettingsDraft>;
 
-// Unsaved company settings. The workspace shell owns them, so an edit survives
-// moving to another page and back; only closing or reloading the tab loses it.
-export function useSettingsDraft(company: Company | null | undefined) {
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>("dashboard-security");
-  const [draft, setDraft] = useState(() => draftFromCompany(company));
-  const [draftSource, setDraftSource] = useState(company);
+// Unsaved settings. The workspace shell owns them, so an edit survives moving
+// to another page and back; only closing or reloading the tab loses it.
+export function useSettingsDraft(settings: GeneralSettings | null) {
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
+  const [draft, setDraft] = useState(() => draftFromSettings(settings));
+  const [draftSource, setDraftSource] = useState(settings);
 
-  // A loaded or saved account replaces any unsaved edits, and signing out
-  // (no company) discards them.
-  if (company !== draftSource) {
-    setDraftSource(company);
-    setDraft(draftFromCompany(company));
+  // Loaded or saved settings replace any unsaved edits.
+  if (settings !== draftSource) {
+    setDraftSource(settings);
+    setDraft(draftFromSettings(settings));
   }
 
   const updateDraft = useCallback(
-    (change: Partial<CompanySettingsDraft>) => setDraft((current) => ({ ...current, ...change })),
+    (change: Partial<Draft>) => setDraft((current) => ({ ...current, ...change })),
     [],
   );
-  const isDirty = Boolean(company) && !draftMatchesCompany(draft, company);
+  const isDirty = Boolean(settings) && !draftMatchesSettings(draft, settings);
 
   useEffect(() => {
     if (!isDirty) return;

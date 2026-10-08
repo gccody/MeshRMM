@@ -6,12 +6,12 @@ test('each source owns its error; clearing one leaves the others', () => {
   let state = {};
   state = actionErrorsReducer(state, { source: 'delete', message: 'The Agent could not be deleted.' });
   state = actionErrorsReducer(state, { source: 'remote', message: 'The remote session could not be started.' });
-  state = actionErrorsReducer(state, { source: 'resume', message: 'Your session could not be resumed.' });
+  state = actionErrorsReducer(state, { source: 'close-session', message: 'The remote session could not be closed.' });
   // A new remote attempt clears only its own error.
   state = actionErrorsReducer(state, { source: 'remote', message: null });
   assert.deepEqual(state, {
     delete: 'The Agent could not be deleted.',
-    resume: 'Your session could not be resumed.',
+    'close-session': 'The remote session could not be closed.',
   });
 });
 
@@ -23,12 +23,12 @@ test('no-op updates keep the same state object', () => {
 });
 
 test('lists errors in a stable order, filtered by source', () => {
-  const state = { resume: 'R', delete: 'D', remote: 'C' };
+  const state = { 'close-session': 'S', delete: 'D', remote: 'C' };
   assert.deepEqual(listActionErrors(state), [
     { source: 'remote', message: 'C' },
+    { source: 'close-session', message: 'S' },
     { source: 'delete', message: 'D' },
-    { source: 'resume', message: 'R' },
   ]);
-  assert.deepEqual(listActionErrors(state, ['delete', 'close-session']), [{ source: 'delete', message: 'D' }]);
+  assert.deepEqual(listActionErrors(state, ['delete']), [{ source: 'delete', message: 'D' }]);
   assert.deepEqual(listActionErrors({}), []);
 });

@@ -1,4 +1,3 @@
-"use client";
 
 import { CircleAlert, CircleCheck, LoaderCircle } from "lucide-react";
 import { useEffect, useState } from "react";

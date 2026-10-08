@@ -1,4 +1,3 @@
-"use client";
 
 import { FileCode, LoaderCircle, X } from "lucide-react";
 import { type FormEvent, type RefObject, useEffect, useId, useState } from "react";
@@ -15,6 +14,7 @@ import {
   scriptDraft,
   scriptDraftProblem,
 } from "./model";
+import type { Sharing } from "./access";
 import { fetchScript, saveScript } from "./toolbox-api";
 
 type Props = {
@@ -24,6 +24,8 @@ type Props = {
   folders: string[];
   /** The folder a new script starts in. */
   initialFolder?: string;
+  // Whether the user may share the script, must, or can't.
+  sharing: Sharing;
   onClose: () => void;
   /** The saved script, or `null` when the user can no longer see it. */
   onSaved: (script: ToolboxScript | null, id: string | null) => void;
@@ -37,9 +39,9 @@ const PLACEHOLDERS: Record<ScriptDraft["language"], string> = {
 };
 
 /** Writes a new script, or edits or views one. */
-export function ScriptEditor({ script, folders, initialFolder = "", onClose, onSaved, returnFocus }: Props) {
+export function ScriptEditor({ script, folders, initialFolder = "", sharing, onClose, onSaved, returnFocus }: Props) {
   const { authorizedFetch } = useWorkspace();
-  const [draft, setDraft] = useState<ScriptDraft>(() => (script ? scriptDraft(script) : emptyScriptDraft(initialFolder)));
+  const [draft, setDraft] = useState<ScriptDraft>(() => (script ? scriptDraft(script) : { ...emptyScriptDraft(initialFolder), shared: sharing === "required" }));
   const [loading, setLoading] = useState(Boolean(script && script.body === undefined));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -89,8 +91,8 @@ export function ScriptEditor({ script, folders, initialFolder = "", onClose, onS
       <p className="eyebrow">Toolbox script</p>
       <h2 id="script-editor-title">{title}</h2>
       <p>{readOnly
-        ? "You can run this script, but only its owner can change it, or an administrator while it is shared."
-        : "Scripts run on Windows devices, from the dashboard or from the toolbox in a remote session."}</p>
+        ? "You can run this script, but only its owner can change it, or someone who manages shared scripts while it is shared."
+        : "Scripts run on devices from this website, or from the toolbox in a remote session."}</p>
       <form onSubmit={(event) => void submit(event)}>
         <fieldset className="script-editor-fields" disabled={readOnly || loading || saving}>
           <div className="script-editor-row">
@@ -111,7 +113,7 @@ export function ScriptEditor({ script, folders, initialFolder = "", onClose, onS
             <textarea id="script-body" className="script-body" rows={14} spellCheck={false} autoCapitalize="off" autoCorrect="off" value={loading ? "Loading…" : draft.body} placeholder={PLACEHOLDERS[draft.language]} onChange={(event) => update({ body: event.target.value })} />
           </label>
           <label className="toolbox-share">
-            <input type="checkbox" checked={draft.shared} onChange={(event) => update({ shared: event.target.checked })} />
+            <input type="checkbox" checked={draft.shared} disabled={sharing !== "optional"} onChange={(event) => update({ shared: event.target.checked })} />
             <span><strong>Share with the whole company</strong>Everyone in the company can see and run it. Otherwise only you can.</span>
           </label>
         </fieldset>

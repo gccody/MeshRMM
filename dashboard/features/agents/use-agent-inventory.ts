@@ -1,28 +1,21 @@
-"use client";
-
 import { useCallback, useEffect, useRef, useState } from "react";
-import { errorMessage } from "../../lib/http";
-import { AuthenticationRequired, type AuthorizedFetch } from "../../lib/http";
-import { type InventoryConnection, STALE_GRACE_MS, inventoryStatus, inventoryStream } from "./inventory-stream";
+import { AuthenticationRequired, type AuthorizedFetch, errorMessage } from "../../lib/http";
+import { type InventoryConnection, STALE_GRACE_MS, eventsSocketUrl, inventoryStatus, inventoryStream } from "./inventory-stream";
 import { parseAgentList, sortAgents } from "./model";
-import { subscriptionRenewal } from "./subscription-renewal";
 import { ThumbnailStore } from "./thumbnails";
 import type { Agent } from "./types";
 
 type Options = {
   enabled: boolean;
-  subscriptionKey?: string;
   authorizedFetch: AuthorizedFetch;
+  // The socket was refused or lost access; the session needs checking.
+  onRefused: () => void;
 };
 
 // `since` is when the stream last stopped being live; null before it starts.
 type Link = { connection: InventoryConnection; since: number | null };
 
-export function useAgentInventory({
-  enabled,
-  subscriptionKey,
-  authorizedFetch,
-}: Options) {
+export function useAgentInventory({ enabled, authorizedFetch, onRefused }: Options) {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [hasData, setHasData] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -33,6 +26,8 @@ export function useAgentInventory({
   const [clock, setClock] = useState(0);
   const revision = useRef(-1);
   const stream = useRef<ReturnType<typeof inventoryStream> | null>(null);
+  const refused = useRef(onRefused);
+  useEffect(() => { refused.current = onRefused; }, [onRefused]);
   // Screen images outlive page changes with the inventory they belong to.
   const [thumbnails] = useState(() => new ThumbnailStore({ fetch: authorizedFetch }));
   useEffect(() => thumbnails.setFetch(authorizedFetch), [authorizedFetch, thumbnails]);
@@ -51,56 +46,36 @@ export function useAgentInventory({
     if (hasData) thumbnails.retain(new Set(agents.map((agent) => agent.id)));
   }, [agents, hasData, thumbnails]);
 
-  const loadAgents = useCallback(
-    async (silent = false) => {
-      if (!enabled) return false;
-      if (!silent) setIsRefreshing(true);
-      try {
-        const response = await authorizedFetch("/v1/agents");
-        if (!response.ok) {
-          throw new Error(
-            await errorMessage(response, "The live agent service could not be reached."),
-          );
-        }
-        const data = parseAgentList(await response.json());
-        if (!data) throw new Error("The live agent service returned an invalid response.");
-        setError(null);
-        if (data.revision < revision.current) return true;
-        revision.current = data.revision;
-        setAgents(sortAgents(data.agents));
-        setHasData(true);
-        setLastUpdated(new Date());
-        return true;
-      } catch (requestError) {
-        if (requestError instanceof AuthenticationRequired) return false;
-        // Keep the devices already on screen; the stale state explains them.
-        setError(`Couldn’t refresh devices: ${
-          requestError instanceof Error
-            ? requestError.message
-            : "The live agent service could not be reached."
-        }`);
-        return false;
-      } finally {
-        setIsRefreshing(false);
-      }
-    },
-    [authorizedFetch, enabled],
-  );
+  const loadAgents = useCallback(async () => {
+    if (!enabled) return false;
+    setIsRefreshing(true);
+    try {
+      const response = await authorizedFetch("/v1/agents");
+      if (!response.ok) throw new Error(await errorMessage(response, "The devices could not be loaded."));
+      const data = parseAgentList(await response.json());
+      if (!data) throw new Error("The server returned an invalid device list.");
+      setError(null);
+      if (data.revision < revision.current) return true;
+      revision.current = data.revision;
+      setAgents(sortAgents(data.agents));
+      setHasData(true);
+      setLastUpdated(new Date());
+      return true;
+    } catch (requestError) {
+      if (requestError instanceof AuthenticationRequired) return false;
+      // Keep the devices already on screen; the stale state explains them.
+      setError(`Couldn’t refresh devices: ${requestError instanceof Error ? requestError.message : "the server could not be reached."}`);
+      return false;
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, [authorizedFetch, enabled]);
 
   useEffect(() => {
-    if (!enabled || !subscriptionKey) return;
+    if (!enabled) return;
     revision.current = -1;
     const current = inventoryStream({
-      subscribe: async () => {
-        try {
-          return await authorizedFetch("/v1/agents/events/subscriptions", { method: "POST" });
-        } catch (requestError) {
-          if (requestError instanceof AuthenticationRequired) return null;
-          throw requestError;
-        }
-      },
-      openSocket: (url) => new WebSocket(url),
-      renewal: (disconnect) => subscriptionRenewal(authorizedFetch, disconnect),
+      openSocket: () => new WebSocket(eventsSocketUrl(window.location)),
       revision,
       onAgents: (update) => {
         setAgents(update);
@@ -116,7 +91,7 @@ export function useAgentInventory({
           return { connection, since };
         });
       },
-      onError: setError,
+      onRefused: () => refused.current(),
       online: navigator.onLine,
     });
     stream.current = current;
@@ -124,7 +99,7 @@ export function useAgentInventory({
       current.stop();
       stream.current = null;
     };
-  }, [authorizedFetch, enabled, subscriptionKey]);
+  }, [enabled]);
 
   // Resynchronize when the network returns or the tab becomes visible again,
   // for example after the computer wakes from sleep.
@@ -157,7 +132,7 @@ export function useAgentInventory({
     return () => window.clearTimeout(timer);
   }, [link]);
 
-  // Reconnects now (also after the server refused the subscription).
+  // Reconnects now, skipping the backoff wait.
   const reconnect = useCallback(() => stream.current?.wake(), []);
 
   // Refresh reloads the list and, while the stream is down, skips the

@@ -1,50 +1,41 @@
 {
-  "name": "meshrmm-dashboard",
+  "name": "meshrmm-website",
   "version": "0.2.0",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "vinext dev",
-    "build": "vinext build",
-    "start": "vinext start",
-    "predeploy": "node ../scripts/verify-dashboard-deploy.mjs",
-    "deploy": "vinext-cloudflare deploy",
-    "deploy:dry-run": "vinext-cloudflare deploy --dry-run",
+    "dev": "vite",
+    "build": "vite build && vite build --ssr src/entry-server.tsx --outDir .prerender && node scripts/prerender.mjs",
     "test": "npm run build && node --experimental-strip-types --test tests/*.test.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern worker-configuration.d.ts",
+    "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "verify": "npm run typecheck && npm run lint && npm test"
   },
   "dependencies": {
-    "@radix-ui/themes": "^3.3.0",
-    "@workos-inc/widgets": "^1.17.0",
+    "@fontsource-variable/geist": "5.3.0",
+    "@fontsource-variable/geist-mono": "5.3.0",
     "lucide-react": "^0.468.0",
     "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "react-dom": "19.2.8",
+    "react-router": "8.4.0",
+    "uqr": "0.1.3"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "1.54.8",
     "@eslint/js": "9.39.4",
-    "@next/eslint-plugin-next": "16.3.2",
     "@types/node": "22.19.19",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",
-    "@vinext/cloudflare": "1.0.0-beta.6",
     "@vitejs/plugin-react": "6.1.0",
-    "@vitejs/plugin-rsc": "0.5.34",
     "eslint": "9.39.4",
     "eslint-plugin-jsx-a11y": "6.10.2",
     "eslint-plugin-react": "7.37.5",
     "eslint-plugin-react-hooks": "7.1.1",
     "globals": "16.4.0",
-    "react-server-dom-webpack": "19.2.8",
     "typescript": "5.9.3",
     "typescript-eslint": "8.67.0",
-    "vinext": "1.0.0-beta.8",
-    "vite": "8.2.2",
-    "wrangler": "4.131.1"
+    "vite": "8.2.2"
   },
   "type": "module"
 }

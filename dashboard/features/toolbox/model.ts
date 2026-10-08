@@ -36,7 +36,12 @@ export type ToolboxFile = {
   updated_at_unix_ms: number;
 };
 
-export type Toolbox = { scripts: ToolboxScript[]; files: ToolboxFile[] };
+export type Toolbox = {
+  scripts: ToolboxScript[];
+  files: ToolboxFile[];
+  /** The largest file the server accepts, in bytes. */
+  max_file_bytes: number;
+};
 
 export type ScriptRunStatus = "pending" | "completed" | "failed" | "timed_out" | "lost";
 
@@ -83,6 +88,7 @@ export const MAX_FILE_NAME_CHARS = 255;
 export const MAX_FOLDER_DEPTH = 8;
 export const MAX_FOLDER_NAME_CHARS = 64;
 export const MAX_FOLDER_BYTES = 255;
+/** The server's default limit, until the toolbox says what it is. */
 export const MAX_TOOLBOX_FILE_BYTES = 95 * 1024 * 1024;
 
 export const LANGUAGE_LABELS: Record<ScriptLanguage, string> = {
@@ -185,9 +191,9 @@ export const scriptBody = (draft: ScriptDraft) => ({
 });
 
 /** Why a file cannot be uploaded, or `null` when it can. */
-export function uploadProblem(file: { name: string; size: number }): string | null {
+export function uploadProblem(file: { name: string; size: number }, maxBytes = MAX_TOOLBOX_FILE_BYTES): string | null {
   if (!isValidFileName(file.name)) return "Windows can't use this file name.";
-  if (file.size > MAX_TOOLBOX_FILE_BYTES) return "Files can be up to 95 MiB.";
+  if (file.size > maxBytes) return `Files can be up to ${formatBytes(maxBytes)}.`;
   return null;
 }
 

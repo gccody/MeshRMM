@@ -7,13 +7,20 @@ use std::{borrow::Cow, sync::Arc};
 
 use axum::{
     Json, Router,
-    extract::{FromRequest, Request, rejection::JsonRejection},
-    http::{HeaderValue, StatusCode, Uri, header},
+    extract::{FromRequest, Request, State, rejection::JsonRejection},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
 use serde::{Serialize, de::DeserializeOwned};
-use tower_http::{services::ServeDir, trace::TraceLayer};
+use tower_http::{
+    compression::{
+        CompressionLayer,
+        predicate::{DefaultPredicate, NotForContentType, Predicate},
+    },
+    services::ServeDir,
+    trace::TraceLayer,
+};
 
 use crate::{
     api,
@@ -25,6 +32,7 @@ use crate::{
     secrets::InstanceKey,
     storage::Storage,
     turn::Turn,
+    website::Website,
 };
 
 /// What every request handler can reach.
@@ -39,23 +47,41 @@ pub struct AppState {
     pub presence: Presence,
     pub sessions: Sessions,
     pub turn: Turn,
+    pub website: Website,
 }
 
 pub fn router(state: AppState) -> Router {
     let hsts = !matches!(state.config.tls, TlsConfig::Proxy { .. })
         && state.config.public_url.scheme() == "https";
+    // Fonts are compressed already.
+    let compress = DefaultPredicate::new().and(NotForContentType::const_new("font/"));
+    let website = Router::new()
+        .fallback(website)
+        .layer(CompressionLayer::new().compress_when(compress))
+        .with_state(state.clone());
     let router = Router::new()
         .route("/healthz", get(health::healthz))
         .nest("/v1", api::router(state.clone()))
         .nest_service("/downloads", ServeDir::new(&state.config.downloads.dir))
-        .fallback(not_found)
+        .fallback_service(website)
         .with_state(state);
     headers::apply(router, hsts).layer(TraceLayer::new_for_http())
 }
 
-async fn not_found(uri: Uri) -> ApiError {
-    tracing::debug!(path = uri.path(), "no route");
-    ApiError::new(StatusCode::NOT_FOUND, "route not found")
+/// Every path the routes above don't take: a website page, or a JSON 404
+/// for an unknown API route.
+async fn website(State(state): State<AppState>, request: Request) -> Response {
+    let path = request.uri().path();
+    let api = path == "/v1" || path.starts_with("/v1/");
+    if !api
+        && let Some(response) = state
+            .website
+            .respond(request.method(), path, request.headers())
+    {
+        return response;
+    }
+    tracing::debug!(path, "no route");
+    ApiError::new(StatusCode::NOT_FOUND, "route not found").into_response()
 }
 
 /// An error response: the status and `{"error": message}`, plus a `code`

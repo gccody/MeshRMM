@@ -1,4 +1,3 @@
-"use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AuthenticationRequired, type AuthorizedFetch, errorMessage } from "../../lib/http";
@@ -78,10 +77,7 @@ export function useRemoteHandoff({ authorizedFetch, reportError }: Options) {
         body: JSON.stringify({ device_id: agent.id, start_in_background: startInBackground, reason }),
       });
       if (!response.ok) throw new Error(await errorMessage(response, "The remote session could not be started."));
-      const handoff = (await response.json()) as { handoff_token: string; api_url: string; start_in_background?: boolean };
-      if (startInBackground && handoff.start_in_background !== true) {
-        throw new Error("Background launch requires an updated server. Try again after the server is updated.");
-      }
+      const handoff = (await response.json()) as { handoff_token: string; api_url: string };
       if (attempt !== attempts.current) return;
       // Watch first: a viewer that is already running can take focus before
       // assign() returns.

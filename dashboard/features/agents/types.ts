@@ -4,6 +4,8 @@ export type Agent = {
   connected: boolean;
   /** The release an offline Agent went offline to install. */
   updating_to?: string;
+  /** When the device enrolled. */
+  created_at?: number;
 };
 
 export type AgentSnapshot = {
@@ -19,10 +21,4 @@ export type AgentEvent =
   | { type: "agent_deleted"; revision: number; agent_id: string };
 
 export type AgentDelta = Exclude<AgentEvent, AgentSnapshot>;
-
-export type AgentEventSubscription = {
-  subscription_token: string;
-  websocket_url: string;
-  expires_at_unix_ms: number;
-};
 

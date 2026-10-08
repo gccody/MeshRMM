@@ -5,7 +5,7 @@ import {
   accountLoader,
   accountRetryDelay,
   isRetryableAccountError,
-} from '../features/workspace/account-load.ts';
+} from '../features/auth/account-load.ts';
 
 const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
 

@@ -73,7 +73,7 @@ export class ThumbnailStore {
     for (const listener of entry.listeners) listener();
   }
 
-  // Uses the dashboard's current request function from now on.
+  // Uses the website's current request function from now on.
   setFetch(fetch: AuthorizedFetch) {
     this.#fetch = fetch;
   }
@@ -91,7 +91,7 @@ export class ThumbnailStore {
   // Loads the device's image if a check is due, and returns how long until
   // the next one, or null when there is none: an offline device uploads
   // nothing, so its last image is loaded once, and a locked or cleared
-  // dashboard loads nothing more.
+  // website loads nothing more.
   async refresh(id: string, online: boolean): Promise<number | null> {
     const entry = this.#entry(id);
     if (online && entry.checkedOffline) {

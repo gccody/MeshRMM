@@ -1,4 +1,3 @@
-"use client";
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Monitor, X } from "lucide-react";
@@ -67,7 +66,6 @@ export function DeviceThumbnail({ agent, store }: { agent: Agent; store: Thumbna
     <span className="device-visual" ref={container}>
       {thumbnail ? (
         <button ref={opener} type="button" className={`device-thumbnail${online}`} onClick={() => setPreviewOpen(true)} aria-label={`Show the screen of ${agent.name}`} aria-haspopup="dialog">
-          {/* eslint-disable-next-line @next/next/no-img-element -- a private blob: URL, which next/image cannot load */}
           <img src={thumbnail.url} alt="" />
           <span />
         </button>
@@ -96,7 +94,6 @@ function ThumbnailPreview({ agent, thumbnail, returnFocus, onClose }: {
         {agent.connected ? "Updates every 5 minutes while the device is online." : "The device is offline. This is the last image it sent."}
         {updated && <> Updated {updated}.</>}
       </p>
-      {/* eslint-disable-next-line @next/next/no-img-element -- a private blob: URL, which next/image cannot load */}
       <img className="thumbnail-preview" src={thumbnail.url} alt={`The main display of ${agent.name}${updated ? ` at ${updated}` : ""}`} />
     </ModalDialog>
   );

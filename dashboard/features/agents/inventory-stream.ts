@@ -1,21 +1,20 @@
-// Keeps the live Agent inventory stream connected: opens a subscription,
-// applies the snapshot and revision-ordered deltas, and reconnects with backoff.
-// It never discards the inventory it already has; the hook shows it as stale.
-import { errorMessage } from "../../lib/http.ts";
+// Keeps the live device inventory socket connected: applies the snapshot and
+// revision-ordered deltas, and reconnects with backoff. It never discards the
+// inventory it already has; the hook shows it as stale.
 import { applyAgentDelta, parseAgentEvent, sortAgents } from "./model.ts";
-import type { Agent, AgentDelta, AgentEventSubscription } from "./types";
+import type { Agent, AgentDelta } from "./types";
 
 const FIRST_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
 const MAX_PENDING_EVENTS = 1_000;
-// The server rotates authorization by closing the socket (4001) and the stream
-// reconnects after 1 s, so a short gap must not mark the inventory stale.
+// A short gap, such as a server restart, must not mark the inventory stale.
 export const STALE_GRACE_MS = 5_000;
 const SOCKET_OPEN = 1;
+// The server closes with this when the session ended or the user may no
+// longer see devices.
+export const ACCESS_REVOKED_CLOSE_CODE = 4001;
 
-// "unavailable": the server refused the subscription (403/404). Retrying
-// automatically cannot help; only an explicit wake() tries again.
-export type InventoryConnection = "connecting" | "live" | "reconnecting" | "offline" | "unavailable";
+export type InventoryConnection = "connecting" | "live" | "reconnecting" | "offline";
 export type InventoryStatus = "loading" | "live" | "stale";
 
 export type SocketLike = EventTarget & {
@@ -23,8 +22,6 @@ export type SocketLike = EventTarget & {
   send(data: string): void;
   close(code?: number, reason?: string): void;
 };
-
-type Renewal = { accept(value: unknown): boolean; stop(): void };
 
 type Timers = {
   setTimeout: (callback: () => void, ms: number) => unknown;
@@ -37,44 +34,29 @@ const globalTimers: Timers = {
 };
 
 type Options = {
-  // Requests a subscription. Resolves null when the session needs to sign in
-  // again; the dashboard locks itself, so the stream just stops trying.
-  subscribe: () => Promise<Response | null>;
-  openSocket: (url: string) => SocketLike;
-  renewal: (disconnect: () => void) => Renewal;
+  openSocket: () => SocketLike;
   // Shared with the HTTP inventory load so neither applies older data.
   revision: { current: number };
   onAgents: (update: (current: Agent[]) => Agent[]) => void;
   onConnection: (connection: InventoryConnection) => void;
-  onError: (message: string | null) => void;
+  // The server refused the socket or closed it for lost access. A browser
+  // can't see why a handshake failed, so the caller checks the session.
+  onRefused: () => void;
   online?: boolean;
   timers?: Timers;
 };
 
-class SubscriptionError extends Error {
-  readonly status: number;
-
-  constructor(message: string, status: number) {
-    super(message);
-    this.status = status;
-  }
-}
-
 export function inventoryStream({
-  subscribe,
   openSocket,
-  renewal: startRenewal,
   revision,
   onAgents,
   onConnection,
-  onError,
+  onRefused,
   online: initiallyOnline = true,
   timers = globalTimers,
 }: Options) {
   let stopped = false;
-  let connecting = false;
   let socket: SocketLike | null = null;
-  let stopRenewal: (() => void) | undefined;
   let timer: unknown;
   let delay = FIRST_RECONNECT_DELAY_MS;
   let state: Exclude<InventoryConnection, "offline"> = "connecting";
@@ -102,14 +84,13 @@ export function inventoryStream({
     if (stopped || timer !== undefined) return;
     timer = timers.setTimeout(() => {
       timer = undefined;
-      void connect();
+      connect();
     }, delay);
     delay = Math.min(delay * 2, MAX_RECONNECT_DELAY_MS);
   };
 
   const listen = (nextSocket: SocketLike) => {
-    const renewal = startRenewal(() => nextSocket.close(4001, "fresh authorization required"));
-    stopRenewal = renewal.stop;
+    let opened = false;
     let awaitingSnapshot = true;
     let pendingEvents: AgentDelta[] = [];
     const current = () => !stopped && socket === nextSocket;
@@ -119,16 +100,14 @@ export function inventoryStream({
 
     nextSocket.addEventListener("open", () => {
       if (!current()) return;
+      opened = true;
       delay = FIRST_RECONNECT_DELAY_MS;
-      onError(null);
     });
     nextSocket.addEventListener("message", (message) => {
       const data = (message as MessageEvent).data;
       if (!current() || typeof data !== "string") return;
       try {
-        const value: unknown = JSON.parse(data);
-        if (renewal.accept(value)) return;
-        const event = parseAgentEvent(value);
+        const event = parseAgentEvent(JSON.parse(data));
         if (!event) {
           requestSnapshot();
           return;
@@ -159,7 +138,7 @@ export function inventoryStream({
           if (awaitingSnapshot) {
             pendingEvents.push(event);
             if (pendingEvents.length > MAX_PENDING_EVENTS) {
-              nextSocket.close(1009, "too many pending Agent events");
+              nextSocket.close(1009, "too many pending device events");
             }
             return;
           }
@@ -179,70 +158,43 @@ export function inventoryStream({
       }
     });
     nextSocket.addEventListener("error", () => nextSocket.close());
-    nextSocket.addEventListener("close", () => {
-      renewal.stop();
+    nextSocket.addEventListener("close", (event) => {
       if (!current()) return;
       socket = null;
       setState("reconnecting");
+      if (!opened || (event as CloseEvent).code === ACCESS_REVOKED_CLOSE_CODE) onRefused();
       scheduleReconnect();
     });
   };
 
-  const connect = async () => {
-    if (stopped || connecting || socket) return;
-    connecting = true;
+  const connect = () => {
+    if (stopped || socket) return;
     clearTimer();
     try {
-      const response = await subscribe();
-      if (stopped || !response) return;
-      if (!response.ok) {
-        throw new SubscriptionError(
-          await errorMessage(response, "The live Agent event stream could not be opened."),
-          response.status,
-        );
-      }
-      const subscription = (await response.json()) as AgentEventSubscription;
-      if (stopped) return;
-      const websocketUrl = new URL(subscription.websocket_url);
-      websocketUrl.searchParams.set("token", subscription.subscription_token);
-      websocketUrl.searchParams.set("protocol", "2");
-      const nextSocket = openSocket(websocketUrl.toString());
+      const nextSocket = openSocket();
       socket = nextSocket;
       listen(nextSocket);
-    } catch (requestError) {
-      if (stopped) return;
-      onError(
-        requestError instanceof Error
-          ? requestError.message
-          : "The live Agent event stream could not be opened.",
-      );
-      // A refused subscription (no access, company gone) will not recover by itself.
-      if (requestError instanceof SubscriptionError && (requestError.status === 403 || requestError.status === 404)) {
-        setState("unavailable");
-        return;
-      }
+    } catch {
       setState("reconnecting");
       scheduleReconnect();
-    } finally {
-      connecting = false;
     }
   };
 
   report();
-  void connect();
+  connect();
 
   return {
-    // Resynchronizes now: asks an open stream for a fresh snapshot, or skips
+    // Resynchronizes now: asks an open socket for a fresh snapshot, or skips
     // the backoff wait and reconnects with the delay reset to 1 s.
     wake() {
-      if (stopped || connecting) return;
+      if (stopped) return;
       if (socket) {
         if (socket.readyState === SOCKET_OPEN) socket.send("refresh");
         return;
       }
       clearTimer();
       delay = FIRST_RECONNECT_DELAY_MS;
-      void connect();
+      connect();
     },
     setOnline(next: boolean) {
       online = next;
@@ -250,12 +202,16 @@ export function inventoryStream({
     },
     stop() {
       stopped = true;
-      stopRenewal?.();
       clearTimer();
-      socket?.close(1000, "dashboard subscription ended");
+      socket?.close(1000, "website closed the inventory");
       socket = null;
     },
   };
+}
+
+// The website's event socket, on this page's own origin.
+export function eventsSocketUrl(location: Pick<Location, "protocol" | "host">) {
+  return `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/v1/events`;
 }
 
 // Whether the inventory on screen is current. `since` is when the stream last

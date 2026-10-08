@@ -1,18 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { STALE_GRACE_MS, inventoryStatus, inventoryStream } from '../features/agents/inventory-stream.ts';
-
-const flush = () => new Promise(resolve => setImmediate(resolve));
+import { ACCESS_REVOKED_CLOSE_CODE, STALE_GRACE_MS, eventsSocketUrl, inventoryStatus, inventoryStream } from '../features/agents/inventory-stream.ts';
 
 class FakeSocket extends EventTarget {
   readyState = 0;
   sent = [];
   closed = null;
-
-  constructor(url) {
-    super();
-    this.url = url;
-  }
 
   open() {
     this.readyState = 1;
@@ -31,7 +24,7 @@ class FakeSocket extends EventTarget {
     if (this.readyState === 3) return;
     this.readyState = 3;
     this.closed = { code, reason };
-    this.dispatchEvent(new Event('close'));
+    this.dispatchEvent(Object.assign(new Event('close'), { code }));
   }
 }
 
@@ -50,112 +43,102 @@ function fakeTimers() {
     clearTimeout(timer) {
       pending.delete(timer);
     },
-    async fire() {
+    fire() {
       assert.equal(pending.size, 1, 'one reconnect is scheduled');
       const [timer] = pending;
       pending.delete(timer);
       timer.callback();
-      await flush();
     },
   };
 }
 
-const subscription = () => Response.json({
-  websocket_url: 'wss://events.example/v1/agents/events',
-  subscription_token: 'token',
-  expires_at_unix_ms: Date.now() + 60_000,
-});
-
 const agent = (id, connected = true) => ({ id, name: id.toUpperCase(), connected });
 
-function harness({ responses = [], online } = {}) {
+function harness({ online } = {}) {
   const sockets = [];
   const connections = [];
-  const errors = [];
   const timers = fakeTimers();
   const revision = { current: -1 };
-  const state = { agents: [], subscribeCalls: 0 };
+  const state = { agents: [], refused: 0 };
   const stream = inventoryStream({
-    subscribe: async () => {
-      state.subscribeCalls++;
-      const next = responses.length ? responses.shift() : subscription;
-      return typeof next === 'function' ? next() : next;
-    },
-    openSocket: url => {
-      const socket = new FakeSocket(url);
+    openSocket: () => {
+      const socket = new FakeSocket();
       sockets.push(socket);
       return socket;
     },
-    renewal: () => ({ accept: value => value?.type === 'authorization', stop() {} }),
     revision,
     onAgents: update => { state.agents = update(state.agents); },
     onConnection: connection => connections.push(connection),
-    onError: message => errors.push(message),
+    onRefused: () => { state.refused++; },
     online,
     timers,
   });
-  return { stream, sockets, connections, errors, timers, revision, state };
+  return { stream, sockets, connections, timers, revision, state };
 }
 
-const unavailable = () => new Response('', { status: 503 });
+// A socket the server never accepted closes without opening.
+const refuse = socket => socket.close(1006);
 
-test('reconnects with backoff from 1 s doubling to 30 s', async () => {
-  const { timers, errors, connections, state } = harness({ responses: Array(8).fill(unavailable) });
-  await flush();
-  for (let attempt = 0; attempt < 7; attempt++) await timers.fire();
+test('the socket is on the page’s own origin', () => {
+  assert.equal(eventsSocketUrl({ protocol: 'https:', host: 'rmm.example.com' }), 'wss://rmm.example.com/v1/events');
+  assert.equal(eventsSocketUrl({ protocol: 'http:', host: 'localhost:5173' }), 'ws://localhost:5173/v1/events');
+});
+
+test('reconnects with backoff from 1 s doubling to 30 s', () => {
+  const { sockets, timers, connections } = harness();
+  for (let attempt = 0; attempt < 8; attempt++) {
+    refuse(sockets.at(-1));
+    if (attempt < 7) timers.fire();
+  }
   assert.deepEqual(timers.delays, [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]);
-  assert.equal(state.subscribeCalls, 8);
-  assert.equal(errors.at(-1), 'The live Agent event stream could not be opened.');
+  assert.equal(sockets.length, 8);
   assert.deepEqual(connections, ['connecting', 'reconnecting']);
 });
 
-test('wake() while waiting connects now and resets the delay to 1 s', async () => {
-  const { stream, timers, state } = harness({ responses: [unavailable, unavailable, unavailable, unavailable] });
-  await flush();
-  await timers.fire();
-  assert.deepEqual(timers.delays, [1_000, 2_000]);
-  stream.wake();
-  await flush();
-  assert.equal(state.subscribeCalls, 3);
-  assert.deepEqual(timers.delays, [1_000, 2_000, 1_000]);
-  assert.equal(timers.pending.size, 1);
+test('a socket that never opened asks the caller to check the session', () => {
+  const { sockets, state } = harness();
+  refuse(sockets[0]);
+  assert.equal(state.refused, 1);
 });
 
-test('wake() on an open stream asks for a fresh snapshot', async () => {
-  const { stream, sockets, state } = harness();
-  await flush();
-  assert.equal(sockets.length, 1);
-  assert.match(sockets[0].url, /token=token/);
-  assert.match(sockets[0].url, /protocol=2/);
+test('losing access closes with 4001, which also asks for a session check', () => {
+  const { sockets, state, timers } = harness();
+  sockets[0].open();
+  sockets[0].close(1011, 'try again');
+  assert.equal(state.refused, 0, 'a server error after opening is not about access');
+  timers.fire();
+  sockets[1].open();
+  sockets[1].close(ACCESS_REVOKED_CLOSE_CODE, 'sign in again');
+  assert.equal(state.refused, 1);
+});
+
+test('wake() while waiting connects now and resets the delay to 1 s', () => {
+  const { stream, sockets, timers } = harness();
+  refuse(sockets[0]);
+  timers.fire();
+  refuse(sockets[1]);
+  assert.deepEqual(timers.delays, [1_000, 2_000]);
+  stream.wake();
+  assert.equal(sockets.length, 3);
+  assert.equal(timers.pending.size, 0);
+  refuse(sockets[2]);
+  assert.deepEqual(timers.delays, [1_000, 2_000, 1_000]);
+});
+
+test('wake() on an open socket asks for a fresh snapshot', () => {
+  const { stream, sockets } = harness();
   stream.wake();
   assert.deepEqual(sockets[0].sent, [], 'a connecting socket cannot send yet');
+  assert.equal(sockets.length, 1, 'a connecting socket is not replaced');
   sockets[0].open();
   stream.wake();
   assert.deepEqual(sockets[0].sent, ['refresh']);
-  assert.equal(state.subscribeCalls, 1);
 });
 
-test('does not subscribe twice while a request is in flight', async () => {
-  let resolve;
-  const { stream, state, sockets } = harness({ responses: [() => new Promise(done => { resolve = done; })] });
-  await flush();
-  stream.wake();
-  stream.wake();
-  assert.equal(state.subscribeCalls, 1);
-  resolve(subscription());
-  await flush();
-  stream.wake();
-  assert.equal(state.subscribeCalls, 1);
-  assert.equal(sockets.length, 1);
-});
-
-test('applies deltas buffered before the snapshot, then live deltas in order', async () => {
-  const { sockets, state, revision, connections, errors } = harness();
-  await flush();
+test('applies deltas buffered before the snapshot, then live deltas in order', () => {
+  const { sockets, state, revision, connections } = harness();
   const socket = sockets[0];
   socket.open();
-  assert.deepEqual(errors, [null]);
-  socket.receive({ type: 'authorization', connection_id: 'a'.repeat(64), expires_at_unix_ms: Date.now() + 60_000 });
   socket.receive({ type: 'agent_upsert', revision: 6, agent: agent('c') });
   socket.receive({ type: 'agent_deleted', revision: 5, agent_id: 'b' });
   assert.deepEqual(state.agents, []);
@@ -177,61 +160,40 @@ test('applies deltas buffered before the snapshot, then live deltas in order', a
   assert.equal(revision.current, 9);
 });
 
-test('a snapshot older than the loaded inventory is refused and requested again', async () => {
+test('a snapshot older than the loaded inventory is refused and requested again', () => {
   const { sockets, state, revision } = harness();
   revision.current = 10;
-  await flush();
   sockets[0].open();
   sockets[0].receive({ type: 'snapshot', revision: 9, agents: [agent('a')], generated_at_unix_ms: 1 });
   assert.deepEqual(state.agents, []);
   assert.deepEqual(sockets[0].sent, ['refresh']);
 });
 
-test('a closed socket reports reconnecting, keeps the devices, and reconnects after 1 s', async () => {
+test('an unreadable message asks for a snapshot', () => {
+  const { sockets } = harness();
+  sockets[0].open();
+  sockets[0].receive({ type: 'mystery', revision: 1 });
+  sockets[0].dispatchEvent(new MessageEvent('message', { data: '{' }));
+  assert.deepEqual(sockets[0].sent, ['refresh', 'refresh']);
+});
+
+test('a closed socket reports reconnecting, keeps the devices, and reconnects after 1 s', () => {
   const { sockets, state, connections, timers } = harness();
-  await flush();
   sockets[0].open();
   sockets[0].receive({ type: 'snapshot', revision: 1, agents: [agent('a')], generated_at_unix_ms: 1 });
-  sockets[0].close(4001, 'fresh authorization required');
+  sockets[0].close(1001, 'going away');
   assert.deepEqual(connections, ['connecting', 'live', 'reconnecting']);
   assert.deepEqual(state.agents.map(item => item.id), ['a']);
   assert.deepEqual(timers.delays, [1_000]);
-  await timers.fire();
+  timers.fire();
   assert.equal(sockets.length, 2);
   sockets[1].open();
   sockets[1].receive({ type: 'snapshot', revision: 2, agents: [agent('a'), agent('b')], generated_at_unix_ms: 2 });
   assert.deepEqual(connections, ['connecting', 'live', 'reconnecting', 'live']);
 });
 
-test('a refused subscription (403/404) stops retrying until wake()', async () => {
-  for (const status of [403, 404]) {
-    const { stream, timers, connections, errors, state, sockets } = harness({
-      responses: [Response.json({ error: 'Company access denied' }, { status })],
-    });
-    await flush();
-    assert.equal(timers.pending.size, 0, `${status} is not retried`);
-    assert.deepEqual(connections, ['connecting', 'unavailable']);
-    assert.deepEqual(errors, ['Company access denied']);
-    stream.wake();
-    await flush();
-    assert.equal(state.subscribeCalls, 2);
-    sockets[0].open();
-    sockets[0].receive({ type: 'snapshot', revision: 1, agents: [], generated_at_unix_ms: 1 });
-    assert.deepEqual(connections, ['connecting', 'unavailable', 'live']);
-  }
-});
-
-test('a sign-in requirement stops the stream quietly', async () => {
-  const { timers, errors, state } = harness({ responses: [null] });
-  await flush();
-  assert.equal(state.subscribeCalls, 1);
-  assert.equal(timers.pending.size, 0);
-  assert.deepEqual(errors, []);
-});
-
-test('offline overrides the stream state until the network returns', async () => {
+test('offline overrides the stream state until the network returns', () => {
   const { stream, sockets, connections } = harness({ online: false });
-  await flush();
   assert.deepEqual(connections, ['offline']);
   sockets[0].open();
   sockets[0].receive({ type: 'snapshot', revision: 1, agents: [], generated_at_unix_ms: 1 });
@@ -242,20 +204,17 @@ test('offline overrides the stream state until the network returns', async () =>
   assert.deepEqual(connections, ['offline', 'live', 'offline']);
 });
 
-test('stop() closes the socket and cancels reconnects', async () => {
+test('stop() closes the socket and cancels reconnects', () => {
   const first = harness();
-  await flush();
   first.stream.stop();
-  assert.deepEqual(first.sockets[0].closed, { code: 1000, reason: 'dashboard subscription ended' });
+  assert.deepEqual(first.sockets[0].closed, { code: 1000, reason: 'website closed the inventory' });
   assert.equal(first.timers.pending.size, 0);
 
-  let resolve;
-  const second = harness({ responses: [() => new Promise(done => { resolve = done; })] });
-  await flush();
+  const second = harness();
+  refuse(second.sockets[0]);
+  assert.equal(second.timers.pending.size, 1);
   second.stream.stop();
-  resolve(subscription());
-  await flush();
-  assert.equal(second.sockets.length, 0, 'a late subscription opens nothing');
+  assert.equal(second.timers.pending.size, 0, 'a pending reconnect is cancelled');
 });
 
 test('inventoryStatus waits out the grace period before calling data stale', () => {
@@ -269,7 +228,6 @@ test('inventoryStatus waits out the grace period before calling data stale', () 
     [{ hasData: true, connection: 'reconnecting', since, now: since + STALE_GRACE_MS }, 'stale'],
     [{ hasData: true, connection: 'offline', since, now: since + 1_000 }, 'live'],
     [{ hasData: true, connection: 'offline', since, now: since + STALE_GRACE_MS }, 'stale'],
-    [{ hasData: true, connection: 'unavailable', since, now: since + STALE_GRACE_MS }, 'stale'],
     [{ hasData: true, connection: 'connecting', since: null, now: 0 }, 'stale'],
     // The hook's clock lags `since` until the grace timer fires.
     [{ hasData: true, connection: 'reconnecting', since, now: since - 90_000 }, 'live'],
