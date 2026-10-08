@@ -92,8 +92,100 @@ async fn hsts_is_sent_when_the_server_terminates_tls() {
     );
 }
 
+/// A downloads directory in `dir` holding `files`, listed in its
+/// artifacts.json as `targets` (target, file, SHA-256 of the listed contents).
+fn write_downloads(dir: &std::path::Path, files: &[(&str, &[u8])], targets: serde_json::Value) {
+    let downloads = dir.join("downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    for (name, contents) in files {
+        std::fs::write(downloads.join(name), contents).unwrap();
+    }
+    let artifacts = serde_json::json!({
+        "schema_version": 1,
+        "version": "1.2.0",
+        "artifacts": targets,
+    });
+    std::fs::write(
+        downloads.join("artifacts.json"),
+        serde_json::to_vec(&artifacts).unwrap(),
+    )
+    .unwrap();
+}
+
+fn sha256(contents: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(contents))
+}
+
 #[tokio::test]
-async fn downloads_are_served_from_the_downloads_directory() {
+async fn downloads_serve_the_listed_builds_and_their_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let signature = "ab".repeat(64);
+    write_downloads(
+        dir.path(),
+        &[
+            ("meshrmm-agent-windows-x64.exe", b"MZ agent"),
+            ("meshrmm-agent-macos.zip", b"PK agent"),
+            ("notes.txt", b"not a build"),
+        ],
+        serde_json::json!({
+            "agent-windows-x64": {
+                "file": "meshrmm-agent-windows-x64.exe",
+                "sha256": sha256(b"MZ agent"),
+                "signature": signature,
+            },
+            "agent-macos": {
+                "file": "meshrmm-agent-macos.zip",
+                "sha256": sha256(b"PK agent"),
+            },
+        }),
+    );
+    let state = meshrmm_server::prepare(common::config(dir.path(), "tls.mode = \"proxy\""))
+        .await
+        .unwrap();
+    assert_eq!(state.downloads.version(), Some("1.2.0"));
+    // Neither is signed with this build's release key.
+    assert_eq!(
+        state.downloads.unsigned(),
+        ["agent-macos", "agent-windows-x64"]
+    );
+    let router = meshrmm_server::http::router(state);
+
+    let (status, headers, body) = get(&router, "/downloads/meshrmm-agent-windows-x64.exe").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"MZ agent");
+    assert_eq!(headers[header::CACHE_CONTROL], "no-cache");
+
+    let (status, headers, body) = get(&router, "/downloads/update-manifest.json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+    let manifest = meshrmm_self_update::UpdateManifest::parse(&body).unwrap();
+    assert_eq!(
+        manifest.releases["agent-windows-x64"],
+        meshrmm_self_update::Release {
+            version: "1.2.0".to_owned(),
+            url: format!("{}/downloads/meshrmm-agent-windows-x64.exe", common::ORIGIN),
+            sha256: sha256(b"MZ agent"),
+            signature: Some(signature),
+        }
+    );
+    assert_eq!(manifest.releases["agent-macos"].signature, None);
+
+    // Only the listed builds are served.
+    for path in [
+        "/downloads/notes.txt",
+        "/downloads/artifacts.json",
+        "/downloads/missing.exe",
+        "/downloads/../data/instance.key",
+        "/downloads/nested/meshrmm-agent-macos.zip",
+    ] {
+        let (status, _, _) = get(&router, path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn without_artifacts_json_there_are_no_downloads() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("downloads")).unwrap();
     std::fs::write(
@@ -104,15 +196,37 @@ async fn downloads_are_served_from_the_downloads_directory() {
     let state = meshrmm_server::prepare(common::config(dir.path(), "tls.mode = \"proxy\""))
         .await
         .unwrap();
+    assert_eq!(state.downloads.version(), None);
     let router = meshrmm_server::http::router(state);
+    for path in [
+        "/downloads/meshrmm-agent-windows-x64.exe",
+        "/downloads/update-manifest.json",
+    ] {
+        let (status, _, _) = get(&router, path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+}
 
-    let (status, _, body) = get(&router, "/downloads/meshrmm-agent-windows-x64.exe").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, b"MZ agent");
-    let (status, _, _) = get(&router, "/downloads/missing.exe").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _, _) = get(&router, "/downloads/../data/instance.key").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+#[tokio::test]
+async fn the_server_refuses_downloads_that_do_not_match_artifacts_json() {
+    for (files, file) in [
+        (&[("agent.exe", b"tampered".as_slice())][..], "agent.exe"),
+        (&[][..], "agent.exe"),
+        (&[][..], "../data/instance.key"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write_downloads(
+            dir.path(),
+            files,
+            serde_json::json!({
+                "agent-windows-x64": { "file": file, "sha256": sha256(b"MZ agent") },
+            }),
+        );
+        let error = meshrmm_server::prepare(common::config(dir.path(), "tls.mode = \"proxy\""))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("agent"), "{file}: {error:#}");
+    }
 }
 
 async fn website_router(website: meshrmm_server::website::Website) -> (tempfile::TempDir, Router) {

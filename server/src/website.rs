@@ -23,9 +23,6 @@ use sha2::{Digest, Sha256};
 // Relative to this crate.
 #[folder = "../dashboard/dist"]
 #[allow_missing = true]
-// The release scripts copy Agent and viewer builds into `public/downloads`,
-// which the server serves from its own directory instead.
-#[exclude = "downloads/*"]
 struct Build;
 
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";

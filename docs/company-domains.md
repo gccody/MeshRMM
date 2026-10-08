@@ -65,7 +65,7 @@ switcher.
    D1 is older, so a deployment that skipped migrations shows up at once.
 
    Then deploy the dashboard by running the **Publish native release**
-   workflow; see [automated native releases](native-releases.md). Do not run
+   workflow; see [releases](releases.md). Do not run
    `npm run deploy` from a checkout: it replaces the published Agent and viewer
    downloads, so it refuses to run outside that workflow.
 

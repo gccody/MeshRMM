@@ -1,6 +1,6 @@
-// The native viewer builds published with each release (see
-// scripts/verify-release-assets.mjs). They are provisioned at release time, so
-// these links 404 in local development.
+// The native viewer builds each server release ships (see
+// scripts/release-artifacts.mjs). A server without them, as in local
+// development, answers these links with 404s.
 export type ViewerPlatform = "windows-x64" | "macos-arm64";
 
 export const VIEWER_PLATFORMS: readonly ViewerPlatform[] = ["windows-x64", "macos-arm64"];

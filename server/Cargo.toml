@@ -29,16 +29,18 @@ httpdate = "1.0.3"
 ipnet = { version = "2.12.2", features = ["serde"] }
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "ring", "rustls-native-certs", "smtp-transport", "tokio1-rustls"] }
 meshrmm-protocol-types.workspace = true
+meshrmm-self-update.workspace = true
 openidconnect = { version = "4.0.1", default-features = false, features = ["accept-string-booleans"] }
 # webauthn-rs verifies with OpenSSL; building it from source keeps the server
 # free of a system OpenSSL, as the static Linux builds need.
 openssl = { version = "0.10.75", features = ["vendored"] }
-rust-embed = { version = "8.13.0", features = ["include-exclude"] }
+rust-embed = "8.13.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 rustls.workspace = true
 rustls-acme = { version = "0.15.4", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
 sea-query = { version = "1.0.2", default-features = false, features = ["backend-postgres", "backend-sqlite", "derive"] }
 sea-query-sqlx = { version = "0.9.1", features = ["sqlx-postgres", "sqlx-sqlite"] }
+semver = "1.0.27"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -48,6 +50,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
 tokio-util = { version = "0.7.19", features = ["io"] }
 totp-rs = { version = "5", default-features = false, features = ["otpauth"] }
+tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["compression-br", "compression-gzip", "fs", "limit", "set-header", "trace"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -65,4 +68,3 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 tempfile = "3"
 tokio-tungstenite.workspace = true
-tower = { version = "0.5.3", features = ["util"] }
