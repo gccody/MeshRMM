@@ -84,7 +84,7 @@ relay_port_min = 49160
 relay_port_max = 49200
 # Addresses relays may not send to or receive from, for example your internal
 # network if no Agent runs there. Loopback, link-local, multicast and broadcast
-# addresses are always refused.
+# addresses, and listen's port on any address, are always refused.
 # blocked_peers = ["10.0.0.0/8"]
 
 [log]
