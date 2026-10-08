@@ -114,7 +114,8 @@ impl Turn {
             public_ip,
             ports: (turn.relay_port_min, turn.relay_port_max),
             peers: Arc::new(PeerFilter::new(
-                SocketAddr::from((public_ip, address.port())),
+                address.port(),
+                public_ip.is_loopback(),
                 &turn.blocked_peers,
             )),
         };
@@ -329,9 +330,12 @@ impl RelayAddressGenerator for Relays {
 /// The peers a relay may exchange packets with.
 #[derive(Debug)]
 struct PeerFilter {
-    /// The TURN server's own listener. Relaying to it would let a relay make
-    /// requests that appear to come from the server.
-    listener: SocketAddr,
+    /// The TURN listener's port, refused on every address. Relaying to the
+    /// listener would let a relay make requests that appear to come from the
+    /// server, and the server answers on each of its addresses, including
+    /// private ones behind NAT that it doesn't know as its own. Peers don't
+    /// use this port, so no address needs it.
+    listener_port: u16,
     blocked: Vec<IpNet>,
     /// Loopback peers are allowed only when the relay itself is on loopback,
     /// as in development.
@@ -339,11 +343,11 @@ struct PeerFilter {
 }
 
 impl PeerFilter {
-    fn new(listener: SocketAddr, blocked: &[IpNet]) -> Self {
+    fn new(listener_port: u16, loopback: bool, blocked: &[IpNet]) -> Self {
         Self {
-            listener,
+            listener_port,
             blocked: blocked.to_vec(),
-            loopback: listener.ip().is_loopback(),
+            loopback,
         }
     }
 
@@ -358,7 +362,7 @@ impl PeerFilter {
             || ip.octets()[0] == 0
             || (ip.is_loopback() && !self.loopback);
         !reserved
-            && SocketAddr::from((ip, peer.port())) != self.listener
+            && peer.port() != self.listener_port
             && !self
                 .blocked
                 .iter()
@@ -480,8 +484,7 @@ mod tests {
 
     #[test]
     fn relays_refuse_reserved_and_blocked_peers() {
-        let listener = SocketAddr::from(([203, 0, 113, 5], 3478));
-        let peers = PeerFilter::new(listener, &["10.0.0.0/8".parse().unwrap()]);
+        let peers = PeerFilter::new(3478, false, &["10.0.0.0/8".parse().unwrap()]);
         for allowed in [
             "198.51.100.7:50000",
             "192.168.1.20:50000",
@@ -499,13 +502,16 @@ mod tests {
             "255.255.255.255:9",
             "10.1.2.3:50000",
             "203.0.113.5:3478",
+            // The server's own address behind NAT, or anyone else's TURN server.
+            "192.168.1.20:3478",
+            "198.51.100.7:3478",
             "[2001:db8::1]:50000",
             "[::1]:50000",
         ] {
             assert!(!peers.allows(refused.parse().unwrap()), "{refused}");
         }
 
-        let development = PeerFilter::new(SocketAddr::from(([127, 0, 0, 1], 3478)), &[]);
+        let development = PeerFilter::new(3478, true, &[]);
         assert!(development.allows("127.0.0.1:50000".parse().unwrap()));
         assert!(!development.allows("127.0.0.1:3478".parse().unwrap()));
     }

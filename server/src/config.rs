@@ -192,7 +192,8 @@ pub struct TurnConfig {
     #[serde(default = "default_relay_port_max")]
     pub relay_port_max: u16,
     /// Addresses relays never send to or accept from, in addition to
-    /// loopback, link-local, multicast and broadcast addresses.
+    /// loopback, link-local, multicast and broadcast addresses and `listen`'s
+    /// port on any address.
     #[serde(default)]
     pub blocked_peers: Vec<IpNet>,
 }
