@@ -1,12 +1,12 @@
 // Errors from actions the user started, kept per source so that clearing one
 // (a retry, a new attempt, a reconnecting stream) never hides another.
-export type ActionErrorSource = "remote" | "delete" | "close-session" | "resume";
+export type ActionErrorSource = "remote" | "delete" | "close-session";
 
 export type ActionErrors = Partial<Record<ActionErrorSource, string>>;
 
 export type ActionErrorUpdate = { source: ActionErrorSource; message: string | null };
 
-const DISPLAY_ORDER: readonly ActionErrorSource[] = ["remote", "close-session", "delete", "resume"];
+const DISPLAY_ORDER: readonly ActionErrorSource[] = ["remote", "close-session", "delete"];
 
 export function actionErrorsReducer(state: ActionErrors, { source, message }: ActionErrorUpdate): ActionErrors {
   if (message === null) {

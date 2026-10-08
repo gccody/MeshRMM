@@ -1,4 +1,3 @@
-"use client";
 
 import { type FormEvent, useCallback, useState } from "react";
 import { type AuthorizedFetch, errorMessage } from "../../lib/http";
@@ -52,7 +51,7 @@ export function useInstallerDownload(authorizedFetch: AuthorizedFetch) {
       }
       const bootstrap = (await bootstrapResponse.json()) as AgentInstallerBootstrap;
       if (platform === "macos") {
-        setCommand(macInstallCommand(window.location.origin, bootstrap));
+        setCommand(macInstallCommand(bootstrap.server, bootstrap));
         setDownloaded(true);
         return;
       }

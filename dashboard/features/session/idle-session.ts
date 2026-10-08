@@ -2,10 +2,10 @@ export const DEFAULT_IDLE_TIMEOUT_MINUTES = 4 * 60;
 export const MIN_IDLE_TIMEOUT_MINUTES = 5;
 export const MAX_IDLE_TIMEOUT_MINUTES = 24 * 60;
 
-const ACTIVITY_KEY_PREFIX = "meshrmm:dashboard-activity:";
+const ACTIVITY_KEY_PREFIX = "meshrmm:activity:";
 
-export function activityStorageKey(organizationId: string) {
-  return `${ACTIVITY_KEY_PREFIX}${organizationId}`;
+export function activityStorageKey(userId: string) {
+  return `${ACTIVITY_KEY_PREFIX}${userId}`;
 }
 
 export function timeoutMilliseconds(timeoutMinutes: number) {
@@ -34,7 +34,7 @@ export function formatIdleTimeout(timeoutMinutes: number) {
     : `${hours.toFixed(1)} hours`;
 }
 
-export function readLastActivity(organizationId: string, fallback = Date.now()) {
-  const stored = Number(window.localStorage.getItem(activityStorageKey(organizationId)));
+export function readLastActivity(userId: string, fallback = Date.now()) {
+  const stored = Number(window.localStorage.getItem(activityStorageKey(userId)));
   return Number.isFinite(stored) && stored > 0 ? stored : fallback;
 }

@@ -1,49 +1,44 @@
-"use client";
-
-import { LoginRequiredError, useAuth } from "../auth/auth-provider";
 import {
-  Network,
   Building2,
-  ChevronRight,
+  ClipboardList,
   Clock3,
   KeyRound,
   LoaderCircle,
+  LogIn,
+  LogOut,
   Menu,
   Monitor,
+  Network,
   Plus,
   RefreshCw,
   Settings,
   ShieldCheck,
+  ShieldAlert,
+  UserCog,
   Users,
   Wrench,
   X,
 } from "lucide-react";
-import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { type ReactNode, useCallback, useEffect, useReducer, useRef, useState } from "react";
-import { AUTH_REFRESH_FAILED_EVENT, useRuntimeConfig } from "../../app/providers";
+import { type ReactNode, useCallback, useReducer, useRef, useState } from "react";
+import { Link, Navigate, Outlet, useLocation } from "react-router";
+import { AuthenticationRequired, apiFetch, errorMessage } from "../../lib/http";
 import { useAgentInventory } from "../agents/use-agent-inventory";
 import type { InventoryConnection } from "../agents/inventory-stream";
 import type { Agent } from "../agents/types";
+import { loginPath } from "../auth/next-path";
+import { type LockReason, useDocumentTitle, useSession } from "../auth/session";
+import type { Account, Permission } from "../auth/types";
 import { EnrollmentModal } from "../enrollment/enrollment-modal";
 import { useInstallerDownload } from "../enrollment/use-installer-download";
-import { AuthenticationRequired, errorMessage, normalizeServer } from "../../lib/http";
-import {
-  DEFAULT_IDLE_TIMEOUT_MINUTES,
-  formatIdleTimeout,
-} from "../session/idle-session";
+import { formatIdleTimeout } from "../session/idle-session";
+import { useIdleSession } from "../session/use-idle-session";
 import { useRemoteHandoff } from "../session/use-remote-handoff";
 import { ViewerDownloadCard } from "../session/viewer-download-links";
+import type { GeneralSettings } from "../settings/general-settings";
 import { useSettingsDraft } from "../settings/use-settings-draft";
-import { AccountLoadError, accountLoader } from "./account-load";
 import { type ActionErrorSource, actionErrorsReducer } from "./action-errors";
-import { AccountModal } from "./account-modal";
-import type { Account } from "./types";
-import { useIdleSession } from "../session/use-idle-session";
-import { VIEW_COPY, VIEW_PATHS, type View, viewForPath } from "./views";
+import { VIEW_COPY, VIEW_PATHS, type View, canView, homeView, viewForPath } from "./views";
 import { type Workspace, WorkspaceContext } from "./workspace-context";
-
-type SessionPauseReason = "idle" | "expired";
 
 // The topbar pill while the inventory on screen is out of date.
 const CONNECTION_PILL: Record<InventoryConnection, string> = {
@@ -51,177 +46,121 @@ const CONNECTION_PILL: Record<InventoryConnection, string> = {
   live: "Connected",
   reconnecting: "Reconnecting",
   offline: "Offline",
-  unavailable: "Updates paused",
 };
 
-// The company workspace around every tenant page. The (workspace) route group
-// layout renders it, so it stays mounted while the user moves between pages:
-// the account, the live inventory subscription, the idle timer and unsaved
-// settings are not reloaded or reset. Each page renders its panel as children.
-export function WorkspaceShell({ children }: { children: ReactNode }) {
-  const view = viewForPath(usePathname());
-  const { serverUrl, workosOrganizationId } = useRuntimeConfig();
-  const {
-    isLoading: isAuthLoading,
-    user,
-    signIn,
-    signOut,
-    getAccessToken,
-    organizationId,
-    role,
-    roles,
-  } = useAuth();
-  const [account, setAccount] = useState<Account | null>(null);
-  const [accountError, setAccountError] = useState<{ message: string; retrying: boolean } | null>(null);
-  const accountLoad = useRef<{ retry: () => void } | null>(null);
-  const [signOutError, setSignOutError] = useState<string | null>(null);
+const NAV_ICONS: Record<View, typeof Monitor> = {
+  devices: Monitor,
+  toolbox: Wrench,
+  users: Users,
+  roles: UserCog,
+  authentication: KeyRound,
+  settings: Settings,
+  audit: ClipboardList,
+  account: ShieldCheck,
+};
+
+const NAV_GROUPS: { label: string; views: View[] }[] = [
+  { label: "Workspace", views: ["devices", "toolbox"] },
+  { label: "Administration", views: ["users", "roles", "authentication", "settings", "audit"] },
+];
+
+// The frame around every workspace page. The layout route renders it, so it
+// stays mounted while the user moves between pages: the live inventory, the
+// idle timer and unsaved settings are not reloaded or reset. Until the
+// browser knows who is signed in (and in the prerendered page), it shows the
+// page's heading over a loading state.
+export function WorkspaceShell() {
+  const { instance, state } = useSession();
+  const location = useLocation();
+  const view = viewForPath(location.pathname) ?? "devices";
+  useDocumentTitle(VIEW_COPY[view].title);
+
+  if (instance?.setup_required) return <Navigate to="/setup" replace />;
+  if (state.status === "signed-out" && state.reason === null) {
+    return <Navigate to={loginPath(`${location.pathname}${location.search}`)} replace />;
+  }
+  if (state.status === "signed-in") return <SignedInWorkspace key={state.account.user.id} account={state.account} view={view} />;
+
+  const pill = state.status === "loading" ? "Checking session" : state.status === "unavailable" ? "Unavailable" : "Session paused";
+  return (
+    <Frame instanceName={instance?.name} pill={pill}>
+      {state.status === "signed-out" && state.reason !== null
+        ? <PausedCard reason={state.reason} idleTimeoutMinutes={state.idleTimeoutMinutes ?? null} />
+        : (
+          <>
+            <PageHeading view={view} />
+            {state.status === "unavailable" ? <UnavailablePanel message={state.message} retrying={state.retrying} /> : <LoadingPanel />}
+          </>
+        )}
+    </Frame>
+  );
+}
+
+function SignedInWorkspace({ account, view }: { account: Account; view: View }) {
+  const { instance, refresh, signOut, lock } = useSession();
+  const location = useLocation();
   const [devicesSearch, setDevicesSearch] = useState("");
-  const [isAuthOpen, setIsAuthOpen] = useState(false);
   const [isAgentOpen, setIsAgentOpen] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  // The control that opened the account or enrollment dialog gets focus back.
+  // The control that opened the enrollment dialog gets focus back.
   const dialogOpener = useRef<HTMLElement | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [actionErrors, dispatchActionError] = useReducer(actionErrorsReducer, {});
-  const [sessionPauseReason, setSessionPauseReason] = useState<SessionPauseReason | null>(null);
-  const [isResumingSession, setIsResumingSession] = useState(false);
+  const [settings, setSettings] = useState<GeneralSettings | null>(null);
+  const enrolling = account.two_factor.enrollment_required;
+  const can = useCallback((permission: Permission) => account.permissions.includes(permission), [account]);
 
-  const hasTenantSession = Boolean(user && workosOrganizationId && organizationId === workosOrganizationId);
-  const isAdmin = Boolean(
-    role === "admin" ||
-    role === "company_admin" ||
-    roles?.some((candidate) => candidate === "admin" || candidate === "company_admin") ||
-    account?.role === "admin" ||
-    account?.role === "company_admin" ||
-    account?.roles.some((candidate) => candidate === "admin" || candidate === "company_admin") ||
-    account?.permissions.includes("company:settings:manage"),
-  );
-  const accountPending = hasTenantSession && !account;
-  const idleTimeoutMinutes = account?.company?.dashboard_idle_timeout_minutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES;
+  const refreshAccount = useCallback(async () => {
+    await refresh();
+  }, [refresh]);
 
-  const lockSession = useCallback((reason: SessionPauseReason) => {
-    setSessionPauseReason((current) => current ?? reason);
-    setIsAuthOpen(false);
-    setIsAgentOpen(false);
-    setIsSidebarOpen(false);
-  }, []);
-
-  const authorizedFetch = useCallback(async (path: string, init: RequestInit = {}) => {
-    let token: string;
-    try {
-      token = await getAccessToken();
-    } catch (tokenError) {
-      if (
-        tokenError instanceof LoginRequiredError ||
-        (tokenError instanceof Error && tokenError.message === "No access token available")
-      ) {
-        lockSession("expired");
-        throw new AuthenticationRequired();
-      }
-      throw tokenError;
-    }
-    if (!token) throw new Error("Your session has expired. Please sign in again.");
-    const response = await fetch(`${normalizeServer(serverUrl)}${path}`, {
-      ...init,
-      headers: { ...init.headers, Authorization: `Bearer ${token}` },
-    });
+  const authorizedFetch = useCallback(async (path: string, init?: RequestInit) => {
+    const response = await apiFetch(path, init);
     if (response.status === 401) {
-      lockSession("expired");
+      await response.body?.cancel();
+      lock("expired");
       throw new AuthenticationRequired();
     }
+    if (response.status === 403) {
+      const body: unknown = await response.clone().json().catch(() => null);
+      if (body && typeof body === "object" && "code" in body && body.code === "two_factor_enrollment_required") void refresh().catch(() => {});
+    }
     return response;
-  }, [getAccessToken, lockSession, serverUrl]);
+  }, [lock, refresh]);
 
-  // The server derives the company from the access token and host, so the
-  // event subscription starts alongside the account request rather than after
-  // it. It stops once the account fails in a way that is not retried.
   const inventory = useAgentInventory({
-    enabled: Boolean(hasTenantSession && !sessionPauseReason && !(accountError && !accountError.retrying)),
-    subscriptionKey: workosOrganizationId,
+    enabled: can("devices.view") && !enrolling,
     authorizedFetch,
+    // A refused or revoked socket means the session or the user's access
+    // changed; the account says which.
+    onRefused: useCallback(() => void refresh().catch(() => {}), [refresh]),
   });
-  const { agents, hasData, status: inventoryStatus, connection, isRefreshing, refresh, reset: resetInventory } = inventory;
+  const { agents, hasData, status: inventoryStatus, connection, isRefreshing, refresh: refreshInventory, reset: resetInventory } = inventory;
   const reportActionError = useCallback(
     (source: ActionErrorSource, message: string | null) => dispatchActionError({ source, message }),
     [],
   );
   const reportRemoteError = useCallback((message: string | null) => reportActionError("remote", message), [reportActionError]);
-
-  const pauseIdleSession = useCallback(() => {
-    resetInventory();
-    lockSession("idle");
-    void signOut({ navigate: false }).catch(() => {
-      // The UI is already locked. A missing/expired WorkOS session needs no further cleanup.
-    });
-  }, [lockSession, resetInventory, signOut]);
+  const remote = useRemoteHandoff({ authorizedFetch, reportError: reportRemoteError });
+  const installer = useInstallerDownload(authorizedFetch);
+  const settingsDraft = useSettingsDraft(settings);
 
   useIdleSession({
-    enabled: Boolean(hasTenantSession && account?.company && !sessionPauseReason),
-    organizationId: workosOrganizationId,
-    timeoutMinutes: idleTimeoutMinutes,
-    onTimeout: pauseIdleSession,
+    enabled: true,
+    userId: account.user.id,
+    timeoutMinutes: account.idle_timeout_minutes,
+    onTimeout: useCallback(() => {
+      resetInventory();
+      void signOut("idle");
+    }, [resetInventory, signOut]),
   });
 
-  useEffect(() => {
-    const handleRefreshFailure = () => {
-      resetInventory();
-      lockSession("expired");
-    };
-    window.addEventListener(AUTH_REFRESH_FAILED_EVENT, handleRefreshFailure);
-    return () => window.removeEventListener(AUTH_REFRESH_FAILED_EVENT, handleRefreshFailure);
-  }, [lockSession, resetInventory]);
-
-  const installer = useInstallerDownload(authorizedFetch);
-  const remote = useRemoteHandoff({ authorizedFetch, reportError: reportRemoteError });
-  const settingsDraft = useSettingsDraft(account?.company);
-
-  const fetchAccount = useCallback(async () => {
-    const response = await authorizedFetch("/v1/account");
-    if (!response.ok) {
-      throw new AccountLoadError(await errorMessage(response, "The company account could not be loaded."), response.status);
-    }
-    return (await response.json()) as Account;
-  }, [authorizedFetch]);
-
-  // The account carries the idle policy, so the workspace stays hidden until it
-  // loads. The event subscription supplies the initial inventory.
-  useEffect(() => {
-    if (isAuthLoading || !hasTenantSession || sessionPauseReason) return;
-    const loader = accountLoader({
-      load: fetchAccount,
-      onLoaded: (data) => {
-        setAccountError(null);
-        setAccount(data);
-      },
-      onError: (requestError, retryInMs) => {
-        if (requestError instanceof AuthenticationRequired) return;
-        setAccountError({
-          message: requestError instanceof Error ? requestError.message : "The company account could not be loaded.",
-          retrying: retryInMs !== null,
-        });
-      },
-    });
-    accountLoad.current = loader;
-    return () => {
-      loader.stop();
-      accountLoad.current = null;
-    };
-  }, [fetchAccount, hasTenantSession, isAuthLoading, sessionPauseReason]);
-
-  const displayName = user ? [user.firstName, user.lastName].filter(Boolean).join(" ") || user.email : "Not signed in";
-  const initials = user ? `${user.firstName?.[0] ?? user.email[0] ?? ""}${user.lastName?.[0] ?? ""}`.toUpperCase() : "--";
-  const companyLabel = account?.company?.name ?? "Company workspace";
-
-  const resumeSession = async () => {
-    setIsResumingSession(true);
-    reportActionError("resume", null);
-    try {
-      await signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } });
-    } catch (resumeError) {
-      reportActionError("resume", resumeError instanceof Error ? resumeError.message : "Your session could not be resumed.");
-      setIsResumingSession(false);
-    }
-  };
+  // Navigating closes the sidebar, so it doesn't cover the new page.
+  const [sidebarPath, setSidebarPath] = useState(location.pathname);
+  if (sidebarPath !== location.pathname) {
+    setSidebarPath(location.pathname);
+    setIsSidebarOpen(false);
+  }
 
   const deleteAgent = async (agent: Agent) => {
     const confirmed = window.confirm(
@@ -231,46 +170,31 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
     setDeletingId(agent.id);
     reportActionError("delete", null);
     try {
-      const response = await authorizedFetch(`/v1/agents/${encodeURIComponent(agent.id)}`, {
-        method: "DELETE",
-      });
-      if (!response.ok) {
-        throw new Error(await errorMessage(response, "The Agent could not be deleted."));
-      }
-      // The backend publishes agent_deleted to the existing subscription.
+      const response = await authorizedFetch(`/v1/agents/${encodeURIComponent(agent.id)}`, { method: "DELETE" });
+      if (!response.ok) throw new Error(await errorMessage(response, "The device could not be deleted."));
+      // The server publishes agent_deleted to the event socket.
     } catch (requestError) {
       if (!(requestError instanceof AuthenticationRequired)) {
-        reportActionError("delete", requestError instanceof Error ? requestError.message : "The Agent could not be deleted.");
+        reportActionError("delete", requestError instanceof Error ? requestError.message : "The device could not be deleted.");
       }
     } finally {
       setDeletingId(null);
     }
   };
 
-  const handleSignOut = async () => {
-    resetInventory();
-    setAccount(null);
-    setIsAuthOpen(false);
-    setSignOutError(null);
-    try {
-      await signOut({ returnTo: "https://meshrmm.com" });
-    } catch {
-      // The browser session is already cleared, but the WorkOS session may remain.
-      setSignOutError("Sign-out could not be completed. Sign in and sign out again, or close your browser, to end your session.");
-    }
-  };
+  if (enrolling && view !== "account") return <Navigate to={VIEW_PATHS.account} replace />;
+  if (!canView(account, view) && view === "devices") {
+    const home = homeView(account);
+    if (home !== "devices") return <Navigate to={VIEW_PATHS[home]} replace />;
+  }
 
-  const closeSidebar = () => setIsSidebarOpen(false);
-  const signInToCompany = () => void signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } });
-
+  const instanceName = instance?.name ?? "MeshRMM";
   const workspace: Workspace = {
     account,
-    company: account?.company,
-    setAccount,
-    isAdmin,
-    displayName,
+    instanceName,
+    can,
+    refreshAccount,
     authorizedFetch,
-    getAccessToken,
     inventory,
     remote,
     deleteAgent,
@@ -279,167 +203,211 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
     reportActionError,
     devicesSearch,
     setDevicesSearch,
+    settings,
+    setSettings,
     settingsDraft,
   };
 
+  const pill = inventoryStatus === "live" ? "Connected"
+    : inventoryStatus === "stale" ? CONNECTION_PILL[connection]
+    : "Signed in";
+  const navigation = (
+    <nav aria-label="Primary navigation">
+      {NAV_GROUPS.map(({ label, views }) => {
+        const visible = views.filter((candidate) => canView(account, candidate));
+        if (!visible.length) return null;
+        return (
+          <div key={label} className="nav-group">
+            <p className="nav-label">{label}</p>
+            {visible.map((candidate) => {
+              const Icon = NAV_ICONS[candidate];
+              return (
+                <NavItem key={candidate} view={candidate} current={view} disabled={enrolling} search={candidate === "devices" ? devicesSearch : ""}>
+                  <Icon size={18} /><span>{VIEW_COPY[candidate].title}</span>
+                  {candidate === "devices" && hasData ? <em>{agents.length}</em> : null}
+                </NavItem>
+              );
+            })}
+          </div>
+        );
+      })}
+    </nav>
+  );
+
   return (
     <WorkspaceContext.Provider value={workspace}>
-      <div className="app-shell">
-        <aside className={`sidebar ${isSidebarOpen ? "sidebar-open" : ""}`}>
-          <div className="brand-row">
-            <div className="brand-mark"><Network size={19} strokeWidth={2.5} /></div>
-            <span>Mesh<span>RMM</span></span>
-            <button className="sidebar-close" onClick={() => setIsSidebarOpen(false)} aria-label="Close navigation"><X size={20} /></button>
-          </div>
+      <Frame
+        instanceName={instanceName}
+        pill={pill}
+        pillState={inventoryStatus === "stale" ? "stale" : inventoryStatus === "live" ? "live" : ""}
+        navigation={navigation}
+        viewerCard={can("sessions.connect")}
+        profile={<ProfileRow account={account} active={view === "account"} onSignOut={() => { resetInventory(); void signOut(); }} />}
+        sidebarOpen={isSidebarOpen}
+        onSidebar={setIsSidebarOpen}
+      >
+        <PageHeading view={view}>
+          {view === "devices" && canView(account, "devices") && <div className="heading-actions">
+            <button className="secondary-button" onClick={() => void refreshInventory()}><RefreshCw size={16} className={isRefreshing ? "spin" : ""} /> Refresh</button>
+            {can("devices.enroll") && <button className="primary-button" onClick={(event) => { dialogOpener.current = event.currentTarget; installer.reset(); setIsAgentOpen(true); }} aria-haspopup="dialog"><Plus size={16} /> Add device</button>}
+          </div>}
+        </PageHeading>
+        {canView(account, view) ? <Outlet /> : <NoAccessPanel />}
+      </Frame>
 
-          <div className="workspace-switcher workspace-identity">
-            <div className="workspace-avatar">{account?.company?.name.slice(0, 2).toUpperCase() ?? "CO"}</div>
-            <div><strong>{companyLabel}</strong><span>Company workspace</span></div>
-          </div>
-
-          <nav aria-label="Primary navigation">
-            <p className="nav-label">Company</p>
-            <NavItem view="agents" search={devicesSearch} current={view} disabled={Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Monitor size={18} /><span>Devices</span>{hasData ? <em>{agents.length}</em> : null}</NavItem>
-            <NavItem view="toolbox" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Wrench size={18} /><span>Toolbox</span></NavItem>
-            {isAdmin && <NavItem view="team" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Users size={18} /><span>Users</span></NavItem>}
-            {isAdmin && <NavItem view="sso" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><KeyRound size={18} /><span>Authentication</span></NavItem>}
-            <NavItem view="settings" current={view} disabled={!hasTenantSession || Boolean(sessionPauseReason)} onNavigate={closeSidebar}><Settings size={18} /><span>Settings</span></NavItem>
-          </nav>
-
-          <ViewerDownloadCard />
-
-          <button className="profile-row profile-button" onClick={(event) => { dialogOpener.current = event.currentTarget; setIsSidebarOpen(false); setIsAuthOpen(true); }} disabled={Boolean(sessionPauseReason)} aria-haspopup="dialog">
-            <div className="profile-avatar">{initials}</div>
-            <div className="profile-details"><strong>Your account</strong><span>{displayName}</span></div>
-            <ChevronRight size={16} aria-hidden="true" />
-          </button>
-        </aside>
-
-        {isSidebarOpen && <button className="sidebar-scrim" onClick={() => setIsSidebarOpen(false)} aria-label="Close navigation" />}
-
-        <main className="main-content">
-          <header className="topbar">
-            <button className="mobile-menu" onClick={() => setIsSidebarOpen(true)} aria-label="Open navigation" aria-expanded={isSidebarOpen} disabled={Boolean(sessionPauseReason)}><Menu size={21} /></button>
-            <div className="workspace-breadcrumb"><Building2 size={16} /><span>{companyLabel}</span></div>
-            <div className="topbar-actions">
-              <div className="connection-pill" role="status">
-                <span className={`status-dot ${inventoryStatus === "stale" ? "stale" : inventoryStatus === "live" ? "live" : ""}`} />
-                {sessionPauseReason ? "Session paused" : isAuthLoading ? "Checking session" : inventoryStatus === "live" ? "Connected" : inventoryStatus === "stale" ? CONNECTION_PILL[connection] : user ? "Signed in" : "Signed out"}
-              </div>
-            </div>
-          </header>
-
-          <div className="page-wrap">
-            {sessionPauseReason ? (
-              <section className="signed-out-card session-paused-card">
-                <div className="modal-icon"><Clock3 size={22} /></div>
-                <p className="eyebrow">Session paused</p>
-                <h1>{sessionPauseReason === "idle" ? "You’ve been signed out for inactivity" : "Your session needs to be renewed"}</h1>
-                <p>{sessionPauseReason === "idle" ? `Your organization pauses inactive dashboards after ${formatIdleTimeout(idleTimeoutMinutes)}.` : "Sign in again to continue managing your devices."}</p>
-                {actionErrors.resume && <p className="session-paused-error" role="alert">{actionErrors.resume}</p>}
-                <button className="primary-button" onClick={() => void resumeSession()} disabled={isResumingSession}>{isResumingSession ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />} Continue securely</button>
-              </section>
-            ) : !user && !isAuthLoading ? (
-              <section className="signed-out-card">
-                <div className="modal-icon"><ShieldCheck size={22} /></div>
-                <p className="eyebrow">Secure company access</p>
-                <h1>Sign in to MeshRMM</h1>
-                <p>Sign in with your company account to manage devices and start remote sessions.</p>
-                {signOutError && <p role="alert">{signOutError}</p>}
-                <button className="primary-button" onClick={signInToCompany}><ShieldCheck size={16} /> Sign in securely</button>
-              </section>
-            ) : user && !hasTenantSession ? (
-              <section className="signed-out-card organization-required">
-                <div className="modal-icon"><Building2 size={22} /></div>
-                <p className="eyebrow">Company-specific access</p>
-                <h1>Continue to this company</h1>
-                <p>Sign in with an account that has access to this company’s workspace.</p>
-                {signOutError && <p role="alert">{signOutError}</p>}
-                <button className="primary-button" onClick={() => void signOut({ navigate: false })
-                  .then(() => signIn({ organizationId: workosOrganizationId, state: { returnTo: "/" } }))
-                  .catch(() => setSignOutError("Your session could not be switched. Please retry."))}><ShieldCheck size={16} /> Continue to company</button>
-              </section>
-            ) : account && !account.company ? (
-              <section className="signed-out-card organization-required">
-                <div className="modal-icon"><Building2 size={22} /></div>
-                <p className="eyebrow">Workspace unavailable</p>
-                <h1>This company is not ready</h1>
-                <p>Contact your administrator to finish setting up this workspace.</p>
-              </section>
-            ) : (
-              <>
-                <section className="page-heading">
-                  <div>
-                    <p className="eyebrow">{account?.company?.name ?? "Company"}</p>
-                    <h1>{VIEW_COPY[view].title}</h1>
-                    <p>{VIEW_COPY[view].description}</p>
-                  </div>
-                  {view === "agents" && !accountPending && <div className="heading-actions">
-                    <button className="secondary-button" onClick={() => void refresh()}><RefreshCw size={16} className={isRefreshing ? "spin" : ""} /> Refresh</button>
-                    {isAdmin && <button className="primary-button" onClick={(event) => { dialogOpener.current = event.currentTarget; installer.reset(); setIsAgentOpen(true); }} aria-haspopup="dialog"><Plus size={16} /> Add device</button>}
-                  </div>}
-                </section>
-
-                {accountPending ? (
-                  <section className="management-panel account-status">
-                    {accountError ? (
-                      <>
-                        <h2>Your company workspace could not be loaded</h2>
-                        <p role="alert">{accountError.message}</p>
-                        <p>{accountError.retrying ? "MeshRMM will keep retrying." : "Resolve the problem, then try again."}</p>
-                        <button className="secondary-button" onClick={() => accountLoad.current?.retry()}><RefreshCw size={16} /> Retry now</button>
-                      </>
-                    ) : (
-                      <p role="status"><LoaderCircle size={16} className="spin" /> Loading your company workspace…</p>
-                    )}
-                  </section>
-                ) : children}
-              </>
-            )}
-          </div>
-        </main>
-
-        {isAuthOpen && (
-          <AccountModal
-            email={user?.email ?? null}
-            displayName={displayName}
-            initials={initials}
-            onClose={() => setIsAuthOpen(false)}
-            onSignIn={signInToCompany}
-            onSignOut={() => void handleSignOut()}
-            returnFocus={dialogOpener}
-          />
-        )}
-
-        {isAgentOpen && (
-          <EnrollmentModal
-            companyName={account?.company?.name}
-            platform={installer.platform}
-            error={installer.error}
-            isDownloading={installer.isDownloading}
-            downloaded={installer.downloaded}
-            command={installer.command}
-            onClose={() => setIsAgentOpen(false)}
-            onPlatformChange={installer.setPlatform}
-            onSubmit={(event) => void installer.download(event)}
-            returnFocus={dialogOpener}
-          />
-        )}
-      </div>
+      {isAgentOpen && (
+        <EnrollmentModal
+          instanceName={instanceName}
+          platform={installer.platform}
+          error={installer.error}
+          isDownloading={installer.isDownloading}
+          downloaded={installer.downloaded}
+          command={installer.command}
+          onClose={() => setIsAgentOpen(false)}
+          onPlatformChange={installer.setPlatform}
+          onSubmit={(event) => void installer.download(event)}
+          returnFocus={dialogOpener}
+        />
+      )}
     </WorkspaceContext.Provider>
   );
 }
 
-// Sidebar entries are links so they can open in a new tab. A plain click
-// navigates in place and closes the mobile sidebar. Unavailable entries stay
-// disabled buttons.
-function NavItem({ view, search = "", current, disabled, onNavigate, children }: {
+function Frame({ instanceName, pill, pillState = "", navigation, viewerCard = false, profile, sidebarOpen = false, onSidebar, children }: {
+  instanceName: string | undefined;
+  pill: string;
+  pillState?: "" | "live" | "stale";
+  navigation?: ReactNode;
+  viewerCard?: boolean;
+  profile?: ReactNode;
+  sidebarOpen?: boolean;
+  onSidebar?: (open: boolean) => void;
+  children: ReactNode;
+}) {
+  return (
+    <div className="app-shell">
+      <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
+        <div className="brand-row">
+          <div className="brand-mark"><Network size={19} strokeWidth={2.5} /></div>
+          <span>Mesh<span>RMM</span></span>
+          <button className="sidebar-close" onClick={() => onSidebar?.(false)} aria-label="Close navigation"><X size={20} /></button>
+        </div>
+
+        <div className="workspace-identity">
+          <div className="workspace-avatar">{instanceName ? initials(instanceName) : "··"}</div>
+          <div><strong>{instanceName ?? "MeshRMM"}</strong><span>Self-hosted server</span></div>
+        </div>
+
+        {navigation}
+        {viewerCard && <ViewerDownloadCard />}
+        {profile}
+      </aside>
+
+      {sidebarOpen && <button className="sidebar-scrim" onClick={() => onSidebar?.(false)} aria-label="Close navigation" />}
+
+      <main className="main-content">
+        <header className="topbar">
+          <button className="mobile-menu" onClick={() => onSidebar?.(true)} aria-label="Open navigation" aria-expanded={sidebarOpen} disabled={!onSidebar}><Menu size={21} /></button>
+          <div className="workspace-breadcrumb"><Building2 size={16} /><span>{instanceName ?? "MeshRMM"}</span></div>
+          <div className="topbar-actions">
+            <div className="connection-pill" role="status">
+              <span className={`status-dot ${pillState}`} />
+              {pill}
+            </div>
+          </div>
+        </header>
+        <div className="page-wrap">{children}</div>
+      </main>
+    </div>
+  );
+}
+
+function PageHeading({ view, children }: { view: View; children?: ReactNode }) {
+  return (
+    <section className="page-heading">
+      <div>
+        <h1>{VIEW_COPY[view].title}</h1>
+        <p>{VIEW_COPY[view].description}</p>
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function LoadingPanel() {
+  return <section className="management-panel account-status"><p role="status"><LoaderCircle size={16} className="spin" /> Loading…</p></section>;
+}
+
+function UnavailablePanel({ message, retrying }: { message: string; retrying: boolean }) {
+  const { retry } = useSession();
+  return (
+    <section className="management-panel account-status">
+      <h2>MeshRMM could not be loaded</h2>
+      <p role="alert">{message}</p>
+      <p>{retrying ? "MeshRMM will keep retrying." : "Resolve the problem, then try again."}</p>
+      <button className="secondary-button" onClick={retry}><RefreshCw size={16} /> Retry now</button>
+    </section>
+  );
+}
+
+function NoAccessPanel() {
+  return (
+    <section className="management-panel account-status">
+      <h2><ShieldAlert size={16} aria-hidden="true" /> You don&apos;t have access to this page</h2>
+      <p>Your roles don&apos;t include it. Ask an administrator if you need it.</p>
+    </section>
+  );
+}
+
+const PAUSED_COPY: Record<LockReason, { title: string; detail: (minutes: number | null) => string }> = {
+  idle: {
+    title: "You’ve been signed out for inactivity",
+    detail: (minutes) => `This server signs out inactive browsers after ${minutes === null ? "a while" : formatIdleTimeout(minutes)}.`,
+  },
+  expired: { title: "Your session has ended", detail: () => "Sign in again to continue." },
+  elsewhere: { title: "You signed out in another tab", detail: () => "Sign in again to continue here." },
+};
+
+function PausedCard({ reason, idleTimeoutMinutes }: { reason: LockReason; idleTimeoutMinutes: number | null }) {
+  const location = useLocation();
+  const copy = PAUSED_COPY[reason];
+  return (
+    <section className="signed-out-card session-paused-card">
+      <div className="modal-icon"><Clock3 size={22} /></div>
+      <p className="eyebrow">Session paused</p>
+      <h1>{copy.title}</h1>
+      <p>{copy.detail(idleTimeoutMinutes)}</p>
+      <Link className="primary-button" to={loginPath(`${location.pathname}${location.search}`)}><LogIn size={16} /> Sign in again</Link>
+    </section>
+  );
+}
+
+function ProfileRow({ account, active, onSignOut }: { account: Account; active: boolean; onSignOut: () => void }) {
+  return (
+    <div className="profile-row">
+      <Link to={VIEW_PATHS.account} className={`profile-link${active ? " active" : ""}`} aria-current={active ? "page" : undefined}>
+        <div className="profile-avatar">{initials(account.user.display_name || account.user.email)}</div>
+        <div className="profile-details"><strong>{account.user.display_name}</strong><span>{account.user.email}</span></div>
+      </Link>
+      <button type="button" className="profile-sign-out" onClick={onSignOut} aria-label="Sign out" title="Sign out"><LogOut size={16} /></button>
+    </div>
+  );
+}
+
+function initials(name: string) {
+  const words = name.trim().split(/\s+/u).filter(Boolean);
+  const letters = words.length > 1 ? [words[0], words[words.length - 1]] : [words[0] ?? ""];
+  return letters.map((word) => Array.from(word)[0] ?? "").join("").toUpperCase() || "··";
+}
+
+// Sidebar entries are links so they can open in a new tab. Unavailable
+// entries stay disabled buttons.
+function NavItem({ view, search = "", current, disabled, children }: {
   view: View;
   // Carries the Devices filters so returning to Devices restores them.
   search?: string;
   current: View;
   disabled: boolean;
-  onNavigate: () => void;
   children: ReactNode;
 }) {
   const className = `nav-item ${view === current ? "active" : ""}`;
@@ -447,5 +415,5 @@ function NavItem({ view, search = "", current, disabled, onNavigate, children }:
   if (disabled) {
     return <button type="button" className={className} aria-current={ariaCurrent} disabled>{children}</button>;
   }
-  return <Link href={`${VIEW_PATHS[view]}${search}`} prefetch={false} className={className} aria-current={ariaCurrent} onNavigate={onNavigate}>{children}</Link>;
+  return <Link to={`${VIEW_PATHS[view]}${search}`} className={className} aria-current={ariaCurrent}>{children}</Link>;
 }

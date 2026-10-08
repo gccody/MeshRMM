@@ -36,6 +36,9 @@ pub struct Account {
     session: CurrentSession,
     /// Sign the browser out after this long without activity.
     idle_timeout_minutes: i64,
+    /// Device users approve each connection, so the website asks for a
+    /// reason first. Policy is otherwise only for `settings.manage`.
+    connection_approval: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,6 +97,7 @@ pub async fn get(
             expires_at: signed_in.session_expires_at,
         },
         idle_timeout_minutes: signed_in.idle_timeout_minutes,
+        connection_approval: settings.connection_approval,
         permissions: signed_in.permissions,
         user: AccountUser {
             has_password: signed_in.user.password_hash.is_some(),

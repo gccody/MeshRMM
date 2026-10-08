@@ -1,4 +1,3 @@
-"use client";
 
 import { type FormEvent, useState } from "react";
 import { Monitor, X } from "lucide-react";
