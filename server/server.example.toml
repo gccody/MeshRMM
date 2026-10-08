@@ -51,6 +51,12 @@ contact_email = "admin@example.com"
 # The Agent and viewer builds shipped with this server release.
 dir = "/usr/share/meshrmm/downloads"
 
+[toolbox]
+# The largest file users may upload to the toolbox library, in bytes. Keep it
+# under any request body limit of a proxy in front of the server (Cloudflare's
+# proxy allows 100 MB on its free plan).
+max_file_bytes = 99614720
+
 [log]
 # A tracing filter, e.g. "info" or "meshrmm_server=debug,info".
 level = "info"

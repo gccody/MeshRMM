@@ -12,15 +12,15 @@ Agent coordinator (Session 0)
        GDI halftone scaling of the primary display to at most 640x400
        Windows Imaging Component JPEG, quality 0.7 (normally 20–80 KiB)
   -> PUT /v1/agents/{device_id}/thumbnail   (Agent credential, HTTPS)
-  -> Worker -> R2 thumbnails/{company_id}/{device_id}.jpg
-Dashboard row on screen
-  -> GET /v1/agents/{device_id}/thumbnail  (WorkOS token, If-None-Match)
-  -> Worker -> R2 conditional get -> 200 with the image, 304, or 204 if none
+  -> server -> {data_dir}/thumbnails/{device_id}.jpg
+Website row on screen
+  -> GET /v1/agents/{device_id}/thumbnail  (session cookie, If-None-Match)
+  -> server -> 200 with the image, 304, or 204 if none
 ```
 
-Durable Objects are not involved. Images never cross the coordinator's
-signaling WebSocket or the company presence stream, and no event announces
-a new image. R2 keeps only the latest image of each device.
+Images never cross the Agent's control connection or the presence stream,
+and no event announces a new image. The server keeps only the latest image of
+each device, replacing it in one step, and reading it needs `devices.view`.
 
 Bandwidth is kept down at each step:
 
@@ -52,20 +52,6 @@ five-minute refresh; Windows Agents retry the same way.
 
 ## Setup
 
-Create the bucket once before deploying the server:
-
-```sh
-cd server
-npx wrangler r2 bucket create meshrmm-thumbnails
-```
-
-`server/wrangler.jsonc` binds it as `THUMBNAILS`. Then deploy the server with
-`node scripts/deploy-server.mjs` and publish a native release so Agents start
-uploading.
-
-## Costs
-
-Each online device makes one Worker request and one R2 Class A write every
-five minutes when its screen changes, about 8,600 a month. Each visible
-dashboard row makes one Worker request and one R2 Class B read per check. The
-platform cost report does not yet include R2.
+Nothing to set up: the server creates `thumbnails/` in its data directory.
+Back it up with the rest of the data directory, or don't; the next upload
+replaces a lost image.

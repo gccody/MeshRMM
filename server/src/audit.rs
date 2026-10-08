@@ -70,6 +70,31 @@ impl<'a> Target<'a> {
         }
     }
 
+    pub fn device(id: &'a str) -> Self {
+        Self { kind: "agent", id }
+    }
+
+    pub fn agent_installer(id: &'a str) -> Self {
+        Self {
+            kind: "agent_installer",
+            id,
+        }
+    }
+
+    pub fn toolbox_script(id: &'a str) -> Self {
+        Self {
+            kind: "toolbox_script",
+            id,
+        }
+    }
+
+    pub fn toolbox_file(id: &'a str) -> Self {
+        Self {
+            kind: "toolbox_file",
+            id,
+        }
+    }
+
     pub fn settings() -> Self {
         Self {
             kind: "settings",

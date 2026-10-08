@@ -167,15 +167,45 @@ pub enum AuditEvents {
 }
 
 #[derive(Iden)]
+pub enum Agents {
+    Table,
+    Id,
+    Name,
+    AuthTokenHash,
+    PendingAuthTokenHash,
+    PendingAuthTokenEncrypted,
+    CreatedByUserId,
+    CreatedAt,
+    UpdatedAt,
+    DeletionRequestedAt,
+}
+
+#[derive(Iden)]
 pub enum AgentInstallTokens {
     Table,
+    Id,
+    TokenHash,
+    CreatedByUserId,
+    Platform,
+    CreatedAt,
     ExpiresAt,
+    UsedAt,
+    DeviceId,
+    ComputerName,
+    RedemptionKeyHash,
 }
 
 #[derive(Iden)]
 pub enum RemoteHandoffs {
     Table,
+    TokenHash,
+    DeviceId,
+    UserId,
+    StartInBackground,
+    Reason,
+    CreatedAt,
     ExpiresAt,
+    UsedAt,
 }
 
 #[derive(Iden)]
@@ -185,13 +215,73 @@ pub enum RemoteSessions {
 }
 
 #[derive(Iden)]
+pub enum ToolboxScripts {
+    Table,
+    Id,
+    OwnerUserId,
+    Shared,
+    Folder,
+    Name,
+    Description,
+    Language,
+    Body,
+    TimeoutSeconds,
+    CreatedAt,
+    UpdatedAt,
+    UpdatedByUserId,
+}
+
+#[derive(Iden)]
+pub enum ToolboxFiles {
+    Table,
+    Id,
+    OwnerUserId,
+    Shared,
+    Folder,
+    Name,
+    SizeBytes,
+    Sha256,
+    CreatedAt,
+    UpdatedAt,
+    UpdatedByUserId,
+}
+
+#[derive(Iden)]
 pub enum ScriptRuns {
     Table,
+    Id,
+    DeviceId,
+    ScriptId,
+    ScriptName,
+    Language,
+    RequestedByUserId,
+    Source,
+    RunAs,
+    TimeoutSeconds,
+    Status,
+    RanAs,
+    ExitCode,
+    Stdout,
+    Stderr,
+    OutputTruncated,
+    Error,
     CreatedAt,
+    CompletedAt,
 }
 
 #[derive(Iden)]
 pub enum FileDeliveries {
     Table,
+    Id,
+    DeviceId,
+    FileId,
+    FileName,
+    SizeBytes,
+    RequestedByUserId,
+    Destination,
+    Status,
+    Path,
+    Error,
     CreatedAt,
+    CompletedAt,
 }

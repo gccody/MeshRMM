@@ -26,9 +26,6 @@ pub const MAX_FILE_NAME_CHARS: usize = 255;
 pub const MAX_FOLDER_BYTES: usize = 255;
 pub const MAX_FOLDER_DEPTH: usize = 8;
 pub const MAX_FOLDER_NAME_CHARS: usize = 64;
-/// A library file. Cloudflare refuses request bodies over 100 MB, and the
-/// dashboard uploads a file in one request.
-pub const MAX_TOOLBOX_FILE_BYTES: u64 = 95 * 1024 * 1024;
 
 /// The interpreter a script runs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

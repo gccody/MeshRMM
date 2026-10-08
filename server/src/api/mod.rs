@@ -1,13 +1,19 @@
-//! The `/v1` API used by the website.
+//! The `/v1` API used by the website, and by Agents and viewers.
 mod account;
+mod agent;
 mod audit_log;
+mod devices;
+mod enrollment;
+mod handoffs;
 mod instance;
 mod invitations;
 mod password_resets;
 mod roles;
+mod runs;
 mod settings;
 mod setup;
 mod sign_in;
+mod toolbox;
 mod users;
 
 use axum::{
@@ -15,7 +21,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
 };
 use serde::Serialize;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -93,6 +99,51 @@ pub fn router(state: AppState) -> Router<AppState> {
         )
         .route("/settings/smtp/test", post(settings::test_smtp))
         .route("/audit", get(audit_log::list))
+        .route("/agent-installers", post(enrollment::create))
+        .route("/agent-installers/redeem", post(enrollment::redeem))
+        .route("/agents", get(devices::list))
+        .route("/agents/{id}", delete(devices::delete))
+        .route(
+            "/agents/{id}/rotate-credential",
+            post(devices::rotate_credential),
+        )
+        .route(
+            "/agents/{id}/thumbnail",
+            get(devices::thumbnail).put(agent::put_thumbnail),
+        )
+        .route("/agents/{id}/script-runs", post(runs::start_run))
+        .route(
+            "/agents/{id}/script-runs/{run_id}/result",
+            post(agent::report_script_run),
+        )
+        .route("/agents/{id}/file-deliveries", post(runs::start_delivery))
+        .route(
+            "/agents/{id}/file-deliveries/{delivery_id}/content",
+            get(agent::delivery_content),
+        )
+        .route(
+            "/agents/{id}/file-deliveries/{delivery_id}/result",
+            post(agent::report_file_delivery),
+        )
+        .route("/toolbox", get(toolbox::list))
+        .route("/toolbox/scripts", post(toolbox::create_script))
+        .route(
+            "/toolbox/scripts/{id}",
+            get(toolbox::get_script)
+                .put(toolbox::update_script)
+                .delete(toolbox::delete_script),
+        )
+        .route("/toolbox/files", post(toolbox::upload_file))
+        .route(
+            "/toolbox/files/{id}",
+            put(toolbox::update_file).delete(toolbox::delete_file),
+        )
+        .route("/toolbox/files/{id}/content", get(toolbox::download_file))
+        .route("/script-runs", get(runs::list_runs))
+        .route("/script-runs/{id}", get(runs::get_run))
+        .route("/file-deliveries", get(runs::list_deliveries))
+        .route("/file-deliveries/{id}", get(runs::get_delivery))
+        .route("/remote/handoffs", post(handoffs::create))
         .layer(middleware::from_fn_with_state(state, csrf::check))
         // Responses carry account data; browsers and proxies must not keep them.
         .layer(SetResponseHeaderLayer::if_not_present(

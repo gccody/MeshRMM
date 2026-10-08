@@ -254,6 +254,9 @@ CREATE TABLE agents (
   auth_token_hash TEXT NOT NULL CHECK (length(auth_token_hash) = 64),
   -- A rotated credential the Agent has not used yet; using it promotes it.
   pending_auth_token_hash TEXT CHECK (pending_auth_token_hash IS NULL OR length(pending_auth_token_hash) = 64),
+  -- The same credential encrypted with the instance key, so it can be sent
+  -- again until the Agent uses it. Cleared with the hash.
+  pending_auth_token_encrypted BLOB,
   created_by_user_id TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
