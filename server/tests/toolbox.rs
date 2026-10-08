@@ -448,7 +448,8 @@ async fn script_runs_reach_the_agent_and_record_its_report() {
         assert_eq!(started.body["source"], "dashboard");
         assert_eq!(started.body["requested_by_you"], true);
         let run_id = started.body["id"].as_str().unwrap().to_owned();
-        let Some(AgentCommand::RunScript { run }) = connection.commands.recv().await else {
+        let Some(AgentCommand::RunScript { run }) = common::next_command(&mut connection).await
+        else {
             panic!("expected a script run");
         };
         assert_eq!(run.run_id, run_id);
@@ -642,7 +643,9 @@ async fn file_deliveries_let_the_agent_download_the_file_once() {
         assert_eq!(started.body["destination"], "public");
         assert_eq!(started.body["status"], "pending");
         let delivery_id = started.body["id"].as_str().unwrap().to_owned();
-        let Some(AgentCommand::DeliverFile { delivery }) = connection.commands.recv().await else {
+        let Some(AgentCommand::DeliverFile { delivery }) =
+            common::next_command(&mut connection).await
+        else {
             panic!("expected a delivery");
         };
         assert_eq!(delivery.delivery_id, delivery_id);

@@ -117,7 +117,7 @@ Nothing crosses the WebRTC session, so the toolbox works on the background
 desktop and with nobody signed in, where the viewer's own file transfers
 cannot. The viewer's toolbox acts for the user who started the session: the
 session record keeps their user ID, and the server checks the viewer's client
-token before serving that user's toolbox. A run or delivery starts only on an
+token before serving that user's toolbox with their current permissions. A run or delivery starts only on an
 undeleted, connected device; an offline device fails it at once.
 
 Uploads are written to a hidden partial file in `toolbox/`, checked, flushed
