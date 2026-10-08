@@ -1,4 +1,3 @@
-"use client";
 
 import { LoaderCircle, Play, SquareTerminal, X } from "lucide-react";
 import { type FormEvent, type RefObject, useEffect, useMemo, useState } from "react";

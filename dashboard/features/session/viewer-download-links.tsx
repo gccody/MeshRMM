@@ -1,4 +1,3 @@
-"use client";
 
 import { Download, MonitorDown } from "lucide-react";
 import { useViewerPlatform } from "./use-viewer-platform";

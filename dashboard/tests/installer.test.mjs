@@ -26,7 +26,7 @@ test("the digest is lowercase hex SHA-256", async () => {
 
 test("the enrollment follows the binary with its length and magic at the end", async () => {
   const binary = new Uint8Array([0x4d, 0x5a, 1, 2, 3]);
-  const bootstrap = { server: "https://acme.meshrmm.com", install_token: "t0ken", expires_at_unix_ms: 1_700_000_000_000 };
+  const bootstrap = { server: "https://rmm.example.com", install_token: "t0ken", expires_at_unix_ms: 1_700_000_000_000 };
   const installer = enrolledInstaller(binary.buffer, bootstrap);
   assert.equal(installer.type, "application/vnd.microsoft.portable-executable");
 
@@ -45,9 +45,9 @@ test("the enrollment follows the binary with its length and magic at the end", a
 });
 
 test("the Mac install command passes the enrollment as hex JSON", () => {
-  const bootstrap = { server: "https://acme.meshrmm.com", install_token: "ab".repeat(32), expires_at_unix_ms: 1 };
-  const command = macInstallCommand("https://acme.meshrmm.com/", bootstrap);
-  const match = command.match(/^curl -fsSL https:\/\/acme\.meshrmm\.com\/install-agent-macos\.sh \| sudo \/bin\/sh -s -- https:\/\/acme\.meshrmm\.com ([0-9a-f]+)$/);
+  const bootstrap = { server: "https://rmm.example.com", install_token: "ab".repeat(32), expires_at_unix_ms: 1 };
+  const command = macInstallCommand("https://rmm.example.com/", bootstrap);
+  const match = command.match(/^curl -fsSL https:\/\/rmm\.example\.com\/install-agent-macos\.sh \| sudo \/bin\/sh -s -- https:\/\/rmm\.example\.com ([0-9a-f]+)$/);
   assert.ok(match, command);
   assert.deepEqual(JSON.parse(Buffer.from(match[1], "hex").toString("utf8")), bootstrap);
 });

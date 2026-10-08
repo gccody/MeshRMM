@@ -1,138 +1,70 @@
-# MeshRMM Dashboard
+# MeshRMM website
 
-The MeshRMM dashboard is a vinext/React application hosted on Cloudflare. It
-uses WorkOS for user and organization identity and calls the Rust control-plane
-Worker for all tenant-scoped Agent operations. It serves marketing on
-`meshrmm.com`, the owner console on `admin.meshrmm.com`, and company dashboards
-on immutable `<slug>.meshrmm.com` hostnames.
+The website people use to manage a MeshRMM server: devices, the toolbox, users,
+roles, sign-in policy, settings, the audit log and their own account. It's a
+Vite + React + React Router app. The build prerenders every page to HTML, and
+the server (`meshrmm-server`) embeds the result and serves it from the same
+origin as its API. Nothing runs on Node in production.
 
-## Prerequisites
+## How it fits together
 
-- Node.js `>=22.13.0`
+- **Prerendered pages.** `npm run build` builds the browser bundle, then renders
+  each page in `src/pages.ts` with `react-dom/server` into `dist/` (`/` is
+  `index.html`, `/users` is `users/index.html`, and unknown paths get `404.html`).
+  Nobody is signed in at build time, so workspace pages render their heading over
+  a loading state, and the browser hydrates them and loads everything from `/v1`.
+  Render nothing in the first pass that depends on the browser (the URL's hash,
+  storage, the session) or hydration won't match.
+- **Content-Security-Policy.** The server sends `default-src 'self'` without
+  `'unsafe-inline'`, so pages can't use inline scripts, `<style>` elements or
+  `style` attributes in their HTML. `tests/prerender.test.mjs` checks this.
+- **Sessions.** Signing in sets an HttpOnly `__Host-meshrmm-session` cookie.
+  Every request that changes something sends `X-MeshRMM-Request: 1` (see
+  `lib/http.ts`), which the server requires along with its own `Origin`.
+  `features/auth/session.tsx` holds who is signed in; a 401 locks the workspace,
+  and other tabs hear about sign-in and sign-out through `localStorage`.
+- **Permissions.** Pages and controls follow the account's permissions
+  (`features/workspace/views.ts`, `features/toolbox/access.ts`); the server
+  enforces them regardless.
+- **Live devices.** `/v1/events` is a WebSocket authenticated by the cookie. It
+  sends a snapshot, then revision-numbered changes (`features/agents/inventory-stream.ts`).
 
 ## Local development
 
-`npm run dev` serves the dashboard at `http://localhost:3000`. With
-`MESHRMM_DEV_ROOT_DOMAIN=localhost`, it serves the production hosts under
-`localhost`: marketing at `localhost:3000`, the owner console at
-`admin.localhost:3000`, and each company at `<slug>.localhost:3000`. Browsers
-resolve every `*.localhost` name to this computer, and the setting lives only in
-the ignored `.dev.vars`, so it never affects a deployed Worker. Chrome, Edge and
-Firefox treat `http://*.localhost` as secure, so the `__Host-` session cookies
-work without HTTPS; Safari does not.
+Requires Node.js 22.13 or newer.
 
-1. Build the control-plane Worker once, and after server changes. When
-   `server/build/` exists, `npm run dev` runs it beside the dashboard, sharing
-   the local D1 database, and `/v1/` requests reach it:
+Run a server in proxy mode, for example with this `server.toml`:
 
-   ```bash
-   cd ../server && worker-build --profile server-release
-   ```
-
-2. Copy `.dev.vars.example` to `.dev.vars` and `../server/.dev.vars.example` to
-   `../server/.dev.vars`, then fill them in. Use a WorkOS **staging**
-   environment: set its client ID in both files, and in WorkOS add
-   `http://<slug>.localhost:3000` (and `http://admin.localhost:3000` for the owner
-   console) as redirect URIs and CORS origins.
-
-3. Create the local database and a fixture company. The organization ID is a
-   WorkOS staging organization that your staging user belongs to:
-
-   ```bash
-   npm install
-   npm run dev:seed -- acme org_01...
-   npm run dev
-   ```
-
-   Then open `http://acme.localhost:3000`. The seed only writes local state
-   under `.wrangler/`; run it again after new migrations.
-
-The Agent list does not load locally. It arrives over a WebSocket that the
-control plane advertises as `wss://<slug>.<root>/v1/agents/events`, without the
-dev server's port or scheme. Sign-in, account and settings, and the owner
-console work; remote sessions, enrollment and installer downloads need the
-production configuration.
-
-## Deployment
-
-Deploy the dashboard only through the **Publish native release** GitHub Actions
-workflow. A deployment replaces every published Agent and viewer download, and
-`public/downloads/` is not committed, so a deployment from a normal checkout
-would remove them or publish local builds. `npm run deploy` refuses to run unless
-the workflow set `MESHRMM_RELEASE_DEPLOY=1` and `public/downloads/` holds the
-complete release for `release.json`'s version. To publish a dashboard change
-without a new native version, run the workflow manually. Use
-`npm run deploy:dry-run` to check a build without deploying. See
-[automated native releases](../docs/native-releases.md).
-
-Application code is organized by responsibility:
-
-- `app/` contains route composition and providers. The company pages live in the
-  `(workspace)` route group, whose layout keeps the workspace shell mounted while
-  the user moves between them.
-- `features/agents/` owns Agent models, event-stream synchronization, the Devices
-  panel, and its URL filters.
-- `features/enrollment/` owns installer enrollment UI and the enrolled installer download.
-- `features/session/` owns organization-scoped dashboard inactivity handling and
-  remote viewer handoffs.
-- `features/settings/` owns the company settings page.
-- `features/workspace/` owns the company dashboard shell and the context it shares
-  with each page, account loading, and the account dialog.
-- `features/workos/` owns the WorkOS user and authentication administration panels.
-- `features/platform/` owns invite-only company provisioning for the platform owner.
-- `features/marketing/` owns the public root-domain experience.
-- `lib/` contains shared behavior: HTTP helpers, host classification (and the
-  request's surface on the server), and the accessible modal dialog.
-- `wrangler.jsonc` owns the production Worker, domain, and runtime settings.
-
-## Session policy
-
-The dashboard Worker manages the public WorkOS PKCE flow and stores refresh
-tokens in an encrypted, host-only `Secure; HttpOnly; SameSite=Lax` cookie.
-Short-lived access tokens are held only in browser memory for API requests and
-WorkOS Widgets. No paid WorkOS custom domain is required. Reloading restores the
-session through a same-origin endpoint; sign-out clears the cookie and revokes
-the WorkOS session. Existing users must sign in once after this migration.
-
-Before deploying, configure `DASHBOARD_SESSION_KEY` as a dashboard Worker secret:
-
-```sh
-openssl rand -base64 32 | npx wrangler secret put DASHBOARD_SESSION_KEY
+```toml
+public_url = "https://localhost"
+data_dir = "/tmp/meshrmm-dev"
+tls.mode = "proxy"
+turn.enabled = false
 ```
 
-Keep this key stable across deployments. Rotating it invalidates all dashboard
-sessions. Never put it in `wrangler.jsonc` or browser environment variables. Local
-development can set it in an ignored `.dev.vars` file; use an HTTPS local origin
-for secure session cookies. The existing WorkOS root callback URLs, CORS origins,
-and `https://meshrmm.com` sign-out URL remain valid. The Worker uses WorkOS's
-public PKCE code and refresh grants without an API key. Session endpoints reject
-cross-origin requests, including other tenant subdomains; transient WorkOS
-failures preserve the cookie for retry. Browser Web Locks serialize refresh and
-sign-out across tabs where supported.
+```bash
+cargo run -p meshrmm-server -- -c server.toml   # prints the first-run setup link
+cd dashboard
+npm install
+npm run dev                                      # http://localhost:5173
+```
 
-MeshRMM enforces a per-organization dashboard inactivity timeout. New
-organizations default to four hours, and organization administrators can change
-the value under **Settings → Dashboard security**. Expiry locks the dashboard and ends the
-WorkOS session without navigating away; the user deliberately resumes through
-WorkOS when they return.
+The dev server proxies `/v1`, `/downloads` and `/healthz` to the server
+(`MESHRMM_SERVER`, default `http://127.0.0.1:8080`) and presents the server's
+public origin (`MESHRMM_PUBLIC_URL`, default `https://localhost`) so its
+same-origin checks pass. Open the setup link from the server's log with
+`http://localhost:5173` in place of its origin. Chrome, Edge and Firefox treat
+`localhost` as secure, so the `__Host-` cookie works over HTTP there; Safari
+doesn't.
 
-WorkOS also has an application-wide inactivity timeout based on token refreshes.
-Set it in the WorkOS Dashboard under **Applications → Sessions** to at least the
-largest MeshRMM organization timeout (24 hours). If it remains at five minutes,
-WorkOS can expire a suspended browser tab before MeshRMM's tenant policy does.
-MeshRMM automatically refreshes WorkOS tokens while the page is in the background,
-so an open dashboard remains active whenever the browser is still running it.
+To try the embedded build instead, run `npm run build` and restart the server:
+debug builds read `dist/` when they start, release builds embed it.
 
-See [company domains and provisioning](../docs/company-domains.md) for wildcard
-DNS, WorkOS redirect/CORS configuration, owner identity, and deployment order.
+## Checks
 
-## Verification
+```bash
+npm run verify   # typecheck, lint, build, and the tests in tests/
+```
 
-- `npm run typecheck`: validate browser and Cloudflare types.
-- `npm run lint`: run the TypeScript, React, accessibility, and Next rules.
-- `npm test`: build and run session-security, rendered-shell, and Agent model tests.
-- `npm run verify`: run the complete dashboard verification sequence.
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
+The tests run on Node's test runner with type stripping, so modules they import
+carry `.ts` extensions and avoid JSX.

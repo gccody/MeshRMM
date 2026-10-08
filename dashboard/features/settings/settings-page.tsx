@@ -1,9 +1,8 @@
-"use client";
 
-import { Clock3, LoaderCircle } from "lucide-react";
-import { type FormEvent, useState } from "react";
-import { AuthenticationRequired, type AuthorizedFetch, errorMessage } from "../../lib/http";
-import type { Account, Company } from "../workspace/types";
+import { Clock3, LoaderCircle, RefreshCw } from "lucide-react";
+import { type FormEvent, useEffect, useState } from "react";
+import { AuthenticationRequired, errorText, expectJson, jsonBody } from "../../lib/http";
+import { useWorkspace } from "../workspace/workspace-context";
 import {
   DEFAULT_BLACKOUT_MESSAGE,
   DEFAULT_CONNECTION_APPROVAL_MESSAGE,
@@ -11,10 +10,12 @@ import {
   IDLE_DISCONNECT_MINUTES,
   MAX_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS,
   MAX_CONNECTION_APPROVAL_TIMEOUT_SECONDS,
+  MAX_INSTANCE_NAME_LENGTH,
   MIN_CONNECTION_APPROVAL_TIMEOUT_SECONDS,
   SETTINGS_TABS,
-  companySettingsBody,
-  draftMatchesCompany,
+  type GeneralSettings,
+  settingsBody,
+  draftMatchesSettings,
   formatIdleDisconnect,
   isBlackoutMessageValid,
   isConnectionApprovalDraftValid,
@@ -22,28 +23,46 @@ import {
   isConnectionApprovalMessageValid,
   isConnectionApprovalTimeoutValid,
   isConnectionNotificationMessageValid,
+  isInstanceNameValid,
   settingsTabForKey,
-} from "./company-settings";
-import type { SettingsDraft } from "./use-settings-draft";
+} from "./general-settings";
 
 // A cleared number field holds NaN in the draft, which the input shows empty.
 const numberInputValue = (value: number) => (Number.isNaN(value) ? "" : value);
 
-type Props = {
-  company: Company | null | undefined;
-  isAdmin: boolean;
-  displayName: string;
-  authorizedFetch: AuthorizedFetch;
-  onSaved: (account: Account) => void;
-  // Owned by the workspace shell so unsaved edits survive navigation.
-  settingsDraft: SettingsDraft;
-};
-
-export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, onSaved, settingsDraft }: Props) {
+// The server's name and the remote session policy. The workspace shell
+// keeps the loaded settings and the unsaved draft, so edits survive moving
+// to another page and back.
+export function SettingsPanel() {
+  const { account, authorizedFetch, refreshAccount, settings, setSettings, settingsDraft } = useWorkspace();
+  const displayName = account.user.display_name;
   const { draft, updateDraft, settingsTab, setSettingsTab } = settingsDraft;
   const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
+
+  // Loads once per visit to the workspace; the shell keeps them after that.
+  useEffect(() => {
+    if (settings) return;
+    let cancelled = false;
+    authorizedFetch("/v1/settings")
+      .then((response) => expectJson<GeneralSettings>(response, "The settings could not be loaded."))
+      .then(
+        (loaded) => {
+          if (!cancelled) setSettings(loaded);
+        },
+        (error: unknown) => {
+          if (!cancelled && !(error instanceof AuthenticationRequired)) setLoadError(errorText(error, "The settings could not be loaded."));
+        },
+      );
+    return () => {
+      cancelled = true;
+    };
+  }, [authorizedFetch, loadAttempt, setSettings, settings]);
+
+  const instanceNameValid = isInstanceNameValid(draft.instanceName);
 
   const blackoutMessageValid = isBlackoutMessageValid(draft.blackoutMessage);
   const notificationMessageValid = isConnectionNotificationMessageValid(draft.connectionNotificationMessage);
@@ -55,19 +74,14 @@ export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, o
     setSettingsNotice(null);
     setSaveError(null);
     try {
-      const response = await authorizedFetch("/v1/company/settings", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(companySettingsBody(draft)),
-      });
-      if (!response.ok) {
-        throw new Error(await errorMessage(response, "The session policy could not be saved."));
-      }
-      onSaved((await response.json()) as Account);
-      setSettingsNotice("Company settings saved. Remote defaults apply to new sessions.");
+      const response = await authorizedFetch("/v1/settings", jsonBody(settingsBody(draft), "PATCH"));
+      setSettings(await expectJson<GeneralSettings>(response, "The settings could not be saved."));
+      setSettingsNotice("Settings saved. Remote session defaults apply to new sessions.");
+      // The server's name and idle timeout reach every page through these.
+      void refreshAccount().catch(() => {});
     } catch (requestError) {
       if (!(requestError instanceof AuthenticationRequired)) {
-        setSaveError(requestError instanceof Error ? requestError.message : "The session policy could not be saved.");
+        setSaveError(errorText(requestError, "The settings could not be saved."));
       }
     } finally {
       setIsSaving(false);
@@ -97,14 +111,19 @@ export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, o
           >{tab.label}</button>
         ))}
       </div>
-      {!company ? <p role="status">Loading company settings…</p> : <>
-        {!isAdmin && <p className="session-notice">Company settings are managed by your administrator.</p>}
+      {!settings ? (
+        loadError
+          ? <div className="management-panel account-status"><p role="alert">{loadError}</p><button type="button" className="secondary-button" onClick={() => { setLoadError(null); setLoadAttempt((attempt) => attempt + 1); }}><RefreshCw size={16} /> Try again</button></div>
+          : <p role="status">Loading settings…</p>
+      ) : <>
         <form className="company-settings-form" onSubmit={saveSettings}>
-          <fieldset disabled={!isAdmin || isSaving}>
-            <section className="settings-section" id="dashboard-security" role="tabpanel" aria-labelledby="settings-tab-dashboard-security" hidden={settingsTab !== "dashboard-security"} tabIndex={0}>
-              <h2>Dashboard security</h2>
-              <p>Choose when an inactive dashboard session is paused.</p>
-              <label htmlFor="idle-timeout">Sign out inactive dashboards after<select id="idle-timeout" value={draft.idleTimeoutMinutes} onChange={(event) => updateDraft({ idleTimeoutMinutes: Number(event.target.value) })}>
+          <fieldset disabled={isSaving}>
+            <section className="settings-section" id="general" role="tabpanel" aria-labelledby="settings-tab-general" hidden={settingsTab !== "general"} tabIndex={0}>
+              <h2>General</h2>
+              <p>The server&apos;s name appears in the website, in emails and in authenticator apps.</p>
+              <label htmlFor="instance-name">Server name<input id="instance-name" required maxLength={MAX_INSTANCE_NAME_LENGTH} value={draft.instanceName} onChange={(event) => updateDraft({ instanceName: event.target.value })} aria-invalid={!instanceNameValid} />
+              </label>
+              <label htmlFor="idle-timeout">Sign out browsers inactive for<select id="idle-timeout" value={draft.idleTimeoutMinutes} onChange={(event) => updateDraft({ idleTimeoutMinutes: Number(event.target.value) })}>
                 <option value={5}>5 minutes</option>
                 <option value={15}>15 minutes</option>
                 <option value={30}>30 minutes</option>
@@ -195,13 +214,14 @@ export function SettingsPage({ company, isAdmin, displayName, authorizedFetch, o
               <p id="connection-approval-lock-idle-help">Between 0 and {MAX_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS} seconds. Nobody is at a device that sits locked, so the technician does not wait. Use 0 to accept whenever the device is locked or nobody is signed in.</p>
             </section>
           </fieldset>
+          {settingsTab !== "general" && !instanceNameValid && <p role="alert">Check the server name before saving: it needs 1 to {MAX_INSTANCE_NAME_LENGTH} characters.</p>}
           {settingsTab !== "blackout" && !blackoutMessageValid && <p role="alert">Check the blackout message before saving: it must contain text and be no larger than 2 KB.</p>}
           {settingsTab !== "connection-notification" && !notificationMessageValid && <p role="alert">Check the connection notification message before saving: it must contain text and be no larger than 512 bytes.</p>}
           {settingsTab !== "connection-approval" && !approvalValid && <p role="alert">Check the connection approval settings before saving.</p>}
-          {isAdmin && <div className="settings-save">
+          <div className="settings-save">
             {saveError && <p className="settings-save-error" role="alert">{saveError}</p>}
-            <button className="primary-button" disabled={isSaving || !blackoutMessageValid || !notificationMessageValid || !approvalValid || draftMatchesCompany(draft, company)}>{isSaving ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save company settings</button>
-          </div>}
+            <button className="primary-button" disabled={isSaving || !instanceNameValid || !blackoutMessageValid || !notificationMessageValid || !approvalValid || draftMatchesSettings(draft, settings)}>{isSaving ? <LoaderCircle size={16} className="spin" /> : <Clock3 size={16} />} Save settings</button>
+          </div>
           {settingsNotice && <p role="status" className="session-notice">{settingsNotice}</p>}
         </form>
       </>}

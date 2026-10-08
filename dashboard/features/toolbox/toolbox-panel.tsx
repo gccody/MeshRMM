@@ -1,4 +1,3 @@
-"use client";
 
 import {
   CircleAlert,
@@ -22,7 +21,7 @@ import {
   X,
 } from "lucide-react";
 import { type KeyboardEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AuthenticationRequired } from "../../lib/http";
+import { AuthenticationRequired, errorText } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
 import type { Agent } from "../agents/types";
 import { useWorkspace } from "../workspace/workspace-context";
@@ -44,6 +43,7 @@ import {
 import { RunResult, useScriptRun } from "./run-result";
 import { RunScriptModal } from "./run-script-modal";
 import { ScriptEditor } from "./script-editor";
+import { toolboxAccess } from "./access";
 import { deleteFile, deleteScript, downloadFile, fetchRuns, fetchToolbox } from "./toolbox-api";
 
 type Tab = "scripts" | "files" | "runs";
@@ -61,13 +61,14 @@ type Dialog =
   | { kind: "file"; file: ToolboxFile }
   | { kind: "run-details"; run: ScriptRun };
 
-const errorText = (error: unknown, fallback: string) => (error instanceof Error ? error.message : fallback);
 
-// The company's scripts and library files, and the runs of those scripts.
+// The toolbox's scripts and library files, and the runs of those scripts.
 // Each item is private to the user who added it unless they share it.
 export function ToolboxPanel() {
-  const { authorizedFetch, inventory } = useWorkspace();
-  const [tab, setTab] = useState<Tab>("scripts");
+  const { authorizedFetch, inventory, can } = useWorkspace();
+  const access = toolboxAccess(can);
+  const tabs = TABS.filter(({ id }) => access.tabs.includes(id));
+  const [tab, setTab] = useState<Tab>(access.tabs[0] ?? "scripts");
   const [toolbox, setToolbox] = useState<Toolbox | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -170,7 +171,7 @@ export function ToolboxPanel() {
     const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
     if (!step) return;
     event.preventDefault();
-    const next = TABS[(index + step + TABS.length) % TABS.length].id;
+    const next = tabs[(index + step + tabs.length) % tabs.length].id;
     selectTab(next);
     document.getElementById(`toolbox-tab-${next}`)?.focus();
   };
@@ -189,7 +190,7 @@ export function ToolboxPanel() {
       <section className="agent-panel toolbox-panel">
         <div className="panel-header">
           <div className="toolbox-tabs" role="tablist" aria-label="Toolbox">
-            {TABS.map(({ id, label, icon: Icon }, index) => (
+            {tabs.map(({ id, label, icon: Icon }, index) => (
               <button
                 key={id}
                 id={`toolbox-tab-${id}`}
@@ -209,10 +210,10 @@ export function ToolboxPanel() {
           </div>
           <div className="heading-actions">
             {tab === "scripts" && <>
-              <button className="secondary-button" onClick={(event) => open({ kind: "run" }, event)} disabled={!scripts.length}><SquareTerminal size={16} /> Run a script</button>
-              <button className="primary-button" onClick={(event) => open({ kind: "script", script: null }, event)}><Plus size={16} /> New script</button>
+              {access.runScripts && <button className="secondary-button" onClick={(event) => open({ kind: "run" }, event)} disabled={!scripts.length}><SquareTerminal size={16} /> Run a script</button>}
+              {access.addScripts && <button className="primary-button" onClick={(event) => open({ kind: "script", script: null }, event)}><Plus size={16} /> New script</button>}
             </>}
-            {tab === "files" && <button className="primary-button" onClick={(event) => open({ kind: "upload" }, event)}><Upload size={16} /> Upload files</button>}
+            {tab === "files" && access.addFiles && <button className="primary-button" onClick={(event) => open({ kind: "upload" }, event)}><Upload size={16} /> Upload files</button>}
             {tab === "runs" && <button className="secondary-button" onClick={() => setRunsVersion((version) => version + 1)}><RefreshCw size={16} /> Refresh</button>}
           </div>
         </div>
@@ -220,7 +221,7 @@ export function ToolboxPanel() {
         {tab !== "runs" && (
           <div className="table-toolbar">
             <label className="agent-search"><Search size={18} /><input aria-label={`Search ${tab}`} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search by name, folder or description" /></label>
-            <span className="toolbox-hint"><Lock size={14} aria-hidden="true" /> Private items are only yours. Shared items are the whole company&apos;s.</span>
+            <span className="toolbox-hint"><Lock size={14} aria-hidden="true" /> Private items are only yours. Shared items are everyone&apos;s.</span>
           </div>
         )}
 
@@ -241,7 +242,7 @@ export function ToolboxPanel() {
                 </div>
                 <SharingBadge item={script} />
                 <div className="row-actions">
-                  <button className="remote-button" onClick={(event) => open({ kind: "run", scriptId: script.id }, event)}><Play size={15} /> Run</button>
+                  {access.runScripts && <button className="remote-button" onClick={(event) => open({ kind: "run", scriptId: script.id }, event)}><Play size={15} /> Run</button>}
                   <button className="close-session-button" onClick={(event) => open({ kind: "script", script }, event)} aria-label={`${script.can_edit ? "Edit" : "View"} ${script.name}`} title={script.can_edit ? "Edit" : "View"}>{script.can_edit ? <Pencil size={16} /> : <Eye size={16} />}</button>
                   {script.can_edit && <button className="agent-delete-button" onClick={() => void removeScript(script)} disabled={busyId === script.id} aria-label={`Delete ${script.name}`} title="Delete">{busyId === script.id ? <LoaderCircle size={16} className="spin" /> : <Trash2 size={16} />}</button>}
                 </div>
@@ -284,6 +285,7 @@ export function ToolboxPanel() {
       {dialog?.kind === "script" && (
         <ScriptEditor
           script={dialog.script}
+          sharing={access.shareScripts ? (access.keepPrivateScripts ? "optional" : "required") : "unavailable"}
           folders={folders}
           onClose={close}
           onSaved={(saved, id) => { replaceScript(saved, id); close(); }}
@@ -302,6 +304,8 @@ export function ToolboxPanel() {
       {dialog?.kind === "upload" && (
         <UploadFilesModal
           folders={folders}
+          maxBytes={toolbox?.max_file_bytes ?? null}
+          sharing={access.shareFiles ? (access.keepPrivateFiles ? "optional" : "required") : "unavailable"}
           onClose={close}
           onUploaded={(file) => replaceFile(file, file.id)}
           returnFocus={opener}
@@ -310,6 +314,8 @@ export function ToolboxPanel() {
       {dialog?.kind === "file" && (
         <FileDetailsModal
           file={dialog.file}
+          canShare={access.shareFiles}
+          canKeepPrivate={access.keepPrivateFiles}
           folders={folders}
           onClose={close}
           onSaved={(saved, id) => { replaceFile(saved, id); close(); }}
@@ -325,7 +331,7 @@ export function ToolboxPanel() {
 
 function SharingBadge({ item }: { item: { shared: boolean; owned: boolean } }) {
   return item.shared
-    ? <span className="toolbox-badge toolbox-badge-shared" title="Everyone in the company can see and use it"><Users size={13} aria-hidden="true" />{item.owned ? "Shared" : "Shared by a teammate"}</span>
+    ? <span className="toolbox-badge toolbox-badge-shared" title="Everyone with access to the toolbox can see and use it"><Users size={13} aria-hidden="true" />{item.owned ? "Shared" : "Shared by a teammate"}</span>
     : <span className="toolbox-badge" title="Only you can see and use it"><Lock size={13} aria-hidden="true" />Private</span>;
 }
 
@@ -378,14 +384,14 @@ function RunHistory({ version, agents, onOpen }: { version: number; agents: Agen
 
   if (error && !runs) return <div className="empty-state"><CircleAlert size={28} /><strong>Recent runs could not be loaded</strong><span role="alert">{error}</span></div>;
   if (!runs) return <div className="empty-state"><LoaderCircle size={28} className="spin" /><strong>Loading recent runs…</strong></div>;
-  if (!runs.length) return <div className="empty-state"><History size={28} /><strong>No runs yet</strong><span>Runs from the dashboard and from remote sessions appear here for 30 days.</span></div>;
+  if (!runs.length) return <div className="empty-state"><History size={28} /><strong>No runs yet</strong><span>Runs from the website and from remote sessions appear here for 30 days.</span></div>;
   return (
     <table className="run-table" aria-label="Recent script runs">
       <thead><tr><th scope="col">Script</th><th scope="col">Device</th><th scope="col">Run as</th><th scope="col">Result</th><th scope="col">Started</th><th scope="col"><span className="sr-only">Details</span></th></tr></thead>
       <tbody>
         {runs.map((run) => (
           <tr key={run.id}>
-            <td><strong>{run.script_name}</strong><span>{run.source === "session" ? "From a remote session" : "From the dashboard"}{run.requested_by_you ? "" : " · by a teammate"}</span></td>
+            <td><strong>{run.script_name}</strong><span>{run.source === "session" ? "From a remote session" : "From the website"}{run.requested_by_you ? "" : " · by a teammate"}</span></td>
             <td>{names.get(run.device_id) ?? run.device_id}</td>
             <td>{ranAsLabel(run)}</td>
             <td><span className={`run-pill run-pill-${runTone(run)}`}>{runOutcome(run)}</span></td>

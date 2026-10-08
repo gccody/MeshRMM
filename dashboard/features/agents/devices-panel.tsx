@@ -1,14 +1,13 @@
-"use client";
 
 import { CircleAlert, X } from "lucide-react";
-import { useSearchParams } from "next/navigation";
+import { useSearchParams } from "react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ConnectionReasonModal } from "../session/connection-reason-modal";
 import { ViewerLaunchNotice } from "../session/viewer-launch-notice";
 import { RunScriptModal } from "../toolbox/run-script-modal";
 import { type ActionErrorSource, listActionErrors } from "../workspace/action-errors";
 import { useWorkspace } from "../workspace/workspace-context";
-import { AgentOverview } from "./agent-overview";
+import { AgentOverview, type DeviceActions } from "./agent-overview";
 import type { Agent } from "./types";
 import {
   type AgentStatusFilter,
@@ -26,26 +25,29 @@ const DEVICE_ACTIONS: readonly ActionErrorSource[] = ["remote", "close-session",
 // Safari rate-limits history updates, so typing reaches the URL in batches.
 const QUERY_WRITE_DELAY_MS = 250;
 
-// Updates the address bar without a server round trip. vinext's patched
-// replaceState updates useSearchParams(); router.replace would refetch the page.
-// A null state lets the router keep its own history metadata.
-function writeFilters(filters: DeviceFilters) {
-  const { pathname, hash } = window.location;
-  window.history.replaceState(null, "", `${pathname}${serializeDeviceFilters(filters)}${hash}`);
-}
-
 export function DevicesPanel() {
-  const { inventory, remote, company, deleteAgent, deletingId, isAdmin, setDevicesSearch, actionErrors, reportActionError } = useWorkspace();
+  const { account, can, inventory, remote, deleteAgent, deletingId, setDevicesSearch, actionErrors, reportActionError } = useWorkspace();
+  const [searchParams, setSearchParams] = useSearchParams();
+  // Filters replace the history entry, so Back leaves the page.
+  const writeFilters = (next: DeviceFilters) => setSearchParams(new URLSearchParams(serializeDeviceFilters(next)), { replace: true });
+  const allowed: DeviceActions = {
+    connect: can("sessions.connect"),
+    connectBackground: can("sessions.connect_background"),
+    closeSession: can("sessions.connect") || can("sessions.close_any"),
+    runScripts: can("scripts.run"),
+    delete: can("devices.delete"),
+    enroll: can("devices.enroll"),
+  };
   // A connection the device's user must approve, waiting for its reason.
   const [pendingConnect, setPendingConnect] = useState<{ agent: Agent; background: boolean } | null>(null);
   // The device a script is about to run on, and the button that asked.
   const [runScriptOn, setRunScriptOn] = useState<Agent | null>(null);
   const runScriptOpener = useRef<HTMLElement | null>(null);
   const requestConnect = (agent: Agent, background: boolean) => {
-    if (company?.connection_approval) setPendingConnect({ agent, background });
+    if (account.connection_approval) setPendingConnect({ agent, background });
     else void remote.connect(agent, background);
   };
-  const filters = parseDeviceFilters(useSearchParams());
+  const filters = parseDeviceFilters(searchParams);
   const status = filters.status;
   // The search box updates at once; the URL follows after a pause in typing.
   const [queryInput, setQueryInput] = useState(filters.query);
@@ -61,6 +63,8 @@ export function DevicesPanel() {
     if (queryInput === filters.query) return;
     const timer = window.setTimeout(() => writeFilters({ query: queryInput, status }), QUERY_WRITE_DELAY_MS);
     return () => window.clearTimeout(timer);
+    // writeFilters changes with the URL, which this effect already follows.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filters.query, queryInput, status]);
 
   // The Devices link carries the filters, including any not yet in the URL.
@@ -97,7 +101,7 @@ export function DevicesPanel() {
         connectingBackgroundId={remote.connectingBackgroundId}
         deletingId={deletingId}
         closingId={remote.closingId}
-        canDelete={isAdmin}
+        allowed={allowed}
         onQueryChange={(query) => setQueryInput(clampDeviceQuery(query))}
         onStatusChange={changeStatus}
         onRemote={(agent) => requestConnect(agent, false)}
