@@ -29,6 +29,7 @@ use crate::{
     db::Database,
     health,
     realtime::{AgentHub, Presence, Sessions},
+    scim,
     secrets::InstanceKey,
     storage::Storage,
     turn::Turn,
@@ -62,6 +63,7 @@ pub fn router(state: AppState) -> Router {
     let router = Router::new()
         .route("/healthz", get(health::healthz))
         .nest("/v1", api::router(state.clone()))
+        .nest("/scim/v2", scim::router())
         .nest_service("/downloads", ServeDir::new(&state.config.downloads.dir))
         .fallback_service(website)
         .with_state(state);
@@ -150,6 +152,10 @@ impl ApiError {
 
     pub fn code(&self) -> Option<&'static str> {
         self.code
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 

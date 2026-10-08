@@ -6,7 +6,10 @@ import { QrCode } from "../../lib/qr-code";
 import { useResource } from "../../lib/use-resource";
 import { NewPasswordFields, newPasswordProblem } from "../auth/password-fields";
 import { useSession } from "../auth/session";
+import { signInMethodLabel } from "../auth/sign-in";
 import { useWorkspace } from "../workspace/workspace-context";
+import { twoFactorSummary } from "./model";
+import { PasskeysSection } from "./passkeys-section";
 import { PasswordPrompt, RecoveryCodes } from "./security-dialogs";
 
 // The signed-in user's own account. While the server requires two-factor
@@ -20,7 +23,7 @@ export function AccountPanel() {
       {enrolling && (
         <div className="error-banner enrollment-banner" role="alert">
           <ShieldCheck size={17} aria-hidden="true" />
-          <span>This server requires two-factor authentication. Set up an authenticator app below to continue.</span>
+          <span>This server requires two-factor authentication. Add a passkey or set up an authenticator app below to continue.</span>
         </div>
       )}
       <TwoFactorSection />
@@ -142,6 +145,8 @@ type TotpSetup = { secret: string; otpauth_uri: string };
 
 type Dialog = "start" | "disable" | "regenerate" | null;
 
+// The second factors: an authenticator app and passkeys, each optional, and
+// the recovery codes that stand in for them.
 function TwoFactorSection() {
   const { account, authorizedFetch, refreshAccount, instanceName } = useWorkspace();
   const { two_factor: twoFactor } = account;
@@ -153,12 +158,20 @@ function TwoFactorSection() {
   // Codes the server just issued; they are never shown again.
   const [codes, setCodes] = useState<string[] | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Removing the last second factor isn't allowed while the server requires one.
+  const totpRequired = twoFactor.required && twoFactor.passkeys === 0;
+
+  const showCodes = (issued: string[]) => {
+    setCodes(issued);
+    setNotice(null);
+  };
 
   const startSetup = async (password: string) => {
     const response = await authorizedFetch("/v1/account/two-factor/totp", jsonBody({ password }));
     setSetup(await expectJson<TotpSetup>(response, "Two-factor setup could not start."));
     setCode("");
     setError(null);
+    setNotice(null);
     setDialog(null);
   };
 
@@ -168,10 +181,11 @@ function TwoFactorSection() {
     setError(null);
     try {
       const response = await authorizedFetch("/v1/account/two-factor/totp/confirm", jsonBody({ code: code.replace(/\s/g, "") }));
-      const { recovery_codes } = await expectJson<{ recovery_codes: string[] }>(response, "The code could not be checked.");
+      // No codes when a passkey already turned two-factor on: the user keeps theirs.
+      const { recovery_codes } = await expectJson<{ recovery_codes: string[] | null }>(response, "The code could not be checked.");
       setSetup(null);
-      setCodes(recovery_codes);
-      setNotice(null);
+      if (recovery_codes) showCodes(recovery_codes);
+      else setNotice("Your authenticator app is set up.");
       await refreshAccount().catch(() => {});
     } catch (failure) {
       if (!(failure instanceof AuthenticationRequired)) setError(errorText(failure, "The code could not be checked."));
@@ -181,10 +195,10 @@ function TwoFactorSection() {
   };
 
   const disable = async (password: string) => {
-    await expectOk(await authorizedFetch("/v1/account/two-factor/totp/disable", jsonBody({ password })), "Two-factor authentication could not be turned off.");
+    await expectOk(await authorizedFetch("/v1/account/two-factor/totp/disable", jsonBody({ password })), "The authenticator app could not be removed.");
     setDialog(null);
     setCodes(null);
-    setNotice("Two-factor authentication is off.");
+    setNotice(twoFactor.passkeys > 0 ? "Your authenticator app was removed." : "Your authenticator app was removed. Two-factor authentication is off.");
     await refreshAccount();
   };
 
@@ -192,71 +206,102 @@ function TwoFactorSection() {
     const response = await authorizedFetch("/v1/account/two-factor/recovery-codes", jsonBody({ password }));
     const { recovery_codes } = await expectJson<{ recovery_codes: string[] }>(response, "New recovery codes could not be made.");
     setDialog(null);
-    setCodes(recovery_codes);
-    setNotice(null);
+    showCodes(recovery_codes);
   };
 
   let body;
   if (codes) {
     body = (
       <>
-        <p className="form-notice" role="status"><CircleCheck size={15} aria-hidden="true" /> Save these recovery codes somewhere safe. If you lose your phone, each one signs you in once. They won&apos;t be shown again.</p>
+        <p className="form-notice" role="status"><CircleCheck size={15} aria-hidden="true" /> Save these recovery codes somewhere safe. If you lose your phone or passkeys, each one signs you in once. They won&apos;t be shown again.</p>
         <RecoveryCodes codes={codes} instanceName={instanceName} email={account.user.email} />
         <div><button type="button" className="primary-button" onClick={() => setCodes(null)}>I&apos;ve saved my codes</button></div>
       </>
     );
-  } else if (setup) {
-    body = (
-      <div className="totp-setup">
-        <QrCode text={setup.otpauth_uri} label="QR code for your authenticator app" />
-        <div>
-          <ol className="totp-steps">
-            <li>Open an authenticator app, such as 1Password, Google Authenticator or Microsoft Authenticator, and add an account.</li>
-            <li>Scan the QR code, or enter this key: <code className="totp-secret">{setup.secret}</code></li>
-            <li>Enter the 6-digit code the app shows.</li>
-          </ol>
-          <form className="form-stack" onSubmit={(event) => void confirm(event)}>
-            <label htmlFor="totp-code">Code from the app
-              <input id="totp-code" inputMode="numeric" autoComplete="one-time-code" required value={code} onChange={(event) => setCode(event.target.value)} />
-            </label>
-            {error && <p role="alert" className="form-error">{error}</p>}
-            <div className="form-actions">
-              <button className="primary-button" disabled={busy}>{busy && <LoaderCircle size={16} className="spin" />} Turn on</button>
-              <button type="button" className="secondary-button" onClick={() => setSetup(null)} disabled={busy}>Cancel</button>
-            </div>
-          </form>
-        </div>
-      </div>
-    );
-  } else if (twoFactor.enabled) {
-    body = (
-      <>
-        <p className="two-factor-status on"><CircleCheck size={16} aria-hidden="true" /> On, with an authenticator app. {twoFactor.recovery_codes_remaining === 1 ? "1 recovery code left." : `${twoFactor.recovery_codes_remaining} recovery codes left.`}</p>
-        {twoFactor.recovery_codes_remaining <= 3 && <p className="field-help field-problem">You&apos;re running out of recovery codes. Get new ones so you can still sign in without your phone.</p>}
-        <div className="form-actions">
-          <button type="button" className="secondary-button" onClick={() => setDialog("regenerate")}><RefreshCw size={15} /> New recovery codes</button>
-          {!twoFactor.required && <button type="button" className="danger-button" onClick={() => setDialog("disable")}><ShieldOff size={15} /> Turn off</button>}
-        </div>
-        {twoFactor.required && <p className="field-help">This server requires two-factor authentication, so it can&apos;t be turned off.</p>}
-      </>
-    );
   } else {
+    let totp;
+    if (setup) {
+      totp = (
+        <div className="totp-setup">
+          <QrCode text={setup.otpauth_uri} label="QR code for your authenticator app" />
+          <div>
+            <ol className="totp-steps">
+              <li>Open an authenticator app, such as 1Password, Google Authenticator or Microsoft Authenticator, and add an account.</li>
+              <li>Scan the QR code, or enter this key: <code className="totp-secret">{setup.secret}</code></li>
+              <li>Enter the 6-digit code the app shows.</li>
+            </ol>
+            <form className="form-stack" onSubmit={(event) => void confirm(event)}>
+              <label htmlFor="totp-code">Code from the app
+                <input id="totp-code" inputMode="numeric" autoComplete="one-time-code" required value={code} onChange={(event) => setCode(event.target.value)} />
+              </label>
+              {error && <p role="alert" className="form-error">{error}</p>}
+              <div className="form-actions">
+                <button className="primary-button" disabled={busy}>{busy && <LoaderCircle size={16} className="spin" />} Turn on</button>
+                <button type="button" className="secondary-button" onClick={() => setSetup(null)} disabled={busy}>Cancel</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      );
+    } else if (twoFactor.totp) {
+      totp = (
+        <>
+          <p className="two-factor-status on"><CircleCheck size={16} aria-hidden="true" /> Set up.</p>
+          {totpRequired
+            ? <p className="field-help">This server requires two-factor authentication. Add a passkey before removing your authenticator app.</p>
+            : <div><button type="button" className="danger-button" onClick={() => setDialog("disable")}><ShieldOff size={15} /> Remove authenticator app</button></div>}
+        </>
+      );
+    } else {
+      totp = (
+        <>
+          <div><button type="button" className={twoFactor.enabled ? "secondary-button" : "primary-button"} onClick={() => setDialog("start")} disabled={!account.user.has_password}><Smartphone size={15} /> Set up authenticator app</button></div>
+          {!account.user.has_password && <p className="field-help">Set a password first: two-factor authentication protects password sign-in.</p>}
+        </>
+      );
+    }
+
     body = (
       <>
-        <p className="two-factor-status off"><CircleAlert size={16} aria-hidden="true" /> Off. Signing in takes only your password.</p>
-        <div><button type="button" className="primary-button" onClick={() => setDialog("start")} disabled={!account.user.has_password}><Smartphone size={15} /> Set up authenticator app</button></div>
-        {!account.user.has_password && <p className="field-help">Set a password first: two-factor authentication protects password sign-in.</p>}
+        <p className={`two-factor-status ${twoFactor.enabled ? "on" : "off"}`}>{twoFactor.enabled ? <CircleCheck size={16} aria-hidden="true" /> : <CircleAlert size={16} aria-hidden="true" />} {twoFactorSummary(twoFactor)}</p>
+        <div className="two-factor-methods">
+          <div className="two-factor-method">
+            <h3><Smartphone size={15} aria-hidden="true" /> Authenticator app</h3>
+            <p className="field-help">A 6-digit code from an app on your phone.</p>
+            {totp}
+          </div>
+          <PasskeysSection onRecoveryCodes={showCodes} onNotice={setNotice} />
+          {twoFactor.enabled && (
+            <div className="two-factor-method">
+              <h3><KeyRound size={15} aria-hidden="true" /> Recovery codes</h3>
+              <p className="field-help">Each signs you in once if you lose your phone and passkeys. {twoFactor.recovery_codes_remaining === 1 ? "1 code left." : `${twoFactor.recovery_codes_remaining} codes left.`}</p>
+              {twoFactor.recovery_codes_remaining <= 3 && <p className="field-help field-problem">You&apos;re running out of recovery codes. Get new ones so you can still sign in without your phone or passkeys.</p>}
+              <div><button type="button" className="secondary-button" onClick={() => setDialog("regenerate")}><RefreshCw size={15} /> New recovery codes</button></div>
+            </div>
+          )}
+        </div>
       </>
     );
   }
 
   return (
     <section className="management-panel">
-      <div className="management-heading"><h2><ShieldCheck size={15} aria-hidden="true" /> Two-factor authentication</h2><p>A code from your phone at sign-in, so a stolen password isn&apos;t enough.</p></div>
-      {notice && <p role="status" className="form-notice">{notice}</p>}
+      <div className="management-heading"><h2><ShieldCheck size={15} aria-hidden="true" /> Two-factor authentication</h2><p>A code from your phone or a passkey at sign-in, so a stolen password isn&apos;t enough.</p></div>
+      {notice && <p role="status" className="form-notice two-factor-notice">{notice}</p>}
       {body}
-      {dialog === "start" && <PasswordPrompt title="Set up two-factor authentication" description="Confirm it's you to add an authenticator app." action="Continue" onConfirm={startSetup} onClose={() => setDialog(null)} />}
-      {dialog === "disable" && <PasswordPrompt title="Turn off two-factor authentication" description="Signing in will take only your password. Your recovery codes stop working." action="Turn off" danger onConfirm={disable} onClose={() => setDialog(null)} />}
+      {dialog === "start" && <PasswordPrompt title="Set up an authenticator app" description="Confirm it's you to add an authenticator app." action="Continue" onConfirm={startSetup} onClose={() => setDialog(null)} />}
+      {dialog === "disable" && (
+        <PasswordPrompt
+          title="Remove your authenticator app"
+          description={twoFactor.passkeys > 0
+            ? "Its codes stop working. You keep signing in with a passkey as your second factor."
+            : "Signing in will take only your password. Your recovery codes stop working."}
+          action="Remove"
+          danger
+          onConfirm={disable}
+          onClose={() => setDialog(null)}
+        />
+      )}
       {dialog === "regenerate" && <PasswordPrompt title="Get new recovery codes" description="Your current recovery codes stop working." action="Get new codes" onConfirm={regenerate} onClose={() => setDialog(null)} />}
     </section>
   );
@@ -311,7 +356,7 @@ function SessionsSection() {
           {sessions.map((session) => (
             <li key={session.id}>
               <div>
-                <strong>{describeUserAgent(session.user_agent)}{session.current && <span className="badge">This browser</span>}</strong>
+                <strong>{describeUserAgent(session.user_agent)}{session.current && <span className="badge">This browser</span>}<span className="badge badge-muted" title="How this session signed in">{signInMethodLabel(session.auth_method)}</span></strong>
                 <span>{session.ip ?? "Unknown address"} · active {formatRelative(session.last_seen_at)} · signed in {formatDateTime(session.created_at)}</span>
               </div>
               <button type="button" className="secondary-button" onClick={() => void end(session)} disabled={busyId === session.id}>

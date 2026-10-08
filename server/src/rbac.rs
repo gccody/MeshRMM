@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::db::{
     self, Executor,
-    tables::{RolePermissions, Roles, UserRoles},
+    tables::{EffectiveUserRoles, RolePermissions, Roles},
 };
 
 /// The ID (and `builtin` value) of the role with every permission.
@@ -174,14 +174,14 @@ pub async fn load_roles(
         .collect())
 }
 
-/// The roles a user holds.
+/// The roles a user holds, directly or through an identity provider group.
 pub async fn user_roles(executor: &mut impl Executor, user_id: &str) -> db::Result<Vec<Role>> {
     let ids: Vec<(String,)> = executor
         .fetch_all(
             &Query::select()
-                .column(UserRoles::RoleId)
-                .from(UserRoles::Table)
-                .and_where(Expr::col(UserRoles::UserId).eq(user_id))
+                .column(EffectiveUserRoles::RoleId)
+                .from(EffectiveUserRoles::Table)
+                .and_where(Expr::col(EffectiveUserRoles::UserId).eq(user_id))
                 .to_owned(),
         )
         .await?;

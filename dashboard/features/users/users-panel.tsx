@@ -4,8 +4,9 @@ import { AuthenticationRequired, errorText, expectJson, expectOk, jsonBody } fro
 import { formatDateTime, formatRelative } from "../../lib/format";
 import { ModalDialog } from "../../lib/modal-dialog";
 import { useResource } from "../../lib/use-resource";
+import { useSession } from "../auth/session";
 import { useWorkspace } from "../workspace/workspace-context";
-import { type CreatedInvitation, type InvitationView, type ResetLink, type Role, type UserView, matchesUser, sortRoles, sortUsers } from "./model";
+import { type CreatedInvitation, type GroupRoleRef, type InvitationView, type ResetLink, type Role, type UserView, groupRoleLabel, matchesUser, sortRoles, sortUsers } from "./model";
 import { OneTimeLink } from "./one-time-link";
 
 type Dialog =
@@ -108,8 +109,11 @@ export function UsersPanel() {
           <tbody>
             {visibleUsers.map((user) => (
               <tr key={user.id} className={user.disabled ? "row-disabled" : undefined}>
-                <td><strong>{user.display_name}</strong><span>{user.email}</span>{user.disabled && <span className="badge badge-muted">Disabled</span>}</td>
-                <td>{user.roles.length ? user.roles.map((role) => role.name).join(", ") : <span className="muted-text">No roles</span>}</td>
+                <td><strong>{user.display_name}</strong><span>{user.email}</span>{user.disabled && <span className="badge badge-muted">Disabled</span>}<IdentityBadges user={user} /></td>
+                <td>
+                  {user.roles.length || user.group_roles.length ? user.roles.map((role) => role.name).join(", ") : <span className="muted-text">No roles</span>}
+                  {user.group_roles.length > 0 && <GroupRoles roles={user.group_roles} />}
+                </td>
                 <td>{user.two_factor_enabled ? <span className="badge badge-good"><ShieldCheck size={13} aria-hidden="true" /> On</span> : <span className="muted-text">Off</span>}</td>
                 <td>{user.last_sign_in_at === null ? <span className="muted-text">Never</span> : <span title={formatDateTime(user.last_sign_in_at)}>{formatRelative(user.last_sign_in_at)}</span>}</td>
                 <td className="row-actions"><button type="button" className="secondary-button" onClick={(event) => open({ kind: "user", user }, event.currentTarget)} aria-haspopup="dialog" aria-label={`Manage ${user.display_name}`}>Manage</button></td>
@@ -168,6 +172,26 @@ export function UsersPanel() {
         />
       )}
     </>
+  );
+}
+
+// Where the account's identity comes from, besides this server.
+function IdentityBadges({ user }: { user: Pick<UserView, "sso_linked" | "scim_managed"> }) {
+  return (
+    <>
+      {user.sso_linked && <span className="badge" title="Signs in with single sign-on">SSO</span>}
+      {user.scim_managed && <span className="badge" title="Managed by your identity provider">SCIM</span>}
+    </>
+  );
+}
+
+// Roles from identity provider groups, which only the provider changes.
+function GroupRoles({ roles }: { roles: GroupRoleRef[] }) {
+  const ssoName = useSession().instance?.sign_in.sso?.name;
+  return (
+    <ul className="role-chips" aria-label="Roles from identity provider groups">
+      {roles.map((role) => <li key={`${role.source}:${role.group}:${role.id}`}>{groupRoleLabel(role, ssoName)}</li>)}
+    </ul>
   );
 }
 
@@ -307,7 +331,8 @@ function UserDialog({ user, roles, returnFocus, onClose, onChanged }: {
   const post = (path: string, action: string, success: string) => run(action, async () => {
     await expectOk(await authorizedFetch(`${userPath}/${path}`, { method: "POST" }), "That didn't work. Try again.");
     setNotice(success);
-    if (path === "reset-two-factor") onChanged({ ...user, two_factor_enabled: false }, user.id);
+    if (path === "reset-two-factor") onChanged({ ...user, two_factor_enabled: false, passkeys: 0 }, user.id);
+    if (path === "unlink-sso") onChanged({ ...user, sso_linked: false }, user.id);
   });
 
   const makeResetLink = () => run("reset", async () => {
@@ -328,11 +353,18 @@ function UserDialog({ user, roles, returnFocus, onClose, onChanged }: {
       <div className="modal-icon"><UserRound size={22} /></div>
       <p className="eyebrow">{user.disabled ? "Disabled user" : self ? "You" : "User"}</p>
       <h2 id={titleId}>{user.display_name}</h2>
-      <p>{user.email} · joined {formatDateTime(user.created_at)} · {user.has_password ? "has a password" : "no password yet"}</p>
+      <p>{user.email} · joined {formatDateTime(user.created_at)} · {user.has_password ? "has a password" : "no password"}{user.passkeys > 0 && ` · ${user.passkeys === 1 ? "1 passkey" : `${user.passkeys} passkeys`}`}<IdentityBadges user={user} /></p>
       <form onSubmit={save}>
         <fieldset className="script-editor-fields" disabled={busy !== null}>
           <label htmlFor="user-name">Name<input id="user-name" required value={name} onChange={(event) => setName(event.target.value)} /></label>
           <RoleChoices roles={roles} selected={selected} onChange={setSelected} />
+          {user.group_roles.length > 0 && (
+            <div className="group-roles">
+              <span>From identity provider groups</span>
+              <GroupRoles roles={user.group_roles} />
+              <small className="field-help">These roles can only be changed at the identity provider, by changing the user&apos;s groups.</small>
+            </div>
+          )}
         </fieldset>
         {error && <p role="alert" className="installer-error">{error}</p>}
         {notice && <p role="status" className="form-notice">{notice}</p>}
@@ -348,8 +380,13 @@ function UserDialog({ user, roles, returnFocus, onClose, onChanged }: {
           <div className="form-actions">
             <button type="button" className="secondary-button" disabled={busy !== null || user.disabled} onClick={() => void makeResetLink()}>Password reset link</button>
             <button type="button" className="secondary-button" disabled={busy !== null || !user.two_factor_enabled} onClick={() => {
-              if (window.confirm(`Remove ${user.display_name}'s authenticator app and recovery codes? They sign in with only their password until they set it up again.`)) void post("reset-two-factor", "two-factor", "Two-factor authentication was reset.");
+              if (window.confirm(`Remove ${user.display_name}'s authenticator app, passkeys and recovery codes? They sign in with only their password until they set up two-factor authentication again.`)) void post("reset-two-factor", "two-factor", "Two-factor authentication was reset.");
             }}>Reset two-factor</button>
+            {user.sso_linked && (
+              <button type="button" className="secondary-button" disabled={busy !== null} onClick={() => {
+                if (window.confirm(`Unlink ${user.display_name}'s SSO identity? Their next single sign-on links the account again by email address, to whichever identity has it then.`)) void post("unlink-sso", "unlink-sso", "The SSO identity was unlinked.");
+              }}>Unlink SSO identity</button>
+            )}
             <button type="button" className="secondary-button" disabled={busy !== null} onClick={() => void post("sign-out", "sign-out", "Signed out everywhere.")}>Sign out everywhere</button>
             <button type="button" className="secondary-button" disabled={busy !== null} onClick={() => void update({ disabled: !user.disabled }, user.disabled ? "Enabled." : "Disabled. They were signed out everywhere.")}>{user.disabled ? "Enable" : "Disable"}</button>
             <button type="button" className="danger-button" disabled={busy !== null} onClick={remove}><Trash2 size={15} /> Delete</button>

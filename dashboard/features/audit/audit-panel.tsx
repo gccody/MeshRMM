@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { AuthenticationRequired, errorText, expectJson } from "../../lib/http";
 import { formatDateTime } from "../../lib/format";
 import { useWorkspace } from "../workspace/workspace-context";
-import { AUDIT_CATEGORIES, type AuditEvent, type AuditPage, actionLabel, targetLabel } from "./model";
+import { AUDIT_CATEGORIES, type AuditEvent, type AuditPage, eventLabel, targetLabel } from "./model";
 
 const PAGE_SIZE = 50;
 
@@ -85,7 +85,7 @@ export function AuditPanel() {
                 <td className="nowrap">{formatDateTime(event.created_at)}</td>
                 <td>{event.actor_label}</td>
                 <td>
-                  <strong>{actionLabel(event.action)}</strong>
+                  <strong>{eventLabel(event)}</strong>
                   <span>{targetLabel(event)}</span>
                   {Object.keys(event.metadata).length > 0 && (
                     <details className="audit-details"><summary>Details</summary><pre>{JSON.stringify(event.metadata, null, 2)}</pre></details>

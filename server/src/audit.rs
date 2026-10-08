@@ -95,6 +95,20 @@ impl<'a> Target<'a> {
         }
     }
 
+    pub fn scim_group(id: &'a str) -> Self {
+        Self {
+            kind: "scim_group",
+            id,
+        }
+    }
+
+    pub fn scim_token(id: &'a str) -> Self {
+        Self {
+            kind: "scim_token",
+            id,
+        }
+    }
+
     pub fn settings() -> Self {
         Self {
             kind: "settings",

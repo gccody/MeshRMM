@@ -21,10 +21,10 @@ export const VIEW_COPY: Record<View, { title: string; description: string }> = {
   toolbox: { title: "Toolbox", description: "Scripts and files to run on or send to your devices." },
   users: { title: "Users", description: "Invite your team and manage their access." },
   roles: { title: "Roles", description: "Choose what each role lets its members do." },
-  authentication: { title: "Authentication", description: "Set the sign-in policy and how MeshRMM sends email." },
+  authentication: { title: "Authentication", description: "Set the sign-in policy, single sign-on, directory sync and how MeshRMM sends email." },
   settings: { title: "Settings", description: "Name this server and set remote session defaults." },
   audit: { title: "Audit log", description: "Who signed in and what they changed." },
-  account: { title: "Your account", description: "Your profile, password, two-factor authentication and sessions." },
+  account: { title: "Your account", description: "Your profile, password, two-factor authentication, passkeys and sessions." },
 };
 
 // A user sees a page when they hold any of these permissions; an empty list
@@ -43,7 +43,8 @@ const VIEW_ACCESS: Record<View, readonly Permission[]> = {
 export function canView(account: Pick<Account, "permissions" | "is_administrator"> | null, view: View) {
   if (!account) return false;
   const required = VIEW_ACCESS[view];
-  // Only administrators manage email, on the Authentication page.
+  // Only administrators manage single sign-on, directory sync and email, on
+  // the Authentication page.
   if (view === "authentication" && account.is_administrator) return true;
   return required.length === 0 || canAny(account, required);
 }

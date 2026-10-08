@@ -3,6 +3,7 @@ use axum::{Json, extract::State};
 use serde::Serialize;
 
 use crate::{
+    auth::{oidc, passkeys},
     http::{ApiError, AppState},
     settings, users,
 };
@@ -21,6 +22,16 @@ struct SignInMethods {
     password: bool,
     /// Whether "forgot password" can email a reset link.
     password_reset_email: bool,
+    /// Passkeys work with this server's public URL.
+    passkey: bool,
+    /// The SSO provider, if SSO is on.
+    sso: Option<SsoMethod>,
+}
+
+#[derive(Debug, Serialize)]
+struct SsoMethod {
+    /// What the "Sign in with ..." button names.
+    name: String,
 }
 
 pub async fn get(State(state): State<AppState>) -> Result<Json<Instance>, ApiError> {
@@ -31,6 +42,12 @@ pub async fn get(State(state): State<AppState>) -> Result<Json<Instance>, ApiErr
         sign_in: SignInMethods {
             password: true,
             password_reset_email: settings.smtp_configured(),
+            passkey: passkeys::relying_party(&state.config, &settings.instance_name).is_ok(),
+            sso: oidc::enabled(&mut database)
+                .await?
+                .map(|provider| SsoMethod {
+                    name: provider.display_name,
+                }),
         },
         password_min_length: settings.password_min_length,
         name: settings.instance_name,
