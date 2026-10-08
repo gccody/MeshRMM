@@ -133,6 +133,21 @@ CREATE TABLE role_permissions (
   PRIMARY KEY (role_id, permission)
 );
 
+-- Every install starts with these two roles. The Administrator holds every
+-- permission implicitly, so it has no role_permissions rows; the Technician
+-- is an editable default.
+INSERT INTO roles (id, name, description, builtin, created_at, updated_at) VALUES
+  ('administrator', 'Administrator', 'Every permission, including users, roles and settings.', 'administrator', 0, 0),
+  ('technician', 'Technician', 'Enrolls and connects to devices and runs toolbox scripts and files.', 'technician', 0, 0);
+
+INSERT INTO role_permissions (role_id, permission) VALUES
+  ('technician', 'devices.view'),
+  ('technician', 'devices.enroll'),
+  ('technician', 'sessions.connect'),
+  ('technician', 'sessions.connect_background'),
+  ('technician', 'scripts.run'),
+  ('technician', 'files.deliver');
+
 CREATE TABLE user_roles (
   user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
   role_id TEXT NOT NULL REFERENCES roles (id) ON DELETE CASCADE,
