@@ -1,9 +1,9 @@
 #!/bin/sh
-# Installs the MeshRMM Agent on this Mac. The dashboard's "Add a device" dialog
+# Installs the MeshRMM Agent on this Mac. The website's "Add a device" dialog
 # shows the command that runs it:
 #
-#   curl -fsSL https://<company>.meshrmm.com/install-agent-macos.sh |
-#     sudo /bin/sh -s -- https://<company>.meshrmm.com <authorization>
+#   curl -fsSL https://rmm.example.com/install-agent-macos.sh |
+#     sudo /bin/sh -s -- https://rmm.example.com <authorization>
 #
 # It downloads the published Agent, checks it against the release manifest's
 # SHA-256, and enrolls this Mac with the one-time authorization.
