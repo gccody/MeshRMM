@@ -197,10 +197,16 @@ impl Database {
 
     /// Starts a transaction. Dropping it without [`Transaction::commit`]
     /// rolls it back.
+    ///
+    /// On SQLite it takes the write lock up front (`BEGIN IMMEDIATE`): a
+    /// transaction that reads and then writes would otherwise fail at once,
+    /// without waiting, when another connection wrote in between.
     pub async fn begin(&self) -> Result<Transaction> {
         Ok(Transaction {
             inner: match &self.pool {
-                Pool::Sqlite(pool) => TransactionInner::Sqlite(pool.begin().await?),
+                Pool::Sqlite(pool) => {
+                    TransactionInner::Sqlite(pool.begin_with("BEGIN IMMEDIATE").await?)
+                }
                 Pool::Postgres(pool) => TransactionInner::Postgres(pool.begin().await?),
             },
         })
@@ -321,3 +327,66 @@ impl Transaction {
         }
     }
 }
+
+/// Query methods shared by [`Database`] and [`Transaction`], for helpers that
+/// run either on their own or as part of a larger change.
+pub trait Executor: Send {
+    fn execute<S: QueryStatementWriter + SqlxBinder + Sync>(
+        &mut self,
+        statement: &S,
+    ) -> impl Future<Output = Result<u64>> + Send;
+
+    fn fetch_all<T: Row, S: QueryStatementWriter + SqlxBinder + Sync>(
+        &mut self,
+        statement: &S,
+    ) -> impl Future<Output = Result<Vec<T>>> + Send;
+
+    fn fetch_optional<T: Row, S: QueryStatementWriter + SqlxBinder + Sync>(
+        &mut self,
+        statement: &S,
+    ) -> impl Future<Output = Result<Option<T>>> + Send;
+
+    fn fetch_one<T: Row, S: QueryStatementWriter + SqlxBinder + Sync>(
+        &mut self,
+        statement: &S,
+    ) -> impl Future<Output = Result<T>> + Send;
+}
+
+/// Implements [`Executor`] by calling the type's inherent methods, named in
+/// full so the call can't resolve back to the trait.
+macro_rules! impl_executor {
+    ($type:ty, $self:ident => $inherent:ty, $receiver:expr) => {
+        impl Executor for $type {
+            async fn execute<S: QueryStatementWriter + SqlxBinder + Sync>(
+                &mut $self,
+                statement: &S,
+            ) -> Result<u64> {
+                <$inherent>::execute($receiver, statement).await
+            }
+
+            async fn fetch_all<T: Row, S: QueryStatementWriter + SqlxBinder + Sync>(
+                &mut $self,
+                statement: &S,
+            ) -> Result<Vec<T>> {
+                <$inherent>::fetch_all($receiver, statement).await
+            }
+
+            async fn fetch_optional<T: Row, S: QueryStatementWriter + SqlxBinder + Sync>(
+                &mut $self,
+                statement: &S,
+            ) -> Result<Option<T>> {
+                <$inherent>::fetch_optional($receiver, statement).await
+            }
+
+            async fn fetch_one<T: Row, S: QueryStatementWriter + SqlxBinder + Sync>(
+                &mut $self,
+                statement: &S,
+            ) -> Result<T> {
+                <$inherent>::fetch_one($receiver, statement).await
+            }
+        }
+    };
+}
+
+impl_executor!(&Database, self => Database, *self);
+impl_executor!(Transaction, self => Transaction, self);
