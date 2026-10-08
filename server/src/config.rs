@@ -34,6 +34,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "downloads",
     "toolbox",
     "remote",
+    "turn",
     "log",
 ];
 
@@ -57,6 +58,8 @@ pub struct Config {
     pub toolbox: ToolboxConfig,
     #[serde(default)]
     pub remote: RemoteConfig,
+    #[serde(default)]
+    pub turn: TurnConfig,
     #[serde(default)]
     pub log: LogConfig,
 }
@@ -164,6 +167,50 @@ impl Default for RemoteConfig {
     }
 }
 
+/// The built-in STUN/TURN server remote sessions use to get through NAT.
+///
+/// Agents and viewers reach it over UDP and IPv4 only, so `host` must have an
+/// A record and must not go through an HTTP proxy.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnConfig {
+    /// Without it, peers that can't reach each other directly can't connect.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// The host name or IPv4 address in the STUN and TURN URLs given to
+    /// peers. Defaults to the host of `public_url`.
+    pub host: Option<String>,
+    /// The address relayed traffic appears to come from. Defaults to the
+    /// IPv4 address `host` resolves to at startup.
+    pub public_ip: Option<Ipv4Addr>,
+    /// The UDP address STUN and TURN requests arrive at.
+    #[serde(default = "default_turn_listen")]
+    pub listen: SocketAddr,
+    /// The UDP ports relays are opened on, one per peer of a relayed session.
+    #[serde(default = "default_relay_port_min")]
+    pub relay_port_min: u16,
+    #[serde(default = "default_relay_port_max")]
+    pub relay_port_max: u16,
+    /// Addresses relays never send to or accept from, in addition to
+    /// loopback, link-local, multicast and broadcast addresses.
+    #[serde(default)]
+    pub blocked_peers: Vec<IpNet>,
+}
+
+impl Default for TurnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            host: None,
+            public_ip: None,
+            listen: default_turn_listen(),
+            relay_port_min: default_relay_port_min(),
+            relay_port_max: default_relay_port_max(),
+            blocked_peers: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogConfig {
@@ -209,6 +256,22 @@ fn default_max_toolbox_file_bytes() -> u64 {
 
 fn default_remote_idle_timeout_seconds() -> u64 {
     15 * 60
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_turn_listen() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::UNSPECIFIED, 3478))
+}
+
+fn default_relay_port_min() -> u16 {
+    49160
+}
+
+fn default_relay_port_max() -> u16 {
+    49200
 }
 
 fn default_log_level() -> String {
@@ -283,6 +346,33 @@ impl Config {
         if !self.data_dir.is_absolute() {
             bail!("data_dir must be an absolute path");
         }
+        self.validate_turn()
+    }
+
+    fn validate_turn(&self) -> anyhow::Result<()> {
+        let turn = &self.turn;
+        if !turn.listen.is_ipv4() {
+            bail!("turn.listen must be an IPv4 address; Agents and viewers use TURN over IPv4");
+        }
+        if turn.relay_port_min == 0 || turn.relay_port_min > turn.relay_port_max {
+            bail!("turn.relay_port_min must be at least 1 and no more than turn.relay_port_max");
+        }
+        let relays = turn.relay_port_min..=turn.relay_port_max;
+        if turn.listen.port() != 0 && relays.contains(&turn.listen.port()) {
+            bail!("turn.listen's port must be outside the relay ports");
+        }
+        match &turn.host {
+            Some(host) => match Host::parse(host) {
+                Ok(Host::Domain(_) | Host::Ipv4(_)) if !host.contains([':', '/']) => {}
+                _ => bail!("turn.host must be a host name or an IPv4 address, with no port"),
+            },
+            None if turn.enabled && matches!(self.public_url.host(), Some(Host::Ipv6(_))) => {
+                bail!(
+                    "public_url's host is an IPv6 address; set turn.host to a name or IPv4 address"
+                )
+            }
+            None => {}
+        }
         Ok(())
     }
 
@@ -303,6 +393,14 @@ impl Config {
             TlsConfig::Proxy { .. } => SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)),
             _ => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 443)),
         })
+    }
+
+    /// The host in the STUN and TURN URLs.
+    pub fn turn_host(&self) -> String {
+        match &self.turn.host {
+            Some(host) => host.clone(),
+            None => self.public_url.host_str().unwrap_or_default().to_owned(),
+        }
     }
 
     /// The proxies whose forwarding headers are trusted. Empty unless the
@@ -487,6 +585,8 @@ mod tests {
         assert!(matches!(config.tls, TlsConfig::Acme { .. }));
         assert_eq!(config.public_origin(), "https://rmm.example.com");
         assert_eq!(config.remote.idle_timeout_seconds, 900);
+        assert!(config.turn.enabled);
+        assert_eq!(config.turn.listen, default_turn_listen());
     }
 
     #[test]
@@ -497,6 +597,48 @@ mod tests {
             );
             assert!(Config::from_toml(&text).is_err(), "{seconds} was accepted");
         }
+    }
+
+    #[test]
+    fn turn_defaults_to_the_public_host() {
+        let config = Config::from_toml(ACME).unwrap();
+        assert!(config.turn.enabled);
+        assert_eq!(config.turn_host(), "rmm.example.com");
+        assert_eq!(config.turn.listen, "0.0.0.0:3478".parse().unwrap());
+        assert_eq!(
+            (config.turn.relay_port_min, config.turn.relay_port_max),
+            (49160, 49200)
+        );
+        let config = Config::from_toml(
+            r#"
+            public_url = "https://rmm.example.com"
+            tls.mode = "proxy"
+            turn = { host = "turn.example.com", public_ip = "203.0.113.5", blocked_peers = ["10.0.0.0/8"] }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.turn_host(), "turn.example.com");
+        assert_eq!(config.turn.public_ip, Some("203.0.113.5".parse().unwrap()));
+    }
+
+    #[test]
+    fn turn_settings_are_checked() {
+        for turn in [
+            "turn.listen = \"[::]:3478\"",
+            "turn.relay_port_min = 0",
+            "turn = { relay_port_min = 50000, relay_port_max = 49999 }",
+            "turn.listen = \"0.0.0.0:49170\"",
+            "turn.host = \"turn.example.com:3478\"",
+            "turn.host = \"[2001:db8::1]\"",
+            "turn.host = \"2001:db8::1\"",
+            "turn.public_ip = \"2001:db8::1\"",
+        ] {
+            let text =
+                format!("public_url = \"https://rmm.example.com\"\ntls.mode = \"proxy\"\n{turn}");
+            assert!(Config::from_toml(&text).is_err(), "{turn} was accepted");
+        }
+        let text = "public_url = \"https://rmm.example.com\"\ntls.mode = \"proxy\"\nturn.host = \"198.51.100.7\"";
+        assert_eq!(Config::from_toml(text).unwrap().turn_host(), "198.51.100.7");
     }
 
     #[test]
