@@ -1,20 +1,28 @@
 //! The self-hosted MeshRMM server: the website, the API, Agent and viewer
 //! connections, and downloads, for one company.
+pub mod admin;
+pub mod api;
+pub mod audit;
+pub mod auth;
 pub mod config;
 pub mod db;
 pub mod health;
 pub mod http;
+pub mod mail;
 pub mod maintenance;
+pub mod rbac;
 pub mod secrets;
 pub mod serve;
+pub mod settings;
 pub mod time;
+pub mod users;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use axum_server::Handle;
 
-use crate::{config::Config, db::Database, http::AppState, secrets::InstanceKey};
+use crate::{auth::AuthState, config::Config, db::Database, http::AppState, secrets::InstanceKey};
 
 /// How long in-flight requests get to finish after a shutdown signal.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -41,12 +49,29 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         config: Arc::new(config),
         database,
         instance_key,
+        auth: Arc::new(AuthState::default()),
     })
+}
+
+/// While no account exists, issues a setup token and logs the link that
+/// creates the first administrator. Returns the link.
+pub async fn announce_setup(state: &AppState) -> anyhow::Result<Option<String>> {
+    if users::count(&mut &state.database).await? > 0 {
+        return Ok(None);
+    }
+    let token = state.auth.setup.issue();
+    let link = format!("{}/setup#token={token}", state.config.public_origin());
+    tracing::warn!(
+        %link,
+        "no accounts exist yet; open this link to create the first administrator (it changes on every restart)"
+    );
+    Ok(Some(link))
 }
 
 /// Runs the server until SIGINT or SIGTERM, then drains connections.
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let state = prepare(config).await?;
+    announce_setup(&state).await?;
     let maintenance = maintenance::spawn(state.database.clone());
     let handle = Handle::<SocketAddr>::new();
     tokio::spawn({

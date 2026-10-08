@@ -10,7 +10,9 @@ description = "The self-hosted MeshRMM server"
 workspace = true
 
 [dependencies]
+aes-gcm = "0.10.3"
 anyhow.workspace = true
+argon2 = "0.5.3"
 axum = "0.8.9"
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
 clap.workspace = true
@@ -18,19 +20,25 @@ figment = { version = "0.10.19", features = ["env", "toml"] }
 futures-util.workspace = true
 getrandom = "0.3"
 ipnet = { version = "2.12.2", features = ["serde"] }
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "ring", "rustls-native-certs", "smtp-transport", "tokio1-rustls"] }
+meshrmm-protocol-types.workspace = true
 rustls.workspace = true
 rustls-acme = { version = "0.15.4", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
 sea-query = { version = "1.0.2", default-features = false, features = ["backend-postgres", "backend-sqlite", "derive"] }
 sea-query-sqlx = { version = "0.9.1", features = ["sqlx-postgres", "sqlx-sqlite"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx = { version = "0.9.0", default-features = false, features = ["derive", "macros", "migrate", "postgres", "runtime-tokio", "sqlite", "tls-rustls-ring-native-roots"] }
+subtle = "2.6.1"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
+totp-rs = { version = "5", default-features = false, features = ["otpauth"] }
 tower-http = { version = "0.7.1", features = ["fs", "limit", "set-header", "trace"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url = { workspace = true, features = ["serde"] }
+uuid = { version = "1.24.1", features = ["v4", "v7"] }
 
 [dev-dependencies]
 figment = { version = "0.10.19", features = ["env", "test", "toml"] }
