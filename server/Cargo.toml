@@ -14,19 +14,27 @@ aes-gcm = "0.10.3"
 anyhow.workspace = true
 argon2 = "0.5.3"
 async-trait = "0.1.92"
+base64 = "0.22.1"
 axum = { version = "0.8.9", features = ["ws"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
 bytes.workspace = true
+chrono = { version = "0.4.42", default-features = false, features = ["std"] }
 clap.workspace = true
 figment = { version = "0.10.19", features = ["env", "toml"] }
 futures-util.workspace = true
 getrandom = "0.3"
 hmac = "0.12.1"
+http = "1.4.0"
 httpdate = "1.0.3"
 ipnet = { version = "2.12.2", features = ["serde"] }
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "ring", "rustls-native-certs", "smtp-transport", "tokio1-rustls"] }
 meshrmm-protocol-types.workspace = true
+openidconnect = { version = "4.0.1", default-features = false, features = ["accept-string-booleans"] }
+# webauthn-rs verifies with OpenSSL; building it from source keeps the server
+# free of a system OpenSSL, as the static Linux builds need.
+openssl = { version = "0.10.75", features = ["vendored"] }
 rust-embed = { version = "8.13.0", features = ["include-exclude"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 rustls.workspace = true
 rustls-acme = { version = "0.15.4", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
 sea-query = { version = "1.0.2", default-features = false, features = ["backend-postgres", "backend-sqlite", "derive"] }
@@ -46,6 +54,8 @@ tracing-subscriber.workspace = true
 turn = "0.11.0"
 url = { workspace = true, features = ["serde"] }
 uuid = { version = "1.24.1", features = ["v4", "v7"] }
+webauthn-rs = { version = "0.5.5", features = ["conditional-ui"] }
+webauthn-rs-proto = "0.5.5"
 webrtc-util = { version = "0.12.0", default-features = false, features = ["conn"] }
 
 [dev-dependencies]

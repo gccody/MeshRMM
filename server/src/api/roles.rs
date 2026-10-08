@@ -16,7 +16,7 @@ use crate::{
     auth::Authorized,
     db::{
         self, Executor,
-        tables::{RolePermissions, Roles, UserRoles},
+        tables::{EffectiveUserRoles, RolePermissions, Roles},
     },
     http::{ApiError, AppState, JsonBody},
     rbac::{self, Permission, Permissions, Role},
@@ -57,10 +57,10 @@ async fn member_counts(executor: &mut impl Executor) -> db::Result<HashMap<Strin
     let counts: Vec<(String, i64)> = executor
         .fetch_all(
             &Query::select()
-                .column(UserRoles::RoleId)
-                .expr(Func::count(Expr::col(UserRoles::UserId)))
-                .from(UserRoles::Table)
-                .group_by_col(UserRoles::RoleId)
+                .column(EffectiveUserRoles::RoleId)
+                .expr(Func::count(Expr::col(EffectiveUserRoles::UserId)))
+                .from(EffectiveUserRoles::Table)
+                .group_by_col(EffectiveUserRoles::RoleId)
                 .to_owned(),
         )
         .await?;

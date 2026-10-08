@@ -40,7 +40,7 @@ enum Admin {
     },
     /// Print a link that sets a new password, and enable the account.
     ResetPassword { email: String },
-    /// Remove a user's authenticator app and recovery codes.
+    /// Remove a user's authenticator app, passkeys and recovery codes.
     ResetTwoFactor { email: String },
 }
 
