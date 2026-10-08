@@ -11,12 +11,15 @@ import {
 
 const digest = "ab".repeat(32);
 
-test("the published checksum is the first field of a sha256sum line", () => {
-  assert.equal(publishedChecksum(`${digest}  meshrmm-agent-windows-x64.exe\n`), digest);
-  assert.equal(publishedChecksum(`  ${digest.toUpperCase()}\n`), digest);
-  assert.equal(publishedChecksum(""), null);
-  assert.equal(publishedChecksum("ab".repeat(31)), null);
-  assert.equal(publishedChecksum(`${"zz".repeat(32)}  file.exe`), null);
+test("the published checksum is the update manifest's SHA-256 for the target", () => {
+  const manifest = (sha256) => ({ schema_version: 2, releases: { "agent-windows-x64": { sha256 } } });
+  assert.equal(publishedChecksum(manifest(digest), "agent-windows-x64"), digest);
+  assert.equal(publishedChecksum(manifest(digest.toUpperCase()), "agent-windows-x64"), digest);
+  assert.equal(publishedChecksum(manifest(digest), "agent-macos"), null);
+  assert.equal(publishedChecksum(manifest("ab".repeat(31)), "agent-windows-x64"), null);
+  assert.equal(publishedChecksum(manifest("zz".repeat(32)), "agent-windows-x64"), null);
+  assert.equal(publishedChecksum(null, "agent-windows-x64"), null);
+  assert.equal(publishedChecksum({}, "agent-windows-x64"), null);
 });
 
 test("the digest is lowercase hex SHA-256", async () => {

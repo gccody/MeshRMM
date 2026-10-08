@@ -7,6 +7,7 @@ pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod downloads;
 pub mod health;
 pub mod http;
 pub mod mail;
@@ -33,6 +34,7 @@ use crate::{
     auth::AuthState,
     config::Config,
     db::Database,
+    downloads::Downloads,
     http::AppState,
     realtime::{AgentHub, Presence, Sessions, presence::UPDATE_GRACE, sessions::Timeouts},
     secrets::InstanceKey,
@@ -58,6 +60,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
     let database =
         Database::connect(&config.database_url(), config.database.max_connections).await?;
     database.migrate().await?;
+    let downloads = Downloads::load(&config.downloads.dir, &config.public_origin()).await?;
     tracing::info!(
         backend = ?database.backend(),
         schema_version = database.backend().expected_schema_version(),
@@ -76,6 +79,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         storage,
         agents,
         website: Website::embedded(),
+        downloads,
     })
 }
 
@@ -96,7 +100,12 @@ pub async fn announce_setup(state: &AppState) -> anyhow::Result<Option<String>> 
 
 /// Runs the server until SIGINT or SIGTERM, then drains connections.
 pub async fn run(config: Config) -> anyhow::Result<()> {
+    tracing::info!(
+        version = meshrmm_self_update::CURRENT_VERSION,
+        "starting the MeshRMM server"
+    );
     let state = prepare(config).await?;
+    state.downloads.warn_about_problems();
     if state.website.is_empty() {
         tracing::warn!(
             "this server was built without its website; run `npm run build` in dashboard/ and rebuild the server"
@@ -172,6 +181,19 @@ pub async fn check(config: Config) -> anyhow::Result<()> {
                     key_path.display()
                 )
             })?;
+    }
+    let downloads = Downloads::load(&config.downloads.dir, &config.public_origin()).await?;
+    match downloads.version() {
+        Some(version) => println!(
+            "{} downloads of release {version}, {} of them signed",
+            downloads.file_count(),
+            downloads.file_count() - downloads.unsigned().len()
+        ),
+        None => println!(
+            "no Agent or viewer downloads: {} has no {}",
+            config.downloads.dir.display(),
+            downloads::ARTIFACTS_FILE
+        ),
     }
     if config.turn.enabled && config.turn.public_ip.is_none() {
         let host = config.turn_host();

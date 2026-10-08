@@ -10,11 +10,14 @@ export type AgentInstallerBootstrap = {
   expires_at_unix_ms: number;
 };
 
-export const INSTALLER_ASSETS: Record<"windows-x64", { label: string; binary: string; checksum: string; fileName: string }> = {
+// The server's update manifest lists each build it ships with its SHA-256.
+export const UPDATE_MANIFEST = "/downloads/update-manifest.json";
+
+export const INSTALLER_ASSETS: Record<"windows-x64", { label: string; binary: string; target: string; fileName: string }> = {
   "windows-x64": {
     label: "Windows 10/11 (x64)",
     binary: "/downloads/meshrmm-agent-windows-x64.exe",
-    checksum: "/downloads/meshrmm-agent-windows-x64.exe.sha256",
+    target: "agent-windows-x64",
     fileName: "MeshRMM-Agent-Setup-Windows-x64.exe",
   },
 };
@@ -31,11 +34,12 @@ export function macInstallCommand(origin: string, bootstrap: AgentInstallerBoots
   return `curl -fsSL ${base}/install-agent-macos.sh | sudo /bin/sh -s -- ${base} ${authorization}`;
 }
 
-// The first field of a `sha256sum`-style file, or null when it is not a
-// SHA-256 digest.
-export function publishedChecksum(text: string): string | null {
-  const checksum = text.trim().split(/\s+/)[0]?.toLowerCase();
-  return checksum?.match(/^[a-f0-9]{64}$/) ? checksum : null;
+// The SHA-256 the update manifest gives `target`'s build, or null when it
+// lists none.
+export function publishedChecksum(manifest: unknown, target: string): string | null {
+  const releases = (manifest as { releases?: Record<string, { sha256?: unknown }> } | null)?.releases;
+  const checksum = releases?.[target]?.sha256;
+  return typeof checksum === "string" && /^[a-fA-F0-9]{64}$/.test(checksum) ? checksum.toLowerCase() : null;
 }
 
 export async function sha256Hex(data: ArrayBuffer): Promise<string> {

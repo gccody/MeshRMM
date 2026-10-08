@@ -1,0 +1,52 @@
+# The MeshRMM server, as installed from a release tarball by install.sh.
+#
+# It runs as the meshrmm user, reads /etc/meshrmm/server.toml and keeps its
+# data in /var/lib/meshrmm. The rest of the file system is read-only to it:
+# with data_dir elsewhere, allow writing there with `systemctl edit
+# meshrmm-server` and a ReadWritePaths= line.
+[Unit]
+Description=MeshRMM server
+Documentation=https://github.com/gccody/MeshRMM
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=exec
+User=meshrmm
+Group=meshrmm
+ExecStart=/usr/bin/meshrmm-server serve
+Restart=on-failure
+RestartSec=5
+# The server gives requests 10 seconds to finish when stopped.
+TimeoutStopSec=30
+StateDirectory=meshrmm
+StateDirectoryMode=0700
+UMask=0077
+LimitNOFILE=65536
+
+# Ports 443 and 3478 are privileged.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

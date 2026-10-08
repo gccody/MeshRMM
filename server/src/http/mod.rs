@@ -18,7 +18,6 @@ use tower_http::{
         CompressionLayer,
         predicate::{DefaultPredicate, NotForContentType, Predicate},
     },
-    services::ServeDir,
     trace::TraceLayer,
 };
 
@@ -27,6 +26,7 @@ use crate::{
     auth::AuthState,
     config::{Config, TlsConfig},
     db::Database,
+    downloads::{self, Downloads},
     health,
     realtime::{AgentHub, Presence, Sessions},
     scim,
@@ -49,6 +49,7 @@ pub struct AppState {
     pub sessions: Sessions,
     pub turn: Turn,
     pub website: Website,
+    pub downloads: Downloads,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -64,7 +65,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(health::healthz))
         .nest("/v1", api::router(state.clone()))
         .nest("/scim/v2", scim::router())
-        .nest_service("/downloads", ServeDir::new(&state.config.downloads.dir))
+        .route("/downloads/{*file}", get(downloads::serve))
         .fallback_service(website)
         .with_state(state);
     headers::apply(router, hsts).layer(TraceLayer::new_for_http())

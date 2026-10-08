@@ -48,7 +48,9 @@ contact_email = "admin@example.com"
 # trusted_proxies = ["127.0.0.1/32", "::1/128"]
 
 [downloads]
-# The Agent and viewer builds shipped with this server release.
+# The Agent and viewer builds shipped with this server release, and the
+# artifacts.json that lists them. The server serves them and their update
+# manifest at /downloads/; Agents and viewers update from it.
 dir = "/usr/share/meshrmm/downloads"
 
 [toolbox]

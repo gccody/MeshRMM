@@ -259,6 +259,12 @@ calls become typed method calls on actor handles.
     `download_origin`/`viewer_server` fields of `release.json`.
   - Enrollment already returns `update_manifest_url`, so it stays required.
   - The viewer derives its manifest URL from the server in its deep link or config.
+  - Releases are signed (decided while building PR 8). A deep link can name any
+    server, so a viewer that takes updates from it would run whatever an
+    attacker's server offered. CI signs each build's target, version and SHA-256
+    with an Ed25519 release key. Agents and viewers embed the public key from
+    `release.json` and install only signed updates, whichever server offers them.
+    See `docs/releases.md`.
   - The macOS viewer bundle no longer embeds a `remote.json` with a server URL.
   - Update the doc comments and error messages that mention Cloudflare.
 - Enrollment is unchanged: the Windows installer still gets the bootstrap trailer appended
@@ -348,8 +354,8 @@ Dependencies:
 - **Windows code signing** remains absent. Appending the bootstrap trailer would break an
   Authenticode signature, so adding signing later needs a different way to pass the
   bootstrap (for example a signed stub plus a separate config download).
-- **The macOS viewer updater** checks only SHA-256, not the code signature. Integrity rests
-  on TLS to the operator's own server. Worth tightening while touching the updater.
+- **The macOS viewer updater** checks only SHA-256, not the code signature. Release
+  signatures (PR 8) now cover it and every other updater, independent of the server.
 - **Single node:** the server is a single point of failure. That's acceptable for now
   (decided above); HA would need shared session state and is out of scope.
 - **Secrets at rest:** TOTP secrets, the OIDC client secret, and the TURN HMAC key are

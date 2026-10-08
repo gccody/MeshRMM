@@ -43,7 +43,7 @@ struct Arguments {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// HTTPS base URL of the deployed MeshRMM Cloudflare Worker.
+    /// HTTPS base URL of the MeshRMM server.
     #[arg(long, env = "MESHRMM_SERVER")]
     server: Option<String>,
 
@@ -51,7 +51,7 @@ struct Arguments {
     #[arg(long, env = "MESHRMM_DEVICE_ID")]
     device_id: Option<String>,
 
-    /// Per-device secret issued once by the company-scoped MeshRMM dashboard.
+    /// Per-device secret issued once by the MeshRMM server.
     #[arg(long, env = "MESHRMM_AGENT_TOKEN", hide_env_values = true)]
     agent_token: Option<String>,
 
@@ -111,7 +111,7 @@ impl Config {
         let update_manifest_url = arguments
             .update_manifest_url
             .or(file.update_manifest_url)
-            .unwrap_or_else(|| meshrmm_self_update::DEFAULT_MANIFEST_URL.to_owned());
+            .context("missing update manifest URL in agent.json or --update-manifest-url")?;
         meshrmm_self_update::validate_manifest_url(&update_manifest_url)?;
         let frames_per_second = arguments
             .frames_per_second

@@ -33,17 +33,13 @@ struct Arguments {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Base URL of the MeshRMM Cloudflare Worker.
+    /// Base URL of the MeshRMM server.
     #[arg(long, env = "MESHRMM_SERVER")]
     server: Option<String>,
 
     /// Short-lived, single-use browser handoff token.
     #[arg(long, env = "MESHRMM_HANDOFF_TOKEN", hide_env_values = true)]
     handoff_token: Option<String>,
-
-    /// HTTPS release manifest checked before starting a remote session.
-    #[arg(long, env = "MESHRMM_UPDATE_MANIFEST_URL")]
-    update_manifest_url: Option<String>,
 
     #[arg(long, env = "MESHRMM_JSON_LOGS", action = ArgAction::SetTrue)]
     json_logs: bool,
@@ -53,7 +49,6 @@ struct Arguments {
 struct FileConfig {
     server: Option<String>,
     handoff_token: Option<String>,
-    update_manifest_url: Option<String>,
     auto_update: Option<bool>,
     json_logs: Option<bool>,
 }
@@ -100,11 +95,9 @@ impl Config {
             .context("missing single-use MeshRMM handoff token")?;
         validate_server(&server)?;
         validate_handoff_token(&handoff_token)?;
-        let update_manifest_url = arguments
-            .update_manifest_url
-            .or(file.update_manifest_url)
-            .unwrap_or_else(|| meshrmm_self_update::DEFAULT_MANIFEST_URL.to_owned());
-        meshrmm_self_update::validate_manifest_url(&update_manifest_url)?;
+        // The server the session is on offers the updates. Any server can,
+        // because only releases signed with the release key are installed.
+        let update_manifest_url = meshrmm_self_update::manifest_url(&server);
 
         let bootstrap = std::env::var("MESHRMM_SESSION_BOOTSTRAP")
             .ok()
@@ -124,14 +117,8 @@ impl Config {
 }
 
 /// Options a dashboard link must not be combined with. A crafted link that
-/// smuggles, say, `--update-manifest-url` into the command line is rejected.
-const LOCAL_OPTIONS: [&str; 5] = [
-    "config",
-    "server",
-    "handoff_token",
-    "update_manifest_url",
-    "json_logs",
-];
+/// smuggles, say, `--config` into the command line is rejected.
+const LOCAL_OPTIONS: [&str; 4] = ["config", "server", "handoff_token", "json_logs"];
 
 fn parse_arguments(
     arguments: impl IntoIterator<Item = std::ffi::OsString>,
@@ -297,11 +284,7 @@ mod tests {
     fn a_link_cannot_carry_other_options() {
         let link = "meshrmm://connect?handoff=abc";
         for values in [
-            vec![
-                link,
-                "--update-manifest-url",
-                "https://evil.example/manifest.json",
-            ],
+            vec![link, "--config", "/tmp/evil.json"],
             vec!["--server", "https://evil.example", link],
             vec![link, "--json-logs"],
         ] {
@@ -312,8 +295,7 @@ mod tests {
             );
         }
         // After the terminator, an injected option is only an extra value.
-        let error =
-            arguments(&["--", link, "--update-manifest-url=https://evil.example"]).unwrap_err();
+        let error = arguments(&["--", link, "--server=https://evil.example"]).unwrap_err();
         assert!(
             crate::errors::user_message(&error).starts_with("The viewer was started with a link")
         );

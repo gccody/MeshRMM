@@ -1,5 +1,10 @@
-name: Publish native release
+name: Publish release
 
+# Builds a server release: the Agent and viewer for Windows and macOS, signed
+# with the release key, inside a server tarball per Linux architecture and a
+# multi-architecture Docker image. On main it publishes them as a GitHub
+# release and to GHCR; a manual run on another branch builds and tests
+# everything without signing or publishing.
 on:
   push:
     branches: [main]
@@ -7,7 +12,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: native-release-production
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -25,11 +30,10 @@ jobs:
 
   validate:
     name: Validate release version
-    # Manual runs can target any branch; only main may publish.
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.release.outputs.version }}
+      publish: ${{ steps.release.outputs.publish }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,9 +45,10 @@ jobs:
         name: Read release configuration
         shell: bash
         run: |
-          node --test scripts/release-config.test.mjs
+          node --test scripts/release-config.test.mjs scripts/release-artifacts.test.mjs
           version=$(node scripts/release-config.mjs version)
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=${{ github.ref == 'refs/heads/main' }}" >> "$GITHUB_OUTPUT"
       - name: Require an increased version
         if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
         env:
@@ -56,17 +61,22 @@ jobs:
             echo "::error::Could not read previous release configuration; refusing to skip validation."
             exit 1
           fi
-      - name: Require a version no older than the published release
-        if: github.event_name == 'workflow_dispatch'
+      - name: Require an unpublished version no older than the latest release
+        if: steps.release.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
         shell: bash
         run: |
-          origin=$(node scripts/release-config.mjs download-origin)
-          if ! curl --fail --silent --show-error --location --retry 3 \
-            "$origin/downloads/update-manifest.json" -o "$RUNNER_TEMP/published-manifest.json"; then
-            echo "::error::Could not read the published update manifest; refusing to republish."
+          if gh release view "v$VERSION" --json tagName >/dev/null 2>&1; then
+            echo "::error::Release v$VERSION is already published; increase the version in release.json."
             exit 1
           fi
-          node scripts/release-config.mjs assert-not-older "$RUNNER_TEMP/published-manifest.json"
+          if latest=$(gh release view --json tagName --jq .tagName 2>/dev/null); then
+            node scripts/release-config.mjs assert-not-older "$latest"
+          else
+            echo "No published release yet."
+          fi
 
   windows:
     name: Build Windows Agent and viewer
@@ -91,16 +101,10 @@ jobs:
         run: |
           & .\scripts\build-agent.ps1
           & .\scripts\build-remote.ps1
-      - name: Collect release artifacts
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path release-output -Force | Out-Null
-          Copy-Item dashboard\public\downloads\*.exe release-output\
-          Copy-Item dashboard\public\downloads\*.sha256 release-output\
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-windows-${{ needs.validate.outputs.version }}
-          path: release-output/
+          path: dist/downloads/*.exe
           if-no-files-found: error
           retention-days: 14
 
@@ -165,7 +169,7 @@ jobs:
             echo "::error::Configure all three macOS notarization secrets."
             exit 1
           fi
-          for pair in "dashboard/public/downloads/meshrmm-remote-macos-arm64.zip=dist/remote-macos/MeshRMM Remote.app" "dashboard/public/downloads/meshrmm-agent-macos.zip=dist/agent-macos/MeshRMM Agent.app"; do
+          for pair in "dist/downloads/meshrmm-remote-macos-arm64.zip=dist/remote-macos/MeshRMM Remote.app" "dist/downloads/meshrmm-agent-macos.zip=dist/agent-macos/MeshRMM Agent.app"; do
             archive=${pair%%=*}
             app_directory=${pair#*=}
             xcrun notarytool submit "$archive" \
@@ -177,26 +181,20 @@ jobs:
             rm -f -- "$archive"
             ditto -c -k --sequesterRsrc --keepParent "$app_directory" "$archive"
           done
-      - name: Collect release artifacts
-        shell: bash
-        run: |
-          mkdir -p release-output
-          cp dashboard/public/downloads/meshrmm-remote-macos-arm64.zip dashboard/public/downloads/meshrmm-agent-macos.zip release-output/
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-macos-arm64-${{ needs.validate.outputs.version }}
-          path: release-output/
+          path: dist/downloads/*.zip
           if-no-files-found: error
           retention-days: 14
 
-  deploy:
-    name: Publish downloads to Cloudflare
-    needs: [checks, validate, windows, macos]
-    if: github.ref == 'refs/heads/main'
+  server:
+    name: Build the ${{ matrix.arch }} Linux server
+    needs: validate
     runs-on: ubuntu-latest
-    environment: production
-    env:
-      CLOUDFLARE_ACCOUNT_ID: "023f5fc9ffca88a15dac8e9f27b8d21f"
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -204,49 +202,155 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: native-windows-${{ needs.validate.outputs.version }}
-          path: dashboard/public/downloads
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: native-macos-arm64-${{ needs.validate.outputs.version }}
-          path: dashboard/public/downloads
-      - name: Generate the release manifest
-        shell: bash
-        run: |
-          version=$(node scripts/release-config.mjs version)
-          origin=$(node scripts/release-config.mjs download-origin)
-          manifest=dashboard/public/downloads/update-manifest.json
-          rm -f -- "$manifest"
-          node scripts/update-release-manifest.mjs "$manifest" agent-windows-x64 "$version" "$origin/downloads/meshrmm-agent-windows-x64.exe" dashboard/public/downloads/meshrmm-agent-windows-x64.exe
-          node scripts/update-release-manifest.mjs "$manifest" client-windows-x64 "$version" "$origin/downloads/meshrmm-remote-windows-x64.exe" dashboard/public/downloads/meshrmm-remote-windows-x64.exe
-          node scripts/update-release-manifest.mjs "$manifest" client-macos-arm64 "$version" "$origin/downloads/meshrmm-remote-macos-arm64.zip" dashboard/public/downloads/meshrmm-remote-macos-arm64.zip
-          node scripts/update-release-manifest.mjs "$manifest" agent-macos "$version" "$origin/downloads/meshrmm-agent-macos.zip" dashboard/public/downloads/meshrmm-agent-macos.zip
-          node scripts/verify-release-assets.mjs "$manifest"
-      - name: Upload assembled release for recovery
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: native-release-${{ needs.validate.outputs.version }}
-          path: dashboard/public/downloads/
-          if-no-files-found: error
-          retention-days: 30
-      - name: Install dashboard dependencies
+      - name: Build the website
         working-directory: dashboard
-        run: npm ci
-      - name: Verify Cloudflare credentials
+        run: |
+          npm ci
+          npm run build
+      - name: Install the musl cross-compiler
+        run: |
+          pip install --user ziglang==0.16.0 cargo-zigbuild==0.23.4
+          rustup target add ${{ matrix.arch }}-unknown-linux-musl
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: server-${{ matrix.arch }}-musl
+      - name: Build the static server with the website
+        run: cargo zigbuild --locked --profile server-release -p meshrmm-server --target ${{ matrix.arch }}-unknown-linux-musl
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: server-${{ matrix.arch }}-${{ needs.validate.outputs.version }}
+          path: target/${{ matrix.arch }}-unknown-linux-musl/server-release/meshrmm-server
+          if-no-files-found: error
+          retention-days: 14
+
+  sign:
+    name: Sign the Agent and viewer builds
+    needs: [validate, windows, macos]
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: native-*-${{ needs.validate.outputs.version }}
+          merge-multiple: true
+          path: downloads
+      - name: Sign every build with the release key
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          MESHRMM_RELEASE_SIGNING_KEY: ${{ secrets.MESHRMM_RELEASE_SIGNING_KEY }}
         shell: bash
         run: |
-          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
-            echo "::error::Add CLOUDFLARE_API_TOKEN to the production GitHub environment or repository secrets."
+          if [ -z "$MESHRMM_RELEASE_SIGNING_KEY" ]; then
+            echo "::error::Add MESHRMM_RELEASE_SIGNING_KEY to the production environment."
             exit 1
           fi
-      - name: Build and deploy dashboard with native downloads
-        working-directory: dashboard
+          node scripts/release-artifacts.mjs write downloads
+          node scripts/release-artifacts.mjs verify downloads
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: artifacts-json-${{ needs.validate.outputs.version }}
+          path: downloads/artifacts.json
+          if-no-files-found: error
+          retention-days: 14
+
+  package:
+    name: Package and test the server release
+    needs: [validate, windows, macos, server, sign]
+    # `sign` is skipped outside main.
+    if: ${{ !cancelled() && !failure() }}
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: native-*-${{ needs.validate.outputs.version }}
+          merge-multiple: true
+          path: downloads
+      - if: needs.validate.outputs.publish == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: artifacts-json-${{ needs.validate.outputs.version }}
+          path: downloads
+      - name: Describe the builds
+        shell: bash
+        run: |
+          if [ "${{ needs.validate.outputs.publish }}" = true ]; then
+            node scripts/release-artifacts.mjs verify downloads
+          else
+            node scripts/release-artifacts.mjs write downloads
+            node scripts/release-artifacts.mjs verify downloads --allow-unsigned
+          fi
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: server-*-${{ needs.validate.outputs.version }}
+          path: servers
+      - name: Pack the tarballs
+        shell: bash
+        run: |
+          for arch in x86_64 aarch64; do
+            sh scripts/package-server.sh "$arch" "servers/server-$arch-$VERSION/meshrmm-server" downloads dist/release
+          done
+          (cd dist/release && sha256sum -- *.tar.gz > SHA256SUMS)
+          cat dist/release/SHA256SUMS
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Test the tarball and Docker image
+        run: sudo sh scripts/test-server-package.sh dist/release
+      - name: Build the image for every architecture
+        run: docker buildx build --platform linux/amd64,linux/arm64 -f packaging/Dockerfile dist/release/image
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ needs.validate.outputs.version }}
+          path: |
+            dist/release/*.tar.gz
+            dist/release/SHA256SUMS
+            dist/release/image/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish to GitHub Releases and GHCR
+    needs: [checks, validate, package]
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-${{ needs.validate.outputs.version }}
+          path: dist/release
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Push the Docker image
+        shell: bash
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}-server"
+          docker buildx build --platform linux/amd64,linux/arm64 -f packaging/Dockerfile \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --tag "$image:$VERSION" --tag "$image:latest" --push dist/release/image
+      - name: Create the GitHub release
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          # Allows `npm run deploy`, which re-verifies the assembled downloads first.
-          MESHRMM_RELEASE_DEPLOY: "1"
-        run: npm run deploy
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "v$VERSION" --target "$GITHUB_SHA" --title "MeshRMM $VERSION" \
+            --notes "Server tarballs for x86_64 and arm64 Linux, each with the Windows and macOS Agent and viewer. The Docker image is ghcr.io/${GITHUB_REPOSITORY,,}-server:$VERSION." \
+            dist/release/*.tar.gz dist/release/SHA256SUMS
