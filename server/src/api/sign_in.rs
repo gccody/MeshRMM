@@ -8,12 +8,14 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
+use webauthn_rs::prelude::{PasskeyAuthentication, PublicKeyCredential, RequestChallengeResponse};
+
 use super::{SignInResult, signed_in_response};
 use crate::{
     audit::{self, Actor, Target},
     auth::{
         limits::ip_key,
-        password,
+        passkeys, password,
         second_factor::{self, TotpState},
         session::{self, AuthMethod, Client},
     },
@@ -21,8 +23,6 @@ use crate::{
     settings,
     users::{self, User},
 };
-
-const SECOND_FACTOR_METHODS: &[&str] = &["totp", "recovery_code"];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,15 +97,61 @@ pub async fn password(
     if user.disabled {
         return Err(ApiError::forbidden("this account is disabled").with_code("account_disabled"));
     }
-    if users::has_two_factor(&mut database, &user.id).await? {
-        let challenge = state.auth.challenges.issue(&user.id);
+    let factors = users::second_factors(&mut database, &user.id).await?;
+    if factors.any() {
+        let (passkey, passkey_state) = if factors.passkeys > 0 {
+            passkey_prompt(&state, &user).await?
+        } else {
+            (None, None)
+        };
+        let mut methods = Vec::new();
+        if factors.totp {
+            methods.push("totp");
+        }
+        if passkey.is_some() {
+            methods.push("passkey");
+        }
+        methods.push("recovery_code");
+        let challenge = state.auth.challenges.issue(&user.id, passkey_state);
         return Ok(Json(SignInResult::SecondFactorRequired {
             challenge,
-            methods: SECOND_FACTOR_METHODS,
+            methods,
+            passkey: passkey.map(Box::new),
         })
         .into_response());
     }
     finish(&state, &user, None, Client::new(ip, &headers)).await
+}
+
+/// A prompt for one of the user's passkeys, unless passkeys can't work on
+/// this server.
+async fn passkey_prompt(
+    state: &AppState,
+    user: &User,
+) -> Result<
+    (
+        Option<RequestChallengeResponse>,
+        Option<PasskeyAuthentication>,
+    ),
+    ApiError,
+> {
+    let mut database = &state.database;
+    let settings = settings::load(&mut database).await?;
+    let Ok(relying_party) = passkeys::relying_party(&state.config, &settings.instance_name) else {
+        return Ok((None, None));
+    };
+    let stored = passkeys::for_user(&mut database, &user.id).await?;
+    let credentials = stored
+        .into_iter()
+        .map(|stored| stored.passkey)
+        .collect::<Vec<_>>();
+    if credentials.is_empty() {
+        return Ok((None, None));
+    }
+    let (options, state) = relying_party
+        .start_passkey_authentication(&credentials)
+        .map_err(|error| anyhow::anyhow!("could not start a passkey prompt: {error}"))?;
+    Ok((Some(options), Some(state)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,10 +162,13 @@ pub struct SecondFactorSignIn {
     code: Option<String>,
     #[serde(default)]
     recovery_code: Option<String>,
+    /// The browser's answer to the passkey prompt.
+    #[serde(default)]
+    passkey: Option<PublicKeyCredential>,
 }
 
 /// `POST /v1/auth/sign-in/second-factor`: completes a sign-in with an
-/// authenticator code or a recovery code.
+/// authenticator code, a passkey or a recovery code.
 pub async fn second_factor(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -133,13 +182,13 @@ pub async fn second_factor(
         )
         .with_code("challenge_expired")
     };
-    let user_id = state
+    let attempt = state
         .auth
         .challenges
-        .attempt(&request.challenge)
+        .attempt(&request.challenge, request.passkey.is_some())
         .ok_or_else(expired)?;
     let mut database = &state.database;
-    let user = users::by_id(&mut database, &user_id)
+    let user = users::by_id(&mut database, &attempt.user_id)
         .await?
         .filter(|user| !user.disabled)
         .ok_or_else(expired)?;
@@ -150,8 +199,8 @@ pub async fn second_factor(
         .sign_in_by_account
         .hit(&user.email)
         .map_err(ApiError::rate_limited)?;
-    let (method, accepted) = match (&request.code, &request.recovery_code) {
-        (Some(code), None) => (
+    let (method, accepted) = match (&request.code, &request.recovery_code, &request.passkey) {
+        (Some(code), None, None) => (
             "totp",
             second_factor::verify_totp(
                 &mut database,
@@ -162,13 +211,25 @@ pub async fn second_factor(
             )
             .await?,
         ),
-        (None, Some(code)) => (
+        (None, Some(code), None) => (
             "recovery_code",
             second_factor::use_recovery_code(&mut database, &user.id, code).await?,
         ),
+        (None, None, Some(credential)) => {
+            let prompt = attempt.passkey.ok_or_else(|| {
+                ApiError::bad_request(
+                    "this sign-in has no passkey prompt; enter your password again",
+                )
+                .with_code("challenge_expired")
+            })?;
+            (
+                "passkey",
+                check_passkey(&state, &user, credential, &prompt).await?,
+            )
+        }
         _ => {
             return Err(ApiError::bad_request(
-                "enter a code from your authenticator app or a recovery code",
+                "use your authenticator app, a passkey or a recovery code",
             ));
         }
     };
@@ -188,6 +249,33 @@ pub async fn second_factor(
     }
     state.auth.challenges.complete(&request.challenge);
     finish(&state, &user, Some(method), Client::new(ip, &headers)).await
+}
+
+/// Checks the browser's answer to a passkey prompt for `user`.
+async fn check_passkey(
+    state: &AppState,
+    user: &User,
+    credential: &PublicKeyCredential,
+    prompt: &PasskeyAuthentication,
+) -> Result<bool, ApiError> {
+    let mut database = &state.database;
+    let settings = settings::load(&mut database).await?;
+    let relying_party = passkeys::relying_party(&state.config, &settings.instance_name)?;
+    let result = match relying_party.finish_passkey_authentication(credential, prompt) {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::info!(%error, user_id = user.id, "a passkey was refused");
+            return Ok(false);
+        }
+    };
+    let Some(mut stored) = passkeys::by_credential_id(&mut database, result.cred_id())
+        .await?
+        .filter(|stored| stored.user_id == user.id)
+    else {
+        return Ok(false);
+    };
+    passkeys::record_use(&mut database, &mut stored, &result).await?;
+    Ok(true)
 }
 
 /// Starts the session and records the sign-in.

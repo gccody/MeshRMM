@@ -55,6 +55,9 @@ pub enum Users {
     PasswordHash,
     PasswordChangedAt,
     Disabled,
+    OidcSubject,
+    ScimExternalId,
+    ScimManaged,
     CreatedAt,
     UpdatedAt,
     LastSignInAt,
@@ -78,6 +81,18 @@ pub enum UserRecoveryCodes {
     CodeHash,
     UsedAt,
     CreatedAt,
+}
+
+#[derive(Iden)]
+pub enum UserPasskeys {
+    Table,
+    Id,
+    UserId,
+    CredentialId,
+    Name,
+    PasskeyJson,
+    CreatedAt,
+    LastUsedAt,
 }
 
 #[derive(Iden)]
@@ -120,6 +135,15 @@ pub enum UserRoles {
     RoleId,
 }
 
+/// A view: the union of `user_roles` and the roles users hold through
+/// identity provider groups.
+#[derive(Iden)]
+pub enum EffectiveUserRoles {
+    Table,
+    UserId,
+    RoleId,
+}
+
 #[derive(Iden)]
 pub enum Invitations {
     Table,
@@ -150,6 +174,67 @@ pub enum PasswordResets {
     CreatedAt,
     ExpiresAt,
     UsedAt,
+}
+
+#[derive(Iden)]
+pub enum OidcProvider {
+    Table,
+    Id,
+    Enabled,
+    DisplayName,
+    IssuerUrl,
+    ClientId,
+    ClientSecretEncrypted,
+    Scopes,
+    AutoProvision,
+    DefaultRoleId,
+    RequireVerifiedEmail,
+    GroupsClaim,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+pub enum OidcGroupRoles {
+    Table,
+    GroupName,
+    RoleId,
+}
+
+#[derive(Iden)]
+pub enum UserOidcGroups {
+    Table,
+    UserId,
+    GroupName,
+}
+
+#[derive(Iden)]
+pub enum ScimTokens {
+    Table,
+    Id,
+    Name,
+    TokenHash,
+    CreatedByUserId,
+    CreatedAt,
+    LastUsedAt,
+    RevokedAt,
+}
+
+#[derive(Iden)]
+pub enum ScimGroups {
+    Table,
+    Id,
+    DisplayName,
+    ExternalId,
+    RoleId,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+pub enum ScimGroupMembers {
+    Table,
+    GroupId,
+    UserId,
 }
 
 #[derive(Iden)]

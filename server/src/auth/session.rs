@@ -12,7 +12,7 @@ use crate::{
     audit::Actor,
     db::{
         Executor,
-        tables::{UserSessions, Users},
+        tables::{UserOidcGroups, UserSessions, Users},
     },
     http::{ApiError, AppState, client_ip::ClientIp},
     rbac::{self, Permission, Permissions, Role},
@@ -107,6 +107,20 @@ pub async fn start(
                 .to_owned(),
         )
         .await?;
+    if method != AuthMethod::Oidc {
+        // Roles from SSO groups last only while the provider vouches for
+        // them, so a sign-in it didn't see drops them until the next SSO
+        // sign-in. Otherwise leaving a group at the provider would never
+        // take effect for someone who signs in with a password or passkey.
+        executor
+            .execute(
+                &Query::delete()
+                    .from_table(UserOidcGroups::Table)
+                    .and_where(Expr::col(UserOidcGroups::UserId).eq(user_id))
+                    .to_owned(),
+            )
+            .await?;
+    }
     executor
         .execute(
             &Query::update()
@@ -195,6 +209,7 @@ pub struct SignedIn {
     pub roles: Vec<Role>,
     pub permissions: Permissions,
     pub two_factor_enabled: bool,
+    pub second_factors: users::SecondFactors,
     /// The instance requires a second factor and this password session's
     /// user has none: only account security routes are open to it.
     pub must_enroll_two_factor: bool,
@@ -288,7 +303,8 @@ pub async fn load(
             .await?;
     }
     let roles = rbac::user_roles(&mut database, &user.id).await?;
-    let two_factor_enabled = users::has_two_factor(&mut database, &user.id).await?;
+    let second_factors = users::second_factors(&mut database, &user.id).await?;
+    let two_factor_enabled = second_factors.any();
     Ok(SignedIn {
         must_enroll_two_factor: settings.require_two_factor
             && session.auth_method == AuthMethod::Password.as_str()
@@ -301,6 +317,7 @@ pub async fn load(
         roles,
         user,
         two_factor_enabled,
+        second_factors,
         idle_timeout_minutes: settings.dashboard_idle_timeout_minutes,
         ip,
     })

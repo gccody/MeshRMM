@@ -131,7 +131,7 @@ pub async fn reset_password(state: &AppState, email: &str) -> anyhow::Result<Str
     ))
 }
 
-/// Removes the user's authenticator app and recovery codes and signs them
+/// Removes the user's authenticator app, passkeys and recovery codes and signs them
 /// out everywhere.
 pub async fn reset_two_factor(state: &AppState, email: &str) -> anyhow::Result<String> {
     let user = find_user(state, email).await?;

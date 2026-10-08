@@ -1,4 +1,6 @@
 // What the server says about itself and the signed-in account.
+import type { RequestOptionsJSON } from "../../lib/webauthn";
+import type { SecondFactorMethod } from "./sign-in";
 
 // GET /v1/instance: what the website needs before anyone signs in.
 export type Instance = {
@@ -9,6 +11,10 @@ export type Instance = {
     password: boolean;
     // Whether "forgot password" can email a reset link.
     password_reset_email: boolean;
+    // False when the server's public address can't host passkeys.
+    passkey: boolean;
+    // Single sign-on, with the name its button shows.
+    sso: { name: string } | null;
   };
   password_min_length: number;
 };
@@ -44,7 +50,10 @@ export type Account = {
     last_sign_in_at: number | null;
   };
   two_factor: {
+    // With an authenticator app, a passkey or both.
     enabled: boolean;
+    totp: boolean;
+    passkeys: number;
     // The instance requires it of password sign-ins.
     required: boolean;
     // Nothing but account security works until it is set up.
@@ -54,17 +63,21 @@ export type Account = {
   roles: RoleRef[];
   permissions: Permission[];
   is_administrator: boolean;
-  session: { id: string; auth_method: string; created_at: number; expires_at: number };
+  session: { id: string; auth_method: AuthMethod; created_at: number; expires_at: number };
   // Sign the browser out after this long without activity.
   idle_timeout_minutes: number;
   // Device users approve each connection, so Connect asks for a reason.
   connection_approval: boolean;
 };
 
-// The body of a response that signs the browser in.
+// How a session was signed in; "oidc" is single sign-on.
+export type AuthMethod = "password" | "passkey" | "oidc";
+
+// The body of a response that signs the browser in. `methods` are the
+// second factors the user has; `passkey` is the prompt for theirs.
 export type SignInResult =
   | { status: "signed_in"; two_factor_enrollment_required: boolean }
-  | { status: "second_factor_required"; challenge: string; methods: string[] };
+  | { status: "second_factor_required"; challenge: string; methods: SecondFactorMethod[]; passkey?: RequestOptionsJSON };
 
 export const can = (account: Pick<Account, "permissions"> | null | undefined, permission: Permission) =>
   Boolean(account?.permissions.includes(permission));

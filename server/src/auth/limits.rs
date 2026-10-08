@@ -9,6 +9,7 @@ use std::{
 };
 
 use subtle::ConstantTimeEq;
+use webauthn_rs::prelude::PasskeyAuthentication;
 
 use crate::secrets::{new_token, token_hash};
 
@@ -119,8 +120,17 @@ pub struct Challenges {
 #[derive(Debug)]
 struct Challenge {
     user_id: String,
+    passkey: Option<PasskeyAuthentication>,
     expires: Instant,
     attempts: u32,
+}
+
+/// An attempt at a challenge: whose it is, and the passkey prompt it
+/// offered, if the user has passkeys.
+#[derive(Debug)]
+pub struct ChallengeAttempt {
+    pub user_id: String,
+    pub passkey: Option<PasskeyAuthentication>,
 }
 
 impl Challenges {
@@ -132,8 +142,9 @@ impl Challenges {
         }
     }
 
-    /// Issues a challenge for `user_id` and returns its token.
-    pub fn issue(&self, user_id: &str) -> String {
+    /// Issues a challenge for `user_id` and returns its token. `passkey` is
+    /// the state of the passkey prompt sent with it.
+    pub fn issue(&self, user_id: &str, passkey: Option<PasskeyAuthentication>) -> String {
         let token = new_token();
         let now = Instant::now();
         let mut pending = self.lock();
@@ -142,6 +153,7 @@ impl Challenges {
             token_hash(&token),
             Challenge {
                 user_id: user_id.to_owned(),
+                passkey,
                 expires: now + self.ttl,
                 attempts: 0,
             },
@@ -149,9 +161,11 @@ impl Challenges {
         token
     }
 
-    /// Counts an attempt at the challenge and returns its user, or `None` if
-    /// it is unknown, expired, or out of attempts (which also removes it).
-    pub fn attempt(&self, token: &str) -> Option<String> {
+    /// Counts an attempt at the challenge and returns it, or `None` if it is
+    /// unknown, expired, or out of attempts (which also removes it). With
+    /// `take_passkey`, the passkey prompt is taken out in the same step, so
+    /// one answer to it can't be checked twice, even by parallel requests.
+    pub fn attempt(&self, token: &str, take_passkey: bool) -> Option<ChallengeAttempt> {
         let key = token_hash(token);
         let mut pending = self.lock();
         let challenge = pending.get_mut(&key)?;
@@ -160,7 +174,14 @@ impl Challenges {
             return None;
         }
         challenge.attempts += 1;
-        Some(challenge.user_id.clone())
+        Some(ChallengeAttempt {
+            user_id: challenge.user_id.clone(),
+            passkey: if take_passkey {
+                challenge.passkey.take()
+            } else {
+                None
+            },
+        })
     }
 
     pub fn complete(&self, token: &str) {
@@ -276,21 +297,28 @@ mod tests {
 
     #[test]
     fn challenges_allow_limited_attempts() {
+        let user = |attempt: Option<ChallengeAttempt>| attempt.map(|attempt| attempt.user_id);
         let challenges = Challenges::new(Duration::from_secs(60), 2);
-        let token = challenges.issue("user-1");
-        assert_eq!(challenges.attempt(&token).as_deref(), Some("user-1"));
-        assert_eq!(challenges.attempt(&token).as_deref(), Some("user-1"));
-        assert_eq!(challenges.attempt(&token), None);
-        assert_eq!(challenges.attempt(&token), None);
-        assert_eq!(challenges.attempt("unknown"), None);
+        let token = challenges.issue("user-1", None);
+        assert_eq!(
+            user(challenges.attempt(&token, false)).as_deref(),
+            Some("user-1")
+        );
+        assert_eq!(
+            user(challenges.attempt(&token, false)).as_deref(),
+            Some("user-1")
+        );
+        assert_eq!(user(challenges.attempt(&token, false)), None);
+        assert_eq!(user(challenges.attempt(&token, false)), None);
+        assert_eq!(user(challenges.attempt("unknown", false)), None);
 
-        let token = challenges.issue("user-2");
+        let token = challenges.issue("user-2", None);
         challenges.complete(&token);
-        assert_eq!(challenges.attempt(&token), None);
+        assert_eq!(user(challenges.attempt(&token, false)), None);
 
         let expired = Challenges::new(Duration::ZERO, 5);
-        let token = expired.issue("user-3");
-        assert_eq!(expired.attempt(&token), None);
+        let token = expired.issue("user-3", None);
+        assert_eq!(user(expired.attempt(&token, false)), None);
     }
 
     #[test]

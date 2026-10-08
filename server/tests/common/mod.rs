@@ -6,6 +6,9 @@
 //! a missing URL fails the tests instead of skipping PostgreSQL silently.
 #![allow(dead_code)]
 
+pub mod oidc_provider;
+pub mod passkey;
+
 use std::path::Path;
 
 use meshrmm_server::{config::Config, db::Database};

@@ -1,10 +1,13 @@
 //! User accounts: lookups, validation and the changes several routes share.
-use sea_query::{Expr, ExprTrait, Func, Query};
+use sea_query::{Expr, ExprTrait, Func, LockType, Query};
 
 use crate::{
     db::{
         self, Executor,
-        tables::{PasswordResets, UserRecoveryCodes, UserRoles, UserSessions, UserTotp, Users},
+        tables::{
+            PasswordResets, UserPasskeys, UserRecoveryCodes, UserRoles, UserSessions, UserTotp,
+            Users,
+        },
     },
     http::ApiError,
 };
@@ -20,18 +23,26 @@ pub struct User {
     pub password_hash: Option<String>,
     pub password_changed_at: Option<i64>,
     pub disabled: bool,
+    /// The SSO provider's subject, once the user has signed in with SSO.
+    pub oidc_subject: Option<String>,
+    pub scim_external_id: Option<String>,
+    /// SCIM created or changed the account.
+    pub scim_managed: bool,
     pub created_at: i64,
     pub updated_at: i64,
     pub last_sign_in_at: Option<i64>,
 }
 
-const COLUMNS: [Users; 9] = [
+const COLUMNS: [Users; 12] = [
     Users::Id,
     Users::Email,
     Users::DisplayName,
     Users::PasswordHash,
     Users::PasswordChangedAt,
     Users::Disabled,
+    Users::OidcSubject,
+    Users::ScimExternalId,
+    Users::ScimManaged,
     Users::CreatedAt,
     Users::UpdatedAt,
     Users::LastSignInAt,
@@ -193,7 +204,26 @@ pub async fn end_sessions(
     executor.execute(&delete).await
 }
 
-/// Removes the user's authenticator app and recovery codes.
+/// Locks the user's row until the transaction ends, so changes that check
+/// what else the user has (such as removing a second factor) run one at a
+/// time. (SQLite's write lock already does; sea-query leaves FOR UPDATE out
+/// there.)
+pub async fn lock(executor: &mut impl Executor, user_id: &str) -> db::Result<()> {
+    executor
+        .fetch_optional::<(String,), _>(
+            &Query::select()
+                .column(Users::Id)
+                .from(Users::Table)
+                .and_where(Expr::col(Users::Id).eq(user_id))
+                .lock(LockType::Update)
+                .to_owned(),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Removes every second factor: the authenticator app, passkeys and
+/// recovery codes.
 pub async fn remove_two_factor(executor: &mut impl Executor, user_id: &str) -> db::Result<()> {
     executor
         .execute(
@@ -206,6 +236,18 @@ pub async fn remove_two_factor(executor: &mut impl Executor, user_id: &str) -> d
     executor
         .execute(
             &Query::delete()
+                .from_table(UserPasskeys::Table)
+                .and_where(Expr::col(UserPasskeys::UserId).eq(user_id))
+                .to_owned(),
+        )
+        .await?;
+    remove_recovery_codes(executor, user_id).await
+}
+
+pub async fn remove_recovery_codes(executor: &mut impl Executor, user_id: &str) -> db::Result<()> {
+    executor
+        .execute(
+            &Query::delete()
                 .from_table(UserRecoveryCodes::Table)
                 .and_where(Expr::col(UserRecoveryCodes::UserId).eq(user_id))
                 .to_owned(),
@@ -215,7 +257,7 @@ pub async fn remove_two_factor(executor: &mut impl Executor, user_id: &str) -> d
 }
 
 /// Whether the user has a confirmed authenticator app.
-pub async fn has_two_factor(executor: &mut impl Executor, user_id: &str) -> db::Result<bool> {
+pub async fn has_totp(executor: &mut impl Executor, user_id: &str) -> db::Result<bool> {
     let row: Option<(String,)> = executor
         .fetch_optional(
             &Query::select()
@@ -227,6 +269,43 @@ pub async fn has_two_factor(executor: &mut impl Executor, user_id: &str) -> db::
         )
         .await?;
     Ok(row.is_some())
+}
+
+pub async fn passkey_count(executor: &mut impl Executor, user_id: &str) -> db::Result<i64> {
+    let (count,): (i64,) = executor
+        .fetch_one(
+            &Query::select()
+                .expr(Func::count(Expr::col(UserPasskeys::Id)))
+                .from(UserPasskeys::Table)
+                .and_where(Expr::col(UserPasskeys::UserId).eq(user_id))
+                .to_owned(),
+        )
+        .await?;
+    Ok(count)
+}
+
+/// The second factors a user has set up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SecondFactors {
+    pub totp: bool,
+    pub passkeys: i64,
+}
+
+impl SecondFactors {
+    /// Two-factor authentication is on: a password alone doesn't sign in.
+    pub fn any(self) -> bool {
+        self.totp || self.passkeys > 0
+    }
+}
+
+pub async fn second_factors(
+    executor: &mut impl Executor,
+    user_id: &str,
+) -> db::Result<SecondFactors> {
+    Ok(SecondFactors {
+        totp: has_totp(executor, user_id).await?,
+        passkeys: passkey_count(executor, user_id).await?,
+    })
 }
 
 /// Trims and lowercases an email address and checks it looks like one. The

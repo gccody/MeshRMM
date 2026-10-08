@@ -8,13 +8,16 @@ mod events;
 mod handoffs;
 mod instance;
 mod invitations;
+mod passkeys;
 mod password_resets;
 mod remote;
 mod roles;
 mod runs;
+mod scim;
 mod settings;
 mod setup;
 mod sign_in;
+mod sso;
 mod toolbox;
 mod users;
 
@@ -30,6 +33,7 @@ use serde::Serialize;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 pub use self::password_resets::create_reset;
+pub(crate) use self::users::ensure_administrator_remains;
 use crate::{
     auth::{Authorized, SignedIn, password},
     http::{ApiError, AppState, csrf},
@@ -44,6 +48,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/auth/sign-in", post(sign_in::password))
         .route("/auth/sign-in/second-factor", post(sign_in::second_factor))
         .route("/auth/sign-out", post(sign_in::sign_out))
+        .route("/auth/passkey/options", post(passkeys::sign_in_options))
+        .route("/auth/passkey", post(passkeys::sign_in))
+        .route("/auth/sso/start", get(sso::start))
+        .route("/auth/sso/callback", get(sso::callback))
         .route("/auth/invitation", post(invitations::lookup))
         .route("/auth/invitation/accept", post(invitations::accept))
         .route("/auth/password-reset", post(password_resets::request))
@@ -67,6 +75,16 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/account/two-factor/recovery-codes",
             post(account::regenerate_recovery_codes),
         )
+        .route(
+            "/account/passkeys",
+            get(passkeys::list).post(passkeys::register),
+        )
+        .route(
+            "/account/passkeys/options",
+            post(passkeys::registration_options),
+        )
+        .route("/account/passkeys/{id}", patch(passkeys::rename))
+        .route("/account/passkeys/{id}/remove", post(passkeys::remove))
         .route("/account/sessions", get(account::sessions))
         .route("/account/sessions/{id}", delete(account::end_session))
         .route("/users", get(users::list))
@@ -80,6 +98,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         )
         .route("/users/{id}/password-reset", post(users::password_reset))
         .route("/users/{id}/sign-out", post(users::sign_out))
+        .route("/users/{id}/unlink-sso", post(users::unlink_sso))
         .route(
             "/invitations",
             get(invitations::list).post(invitations::create),
@@ -101,6 +120,16 @@ pub fn router(state: AppState) -> Router<AppState> {
                 .delete(settings::delete_smtp),
         )
         .route("/settings/smtp/test", post(settings::test_smtp))
+        .route("/settings/scim", get(scim::get))
+        .route("/settings/scim/tokens", post(scim::create_token))
+        .route("/settings/scim/tokens/{id}", delete(scim::revoke_token))
+        .route("/settings/scim/groups/{id}", patch(scim::update_group))
+        .route(
+            "/settings/sso",
+            get(sso::get_settings)
+                .put(sso::put_settings)
+                .delete(sso::delete_settings),
+        )
         .route("/audit", get(audit_log::list))
         .route("/agent-installers", post(enrollment::create))
         .route("/agent-installers/redeem", post(enrollment::redeem))
@@ -186,8 +215,9 @@ pub fn router(state: AppState) -> Router<AppState> {
         ))
 }
 
-/// What a signed-in user changes may end sessions or change permissions, so
-/// open event sockets check their own access again after it.
+/// What a signed-in user changes may end sessions or change permissions,
+/// and so may signing in (it can drop roles from SSO groups), so open event
+/// sockets and remote sessions check their own access again after either.
 async fn recheck_access(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -196,9 +226,19 @@ async fn recheck_access(
     let change = !matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
-    ) && crate::auth::session::token(request.headers()).is_some();
+    );
+    let signed_in = crate::auth::session::token(request.headers()).is_some();
     let response = next.run(request).await;
-    if change && response.status().is_success() {
+    let signs_in = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .any(|cookie| {
+            cookie
+                .as_bytes()
+                .starts_with(format!("{}=", crate::auth::session::COOKIE_NAME).as_bytes())
+        });
+    if change && (signed_in || signs_in) && response.status().is_success() {
         state.presence.recheck_access();
     }
     response
@@ -215,7 +255,12 @@ enum SignInResult {
     },
     SecondFactorRequired {
         challenge: String,
-        methods: &'static [&'static str],
+        /// `totp`, `passkey` and `recovery_code`, as the user has them.
+        methods: Vec<&'static str>,
+        /// The prompt for `navigator.credentials.get`, if `methods` has
+        /// `passkey`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        passkey: Option<Box<webauthn_rs::prelude::RequestChallengeResponse>>,
     },
 }
 
@@ -276,6 +321,26 @@ async fn confirm_password(state: &AppState, user: &User, password: &str) -> Resu
     } else {
         Err(ApiError::forbidden("the password is incorrect").with_code("incorrect_password"))
     }
+}
+
+/// Call after removing one of a user's second factors, in the same
+/// transaction. Refuses to remove the last one when the instance requires
+/// two-factor authentication; otherwise the recovery codes go with it.
+async fn second_factor_removed(
+    executor: &mut impl crate::db::Executor,
+    user_id: &str,
+) -> Result<(), ApiError> {
+    if crate::users::second_factors(executor, user_id).await?.any() {
+        return Ok(());
+    }
+    if crate::settings::load(executor).await?.require_two_factor {
+        return Err(ApiError::forbidden(
+            "this server requires two-factor authentication, so your last second factor can't be removed",
+        )
+        .with_code("two_factor_required"));
+    }
+    crate::users::remove_recovery_codes(executor, user_id).await?;
+    Ok(())
 }
 
 /// Counts a try at a one-time link token from `ip`.

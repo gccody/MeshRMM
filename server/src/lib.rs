@@ -13,6 +13,7 @@ pub mod mail;
 pub mod maintenance;
 pub mod rbac;
 pub mod realtime;
+pub mod scim;
 pub mod secrets;
 pub mod serve;
 pub mod settings;

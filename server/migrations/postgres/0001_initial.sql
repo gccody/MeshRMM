@@ -59,6 +59,8 @@ CREATE TABLE users (
   disabled BOOLEAN NOT NULL DEFAULT FALSE,
   oidc_subject TEXT UNIQUE,
   scim_external_id TEXT UNIQUE,
+  -- SCIM created or changed the account, so the identity provider manages it.
+  scim_managed BOOLEAN NOT NULL DEFAULT FALSE,
   created_at BIGINT NOT NULL,
   updated_at BIGINT NOT NULL,
   last_sign_in_at BIGINT
@@ -198,11 +200,30 @@ CREATE TABLE oidc_provider (
   -- Create an account on first sign-in for users the IdP vouches for.
   auto_provision BOOLEAN NOT NULL DEFAULT FALSE,
   default_role_id TEXT REFERENCES roles (id) ON DELETE SET NULL,
-  -- The claim listing the user's groups, and a JSON object mapping group to role ID.
+  -- Link or create accounts by email only when the provider says the address
+  -- is verified. Without that, whoever controls the provider's email claim
+  -- could take over the matching account.
+  require_verified_email BOOLEAN NOT NULL DEFAULT TRUE,
+  -- The claim listing the user's groups; oidc_group_roles maps them to roles.
   groups_claim TEXT,
-  group_role_mappings_json TEXT NOT NULL DEFAULT '{}',
   updated_at BIGINT NOT NULL
 );
+
+-- Members of an SSO group (named in the groups claim) hold these roles.
+CREATE TABLE oidc_group_roles (
+  group_name TEXT NOT NULL CHECK (length(group_name) BETWEEN 1 AND 256),
+  role_id TEXT NOT NULL REFERENCES roles (id) ON DELETE CASCADE,
+  PRIMARY KEY (group_name, role_id)
+);
+
+-- The groups the user's last SSO sign-in reported.
+CREATE TABLE user_oidc_groups (
+  user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  group_name TEXT NOT NULL,
+  PRIMARY KEY (user_id, group_name)
+);
+
+CREATE INDEX idx_user_oidc_groups_group ON user_oidc_groups (group_name);
 
 CREATE TABLE scim_tokens (
   id TEXT NOT NULL PRIMARY KEY,
@@ -216,7 +237,7 @@ CREATE TABLE scim_tokens (
 
 CREATE TABLE scim_groups (
   id TEXT NOT NULL PRIMARY KEY,
-  display_name TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL UNIQUE CHECK (length(display_name) BETWEEN 1 AND 256),
   external_id TEXT UNIQUE,
   -- Members of the group hold this role while they stay in it.
   role_id TEXT REFERENCES roles (id) ON DELETE SET NULL,
@@ -229,6 +250,20 @@ CREATE TABLE scim_group_members (
   user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
   PRIMARY KEY (group_id, user_id)
 );
+
+CREATE INDEX idx_scim_group_members_user ON scim_group_members (user_id);
+
+-- The roles each user holds: assigned to them, or through an identity
+-- provider's group (a SCIM group, or a group in the SSO groups claim).
+CREATE VIEW effective_user_roles AS
+  SELECT user_id, role_id FROM user_roles
+  UNION
+  SELECT m.user_id, g.role_id
+    FROM scim_group_members AS m JOIN scim_groups AS g ON g.id = m.group_id
+    WHERE g.role_id IS NOT NULL
+  UNION
+  SELECT u.user_id, r.role_id
+    FROM user_oidc_groups AS u JOIN oidc_group_roles AS r ON r.group_name = u.group_name;
 
 CREATE TABLE audit_events (
   id TEXT NOT NULL PRIMARY KEY,

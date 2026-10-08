@@ -13,7 +13,7 @@ async fn sqlite_schema(url: &str) -> (Columns, BTreeSet<String>) {
     let columns: Vec<(String, String, bool)> = sqlx::query_as(
         "SELECT m.name, p.name, p.\"notnull\" = 0 \
          FROM sqlite_master AS m JOIN pragma_table_info(m.name) AS p \
-         WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND m.name <> '_sqlx_migrations'",
+         WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite_%' AND m.name <> '_sqlx_migrations'",
     )
     .fetch_all(&mut connection)
     .await
