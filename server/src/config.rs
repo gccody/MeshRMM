@@ -1,0 +1,442 @@
+//! The server's configuration: a TOML file (by default
+//! `/etc/meshrmm/server.toml`) overridden by `MESHRMM_*` environment variables.
+//!
+//! An environment variable names a key path with `__` between levels, e.g.
+//! `MESHRMM_TLS__MODE=proxy` or `MESHRMM_DATABASE__URL=postgres://...`.
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context, bail};
+use figment::{
+    Figment,
+    providers::{Env, Format, Toml},
+};
+use ipnet::IpNet;
+use serde::Deserialize;
+use url::{Host, Url};
+
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/meshrmm/server.toml";
+const DEFAULT_DATA_DIR: &str = "/var/lib/meshrmm";
+const DEFAULT_DOWNLOADS_DIR: &str = "/usr/share/meshrmm/downloads";
+const LETS_ENCRYPT_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
+
+/// The top-level keys environment variables may set. Anything else with the
+/// `MESHRMM_` prefix (for example an Agent's `MESHRMM_SERVER` on a developer
+/// machine) is ignored rather than rejected as an unknown key.
+const TOP_LEVEL_KEYS: &[&str] = &[
+    "public_url",
+    "data_dir",
+    "database",
+    "tls",
+    "http",
+    "downloads",
+    "log",
+];
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// The URL users, Agents and viewers reach this server at.
+    pub public_url: Url,
+    /// Where the server keeps its instance key, ACME account and certificates,
+    /// uploaded files, and (by default) its SQLite database.
+    #[serde(default = "default_data_dir")]
+    pub data_dir: PathBuf,
+    #[serde(default)]
+    pub database: DatabaseConfig,
+    pub tls: TlsConfig,
+    #[serde(default)]
+    pub http: HttpConfig,
+    #[serde(default)]
+    pub downloads: DownloadsConfig,
+    #[serde(default)]
+    pub log: LogConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseConfig {
+    /// `sqlite://<path>` or `postgres://...`. Defaults to `meshrmm.db` in the
+    /// data directory.
+    pub url: Option<String>,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            max_connections: default_max_connections(),
+        }
+    }
+}
+
+/// How the server gets the certificate it serves HTTPS with.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum TlsConfig {
+    /// Obtain and renew a certificate from an ACME CA (Let's Encrypt by
+    /// default) using the TLS-ALPN-01 challenge on the HTTPS port.
+    Acme {
+        /// Defaults to the host of `public_url`.
+        #[serde(default)]
+        domains: Vec<String>,
+        contact_email: Option<String>,
+        #[serde(default = "default_acme_directory")]
+        directory_url: Url,
+    },
+    /// Serve a certificate and key from PEM files, reloaded when they change.
+    Files {
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    },
+    /// Serve plain HTTP behind a reverse proxy that terminates TLS.
+    Proxy {
+        /// Peers whose `X-Forwarded-For` header is believed.
+        #[serde(default = "default_trusted_proxies")]
+        trusted_proxies: Vec<IpNet>,
+    },
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpConfig {
+    /// Defaults to `0.0.0.0:443`, or `127.0.0.1:8080` in proxy mode.
+    pub listen: Option<SocketAddr>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DownloadsConfig {
+    /// The Agent and viewer builds shipped with this server release.
+    #[serde(default = "default_downloads_dir")]
+    pub dir: PathBuf,
+}
+
+impl Default for DownloadsConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_downloads_dir(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogConfig {
+    /// A `tracing` filter such as `info` or `meshrmm_server=debug,info`.
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    #[serde(default)]
+    pub format: LogFormat,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: LogFormat::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+fn default_data_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_DATA_DIR)
+}
+
+fn default_downloads_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_DOWNLOADS_DIR)
+}
+
+fn default_max_connections() -> u32 {
+    10
+}
+
+fn default_log_level() -> String {
+    "info".to_owned()
+}
+
+fn default_acme_directory() -> Url {
+    Url::parse(LETS_ENCRYPT_DIRECTORY).expect("the Let's Encrypt directory URL is valid")
+}
+
+fn default_trusted_proxies() -> Vec<IpNet> {
+    vec![
+        IpNet::from(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        IpNet::from(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+    ]
+}
+
+impl Config {
+    /// Loads the configuration from `path` (if it exists) and the environment,
+    /// then validates it. A missing file is an error only when `required`.
+    pub fn load(path: &Path, required: bool) -> anyhow::Result<Self> {
+        if required && !path.exists() {
+            bail!("configuration file {} does not exist", path.display());
+        }
+        let environment = Env::prefixed("MESHRMM_").split("__").filter(|key| {
+            let top = key.as_str().split('.').next().unwrap_or_default();
+            TOP_LEVEL_KEYS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(top))
+        });
+        Self::from_figment(Figment::new().merge(Toml::file(path)).merge(environment))
+            .with_context(|| format!("invalid configuration (file {})", path.display()))
+    }
+
+    /// Parses and validates a configuration given as TOML text.
+    pub fn from_toml(text: &str) -> anyhow::Result<Self> {
+        Self::from_figment(Figment::new().merge(Toml::string(text)))
+    }
+
+    fn from_figment(figment: Figment) -> anyhow::Result<Self> {
+        let mut config: Self = figment.extract()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&mut self) -> anyhow::Result<()> {
+        validate_public_url(&self.public_url)?;
+        if let TlsConfig::Acme { domains, .. } = &mut self.tls
+            && domains.is_empty()
+        {
+            match self.public_url.host() {
+                Some(Host::Domain(domain)) => domains.push(domain.to_owned()),
+                _ => bail!(
+                    "tls.mode = \"acme\" needs public_url to name a DNS host, not an IP address"
+                ),
+            }
+        }
+        if let TlsConfig::Proxy { trusted_proxies } = &self.tls
+            && trusted_proxies.is_empty()
+        {
+            bail!("tls.trusted_proxies must list at least one address");
+        }
+        if self.database.max_connections == 0 {
+            bail!("database.max_connections must be at least 1");
+        }
+        if !self.data_dir.is_absolute() {
+            bail!("data_dir must be an absolute path");
+        }
+        Ok(())
+    }
+
+    /// `https://host[:port]` with no trailing slash.
+    pub fn public_origin(&self) -> String {
+        self.public_url.origin().ascii_serialization()
+    }
+
+    pub fn database_url(&self) -> String {
+        match &self.database.url {
+            Some(url) => url.clone(),
+            None => format!("sqlite://{}", self.data_dir.join("meshrmm.db").display()),
+        }
+    }
+
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.http.listen.unwrap_or(match self.tls {
+            TlsConfig::Proxy { .. } => SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)),
+            _ => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 443)),
+        })
+    }
+
+    /// The proxies whose forwarding headers are trusted. Empty unless the
+    /// server runs behind a reverse proxy.
+    pub fn trusted_proxies(&self) -> &[IpNet] {
+        match &self.tls {
+            TlsConfig::Proxy { trusted_proxies } => trusted_proxies,
+            _ => &[],
+        }
+    }
+}
+
+/// Agents and viewers only speak HTTPS, so the public URL must be HTTPS. Plain
+/// HTTP is allowed for a loopback host, for development.
+fn validate_public_url(url: &Url) -> anyhow::Result<()> {
+    let loopback = match url.host() {
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => bail!("public_url must include a host"),
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        _ => bail!("public_url must be an https:// URL"),
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        bail!("public_url must be an origin, with no path, query or fragment");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("public_url must not contain credentials");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ACME: &str = r#"
+        public_url = "https://rmm.example.com"
+        [tls]
+        mode = "acme"
+        contact_email = "ops@example.com"
+    "#;
+
+    #[test]
+    fn acme_defaults_its_domain_to_the_public_host() {
+        let config = Config::from_toml(ACME).unwrap();
+        let TlsConfig::Acme {
+            domains,
+            directory_url,
+            ..
+        } = &config.tls
+        else {
+            panic!("expected ACME");
+        };
+        assert_eq!(domains, &["rmm.example.com"]);
+        assert_eq!(directory_url.as_str(), LETS_ENCRYPT_DIRECTORY);
+        assert_eq!(config.listen_addr(), "0.0.0.0:443".parse().unwrap());
+        assert_eq!(config.public_origin(), "https://rmm.example.com");
+        assert_eq!(
+            config.database_url(),
+            "sqlite:///var/lib/meshrmm/meshrmm.db"
+        );
+        assert!(config.trusted_proxies().is_empty());
+    }
+
+    #[test]
+    fn acme_rejects_an_ip_address_host() {
+        let error = Config::from_toml(
+            r#"
+            public_url = "https://203.0.113.5"
+            tls.mode = "acme"
+        "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("DNS host"), "{error}");
+    }
+
+    #[test]
+    fn proxy_mode_listens_on_loopback_and_trusts_loopback_proxies() {
+        let config = Config::from_toml(
+            r#"
+            public_url = "https://rmm.example.com"
+            tls.mode = "proxy"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.listen_addr(), "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(
+            config.trusted_proxies(),
+            &[
+                "127.0.0.1/32".parse::<IpNet>().unwrap(),
+                "::1/128".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn files_mode_needs_both_paths() {
+        assert!(
+            Config::from_toml(
+                r#"
+                public_url = "https://rmm.example.com"
+                tls = { mode = "files", cert_path = "/etc/meshrmm/cert.pem" }
+            "#
+            )
+            .is_err()
+        );
+        let config = Config::from_toml(
+            r#"
+            public_url = "https://rmm.example.com"
+            data_dir = "/srv/meshrmm"
+            database.url = "postgres://meshrmm@db/meshrmm"
+            http.listen = "[::]:8443"
+            tls = { mode = "files", cert_path = "/etc/meshrmm/cert.pem", key_path = "/etc/meshrmm/key.pem" }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.database_url(), "postgres://meshrmm@db/meshrmm");
+        assert_eq!(config.listen_addr(), "[::]:8443".parse().unwrap());
+    }
+
+    #[test]
+    fn public_url_must_be_an_https_origin() {
+        for url in [
+            "http://rmm.example.com",
+            "https://rmm.example.com/meshrmm",
+            "https://rmm.example.com/?a=b",
+            "https://user:pass@rmm.example.com",
+            "ftp://rmm.example.com",
+        ] {
+            let text = format!("public_url = \"{url}\"\ntls.mode = \"proxy\"");
+            assert!(Config::from_toml(&text).is_err(), "{url} was accepted");
+        }
+        for url in [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "https://rmm.example.com/",
+        ] {
+            let text = format!("public_url = \"{url}\"\ntls.mode = \"proxy\"");
+            Config::from_toml(&text).unwrap_or_else(|error| panic!("{url}: {error}"));
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected() {
+        let error = Config::from_toml(
+            r#"
+            public_url = "https://rmm.example.com"
+            tls.mode = "proxy"
+            databse.url = "sqlite:///tmp/x.db"
+        "#,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("databse"), "{error:#}");
+    }
+
+    #[test]
+    #[allow(
+        clippy::result_large_err,
+        reason = "figment::Jail's closure returns figment::Error"
+    )]
+    fn environment_overrides_the_file_and_ignores_unrelated_variables() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("server.toml", ACME)?;
+            jail.set_env("MESHRMM_TLS__MODE", "proxy");
+            jail.set_env("MESHRMM_DATABASE__URL", "postgres://env@db/meshrmm");
+            jail.set_env("MESHRMM_SERVER", "https://agent-setting.example.com");
+            let config =
+                Config::load(Path::new("server.toml"), true).map_err(|error| error.to_string())?;
+            assert!(matches!(config.tls, TlsConfig::Proxy { .. }));
+            assert_eq!(config.database_url(), "postgres://env@db/meshrmm");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_example_configuration_is_valid() {
+        let config = Config::from_toml(include_str!("../server.example.toml")).unwrap();
+        assert!(matches!(config.tls, TlsConfig::Acme { .. }));
+        assert_eq!(config.public_origin(), "https://rmm.example.com");
+    }
+
+    #[test]
+    fn a_required_file_must_exist() {
+        let error = Config::load(Path::new("/nonexistent/meshrmm.toml"), true).unwrap_err();
+        assert!(error.to_string().contains("does not exist"), "{error}");
+    }
+}

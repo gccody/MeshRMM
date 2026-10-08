@@ -4,24 +4,38 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "The MeshRMM server on Cloudflare Workers"
+description = "The self-hosted MeshRMM server"
 
 [lints]
 workspace = true
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
+anyhow.workspace = true
+axum = "0.8.9"
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+clap.workspace = true
+figment = { version = "0.10.19", features = ["env", "toml"] }
 futures-util.workspace = true
-getrandom = { version = "0.2.17", features = ["js"] }
-jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
-meshrmm-protocol-types.workspace = true
+getrandom = "0.3"
+ipnet = { version = "2.12.2", features = ["serde"] }
+rustls.workspace = true
+rustls-acme = { version = "0.15.4", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
+sea-query = { version = "1.0.2", default-features = false, features = ["backend-postgres", "backend-sqlite", "derive"] }
+sea-query-sqlx = { version = "0.9.1", features = ["sqlx-postgres", "sqlx-sqlite"] }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.11.0"
-subtle = "2.6.1"
-uuid = { version = "1.24.1", features = ["v4", "js"] }
-url.workspace = true
-worker = { version = "0.8.5", features = ["d1", "http"] }
-worker-macros = { version = "0.8.5", features = ["http"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["derive", "macros", "migrate", "postgres", "runtime-tokio", "sqlite", "tls-rustls-ring-native-roots"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tower-http = { version = "0.7.1", features = ["fs", "limit", "set-header", "trace"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+figment = { version = "0.10.19", features = ["env", "test", "toml"] }
+http-body-util = "0.1"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+tempfile = "3"
+tower = { version = "0.5.3", features = ["util"] }
