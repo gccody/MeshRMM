@@ -3,39 +3,10 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{ADMIN_EMAIL, App, Browser};
+use common::{ADMIN_EMAIL, App};
 use serde_json::{Value, json};
 
-/// Invites `email` with `role_ids`, accepts, and returns the new user's
-/// browser and ID.
-async fn add_user(
-    app: &App,
-    admin: &mut Browser,
-    email: &str,
-    role_ids: &[&str],
-) -> (Browser, String) {
-    let invited = admin
-        .post(
-            "/v1/invitations",
-            json!({ "email": email, "role_ids": role_ids }),
-        )
-        .await;
-    assert_eq!(invited.status, StatusCode::CREATED, "{:?}", invited.body);
-    let token = common::link_token(invited.body["link"].as_str().unwrap());
-    let mut browser = app.browser();
-    let accepted = browser
-        .post(
-            "/v1/auth/invitation/accept",
-            json!({ "token": token, "display_name": email, "password": "a long enough password" }),
-        )
-        .await;
-    assert_eq!(accepted.status, StatusCode::CREATED, "{:?}", accepted.body);
-    let id = browser.get("/v1/account").await.body["user"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    (browser, id)
-}
+use common::add_user;
 
 fn ids(list: &Value) -> Vec<String> {
     list.as_array()

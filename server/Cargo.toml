@@ -15,10 +15,12 @@ anyhow.workspace = true
 argon2 = "0.5.3"
 axum = "0.8.9"
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+bytes.workspace = true
 clap.workspace = true
 figment = { version = "0.10.19", features = ["env", "toml"] }
 futures-util.workspace = true
 getrandom = "0.3"
+httpdate = "1.0.3"
 ipnet = { version = "2.12.2", features = ["serde"] }
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "ring", "rustls-native-certs", "smtp-transport", "tokio1-rustls"] }
 meshrmm-protocol-types.workspace = true
@@ -33,6 +35,7 @@ sqlx = { version = "0.9.0", default-features = false, features = ["derive", "mac
 subtle = "2.6.1"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio-util = { version = "0.7.19", features = ["io"] }
 totp-rs = { version = "5", default-features = false, features = ["otpauth"] }
 tower-http = { version = "0.7.1", features = ["fs", "limit", "set-header", "trace"] }
 tracing.workspace = true

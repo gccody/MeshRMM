@@ -21,7 +21,9 @@ use crate::{
     config::{Config, TlsConfig},
     db::Database,
     health,
+    realtime::AgentHub,
     secrets::InstanceKey,
+    storage::Storage,
 };
 
 /// What every request handler can reach.
@@ -31,6 +33,8 @@ pub struct AppState {
     pub database: Database,
     pub instance_key: InstanceKey,
     pub auth: Arc<AuthState>,
+    pub storage: Storage,
+    pub agents: AgentHub,
 }
 
 pub fn router(state: AppState) -> Router {

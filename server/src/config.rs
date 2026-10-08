@@ -32,6 +32,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "tls",
     "http",
     "downloads",
+    "toolbox",
     "log",
 ];
 
@@ -51,6 +52,8 @@ pub struct Config {
     pub http: HttpConfig,
     #[serde(default)]
     pub downloads: DownloadsConfig,
+    #[serde(default)]
+    pub toolbox: ToolboxConfig,
     #[serde(default)]
     pub log: LogConfig,
 }
@@ -126,6 +129,24 @@ impl Default for DownloadsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ToolboxConfig {
+    /// The largest library file a user may upload, in bytes. A reverse proxy
+    /// in front of the server may cap request bodies lower; Cloudflare's
+    /// proxy refuses bodies over 100 MB on its free plan.
+    #[serde(default = "default_max_toolbox_file_bytes")]
+    pub max_file_bytes: u64,
+}
+
+impl Default for ToolboxConfig {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: default_max_toolbox_file_bytes(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogConfig {
     /// A `tracing` filter such as `info` or `meshrmm_server=debug,info`.
     #[serde(default = "default_log_level")]
@@ -161,6 +182,10 @@ fn default_downloads_dir() -> PathBuf {
 
 fn default_max_connections() -> u32 {
     10
+}
+
+fn default_max_toolbox_file_bytes() -> u64 {
+    95 * 1024 * 1024
 }
 
 fn default_log_level() -> String {
@@ -225,6 +250,9 @@ impl Config {
         }
         if self.database.max_connections == 0 {
             bail!("database.max_connections must be at least 1");
+        }
+        if self.toolbox.max_file_bytes == 0 {
+            bail!("toolbox.max_file_bytes must be at least 1");
         }
         if !self.data_dir.is_absolute() {
             bail!("data_dir must be an absolute path");

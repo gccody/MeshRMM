@@ -276,13 +276,15 @@ impl Browser {
 
     /// Sends `request` as is, apart from tracking cookies.
     pub async fn raw(&mut self, request: axum::http::Request<axum::body::Body>) -> Response {
-        use http_body_util::BodyExt;
-        use tower::ServiceExt;
+        let response = self.bytes(request).await;
+        response.json(self.name)
+    }
 
-        let response = self.router.clone().oneshot(request).await.unwrap();
-        let status = response.status();
-        let headers = response.headers().clone();
-        if let Some(set_cookie) = headers.get("set-cookie") {
+    /// Sends `request` as is, apart from tracking cookies, and returns the
+    /// body as bytes.
+    pub async fn bytes(&mut self, request: axum::http::Request<axum::body::Body>) -> RawResponse {
+        let response = send(&self.router, request).await;
+        if let Some(set_cookie) = response.headers.get("set-cookie") {
             let set_cookie = set_cookie.to_str().unwrap();
             let pair = set_cookie.split(';').next().unwrap();
             self.cookie = if set_cookie.contains("Max-Age=0") {
@@ -291,24 +293,232 @@ impl Browser {
                 Some(pair.to_owned())
             };
         }
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let body = if bytes.is_empty() {
+        response
+    }
+
+    /// A request the way the website sends it, with the session cookie.
+    pub fn request(&self, method: axum::http::Method, path: &str) -> axum::http::request::Builder {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("origin", ORIGIN)
+            .header("x-meshrmm-request", "1");
+        if let Some(cookie) = &self.cookie {
+            request = request.header("cookie", cookie);
+        }
+        request
+    }
+}
+
+async fn send(
+    router: &axum::Router,
+    request: axum::http::Request<axum::body::Body>,
+) -> RawResponse {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    RawResponse {
+        status,
+        headers,
+        body,
+    }
+}
+
+/// A response whose body may not be JSON.
+pub struct RawResponse {
+    pub status: axum::http::StatusCode,
+    pub headers: axum::http::HeaderMap,
+    pub body: Vec<u8>,
+}
+
+impl RawResponse {
+    pub fn json(self, name: &str) -> Response {
+        let body = if self.body.is_empty() {
             serde_json::Value::Null
         } else {
-            serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            serde_json::from_slice(&self.body).unwrap_or_else(|_| {
                 panic!(
-                    "{}: response is not JSON: {}",
-                    self.name,
-                    String::from_utf8_lossy(&bytes)
+                    "{name}: response is not JSON: {}",
+                    String::from_utf8_lossy(&self.body)
                 )
             })
         };
         Response {
-            status,
-            headers,
+            status: self.status,
+            headers: self.headers,
             body,
         }
     }
+
+    pub fn header(&self, name: &str) -> &str {
+        self.headers
+            .get(name)
+            .map(|value| value.to_str().unwrap())
+            .unwrap_or_default()
+    }
+}
+
+/// An Agent: requests carry its credential and no cookie or origin.
+#[derive(Clone)]
+pub struct Agent {
+    router: axum::Router,
+    name: &'static str,
+    pub device_id: String,
+    pub token: String,
+}
+
+impl Agent {
+    pub fn request(&self, method: axum::http::Method, path: &str) -> axum::http::request::Builder {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {}", self.token))
+    }
+
+    pub async fn send(&self, request: axum::http::Request<axum::body::Body>) -> RawResponse {
+        send(&self.router, request).await
+    }
+
+    /// Posts JSON to `/v1/agents/{device}/{path}`.
+    pub async fn report(&self, path: &str, body: serde_json::Value) -> Response {
+        let request = self
+            .request(
+                axum::http::Method::POST,
+                &format!("/v1/agents/{}/{path}", self.device_id),
+            )
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        self.send(request).await.json(self.name)
+    }
+
+    /// The same Agent with another credential.
+    pub fn with_token(&self, token: &str) -> Self {
+        Self {
+            token: token.to_owned(),
+            ..self.clone()
+        }
+    }
+}
+
+impl App {
+    /// Issues an installer as `browser` and redeems it as a computer called
+    /// `name`, returning the enrolled Agent.
+    pub async fn enroll(&self, browser: &mut Browser, name: &str) -> Agent {
+        let installer = browser
+            .post(
+                "/v1/agent-installers",
+                serde_json::json!({ "platform": "windows-x64" }),
+            )
+            .await;
+        assert_eq!(installer.status, 201, "{}: {:?}", self.name, installer.body);
+        let redeemed = redeem(
+            self,
+            installer.body["install_token"].as_str().unwrap(),
+            name,
+            &random_hex(32),
+        )
+        .await;
+        assert_eq!(redeemed.status, 200, "{}: {:?}", self.name, redeemed.body);
+        Agent {
+            router: self.router.clone(),
+            name: self.name,
+            device_id: redeemed.body["device_id"].as_str().unwrap().to_owned(),
+            token: redeemed.body["agent_token"].as_str().unwrap().to_owned(),
+        }
+    }
+}
+
+/// Redeems an installer the way the Agent installer does.
+pub async fn redeem(app: &App, install_token: &str, name: &str, redemption_key: &str) -> Response {
+    let request = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri("/v1/agent-installers/redeem")
+        .header("authorization", format!("Bearer {install_token}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({ "name": name, "redemption_key": redemption_key }).to_string(),
+        ))
+        .unwrap();
+    send(&app.router, request).await.json(app.name)
+}
+
+/// Invites `email` with `role_ids`, accepts, and returns the new user's
+/// browser and ID.
+pub async fn add_user(
+    app: &App,
+    admin: &mut Browser,
+    email: &str,
+    role_ids: &[&str],
+) -> (Browser, String) {
+    let invited = admin
+        .post(
+            "/v1/invitations",
+            serde_json::json!({ "email": email, "role_ids": role_ids }),
+        )
+        .await;
+    assert_eq!(invited.status, 201, "{:?}", invited.body);
+    let token = link_token(invited.body["link"].as_str().unwrap());
+    let mut browser = app.browser();
+    let accepted = browser
+        .post(
+            "/v1/auth/invitation/accept",
+            serde_json::json!({ "token": token, "display_name": email, "password": "a long enough password" }),
+        )
+        .await;
+    assert_eq!(accepted.status, 201, "{:?}", accepted.body);
+    let id = browser.get("/v1/account").await.body["user"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    (browser, id)
+}
+
+/// Creates a role with `permissions` and returns its ID.
+pub async fn add_role(admin: &mut Browser, name: &str, permissions: &[&str]) -> String {
+    let created = admin
+        .post(
+            "/v1/roles",
+            serde_json::json!({ "name": name, "permissions": permissions }),
+        )
+        .await;
+    assert_eq!(created.status, 201, "{:?}", created.body);
+    created.body["id"].as_str().unwrap().to_owned()
+}
+
+/// A user holding exactly `permissions`, through a role of their own.
+pub async fn user_with(
+    app: &App,
+    admin: &mut Browser,
+    email: &str,
+    permissions: &[&str],
+) -> (Browser, String) {
+    let role = add_role(admin, email, permissions).await;
+    add_user(app, admin, email, &[&role]).await
+}
+
+/// The audit events for `action`, newest first.
+pub async fn audit_events(app: &App, action: &str) -> Vec<meshrmm_server::audit::Event> {
+    meshrmm_server::audit::list(
+        &mut app.db(),
+        &meshrmm_server::audit::Filter {
+            action: Some(action.to_owned()),
+            ..Default::default()
+        },
+        100,
+    )
+    .await
+    .unwrap()
 }
 
 pub const ADMIN_EMAIL: &str = "admin@example.com";
