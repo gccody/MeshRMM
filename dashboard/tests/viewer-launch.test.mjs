@@ -37,7 +37,7 @@ test("the viewer build follows the browser's platform", () => {
 });
 
 test("viewer downloads are the builds the release publishes", async () => {
-  const releaseAssets = await readFile(new URL("../../scripts/verify-release-assets.mjs", import.meta.url), "utf8");
+  const releaseAssets = await readFile(new URL("../../scripts/release-artifacts.mjs", import.meta.url), "utf8");
   for (const platform of VIEWER_PLATFORMS) {
     const { href } = VIEWER_DOWNLOADS[platform];
     assert.match(href, /^\/downloads\/[^/]+$/);

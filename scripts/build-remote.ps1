@@ -1,5 +1,8 @@
+# Builds the Windows viewer into dist\downloads, the directory a local server
+# can serve as its downloads, and describes it in dist\downloads\artifacts.json.
+# The build is signed when MESHRMM_RELEASE_SIGNING_KEY holds the signing key.
 [CmdletBinding()]
-param([string]$DownloadOrigin)
+param()
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -9,25 +12,9 @@ $manifestPath = Join-Path $repositoryRoot 'remote\Cargo.toml'
 $sourceExecutable = Join-Path $repositoryRoot 'target\release\meshrmm-remote.exe'
 $distributionDirectory = Join-Path $repositoryRoot 'dist\remote'
 $destinationExecutable = Join-Path $distributionDirectory 'meshrmm-remote.exe'
-$dashboardDownloadDirectory = Join-Path $repositoryRoot 'dashboard\public\downloads'
-$dashboardExecutable = Join-Path $dashboardDownloadDirectory 'meshrmm-remote-windows-x64.exe'
-$dashboardChecksum = "$dashboardExecutable.sha256"
-$updateManifest = Join-Path $dashboardDownloadDirectory 'update-manifest.json'
-$manifestWriter = Join-Path $PSScriptRoot 'update-release-manifest.mjs'
-$releaseConfig = Join-Path $repositoryRoot 'scripts\release-config.mjs'
-
-if (-not $DownloadOrigin) {
-    $configuredDownloadOrigin = & node $releaseConfig 'download-origin'
-    if ($LASTEXITCODE -ne 0) {
-        exit $LASTEXITCODE
-    }
-    $DownloadOrigin = $configuredDownloadOrigin.Trim()
-}
-$configuredVersion = & node $releaseConfig 'version'
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
-}
-$version = $configuredVersion.Trim()
+$downloadDirectory = Join-Path $repositoryRoot 'dist\downloads'
+$downloadExecutable = Join-Path $downloadDirectory 'meshrmm-remote-windows-x64.exe'
+$artifactsWriter = Join-Path $PSScriptRoot 'release-artifacts.mjs'
 
 . (Join-Path $PSScriptRoot 'use-cmake.ps1')
 & cargo build --locked --release --manifest-path $manifestPath
@@ -37,24 +24,18 @@ if ($LASTEXITCODE -ne 0) {
 
 New-Item -ItemType Directory -Path $distributionDirectory -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $repositoryRoot 'THIRD_PARTY_NOTICES.txt') -Destination $distributionDirectory -Force
-New-Item -ItemType Directory -Path $dashboardDownloadDirectory -Force | Out-Null
+New-Item -ItemType Directory -Path $downloadDirectory -Force | Out-Null
 Copy-Item -LiteralPath $sourceExecutable -Destination $destinationExecutable -Force
-Copy-Item -LiteralPath $sourceExecutable -Destination $dashboardExecutable -Force
+Copy-Item -LiteralPath $sourceExecutable -Destination $downloadExecutable -Force
 
 $artifact = Get-Item -LiteralPath $sourceExecutable
 $checksum = Get-FileHash -Algorithm SHA256 -LiteralPath $sourceExecutable
-$checksum.Hash.ToLowerInvariant() | Set-Content -LiteralPath $dashboardChecksum -Encoding ascii -NoNewline
-& node $manifestWriter `
-    $updateManifest `
-    'client-windows-x64' `
-    $version `
-    "$($DownloadOrigin.TrimEnd('/'))/downloads/meshrmm-remote-windows-x64.exe" `
-    $dashboardExecutable
+& node $artifactsWriter 'write' $downloadDirectory
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
 Write-Output "Remote client built at $($artifact.FullName)"
-Write-Output "Dashboard update asset copied to $dashboardExecutable"
+Write-Output "Download copied to $downloadExecutable"
 Write-Output "Size: $($artifact.Length) bytes"
 Write-Output "SHA256: $($checksum.Hash)"

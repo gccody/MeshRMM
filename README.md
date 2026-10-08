@@ -186,33 +186,28 @@ stores company-owned Agent records and audit events, and Durable Objects retain
 live signaling state. See [company domains and provisioning](docs/company-domains.md)
 for production setup and onboarding details.
 
-### Automated native releases
+### Releases
 
-`release.json` is the single source of truth for the deployed Agent and viewer
-version. To publish an update, increase only its `version` field, commit the
-change, and push it to `main`:
+`release.json` holds the release version and the release signing public key:
 
 ```json
 {
-  "version": "0.2.2",
-  "download_origin": "https://meshrmm.com",
-  "viewer_server": "https://api.meshrmm.com"
+  "version": "0.3.8",
+  "signing_public_key": "94d87ebff16c65b9c89fd143596e329f90080f8463dafbf1e9b9f1bd6ed98af3"
 }
 ```
 
-The **Publish native release** GitHub Actions workflow validates that the
-version increased, builds the Windows Agent plus Windows and Apple Silicon
-macOS viewers, generates one verified release manifest, and deploys the
-dashboard containing all update assets. It requires the `CLOUDFLARE_API_TOKEN`
-secret plus the Apple Developer ID signing and notarization secrets. See
-[automated native releases](docs/native-releases.md) for the one-time setup and
-recovery procedure.
+To publish a release, increase `version` and squash-merge the change into
+`main`. The **Publish release** workflow builds the Windows and macOS Agents
+and viewers, signs them with the release key, packs them with the static Linux
+server into a tarball per architecture and a Docker image, tests both, and
+publishes them to GitHub Releases and GHCR. Each server serves its release's
+builds and update manifest itself. See [releases](docs/releases.md) for the
+contents, the signing scheme, the one-time setup and development keys.
 
-For local builds, the following wrappers read the same `release.json`. The
-Agent wrapper copies the finished generic executable into both `dist/agent/`
-and the dashboard's ignored `public/downloads/` release directory, then writes
-its SHA-256 file and release-manifest entry. The remote-client wrapper does the
-same for the Windows client:
+For local builds, these wrappers read the same `release.json`. They put the
+builds in `dist/downloads/`, which a development server can serve as its
+downloads directory, and describe them in `dist/downloads/artifacts.json`:
 
 ```powershell
 & .\scripts\build-agent.ps1
@@ -234,9 +229,9 @@ sessions. Use `-SkipBuild` to install an existing `target/release/meshrmm-agent.
 Results and a diagnostic log copy are saved under `dist/`. Normal automatic
 updates remain enabled; a newer published version can replace this local build.
 
-On a Mac, build an application bundle. The wrapper generates its non-secret
-`dist/remote/remote.json` sidecar from `release.json` (or accepts an explicit
-sidecar path as its first argument):
+On a Mac, build an application bundle. The viewer takes its server from each
+dashboard link; an optional JSON file passed as the first argument becomes the
+bundle's `Contents/MacOS/remote.json` for local settings:
 
 ```sh
 sh scripts/build-remote-macos.sh
@@ -254,20 +249,18 @@ This builds and signs a release-mode viewer, closes any running viewer,
 installs it in `~/Applications/MeshRMM Remote.app`, and registers dashboard links.
 Use a fresh **Connect** link to start a session. Existing installs
 are retained in a `.meshrmm-backup.*` folder under `~/Applications`.
-An optional JSON configuration path can be passed as the first argument.
-The installed configuration sets `auto_update` to `false` so production releases
+The installed configuration sets `auto_update` to `false` so releases
 cannot replace the local build. Normal builds default to automatic updates;
 reinstall a normal release to restore that behavior. This script does not change
-`release.json`, generate dashboard download assets, or deploy anything.
+`release.json` or write download assets.
 For a local bundle without installation, use `sh scripts/build-remote-macos.sh --local`.
 
-The script builds for the Mac architecture it runs on, copies the Cloudflare
-API URL into the app bundle, signs it, and publishes a zipped update artifact
-plus the corresponding manifest entry. Run it on each macOS architecture that
-you distribute. A browser deep link supplies a 60-second, single-use handoff
-token. The viewer redeems it before checking for updates and carries the resulting
-session through an update relaunch. A session awaiting its first viewer has a
-15-minute startup window; connected sessions use the configured sliding timeout.
+The script builds for the Mac architecture it runs on, signs the bundle, and
+archives it in `dist/downloads/`. A browser deep link supplies a 60-second,
+single-use handoff token. The viewer redeems it before checking for updates and
+carries the resulting session through an update relaunch. A session awaiting its
+first viewer has a 15-minute startup window; connected sessions use the
+configured sliding timeout.
 The macOS build scripts sign with the keychain's Developer ID Application
 certificate, which keeps the Agent's privacy permissions across rebuilds.
 If the keychain holds several, set `MESHRMM_CODESIGN_IDENTITY` to the one to
@@ -277,8 +270,8 @@ workflow notarizes, because locally built apps aren't quarantined.
 
 The native update version is compiled from `release.json`; Cargo package
 metadata is not used to decide whether an update is newer. Manifest and release
-URLs must use HTTPS. Each updater verifies the downloaded artifact against the
-manifest's SHA-256 digest before replacing anything.
+URLs must use HTTPS. Each updater checks the release signature before
+downloading and the SHA-256 digest before replacing anything.
 
 Existing installations are repaired without replacing their device identity. New
 installations persist a private recovery key and pending configuration so a failed
@@ -304,18 +297,6 @@ sliding `REMOTE_SESSION_IDLE_TIMEOUT_SECONDS` idle timeout (900 seconds by
 default): a connected viewer renews the deadline every 30 seconds, and the
 session expires after the viewer stops reporting activity for the configured
 interval. TURN credentials use the same configured lifetime when issued.
-
-For local Worker development, bind a local D1 database, put the two TURN values
-in an ignored `server/.dev.vars` file, and use `npx wrangler dev`. Cloudflare
-TURN credential generation still needs real credentials and outbound access.
-Deploy the server with `node scripts/deploy-server.mjs` (add `--dry-run` to
-list pending migrations and build without deploying). It applies the D1
-migrations before deploying the Worker and then checks `/healthz`, which
-reports the newest applied migration and answers 503 when D1 is older than the
-Worker expects. See [company domains](docs/company-domains.md).
-`node scripts/deploy-prod.mjs` deploys the server and publishes a native release
-in one step, then verifies production. See
-[automated native releases](docs/native-releases.md#deploy-everything-to-production).
 
 ## Run
 

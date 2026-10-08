@@ -4,7 +4,3 @@
 /coverage
 .DS_Store
 npm-debug.log*
-
-# Agent and viewer builds the release scripts copy here; the server serves
-# downloads from its own directory, not from the website.
-/public/downloads/
