@@ -19,6 +19,7 @@ pub mod settings;
 pub mod storage;
 pub mod time;
 pub mod toolbox;
+pub mod turn;
 pub mod users;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -34,6 +35,7 @@ use crate::{
     realtime::{AgentHub, Presence, Sessions, presence::UPDATE_GRACE, sessions::Timeouts},
     secrets::InstanceKey,
     storage::Storage,
+    turn::Turn,
 };
 
 /// How long in-flight requests get to finish after a shutdown signal.
@@ -64,6 +66,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         config: Arc::new(config),
         presence: Presence::new(database.clone(), agents.clone(), UPDATE_GRACE),
         sessions: Sessions::new(Timeouts::new(idle)),
+        turn: Turn::new(&instance_key),
         database,
         instance_key,
         auth: Arc::new(AuthState::default()),
@@ -98,6 +101,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             "resumed remote sessions that were live at shutdown"
         );
     }
+    state.turn.start(&state.config).await?;
     let maintenance = maintenance::spawn(state.database.clone(), state.storage.clone());
     let handle = Handle::<SocketAddr>::new();
     tokio::spawn({
@@ -110,6 +114,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     });
     let served = serve::serve(&state.config, http::router(state.clone()), handle).await;
     maintenance.abort();
+    state.turn.stop().await;
     state.database.close().await;
     served
 }
@@ -158,6 +163,11 @@ pub async fn check(config: Config) -> anyhow::Result<()> {
                     key_path.display()
                 )
             })?;
+    }
+    if config.turn.enabled && config.turn.public_ip.is_none() {
+        let host = config.turn_host();
+        let ip = turn::resolve(&host).await?;
+        println!("TURN relays will use {ip}, the address of {host}");
     }
     let url = config.database_url();
     if let Some(path) = db::sqlite_path(&url)?

@@ -2666,6 +2666,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "argon2",
+ "async-trait",
  "axum",
  "axum-server",
  "bytes",
@@ -2673,6 +2674,7 @@ dependencies = [
  "figment",
  "futures-util",
  "getrandom 0.3.4",
+ "hmac 0.12.1",
  "http-body-util",
  "httpdate",
  "ipnet",
@@ -2699,8 +2701,10 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "turn",
  "url",
  "uuid",
+ "webrtc-util",
 ]
 
 [[package]]
@@ -5220,8 +5224,6 @@ dependencies = [
 [[package]]
 name = "turn"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ed995882f66ab94238de77c62e5e778389698ab700afa4696f4754da8f457cb"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
