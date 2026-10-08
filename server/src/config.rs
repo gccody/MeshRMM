@@ -33,6 +33,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "http",
     "downloads",
     "toolbox",
+    "remote",
     "log",
 ];
 
@@ -54,6 +55,8 @@ pub struct Config {
     pub downloads: DownloadsConfig,
     #[serde(default)]
     pub toolbox: ToolboxConfig,
+    #[serde(default)]
+    pub remote: RemoteConfig,
     #[serde(default)]
     pub log: LogConfig,
 }
@@ -147,6 +150,22 @@ impl Default for ToolboxConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RemoteConfig {
+    /// How long a remote session lasts after its viewer was last heard from.
+    #[serde(default = "default_remote_idle_timeout_seconds")]
+    pub idle_timeout_seconds: u64,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_seconds: default_remote_idle_timeout_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogConfig {
     /// A `tracing` filter such as `info` or `meshrmm_server=debug,info`.
     #[serde(default = "default_log_level")]
@@ -186,6 +205,10 @@ fn default_max_connections() -> u32 {
 
 fn default_max_toolbox_file_bytes() -> u64 {
     95 * 1024 * 1024
+}
+
+fn default_remote_idle_timeout_seconds() -> u64 {
+    15 * 60
 }
 
 fn default_log_level() -> String {
@@ -253,6 +276,9 @@ impl Config {
         }
         if self.toolbox.max_file_bytes == 0 {
             bail!("toolbox.max_file_bytes must be at least 1");
+        }
+        if !(60..=3600).contains(&self.remote.idle_timeout_seconds) {
+            bail!("remote.idle_timeout_seconds must be between 60 and 3600");
         }
         if !self.data_dir.is_absolute() {
             bail!("data_dir must be an absolute path");
@@ -460,6 +486,17 @@ mod tests {
         let config = Config::from_toml(include_str!("../server.example.toml")).unwrap();
         assert!(matches!(config.tls, TlsConfig::Acme { .. }));
         assert_eq!(config.public_origin(), "https://rmm.example.com");
+        assert_eq!(config.remote.idle_timeout_seconds, 900);
+    }
+
+    #[test]
+    fn the_remote_idle_timeout_is_bounded() {
+        for seconds in [0, 59, 3601] {
+            let text = format!(
+                "public_url = \"https://rmm.example.com\"\ntls.mode = \"proxy\"\nremote.idle_timeout_seconds = {seconds}"
+            );
+            assert!(Config::from_toml(&text).is_err(), "{seconds} was accepted");
+        }
     }
 
     #[test]

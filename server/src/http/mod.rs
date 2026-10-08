@@ -21,7 +21,7 @@ use crate::{
     config::{Config, TlsConfig},
     db::Database,
     health,
-    realtime::AgentHub,
+    realtime::{AgentHub, Presence, Sessions},
     secrets::InstanceKey,
     storage::Storage,
 };
@@ -35,6 +35,8 @@ pub struct AppState {
     pub auth: Arc<AuthState>,
     pub storage: Storage,
     pub agents: AgentHub,
+    pub presence: Presence,
+    pub sessions: Sessions,
 }
 
 pub fn router(state: AppState) -> Router {

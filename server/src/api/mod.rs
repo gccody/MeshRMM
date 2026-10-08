@@ -4,10 +4,12 @@ mod agent;
 mod audit_log;
 mod devices;
 mod enrollment;
+mod events;
 mod handoffs;
 mod instance;
 mod invitations;
 mod password_resets;
+mod remote;
 mod roles;
 mod runs;
 mod settings;
@@ -18,7 +20,8 @@ mod users;
 
 use axum::{
     Json, Router,
-    http::{HeaderValue, StatusCode, header},
+    extract::State,
+    http::{HeaderValue, Method, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -101,8 +104,11 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/audit", get(audit_log::list))
         .route("/agent-installers", post(enrollment::create))
         .route("/agent-installers/redeem", post(enrollment::redeem))
+        .route("/events", get(events::subscribe))
         .route("/agents", get(devices::list))
         .route("/agents/{id}", delete(devices::delete))
+        .route("/agents/{id}/connect", get(agent::connect))
+        .route("/agents/{id}/close-session", post(remote::close))
         .route(
             "/agents/{id}/rotate-credential",
             post(devices::rotate_credential),
@@ -144,12 +150,58 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/file-deliveries", get(runs::list_deliveries))
         .route("/file-deliveries/{id}", get(runs::get_delivery))
         .route("/remote/handoffs", post(handoffs::create))
+        .route("/remote/handoffs/redeem", post(remote::redeem))
+        .route("/remote/sessions/{id}/signal", get(remote::signal))
+        .route("/remote/sessions/{id}/resume", post(remote::resume))
+        .route("/remote/sessions/{id}/end", post(remote::end))
+        .route(
+            "/remote/sessions/{id}/toolbox",
+            get(remote::session_toolbox),
+        )
+        .route(
+            "/remote/sessions/{id}/script-runs",
+            post(remote::session_run_script),
+        )
+        .route(
+            "/remote/sessions/{id}/script-runs/{run_id}",
+            get(remote::session_script_run),
+        )
+        .route(
+            "/remote/sessions/{id}/file-deliveries",
+            post(remote::session_deliver_file),
+        )
+        .route(
+            "/remote/sessions/{id}/file-deliveries/{delivery_id}",
+            get(remote::session_file_delivery),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            recheck_access,
+        ))
         .layer(middleware::from_fn_with_state(state, csrf::check))
         // Responses carry account data; browsers and proxies must not keep them.
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
         ))
+}
+
+/// What a signed-in user changes may end sessions or change permissions, so
+/// open event sockets check their own access again after it.
+async fn recheck_access(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let change = !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) && crate::auth::session::token(request.headers()).is_some();
+    let response = next.run(request).await;
+    if change && response.status().is_success() {
+        state.presence.recheck_access();
+    }
+    response
 }
 
 /// The body of a response that signs the browser in.

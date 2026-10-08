@@ -27,8 +27,13 @@ use anyhow::Context;
 use axum_server::Handle;
 
 use crate::{
-    auth::AuthState, config::Config, db::Database, http::AppState, realtime::AgentHub,
-    secrets::InstanceKey, storage::Storage,
+    auth::AuthState,
+    config::Config,
+    db::Database,
+    http::AppState,
+    realtime::{AgentHub, Presence, Sessions, presence::UPDATE_GRACE, sessions::Timeouts},
+    secrets::InstanceKey,
+    storage::Storage,
 };
 
 /// How long in-flight requests get to finish after a shutdown signal.
@@ -53,13 +58,17 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         schema_version = database.backend().expected_schema_version(),
         "database ready"
     );
+    let agents = AgentHub::default();
+    let idle = Duration::from_secs(config.remote.idle_timeout_seconds);
     Ok(AppState {
         config: Arc::new(config),
+        presence: Presence::new(database.clone(), agents.clone(), UPDATE_GRACE),
+        sessions: Sessions::new(Timeouts::new(idle)),
         database,
         instance_key,
         auth: Arc::new(AuthState::default()),
         storage,
-        agents: AgentHub::default(),
+        agents,
     })
 }
 
@@ -82,6 +91,13 @@ pub async fn announce_setup(state: &AppState) -> anyhow::Result<Option<String>> 
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let state = prepare(config).await?;
     announce_setup(&state).await?;
+    let restored = state.sessions.restore(&state).await?;
+    if restored > 0 {
+        tracing::info!(
+            restored,
+            "resumed remote sessions that were live at shutdown"
+        );
+    }
     let maintenance = maintenance::spawn(state.database.clone(), state.storage.clone());
     let handle = Handle::<SocketAddr>::new();
     tokio::spawn({

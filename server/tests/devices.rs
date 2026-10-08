@@ -124,7 +124,7 @@ async fn devices_list_online_first_and_deleting_one_uninstalls_its_agent() {
             deleted.body
         );
         assert_eq!(
-            connection.commands.recv().await,
+            common::next_command(&mut connection).await,
             Some(AgentCommand::Uninstall)
         );
         assert_eq!(
@@ -187,7 +187,8 @@ async fn rotation_resends_the_pending_credential_until_the_agent_uses_it() {
             "{name}: {:?}",
             rotated.body
         );
-        let Some(AgentCommand::RotateToken { token: first }) = connection.commands.recv().await
+        let Some(AgentCommand::RotateToken { token: first }) =
+            common::next_command(&mut connection).await
         else {
             panic!("expected a rotation");
         };
@@ -203,7 +204,7 @@ async fn rotation_resends_the_pending_credential_until_the_agent_uses_it() {
             StatusCode::ACCEPTED
         );
         assert_eq!(
-            connection.commands.recv().await,
+            common::next_command(&mut connection).await,
             Some(AgentCommand::RotateToken {
                 token: first.clone()
             })
@@ -235,7 +236,8 @@ async fn rotation_resends_the_pending_credential_until_the_agent_uses_it() {
             admin.post(&path, json!({})).await.status,
             StatusCode::ACCEPTED
         );
-        let Some(AgentCommand::RotateToken { token: second }) = connection.commands.recv().await
+        let Some(AgentCommand::RotateToken { token: second }) =
+            common::next_command(&mut connection).await
         else {
             panic!("expected a rotation");
         };
@@ -264,7 +266,8 @@ async fn rotation_resends_the_pending_credential_until_the_agent_uses_it() {
             admin.post(&path, json!({})).await.status,
             StatusCode::ACCEPTED
         );
-        let Some(AgentCommand::RotateToken { token: third }) = connection.commands.recv().await
+        let Some(AgentCommand::RotateToken { token: third }) =
+            common::next_command(&mut connection).await
         else {
             panic!("expected a rotation");
         };

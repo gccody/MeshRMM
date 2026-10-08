@@ -293,17 +293,19 @@ CREATE TABLE remote_handoffs (
 CREATE INDEX idx_remote_handoffs_expiry ON remote_handoffs (expires_at);
 
 -- Live remote sessions, persisted so a viewer and Agent can resume one after
--- the server restarts.
+-- the server restarts. A device has at most one; `expires_at` is its idle
+-- deadline, which activity moves forward. The record holds the session's
+-- signaling tokens, so it is sealed with the instance key.
 CREATE TABLE remote_sessions (
   id TEXT NOT NULL PRIMARY KEY,
-  device_id TEXT NOT NULL,
+  device_id TEXT NOT NULL UNIQUE,
   user_id TEXT NOT NULL,
-  state_json TEXT NOT NULL,
+  record_encrypted BYTEA NOT NULL,
   created_at BIGINT NOT NULL,
   expires_at BIGINT NOT NULL
 );
 
-CREATE INDEX idx_remote_sessions_device ON remote_sessions (device_id);
+CREATE INDEX idx_remote_sessions_user ON remote_sessions (user_id);
 CREATE INDEX idx_remote_sessions_expiry ON remote_sessions (expires_at);
 
 CREATE TABLE toolbox_scripts (

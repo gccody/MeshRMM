@@ -225,74 +225,85 @@ impl FromRequestParts<AppState> for SignedIn {
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
         let token = token(&parts.headers).ok_or_else(unauthenticated)?;
-        let mut database = &state.database;
-        let session: SessionRow = database
-            .fetch_optional(
-                &Query::select()
-                    .columns([
-                        UserSessions::Id,
-                        UserSessions::UserId,
-                        UserSessions::AuthMethod,
-                        UserSessions::CreatedAt,
-                        UserSessions::LastSeenAt,
-                        UserSessions::ExpiresAt,
-                    ])
-                    .from(UserSessions::Table)
-                    .and_where(Expr::col(UserSessions::TokenHash).eq(token_hash(&token)))
-                    .to_owned(),
-            )
-            .await?
-            .ok_or_else(unauthenticated)?;
-        let settings = settings::load(&mut database).await?;
-        let now = now_ms();
-        let idle_ms = settings.dashboard_idle_timeout_minutes * MINUTE_MS;
-        if now >= session.expires_at || now >= session.last_seen_at + idle_ms {
-            database
-                .execute(
-                    &Query::delete()
-                        .from_table(UserSessions::Table)
-                        .and_where(Expr::col(UserSessions::Id).eq(session.id.as_str()))
-                        .to_owned(),
-                )
-                .await?;
-            return Err(unauthenticated());
-        }
-        let user = users::by_id(&mut database, &session.user_id)
-            .await?
-            .filter(|user| !user.disabled)
-            .ok_or_else(unauthenticated)?;
-        if now - session.last_seen_at >= TOUCH_INTERVAL_MS {
-            database
-                .execute(
-                    &Query::update()
-                        .table(UserSessions::Table)
-                        .value(UserSessions::LastSeenAt, now)
-                        .and_where(Expr::col(UserSessions::Id).eq(session.id.as_str()))
-                        .to_owned(),
-                )
-                .await?;
-        }
-        let roles = rbac::user_roles(&mut database, &user.id).await?;
-        let two_factor_enabled = users::has_two_factor(&mut database, &user.id).await?;
         let ClientIp(ip) = ClientIp::from_request_parts(parts, state)
             .await
             .unwrap_or_else(|never| match never {});
-        Ok(Self {
-            must_enroll_two_factor: settings.require_two_factor
-                && session.auth_method == AuthMethod::Password.as_str()
-                && !two_factor_enabled,
-            session_id: session.id,
-            auth_method: session.auth_method,
-            session_created_at: session.created_at,
-            session_expires_at: session.expires_at,
-            permissions: rbac::permissions_of(&roles),
-            roles,
-            user,
-            two_factor_enabled,
-            idle_timeout_minutes: settings.dashboard_idle_timeout_minutes,
-            ip,
-        })
+        load(state, &token, ip, true).await
     }
+}
+
+/// The live session `token` names. `touch` counts the request as activity,
+/// which a check that the user is still signed in should not.
+pub async fn load(
+    state: &AppState,
+    token: &str,
+    ip: IpAddr,
+    touch: bool,
+) -> Result<SignedIn, ApiError> {
+    let mut database = &state.database;
+    let session: SessionRow = database
+        .fetch_optional(
+            &Query::select()
+                .columns([
+                    UserSessions::Id,
+                    UserSessions::UserId,
+                    UserSessions::AuthMethod,
+                    UserSessions::CreatedAt,
+                    UserSessions::LastSeenAt,
+                    UserSessions::ExpiresAt,
+                ])
+                .from(UserSessions::Table)
+                .and_where(Expr::col(UserSessions::TokenHash).eq(token_hash(token)))
+                .to_owned(),
+        )
+        .await?
+        .ok_or_else(unauthenticated)?;
+    let settings = settings::load(&mut database).await?;
+    let now = now_ms();
+    let idle_ms = settings.dashboard_idle_timeout_minutes * MINUTE_MS;
+    if now >= session.expires_at || now >= session.last_seen_at + idle_ms {
+        database
+            .execute(
+                &Query::delete()
+                    .from_table(UserSessions::Table)
+                    .and_where(Expr::col(UserSessions::Id).eq(session.id.as_str()))
+                    .to_owned(),
+            )
+            .await?;
+        return Err(unauthenticated());
+    }
+    let user = users::by_id(&mut database, &session.user_id)
+        .await?
+        .filter(|user| !user.disabled)
+        .ok_or_else(unauthenticated)?;
+    if touch && now - session.last_seen_at >= TOUCH_INTERVAL_MS {
+        database
+            .execute(
+                &Query::update()
+                    .table(UserSessions::Table)
+                    .value(UserSessions::LastSeenAt, now)
+                    .and_where(Expr::col(UserSessions::Id).eq(session.id.as_str()))
+                    .to_owned(),
+            )
+            .await?;
+    }
+    let roles = rbac::user_roles(&mut database, &user.id).await?;
+    let two_factor_enabled = users::has_two_factor(&mut database, &user.id).await?;
+    Ok(SignedIn {
+        must_enroll_two_factor: settings.require_two_factor
+            && session.auth_method == AuthMethod::Password.as_str()
+            && !two_factor_enabled,
+        session_id: session.id,
+        auth_method: session.auth_method,
+        session_created_at: session.created_at,
+        session_expires_at: session.expires_at,
+        permissions: rbac::permissions_of(&roles),
+        roles,
+        user,
+        two_factor_enabled,
+        idle_timeout_minutes: settings.dashboard_idle_timeout_minutes,
+        ip,
+    })
 }
 
 /// A signed-in user with full access to the routes their permissions allow.
@@ -308,6 +319,17 @@ impl std::ops::Deref for Authorized {
 }
 
 impl Authorized {
+    /// Full access, unless the user must still set up a second factor.
+    pub fn new(signed_in: SignedIn) -> Result<Self, ApiError> {
+        if signed_in.must_enroll_two_factor {
+            return Err(
+                ApiError::forbidden("set up two-factor authentication to continue")
+                    .with_code("two_factor_enrollment_required"),
+            );
+        }
+        Ok(Self(signed_in))
+    }
+
     pub fn require(&self, permission: Permission) -> Result<(), ApiError> {
         if self.has(permission) {
             Ok(())
@@ -324,14 +346,7 @@ impl FromRequestParts<AppState> for Authorized {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
-        let signed_in = SignedIn::from_request_parts(parts, state).await?;
-        if signed_in.must_enroll_two_factor {
-            return Err(
-                ApiError::forbidden("set up two-factor authentication to continue")
-                    .with_code("two_factor_enrollment_required"),
-            );
-        }
-        Ok(Self(signed_in))
+        Self::new(SignedIn::from_request_parts(parts, state).await?)
     }
 }
 

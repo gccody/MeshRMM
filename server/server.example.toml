@@ -57,6 +57,12 @@ dir = "/usr/share/meshrmm/downloads"
 # proxy allows 100 MB on its free plan).
 max_file_bytes = 99614720
 
+[remote]
+# A remote session ends this many seconds after its viewer was last heard
+# from (60 to 3600). An open viewer checks in every 30 seconds, so this is how
+# long a viewer that crashed or lost its network can take to resume.
+idle_timeout_seconds = 900
+
 [log]
 # A tracing filter, e.g. "info" or "meshrmm_server=debug,info".
 level = "info"

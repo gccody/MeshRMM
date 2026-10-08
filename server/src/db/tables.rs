@@ -211,6 +211,11 @@ pub enum RemoteHandoffs {
 #[derive(Iden)]
 pub enum RemoteSessions {
     Table,
+    Id,
+    DeviceId,
+    UserId,
+    RecordEncrypted,
+    CreatedAt,
     ExpiresAt,
 }
 
