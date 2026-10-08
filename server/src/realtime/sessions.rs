@@ -21,8 +21,8 @@ use std::{
 };
 
 use meshrmm_protocol_types::{
-    AgentCommand, AgentSessionRequest, ConnectionApproval, IceServer, IdleDisconnectPolicy,
-    RemoteSessionId, SessionBootstrap, SignalMessage, TogglePolicy,
+    AgentCommand, AgentSessionRequest, ConnectionApproval, IdleDisconnectPolicy, RemoteSessionId,
+    SessionBootstrap, SignalMessage, TogglePolicy,
 };
 use sea_query::{Expr, ExprTrait, OnConflict, Query};
 use serde::{Deserialize, Serialize};
@@ -176,12 +176,6 @@ impl Record {
         );
         Ok(record)
     }
-}
-
-/// The STUN and TURN servers a session's peers use. None yet: the peers
-/// connect directly.
-fn ice_servers() -> Vec<IceServer> {
-    Vec::new()
 }
 
 fn token_matches(supplied: &str, expected: &str) -> bool {
@@ -607,7 +601,7 @@ impl Sessions {
                 session_id: RemoteSessionId::new(session_id.as_str()),
                 signaling_token: new_token(),
                 expires_at_unix_ms: unix_ms(expires_at),
-                ice_servers: ice_servers(),
+                ice_servers: state.turn.ice_servers(&session_id),
             },
         };
         let mut transaction = state.database.begin().await?;
@@ -700,6 +694,7 @@ impl Sessions {
     ) -> (u64, mpsc::Sender<Message>) {
         let id = self.inner.next_actor.fetch_add(1, Ordering::Relaxed);
         let (sender, inbox) = mpsc::channel(INBOX);
+        state.turn.session_started(&record.session_id);
         let actor = SessionActor {
             state: state.clone(),
             sessions: self.clone(),
@@ -1041,7 +1036,7 @@ impl SessionActor {
         let expires_at = now_ms() + self.record.idle_timeout_ms;
         let mut record = self.record.clone();
         record.agent_request.expires_at_unix_ms = unix_ms(expires_at);
-        record.agent_request.ice_servers = ice_servers();
+        record.agent_request.ice_servers = self.state.turn.ice_servers(&record.session_id);
         // The Agent ignores a request that only moves the deadline. A new
         // token makes it restart its side of the session, which a viewer
         // that resumes needs.
@@ -1109,10 +1104,12 @@ impl SessionActor {
         Ok(None)
     }
 
-    /// Ends the session: its row, both sockets, and the Agent's side.
+    /// Ends the session: its row, its TURN relays, both sockets, and the
+    /// Agent's side.
     async fn expire(&mut self, reason: &'static str) {
         self.expires_at = 0;
         delete(&self.state, &self.record.session_id).await;
+        self.state.turn.session_ended(&self.record.session_id).await;
         for role in [Role::Client, Role::Agent] {
             self.close_peer(role, 4001, reason);
         }

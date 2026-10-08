@@ -13,6 +13,7 @@ workspace = true
 aes-gcm = "0.10.3"
 anyhow.workspace = true
 argon2 = "0.5.3"
+async-trait = "0.1.92"
 axum = { version = "0.8.9", features = ["ws"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
 bytes.workspace = true
@@ -20,6 +21,7 @@ clap.workspace = true
 figment = { version = "0.10.19", features = ["env", "toml"] }
 futures-util.workspace = true
 getrandom = "0.3"
+hmac = "0.12.1"
 httpdate = "1.0.3"
 ipnet = { version = "2.12.2", features = ["serde"] }
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "ring", "rustls-native-certs", "smtp-transport", "tokio1-rustls"] }
@@ -40,8 +42,10 @@ totp-rs = { version = "5", default-features = false, features = ["otpauth"] }
 tower-http = { version = "0.7.1", features = ["fs", "limit", "set-header", "trace"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+turn = "0.11.0"
 url = { workspace = true, features = ["serde"] }
 uuid = { version = "1.24.1", features = ["v4", "v7"] }
+webrtc-util = { version = "0.12.0", default-features = false, features = ["conn"] }
 
 [dev-dependencies]
 figment = { version = "0.10.19", features = ["env", "test", "toml"] }

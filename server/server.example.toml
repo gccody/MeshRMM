@@ -63,6 +63,30 @@ max_file_bytes = 99614720
 # long a viewer that crashed or lost its network can take to resume.
 idle_timeout_seconds = 900
 
+[turn]
+# The built-in STUN/TURN server. Remote sessions use it to get through NAT:
+# when the viewer and the Agent can't reach each other directly, it relays
+# their traffic. Agents and viewers use it over UDP and IPv4 only, so open
+# turn.listen's port and the relay ports to UDP from the internet. TURN can't
+# go through an HTTP reverse proxy or Cloudflare's proxy; with either in front
+# of public_url, set host to a DNS-only name for this server.
+enabled = true
+# The name or IPv4 address peers reach the TURN server at. Defaults to
+# public_url's host, which must then have an A record.
+# host = "turn.example.com"
+# The public IPv4 address relayed traffic comes from. Defaults to the address
+# host resolves to at startup. Set it if the server is behind NAT and host
+# resolves to a private address.
+# public_ip = "203.0.113.5"
+listen = "0.0.0.0:3478"
+# Each peer that relays uses one port while its session lasts.
+relay_port_min = 49160
+relay_port_max = 49200
+# Addresses relays may not send to or receive from, for example your internal
+# network if no Agent runs there. Loopback, link-local, multicast and broadcast
+# addresses, and listen's port on any address, are always refused.
+# blocked_peers = ["10.0.0.0/8"]
+
 [log]
 # A tracing filter, e.g. "info" or "meshrmm_server=debug,info".
 level = "info"

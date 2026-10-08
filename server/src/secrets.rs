@@ -104,12 +104,18 @@ impl InstanceKey {
             })
     }
 
-    fn cipher(&self) -> Aes256Gcm {
-        let key = Sha256::new()
-            .chain_update(ENCRYPTION_KEY_LABEL)
+    /// A key for one purpose, named by `label`, derived from the instance
+    /// key so that no two purposes share a key.
+    pub fn derive(&self, label: &[u8]) -> [u8; 32] {
+        Sha256::new()
+            .chain_update(label)
             .chain_update(self.0)
-            .finalize();
-        Aes256Gcm::new(&key)
+            .finalize()
+            .into()
+    }
+
+    fn cipher(&self) -> Aes256Gcm {
+        Aes256Gcm::new(&self.derive(ENCRYPTION_KEY_LABEL).into())
     }
 
     fn parse(text: &str) -> anyhow::Result<Self> {

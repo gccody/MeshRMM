@@ -352,9 +352,8 @@ mod tests {
         let mut count = 0;
         // The stream also delivers silence, so it is read for a fixed time.
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while let Some(packet) = packets
-            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-            .ok()
+        while let Ok(packet) =
+            packets.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
         {
             assert_eq!(
                 u32::from_le_bytes(packet[..4].try_into().unwrap()),
