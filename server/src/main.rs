@@ -21,6 +21,27 @@ enum Command {
     Serve,
     /// Check the configuration and database connection, then exit.
     CheckConfig,
+    /// Repair accounts when nobody can sign in to fix them.
+    #[command(subcommand)]
+    Admin(Admin),
+}
+
+#[derive(Subcommand)]
+enum Admin {
+    /// Create a user and print a link to choose their password.
+    CreateUser {
+        email: String,
+        /// The display name; defaults to the email address.
+        #[arg(long)]
+        name: Option<String>,
+        /// A role ID or name to grant; repeatable. Defaults to Administrator.
+        #[arg(long = "role")]
+        roles: Vec<String>,
+    },
+    /// Print a link that sets a new password, and enable the account.
+    ResetPassword { email: String },
+    /// Remove a user's authenticator app and recovery codes.
+    ResetTwoFactor { email: String },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -37,8 +58,28 @@ fn main() -> anyhow::Result<()> {
         match cli.command.unwrap_or(Command::Serve) {
             Command::Serve => meshrmm_server::run(config).await,
             Command::CheckConfig => meshrmm_server::check(config).await,
+            Command::Admin(command) => admin(config, command).await,
         }
     })
+}
+
+async fn admin(config: Config, command: Admin) -> anyhow::Result<()> {
+    let state = meshrmm_server::prepare(config).await?;
+    let result = match command {
+        Admin::CreateUser { email, name, roles } => {
+            let name = name.unwrap_or_else(|| email.clone());
+            meshrmm_server::admin::create_user(&state, &email, &name, &roles).await
+        }
+        Admin::ResetPassword { email } => {
+            meshrmm_server::admin::reset_password(&state, &email).await
+        }
+        Admin::ResetTwoFactor { email } => {
+            meshrmm_server::admin::reset_two_factor(&state, &email).await
+        }
+    };
+    state.database.close().await;
+    println!("{}", result?);
+    Ok(())
 }
 
 fn init_logging(config: &Config) {
@@ -49,7 +90,10 @@ fn init_logging(config: &Config) {
         );
         EnvFilter::new("info")
     });
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    // Logs go to stderr, so admin commands' stdout carries only their result.
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
     match config.log.format {
         LogFormat::Text => builder.init(),
         LogFormat::Json => builder.json().init(),

@@ -12,21 +12,158 @@ pub enum SqlxMigrations {
 }
 
 #[derive(Iden)]
+pub enum Settings {
+    Table,
+    Id,
+    InstanceName,
+    DashboardIdleTimeoutMinutes,
+    BlackoutMessage,
+    DisplayBorder,
+    PreventIdleLock,
+    AllowIdleOverride,
+    SessionBanner,
+    ConnectionNotification,
+    BackgroundConnectionNotification,
+    ConnectionNotificationMessage,
+    IdleDisconnectMinutes,
+    AllowIdleDisconnectOverride,
+    ClearClipboardOnClose,
+    AllowClearClipboardOverride,
+    ConnectionApproval,
+    ConnectionApprovalMessage,
+    ConnectionApprovalTimeoutSeconds,
+    ConnectionApprovalLockIdleSeconds,
+    RequireTwoFactor,
+    PasswordMinLength,
+    SessionLifetimeHours,
+    SmtpHost,
+    SmtpPort,
+    SmtpSecurity,
+    SmtpUsername,
+    SmtpPasswordEncrypted,
+    SmtpFrom,
+    UpdatedAt,
+    UpdatedByUserId,
+}
+
+#[derive(Iden)]
+pub enum Users {
+    Table,
+    Id,
+    Email,
+    DisplayName,
+    PasswordHash,
+    PasswordChangedAt,
+    Disabled,
+    CreatedAt,
+    UpdatedAt,
+    LastSignInAt,
+}
+
+#[derive(Iden)]
+pub enum UserTotp {
+    Table,
+    UserId,
+    SecretEncrypted,
+    ConfirmedAt,
+    LastUsedStep,
+    CreatedAt,
+}
+
+#[derive(Iden)]
+pub enum UserRecoveryCodes {
+    Table,
+    Id,
+    UserId,
+    CodeHash,
+    UsedAt,
+    CreatedAt,
+}
+
+#[derive(Iden)]
 pub enum UserSessions {
     Table,
+    Id,
+    TokenHash,
+    UserId,
+    AuthMethod,
+    CreatedAt,
+    LastSeenAt,
     ExpiresAt,
+    VerifiedAt,
+    Ip,
+    UserAgent,
+}
+
+#[derive(Iden)]
+pub enum Roles {
+    Table,
+    Id,
+    Name,
+    Description,
+    Builtin,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+pub enum RolePermissions {
+    Table,
+    RoleId,
+    Permission,
+}
+
+#[derive(Iden)]
+pub enum UserRoles {
+    Table,
+    UserId,
+    RoleId,
 }
 
 #[derive(Iden)]
 pub enum Invitations {
     Table,
+    Id,
+    TokenHash,
+    Email,
+    CreatedByUserId,
+    CreatedAt,
     ExpiresAt,
+    AcceptedAt,
+    RevokedAt,
+}
+
+#[derive(Iden)]
+pub enum InvitationRoles {
+    Table,
+    InvitationId,
+    RoleId,
 }
 
 #[derive(Iden)]
 pub enum PasswordResets {
     Table,
+    Id,
+    TokenHash,
+    UserId,
+    CreatedByUserId,
+    CreatedAt,
     ExpiresAt,
+    UsedAt,
+}
+
+#[derive(Iden)]
+pub enum AuditEvents {
+    Table,
+    Id,
+    ActorUserId,
+    ActorLabel,
+    Action,
+    TargetType,
+    TargetId,
+    MetadataJson,
+    Ip,
+    CreatedAt,
 }
 
 #[derive(Iden)]

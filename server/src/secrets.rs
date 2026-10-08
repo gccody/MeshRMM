@@ -10,10 +10,18 @@ use std::{
     path::Path,
 };
 
+use aes_gcm::{
+    Aes256Gcm, KeyInit, Nonce,
+    aead::{Aead, Payload},
+};
 use anyhow::{Context, bail};
+use sha2::{Digest, Sha256};
 
 const INSTANCE_KEY_FILE: &str = "instance.key";
 const INSTANCE_KEY_BYTES: usize = 32;
+const NONCE_BYTES: usize = 12;
+/// Separates the encryption key from other keys derived from the instance key.
+const ENCRYPTION_KEY_LABEL: &[u8] = b"meshrmm secret encryption v1";
 
 #[derive(Clone)]
 pub struct InstanceKey([u8; INSTANCE_KEY_BYTES]);
@@ -37,9 +45,7 @@ impl InstanceKey {
                 return Err(error).with_context(|| format!("could not read {}", path.display()));
             }
         }
-        let mut key = [0; INSTANCE_KEY_BYTES];
-        getrandom::fill(&mut key)
-            .map_err(|error| anyhow::anyhow!("could not generate the instance key: {error}"))?;
+        let key = random_bytes::<INSTANCE_KEY_BYTES>();
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -59,6 +65,51 @@ impl InstanceKey {
             .with_context(|| format!("could not write {}", path.display()))?;
         tracing::info!(path = %path.display(), "generated the instance key; back it up with the database");
         Ok(Self(key))
+    }
+
+    /// Encrypts a secret for storage with AES-256-GCM. `context` names what
+    /// the secret is and whose (for example `totp:<user id>`), so a stored
+    /// value copied to another row or column no longer decrypts.
+    pub fn encrypt(&self, context: &str, plaintext: &[u8]) -> Vec<u8> {
+        let nonce = random_bytes::<NONCE_BYTES>();
+        let ciphertext = self
+            .cipher()
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: context.as_bytes(),
+                },
+            )
+            .expect("AES-GCM encryption of a bounded secret cannot fail");
+        [nonce.as_slice(), &ciphertext].concat()
+    }
+
+    /// Decrypts a value from [`InstanceKey::encrypt`] with the same `context`.
+    pub fn decrypt(&self, context: &str, sealed: &[u8]) -> anyhow::Result<Vec<u8>> {
+        if sealed.len() < NONCE_BYTES {
+            bail!("the encrypted value is truncated");
+        }
+        let (nonce, ciphertext) = sealed.split_at(NONCE_BYTES);
+        self.cipher()
+            .decrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad: context.as_bytes(),
+                },
+            )
+            .map_err(|_| {
+                anyhow::anyhow!("the encrypted value does not match the instance key; was instance.key replaced?")
+            })
+    }
+
+    fn cipher(&self) -> Aes256Gcm {
+        let key = Sha256::new()
+            .chain_update(ENCRYPTION_KEY_LABEL)
+            .chain_update(self.0)
+            .finalize();
+        Aes256Gcm::new(&key)
     }
 
     fn parse(text: &str) -> anyhow::Result<Self> {
@@ -96,6 +147,24 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Bytes from the operating system's secure random source.
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut bytes = [0; N];
+    getrandom::fill(&mut bytes).expect("the operating system's random source failed");
+    bytes
+}
+
+/// A new bearer token: 32 random bytes as 64 hex digits.
+pub fn new_token() -> String {
+    hex(&random_bytes::<32>())
+}
+
+/// The SHA-256 of a token as 64 hex digits. Tokens are stored only as this
+/// hash, so a database leak does not reveal usable tokens.
+pub fn token_hash(token: &str) -> String {
+    hex(&Sha256::digest(token.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +192,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(INSTANCE_KEY_FILE), "not a key\n").unwrap();
         assert!(InstanceKey::load_or_create(dir.path()).is_err());
+    }
+
+    #[test]
+    fn secrets_decrypt_only_with_the_same_key_and_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = InstanceKey::load_or_create(dir.path()).unwrap();
+        let sealed = key.encrypt("totp:user-1", b"seed");
+        assert_eq!(key.decrypt("totp:user-1", &sealed).unwrap(), b"seed");
+        assert_ne!(sealed, key.encrypt("totp:user-1", b"seed"), "nonces repeat");
+        assert!(key.decrypt("totp:user-2", &sealed).is_err());
+        assert!(key.decrypt("totp:user-1", &sealed[..8]).is_err());
+
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = InstanceKey::load_or_create(other_dir.path()).unwrap();
+        assert!(other.decrypt("totp:user-1", &sealed).is_err());
+    }
+
+    #[test]
+    fn token_hashes_are_sha256_hex() {
+        assert_eq!(
+            token_hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let token = new_token();
+        assert_eq!(token.len(), 64);
+        assert_ne!(token, new_token());
     }
 
     #[test]
