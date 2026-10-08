@@ -11,6 +11,8 @@ workspace with platform and transport responsibilities kept in focused crates:
   authentication and WebRTC signaling.
 - `remote/` — the native Windows/macOS viewer. Windows uses Media Foundation
   and D3D11; macOS uses AVFoundation, CoreMedia, Core Animation, and AppKit.
+- `site/` — the static marketing page, separate from the server (see
+  [its README](site/README.md)).
 
 ## MVP data path
 

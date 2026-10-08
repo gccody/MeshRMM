@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; font-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <title>MeshRMM | Remote monitoring and management on your own server</title>
+  <meta name="description" content="MeshRMM is remote support and device management that runs entirely on a Linux server you control: website, sign-in, device connections, NAT traversal and updates in one program.">
+  <link rel="canonical" href="https://meshrmm.com/">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="fonts/geist-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://meshrmm.com/">
+  <meta property="og:title" content="MeshRMM | Remote monitoring and management on your own server">
+  <meta property="og:description" content="Remote support and device management that runs entirely on a Linux server you control.">
+  <meta name="twitter:card" content="summary">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="wrap header-row">
+      <a class="brand" href="./" aria-label="MeshRMM home">
+        <img src="favicon.svg" alt="" width="28" height="28">
+        <span>MeshRMM</span>
+      </a>
+      <nav aria-label="Main">
+        <ul class="nav-links">
+          <li><a href="#server">The server</a></li>
+          <li><a href="#features">Features</a></li>
+          <li><a href="#access">Sign-in</a></li>
+          <li><a href="#install">Install</a></li>
+          <li><a href="https://github.com/gccody/MeshRMM">GitHub</a></li>
+        </ul>
+      </nav>
+      <a class="button button-small" href="https://github.com/gccody/MeshRMM/releases/latest">Download</a>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="wrap hero-grid">
+        <div class="hero-copy">
+          <h1 id="hero-title">Remote support for your devices, from a server you run.</h1>
+          <p class="lede">
+            MeshRMM is remote monitoring and management in one Linux program: the website,
+            sign-in, device connections, NAT traversal and Agent updates. Install it on your own
+            machine. It doesn't depend on any hosted service.
+          </p>
+          <div class="actions">
+            <a class="button" href="#install">Install the server</a>
+            <a class="button button-quiet" href="https://github.com/gccody/MeshRMM">View the source</a>
+          </div>
+        </div>
+
+        <figure class="terminal" aria-labelledby="terminal-caption">
+          <div class="terminal-window">
+            <div class="terminal-bar" aria-hidden="true"><span></span><span></span><span></span></div>
+<pre class="terminal-body"><code><span class="prompt">$</span> docker run -d --name meshrmm \
+    -p 443:443 -p 3478:3478/udp \
+    -p 49160-49200:49160-49200/udp \
+    -v meshrmm:/var/lib/meshrmm \
+    -e MESHRMM_PUBLIC_URL=https://rmm.example.com \
+    -e MESHRMM_TLS__CONTACT_EMAIL=you@example.com \
+    ghcr.io/gccody/meshrmm-server
+<span class="prompt">$</span> docker logs meshrmm
+<span class="log log-1"><span class="level-info">INFO</span> starting the MeshRMM server</span>
+<span class="log log-2"><span class="level-info">INFO</span> database ready backend=Sqlite</span>
+<span class="log log-3"><span class="level-warn">WARN</span> no accounts exist yet; open this link to
+     create the first administrator
+     link=<mark>https://rmm.example.com/setup#token=…</mark></span></code></pre>
+          </div>
+          <figcaption id="terminal-caption">The first start. Open the link to create your administrator account.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="server" class="section" aria-labelledby="server-title">
+      <div class="wrap">
+        <h2 id="server-title">One server. Every part of it is yours.</h2>
+        <p class="section-lede">
+          Technicians and endpoints connect only to your server. Remote sessions then run directly
+          between the viewer and the Agent, and fall back to your server's own relay when a
+          network won't let them meet.
+        </p>
+
+        <div class="topology">
+          <div class="node node-side">
+            <h3>Technician</h3>
+            <ul>
+              <li><strong>Browser</strong> for devices, the toolbox, users and settings</li>
+              <li><strong>Viewer</strong> for Windows or macOS</li>
+            </ul>
+          </div>
+
+          <div class="link link-left" aria-hidden="true"><span>HTTPS, WebSocket</span></div>
+
+          <div class="node node-server">
+            <h3>meshrmm-server <span>on your Linux machine</span></h3>
+            <ul class="server-parts">
+              <li>Website</li>
+              <li>API</li>
+              <li>Sign-in and roles</li>
+              <li>Session signaling</li>
+              <li>STUN/TURN relay</li>
+              <li>Installers and updates</li>
+            </ul>
+            <p class="server-store">SQLite or PostgreSQL, plus a data directory for files and keys</p>
+          </div>
+
+          <div class="link link-right" aria-hidden="true"><span>HTTPS, WebSocket</span></div>
+
+          <div class="node node-side">
+            <h3>Endpoint</h3>
+            <ul>
+              <li><strong>Agent</strong> on Windows or macOS, running as a service</li>
+            </ul>
+          </div>
+
+          <div class="p2p-bracket" aria-hidden="true"><span></span><span></span><span></span></div>
+          <p class="p2p">Screen, input, audio and files travel peer to peer, encrypted end to end by WebRTC. Your relay carries them only when a direct path fails.</p>
+        </div>
+
+        <dl class="facts">
+          <div>
+            <dt>Install</dt>
+            <dd>A Docker image, or a tarball with a systemd unit. Linux on x86_64 or arm64.</dd>
+          </div>
+          <div>
+            <dt>Database</dt>
+            <dd>SQLite for a single machine, or PostgreSQL if you already run one.</dd>
+          </div>
+          <div>
+            <dt>Certificates</dt>
+            <dd>Automatic from Let's Encrypt, your own certificate files, or a reverse proxy in front.</dd>
+          </div>
+          <div>
+            <dt>Updates</dt>
+            <dd>Each server release carries its Agents and viewers. Upgrade the server and they follow.</dd>
+          </div>
+        </dl>
+        <p class="note">
+          The server contacts only what you set up: your identity provider and mail server if you
+          use them, and Let's Encrypt if you choose automatic certificates.
+        </p>
+      </div>
+    </section>
+
+    <section id="features" class="section section-tint" aria-labelledby="features-title">
+      <div class="wrap">
+        <h2 id="features-title">What technicians get</h2>
+
+        <div class="features">
+          <article class="feature feature-lead">
+            <h3>Remote desktop that keeps up</h3>
+            <p>
+              The endpoint encodes its screen as H.265 or H.264, on its GPU when it has one, and
+              sends it straight to the viewer. Pick a quality preset, from a 1&nbsp;Mbps data saver to 12&nbsp;Mbps,
+              and switch Windows viewers to 4:4:4 color for crisp text when both GPUs support it.
+              Clipboard (text, rich text, images and files), file transfer, chat and system audio
+              come with every session.
+            </p>
+          </article>
+
+          <article class="feature">
+            <h3>Work without taking over the screen</h3>
+            <p>
+              Background mode opens a private desktop on a Windows endpoint, with its own taskbar,
+              Command Prompt, PowerShell, Services and File Explorer, while the user keeps working.
+              It's experimental.
+            </p>
+          </article>
+
+          <article class="feature">
+            <h3>Scripts and files on hand</h3>
+            <p>
+              The toolbox keeps PowerShell, Command Prompt and zsh scripts and a library of files.
+              Run a script from the website or during a session, as the signed-in user or as
+              SYSTEM (root on a Mac), and send files to the device.
+            </p>
+          </article>
+
+          <article class="feature">
+            <h3>Every device at a glance</h3>
+            <p>
+              See which devices are online, with a recent picture of each screen. Add a Windows
+              device with a downloaded installer, or a Mac with one Terminal command.
+            </p>
+          </article>
+
+          <article class="feature">
+            <h3>Maintenance controls</h3>
+            <p>
+              Block the user's keyboard and mouse, black out the screens with your own message
+              while you work, and lock the computer or sign the user out when you leave.
+            </p>
+          </article>
+
+          <article class="feature">
+            <h3>The user stays informed</h3>
+            <p>
+              Optionally ask the user to approve each connection, notify them when a session
+              starts, and show a banner and border while it's live.
+            </p>
+          </article>
+
+          <article class="feature">
+            <h3>Restarts don't end the session</h3>
+            <p>
+              Restart a computer from the viewer, into Safe Mode with Networking if you need to.
+              The viewer waits, and the session picks up again when the Agent is back.
+            </p>
+          </article>
+
+          <article class="feature">
+            <h3>Computers without a monitor</h3>
+            <p>
+              When a Windows computer has no monitor connected, the Agent adds a virtual one for
+              the session, at the size you choose.
+            </p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="access" class="section" aria-labelledby="access-title">
+      <div class="wrap access-grid">
+        <div>
+          <h2 id="access-title">Sign-in and permissions, built in</h2>
+          <p class="section-lede">
+            Accounts live in your database. Connect your identity provider if you have one; you
+            don't need one.
+          </p>
+        </div>
+        <ul class="checklist">
+          <li><strong>Strong sign-in.</strong> Passwords with authenticator-app codes, recovery codes and passkeys. Require two-factor sign-in for everyone.</li>
+          <li><strong>Single sign-on.</strong> Any OpenID Connect provider, with SCIM to create, update and disable users from your directory.</li>
+          <li><strong>Custom roles.</strong> Build roles from permissions such as connecting to devices, running scripts or managing users.</li>
+          <li><strong>Audit log.</strong> Sign-ins, settings changes, enrollments, sessions, script runs and file deliveries.</li>
+          <li><strong>Email optional.</strong> Send invitations and password resets through your SMTP server, or copy the links and send them yourself.</li>
+          <li><strong>Signed updates.</strong> Agents and viewers install only updates signed with the MeshRMM release key, whichever server offers them.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="install" class="section section-tint" aria-labelledby="install-title">
+      <div class="wrap">
+        <h2 id="install-title">Install</h2>
+        <p class="section-lede">
+          You need a Linux machine with a DNS name, TCP port 443, and UDP ports 3478 and
+          49160–49200 open to the internet.
+        </p>
+
+        <ol class="steps">
+          <li>
+            <h3>Start the server</h3>
+            <p>
+              Run the Docker image as shown above, or unpack a release tarball and run
+              <code>sudo ./install.sh</code>. Then edit <code>/etc/meshrmm/server.toml</code> and
+              start it with <code>systemctl enable --now meshrmm-server</code>.
+            </p>
+          </li>
+          <li>
+            <h3>Open the setup link</h3>
+            <p>
+              On its first start the server writes a one-time link to its log. Open it to name
+              your instance and create the first administrator.
+            </p>
+          </li>
+          <li>
+            <h3>Add your devices</h3>
+            <p>
+              Choose <strong>Add device</strong> on the Devices page. Download the Windows
+              installer, or copy the Terminal command for a Mac.
+            </p>
+          </li>
+        </ol>
+
+        <div class="actions">
+          <a class="button" href="https://github.com/gccody/MeshRMM/releases/latest">Download the latest release</a>
+          <a class="button button-quiet" href="https://github.com/gccody/MeshRMM#readme">Read the documentation</a>
+        </div>
+
+        <dl class="requirements">
+          <div>
+            <dt>Server</dt>
+            <dd>Linux, x86_64 or arm64</dd>
+          </div>
+          <div>
+            <dt>Agent</dt>
+            <dd>Windows 10 version 1903 or newer; macOS 12.3 or newer (still being ported)</dd>
+          </div>
+          <div>
+            <dt>Viewer</dt>
+            <dd>Windows 10 version 1903 or newer; macOS 12 or newer</dd>
+          </div>
+        </dl>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap footer-row">
+      <p>MeshRMM is in active development and isn't ready for production use yet.</p>
+      <ul class="footer-links">
+        <li><a href="https://github.com/gccody/MeshRMM">Source</a></li>
+        <li><a href="https://github.com/gccody/MeshRMM/releases">Releases</a></li>
+        <li><a href="https://github.com/gccody/MeshRMM/issues">Report a problem</a></li>
+        <li><a href="fonts/OFL.txt">Font license</a></li>
+      </ul>
+    </div>
+  </footer>
+</body>
+</html>
