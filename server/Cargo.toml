@@ -13,7 +13,7 @@ workspace = true
 aes-gcm = "0.10.3"
 anyhow.workspace = true
 argon2 = "0.5.3"
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
 bytes.workspace = true
 clap.workspace = true
@@ -49,4 +49,5 @@ http-body-util = "0.1"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 tempfile = "3"
+tokio-tungstenite.workspace = true
 tower = { version = "0.5.3", features = ["util"] }

@@ -8,7 +8,6 @@ use axum::{
 };
 use meshrmm_protocol_types::AgentCommand;
 use sea_query::{Expr, ExprTrait, Query};
-use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -19,58 +18,19 @@ use crate::{
     db::tables::Agents,
     http::{ApiError, AppState},
     rbac::Permission,
+    realtime::presence::PresenceEvent,
     secrets::{hex, new_token, token_hash},
     time::now_ms,
 };
 
-#[derive(Debug, Serialize)]
-pub struct DeviceView {
-    id: String,
-    name: String,
-    /// The Agent's control connection is open.
-    connected: bool,
-    created_at: i64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct DeviceList {
-    agents: Vec<DeviceView>,
-}
-
-/// `GET /v1/agents`: enrolled devices, online ones first, then by name.
+/// `GET /v1/agents`: enrolled devices, online ones first, then by name, as
+/// the presence snapshot the website's event socket starts from.
 pub async fn list(
     State(state): State<AppState>,
     actor: Authorized,
-) -> Result<Json<DeviceList>, ApiError> {
+) -> Result<Json<PresenceEvent>, ApiError> {
     actor.require(Permission::DevicesView)?;
-    let rows: Vec<(String, String, i64)> = state
-        .database
-        .fetch_all(
-            &Query::select()
-                .columns([Agents::Id, Agents::Name, Agents::CreatedAt])
-                .from(Agents::Table)
-                .and_where(Expr::col(Agents::DeletionRequestedAt).is_null())
-                .to_owned(),
-        )
-        .await?;
-    let connected = state.agents.connected();
-    let mut agents = rows
-        .into_iter()
-        .map(|(id, name, created_at)| DeviceView {
-            connected: connected.contains(&id),
-            id,
-            name,
-            created_at,
-        })
-        .collect::<Vec<_>>();
-    agents.sort_by_cached_key(|agent| {
-        (
-            !agent.connected,
-            agent.name.to_lowercase(),
-            agent.id.clone(),
-        )
-    });
-    Ok(Json(DeviceList { agents }))
+    Ok(Json(state.presence.snapshot().await?))
 }
 
 /// `DELETE /v1/agents/{id}`: removes the device and tells its Agent to
@@ -119,22 +79,20 @@ pub async fn delete(
     if let Err(error) = state.storage.remove(&state.storage.thumbnail(&id)).await {
         tracing::warn!(device_id = id, %error, "could not remove a deleted device's thumbnail");
     }
+    if let Err(error) = state
+        .sessions
+        .end_for_device(&state, &id, "the device was removed")
+        .await
+    {
+        tracing::warn!(device_id = id, status = %error.status(), "could not end a deleted device's remote session");
+    }
     state.agents.send(&id, AgentCommand::Uninstall);
+    state.presence.refresh(&id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
 const OFFLINE_FOR_ROTATION: &str =
     "the Agent must be online to receive its new credential; its current credential still works";
-
-fn rotation_context(device_id: &str) -> String {
-    format!("agent-rotation:{device_id}")
-}
-
-#[derive(sqlx::FromRow)]
-struct PendingCredential {
-    pending_auth_token_hash: Option<String>,
-    pending_auth_token_encrypted: Option<Vec<u8>>,
-}
 
 /// `POST /v1/agents/{id}/rotate-credential`: sends the online Agent a new
 /// credential. The current one keeps working until the Agent uses the new
@@ -149,35 +107,13 @@ pub async fn rotate_credential(
     actor.require(Permission::DevicesRotateCredentials)?;
     let id = parse_id(&id, "device")?;
     let mut transaction = state.database.begin().await?;
-    let pending: PendingCredential = transaction
-        .fetch_optional(
-            &Query::select()
-                .columns([
-                    Agents::PendingAuthTokenHash,
-                    Agents::PendingAuthTokenEncrypted,
-                ])
-                .from(Agents::Table)
-                .and_where(Expr::col(Agents::Id).eq(id.as_str()))
-                .and_where(Expr::col(Agents::DeletionRequestedAt).is_null())
-                .to_owned(),
-        )
+    let pending = agents::pending_credential(&mut transaction, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("Device not found"))?;
     if !state.agents.is_connected(&id) {
         return Err(ApiError::conflict(OFFLINE_FOR_ROTATION).with_code("device_offline"));
     }
-    let context = rotation_context(&id);
-    let staged = match (
-        &pending.pending_auth_token_hash,
-        &pending.pending_auth_token_encrypted,
-    ) {
-        (Some(hash), Some(sealed)) => {
-            let token = String::from_utf8(state.instance_key.decrypt(&context, sealed)?)
-                .map_err(anyhow::Error::from)?;
-            (token_hash(&token) == *hash).then_some(token)
-        }
-        _ => None,
-    };
+    let staged = pending.token(&state.instance_key, &id)?;
     let redelivered = staged.is_some();
     let token = match staged {
         Some(token) => token,
@@ -189,7 +125,9 @@ pub async fn rotate_credential(
                 .value(Agents::PendingAuthTokenHash, token_hash(&token))
                 .value(
                     Agents::PendingAuthTokenEncrypted,
-                    state.instance_key.encrypt(&context, token.as_bytes()),
+                    state
+                        .instance_key
+                        .encrypt(&agents::rotation_context(&id), token.as_bytes()),
                 )
                 .value(Agents::UpdatedAt, now_ms())
                 .and_where(Expr::col(Agents::Id).eq(id.as_str()))

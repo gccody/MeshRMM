@@ -138,44 +138,135 @@ pub struct App {
     pub name: &'static str,
     pub state: meshrmm_server::http::AppState,
     router: axum::Router,
+    config: Config,
+    customize: Customize,
     database: Option<TestDatabase>,
     _dir: TempDir,
 }
 
-impl App {
-    pub async fn sqlite() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let state = meshrmm_server::prepare(config(dir.path(), "tls.mode = \"proxy\""))
+/// The same instance after a restart.
+pub struct Restarted {
+    pub name: &'static str,
+    pub state: meshrmm_server::http::AppState,
+    router: axum::Router,
+}
+
+impl Restarted {
+    pub fn browser(&self) -> Browser {
+        Browser {
+            router: self.router.clone(),
+            cookie: None,
+            name: self.name,
+        }
+    }
+
+    pub async fn serve(&self) -> Server {
+        Server::start(self.router.clone()).await
+    }
+
+    pub async fn finish(self) {
+        self.state.database.close().await;
+    }
+}
+
+/// An app listening on a loopback port.
+pub struct Server {
+    pub addr: std::net::SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Server {
+    async fn start(router: axum::Router) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
             .await
             .unwrap();
-        Self::new("sqlite", state, None, dir)
+        });
+        Self { addr, task }
+    }
+
+    pub fn ws_url(&self, path: &str) -> String {
+        format!("ws://{}{path}", self.addr)
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Changes a server's state before it serves anything, e.g. to shorten
+/// timeouts.
+pub type Customize = fn(&mut meshrmm_server::http::AppState);
+
+impl App {
+    pub async fn sqlite() -> Self {
+        Self::sqlite_with(|_| {}).await
+    }
+
+    pub async fn sqlite_with(customize: Customize) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), "tls.mode = \"proxy\"");
+        Self::new("sqlite", config, None, dir, customize).await
     }
 
     pub async fn postgres(admin_url: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let database = postgres_with(admin_url, false).await;
-        let state = meshrmm_server::prepare(config(
-            dir.path(),
-            &format!("tls.mode = \"proxy\"\ndatabase.url = \"{}\"", database.url),
-        ))
-        .await
-        .unwrap();
-        Self::new("postgres", state, Some(database), dir)
+        Self::postgres_with(admin_url, |_| {}).await
     }
 
-    fn new(
+    pub async fn postgres_with(admin_url: &str, customize: Customize) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let database = postgres_with(admin_url, false).await;
+        let config = config(
+            dir.path(),
+            &format!("tls.mode = \"proxy\"\ndatabase.url = \"{}\"", database.url),
+        );
+        Self::new("postgres", config, Some(database), dir, customize).await
+    }
+
+    async fn new(
         name: &'static str,
-        state: meshrmm_server::http::AppState,
+        config: Config,
         database: Option<TestDatabase>,
         dir: TempDir,
+        customize: Customize,
     ) -> Self {
+        let mut state = meshrmm_server::prepare(config.clone()).await.unwrap();
+        customize(&mut state);
         Self {
             name,
             router: meshrmm_server::http::router(state.clone()),
             state,
+            config,
+            customize,
             database,
             _dir: dir,
         }
+    }
+
+    /// A second server on the same data directory and database, as after a
+    /// restart, with the remote sessions that were live restored. This one
+    /// keeps running; its sockets and sessions are its own.
+    pub async fn restarted(&self) -> Restarted {
+        let mut state = meshrmm_server::prepare(self.config.clone()).await.unwrap();
+        (self.customize)(&mut state);
+        state.sessions.restore(&state).await.unwrap();
+        Restarted {
+            name: self.name,
+            router: meshrmm_server::http::router(state.clone()),
+            state,
+        }
+    }
+
+    /// Serves the app on a loopback port, for WebSocket clients.
+    pub async fn serve(&self) -> Server {
+        Server::start(self.router.clone()).await
     }
 
     /// A browser with no session.
@@ -201,9 +292,14 @@ impl App {
 
 /// A server on every backend under test.
 pub async fn apps() -> Vec<App> {
-    let mut apps = vec![App::sqlite().await];
+    apps_with(|_| {}).await
+}
+
+/// A server on every backend under test, each changed by `customize`.
+pub async fn apps_with(customize: Customize) -> Vec<App> {
+    let mut apps = vec![App::sqlite_with(customize).await];
     if let Some(admin_url) = postgres_admin_url() {
-        apps.push(App::postgres(&admin_url).await);
+        apps.push(App::postgres_with(&admin_url, customize).await);
     }
     apps
 }
@@ -669,4 +765,139 @@ pub async fn set_up_or_sign_in(app: &App) -> Browser {
         .await;
     assert_eq!(response.status, 200, "{:?}", response.body);
     browser
+}
+
+/// The next command for a stand-in Agent connection, or `None` once the
+/// connection was replaced.
+pub async fn next_command(
+    connection: &mut meshrmm_server::realtime::AgentConnection,
+) -> Option<meshrmm_protocol_types::AgentCommand> {
+    match connection.commands.recv().await? {
+        meshrmm_server::realtime::ToAgent::Command(command) => Some(command),
+        other => panic!("expected a command, got {other:?}"),
+    }
+}
+
+pub type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// How long a test waits for a socket to say something.
+pub const SOCKET_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Opens a WebSocket with `headers`. A refused handshake is the HTTP status.
+pub async fn ws(url: &str, headers: &[(&str, &str)]) -> Result<Ws, u16> {
+    use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
+
+    let mut request = url.into_client_request().unwrap();
+    for (name, value) in headers {
+        request.headers_mut().insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value.parse().unwrap(),
+        );
+    }
+    match tokio_tungstenite::connect_async(request).await {
+        Ok((socket, _)) => Ok(socket),
+        Err(tungstenite::Error::Http(response)) => Err(response.status().as_u16()),
+        Err(error) => panic!("could not connect to {url}: {error}"),
+    }
+}
+
+/// What a socket received, ignoring pings and pongs.
+#[derive(Debug, PartialEq)]
+pub enum Received {
+    Json(serde_json::Value),
+    Close(u16),
+    /// Closed without a close frame.
+    Gone,
+}
+
+pub async fn receive(socket: &mut Ws) -> Received {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    loop {
+        let frame = tokio::time::timeout(SOCKET_WAIT, socket.next())
+            .await
+            .expect("the socket said nothing");
+        match frame {
+            Some(Ok(Message::Text(text))) => {
+                return Received::Json(serde_json::from_str(&text).unwrap());
+            }
+            Some(Ok(Message::Close(frame))) => {
+                return Received::Close(frame.map_or(1005, |frame| u16::from(frame.code)));
+            }
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            Some(Ok(other)) => panic!("unexpected frame {other:?}"),
+            Some(Err(_)) | None => return Received::Gone,
+        }
+    }
+}
+
+/// The next JSON message.
+pub async fn receive_json(socket: &mut Ws) -> serde_json::Value {
+    match receive(socket).await {
+        Received::Json(value) => value,
+        other => panic!("expected a message, got {other:?}"),
+    }
+}
+
+/// The code the socket closes with next, skipping messages before it.
+pub async fn receive_close(socket: &mut Ws) -> u16 {
+    loop {
+        match receive(socket).await {
+            Received::Json(_) => {}
+            Received::Close(code) => return code,
+            Received::Gone => panic!("the socket ended without a close frame"),
+        }
+    }
+}
+
+/// Asserts the socket says nothing for a while.
+pub async fn quiet(socket: &mut Ws, wait: std::time::Duration) {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match tokio::time::timeout_at(deadline, socket.next()).await {
+            Err(_) => return,
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+            Ok(other) => panic!("expected nothing, got {other:?}"),
+        }
+    }
+}
+
+pub async fn send_text(socket: &mut Ws, text: &str) {
+    use futures_util::SinkExt;
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+        .await
+        .unwrap();
+}
+
+pub async fn send_json(socket: &mut Ws, value: serde_json::Value) {
+    send_text(socket, &value.to_string()).await;
+}
+
+impl Agent {
+    /// Opens the Agent's control connection.
+    pub async fn connect(&self, server: &Server) -> Result<Ws, u16> {
+        ws(
+            &server.ws_url(&format!("/v1/agents/{}/connect", self.device_id)),
+            &[("authorization", &format!("Bearer {}", self.token))],
+        )
+        .await
+    }
+}
+
+impl Browser {
+    /// Opens the website's event socket.
+    pub async fn events(&self, server: &Server) -> Result<Ws, u16> {
+        let mut headers = vec![("origin", ORIGIN)];
+        if let Some(cookie) = &self.cookie {
+            headers.push(("cookie", cookie));
+        }
+        ws(&server.ws_url("/v1/events"), &headers).await
+    }
 }

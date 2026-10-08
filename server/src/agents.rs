@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 use crate::{
     db::{Executor, tables::Agents},
     http::{ApiError, AppState},
-    secrets::token_hash,
+    secrets::{InstanceKey, token_hash},
     time::now_ms,
 };
 
@@ -139,6 +139,53 @@ pub async fn authenticate(
         name: row.name,
         deletion_requested: row.deletion_requested_at.is_some(),
     })
+}
+
+/// What the device's rotated credential is sealed for.
+pub fn rotation_context(device_id: &str) -> String {
+    format!("agent-rotation:{device_id}")
+}
+
+/// A device's staged rotation: the pending credential's hash, and the
+/// credential sealed with the instance key.
+#[derive(Debug, sqlx::FromRow)]
+pub struct PendingCredential {
+    pub pending_auth_token_hash: Option<String>,
+    pub pending_auth_token_encrypted: Option<Vec<u8>>,
+}
+
+impl PendingCredential {
+    /// The staged credential, while it is still the pending one.
+    pub fn token(&self, key: &InstanceKey, device_id: &str) -> anyhow::Result<Option<String>> {
+        let (Some(hash), Some(sealed)) = (
+            &self.pending_auth_token_hash,
+            &self.pending_auth_token_encrypted,
+        ) else {
+            return Ok(None);
+        };
+        let token = String::from_utf8(key.decrypt(&rotation_context(device_id), sealed)?)?;
+        Ok((token_hash(&token) == *hash).then_some(token))
+    }
+}
+
+/// The device's staged rotation, if it is enrolled and not deleted.
+pub async fn pending_credential(
+    executor: &mut impl Executor,
+    device_id: &str,
+) -> crate::db::Result<Option<PendingCredential>> {
+    executor
+        .fetch_optional(
+            &Query::select()
+                .columns([
+                    Agents::PendingAuthTokenHash,
+                    Agents::PendingAuthTokenEncrypted,
+                ])
+                .from(Agents::Table)
+                .and_where(Expr::col(Agents::Id).eq(device_id))
+                .and_where(Expr::col(Agents::DeletionRequestedAt).is_null())
+                .to_owned(),
+        )
+        .await
 }
 
 /// Whether the device is enrolled and not deleted.
