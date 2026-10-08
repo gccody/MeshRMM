@@ -1,0 +1,58 @@
+# MeshRMM server configuration. Copy to /etc/meshrmm/server.toml and edit.
+#
+# Every key can also be set with an environment variable: MESHRMM_ followed by
+# the key path in capitals with __ between levels, for example
+# MESHRMM_PUBLIC_URL, MESHRMM_TLS__MODE or MESHRMM_DATABASE__URL. Variables
+# override this file. Check a configuration with `meshrmm-server check-config`.
+
+# The address users, Agents and viewers reach this server at. Agents and
+# viewers require HTTPS with TLS 1.3, so this must be an https:// URL.
+public_url = "https://rmm.example.com"
+
+# Holds the instance key, ACME certificates, uploaded files and (by default)
+# the SQLite database. Back it up; the database's encrypted secrets cannot be
+# read without the instance key stored here.
+data_dir = "/var/lib/meshrmm"
+
+[database]
+# SQLite (the default, a file in data_dir) or PostgreSQL:
+# url = "sqlite:///var/lib/meshrmm/meshrmm.db"
+# url = "postgres://meshrmm:password@db.internal/meshrmm"
+max_connections = 10
+
+[http]
+# Defaults to 0.0.0.0:443, or 127.0.0.1:8080 when tls.mode = "proxy".
+# listen = "0.0.0.0:443"
+
+# Choose one TLS mode.
+[tls]
+# Let's Encrypt: the server obtains and renews its certificate itself, using
+# the TLS-ALPN-01 challenge on port 443. public_url's host must resolve to this
+# server and port 443 must be reachable from the internet.
+mode = "acme"
+contact_email = "admin@example.com"
+# domains = ["rmm.example.com"]                 # defaults to public_url's host
+# directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+# Your own certificate (for example from an internal CA, certbot, or a
+# Cloudflare origin certificate behind Cloudflare's proxy). The files are
+# reloaded when they change.
+# mode = "files"
+# cert_path = "/etc/meshrmm/fullchain.pem"
+# key_path = "/etc/meshrmm/privkey.pem"
+
+# Behind a reverse proxy that terminates TLS (Caddy, nginx, Traefik). The
+# proxy must offer TLS 1.3, forward WebSocket upgrades, and set
+# X-Forwarded-For. Only these peers' forwarding headers are believed.
+# mode = "proxy"
+# trusted_proxies = ["127.0.0.1/32", "::1/128"]
+
+[downloads]
+# The Agent and viewer builds shipped with this server release.
+dir = "/usr/share/meshrmm/downloads"
+
+[log]
+# A tracing filter, e.g. "info" or "meshrmm_server=debug,info".
+level = "info"
+# "text" or "json".
+format = "text"
