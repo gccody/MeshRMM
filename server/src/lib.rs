@@ -1,6 +1,7 @@
 //! The self-hosted MeshRMM server: the website, the API, Agent and viewer
 //! connections, and downloads, for one company.
 pub mod admin;
+pub mod agents;
 pub mod api;
 pub mod audit;
 pub mod auth;
@@ -11,10 +12,13 @@ pub mod http;
 pub mod mail;
 pub mod maintenance;
 pub mod rbac;
+pub mod realtime;
 pub mod secrets;
 pub mod serve;
 pub mod settings;
+pub mod storage;
 pub mod time;
+pub mod toolbox;
 pub mod users;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -22,7 +26,10 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use anyhow::Context;
 use axum_server::Handle;
 
-use crate::{auth::AuthState, config::Config, db::Database, http::AppState, secrets::InstanceKey};
+use crate::{
+    auth::AuthState, config::Config, db::Database, http::AppState, realtime::AgentHub,
+    secrets::InstanceKey, storage::Storage,
+};
 
 /// How long in-flight requests get to finish after a shutdown signal.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -37,6 +44,7 @@ pub fn install_crypto_provider() {
 pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
     secrets::ensure_data_dir(&config.data_dir)?;
     let instance_key = InstanceKey::load_or_create(&config.data_dir)?;
+    let storage = Storage::open(&config.data_dir)?;
     let database =
         Database::connect(&config.database_url(), config.database.max_connections).await?;
     database.migrate().await?;
@@ -50,6 +58,8 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         database,
         instance_key,
         auth: Arc::new(AuthState::default()),
+        storage,
+        agents: AgentHub::default(),
     })
 }
 
@@ -72,7 +82,7 @@ pub async fn announce_setup(state: &AppState) -> anyhow::Result<Option<String>> 
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let state = prepare(config).await?;
     announce_setup(&state).await?;
-    let maintenance = maintenance::spawn(state.database.clone());
+    let maintenance = maintenance::spawn(state.database.clone(), state.storage.clone());
     let handle = Handle::<SocketAddr>::new();
     tokio::spawn({
         let handle = handle.clone();
