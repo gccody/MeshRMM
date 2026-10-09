@@ -59,7 +59,7 @@ function harness({ online } = {}) {
   const connections = [];
   const timers = fakeTimers();
   const revision = { current: -1 };
-  const state = { agents: [], refused: 0 };
+  const state = { agents: [], refused: 0, readings: [] };
   const stream = inventoryStream({
     openSocket: () => {
       const socket = new FakeSocket();
@@ -68,6 +68,7 @@ function harness({ online } = {}) {
     },
     revision,
     onAgents: update => { state.agents = update(state.agents); },
+    onMetrics: readings => { state.readings.push(...readings); },
     onConnection: connection => connections.push(connection),
     onRefused: () => { state.refused++; },
     online,
@@ -234,4 +235,19 @@ test('inventoryStatus waits out the grace period before calling data stale', () 
   ];
   for (const [input, expected] of cases) assert.equal(inventoryStatus(input), expected, JSON.stringify(input));
   assert.equal(STALE_GRACE_MS, 5_000);
+});
+
+test('resource usage arrives beside the revisions without disturbing them', () => {
+  const { sockets, state, revision } = harness();
+  sockets[0].open();
+  sockets[0].receive({ type: 'snapshot', revision: 3, agents: [agent('a')], generated_at_unix_ms: 0 });
+  const reading = {
+    device_id: 'a', at: 10, cpu_percent: 12.5, memory_used_bytes: 1, memory_total_bytes: 2,
+    network_received_bytes_per_second: 3, network_sent_bytes_per_second: 4, uptime_seconds: 5,
+    volumes: [{ name: 'C:', total_bytes: 10, free_bytes: 4 }],
+  };
+  sockets[0].receive({ type: 'metrics', readings: [reading, { device_id: 'b' }] });
+  assert.deepEqual(state.readings, [reading], 'invalid readings are skipped');
+  assert.equal(revision.current, 3);
+  assert.deepEqual(sockets[0].sent, [], 'no snapshot is requested');
 });

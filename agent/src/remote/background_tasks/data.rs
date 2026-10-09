@@ -8,7 +8,6 @@ use std::time::Instant;
 use anyhow::{Context, ensure};
 use std::sync::Arc;
 use windows::Win32::Foundation::*;
-use windows::Win32::NetworkManagement::IpHelper::*;
 use windows::Win32::Security::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Diagnostics::ToolHelp::*;
@@ -679,25 +678,17 @@ fn system_counters(next: &mut Snapshot) -> anyhow::Result<()> {
         next.handles = performance.HandleCount;
         next.threads = performance.ThreadCount;
         next.uptime = GetTickCount64() / 1000;
-        let mut table = std::ptr::null_mut();
-        if GetIfTable2(&mut table).is_ok() && !table.is_null() {
-            for row in
-                std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
-            {
-                // Hardware adapters only: avoid counting loopback/tunnel traffic twice.
-                if row.InterfaceAndOperStatusFlags._bitfield & 1 != 0 {
-                    next.network_capacity = next
-                        .network_capacity
-                        .saturating_add(row.ReceiveLinkSpeed.max(row.TransmitLinkSpeed));
-                    next.network_bytes = next
-                        .network_bytes
-                        .saturating_add(row.InOctets)
-                        .saturating_add(row.OutOctets);
-                }
-            }
-            FreeMibTable(table.cast());
-        }
     }
+    // The network graph is optional; the rest of the sample stands without it.
+    let _ = crate::remote::metrics::windows::for_each_hardware_interface(|row| {
+        next.network_capacity = next
+            .network_capacity
+            .saturating_add(row.ReceiveLinkSpeed.max(row.TransmitLinkSpeed));
+        next.network_bytes = next
+            .network_bytes
+            .saturating_add(row.InOctets)
+            .saturating_add(row.OutOctets);
+    });
     Ok(())
 }
 

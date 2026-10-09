@@ -37,6 +37,8 @@ mod input_block;
 mod keep_awake;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) mod metrics;
 #[cfg(any(windows, target_os = "macos", test))]
 mod native_task;
 #[cfg(any(windows, target_os = "macos"))]
@@ -130,6 +132,23 @@ async fn announce_update(socket: &SignalingConnection, version: String) {
     }
 }
 
+/// Sends the computer's resource usage without waiting for it to be written.
+/// A report that does not fit in the send queue is dropped; the next one
+/// follows within seconds.
+#[cfg(any(windows, target_os = "macos"))]
+fn report_metrics(socket: &SignalingConnection, metrics: meshrmm_protocol::SystemMetrics) {
+    let status = AgentStatusMessage::Metrics {
+        metrics: metrics.sanitized(),
+    };
+    let queued = match serde_json::to_string(&status) {
+        Ok(text) => socket.queue(Message::Text(text.into())),
+        Err(error) => Err(error.into()),
+    };
+    if let Err(error) = queued {
+        tracing::debug!(error = %error, "dropped a resource usage report");
+    }
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 async fn uninstall(socket: &SignalingConnection) -> anyhow::Result<ControlFlow<bool>> {
     crate::installer::schedule_uninstall().context("failed to schedule Agent self-uninstall")?;
@@ -176,6 +195,9 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
         Coordinator {
             // Created once, so reconnecting does not capture again before the interval ends.
             thumbnails: thumbnail::Thumbnails::new(mode),
+            // Likewise, so the first sample after a reconnect still measures
+            // from the previous one.
+            metrics: metrics::Reports::new(),
             config,
             mode,
             link,
@@ -194,6 +216,7 @@ struct Coordinator {
     mode: ExecutionMode,
     link: std::sync::Arc<service_link::ServiceLink>,
     thumbnails: thumbnail::Thumbnails,
+    metrics: metrics::Reports,
     active_session: Option<ActiveSession>,
     // Outlives session tasks, which end whenever the viewer drops its
     // connection, so the close action runs only once the session ends.
@@ -268,6 +291,7 @@ impl Coordinator {
                     }
                 }
                 () = self.thumbnails.due() => self.thumbnails.refresh(&self.config),
+                metrics = self.metrics.next() => report_metrics(socket, metrics),
                 () = self.link.stopped() => {
                     if let Some(version) = self.link.update_version() {
                         announce_update(socket, version).await;

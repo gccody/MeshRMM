@@ -3,8 +3,9 @@
 //! The socket's task is the device's coordinator while it is connected: it
 //! registers with the [`super::AgentHub`], publishes the device's presence,
 //! gives the Agent its live remote session and any rotated credential it
-//! hasn't used yet, then forwards what the API sends until the Agent
-//! disconnects or a newer connection from the device replaces it.
+//! hasn't used yet, then forwards what the API sends, and records the
+//! resource usage the Agent reports, until the Agent disconnects or a newer
+//! connection from the device replaces it.
 use std::time::Instant;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -70,6 +71,11 @@ pub async fn serve(
                             send(&mut socket, close_frame(1003, "invalid Agent update version")).await;
                             break;
                         }
+                        Ok(AgentStatusMessage::Metrics { metrics }) => {
+                            if state.agents.is_current(&device_id, connection.id) {
+                                state.metrics.record(&device_id, metrics).await;
+                            }
+                        }
                         // Only a deleted device's Agent uninstalls.
                         Ok(AgentStatusMessage::UninstallScheduled) => {}
                         Err(_) => {
@@ -83,6 +89,10 @@ pub async fn serve(
         }
     }
     drop(connection);
+    // A newer connection from the device keeps reporting.
+    if !state.agents.is_connected(&device_id) {
+        state.metrics.disconnected(&device_id).await;
+    }
     state.presence.disconnected(&device_id).await;
     tracing::info!(device_id, "Agent disconnected");
 }

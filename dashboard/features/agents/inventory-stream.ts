@@ -1,6 +1,7 @@
 // Keeps the live device inventory socket connected: applies the snapshot and
 // revision-ordered deltas, and reconnects with backoff. It never discards the
 // inventory it already has; the hook shows it as stale.
+import { type MetricsReading, parseMetricsEvent } from "../metrics/model.ts";
 import { applyAgentDelta, parseAgentEvent, sortAgents } from "./model.ts";
 import type { Agent, AgentDelta, AgentEvent, AgentSnapshot } from "./types";
 
@@ -38,6 +39,8 @@ type Options = {
   // Shared with the HTTP inventory load so neither applies older data.
   revision: { current: number };
   onAgents: (update: (current: Agent[]) => Agent[]) => void;
+  // Devices' latest resource usage, which carries no revision.
+  onMetrics?: (readings: MetricsReading[]) => void;
   onConnection: (connection: InventoryConnection) => void;
   // The server refused the socket or closed it for lost access. A browser
   // can't see why a handshake failed, so the caller checks the session.
@@ -165,9 +168,10 @@ function eventSequencer({ revision, onAgents, requestSnapshot, overflow }: {
 
 // Handles one socket's events while it is the stream's current socket.
 // `onClose` learns whether the server refused the socket or revoked access.
-function watchSocket(socket: SocketLike, { revision, onAgents, current, onOpen, onLive, onClose }: {
+function watchSocket(socket: SocketLike, { revision, onAgents, onMetrics, current, onOpen, onLive, onClose }: {
   revision: { current: number };
   onAgents: (update: (current: Agent[]) => Agent[]) => void;
+  onMetrics?: (readings: MetricsReading[]) => void;
   current: () => boolean;
   onOpen: () => void;
   onLive: () => void;
@@ -193,7 +197,10 @@ function watchSocket(socket: SocketLike, { revision, onAgents, current, onOpen, 
     const data = (message as MessageEvent).data;
     if (!current() || typeof data !== "string") return;
     try {
-      if (sequence(parseAgentEvent(JSON.parse(data)))) onLive();
+      const event: unknown = JSON.parse(data);
+      const readings = parseMetricsEvent(event);
+      if (readings) onMetrics?.(readings);
+      else if (sequence(parseAgentEvent(event))) onLive();
     } catch {
       requestSnapshot();
     }
@@ -209,6 +216,7 @@ export function inventoryStream({
   openSocket,
   revision,
   onAgents,
+  onMetrics,
   onConnection,
   onRefused,
   online = true,
@@ -222,6 +230,7 @@ export function inventoryStream({
   const listen = (nextSocket: SocketLike) => watchSocket(nextSocket, {
     revision,
     onAgents,
+    onMetrics,
     current: () => !stopped && socket === nextSocket,
     onOpen: () => reconnect.reset(),
     onLive: () => connection.setState("live"),

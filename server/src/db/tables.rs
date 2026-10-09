@@ -265,6 +265,22 @@ pub enum Agents {
     DeletionRequestedAt,
 }
 
+#[derive(Iden, Clone, Copy)]
+pub enum DeviceMetrics {
+    Table,
+    DeviceId,
+    Minute,
+    Samples,
+    CpuPercent,
+    CpuPercentMax,
+    MemoryUsedBytes,
+    MemoryTotalBytes,
+    NetworkReceivedBytesPerSecond,
+    NetworkSentBytesPerSecond,
+    StorageUsedBytes,
+    StorageTotalBytes,
+}
+
 #[derive(Iden)]
 pub enum AgentInstallTokens {
     Table,

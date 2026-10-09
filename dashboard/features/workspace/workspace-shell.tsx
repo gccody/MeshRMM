@@ -43,13 +43,16 @@ export function WorkspaceShell() {
   const { instance, state } = useSession();
   const location = useLocation();
   const view = viewForPath(location.pathname) ?? "devices";
-  useDocumentTitle(VIEW_COPY[view].title);
+  // A page such as a device's names itself.
+  const [pageTitle, setPageTitle] = useState<string | null>(null);
+  const title = pageTitle ?? VIEW_COPY[view].title;
+  useDocumentTitle(title);
 
   if (instance?.setup_required) return <Navigate to="/setup" replace />;
   if (state.status === "signed-out" && state.reason === null) {
     return <Navigate to={loginPath(`${location.pathname}${location.search}`)} replace />;
   }
-  if (state.status === "signed-in") return <SignedInWorkspace key={state.account.user.id} account={state.account} view={view} />;
+  if (state.status === "signed-in") return <SignedInWorkspace key={state.account.user.id} account={state.account} view={view} title={title} setPageTitle={setPageTitle} />;
 
   const status = state.status === "loading" ? "Checking session" : state.status === "unavailable" ? "Unavailable" : "Session paused";
   return (
@@ -58,7 +61,7 @@ export function WorkspaceShell() {
         ? <PausedCard reason={state.reason} idleTimeoutMinutes={state.idleTimeoutMinutes ?? null} />
         : (
           <>
-            <PageHeading view={view} />
+            <PageHeading title={title} />
             {state.status === "unavailable" ? <UnavailablePanel message={state.message} retrying={state.retrying} /> : <LoadingPanel />}
           </>
         )}
@@ -66,7 +69,12 @@ export function WorkspaceShell() {
   );
 }
 
-function SignedInWorkspace({ account, view }: { account: Account; view: View }) {
+function SignedInWorkspace({ account, view, title, setPageTitle }: {
+  account: Account;
+  view: View;
+  title: string;
+  setPageTitle: (title: string | null) => void;
+}) {
   const { instance, refresh, signOut, lock } = useSession();
   const location = useLocation();
   const [devicesSearch, setDevicesSearch] = useState("");
@@ -174,6 +182,7 @@ function SignedInWorkspace({ account, view }: { account: Account; view: View }) 
     setSettings,
     settingsDraft,
     headerSlot,
+    setPageTitle,
   };
 
   const status = inventoryStatus === "live" ? "Live"
@@ -187,7 +196,7 @@ function SignedInWorkspace({ account, view }: { account: Account; view: View }) 
         return (
           <div key={group[0]} className="nav-group">
             {visible.map((candidate) => (
-              <NavItem key={candidate} view={candidate} current={view} disabled={enrolling} search={candidate === "devices" ? devicesSearch : ""}>
+              <NavItem key={candidate} view={candidate} current={view === "device" ? "devices" : view} disabled={enrolling} search={candidate === "devices" ? devicesSearch : ""}>
                 {VIEW_COPY[candidate].title}
                 {candidate === "devices" && hasData ? <em>{agents.length}</em> : null}
               </NavItem>
@@ -212,7 +221,7 @@ function SignedInWorkspace({ account, view }: { account: Account; view: View }) 
           <AccountMenu account={account} active={view === "account"} onSignOut={() => { resetInventory(); void signOut(); }} />
         </>}
       >
-        <PageHeading view={view} slot={setHeaderSlot} />
+        <PageHeading title={title} slot={setHeaderSlot} />
         {canView(account, view) ? <Outlet /> : <NoAccessPanel />}
       </Frame>
     </WorkspaceContext.Provider>
@@ -264,10 +273,10 @@ export function BrandMark() {
   );
 }
 
-function PageHeading({ view, slot }: { view: View; slot?: (element: HTMLElement | null) => void }) {
+function PageHeading({ title, slot }: { title: string; slot?: (element: HTMLElement | null) => void }) {
   return (
     <section className="page-heading">
-      <h1>{VIEW_COPY[view].title}</h1>
+      <h1>{title}</h1>
       {slot && <div className="heading-actions" ref={slot} />}
     </section>
   );
