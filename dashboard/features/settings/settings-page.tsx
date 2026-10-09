@@ -14,6 +14,8 @@ import {
   MIN_CONNECTION_APPROVAL_TIMEOUT_SECONDS,
   SETTINGS_TABS,
   type GeneralSettings,
+  type SettingsDraft,
+  type SettingsTab,
   settingsBody,
   draftMatchesSettings,
   formatIdleDisconnect,
@@ -90,27 +92,7 @@ export function SettingsPanel() {
 
   return (
     <div className="settings-page">
-      <div className="settings-categories" role="tablist" aria-label="Settings categories">
-        {SETTINGS_TABS.map((tab, index) => (
-          <button
-            key={tab.id}
-            type="button"
-            role="tab"
-            id={`settings-tab-${tab.id}`}
-            aria-controls={tab.id}
-            aria-selected={settingsTab === tab.id}
-            tabIndex={settingsTab === tab.id ? 0 : -1}
-            onClick={() => setSettingsTab(tab.id)}
-            onKeyDown={(event) => {
-              const next = settingsTabForKey(index, event.key);
-              if (next === null) return;
-              event.preventDefault();
-              setSettingsTab(SETTINGS_TABS[next].id);
-              document.getElementById(`settings-tab-${SETTINGS_TABS[next].id}`)?.focus();
-            }}
-          >{tab.label}</button>
-        ))}
-      </div>
+      <SettingsTabs selected={settingsTab} onSelect={setSettingsTab} />
       {!settings ? (
         loadError
           ? <div className="management-panel account-status"><p role="alert">{loadError}</p><button type="button" className="secondary-button" onClick={() => { setLoadError(null); setLoadAttempt((attempt) => attempt + 1); }}><RefreshCw size={16} /> Try again</button></div>
@@ -188,31 +170,7 @@ export function SettingsPanel() {
               </div>
               <button type="button" className="secondary-button" onClick={() => updateDraft({ connectionNotificationMessage: DEFAULT_CONNECTION_NOTIFICATION_MESSAGE })}>Restore default message</button>
             </section>
-            <section className="settings-section" id="connection-approval" role="tabpanel" aria-labelledby="settings-tab-connection-approval" hidden={settingsTab !== "connection-approval"} tabIndex={0}>
-              <h2>Connection approval</h2>
-              <p>Asks the remote device’s user to accept or deny each connection before the technician can see or control anything.</p>
-              <label>
-                <input type="checkbox" checked={draft.connectionApproval} onChange={(event) => updateDraft({ connectionApproval: event.target.checked })} aria-describedby="connection-approval-help" /> Prompt the agent’s user to approve each connection</label>
-              <p id="connection-approval-help">Applies to every new session, including background mode, and cannot be changed by users. Technicians can give a reason when they connect. A reconnect to the same session does not ask again.</p>
-              <label htmlFor="connection-approval-message">Prompt message<textarea id="connection-approval-message" rows={3} required maxLength={512} value={draft.connectionApprovalMessage} onChange={(event) => updateDraft({ connectionApprovalMessage: event.target.value })} aria-describedby="connection-approval-message-help" />
-              </label>
-              <p id="connection-approval-message-help">Use {"{user_name}"} for the technician’s banner name. The technician’s reason, if they give one, appears below it. Keep the message short (up to 512 bytes).</p>
-              {!isConnectionApprovalMessageValid(draft.connectionApprovalMessage) && <p role="alert">The prompt message must contain text and be no larger than 512 bytes.</p>}
-              <div className="connection-approval-preview" aria-label="Connection approval preview">
-                <strong>Remote connection request</strong>
-                <span>{draft.connectionApprovalMessage.replaceAll("{user_name}", displayName)}</span>
-                <span className="connection-approval-reason">Reason: Checking the printer queue</span>
-                <small>Accepts automatically in {numberInputValue(draft.connectionApprovalTimeoutSeconds)} seconds.</small>
-                <span className="connection-approval-buttons" aria-hidden="true"><span>Deny</span><span>Accept</span></span>
-              </div>
-              <button type="button" className="secondary-button" onClick={() => updateDraft({ connectionApprovalMessage: DEFAULT_CONNECTION_APPROVAL_MESSAGE })}>Restore default message</button>
-              <label htmlFor="connection-approval-timeout">Accept automatically when there is no answer after (seconds)<input id="connection-approval-timeout" type="number" inputMode="numeric" required min={MIN_CONNECTION_APPROVAL_TIMEOUT_SECONDS} max={MAX_CONNECTION_APPROVAL_TIMEOUT_SECONDS} step={1} value={numberInputValue(draft.connectionApprovalTimeoutSeconds)} onChange={(event) => updateDraft({ connectionApprovalTimeoutSeconds: event.target.valueAsNumber })} aria-describedby="connection-approval-timeout-help" aria-invalid={!isConnectionApprovalTimeoutValid(draft.connectionApprovalTimeoutSeconds)} />
-              </label>
-              <p id="connection-approval-timeout-help">Between {MIN_CONNECTION_APPROVAL_TIMEOUT_SECONDS} and {MAX_CONNECTION_APPROVAL_TIMEOUT_SECONDS} seconds. The technician waits at most this long.</p>
-              <label htmlFor="connection-approval-lock-idle">Accept at once when the device is locked and has been idle for (seconds)<input id="connection-approval-lock-idle" type="number" inputMode="numeric" required min={0} max={MAX_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS} step={1} value={numberInputValue(draft.connectionApprovalLockIdleSeconds)} onChange={(event) => updateDraft({ connectionApprovalLockIdleSeconds: event.target.valueAsNumber })} aria-describedby="connection-approval-lock-idle-help" aria-invalid={!isConnectionApprovalLockIdleValid(draft.connectionApprovalLockIdleSeconds)} />
-              </label>
-              <p id="connection-approval-lock-idle-help">Between 0 and {MAX_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS} seconds. Nobody is at a device that sits locked, so the technician does not wait. Use 0 to accept whenever the device is locked or nobody is signed in.</p>
-            </section>
+            <ConnectionApprovalSection draft={draft} updateDraft={updateDraft} displayName={displayName} hidden={settingsTab !== "connection-approval"} />
           </fieldset>
           {settingsTab !== "general" && !instanceNameValid && <p role="alert">Check the server name before saving: it needs 1 to {MAX_INSTANCE_NAME_LENGTH} characters.</p>}
           {settingsTab !== "blackout" && !blackoutMessageValid && <p role="alert">Check the blackout message before saving: it must contain text and be no larger than 2 KB.</p>}
@@ -226,5 +184,66 @@ export function SettingsPanel() {
         </form>
       </>}
     </div>
+  );
+}
+
+function SettingsTabs({ selected, onSelect }: { selected: SettingsTab; onSelect: (tab: SettingsTab) => void }) {
+  return (
+    <div className="settings-categories" role="tablist" aria-label="Settings categories">
+      {SETTINGS_TABS.map((tab, index) => (
+        <button
+          key={tab.id}
+          type="button"
+          role="tab"
+          id={`settings-tab-${tab.id}`}
+          aria-controls={tab.id}
+          aria-selected={selected === tab.id}
+          tabIndex={selected === tab.id ? 0 : -1}
+          onClick={() => onSelect(tab.id)}
+          onKeyDown={(event) => {
+            const next = settingsTabForKey(index, event.key);
+            if (next === null) return;
+            event.preventDefault();
+            onSelect(SETTINGS_TABS[next].id);
+            document.getElementById(`settings-tab-${SETTINGS_TABS[next].id}`)?.focus();
+          }}
+        >{tab.label}</button>
+      ))}
+    </div>
+  );
+}
+
+function ConnectionApprovalSection({ draft, updateDraft, displayName, hidden }: {
+  draft: SettingsDraft;
+  updateDraft: (change: Partial<SettingsDraft>) => void;
+  displayName: string;
+  hidden: boolean;
+}) {
+  return (
+    <section className="settings-section" id="connection-approval" role="tabpanel" aria-labelledby="settings-tab-connection-approval" hidden={hidden} tabIndex={0}>
+      <h2>Connection approval</h2>
+      <p>Asks the remote device’s user to accept or deny each connection before the technician can see or control anything.</p>
+      <label>
+        <input type="checkbox" checked={draft.connectionApproval} onChange={(event) => updateDraft({ connectionApproval: event.target.checked })} aria-describedby="connection-approval-help" /> Prompt the agent’s user to approve each connection</label>
+      <p id="connection-approval-help">Applies to every new session, including background mode, and cannot be changed by users. Technicians can give a reason when they connect. A reconnect to the same session does not ask again.</p>
+      <label htmlFor="connection-approval-message">Prompt message<textarea id="connection-approval-message" rows={3} required maxLength={512} value={draft.connectionApprovalMessage} onChange={(event) => updateDraft({ connectionApprovalMessage: event.target.value })} aria-describedby="connection-approval-message-help" />
+      </label>
+      <p id="connection-approval-message-help">Use {"{user_name}"} for the technician’s banner name. The technician’s reason, if they give one, appears below it. Keep the message short (up to 512 bytes).</p>
+      {!isConnectionApprovalMessageValid(draft.connectionApprovalMessage) && <p role="alert">The prompt message must contain text and be no larger than 512 bytes.</p>}
+      <div className="connection-approval-preview" aria-label="Connection approval preview">
+        <strong>Remote connection request</strong>
+        <span>{draft.connectionApprovalMessage.replaceAll("{user_name}", displayName)}</span>
+        <span className="connection-approval-reason">Reason: Checking the printer queue</span>
+        <small>Accepts automatically in {numberInputValue(draft.connectionApprovalTimeoutSeconds)} seconds.</small>
+        <span className="connection-approval-buttons" aria-hidden="true"><span>Deny</span><span>Accept</span></span>
+      </div>
+      <button type="button" className="secondary-button" onClick={() => updateDraft({ connectionApprovalMessage: DEFAULT_CONNECTION_APPROVAL_MESSAGE })}>Restore default message</button>
+      <label htmlFor="connection-approval-timeout">Accept automatically when there is no answer after (seconds)<input id="connection-approval-timeout" type="number" inputMode="numeric" required min={MIN_CONNECTION_APPROVAL_TIMEOUT_SECONDS} max={MAX_CONNECTION_APPROVAL_TIMEOUT_SECONDS} step={1} value={numberInputValue(draft.connectionApprovalTimeoutSeconds)} onChange={(event) => updateDraft({ connectionApprovalTimeoutSeconds: event.target.valueAsNumber })} aria-describedby="connection-approval-timeout-help" aria-invalid={!isConnectionApprovalTimeoutValid(draft.connectionApprovalTimeoutSeconds)} />
+      </label>
+      <p id="connection-approval-timeout-help">Between {MIN_CONNECTION_APPROVAL_TIMEOUT_SECONDS} and {MAX_CONNECTION_APPROVAL_TIMEOUT_SECONDS} seconds. The technician waits at most this long.</p>
+      <label htmlFor="connection-approval-lock-idle">Accept at once when the device is locked and has been idle for (seconds)<input id="connection-approval-lock-idle" type="number" inputMode="numeric" required min={0} max={MAX_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS} step={1} value={numberInputValue(draft.connectionApprovalLockIdleSeconds)} onChange={(event) => updateDraft({ connectionApprovalLockIdleSeconds: event.target.valueAsNumber })} aria-describedby="connection-approval-lock-idle-help" aria-invalid={!isConnectionApprovalLockIdleValid(draft.connectionApprovalLockIdleSeconds)} />
+      </label>
+      <p id="connection-approval-lock-idle-help">Between 0 and {MAX_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS} seconds. Nobody is at a device that sits locked, so the technician does not wait. Use 0 to accept whenever the device is locked or nobody is signed in.</p>
+    </section>
   );
 }
