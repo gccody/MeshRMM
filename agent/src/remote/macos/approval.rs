@@ -11,7 +11,7 @@ use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSButton, NSColor, NSFont, NSFontWeightRegular,
-    NSFontWeightSemibold, NSPanel, NSScreen, NSStatusWindowLevel, NSTextField,
+    NSFontWeightSemibold, NSPanel, NSScreen, NSStatusWindowLevel, NSTextField, NSView,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFRetained, CFString};
@@ -203,6 +203,68 @@ fn show(
     deadline: Instant,
     answers: mpsc::Sender<Decision>,
 ) -> anyhow::Result<u64> {
+    let (rows, countdown_label) = labels(mtm, prompt, deadline);
+    let inner = WIDTH - 2.0 * PADDING;
+    let buttons = 32.0;
+    let height =
+        PADDING * 2.0 + rows.iter().map(|(_, height)| height + 8.0).sum::<f64>() + buttons + 8.0;
+    let panel = create_panel(mtm, height);
+    let content = panel
+        .contentView()
+        .ok_or_else(|| anyhow::anyhow!("the prompt has no content view"))?;
+    let mut top = height - PADDING;
+    for (label, row_height) in &rows {
+        top -= row_height;
+        label.setFrame(NSRect::new(
+            NSPoint::new(PADDING, top),
+            NSSize::new(inner, *row_height),
+        ));
+        content.addSubview(label);
+        top -= 8.0;
+    }
+    let target = PromptTarget::alloc(mtm).set_ivars(TargetIvars {
+        answers,
+        answered: Cell::new(false),
+        countdown: countdown_label,
+        timeout: prompt.timeout,
+        deadline,
+    });
+    // SAFETY: NSObject's init is always valid.
+    let target: Retained<PromptTarget> = unsafe { msg_send![super(target), init] };
+    add_buttons(mtm, &content, &target, buttons);
+    // SAFETY: the target and selector are valid for the timer's life.
+    let timer = unsafe {
+        NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+            0.25,
+            &target,
+            sel!(tick:),
+            None,
+            true,
+        )
+    };
+    NSApplication::sharedApplication(mtm).activate();
+    panel.makeKeyAndOrderFront(None);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SHOWN.with(|shown| {
+        shown.borrow_mut().push((
+            id,
+            Shown {
+                panel,
+                _target: target,
+                timer,
+            },
+        ))
+    });
+    Ok(id)
+}
+
+/// Returns the prompt's text rows with their heights, top to bottom, and the
+/// countdown label, which is also the last row.
+fn labels(
+    mtm: MainThreadMarker,
+    prompt: &ApprovalPrompt,
+    deadline: Instant,
+) -> (Vec<(Retained<NSTextField>, f64)>, Retained<NSTextField>) {
     let white = NSColor::whiteColor();
     let body = NSColor::colorWithSRGBRed_green_blue_alpha(0.886, 0.898, 0.922, 1.0);
     let muted = NSColor::colorWithSRGBRed_green_blue_alpha(0.580, 0.639, 0.722, 1.0);
@@ -224,7 +286,6 @@ fn show(
         false,
         &muted,
     );
-    let inner = WIDTH - 2.0 * PADDING;
     let height_of = |label: &NSTextField| label.fittingSize().height.min(240.0);
     let mut rows = vec![(title.clone(), height_of(&title))];
     rows.push((message.clone(), height_of(&message)));
@@ -232,9 +293,12 @@ fn show(
         rows.push((reason.clone(), height_of(reason)));
     }
     rows.push((countdown_label.clone(), height_of(&countdown_label)));
-    let buttons = 32.0;
-    let height =
-        PADDING * 2.0 + rows.iter().map(|(_, height)| height + 8.0).sum::<f64>() + buttons + 8.0;
+    (rows, countdown_label)
+}
+
+/// A titled panel of `height`, centered on the main screen above other windows
+/// and on every Space.
+fn create_panel(mtm: MainThreadMarker, height: f64) -> Retained<NSPanel> {
     let visible = NSScreen::mainScreen(mtm)
         .map(|screen| screen.visibleFrame())
         .unwrap_or(NSRect::new(NSPoint::ZERO, NSSize::new(1280.0, 800.0)));
@@ -267,40 +331,22 @@ fn show(
     panel.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
         0.129, 0.169, 0.220, 1.0,
     )));
-    let content = panel
-        .contentView()
-        .ok_or_else(|| anyhow::anyhow!("the prompt has no content view"))?;
-    let mut top = height - PADDING;
-    for (label, row_height) in &rows {
-        top -= row_height;
-        label.setFrame(NSRect::new(
-            NSPoint::new(PADDING, top),
-            NSSize::new(inner, *row_height),
-        ));
-        content.addSubview(label);
-        top -= 8.0;
-    }
-    let target = PromptTarget::alloc(mtm).set_ivars(TargetIvars {
-        answers,
-        answered: Cell::new(false),
-        countdown: countdown_label,
-        timeout: prompt.timeout,
-        deadline,
-    });
-    // SAFETY: NSObject's init is always valid.
-    let target: Retained<PromptTarget> = unsafe { msg_send![super(target), init] };
+    panel
+}
+
+fn add_buttons(mtm: MainThreadMarker, content: &NSView, target: &PromptTarget, height: f64) {
     // SAFETY: the target outlives the buttons' use of it.
     let (accept, deny) = unsafe {
         (
             NSButton::buttonWithTitle_target_action(
                 &NSString::from_str("Accept"),
-                Some(&target),
+                Some(target),
                 Some(sel!(accept:)),
                 mtm,
             ),
             NSButton::buttonWithTitle_target_action(
                 &NSString::from_str("Deny"),
-                Some(&target),
+                Some(target),
                 Some(sel!(deny:)),
                 mtm,
             ),
@@ -309,38 +355,14 @@ fn show(
     accept.setKeyEquivalent(&NSString::from_str("\r"));
     accept.setFrame(NSRect::new(
         NSPoint::new(WIDTH - PADDING - 92.0, PADDING),
-        NSSize::new(92.0, buttons),
+        NSSize::new(92.0, height),
     ));
     deny.setFrame(NSRect::new(
         NSPoint::new(WIDTH - PADDING - 2.0 * 92.0 - 8.0, PADDING),
-        NSSize::new(92.0, buttons),
+        NSSize::new(92.0, height),
     ));
     content.addSubview(&accept);
     content.addSubview(&deny);
-    // SAFETY: the target and selector are valid for the timer's life.
-    let timer = unsafe {
-        NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-            0.25,
-            &target,
-            sel!(tick:),
-            None,
-            true,
-        )
-    };
-    NSApplication::sharedApplication(mtm).activate();
-    panel.makeKeyAndOrderFront(None);
-    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    SHOWN.with(|shown| {
-        shown.borrow_mut().push((
-            id,
-            Shown {
-                panel,
-                _target: target,
-                timer,
-            },
-        ))
-    });
-    Ok(id)
 }
 
 #[cfg(test)]

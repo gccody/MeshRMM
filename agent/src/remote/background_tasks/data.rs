@@ -244,23 +244,7 @@ fn description(path: &str) -> Option<String> {
 
 pub fn processes(previous: &[Process]) -> anyhow::Result<Vec<Process>> {
     let prior: HashMap<_, _> = previous.iter().map(|p| ((p.pid, p.created), p)).collect();
-    unsafe extern "system" fn hung_window(hwnd: HWND, context: LPARAM) -> windows::core::BOOL {
-        unsafe {
-            if IsWindowVisible(hwnd).as_bool() && IsHungAppWindow(hwnd).as_bool() {
-                let mut pid = 0;
-                GetWindowThreadProcessId(hwnd, Some(&mut pid));
-                (&mut *(context.0 as *mut std::collections::HashSet<u32>)).insert(pid);
-            }
-        }
-        windows::core::BOOL(1)
-    }
-    let mut hung = std::collections::HashSet::<u32>::new();
-    let _ = unsafe {
-        EnumWindows(
-            Some(hung_window),
-            LPARAM((&mut hung as *mut std::collections::HashSet<u32>) as isize),
-        )
-    };
+    let hung = hung_processes();
     let snapshot = OwnedHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)? });
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
@@ -288,63 +272,7 @@ pub fn processes(previous: &[Process]) -> anyhow::Result<Vec<Process>> {
         if let Ok(handle) =
             unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, row.pid) }
         {
-            let handle = OwnedHandle(handle);
-            let (mut created, mut exit, mut kernel, mut user) = Default::default();
-            if unsafe { GetProcessTimes(handle.0, &mut created, &mut exit, &mut kernel, &mut user) }
-                .is_ok()
-            {
-                row.created = Some(time(created));
-                row.cpu_time = time(kernel) + time(user);
-            }
-            if let Some(old) = prior.get(&(row.pid, row.created)) {
-                row.path.clone_from(&old.path);
-                row.icon.clone_from(&old.icon);
-                row.user.clone_from(&old.user);
-                row.description.clone_from(&old.description);
-            } else {
-                let mut path = [0u16; 32768];
-                let mut len = path.len() as u32;
-                if unsafe {
-                    QueryFullProcessImageNameW(
-                        handle.0,
-                        PROCESS_NAME_WIN32,
-                        PWSTR(path.as_mut_ptr()),
-                        &mut len,
-                    )
-                }
-                .is_ok()
-                {
-                    row.path = String::from_utf16_lossy(&path[..len as usize]);
-                    row.description = description(&row.path).unwrap_or_else(|| row.name.clone());
-                    let path = wide(&row.path);
-                    let mut icon = HICON::default();
-                    unsafe {
-                        ExtractIconExW(PCWSTR(path.as_ptr()), 0, None, Some(&mut icon), 1);
-                    }
-                    if !icon.is_invalid() {
-                        row.icon = Some(Arc::new(Icon(icon.0 as usize)));
-                    }
-                }
-                row.user = owner(handle.0).unwrap_or_default();
-            }
-            let mut counters = PROCESS_MEMORY_COUNTERS::default();
-            if unsafe {
-                GetProcessMemoryInfo(
-                    handle.0,
-                    &mut counters,
-                    std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-                )
-            }
-            .is_ok()
-            {
-                row.memory = Some(counters.WorkingSetSize);
-            }
-            let mut io = IO_COUNTERS::default();
-            if unsafe { GetProcessIoCounters(handle.0, &mut io) }.is_ok() {
-                row.io_bytes = Some(io.ReadTransferCount.saturating_add(io.WriteTransferCount));
-            }
-            let _ = unsafe { GetProcessHandleCount(handle.0, &mut row.handles) };
-            row.priority = unsafe { GetPriorityClass(handle.0) };
+            query_process(&mut row, &OwnedHandle(handle), &prior);
         }
         if row.pid == std::process::id() {
             row.description = "Task Manager".into();
@@ -362,6 +290,89 @@ pub fn processes(previous: &[Process]) -> anyhow::Result<Vec<Process>> {
         }
     }
     Ok(rows)
+}
+
+fn hung_processes() -> HashSet<u32> {
+    unsafe extern "system" fn hung_window(hwnd: HWND, context: LPARAM) -> windows::core::BOOL {
+        unsafe {
+            if IsWindowVisible(hwnd).as_bool() && IsHungAppWindow(hwnd).as_bool() {
+                let mut pid = 0;
+                GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                (&mut *(context.0 as *mut std::collections::HashSet<u32>)).insert(pid);
+            }
+        }
+        windows::core::BOOL(1)
+    }
+    let mut hung = std::collections::HashSet::<u32>::new();
+    let _ = unsafe {
+        EnumWindows(
+            Some(hung_window),
+            LPARAM((&mut hung as *mut std::collections::HashSet<u32>) as isize),
+        )
+    };
+    hung
+}
+
+fn query_process(
+    row: &mut Process,
+    handle: &OwnedHandle,
+    prior: &HashMap<(u32, Option<u64>), &Process>,
+) {
+    let (mut created, mut exit, mut kernel, mut user) = Default::default();
+    if unsafe { GetProcessTimes(handle.0, &mut created, &mut exit, &mut kernel, &mut user) }.is_ok()
+    {
+        row.created = Some(time(created));
+        row.cpu_time = time(kernel) + time(user);
+    }
+    if let Some(old) = prior.get(&(row.pid, row.created)) {
+        row.path.clone_from(&old.path);
+        row.icon.clone_from(&old.icon);
+        row.user.clone_from(&old.user);
+        row.description.clone_from(&old.description);
+    } else {
+        let mut path = [0u16; 32768];
+        let mut len = path.len() as u32;
+        if unsafe {
+            QueryFullProcessImageNameW(
+                handle.0,
+                PROCESS_NAME_WIN32,
+                PWSTR(path.as_mut_ptr()),
+                &mut len,
+            )
+        }
+        .is_ok()
+        {
+            row.path = String::from_utf16_lossy(&path[..len as usize]);
+            row.description = description(&row.path).unwrap_or_else(|| row.name.clone());
+            let path = wide(&row.path);
+            let mut icon = HICON::default();
+            unsafe {
+                ExtractIconExW(PCWSTR(path.as_ptr()), 0, None, Some(&mut icon), 1);
+            }
+            if !icon.is_invalid() {
+                row.icon = Some(Arc::new(Icon(icon.0 as usize)));
+            }
+        }
+        row.user = owner(handle.0).unwrap_or_default();
+    }
+    let mut counters = PROCESS_MEMORY_COUNTERS::default();
+    if unsafe {
+        GetProcessMemoryInfo(
+            handle.0,
+            &mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    }
+    .is_ok()
+    {
+        row.memory = Some(counters.WorkingSetSize);
+    }
+    let mut io = IO_COUNTERS::default();
+    if unsafe { GetProcessIoCounters(handle.0, &mut io) }.is_ok() {
+        row.io_bytes = Some(io.ReadTransferCount.saturating_add(io.WriteTransferCount));
+    }
+    let _ = unsafe { GetProcessHandleCount(handle.0, &mut row.handles) };
+    row.priority = unsafe { GetPriorityClass(handle.0) };
 }
 
 #[derive(Clone, Default)]
@@ -594,6 +605,58 @@ pub fn sample(previous: &Snapshot, inventory: bool) -> anyhow::Result<Snapshot> 
         processes: processes(&previous.processes)?,
         ..Default::default()
     };
+    system_counters(&mut next)?;
+    if let Some(shared) = &next.telemetry
+        && let Ok(mut counters) = shared.lock()
+    {
+        if counters.lost {
+            next.errors
+                .push("Disk/network event loss detected; per-process rates unavailable.".into());
+        } else {
+            for p in &mut next.processes {
+                let (disk, network) = counters.bytes.get(&p.pid).copied().unwrap_or_default();
+                p.disk_bytes = Some(disk);
+                p.network_bytes = Some(network);
+            }
+        }
+        let alive: std::collections::HashSet<_> = next.processes.iter().map(|p| p.pid).collect();
+        counters.bytes.retain(|pid, _| alive.contains(pid));
+    }
+    (next.disk, next.disk_rate) = disk_sample();
+    next.sampled = Instant::now();
+    rates(previous, &mut next);
+    if inventory {
+        match services() {
+            Ok(v) => next.services = v,
+            Err(e) => {
+                next.services.clone_from(&previous.services);
+                next.errors.push(format!("Services: {e}"));
+            }
+        }
+        match users() {
+            Ok(v) => next.users = v,
+            Err(e) => {
+                next.users.clone_from(&previous.users);
+                next.errors.push(format!("Users: {e}"));
+            }
+        }
+        match startup::startups() {
+            Ok(v) => next.startups = v,
+            Err(e) => {
+                next.startups.clone_from(&previous.startups);
+                next.errors.push(format!("Startup: {e}"));
+            }
+        }
+    } else {
+        next.services.clone_from(&previous.services);
+        next.users.clone_from(&previous.users);
+        next.startups.clone_from(&previous.startups);
+    }
+    Ok(next)
+}
+
+/// Reads the system-wide CPU, memory, handle and network counters.
+fn system_counters(next: &mut Snapshot) -> anyhow::Result<()> {
     unsafe {
         let (mut idle, mut kernel, mut user) = Default::default();
         GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user))?;
@@ -635,24 +698,11 @@ pub fn sample(previous: &Snapshot, inventory: bool) -> anyhow::Result<Snapshot> 
             FreeMibTable(table.cast());
         }
     }
-    if let Some(shared) = &next.telemetry
-        && let Ok(mut counters) = shared.lock()
-    {
-        if counters.lost {
-            next.errors
-                .push("Disk/network event loss detected; per-process rates unavailable.".into());
-        } else {
-            for p in &mut next.processes {
-                let (disk, network) = counters.bytes.get(&p.pid).copied().unwrap_or_default();
-                p.disk_bytes = Some(disk);
-                p.network_bytes = Some(network);
-            }
-        }
-        let alive: std::collections::HashSet<_> = next.processes.iter().map(|p| p.pid).collect();
-        counters.bytes.retain(|pid, _| alive.contains(pid));
-    }
-    (next.disk, next.disk_rate) = disk_sample();
-    next.sampled = Instant::now();
+    Ok(())
+}
+
+/// Derives CPU, network and per-process rates from the previous sample.
+fn rates(previous: &Snapshot, next: &mut Snapshot) {
     let elapsed = next.sampled.duration_since(previous.sampled).as_secs_f64();
     if previous.cpu_total > 0 && next.cpu_total >= previous.cpu_total {
         let total = next.cpu_total - previous.cpu_total;
@@ -693,34 +743,6 @@ pub fn sample(previous: &Snapshot, inventory: bool) -> anyhow::Result<Snapshot> 
             }
         }
     }
-    if inventory {
-        match services() {
-            Ok(v) => next.services = v,
-            Err(e) => {
-                next.services.clone_from(&previous.services);
-                next.errors.push(format!("Services: {e}"));
-            }
-        }
-        match users() {
-            Ok(v) => next.users = v,
-            Err(e) => {
-                next.users.clone_from(&previous.users);
-                next.errors.push(format!("Users: {e}"));
-            }
-        }
-        match startup::startups() {
-            Ok(v) => next.startups = v,
-            Err(e) => {
-                next.startups.clone_from(&previous.startups);
-                next.errors.push(format!("Startup: {e}"));
-            }
-        }
-    } else {
-        next.services.clone_from(&previous.services);
-        next.users.clone_from(&previous.users);
-        next.startups.clone_from(&previous.startups);
-    }
-    Ok(next)
 }
 
 // PDH owns counter history across sampling threads. Integer handles permit

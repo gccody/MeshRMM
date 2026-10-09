@@ -1,5 +1,8 @@
 //! The Task Manager window: creation, window procedures, menus and scrollbars.
+mod messages;
+
 use super::*;
+use messages::window_proc;
 
 pub(super) unsafe fn captured_scrollbars(list: HWND, dc: HDC) {
     unsafe {
@@ -216,327 +219,6 @@ pub(super) unsafe fn context_menu(state: &State, point: POINT) {
     }
 }
 
-pub(super) unsafe extern "system" fn window_proc(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    unsafe {
-        let cell = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<State>;
-        if message == WM_NCCALCSIZE {
-            let rect = if wparam.0 != 0 {
-                &mut (*(lparam.0 as *mut NCCALCSIZE_PARAMS)).rgrc[0]
-            } else {
-                &mut *(lparam.0 as *mut RECT)
-            };
-            let outer = crate::remote::background::frame_rect(hwnd, *rect);
-            let border = crate::remote::background::frame_border(hwnd);
-            let result = DefWindowProcW(hwnd, message, wparam, lparam);
-            rect.left = outer.left + border;
-            rect.right = outer.right - border;
-            rect.bottom = outer.bottom - border;
-            return result;
-        }
-        if message == WM_GETMINMAXINFO && lparam.0 != 0 {
-            let info = &mut *(lparam.0 as *mut MINMAXINFO);
-            let area = crate::remote::background::work_area();
-            info.ptMaxTrackSize = POINT {
-                x: area.right - area.left,
-                y: area.bottom - area.top,
-            };
-            let compact = !cell.is_null() && (*cell).try_borrow().map_or(true, |s| s.compact);
-            info.ptMinTrackSize = if compact {
-                POINT { x: 280, y: 200 }
-            } else {
-                POINT { x: 650, y: 390 }
-            };
-            return LRESULT(0);
-        }
-        if message == WM_DESTROY {
-            PostQuitMessage(0);
-            return LRESULT(0);
-        }
-        if !cell.is_null() {
-            if message == WM_DRAWITEM
-                && lparam.0 != 0
-                && let Ok(state) = (*cell).try_borrow()
-            {
-                let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
-                if item.CtlID == COMPACT as u32 {
-                    fill(item.hDC, &item.rcItem, WHITE);
-                    SelectObject(item.hDC, state.font.into());
-                    let pen = CreatePen(PS_SOLID, 1, COLORREF(0x999999));
-                    let old = SelectObject(item.hDC, pen.into());
-                    let brush = SelectObject(item.hDC, GetStockObject(WHITE_BRUSH));
-                    let _ = Ellipse(item.hDC, 1, 3, 19, 21);
-                    SelectObject(item.hDC, brush);
-                    SelectObject(item.hDC, old);
-                    let _ = DeleteObject(pen.into());
-                    draw_text(
-                        item.hDC,
-                        if state.compact { "⌄" } else { "⌃" },
-                        RECT {
-                            left: 1,
-                            top: 2,
-                            right: 19,
-                            bottom: 20,
-                        },
-                        COLORREF(0x555555),
-                        DT_CENTER,
-                    );
-                    draw_text(
-                        item.hDC,
-                        if state.compact {
-                            "More details"
-                        } else {
-                            "Fewer details"
-                        },
-                        RECT {
-                            left: 25,
-                            ..item.rcItem
-                        },
-                        COLORREF(0x222222),
-                        DT_LEFT,
-                    );
-                    if item.itemState.0 & ODS_FOCUS.0 != 0 {
-                        let _ = DrawFocusRect(item.hDC, &item.rcItem);
-                    }
-                    return LRESULT(1);
-                }
-            }
-            if message == WM_NCHITTEST {
-                let hit = DefWindowProcW(hwnd, message, wparam, lparam);
-                let mut window = RECT::default();
-                let _ = GetWindowRect(hwnd, &mut window);
-                let bounds = crate::remote::background::frame_rect(hwnd, window);
-                let x = lparam.0 as i16 as i32 - bounds.left;
-                let y = (lparam.0 >> 16) as i16 as i32 - bounds.top;
-                if !IsZoomed(hwnd).as_bool() {
-                    let border = crate::remote::background::RESIZE_BORDER;
-                    let left = x < border;
-                    let right = x >= bounds.right - bounds.left - border;
-                    let top = y < border;
-                    let bottom = y >= bounds.bottom - bounds.top - border;
-                    let edge = match (left, right, top, bottom) {
-                        (true, _, true, _) => HTTOPLEFT,
-                        (_, true, true, _) => HTTOPRIGHT,
-                        (true, _, _, true) => HTBOTTOMLEFT,
-                        (_, true, _, true) => HTBOTTOMRIGHT,
-                        (true, _, _, _) => HTLEFT,
-                        (_, true, _, _) => HTRIGHT,
-                        (_, _, true, _) => HTTOP,
-                        (_, _, _, true) => HTBOTTOM,
-                        _ => HTNOWHERE,
-                    };
-                    if edge != HTNOWHERE {
-                        return LRESULT(edge as isize);
-                    }
-                }
-                if (4..30).contains(&y) && x >= bounds.right - bounds.left - 139 {
-                    return LRESULT(if x >= bounds.right - bounds.left - 47 {
-                        HTCLOSE
-                    } else if x >= bounds.right - bounds.left - 93 {
-                        HTMAXBUTTON
-                    } else {
-                        HTMINBUTTON
-                    } as isize);
-                }
-                return hit;
-            }
-            if message == WM_NCLBUTTONDOWN
-                && matches!(wparam.0 as u32, HTCLOSE | HTMAXBUTTON | HTMINBUTTON)
-            {
-                let command = match wparam.0 as u32 {
-                    HTCLOSE => SC_CLOSE,
-                    HTMINBUTTON => SC_MINIMIZE,
-                    _ => {
-                        if IsZoomed(hwnd).as_bool() {
-                            SC_RESTORE
-                        } else {
-                            SC_MAXIMIZE
-                        }
-                    }
-                };
-                let _ = PostMessageW(
-                    Some(hwnd),
-                    WM_SYSCOMMAND,
-                    WPARAM(command as usize),
-                    LPARAM(0),
-                );
-                return LRESULT(0);
-            }
-            if matches!(message, WM_NCPAINT | WM_NCACTIVATE | WM_PRINT) {
-                let result = DefWindowProcW(hwnd, message, wparam, lparam);
-                if let Ok(state) = (*cell).try_borrow() {
-                    let dc = if message == WM_PRINT {
-                        HDC(wparam.0 as *mut _)
-                    } else {
-                        GetWindowDC(Some(hwnd))
-                    };
-                    if !dc.is_invalid() {
-                        caption(&state, dc);
-                        if message != WM_PRINT {
-                            ReleaseDC(Some(hwnd), dc);
-                        }
-                    }
-                }
-                return result;
-            }
-            if message == WM_NOTIFY && lparam.0 != 0 {
-                let notification = &*(lparam.0 as *const NMHDR);
-                if notification.code == NM_CUSTOMDRAW
-                    && let Ok(state) = (*cell).try_borrow()
-                    && notification.hwndFrom == state.list
-                {
-                    let draw = &mut *(lparam.0 as *mut NMLVCUSTOMDRAW);
-                    match draw.nmcd.dwDrawStage {
-                        CDDS_PREPAINT => return LRESULT(CDRF_NOTIFYITEMDRAW as isize),
-                        CDDS_ITEMPREPAINT => {
-                            return LRESULT(CDRF_NOTIFYSUBITEMDRAW as isize);
-                        }
-                        // Keep the native cell renderer. Geometry/selection
-                        // queries re-entering the list from this paint callback
-                        // caused a user32 callback crash on the Session 0 desktop.
-                        stage if stage.0 == CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0 => {
-                            if let Some(row) = state.rows.get(draw.nmcd.dwItemSpec) {
-                                draw.clrText = if row.section {
-                                    BLUE
-                                } else {
-                                    COLORREF(0x222222)
-                                };
-                                draw.clrTextBk = if !row.section
-                                    && state.tab == Tab::Processes
-                                    && draw.iSubItem >= 2
-                                    && !state.compact
-                                {
-                                    let heat = row
-                                        .heat
-                                        .get(draw.iSubItem as usize)
-                                        .copied()
-                                        .unwrap_or(0.0)
-                                        .sqrt()
-                                        .clamp(0.0, 1.0);
-                                    COLORREF(
-                                        255 | ((249.0 - 65.0 * heat) as u32) << 8
-                                            | ((215.0 - 170.0 * heat) as u32) << 16,
-                                    )
-                                } else {
-                                    WHITE
-                                };
-                                SelectObject(
-                                    draw.nmcd.hdc,
-                                    if row.section {
-                                        state.heading_font
-                                    } else {
-                                        state.font
-                                    }
-                                    .into(),
-                                );
-                                return LRESULT(CDRF_NEWFONT as isize);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if let Ok(mut state) = (*cell).try_borrow_mut() {
-                let old_notice = state.notice.clone();
-                let mut handled = true;
-                let result = match message {
-                    WM_TIMER => {
-                        if wparam.0 == 1 {
-                            state.refresh();
-                        }
-                        state.poll()
-                    }
-                    WM_SIZE => {
-                        state.layout();
-                        Ok(())
-                    }
-                    WM_COMMAND => state.command(wparam.0 & 0xffff),
-                    WM_NOTIFY if lparam.0 != 0 => {
-                        let notification = &*(lparam.0 as *const NMHDR);
-                        if notification.hwndFrom == state.tabs && notification.code == TCN_SELCHANGE
-                        {
-                            let index = SendMessageW(state.tabs, TCM_GETCURSEL, None, None).0;
-                            state.change_tab(Tab::from_index(index as usize));
-                        } else if notification.hwndFrom == state.list {
-                            match notification.code {
-                                LVN_COLUMNCLICK => {
-                                    let info = &*(lparam.0 as *const NMLISTVIEW);
-                                    let column = info.iSubItem as usize;
-                                    if state.sort == column {
-                                        state.descending = !state.descending;
-                                    } else {
-                                        state.sort = column;
-                                        state.descending = false;
-                                    }
-                                    state.rebuild();
-                                }
-                                NM_DBLCLK => state.expand(),
-                                NM_CLICK => {
-                                    let info = &*(lparam.0 as *const NMITEMACTIVATE);
-                                    if info.ptAction.x < 28 {
-                                        state.expand();
-                                    }
-                                }
-                                LVN_KEYDOWN => {
-                                    let info = &*(lparam.0 as *const NMLVKEYDOWN);
-                                    match info.wVKey {
-                                        0x2e => {
-                                            let _ = PostMessageW(
-                                                Some(hwnd),
-                                                WM_COMMAND,
-                                                WPARAM(END_TASK),
-                                                LPARAM(0),
-                                            );
-                                        }
-                                        0x25 | 0x27 | 0x0d => state.expand(),
-                                        0x74 => state.refresh(),
-                                        _ => {}
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        Ok(())
-                    }
-                    WM_CONTEXTMENU => {
-                        let point = if lparam.0 == -1 {
-                            let mut p = POINT::default();
-                            let _ = GetCursorPos(&mut p);
-                            p
-                        } else {
-                            POINT {
-                                x: lparam.0 as i16 as i32,
-                                y: (lparam.0 >> 16) as i16 as i32,
-                            }
-                        };
-                        context_menu(&state, point);
-                        Ok(())
-                    }
-                    _ => {
-                        handled = false;
-                        Ok(())
-                    }
-                };
-                if let Err(e) = result {
-                    state.notice = format!("{e:#}");
-                }
-                if handled {
-                    state.footer();
-                    if message == WM_COMMAND || state.notice != old_notice {
-                        state.layout();
-                    }
-                    return LRESULT(0);
-                }
-            }
-        }
-        DefWindowProcW(hwnd, message, wparam, lparam)
-    }
-}
-
 pub(super) unsafe fn menu() -> anyhow::Result<HMENU> {
     unsafe {
         let bar = CreateMenu()?;
@@ -608,6 +290,83 @@ pub(super) fn create_window() -> anyhow::Result<Box<RefCell<State>>> {
             dwICC: ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES,
         })
         .ok()?;
+        let (class, panel) = register_classes()?;
+        let font = create_font(-12);
+        let hwnd = CreateWindowExW(
+            WS_EX_COMPOSITED,
+            class,
+            w!("Task Manager"),
+            WS_OVERLAPPEDWINDOW,
+            40,
+            24,
+            650,
+            480,
+            None,
+            Some(menu()?),
+            None,
+            None,
+        )?;
+        let (list, images) = create_list(hwnd, font)?;
+        let tabs = create_tabs(hwnd, font)?;
+        install_list_scrollbars(list)?;
+        let status = control(
+            hwnd,
+            w!("STATIC"),
+            "Loading processes…",
+            109,
+            WS_VISIBLE,
+            font,
+        )?;
+        create_buttons(hwnd, font)?;
+        let header = control(hwnd, panel, "", HEADER, WS_VISIBLE, font)?;
+        let graph = control(hwnd, panel, "", GRAPH, WINDOW_STYLE(0), font)?;
+        let state = Box::new(RefCell::new(State {
+            hwnd,
+            menu: GetMenu(hwnd),
+            list,
+            tabs,
+            status,
+            header,
+            graph,
+            font,
+            images,
+            icon_indices: HashMap::new(),
+            heading_font: create_font(-16),
+            rows: Vec::new(),
+            snapshot: Snapshot::default(),
+            receiver: None,
+            action: None,
+            pending: None,
+            notice: String::new(),
+            tab: Tab::Processes,
+            compact: false,
+            expanded_size: (650, 480),
+            grouped: true,
+            expanded: HashSet::new(),
+            sort: 0,
+            descending: false,
+            interval: 1000,
+            tick: 0,
+            run_visible: false,
+            topmost: false,
+            samples: VecDeque::new(),
+            performance: 0,
+            history: BTreeMap::new(),
+            history_baseline: HashMap::new(),
+        }));
+        SetWindowLongPtrW(
+            hwnd,
+            GWLP_USERDATA,
+            (&*state as *const RefCell<State>) as isize,
+        );
+        state.borrow_mut().configure();
+        Ok(state)
+    }
+}
+
+/// Returns the window and panel class names.
+fn register_classes() -> anyhow::Result<(PCWSTR, PCWSTR)> {
+    unsafe {
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             lpszClassName: w!("MeshRMMBackgroundTasks"),
@@ -633,8 +392,14 @@ pub(super) fn create_window() -> anyhow::Result<Box<RefCell<State>>> {
                 "Could not register Task Manager panels"
             );
         }
-        let font = CreateFontW(
-            -12,
+        Ok((class.lpszClassName, panel.lpszClassName))
+    }
+}
+
+fn create_font(height: i32) -> HFONT {
+    unsafe {
+        CreateFontW(
+            height,
             0,
             0,
             0,
@@ -648,21 +413,13 @@ pub(super) fn create_window() -> anyhow::Result<Box<RefCell<State>>> {
             CLEARTYPE_QUALITY,
             DEFAULT_PITCH.0 as u32,
             w!("Segoe UI"),
-        );
-        let hwnd = CreateWindowExW(
-            WS_EX_COMPOSITED,
-            class.lpszClassName,
-            w!("Task Manager"),
-            WS_OVERLAPPEDWINDOW,
-            40,
-            24,
-            650,
-            480,
-            None,
-            Some(menu()?),
-            None,
-            None,
-        )?;
+        )
+    }
+}
+
+/// Returns the list view and its small image list.
+unsafe fn create_list(hwnd: HWND, font: HFONT) -> anyhow::Result<(HWND, HIMAGELIST)> {
+    unsafe {
         let list = control(
             hwnd,
             w!("SysListView32"),
@@ -694,6 +451,12 @@ pub(super) fn create_window() -> anyhow::Result<Box<RefCell<State>>> {
             Some(WPARAM(LVSIL_SMALL as usize)),
             Some(LPARAM(images.0 as isize)),
         );
+        Ok((list, images))
+    }
+}
+
+unsafe fn create_tabs(hwnd: HWND, font: HFONT) -> anyhow::Result<HWND> {
+    unsafe {
         let tabs = control(
             hwnd,
             w!("SysTabControl32"),
@@ -716,15 +479,13 @@ pub(super) fn create_window() -> anyhow::Result<Box<RefCell<State>>> {
                 Some(LPARAM((&item as *const TCITEMW) as isize)),
             );
         }
-        install_list_scrollbars(list)?;
-        let status = control(
-            hwnd,
-            w!("STATIC"),
-            "Loading processes…",
-            109,
-            WS_VISIBLE,
-            font,
-        )?;
+        Ok(tabs)
+    }
+}
+
+/// Creates the footer buttons and the hidden Run edit.
+unsafe fn create_buttons(hwnd: HWND, font: HFONT) -> anyhow::Result<()> {
+    unsafe {
         for (id, label) in [
             (COMPACT, "⌃  Fewer details"),
             (REFRESH, "Refresh"),
@@ -758,63 +519,6 @@ pub(super) fn create_window() -> anyhow::Result<Box<RefCell<State>>> {
             WS_TABSTOP | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
             font,
         )?;
-        let header = control(hwnd, panel.lpszClassName, "", HEADER, WS_VISIBLE, font)?;
-        let graph = control(hwnd, panel.lpszClassName, "", GRAPH, WINDOW_STYLE(0), font)?;
-        let state = Box::new(RefCell::new(State {
-            hwnd,
-            menu: GetMenu(hwnd),
-            list,
-            tabs,
-            status,
-            header,
-            graph,
-            font,
-            images,
-            icon_indices: HashMap::new(),
-            heading_font: CreateFontW(
-                -16,
-                0,
-                0,
-                0,
-                400,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                DEFAULT_PITCH.0 as u32,
-                w!("Segoe UI"),
-            ),
-            rows: Vec::new(),
-            snapshot: Snapshot::default(),
-            receiver: None,
-            action: None,
-            pending: None,
-            notice: String::new(),
-            tab: Tab::Processes,
-            compact: false,
-            expanded_size: (650, 480),
-            grouped: true,
-            expanded: HashSet::new(),
-            sort: 0,
-            descending: false,
-            interval: 1000,
-            tick: 0,
-            run_visible: false,
-            topmost: false,
-            samples: VecDeque::new(),
-            performance: 0,
-            history: BTreeMap::new(),
-            history_baseline: HashMap::new(),
-        }));
-        SetWindowLongPtrW(
-            hwnd,
-            GWLP_USERDATA,
-            (&*state as *const RefCell<State>) as isize,
-        );
-        state.borrow_mut().configure();
-        Ok(state)
+        Ok(())
     }
 }
