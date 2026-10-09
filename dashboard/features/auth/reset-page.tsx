@@ -1,4 +1,4 @@
-import { CircleCheck, KeyRound, LoaderCircle, Mail } from "lucide-react";
+import { KeyRound, LoaderCircle, Mail } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
 import { Link } from "react-router";
 import { apiFetch, errorText, expectJson, expectOk, jsonBody } from "../../lib/http";
@@ -12,7 +12,7 @@ import { useDocumentTitle, useSession } from "./session";
 export function ResetPage() {
   useDocumentTitle("Reset password");
   const token = useHashToken();
-  if (token === undefined) return <AuthCard icon={<KeyRound size={22} />} title="Reset your password"><Pending label="Loading…" /></AuthCard>;
+  if (token === undefined) return <AuthCard title="Reset your password"><Pending label="Loading…" /></AuthCard>;
   return token ? <SetNewPassword token={token} /> : <RequestReset />;
 }
 
@@ -23,11 +23,11 @@ function RequestReset() {
   const [sent, setSent] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  if (!instance) return <AuthCard icon={<KeyRound size={22} />} title="Reset your password"><Pending label="Loading…" /></AuthCard>;
+  if (!instance) return <AuthCard title="Reset your password"><Pending label="Loading…" /></AuthCard>;
 
   if (!instance.sign_in.password_reset_email) {
     return (
-      <AuthCard icon={<KeyRound size={22} />} eyebrow={instance.name} title="Reset your password">
+      <AuthCard eyebrow={instance.name} title="Reset your password">
         <p>This server doesn&apos;t send email. Ask an administrator for a password reset link; they can make one on the Users page.</p>
         <Link className="secondary-button" to="/login">Back to sign in</Link>
       </AuthCard>
@@ -36,7 +36,7 @@ function RequestReset() {
 
   if (sent) {
     return (
-      <AuthCard icon={<Mail size={22} />} eyebrow={instance.name} title="Check your email">
+      <AuthCard eyebrow={instance.name} title="Check your email">
         <p>If an account uses {email.trim()}, a link to reset its password is on its way. The link works for an hour.</p>
         <Link className="secondary-button" to="/login">Back to sign in</Link>
       </AuthCard>
@@ -58,7 +58,7 @@ function RequestReset() {
   };
 
   return (
-    <AuthCard icon={<KeyRound size={22} />} eyebrow={instance.name} title="Reset your password">
+    <AuthCard eyebrow={instance.name} title="Reset your password">
       <p>Enter your account&apos;s email and we&apos;ll send you a link to choose a new password.</p>
       <form className="form-stack" onSubmit={(event) => void submit(event)}>
         <label htmlFor="email">Email
@@ -95,10 +95,10 @@ function SetNewPassword({ token }: { token: string }) {
     return () => { cancelled = true; };
   }, [token]);
 
-  if (lookup.status === "loading") return <AuthCard icon={<KeyRound size={22} />} title="Reset your password"><Pending label="Checking your link…" /></AuthCard>;
+  if (lookup.status === "loading") return <AuthCard title="Reset your password"><Pending label="Checking your link…" /></AuthCard>;
   if (lookup.status === "failed") {
     return (
-      <AuthCard icon={<KeyRound size={22} />} title="This link doesn't work">
+      <AuthCard title="This link doesn't work">
         <p>{lookup.message} Reset links work once, for a limited time.</p>
         <div className="auth-actions">
           <Link className="primary-button" to="/reset">Get a new link</Link>
@@ -109,7 +109,7 @@ function SetNewPassword({ token }: { token: string }) {
   }
   if (done) {
     return (
-      <AuthCard icon={<CircleCheck size={22} />} title="Password changed">
+      <AuthCard title="Password changed">
         <p>Every session of {lookup.email} was signed out. Sign in with your new password.</p>
         <Link className="primary-button" to="/login">Sign in</Link>
       </AuthCard>
@@ -138,7 +138,7 @@ function SetNewPassword({ token }: { token: string }) {
   };
 
   return (
-    <AuthCard icon={<KeyRound size={22} />} eyebrow={instance?.name} title="Choose a new password">
+    <AuthCard eyebrow={instance?.name} title="Choose a new password">
       <p>For {lookup.email}. Every place the account is signed in will be signed out.</p>
       <form className="form-stack" onSubmit={(event) => void submit(event)}>
         <input type="email" autoComplete="username" value={lookup.email} readOnly hidden />

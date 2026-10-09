@@ -17,7 +17,7 @@ import {
   isConnectionApprovalTimeoutValid,
   isConnectionNotificationMessageValid,
   isInstanceNameValid,
-  settingsTabForKey,
+  tabForKey,
 } from "../features/settings/general-settings.ts";
 import { DEFAULT_IDLE_TIMEOUT_MINUTES } from "../features/session/idle-session.ts";
 
@@ -196,13 +196,15 @@ test("idle disconnect choices read as durations, with never first", () => {
   );
 });
 
-test("arrow keys wrap between settings tabs and Home/End jump to the ends", () => {
-  const last = SETTINGS_TABS.length - 1;
-  assert.equal(settingsTabForKey(0, "ArrowRight"), 1);
-  assert.equal(settingsTabForKey(last, "ArrowRight"), 0);
-  assert.equal(settingsTabForKey(0, "ArrowLeft"), last);
-  assert.equal(settingsTabForKey(1, "Home"), 0);
-  assert.equal(settingsTabForKey(0, "End"), last);
-  assert.equal(settingsTabForKey(0, "Enter"), null);
-  assert.equal(settingsTabForKey(0, "ArrowDown"), null);
+test("arrow keys wrap between tabs and Home/End jump to the ends", () => {
+  const count = SETTINGS_TABS.length;
+  const last = count - 1;
+  assert.equal(tabForKey(0, count, "ArrowRight"), 1);
+  assert.equal(tabForKey(0, count, "ArrowDown"), 1);
+  assert.equal(tabForKey(last, count, "ArrowRight"), 0);
+  assert.equal(tabForKey(0, count, "ArrowLeft"), last);
+  assert.equal(tabForKey(0, count, "ArrowUp"), last);
+  assert.equal(tabForKey(1, count, "Home"), 0);
+  assert.equal(tabForKey(0, count, "End"), last);
+  assert.equal(tabForKey(0, count, "Enter"), null);
 });

@@ -18,7 +18,7 @@ export function NewPasswordFields({ password, confirmation, minLength, onPasswor
       <label htmlFor={`${id}-password`}>{label}
         <input id={`${id}-password`} type="password" autoComplete="new-password" required minLength={minLength} value={password} onChange={(event) => onPassword(event.target.value)} aria-describedby={`${id}-help`} />
       </label>
-      <small id={`${id}-help`} className="field-help">At least {minLength} characters. A long phrase is easier to remember than a short, complex one.</small>
+      <small id={`${id}-help`} className="field-help">At least {minLength} characters.</small>
       <label htmlFor={`${id}-confirmation`}>Confirm {label.toLowerCase()}
         <input id={`${id}-confirmation`} type="password" autoComplete="new-password" required value={confirmation} onChange={(event) => onConfirmation(event.target.value)} aria-invalid={mismatch} />
       </label>

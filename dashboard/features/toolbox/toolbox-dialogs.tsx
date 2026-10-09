@@ -1,4 +1,4 @@
-import { SquareTerminal, X } from "lucide-react";
+import { X } from "lucide-react";
 import type { RefObject } from "react";
 import { ModalDialog } from "../../lib/modal-dialog";
 import type { Agent } from "../agents/types";
@@ -86,8 +86,6 @@ function RunDetailsModal({ run: listed, agents, onClose, returnFocus }: { run: S
   return (
     <ModalDialog className="settings-modal toolbox-modal" labelledBy="run-details-title" onClose={onClose} returnFocus={returnFocus}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>
-      <div className="modal-icon"><SquareTerminal size={22} /></div>
-      <p className="eyebrow">Script run</p>
       <h2 id="run-details-title">{listed.script_name}</h2>
       {run && <RunResult run={run} deviceName={deviceName} error={error} />}
       <div className="connection-reason-actions"><button type="button" className="primary-button" onClick={onClose}>Done</button></div>

@@ -1,5 +1,5 @@
 
-import { LoaderCircle, Play, SquareTerminal, X } from "lucide-react";
+import { LoaderCircle, Play, X } from "lucide-react";
 import { type FormEvent, type RefObject, useEffect, useMemo, useState } from "react";
 import { AuthenticationRequired } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
@@ -71,8 +71,6 @@ export function RunScriptModal({ agents, scripts: givenScripts, initialAgentId, 
   return (
     <ModalDialog className="settings-modal toolbox-modal" labelledBy="run-script-title" onClose={onClose} returnFocus={returnFocus}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>
-      <div className="modal-icon"><SquareTerminal size={22} /></div>
-      <p className="eyebrow">Toolbox</p>
       <h2 id="run-script-title">Run a script</h2>
       {run ? (
         <>

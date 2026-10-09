@@ -1,20 +1,6 @@
 
-import { Download, MonitorDown } from "lucide-react";
-import { useViewerPlatform } from "./use-viewer-platform";
+import { Download } from "lucide-react";
 import { VIEWER_DOWNLOADS, VIEWER_PLATFORMS, type ViewerPlatform } from "./viewer-downloads";
-
-// The permanent sidebar entry point for the viewer, for every role.
-export function ViewerDownloadCard() {
-  const platform = useViewerPlatform();
-  return (
-    <section className="support-card viewer-card" aria-labelledby="viewer-card-title">
-      <div className="support-icon"><MonitorDown size={16} aria-hidden="true" /></div>
-      <strong id="viewer-card-title">MeshRMM Remote</strong>
-      <p>Needed to connect to devices.</p>
-      <ViewerDownloadLinks platform={platform} />
-    </section>
-  );
-}
 
 // This computer's build first; every build behind "Other platforms". With no
 // detected platform, every build is listed.

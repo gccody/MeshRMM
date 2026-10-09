@@ -67,7 +67,7 @@ export function PasskeysSection({ onRecoveryCodes, onNotice }: {
   return (
     <div className="two-factor-method">
       <h3><Fingerprint size={15} aria-hidden="true" /> Passkeys</h3>
-      <p className="field-help">Sign in with your fingerprint, face or screen lock, or a security key. A passkey also signs you in without your email and password.</p>
+      <p className="field-help">Fingerprint, face, screen lock or a security key. Also signs you in without a password.</p>
       {!passkeys ? (
         error
           ? <><p role="alert" className="form-error">{error}</p><div><button type="button" className="secondary-button" onClick={reload}><RefreshCw size={15} /> Try again</button></div></>
@@ -145,9 +145,8 @@ function AddPasskeyDialog({ onAdded, onClose }: { onAdded: (added: AddedPasskey)
   return (
     <ModalDialog className="settings-modal" labelledBy={`${id}-title`} onClose={busy ? () => {} : onClose}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close" disabled={busy}><X size={19} /></button>
-      <div className="modal-icon"><Fingerprint size={22} /></div>
       <h2 id={`${id}-title`}>Add a passkey</h2>
-      <p>Name it after where it lives, then follow your browser&apos;s prompt. You can save it on this device, your phone or a security key.</p>
+      <p>Name it after where it lives, then follow your browser&apos;s prompt.</p>
       <form onSubmit={(event) => void submit(event)}>
         <input type="email" autoComplete="username" value={account.user.email} readOnly hidden />
         <label htmlFor={`${id}-name`}>Passkey name
@@ -197,9 +196,8 @@ function RenamePasskeyDialog({ passkey, onRenamed, onClose }: {
   return (
     <ModalDialog className="settings-modal" labelledBy={`${id}-title`} onClose={busy ? () => {} : onClose}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close" disabled={busy}><X size={19} /></button>
-      <div className="modal-icon"><Pencil size={22} /></div>
       <h2 id={`${id}-title`}>Rename passkey</h2>
-      <p>The name helps you tell your passkeys apart. Only you see it.</p>
+      <p>Only you see this name.</p>
       <form onSubmit={(event) => void submit(event)}>
         <label htmlFor={`${id}-name`}>Passkey name
           <input id={`${id}-name`} required maxLength={MAX_PASSKEY_NAME_LENGTH} value={name} onChange={(event) => setName(event.target.value)} />

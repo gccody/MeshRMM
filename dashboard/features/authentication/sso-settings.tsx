@@ -89,7 +89,7 @@ export function SsoSettingsSection() {
     <section className="management-panel">
       <div className="management-heading">
         <h2><LogIn size={15} aria-hidden="true" /> Single sign-on (OpenID Connect)</h2>
-        <p>Let people sign in through your identity provider, such as Okta, Microsoft Entra ID, Google or Keycloak. Their email address there finds their MeshRMM account.</p>
+        <p>Sign in through Okta, Entra ID, Google or any OpenID Connect provider.</p>
       </div>
       {!saved ? (
         error
@@ -97,25 +97,23 @@ export function SsoSettingsSection() {
           : <p role="status" className="field-help"><LoaderCircle size={14} className="spin" /> Loading…</p>
       ) : (
         <>
-          <p className={`two-factor-status ${provider?.enabled ? "on" : "off"}`}>{provider ? (provider.enabled ? `On: the sign-in page offers “Sign in with ${provider.display_name}”.` : "Set up, but off.") : "Not set up."}</p>
+          <p className={`two-factor-status ${provider?.enabled ? "on" : "off"}`}>{provider ? (provider.enabled ? `On: “Sign in with ${provider.display_name}”` : "Set up, but off.") : "Not set up."}</p>
           <div className="form-stack form-narrow">
             <CopyField label="Redirect URI" value={saved.redirect_uri} />
-            <small className="field-help">Create an OpenID Connect web application at your identity provider and register this as its redirect (sign-in) URI. The provider gives you the client ID and secret to enter below.</small>
+            <small className="field-help">Register this in your provider’s OpenID Connect app.</small>
           </div>
           <form className="form-stack form-narrow sso-form" onSubmit={save}>
             <fieldset className="form-stack" disabled={busy !== null}>
               <label className="checkbox-row">
                 <input type="checkbox" checked={form.enabled} onChange={(event) => edit({ enabled: event.target.checked })} />
-                <span><strong>Turn on single sign-on</strong>Saving checks that MeshRMM can reach the provider.</span>
+                <strong>Turn on single sign-on</strong>
               </label>
               <label htmlFor="sso-name">Provider name
-                <input id="sso-name" required maxLength={MAX_SSO_NAME_LENGTH} placeholder="Okta" value={form.displayName} onChange={(event) => edit({ displayName: event.target.value })} aria-describedby="sso-name-help" />
+                <input id="sso-name" required maxLength={MAX_SSO_NAME_LENGTH} placeholder="Okta" value={form.displayName} onChange={(event) => edit({ displayName: event.target.value })} />
               </label>
-              <small id="sso-name-help" className="field-help">The sign-in button reads “Sign in with {form.displayName.trim() || "…"}”.</small>
               <label htmlFor="sso-issuer">Issuer URL
-                <input id="sso-issuer" type="url" required placeholder="https://example.okta.com" value={form.issuerUrl} onChange={(event) => edit({ issuerUrl: event.target.value })} aria-describedby="sso-issuer-help" />
+                <input id="sso-issuer" type="url" required placeholder="https://example.okta.com" value={form.issuerUrl} onChange={(event) => edit({ issuerUrl: event.target.value })} />
               </label>
-              <small id="sso-issuer-help" className="field-help">An https:// address; MeshRMM reads its /.well-known/openid-configuration.</small>
               <label htmlFor="sso-client-id">Client ID
                 <input id="sso-client-id" required autoComplete="off" spellCheck={false} value={form.clientId} onChange={(event) => edit({ clientId: event.target.value })} />
               </label>
@@ -131,17 +129,16 @@ export function SsoSettingsSection() {
                 />
               </label>
               {provider?.has_client_secret && !form.clientSecret ? (
-                <label className="checkbox-row"><input type="checkbox" checked={form.removeSecret} onChange={(event) => edit({ removeSecret: event.target.checked })} /><span>Remove the stored secret, for a provider app without one</span></label>
+                <label className="checkbox-row"><input type="checkbox" checked={form.removeSecret} onChange={(event) => edit({ removeSecret: event.target.checked })} /><span>Remove the stored secret</span></label>
               ) : (
-                <small id="sso-client-secret-help" className="field-help">Leave it empty for a public client that has no secret.</small>
+                <small id="sso-client-secret-help" className="field-help">Leave empty for a public client.</small>
               )}
               <label htmlFor="sso-scopes">Scopes
-                <input id="sso-scopes" autoComplete="off" spellCheck={false} placeholder={DEFAULT_SCOPES} value={form.scopes} onChange={(event) => edit({ scopes: event.target.value })} aria-describedby="sso-scopes-help" />
+                <input id="sso-scopes" autoComplete="off" spellCheck={false} placeholder={DEFAULT_SCOPES} value={form.scopes} onChange={(event) => edit({ scopes: event.target.value })} />
               </label>
-              <small id="sso-scopes-help" className="field-help">Separated by spaces. MeshRMM always asks for openid; it needs the email address too.</small>
               <label className="checkbox-row">
                 <input type="checkbox" checked={form.requireVerifiedEmail} onChange={(event) => edit({ requireVerifiedEmail: event.target.checked })} />
-                <span><strong>Require a verified email address</strong>Sign in only when the provider says it verified the email address. Microsoft Entra ID says so only with its optional xms_edov claim; add that claim to the app&apos;s token, or turn this off. Without it, anyone the provider gives an address to can sign in as that address&apos;s account, so only do that when you control which addresses the provider assigns.</span>
+                <span><strong>Require a verified email address</strong>Turn off only if you control every address the provider issues. Entra ID needs its optional xms_edov claim.</span>
               </label>
               <SsoRoleFields form={form} roles={roles} edit={edit} editMapping={editMapping} />
             </fieldset>
@@ -175,7 +172,7 @@ function SsoRoleFields({ form, roles, edit, editMapping }: {
     <>
       <label className="checkbox-row">
         <input type="checkbox" checked={form.autoProvision} onChange={(event) => edit({ autoProvision: event.target.checked })} />
-        <span><strong>Create accounts on first sign-in</strong>Anyone the provider signs in gets an account here. Otherwise, only invited people can sign in with it.</span>
+        <span><strong>Create accounts on first sign-in</strong>Otherwise only invited people can use it.</span>
       </label>
       {form.autoProvision && (
         <label htmlFor="sso-default-role">Role for new accounts
@@ -188,7 +185,7 @@ function SsoRoleFields({ form, roles, edit, editMapping }: {
       <label htmlFor="sso-groups-claim">Groups claim (optional)
         <input id="sso-groups-claim" autoComplete="off" spellCheck={false} placeholder="groups" value={form.groupsClaim} onChange={(event) => edit({ groupsClaim: event.target.value })} aria-describedby="sso-groups-claim-help" />
       </label>
-      <small id="sso-groups-claim-help" className="field-help">The claim that lists a user&apos;s groups, such as groups, or a dotted path like realm_access.roles. Each SSO sign-in updates the roles their groups grant below. Signing in with a password or passkey drops those roles until the next SSO sign-in.</small>
+      <small id="sso-groups-claim-help" className="field-help">Such as groups or realm_access.roles. Roles from groups apply only to SSO sign-ins.</small>
       {form.groupsClaim.trim() && (
         <fieldset className="group-mappings">
           <legend>Roles from groups</legend>

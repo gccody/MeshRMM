@@ -25,13 +25,10 @@ export function ConnectionReasonModal({ agentName, background, onCancel, onConne
   return (
     <ModalDialog className="settings-modal connection-reason-modal" labelledBy="connection-reason-title" onClose={onCancel}>
       <button type="button" className="modal-close" onClick={onCancel} aria-label="Close"><X size={19} /></button>
-      <div className="modal-icon"><Monitor size={22} /></div>
-      <p className="eyebrow">{background ? "Connect to background" : "Connect"}</p>
-      <h2 id="connection-reason-title">Request access to {agentName}</h2>
-      <p>The person at this device is asked to accept the connection. A reason helps them decide.</p>
+      <h2 id="connection-reason-title">{background ? "Request background access" : "Request access"} to {agentName}</h2>
+      <p>The person at this device must accept. A reason helps them decide.</p>
       <form onSubmit={submit}>
-        <label htmlFor="connection-reason">Reason (optional)<textarea id="connection-reason" rows={3} maxLength={MAX_CONNECTION_REASON_BYTES} value={reason} onChange={(event) => setReason(event.target.value)} aria-describedby="connection-reason-help" aria-invalid={!valid} /></label>
-        <small id="connection-reason-help" className="field-help">Without a reason, the prompt only asks to accept your connection. Up to {MAX_CONNECTION_REASON_BYTES} bytes.</small>
+        <label htmlFor="connection-reason">Reason (optional)<textarea id="connection-reason" rows={3} maxLength={MAX_CONNECTION_REASON_BYTES} value={reason} onChange={(event) => setReason(event.target.value)} aria-invalid={!valid} /></label>
         {!valid && <p role="alert" className="installer-error">Shorten the reason to {MAX_CONNECTION_REASON_BYTES} bytes and remove tabs or other control characters.</p>}
         <div className="connection-reason-actions">
           <button type="button" className="secondary-button" onClick={onCancel}>Cancel</button>

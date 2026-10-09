@@ -1,4 +1,4 @@
-import { CircleCheck, LoaderCircle, Rocket, ScrollText } from "lucide-react";
+import { LoaderCircle, Rocket } from "lucide-react";
 import { type FormEvent, useState } from "react";
 import { Link, useNavigate } from "react-router";
 import { RequestError, apiFetch, errorText, expectJson, jsonBody } from "../../lib/http";
@@ -28,12 +28,12 @@ export function SetupPage() {
   const [touched, setTouched] = useState(false);
 
   if (token === undefined || (!instance && state.status === "loading")) {
-    return <AuthCard icon={<Rocket size={22} />} title="Set up MeshRMM"><Pending label="Checking this server…" /></AuthCard>;
+    return <AuthCard title="Set up MeshRMM"><Pending label="Checking this server…" /></AuthCard>;
   }
 
   if (instance && !instance.setup_required && !busy) {
     return (
-      <AuthCard icon={<CircleCheck size={22} />} eyebrow={instance.name} title="This server is set up">
+      <AuthCard eyebrow={instance.name} title="This server is set up">
         <p>Its first administrator already exists. Sign in, or ask an administrator to invite you.</p>
         <Link className="primary-button" to="/login">Sign in</Link>
       </AuthCard>
@@ -42,7 +42,7 @@ export function SetupPage() {
 
   if (!token) {
     return (
-      <AuthCard icon={<ScrollText size={22} />} title="Open the setup link">
+      <AuthCard title="Open the setup link">
         <p>
           When it has no accounts yet, the server writes a one-time setup link to its log. Open that link to create the
           first administrator. It changes every time the server restarts, so use the newest one.
@@ -82,7 +82,7 @@ export function SetupPage() {
   };
 
   return (
-    <AuthCard icon={<Rocket size={22} />} eyebrow="First run" title="Set up MeshRMM" wide>
+    <AuthCard eyebrow="First run" title="Set up MeshRMM" wide>
       <p>Name this server and create your administrator account. You can invite your team once you&apos;re in.</p>
       <form className="form-stack" onSubmit={(event) => void submit(event)}>
         <label htmlFor="instance-name">Server name

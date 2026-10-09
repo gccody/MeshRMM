@@ -144,7 +144,8 @@ const TARGET_LABELS: Record<string, string> = {
   settings: "Settings",
 };
 
-export function targetLabel(event: Pick<AuditEvent, "actor_user_id" | "target_type" | "target_id" | "metadata">) {
+// `deviceNames` names devices still in the inventory, rather than their IDs.
+export function targetLabel(event: Pick<AuditEvent, "actor_user_id" | "target_type" | "target_id" | "metadata">, deviceNames?: ReadonlyMap<string, string>) {
   const kind = TARGET_LABELS[event.target_type] ?? event.target_type;
   if (event.target_type === "settings") return kind;
   // Sign-ins and account changes name the user who acted.
@@ -153,6 +154,6 @@ export function targetLabel(event: Pick<AuditEvent, "actor_user_id" | "target_ty
   const detail = typeof name === "string" ? name
     : typeof email === "string" ? email
     : typeof displayName === "string" ? displayName
-    : event.target_id;
+    : (event.target_type === "agent" && deviceNames?.get(event.target_id)) || event.target_id;
   return `${kind}: ${detail}`;
 }

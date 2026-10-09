@@ -16,15 +16,16 @@ export const VIEW_PATHS: Record<View, string> = {
   account: "/account",
 };
 
-export const VIEW_COPY: Record<View, { title: string; description: string }> = {
-  devices: { title: "Devices", description: "Connect to your devices and keep your team working." },
-  toolbox: { title: "Toolbox", description: "Scripts and files to run on or send to your devices." },
-  users: { title: "Users", description: "Invite your team and manage their access." },
-  roles: { title: "Roles", description: "Choose what each role lets its members do." },
-  authentication: { title: "Authentication", description: "Set the sign-in policy, single sign-on, directory sync and how MeshRMM sends email." },
-  settings: { title: "Settings", description: "Name this server and set remote session defaults." },
-  audit: { title: "Audit log", description: "Who signed in and what they changed." },
-  account: { title: "Your account", description: "Your profile, password, two-factor authentication, passkeys and sessions." },
+// Each page's title, which its navigation entry shows too.
+export const VIEW_COPY: Record<View, { title: string }> = {
+  devices: { title: "Devices" },
+  toolbox: { title: "Toolbox" },
+  users: { title: "Users" },
+  roles: { title: "Roles" },
+  authentication: { title: "Authentication" },
+  settings: { title: "Settings" },
+  audit: { title: "Audit log" },
+  account: { title: "Your account" },
 };
 
 // A user sees a page when they hold any of these permissions; an empty list

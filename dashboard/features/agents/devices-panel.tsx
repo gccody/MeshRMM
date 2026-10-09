@@ -2,6 +2,8 @@
 import { CircleAlert, X } from "lucide-react";
 import { useSearchParams } from "react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { EnrollmentModal } from "../enrollment/enrollment-modal";
+import { useInstallerDownload } from "../enrollment/use-installer-download";
 import { ConnectionReasonModal } from "../session/connection-reason-modal";
 import { ViewerLaunchNotice } from "../session/viewer-launch-notice";
 import { RunScriptModal } from "../toolbox/run-script-modal";
@@ -26,7 +28,11 @@ const DEVICE_ACTIONS: readonly ActionErrorSource[] = ["remote", "close-session",
 const QUERY_WRITE_DELAY_MS = 250;
 
 export function DevicesPanel() {
-  const { account, can, inventory, remote, deleteAgent, deletingId, setDevicesSearch, actionErrors, reportActionError } = useWorkspace();
+  const { account, authorizedFetch, can, inventory, remote, deleteAgent, deletingId, setDevicesSearch, actionErrors, reportActionError } = useWorkspace();
+  const installer = useInstallerDownload(authorizedFetch);
+  const [isEnrolling, setIsEnrolling] = useState(false);
+  // The control that opened the enrollment dialog gets focus back.
+  const enrollOpener = useRef<HTMLElement | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
   // Filters replace the history entry, so Back leaves the page.
   const writeFilters = (next: DeviceFilters) => setSearchParams(new URLSearchParams(serializeDeviceFilters(next)), { replace: true });
@@ -85,7 +91,7 @@ export function DevicesPanel() {
       {remote.launch && <ViewerLaunchNotice key={remote.launch.attempt} launch={remote.launch} offline={inventory.connection === "offline"} onRetry={() => remote.retryLaunch(inventory.agents)} onDismiss={remote.dismissLaunch} />}
       {listActionErrors(actionErrors, DEVICE_ACTIONS).map(({ source, message }) => (
         <div key={source} className="error-banner" role="alert">
-          <CircleAlert size={17} aria-hidden="true" /><span>{message}</span>
+          <CircleAlert size={16} aria-hidden="true" /><span>{message}</span>
           <button onClick={() => reportActionError(source, null)} aria-label="Dismiss"><X size={16} /></button>
         </div>
       ))}
@@ -95,6 +101,8 @@ export function DevicesPanel() {
         inventory={inventory}
         thumbnails={inventory.thumbnails}
         onReconnect={inventory.reconnect}
+        onRefresh={() => void inventory.refresh()}
+        onAddDevice={(opener) => { enrollOpener.current = opener; installer.reset(); setIsEnrolling(true); }}
         query={queryInput}
         status={status}
         connectingId={remote.connectingId}
@@ -110,6 +118,17 @@ export function DevicesPanel() {
         onDelete={(agent) => void deleteAgent(agent)}
         onRunScript={(agent, opener) => { runScriptOpener.current = opener; setRunScriptOn(agent); }}
       />
+      {isEnrolling && <EnrollmentModal
+        platform={installer.platform}
+        error={installer.error}
+        isDownloading={installer.isDownloading}
+        downloaded={installer.downloaded}
+        command={installer.command}
+        onClose={() => setIsEnrolling(false)}
+        onPlatformChange={installer.setPlatform}
+        onSubmit={(event) => void installer.download(event)}
+        returnFocus={enrollOpener}
+      />}
       {runScriptOn && <RunScriptModal
         agents={inventory.agents}
         initialAgentId={runScriptOn.id}
