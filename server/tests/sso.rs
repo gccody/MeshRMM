@@ -261,6 +261,53 @@ async fn sso_creates_accounts_and_maps_groups_to_roles() {
     }
 }
 
+/// Without auto-provisioning, sign-ins that don't carry an existing
+/// account's verified email are refused.
+async fn refuse_unmatched_sign_ins(name: &str, app: &App, provider: &MockProvider) {
+    let (_, location) = sign_in(
+        app,
+        provider,
+        json!({ "sub": "tech", "email": "tech@example.com", "email_verified": false }),
+    )
+    .await;
+    assert_eq!(location, failed("email_unverified"), "{name}");
+    let (_, location) = sign_in(
+        app,
+        provider,
+        json!({ "sub": "nobody", "email": "nobody@example.com", "email_verified": true }),
+    )
+    .await;
+    assert_eq!(location, failed("no_account"), "{name}");
+    let (_, location) = sign_in(app, provider, json!({ "sub": "anonymous" })).await;
+    assert_eq!(location, failed("no_email"), "{name}");
+}
+
+async fn end_group_roles_on_password_sign_in(name: &str, app: &App, provider: &MockProvider) {
+    let (mut sso_browser, _) = sign_in(
+        app,
+        provider,
+        json!({ "sub": "tech", "groups": ["rmm-admins"] }),
+    )
+    .await;
+    let account = sso_browser.get("/v1/account").await;
+    assert_eq!(account.body["is_administrator"], true, "{name}");
+    let mut password_browser = app.browser();
+    let signed_in = password_browser
+        .post(
+            "/v1/auth/sign-in",
+            json!({ "email": "tech@example.com", "password": "a long enough password" }),
+        )
+        .await;
+    assert_eq!(
+        signed_in.status,
+        StatusCode::OK,
+        "{name}: {:?}",
+        signed_in.body
+    );
+    let account = sso_browser.get("/v1/account").await;
+    assert_eq!(account.body["is_administrator"], false, "{name}");
+}
+
 #[tokio::test]
 async fn sso_links_existing_accounts_only_by_a_verified_email() {
     let provider = MockProvider::start().await;
@@ -276,22 +323,7 @@ async fn sso_links_existing_accounts_only_by_a_verified_email() {
         let (_, tech_id) =
             common::add_user(&app, &mut admin, "tech@example.com", &["technician"]).await;
 
-        let (_, location) = sign_in(
-            &app,
-            &provider,
-            json!({ "sub": "tech", "email": "tech@example.com", "email_verified": false }),
-        )
-        .await;
-        assert_eq!(location, failed("email_unverified"), "{name}");
-        let (_, location) = sign_in(
-            &app,
-            &provider,
-            json!({ "sub": "nobody", "email": "nobody@example.com", "email_verified": true }),
-        )
-        .await;
-        assert_eq!(location, failed("no_account"), "{name}");
-        let (_, location) = sign_in(&app, &provider, json!({ "sub": "anonymous" })).await;
-        assert_eq!(location, failed("no_email"), "{name}");
+        refuse_unmatched_sign_ins(name, &app, &provider).await;
 
         // Userinfo fills in an email the ID token lacks.
         provider.set_userinfo(Some(
@@ -306,29 +338,7 @@ async fn sso_links_existing_accounts_only_by_a_verified_email() {
 
         // Roles from SSO groups hold only until a sign-in the provider
         // didn't see.
-        let (mut sso_browser, _) = sign_in(
-            &app,
-            &provider,
-            json!({ "sub": "tech", "groups": ["rmm-admins"] }),
-        )
-        .await;
-        let account = sso_browser.get("/v1/account").await;
-        assert_eq!(account.body["is_administrator"], true, "{name}");
-        let mut password_browser = app.browser();
-        let signed_in = password_browser
-            .post(
-                "/v1/auth/sign-in",
-                json!({ "email": "tech@example.com", "password": "a long enough password" }),
-            )
-            .await;
-        assert_eq!(
-            signed_in.status,
-            StatusCode::OK,
-            "{name}: {:?}",
-            signed_in.body
-        );
-        let account = sso_browser.get("/v1/account").await;
-        assert_eq!(account.body["is_administrator"], false, "{name}");
+        end_group_roles_on_password_sign_in(name, &app, &provider).await;
 
         // Another identity at the provider with the same email can't take
         // the account over.
