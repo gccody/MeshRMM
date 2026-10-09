@@ -1,6 +1,21 @@
 # Plan: pivot MeshRMM to a single-company, fully self-hosted product
 
-Status: draft for review (2026-10-07).
+Status: implemented (2026-10-08). Each step below landed on `pivot/self-hosted` as its own
+PR. The follow-ups named under [Risks and open items](#risks-and-open-items) are still open.
+
+| Step | PR |
+|---|---|
+| 1. Server foundation | #86 |
+| 2. Accounts and access | #87 |
+| 3. Devices and toolbox | #88 |
+| 4. Realtime | #89 |
+| 5. STUN/TURN | #90, with fixes in #91 |
+| 6. Website | #92 |
+| 7. Passkeys, OIDC, SCIM | #93 |
+| 8. Releases and packaging | #94 |
+| 9. Marketing site | #95 |
+| 10. Operator docs and end-to-end validation | #96 |
+| Not in the plan: macOS builds signed with each company's own Developer ID | #97 |
 
 ## Goal
 
