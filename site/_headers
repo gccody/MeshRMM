@@ -1,0 +1,7 @@
+# Cloudflare sends these with every response. `frame-ancestors` only works as
+# a header; the rest of the policy is in each page's <meta> tag.
+/*
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+  Content-Security-Policy: frame-ancestors 'none'
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
