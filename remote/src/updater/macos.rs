@@ -1,5 +1,4 @@
 use std::ffi::{OsStr, OsString};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
@@ -84,12 +83,22 @@ pub async fn check_and_schedule(
     })?;
     let archive_path = helper_directory.join("client-update.zip");
     write_new_file(&archive_path, &archive)?;
-    let helper = helper_directory.join("update-helper");
-    std::fs::copy(&executable, &helper)
-        .with_context(|| format!("failed to create client update helper {}", helper.display()))?;
-    let mut permissions = std::fs::metadata(&helper)?.permissions();
-    permissions.set_mode(0o700);
-    std::fs::set_permissions(&helper, permissions)?;
+    // The helper runs from a copy of the whole bundle. macOS kills a signed
+    // executable copied out of its bundle, because the signature covers the
+    // bundle's Info.plist.
+    let helper_bundle = helper_directory.join("update-helper.app");
+    let output = Command::new("/usr/bin/ditto")
+        .arg(&app_bundle)
+        .arg(&helper_bundle)
+        .output()
+        .context("failed to copy the viewer for its update helper")?;
+    if !output.status.success() {
+        bail!(
+            "could not copy the viewer for its update helper: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let helper = helper_bundle.join("Contents/MacOS/meshrmm-remote");
 
     let mut command = Command::new(&helper);
     command
@@ -146,7 +155,7 @@ fn apply_update_inner() -> anyhow::Result<()> {
     let archive = PathBuf::from(&arguments[2]);
     let launch_arguments = arguments.into_iter().skip(3).collect::<Vec<OsString>>();
     let helper = std::env::current_exe().context("could not locate the client update helper")?;
-    let helper_directory = helper
+    let helper_directory = app_bundle_for_executable(&helper)?
         .parent()
         .context("client update helper has no parent directory")?
         .to_owned();

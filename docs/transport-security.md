@@ -26,8 +26,9 @@ credentials. Viewer session HTTP requests and Agent enrollment are HTTPS-only,
 including redirects. Local plaintext WebSockets are used only by isolated
 network-liveness unit tests, without the authenticated connector.
 
-Every native HTTPS and WSS client offers only TLS 1.3, matching the zone's
-TLS 1.3 minimum (see [strict public TLS](#strict-public-tls-follow-up--september-16-2026)):
+Every native HTTPS and WSS client offers only TLS 1.3, so a MeshRMM server, or
+the proxy in front of it, must offer TLS 1.3 (see
+[running a MeshRMM server](self-hosting.md#tls)):
 the Agent's and viewer's signaling WebSockets, the viewer's session API
 requests, the Agent's enrollment request, and both update checks and
 downloads. `meshrmm_signaling_client::tls` holds the shared settings. The
@@ -97,6 +98,9 @@ Detailed local command output is retained under `dist/security-validation/`.
   used direct ICE; forced TURN was subsequently verified below.
 
 ## Public TLS policy — September 16, 2026
+
+This and the other dated sections below record checks of the hosted
+Cloudflare deployment that MeshRMM used before it became self-hosted.
 
 The `meshrmm.com` Cloudflare zone uses these Edge Certificates settings:
 
