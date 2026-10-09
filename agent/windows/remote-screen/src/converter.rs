@@ -5,8 +5,8 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-    DXGI_FORMAT_AYUV, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_R8G8B8A8_UNORM,
-    DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_AYUV, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::core::Interface;
 
@@ -96,74 +96,15 @@ impl BgraToYuvConverter {
             let processor = video_device
                 .CreateVideoProcessor(&enumerator, 0)
                 .map_err(Error::Processor)?;
-            let rect = RECT {
-                left: 0,
-                top: 0,
-                right: width as i32,
-                bottom: height as i32,
-            };
-            video_context.VideoProcessorSetOutputTargetRect(&processor, true, Some(&rect));
-            video_context.VideoProcessorSetStreamFrameFormat(
-                &processor,
-                0,
-                D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-            );
-            video_context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&rect));
-            video_context.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&rect));
-            // Desktop capture is full-range RGB. Make the RGB -> studio-range
-            // BT.709 conversion explicit so drivers do not choose SD-video
-            // defaults and the bitstream's color metadata matches its pixels.
-            if let Ok(video_context1) = video_context.cast::<ID3D11VideoContext1>() {
-                video_context1.VideoProcessorSetStreamColorSpace1(
-                    &processor,
-                    0,
-                    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
-                );
-                video_context1.VideoProcessorSetOutputColorSpace1(
-                    &processor,
-                    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-                );
-            }
-
-            let texture_desc = D3D11_TEXTURE2D_DESC {
-                Width: width,
-                Height: height,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: output_format,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
-                CPUAccessFlags: 0,
-                MiscFlags: 0,
-            };
-            let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
-                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-                    Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
-                },
-            };
-            let mut surfaces = Vec::with_capacity(SURFACE_COUNT);
-            for _ in 0..SURFACE_COUNT {
-                let mut texture = None;
-                device
-                    .CreateTexture2D(&texture_desc, None, Some(&mut texture))
-                    .map_err(Error::Processor)?;
-                let texture = texture.ok_or(Error::MissingTexture)?;
-                let mut view = None;
-                video_device
-                    .CreateVideoProcessorOutputView(
-                        &texture,
-                        &enumerator,
-                        &output_desc,
-                        Some(&mut view),
-                    )
-                    .map_err(Error::Processor)?;
-                surfaces.push((texture, view.ok_or(Error::MissingView)?));
-            }
+            configure_processor(&video_context, &processor, width, height);
+            let surfaces = create_surfaces(
+                device,
+                &video_device,
+                &enumerator,
+                width,
+                height,
+                output_format,
+            )?;
             Ok(Self {
                 video_device,
                 video_context,
@@ -225,4 +166,93 @@ impl BgraToYuvConverter {
             Ok(&self.surfaces[output_index].0)
         }
     }
+}
+
+/// Sets full-frame rectangles and the color spaces for one input stream.
+fn configure_processor(
+    video_context: &ID3D11VideoContext,
+    processor: &ID3D11VideoProcessor,
+    width: u32,
+    height: u32,
+) {
+    // Safety: the processor was created on the device that owns `video_context`.
+    unsafe {
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
+        video_context.VideoProcessorSetOutputTargetRect(processor, true, Some(&rect));
+        video_context.VideoProcessorSetStreamFrameFormat(
+            processor,
+            0,
+            D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+        );
+        video_context.VideoProcessorSetStreamSourceRect(processor, 0, true, Some(&rect));
+        video_context.VideoProcessorSetStreamDestRect(processor, 0, true, Some(&rect));
+        // Desktop capture is full-range RGB. Make the RGB -> studio-range
+        // BT.709 conversion explicit so drivers do not choose SD-video
+        // defaults and the bitstream's color metadata matches its pixels.
+        if let Ok(video_context1) = video_context.cast::<ID3D11VideoContext1>() {
+            video_context1.VideoProcessorSetStreamColorSpace1(
+                processor,
+                0,
+                DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+            );
+            video_context1.VideoProcessorSetOutputColorSpace1(
+                processor,
+                DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+            );
+        }
+    }
+}
+
+/// Allocates the output texture pool and a processor view for each texture.
+fn create_surfaces(
+    device: &ID3D11Device,
+    video_device: &ID3D11VideoDevice,
+    enumerator: &ID3D11VideoProcessorEnumerator,
+    width: u32,
+    height: u32,
+    output_format: DXGI_FORMAT,
+) -> Result<Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>, Error> {
+    let texture_desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: output_format,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+        ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+            Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+        },
+    };
+    let mut surfaces = Vec::with_capacity(SURFACE_COUNT);
+    for _ in 0..SURFACE_COUNT {
+        // Safety: the enumerator and video device belong to `device`.
+        unsafe {
+            let mut texture = None;
+            device
+                .CreateTexture2D(&texture_desc, None, Some(&mut texture))
+                .map_err(Error::Processor)?;
+            let texture = texture.ok_or(Error::MissingTexture)?;
+            let mut view = None;
+            video_device
+                .CreateVideoProcessorOutputView(&texture, enumerator, &output_desc, Some(&mut view))
+                .map_err(Error::Processor)?;
+            surfaces.push((texture, view.ok_or(Error::MissingView)?));
+        }
+    }
+    Ok(surfaces)
 }

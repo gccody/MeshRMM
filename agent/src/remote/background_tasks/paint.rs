@@ -229,6 +229,8 @@ pub(super) unsafe extern "system" fn list_paint(
     }
 }
 
+const PERFORMANCE_TITLES: [&str; 4] = ["CPU", "Memory", "Disk", "Ethernet / Wi-Fi"];
+
 pub(super) unsafe fn performance_paint(state: &State, hwnd: HWND, dc: HDC) {
     unsafe {
         let mut rect = RECT::default();
@@ -254,52 +256,13 @@ pub(super) unsafe fn performance_paint(state: &State, hwnd: HWND, dc: HDC) {
                 .network_rate
                 .map_or_else(|| "—".into(), |n| format!("{:.2} Mbps", n * 8.0 / 1e6)),
         ];
-        let titles = ["CPU", "Memory", "Disk", "Ethernet / Wi-Fi"];
-        for i in 0..4 {
-            let top = 10 + i as i32 * 66;
-            if i == selected {
-                fill(
-                    dc,
-                    &RECT {
-                        left: 6,
-                        top,
-                        right: sidebar - 6,
-                        bottom: top + 60,
-                    },
-                    COLORREF(0xf2e7d9),
-                );
-            }
-            draw_text(
-                dc,
-                titles[i],
-                RECT {
-                    left: 18,
-                    top: top + 4,
-                    right: sidebar - 10,
-                    bottom: top + 29,
-                },
-                COLORREF(0x222222),
-                DT_LEFT,
-            );
-            draw_text(
-                dc,
-                &values[i],
-                RECT {
-                    left: 18,
-                    top: top + 29,
-                    right: sidebar - 10,
-                    bottom: top + 51,
-                },
-                COLORREF(0x555555),
-                DT_LEFT,
-            );
-        }
+        performance_sidebar(dc, sidebar, selected, &values);
         let left = sidebar + 20;
         let right = rect.right - 24;
         let top = 56;
         draw_text(
             dc,
-            titles[selected],
+            PERFORMANCE_TITLES[selected],
             RECT {
                 left,
                 top: 8,
@@ -333,6 +296,94 @@ pub(super) unsafe fn performance_paint(state: &State, hwnd: HWND, dc: HDC) {
             right,
             bottom: (rect.bottom - 126).max(top + 60),
         };
+        performance_graph(state, dc, graph);
+        draw_text(
+            dc,
+            &format!(
+                "60 samples • {}",
+                if state.interval == 0 {
+                    "Paused".into()
+                } else {
+                    format!("{:.1} second interval", state.interval as f64 / 1000.0)
+                }
+            ),
+            RECT {
+                left,
+                top: graph.bottom,
+                right,
+                bottom: graph.bottom + 23,
+            },
+            COLORREF(0x777777),
+            DT_LEFT,
+        );
+        for (i, line) in performance_summary(state, &values, used).iter().enumerate() {
+            draw_text(
+                dc,
+                line,
+                RECT {
+                    left,
+                    top: graph.bottom + 30 + i as i32 * 25,
+                    right,
+                    bottom: graph.bottom + 55 + i as i32 * 25,
+                },
+                COLORREF(0x333333),
+                DT_LEFT,
+            );
+        }
+    }
+}
+
+unsafe fn performance_sidebar(dc: HDC, sidebar: i32, selected: usize, values: &[String; 4]) {
+    unsafe {
+        for i in 0..4 {
+            let top = 10 + i as i32 * 66;
+            if i == selected {
+                fill(
+                    dc,
+                    &RECT {
+                        left: 6,
+                        top,
+                        right: sidebar - 6,
+                        bottom: top + 60,
+                    },
+                    COLORREF(0xf2e7d9),
+                );
+            }
+            draw_text(
+                dc,
+                PERFORMANCE_TITLES[i],
+                RECT {
+                    left: 18,
+                    top: top + 4,
+                    right: sidebar - 10,
+                    bottom: top + 29,
+                },
+                COLORREF(0x222222),
+                DT_LEFT,
+            );
+            draw_text(
+                dc,
+                &values[i],
+                RECT {
+                    left: 18,
+                    top: top + 29,
+                    right: sidebar - 10,
+                    bottom: top + 51,
+                },
+                COLORREF(0x555555),
+                DT_LEFT,
+            );
+        }
+    }
+}
+
+/// Draws the grid and the selected resource's last 60 samples.
+unsafe fn performance_graph(state: &State, dc: HDC, graph: RECT) {
+    unsafe {
+        let RECT {
+            left, top, right, ..
+        } = graph;
+        let selected = state.performance;
         fill(dc, &graph, COLORREF(0xfffcf8));
         for col in 0..=12 {
             let x = left + (right - left) * col / 12;
@@ -382,89 +433,59 @@ pub(super) unsafe fn performance_paint(state: &State, hwnd: HWND, dc: HDC) {
         }
         SelectObject(dc, old);
         let _ = DeleteObject(pen.into());
-        draw_text(
-            dc,
-            &format!(
-                "60 samples • {}",
-                if state.interval == 0 {
-                    "Paused".into()
-                } else {
-                    format!("{:.1} second interval", state.interval as f64 / 1000.0)
-                }
+    }
+}
+
+fn performance_summary(state: &State, values: &[String; 4], used: u64) -> Vec<String> {
+    match state.performance {
+        0 => vec![
+            format!("Utilization    {}", values[0]),
+            format!(
+                "Processes    {}     Threads    {}     Handles    {}",
+                state.snapshot.processes.len(),
+                state.snapshot.threads,
+                state.snapshot.handles
             ),
-            RECT {
-                left,
-                top: graph.bottom,
-                right,
-                bottom: graph.bottom + 23,
-            },
-            COLORREF(0x777777),
-            DT_LEFT,
-        );
-        let summary = match selected {
-            0 => vec![
-                format!("Utilization    {}", values[0]),
-                format!(
-                    "Processes    {}     Threads    {}     Handles    {}",
-                    state.snapshot.processes.len(),
-                    state.snapshot.threads,
-                    state.snapshot.handles
-                ),
-                format!(
-                    "Up time    {}:{:02}:{:02}:{:02}",
-                    state.snapshot.uptime / 86400,
-                    state.snapshot.uptime / 3600 % 24,
-                    state.snapshot.uptime / 60 % 60,
-                    state.snapshot.uptime % 60
-                ),
-            ],
-            1 => vec![
-                format!(
-                    "In use    {:.1} GB       Available    {:.1} GB",
-                    used as f64 / 1073741824.0,
-                    state.snapshot.memory_available as f64 / 1073741824.0
-                ),
-                format!(
-                    "Committed    {:.1} / {:.1} GB",
-                    state.snapshot.commit as f64 / 1073741824.0,
-                    state.snapshot.commit_limit as f64 / 1073741824.0
-                ),
-                format!(
-                    "Total physical memory    {:.1} GB",
-                    state.snapshot.memory_total as f64 / 1073741824.0
-                ),
-            ],
-            2 => vec![
-                format!("Active time    {}", values[2]),
-                state.snapshot.disk_rate.map_or_else(
-                    || "Transfer rate    —".into(),
-                    |v| format!("Transfer rate    {:.2} MB/s", v / 1048576.0),
-                ),
-                "All physical disks combined".into(),
-            ],
-            _ => vec![
-                format!("Send + receive    {}", values[3]),
-                format!(
-                    "Combined link capacity    {:.0} Mbps",
-                    state.snapshot.network_capacity as f64 / 1e6
-                ),
-                "Loopback and virtual interfaces excluded".into(),
-            ],
-        };
-        for (i, line) in summary.iter().enumerate() {
-            draw_text(
-                dc,
-                line,
-                RECT {
-                    left,
-                    top: graph.bottom + 30 + i as i32 * 25,
-                    right,
-                    bottom: graph.bottom + 55 + i as i32 * 25,
-                },
-                COLORREF(0x333333),
-                DT_LEFT,
-            );
-        }
+            format!(
+                "Up time    {}:{:02}:{:02}:{:02}",
+                state.snapshot.uptime / 86400,
+                state.snapshot.uptime / 3600 % 24,
+                state.snapshot.uptime / 60 % 60,
+                state.snapshot.uptime % 60
+            ),
+        ],
+        1 => vec![
+            format!(
+                "In use    {:.1} GB       Available    {:.1} GB",
+                used as f64 / 1073741824.0,
+                state.snapshot.memory_available as f64 / 1073741824.0
+            ),
+            format!(
+                "Committed    {:.1} / {:.1} GB",
+                state.snapshot.commit as f64 / 1073741824.0,
+                state.snapshot.commit_limit as f64 / 1073741824.0
+            ),
+            format!(
+                "Total physical memory    {:.1} GB",
+                state.snapshot.memory_total as f64 / 1073741824.0
+            ),
+        ],
+        2 => vec![
+            format!("Active time    {}", values[2]),
+            state.snapshot.disk_rate.map_or_else(
+                || "Transfer rate    —".into(),
+                |v| format!("Transfer rate    {:.2} MB/s", v / 1048576.0),
+            ),
+            "All physical disks combined".into(),
+        ],
+        _ => vec![
+            format!("Send + receive    {}", values[3]),
+            format!(
+                "Combined link capacity    {:.0} Mbps",
+                state.snapshot.network_capacity as f64 / 1e6
+            ),
+            "Loopback and virtual interfaces excluded".into(),
+        ],
     }
 }
 
