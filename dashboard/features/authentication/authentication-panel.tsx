@@ -1,7 +1,8 @@
-import { LoaderCircle, Mail, RefreshCw, Send, ShieldCheck, Trash2 } from "lucide-react";
-import { type FormEvent, useCallback, useState } from "react";
+import { LoaderCircle, RefreshCw, Send, Trash2 } from "lucide-react";
+import { type FormEvent, type ReactNode, useCallback, useState } from "react";
 import { AuthenticationRequired, errorText, expectJson, expectOk, jsonBody } from "../../lib/http";
 import { useResource } from "../../lib/use-resource";
+import { CategoryTabs } from "../workspace/category-tabs";
 import { useWorkspace } from "../workspace/workspace-context";
 import { ScimSettingsSection } from "./scim-settings";
 import { SsoSettingsSection } from "./sso-settings";
@@ -39,14 +40,30 @@ const SECURITY_LABELS: Record<SmtpSecurity, string> = {
 
 // The sign-in policy, and for administrators, single sign-on, directory
 // sync and how the server sends email.
+type Category = "policy" | "sso" | "scim" | "email";
+
 export function AuthenticationPanel() {
   const { account, can } = useWorkspace();
+  const categories = ([
+    { id: "policy", label: "Sign-in policy", visible: can("authentication.manage") },
+    { id: "sso", label: "Single sign-on", visible: account.is_administrator },
+    { id: "scim", label: "Directory sync", visible: account.is_administrator },
+    { id: "email", label: "Email", visible: account.is_administrator },
+  ] as const).filter((category) => category.visible);
+  const [selected, setSelected] = useState<Category>(categories[0]?.id ?? "policy");
+  // Every section stays mounted, so unsaved edits survive switching.
+  const panel = (id: Category, content: ReactNode) => categories.some((category) => category.id === id) && (
+    <div id={`authentication-${id}`} role="tabpanel" aria-labelledby={`authentication-tab-${id}`} hidden={selected !== id} className="category-panel">{content}</div>
+  );
   return (
-    <div className="management-stack">
-      {can("authentication.manage") && <SignInPolicy />}
-      {account.is_administrator && <SsoSettingsSection />}
-      {account.is_administrator && <ScimSettingsSection />}
-      {account.is_administrator && <EmailSettings />}
+    <div className="settings-page">
+      <CategoryTabs label="Authentication categories" idPrefix="authentication" tabs={categories} selected={selected} onSelect={setSelected} />
+      <div>
+        {panel("policy", <SignInPolicy />)}
+        {panel("sso", <SsoSettingsSection />)}
+        {panel("scim", <ScimSettingsSection />)}
+        {panel("email", <EmailSettings />)}
+      </div>
     </div>
   );
 }
@@ -114,7 +131,7 @@ function SignInPolicy() {
 
   return (
     <section className="management-panel">
-      <div className="management-heading"><h2><ShieldCheck size={15} aria-hidden="true" /> Sign-in policy</h2><p>Applies to everyone who signs in with a password.</p></div>
+      <div className="management-heading"><h2>Sign-in policy</h2><p>For everyone who signs in with a password.</p></div>
       {!saved ? (
         error
           ? <><p role="alert" className="form-error">{error}</p><button type="button" className="secondary-button" onClick={reload}><RefreshCw size={15} /> Try again</button></>
@@ -123,16 +140,16 @@ function SignInPolicy() {
         <form className="form-stack form-narrow" onSubmit={(event) => void submit(event)}>
           <label className="checkbox-row">
             <input type="checkbox" checked={requireTwoFactor} onChange={(event) => setRequireTwoFactor(event.target.checked)} />
-            <span><strong>Require two-factor authentication</strong>Users without an authenticator app or passkey must add one the next time they sign in, before anything else. Single sign-on leaves two-factor to the identity provider.</span>
+            <span><strong>Require two-factor authentication</strong>Users add an authenticator app or passkey at their next sign-in.</span>
           </label>
           <label htmlFor="password-min-length">Minimum password length
             <input id="password-min-length" type="number" inputMode="numeric" min={MIN_PASSWORD_LENGTH} max={MAX_PASSWORD_LENGTH} step={1} required value={minLength} onChange={(event) => setMinLength(event.target.value)} aria-invalid={!minLengthValid} aria-describedby="password-min-length-help" />
           </label>
-          <small id="password-min-length-help" className="field-help">Between {MIN_PASSWORD_LENGTH} and {MAX_PASSWORD_LENGTH} characters. Applies to new passwords; existing ones keep working.</small>
+          <small id="password-min-length-help" className="field-help">{MIN_PASSWORD_LENGTH} to {MAX_PASSWORD_LENGTH} characters, for new passwords.</small>
           <label htmlFor="session-lifetime">Sign everyone in again after (hours)
             <input id="session-lifetime" type="number" inputMode="numeric" min={1} max={MAX_SESSION_LIFETIME_HOURS} step={1} required value={lifetime} onChange={(event) => setLifetime(event.target.value)} aria-invalid={!lifetimeValid} aria-describedby="session-lifetime-help" />
           </label>
-          <small id="session-lifetime-help" className="field-help">How long a sign-in lasts, however active the user is: 1 to {MAX_SESSION_LIFETIME_HOURS} hours. Applies to sign-ins from now on. Inactive browsers sign out sooner, as set in Settings.</small>
+          <small id="session-lifetime-help" className="field-help">However active they are. 1 to {MAX_SESSION_LIFETIME_HOURS} hours.</small>
           {error && <p role="alert" className="form-error">{error}</p>}
           {notice && <p role="status" className="form-notice">{notice}</p>}
           <div><button className="primary-button" disabled={busy || !changed || !minLengthValid || !lifetimeValid}>{busy && <LoaderCircle size={16} className="spin" />} Save sign-in policy</button></div>
@@ -229,8 +246,8 @@ function EmailSettings() {
   return (
     <section className="management-panel">
       <div className="management-heading">
-        <h2><Mail size={15} aria-hidden="true" /> Email</h2>
-        <p>MeshRMM emails invitations and password reset links through your SMTP server. Without it, administrators copy the links and pass them on.</p>
+        <h2>Email</h2>
+        <p>Sends invitations and password reset links through your SMTP server.</p>
       </div>
       {!saved ? (
         error
@@ -238,7 +255,7 @@ function EmailSettings() {
           : <p role="status" className="field-help"><LoaderCircle size={14} className="spin" /> Loading…</p>
       ) : (
         <>
-          <p className={`two-factor-status ${saved.configured ? "on" : "off"}`}>{saved.configured ? "Email is set up." : "Email is off."}</p>
+          <p className={`two-factor-status ${saved.configured ? "on" : "off"}`}>{saved.configured ? "Email is on." : "Email is off. Administrators copy links and pass them on."}</p>
           <form className="form-stack form-narrow" onSubmit={save}>
             <fieldset className="form-stack" disabled={busy !== null}>
               <label htmlFor="smtp-host">SMTP server<input id="smtp-host" required placeholder="smtp.example.com" value={host} onChange={(event) => setHost(event.target.value)} /></label>

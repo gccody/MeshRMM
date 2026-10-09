@@ -406,7 +406,7 @@ restarts the service. If the new service does not reach `Running`, the helper
 restores and starts the previous binary. Update-check failures are logged and
 do not disconnect the installed Agent.
 
-Technicians download the viewer from the links in the website's sidebar, or
+Technicians download the viewer from the website's Remote app menu, or
 copy `dist/remote/` from a local build, and open `meshrmm-remote.exe` once to register the protocol.
 Remote sessions are then launched from the website. A viewer can also redeem
 a handoff from the command line:

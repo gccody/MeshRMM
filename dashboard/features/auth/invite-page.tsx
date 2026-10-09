@@ -1,4 +1,4 @@
-import { LoaderCircle, MailOpen, UserPlus } from "lucide-react";
+import { LoaderCircle, UserPlus } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router";
 import { apiFetch, errorText, expectJson, jsonBody } from "../../lib/http";
@@ -43,17 +43,17 @@ export function InvitePage() {
 
   if (token === null) {
     return (
-      <AuthCard icon={<MailOpen size={22} />} title="Invitation link incomplete">
+      <AuthCard title="Invitation link incomplete">
         <p>Open the whole link from your invitation. If it was cut short, ask the person who invited you to send it again.</p>
       </AuthCard>
     );
   }
   if (token === undefined || lookup.status === "loading") {
-    return <AuthCard icon={<MailOpen size={22} />} title="Accept invitation"><Pending label="Checking your invitation…" /></AuthCard>;
+    return <AuthCard title="Accept invitation"><Pending label="Checking your invitation…" /></AuthCard>;
   }
   if (lookup.status === "failed") {
     return (
-      <AuthCard icon={<MailOpen size={22} />} title="This invitation doesn't work">
+      <AuthCard title="This invitation doesn't work">
         <p>{lookup.message} Ask the person who invited you for a new link.</p>
         <Link className="secondary-button" to="/login">Go to sign in</Link>
       </AuthCard>
@@ -82,7 +82,7 @@ export function InvitePage() {
   };
 
   return (
-    <AuthCard icon={<UserPlus size={22} />} eyebrow={invitation.instance_name} title="Create your account" wide>
+    <AuthCard eyebrow={invitation.instance_name} title="Create your account" wide>
       <p>You were invited as <strong>{invitation.email}</strong>. Choose your name and a password to finish.</p>
       {account && account.user.email !== invitation.email && (
         <p className="auth-note">This browser is signed in as {account.user.email}. Accepting signs it in as {invitation.email} instead.</p>

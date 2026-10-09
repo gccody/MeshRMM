@@ -1,4 +1,4 @@
-import { Fingerprint, KeyRound, LoaderCircle, LogIn, ShieldCheck } from "lucide-react";
+import { Fingerprint, LoaderCircle, LogIn } from "lucide-react";
 import { type FormEvent, useState } from "react";
 import { Link, Navigate, useNavigate, useSearchParams } from "react-router";
 import { RequestError, apiFetch, errorText, expectJson, jsonBody } from "../../lib/http";
@@ -200,7 +200,7 @@ function PasswordCard({ instanceName, ssoError, sso, passkey, next, email, passw
   onPasskey: () => void;
 }) {
   return (
-    <AuthCard icon={<KeyRound size={22} />} eyebrow={instanceName} title="Sign in">
+    <AuthCard eyebrow={instanceName} title="Sign in">
       {ssoError && <p className="form-error auth-sso-error" role="alert">{ssoError}</p>}
       <form className="form-stack" onSubmit={onSubmit}>
         <label htmlFor="email">Email
@@ -242,7 +242,7 @@ function SecondFactorCard({ step, instanceName, passkeyUsable, code, busy, error
   const choices = (Object.keys(METHOD_CHOICES) as SecondFactorMethod[]).filter((method) =>
     method !== step.method && step.methods.includes(method) && (method !== "passkey" || passkeyUsable));
   return (
-    <AuthCard icon={<ShieldCheck size={22} />} eyebrow={instanceName} title="Two-factor authentication">
+    <AuthCard eyebrow={instanceName} title="Two-factor authentication">
       {step.method === "passkey" ? (
         <>
           <p>Use one of your passkeys: on this device, your phone or a security key.</p>

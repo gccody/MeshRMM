@@ -1,4 +1,5 @@
-import { LoaderCircle, Network } from "lucide-react";
+import { LoaderCircle } from "lucide-react";
+import { BrandMark } from "../workspace/workspace-shell";
 import type { ReactNode } from "react";
 import { Outlet } from "react-router";
 
@@ -7,16 +8,15 @@ export function PublicLayout() {
   return (
     <main className="auth-page">
       <div className="auth-brand">
-        <span className="brand-mark"><Network size={19} strokeWidth={2.5} /></span>
-        <span>Mesh<span>RMM</span></span>
+        <BrandMark />
+        <span>MeshRMM</span>
       </div>
       <Outlet />
     </main>
   );
 }
 
-export function AuthCard({ icon, eyebrow, title, children, wide = false }: {
-  icon: ReactNode;
+export function AuthCard({ eyebrow, title, children, wide = false }: {
   eyebrow?: string;
   title: string;
   children: ReactNode;
@@ -24,8 +24,7 @@ export function AuthCard({ icon, eyebrow, title, children, wide = false }: {
 }) {
   return (
     <section className={`auth-card${wide ? " auth-card-wide" : ""}`} aria-labelledby="auth-title">
-      <div className="modal-icon">{icon}</div>
-      {eyebrow && <p className="eyebrow">{eyebrow}</p>}
+      {eyebrow && <p className="auth-context">{eyebrow}</p>}
       <h1 id="auth-title">{title}</h1>
       {children}
     </section>

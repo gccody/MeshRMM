@@ -1,4 +1,4 @@
-import { Compass } from "lucide-react";
+import {  } from "lucide-react";
 import { Link, Route, Routes } from "react-router";
 import { AccountPanel } from "../features/account/account-panel";
 import { DevicesPanel } from "../features/agents/devices-panel";
@@ -50,7 +50,7 @@ export function App() {
 function NotFoundPage() {
   useDocumentTitle(NOT_FOUND_TITLE);
   return (
-    <AuthCard icon={<Compass size={22} />} title={NOT_FOUND_TITLE}>
+    <AuthCard title={NOT_FOUND_TITLE}>
       <p>There&apos;s nothing at this address. Check the link, or start from the devices list.</p>
       <Link className="primary-button" to="/">Go to MeshRMM</Link>
     </AuthCard>

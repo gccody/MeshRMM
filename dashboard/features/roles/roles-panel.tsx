@@ -1,10 +1,11 @@
-import { CircleAlert, LoaderCircle, Lock, Plus, RefreshCw, Trash2, UserCog, X } from "lucide-react";
+import { CircleAlert, LoaderCircle, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { type FormEvent, type RefObject, useCallback, useId, useRef, useState } from "react";
 import { AuthenticationRequired, errorText, expectJson, expectOk, jsonBody } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
 import { useResource } from "../../lib/use-resource";
 import type { Permission } from "../auth/types";
 import { ADMINISTRATOR_ROLE_ID, type PermissionInfo, type Role, sortRoles } from "../users/model";
+import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import { groupPermissions } from "./permissions";
 
@@ -59,13 +60,10 @@ export function RolesPanel() {
           <button onClick={() => setActionError(null)} aria-label="Dismiss"><X size={16} /></button>
         </div>
       )}
+      <HeaderActions>
+        <button type="button" className="primary-button" onClick={(event) => { opener.current = event.currentTarget; setDialog({ role: null }); }} aria-haspopup="dialog"><Plus size={16} /> New role</button>
+      </HeaderActions>
       <section className="agent-panel">
-        <div className="panel-header">
-          <div><h2>Roles</h2><span>{roles.length === 1 ? "1 role" : `${roles.length} roles`}</span></div>
-          <div className="heading-actions">
-            <button type="button" className="primary-button" onClick={(event) => { opener.current = event.currentTarget; setDialog({ role: null }); }} aria-haspopup="dialog"><Plus size={16} /> New role</button>
-          </div>
-        </div>
         <table className="data-table" aria-label="Roles">
           <thead><tr><th scope="col">Role</th><th scope="col">Permissions</th><th scope="col">Members</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
           <tbody>
@@ -153,8 +151,6 @@ function RoleEditor({ role, permissions, returnFocus, onClose, onSaved }: {
   return (
     <ModalDialog className="settings-modal role-modal" labelledBy={titleId} onClose={onClose} returnFocus={returnFocus}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>
-      <div className="modal-icon">{administrator ? <Lock size={22} /> : <UserCog size={22} />}</div>
-      <p className="eyebrow">{role?.builtin ? "Built-in role" : "Role"}</p>
       <h2 id={titleId}>{role ? role.name : "New role"}</h2>
       {administrator && <p>Administrators can do everything, including what later releases add. This role can&apos;t be changed.</p>}
       <form onSubmit={(event) => void submit(event)}>

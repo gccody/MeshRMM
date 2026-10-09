@@ -1,7 +1,8 @@
 import { ClipboardList, LoaderCircle, RefreshCw } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { AuthenticationRequired, errorText, expectJson } from "../../lib/http";
 import { formatDateTime } from "../../lib/format";
+import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import { AUDIT_CATEGORIES, type AuditEvent, type AuditPage, eventLabel, targetLabel } from "./model";
 
@@ -9,7 +10,8 @@ const PAGE_SIZE = 50;
 
 // What happened on this server, newest first.
 export function AuditPanel() {
-  const { authorizedFetch } = useWorkspace();
+  const { authorizedFetch, inventory } = useWorkspace();
+  const deviceNames = useMemo(() => new Map(inventory.agents.map((agent) => [agent.id, agent.name])), [inventory.agents]);
   const [category, setCategory] = useState("");
   const [events, setEvents] = useState<AuditEvent[] | null>(null);
   const [next, setNext] = useState<string | undefined>();
@@ -61,24 +63,16 @@ export function AuditPanel() {
 
   return (
     <section className="agent-panel">
-      <div className="panel-header">
-        <div><h2>Events</h2><span>{events ? `${events.length}${next ? "+" : ""} shown` : "Loading…"}</span></div>
-        <div className="heading-actions">
-          <button type="button" className="secondary-button" onClick={() => setAttempt((count) => count + 1)} disabled={busy}><RefreshCw size={16} /> Refresh</button>
-        </div>
-      </div>
-      <div className="table-toolbar">
-        <label className="status-filter audit-filter">
-          <span className="sr-only">Show</span>
-          <select value={category} onChange={(event) => setCategory(event.target.value)} aria-label="Show events about">
-            {AUDIT_CATEGORIES.map(({ prefix, label }) => <option key={prefix} value={prefix}>{label}</option>)}
-          </select>
-        </label>
-      </div>
+      <HeaderActions>
+        <select className="audit-filter" value={category} onChange={(event) => setCategory(event.target.value)} aria-label="Show events about">
+          {AUDIT_CATEGORIES.map(({ prefix, label }) => <option key={prefix} value={prefix}>{label}</option>)}
+        </select>
+        <button type="button" className="icon-button" onClick={() => setAttempt((count) => count + 1)} disabled={busy} aria-label="Refresh" title="Refresh"><RefreshCw size={16} /></button>
+      </HeaderActions>
       {error && <p role="alert" className="form-error table-message">{error}</p>}
       {events && (
         <table className="data-table audit-table" aria-label="Audit events">
-          <thead><tr><th scope="col">When</th><th scope="col">Who</th><th scope="col">What</th><th scope="col">Address</th></tr></thead>
+          <thead><tr><th scope="col">When</th><th scope="col">Who</th><th scope="col">What</th><th scope="col">IP address</th></tr></thead>
           <tbody>
             {events.map((event) => (
               <tr key={event.id}>
@@ -86,7 +80,7 @@ export function AuditPanel() {
                 <td>{event.actor_label}</td>
                 <td>
                   <strong>{eventLabel(event)}</strong>
-                  <span>{targetLabel(event)}</span>
+                  <span>{targetLabel(event, deviceNames)}</span>
                   {Object.keys(event.metadata).length > 0 && (
                     <details className="audit-details"><summary>Details</summary><pre>{JSON.stringify(event.metadata, null, 2)}</pre></details>
                   )}
@@ -97,7 +91,7 @@ export function AuditPanel() {
           </tbody>
         </table>
       )}
-      {events && !events.length && <div className="empty-state"><ClipboardList size={28} /><strong>No events</strong><span>Nothing matches this filter yet.</span></div>}
+      {events && !events.length && <div className="empty-state"><ClipboardList size={22} /><strong>No events match this filter</strong></div>}
       {!events && !error && <p role="status" className="field-help table-message"><LoaderCircle size={14} className="spin" /> Loading…</p>}
       {next && <div className="panel-footer"><button type="button" className="secondary-button" onClick={() => void loadMore()} disabled={busy}>{busy && <LoaderCircle size={15} className="spin" />} Show older events</button></div>}
     </section>

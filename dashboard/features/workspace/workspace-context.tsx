@@ -32,6 +32,8 @@ export type Workspace = {
   settings: GeneralSettings | null;
   setSettings: (settings: GeneralSettings) => void;
   settingsDraft: SettingsDraft;
+  // Where HeaderActions puts a page's controls, beside its title.
+  headerSlot: HTMLElement | null;
 };
 
 export const WorkspaceContext = createContext<Workspace | null>(null);
