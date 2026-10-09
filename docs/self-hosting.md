@@ -115,6 +115,8 @@ with `SHA256SUMS` beside it. The tarball's `install.sh` installs:
 - `/usr/bin/meshrmm-server`, a static binary that runs on any Linux
   distribution;
 - the Agent and viewer builds in `/usr/share/meshrmm/downloads`;
+- `/usr/libexec/meshrmm/rcodesign`, which signs the macOS builds if you
+  [set that up](#sign-the-macos-builds);
 - a systemd unit, `meshrmm-server.service`, which runs the server as the
   `meshrmm` user with most of the file system read-only;
 - `/etc/meshrmm/server.toml`, copied from the example on a new install.
@@ -353,6 +355,83 @@ its tables on first start and applies any new migrations when an upgraded
 server starts. There's no tool to move an install from one backend to the
 other.
 
+## Sign the macOS builds
+
+Releases sign the macOS Agent and viewer only ad hoc, so no certificate vouches
+for them. They work, with two drawbacks:
+
+- macOS blocks the viewer the first time it's opened after downloading it from
+  the website. The technician allows it in **System Settings → Privacy &
+  Security → Open Anyway**. The Agent installs from Terminal, which macOS
+  doesn't block.
+- macOS ties the Agent's Screen Recording, Accessibility and Input Monitoring
+  permissions to its signature, so the Mac's user has to grant them again
+  after every Agent update.
+
+To avoid both, have the server sign them with your company's Developer ID. You
+need an Apple Developer Program membership. Set this up before you enroll
+Macs: a Mac installed with an ad-hoc signed Agent or viewer keeps updating to
+ad-hoc builds until you reinstall it.
+
+1. Create a **Developer ID Application** certificate in your Apple Developer
+   account, and export it with its private key from Keychain Access as a
+   `.p12` file.
+2. Convert it to the form rcodesign reads, which holds only that certificate
+   and uses legacy encryption. On a machine with OpenSSL 3:
+
+   ```sh
+   openssl pkcs12 -legacy -in Exported.p12 -clcerts -nodes -out identity.pem
+   openssl pkcs12 -export -legacy -in identity.pem -out developer-id.p12
+   rm identity.pem
+   ```
+
+   Put the export password in a file of its own, such as
+   `developer-id.password`.
+3. To notarize the builds, which macOS needs before it opens the viewer
+   without asking, create an App Store Connect API key (**Users and Access →
+   Integrations → App Store Connect API**, with the Developer role), download
+   its `.p8` file, and combine it with the key's issuer ID and key ID:
+
+   ```sh
+   /usr/libexec/meshrmm/rcodesign encode-app-store-connect-api-key \
+     -o notary-api-key.json <issuer-id> <key-id> AuthKey_<key-id>.p8
+   ```
+
+4. Copy the files to the server where only it can read them, and configure
+   them:
+
+   ```sh
+   sudo install -m 0640 -g meshrmm developer-id.p12 developer-id.password \
+     notary-api-key.json /etc/meshrmm/
+   ```
+
+   ```toml
+   [downloads.macos_signing]
+   certificate = "/etc/meshrmm/developer-id.p12"
+   certificate_password_file = "/etc/meshrmm/developer-id.password"
+   notary_api_key = "/etc/meshrmm/notary-api-key.json"
+   ```
+
+   With Docker, mount the files read-only and name them with
+   `MESHRMM_DOWNLOADS__MACOS_SIGNING__CERTIFICATE`,
+   `MESHRMM_DOWNLOADS__MACOS_SIGNING__CERTIFICATE_PASSWORD_FILE` and
+   `MESHRMM_DOWNLOADS__MACOS_SIGNING__NOTARY_API_KEY`. The files must be
+   readable by UID 65532.
+5. Run `meshrmm-server check-config`. It checks that rcodesign opens the
+   certificate and that it's a Developer ID Application certificate.
+
+The first time the server starts a release, it signs and notarizes the macOS
+builds in the background, which usually takes a few minutes, and logs when
+it's done. Until then the macOS installers answer "still signing" and Macs
+wait for their update. Later starts reuse the signed builds in
+`<data_dir>/developer-id` until the release or the certificate changes. The
+server needs outbound access to Apple: `http://timestamp.apple.com` for the
+signature's timestamp, and HTTPS to Apple's notary service to notarize.
+
+A Mac signed with your Developer ID only takes updates signed by the same
+team. A renewed certificate from the same team works; a different team's
+means reinstalling the Macs and viewers.
+
 ## First run
 
 When no account exists yet, the server logs a one-time setup link:
@@ -510,7 +589,9 @@ Agents then update themselves from the server: each checks the server's update
 manifest when it starts and every six hours, and installs a newer build that
 carries a valid release signature. Viewers check when a session starts. An
 Agent or viewer never installs a build without the release signature, whatever
-the server offers.
+the server offers, except that a Mac app signed with your Developer ID installs
+only builds signed by the same team instead. With macOS signing set up, Macs
+update once the server has signed the new release's builds.
 
 Don't run an older release against a database a newer one has migrated: the
 server refuses to start, and `check-config` reports the mismatch. To go back,
@@ -547,3 +628,7 @@ restore the backup taken before the upgrade.
 - **The website shows an error about missing downloads, or Agents don't
   update.** `check-config` reports what the downloads directory holds and
   whether the builds are signed.
+- **The macOS installer says the server is still signing, or couldn't sign.**
+  Signing and notarizing take a few minutes after a new release first starts.
+  If it failed, the log says why (search for `Developer ID`); fix it and
+  restart the server to try again.
