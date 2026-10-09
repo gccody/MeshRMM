@@ -149,28 +149,10 @@ pub(super) fn dispatch_input_events(
         set_status(&status, Err(message));
     };
     loop {
-        let event = match read_event(&mut output) {
-            Ok(event) if helper_sends(kind, &event) => event,
-            Ok(event) => {
-                tracing::warn!(
-                    helper_kind = ?kind,
-                    event = child_event_name(&event),
-                    "desktop helper sent an event it never sends; stopping it"
-                );
-                fail(
-                    &mut started_tx,
-                    format!(
-                        "desktop {kind:?} helper sent an unexpected {} event",
-                        child_event_name(&event)
-                    ),
-                );
-                break;
-            }
-            Err(error) => {
-                fail(
-                    &mut started_tx,
-                    format!("desktop input-helper IPC failed: {error}"),
-                );
+        let event = match read_helper_event(&mut output, kind) {
+            Ok(event) => event,
+            Err(message) => {
+                fail(&mut started_tx, message);
                 break;
             }
         };
@@ -187,25 +169,9 @@ pub(super) fn dispatch_input_events(
                 }
             }
             ChildEvent::Credentials(result) => {
-                let mut current = credentials.lock().unwrap();
-                if result.encrypted.is_some()
-                    && (kind != HelperKind::Chat || !current.state.prompt_active)
-                {
+                if !store_credential_result(&credentials, kind, result) {
                     set_status(&status, Err("unexpected credential result".into()));
                     break;
-                }
-                current.state.message = result.message;
-                if let Some(encrypted) = result.encrypted {
-                    match crate::remote::credentials::save(&current.store, &encrypted) {
-                        Ok(()) => current.state.saved = true,
-                        Err(error) => {
-                            current.state.message =
-                                format!("Validated, but could not save credentials: {error:#}")
-                        }
-                    }
-                }
-                if kind == HelperKind::Chat {
-                    current.state.prompt_active = false;
                 }
             }
             ChildEvent::CredentialPrompt(ready) => {
@@ -229,24 +195,8 @@ pub(super) fn dispatch_input_events(
                 *cursor.lock().unwrap_or_else(|error| error.into_inner()) =
                     (shape, viewer_controls_input, pointer_display);
             }
-            ChildEvent::Files(message) => {
-                // A window of the helper's transfer plus its acknowledgements
-                // of the viewer's fits; the windows keep it from growing further.
-                let mut queue = files.queue.lock().unwrap();
-                if queue.len() < meshrmm_file_transfer::COMMAND_QUEUE {
-                    queue.push_back(message);
-                    files.ready.notify_one();
-                } else {
-                    tracing::warn!("dropped a file-transfer message from the desktop helper");
-                }
-            }
-            ChildEvent::Chat(text) => {
-                let mut queue = chat.queue.lock().unwrap_or_else(|e| e.into_inner());
-                if queue.len() < 32 {
-                    queue.push_back(text);
-                    chat.ready.notify_one();
-                }
-            }
+            ChildEvent::Files(message) => queue_file_message(&files, message),
+            ChildEvent::Chat(text) => queue_chat_text(&chat, text),
             ChildEvent::Clipboard(text) => {
                 *clipboard
                     .latest
@@ -277,6 +227,73 @@ pub(super) fn dispatch_input_events(
                 break;
             }
         }
+    }
+}
+
+/// Reads the helper's next event, or why the helper must stop.
+fn read_helper_event(output: &mut impl Read, kind: HelperKind) -> Result<ChildEvent, String> {
+    match read_event(output) {
+        Ok(event) if helper_sends(kind, &event) => Ok(event),
+        Ok(event) => {
+            tracing::warn!(
+                helper_kind = ?kind,
+                event = child_event_name(&event),
+                "desktop helper sent an event it never sends; stopping it"
+            );
+            Err(format!(
+                "desktop {kind:?} helper sent an unexpected {} event",
+                child_event_name(&event)
+            ))
+        }
+        Err(error) => Err(format!("desktop input-helper IPC failed: {error}")),
+    }
+}
+
+/// Records a credential result and saves the credentials it carries.
+/// Returns false, recording nothing, when credentials arrive from anything
+/// but a prompt the chat helper is showing.
+fn store_credential_result(
+    credentials: &HelperCredentials,
+    kind: HelperKind,
+    result: CredentialResult,
+) -> bool {
+    let mut current = credentials.lock().unwrap();
+    if result.encrypted.is_some() && (kind != HelperKind::Chat || !current.state.prompt_active) {
+        return false;
+    }
+    current.state.message = result.message;
+    if let Some(encrypted) = result.encrypted {
+        match crate::remote::credentials::save(&current.store, &encrypted) {
+            Ok(()) => current.state.saved = true,
+            Err(error) => {
+                current.state.message =
+                    format!("Validated, but could not save credentials: {error:#}")
+            }
+        }
+    }
+    if kind == HelperKind::Chat {
+        current.state.prompt_active = false;
+    }
+    true
+}
+
+fn queue_file_message(files: &HelperFiles, message: meshrmm_protocol::FileMessage) {
+    // A window of the helper's transfer plus its acknowledgements
+    // of the viewer's fits; the windows keep it from growing further.
+    let mut queue = files.queue.lock().unwrap();
+    if queue.len() < meshrmm_file_transfer::COMMAND_QUEUE {
+        queue.push_back(message);
+        files.ready.notify_one();
+    } else {
+        tracing::warn!("dropped a file-transfer message from the desktop helper");
+    }
+}
+
+fn queue_chat_text(chat: &HelperChat, text: String) {
+    let mut queue = chat.queue.lock().unwrap_or_else(|e| e.into_inner());
+    if queue.len() < 32 {
+        queue.push_back(text);
+        chat.ready.notify_one();
     }
 }
 
