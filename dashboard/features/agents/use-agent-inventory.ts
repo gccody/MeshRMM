@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AuthenticationRequired, type AuthorizedFetch, errorMessage } from "../../lib/http";
+import type { MetricsReading } from "../metrics/model";
 import { inventoryStatus } from "./inventory-stream";
 import { parseAgentList, sortAgents } from "./model";
 import { ThumbnailStore } from "./thumbnails";
@@ -27,6 +28,8 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused }: Optio
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Each online device's latest resource usage, by device ID.
+  const [metrics, setMetrics] = useState<ReadonlyMap<string, MetricsReading>>(() => new Map());
   const revision = useRef(-1);
   // Screen images outlive page changes with the inventory they belong to.
   const [thumbnails] = useState(() => new ThumbnailStore({ fetch: authorizedFetch }));
@@ -36,6 +39,7 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused }: Optio
   const reset = useCallback(() => {
     thumbnails.clear();
     setAgents([]);
+    setMetrics(new Map());
     setHasData(false);
     setLastUpdated(null);
     setError(null);
@@ -45,6 +49,12 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused }: Optio
   useEffect(() => {
     if (hasData) thumbnails.retain(new Set(agents.map((agent) => agent.id)));
   }, [agents, hasData, thumbnails]);
+
+  // An offline device's last reading no longer describes it.
+  const onlineMetrics = useMemo(() => {
+    const online = new Set(agents.filter((agent) => agent.connected).map((agent) => agent.id));
+    return new Map([...metrics].filter(([id]) => online.has(id)));
+  }, [agents, metrics]);
 
   const loadAgents = useCallback(async () => {
     if (!enabled) return false;
@@ -74,7 +84,14 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused }: Optio
     setLastUpdated(new Date());
     setError(null);
   }, []);
-  const { connection, since, now, reconnect } = useInventoryConnection({ enabled, revisionRef: revision, onAgents: applyStreamUpdate, onRefused });
+  const applyMetrics = useCallback((readings: MetricsReading[]) => {
+    setMetrics((current) => {
+      const next = new Map(current);
+      for (const reading of readings) next.set(reading.device_id, reading);
+      return next;
+    });
+  }, []);
+  const { connection, since, now, reconnect } = useInventoryConnection({ enabled, revisionRef: revision, onAgents: applyStreamUpdate, onMetrics: applyMetrics, onRefused });
 
   // Refresh reloads the list and, while the stream is down, skips the
   // reconnect wait. An open stream is already current.
@@ -87,6 +104,7 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused }: Optio
   const status = inventoryStatus({ hasData, connection, since, now });
   return {
     agents: enabled ? agents : [],
+    metrics: onlineMetrics,
     hasData: enabled && hasData,
     status: enabled ? status : "loading",
     connection,

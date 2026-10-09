@@ -2,6 +2,7 @@ import {  } from "lucide-react";
 import { Link, Route, Routes } from "react-router";
 import { AccountPanel } from "../features/account/account-panel";
 import { DevicesPanel } from "../features/agents/devices-panel";
+import { DevicePage } from "../features/metrics/device-page";
 import { AuditPanel } from "../features/audit/audit-panel";
 import { AuthenticationPanel } from "../features/authentication/authentication-panel";
 import { InvitePage } from "../features/auth/invite-page";
@@ -26,6 +27,7 @@ export function App() {
         <Routes>
           <Route element={<WorkspaceShell />}>
             <Route index element={<DevicesPanel />} />
+            <Route path="device" element={<DevicePage />} />
             <Route path="toolbox" element={<ToolboxPanel />} />
             <Route path="users" element={<UsersPanel />} />
             <Route path="roles" element={<RolesPanel />} />

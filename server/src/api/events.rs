@@ -1,8 +1,11 @@
-//! `GET /v1/events`: the website's socket for device presence.
+//! `GET /v1/events`: the website's socket for device presence and resource
+//! usage.
 //!
 //! It sends a snapshot of the devices, then each change with the next
 //! revision. The website sends `refresh` for a new snapshot when it missed a
-//! change. The socket stays authorized by the session cookie it opened with:
+//! change. Every few seconds it also sends the latest resource usage of the
+//! devices that reported since it last did, which carries no revision: after
+//! each snapshot it sends every online device's. The socket stays authorized by the session cookie it opened with:
 //! it checks the session and the `devices.view` permission again every half
 //! minute, and at once after a signed-in user changes something, and closes
 //! with 4001 when either is gone.
@@ -25,7 +28,7 @@ use crate::{
     auth::{Authorized, session},
     http::{ApiError, AppState, client_ip::ClientIp},
     rbac::Permission,
-    realtime::{close_frame, presence::PresenceEvent, send},
+    realtime::{close_frame, metrics::MetricsEvent, presence::PresenceEvent, send},
 };
 
 const RECHECK_INTERVAL: Duration = Duration::from_secs(30);
@@ -34,6 +37,9 @@ const RECHECK_INTERVAL: Duration = Duration::from_secs(30);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// A browser that hasn't answered two pings is gone.
 const SILENCE_LIMIT: Duration = Duration::from_secs(75);
+/// How often new resource usage readings are sent, as often as Agents report.
+const METRICS_INTERVAL: Duration =
+    Duration::from_secs(meshrmm_protocol_types::METRICS_INTERVAL_SECONDS);
 
 pub async fn subscribe(
     State(state): State<AppState>,
@@ -72,6 +78,10 @@ async fn serve(state: AppState, token: String, ip: IpAddr, mut socket: WebSocket
     // Both fire at once; the socket was just authorized.
     recheck.tick().await;
     ping.tick().await;
+    // Fires at once, sending every online device's usage.
+    let mut metrics = tokio::time::interval(METRICS_INTERVAL);
+    metrics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut metrics_sent = 0;
     let mut last_heard = Instant::now();
     loop {
         tokio::select! {
@@ -84,7 +94,11 @@ async fn serve(state: AppState, token: String, ip: IpAddr, mut socket: WebSocket
                 }
                 Ok(_) => {}
                 Err(RecvError::Lagged(_)) => match send_snapshot(&state, &mut socket).await {
-                    Some(sent) => revision = sent,
+                    Some(sent) => {
+                        revision = sent;
+                        metrics_sent = 0;
+                        metrics.reset_immediately();
+                    }
                     None => return,
                 },
                 Err(RecvError::Closed) => return,
@@ -94,7 +108,11 @@ async fn serve(state: AppState, token: String, ip: IpAddr, mut socket: WebSocket
                 match frame {
                 Some(Ok(Message::Text(text))) if text.as_str() == "refresh" => {
                     match send_snapshot(&state, &mut socket).await {
-                        Some(sent) => revision = sent,
+                        Some(sent) => {
+                            revision = sent;
+                            metrics_sent = 0;
+                            metrics.reset_immediately();
+                        }
                         None => return,
                     }
                 }
@@ -116,6 +134,17 @@ async fn serve(state: AppState, token: String, ip: IpAddr, mut socket: WebSocket
                 if !still_allowed(&state, &token, ip).await {
                     send(&mut socket, close_frame(4001, "sign in again")).await;
                     return;
+                }
+            }
+            _ = metrics.tick() => {
+                let (readings, sequence) = state.metrics.since(metrics_sent);
+                metrics_sent = sequence;
+                if !readings.is_empty() {
+                    let json = serde_json::to_string(&MetricsEvent::Metrics { readings })
+                        .expect("metrics events serialize");
+                    if !send(&mut socket, Message::Text(json.into())).await {
+                        return;
+                    }
                 }
             }
             _ = ping.tick() => {

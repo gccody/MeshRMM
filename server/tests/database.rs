@@ -224,12 +224,50 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
                 .unwrap();
         }
 
+        for (minute, device) in [(NOW - 8 * DAY_MS, "old"), (NOW - 6 * DAY_MS, "recent")] {
+            database
+                .execute(
+                    &Query::insert()
+                        .into_table("device_metrics")
+                        .columns([
+                            "device_id",
+                            "minute",
+                            "samples",
+                            "cpu_percent",
+                            "cpu_percent_max",
+                            "memory_used_bytes",
+                            "memory_total_bytes",
+                            "network_received_bytes_per_second",
+                            "network_sent_bytes_per_second",
+                            "storage_used_bytes",
+                            "storage_total_bytes",
+                        ])
+                        .values_panic([
+                            device.into(),
+                            minute.into(),
+                            12.into(),
+                            1.5.into(),
+                            3.0.into(),
+                            1.into(),
+                            2.into(),
+                            3.into(),
+                            4.into(),
+                            5.into(),
+                            6.into(),
+                        ])
+                        .to_owned(),
+                )
+                .await
+                .unwrap();
+        }
+
         let purged = maintenance::purge(database, NOW).await.unwrap();
         assert_eq!(
             purged,
             Purged {
                 handoffs: 1,
                 script_runs: 1,
+                device_metrics: 1,
                 ..Purged::default()
             },
             "{}",

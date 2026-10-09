@@ -89,8 +89,9 @@ fn storable(text: &str) -> String {
     text.replace('\0', "\u{fffd}")
 }
 
-/// The largest message an Agent sends on its control connection.
-const MAX_CONTROL_MESSAGE_BYTES: usize = 4096;
+/// The largest message an Agent sends on its control connection: a resource
+/// usage report listing the most volumes, each with the longest name.
+const MAX_CONTROL_MESSAGE_BYTES: usize = 16 * 1024;
 
 /// `GET /v1/agents/{id}/connect`: the Agent's control connection, which it
 /// keeps open while it runs. See [`coordinator`].

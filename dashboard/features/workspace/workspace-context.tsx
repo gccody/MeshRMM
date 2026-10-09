@@ -34,6 +34,9 @@ export type Workspace = {
   settingsDraft: SettingsDraft;
   // Where HeaderActions puts a page's controls, beside its title.
   headerSlot: HTMLElement | null;
+  // Names the page in its heading and the window title in place of the
+  // view's title; null restores it.
+  setPageTitle: (title: string | null) => void;
 };
 
 export const WorkspaceContext = createContext<Workspace | null>(null);
