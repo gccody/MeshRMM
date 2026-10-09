@@ -1,13 +1,186 @@
 use std::sync::Arc;
 
-use meshrmm_protocol::SessionMessage;
-use meshrmm_session_transport::{ServiceChannel, ServiceRoute};
+use anyhow::Context;
+use meshrmm_protocol::{
+    Annotation, FileMessage, RemoteInput, RemoteSessionId, SessionMessage, TogglePolicy,
+};
+use meshrmm_session_transport::{
+    CHAT_CHANNEL, CLIPBOARD_CHANNEL, FILE_CHANNEL, ServiceChannel, ServiceRoute,
+};
 use tokio::sync::mpsc;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 
-use super::ControlCommand;
 use super::control_channel::send_control_message;
+use super::{ControlCommand, SenderCleanup};
+use crate::remote::native_task::{NativeTask, command_worker};
+use crate::remote::platform::ScreenInput;
+
+/// Queues of the workers that apply viewer messages off the control channel.
+#[derive(Clone)]
+pub(super) struct WorkerQueues {
+    pub(super) input: mpsc::Sender<RemoteInput>,
+    pub(super) maintenance: mpsc::Sender<SessionMessage>,
+    pub(super) annotation: mpsc::Sender<Annotation>,
+    pub(super) clipboard: mpsc::Sender<SessionMessage>,
+    pub(super) chat: mpsc::Sender<SessionMessage>,
+    pub(super) files: mpsc::Sender<FileMessage>,
+}
+
+pub(super) struct SessionWorkers {
+    pub(super) queues: WorkerQueues,
+    pub(super) control_service: ServiceChannel,
+}
+
+pub(super) async fn spawn_session_workers(
+    input: &Arc<dyn ScreenInput>,
+    control_channel: &Arc<RTCDataChannel>,
+    control_tx: &mpsc::UnboundedSender<ControlCommand>,
+    session_id: &RemoteSessionId,
+    idle_policy: TogglePolicy,
+    cleanup: &mut SenderCleanup,
+) -> anyhow::Result<(SessionWorkers, [(&'static str, Arc<ServiceRoute>); 3])> {
+    let (input_tx, input_task) = spawn_input_worker(
+        Arc::clone(input),
+        Arc::clone(control_channel),
+        control_tx.clone(),
+    )?;
+    cleanup.workers.push(input_task);
+    let (maintenance_tx, maintenance_task) = spawn_maintenance_worker(
+        Arc::clone(input),
+        control_tx.clone(),
+        session_id.clone(),
+        idle_policy,
+    )?;
+    cleanup.workers.push(maintenance_task);
+    let (annotation_tx, annotation_task) =
+        spawn_annotation_worker(Arc::clone(input), control_tx.clone())?;
+    cleanup.workers.push(annotation_task);
+    let control_service = ServiceChannel::new(control_channel.clone()).await;
+    let clipboard_route = Arc::new(ServiceRoute::default());
+    let file_route = Arc::new(ServiceRoute::default());
+    let chat_route = Arc::new(ServiceRoute::default());
+    let (clipboard_tx, clipboard_task) = spawn_clipboard_worker(
+        Arc::clone(input),
+        control_service.clone(),
+        Some(clipboard_route.clone()),
+    )?;
+    cleanup.workers.push(clipboard_task);
+    let (chat_tx, chat_task) = spawn_chat_worker(
+        Arc::clone(input),
+        control_service.clone(),
+        Some(chat_route.clone()),
+    )?;
+    cleanup.workers.push(chat_task);
+    let (files_tx, files_task) = spawn_file_worker(
+        Arc::clone(input),
+        control_service.clone(),
+        Some(file_route.clone()),
+    )?;
+    cleanup.workers.push(files_task);
+    let workers = SessionWorkers {
+        queues: WorkerQueues {
+            input: input_tx,
+            maintenance: maintenance_tx,
+            annotation: annotation_tx,
+            clipboard: clipboard_tx,
+            chat: chat_tx,
+            files: files_tx,
+        },
+        control_service,
+    };
+    let routes = [
+        (CLIPBOARD_CHANNEL, clipboard_route),
+        (FILE_CHANNEL, file_route),
+        (CHAT_CHANNEL, chat_route),
+    ];
+    Ok((workers, routes))
+}
+
+fn spawn_maintenance_worker(
+    maintenance_input: Arc<dyn ScreenInput>,
+    maintenance_errors: mpsc::UnboundedSender<ControlCommand>,
+    restart_session: RemoteSessionId,
+    idle_policy: TogglePolicy,
+) -> anyhow::Result<(mpsc::Sender<SessionMessage>, NativeTask)> {
+    let cleanup_input = Arc::clone(&maintenance_input);
+    Ok(command_worker(
+        "meshrmm-maintenance",
+        32,
+        std::time::Duration::from_secs(3600),
+        move |message| {
+            let result = match message {
+                Some(
+                    message @ (SessionMessage::PromptForCredentials
+                    | SessionMessage::AutofillCredentials
+                    | SessionMessage::ForgetCredentials),
+                ) => maintenance_input.credential_command(message),
+                Some(SessionMessage::SendSecureAttention) => {
+                    if !maintenance_input.is_console_session() {
+                        Err(anyhow::anyhow!(
+                            "Ctrl+Alt+Del is only available for the console session"
+                        ))
+                    } else {
+                        crate::remote::secure_attention::send()
+                    }
+                }
+                Some(SessionMessage::SetPreventIdleLock { enabled }) => {
+                    maintenance_input.set_prevent_idle_lock(idle_policy.effective(Some(enabled)))
+                }
+                Some(SessionMessage::SetWallpaperHidden { hidden }) => {
+                    maintenance_input.set_wallpaper_hidden(hidden)
+                }
+                Some(SessionMessage::SetBlackout { enabled }) => {
+                    maintenance_input.set_blackout(enabled)
+                }
+                Some(SessionMessage::SetAgentInputBlocked { blocked }) => {
+                    maintenance_input.set_agent_input_blocked(blocked)
+                }
+                Some(SessionMessage::Restart { safe_mode }) => {
+                    crate::remote::connection_approval::remember_across_restart(&restart_session)
+                        .and_then(|()| crate::power::restart(safe_mode))
+                        .context("Restart")
+                }
+                _ => Ok(()),
+            };
+            if let Err(error) = result {
+                let _ =
+                    maintenance_errors.send(ControlCommand::MaintenanceError(format!("{error:#}")));
+            }
+        },
+        move || {
+            let _ = cleanup_input.set_prevent_idle_lock(false);
+            let _ = cleanup_input.set_wallpaper_hidden(false);
+            let _ = cleanup_input.set_blackout(false);
+            let _ = cleanup_input.set_agent_input_blocked(false);
+        },
+    )?)
+}
+
+// Its own queue: a slow overlay never holds up input or maintenance.
+fn spawn_annotation_worker(
+    annotation_input: Arc<dyn ScreenInput>,
+    annotation_errors: mpsc::UnboundedSender<ControlCommand>,
+) -> anyhow::Result<(mpsc::Sender<Annotation>, NativeTask)> {
+    let cleanup_annotations = Arc::clone(&annotation_input);
+    Ok(command_worker(
+        "meshrmm-annotation",
+        1024,
+        std::time::Duration::from_secs(3600),
+        move |annotation| {
+            if let Some(annotation) = annotation
+                && let Err(error) = annotation_input.annotate(annotation)
+            {
+                let _ = annotation_errors.send(ControlCommand::MaintenanceError(format!(
+                    "Annotate: {error:#}"
+                )));
+            }
+        },
+        move || {
+            let _ = cleanup_annotations.annotate(Annotation::Clear);
+        },
+    )?)
+}
 
 pub(super) fn spawn_file_worker(
     input: Arc<dyn crate::remote::platform::ScreenInput>,
