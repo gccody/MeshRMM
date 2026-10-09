@@ -60,6 +60,7 @@ uuid = { version = "1.24.1", features = ["v4", "v7"] }
 webauthn-rs = { version = "0.5.5", features = ["conditional-ui"] }
 webauthn-rs-proto = "0.5.5"
 webrtc-util = { version = "0.12.0", default-features = false, features = ["conn"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
 figment = { version = "0.10.19", features = ["env", "test", "toml"] }
@@ -68,3 +69,4 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 tempfile = "3"
 tokio-tungstenite.workspace = true
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

@@ -60,16 +60,19 @@ import hashlib, json, sys, urllib.request
 server, artifacts_path, manifest_path = sys.argv[1:]
 artifacts = json.load(open(artifacts_path))
 manifest = json.load(open(manifest_path))
-assert manifest["schema_version"] == 2, manifest
+assert manifest["schema_version"] == 3, manifest
 assert manifest["releases"].keys() == artifacts["artifacts"].keys(), manifest
 for target, artifact in artifacts["artifacts"].items():
     release = manifest["releases"][target]
     assert release["version"] == artifacts["version"], release
-    assert release["url"] == f"https://rmm.example.com/downloads/{artifact['file']}", release
+    assert release["url"] == f"https://rmm.example.com/downloads/release/{artifact['file']}", release
     assert release["sha256"] == artifact["sha256"], release
     assert release.get("signature") == artifact.get("signature"), release
-    body = urllib.request.urlopen(f"{server}/downloads/{artifact['file']}").read()
-    assert hashlib.sha256(body).hexdigest() == artifact["sha256"], target
+    assert "developer_id" not in release, release
+    # Without macOS signing, the installer is the release build.
+    for path in (f"release/{artifact['file']}", artifact["file"]):
+        body = urllib.request.urlopen(f"{server}/downloads/{path}").read()
+        assert hashlib.sha256(body).hexdigest() == artifact["sha256"], path
 print(f"{server} serves {len(manifest['releases'])} builds of {artifacts['version']}")
 PY
 }
@@ -85,6 +88,7 @@ http.listen = "127.0.0.1:8080"
 turn.enabled = false
 EOF
 meshrmm-server check-config
+/usr/libexec/meshrmm/rcodesign --version
 systemctl start meshrmm-server
 wait_healthy http://127.0.0.1:8080
 check_downloads http://127.0.0.1:8080 /usr/share/meshrmm/downloads/artifacts.json
@@ -108,6 +112,7 @@ run_container() {
         -e MESHRMM_TURN__ENABLED=false \
         meshrmm-server:package-test >/dev/null
 }
+docker run --rm --entrypoint /usr/libexec/meshrmm/rcodesign meshrmm-server:package-test --version
 run_container
 wait_healthy http://127.0.0.1:8081
 check_downloads http://127.0.0.1:8081 "$OUTPUT/image/linux-$IMAGE_ARCH/share/meshrmm/downloads/artifacts.json"

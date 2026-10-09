@@ -1685,6 +1685,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -3016,6 +3017,7 @@ dependencies = [
  "webauthn-rs",
  "webauthn-rs-proto",
  "webrtc-util",
+ "zip",
 ]
 
 [[package]]
@@ -5894,6 +5896,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7036,6 +7044,25 @@ dependencies = [
  "quote",
  "syn 3.0.3",
 ]
+
+[[package]]
+name = "zip"
+version = "8.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap 2.14.0",
+ "memchr",
+ "typed-path",
+]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"

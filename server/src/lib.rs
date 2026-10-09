@@ -60,7 +60,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
     let database =
         Database::connect(&config.database_url(), config.database.max_connections).await?;
     database.migrate().await?;
-    let downloads = Downloads::load(&config.downloads.dir, &config.public_origin()).await?;
+    let downloads = Downloads::load(&config).await?;
     tracing::info!(
         backend = ?database.backend(),
         schema_version = database.backend().expected_schema_version(),
@@ -106,6 +106,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     );
     let state = prepare(config).await?;
     state.downloads.warn_about_problems();
+    state.downloads.start_signing();
     if state.website.is_empty() {
         tracing::warn!(
             "this server was built without its website; run `npm run build` in dashboard/ and rebuild the server"
@@ -182,7 +183,7 @@ pub async fn check(config: Config) -> anyhow::Result<()> {
                 )
             })?;
     }
-    let downloads = Downloads::load(&config.downloads.dir, &config.public_origin()).await?;
+    let downloads = Downloads::load(&config).await?;
     match downloads.version() {
         Some(version) => println!(
             "{} downloads of release {version}, {} of them signed",
@@ -194,6 +195,22 @@ pub async fn check(config: Config) -> anyhow::Result<()> {
             config.downloads.dir.display(),
             downloads::ARTIFACTS_FILE
         ),
+    }
+    if let Some(signing) = &config.downloads.macos_signing {
+        let checked = signing.clone();
+        let (rcodesign, team) = tokio::task::spawn_blocking(move || {
+            downloads::developer_id::check_certificate(&checked)
+        })
+        .await??;
+        println!("{rcodesign} will sign the macOS builds with Developer ID team {team}");
+        if signing.notary_api_key.is_none() {
+            println!(
+                "the macOS builds won't be notarized; without downloads.macos_signing.notary_api_key, macOS blocks the viewer when it's first opened"
+            );
+        }
+        if let Some(status) = downloads.macos_signing() {
+            println!("macOS builds: {status}");
+        }
     }
     if config.turn.enabled && config.turn.public_ip.is_none() {
         let host = config.turn_host();

@@ -67,7 +67,7 @@ const HELPER_PLIST: &str = "/Library/LaunchAgents/com.meshrmm.agent.session.plis
 /// Where the root coordinator accepts session helpers. Only root can create
 /// files in `/var/run`, so no other process can take the name first.
 pub(crate) const HELPER_SOCKET: &str = "/var/run/com.meshrmm.agent.sock";
-const BUNDLE_IDENTIFIER: &str = "com.meshrmm.agent";
+pub(crate) const BUNDLE_IDENTIFIER: &str = "com.meshrmm.agent";
 
 /// Installs or repairs the Agent from the running copy, enrolling it with the
 /// hex-encoded installer authorization the dashboard's install command passes.
