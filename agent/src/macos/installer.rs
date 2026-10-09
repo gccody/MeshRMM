@@ -101,7 +101,7 @@ pub fn install(authorization: &str) -> anyhow::Result<()> {
     };
     if config.server.trim_end_matches('/') != bootstrap.server.trim_end_matches('/') {
         anyhow::bail!(
-            "this Mac is already enrolled with another server; uninstall the Agent before enrolling it in a different company"
+            "this Mac is already enrolled with another server; uninstall the Agent before enrolling it with this one"
         );
     }
 

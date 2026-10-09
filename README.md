@@ -1,14 +1,23 @@
 # MeshRMM
 
-MeshRMM is a multi-tenant remote monitoring and management project. It adds
-low-latency Windows desktop streaming and remote control in a single Cargo
-workspace with platform and transport responsibilities kept in focused crates:
+MeshRMM is a self-hosted remote monitoring and management project with
+low-latency desktop streaming and remote control. A company runs its own
+MeshRMM server, which serves the website, the API, the Agents' and viewers'
+connections, STUN/TURN, and the Agent and viewer downloads; nothing calls a
+hosted service. To install and run a server, see
+[running a MeshRMM server](docs/self-hosting.md).
+
+The code is a single Cargo workspace with platform and transport
+responsibilities kept in focused crates:
 
 - `agent/` — the native endpoint Agent, binary control/video protocol, and the
   Windows-specific `windows/remote-screen` capture/encoder package.
 - `crates/` — lightweight shared JSON protocol types and signaling client code.
-- `server/` — the Rust Cloudflare Worker and Durable Objects used only for
-  authentication and WebRTC signaling.
+- `server/` — `meshrmm-server`, the self-hosted server: accounts and sign-in,
+  devices, the toolbox, WebRTC signaling, STUN/TURN, and downloads. It embeds
+  the website.
+- `dashboard/` — the website, a Vite + React app prerendered at build time
+  (see [its README](dashboard/README.md)).
 - `remote/` — the native Windows/macOS viewer. Windows uses Media Foundation
   and D3D11; macOS uses AVFoundation, CoreMedia, Core Animation, and AppKit.
 - `site/` — the static marketing page, separate from the server (see
@@ -51,12 +60,12 @@ channel drains and declares congestion using bitrate-relative time budgets
 instead of fixed byte counts, keeping the three quality presets similarly
 responsive.
 
-Cloudflare is not in that data path. An Agent coordinator Durable Object keeps
-the authenticated Agent reachable, and a temporary remote-session Durable
-Object forwards bounded JSON SDP/ICE messages between exactly one Agent and one
-client. The P2P connection itself is encrypted by WebRTC DTLS. Cloudflare TURN
-credentials are created server-side with the configured idle-timeout lifetime
-and are used by ICE only when a direct candidate pair cannot connect.
+The server is not in that data path. It keeps each authenticated Agent's
+control connection, and for each remote session forwards bounded JSON SDP/ICE
+messages between exactly one Agent and one viewer. The peer-to-peer connection
+itself is encrypted by WebRTC DTLS. When no direct candidate pair connects,
+ICE relays through the server's built-in TURN server, with credentials the
+server issues for each session.
 
 ## Prerequisites
 
@@ -64,9 +73,11 @@ and are used by ICE only when a direct candidate pair cannot connect.
 - Local administrator approval to install the Agent as a Windows service.
 - macOS 12 or newer for the macOS viewer.
 - macOS 12.3 or newer for the macOS Agent, which is in development (see below).
+- A Linux machine (x86_64 or arm64) for the server; see
+  [running a MeshRMM server](docs/self-hosting.md).
 - rustup. The first `cargo` command in the repository installs the toolchain
   pinned in `rust-toolchain.toml` (the MSVC host toolchain on Windows) with
-  Clippy, rustfmt and the `wasm32-unknown-unknown` target.
+  Clippy and rustfmt.
 - CMake and a C compiler, which build the bundled libopus audio codec. On
   Windows, the Visual Studio C++ build tools provide the compiler, and their
   "C++ CMake tools for Windows" component provides CMake:
@@ -76,11 +87,10 @@ and are used by ICE only when a direct candidate pair cannot connect.
   decode plus D3D11 NV12 video processing. Without one, video falls back to
   software H.264 (see below). Hardware H.265/HEVC and AYUV 4:4:4 support are
   optional and negotiated only when available at both ends.
-- Node.js/npm and a Cloudflare account for the one-time server deployment.
+- Node.js 22.13 or newer to build the website, which the server embeds.
 
 A `cargo` that rustup does not manage, such as Homebrew's, ignores
-`rust-toolchain.toml` and has no wasm32 target. Put rustup's `cargo` first in
-`PATH`.
+`rust-toolchain.toml`. Put rustup's `cargo` first in `PATH`.
 
 Software H.264 4:2:0 is the final fallback at both ends. An Agent whose GPU
 cannot convert or encode the stream, or that has no GPU, copies frames to the
@@ -118,8 +128,8 @@ the toolbox runs Shell (zsh) scripts as the console user or root and
 delivers files to the user's Documents transfer folder.
 VideoToolbox has no 4:4:4 encoder, so Mac Agents always stream 4:2:0.
 
-The dashboard's **Add a device** dialog creates a one-time Terminal command
-for Macs. It runs `install-agent-macos.sh` from the dashboard, which downloads
+The website's **Add device** dialog creates a one-time Terminal command
+for Macs. It runs `install-agent-macos.sh` from the server, which downloads
 the universal (Apple silicon and Intel) Agent named in the release manifest,
 checks its SHA-256, and runs `sudo meshrmm-agent --install <authorization>`.
 That enrolls the Mac with the hex-encoded installer authorization and installs
@@ -166,27 +176,25 @@ while a real monitor is connected.
 
 ## Toolbox
 
-The dashboard's **Toolbox** page keeps PowerShell, Command Prompt and Shell (zsh) scripts and
+The website's **Toolbox** page keeps PowerShell, Command Prompt and Shell (zsh) scripts and
 a library of files, each private to the user who added it or shared with the
-company. Scripts run on a device from the dashboard or from the viewer's
+company. Scripts run on a device from the website or from the viewer's
 toolbox button, as the signed-in user or as SYSTEM; with nobody signed in they
 run as SYSTEM. The viewer's toolbox also sends library files to the connected
 device's Documents transfer folder, or to Public Documents from the background
 desktop. The server hands both to the Agent, so they work in background mode
 too. See [the toolbox](docs/toolbox.md).
 
-## Preconfigured deployment
+## Configuration
 
-The viewer loads sidecar JSON next to its executable. The installed Agent reads
-its protected configuration from `%ProgramData%\MeshRMM\Agent\agent.json`.
-No environment variables are required on Agent or viewer machines. The public
-site is deployed at `https://meshrmm.com`; the owner console lives at
-`https://admin.meshrmm.com`, and each company uses an immutable
-`https://<slug>.meshrmm.com` dashboard and Agent control-plane endpoint. WorkOS
-organizations and memberships define the identity boundary, Cloudflare D1
-stores company-owned Agent records and audit events, and Durable Objects retain
-live signaling state. See [company domains and provisioning](docs/company-domains.md)
-for production setup and onboarding details.
+The installed Agent reads its protected configuration from
+`%ProgramData%\MeshRMM\Agent\agent.json` on Windows, written when it
+enrolls with a server: the server's URL, the device ID and credential, and the
+server's update manifest. The viewer takes its server from each website link
+and loads optional local settings from a sidecar JSON file next to its
+executable. No environment variables are required on Agent or viewer
+machines. The server's own configuration is described in
+[running a MeshRMM server](docs/self-hosting.md#configure).
 
 ### Releases
 
@@ -194,7 +202,7 @@ for production setup and onboarding details.
 
 ```json
 {
-  "version": "0.3.8",
+  "version": "0.4.0",
   "signing_public_key": "94d87ebff16c65b9c89fd143596e329f90080f8463dafbf1e9b9f1bd6ed98af3"
 }
 ```
@@ -232,7 +240,7 @@ Results and a diagnostic log copy are saved under `dist/`. Normal automatic
 updates remain enabled; a newer published version can replace this local build.
 
 On a Mac, build an application bundle. The viewer takes its server from each
-dashboard link; an optional JSON file passed as the first argument becomes the
+website link; an optional JSON file passed as the first argument becomes the
 bundle's `Contents/MacOS/remote.json` for local settings:
 
 ```sh
@@ -248,7 +256,7 @@ sh scripts/install-remote-macos.sh
 ```
 
 This builds and signs a release-mode viewer, closes any running viewer,
-installs it in `~/Applications/MeshRMM Remote.app`, and registers dashboard links.
+installs it in `~/Applications/MeshRMM Remote.app`, and registers website links.
 Use a fresh **Connect** link to start a session. Existing installs
 are retained in a `.meshrmm-backup.*` folder under `~/Applications`.
 The installed configuration sets `auto_update` to `false` so releases
@@ -280,76 +288,59 @@ installations persist a private recovery key and pending configuration so a fail
 or interrupted enrollment can be retried. Installer authorization remains limited
 to its original expiry; recovery is restricted to the endpoint holding that key.
 
-Creating a new TURN key requires an explicit secure API token with Cloudflare
-Calls Write permission. `scripts/provision-cloudflare.ps1` installs only those
-TURN secrets. Agent credentials are created or rotated per company in the
-control plane and are stored in D1 only as SHA-256 hashes.
+Agent credentials are created or rotated by the server, which stores only
+their SHA-256 hashes.
 
-Each Agent installer downloaded from the dashboard contains a random,
-single-use company enrollment authorization that expires after 30 minutes.
+Each Agent installer downloaded from the website contains a random,
+single-use enrollment authorization that expires after 30 minutes.
 During setup, the endpoint reads its Windows computer name and redeems that
 authorization. The server generates the device ID and Agent credential, creates
-the company-owned Agent record, and returns the protected runtime configuration.
+the device's record, and returns the protected runtime configuration.
 Delete the downloaded installer after it succeeds.
 The installed copy stores only the executable under Program Files and protects
 the credential under ProgramData so only LocalSystem and administrators can
 read it. `dist/remote/remote.json` contains no viewer credential. Browser
-handoffs expire after 60 seconds. Remote sessions use the
-sliding `REMOTE_SESSION_IDLE_TIMEOUT_SECONDS` idle timeout (900 seconds by
-default): a connected viewer renews the deadline every 30 seconds, and the
-session expires after the viewer stops reporting activity for the configured
-interval. TURN credentials use the same configured lifetime when issued.
+handoffs expire after 60 seconds. Remote sessions use the server's sliding
+`remote.idle_timeout_seconds` (900 seconds by default): a connected viewer
+renews the deadline every 30 seconds, and the session expires after the viewer
+stops reporting activity for that long. A session's TURN credentials work
+only while the session lasts.
 
 ## Run
 
-### Web dashboard
+### Website
 
-The responsive dashboard at `https://<company>.meshrmm.com` lists only Agents
-owned by the organization bound to that hostname and the current WorkOS token. It receives inventory
-and connection changes from a company-scoped, hibernating WebSocket event
-stream instead of polling. The browser obtains a 60-second, one-use
-subscription token and reconnects automatically after failure. Authorization is
-renewed on the existing connection before its five-minute deadline, without
-issuing another subscription token or loading the inventory again. **Refresh**
-requests a single backend snapshot when needed; snapshots never contact Agents
-or their coordinators. Online/offline transitions are published by the backend
-coordinator with durable, ordered retries, and healthy idle Agents have no
-recurring presence alarm. The company-level 30-second authorization check remains
-in place. Device creation/deletion notifications are committed with their D1
-catalog changes and delivered immediately; that existing check also retries any
-undelivered catalog notifications while a dashboard is subscribed.
+The server's website lists the company's devices. It receives inventory and
+connection changes over a WebSocket, authenticated by the sign-in cookie,
+instead of polling: a snapshot, then revision-numbered changes. The server
+publishes Agents going online and offline, updating, and being enrolled or
+deleted as they happen, and closes a user's socket when they sign out, are
+disabled, or lose permission to view devices. **Refresh** requests a fresh
+snapshot; snapshots never contact Agents.
 
-Apply `0011_presence_catalog_outbox.sql` with the other D1 migrations **before**
-deploying this server, then deploy the dashboard. Existing Agents and native
-viewers remain wire-compatible and do not need reinstalling. Older dashboard
-connections continue to expire and reconnect until their page is refreshed.
-
-**Remote** requests a one-time server
+**Connect** requests a one-time server
 handoff, then opens the native viewer with a
 `meshrmm://connect?handoff=...&server=...` deep link. No service credential is
 entered into or retained by the browser.
 
-Company administrators can use **Close session** beside an Agent's **Remote**
+Users with permission to close sessions can use **Close session** beside a device's **Connect**
 button to disconnect its viewer and clear a stale session reservation. The Agent
 stays online and can accept a fresh connection immediately. This action is safe
-to repeat when no session exists and is recorded in the company audit log.
+to repeat when no session exists and is recorded in the audit log.
 
 During desktop sharing, the Windows endpoint shows a translucent banner at the
-top of the primary screen with the connected user's dashboard name (WorkOS
-first and last name, or email when no name is set). Click the banner to collapse
+top of the primary screen with the connected user's display name. Click the banner to collapse
 it to a tiny arrow tab with no name; click again to expand it. Drag either state
 sideways to move it out of the way; its horizontal position persists when toggling. It does not take keyboard
 focus and disappears when capture stops. The server resolves the name from the
-authenticated handoff owner and retains it across session reconnects. Deploy
-both the server and updated Windows Agent to enable named banners; older
-session records use “Remote user”.
+authenticated handoff owner and retains it across session reconnects.
 
 When a technician connects, the Windows endpoint also shows a connection
 notification in the bottom-right corner of the primary monitor, above the
 taskbar. It shows once per session and closes when clicked or after 15 seconds.
 It is on by default for sessions that view the user's desktop. Background-mode
 sessions notify the user only if an administrator enables that separately.
-Company administrators configure both and edit the message under **Settings →
+Administrators configure both and edit the message under **Settings →
 Connection notification**; see
 [maintenance controls](docs/maintenance-controls.md#connection-notification).
 
@@ -361,37 +352,34 @@ Nobody answering accepts the connection after a configurable time, and a
 computer that has been idle at the lock screen accepts at once; see
 [maintenance controls](docs/maintenance-controls.md#connection-approval).
 
-Company administrators use the embedded WorkOS user-management, domain, and
-SSO widgets to invite users, assign roles, verify domains, and configure a SAML
-or OIDC identity provider. The application has no company switcher; a user with
-multiple memberships signs into another company by visiting its URL. Company
-administrators can also set an organization-specific dashboard
-idle timeout under **Profile & session**; new organizations default to four
-hours. WorkOS's application-wide inactivity timeout must be at least as long as
-the largest permitted organization policy (24 hours) so WorkOS's session policy
-does not expire sessions first. The dashboard renews WorkOS tokens
-while its page is in the background and restores sessions on reload using an
-encrypted HttpOnly cookie, without a paid WorkOS custom domain. **Add Agent** asks only for the
-installer platform and downloads a company-authorized Windows setup executable.
-The computer name comes from the endpoint, the device ID is generated by the
-server, and no Agent record is created until setup redeems its authorization.
-The dashboard never substitutes sample inventory or exposes a loose
-`agent.json`.
+Administrators manage the server in the website: **Users** (invitations,
+roles, disabling accounts, resetting two-factor), **Roles** (custom roles
+built from a list of permissions), **Authentication** (the sign-in policy,
+single sign-on with an OIDC provider, SCIM provisioning and email), **Settings**
+(the company's remote-session policy) and **Audit**. Users sign in with a
+password and an authenticator app, a passkey, or single sign-on; each manages
+their own sign-in methods and sessions under **Account**. The website signs a
+user out after the idle time set under **Settings → General**.
 
-The Worker exposes organization-scoped Agent, enrollment, and handoff APIs. On
-Windows, opening the viewer once registers the `meshrmm` protocol for the
+**Add device** asks for the platform. For Windows it downloads a setup
+executable carrying a single-use enrollment authorization; for macOS it shows
+an install command. The computer name comes from the endpoint, the device ID
+is generated by the server, and no device record is created until setup
+redeems its authorization.
+
+On Windows, opening the viewer once registers the `meshrmm` protocol for the
 current user. The macOS application bundle declares the same protocol in its
 `Info.plist`.
 
-On the target endpoint, sign in to the dashboard as a company administrator,
-choose **Add Agent**, select **Windows 10/11 (x64)**, and download the installer.
+On the target endpoint, sign in to the website as a user who may enroll
+devices, choose **Add device**, select Windows, and download the installer.
 Run it within 30 minutes and approve the Windows User Account Control prompt.
 Setup reads the Windows computer name, obtains a server-generated device ID and
 credential, installs the binary under `%ProgramFiles%\MeshRMM\Agent`, registers
 the automatic `MeshRMMAgent` LocalSystem service with recovery actions,
 protects its configuration under `%ProgramData%\MeshRMM\Agent`, and starts it.
 
-Deleting an Agent from the dashboard immediately removes it from inventory and
+Deleting a device in the website immediately removes it from inventory and
 queues an authenticated self-uninstall. Online Agents remove the service,
 binary, configuration, log, and empty MeshRMM directories immediately; offline
 Agents perform the same cleanup the next time they connect.
@@ -411,22 +399,21 @@ restarts the service. If the new service does not reach `Running`, the helper
 restores and starts the previous binary. Update-check failures are logged and
 do not disconnect the installed Agent.
 
-Copy `dist/remote/` to the authorized viewer computer and open
-`meshrmm-remote.exe` once to register the protocol. Remote sessions should
-then be launched from the dashboard. A viewer can also redeem a handoff from
-the command line:
+Technicians download the viewer from the links in the website's sidebar, or
+copy `dist/remote/` from a local build, and open `meshrmm-remote.exe` once to register the protocol.
+Remote sessions are then launched from the website. A viewer can also redeem
+a handoff from the command line:
 
 ```powershell
-.\meshrmm-remote.exe "meshrmm://connect?handoff=<one-time-token>&server=https%3A%2F%2Fapi.meshrmm.com"
+.\meshrmm-remote.exe "meshrmm://connect?handoff=<one-time-token>&server=https%3A%2F%2Frmm.example.com"
 ```
 
-For macOS, copy `MeshRMM Remote.app` from `dist/remote-macos/` to the
-authorized Mac and open it. The app reads `remote.json` from its own
-`Contents/MacOS` directory; it connects to the same preconfigured Cloudflare
-deployment as the Windows viewer.
+For macOS, copy `MeshRMM Remote.app` to the Mac and open it. The app takes
+its server from each link and reads optional local settings from
+`remote.json` in its own `Contents/MacOS` directory.
 
-The Windows and macOS clients check for a newer release at the start of each
-dashboard launch. When one is available, the client verifies it, replaces the
+The Windows and macOS clients check the server's update manifest at the start
+of each launch from the website. When one is available, the client verifies it, replaces the
 installed executable or signed application bundle through a helper, and
 relaunches with the already-authorized session so the requested session continues.
 If no update is available, or the check cannot reach the release host, the
@@ -442,8 +429,8 @@ candidate-pair logs identify a `direct` or `turn` connection; periodic WebRTC
 logs include measured RTT.
 
 The viewer also offers independent technician-input blocking, agent-input blocking,
-and all-monitor blackout. Company admins customize the blackout notice under
-**Profile & session**. See [maintenance controls](docs/maintenance-controls.md)
+and all-monitor blackout. Administrators customize the blackout notice under
+**Settings → Blackout message**. See [maintenance controls](docs/maintenance-controls.md)
 for usage, Windows requirements, and cleanup behavior.
 
 **On session close** (**When the session ends → Remote user** in the macOS gear
@@ -452,7 +439,7 @@ session ends: **No action** (default; **Leave signed in** on macOS), **Lock**, o
 **Logout** (**Sign out** on macOS). The choice is not saved: every new remote
 session starts with **No action**, so choose it again each session. It is kept across reconnects of the same session.
 The action runs when the server ends the session: when the viewer closes it, when
-it is closed from the dashboard, or when an unreachable viewer reaches the session
+it is closed from the website, or when an unreachable viewer reaches the session
 idle timeout. It does not run while the viewer is reconnecting to the same session. The action applies to the console or RDP user session viewed last.
 If no user is signed in, or the session was in background mode, nothing happens.
 Logout does not save open work. Updating or restarting the Agent service skips
@@ -461,7 +448,7 @@ the action.
 **Clear clipboard on session close** (**When the session ends → Clear remote
 clipboard** in the macOS gear menu; Troubleshooting settings on Windows) empties the clipboard of that same Windows session when the
 remote session ends, at the same points as **On session close** and before any
-Lock. Company admins set its default for new sessions under **Settings → Remote
+Lock. Administrators set its default for new sessions under **Settings → Remote
 sessions**, and choose whether users may change it per session. When allowed, the
 viewer's choice applies to the current session only and is kept across reconnects;
 otherwise the toggle is shown as company managed and the Agent enforces the
@@ -476,12 +463,10 @@ controls that act on the session, and sent chat messages count as activity.
 Time spent connecting or reconnecting does not count, and the idle time
 restarts once the remote display is back. When it runs out, the viewer ends the
 session as if the technician had disconnected (any **On session close**
-action runs) and says why. Company administrators choose the default under
-**Settings → Remote sessions** (**Never** for new organizations) and whether
+action runs) and says why. Administrators choose the default under
+**Settings → Remote sessions** (**Never** on a new server) and whether
 users may choose another time. A user's choice lasts only for that session,
 including its reconnects; the next session starts with the company default.
-Apply migration `0016_idle_disconnect.sql` before deploying the updated server;
-`/healthz` expects it.
 
 System audio from the Windows default playback device is forwarded to both native
 viewers over a separate, bounded WebRTC audio channel, including while muted.
@@ -636,13 +621,17 @@ cargo fmt --all -- --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo check -p meshrmm-server --target wasm32-unknown-unknown
 
 Push-Location dashboard
 npm ci
 npm run verify
 Pop-Location
 ```
+
+The server's integration tests run against SQLite, and also against
+PostgreSQL when `MESHRMM_TEST_POSTGRES_URL` names a server where they may
+create databases, for example
+`postgres://postgres:postgres@localhost:5432/postgres`. CI runs both.
 
 The macOS target can be checked on macOS with:
 
@@ -653,8 +642,8 @@ cargo test --manifest-path remote/Cargo.toml
 ```
 
 Compilation verifies API integration, not the physical GPU, two-machine ICE,
-or TURN paths. Those require the deployment and hardware smoke test described
-above; do not infer performance measurements from a successful build.
+or TURN paths. Those require a running server and real devices; do not infer
+performance measurements from a successful build.
 
 ## Intentional MVP limits
 
@@ -671,12 +660,7 @@ images in D3D11 textures; macOS hands compressed samples to AVSampleBufferDispla
 not create a CPU RGBA frame in application code.
 
 
-Apply migration `0007_recoverable_enrollment.sql` before deploying the audit fixes.
-The new enrollment and credential-rotation queries require its columns. Publish
-updated native binaries with the server change to enable recoverable enrollment,
-acknowledged credential rotation, and cancellation cleanup on endpoints. Older
-installers retain one-shot enrollment, and older agents retain their current token
-when they do not understand the staged rotation command. Rotation returns HTTP 202
+Rotating a device's credential stages a new one on the Agent. Rotation returns HTTP 202
 with `rotation_pending`; the agent commits the credential by reconnecting with it.
 The Agent must be online: an offline Agent gets HTTP 409 and nothing is staged.
 Rotating again before the Agent reconnects resends the same pending credential,
@@ -684,13 +668,12 @@ and the coordinator deletes its copy of the credential once the Agent has
 authenticated with it.
 
 An agent accepts one active remote session. A second viewer receives a busy response;
-closing the current viewer releases the session. Suspending a company revokes its
-live coordinator/session/inventory connections and blocks token redemption.
+closing the current viewer releases the session.
 
 ### Experimental Session 0 background GUI
 
-With an updated Windows agent installed, choose **Background** on the dashboard
-to open the private workspace directly, without first capturing or changing the
+With an updated Windows agent installed, choose **Connect → Connect to background**
+in the website to open the private workspace directly, without first capturing or changing the
 user's desktop. You can also connect normally and select
 **Background (Session 0 · experimental)** in the viewer's display selector.
 The black workspace has a charcoal bottom taskbar with icon launchers and hover labels.
@@ -757,7 +740,7 @@ and windows their application already layers itself, are still printed. The
 built-in tools avoid the shell dependencies of Windows Task Manager and Explorer. Text previews are read-only
 and limited to 1 MiB; recursive folder copying and shell file associations are not
 supported. Background mode is currently entered after a normal connection; it
-does not yet provide a separate background-only connection from the dashboard.
+does not yet provide a separate background-only connection from the website.
 
 The ignored native test `remote::background::tests::session_zero_gui` exercises
 the launcher, text input, PowerShell keyboard input, Registry Editor rendering, H.264 output, Session 0

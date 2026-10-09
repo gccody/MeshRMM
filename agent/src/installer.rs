@@ -234,7 +234,7 @@ fn install() -> anyhow::Result<Option<String>> {
     };
     if provisioned_config.server.trim_end_matches('/') != bootstrap.server.trim_end_matches('/') {
         bail!(
-            "this endpoint is already enrolled with another server; uninstall it before enrolling in a different company"
+            "this endpoint is already enrolled with another server; uninstall it before enrolling with this one"
         );
     }
     let agent_path = install_directory.join("meshrmm-agent.exe");
