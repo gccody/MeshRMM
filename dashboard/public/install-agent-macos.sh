@@ -1,23 +1,23 @@
 #!/bin/sh
-# Installs the MeshRMM Agent on this Mac. The dashboard's "Add a device" dialog
+# Installs the MeshRMM Agent on this Mac. The website's "Add a device" dialog
 # shows the command that runs it:
 #
-#   curl -fsSL https://<company>.meshrmm.com/install-agent-macos.sh |
-#     sudo /bin/sh -s -- https://<company>.meshrmm.com <authorization>
+#   curl -fsSL https://rmm.example.com/install-agent-macos.sh |
+#     sudo /bin/sh -s -- https://rmm.example.com <authorization>
 #
 # It downloads the published Agent, checks it against the release manifest's
 # SHA-256, and enrolls this Mac with the one-time authorization.
 set -eu
 
 if [ "$#" -ne 2 ]; then
-    echo "Usage: install-agent-macos.sh <dashboard URL> <authorization>" >&2
+    echo "Usage: install-agent-macos.sh <server URL> <authorization>" >&2
     exit 2
 fi
 ORIGIN=${1%/}
 AUTHORIZATION=$2
 case "$ORIGIN" in
     https://*) ;;
-    *) echo "The dashboard URL must use HTTPS." >&2; exit 2 ;;
+    *) echo "The server URL must use HTTPS." >&2; exit 2 ;;
 esac
 if [ "$(id -u)" -ne 0 ]; then
     echo "Run the installer with sudo." >&2

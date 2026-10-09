@@ -31,9 +31,9 @@ Disconnecting, closing the viewer, service shutdown, helper exit, or capture fai
 removes blackout and input hooks. Technician input blocking remains a viewer choice
 for a reconnect, while agent restrictions reset.
 
-## Company message
+## Blackout message
 
-A company administrator can edit **Profile & session → Agent blackout message**.
+An administrator can edit **Settings → Blackout message**.
 The default is:
 
 > This machine is under maintenance by {user_name}.
@@ -41,13 +41,11 @@ The default is:
 `{user_name}` is replaced with the authenticated technician name used in the agent
 banner. Templates support newlines and Unicode, are limited to 2048 UTF-8 bytes,
 and must be nonempty. The preview uses the signed-in administrator's name.
-**Restore default message**, followed by **Save company settings**, resets it.
+**Restore default message**, followed by **Save settings**, resets it.
 Changes apply to new remote sessions; a reconnect retains its session's message.
 
-The server resolves the template from the enrolled agent's company and retains it
-in the session record. The viewer cannot supply a replacement template. Legacy
-session records and older servers use the default message. Apply migration
-`0008_blackout_message.sql` before deploying the updated server and dashboard.
+The server resolves the template from its settings and retains it in the
+session record. The viewer cannot supply a replacement template.
 
 ## Connection notification
 
@@ -57,7 +55,7 @@ clicked or after 15 seconds; resting the pointer on it restarts the countdown.
 Unlike the blackout notice, it is not excluded from capture, so the technician
 sees what the user sees.
 
-A company administrator configures it under **Settings → Connection
+An administrator configures it under **Settings → Connection
 notification**, with two settings:
 
 - **Notify the agent's user when a technician connects to their session** (on
@@ -73,9 +71,9 @@ Both use the same message. The default is:
 
 `{user_name}` works as it does in the blackout message. The template supports
 newlines and Unicode, must be nonempty, and is limited to 512 UTF-8 bytes. Only
-company administrators can save the setting. There is no per-session or viewer
-override: the server resolves the setting and template from the enrolled agent's
-company. It sends them only in the authenticated Agent session request and keeps
+users with the settings permission can save the setting. There is no
+per-session or viewer override: the server resolves the setting and template
+from its settings. It sends them only in the authenticated Agent session request and keeps
 them in the session record. Requests from servers without the fields show no
 notification. Changes apply to new remote sessions.
 
@@ -90,7 +88,7 @@ and dashboard; `/healthz` expects it.
 
 ## Connection approval
 
-A company administrator can make the Agent's user approve each connection under
+An administrator can make the Agent's user approve each connection under
 **Settings → Connection approval**. It is off by default. When it is on, the
 technician sees a dialog after choosing **Connect** or **Connect to
 background** and may give a reason, up to 500 UTF-8 bytes. The Agent then shows
@@ -126,8 +124,8 @@ retry. The connection is accepted without an answer when:
   unlocks it and answers, or the time runs out.
 
 The policy applies to every new session, including background mode, and has
-no per-session or viewer override: the server resolves it from the enrolled
-agent's company and sends it only in the authenticated Agent session request.
+no per-session or viewer override: the server resolves it from its settings
+and sends it only in the authenticated Agent session request.
 The reason is stored with the one-time handoff, recorded in the
 `remote.handoff_create` audit event, and kept in the session record. Viewer
 reconnects and resumes of the same session do not ask again; a session the user
