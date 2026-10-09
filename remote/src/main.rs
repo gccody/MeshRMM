@@ -295,27 +295,14 @@ async fn run_resumable_session(
             }
             return Err(reconnect::stopped_error(&error));
         }
-        let failed_at = Instant::now();
-        let streamed_for = resume_state.attempt_streamed_for(failed_at);
-        let delay = backoff.delay_after(streamed_for);
-        let status = resume_state.record_failure(&error, failed_at);
-        // Shows the reason in the kept window while the session resumes.
-        resume_state.set_reconnect_phase(ReconnectPhase::Attempting);
-        tracing::warn!(
-            error = ?error,
-            session_id = %bootstrap.session_id,
-            retry_seconds = delay.as_secs(),
-            streamed_seconds = streamed_for.map(|streamed| streamed.as_secs()),
-            reason = ?status.reason,
+        let delay = schedule_reconnect(
+            resume_state,
+            &mut backoff,
+            &error,
+            &bootstrap,
+            ever_presented,
             startup_failures,
-            "remote viewer disconnected; waiting to resume"
         );
-        if !ever_presented {
-            launch_status::report(LaunchStatus::Retrying {
-                attempt: startup_failures + 1,
-                max: reconnect::STARTUP_ATTEMPTS,
-            });
-        }
         let resumed = tokio::select! {
             resumed = signaling::resume_session(config, &bootstrap) => resumed,
             () = shutdown::wait() => {
@@ -323,33 +310,7 @@ async fn run_resumable_session(
                 return Ok(());
             }
         };
-        match resumed {
-            Ok(refreshed) => {
-                bootstrap = refreshed;
-                tracing::info!(
-                    session_id = %bootstrap.session_id,
-                    expires_at_unix_ms = bootstrap.expires_at_unix_ms,
-                    "refreshed remote-session credentials for reconnect"
-                );
-            }
-            Err(error) if signaling::is_terminal_session_error(&error) => {
-                return Err(error).context("remote viewer session can no longer be resumed");
-            }
-            Err(error) => {
-                // A restart explains an offline Agent better than the failure does.
-                let reason = reconnect::classify_resume_failure(&error)
-                    .filter(|_| resume_state.restarting().is_none());
-                if let Some(reason) = reason {
-                    resume_state.update_reconnect_status(|status| status.reason = reason);
-                }
-                tracing::warn!(
-                    error = ?error,
-                    session_id = %bootstrap.session_id,
-                    ?reason,
-                    "could not refresh resume credentials; retrying the existing session"
-                );
-            }
-        }
+        apply_resumed(resume_state, &mut bootstrap, resumed)?;
         // "Retry now" ends only this wait: a click from before it is ignored,
         // and skipping the wait leaves the backoff where it is.
         let retry = reconnect::retry_generation();
@@ -368,6 +329,77 @@ async fn run_resumable_session(
         }
         resume_state.set_reconnect_phase(ReconnectPhase::Attempting);
     }
+}
+
+/// Marks the session as reconnecting after a failed attempt and returns how
+/// long to wait before the next one.
+fn schedule_reconnect(
+    resume_state: &transport::ViewerResumeState,
+    backoff: &mut ReconnectBackoff,
+    error: &anyhow::Error,
+    bootstrap: &meshrmm_protocol::SessionBootstrap,
+    ever_presented: bool,
+    startup_failures: u32,
+) -> Duration {
+    let failed_at = Instant::now();
+    let streamed_for = resume_state.attempt_streamed_for(failed_at);
+    let delay = backoff.delay_after(streamed_for);
+    let status = resume_state.record_failure(error, failed_at);
+    // Shows the reason in the kept window while the session resumes.
+    resume_state.set_reconnect_phase(ReconnectPhase::Attempting);
+    tracing::warn!(
+        error = ?error,
+        session_id = %bootstrap.session_id,
+        retry_seconds = delay.as_secs(),
+        streamed_seconds = streamed_for.map(|streamed| streamed.as_secs()),
+        reason = ?status.reason,
+        startup_failures,
+        "remote viewer disconnected; waiting to resume"
+    );
+    if !ever_presented {
+        launch_status::report(LaunchStatus::Retrying {
+            attempt: startup_failures + 1,
+            max: reconnect::STARTUP_ATTEMPTS,
+        });
+    }
+    delay
+}
+
+/// Takes refreshed credentials for the next attempt. Failing to refresh them
+/// retries the existing session unless it can no longer be resumed.
+fn apply_resumed(
+    resume_state: &transport::ViewerResumeState,
+    bootstrap: &mut meshrmm_protocol::SessionBootstrap,
+    resumed: anyhow::Result<meshrmm_protocol::SessionBootstrap>,
+) -> anyhow::Result<()> {
+    match resumed {
+        Ok(refreshed) => {
+            *bootstrap = refreshed;
+            tracing::info!(
+                session_id = %bootstrap.session_id,
+                expires_at_unix_ms = bootstrap.expires_at_unix_ms,
+                "refreshed remote-session credentials for reconnect"
+            );
+        }
+        Err(error) if signaling::is_terminal_session_error(&error) => {
+            return Err(error).context("remote viewer session can no longer be resumed");
+        }
+        Err(error) => {
+            // A restart explains an offline Agent better than the failure does.
+            let reason = reconnect::classify_resume_failure(&error)
+                .filter(|_| resume_state.restarting().is_none());
+            if let Some(reason) = reason {
+                resume_state.update_reconnect_status(|status| status.reason = reason);
+            }
+            tracing::warn!(
+                error = ?error,
+                session_id = %bootstrap.session_id,
+                ?reason,
+                "could not refresh resume credentials; retrying the existing session"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Releases the device lease after the session ended by choice. A failure
