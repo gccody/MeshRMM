@@ -27,18 +27,12 @@ impl DesktopCaptureStreamer {
             Some(DesktopTarget::Background) | None => preferred_desktop(),
             Some(target) => target,
         };
-        match start_input_helper(
+        match self.start_helper(
             ParentCommand::ShowConnectionNotification {
                 text: notification.text().to_owned(),
             },
             target,
             DisplayId(0),
-            Arc::clone(&self.cursor),
-            Arc::clone(&self.clipboard),
-            Arc::clone(&self.files),
-            Arc::clone(&self.chat),
-            Arc::clone(&self.maintenance),
-            Arc::clone(&self.credentials),
         ) {
             Ok(helper) => {
                 notification.mark_shown();

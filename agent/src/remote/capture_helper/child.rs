@@ -1,4 +1,6 @@
 //! The helper processes' side: a run loop for each kind of helper.
+use std::ops::ControlFlow;
+
 use super::*;
 
 /// Entry point for the isolated LocalSystem desktop helper. It loads no Agent
@@ -116,6 +118,8 @@ pub fn run_child() -> anyhow::Result<()> {
     }
 }
 
+type ChildOutput = Arc<Mutex<BufWriter<io::Stdout>>>;
+
 pub(super) fn run_capture_child(
     command_rx: mpsc::Receiver<io::Result<ParentCommand>>,
     mut display_id: Option<DisplayId>,
@@ -124,7 +128,7 @@ pub(super) fn run_capture_child(
 ) -> anyhow::Result<()> {
     let background = is_background_child();
     let mut border_enabled = false;
-    'capture: loop {
+    loop {
         if config.frames_per_second == 0 || config.bitrate_bits_per_second == 0 {
             anyhow::bail!("desktop-helper frame rate and bitrate must be positive");
         }
@@ -145,7 +149,7 @@ pub(super) fn run_capture_child(
             .or_else(|| displays.first())
             .cloned()
             .context("Windows reported no displays on the active desktop")?;
-        let mut border = if border_enabled && !background {
+        let border = if border_enabled && !background {
             Some(crate::remote::display_border::DisplayBorder::show(
                 &active_display,
             )?)
@@ -154,19 +158,7 @@ pub(super) fn run_capture_child(
         };
         let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
         let ipc_failed = Arc::new(AtomicBool::new(false));
-        let sink_output = Arc::clone(&output);
-        let sink_failed = Arc::clone(&ipc_failed);
-        let sink: EncodedFrameSink = Arc::new(move |frame| {
-            let mut output = sink_output
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if write_event(&mut *output, &ChildEvent::Frame(frame))
-                .and_then(|()| output.flush())
-                .is_err()
-            {
-                sink_failed.store(true, Ordering::Release);
-            }
-        });
+        let sink = frame_sink(Arc::clone(&output), Arc::clone(&ipc_failed));
         let mut streamer = WindowsDesktopDuplicationStreamer::new();
         let active = match streamer.start(config, active_display.id.0, sink) {
             Ok(active) => active,
@@ -183,70 +175,135 @@ pub(super) fn run_capture_child(
                 active_display: active_display.clone(),
             }),
         )?;
-
-        let mut terminal_error = None;
-        loop {
-            let _keep_border_alive = &border;
-            if ipc_failed.load(Ordering::Acquire) {
-                break;
+        let mut stream = CaptureStream {
+            streamer,
+            ipc_failed,
+            output,
+            border,
+            active_display,
+        };
+        let terminal_error = match stream.serve(&command_rx, &mut border_enabled, background)? {
+            CaptureEnd::Restart {
+                display_id: next_display,
+                headless: next_headless,
+                config: next_config,
+            } => {
+                display_id = next_display;
+                headless = next_headless;
+                config = next_config;
+                continue;
             }
-            if let Some(result) = streamer.poll_ended() {
-                if let Err(error) = result {
-                    terminal_error = Some(error.to_string());
-                }
-                break;
+            CaptureEnd::Finished(terminal_error) => terminal_error,
+        };
+        let _ = stream.streamer.stop();
+        if stream.ipc_failed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match terminal_error {
+            Some(message) => emit_child_event(&stream.output, ChildEvent::Error(message))?,
+            None => emit_child_event(&stream.output, ChildEvent::Stopped)?,
+        }
+        return Ok(());
+    }
+}
+
+/// Writes each encoded frame to the parent, and records a failed write in
+/// `failed` so the capture loop can stop.
+fn frame_sink(output: ChildOutput, failed: Arc<AtomicBool>) -> EncodedFrameSink {
+    Arc::new(move |frame| {
+        let mut output = output.lock().unwrap_or_else(|error| error.into_inner());
+        if write_event(&mut *output, &ChildEvent::Frame(frame))
+            .and_then(|()| output.flush())
+            .is_err()
+        {
+            failed.store(true, Ordering::Release);
+        }
+    })
+}
+
+/// How a capture stream ended.
+enum CaptureEnd {
+    /// The parent sent new settings, so capture starts again with them.
+    Restart {
+        display_id: Option<DisplayId>,
+        headless: Option<HeadlessTarget>,
+        config: StreamConfig,
+    },
+    /// The stream is over, with the error to report if it failed.
+    Finished(Option<String>),
+}
+
+/// A started capture stream. Fields drop in declaration order, so the
+/// streamer stops before the display border closes.
+struct CaptureStream {
+    streamer: WindowsDesktopDuplicationStreamer,
+    ipc_failed: Arc<AtomicBool>,
+    output: ChildOutput,
+    border: Option<crate::remote::display_border::DisplayBorder>,
+    active_display: Display,
+}
+
+impl CaptureStream {
+    /// Applies the parent's commands until the stream ends or the parent
+    /// restarts it with new settings.
+    fn serve(
+        &mut self,
+        command_rx: &mpsc::Receiver<io::Result<ParentCommand>>,
+        border_enabled: &mut bool,
+        background: bool,
+    ) -> anyhow::Result<CaptureEnd> {
+        loop {
+            if self.ipc_failed.load(Ordering::Acquire) {
+                return Ok(CaptureEnd::Finished(None));
+            }
+            if let Some(result) = self.streamer.poll_ended() {
+                return Ok(CaptureEnd::Finished(
+                    result.err().map(|error| error.to_string()),
+                ));
             }
             match command_rx.recv_timeout(Duration::from_millis(16)) {
                 Ok(Ok(ParentCommand::SetDisplayBorder(enabled))) => {
-                    border = None;
-                    border_enabled = enabled && !background;
-                    if border_enabled {
-                        match crate::remote::display_border::DisplayBorder::show(&active_display) {
-                            Ok(value) => border = Some(value),
-                            Err(error) => emit_child_event(
-                                &output,
-                                ChildEvent::MaintenanceError(format!("Display border: {error:#}")),
-                            )?,
-                        }
-                    }
+                    *border_enabled = enabled && !background;
+                    self.set_border(*border_enabled)?;
                 }
                 Ok(Ok(ParentCommand::SetCursorCapture(enabled))) => {
-                    streamer.set_cursor_capture(enabled);
+                    self.streamer.set_cursor_capture(enabled);
                 }
                 Ok(Ok(ParentCommand::RequestKeyframe)) => {
-                    if let Err(error) = streamer.request_keyframe() {
-                        terminal_error = Some(error.to_string());
-                        break;
+                    if let Err(error) = self.streamer.request_keyframe() {
+                        return Ok(CaptureEnd::Finished(Some(error.to_string())));
                     }
                 }
                 Ok(Ok(ParentCommand::SetBitrate(bits_per_second))) => {
-                    if let Err(error) = streamer.set_bitrate(bits_per_second.max(1)) {
-                        terminal_error = Some(error.to_string());
-                        break;
+                    if let Err(error) = self.streamer.set_bitrate(bits_per_second.max(1)) {
+                        return Ok(CaptureEnd::Finished(Some(error.to_string())));
                     }
                 }
-                Ok(Ok(ParentCommand::Stop)) => break,
+                Ok(Ok(ParentCommand::Stop)) => return Ok(CaptureEnd::Finished(None)),
                 Ok(Ok(ParentCommand::Start {
                     viewer_name: _,
-                    display_id: next_display,
-                    frames_per_second: next_fps,
-                    bitrate_bits_per_second: next_bitrate,
-                    codec: next_codec,
-                    pixel_format: next_pixel_format,
-                    capture_cursor: next_capture_cursor,
-                    grayscale: next_grayscale,
-                    headless: next_headless,
+                    display_id,
+                    frames_per_second,
+                    bitrate_bits_per_second,
+                    codec,
+                    pixel_format,
+                    capture_cursor,
+                    grayscale,
+                    headless,
                 })) => {
-                    streamer.stop()?;
-                    display_id = next_display;
-                    headless = next_headless;
-                    config.frames_per_second = next_fps;
-                    config.bitrate_bits_per_second = next_bitrate;
-                    config.codec = next_codec;
-                    config.pixel_format = next_pixel_format;
-                    config.capture_cursor = next_capture_cursor;
-                    config.grayscale = next_grayscale;
-                    continue 'capture;
+                    self.streamer.stop()?;
+                    return Ok(CaptureEnd::Restart {
+                        display_id,
+                        headless,
+                        config: StreamConfig {
+                            frames_per_second,
+                            bitrate_bits_per_second,
+                            codec,
+                            pixel_format,
+                            capture_cursor,
+                            grayscale,
+                        },
+                    });
                 }
                 Ok(Ok(
                     ParentCommand::EnumerateDisplays
@@ -272,23 +329,30 @@ pub(super) fn run_capture_child(
                     | ParentCommand::StartChat
                     | ParentCommand::StopChat,
                 )) => {
-                    terminal_error =
-                        Some("capture helper received a command reserved for input".into());
-                    break;
+                    return Ok(CaptureEnd::Finished(Some(
+                        "capture helper received a command reserved for input".into(),
+                    )));
                 }
-                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok(CaptureEnd::Finished(None));
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
-        let _ = streamer.stop();
-        if ipc_failed.load(Ordering::Acquire) {
-            return Ok(());
+    }
+
+    fn set_border(&mut self, enabled: bool) -> io::Result<()> {
+        self.border = None;
+        if enabled {
+            match crate::remote::display_border::DisplayBorder::show(&self.active_display) {
+                Ok(value) => self.border = Some(value),
+                Err(error) => emit_child_event(
+                    &self.output,
+                    ChildEvent::MaintenanceError(format!("Display border: {error:#}")),
+                )?,
+            }
         }
-        match terminal_error {
-            Some(message) => emit_child_event(&output, ChildEvent::Error(message))?,
-            None => emit_child_event(&output, ChildEvent::Stopped)?,
-        }
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -300,11 +364,7 @@ pub(super) fn run_input_child(
     if is_background_child() {
         return run_background_input_child(command_rx);
     }
-    let displays = enumerate_displays()?;
-    let active_display = displays
-        .into_iter()
-        .find(|display| display.id == display_id)
-        .context("input helper could not find the selected display")?;
+    let active_display = find_display(display_id)?;
     let mut keep_awake = None;
     let mut input = WindowsInputController::new();
     input.set_active_display(active_display)?;
@@ -319,8 +379,57 @@ pub(super) fn run_input_child(
     )?;
     // UI Automation providers may block; keep discovery and fills off the
     // desktop input loop so pointer/key release remains responsive.
+    let credential_tx = spawn_credential_filler(output.clone())?;
+    let mut sent_cursor = None;
+    let terminal_error = loop {
+        let cursor = (
+            input.cursor_shape(),
+            input.viewer_controls_input(),
+            input.agent_pointer_display(),
+        );
+        if sent_cursor != Some(cursor) {
+            if emit_child_event(&output, ChildEvent::Cursor(cursor.0, cursor.1, cursor.2)).is_err()
+            {
+                break None;
+            }
+            sent_cursor = Some(cursor);
+        }
+        match command_rx.recv_timeout(Duration::from_millis(16)) {
+            Ok(Ok(command)) => {
+                let flow = apply_input_command(
+                    command,
+                    &mut input,
+                    &mut keep_awake,
+                    &credential_tx,
+                    &output,
+                )?;
+                if let ControlFlow::Break(terminal_error) = flow {
+                    break terminal_error;
+                }
+            }
+            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    let _ = input.release_all();
+    match terminal_error {
+        Some(message) => emit_child_event(&output, ChildEvent::Error(message))?,
+        None => emit_child_event(&output, ChildEvent::Stopped)?,
+    }
+    Ok(())
+}
+
+fn find_display(display_id: DisplayId) -> anyhow::Result<Display> {
+    enumerate_displays()?
+        .into_iter()
+        .find(|display| display.id == display_id)
+        .context("input helper could not find the selected display")
+}
+
+/// Starts the thread that reports whether a credential prompt is showing
+/// and fills it with the credentials sent through the returned channel.
+fn spawn_credential_filler(output: ChildOutput) -> io::Result<mpsc::SyncSender<Vec<u8>>> {
     let (credential_tx, credential_rx) = mpsc::sync_channel::<Vec<u8>>(1);
-    let credential_output = output.clone();
     thread::Builder::new()
         .name("meshrmm-credential-fields".into())
         .spawn(move || {
@@ -329,9 +438,7 @@ pub(super) fn run_input_child(
             loop {
                 let ready = detector.as_ref().is_some_and(|d| d.ready());
                 if last_ready != Some(ready) {
-                    if emit_child_event(&credential_output, ChildEvent::CredentialPrompt(ready))
-                        .is_err()
-                    {
+                    if emit_child_event(&output, ChildEvent::CredentialPrompt(ready)).is_err() {
                         break;
                     }
                     last_ready = Some(ready);
@@ -350,7 +457,7 @@ pub(super) fn run_input_child(
                             Err(error) => format!("Autofill: {error:#}"),
                         };
                         if emit_child_event(
-                            &credential_output,
+                            &output,
                             ChildEvent::Credentials(CredentialResult {
                                 encrypted: None,
                                 message,
@@ -366,113 +473,90 @@ pub(super) fn run_input_child(
                 }
             }
         })?;
-    let mut sent_cursor = None;
-    let mut terminal_error = None;
-    loop {
-        let cursor = (
-            input.cursor_shape(),
-            input.viewer_controls_input(),
-            input.agent_pointer_display(),
-        );
-        if sent_cursor != Some(cursor) {
-            if emit_child_event(&output, ChildEvent::Cursor(cursor.0, cursor.1, cursor.2)).is_err()
-            {
-                break;
-            }
-            sent_cursor = Some(cursor);
-        }
-        match command_rx.recv_timeout(Duration::from_millis(16)) {
-            Ok(Ok(ParentCommand::AutofillCredentials(encrypted))) => {
-                if credential_tx.try_send(encrypted).is_err() {
-                    emit_child_event(
-                        &output,
-                        ChildEvent::MaintenanceError(
-                            "Credential autofill is busy; try again".into(),
-                        ),
-                    )?;
-                }
-            }
-            Ok(Ok(ParentCommand::SetPreventIdleLock(enabled))) => {
-                if let Err(error) = crate::remote::keep_awake::set_enabled(&mut keep_awake, enabled)
-                {
-                    emit_child_event(
-                        &output,
-                        ChildEvent::MaintenanceError(format!("Prevent idle lock: {error:#}")),
-                    )?;
-                }
-            }
-            Ok(Ok(ParentCommand::StartInput { display_id, .. })) => {
-                let result = enumerate_displays().and_then(|displays| {
-                    let display = displays
-                        .into_iter()
-                        .find(|display| display.id == display_id)
-                        .context("input helper could not find the selected display")?;
-                    input.set_active_display(display)
-                });
-                if let Err(error) = result {
-                    terminal_error = Some(error.to_string());
-                    break;
-                }
-            }
-            Ok(Ok(ParentCommand::Input(event))) => {
-                if let Err(error) = input.apply(event) {
-                    tracing::warn!(%error, "desktop input helper discarded invalid input");
-                }
-            }
-            Ok(Ok(ParentCommand::Annotate(annotation))) => {
-                if let Err(error) = input.annotate(annotation) {
-                    emit_child_event(
-                        &output,
-                        ChildEvent::MaintenanceError(format!("Annotate: {error:#}")),
-                    )?;
-                }
-            }
-            Ok(Ok(ParentCommand::Blackout { enabled, text })) => {
-                if let Err(error) = input.set_blackout(enabled, &text) {
-                    emit_child_event(&output, ChildEvent::MaintenanceError(error.to_string()))?;
-                    continue;
-                }
+    Ok(credential_tx)
+}
+
+/// Applies one parent command to the input helper. `Break` ends the helper,
+/// with the error to report if it failed.
+fn apply_input_command(
+    command: ParentCommand,
+    input: &mut WindowsInputController,
+    keep_awake: &mut Option<crate::remote::keep_awake::KeepAwake>,
+    credential_tx: &mpsc::SyncSender<Vec<u8>>,
+    output: &ChildOutput,
+) -> anyhow::Result<ControlFlow<Option<String>>> {
+    match command {
+        ParentCommand::AutofillCredentials(encrypted) => {
+            if credential_tx.try_send(encrypted).is_err() {
                 emit_child_event(
-                    &output,
-                    ChildEvent::MaintenanceState {
-                        agent_input_blocked: input.blocked(),
-                        blacked_out: input.blacked_out(),
-                    },
+                    output,
+                    ChildEvent::MaintenanceError("Credential autofill is busy; try again".into()),
                 )?;
             }
-            Ok(Ok(ParentCommand::BlockInput(blocked))) => {
-                if let Err(error) = input.set_blocked(blocked) {
-                    emit_child_event(&output, ChildEvent::MaintenanceError(error.to_string()))?;
-                    continue;
-                }
+        }
+        ParentCommand::SetPreventIdleLock(enabled) => {
+            if let Err(error) = crate::remote::keep_awake::set_enabled(keep_awake, enabled) {
                 emit_child_event(
-                    &output,
-                    ChildEvent::MaintenanceState {
-                        agent_input_blocked: input.blocked(),
-                        blacked_out: input.blacked_out(),
-                    },
+                    output,
+                    ChildEvent::MaintenanceError(format!("Prevent idle lock: {error:#}")),
                 )?;
             }
-            Ok(Ok(ParentCommand::ReleaseInput)) => {
-                if let Err(error) = input.release_all() {
-                    tracing::warn!(%error, "desktop input helper could not release input");
-                }
+        }
+        ParentCommand::StartInput { display_id, .. } => {
+            let result =
+                find_display(display_id).and_then(|display| input.set_active_display(display));
+            if let Err(error) = result {
+                return Ok(ControlFlow::Break(Some(error.to_string())));
             }
-            Ok(Ok(ParentCommand::Stop)) => break,
-            Ok(Ok(_)) => {
-                terminal_error = Some("input helper received a video command".into());
-                break;
+        }
+        ParentCommand::Input(event) => {
+            if let Err(error) = input.apply(event) {
+                tracing::warn!(%error, "desktop input helper discarded invalid input");
             }
-            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        ParentCommand::Annotate(annotation) => {
+            if let Err(error) = input.annotate(annotation) {
+                emit_child_event(
+                    output,
+                    ChildEvent::MaintenanceError(format!("Annotate: {error:#}")),
+                )?;
+            }
+        }
+        ParentCommand::Blackout { enabled, text } => match input.set_blackout(enabled, &text) {
+            Ok(()) => emit_maintenance_state(output, input)?,
+            Err(error) => {
+                emit_child_event(output, ChildEvent::MaintenanceError(error.to_string()))?
+            }
+        },
+        ParentCommand::BlockInput(blocked) => match input.set_blocked(blocked) {
+            Ok(()) => emit_maintenance_state(output, input)?,
+            Err(error) => {
+                emit_child_event(output, ChildEvent::MaintenanceError(error.to_string()))?
+            }
+        },
+        ParentCommand::ReleaseInput => {
+            if let Err(error) = input.release_all() {
+                tracing::warn!(%error, "desktop input helper could not release input");
+            }
+        }
+        ParentCommand::Stop => return Ok(ControlFlow::Break(None)),
+        _ => {
+            return Ok(ControlFlow::Break(Some(
+                "input helper received a video command".into(),
+            )));
         }
     }
-    let _ = input.release_all();
-    match terminal_error {
-        Some(message) => emit_child_event(&output, ChildEvent::Error(message))?,
-        None => emit_child_event(&output, ChildEvent::Stopped)?,
-    }
-    Ok(())
+    Ok(ControlFlow::Continue(()))
+}
+
+fn emit_maintenance_state(output: &ChildOutput, input: &WindowsInputController) -> io::Result<()> {
+    emit_child_event(
+        output,
+        ChildEvent::MaintenanceState {
+            agent_input_blocked: input.blocked(),
+            blacked_out: input.blacked_out(),
+        },
+    )
 }
 
 pub(super) fn is_background_child() -> bool {
@@ -567,10 +651,7 @@ pub(super) fn enumerate_displays() -> anyhow::Result<Vec<Display>> {
         .collect()
 }
 
-pub(super) fn emit_child_event(
-    output: &Arc<Mutex<BufWriter<io::Stdout>>>,
-    event: ChildEvent,
-) -> io::Result<()> {
+pub(super) fn emit_child_event(output: &ChildOutput, event: ChildEvent) -> io::Result<()> {
     let mut output = output.lock().unwrap_or_else(|error| error.into_inner());
     write_event(&mut *output, &event)?;
     output.flush()

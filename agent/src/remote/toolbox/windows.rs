@@ -332,13 +332,73 @@ fn execute(
     user: Option<&UserLogon>,
     timeout: Duration,
 ) -> anyhow::Result<Outcome> {
-    // Pipes start non-inheritable. Only the child's ends become
-    // inheritable, and the handle list keeps a concurrent launch from
-    // passing them on.
     let (child_input, parent_input) = create_pipe()?;
     let (parent_output, child_output) = create_pipe()?;
     let (parent_error, child_error) = create_pipe()?;
     drop(parent_input);
+    let (process, thread) = create_suspended(
+        application,
+        command_line,
+        working_directory,
+        user,
+        [child_input, child_output, child_error],
+    )?;
+    // A job lets a timeout stop what the script started, too. It is not
+    // closed with the job, so programs a finished script started keep
+    // running.
+    let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+        .ok()
+        .map(OwnedHandle)
+        .filter(|job| unsafe { AssignProcessToJobObject(job.0, process.0) }.is_ok());
+    unsafe { ResumeThread(thread.0) };
+    drop(thread);
+
+    let stdout = Arc::new(Mutex::new(Output::default()));
+    let stderr = Arc::new(Mutex::new(Output::default()));
+    let drained = drain_output([(parent_output, &stdout), (parent_error, &stderr)])?;
+
+    let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+    let timed_out = unsafe { WaitForSingleObject(process.0, milliseconds) } == WAIT_TIMEOUT;
+    if timed_out {
+        match &job {
+            Some(job) => unsafe { TerminateJobObject(job.0, 1) },
+            None => unsafe { TerminateProcess(process.0, 1) },
+        }
+        .context("could not stop the script after its timeout")?;
+        unsafe { WaitForSingleObject(process.0, 5_000) };
+    }
+    let mut exit_code = 0;
+    unsafe { GetExitCodeProcess(process.0, &mut exit_code) }
+        .context("could not read the script's exit code")?;
+    for _ in 0..2 {
+        if drained.recv_timeout(OUTPUT_DRAIN).is_err() {
+            break;
+        }
+    }
+    let take = |output: &Arc<Mutex<Output>>| {
+        std::mem::take(&mut *output.lock().unwrap_or_else(|error| error.into_inner()))
+    };
+    Ok(Outcome {
+        exit_code,
+        timed_out,
+        stdout: take(&stdout),
+        stderr: take(&stderr),
+    })
+}
+
+/// Starts `application` suspended, with the child's ends of the input,
+/// output and error pipes as its standard handles, and returns its process
+/// and main thread.
+fn create_suspended(
+    application: &Path,
+    command_line: &str,
+    working_directory: &Path,
+    user: Option<&UserLogon>,
+    [child_input, child_output, child_error]: [OwnedHandle; 3],
+) -> anyhow::Result<(OwnedHandle, OwnedHandle)> {
+    // Pipes start non-inheritable. Only the child's ends become
+    // inheritable, and the handle list keeps a concurrent launch from
+    // passing them on.
     let child_handles = [child_input.0, child_output.0, child_error.0];
     for handle in child_handles {
         unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
@@ -414,22 +474,19 @@ fn execute(
         let _ = unsafe { DestroyEnvironmentBlock(environment) };
     }
     launched.context("Windows could not start the interpreter")?;
-    let process = OwnedHandle(information.hProcess);
-    let thread = OwnedHandle(information.hThread);
-    // A job lets a timeout stop what the script started, too. It is not
-    // closed with the job, so programs a finished script started keep
-    // running.
-    let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
-        .ok()
-        .map(OwnedHandle)
-        .filter(|job| unsafe { AssignProcessToJobObject(job.0, process.0) }.is_ok());
-    unsafe { ResumeThread(thread.0) };
-    drop(thread);
+    Ok((
+        OwnedHandle(information.hProcess),
+        OwnedHandle(information.hThread),
+    ))
+}
 
-    let stdout = Arc::new(Mutex::new(Output::default()));
-    let stderr = Arc::new(Mutex::new(Output::default()));
+/// Copies each pipe into its output on a thread of its own. The returned
+/// receiver gets a message as each pipe closes.
+fn drain_output(
+    pipes: [(OwnedHandle, &Arc<Mutex<Output>>); 2],
+) -> anyhow::Result<mpsc::Receiver<()>> {
     let (drained_tx, drained) = mpsc::channel();
-    for (pipe, output) in [(parent_output, &stdout), (parent_error, &stderr)] {
+    for (pipe, output) in pipes {
         let output = Arc::clone(output);
         let drained_tx = drained_tx.clone();
         std::thread::Builder::new()
@@ -451,34 +508,7 @@ fn execute(
             .context("could not start a thread for the script's output")?;
     }
     drop(drained_tx);
-
-    let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
-    let timed_out = unsafe { WaitForSingleObject(process.0, milliseconds) } == WAIT_TIMEOUT;
-    if timed_out {
-        match &job {
-            Some(job) => unsafe { TerminateJobObject(job.0, 1) },
-            None => unsafe { TerminateProcess(process.0, 1) },
-        }
-        .context("could not stop the script after its timeout")?;
-        unsafe { WaitForSingleObject(process.0, 5_000) };
-    }
-    let mut exit_code = 0;
-    unsafe { GetExitCodeProcess(process.0, &mut exit_code) }
-        .context("could not read the script's exit code")?;
-    for _ in 0..2 {
-        if drained.recv_timeout(OUTPUT_DRAIN).is_err() {
-            break;
-        }
-    }
-    let take = |output: &Arc<Mutex<Output>>| {
-        std::mem::take(&mut *output.lock().unwrap_or_else(|error| error.into_inner()))
-    };
-    Ok(Outcome {
-        exit_code,
-        timed_out,
-        stdout: take(&stdout),
-        stderr: take(&stderr),
-    })
+    Ok(drained)
 }
 
 /// Downloads, checks and saves `delivery`'s file, and returns where it went.
