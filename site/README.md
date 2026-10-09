@@ -34,8 +34,9 @@ serves only static assets:
   works as a header.
 
 The workflow needs the `CLOUDFLARE_API_TOKEN` repository secret: an API token
-with Account › Workers Scripts › Edit and, for the `meshrmm.com` zone,
-Zone › Workers Routes › Edit and DNS › Edit. To deploy from your own machine
+made from Cloudflare's "Edit Cloudflare Workers" template, limited to the
+account in `wrangler.jsonc` and the `meshrmm.com` zone. Set it with
+`gh secret set CLOUDFLARE_API_TOKEN`. To deploy from your own machine
 instead, run `npx wrangler login`, then `npx wrangler deploy` in this directory.
 
 On another static host, publish `index.html`, `styles.css`, `favicon.svg` and
