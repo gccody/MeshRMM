@@ -3,13 +3,11 @@
 use super::tests::*;
 use super::*;
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
-use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
-};
-use windows::Win32::System::Variant::{VARIANT, VARIANT_0_0, VT_I4};
-use windows::Win32::UI::Accessibility::*;
-use windows::Win32::UI::Controls::{LVM_GETITEMCOUNT, SetScrollInfo};
-use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, SetFocus};
+use windows::Win32::UI::Controls::SetScrollInfo;
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+
+mod automation;
+mod native_apps;
 
 fn display() -> meshrmm_protocol::DisplayId {
     meshrmm_protocol::DisplayId(background::DISPLAY_ID)
@@ -135,89 +133,117 @@ static CONTEXT_POINT: AtomicIsize = AtomicIsize::new(0);
 const FIND: usize = 101;
 const COPY: usize = 201;
 
+/// The launcher index of the pin that runs `program` with `arguments`.
+fn pin(program: &str, arguments: &str) -> usize {
+    PINS.iter()
+        .position(|pin| pin.program.ends_with(program) && pin.arguments == arguments)
+        .unwrap()
+        + 1
+}
+
+fn find(
+    workspace: &mut Workspace,
+    what: &str,
+    found: &dyn Fn() -> Option<HWND>,
+) -> anyhow::Result<HWND> {
+    wait_until(workspace, what, 20, &|_| found().is_some())?;
+    found().context("window went away")
+}
+
+unsafe extern "system" fn menu_window_proc(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // Controls send WM_COMMAND too; a menu's has no control.
+    let menu_command = message == WM_COMMAND && lparam.0 == 0;
+    let name = match message {
+        WM_ENTERMENULOOP => Some("enter"),
+        WM_EXITMENULOOP => Some("exit"),
+        WM_INITMENUPOPUP => Some("init"),
+        WM_UNINITMENUPOPUP => Some("uninit"),
+        WM_MENUSELECT => Some("select"),
+        WM_CANCELMODE => Some("cancel"),
+        _ if menu_command => Some("command"),
+        _ => None,
+    };
+    if let Some(name) = name {
+        MENU_LOG
+            .lock()
+            .unwrap()
+            .push(format!("{name} {:#x} {:#x}", wparam.0, lparam.0));
+    }
+    match message {
+        _ if menu_command => COMMAND.store(wparam.0 & 0xffff, Ordering::SeqCst),
+        WM_LBUTTONDOWN => {
+            CLIENT_PRESSES.fetch_add(1, Ordering::SeqCst);
+        }
+        WM_CONTEXTMENU => CONTEXT_POINT.store(lparam.0, Ordering::SeqCst),
+        _ => return unsafe { DefWindowProcW(window, message, wparam, lparam) },
+    }
+    LRESULT(0)
+}
+
+/// A window with a File and an Edit menu and a focused edit control, as
+/// integers that can cross back to the test's thread.
+fn menu_test_window() -> anyhow::Result<(isize, isize, isize)> {
+    unsafe {
+        let menu = CreateMenu()?;
+        let file = CreatePopupMenu()?;
+        AppendMenuW(file, MF_STRING, FIND, w!("&Find..."))?;
+        AppendMenuW(file, MF_STRING, 102, w!("E&xit"))?;
+        AppendMenuW(menu, MF_POPUP, file.0 as usize, w!("&File"))?;
+        let edit_menu = CreatePopupMenu()?;
+        AppendMenuW(edit_menu, MF_STRING, COPY, w!("&Copy"))?;
+        AppendMenuW(menu, MF_POPUP, edit_menu.0 as usize, w!("&Edit"))?;
+        let window = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("MeshRMMMenuTest"),
+            w!("Menu test"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            100,
+            100,
+            500,
+            320,
+            None,
+            Some(menu),
+            None,
+            None,
+        )?;
+        let edit = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            w!("EDIT"),
+            w!(""),
+            WS_CHILD | WS_VISIBLE,
+            10,
+            10,
+            240,
+            24,
+            Some(window),
+            None,
+            None,
+            None,
+        )?;
+        anyhow::ensure!(
+            SetForegroundWindow(window).as_bool(),
+            "the test window did not take the foreground"
+        );
+        SetFocus(Some(edit))?;
+        Ok((window.0 as isize, menu.0 as isize, edit.0 as isize))
+    }
+}
+
 #[test]
 #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
 fn menus_open_and_run_from_clicks() -> anyhow::Result<()> {
-    unsafe extern "system" fn procedure(
-        window: HWND,
-        message: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        // Controls send WM_COMMAND too; a menu's has no control.
-        let menu_command = message == WM_COMMAND && lparam.0 == 0;
-        let name = match message {
-            WM_ENTERMENULOOP => Some("enter"),
-            WM_EXITMENULOOP => Some("exit"),
-            WM_INITMENUPOPUP => Some("init"),
-            WM_UNINITMENUPOPUP => Some("uninit"),
-            WM_MENUSELECT => Some("select"),
-            WM_CANCELMODE => Some("cancel"),
-            _ if menu_command => Some("command"),
-            _ => None,
-        };
-        if let Some(name) = name {
-            MENU_LOG
-                .lock()
-                .unwrap()
-                .push(format!("{name} {:#x} {:#x}", wparam.0, lparam.0));
-        }
-        match message {
-            _ if menu_command => COMMAND.store(wparam.0 & 0xffff, Ordering::SeqCst),
-            WM_LBUTTONDOWN => {
-                CLIENT_PRESSES.fetch_add(1, Ordering::SeqCst);
-            }
-            WM_CONTEXTMENU => CONTEXT_POINT.store(lparam.0, Ordering::SeqCst),
-            _ => return unsafe { DefWindowProcW(window, message, wparam, lparam) },
-        }
-        LRESULT(0)
-    }
     in_workspace(|workspace| {
-        register(w!("MeshRMMMenuTest"), Some(procedure), WNDCLASS_STYLES(0))?;
-        let (ui, (window, menu, edit)) = UiThread::start(|| unsafe {
-            let menu = CreateMenu()?;
-            let file = CreatePopupMenu()?;
-            AppendMenuW(file, MF_STRING, FIND, w!("&Find..."))?;
-            AppendMenuW(file, MF_STRING, 102, w!("E&xit"))?;
-            AppendMenuW(menu, MF_POPUP, file.0 as usize, w!("&File"))?;
-            let edit_menu = CreatePopupMenu()?;
-            AppendMenuW(edit_menu, MF_STRING, COPY, w!("&Copy"))?;
-            AppendMenuW(menu, MF_POPUP, edit_menu.0 as usize, w!("&Edit"))?;
-            let window = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("MeshRMMMenuTest"),
-                w!("Menu test"),
-                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                100,
-                100,
-                500,
-                320,
-                None,
-                Some(menu),
-                None,
-                None,
-            )?;
-            let edit = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
-                w!("EDIT"),
-                w!(""),
-                WS_CHILD | WS_VISIBLE,
-                10,
-                10,
-                240,
-                24,
-                Some(window),
-                None,
-                None,
-                None,
-            )?;
-            anyhow::ensure!(
-                SetForegroundWindow(window).as_bool(),
-                "the test window did not take the foreground"
-            );
-            SetFocus(Some(edit))?;
-            Ok((window.0 as isize, menu.0 as isize, edit.0 as isize))
-        })?;
+        register(
+            w!("MeshRMMMenuTest"),
+            Some(menu_window_proc),
+            WNDCLASS_STYLES(0),
+        )?;
+        let (ui, (window, menu, edit)) = UiThread::start(menu_test_window)?;
         let (window, menu, edit) = (hwnd(window), HMENU(menu as *mut _), hwnd(edit));
         settle(workspace, 200);
 
@@ -267,34 +293,7 @@ fn menus_open_and_run_from_clicks() -> anyhow::Result<()> {
         })?;
         anyhow::ensure!(open_menu()?.is_none(), "the menu stayed open");
 
-        // Moving across the menu bar with a menu open switches menus.
-        unsafe { GetMenuItemRect(Some(window), menu, 0, &mut item)? };
-        click_at(
-            workspace,
-            (item.left + item.right) / 2,
-            (item.top + item.bottom) / 2,
-        )?;
-        wait_until(workspace, "the File menu", 5, &|_| {
-            open_menu().ok().flatten().is_some()
-        })?;
-        unsafe { GetMenuItemRect(Some(window), menu, 1, &mut item)? };
-        let (x, y) = normalized((item.left + item.right) / 2, (item.top + item.bottom) / 2);
-        workspace.apply(RemoteInput::PointerMove {
-            display_id: display(),
-            x,
-            y,
-        })?;
-        wait_until(workspace, "the Edit menu on hover", 5, &|_| {
-            open_menu()
-                .ok()
-                .flatten()
-                .is_some_and(|(_, items)| items == ["Copy"])
-        })?;
-        key(workspace, 0x01, false)?;
-        key(workspace, 0x01, false)?;
-        wait_until(workspace, "Escape to close the menu", 5, &|_| {
-            open_menu().ok().flatten().is_none()
-        })?;
+        hover_switches_menus(workspace, window, menu)?;
 
         // A right-click opens the context menu at the pointer.
         let point = client_to_screen(window, 300, 150);
@@ -322,141 +321,194 @@ fn menus_open_and_run_from_clicks() -> anyhow::Result<()> {
     })
 }
 
+/// Moving across the menu bar with a menu open switches menus.
+fn hover_switches_menus(
+    workspace: &mut Workspace,
+    window: HWND,
+    menu: HMENU,
+) -> anyhow::Result<()> {
+    let mut item = RECT::default();
+    unsafe { GetMenuItemRect(Some(window), menu, 0, &mut item)? };
+    click_at(
+        workspace,
+        (item.left + item.right) / 2,
+        (item.top + item.bottom) / 2,
+    )?;
+    wait_until(workspace, "the File menu", 5, &|_| {
+        open_menu().ok().flatten().is_some()
+    })?;
+    unsafe { GetMenuItemRect(Some(window), menu, 1, &mut item)? };
+    let (x, y) = normalized((item.left + item.right) / 2, (item.top + item.bottom) / 2);
+    workspace.apply(RemoteInput::PointerMove {
+        display_id: display(),
+        x,
+        y,
+    })?;
+    wait_until(workspace, "the Edit menu on hover", 5, &|_| {
+        open_menu()
+            .ok()
+            .flatten()
+            .is_some_and(|(_, items)| items == ["Copy"])
+    })?;
+    key(workspace, 0x01, false)?;
+    key(workspace, 0x01, false)?;
+    wait_until(workspace, "Escape to close the menu", 5, &|_| {
+        open_menu().ok().flatten().is_none()
+    })?;
+    Ok(())
+}
+
 static DOUBLE_CLICKS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "system" fn double_click_proc(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_LBUTTONDBLCLK {
+        DOUBLE_CLICKS.fetch_add(1, Ordering::SeqCst);
+        return LRESULT(0);
+    }
+    unsafe { DefWindowProcW(window, message, wparam, lparam) }
+}
+
+/// A pane with its own scrollbar, like Disk Management's graphical view.
+unsafe extern "system" fn scroll_pane_proc(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        if message == WM_VSCROLL {
+            let mut info = SCROLLINFO {
+                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_ALL,
+                ..Default::default()
+            };
+            let _ = GetScrollInfo(window, SB_VERT, &mut info);
+            let position = match SCROLLBAR_COMMAND((wparam.0 & 0xffff) as i32) {
+                SB_LINEUP => info.nPos - 1,
+                SB_LINEDOWN => info.nPos + 1,
+                SB_PAGEUP => info.nPos - info.nPage as i32,
+                SB_PAGEDOWN => info.nPos + info.nPage as i32,
+                SB_THUMBTRACK | SB_THUMBPOSITION => info.nTrackPos,
+                _ => info.nPos,
+            };
+            info.fMask = SIF_POS;
+            info.nPos = position;
+            SetScrollInfo(window, SB_VERT, &info, true);
+            return LRESULT(0);
+        }
+        DefWindowProcW(window, message, wparam, lparam)
+    }
+}
+
+/// A window with a scrolling pane, a long list and a focused edit control,
+/// as integers that can cross back to the test's thread.
+fn pointer_test_windows() -> anyhow::Result<(isize, isize, isize)> {
+    unsafe {
+        let window = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("MeshRMMPointerTest"),
+            w!("Pointer test"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            100,
+            80,
+            600,
+            400,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        let pane = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            w!("MeshRMMScrollPane"),
+            w!(""),
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL,
+            10,
+            10,
+            200,
+            240,
+            Some(window),
+            None,
+            None,
+            None,
+        )?;
+        let info = SCROLLINFO {
+            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+            nMin: 0,
+            nMax: 109,
+            nPage: 10,
+            nPos: 0,
+            nTrackPos: 0,
+        };
+        SetScrollInfo(pane, SB_VERT, &info, true);
+        let list = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            w!("LISTBOX"),
+            w!(""),
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL,
+            240,
+            10,
+            200,
+            200,
+            Some(window),
+            None,
+            None,
+            None,
+        )?;
+        for index in 0..100 {
+            let label = wide(format!("Item {index}"));
+            SendMessageW(
+                list,
+                LB_ADDSTRING,
+                None,
+                Some(LPARAM(label.as_ptr() as isize)),
+            );
+        }
+        let edit = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            w!("EDIT"),
+            w!(""),
+            WS_CHILD | WS_VISIBLE,
+            240,
+            230,
+            200,
+            24,
+            Some(window),
+            None,
+            None,
+            None,
+        )?;
+        anyhow::ensure!(
+            SetForegroundWindow(window).as_bool(),
+            "the test window did not take the foreground"
+        );
+        // The edit keeps the focus: the test's clicks don't take it.
+        SetFocus(Some(edit))?;
+        Ok((window.0 as isize, pane.0 as isize, list.0 as isize))
+    }
+}
 
 #[test]
 #[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
 fn double_clicks_scrollbars_and_wheel() -> anyhow::Result<()> {
-    unsafe extern "system" fn procedure(
-        window: HWND,
-        message: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        if message == WM_LBUTTONDBLCLK {
-            DOUBLE_CLICKS.fetch_add(1, Ordering::SeqCst);
-            return LRESULT(0);
-        }
-        unsafe { DefWindowProcW(window, message, wparam, lparam) }
-    }
-    /// A pane with its own scrollbar, like Disk Management's graphical view.
-    unsafe extern "system" fn pane(
-        window: HWND,
-        message: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        unsafe {
-            if message == WM_VSCROLL {
-                let mut info = SCROLLINFO {
-                    cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-                    fMask: SIF_ALL,
-                    ..Default::default()
-                };
-                let _ = GetScrollInfo(window, SB_VERT, &mut info);
-                let position = match SCROLLBAR_COMMAND((wparam.0 & 0xffff) as i32) {
-                    SB_LINEUP => info.nPos - 1,
-                    SB_LINEDOWN => info.nPos + 1,
-                    SB_PAGEUP => info.nPos - info.nPage as i32,
-                    SB_PAGEDOWN => info.nPos + info.nPage as i32,
-                    SB_THUMBTRACK | SB_THUMBPOSITION => info.nTrackPos,
-                    _ => info.nPos,
-                };
-                info.fMask = SIF_POS;
-                info.nPos = position;
-                SetScrollInfo(window, SB_VERT, &info, true);
-                return LRESULT(0);
-            }
-            DefWindowProcW(window, message, wparam, lparam)
-        }
-    }
     in_workspace(|workspace| {
-        register(w!("MeshRMMPointerTest"), Some(procedure), CS_DBLCLKS)?;
-        register(w!("MeshRMMScrollPane"), Some(pane), WNDCLASS_STYLES(0))?;
-        let (ui, (window, pane, list)) = UiThread::start(|| unsafe {
-            let window = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("MeshRMMPointerTest"),
-                w!("Pointer test"),
-                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                100,
-                80,
-                600,
-                400,
-                None,
-                None,
-                None,
-                None,
-            )?;
-            let pane = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
-                w!("MeshRMMScrollPane"),
-                w!(""),
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL,
-                10,
-                10,
-                200,
-                240,
-                Some(window),
-                None,
-                None,
-                None,
-            )?;
-            let info = SCROLLINFO {
-                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-                fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
-                nMin: 0,
-                nMax: 109,
-                nPage: 10,
-                nPos: 0,
-                nTrackPos: 0,
-            };
-            SetScrollInfo(pane, SB_VERT, &info, true);
-            let list = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
-                w!("LISTBOX"),
-                w!(""),
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL,
-                240,
-                10,
-                200,
-                200,
-                Some(window),
-                None,
-                None,
-                None,
-            )?;
-            for index in 0..100 {
-                let label = wide(format!("Item {index}"));
-                SendMessageW(
-                    list,
-                    LB_ADDSTRING,
-                    None,
-                    Some(LPARAM(label.as_ptr() as isize)),
-                );
-            }
-            let edit = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
-                w!("EDIT"),
-                w!(""),
-                WS_CHILD | WS_VISIBLE,
-                240,
-                230,
-                200,
-                24,
-                Some(window),
-                None,
-                None,
-                None,
-            )?;
-            anyhow::ensure!(
-                SetForegroundWindow(window).as_bool(),
-                "the test window did not take the foreground"
-            );
-            // The edit keeps the focus: the clicks below don't take it.
-            SetFocus(Some(edit))?;
-            Ok((window.0 as isize, pane.0 as isize, list.0 as isize))
-        })?;
+        register(
+            w!("MeshRMMPointerTest"),
+            Some(double_click_proc),
+            CS_DBLCLKS,
+        )?;
+        register(
+            w!("MeshRMMScrollPane"),
+            Some(scroll_pane_proc),
+            WNDCLASS_STYLES(0),
+        )?;
+        let (ui, (window, pane, list)) = UiThread::start(pointer_test_windows)?;
         let (window, pane, list) = (hwnd(window), hwnd(pane), hwnd(list));
         settle(workspace, 200);
 
@@ -519,684 +571,6 @@ fn double_clicks_scrollbars_and_wheel() -> anyhow::Result<()> {
         )?;
         drop(ui);
         println!("Session 0 double-clicks, scrollbars, wheel and caption double-click passed");
-        Ok(())
-    })
-}
-
-/// A visible dialog (`#32770`) of the workspace's job whose title satisfies `accept`.
-fn dialog(workspace: &Workspace, accept: &dyn Fn(&str) -> bool) -> Option<HWND> {
-    background::windows().ok()?.into_iter().find(|window| {
-        let mut class = [0_u16; 16];
-        let length = unsafe { GetClassNameW(*window, &mut class) } as usize;
-        String::from_utf16_lossy(&class[..length]) == "#32770"
-            && accept(&window_text(*window))
-            && workspace.owns_window(*window)
-    })
-}
-
-/// Waits for a dialog, then closes it with Escape.
-fn dialog_opens(
-    workspace: &mut Workspace,
-    what: &str,
-    accept: &dyn Fn(&str) -> bool,
-) -> anyhow::Result<()> {
-    wait_until(workspace, what, 10, &|workspace| {
-        dialog(workspace, accept).is_some()
-    })
-    .inspect_err(|_| {
-        let _ = proof(&format!(
-            "background-{}-failure.bmp",
-            what.replace(' ', "-")
-        ));
-    })?;
-    proof(&format!("background-{}.bmp", what.replace(' ', "-")))?;
-    key(workspace, 0x01, false)?;
-    wait_until(workspace, &format!("{what} to close"), 10, &|workspace| {
-        dialog(workspace, accept).is_none()
-    })
-}
-
-/// The first row of a report-view list, below its header.
-fn first_row(list: HWND) -> anyhow::Result<POINT> {
-    let mut rect = RECT::default();
-    unsafe { GetWindowRect(list, &mut rect)? };
-    let top = child(list, "SysHeader32", &|_| true)
-        .map(|header| {
-            let mut header_rect = RECT::default();
-            let _ = unsafe { GetWindowRect(header, &mut header_rect) };
-            header_rect.bottom
-        })
-        .unwrap_or(rect.top);
-    Ok(POINT {
-        x: rect.left + 40,
-        y: top + 8,
-    })
-}
-
-/// The launcher index of the pin that runs `program` with `arguments`.
-fn pin(program: &str, arguments: &str) -> usize {
-    PINS.iter()
-        .position(|pin| pin.program.ends_with(program) && pin.arguments == arguments)
-        .unwrap()
-        + 1
-}
-
-fn find(
-    workspace: &mut Workspace,
-    what: &str,
-    found: &dyn Fn() -> Option<HWND>,
-) -> anyhow::Result<HWND> {
-    wait_until(workspace, what, 20, &|_| found().is_some())?;
-    found().context("window went away")
-}
-
-#[test]
-#[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
-fn native_apps_take_real_pointer_input() -> anyhow::Result<()> {
-    in_workspace(|workspace| {
-        // regedit: the Edit menu opens on click without moving the splitter,
-        // and Find... runs from a click.
-        workspace.launch(pin("regedit.exe", "/m"))?;
-        let regedit = find(workspace, "Registry Editor", &|| unsafe {
-            FindWindowW(w!("RegEdit_RegEdit"), None).ok()
-        })?;
-        let tree = find(workspace, "the key tree", &|| {
-            child(regedit, "SysTreeView32", &|_| true)
-        })?;
-        // regedit restores where it last was, which can be off the canvas.
-        unsafe {
-            let _ = ShowWindow(regedit, SW_RESTORE);
-            SetWindowPos(regedit, None, 40, 24, 1000, 640, SWP_NOZORDER)?;
-        }
-        settle(workspace, 1000);
-        let mut before = RECT::default();
-        unsafe { GetWindowRect(tree, &mut before)? };
-        let menu = unsafe { GetMenu(regedit) };
-        let mut item = RECT::default();
-        unsafe { GetMenuItemRect(Some(regedit), menu, 1, &mut item)? };
-        println!("regedit's Edit menu is at {item:?}");
-        click_at(
-            workspace,
-            (item.left + item.right) / 2,
-            (item.top + item.bottom) / 2,
-        )?;
-        wait_until(workspace, "regedit's Edit menu", 5, &|_| {
-            open_menu()
-                .ok()
-                .flatten()
-                .is_some_and(|(_, items)| items.iter().any(|item| item.starts_with("Find")))
-        })?;
-        let mut after = RECT::default();
-        unsafe { GetWindowRect(tree, &mut after)? };
-        anyhow::ensure!(
-            before == after,
-            "the menu-bar click moved regedit's splitter from {before:?} to {after:?}"
-        );
-        let popup = unsafe { GetSubMenu(menu, 1) };
-        let find_item = (0..unsafe { GetMenuItemCount(Some(popup)) })
-            .find(|position| {
-                let mut label = [0_u16; 64];
-                let length = unsafe {
-                    GetMenuStringW(popup, *position as u32, Some(&mut label), MF_BYPOSITION)
-                };
-                String::from_utf16_lossy(&label[..length.max(0) as usize])
-                    .replace('&', "")
-                    .starts_with("Find")
-            })
-            .context("regedit's Edit menu has no Find...")?;
-        let target = popup_item(popup, find_item as u32)?;
-        click_at(
-            workspace,
-            (target.left + target.right) / 2,
-            (target.top + target.bottom) / 2,
-        )?;
-        dialog_opens(workspace, "regedit Find", &|title| title == "Find")?;
-
-        // Double-clicking a value opens its editor.
-        let address = find(workspace, "the address bar", &|| {
-            child(regedit, "Edit", &|edit| {
-                window_text(edit).starts_with("Computer")
-            })
-        })?;
-        let point = center(address)?;
-        click_at(workspace, point.x, point.y)?;
-        let path = "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
-        // Home, then Shift+End, selects what the address bar shows.
-        key(workspace, 0x47, true)?;
-        for pressed in [true, false] {
-            workspace.apply(RemoteInput::Key {
-                display_id: display(),
-                scan_code: 0x2a,
-                extended: false,
-                pressed,
-            })?;
-            if pressed {
-                key(workspace, 0x4f, true)?;
-            }
-        }
-        workspace.apply(RemoteInput::TypeText {
-            display_id: display(),
-            text: path.into(),
-        })?;
-        key(workspace, 0x1c, false)?;
-        let expected = format!("Computer\\{path}");
-        wait_until(workspace, "regedit to open the typed key", 10, &|_| {
-            window_text(address) == expected
-        })
-        .with_context(|| format!("address bar shows {:?}", window_text(address)))?;
-        let list = child(regedit, "SysListView32", &|_| true).context("regedit value list")?;
-        settle(workspace, 500);
-        let row = first_row(list)?;
-        double_click(workspace, row.x, row.y)?;
-        dialog_opens(workspace, "regedit value editor", &|title| {
-            title.starts_with("Edit ")
-        })?;
-
-        // Right-clicking a value opens the value's menu at the pointer. regedit
-        // reads the real cursor, so a stale one gets its empty-area New menu
-        // at Session 0's screen centre.
-        let (x, y) = normalized(row.x, row.y);
-        for pressed in [true, false] {
-            workspace.apply(RemoteInput::PointerButtonAt {
-                display_id: display(),
-                x,
-                y,
-                button: PointerButton::Right,
-                pressed,
-            })?;
-        }
-        wait_until(workspace, "regedit's value menu", 5, &|_| {
-            open_menu().ok().flatten().is_some()
-        })
-        .inspect_err(|_| {
-            let _ = proof("background-regedit-value-menu-failure.bmp");
-        })?;
-        let (menu, items) = open_menu()?.context("regedit's value menu closed")?;
-        anyhow::ensure!(
-            ["Modify", "Delete", "Rename"]
-                .iter()
-                .all(|name| items.iter().any(|item| item.starts_with(name))),
-            "right-clicking a value opened {items:?}"
-        );
-        let mut rect = RECT::default();
-        unsafe { GetWindowRect(menu, &mut rect)? };
-        let near = |edge: i32, pointer: i32| (edge - pointer).abs() <= 2;
-        anyhow::ensure!(
-            (near(rect.left, row.x) || near(rect.right, row.x))
-                && (near(rect.top, row.y) || near(rect.bottom, row.y)),
-            "regedit's value menu is at {rect:?}, not at the pointer {row:?}"
-        );
-        proof("background-regedit-value-menu.bmp")?;
-        key(workspace, 0x01, false)?;
-        wait_until(workspace, "Escape to close the value menu", 5, &|_| {
-            open_menu().ok().flatten().is_none()
-        })?;
-
-        // Services: the Action menu opens on click, double-clicking a service
-        // opens its properties, and double-clicking the caption maximizes.
-        workspace.launch(pin("mmc.exe", "services.msc"))?;
-        let services = find(workspace, "Services", &|| unsafe {
-            FindWindowW(w!("MMCMainFrame"), w!("Services")).ok()
-        })?;
-        wait_until(
-            workspace,
-            "Services to come to the front",
-            10,
-            &|_| unsafe { GetForegroundWindow() == services },
-        )?;
-        let list = find(workspace, "the service list", &|| {
-            child(services, "SysListView32", &|list| unsafe {
-                SendMessageW(list, LVM_GETITEMCOUNT, None, None).0 > 0
-            })
-        })?;
-        settle(workspace, 1000);
-        let row = first_row(list)?;
-        println!("double-clicking the first service at {row:?}");
-        double_click(workspace, row.x, row.y)?;
-        dialog_opens(workspace, "service properties", &|title| {
-            title.contains("Properties")
-        })?;
-        action_menu_opens(workspace, services)?;
-        let mut rect = RECT::default();
-        unsafe { GetWindowRect(services, &mut rect)? };
-        double_click(workspace, rect.left + 200, rect.top + 12)?;
-        wait_until(
-            workspace,
-            "a caption double-click to maximize",
-            5,
-            &|_| unsafe { IsZoomed(services).as_bool() },
-        )?;
-
-        // Disk Management's graphical pane scrolls by its arrows and thumb.
-        workspace.launch(pin("mmc.exe", "diskmgmt.msc"))?;
-        let disks = find(workspace, "Disk Management", &|| unsafe {
-            FindWindowW(w!("MMCMainFrame"), w!("Disk Management")).ok()
-        })?;
-        settle(workspace, 3000);
-        disk_pane_scrolls(workspace, disks)?;
-
-        // Device Manager: double-clicking a category expands it, and
-        // double-clicking a device opens its properties.
-        workspace.launch(pin("mmc.exe", "devmgmt.msc"))?;
-        let devices = find(workspace, "Device Manager", &|| unsafe {
-            FindWindowW(w!("MMCMainFrame"), w!("Device Manager")).ok()
-        })?;
-        settle(workspace, 2000);
-        let tree = child(devices, "SysTreeView32", &|_| true).context("the device tree")?;
-        let row = |index: i32| -> anyhow::Result<POINT> {
-            use windows::Win32::UI::Controls::TVM_GETITEMHEIGHT;
-            let height = unsafe { SendMessageW(tree, TVM_GETITEMHEIGHT, None, None).0 } as i32;
-            let mut rect = RECT::default();
-            unsafe { GetWindowRect(tree, &mut rect)? };
-            Ok(POINT {
-                x: rect.left + 60,
-                y: rect.top + 2 + index * height + height / 2,
-            })
-        };
-        // Row 0 is the computer; row 1 its first category.
-        let category = row(1)?;
-        double_click(workspace, category.x, category.y)?;
-        settle(workspace, 1000);
-        let device = row(2)?;
-        double_click(workspace, device.x + 20, device.y)?;
-        dialog_opens(workspace, "device properties", &|title| {
-            title.ends_with("Properties")
-        })?;
-
-        // Resource Monitor's menus open on click.
-        workspace.launch(pin("resmon.exe", ""))?;
-        let monitor = find(workspace, "Resource Monitor", &|| unsafe {
-            FindWindowW(None, w!("Resource Monitor")).ok()
-        })?;
-        settle(workspace, 3000);
-        let items = menu_bar_opens(workspace, monitor, 0)?;
-        anyhow::ensure!(!items.is_empty(), "Resource Monitor's first menu is empty");
-        println!("Resource Monitor menu: {items:?}");
-        println!(
-            "Session 0 regedit, Services, Disk Management and Resource Monitor pointer input passed"
-        );
-        Ok(())
-    })
-}
-
-/// MMC draws its menu bar as a toolbar in its own process. Its Action button
-/// is found by opening each button from the left until a menu shows the
-/// snap-in's commands.
-fn action_menu_opens(workspace: &mut Workspace, frame: HWND) -> anyhow::Result<()> {
-    let mut frame_rect = RECT::default();
-    unsafe { GetWindowRect(frame, &mut frame_rect)? };
-    let bar = child(frame, "ToolbarWindow32", &|toolbar| {
-        let mut rect = RECT::default();
-        let _ = unsafe { GetWindowRect(toolbar, &mut rect) };
-        rect.top - frame_rect.top < 60
-    })
-    .context("MMC's menu bar")?;
-    let mut rect = RECT::default();
-    unsafe { GetWindowRect(bar, &mut rect)? };
-    let y = (rect.top + rect.bottom) / 2;
-    for x in (rect.left + 4..rect.left + 200).step_by(8) {
-        click_at(workspace, x, y)?;
-        settle(workspace, 300);
-        if let Some((_, items)) = open_menu()? {
-            key(workspace, 0x01, false)?;
-            key(workspace, 0x01, false)?;
-            settle(workspace, 300);
-            if items.iter().any(|item| item.starts_with("Refresh")) {
-                println!("MMC Action menu: {items:?}");
-                return Ok(());
-            }
-        }
-    }
-    anyhow::bail!("no click on MMC's menu bar opened the Action menu")
-}
-
-fn disk_pane_scrolls(workspace: &mut Workspace, frame: HWND) -> anyhow::Result<()> {
-    let pane = child(frame, "AfxWnd42u", &|window| unsafe {
-        let mut info = SCROLLINFO {
-            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-            fMask: SIF_ALL,
-            ..Default::default()
-        };
-        GetWindowLongW(window, GWL_STYLE) as u32 & WS_VSCROLL.0 != 0
-            && GetScrollInfo(window, SB_VERT, &mut info).is_ok()
-            && info.nMax - info.nMin + 1 > info.nPage as i32
-    });
-    let Some(pane) = pane else {
-        println!("Disk Management's graphical pane has nothing to scroll on this machine");
-        return Ok(());
-    };
-    let position = || unsafe { GetScrollPos(pane, SB_VERT) };
-    let mut bar = SCROLLBARINFO {
-        cbSize: std::mem::size_of::<SCROLLBARINFO>() as u32,
-        ..Default::default()
-    };
-    unsafe { GetScrollBarInfo(pane, OBJID_VSCROLL, &mut bar)? };
-    let x = (bar.rcScrollBar.left + bar.rcScrollBar.right) / 2;
-    let start = position();
-    click_at(workspace, x, bar.rcScrollBar.bottom - bar.dxyLineButton / 2)?;
-    wait_until(workspace, "Disk Management's arrow to scroll", 5, &|_| {
-        position() > start
-    })?;
-    unsafe { GetScrollBarInfo(pane, OBJID_VSCROLL, &mut bar)? };
-    let thumb = bar.rcScrollBar.top + (bar.xyThumbTop + bar.xyThumbBottom) / 2;
-    let scrolled = position();
-    drag(
-        workspace,
-        POINT { x, y: thumb },
-        POINT {
-            x,
-            y: bar.rcScrollBar.top,
-        },
-    )?;
-    anyhow::ensure!(
-        position() < scrolled,
-        "dragging Disk Management's thumb left it at {}",
-        position()
-    );
-    proof("background-disk-management.bmp")?;
-    Ok(())
-}
-
-/// A control UI Automation found, with what the tests match it on.
-struct Element {
-    element: IUIAutomationElement,
-    name: String,
-    id: String,
-    rect: RECT,
-}
-
-impl Element {
-    /// Where the control is now; it may have moved since it was found.
-    fn bounds(&self) -> RECT {
-        unsafe { self.element.CurrentBoundingRectangle() }.unwrap_or_default()
-    }
-
-    fn click(&self, workspace: &mut Workspace) -> anyhow::Result<()> {
-        let rect = self.bounds();
-        click_at(
-            workspace,
-            (rect.left + rect.right) / 2,
-            (rect.top + rect.bottom) / 2,
-        )
-    }
-
-    fn selected(&self) -> bool {
-        unsafe {
-            self.element
-                .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
-                    UIA_SelectionItemPatternId,
-                )
-                .and_then(|pattern| pattern.CurrentIsSelected())
-                .is_ok_and(|selected| selected.as_bool())
-        }
-    }
-}
-
-/// UI Automation finds controls that aren't windows, such as Resource
-/// Monitor's DirectUI buttons, and reads state that window messages don't
-/// report, such as whether a WinForms radio button is selected.
-struct Automation(IUIAutomation);
-
-impl Automation {
-    fn new() -> anyhow::Result<Self> {
-        unsafe {
-            CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
-            Ok(Self(CoCreateInstance(
-                &CUIAutomation,
-                None,
-                CLSCTX_INPROC_SERVER,
-            )?))
-        }
-    }
-
-    /// The controls of type `kind` under `window`. Controls that go away
-    /// while they're read are left out.
-    fn find(&self, window: HWND, kind: UIA_CONTROLTYPE_ID) -> anyhow::Result<Vec<Element>> {
-        unsafe {
-            let mut value = VARIANT::default();
-            value.Anonymous.Anonymous = std::mem::ManuallyDrop::new(VARIANT_0_0 {
-                vt: VT_I4,
-                ..Default::default()
-            });
-            (*value.Anonymous.Anonymous).Anonymous.lVal = kind.0;
-            let condition = self
-                .0
-                .CreatePropertyCondition(UIA_ControlTypePropertyId, &value)?;
-            let found = self
-                .0
-                .ElementFromHandle(window)?
-                .FindAll(TreeScope_Descendants, &condition)?;
-            Ok((0..found.Length()?)
-                .filter_map(|index| {
-                    let element = found.GetElement(index).ok()?;
-                    Some(Element {
-                        name: element.CurrentName().ok()?.to_string(),
-                        id: element.CurrentAutomationId().ok()?.to_string(),
-                        rect: element.CurrentBoundingRectangle().ok()?,
-                        element,
-                    })
-                })
-                .collect())
-        }
-    }
-
-    /// Waits up to 20 seconds for a control of type `kind` under `window`
-    /// that satisfies `accept`.
-    fn wait(
-        &self,
-        workspace: &mut Workspace,
-        what: &str,
-        window: HWND,
-        kind: UIA_CONTROLTYPE_ID,
-        accept: &dyn Fn(&Element) -> bool,
-    ) -> anyhow::Result<Element> {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Some(element) = self.find(window, kind)?.into_iter().find(accept) {
-                return Ok(element);
-            }
-            if Instant::now() >= deadline {
-                let _ = proof(&format!(
-                    "background-{}-failure.bmp",
-                    what.replace(' ', "-")
-                ));
-                anyhow::bail!("timed out waiting for {what}");
-            }
-            settle(workspace, 100);
-        }
-    }
-}
-
-#[test]
-#[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
-fn firewall_wizard_takes_clicks_and_cancels() -> anyhow::Result<()> {
-    in_workspace(|workspace| {
-        let automation = Automation::new()?;
-        workspace.launch(pin("mmc.exe", "wf.msc"))?;
-        let frame = wait_for_job_window(workspace, "Windows Firewall", &|class, title| {
-            class == "MMCMainFrame" && title.contains("Firewall")
-        })?;
-        // Selecting Inbound Rules puts New Rule... in the Actions pane. The
-        // searches stay out of the rule list, which UI Automation walks slowly.
-        let tree = find(workspace, "the console tree", &|| {
-            child(frame, "SysTreeView32", &|_| true)
-        })?;
-        automation
-            .wait(
-                workspace,
-                "the Inbound Rules node",
-                tree,
-                UIA_TreeItemControlTypeId,
-                &|item| item.name == "Inbound Rules",
-            )?
-            .click(workspace)?;
-        // New Rule... does nothing until the snap-in has listed the rules.
-        find(workspace, "the inbound rules", &|| {
-            child(frame, "SysListView32", &|list| unsafe {
-                SendMessageW(list, LVM_GETITEMCOUNT, None, None).0 > 0
-            })
-        })?;
-        settle(workspace, 1000);
-        let actions = find(workspace, "the Actions pane", &|| {
-            child(frame, "NativeHWNDHost", &|host| {
-                window_text(host) == "ActionsPaneView"
-            })
-        })?;
-        let new_rule = automation.wait(
-            workspace,
-            "New Rule... in the Actions pane",
-            actions,
-            UIA_ButtonControlTypeId,
-            &|button| button.name == "New Rule...",
-        )?;
-        proof("background-firewall-inbound-rules.bmp")?;
-        let before = background::windows()?;
-        new_rule.click(workspace)?;
-        let wizard = wait_for_job_window(workspace, "the New Inbound Rule Wizard", &|_, title| {
-            title == "New Inbound Rule Wizard"
-        })?;
-        // The wizard's WinForms radio buttons and buttons take clicks.
-        let port = automation.wait(
-            workspace,
-            "the Port rule type",
-            wizard,
-            UIA_RadioButtonControlTypeId,
-            &|radio| radio.name == "Port",
-        )?;
-        port.click(workspace)?;
-        wait_until(workspace, "a click to select Port", 5, &|_| port.selected())?;
-        automation
-            .wait(
-                workspace,
-                "the wizard's Next button",
-                wizard,
-                UIA_ButtonControlTypeId,
-                &|button| button.name.starts_with("Next"),
-            )?
-            .click(workspace)?;
-        automation.wait(
-            workspace,
-            "the Protocol and Ports step",
-            wizard,
-            UIA_RadioButtonControlTypeId,
-            &|radio| radio.name == "TCP",
-        )?;
-        proof("background-firewall-wizard.bmp")?;
-
-        // Cancel closes the wizard. A posted click on it once crashed the
-        // snap-in: the Cancel button's mouse-up hit ObjectDisposedException.
-        automation
-            .wait(
-                workspace,
-                "the wizard's Cancel button",
-                wizard,
-                UIA_ButtonControlTypeId,
-                &|button| button.name == "Cancel",
-            )?
-            .click(workspace)?;
-        wait_until(workspace, "Cancel to close the wizard", 10, &|_| {
-            background::windows().is_ok_and(|windows| !windows.contains(&wizard))
-        })?;
-        settle(workspace, 2000);
-        proof("background-firewall-cancelled.bmp")?;
-        let opened = background::windows()?
-            .into_iter()
-            .filter(|window| !before.contains(window))
-            .map(window_text)
-            .collect::<Vec<_>>();
-        anyhow::ensure!(opened.is_empty(), "cancelling the wizard opened {opened:?}");
-        anyhow::ensure!(
-            unsafe { IsWindowEnabled(frame).as_bool() },
-            "the Firewall window stayed disabled after the wizard closed"
-        );
-        println!("Session 0 Firewall New Rule wizard clicks and Cancel passed");
-        Ok(())
-    })
-}
-
-#[test]
-#[ignore = "Requires a dedicated Session 0 process; creates GUI applications"]
-fn resource_monitor_arrows_toggle_sections() -> anyhow::Result<()> {
-    in_workspace(|workspace| {
-        let automation = Automation::new()?;
-        workspace.launch(pin("resmon.exe", ""))?;
-        let monitor = wait_for_job_window(workspace, "Resource Monitor", &|class, title| {
-            class == "WdcWindow" && title == "Resource Monitor"
-        })?;
-        let cpu = automation.wait(
-            workspace,
-            "the CPU section",
-            monitor,
-            UIA_GroupControlTypeId,
-            &|group| group.id == "expandoCpu",
-        )?;
-        // The CPU section's arrow collapses its table, and expands it again.
-        let inside = |inner: RECT, outer: RECT| {
-            inner.left >= outer.left
-                && inner.right <= outer.right
-                && inner.top >= outer.top
-                && inner.bottom <= outer.bottom
-        };
-        let area = cpu.bounds();
-        let arrow = automation.wait(
-            workspace,
-            "the CPU section's arrow",
-            monitor,
-            UIA_ButtonControlTypeId,
-            &|button| button.id == "arrow" && inside(button.rect, area),
-        )?;
-        let height = || {
-            let rect = cpu.bounds();
-            rect.bottom - rect.top
-        };
-        let expanded = height();
-        arrow.click(workspace)?;
-        wait_until(workspace, "the arrow to collapse the CPU table", 5, &|_| {
-            height() < expanded / 2
-        })
-        .with_context(|| format!("the CPU section is {} px high", height()))?;
-        proof("background-resource-monitor-collapsed.bmp")?;
-        arrow.click(workspace)?;
-        wait_until(workspace, "the arrow to expand the CPU table", 5, &|_| {
-            height() == expanded
-        })
-        .with_context(|| format!("the CPU section is {} px high", height()))?;
-
-        // The chart pane's arrow collapses the charts, which widens the
-        // tables, and expands them again.
-        let width = || {
-            let rect = cpu.bounds();
-            rect.right - rect.left
-        };
-        let narrow = width();
-        automation
-            .wait(
-                workspace,
-                "the chart pane's arrow",
-                monitor,
-                UIA_ButtonControlTypeId,
-                &|button| button.name == "Collapse Charts",
-            )?
-            .click(workspace)?;
-        wait_until(workspace, "the arrow to collapse the charts", 5, &|_| {
-            width() > narrow + 100
-        })
-        .with_context(|| format!("the CPU section is {} px wide", width()))?;
-        proof("background-resource-monitor-charts-collapsed.bmp")?;
-        automation
-            .wait(
-                workspace,
-                "the collapsed chart pane's arrow",
-                monitor,
-                UIA_ButtonControlTypeId,
-                &|button| button.name == "Expand Charts",
-            )?
-            .click(workspace)?;
-        wait_until(workspace, "the arrow to expand the charts", 5, &|_| {
-            width() == narrow
-        })
-        .with_context(|| format!("the CPU section is {} px wide", width()))?;
-        println!("Session 0 Resource Monitor table and chart arrows passed");
         Ok(())
     })
 }
