@@ -346,6 +346,31 @@ fn assert_same_family(window: HWND, before: &[HWND]) {
     }
 }
 
+fn console(id: u32, width: u32, height: u32) -> Display {
+    display(DesktopSession::Console, id, width, height)
+}
+
+fn rdp() -> DesktopSession {
+    DesktopSession::Rdp {
+        id: 2,
+        user: "probe".into(),
+    }
+}
+
+/// The probe window and the state each reset must leave as it was.
+struct ResetProbe {
+    sent: Arc<Mutex<Vec<SessionMessage>>>,
+    presentation: Presentation,
+    window: HWND,
+    device: ID3D11Device,
+    /// The window's children and popups before the first reset.
+    family: Vec<HWND>,
+    chat_popup: HWND,
+    chat_before: Vec<String>,
+    chat_visible: bool,
+    focus: HWND,
+}
+
 #[test]
 #[ignore = "needs an interactive desktop and a D3D11 video device"]
 fn reset_probe_keeps_the_window_and_follows_the_new_stream() {
@@ -354,292 +379,360 @@ fn reset_probe_keeps_the_window_and_follows_the_new_stream() {
 
 unsafe fn run_probe() {
     super::enable_dpi_awareness();
-    let sent = Arc::new(Mutex::new(Vec::new()));
-    let chat = meshrmm_chat::ChatSession::default();
-    chat.set_available(true);
-    chat.receive("Transcript line from before the reset".into());
-    let console = |id, width, height| display(DesktopSession::Console, id, width, height);
-    let rdp = DesktopSession::Rdp {
-        id: 2,
-        user: "probe".into(),
-    };
-    let first = console(1, 1280, 720);
-    let first_displays = vec![
-        first.clone(),
-        console(2, 1920, 1080),
-        display(rdp.clone(), 7, 1600, 900),
-    ];
-    let first_format = format(1280, 720, Codec::H264, PixelFormat::Nv12);
+    let mut probe = unsafe { ResetProbe::open() };
+    let initial = unsafe { probe.check_initial_state() };
+    let pressed = probe.hold_key();
+    unsafe { probe.switch_display(&initial, &pressed) };
+    let portrait_state = unsafe { probe.rotate_to_portrait() };
+    unsafe { probe.try_full_chroma(&portrait_state) };
+    unsafe { probe.refuse_profiles_without_decoder() };
+    let restored = unsafe { probe.reset_while_minimized() };
+    unsafe { probe.check_drawn_after_resets(&restored) };
+    println!("reset probe passed on HWND {:?}", probe.window.0);
+    drop(probe.presentation);
+}
 
-    let mut presentation = unsafe {
-        Presentation::new(
-            first_format,
-            first,
-            first_displays,
-            test_sink(Arc::clone(&sent), chat.clone()),
-            DebugInfo::new("reset-probe"),
-        )
-    }
-    .expect("the probe window and renderer");
-    let window = presentation.window();
-    let device = presentation.device().clone();
-    unsafe { pump(window, Duration::from_millis(300)) };
-    unsafe { present_synthetic(&mut presentation, 1280, 720, PixelFormat::Nv12) }.unwrap();
-
-    // Put state in the popups that a new window would lose.
-    unsafe { probe_toggle_chat(window) };
-    unsafe { pump(window, Duration::from_millis(400)) };
-    let family = unsafe { window_family(window) };
-    let (chat_popup, _) = unsafe { chat_contents(&family) }.expect("chat popup");
-    let mut chat_children = Vec::new();
-    let _ = unsafe {
-        EnumChildWindows(
-            Some(chat_popup),
-            Some(collect_window),
-            LPARAM(&mut chat_children as *mut Vec<HWND> as isize),
-        )
-    };
-    let entry = chat_children
-        .iter()
-        .copied()
-        .find(|child| {
-            unsafe { class_name(*child) }.eq_ignore_ascii_case("Edit")
-                && unsafe { GetWindowLongW(*child, GWL_STYLE) } & ES_MULTILINE == 0
-        })
-        .expect("chat entry");
-    unsafe { SetWindowTextW(entry, w!("Draft typed before the reset")) }.unwrap();
-    let chat_before = unsafe { chat_contents(&family) }.unwrap().1;
-    println!("chat before: {chat_before:?}");
-    let chat_visible = unsafe { IsWindowVisible(chat_popup) }.as_bool();
-    let _ = unsafe { SetFocus(Some(window)) };
-    let focus = unsafe { GetFocus() };
-
-    let initial = unsafe { probe_state(window) }.unwrap();
-    println!("initial: {initial:#?}");
-    assert_eq!(initial.displays, ["Display 1", "Display 2"]);
-    assert_eq!(initial.users, ["Console", "probe (RDP 2)"]);
-    assert!(initial.display_combo_enabled);
-    unsafe { assert_pointer_corners(window, &sent, &initial) };
-    let toolbar_colors = unsafe { distinct_colors(window, initial.toolbar_height) }.unwrap();
-    println!("toolbar colors before: {toolbar_colors}");
-    assert!(toolbar_colors > 2, "the toolbar was not drawn");
-
-    // The agent pointer marker survives a repopulated display list.
-    unsafe { window::set_agent_pointer_display(window, Some(DisplayId(2))) };
-
-    // Hold a key on display 1; switching displays must release it there.
-    sent.lock().unwrap().clear();
-    let key_down = LPARAM(1 | (0x1e << 16));
-    unsafe { PostMessageW(Some(window), WM_KEYDOWN, WPARAM(0x41), key_down) }.unwrap();
-    unsafe { pump(window, Duration::from_millis(50)) };
-    let pressed = sent.lock().unwrap().clone();
-    println!("sent for the held key: {pressed:?}");
-
-    // F8 or the display combo: a larger display, a new display list, and a
-    // new active display.
-    let second = console(2, 1920, 1080);
-    let second_displays = vec![
-        console(1, 1280, 720),
-        second.clone(),
-        console(3, 1080, 1920),
-        display(rdp.clone(), 7, 1600, 900),
-    ];
-    let second_format = format(1920, 1080, Codec::H264, PixelFormat::Nv12);
-    sent.lock().unwrap().clear();
-    unsafe { presentation.reset_presentation(second_format, second, second_displays) }.unwrap();
-    let during_reset = sent.lock().unwrap().clone();
-    println!("sent during the display switch: {during_reset:?}");
-    if pressed.iter().any(|message| {
-        matches!(
-            message,
-            SessionMessage::Input(RemoteInput::Key { pressed: true, .. })
-        )
-    }) {
-        assert_eq!(
-            during_reset,
-            [SessionMessage::Input(RemoteInput::Key {
-                display_id: DisplayId(1),
-                scan_code: 0x1e,
-                extended: false,
-                pressed: false,
-            })],
-            "a held key must be released on the display it was pressed on"
-        );
-    } else {
-        // The key only reaches the device while the window has focus.
-        println!("the posted key was not forwarded; skipping the release check");
-        assert!(during_reset.iter().all(|message| matches!(
-            message,
-            SessionMessage::Input(RemoteInput::Key { pressed: false, .. })
-        )));
-    }
-    unsafe { pump(window, Duration::from_millis(100)) };
-    assert_same_family(window, &family);
-    let switched = unsafe { probe_state(window) }.unwrap();
-    println!("after the display switch: {switched:#?}");
-    assert_eq!(switched.video_size, (1920, 1080));
-    assert_eq!(switched.active_display, DisplayId(2));
-    assert_ne!(switched.title, initial.title);
-    assert!(
-        switched.title.contains(r"\\.\DISPLAY2"),
-        "{}",
-        switched.title
-    );
-    assert_eq!(switched.displays, ["Display 1", "➤ Display 2", "Display 3"]);
-    assert_eq!(switched.selected_display, 1);
-    assert_eq!(switched.users, initial.users);
-    assert_eq!(switched.selected_user, 0);
-    assert_eq!(switched.quality, initial.quality);
-    assert_eq!(switched.chroma, initial.chroma);
-    assert_eq!(
-        unsafe { GetFocus() },
-        focus,
-        "the reset moved keyboard focus"
-    );
-    assert_eq!(unsafe { chat_contents(&family) }.unwrap().1, chat_before);
-    assert_eq!(
-        unsafe { IsWindowVisible(chat_popup) }.as_bool(),
-        chat_visible
-    );
-    unsafe { assert_pointer_corners(window, &sent, &switched) };
-    unsafe { present_synthetic(&mut presentation, 1920, 1080, PixelFormat::Nv12) }.unwrap();
-
-    // Portrait, and the same display rotated: only the size changes.
-    let portrait = console(3, 1080, 1920);
-    unsafe {
-        presentation.reset_presentation(
-            format(1080, 1920, Codec::H264, PixelFormat::Nv12),
-            portrait,
-            vec![
-                console(1, 1280, 720),
-                console(2, 1920, 1080),
-                console(3, 1080, 1920),
-            ],
-        )
-    }
-    .unwrap();
-    unsafe { pump(window, Duration::from_millis(100)) };
-    let portrait_state = unsafe { probe_state(window) }.unwrap();
-    println!("portrait: {portrait_state:#?}");
-    assert_eq!(portrait_state.video_size, (1080, 1920));
-    assert_eq!(portrait_state.users, ["Console"]);
-    assert_eq!(portrait_state.selected_display, 2);
-    let video = portrait_state.video.unwrap();
-    assert!(video.height > video.width, "{video:?}");
-    unsafe { assert_pointer_corners(window, &sent, &portrait_state) };
-    unsafe { present_synthetic(&mut presentation, 1080, 1920, PixelFormat::Nv12) }.unwrap();
-    assert_same_family(window, &family);
-
-    // 4:4:4: the processor takes AYUV surfaces, if the GPU converts them.
-    let crisp = format(1080, 1920, Codec::H264, PixelFormat::Ayuv);
-    sent.lock().unwrap().clear();
-    match unsafe {
-        presentation.reset_presentation(crisp, console(3, 1080, 1920), vec![console(3, 1080, 1920)])
-    } {
-        Ok(()) => {
-            println!("4:4:4 reset applied");
-            if let Err(error) =
-                unsafe { present_synthetic(&mut presentation, 1080, 1920, PixelFormat::Ayuv) }
-            {
-                // Synthetic AYUV surfaces are a probe limitation; decoders
-                // allocate their own.
-                println!("no synthetic 4:4:4 frame: {error:#}");
-            }
-        }
-        Err(error) => {
-            // Nothing may change when the new processor cannot be created.
-            println!("4:4:4 reset refused: {error:#}");
-            assert_eq!(unsafe { probe_state(window) }.unwrap(), portrait_state);
-        }
-    }
-    // Quality and chroma are shown, never sent again: the device would
-    // answer with another configuration and another reset.
-    let resent = sent.lock().unwrap().clone();
-    assert!(
-        !resent.iter().any(|message| matches!(
-            message,
-            SessionMessage::SetQuality { .. } | SessionMessage::SetChroma { .. }
-        )),
-        "{resent:?}"
-    );
-    assert_same_family(window, &family);
-
-    // A profile without a decoder is refused before anything
-    // changes; the caller then reports it with VideoProfileRejected.
-    let before_refusal = unsafe { probe_state(window) }.unwrap();
-    let mut refused = 0;
-    for (codec, pixel_format) in [
-        (Codec::H264, PixelFormat::Nv12),
-        (Codec::H265, PixelFormat::Nv12),
-        (Codec::H264, PixelFormat::Ayuv),
-        (Codec::H265, PixelFormat::Ayuv),
-    ] {
-        let candidate = format(2560, 1440, codec, pixel_format);
-        match unsafe { Decoder::new(&device, candidate) } {
-            Ok(_) => println!("{codec:?} {pixel_format:?}: decoder available"),
-            Err(error) => {
-                println!("{codec:?} {pixel_format:?}: no decoder: {error:#}");
-                let result = unsafe {
-                    presentation.reset_stream(
-                        candidate,
-                        console(1, 2560, 1440),
-                        vec![console(1, 2560, 1440)],
-                    )
-                };
-                assert!(result.is_err());
-                assert_eq!(unsafe { probe_state(window) }.unwrap(), before_refusal);
-                refused += 1;
-            }
-        }
-    }
-    println!("profiles refused without changes: {refused}");
-    println!(
-        "supported_video_profiles: {:?}",
-        supported_video_profiles(format(1920, 1080, Codec::H264, PixelFormat::Nv12))
-    );
-
-    // A minimized window has no client area; the reset must still leave a
-    // usable output until it is restored.
-    let _ = unsafe { ShowWindow(window, SW_MINIMIZE) };
-    unsafe { pump(window, Duration::from_millis(200)) };
-    unsafe {
-        presentation.reset_presentation(
-            format(1920, 1080, Codec::H264, PixelFormat::Nv12),
+impl ResetProbe {
+    /// Opens the window on the first display and puts state in the popups
+    /// that a new window would lose.
+    unsafe fn open() -> Self {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let chat = meshrmm_chat::ChatSession::default();
+        chat.set_available(true);
+        chat.receive("Transcript line from before the reset".into());
+        let first = console(1, 1280, 720);
+        let first_displays = vec![
+            first.clone(),
             console(2, 1920, 1080),
-            vec![console(1, 1280, 720), console(2, 1920, 1080)],
-        )
-    }
-    .unwrap();
-    let frame =
-        unsafe { present_synthetic(&mut presentation, 1920, 1080, PixelFormat::Nv12) }.unwrap();
-    let _ = unsafe { ShowWindow(window, SW_RESTORE) };
-    unsafe { pump(window, Duration::from_millis(300)) };
-    if let Some(layout) = unsafe { window::take_resize(window) } {
-        unsafe { presentation.renderer().resize(&layout) }.unwrap();
-    }
-    unsafe { presentation.renderer().present(&frame, 0) }.unwrap();
-    unsafe { pump(window, Duration::from_millis(200)) };
-    let restored = unsafe { probe_state(window) }.unwrap();
-    unsafe { assert_pointer_corners(window, &sent, &restored) };
-    assert_same_family(window, &family);
+            display(rdp(), 7, 1600, 900),
+        ];
+        let first_format = format(1280, 720, Codec::H264, PixelFormat::Nv12);
 
-    let toolbar_colors = unsafe { distinct_colors(window, restored.toolbar_height) }.unwrap();
-    println!("toolbar colors after: {toolbar_colors}");
-    assert!(
-        toolbar_colors > 2,
-        "the toolbar was not drawn after the resets"
-    );
-    if unsafe { IsWindowVisible(chat_popup) }.as_bool() {
-        let chat_colors = unsafe { distinct_colors(chat_popup, 0) }.unwrap();
-        println!("chat colors after: {chat_colors}");
-        assert!(
-            chat_colors > 2,
-            "the chat popup was not drawn after the resets"
-        );
-    } else {
-        println!("the chat popup is hidden (no foreground rights); its contents were compared");
+        let mut presentation = unsafe {
+            Presentation::new(
+                first_format,
+                first,
+                first_displays,
+                test_sink(Arc::clone(&sent), chat.clone()),
+                DebugInfo::new("reset-probe"),
+            )
+        }
+        .expect("the probe window and renderer");
+        let window = presentation.window();
+        let device = presentation.device().clone();
+        unsafe { pump(window, Duration::from_millis(300)) };
+        unsafe { present_synthetic(&mut presentation, 1280, 720, PixelFormat::Nv12) }.unwrap();
+
+        // Put state in the popups that a new window would lose.
+        unsafe { probe_toggle_chat(window) };
+        unsafe { pump(window, Duration::from_millis(400)) };
+        let family = unsafe { window_family(window) };
+        let (chat_popup, _) = unsafe { chat_contents(&family) }.expect("chat popup");
+        let mut chat_children = Vec::new();
+        let _ = unsafe {
+            EnumChildWindows(
+                Some(chat_popup),
+                Some(collect_window),
+                LPARAM(&mut chat_children as *mut Vec<HWND> as isize),
+            )
+        };
+        let entry = chat_children
+            .iter()
+            .copied()
+            .find(|child| {
+                unsafe { class_name(*child) }.eq_ignore_ascii_case("Edit")
+                    && unsafe { GetWindowLongW(*child, GWL_STYLE) } & ES_MULTILINE == 0
+            })
+            .expect("chat entry");
+        unsafe { SetWindowTextW(entry, w!("Draft typed before the reset")) }.unwrap();
+        let chat_before = unsafe { chat_contents(&family) }.unwrap().1;
+        println!("chat before: {chat_before:?}");
+        let chat_visible = unsafe { IsWindowVisible(chat_popup) }.as_bool();
+        let _ = unsafe { SetFocus(Some(window)) };
+        let focus = unsafe { GetFocus() };
+        Self {
+            sent,
+            presentation,
+            window,
+            device,
+            family,
+            chat_popup,
+            chat_before,
+            chat_visible,
+            focus,
+        }
     }
-    assert_eq!(unsafe { chat_contents(&family) }.unwrap().1, chat_before);
-    println!("reset probe passed on HWND {:?}", window.0);
-    drop(presentation);
+
+    unsafe fn check_initial_state(&self) -> ProbeState {
+        let window = self.window;
+        let initial = unsafe { probe_state(window) }.unwrap();
+        println!("initial: {initial:#?}");
+        assert_eq!(initial.displays, ["Display 1", "Display 2"]);
+        assert_eq!(initial.users, ["Console", "probe (RDP 2)"]);
+        assert!(initial.display_combo_enabled);
+        unsafe { assert_pointer_corners(window, &self.sent, &initial) };
+        let toolbar_colors = unsafe { distinct_colors(window, initial.toolbar_height) }.unwrap();
+        println!("toolbar colors before: {toolbar_colors}");
+        assert!(toolbar_colors > 2, "the toolbar was not drawn");
+
+        // The agent pointer marker survives a repopulated display list.
+        unsafe { window::set_agent_pointer_display(window, Some(DisplayId(2))) };
+        initial
+    }
+
+    /// Holds a key on display 1 and returns what the window sent for it.
+    fn hold_key(&self) -> Vec<SessionMessage> {
+        self.sent.lock().unwrap().clear();
+        let key_down = LPARAM(1 | (0x1e << 16));
+        unsafe { PostMessageW(Some(self.window), WM_KEYDOWN, WPARAM(0x41), key_down) }.unwrap();
+        unsafe { pump(self.window, Duration::from_millis(50)) };
+        let pressed = self.sent.lock().unwrap().clone();
+        println!("sent for the held key: {pressed:?}");
+        pressed
+    }
+
+    /// F8 or the display combo: a larger display, a new display list, and a
+    /// new active display. Switching displays must release the held key on
+    /// the display it was pressed on.
+    unsafe fn switch_display(&mut self, initial: &ProbeState, pressed: &[SessionMessage]) {
+        let window = self.window;
+        let second = console(2, 1920, 1080);
+        let second_displays = vec![
+            console(1, 1280, 720),
+            second.clone(),
+            console(3, 1080, 1920),
+            display(rdp(), 7, 1600, 900),
+        ];
+        let second_format = format(1920, 1080, Codec::H264, PixelFormat::Nv12);
+        self.sent.lock().unwrap().clear();
+        unsafe {
+            self.presentation
+                .reset_presentation(second_format, second, second_displays)
+        }
+        .unwrap();
+        let during_reset = self.sent.lock().unwrap().clone();
+        println!("sent during the display switch: {during_reset:?}");
+        if pressed.iter().any(|message| {
+            matches!(
+                message,
+                SessionMessage::Input(RemoteInput::Key { pressed: true, .. })
+            )
+        }) {
+            assert_eq!(
+                during_reset,
+                [SessionMessage::Input(RemoteInput::Key {
+                    display_id: DisplayId(1),
+                    scan_code: 0x1e,
+                    extended: false,
+                    pressed: false,
+                })],
+                "a held key must be released on the display it was pressed on"
+            );
+        } else {
+            // The key only reaches the device while the window has focus.
+            println!("the posted key was not forwarded; skipping the release check");
+            assert!(during_reset.iter().all(|message| matches!(
+                message,
+                SessionMessage::Input(RemoteInput::Key { pressed: false, .. })
+            )));
+        }
+        unsafe { pump(window, Duration::from_millis(100)) };
+        assert_same_family(window, &self.family);
+        let switched = unsafe { probe_state(window) }.unwrap();
+        println!("after the display switch: {switched:#?}");
+        assert_eq!(switched.video_size, (1920, 1080));
+        assert_eq!(switched.active_display, DisplayId(2));
+        assert_ne!(switched.title, initial.title);
+        assert!(
+            switched.title.contains(r"\\.\DISPLAY2"),
+            "{}",
+            switched.title
+        );
+        assert_eq!(switched.displays, ["Display 1", "➤ Display 2", "Display 3"]);
+        assert_eq!(switched.selected_display, 1);
+        assert_eq!(switched.users, initial.users);
+        assert_eq!(switched.selected_user, 0);
+        assert_eq!(switched.quality, initial.quality);
+        assert_eq!(switched.chroma, initial.chroma);
+        assert_eq!(
+            unsafe { GetFocus() },
+            self.focus,
+            "the reset moved keyboard focus"
+        );
+        assert_eq!(
+            unsafe { chat_contents(&self.family) }.unwrap().1,
+            self.chat_before
+        );
+        assert_eq!(
+            unsafe { IsWindowVisible(self.chat_popup) }.as_bool(),
+            self.chat_visible
+        );
+        unsafe { assert_pointer_corners(window, &self.sent, &switched) };
+        unsafe { present_synthetic(&mut self.presentation, 1920, 1080, PixelFormat::Nv12) }
+            .unwrap();
+    }
+
+    /// Portrait, and the same display rotated: only the size changes.
+    unsafe fn rotate_to_portrait(&mut self) -> ProbeState {
+        let window = self.window;
+        let portrait = console(3, 1080, 1920);
+        unsafe {
+            self.presentation.reset_presentation(
+                format(1080, 1920, Codec::H264, PixelFormat::Nv12),
+                portrait,
+                vec![
+                    console(1, 1280, 720),
+                    console(2, 1920, 1080),
+                    console(3, 1080, 1920),
+                ],
+            )
+        }
+        .unwrap();
+        unsafe { pump(window, Duration::from_millis(100)) };
+        let portrait_state = unsafe { probe_state(window) }.unwrap();
+        println!("portrait: {portrait_state:#?}");
+        assert_eq!(portrait_state.video_size, (1080, 1920));
+        assert_eq!(portrait_state.users, ["Console"]);
+        assert_eq!(portrait_state.selected_display, 2);
+        let video = portrait_state.video.unwrap();
+        assert!(video.height > video.width, "{video:?}");
+        unsafe { assert_pointer_corners(window, &self.sent, &portrait_state) };
+        unsafe { present_synthetic(&mut self.presentation, 1080, 1920, PixelFormat::Nv12) }
+            .unwrap();
+        assert_same_family(window, &self.family);
+        portrait_state
+    }
+
+    /// 4:4:4: the processor takes AYUV surfaces, if the GPU converts them.
+    unsafe fn try_full_chroma(&mut self, portrait_state: &ProbeState) {
+        let crisp = format(1080, 1920, Codec::H264, PixelFormat::Ayuv);
+        self.sent.lock().unwrap().clear();
+        match unsafe {
+            self.presentation.reset_presentation(
+                crisp,
+                console(3, 1080, 1920),
+                vec![console(3, 1080, 1920)],
+            )
+        } {
+            Ok(()) => {
+                println!("4:4:4 reset applied");
+                if let Err(error) = unsafe {
+                    present_synthetic(&mut self.presentation, 1080, 1920, PixelFormat::Ayuv)
+                } {
+                    // Synthetic AYUV surfaces are a probe limitation; decoders
+                    // allocate their own.
+                    println!("no synthetic 4:4:4 frame: {error:#}");
+                }
+            }
+            Err(error) => {
+                // Nothing may change when the new processor cannot be created.
+                println!("4:4:4 reset refused: {error:#}");
+                assert_eq!(
+                    unsafe { probe_state(self.window) }.unwrap(),
+                    *portrait_state
+                );
+            }
+        }
+        // Quality and chroma are shown, never sent again: the device would
+        // answer with another configuration and another reset.
+        let resent = self.sent.lock().unwrap().clone();
+        assert!(
+            !resent.iter().any(|message| matches!(
+                message,
+                SessionMessage::SetQuality { .. } | SessionMessage::SetChroma { .. }
+            )),
+            "{resent:?}"
+        );
+        assert_same_family(self.window, &self.family);
+    }
+
+    /// A profile without a decoder is refused before anything
+    /// changes; the caller then reports it with VideoProfileRejected.
+    unsafe fn refuse_profiles_without_decoder(&mut self) {
+        let before_refusal = unsafe { probe_state(self.window) }.unwrap();
+        let mut refused = 0;
+        for (codec, pixel_format) in [
+            (Codec::H264, PixelFormat::Nv12),
+            (Codec::H265, PixelFormat::Nv12),
+            (Codec::H264, PixelFormat::Ayuv),
+            (Codec::H265, PixelFormat::Ayuv),
+        ] {
+            let candidate = format(2560, 1440, codec, pixel_format);
+            match unsafe { Decoder::new(&self.device, candidate) } {
+                Ok(_) => println!("{codec:?} {pixel_format:?}: decoder available"),
+                Err(error) => {
+                    println!("{codec:?} {pixel_format:?}: no decoder: {error:#}");
+                    let result = unsafe {
+                        self.presentation.reset_stream(
+                            candidate,
+                            console(1, 2560, 1440),
+                            vec![console(1, 2560, 1440)],
+                        )
+                    };
+                    assert!(result.is_err());
+                    assert_eq!(unsafe { probe_state(self.window) }.unwrap(), before_refusal);
+                    refused += 1;
+                }
+            }
+        }
+        println!("profiles refused without changes: {refused}");
+        println!(
+            "supported_video_profiles: {:?}",
+            supported_video_profiles(format(1920, 1080, Codec::H264, PixelFormat::Nv12))
+        );
+    }
+
+    /// A minimized window has no client area; the reset must still leave a
+    /// usable output until it is restored.
+    unsafe fn reset_while_minimized(&mut self) -> ProbeState {
+        let window = self.window;
+        let _ = unsafe { ShowWindow(window, SW_MINIMIZE) };
+        unsafe { pump(window, Duration::from_millis(200)) };
+        unsafe {
+            self.presentation.reset_presentation(
+                format(1920, 1080, Codec::H264, PixelFormat::Nv12),
+                console(2, 1920, 1080),
+                vec![console(1, 1280, 720), console(2, 1920, 1080)],
+            )
+        }
+        .unwrap();
+        let frame =
+            unsafe { present_synthetic(&mut self.presentation, 1920, 1080, PixelFormat::Nv12) }
+                .unwrap();
+        let _ = unsafe { ShowWindow(window, SW_RESTORE) };
+        unsafe { pump(window, Duration::from_millis(300)) };
+        if let Some(layout) = unsafe { window::take_resize(window) } {
+            unsafe { self.presentation.renderer().resize(&layout) }.unwrap();
+        }
+        unsafe { self.presentation.renderer().present(&frame, 0) }.unwrap();
+        unsafe { pump(window, Duration::from_millis(200)) };
+        let restored = unsafe { probe_state(window) }.unwrap();
+        unsafe { assert_pointer_corners(window, &self.sent, &restored) };
+        assert_same_family(window, &self.family);
+        restored
+    }
+
+    unsafe fn check_drawn_after_resets(&self, restored: &ProbeState) {
+        let toolbar_colors =
+            unsafe { distinct_colors(self.window, restored.toolbar_height) }.unwrap();
+        println!("toolbar colors after: {toolbar_colors}");
+        assert!(
+            toolbar_colors > 2,
+            "the toolbar was not drawn after the resets"
+        );
+        if unsafe { IsWindowVisible(self.chat_popup) }.as_bool() {
+            let chat_colors = unsafe { distinct_colors(self.chat_popup, 0) }.unwrap();
+            println!("chat colors after: {chat_colors}");
+            assert!(
+                chat_colors > 2,
+                "the chat popup was not drawn after the resets"
+            );
+        } else {
+            println!("the chat popup is hidden (no foreground rights); its contents were compared");
+        }
+        assert_eq!(
+            unsafe { chat_contents(&self.family) }.unwrap().1,
+            self.chat_before
+        );
+    }
 }
