@@ -441,7 +441,7 @@ impl IFileDialogControlEvents_Impl for PickerEvents_Impl {
         _: u32,
     ) -> windows::core::Result<()> {
         unsafe {
-            let dialog: IFileOpenDialog = customize.as_ref().unwrap().cast()?;
+            let dialog: IFileOpenDialog = customize.ok()?.cast()?;
             let items = dialog.GetSelectedItems()?;
             let mut paths = Vec::new();
             for index in 0..items.GetCount()? {

@@ -200,13 +200,12 @@ fn id() -> u64 {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos() as u64;
-    let previous = LAST
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+    let (Ok(previous) | Err(previous)) =
+        LAST.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
             Some(now.max(last + 1))
-        })
-        .unwrap();
+        });
     now.max(previous + 1)
 }
 
@@ -996,7 +995,10 @@ impl Incoming {
                         .filter(|declared| *declared <= self.total_bytes)
                         .context("files are larger than announced")?;
                 }
-                let root = path.split('/').next().unwrap().to_owned();
+                let root = path
+                    .split_once('/')
+                    .map_or(&*path, |(root, _)| root)
+                    .to_owned();
                 if !self.roots.contains(&root) {
                     self.roots.push(root);
                 }

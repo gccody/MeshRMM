@@ -253,7 +253,7 @@ mod tests {
             load(&path).headless_resolution,
             HeadlessResolution::default()
         );
-        // The session close action used to be saved here; it is now per session.
+        // Unknown keys are ignored.
         std::fs::write(
             &path,
             r#"{"disconnect_confirmation":false,"session_close_action":"lock"}"#,

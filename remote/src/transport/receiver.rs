@@ -12,7 +12,7 @@ use meshrmm_protocol::{
     CONTROL_CHANNEL_LABEL, ChromaMode, Codec, IceServer, SessionBootstrap, SessionMessage,
     SessionState, SignalErrorCode, SignalMessage, VideoProfile,
 };
-use meshrmm_session_transport::{SERVICE_CHANNELS, ServiceChannel};
+use meshrmm_session_transport::ServiceChannel;
 use meshrmm_signaling_client::SessionSignaling;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -604,8 +604,7 @@ fn install_data_channel_handler(
                         lifecycle.shutting_down,
                     )
                 }
-                label if SERVICE_CHANNELS.contains(&label) => {
-                    let route = service_routes.get(label).unwrap().clone();
+                label if let Some(route) = service_routes.get(label).cloned() => {
                     let channel = ServiceChannel::new(channel).await;
                     route.attach(channel.clone());
                     let label = channel.label().to_owned();

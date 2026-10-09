@@ -364,9 +364,9 @@ fn substitute(template: &str, path: &str, arguments: &str) -> anyhow::Result<Str
             remaining = rest;
             continue;
         }
-        let c = remaining.chars().next().unwrap();
-        command.push(c);
-        remaining = &remaining[c.len_utf8()..];
+        let mut chars = remaining.chars();
+        command.extend(chars.next());
+        remaining = chars.as_str();
     }
     ensure!(found, "This file association does not accept a filename.");
     Ok(command)
