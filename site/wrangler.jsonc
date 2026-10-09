@@ -1,0 +1,19 @@
+// Publishes the site as a Cloudflare Worker that serves only static assets.
+// `.github/workflows/site.yml` deploys it when `site/` changes on main.
+{
+  "name": "meshrmm-site",
+  "account_id": "023f5fc9ffca88a15dac8e9f27b8d21f",
+  "compatibility_date": "2026-10-09",
+  // `.assetsignore` keeps this file, the README and the tests out.
+  "assets": {
+    "directory": ".",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "none"
+  },
+  "routes": [
+    { "pattern": "meshrmm.com", "custom_domain": true },
+    { "pattern": "www.meshrmm.com", "custom_domain": true }
+  ],
+  "workers_dev": false,
+  "preview_urls": false
+}

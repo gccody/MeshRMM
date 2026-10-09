@@ -1,0 +1,5 @@
+.assetsignore
+.wrangler
+wrangler.jsonc
+README.md
+*.test.mjs

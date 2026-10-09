@@ -21,15 +21,22 @@ Then open <http://127.0.0.1:4719/>.
 
 ## Publish
 
-Copy `index.html`, `styles.css`, `favicon.svg` and `fonts/` to any static host.
-The page sets its Content Security Policy in a `<meta>` tag. A host that can
-set response headers should also send:
+`.github/workflows/site.yml` deploys the site to <https://meshrmm.com> whenever
+`site/` changes on main, and can be run by hand from the Actions tab. It runs
+`wrangler deploy` here, which publishes the files as a Cloudflare Worker that
+serves only static assets:
 
-```text
-Strict-Transport-Security: max-age=31536000; includeSubDomains
-Content-Security-Policy: frame-ancestors 'none'
-X-Content-Type-Options: nosniff
-Referrer-Policy: strict-origin-when-cross-origin
-```
+- `wrangler.jsonc`: the Worker, its account, and the `meshrmm.com` and
+  `www.meshrmm.com` custom domains.
+- `.assetsignore`: the files in this directory that aren't published.
+- `_headers`: response headers Cloudflare sends with every file. The page sets
+  its Content Security Policy in a `<meta>` tag, but `frame-ancestors` only
+  works as a header.
 
-`frame-ancestors` only works as a header, not in the `<meta>` tag.
+The workflow needs the `CLOUDFLARE_API_TOKEN` repository secret: an API token
+with Account › Workers Scripts › Edit and, for the `meshrmm.com` zone,
+Zone › Workers Routes › Edit and DNS › Edit. To deploy from your own machine
+instead, run `npx wrangler login`, then `npx wrangler deploy` in this directory.
+
+On another static host, publish `index.html`, `styles.css`, `favicon.svg` and
+`fonts/`, and send the headers in `_headers`.
