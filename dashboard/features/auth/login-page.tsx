@@ -166,58 +166,48 @@ export function LoginPage() {
   };
 
   if (step.kind === "second-factor") {
-    const choices = (Object.keys(METHOD_CHOICES) as SecondFactorMethod[]).filter((method) =>
-      method !== step.method && step.methods.includes(method) && (method !== "passkey" || passkeyUsable(step)));
     return (
-      <AuthCard icon={<ShieldCheck size={22} />} eyebrow={instance?.name} title="Two-factor authentication">
-        {step.method === "passkey" ? (
-          <>
-            <p>Use one of your passkeys: on this device, your phone or a security key.</p>
-            <div className="form-stack">
-              <FormError message={error} />
-              <button type="button" className="primary-button" disabled={busy} onClick={() => void answerWithPasskey()}>{busy ? <LoaderCircle size={16} className="spin" /> : <Fingerprint size={16} />} Use a passkey</button>
-            </div>
-          </>
-        ) : (
-          <>
-            <p>{step.method === "recovery_code"
-              ? "Enter one of the recovery codes you saved when you set up two-factor authentication. Each code works once."
-              : "Enter the 6-digit code from your authenticator app."}</p>
-            <form className="form-stack" onSubmit={submitCode}>
-              {step.method === "recovery_code" ? (
-                <label htmlFor="recovery-code">Recovery code
-                  <input id="recovery-code" autoComplete="off" autoCapitalize="off" spellCheck={false} required value={code} onChange={(event) => setCode(event.target.value)} />
-                </label>
-              ) : (
-                <label htmlFor="totp-code">Authentication code
-                  <input id="totp-code" inputMode="numeric" autoComplete="one-time-code" required value={code} onChange={(event) => setCode(event.target.value)} />
-                </label>
-              )}
-              <FormError message={error} />
-              <button className="primary-button" disabled={busy}>{busy ? <LoaderCircle size={16} className="spin" /> : <LogIn size={16} />} Sign in</button>
-            </form>
-          </>
-        )}
-        <div className="auth-links">
-          {choices.map((method) => <button key={method} type="button" className="link-button" disabled={busy} onClick={() => choose(method)}>{METHOD_CHOICES[method]}</button>)}
-          <button type="button" className="link-button" disabled={busy} onClick={() => startOver()}>Start over</button>
-        </div>
-      </AuthCard>
+      <SecondFactorCard
+        step={step} instanceName={instance?.name} passkeyUsable={passkeyUsable(step)} code={code} busy={busy} error={error}
+        onCodeChange={setCode} onSubmitCode={submitCode} onPasskey={() => void answerWithPasskey()} onChoose={choose} onStartOver={() => startOver()}
+      />
     );
   }
 
-  const sso = instance?.sign_in.sso ?? null;
-  const passkey = Boolean(instance?.sign_in.passkey) && passkeySupport;
-
   return (
-    <AuthCard icon={<KeyRound size={22} />} eyebrow={instance?.name} title="Sign in">
+    <PasswordCard
+      instanceName={instance?.name} ssoError={ssoError} sso={instance?.sign_in.sso ?? null} passkey={Boolean(instance?.sign_in.passkey) && passkeySupport} next={next}
+      email={email} password={password} busy={busy} error={error} onEmailChange={setEmail} onPasswordChange={setPassword}
+      onSubmit={(event) => void submitPassword(event)} onPasskey={() => void signInWithPasskey()}
+    />
+  );
+}
+
+function PasswordCard({ instanceName, ssoError, sso, passkey, next, email, password, busy, error, onEmailChange, onPasswordChange, onSubmit, onPasskey }: {
+  instanceName: string | undefined;
+  ssoError: string | null;
+  sso: { name: string } | null;
+  // Whether the server and this browser both offer passkey sign-in.
+  passkey: boolean;
+  next: string;
+  email: string;
+  password: string;
+  busy: boolean;
+  error: string | null;
+  onEmailChange: (email: string) => void;
+  onPasswordChange: (password: string) => void;
+  onSubmit: (event: FormEvent) => void;
+  onPasskey: () => void;
+}) {
+  return (
+    <AuthCard icon={<KeyRound size={22} />} eyebrow={instanceName} title="Sign in">
       {ssoError && <p className="form-error auth-sso-error" role="alert">{ssoError}</p>}
-      <form className="form-stack" onSubmit={(event) => void submitPassword(event)}>
+      <form className="form-stack" onSubmit={onSubmit}>
         <label htmlFor="email">Email
-          <input id="email" type="email" autoComplete="username" required value={email} onChange={(event) => setEmail(event.target.value)} />
+          <input id="email" type="email" autoComplete="username" required value={email} onChange={(event) => onEmailChange(event.target.value)} />
         </label>
         <label htmlFor="password">Password
-          <input id="password" type="password" autoComplete="current-password" required value={password} onChange={(event) => setPassword(event.target.value)} />
+          <input id="password" type="password" autoComplete="current-password" required value={password} onChange={(event) => onPasswordChange(event.target.value)} />
         </label>
         <FormError message={error} />
         <button className="primary-button" disabled={busy}>{busy ? <LoaderCircle size={16} className="spin" /> : <LogIn size={16} />} Sign in</button>
@@ -225,12 +215,65 @@ export function LoginPage() {
       {(sso || passkey) && (
         <div className="auth-alternatives">
           <p className="auth-divider"><span>or</span></p>
-          {passkey && <button type="button" className="secondary-button" disabled={busy} onClick={() => void signInWithPasskey()}><Fingerprint size={16} /> Sign in with a passkey</button>}
+          {passkey && <button type="button" className="secondary-button" disabled={busy} onClick={onPasskey}><Fingerprint size={16} /> Sign in with a passkey</button>}
           {sso && <a className="secondary-button" href={ssoStartPath(next)}><LogIn size={16} /> Sign in with {sso.name}</a>}
         </div>
       )}
       <div className="auth-links">
         <Link to="/reset">Forgot your password?</Link>
+      </div>
+    </AuthCard>
+  );
+}
+
+function SecondFactorCard({ step, instanceName, passkeyUsable, code, busy, error, onCodeChange, onSubmitCode, onPasskey, onChoose, onStartOver }: {
+  step: SecondFactor;
+  instanceName: string | undefined;
+  passkeyUsable: boolean;
+  code: string;
+  busy: boolean;
+  error: string | null;
+  onCodeChange: (code: string) => void;
+  onSubmitCode: (event: FormEvent) => void;
+  onPasskey: () => void;
+  onChoose: (method: SecondFactorMethod) => void;
+  onStartOver: () => void;
+}) {
+  const choices = (Object.keys(METHOD_CHOICES) as SecondFactorMethod[]).filter((method) =>
+    method !== step.method && step.methods.includes(method) && (method !== "passkey" || passkeyUsable));
+  return (
+    <AuthCard icon={<ShieldCheck size={22} />} eyebrow={instanceName} title="Two-factor authentication">
+      {step.method === "passkey" ? (
+        <>
+          <p>Use one of your passkeys: on this device, your phone or a security key.</p>
+          <div className="form-stack">
+            <FormError message={error} />
+            <button type="button" className="primary-button" disabled={busy} onClick={onPasskey}>{busy ? <LoaderCircle size={16} className="spin" /> : <Fingerprint size={16} />} Use a passkey</button>
+          </div>
+        </>
+      ) : (
+        <>
+          <p>{step.method === "recovery_code"
+            ? "Enter one of the recovery codes you saved when you set up two-factor authentication. Each code works once."
+            : "Enter the 6-digit code from your authenticator app."}</p>
+          <form className="form-stack" onSubmit={onSubmitCode}>
+            {step.method === "recovery_code" ? (
+              <label htmlFor="recovery-code">Recovery code
+                <input id="recovery-code" autoComplete="off" autoCapitalize="off" spellCheck={false} required value={code} onChange={(event) => onCodeChange(event.target.value)} />
+              </label>
+            ) : (
+              <label htmlFor="totp-code">Authentication code
+                <input id="totp-code" inputMode="numeric" autoComplete="one-time-code" required value={code} onChange={(event) => onCodeChange(event.target.value)} />
+              </label>
+            )}
+            <FormError message={error} />
+            <button className="primary-button" disabled={busy}>{busy ? <LoaderCircle size={16} className="spin" /> : <LogIn size={16} />} Sign in</button>
+          </form>
+        </>
+      )}
+      <div className="auth-links">
+        {choices.map((method) => <button key={method} type="button" className="link-button" disabled={busy} onClick={() => onChoose(method)}>{METHOD_CHOICES[method]}</button>)}
+        <button type="button" className="link-button" disabled={busy} onClick={onStartOver}>Start over</button>
       </div>
     </AuthCard>
   );

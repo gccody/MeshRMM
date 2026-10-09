@@ -143,39 +143,7 @@ export function SsoSettingsSection() {
                 <input type="checkbox" checked={form.requireVerifiedEmail} onChange={(event) => edit({ requireVerifiedEmail: event.target.checked })} />
                 <span><strong>Require a verified email address</strong>Sign in only when the provider says it verified the email address. Microsoft Entra ID says so only with its optional xms_edov claim; add that claim to the app&apos;s token, or turn this off. Without it, anyone the provider gives an address to can sign in as that address&apos;s account, so only do that when you control which addresses the provider assigns.</span>
               </label>
-              <label className="checkbox-row">
-                <input type="checkbox" checked={form.autoProvision} onChange={(event) => edit({ autoProvision: event.target.checked })} />
-                <span><strong>Create accounts on first sign-in</strong>Anyone the provider signs in gets an account here. Otherwise, only invited people can sign in with it.</span>
-              </label>
-              {form.autoProvision && (
-                <label htmlFor="sso-default-role">Role for new accounts
-                  <select id="sso-default-role" value={form.defaultRoleId} onChange={(event) => edit({ defaultRoleId: event.target.value })}>
-                    <option value="">No role (groups may still grant one)</option>
-                    {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
-                  </select>
-                </label>
-              )}
-              <label htmlFor="sso-groups-claim">Groups claim (optional)
-                <input id="sso-groups-claim" autoComplete="off" spellCheck={false} placeholder="groups" value={form.groupsClaim} onChange={(event) => edit({ groupsClaim: event.target.value })} aria-describedby="sso-groups-claim-help" />
-              </label>
-              <small id="sso-groups-claim-help" className="field-help">The claim that lists a user&apos;s groups, such as groups, or a dotted path like realm_access.roles. Each SSO sign-in updates the roles their groups grant below. Signing in with a password or passkey drops those roles until the next SSO sign-in.</small>
-              {form.groupsClaim.trim() && (
-                <fieldset className="group-mappings">
-                  <legend>Roles from groups</legend>
-                  {form.groupRoles.length === 0 && <p className="field-help">No groups grant a role yet.</p>}
-                  {form.groupRoles.map((mapping, index) => (
-                    <div className="group-mapping" key={index}>
-                      <input aria-label={`Group ${index + 1}`} placeholder="Group name" value={mapping.group} onChange={(event) => editMapping(index, { group: event.target.value })} />
-                      <select aria-label={`Role for group ${index + 1}`} value={mapping.role_id} onChange={(event) => editMapping(index, { role_id: event.target.value })}>
-                        <option value="" disabled>Choose a role</option>
-                        {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
-                      </select>
-                      <button type="button" className="agent-delete-button" onClick={() => edit({ groupRoles: form.groupRoles.filter((_, at) => at !== index) })} aria-label={`Remove group ${index + 1}`} title="Remove"><X size={16} /></button>
-                    </div>
-                  ))}
-                  <div><button type="button" className="secondary-button" onClick={() => edit({ groupRoles: [...form.groupRoles, { group: "", role_id: "" }] })}><Plus size={15} /> Add a group</button></div>
-                </fieldset>
-              )}
+              <SsoRoleFields form={form} roles={roles} edit={edit} editMapping={editMapping} />
             </fieldset>
             {discoveryError && (
               <div className="error-banner sso-discovery-error" role="alert">
@@ -193,5 +161,51 @@ export function SsoSettingsSection() {
         </>
       )}
     </section>
+  );
+}
+
+// Who gets an account on first sign-in, and the roles the provider's groups grant.
+function SsoRoleFields({ form, roles, edit, editMapping }: {
+  form: SsoForm;
+  roles: Role[];
+  edit: (change: Partial<SsoForm>) => void;
+  editMapping: (index: number, change: Partial<SsoForm["groupRoles"][number]>) => void;
+}) {
+  return (
+    <>
+      <label className="checkbox-row">
+        <input type="checkbox" checked={form.autoProvision} onChange={(event) => edit({ autoProvision: event.target.checked })} />
+        <span><strong>Create accounts on first sign-in</strong>Anyone the provider signs in gets an account here. Otherwise, only invited people can sign in with it.</span>
+      </label>
+      {form.autoProvision && (
+        <label htmlFor="sso-default-role">Role for new accounts
+          <select id="sso-default-role" value={form.defaultRoleId} onChange={(event) => edit({ defaultRoleId: event.target.value })}>
+            <option value="">No role (groups may still grant one)</option>
+            {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
+          </select>
+        </label>
+      )}
+      <label htmlFor="sso-groups-claim">Groups claim (optional)
+        <input id="sso-groups-claim" autoComplete="off" spellCheck={false} placeholder="groups" value={form.groupsClaim} onChange={(event) => edit({ groupsClaim: event.target.value })} aria-describedby="sso-groups-claim-help" />
+      </label>
+      <small id="sso-groups-claim-help" className="field-help">The claim that lists a user&apos;s groups, such as groups, or a dotted path like realm_access.roles. Each SSO sign-in updates the roles their groups grant below. Signing in with a password or passkey drops those roles until the next SSO sign-in.</small>
+      {form.groupsClaim.trim() && (
+        <fieldset className="group-mappings">
+          <legend>Roles from groups</legend>
+          {form.groupRoles.length === 0 && <p className="field-help">No groups grant a role yet.</p>}
+          {form.groupRoles.map((mapping, index) => (
+            <div className="group-mapping" key={index}>
+              <input aria-label={`Group ${index + 1}`} placeholder="Group name" value={mapping.group} onChange={(event) => editMapping(index, { group: event.target.value })} />
+              <select aria-label={`Role for group ${index + 1}`} value={mapping.role_id} onChange={(event) => editMapping(index, { role_id: event.target.value })}>
+                <option value="" disabled>Choose a role</option>
+                {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
+              </select>
+              <button type="button" className="agent-delete-button" onClick={() => edit({ groupRoles: form.groupRoles.filter((_, at) => at !== index) })} aria-label={`Remove group ${index + 1}`} title="Remove"><X size={16} /></button>
+            </div>
+          ))}
+          <div><button type="button" className="secondary-button" onClick={() => edit({ groupRoles: [...form.groupRoles, { group: "", role_id: "" }] })}><Plus size={15} /> Add a group</button></div>
+        </fieldset>
+      )}
+    </>
   );
 }
