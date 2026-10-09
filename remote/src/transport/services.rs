@@ -70,7 +70,7 @@ pub(super) type ViewerServiceSetup = (ServiceInbox, ViewerServices);
 pub(super) fn start_viewer_services(
     viewer: ViewerControlQueue,
     control: tokio::sync::watch::Sender<Option<ServiceChannel>>,
-    mut controls: mpsc::UnboundedReceiver<SessionMessage>,
+    controls: mpsc::UnboundedReceiver<SessionMessage>,
     lifecycle: ReceiverLifecycle,
 ) -> anyhow::Result<ViewerServiceSetup> {
     let (stop, _) = tokio::sync::watch::channel(false);
@@ -79,139 +79,41 @@ pub(super) fn start_viewer_services(
         stopping: lifecycle.shutting_down.clone(),
         tasks: Vec::new(),
     };
-    let control_writer = control.clone();
-    let errors = lifecycle.presentation_failure.clone();
-    let writer = tokio::spawn(async move {
-        while let Some(message) = controls.recv().await {
-            let Ok(channel) = wait_control_channel(&control_writer).await else {
-                break;
-            };
-            if let Err(error) = meshrmm_session_transport::send(&channel, message).await {
-                let _ = errors.send(format!("input/control send failed: {error:#}"));
-                break;
-            }
-        }
-    });
+    let writer = spawn_control_writer(
+        control.clone(),
+        controls,
+        lifecycle.presentation_failure.clone(),
+    );
     owner.tasks.push(writer.abort_handle());
     let mut inbox = HashMap::new();
     let mut routes = HashMap::new();
     for label in SERVICE_CHANNELS {
         let route = Arc::new(ServiceRoute::default());
         routes.insert(label, route.clone());
-        let (outgoing, mut pending) =
+        let (outgoing, pending) =
             mpsc::channel::<SessionMessage>(if label == CLIPBOARD_CHANNEL { 1024 } else { 64 });
         viewer
             .service_senders
             .lock()
             .unwrap()
             .insert(label, outgoing.clone());
-        let fallback = control.clone();
-        let writer = tokio::spawn(async move {
-            let Ok(fallback) = wait_control_channel(&fallback).await else {
-                return;
-            };
-            let Ok(channel) = route.resolve(fallback).await else {
-                return;
-            };
-            while let Some(message) = pending.recv().await {
-                if let Err(error) = channel.writable().await {
-                    tracing::warn!(label, %error, "viewer service channel unavailable");
-                    break;
-                }
-                if let Err(error) = meshrmm_session_transport::send(&channel, message).await {
-                    tracing::warn!(label, %error, "viewer service send failed");
-                    break;
-                }
-            }
-        });
+        let writer = spawn_service_writer(label, route, control.clone(), pending);
         owner.tasks.push(writer.abort_handle());
-        let (incoming, mut messages) = mpsc::channel(1024);
+        let (incoming, messages) = mpsc::channel(1024);
         inbox.insert(label, incoming);
-        let viewer = viewer.clone();
-        let control = control.clone();
-        let stopping = lifecycle.shutting_down.clone();
+        let worker = ServiceWorker {
+            label,
+            viewer: viewer.clone(),
+            control: control.clone(),
+            stopping: lifecycle.shutting_down.clone(),
+            stop: stop.subscribe(),
+            service_sender: outgoing,
+            messages,
+        };
         let runtime = tokio::runtime::Handle::current();
-        let mut stop = stop.subscribe();
-        let service_sender = outgoing;
-        std::thread::Builder::new().name(format!("viewer-{label}")).spawn(move || {
-            runtime.block_on(async move {
-                let mut clipboard_enabled = label == CLIPBOARD_CHANNEL && crate::preferences::clipboard_sync();
-                let mut clipboard = if clipboard_enabled { ClipboardSync::new(true).ok() } else { None };
-                let mut receiver = meshrmm_protocol::ClipboardReceiver::default();
-                let mut outgoing = std::collections::VecDeque::new();
-                let chat_ready = viewer.chat.outgoing_ready();
-                let files_ready = viewer.files.outgoing_ready();
-                let mut files_pending = true;
-                if label == CHAT_CHANNEL {
-                    tokio::select! {
-                        result = wait_control_channel(&control) => if result.is_err() { return; },
-                        _ = stop.wait_for(|stopped| *stopped) => return,
-                    }
-                    viewer.send(SessionMessage::ChatAvailable);
-                }
-                let mut poll = tokio::time::interval(CLIPBOARD_POLL_INTERVAL);
-                poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                while !stopping.load(Ordering::Acquire) {
-                    tokio::select! {
-                        _ = stop.wait_for(|stopped| *stopped) => break,
-                        message = messages.recv() => {
-                            let Some(message) = message else { break; };
-                            match message {
-                                SessionMessage::FileTransfer(message) => viewer.files.receive(message),
-                                SessionMessage::ChatAvailable => viewer.chat.set_available(true),
-                                SessionMessage::Chat { text } => { viewer.chat.set_available(true); viewer.chat.receive(text); },
-                                message => match receiver.receive(message) {
-                                    Ok(Some(content)) => {
-                                        outgoing.clear();
-                                        if crate::preferences::clipboard_sync()
-                                            && let Some(clipboard) = clipboard.as_mut()
-                                            && let Err(error) = clipboard.apply(content) { tracing::warn!(%error, "viewer clipboard apply failed"); }
-                                    }
-                                    Ok(None) => {},
-                                    Err(error) => tracing::warn!(%error, "invalid viewer clipboard payload"),
-                                },
-                            }
-                        }
-                        _ = chat_ready.notified(), if label == CHAT_CHANNEL => {
-                            while let Some(text) = viewer.chat.poll() {
-                                viewer.resume_state.note_activity();
-                                viewer.send(SessionMessage::Chat { text });
-                            }
-                        }
-                        _ = files_ready.notified(), if label == FILE_CHANNEL => files_pending = true,
-                        permit = service_sender.reserve(), if label == FILE_CHANNEL && files_pending => {
-                            let Ok(permit) = permit else { break; };
-                            if let Some(message) = viewer.files.poll() {
-                                permit.send(SessionMessage::FileTransfer(message));
-                            } else { files_pending = false; }
-                        }
-                        permit = service_sender.reserve(), if label == CLIPBOARD_CHANNEL && !outgoing.is_empty() => {
-                            let Ok(permit) = permit else { break; };
-                            if let Some(message) = outgoing.pop_front() { permit.send(message); }
-                        }
-                        _ = poll.tick(), if label == CLIPBOARD_CHANNEL => {
-                            let enabled = crate::preferences::clipboard_sync();
-                            if enabled != clipboard_enabled {
-                                clipboard_enabled = enabled;
-                                outgoing.clear();
-                                // Re-enabling syncs later copies only; content copied while off stays local.
-                                clipboard = if enabled { ClipboardSync::new(false).ok() } else { None };
-                            }
-                            let open = control.borrow().as_ref().is_some_and(|c| c.ready_state() == RTCDataChannelState::Open);
-                            if !open { continue; }
-                            if let Some(clipboard) = clipboard.as_mut() {
-                                match clipboard.poll().and_then(|c| Ok(c.map(|c| c.messages()).transpose()?)) {
-                                    Ok(Some(messages)) => outgoing = messages.into(),
-                                    Ok(None) => {},
-                                    Err(error) => tracing::warn!(%error, "viewer clipboard poll failed"),
-                                }
-                            }
-                        }
-                    }
-                }
-                if label == CHAT_CHANNEL { viewer.chat.set_available(false); }
-            });
-        })?;
+        std::thread::Builder::new()
+            .name(format!("viewer-{label}"))
+            .spawn(move || runtime.block_on(worker.run()))?;
     }
     Ok((
         ServiceInbox {
@@ -220,4 +122,159 @@ pub(super) fn start_viewer_services(
         },
         owner,
     ))
+}
+
+/// Writes queued control messages once the control channel is open.
+fn spawn_control_writer(
+    control: tokio::sync::watch::Sender<Option<ServiceChannel>>,
+    mut controls: mpsc::UnboundedReceiver<SessionMessage>,
+    errors: mpsc::UnboundedSender<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(message) = controls.recv().await {
+            let Ok(channel) = wait_control_channel(&control).await else {
+                break;
+            };
+            if let Err(error) = meshrmm_session_transport::send(&channel, message).await {
+                let _ = errors.send(format!("input/control send failed: {error:#}"));
+                break;
+            }
+        }
+    })
+}
+
+/// Writes a service's messages on its own channel, or on the control channel
+/// when the route falls back to it.
+fn spawn_service_writer(
+    label: &'static str,
+    route: Arc<ServiceRoute>,
+    fallback: tokio::sync::watch::Sender<Option<ServiceChannel>>,
+    mut pending: mpsc::Receiver<SessionMessage>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let Ok(fallback) = wait_control_channel(&fallback).await else {
+            return;
+        };
+        let Ok(channel) = route.resolve(fallback).await else {
+            return;
+        };
+        while let Some(message) = pending.recv().await {
+            if let Err(error) = channel.writable().await {
+                tracing::warn!(label, %error, "viewer service channel unavailable");
+                break;
+            }
+            if let Err(error) = meshrmm_session_transport::send(&channel, message).await {
+                tracing::warn!(label, %error, "viewer service send failed");
+                break;
+            }
+        }
+    })
+}
+
+/// One service's thread: applies what the device sends and queues what the
+/// viewer sends.
+struct ServiceWorker {
+    label: &'static str,
+    viewer: ViewerControlQueue,
+    control: tokio::sync::watch::Sender<Option<ServiceChannel>>,
+    stopping: Arc<AtomicBool>,
+    stop: tokio::sync::watch::Receiver<bool>,
+    service_sender: mpsc::Sender<SessionMessage>,
+    messages: mpsc::Receiver<SessionMessage>,
+}
+
+impl ServiceWorker {
+    async fn run(self) {
+        let Self {
+            label,
+            viewer,
+            control,
+            stopping,
+            mut stop,
+            service_sender,
+            mut messages,
+        } = self;
+        let mut clipboard_enabled =
+            label == CLIPBOARD_CHANNEL && crate::preferences::clipboard_sync();
+        let mut clipboard = if clipboard_enabled {
+            ClipboardSync::new(true).ok()
+        } else {
+            None
+        };
+        let mut receiver = meshrmm_protocol::ClipboardReceiver::default();
+        let mut outgoing = std::collections::VecDeque::new();
+        let chat_ready = viewer.chat.outgoing_ready();
+        let files_ready = viewer.files.outgoing_ready();
+        let mut files_pending = true;
+        if label == CHAT_CHANNEL {
+            tokio::select! {
+                result = wait_control_channel(&control) => if result.is_err() { return; },
+                _ = stop.wait_for(|stopped| *stopped) => return,
+            }
+            viewer.send(SessionMessage::ChatAvailable);
+        }
+        let mut poll = tokio::time::interval(CLIPBOARD_POLL_INTERVAL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        while !stopping.load(Ordering::Acquire) {
+            tokio::select! {
+                _ = stop.wait_for(|stopped| *stopped) => break,
+                message = messages.recv() => {
+                    let Some(message) = message else { break; };
+                    match message {
+                        SessionMessage::FileTransfer(message) => viewer.files.receive(message),
+                        SessionMessage::ChatAvailable => viewer.chat.set_available(true),
+                        SessionMessage::Chat { text } => { viewer.chat.set_available(true); viewer.chat.receive(text); },
+                        message => match receiver.receive(message) {
+                            Ok(Some(content)) => {
+                                outgoing.clear();
+                                if crate::preferences::clipboard_sync()
+                                    && let Some(clipboard) = clipboard.as_mut()
+                                    && let Err(error) = clipboard.apply(content) { tracing::warn!(%error, "viewer clipboard apply failed"); }
+                            }
+                            Ok(None) => {},
+                            Err(error) => tracing::warn!(%error, "invalid viewer clipboard payload"),
+                        },
+                    }
+                }
+                _ = chat_ready.notified(), if label == CHAT_CHANNEL => {
+                    while let Some(text) = viewer.chat.poll() {
+                        viewer.resume_state.note_activity();
+                        viewer.send(SessionMessage::Chat { text });
+                    }
+                }
+                _ = files_ready.notified(), if label == FILE_CHANNEL => files_pending = true,
+                permit = service_sender.reserve(), if label == FILE_CHANNEL && files_pending => {
+                    let Ok(permit) = permit else { break; };
+                    if let Some(message) = viewer.files.poll() {
+                        permit.send(SessionMessage::FileTransfer(message));
+                    } else { files_pending = false; }
+                }
+                permit = service_sender.reserve(), if label == CLIPBOARD_CHANNEL && !outgoing.is_empty() => {
+                    let Ok(permit) = permit else { break; };
+                    if let Some(message) = outgoing.pop_front() { permit.send(message); }
+                }
+                _ = poll.tick(), if label == CLIPBOARD_CHANNEL => {
+                    let enabled = crate::preferences::clipboard_sync();
+                    if enabled != clipboard_enabled {
+                        clipboard_enabled = enabled;
+                        outgoing.clear();
+                        // Re-enabling syncs later copies only; content copied while off stays local.
+                        clipboard = if enabled { ClipboardSync::new(false).ok() } else { None };
+                    }
+                    let open = control.borrow().as_ref().is_some_and(|c| c.ready_state() == RTCDataChannelState::Open);
+                    if !open { continue; }
+                    if let Some(clipboard) = clipboard.as_mut() {
+                        match clipboard.poll().and_then(|c| Ok(c.map(|c| c.messages()).transpose()?)) {
+                            Ok(Some(messages)) => outgoing = messages.into(),
+                            Ok(None) => {},
+                            Err(error) => tracing::warn!(%error, "viewer clipboard poll failed"),
+                        }
+                    }
+                }
+            }
+        }
+        if label == CHAT_CHANNEL {
+            viewer.chat.set_available(false);
+        }
+    }
 }

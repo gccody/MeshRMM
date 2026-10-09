@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use meshrmm_protocol::{
-    CONTROL_CHANNEL_LABEL, ChromaMode, Codec, CursorShape, SessionMessage, VideoProfile,
+    CONTROL_CHANNEL_LABEL, ChromaMode, Codec, CursorShape, Display, DisplayId, SessionMessage,
+    VideoFormat, VideoProfile, VideoStreamId,
 };
 use meshrmm_session_transport::ServiceChannel;
 use tokio::sync::{Notify, mpsc};
@@ -168,333 +169,493 @@ pub(super) fn install_control_handler(
     debug: DebugInfo,
     shutting_down: Arc<AtomicBool>,
 ) {
-    {
+    install_close_handler(
+        &channel,
+        presentation_failure.clone(),
+        debug.clone(),
+        shutting_down,
+    );
+    let handler = ControlHandler {
+        presenter,
+        viewer_control,
+        remote_text,
+        presentation_failure,
+        debug,
+        cursor_shape: Arc::new(Mutex::new(CursorShape::Default)),
+        pointer_display: Arc::new(Mutex::new(None)),
+        capabilities_sent: Arc::new(AtomicBool::new(false)),
+        supported_profiles: Arc::new(OnceLock::new()),
+        configurations_seen: Arc::new(AtomicU64::new(0)),
+    };
+    channel.on_message(Box::new(move |message| {
+        let handler = handler.clone();
+        Box::pin(async move { handler.handle(&message.data) })
+    }));
+}
+
+fn install_close_handler(
+    channel: &ServiceChannel,
+    presentation_failure: mpsc::UnboundedSender<String>,
+    debug: DebugInfo,
+    shutting_down: Arc<AtomicBool>,
+) {
+    let closing = channel.notifier();
+    channel.on_close(Box::new(move || {
+        closing.notify_waiters();
         let presentation_failure = presentation_failure.clone();
         let debug = debug.clone();
         let shutting_down = Arc::clone(&shutting_down);
-        let closing = channel.notifier();
-        channel.on_close(Box::new(move || {
-            closing.notify_waiters();
-            let presentation_failure = presentation_failure.clone();
-            let debug = debug.clone();
-            let shutting_down = Arc::clone(&shutting_down);
-            Box::pin(async move {
-                debug.set_data_channel(CONTROL_CHANNEL_LABEL, "closed");
-                if shutting_down.load(Ordering::Acquire) {
-                    tracing::info!("viewer control data channel closed during viewer shutdown");
-                    return;
-                }
-                tracing::error!("viewer control data channel closed while video was active");
-                let _ = presentation_failure.send(
-                    "remote input/control channel closed while video was still active".into(),
-                );
-            })
-        }));
-    }
-    let cursor_shape = Arc::new(Mutex::new(CursorShape::Default));
-    let pointer_display = Arc::new(Mutex::new(None));
-    let capabilities_sent = Arc::new(AtomicBool::new(false));
-    let supported_profiles = Arc::new(OnceLock::<Arc<Vec<VideoProfile>>>::new());
-    let configurations_seen = Arc::new(AtomicU64::new(0));
-    let resume_state = viewer_control.resume_state.clone();
-    let quality_preset = Arc::clone(&resume_state.quality);
-    let chroma_mode = Arc::clone(&resume_state.chroma);
-    let selected_display_id = Arc::clone(&resume_state.display_id);
-    channel.on_message(Box::new(move |message| {
-        let presenter = Arc::clone(&presenter);
-        let cursor_shape = Arc::clone(&cursor_shape);
-        let pointer_display = Arc::clone(&pointer_display);
-        let capabilities_sent = Arc::clone(&capabilities_sent);
-        let supported_profiles = Arc::clone(&supported_profiles);
-        let configurations_seen = Arc::clone(&configurations_seen);
-        let quality_preset = Arc::clone(&quality_preset);
-        let chroma_mode = Arc::clone(&chroma_mode);
-        let viewer_control = viewer_control.clone();
-        let remote_text = remote_text.clone();
-        let presentation_failure = presentation_failure.clone();
-        let debug = debug.clone();
-        let selected_display_id = Arc::clone(&selected_display_id);
         Box::pin(async move {
-            match SessionMessage::decode(&message.data) {
-                Ok(SessionMessage::DisplayConfiguration {
-                    displays,
-                    active_display_id,
-                    stream_id,
-                    format,
-                }) => {
-                    let configuration_sequence =
-                        configurations_seen.fetch_add(1, Ordering::AcqRel) + 1;
-                    let previous = presenter.lock().ok().and_then(|guard| {
-                        guard
-                            .as_ref()
-                            .map(|active| (active.stream_id, active.profile))
-                    });
-                    tracing::info!(
-                        configuration_sequence,
-                        previous_stream_id = previous.map(|value| value.0.0),
-                        previous_profile = ?previous.map(|value| value.1),
-                        stream_id = stream_id.0,
-                        display_id = active_display_id.0,
-                        width = format.width,
-                        height = format.height,
-                        fps = format.frames_per_second,
-                        bitrate_bits_per_second = format.bitrate_bits_per_second,
-                        codec = ?format.codec,
-                        "viewer received display configuration"
-                    );
-                    let Some(active_display) = displays
-                        .iter()
-                        .find(|display| display.id == active_display_id)
-                        .cloned()
-                    else {
-                        tracing::error!(display_id = active_display_id.0, "Agent selected an unknown display");
-                        return;
-                    };
-                    let message_queue = viewer_control.clone();
-                    let input_gate = viewer_control.clone();
-                    // Probing Windows hardware MFTs can take noticeable time.
-                    // Codec support is a viewer capability, so do it once per
-                    // connection rather than again for the negotiated echo.
-                    let profiles = supported_profiles
-                        .get_or_init(|| {
-                            Arc::new(crate::platform::supported_video_profiles(format))
-                        })
-                        .clone();
-                    let resumed_display = selected_display_id
-                        .lock()
-                        .ok()
-                        .and_then(|selected| *selected)
-                        .filter(|selected| {
-                            configuration_sequence == 1
-                                && *selected != active_display_id
-                                && displays.iter().any(|display| display.id == *selected)
-                        });
-                    // Replay a remembered choice only on transport reconnect. Later
-                    // configurations acknowledge selection or recovery; replaying a
-                    // failed choice there would cause an endless switch/restore loop.
-                    if resumed_display.is_none()
-                        && let Ok(mut selected) = selected_display_id.lock() {
-                        *selected = Some(active_display_id);
-                    }
-                    let sink = ControlSink::new(ControlSinkParts {
-                        idle: Arc::clone(&viewer_control.resume_state.idle),
-                        idle_disconnect: Arc::clone(&viewer_control.resume_state.idle_disconnect),
-                        clear_clipboard: Arc::clone(&viewer_control.resume_state.clear_clipboard),
-                        display_border: Arc::clone(&viewer_control.resume_state.display_border),
-                        files: viewer_control.files.clone(),
-                        chat: viewer_control.chat.clone(),
-                        audio: viewer_control.resume_state.audio.clone(),
-                        recording: viewer_control.recording.clone(),
-                        send: Arc::new(move |message| message_queue.send(message)),
-                        set_input_enabled: Arc::new(move |enabled| input_gate.set_input_enabled(enabled)),
-                        maintenance: Arc::clone(&viewer_control.maintenance),
-                        credentials: Arc::clone(&viewer_control.credentials),
-                        technician_blocked: Arc::clone(&viewer_control.resume_state.technician_blocked),
-                        wallpaper_hidden: Arc::clone(&viewer_control.resume_state.wallpaper_hidden),
-                        remote_cursor_hidden: Arc::clone(&viewer_control.resume_state.remote_cursor_hidden),
-                        session_close_action: Arc::clone(&viewer_control.resume_state.session_close_action),
-                        restarting: Arc::clone(&viewer_control.resume_state.restarting),
-                        toolbox: viewer_control.resume_state.toolbox.clone(),
-                        quality: Arc::clone(&quality_preset),
-                        chroma: Arc::clone(&chroma_mode),
-                        #[cfg(windows)]
-                        profiles: Arc::clone(&profiles),
-                    });
-                    debug.configure_stream(
-                        active_display.name.clone(),
-                        format.width,
-                        format.height,
-                        format.frames_per_second,
-                        format.codec,
-                    );
-                    let reset_in_place = if capabilities_sent.load(Ordering::Acquire)
-                        && let Ok(mut guard) = presenter.lock()
-                        && let Some(active) = guard.as_mut()
-                        && Presenter::can_reset_in_place(active.format, format)
-                    {
-                        match active.presenter.reset_stream(format, active_display.clone(), displays.clone()) {
-                            Ok(()) => {
-                                let previous_stream_id = active.stream_id;
-                                active.stream_id = stream_id;
-                                active.format = format;
-                                active.profile = format.profile();
-                                tracing::info!(
-                                    configuration_sequence,
-                                    previous_stream_id = previous_stream_id.0,
-                                    stream_id = stream_id.0,
-                                    bitrate_bits_per_second = format.bitrate_bits_per_second,
-                                    codec = ?format.codec,
-                                    "reconfigured the video decoder in place for a replacement stream"
-                                );
-                                true
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    error = %error,
-                                    configuration_sequence,
-                                    previous_stream_id = active.stream_id.0,
-                                    stream_id = stream_id.0,
-                                    "could not reconfigure the video decoder in place; replacing the presenter"
-                                );
-                                false
-                            }
-                        }
-                    } else {
-                        false
-                    };
-
-                    if reset_in_place {
-                        viewer_control.send(SessionMessage::RequestKeyframe { stream_id });
-                        if let Some(display_id) = resumed_display {
-                            viewer_control.send(SessionMessage::SelectDisplay { display_id });
-                        }
-                        tracing::info!(configuration_sequence, stream_id = stream_id.0, display_id = active_display_id.0, display_name = %active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, bitrate_bits_per_second = format.bitrate_bits_per_second, codec = ?format.codec, "remote control stream reconfigured without replacing its window");
-                        return;
-                    }
-                    if !capabilities_sent.swap(true, Ordering::AcqRel) {
-                        // The first configuration describes the Agent's mandatory
-                        // bootstrap profile. Negotiate the best common profile
-                        // before creating a visible presenter; the Agent echoes a
-                        // settled configuration even when that profile is retained.
-                        viewer_control.send(SessionMessage::SetPreventIdleLock { enabled: sink.prevent_idle_lock() });
-                        viewer_control.send(SessionMessage::SetSessionCloseAction { action: sink.session_close_action() });
-                        viewer_control.send(SessionMessage::SetClearClipboardOnClose { enabled: sink.clear_clipboard_on_close() });
-                        viewer_control.send(SessionMessage::SetDisplayBorder { enabled: sink.display_border() });
-                        viewer_control.send(SessionMessage::SetWallpaperHidden { hidden: sink.wallpaper_hidden() });
-                        viewer_control.send(SessionMessage::SetRecording {
-                            enabled: viewer_control.recording.active(),
-                        });
-                        viewer_control.send(SessionMessage::SetCursorCapture {
-                            enabled: sink.show_remote_cursor(),
-                        });
-                        // Before the capabilities, so the Agent never starts
-                        // audio for a muted viewer.
-                        viewer_control.send(crate::platform::audio_preference(sink.audio_muted()));
-                        viewer_control.send(SessionMessage::ViewerCapabilities {
-                            profiles: profiles.as_ref().clone(),
-                            quality: sink.quality_preset(),
-                            chroma: sink.chroma_mode(),
-                            headless_resolution: crate::preferences::headless_resolution(),
-                        });
-                        tracing::info!(
-                            configuration_sequence,
-                            stream_id = stream_id.0,
-                            "viewer capabilities sent; waiting for the settled video profile"
-                        );
-                        return;
-                    }
-                    match Presenter::start(
-                        format,
-                        active_display.clone(),
-                        displays,
-                        sink.clone(),
-                        debug.clone(),
-                    ) {
-                        Ok(new_presenter) => {
-                            crate::launch_status::finish();
-                            if let Ok(display) = pointer_display.lock() { new_presenter.set_agent_pointer_display(*display); }
-                            if let Ok(shape) = cursor_shape.lock() {
-                                new_presenter.set_cursor_shape(*shape);
-                            }
-                            let mut old = presenter
-                                .lock()
-                                .ok()
-                                .and_then(|mut guard| guard.replace(ActivePresenter {
-                                    stream_id,
-                                    format,
-                                    profile: format.profile(),
-                                    presenter: new_presenter,
-                                }));
-                            if let Some(old) = old.as_mut() {
-                                tracing::warn!(
-                                    configuration_sequence,
-                                    previous_stream_id = old.stream_id.0,
-                                    previous_profile = ?old.profile,
-                                    stream_id = stream_id.0,
-                                    codec = ?format.codec,
-                                    "replacing the active presenter after display configuration"
-                                );
-                                old.presenter.stop();
-                            }
-                            // The new window is up; retire the one kept while reconnecting.
-                            viewer_control.resume_state.close_reconnecting_window();
-                            let request = SessionMessage::RequestKeyframe { stream_id };
-                            viewer_control.send(request);
-                            if let Some(display_id) = resumed_display {
-                                viewer_control.send(SessionMessage::SelectDisplay { display_id });
-                                tracing::info!(
-                                    display_id = display_id.0,
-                                    "restored viewer display selection after reconnect"
-                                );
-                            }
-                            tracing::info!(configuration_sequence, stream_id = stream_id.0, display_id = active_display_id.0, display_name = %active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, bitrate_bits_per_second = format.bitrate_bits_per_second, codec = ?format.codec, "remote control stream configured");
-                        }
-                        Err(error) => {
-                            let message = format!(
-                                "hardware decoder/presenter initialization failed: {error:#}"
-                            );
-                            tracing::error!(error = %error, "hardware decoder/presenter initialization failed");
-                            if format.profile()
-                                != (VideoProfile {
-                                    codec: Codec::H264,
-                                    chroma: ChromaMode::Yuv420,
-                                })
-                            {
-                                viewer_control.send(SessionMessage::VideoProfileRejected {
-                                    profile: format.profile(),
-                                    reason: message,
-                                });
-                            } else {
-                                let _ = presentation_failure.send(message);
-                            }
-                        }
-                    }
-                }
-                Ok(SessionMessage::CredentialState(state)) => {
-                    if let Ok(mut current) = viewer_control.credentials.lock() { *current = state; }
-                    if let Ok(guard) = presenter.lock() && let Some(active) = guard.as_ref() { active.presenter.refresh_controls(); }
-                }
-                Ok(SessionMessage::MaintenanceError { reason }) => {
-                    // A failed restart leaves the computer running.
-                    if let Ok(mut restarting) = viewer_control.resume_state.restarting.lock() { restarting.take(); }
-                    if let Ok(mut state) = viewer_control.maintenance.lock() { state.error = Some(reason); }
-                    if let Ok(guard) = presenter.lock() && let Some(active) = guard.as_ref() { active.presenter.refresh_controls(); }
-                }
-                Ok(SessionMessage::MaintenanceState { agent_input_blocked, blacked_out }) => {
-                    if let Ok(mut state) = viewer_control.maintenance.lock() {
-                        *state = crate::platform::MaintenanceState { available: true, agent_input_blocked, blacked_out, error: None, power: state.power, platform: state.platform };
-                    }
-                }
-                Ok(SessionMessage::DeviceState { platform, safe_mode }) => {
-                    if let Ok(mut state) = viewer_control.maintenance.lock() {
-                        state.power = Some(safe_mode);
-                        state.platform = Some(platform);
-                    }
-                    if let Ok(guard) = presenter.lock() && let Some(active) = guard.as_ref() { active.presenter.refresh_controls(); }
-                }
-                Ok(SessionMessage::Stop { reason }) => tracing::info!(reason, "Agent stopped stream"),
-                Ok(SessionMessage::AgentPointerDisplay { display_id }) => {
-                    if let Ok(mut current) = pointer_display.lock() { *current = display_id; }
-                    if let Ok(guard) = presenter.lock() && let Some(active) = guard.as_ref() { active.presenter.set_agent_pointer_display(display_id); }
-                }
-                Ok(SessionMessage::CursorShape { shape }) => {
-                    if let Ok(mut current) = cursor_shape.lock() {
-                        *current = shape;
-                    }
-                    if let Ok(guard) = presenter.lock()
-                        && let Some(active) = guard.as_ref()
-                    {
-                        active.presenter.set_cursor_shape(shape);
-                    }
-                }
-                Ok(message @ (SessionMessage::FileTransfer(_) | SessionMessage::Clipboard { .. } | SessionMessage::ClipboardChunk { .. } | SessionMessage::Chat { .. } | SessionMessage::ChatAvailable)) => {
-                    remote_text.send(message);
-                }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(error = %error, "discarding invalid control message"),
+            debug.set_data_channel(CONTROL_CHANNEL_LABEL, "closed");
+            if shutting_down.load(Ordering::Acquire) {
+                tracing::info!("viewer control data channel closed during viewer shutdown");
+                return;
             }
+            tracing::error!("viewer control data channel closed while video was active");
+            let _ = presentation_failure
+                .send("remote input/control channel closed while video was still active".into());
         })
     }));
+}
+
+/// Applies the messages the device sends on the control channel. The state
+/// lasts for one control channel.
+#[derive(Clone)]
+struct ControlHandler {
+    presenter: Arc<Mutex<Option<ActivePresenter>>>,
+    viewer_control: ViewerControlQueue,
+    remote_text: ServiceInbox,
+    presentation_failure: mpsc::UnboundedSender<String>,
+    debug: DebugInfo,
+    cursor_shape: Arc<Mutex<CursorShape>>,
+    pointer_display: Arc<Mutex<Option<DisplayId>>>,
+    capabilities_sent: Arc<AtomicBool>,
+    supported_profiles: Arc<OnceLock<Arc<Vec<VideoProfile>>>>,
+    configurations_seen: Arc<AtomicU64>,
+}
+
+/// A display configuration from the device, with the display it shows.
+struct Configuration {
+    sequence: u64,
+    displays: Vec<Display>,
+    active_display: Display,
+    stream_id: VideoStreamId,
+    format: VideoFormat,
+}
+
+impl ControlHandler {
+    fn handle(&self, data: &[u8]) {
+        match SessionMessage::decode(data) {
+            Ok(SessionMessage::DisplayConfiguration {
+                displays,
+                active_display_id,
+                stream_id,
+                format,
+            }) => self.apply_display_configuration(displays, active_display_id, stream_id, format),
+            Ok(SessionMessage::CredentialState(state)) => {
+                if let Ok(mut current) = self.viewer_control.credentials.lock() {
+                    *current = state;
+                }
+                self.refresh_controls();
+            }
+            Ok(SessionMessage::MaintenanceError { reason }) => {
+                // A failed restart leaves the computer running.
+                if let Ok(mut restarting) = self.viewer_control.resume_state.restarting.lock() {
+                    restarting.take();
+                }
+                if let Ok(mut state) = self.viewer_control.maintenance.lock() {
+                    state.error = Some(reason);
+                }
+                self.refresh_controls();
+            }
+            Ok(SessionMessage::MaintenanceState {
+                agent_input_blocked,
+                blacked_out,
+            }) => {
+                if let Ok(mut state) = self.viewer_control.maintenance.lock() {
+                    *state = crate::platform::MaintenanceState {
+                        available: true,
+                        agent_input_blocked,
+                        blacked_out,
+                        error: None,
+                        power: state.power,
+                        platform: state.platform,
+                    };
+                }
+            }
+            Ok(SessionMessage::DeviceState {
+                platform,
+                safe_mode,
+            }) => {
+                if let Ok(mut state) = self.viewer_control.maintenance.lock() {
+                    state.power = Some(safe_mode);
+                    state.platform = Some(platform);
+                }
+                self.refresh_controls();
+            }
+            Ok(SessionMessage::Stop { reason }) => tracing::info!(reason, "Agent stopped stream"),
+            Ok(SessionMessage::AgentPointerDisplay { display_id }) => {
+                if let Ok(mut current) = self.pointer_display.lock() {
+                    *current = display_id;
+                }
+                if let Ok(guard) = self.presenter.lock()
+                    && let Some(active) = guard.as_ref()
+                {
+                    active.presenter.set_agent_pointer_display(display_id);
+                }
+            }
+            Ok(SessionMessage::CursorShape { shape }) => {
+                if let Ok(mut current) = self.cursor_shape.lock() {
+                    *current = shape;
+                }
+                if let Ok(guard) = self.presenter.lock()
+                    && let Some(active) = guard.as_ref()
+                {
+                    active.presenter.set_cursor_shape(shape);
+                }
+            }
+            Ok(
+                message @ (SessionMessage::FileTransfer(_)
+                | SessionMessage::Clipboard { .. }
+                | SessionMessage::ClipboardChunk { .. }
+                | SessionMessage::Chat { .. }
+                | SessionMessage::ChatAvailable),
+            ) => {
+                self.remote_text.send(message);
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(error = %error, "discarding invalid control message"),
+        }
+    }
+
+    fn refresh_controls(&self) {
+        if let Ok(guard) = self.presenter.lock()
+            && let Some(active) = guard.as_ref()
+        {
+            active.presenter.refresh_controls();
+        }
+    }
+
+    fn apply_display_configuration(
+        &self,
+        displays: Vec<Display>,
+        active_display_id: DisplayId,
+        stream_id: VideoStreamId,
+        format: VideoFormat,
+    ) {
+        let configuration_sequence = self.configurations_seen.fetch_add(1, Ordering::AcqRel) + 1;
+        let previous = self.presenter.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|active| (active.stream_id, active.profile))
+        });
+        tracing::info!(
+            configuration_sequence,
+            previous_stream_id = previous.map(|value| value.0.0),
+            previous_profile = ?previous.map(|value| value.1),
+            stream_id = stream_id.0,
+            display_id = active_display_id.0,
+            width = format.width,
+            height = format.height,
+            fps = format.frames_per_second,
+            bitrate_bits_per_second = format.bitrate_bits_per_second,
+            codec = ?format.codec,
+            "viewer received display configuration"
+        );
+        let Some(active_display) = displays
+            .iter()
+            .find(|display| display.id == active_display_id)
+            .cloned()
+        else {
+            tracing::error!(
+                display_id = active_display_id.0,
+                "Agent selected an unknown display"
+            );
+            return;
+        };
+        // Probing Windows hardware MFTs can take noticeable time.
+        // Codec support is a viewer capability, so do it once per
+        // connection rather than again for the negotiated echo.
+        let profiles = self
+            .supported_profiles
+            .get_or_init(|| Arc::new(crate::platform::supported_video_profiles(format)))
+            .clone();
+        let resumed_display =
+            self.resumed_display(configuration_sequence, active_display_id, &displays);
+        let sink = self.control_sink(&profiles);
+        self.debug.configure_stream(
+            active_display.name.clone(),
+            format.width,
+            format.height,
+            format.frames_per_second,
+            format.codec,
+        );
+        let configuration = Configuration {
+            sequence: configuration_sequence,
+            displays,
+            active_display,
+            stream_id,
+            format,
+        };
+        if self.reset_in_place(&configuration) {
+            self.viewer_control
+                .send(SessionMessage::RequestKeyframe { stream_id });
+            if let Some(display_id) = resumed_display {
+                self.viewer_control
+                    .send(SessionMessage::SelectDisplay { display_id });
+            }
+            tracing::info!(configuration_sequence, stream_id = stream_id.0, display_id = active_display_id.0, display_name = %configuration.active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, bitrate_bits_per_second = format.bitrate_bits_per_second, codec = ?format.codec, "remote control stream reconfigured without replacing its window");
+            return;
+        }
+        if !self.capabilities_sent.swap(true, Ordering::AcqRel) {
+            self.send_capabilities(&sink, &profiles, &configuration);
+            return;
+        }
+        self.start_presenter(configuration, &sink, resumed_display);
+    }
+
+    /// The display to select again after a transport reconnect, if the
+    /// device came back showing another one.
+    fn resumed_display(
+        &self,
+        configuration_sequence: u64,
+        active_display_id: DisplayId,
+        displays: &[Display],
+    ) -> Option<DisplayId> {
+        let selected_display_id = &self.viewer_control.resume_state.display_id;
+        let resumed_display = selected_display_id
+            .lock()
+            .ok()
+            .and_then(|selected| *selected)
+            .filter(|selected| {
+                configuration_sequence == 1
+                    && *selected != active_display_id
+                    && displays.iter().any(|display| display.id == *selected)
+            });
+        // Replay a remembered choice only on transport reconnect. Later
+        // configurations acknowledge selection or recovery; replaying a
+        // failed choice there would cause an endless switch/restore loop.
+        if resumed_display.is_none()
+            && let Ok(mut selected) = selected_display_id.lock()
+        {
+            *selected = Some(active_display_id);
+        }
+        resumed_display
+    }
+
+    fn control_sink(&self, profiles: &Arc<Vec<VideoProfile>>) -> ControlSink {
+        #[cfg(not(windows))]
+        let _ = profiles;
+        let viewer_control = &self.viewer_control;
+        let message_queue = viewer_control.clone();
+        let input_gate = viewer_control.clone();
+        let resume_state = &viewer_control.resume_state;
+        ControlSink::new(ControlSinkParts {
+            idle: Arc::clone(&resume_state.idle),
+            idle_disconnect: Arc::clone(&resume_state.idle_disconnect),
+            clear_clipboard: Arc::clone(&resume_state.clear_clipboard),
+            display_border: Arc::clone(&resume_state.display_border),
+            files: viewer_control.files.clone(),
+            chat: viewer_control.chat.clone(),
+            audio: resume_state.audio.clone(),
+            recording: viewer_control.recording.clone(),
+            send: Arc::new(move |message| message_queue.send(message)),
+            set_input_enabled: Arc::new(move |enabled| input_gate.set_input_enabled(enabled)),
+            maintenance: Arc::clone(&viewer_control.maintenance),
+            credentials: Arc::clone(&viewer_control.credentials),
+            technician_blocked: Arc::clone(&resume_state.technician_blocked),
+            wallpaper_hidden: Arc::clone(&resume_state.wallpaper_hidden),
+            remote_cursor_hidden: Arc::clone(&resume_state.remote_cursor_hidden),
+            session_close_action: Arc::clone(&resume_state.session_close_action),
+            restarting: Arc::clone(&resume_state.restarting),
+            toolbox: resume_state.toolbox.clone(),
+            quality: Arc::clone(&resume_state.quality),
+            chroma: Arc::clone(&resume_state.chroma),
+            #[cfg(windows)]
+            profiles: Arc::clone(profiles),
+        })
+    }
+
+    /// Resets the active presenter for a replacement stream, keeping its
+    /// window. False when it has to be replaced instead.
+    fn reset_in_place(&self, configuration: &Configuration) -> bool {
+        let Configuration {
+            sequence: configuration_sequence,
+            stream_id,
+            format,
+            ..
+        } = *configuration;
+        if self.capabilities_sent.load(Ordering::Acquire)
+            && let Ok(mut guard) = self.presenter.lock()
+            && let Some(active) = guard.as_mut()
+            && Presenter::can_reset_in_place(active.format, format)
+        {
+            match active.presenter.reset_stream(
+                format,
+                configuration.active_display.clone(),
+                configuration.displays.clone(),
+            ) {
+                Ok(()) => {
+                    let previous_stream_id = active.stream_id;
+                    active.stream_id = stream_id;
+                    active.format = format;
+                    active.profile = format.profile();
+                    tracing::info!(
+                        configuration_sequence,
+                        previous_stream_id = previous_stream_id.0,
+                        stream_id = stream_id.0,
+                        bitrate_bits_per_second = format.bitrate_bits_per_second,
+                        codec = ?format.codec,
+                        "reconfigured the video decoder in place for a replacement stream"
+                    );
+                    true
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        configuration_sequence,
+                        previous_stream_id = active.stream_id.0,
+                        stream_id = stream_id.0,
+                        "could not reconfigure the video decoder in place; replacing the presenter"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+
+    /// The first configuration describes the Agent's mandatory bootstrap
+    /// profile. Negotiate the best common profile before creating a visible
+    /// presenter; the Agent echoes a settled configuration even when that
+    /// profile is retained.
+    fn send_capabilities(
+        &self,
+        sink: &ControlSink,
+        profiles: &Arc<Vec<VideoProfile>>,
+        configuration: &Configuration,
+    ) {
+        let viewer_control = &self.viewer_control;
+        viewer_control.send(SessionMessage::SetPreventIdleLock {
+            enabled: sink.prevent_idle_lock(),
+        });
+        viewer_control.send(SessionMessage::SetSessionCloseAction {
+            action: sink.session_close_action(),
+        });
+        viewer_control.send(SessionMessage::SetClearClipboardOnClose {
+            enabled: sink.clear_clipboard_on_close(),
+        });
+        viewer_control.send(SessionMessage::SetDisplayBorder {
+            enabled: sink.display_border(),
+        });
+        viewer_control.send(SessionMessage::SetWallpaperHidden {
+            hidden: sink.wallpaper_hidden(),
+        });
+        viewer_control.send(SessionMessage::SetRecording {
+            enabled: viewer_control.recording.active(),
+        });
+        viewer_control.send(SessionMessage::SetCursorCapture {
+            enabled: sink.show_remote_cursor(),
+        });
+        // Before the capabilities, so the Agent never starts
+        // audio for a muted viewer.
+        viewer_control.send(crate::platform::audio_preference(sink.audio_muted()));
+        viewer_control.send(SessionMessage::ViewerCapabilities {
+            profiles: profiles.as_ref().clone(),
+            quality: sink.quality_preset(),
+            chroma: sink.chroma_mode(),
+            headless_resolution: crate::preferences::headless_resolution(),
+        });
+        tracing::info!(
+            configuration_sequence = configuration.sequence,
+            stream_id = configuration.stream_id.0,
+            "viewer capabilities sent; waiting for the settled video profile"
+        );
+    }
+
+    fn start_presenter(
+        &self,
+        configuration: Configuration,
+        sink: &ControlSink,
+        resumed_display: Option<DisplayId>,
+    ) {
+        let Configuration {
+            sequence: configuration_sequence,
+            displays,
+            active_display,
+            stream_id,
+            format,
+        } = configuration;
+        match Presenter::start(
+            format,
+            active_display.clone(),
+            displays,
+            sink.clone(),
+            self.debug.clone(),
+        ) {
+            Ok(new_presenter) => {
+                crate::launch_status::finish();
+                if let Ok(display) = self.pointer_display.lock() {
+                    new_presenter.set_agent_pointer_display(*display);
+                }
+                if let Ok(shape) = self.cursor_shape.lock() {
+                    new_presenter.set_cursor_shape(*shape);
+                }
+                let mut old = self.presenter.lock().ok().and_then(|mut guard| {
+                    guard.replace(ActivePresenter {
+                        stream_id,
+                        format,
+                        profile: format.profile(),
+                        presenter: new_presenter,
+                    })
+                });
+                if let Some(old) = old.as_mut() {
+                    tracing::warn!(
+                        configuration_sequence,
+                        previous_stream_id = old.stream_id.0,
+                        previous_profile = ?old.profile,
+                        stream_id = stream_id.0,
+                        codec = ?format.codec,
+                        "replacing the active presenter after display configuration"
+                    );
+                    old.presenter.stop();
+                }
+                // The new window is up; retire the one kept while reconnecting.
+                self.viewer_control.resume_state.close_reconnecting_window();
+                let request = SessionMessage::RequestKeyframe { stream_id };
+                self.viewer_control.send(request);
+                if let Some(display_id) = resumed_display {
+                    self.viewer_control
+                        .send(SessionMessage::SelectDisplay { display_id });
+                    tracing::info!(
+                        display_id = display_id.0,
+                        "restored viewer display selection after reconnect"
+                    );
+                }
+                tracing::info!(configuration_sequence, stream_id = stream_id.0, display_id = active_display.id.0, display_name = %active_display.name, width = format.width, height = format.height, fps = format.frames_per_second, bitrate_bits_per_second = format.bitrate_bits_per_second, codec = ?format.codec, "remote control stream configured");
+            }
+            Err(error) => {
+                let message =
+                    format!("hardware decoder/presenter initialization failed: {error:#}");
+                tracing::error!(error = %error, "hardware decoder/presenter initialization failed");
+                if format.profile()
+                    != (VideoProfile {
+                        codec: Codec::H264,
+                        chroma: ChromaMode::Yuv420,
+                    })
+                {
+                    self.viewer_control
+                        .send(SessionMessage::VideoProfileRejected {
+                            profile: format.profile(),
+                            reason: message,
+                        });
+                } else {
+                    let _ = self.presentation_failure.send(message);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

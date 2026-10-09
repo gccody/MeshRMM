@@ -4,6 +4,7 @@
 //! reconnects in the background.
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +14,7 @@ use meshrmm_protocol::{
     SessionState, SignalErrorCode, SignalMessage, VideoProfile,
 };
 use meshrmm_session_transport::ServiceChannel;
+use meshrmm_session_transport::identity::PeerIdentity;
 use meshrmm_signaling_client::SessionSignaling;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -44,35 +46,14 @@ pub async fn run_receiver(
     bootstrap: SessionBootstrap,
     resume_state: ViewerResumeState,
 ) -> anyhow::Result<()> {
-    resume_state
-        .display_border
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert(bootstrap.display_border);
-    resume_state
-        .idle
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .policy = bootstrap.idle_policy;
-    resume_state
-        .idle_disconnect
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .set_policy(bootstrap.idle_disconnect);
-    resume_state
-        .clear_clipboard
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .policy = bootstrap.clear_clipboard_policy;
+    apply_bootstrap_policies(&resume_state, &bootstrap);
     // Resumes keep the session and its client token.
     resume_state.toolbox.connect(
         &config.server,
         bootstrap.session_id.as_str(),
         &bootstrap.signaling_token,
     );
-    let identity = meshrmm_session_transport::identity::PeerIdentity::load(
-        &meshrmm_session_transport::identity::viewer_directory()?,
-    )?;
+    let identity = PeerIdentity::load(&meshrmm_session_transport::identity::viewer_directory()?)?;
     let debug = DebugInfo::new(bootstrap.session_id.as_str());
     let url = session_signal_url(&config.server, bootstrap.session_id.as_str())?;
     // Connecting can take a while on a bad network; Cancel must not wait for it.
@@ -80,8 +61,8 @@ pub async fn run_receiver(
         signaling = SessionSignaling::connect(url, bootstrap.signaling_token.clone()) => signaling?,
         () = crate::shutdown::wait() => return Ok(()),
     };
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<SignalMessage>();
-    let (state_tx, mut state_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
+    let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<SignalMessage>();
+    let (state_tx, state_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
     let peer = create_peer(
         &bootstrap.ice_servers,
         outgoing_tx.clone(),
@@ -94,8 +75,7 @@ pub async fn run_receiver(
     let control_channel = tokio::sync::watch::channel(None::<ServiceChannel>).0;
     let (viewer_control_tx, viewer_control_rx) = mpsc::unbounded_channel::<SessionMessage>();
     let viewer_control = ViewerControlQueue::new(viewer_control_tx, resume_state.clone());
-    let (presentation_failure_tx, mut presentation_failure_rx) =
-        mpsc::unbounded_channel::<String>();
+    let (presentation_failure_tx, presentation_failure_rx) = mpsc::unbounded_channel::<String>();
     let lifecycle = ReceiverLifecycle {
         presentation_failure: presentation_failure_tx,
         shutting_down: Arc::new(AtomicBool::new(false)),
@@ -124,262 +104,441 @@ pub async fn run_receiver(
     outgoing_tx.send(SignalMessage::Activity)?;
     session_state = session_state.transition(SessionState::Connecting)?;
     launch_status::report(LaunchStatus::WaitingForRemoteComputer);
-    let mut presenter_missing_since = Some(tokio::time::Instant::now());
-    let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(2));
-    let mut statistics_log = crate::debug::StatisticsLog::default();
-    stats_interval.tick().await;
-    let mut activity_interval = tokio::time::interval(SESSION_ACTIVITY_INTERVAL);
-    activity_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    activity_interval.tick().await;
-    let mut negotiation_interval = tokio::time::interval(NEGOTIATION_RETRY_INTERVAL);
-    negotiation_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    negotiation_interval.tick().await;
-    let mut remote_description_set = false;
-    let mut pending_candidates = Vec::new();
-    let mut disconnected_since = None::<tokio::time::Instant>;
-    // Whether WebRTC connected in this attempt, and whether the Agent
-    // answered at all, tell a blocked network path from a silent Agent.
-    let mut peer_connected = false;
-    let mut offer_received = false;
-    let mut awaiting_approval_since = None::<tokio::time::Instant>;
+    let mut session = SignalingLoop {
+        bootstrap: &bootstrap,
+        resume_state: &resume_state,
+        identity: &identity,
+        debug: &debug,
+        peer: &peer,
+        outgoing: &outgoing_tx,
+        presenter: &presenter,
+        viewer_control: &viewer_control,
+        lifecycle: &lifecycle,
+        session_state,
+        presenter_missing_since: Some(tokio::time::Instant::now()),
+        statistics_log: crate::debug::StatisticsLog::default(),
+        remote_description_set: false,
+        pending_candidates: Vec::new(),
+        disconnected_since: None,
+        peer_connected: false,
+        offer_received: false,
+        awaiting_approval_since: None,
+    };
+    let mut events = SignalingEvents::start(outgoing_rx, state_rx, presentation_failure_rx).await;
     // Pointer pacing must not depend on the receiver loop being available: a
     // control-channel send can await long enough for a short movement burst to
     // end. This activity-driven flusher always queues that burst's newest
     // position after the coalescing window.
     let pointer_flusher = tokio::spawn(flush_pointer_motion(viewer_control.clone()));
-    let result: anyhow::Result<()> = async {
+    let result = session.run(&mut signaling, &mut events).await;
+    session
+        .finish(result, &mut signaling, pointer_flusher)
+        .await
+}
+
+/// Applies the session's policies, keeping the technician's choices from
+/// earlier connections where there are any.
+fn apply_bootstrap_policies(resume_state: &ViewerResumeState, bootstrap: &SessionBootstrap) {
+    resume_state
+        .display_border
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert(bootstrap.display_border);
+    resume_state
+        .idle
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .policy = bootstrap.idle_policy;
+    resume_state
+        .idle_disconnect
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_policy(bootstrap.idle_disconnect);
+    resume_state
+        .clear_clipboard
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .policy = bootstrap.clear_clipboard_policy;
+}
+
+/// The channels and timers that wake the signaling loop.
+struct SignalingEvents {
+    outgoing: mpsc::UnboundedReceiver<SignalMessage>,
+    peer_state: mpsc::UnboundedReceiver<RTCPeerConnectionState>,
+    presentation_failure: mpsc::UnboundedReceiver<String>,
+    stats: tokio::time::Interval,
+    activity: tokio::time::Interval,
+    negotiation: tokio::time::Interval,
+}
+
+impl SignalingEvents {
+    async fn start(
+        outgoing: mpsc::UnboundedReceiver<SignalMessage>,
+        peer_state: mpsc::UnboundedReceiver<RTCPeerConnectionState>,
+        presentation_failure: mpsc::UnboundedReceiver<String>,
+    ) -> Self {
+        let mut stats = tokio::time::interval(std::time::Duration::from_secs(2));
+        stats.tick().await;
+        let mut activity = tokio::time::interval(SESSION_ACTIVITY_INTERVAL);
+        activity.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        activity.tick().await;
+        let mut negotiation = tokio::time::interval(NEGOTIATION_RETRY_INTERVAL);
+        negotiation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        negotiation.tick().await;
+        Self {
+            outgoing,
+            peer_state,
+            presentation_failure,
+            stats,
+            activity,
+            negotiation,
+        }
+    }
+}
+
+/// One connection attempt's signaling and health checks, from the first
+/// offer until the session ends.
+struct SignalingLoop<'a> {
+    bootstrap: &'a SessionBootstrap,
+    resume_state: &'a ViewerResumeState,
+    identity: &'a PeerIdentity,
+    debug: &'a DebugInfo,
+    peer: &'a RTCPeerConnection,
+    outgoing: &'a mpsc::UnboundedSender<SignalMessage>,
+    presenter: &'a Mutex<Option<ActivePresenter>>,
+    viewer_control: &'a ViewerControlQueue,
+    lifecycle: &'a ReceiverLifecycle,
+    session_state: SessionState,
+    presenter_missing_since: Option<tokio::time::Instant>,
+    statistics_log: crate::debug::StatisticsLog,
+    remote_description_set: bool,
+    pending_candidates: Vec<RTCIceCandidateInit>,
+    disconnected_since: Option<tokio::time::Instant>,
+    // Whether WebRTC connected in this attempt, and whether the Agent
+    // answered at all, tell a blocked network path from a silent Agent.
+    peer_connected: bool,
+    offer_received: bool,
+    awaiting_approval_since: Option<tokio::time::Instant>,
+}
+
+impl SignalingLoop<'_> {
+    async fn run(
+        &mut self,
+        signaling: &mut SessionSignaling,
+        events: &mut SignalingEvents,
+    ) -> anyhow::Result<()> {
         loop {
             tokio::select! {
-            Some(signal) = outgoing_rx.recv() => {
+            Some(signal) = events.outgoing.recv() => {
                 signaling.send(Message::Text(serde_json::to_string(&signal)?.into())).await?;
             }
-            _ = activity_interval.tick() => {
-                outgoing_tx.send(SignalMessage::Activity)?;
+            _ = events.activity.tick() => {
+                self.outgoing.send(SignalMessage::Activity)?;
             }
-            _ = negotiation_interval.tick(), if session_state == SessionState::Connecting => {
-                outgoing_tx.send(SignalMessage::Ready)?;
+            _ = events.negotiation.tick(), if self.session_state == SessionState::Connecting => {
+                self.outgoing.send(SignalMessage::Ready)?;
             }
             incoming = signaling.next() => {
                 let text = match incoming {
                     Some(Ok(Message::Text(text))) => text,
                     Some(Ok(_)) => continue,
-                    Some(Err(error)) if meshrmm_signaling_client::is_terminal_websocket_error(&error) => break Err(error),
-                    Some(Err(error)) => break Err(SessionFailure::new(FailureKind::SignalingLost, format!("{error:#}")).into()),
-                    None => break Err(SessionFailure::new(FailureKind::SignalingLost, "signaling connection closed").into()),
+                    Some(Err(error)) if meshrmm_signaling_client::is_terminal_websocket_error(&error) => return Err(error),
+                    Some(Err(error)) => return Err(SessionFailure::new(FailureKind::SignalingLost, format!("{error:#}")).into()),
+                    None => return Err(SessionFailure::new(FailureKind::SignalingLost, "signaling connection closed").into()),
                 };
-                let signal: SignalMessage = serde_json::from_str(text.as_str())?;
-                match signal {
-                    SignalMessage::Offer { sdp } => {
-                        offer_received = true;
-                        if let Some(since) = awaiting_approval_since.take() {
-                            resume_state.add_approval_wait(since.elapsed());
-                        }
-                        launch_status::report(LaunchStatus::EstablishingConnection);
-                        debug.set_peer_fingerprint(identity.verify_sdp(&sdp)?);
-                        peer.set_remote_description(RTCSessionDescription::offer(sdp)?).await?;
-                        remote_description_set = true;
-                        for candidate in pending_candidates.drain(..) {
-                            peer.add_ice_candidate(candidate).await?;
-                        }
-                        let answer = peer.create_answer(None).await?;
-                        peer.set_local_description(answer).await?;
-                        let local = peer.local_description().await
-                            .ok_or_else(|| anyhow::anyhow!("WebRTC did not retain its local answer"))?;
-                        outgoing_tx.send(SignalMessage::Answer { sdp: local.sdp })?;
-                    }
-                    SignalMessage::IceCandidate { candidate, sdp_mid, sdp_mline_index, username_fragment } => {
-                        let candidate = RTCIceCandidateInit { candidate, sdp_mid, sdp_mline_index, username_fragment };
-                        if remote_description_set {
-                            peer.add_ice_candidate(candidate).await?;
-                        } else {
-                            if pending_candidates.len() >= 256 { anyhow::bail!("too many pending ICE candidates"); }
-                            pending_candidates.push(candidate);
-                        }
-                    }
-                    SignalMessage::PeerLeft => {
-                        break Err(SessionFailure::new(FailureKind::AgentLeft, "Agent disconnected from the remote session").into());
-                    }
-                    SignalMessage::AwaitingApproval { remaining_seconds } if !offer_received => {
-                        launch_status::report(LaunchStatus::AwaitingApproval { remaining_seconds });
-                        // The video deadline starts once the user answers.
-                        let now = tokio::time::Instant::now();
-                        awaiting_approval_since.get_or_insert(now);
-                        presenter_missing_since = Some(now);
-                    }
-                    SignalMessage::Error { message, code } => {
-                        if code == Some(SignalErrorCode::IdentityMismatch)
-                            || message.starts_with("Peer identity verification failed:")
-                        {
-                            break Err(meshrmm_session_transport::identity::IdentityError(message).into());
-                        }
-                        break Err(SessionFailure::new(FailureKind::AgentReported(code), message).into());
-                    }
-                    _ => {}
-                }
+                self.handle_signal(serde_json::from_str(text.as_str())?).await?;
             }
-            Some(state) = state_rx.recv() => {
-                tracing::info!(?state, session_id = %bootstrap.session_id, "WebRTC connection state changed");
-                debug.set_connection_state(format!("{state:?}").to_ascii_lowercase());
-                if state == RTCPeerConnectionState::Connected
-                    && session_state == SessionState::Connecting
-                {
-                    session_state = session_state.transition(SessionState::Streaming)?;
-                    outgoing_tx.send(SignalMessage::Activity)?;
-                    launch_status::report(LaunchStatus::StartingDisplay);
-                }
-                if state == RTCPeerConnectionState::Connected {
-                    // The session no longer depends on signaling.
-                    signaling.peer_connected();
-                    peer_connected = true;
-                    disconnected_since = None;
-                } else if state == RTCPeerConnectionState::Disconnected {
-                    disconnected_since.get_or_insert_with(tokio::time::Instant::now);
-                }
-                if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
-                    break Err(SessionFailure::new(
-                        peer_failure_kind(peer_connected),
-                        format!("WebRTC connection ended in state {state:?}"),
-                    ).into());
-                }
-            }
-            Some(error) = presentation_failure_rx.recv() => {
+            Some(state) = events.peer_state.recv() => self.handle_peer_state(state, signaling)?,
+            Some(error) = events.presentation_failure.recv() => {
                 tracing::error!(%error, "viewer presentation path reported a terminal failure");
-                break Err(SessionFailure::new(FailureKind::PresentationFailed, error).into());
+                return Err(SessionFailure::new(FailureKind::PresentationFailed, error).into());
             }
-            _ = stats_interval.tick() => {
-                if disconnected_since.is_some_and(|since| since.elapsed() >= DISCONNECTED_GRACE_PERIOD) {
-                    break Err(SessionFailure::new(
-                        peer_failure_kind(peer_connected),
-                        format!(
-                            "WebRTC remained disconnected for {} seconds",
-                            DISCONNECTED_GRACE_PERIOD.as_secs()
-                        ),
-                    ).into());
-                }
-                let presenter_missing = presenter.lock().is_ok_and(|guard| {
-                    let presented = guard.as_ref().and_then(|active| active.presenter.first_presented_at());
-                    lifecycle.observe_presentation(presented);
-                    presented.is_none()
-                });
-                if presenter_missing {
-                    let waiting_since = presenter_missing_since
-                        .get_or_insert_with(tokio::time::Instant::now);
-                    if waiting_since.elapsed() >= std::time::Duration::from_secs(30) {
-                        break Err(SessionFailure::new(
-                            video_timeout_kind(offer_received, peer_connected),
-                            "timed out waiting 30 seconds for the remote video stream; check the Agent's WebRTC and ICE logs",
-                        ).into());
-                    }
-                } else {
-                    presenter_missing_since = None;
-                }
-                update_network_stats(&peer, &debug, statistics_log.due()).await;
-                let ended = presenter
-                    .lock()
-                    .ok()
-                    .and_then(|guard| {
-                        guard.as_ref().and_then(|active| {
-                            active
-                                .presenter
-                                .poll_ended()
-                                .map(|ended| (active.profile, ended))
-                        })
-                    });
-                if let Some((profile, ended)) = ended {
-                    match (profile, ended) {
-                        (profile, Err(reason))
-                            if profile
-                                != (VideoProfile {
-                                    codec: Codec::H264,
-                                    chroma: ChromaMode::Yuv420,
-                                }) =>
-                        {
-                            tracing::warn!(%reason, ?profile, "video presentation failed; requesting profile fallback");
-                            viewer_control.send(SessionMessage::VideoProfileRejected {
-                                profile,
-                                reason,
-                            });
-                            if let Ok(mut guard) = presenter.lock()
-                                && let Some(mut failed) = guard.take()
-                            {
-                                failed.presenter.stop();
-                            }
-                            presenter_missing_since = Some(tokio::time::Instant::now());
-                        }
-                        (_, ended) => {
-                            break ended.map_err(|reason| {
-                                SessionFailure::new(FailureKind::PresentationFailed, reason).into()
-                            });
-                        }
-                    }
+            _ = events.stats.tick() => {
+                if self.check_health().await?.is_break() {
+                    return Ok(());
                 }
             },
-            _ = tokio::signal::ctrl_c() => break Ok(()),
-            () = crate::shutdown::wait() => break Ok(()),
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            () = crate::shutdown::wait() => return Ok(()),
             }
         }
     }
-    .await;
-    if let Some(since) = awaiting_approval_since.take() {
-        resume_state.add_approval_wait(since.elapsed());
+
+    async fn handle_signal(&mut self, signal: SignalMessage) -> anyhow::Result<()> {
+        match signal {
+            SignalMessage::Offer { sdp } => self.answer_offer(sdp).await?,
+            SignalMessage::IceCandidate {
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+                username_fragment,
+            } => {
+                let candidate = RTCIceCandidateInit {
+                    candidate,
+                    sdp_mid,
+                    sdp_mline_index,
+                    username_fragment,
+                };
+                if self.remote_description_set {
+                    self.peer.add_ice_candidate(candidate).await?;
+                } else {
+                    if self.pending_candidates.len() >= 256 {
+                        anyhow::bail!("too many pending ICE candidates");
+                    }
+                    self.pending_candidates.push(candidate);
+                }
+            }
+            SignalMessage::PeerLeft => {
+                return Err(SessionFailure::new(
+                    FailureKind::AgentLeft,
+                    "Agent disconnected from the remote session",
+                )
+                .into());
+            }
+            SignalMessage::AwaitingApproval { remaining_seconds } if !self.offer_received => {
+                launch_status::report(LaunchStatus::AwaitingApproval { remaining_seconds });
+                // The video deadline starts once the user answers.
+                let now = tokio::time::Instant::now();
+                self.awaiting_approval_since.get_or_insert(now);
+                self.presenter_missing_since = Some(now);
+            }
+            SignalMessage::Error { message, code } => {
+                if code == Some(SignalErrorCode::IdentityMismatch)
+                    || message.starts_with("Peer identity verification failed:")
+                {
+                    return Err(meshrmm_session_transport::identity::IdentityError(message).into());
+                }
+                return Err(SessionFailure::new(FailureKind::AgentReported(code), message).into());
+            }
+            _ => {}
+        }
+        Ok(())
     }
-    // A frame can finish between the last health poll and a transport failure.
-    if let Ok(guard) = presenter.lock() {
-        lifecycle.observe_presentation(
-            guard
+
+    async fn answer_offer(&mut self, sdp: String) -> anyhow::Result<()> {
+        self.offer_received = true;
+        if let Some(since) = self.awaiting_approval_since.take() {
+            self.resume_state.add_approval_wait(since.elapsed());
+        }
+        launch_status::report(LaunchStatus::EstablishingConnection);
+        self.debug
+            .set_peer_fingerprint(self.identity.verify_sdp(&sdp)?);
+        self.peer
+            .set_remote_description(RTCSessionDescription::offer(sdp)?)
+            .await?;
+        self.remote_description_set = true;
+        for candidate in self.pending_candidates.drain(..) {
+            self.peer.add_ice_candidate(candidate).await?;
+        }
+        let answer = self.peer.create_answer(None).await?;
+        self.peer.set_local_description(answer).await?;
+        let local = self
+            .peer
+            .local_description()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("WebRTC did not retain its local answer"))?;
+        self.outgoing
+            .send(SignalMessage::Answer { sdp: local.sdp })?;
+        Ok(())
+    }
+
+    fn handle_peer_state(
+        &mut self,
+        state: RTCPeerConnectionState,
+        signaling: &mut SessionSignaling,
+    ) -> anyhow::Result<()> {
+        tracing::info!(?state, session_id = %self.bootstrap.session_id, "WebRTC connection state changed");
+        self.debug
+            .set_connection_state(format!("{state:?}").to_ascii_lowercase());
+        if state == RTCPeerConnectionState::Connected
+            && self.session_state == SessionState::Connecting
+        {
+            self.session_state = self.session_state.transition(SessionState::Streaming)?;
+            self.outgoing.send(SignalMessage::Activity)?;
+            launch_status::report(LaunchStatus::StartingDisplay);
+        }
+        if state == RTCPeerConnectionState::Connected {
+            // The session no longer depends on signaling.
+            signaling.peer_connected();
+            self.peer_connected = true;
+            self.disconnected_since = None;
+        } else if state == RTCPeerConnectionState::Disconnected {
+            self.disconnected_since
+                .get_or_insert_with(tokio::time::Instant::now);
+        }
+        if matches!(
+            state,
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+        ) {
+            return Err(SessionFailure::new(
+                peer_failure_kind(self.peer_connected),
+                format!("WebRTC connection ended in state {state:?}"),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// The periodic check of the connection and the video. Breaks when the
+    /// presenter ended cleanly.
+    async fn check_health(&mut self) -> anyhow::Result<ControlFlow<()>> {
+        if self
+            .disconnected_since
+            .is_some_and(|since| since.elapsed() >= DISCONNECTED_GRACE_PERIOD)
+        {
+            return Err(SessionFailure::new(
+                peer_failure_kind(self.peer_connected),
+                format!(
+                    "WebRTC remained disconnected for {} seconds",
+                    DISCONNECTED_GRACE_PERIOD.as_secs()
+                ),
+            )
+            .into());
+        }
+        self.check_video_arrived()?;
+        update_network_stats(self.peer, self.debug, self.statistics_log.due()).await;
+        self.poll_presenter_end()
+    }
+
+    fn check_video_arrived(&mut self) -> anyhow::Result<()> {
+        let presenter_missing = self.presenter.lock().is_ok_and(|guard| {
+            let presented = guard
                 .as_ref()
-                .and_then(|active| active.presenter.first_presented_at()),
-        );
+                .and_then(|active| active.presenter.first_presented_at());
+            self.lifecycle.observe_presentation(presented);
+            presented.is_none()
+        });
+        if presenter_missing {
+            let waiting_since = self
+                .presenter_missing_since
+                .get_or_insert_with(tokio::time::Instant::now);
+            if waiting_since.elapsed() >= std::time::Duration::from_secs(30) {
+                return Err(SessionFailure::new(
+                    video_timeout_kind(self.offer_received, self.peer_connected),
+                    "timed out waiting 30 seconds for the remote video stream; check the Agent's WebRTC and ICE logs",
+                )
+                .into());
+            }
+        } else {
+            self.presenter_missing_since = None;
+        }
+        Ok(())
     }
-    lifecycle.shutting_down.store(true, Ordering::Release);
-    pointer_flusher.abort();
-    let _ = pointer_flusher.await;
 
-    if result.is_ok()
-        || result.as_ref().err().is_some_and(|error| {
-            error
-                .downcast_ref::<meshrmm_session_transport::identity::IdentityError>()
-                .is_some()
-        })
-    {
-        let end_message = serde_json::to_string(&SignalMessage::EndSession)?;
-        if let Err(error) = signaling.send(Message::Text(end_message.into())).await {
-            tracing::warn!(error = %error, "failed to notify the server that the viewer ended the session");
+    /// Asks the Agent for a fallback profile when a presenter fails with
+    /// anything but H.264 4:2:0; otherwise its end ends the session.
+    fn poll_presenter_end(&mut self) -> anyhow::Result<ControlFlow<()>> {
+        let ended = self.presenter.lock().ok().and_then(|guard| {
+            guard.as_ref().and_then(|active| {
+                active
+                    .presenter
+                    .poll_ended()
+                    .map(|ended| (active.profile, ended))
+            })
+        });
+        let Some((profile, ended)) = ended else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        match (profile, ended) {
+            (profile, Err(reason))
+                if profile
+                    != (VideoProfile {
+                        codec: Codec::H264,
+                        chroma: ChromaMode::Yuv420,
+                    }) =>
+            {
+                tracing::warn!(%reason, ?profile, "video presentation failed; requesting profile fallback");
+                self.viewer_control
+                    .send(SessionMessage::VideoProfileRejected { profile, reason });
+                if let Ok(mut guard) = self.presenter.lock()
+                    && let Some(mut failed) = guard.take()
+                {
+                    failed.presenter.stop();
+                }
+                self.presenter_missing_since = Some(tokio::time::Instant::now());
+                Ok(ControlFlow::Continue(()))
+            }
+            (_, ended) => ended.map(ControlFlow::Break).map_err(|reason| {
+                SessionFailure::new(FailureKind::PresentationFailed, reason).into()
+            }),
         }
     }
 
-    if matches!(
-        session_state,
-        SessionState::Requested
-            | SessionState::Signaling
-            | SessionState::Connecting
-            | SessionState::Streaming
-    ) {
-        session_state = session_state.transition(SessionState::Closing)?;
-    }
-    if let Some(mut active) = presenter.lock().ok().and_then(|mut guard| guard.take()) {
+    /// Ends the attempt: tells the server when the viewer ended the session,
+    /// keeps the window up when the session may resume, and closes the peer.
+    async fn finish(
+        mut self,
+        result: anyhow::Result<()>,
+        signaling: &mut SessionSignaling,
+        pointer_flusher: tokio::task::JoinHandle<()>,
+    ) -> anyhow::Result<()> {
+        if let Some(since) = self.awaiting_approval_since.take() {
+            self.resume_state.add_approval_wait(since.elapsed());
+        }
+        // A frame can finish between the last health poll and a transport failure.
+        if let Ok(guard) = self.presenter.lock() {
+            self.lifecycle.observe_presentation(
+                guard
+                    .as_ref()
+                    .and_then(|active| active.presenter.first_presented_at()),
+            );
+        }
+        self.lifecycle.shutting_down.store(true, Ordering::Release);
+        pointer_flusher.abort();
+        let _ = pointer_flusher.await;
+
+        if result.is_ok()
+            || result.as_ref().err().is_some_and(|error| {
+                error
+                    .downcast_ref::<meshrmm_session_transport::identity::IdentityError>()
+                    .is_some()
+            })
+        {
+            let end_message = serde_json::to_string(&SignalMessage::EndSession)?;
+            if let Err(error) = signaling.send(Message::Text(end_message.into())).await {
+                tracing::warn!(error = %error, "failed to notify the server that the viewer ended the session");
+            }
+        }
+
+        let mut session_state = self.session_state;
+        if matches!(
+            session_state,
+            SessionState::Requested
+                | SessionState::Signaling
+                | SessionState::Connecting
+                | SessionState::Streaming
+        ) {
+            session_state = session_state.transition(SessionState::Closing)?;
+        }
+        if let Some(mut active) = self
+            .presenter
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+        {
+            match &result {
+                Ok(()) => active.presenter.stop(),
+                // The session may resume; keep its window up until then.
+                Err(error) => self.resume_state.keep_while_reconnecting(active, error),
+            }
+        }
+        self.viewer_control.chat.set_available(false);
+        let mut result = result;
+        if let Err(error) = self.peer.close().await {
+            tracing::warn!(error = %error, "WebRTC peer did not close cleanly");
+            if result.is_ok() {
+                result = Err(error).context("failed to close WebRTC peer");
+            }
+        }
+        session_state = session_state.transition(SessionState::Idle)?;
         match &result {
-            Ok(()) => active.presenter.stop(),
-            // The session may resume; keep its window up until then.
-            Err(error) => resume_state.keep_while_reconnecting(active, error),
+            Ok(()) => tracing::info!(?session_state, "remote viewer session stopped cleanly"),
+            Err(error) => {
+                tracing::error!(error = ?error, ?session_state, "remote viewer session stopped with an error")
+            }
         }
+        result
     }
-    viewer_control.chat.set_available(false);
-    let mut result = result;
-    if let Err(error) = peer.close().await {
-        tracing::warn!(error = %error, "WebRTC peer did not close cleanly");
-        if result.is_ok() {
-            result = Err(error).context("failed to close WebRTC peer");
-        }
-    }
-    session_state = session_state.transition(SessionState::Idle)?;
-    match &result {
-        Ok(()) => tracing::info!(?session_state, "remote viewer session stopped cleanly"),
-        Err(error) => {
-            tracing::error!(error = ?error, ?session_state, "remote viewer session stopped with an error")
-        }
-    }
-    result
 }
 
 /// A WebRTC failure is a lost connection only if it ever connected; otherwise
