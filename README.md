@@ -202,7 +202,7 @@ machines. The server's own configuration is described in
 
 ```json
 {
-  "version": "0.3.8",
+  "version": "0.4.0",
   "signing_public_key": "94d87ebff16c65b9c89fd143596e329f90080f8463dafbf1e9b9f1bd6ed98af3"
 }
 ```

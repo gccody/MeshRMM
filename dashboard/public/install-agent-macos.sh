@@ -10,14 +10,14 @@
 set -eu
 
 if [ "$#" -ne 2 ]; then
-    echo "Usage: install-agent-macos.sh <dashboard URL> <authorization>" >&2
+    echo "Usage: install-agent-macos.sh <server URL> <authorization>" >&2
     exit 2
 fi
 ORIGIN=${1%/}
 AUTHORIZATION=$2
 case "$ORIGIN" in
     https://*) ;;
-    *) echo "The dashboard URL must use HTTPS." >&2; exit 2 ;;
+    *) echo "The server URL must use HTTPS." >&2; exit 2 ;;
 esac
 if [ "$(id -u)" -ne 0 ]; then
     echo "Run the installer with sudo." >&2
