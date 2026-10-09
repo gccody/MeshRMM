@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use meshrmm_protocol::DisplayId;
 
-use super::protocol::{self, Call, Event, Frame, Hello, Reply, Request};
+use super::protocol::{self, Call, Event, Frame, Hello, Reply, Request, StreamSettings};
 use crate::remote::macos::local::{LocalInput, LocalScreen};
 use crate::remote::platform::ScreenInput;
 
@@ -179,6 +180,68 @@ struct Served {
     events: mpsc::SyncSender<Event>,
 }
 
+impl Served {
+    /// Shows `prompt` in its own thread, cancelling any prompt that is already showing.
+    fn prompt_approval(
+        &self,
+        prompt: crate::remote::connection_approval::ApprovalPrompt,
+    ) -> anyhow::Result<()> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let previous = std::mem::replace(
+            &mut *self.approval.lock().unwrap_or_else(|e| e.into_inner()),
+            Arc::clone(&cancelled),
+        );
+        previous.store(true, Ordering::SeqCst);
+        let events = self.events.clone();
+        std::thread::Builder::new()
+            .name("meshrmm-approval-prompt".into())
+            .spawn(move || {
+                let answer = crate::remote::connection_approval::ask(&prompt, || {
+                    cancelled.load(Ordering::SeqCst)
+                });
+                if let Some(decision) = answer {
+                    let _ = events.send(Event::ApprovalDecision(decision.to_byte()));
+                }
+            })?;
+        Ok(())
+    }
+
+    /// Starts capture, sending each encoded frame to the coordinator.
+    fn start_capture(
+        &self,
+        display_id: Option<DisplayId>,
+        settings: StreamSettings,
+    ) -> anyhow::Result<Reply> {
+        let events = self.events.clone();
+        let sequence = Arc::clone(&self.sequence);
+        let started = self
+            .screen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .start(display_id, settings, move |unit| {
+                let mut data = unit.codec_config.unwrap_or_default();
+                data.extend_from_slice(&unit.data);
+                let frame = Frame {
+                    data,
+                    keyframe: unit.keyframe,
+                    capture_timestamp_us: unit.capture_timestamp_us,
+                    encode_complete_timestamp_us: unit.encode_complete_timestamp_us,
+                };
+                // A full queue drops the frame; the gap in sequence
+                // numbers makes the coordinator ask for a keyframe.
+                let _ = events.try_send(Event::Frame(
+                    sequence.fetch_add(1, Ordering::Relaxed),
+                    frame,
+                ));
+            })?;
+        Ok(Reply::Started {
+            displays: started.displays,
+            active_display: started.active_display,
+            format: started.format,
+        })
+    }
+}
+
 fn handle(request: Request, served: &Served) -> anyhow::Result<Reply> {
     let Served {
         input,
@@ -186,8 +249,8 @@ fn handle(request: Request, served: &Served) -> anyhow::Result<Reply> {
         audio,
         active,
         approval,
-        sequence,
         events,
+        ..
     } = served;
     match request {
         Request::BeginSession(session) => {
@@ -203,31 +266,12 @@ fn handle(request: Request, served: &Served) -> anyhow::Result<Reply> {
             reason,
             timeout_seconds,
             lock_idle_seconds,
-        } => {
-            let cancelled = Arc::new(AtomicBool::new(false));
-            let previous = std::mem::replace(
-                &mut *approval.lock().unwrap_or_else(|e| e.into_inner()),
-                Arc::clone(&cancelled),
-            );
-            previous.store(true, Ordering::SeqCst);
-            let prompt = crate::remote::connection_approval::ApprovalPrompt {
-                text,
-                reason,
-                timeout: Duration::from_secs(timeout_seconds.into()),
-                lock_idle: Duration::from_secs(lock_idle_seconds.into()),
-            };
-            let events = events.clone();
-            std::thread::Builder::new()
-                .name("meshrmm-approval-prompt".into())
-                .spawn(move || {
-                    let answer = crate::remote::connection_approval::ask(&prompt, || {
-                        cancelled.load(Ordering::SeqCst)
-                    });
-                    if let Some(decision) = answer {
-                        let _ = events.send(Event::ApprovalDecision(decision.to_byte()));
-                    }
-                })?;
-        }
+        } => served.prompt_approval(crate::remote::connection_approval::ApprovalPrompt {
+            text,
+            reason,
+            timeout: Duration::from_secs(timeout_seconds.into()),
+            lock_idle: Duration::from_secs(lock_idle_seconds.into()),
+        })?,
         Request::ClearClipboard => crate::remote::macos::session_close::clear_clipboard_here()?,
         Request::LockScreen => crate::remote::macos::session_close::lock_here()?,
         Request::LogOut => crate::remote::macos::session_close::log_out_here()?,
@@ -249,35 +293,7 @@ fn handle(request: Request, served: &Served) -> anyhow::Result<Reply> {
         Request::Start {
             display_id,
             settings,
-        } => {
-            let events = events.clone();
-            let sequence = Arc::clone(sequence);
-            let started = screen.lock().unwrap_or_else(|e| e.into_inner()).start(
-                display_id,
-                settings,
-                move |unit| {
-                    let mut data = unit.codec_config.unwrap_or_default();
-                    data.extend_from_slice(&unit.data);
-                    let frame = Frame {
-                        data,
-                        keyframe: unit.keyframe,
-                        capture_timestamp_us: unit.capture_timestamp_us,
-                        encode_complete_timestamp_us: unit.encode_complete_timestamp_us,
-                    };
-                    // A full queue drops the frame; the gap in sequence
-                    // numbers makes the coordinator ask for a keyframe.
-                    let _ = events.try_send(Event::Frame(
-                        sequence.fetch_add(1, Ordering::Relaxed),
-                        frame,
-                    ));
-                },
-            )?;
-            return Ok(Reply::Started {
-                displays: started.displays,
-                active_display: started.active_display,
-                format: started.format,
-            });
-        }
+        } => return served.start_capture(display_id, settings),
         Request::StopCapture => screen.lock().unwrap_or_else(|e| e.into_inner()).stop(),
         Request::Keyframe => screen
             .lock()
