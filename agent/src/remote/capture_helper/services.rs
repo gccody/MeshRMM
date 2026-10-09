@@ -59,7 +59,7 @@ pub(super) fn helper_uses_user_token(kind: HelperKind, target: DesktopTarget) ->
 
 // Keep the helper's startup options and independently shared event destinations explicit.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn start_input_helper(
+fn start_input_helper(
     start: ParentCommand,
     target: DesktopTarget,
     display_id: DisplayId,
@@ -153,95 +153,9 @@ impl DesktopCaptureStreamer {
         display_id: DisplayId,
     ) -> anyhow::Result<()> {
         if target != DesktopTarget::Background {
-            if self
-                .file_helper
-                .as_ref()
-                .is_none_or(|h| h.status.lock().unwrap().is_some())
-                || self.file_route.lock().unwrap().is_none()
-            {
-                self.stop_file_helper();
-                match start_input_helper(
-                    ParentCommand::StartFiles,
-                    match target {
-                        DesktopTarget::Rdp(id, _) => DesktopTarget::Rdp(id, false),
-                        _ => DesktopTarget::Default,
-                    },
-                    display_id,
-                    Arc::clone(&self.cursor),
-                    Arc::clone(&self.clipboard),
-                    Arc::clone(&self.files),
-                    Arc::clone(&self.chat),
-                    Arc::clone(&self.maintenance),
-                    Arc::clone(&self.credentials),
-                ) {
-                    Ok(helper) => {
-                        let mut route = self.file_route.lock().unwrap();
-                        send_command(
-                            &helper.input,
-                            &ParentCommand::SetWallpaperHidden(
-                                self.wallpaper_hidden.load(Ordering::Acquire),
-                            ),
-                        )?;
-                        *route = Some(Arc::clone(&helper.input));
-                        self.file_helper = Some(helper);
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "file transfers require a signed-in interactive user")
-                    }
-                }
-            }
-            if self.chat_helper.as_ref().is_none_or(|helper| {
-                helper.target != target || helper.status.lock().unwrap().is_some()
-            }) {
-                self.stop_chat_helper();
-                match start_input_helper(
-                    ParentCommand::StartChatHelper {
-                        viewer_name: self.viewer_name.clone(),
-                        show_banner: self.session_banner,
-                    },
-                    target,
-                    display_id,
-                    Arc::clone(&self.cursor),
-                    Arc::clone(&self.clipboard),
-                    Arc::clone(&self.files),
-                    Arc::clone(&self.chat),
-                    Arc::clone(&self.maintenance),
-                    Arc::clone(&self.credentials),
-                ) {
-                    Ok(helper) => {
-                        if self.chat_enabled.load(Ordering::Acquire) {
-                            send_command(&helper.input, &ParentCommand::StartChat)?;
-                        }
-                        *self.chat_route.lock().unwrap() = Some(Arc::clone(&helper.input));
-                        self.chat_helper = Some(helper);
-                    }
-                    Err(error) => tracing::warn!(%error, "independent chat helper unavailable"),
-                }
-            }
-            if self.clipboard_helper.as_ref().is_none_or(|helper| {
-                helper.target != target || helper.status.lock().unwrap().is_some()
-            }) {
-                self.stop_clipboard_helper();
-                match start_input_helper(
-                    ParentCommand::StartClipboard,
-                    target,
-                    display_id,
-                    Arc::clone(&self.cursor),
-                    Arc::clone(&self.clipboard),
-                    Arc::clone(&self.files),
-                    Arc::clone(&self.chat),
-                    Arc::clone(&self.maintenance),
-                    Arc::clone(&self.credentials),
-                ) {
-                    Ok(helper) => {
-                        *self.clipboard_route.lock().unwrap() = Some(Arc::clone(&helper.input));
-                        self.clipboard_helper = Some(helper);
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "independent clipboard helper unavailable")
-                    }
-                }
-            }
+            self.ensure_file_helper(target, display_id)?;
+            self.ensure_chat_helper(target, display_id)?;
+            self.ensure_clipboard_helper(target, display_id);
         }
         if let Some(helper) = self.input.as_mut()
             && helper.target == target
@@ -271,19 +185,13 @@ impl DesktopCaptureStreamer {
             .latest
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
-        let helper = start_input_helper(
+        let helper = self.start_helper(
             ParentCommand::StartInput {
                 display_id,
                 viewer_name: self.viewer_name.clone(),
             },
             target,
             display_id,
-            Arc::clone(&self.cursor),
-            Arc::clone(&self.clipboard),
-            Arc::clone(&self.files),
-            Arc::clone(&self.chat),
-            Arc::clone(&self.maintenance),
-            Arc::clone(&self.credentials),
         )?;
         let mut route = self
             .input_route
@@ -296,6 +204,118 @@ impl DesktopCaptureStreamer {
         *route = Some(Arc::clone(&helper.input));
         self.input = Some(helper);
         Ok(())
+    }
+
+    /// The file helper always runs on the normal desktop, even while the
+    /// viewer sees the secure one.
+    fn ensure_file_helper(
+        &mut self,
+        target: DesktopTarget,
+        display_id: DisplayId,
+    ) -> anyhow::Result<()> {
+        if self
+            .file_helper
+            .as_ref()
+            .is_none_or(|h| h.status.lock().unwrap().is_some())
+            || self.file_route.lock().unwrap().is_none()
+        {
+            self.stop_file_helper();
+            match self.start_helper(
+                ParentCommand::StartFiles,
+                match target {
+                    DesktopTarget::Rdp(id, _) => DesktopTarget::Rdp(id, false),
+                    _ => DesktopTarget::Default,
+                },
+                display_id,
+            ) {
+                Ok(helper) => {
+                    let mut route = self.file_route.lock().unwrap();
+                    send_command(
+                        &helper.input,
+                        &ParentCommand::SetWallpaperHidden(
+                            self.wallpaper_hidden.load(Ordering::Acquire),
+                        ),
+                    )?;
+                    *route = Some(Arc::clone(&helper.input));
+                    self.file_helper = Some(helper);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "file transfers require a signed-in interactive user")
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_chat_helper(
+        &mut self,
+        target: DesktopTarget,
+        display_id: DisplayId,
+    ) -> anyhow::Result<()> {
+        if self
+            .chat_helper
+            .as_ref()
+            .is_none_or(|helper| helper.target != target || helper.status.lock().unwrap().is_some())
+        {
+            self.stop_chat_helper();
+            match self.start_helper(
+                ParentCommand::StartChatHelper {
+                    viewer_name: self.viewer_name.clone(),
+                    show_banner: self.session_banner,
+                },
+                target,
+                display_id,
+            ) {
+                Ok(helper) => {
+                    if self.chat_enabled.load(Ordering::Acquire) {
+                        send_command(&helper.input, &ParentCommand::StartChat)?;
+                    }
+                    *self.chat_route.lock().unwrap() = Some(Arc::clone(&helper.input));
+                    self.chat_helper = Some(helper);
+                }
+                Err(error) => tracing::warn!(%error, "independent chat helper unavailable"),
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_clipboard_helper(&mut self, target: DesktopTarget, display_id: DisplayId) {
+        if self
+            .clipboard_helper
+            .as_ref()
+            .is_none_or(|helper| helper.target != target || helper.status.lock().unwrap().is_some())
+        {
+            self.stop_clipboard_helper();
+            match self.start_helper(ParentCommand::StartClipboard, target, display_id) {
+                Ok(helper) => {
+                    *self.clipboard_route.lock().unwrap() = Some(Arc::clone(&helper.input));
+                    self.clipboard_helper = Some(helper);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "independent clipboard helper unavailable")
+                }
+            }
+        }
+    }
+
+    /// Starts a helper that reports to this streamer's shared event destinations.
+    pub(super) fn start_helper(
+        &self,
+        start: ParentCommand,
+        target: DesktopTarget,
+        display_id: DisplayId,
+    ) -> anyhow::Result<RunningInputHelper> {
+        start_input_helper(
+            start,
+            target,
+            display_id,
+            Arc::clone(&self.cursor),
+            Arc::clone(&self.clipboard),
+            Arc::clone(&self.files),
+            Arc::clone(&self.chat),
+            Arc::clone(&self.maintenance),
+            Arc::clone(&self.credentials),
+        )
     }
 
     pub(super) fn stop_chat_helper(&mut self) {

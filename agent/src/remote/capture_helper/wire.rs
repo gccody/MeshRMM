@@ -7,8 +7,7 @@ pub(super) fn write_command(mut writer: impl Write, command: &ParentCommand) -> 
         ParentCommand::AutofillCredentials(bytes) => {
             checked_len(bytes.len(), 8192, "protected credentials")?;
             writer.write_all(&[24])?;
-            write_u32(&mut writer, bytes.len() as u32)?;
-            writer.write_all(bytes)
+            write_sized(&mut writer, bytes)
         }
         ParentCommand::EnumerateDisplays => writer.write_all(&[COMMAND_ENUMERATE_DISPLAYS]),
         ParentCommand::CaptureThumbnail => writer.write_all(&[COMMAND_CAPTURE_THUMBNAIL]),
@@ -20,15 +19,13 @@ pub(super) fn write_command(mut writer: impl Write, command: &ParentCommand) -> 
         } => {
             checked_len(viewer_name.len(), MAX_CONTROL_BYTES, "viewer name")?;
             writer.write_all(&[17])?;
-            write_u32(&mut writer, viewer_name.len() as u32)?;
-            writer.write_all(viewer_name.as_bytes())?;
+            write_sized(&mut writer, viewer_name.as_bytes())?;
             writer.write_all(&[u8::from(*show_banner)])
         }
         ParentCommand::ShowConnectionNotification { text } => {
             checked_len(text.len(), MAX_CONTROL_BYTES, "connection notification")?;
             writer.write_all(&[25])?;
-            write_u32(&mut writer, text.len() as u32)?;
-            writer.write_all(text.as_bytes())
+            write_sized(&mut writer, text.as_bytes())
         }
         ParentCommand::PromptConnectionApproval {
             text,
@@ -39,10 +36,8 @@ pub(super) fn write_command(mut writer: impl Write, command: &ParentCommand) -> 
             checked_len(text.len(), MAX_CONTROL_BYTES, "connection approval message")?;
             checked_len(reason.len(), MAX_CONTROL_BYTES, "connection reason")?;
             writer.write_all(&[COMMAND_PROMPT_CONNECTION_APPROVAL])?;
-            write_u32(&mut writer, text.len() as u32)?;
-            writer.write_all(text.as_bytes())?;
-            write_u32(&mut writer, reason.len() as u32)?;
-            writer.write_all(reason.as_bytes())?;
+            write_sized(&mut writer, text.as_bytes())?;
+            write_sized(&mut writer, reason.as_bytes())?;
             write_u32(&mut writer, *timeout_seconds)?;
             write_u32(&mut writer, *lock_idle_seconds)
         }
@@ -63,8 +58,7 @@ pub(super) fn write_command(mut writer: impl Write, command: &ParentCommand) -> 
         } => {
             writer.write_all(&[COMMAND_START])?;
             checked_len(viewer_name.len(), MAX_DISPLAY_NAME_BYTES, "viewer name")?;
-            write_u32(&mut writer, viewer_name.len() as u32)?;
-            writer.write_all(viewer_name.as_bytes())?;
+            write_sized(&mut writer, viewer_name.as_bytes())?;
             write_u32(&mut writer, display_id.map_or(NO_DISPLAY, |id| id.0))?;
             write_u32(&mut writer, *frames_per_second)?;
             write_u32(&mut writer, *bitrate_bits_per_second)
@@ -90,58 +84,34 @@ pub(super) fn write_command(mut writer: impl Write, command: &ParentCommand) -> 
             checked_len(viewer_name.len(), MAX_DISPLAY_NAME_BYTES, "viewer name")?;
             writer.write_all(&[COMMAND_START_INPUT])?;
             write_u32(&mut writer, display_id.0)?;
-            write_u32(&mut writer, viewer_name.len() as u32)?;
-            writer.write_all(viewer_name.as_bytes())
+            write_sized(&mut writer, viewer_name.as_bytes())
         }
         ParentCommand::Input(input) => {
-            let bytes = SessionMessage::Input(input.clone())
-                .encode()
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let bytes = encode_message(SessionMessage::Input(input.clone()))?;
             checked_len(bytes.len(), MAX_CONTROL_BYTES, "desktop input")?;
             writer.write_all(&[COMMAND_INPUT])?;
-            write_u32(&mut writer, bytes.len() as u32)?;
-            writer.write_all(&bytes)
+            write_sized(&mut writer, &bytes)
         }
         ParentCommand::Annotate(annotation) => {
-            let bytes = SessionMessage::Annotate(*annotation)
-                .encode()
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let bytes = encode_message(SessionMessage::Annotate(*annotation))?;
             writer.write_all(&[COMMAND_ANNOTATE])?;
-            write_u32(&mut writer, bytes.len() as u32)?;
-            writer.write_all(&bytes)
+            write_sized(&mut writer, &bytes)
         }
         ParentCommand::Blackout { enabled, text } => {
             checked_len(text.len(), MAX_CONTROL_BYTES, "blackout message")?;
             writer.write_all(&[COMMAND_BLACKOUT, u8::from(*enabled)])?;
-            write_u32(&mut writer, text.len() as u32)?;
-            writer.write_all(text.as_bytes())
+            write_sized(&mut writer, text.as_bytes())
         }
         ParentCommand::BlockInput(blocked) => {
             writer.write_all(&[COMMAND_BLOCK_INPUT, u8::from(*blocked)])
         }
         ParentCommand::ReleaseInput => writer.write_all(&[COMMAND_RELEASE_INPUT]),
-        ParentCommand::Clipboard(text) => {
-            let bytes = text
-                .encode()
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            checked_len(bytes.len(), MAX_CLIPBOARD_WIRE_BYTES, "desktop clipboard")?;
-            writer.write_all(&[COMMAND_CLIPBOARD])?;
-            write_u32(&mut writer, bytes.len() as u32)?;
-            writer.write_all(&bytes)
+        ParentCommand::Clipboard(content) => {
+            write_clipboard(&mut writer, COMMAND_CLIPBOARD, content, "desktop clipboard")
         }
         ParentCommand::StopChat => writer.write_all(&[COMMAND_STOP_CHAT]),
         ParentCommand::StartChat => writer.write_all(&[COMMAND_START_CHAT]),
-        ParentCommand::Chat(text) => {
-            if !meshrmm_protocol::valid_chat_text(text) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid chat text",
-                ));
-            }
-            writer.write_all(&[COMMAND_CHAT])?;
-            write_u32(&mut writer, text.len() as u32)?;
-            writer.write_all(text.as_bytes())
-        }
+        ParentCommand::Chat(text) => write_chat_text(&mut writer, COMMAND_CHAT, text),
         ParentCommand::Stop => writer.write_all(&[COMMAND_STOP]),
     }
 }
@@ -149,204 +119,94 @@ pub(super) fn write_command(mut writer: impl Write, command: &ParentCommand) -> 
 pub(super) fn read_command(mut reader: impl Read) -> io::Result<ParentCommand> {
     match read_u8(&mut reader)? {
         23 => Ok(ParentCommand::PromptCredentials),
-        24 => {
-            let length = bounded_len(read_u32(&mut reader)?, 8192, "protected credentials")?;
-            let mut bytes = vec![0; length];
-            reader.read_exact(&mut bytes)?;
-            Ok(ParentCommand::AutofillCredentials(bytes))
-        }
+        24 => Ok(ParentCommand::AutofillCredentials(read_sized(
+            &mut reader,
+            8192,
+            "protected credentials",
+        )?)),
         COMMAND_ENUMERATE_DISPLAYS => Ok(ParentCommand::EnumerateDisplays),
         COMMAND_CAPTURE_THUMBNAIL => Ok(ParentCommand::CaptureThumbnail),
         16 => Ok(ParentCommand::StartClipboard),
-        17 => {
-            let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "viewer name")?;
-            let mut name = vec![0; length];
-            reader.read_exact(&mut name)?;
-            let viewer_name = String::from_utf8(name)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(ParentCommand::StartChatHelper {
-                viewer_name,
-                show_banner: read_bool(&mut reader)?,
-            })
-        }
-        25 => {
-            let length = bounded_len(
-                read_u32(&mut reader)?,
-                MAX_CONTROL_BYTES,
-                "connection notification",
-            )?;
-            let mut text = vec![0; length];
-            reader.read_exact(&mut text)?;
-            Ok(ParentCommand::ShowConnectionNotification {
-                text: String::from_utf8(text)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-            })
-        }
+        17 => Ok(ParentCommand::StartChatHelper {
+            viewer_name: read_sized_string(&mut reader, MAX_CONTROL_BYTES, "viewer name")?,
+            show_banner: read_bool(&mut reader)?,
+        }),
+        25 => Ok(ParentCommand::ShowConnectionNotification {
+            text: read_sized_string(&mut reader, MAX_CONTROL_BYTES, "connection notification")?,
+        }),
         COMMAND_PROMPT_CONNECTION_APPROVAL => {
-            let mut text = || -> io::Result<String> {
-                let length = bounded_len(
-                    read_u32(&mut reader)?,
-                    MAX_CONTROL_BYTES,
-                    "connection approval text",
-                )?;
-                let mut bytes = vec![0; length];
-                reader.read_exact(&mut bytes)?;
-                String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-            };
-            let (text, reason) = (text()?, text()?);
+            let label = "connection approval text";
             Ok(ParentCommand::PromptConnectionApproval {
-                text,
-                reason,
+                text: read_sized_string(&mut reader, MAX_CONTROL_BYTES, label)?,
+                reason: read_sized_string(&mut reader, MAX_CONTROL_BYTES, label)?,
                 timeout_seconds: read_u32(&mut reader)?,
                 lock_idle_seconds: read_u32(&mut reader)?,
             })
         }
-        COMMAND_START => {
-            let length = bounded_len(
-                read_u32(&mut reader)?,
-                MAX_DISPLAY_NAME_BYTES,
-                "viewer name",
-            )?;
-            let mut name = vec![0; length];
-            reader.read_exact(&mut name)?;
-            let viewer_name = String::from_utf8(name)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let display_id = read_u32(&mut reader)?;
-            Ok(ParentCommand::Start {
-                viewer_name,
-                display_id: (display_id != NO_DISPLAY).then_some(DisplayId(display_id)),
-                frames_per_second: read_u32(&mut reader)?,
-                bitrate_bits_per_second: read_u32(&mut reader)?,
-                codec: read_codec(&mut reader)?,
-                pixel_format: read_pixel_format(&mut reader)?,
-                capture_cursor: read_bool(&mut reader)?,
-                grayscale: read_bool(&mut reader)?,
-                headless: read_headless_target(&mut reader)?,
-            })
-        }
+        COMMAND_START => read_start_command(&mut reader),
         19 => Ok(ParentCommand::SetWallpaperHidden(read_bool(&mut reader)?)),
         21 => Ok(ParentCommand::SetPreventIdleLock(read_bool(&mut reader)?)),
         18 => Ok(ParentCommand::SetCursorCapture(read_bool(&mut reader)?)),
         20 => Ok(ParentCommand::SetDisplayBorder(read_bool(&mut reader)?)),
         COMMAND_REQUEST_KEYFRAME => Ok(ParentCommand::RequestKeyframe),
         COMMAND_SET_BITRATE => Ok(ParentCommand::SetBitrate(read_u32(&mut reader)?)),
-        COMMAND_START_INPUT => {
-            let display_id = DisplayId(read_u32(&mut reader)?);
-            let length = bounded_len(
-                read_u32(&mut reader)?,
-                MAX_DISPLAY_NAME_BYTES,
-                "viewer name",
-            )?;
-            let mut name = vec![0; length];
-            reader.read_exact(&mut name)?;
-            let viewer_name = String::from_utf8(name)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(ParentCommand::StartInput {
-                display_id,
-                viewer_name,
-            })
-        }
-        COMMAND_INPUT => {
-            let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "desktop input")?;
-            let mut bytes = vec![0; length];
-            reader.read_exact(&mut bytes)?;
-            match SessionMessage::decode(&bytes) {
-                Ok(SessionMessage::Input(input)) => Ok(ParentCommand::Input(input)),
-                Ok(_) => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "desktop input contained a non-input message",
-                )),
-                Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
-            }
-        }
-        COMMAND_ANNOTATE => {
-            let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "annotation")?;
-            let mut bytes = vec![0; length];
-            reader.read_exact(&mut bytes)?;
-            match SessionMessage::decode(&bytes) {
-                Ok(SessionMessage::Annotate(annotation)) => Ok(ParentCommand::Annotate(annotation)),
-                Ok(_) => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "annotation contained another message",
-                )),
-                Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
-            }
-        }
+        COMMAND_START_INPUT => Ok(ParentCommand::StartInput {
+            display_id: DisplayId(read_u32(&mut reader)?),
+            viewer_name: read_sized_string(&mut reader, MAX_DISPLAY_NAME_BYTES, "viewer name")?,
+        }),
+        COMMAND_INPUT => match read_session_message(&mut reader, "desktop input")? {
+            SessionMessage::Input(input) => Ok(ParentCommand::Input(input)),
+            _ => Err(invalid_data("desktop input contained a non-input message")),
+        },
+        COMMAND_ANNOTATE => match read_session_message(&mut reader, "annotation")? {
+            SessionMessage::Annotate(annotation) => Ok(ParentCommand::Annotate(annotation)),
+            _ => Err(invalid_data("annotation contained another message")),
+        },
         COMMAND_BLACKOUT => {
             let enabled = read_u8(&mut reader)?;
             if enabled > 1 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid blackout flag",
-                ));
+                return Err(invalid_data("invalid blackout flag"));
             }
-            let length = bounded_len(
-                read_u32(&mut reader)?,
-                MAX_CONTROL_BYTES,
-                "blackout message",
-            )?;
-            let mut text = vec![0; length];
-            reader.read_exact(&mut text)?;
-            let text = String::from_utf8(text)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             Ok(ParentCommand::Blackout {
                 enabled: enabled == 1,
-                text,
+                text: read_sized_string(&mut reader, MAX_CONTROL_BYTES, "blackout message")?,
             })
         }
-        COMMAND_BLOCK_INPUT => {
-            let mut value = [0];
-            reader.read_exact(&mut value)?;
-            match value[0] {
-                0 => Ok(ParentCommand::BlockInput(false)),
-                1 => Ok(ParentCommand::BlockInput(true)),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid input block flag",
-                )),
-            }
-        }
+        COMMAND_BLOCK_INPUT => match read_u8(&mut reader)? {
+            0 => Ok(ParentCommand::BlockInput(false)),
+            1 => Ok(ParentCommand::BlockInput(true)),
+            _ => Err(invalid_data("invalid input block flag")),
+        },
         COMMAND_RELEASE_INPUT => Ok(ParentCommand::ReleaseInput),
         COMMAND_CLIPBOARD => {
-            let length = bounded_len(
-                read_u32(&mut reader)?,
-                MAX_CLIPBOARD_WIRE_BYTES,
-                "desktop clipboard",
-            )?;
-            let mut bytes = vec![0; length];
-            reader.read_exact(&mut bytes)?;
-            ClipboardContent::decode(&bytes)
-                .map(ParentCommand::Clipboard)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            read_clipboard(&mut reader, "desktop clipboard").map(ParentCommand::Clipboard)
         }
         13 => Ok(ParentCommand::StartFiles),
         12 => Ok(ParentCommand::Files(read_file_message(&mut reader)?)),
         COMMAND_STOP_CHAT => Ok(ParentCommand::StopChat),
         COMMAND_START_CHAT => Ok(ParentCommand::StartChat),
-        COMMAND_CHAT => {
-            let length = bounded_len(
-                read_u32(&mut reader)?,
-                meshrmm_protocol::MAX_CHAT_TEXT_BYTES,
-                "chat text",
-            )?;
-            let mut bytes = vec![0; length];
-            reader.read_exact(&mut bytes)?;
-            let text = String::from_utf8(bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if !meshrmm_protocol::valid_chat_text(&text) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid chat text",
-                ));
-            }
-            Ok(ParentCommand::Chat(text))
-        }
+        COMMAND_CHAT => read_chat_text(&mut reader).map(ParentCommand::Chat),
         COMMAND_STOP => Ok(ParentCommand::Stop),
-        opcode => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unknown desktop-helper command opcode {opcode}"),
-        )),
+        opcode => Err(invalid_data(format!(
+            "unknown desktop-helper command opcode {opcode}"
+        ))),
     }
+}
+
+fn read_start_command(reader: &mut impl Read) -> io::Result<ParentCommand> {
+    let viewer_name = read_sized_string(reader, MAX_DISPLAY_NAME_BYTES, "viewer name")?;
+    let display_id = read_u32(reader)?;
+    Ok(ParentCommand::Start {
+        viewer_name,
+        display_id: (display_id != NO_DISPLAY).then_some(DisplayId(display_id)),
+        frames_per_second: read_u32(reader)?,
+        bitrate_bits_per_second: read_u32(reader)?,
+        codec: read_codec(reader)?,
+        pixel_format: read_pixel_format(reader)?,
+        capture_cursor: read_bool(reader)?,
+        grayscale: read_bool(reader)?,
+        headless: read_headless_target(reader)?,
+    })
 }
 
 fn write_headless_target(
@@ -389,8 +249,7 @@ pub(super) fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Res
             let bytes = serde_json::to_vec(result).map_err(io::Error::other)?;
             checked_len(bytes.len(), 32768, "credential result")?;
             writer.write_all(&[12])?;
-            write_u32(&mut writer, bytes.len() as u32)?;
-            writer.write_all(&bytes)
+            write_sized(&mut writer, &bytes)
         }
         ChildEvent::Files(message) => {
             writer.write_all(&[9])?;
@@ -415,8 +274,7 @@ pub(super) fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Res
         ChildEvent::MaintenanceError(reason) => {
             checked_len(reason.len(), MAX_ERROR_BYTES, "maintenance error")?;
             writer.write_all(&[11])?;
-            write_u32(&mut writer, reason.len() as u32)?;
-            writer.write_all(reason.as_bytes())
+            write_sized(&mut writer, reason.as_bytes())
         }
         ChildEvent::MaintenanceState {
             agent_input_blocked,
@@ -441,35 +299,16 @@ pub(super) fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Res
             writer.write_all(&frame.data)
         }
         ChildEvent::Cursor(shape, viewer_controls_input, pointer_display) => {
-            let bytes = SessionMessage::CursorShape { shape: *shape }
-                .encode()
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let bytes = encode_message(SessionMessage::CursorShape { shape: *shape })?;
             checked_len(bytes.len(), MAX_CONTROL_BYTES, "cursor shape")?;
             writer.write_all(&[EVENT_CURSOR, u8::from(*viewer_controls_input)])?;
             write_u32(&mut writer, pointer_display.map_or(u32::MAX, |id| id.0))?;
-            write_u32(&mut writer, bytes.len() as u32)?;
-            writer.write_all(&bytes)
+            write_sized(&mut writer, &bytes)
         }
-        ChildEvent::Clipboard(text) => {
-            let bytes = text
-                .encode()
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            checked_len(bytes.len(), MAX_CLIPBOARD_WIRE_BYTES, "clipboard content")?;
-            writer.write_all(&[EVENT_CLIPBOARD])?;
-            write_u32(&mut writer, bytes.len() as u32)?;
-            writer.write_all(&bytes)
+        ChildEvent::Clipboard(content) => {
+            write_clipboard(&mut writer, EVENT_CLIPBOARD, content, "clipboard content")
         }
-        ChildEvent::Chat(text) => {
-            if !meshrmm_protocol::valid_chat_text(text) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid chat text",
-                ));
-            }
-            writer.write_all(&[EVENT_CHAT])?;
-            write_u32(&mut writer, text.len() as u32)?;
-            writer.write_all(text.as_bytes())
-        }
+        ChildEvent::Chat(text) => write_chat_text(&mut writer, EVENT_CHAT, text),
         ChildEvent::ApprovalDecision(decision) => {
             writer.write_all(&[EVENT_APPROVAL_DECISION, decision.to_byte()])
         }
@@ -477,8 +316,7 @@ pub(super) fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Res
             let message = message.as_bytes();
             checked_len(message.len(), MAX_ERROR_BYTES, "desktop-helper error")?;
             writer.write_all(&[EVENT_ERROR])?;
-            write_u32(&mut writer, message.len() as u32)?;
-            writer.write_all(message)
+            write_sized(&mut writer, message)
         }
         ChildEvent::NoDisplays => writer.write_all(&[EVENT_NO_DISPLAYS]),
         ChildEvent::Stopped => writer.write_all(&[EVENT_STOPPED]),
@@ -488,9 +326,7 @@ pub(super) fn write_event(mut writer: impl Write, event: &ChildEvent) -> io::Res
 pub(super) fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
     match read_u8(&mut reader)? {
         12 => {
-            let length = bounded_len(read_u32(&mut reader)?, 32768, "credential result")?;
-            let mut bytes = vec![0; length];
-            reader.read_exact(&mut bytes)?;
+            let bytes = read_sized(&mut reader, 32768, "credential result")?;
             Ok(ChildEvent::Credentials(
                 serde_json::from_slice(&bytes).map_err(io::Error::other)?,
             ))
@@ -500,165 +336,171 @@ pub(super) fn read_event(mut reader: impl Read) -> io::Result<ChildEvent> {
             1 => Ok(ChildEvent::CredentialPrompt(true)),
             _ => Err(io::Error::other("invalid credential prompt state")),
         },
-        11 => {
-            let length = bounded_len(read_u32(&mut reader)?, MAX_ERROR_BYTES, "maintenance error")?;
-            let mut bytes = vec![0; length];
-            reader.read_exact(&mut bytes)?;
-            Ok(ChildEvent::MaintenanceError(
-                String::from_utf8(bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-            ))
-        }
+        11 => Ok(ChildEvent::MaintenanceError(read_sized_string(
+            &mut reader,
+            MAX_ERROR_BYTES,
+            "maintenance error",
+        )?)),
         10 => {
             let a = read_u8(&mut reader)?;
             let b = read_u8(&mut reader)?;
             if a > 1 || b > 1 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid maintenance state",
-                ));
+                return Err(invalid_data("invalid maintenance state"));
             }
             Ok(ChildEvent::MaintenanceState {
                 agent_input_blocked: a == 1,
                 blacked_out: b == 1,
             })
         }
-        EVENT_STARTED => {
-            let format = ActiveFormat {
-                width: read_u32(&mut reader)?,
-                height: read_u32(&mut reader)?,
-                frames_per_second: read_u32(&mut reader)?,
-                bitrate_bits_per_second: read_u32(&mut reader)?,
-                codec: read_codec(&mut reader)?,
-                pixel_format: read_pixel_format(&mut reader)?,
-            };
-            let active_display_id = DisplayId(read_u32(&mut reader)?);
-            let count = bounded_len(read_u32(&mut reader)?, MAX_DISPLAYS, "display list")?;
-            let mut displays = Vec::with_capacity(count);
-            for _ in 0..count {
-                displays.push(read_display(&mut reader)?);
-            }
-            let active_display = displays
-                .iter()
-                .find(|display| display.id == active_display_id)
-                .cloned()
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "desktop helper selected an unknown display",
-                    )
-                })?;
-            Ok(ChildEvent::Started(StartedDesktop {
-                format,
-                displays,
-                active_display,
-            }))
-        }
+        EVENT_STARTED => read_started_event(&mut reader),
         EVENT_INPUT_STARTED => Ok(ChildEvent::InputStarted),
-        EVENT_FRAME => {
-            let capture_timestamp_us = read_u64(&mut reader)?;
-            let encode_complete_timestamp_us = read_u64(&mut reader)?;
-            let keyframe = match read_u8(&mut reader)? {
-                0 => false,
-                1 => true,
-                value => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("invalid keyframe flag {value}"),
-                    ));
-                }
-            };
-            let codec_config_len = bounded_len(
-                read_u32(&mut reader)?,
-                MAX_CODEC_CONFIG_BYTES,
-                "codec configuration",
-            )?;
-            let frame_len = bounded_len(read_u32(&mut reader)?, MAX_FRAME_BYTES, "encoded frame")?;
-            let mut codec_config = vec![0; codec_config_len];
-            let mut data = vec![0; frame_len];
-            reader.read_exact(&mut codec_config)?;
-            reader.read_exact(&mut data)?;
-            Ok(ChildEvent::Frame(EncodedAccessUnit {
-                capture_timestamp_us,
-                encode_complete_timestamp_us,
-                keyframe,
-                codec_config: (!codec_config.is_empty()).then_some(codec_config),
-                data,
-            }))
-        }
+        EVENT_FRAME => read_frame_event(&mut reader),
         EVENT_CURSOR => {
             let viewer_controls_input = read_bool(&mut reader)?;
             let pointer_id = read_u32(&mut reader)?;
             let pointer_display = (pointer_id != u32::MAX).then_some(DisplayId(pointer_id));
-            let length = bounded_len(read_u32(&mut reader)?, MAX_CONTROL_BYTES, "cursor shape")?;
-            let mut bytes = vec![0; length];
-            reader.read_exact(&mut bytes)?;
-            match SessionMessage::decode(&bytes) {
-                Ok(SessionMessage::CursorShape { shape }) => Ok(ChildEvent::Cursor(
+            match read_session_message(&mut reader, "cursor shape")? {
+                SessionMessage::CursorShape { shape } => Ok(ChildEvent::Cursor(
                     shape,
                     viewer_controls_input,
                     pointer_display,
                 )),
-                Ok(_) => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "cursor event contained an unexpected message",
-                )),
-                Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+                _ => Err(invalid_data("cursor event contained an unexpected message")),
             }
         }
         EVENT_CLIPBOARD => {
-            let length = bounded_len(
-                read_u32(&mut reader)?,
-                MAX_CLIPBOARD_WIRE_BYTES,
-                "clipboard content",
-            )?;
-            let mut bytes = vec![0; length];
-            reader.read_exact(&mut bytes)?;
-            ClipboardContent::decode(&bytes)
-                .map(ChildEvent::Clipboard)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            read_clipboard(&mut reader, "clipboard content").map(ChildEvent::Clipboard)
         }
         9 => Ok(ChildEvent::Files(read_file_message(&mut reader)?)),
-        EVENT_CHAT => {
-            let length = bounded_len(
-                read_u32(&mut reader)?,
-                meshrmm_protocol::MAX_CHAT_TEXT_BYTES,
-                "chat text",
-            )?;
-            let mut bytes = vec![0; length];
-            reader.read_exact(&mut bytes)?;
-            let text = String::from_utf8(bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if !meshrmm_protocol::valid_chat_text(&text) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid chat text",
-                ));
-            }
-            Ok(ChildEvent::Chat(text))
-        }
-        EVENT_ERROR => {
-            let length = bounded_len(
-                read_u32(&mut reader)?,
-                MAX_ERROR_BYTES,
-                "desktop-helper error",
-            )?;
-            let mut message = vec![0; length];
-            reader.read_exact(&mut message)?;
-            String::from_utf8(message)
-                .map(ChildEvent::Error)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-        }
+        EVENT_CHAT => read_chat_text(&mut reader).map(ChildEvent::Chat),
+        EVENT_ERROR => read_sized_string(&mut reader, MAX_ERROR_BYTES, "desktop-helper error")
+            .map(ChildEvent::Error),
         EVENT_STOPPED => Ok(ChildEvent::Stopped),
         EVENT_NO_DISPLAYS => Ok(ChildEvent::NoDisplays),
         EVENT_APPROVAL_DECISION => Decision::from_byte(read_u8(&mut reader)?)
             .map(ChildEvent::ApprovalDecision)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid approval decision")),
-        opcode => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unknown desktop-helper event opcode {opcode}"),
-        )),
+            .ok_or_else(|| invalid_data("invalid approval decision")),
+        opcode => Err(invalid_data(format!(
+            "unknown desktop-helper event opcode {opcode}"
+        ))),
     }
+}
+
+fn read_started_event(reader: &mut impl Read) -> io::Result<ChildEvent> {
+    let format = ActiveFormat {
+        width: read_u32(reader)?,
+        height: read_u32(reader)?,
+        frames_per_second: read_u32(reader)?,
+        bitrate_bits_per_second: read_u32(reader)?,
+        codec: read_codec(reader)?,
+        pixel_format: read_pixel_format(reader)?,
+    };
+    let active_display_id = DisplayId(read_u32(reader)?);
+    let count = bounded_len(read_u32(reader)?, MAX_DISPLAYS, "display list")?;
+    let mut displays = Vec::with_capacity(count);
+    for _ in 0..count {
+        displays.push(read_display(reader)?);
+    }
+    let active_display = displays
+        .iter()
+        .find(|display| display.id == active_display_id)
+        .cloned()
+        .ok_or_else(|| invalid_data("desktop helper selected an unknown display"))?;
+    Ok(ChildEvent::Started(StartedDesktop {
+        format,
+        displays,
+        active_display,
+    }))
+}
+
+fn read_frame_event(reader: &mut impl Read) -> io::Result<ChildEvent> {
+    let capture_timestamp_us = read_u64(reader)?;
+    let encode_complete_timestamp_us = read_u64(reader)?;
+    let keyframe = match read_u8(reader)? {
+        0 => false,
+        1 => true,
+        value => return Err(invalid_data(format!("invalid keyframe flag {value}"))),
+    };
+    let codec_config_len = bounded_len(
+        read_u32(reader)?,
+        MAX_CODEC_CONFIG_BYTES,
+        "codec configuration",
+    )?;
+    let frame_len = bounded_len(read_u32(reader)?, MAX_FRAME_BYTES, "encoded frame")?;
+    let mut codec_config = vec![0; codec_config_len];
+    let mut data = vec![0; frame_len];
+    reader.read_exact(&mut codec_config)?;
+    reader.read_exact(&mut data)?;
+    Ok(ChildEvent::Frame(EncodedAccessUnit {
+        capture_timestamp_us,
+        encode_complete_timestamp_us,
+        keyframe,
+        codec_config: (!codec_config.is_empty()).then_some(codec_config),
+        data,
+    }))
+}
+
+fn write_chat_text(writer: &mut impl Write, opcode: u8, text: &str) -> io::Result<()> {
+    if !meshrmm_protocol::valid_chat_text(text) {
+        return Err(invalid_data("invalid chat text"));
+    }
+    writer.write_all(&[opcode])?;
+    write_sized(writer, text.as_bytes())
+}
+
+fn read_chat_text(reader: &mut impl Read) -> io::Result<String> {
+    let text = read_sized_string(reader, meshrmm_protocol::MAX_CHAT_TEXT_BYTES, "chat text")?;
+    if !meshrmm_protocol::valid_chat_text(&text) {
+        return Err(invalid_data("invalid chat text"));
+    }
+    Ok(text)
+}
+
+fn write_clipboard(
+    writer: &mut impl Write,
+    opcode: u8,
+    content: &ClipboardContent,
+    label: &str,
+) -> io::Result<()> {
+    let bytes = content.encode().map_err(invalid_data)?;
+    checked_len(bytes.len(), MAX_CLIPBOARD_WIRE_BYTES, label)?;
+    writer.write_all(&[opcode])?;
+    write_sized(writer, &bytes)
+}
+
+fn read_clipboard(reader: &mut impl Read, label: &str) -> io::Result<ClipboardContent> {
+    let bytes = read_sized(reader, MAX_CLIPBOARD_WIRE_BYTES, label)?;
+    ClipboardContent::decode(&bytes).map_err(invalid_data)
+}
+
+fn encode_message(message: SessionMessage) -> io::Result<Vec<u8>> {
+    message.encode().map_err(invalid_data)
+}
+
+/// Reads a length-prefixed control message, which the caller checks is the one it expects.
+fn read_session_message(reader: &mut impl Read, label: &str) -> io::Result<SessionMessage> {
+    let bytes = read_sized(reader, MAX_CONTROL_BYTES, label)?;
+    SessionMessage::decode(&bytes).map_err(invalid_data)
+}
+
+fn write_sized(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    write_u32(writer, bytes.len() as u32)?;
+    writer.write_all(bytes)
+}
+
+fn read_sized(reader: &mut impl Read, maximum: usize, label: &str) -> io::Result<Vec<u8>> {
+    let length = bounded_len(read_u32(reader)?, maximum, label)?;
+    let mut bytes = vec![0; length];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_sized_string(reader: &mut impl Read, maximum: usize, label: &str) -> io::Result<String> {
+    String::from_utf8(read_sized(reader, maximum, label)?).map_err(invalid_data)
+}
+
+fn invalid_data(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 /// The thumbnail helper's reply: a JPEG, or why there is none.
