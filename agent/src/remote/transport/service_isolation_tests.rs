@@ -1,6 +1,11 @@
+use meshrmm_protocol::SessionMessage;
+use meshrmm_session_transport::ServiceChannel;
 use webrtc::data_channel::RTCDataChannel;
 
 use super::super::platform::ScreenInput;
+use super::service_workers::{
+    spawn_chat_worker, spawn_clipboard_worker, spawn_file_worker, spawn_input_worker,
+};
 use super::*;
 #[test]
 fn recording_keeps_cursor_for_both_input_owners_and_restores_preference() {

@@ -71,12 +71,16 @@ mod video;
 pub(crate) mod wallpaper;
 
 #[cfg(any(windows, target_os = "macos"))]
+use std::ops::ControlFlow;
+#[cfg(any(windows, target_os = "macos"))]
 use std::time::Duration;
 
 #[cfg(any(windows, target_os = "macos"))]
 use anyhow::Context;
 #[cfg(any(windows, target_os = "macos"))]
-use meshrmm_protocol::{AgentCommand, AgentSessionRequest, AgentStatusMessage};
+use meshrmm_protocol::{AgentCommand, AgentSessionRequest, AgentStatusMessage, RemoteSessionId};
+#[cfg(any(windows, target_os = "macos"))]
+use meshrmm_signaling_client::SignalingConnection;
 #[cfg(any(windows, target_os = "macos"))]
 use tokio::time::sleep;
 #[cfg(any(windows, target_os = "macos"))]
@@ -88,7 +92,7 @@ use self::signaling::{agent_connection_url, authenticated_websocket};
 
 #[cfg(any(windows, target_os = "macos"))]
 struct ActiveSession {
-    session_id: meshrmm_protocol::RemoteSessionId,
+    session_id: RemoteSessionId,
     request: AgentSessionRequest,
     task: tokio::task::JoinHandle<()>,
 }
@@ -109,12 +113,10 @@ fn replays_session(
         }
 }
 
-/// Ends the remote session and runs its close actions before the coordinator exits, since the
-/// session cannot outlive it and nothing else would run them.
 /// Tells the server the Agent is going offline to install `version`, so the dashboard shows
 /// the update instead of an unexplained outage. The stop goes ahead if this fails.
 #[cfg(any(windows, target_os = "macos"))]
-async fn announce_update(socket: &meshrmm_signaling_client::SignalingConnection, version: String) {
+async fn announce_update(socket: &SignalingConnection, version: String) {
     let status = AgentStatusMessage::Updating { version };
     let sent = match serde_json::to_string(&status) {
         Ok(text) => socket.send(Message::Text(text.into())).await,
@@ -129,21 +131,16 @@ async fn announce_update(socket: &meshrmm_signaling_client::SignalingConnection,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-async fn end_sessions(
-    active_session: &mut Option<ActiveSession>,
-    session_close: &mut Option<(
-        meshrmm_protocol::RemoteSessionId,
-        std::sync::Arc<session_close::SessionClose>,
-    )>,
-) {
-    if let Some(active) = active_session.take() {
-        active.task.abort();
-        let _ = active.task.await;
-        tracing::info!(session_id = %active.session_id, "stopped remote session because the Agent is stopping");
-    }
-    if let Some((id, close)) = session_close.take() {
-        close.finish(&id).await;
-    }
+async fn uninstall(socket: &SignalingConnection) -> anyhow::Result<ControlFlow<bool>> {
+    crate::installer::schedule_uninstall().context("failed to schedule Agent self-uninstall")?;
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&AgentStatusMessage::UninstallScheduled)?.into(),
+        ))
+        .await
+        .context("failed to acknowledge Agent self-uninstall")?;
+    sleep(Duration::from_millis(250)).await;
+    Ok(ControlFlow::Break(true))
 }
 
 /// Entry point of `--session-helper`, which launchd runs in each graphical
@@ -155,10 +152,7 @@ pub fn run_session_helper() -> anyhow::Result<()> {
 }
 
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(unused_variables))]
-pub async fn run(
-    #[allow(unused_mut)] mut config: Config,
-    mode: ExecutionMode,
-) -> anyhow::Result<()> {
+pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
     #[cfg(not(any(windows, target_os = "macos")))]
     anyhow::bail!("the MeshRMM Agent requires Windows or macOS");
 
@@ -179,180 +173,48 @@ pub async fn run(
                 std::sync::Arc::clone(&link),
             ));
         }
-        // Created once, so reconnecting does not capture again before the interval ends.
-        let mut thumbnails = thumbnail::Thumbnails::new(mode);
+        Coordinator {
+            // Created once, so reconnecting does not capture again before the interval ends.
+            thumbnails: thumbnail::Thumbnails::new(mode),
+            config,
+            mode,
+            link,
+            active_session: None,
+            session_close: None,
+        }
+        .run()
+        .await
+    }
+}
+
+/// The Agent's connection to the server, and the remote session it runs.
+#[cfg(any(windows, target_os = "macos"))]
+struct Coordinator {
+    config: Config,
+    mode: ExecutionMode,
+    link: std::sync::Arc<service_link::ServiceLink>,
+    thumbnails: thumbnail::Thumbnails,
+    active_session: Option<ActiveSession>,
+    // Outlives session tasks, which end whenever the viewer drops its
+    // connection, so the close action runs only once the session ends.
+    session_close: Option<(RemoteSessionId, std::sync::Arc<session_close::SessionClose>)>,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl Coordinator {
+    async fn run(mut self) -> anyhow::Result<()> {
         let mut retry_delay = Duration::from_secs(1);
-        let mut active_session = None::<ActiveSession>;
-        // Outlives session tasks, which end whenever the viewer drops its
-        // connection, so the close action runs only once the session ends.
-        let mut session_close = None::<(
-            meshrmm_protocol::RemoteSessionId,
-            std::sync::Arc<session_close::SessionClose>,
-        )>;
         loop {
-            let url = agent_connection_url(&config.server, &config.device_id)?;
-            tracing::info!(device_id = %config.device_id, url = %url, "connecting Agent to the server");
-            match authenticated_websocket(url, &config.agent_token).await {
+            let url = agent_connection_url(&self.config.server, &self.config.device_id)?;
+            tracing::info!(device_id = %self.config.device_id, url = %url, "connecting Agent to the server");
+            match authenticated_websocket(url, &self.config.agent_token).await {
                 Ok((socket, _response)) => {
-                    let mut socket = meshrmm_signaling_client::SignalingConnection::new(socket);
+                    let mut socket = SignalingConnection::new(socket);
                     retry_delay = Duration::from_secs(1);
-                    tracing::info!(device_id = %config.device_id, "Agent signaling connected");
-                    let connection_result: anyhow::Result<bool> = async {
-                        loop {
-                            if active_session
-                                .as_ref()
-                                .is_some_and(|session| session.task.is_finished())
-                                && let Some(session) = active_session.take()
-                            {
-                                let _ = session.task.await;
-                            }
-                            tokio::select! {
-                                message = socket.next() => {
-                                    let Some(message) = message else { break Ok(false); };
-                                    match message.context("Agent signaling WebSocket read failed")? {
-                                        Message::Text(text) => {
-                                            let background_request = if let Ok(command) = serde_json::from_str::<AgentCommand>(text.as_str()) {
-                                                match command {
-                                                    AgentCommand::RotateToken { token } => {
-                                                        if token == config.agent_token { continue; }
-                                                        if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                                                            anyhow::bail!("invalid rotated Agent credential");
-                                                        }
-                                                        let mut stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&config.config_path)?)?;
-                                                        stored["agent_token"] = serde_json::Value::String(token.clone());
-                                                        crate::installer::replace_file(&config.config_path, &serde_json::to_vec_pretty(&stored)?)?;
-                                                        config.agent_token = token;
-                                                        break Ok(false);
-                                                    }
-                                                    AgentCommand::Uninstall => {
-                                                        {
-                                                        crate::installer::schedule_uninstall()
-                                                            .context("failed to schedule Agent self-uninstall")?;
-                                                        socket
-                                                            .send(Message::Text(
-                                                                serde_json::to_string(&AgentStatusMessage::UninstallScheduled)?
-                                                                    .into(),
-                                                            ))
-                                                            .await
-                                                            .context("failed to acknowledge Agent self-uninstall")?;
-                                                        sleep(Duration::from_millis(250)).await;
-                                                        break Ok(true);
-                                                        }
-                                                    }
-                                                    AgentCommand::EndSession { session_id } => {
-                                                        if active_session.as_ref().is_some_and(
-                                                            |active| active.session_id == session_id,
-                                                        ) && let Some(active) = active_session.take()
-                                                        {
-                                                            active.task.abort();
-                                                            let _ = active.task.await;
-                                                            tracing::info!(%session_id, "stopped expired remote session");
-                                                        }
-                                                        if session_close.as_ref().is_some_and(|(id, _)| *id == session_id)
-                                                            && let Some((id, close)) = session_close.take()
-                                                        {
-                                                            close.run(&id);
-                                                        }
-                                                        continue;
-                                                    }
-                                                    AgentCommand::StartBackgroundSession { request } => Some(request),
-                                                    AgentCommand::RunScript { run } => {
-                                                        tracing::info!(run_id = %run.run_id, language = run.language.as_str(), run_as = run.run_as.as_str(), "running a toolbox script");
-                                                        toolbox::run_script(&config, mode, run);
-                                                        continue;
-                                                    }
-                                                    AgentCommand::DeliverFile { delivery } => {
-                                                        tracing::info!(delivery_id = %delivery.delivery_id, size_bytes = delivery.size_bytes, "receiving a toolbox file");
-                                                        toolbox::deliver_file(&config, mode, delivery);
-                                                        continue;
-                                                    }
-                                                }
-                                            } else { None };
-                                            let request: AgentSessionRequest = match background_request.map(Ok).unwrap_or_else(|| serde_json::from_str(text.as_str())) {
-                                                Ok(request) => request,
-                                                Err(error) => {
-                                                    tracing::warn!(error = %error, "discarding invalid remote-session request");
-                                                    continue;
-                                                }
-                                            };
-                                            if active_session.as_ref().is_some_and(|active| {
-                                                replays_session(&active.request, &request)
-                                                    && !active.task.is_finished()
-                                            }) {
-                                                tracing::info!(
-                                                    session_id = %request.session_id,
-                                                    "active remote session request replayed after coordinator reconnect"
-                                                );
-                                                continue;
-                                            }
-                                            if let Some(active) = active_session.take() {
-                                                tracing::info!(
-                                                    previous_session_id = %active.session_id,
-                                                    session_id = %request.session_id,
-                                                    "replacing active remote session"
-                                                );
-                                                active.task.abort();
-                                                let _ = active.task.await;
-                                            }
-                                            let session_id = request.session_id.clone();
-                                            if session_close.as_ref().is_some_and(|(id, _)| *id != session_id)
-                                                && let Some((id, close)) = session_close.take()
-                                            {
-                                                close.run(&id);
-                                            }
-                                            let close = std::sync::Arc::clone(
-                                                &session_close
-                                                    .get_or_insert_with(|| {
-                                                        (
-                                                            session_id.clone(),
-                                                            std::sync::Arc::new(session_close::SessionClose::new(
-                                                                request.clear_clipboard_policy,
-                                                            )),
-                                                        )
-                                                    })
-                                                    .1,
-                                            );
-                                            let active_request = request.clone();
-                                            let session_config = config.clone();
-                                            let task_session_id = session_id.clone();
-                                            let activity = link.session_started();
-                                            let task = tokio::spawn(async move {
-                                                let _activity = activity;
-                                                if let Err(error) = session::run(&session_config, request, mode, close).await {
-                                                    tracing::error!(
-                                                        error = ?error,
-                                                        session_id = %task_session_id,
-                                                        "remote session ended with an error"
-                                                    );
-                                                }
-                                            });
-                                            active_session = Some(ActiveSession {
-                                                session_id,
-                                                request: active_request,
-                                                task,
-                                            });
-                                        }
-                                        Message::Ping(payload) => socket
-                                            .send(Message::Pong(payload))
-                                            .await
-                                            .context("failed to answer signaling ping")?,
-                                        Message::Close(_) => break Ok(false),
-                                        _ => {}
-                                    }
-                                }
-                                () = thumbnails.due() => thumbnails.refresh(&config),
-                                () = link.stopped() => {
-                                    if let Some(version) = link.update_version() {
-                                        announce_update(&socket, version).await;
-                                    }
-                                    break Ok(true);
-                                }
-                            }
-                        }
-                    }.await;
-                    match connection_result {
+                    tracing::info!(device_id = %self.config.device_id, "Agent signaling connected");
+                    match self.serve(&mut socket).await {
                         Ok(true) => {
-                            end_sessions(&mut active_session, &mut session_close).await;
+                            self.end_sessions().await;
                             return Ok(());
                         }
                         Ok(false) => tracing::warn!("Agent signaling disconnected"),
@@ -367,12 +229,219 @@ pub async fn run(
             }
             tokio::select! {
                 _ = sleep(retry_delay) => {},
-                () = link.stopped() => {
-                    end_sessions(&mut active_session, &mut session_close).await;
+                () = self.link.stopped() => {
+                    self.end_sessions().await;
                     return Ok(());
                 },
             }
             retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+        }
+    }
+
+    /// Handles the server's messages until the connection ends, returning whether the Agent is
+    /// stopping.
+    async fn serve(&mut self, socket: &mut SignalingConnection) -> anyhow::Result<bool> {
+        loop {
+            if self
+                .active_session
+                .as_ref()
+                .is_some_and(|session| session.task.is_finished())
+                && let Some(session) = self.active_session.take()
+            {
+                let _ = session.task.await;
+            }
+            tokio::select! {
+                message = socket.next() => {
+                    let Some(message) = message else { break Ok(false); };
+                    match message.context("Agent signaling WebSocket read failed")? {
+                        Message::Text(text) => {
+                            if let ControlFlow::Break(stopping) = self.handle_text(socket, text.as_str()).await? {
+                                break Ok(stopping);
+                            }
+                        }
+                        Message::Ping(payload) => socket
+                            .send(Message::Pong(payload))
+                            .await
+                            .context("failed to answer signaling ping")?,
+                        Message::Close(_) => break Ok(false),
+                        _ => {}
+                    }
+                }
+                () = self.thumbnails.due() => self.thumbnails.refresh(&self.config),
+                () = self.link.stopped() => {
+                    if let Some(version) = self.link.update_version() {
+                        announce_update(socket, version).await;
+                    }
+                    break Ok(true);
+                }
+            }
+        }
+    }
+
+    /// Breaks, with whether the Agent is stopping, when the connection must end.
+    async fn handle_text(
+        &mut self,
+        socket: &SignalingConnection,
+        text: &str,
+    ) -> anyhow::Result<ControlFlow<bool>> {
+        let background_request = if let Ok(command) = serde_json::from_str::<AgentCommand>(text) {
+            match command {
+                AgentCommand::RotateToken { token } => return self.rotate_token(token),
+                AgentCommand::Uninstall => return uninstall(socket).await,
+                AgentCommand::EndSession { session_id } => {
+                    self.end_session(session_id).await;
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::StartBackgroundSession { request } => Some(request),
+                AgentCommand::RunScript { run } => {
+                    tracing::info!(run_id = %run.run_id, language = run.language.as_str(), run_as = run.run_as.as_str(), "running a toolbox script");
+                    toolbox::run_script(&self.config, self.mode, run);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::DeliverFile { delivery } => {
+                    tracing::info!(delivery_id = %delivery.delivery_id, size_bytes = delivery.size_bytes, "receiving a toolbox file");
+                    toolbox::deliver_file(&self.config, self.mode, delivery);
+                    return Ok(ControlFlow::Continue(()));
+                }
+            }
+        } else {
+            None
+        };
+        let request: AgentSessionRequest = match background_request
+            .map(Ok)
+            .unwrap_or_else(|| serde_json::from_str(text))
+        {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(error = %error, "discarding invalid remote-session request");
+                return Ok(ControlFlow::Continue(()));
+            }
+        };
+        self.start_session(request).await;
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn rotate_token(&mut self, token: String) -> anyhow::Result<ControlFlow<bool>> {
+        if token == self.config.agent_token {
+            return Ok(ControlFlow::Continue(()));
+        }
+        if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("invalid rotated Agent credential");
+        }
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&self.config.config_path)?)?;
+        stored["agent_token"] = serde_json::Value::String(token.clone());
+        crate::installer::replace_file(
+            &self.config.config_path,
+            &serde_json::to_vec_pretty(&stored)?,
+        )?;
+        self.config.agent_token = token;
+        Ok(ControlFlow::Break(false))
+    }
+
+    async fn end_session(&mut self, session_id: RemoteSessionId) {
+        if self
+            .active_session
+            .as_ref()
+            .is_some_and(|active| active.session_id == session_id)
+            && let Some(active) = self.active_session.take()
+        {
+            active.task.abort();
+            let _ = active.task.await;
+            tracing::info!(%session_id, "stopped expired remote session");
+        }
+        if self
+            .session_close
+            .as_ref()
+            .is_some_and(|(id, _)| *id == session_id)
+            && let Some((id, close)) = self.session_close.take()
+        {
+            close.run(&id);
+        }
+    }
+
+    async fn start_session(&mut self, request: AgentSessionRequest) {
+        if self.active_session.as_ref().is_some_and(|active| {
+            replays_session(&active.request, &request) && !active.task.is_finished()
+        }) {
+            tracing::info!(
+                session_id = %request.session_id,
+                "active remote session request replayed after coordinator reconnect"
+            );
+            return;
+        }
+        if let Some(active) = self.active_session.take() {
+            tracing::info!(
+                previous_session_id = %active.session_id,
+                session_id = %request.session_id,
+                "replacing active remote session"
+            );
+            active.task.abort();
+            let _ = active.task.await;
+        }
+        let session_id = request.session_id.clone();
+        let close = self.session_close_for(&request);
+        let active_request = request.clone();
+        let session_config = self.config.clone();
+        let task_session_id = session_id.clone();
+        let activity = self.link.session_started();
+        let mode = self.mode;
+        let task = tokio::spawn(async move {
+            let _activity = activity;
+            if let Err(error) = session::run(&session_config, request, mode, close).await {
+                tracing::error!(
+                    error = ?error,
+                    session_id = %task_session_id,
+                    "remote session ended with an error"
+                );
+            }
+        });
+        self.active_session = Some(ActiveSession {
+            session_id,
+            request: active_request,
+            task,
+        });
+    }
+
+    /// Runs the close action of any other session, and returns the close state `request` shares
+    /// with earlier connections of its session.
+    fn session_close_for(
+        &mut self,
+        request: &AgentSessionRequest,
+    ) -> std::sync::Arc<session_close::SessionClose> {
+        if self
+            .session_close
+            .as_ref()
+            .is_some_and(|(id, _)| *id != request.session_id)
+            && let Some((id, close)) = self.session_close.take()
+        {
+            close.run(&id);
+        }
+        std::sync::Arc::clone(
+            &self
+                .session_close
+                .get_or_insert_with(|| {
+                    (
+                        request.session_id.clone(),
+                        std::sync::Arc::new(session_close::SessionClose::new(
+                            request.clear_clipboard_policy,
+                        )),
+                    )
+                })
+                .1,
+        )
+    }
+
+    /// Ends the remote session and runs its close actions before the coordinator exits, since the
+    /// session cannot outlive it and nothing else would run them.
+    async fn end_sessions(&mut self) {
+        if let Some(active) = self.active_session.take() {
+            active.task.abort();
+            let _ = active.task.await;
+            tracing::info!(session_id = %active.session_id, "stopped remote session because the Agent is stopping");
+        }
+        if let Some((id, close)) = self.session_close.take() {
+            close.finish(&id).await;
         }
     }
 }
