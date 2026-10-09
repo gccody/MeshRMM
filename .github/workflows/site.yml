@@ -1,0 +1,35 @@
+name: Site
+
+# Publishes `site/` to meshrmm.com when it changes on main. The CI workflow
+# checks it on pull requests.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '!site/**/*.md'
+      - '.github/workflows/site.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Deploys run one at a time, in order, so an older commit can't finish last.
+concurrency:
+  group: site-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - run: node --test site/*.test.mjs
+      - name: Deploy
+        working-directory: site
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx --yes wrangler@4.149.0 deploy
