@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use thiserror::Error;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
@@ -655,11 +654,6 @@ impl Drop for WindowsScreenStreamer {
         }
     }
 }
-
-// These are deliberately kept private to this package. The callback owns them
-// and windows-capture invokes it on the single capture/GPU worker thread.
-#[allow(dead_code)]
-fn _assert_device_types(_: &ID3D11Device, _: &ID3D11DeviceContext) {}
 
 #[cfg(test)]
 mod tests {

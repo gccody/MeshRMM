@@ -11,9 +11,15 @@ pub(crate) struct Matroska<W> {
 
 fn element(id: u32, data: &[u8]) -> Vec<u8> {
     let bytes = id.to_be_bytes();
-    let mut result = bytes[bytes.iter().position(|b| *b != 0).unwrap()..].to_vec();
+    let first = bytes
+        .iter()
+        .position(|b| *b != 0)
+        .expect("element IDs are nonzero");
+    let mut result = bytes[first..].to_vec();
     let length = data.len() as u64;
-    let width = (1..=8).find(|w| length < (1u64 << (7 * w)) - 1).unwrap();
+    let width = (1..=8)
+        .find(|w| length < (1u64 << (7 * w)) - 1)
+        .expect("elements are smaller than 2^56 - 1 bytes");
     let size = (length | (1u64 << (7 * width))).to_be_bytes();
     result.extend_from_slice(&size[8 - width..]);
     result.extend_from_slice(data);

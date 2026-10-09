@@ -212,7 +212,7 @@ export async function createPasskey(options: CreationOptionsJSON): Promise<Regis
     throw promptError(error, "create");
   }
   if (!credential) throw new PasskeyPromptError("The passkey prompt was closed.", true);
-  return registrationJSON(credential as unknown as RegistrationCredential);
+  return registrationJSON(credential as RegistrationCredential);
 }
 
 // Asks the browser for a passkey that answers the server's prompt.
@@ -224,5 +224,5 @@ export async function getPasskey(options: RequestOptionsJSON): Promise<Assertion
     throw promptError(error, "get");
   }
   if (!credential) throw new PasskeyPromptError("The passkey prompt was closed.", true);
-  return assertionJSON(credential as unknown as AssertionCredential);
+  return assertionJSON(credential as AssertionCredential);
 }
