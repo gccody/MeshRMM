@@ -35,7 +35,9 @@ and upgrading it.
 | 49160–49200 (`turn.relay_port_min`–`max`) | UDP | TURN relays | Agents and viewers |
 
 Behind a reverse proxy the server listens on `127.0.0.1:8080` instead of 443,
-and the proxy takes 443. TURN can't go through the proxy: its ports must reach
+and the proxy takes 443. If something else already uses 443 on the machine,
+set `http.listen` to another port and forward port 443 of the public address
+to it: Let's Encrypt's challenge always arrives on port 443. TURN can't go through the proxy: its ports must reach
 the server directly.
 
 Each peer that relays through TURN holds one relay port while its session
