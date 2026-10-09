@@ -205,28 +205,7 @@ fn install() -> anyhow::Result<Option<String>> {
     let recovery_key = enrollment::recovery_key(&config_directory)?;
     let config_path = config_directory.join("agent.json");
     // Repair preserves the installed identity, including legacy installations.
-    let mut notice = None;
-    let previous_config = if config_path.exists() {
-        Some(std::fs::read(&config_path)?)
-    } else {
-        // Nothing re-secured the legacy directory, so a configuration that another account could
-        // have planted, for example one naming its own server, is ignored and the endpoint
-        // enrolls as a new device instead.
-        let legacy = program_data
-            .join("PulseRMM")
-            .join("Agent")
-            .join("agent.json");
-        match private_directory::read_protected_file(&legacy) {
-            Ok(config) => config,
-            Err(error) => {
-                let untrusted = error.downcast::<private_directory::UntrustedPath>()?;
-                notice = Some(format!(
-                    "The previous PulseRMM configuration was not imported because {untrusted}. This endpoint was enrolled as a new device."
-                ));
-                None
-            }
-        }
-    };
+    let (previous_config, notice) = read_previous_config(&config_path, &program_data)?;
     let provisioned_config = if let Some(config) = previous_config {
         serde_json::from_slice::<enrollment::ProvisionedAgentConfig>(&config)?
     } else {
@@ -265,11 +244,75 @@ fn install() -> anyhow::Result<Option<String>> {
         stop_service(service)?;
     }
 
-    let agent_path = install_directory.join("meshrmm-agent.exe");
-    let config_path = config_directory.join("agent.json");
     replace_file(&agent_path, embedded.executable)?;
     replace_file(&config_path, &config_bytes)?;
 
+    let service = register_service(
+        &manager,
+        existing_service,
+        service_access,
+        agent_path,
+        config_path,
+    )?;
+    crate::power::register_safe_mode_service()?;
+    let start_result = service
+        .start::<&OsStr>(&[])
+        .context("failed to start the Agent service")
+        .and_then(|()| wait_for_state(&service, ServiceState::Running, Duration::from_secs(20)));
+    if let Err(error) = start_result {
+        if let Some(legacy_service) = legacy_service.as_ref() {
+            let _ = legacy_service.start::<&OsStr>(&[]);
+        }
+        return Err(error);
+    }
+    rollback.committed = true;
+    enrollment::finish(&config_directory);
+    if let Some(legacy_service) = legacy_service {
+        legacy_service
+            .delete()
+            .context("failed to unregister the legacy Agent service")?;
+        remove_legacy_directories()?;
+    }
+    Ok(notice)
+}
+
+/// Reads the configuration a repair keeps, with a notice for the user when legacy state is skipped.
+fn read_previous_config(
+    config_path: &Path,
+    program_data: &Path,
+) -> anyhow::Result<(Option<Vec<u8>>, Option<String>)> {
+    if config_path.exists() {
+        return Ok((Some(std::fs::read(config_path)?), None));
+    }
+    // Nothing re-secured the legacy directory, so a configuration that another account could
+    // have planted, for example one naming its own server, is ignored and the endpoint
+    // enrolls as a new device instead.
+    let legacy = program_data
+        .join("PulseRMM")
+        .join("Agent")
+        .join("agent.json");
+    match private_directory::read_protected_file(&legacy) {
+        Ok(config) => Ok((config, None)),
+        Err(error) => {
+            let untrusted = error.downcast::<private_directory::UntrustedPath>()?;
+            Ok((
+                None,
+                Some(format!(
+                    "The previous PulseRMM configuration was not imported because {untrusted}. This endpoint was enrolled as a new device."
+                )),
+            ))
+        }
+    }
+}
+
+/// Creates the Agent service, or updates an existing one, with its description and recovery.
+fn register_service(
+    manager: &ServiceManager,
+    existing_service: Option<windows_service::service::Service>,
+    service_access: ServiceAccess,
+    agent_path: PathBuf,
+    config_path: PathBuf,
+) -> anyhow::Result<windows_service::service::Service> {
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
         display_name: OsString::from("MeshRMM Agent"),
@@ -311,26 +354,7 @@ fn install() -> anyhow::Result<Option<String>> {
     service
         .set_failure_actions_on_non_crash_failures(true)
         .context("failed to enable Agent service recovery")?;
-    crate::power::register_safe_mode_service()?;
-    let start_result = service
-        .start::<&OsStr>(&[])
-        .context("failed to start the Agent service")
-        .and_then(|()| wait_for_state(&service, ServiceState::Running, Duration::from_secs(20)));
-    if let Err(error) = start_result {
-        if let Some(legacy_service) = legacy_service.as_ref() {
-            let _ = legacy_service.start::<&OsStr>(&[]);
-        }
-        return Err(error);
-    }
-    rollback.committed = true;
-    enrollment::finish(&config_directory);
-    if let Some(legacy_service) = legacy_service {
-        legacy_service
-            .delete()
-            .context("failed to unregister the legacy Agent service")?;
-        remove_legacy_directories()?;
-    }
-    Ok(notice)
+    Ok(service)
 }
 
 fn read_optional(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
