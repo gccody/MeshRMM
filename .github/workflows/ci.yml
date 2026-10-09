@@ -120,7 +120,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:17
+        # Docker Hub's official image, from Google's mirror: Docker Hub
+        # rate-limits the shared runners' anonymous pulls.
+        image: mirror.gcr.io/library/postgres:17
         env:
           POSTGRES_PASSWORD: postgres
         ports:

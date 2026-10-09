@@ -1,5 +1,7 @@
 import { useRef, useState } from "react";
+import { Link, useNavigate } from "react-router";
 import {
+  Activity,
   Copy,
   Ellipsis,
   Expand,
@@ -16,6 +18,8 @@ import {
   WifiOff,
 } from "lucide-react";
 import { usePopover } from "../../lib/use-popover";
+import type { MetricsReading } from "../metrics/model";
+import { DeviceUsage } from "../metrics/usage-meter";
 import { HeaderActions } from "../workspace/header-actions";
 import type { AgentStatusFilter } from "./device-filters";
 import { ScreenPreview, useDeviceScreen } from "./device-thumbnail";
@@ -36,6 +40,8 @@ type Props = {
   filteredAgents: Agent[];
   inventory: InventoryState;
   thumbnails: ThumbnailStore;
+  // Each online device's latest resource usage.
+  metrics: ReadonlyMap<string, MetricsReading>;
   onReconnect: () => void;
   onRefresh: () => void;
   onAddDevice: (opener: HTMLElement) => void;
@@ -75,6 +81,9 @@ type TileState = {
   anyClosing: boolean;
 };
 
+// The device's own page, with its resource usage.
+const devicePath = (agent: Agent) => `/device?id=${encodeURIComponent(agent.id)}`;
+
 const formatTime = (date: Date | null) =>
   date?.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) ?? "";
 
@@ -110,6 +119,7 @@ export function AgentOverview({
   filteredAgents,
   inventory,
   thumbnails,
+  metrics,
   onReconnect,
   onRefresh,
   onAddDevice,
@@ -158,6 +168,7 @@ export function AgentOverview({
             <DeviceTile
               key={agent.id}
               agent={agent}
+              reading={metrics.get(agent.id)}
               store={thumbnails}
               allowed={allowed}
               state={{
@@ -189,8 +200,9 @@ export function AgentOverview({
   );
 }
 
-function DeviceTile({ agent, store, allowed, state, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript }: {
+function DeviceTile({ agent, reading, store, allowed, state, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript }: {
   agent: Agent;
+  reading: MetricsReading | undefined;
   store: ThumbnailStore;
   allowed: DeviceActions;
   state: TileState;
@@ -237,7 +249,7 @@ function DeviceTile({ agent, store, allowed, state, onRemote, onRemoteBackground
           : <div className="device-screen">{screen}</div>}
       <div className="device-meta">
         <i className={`led ${tone}`} aria-hidden="true" />
-        <strong title={agent.name}>{agent.name}</strong>
+        <strong title={agent.name}><Link to={devicePath(agent)}>{agent.name}</Link></strong>
         <span className="sr-only">{tone === "online" ? "Online" : tone === "updating" ? `Updating to ${agent.updating_to}` : "Offline"}</span>
         <DeviceMenu
           agent={agent}
@@ -251,6 +263,7 @@ function DeviceTile({ agent, store, allowed, state, onRemote, onRemoteBackground
           onRunScript={onRunScript}
         />
       </div>
+      {reading && <DeviceUsage reading={reading} />}
       {previewOpen && thumbnail && <ScreenPreview agent={agent} thumbnail={thumbnail} returnFocus={previewOpener} onClose={() => setPreviewOpen(false)} />}
     </li>
   );
@@ -268,6 +281,7 @@ function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onRemoteBa
   onRunScript: (agent: Agent, opener: HTMLElement) => void;
 }) {
   const { open, setOpen, close, container, trigger } = usePopover();
+  const navigate = useNavigate();
   const menuId = `device-menu-${agent.id}`;
   const reachable = agent.connected && !state.browserOffline;
   // A chosen item's dialog gives focus back to the menu's trigger.
@@ -285,6 +299,7 @@ function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onRemoteBa
         <div id={menuId} className="popover menu" role="group" aria-label={`Actions for ${agent.name}`}>
           {allowed.connectBackground && <button type="button" disabled={!reachable || state.connecting} onClick={() => choose(() => onRemoteBackground(agent))}><Layers size={16} aria-hidden="true" />Connect in background</button>}
           {allowed.runScripts && <button type="button" disabled={!reachable || state.deleting} onClick={() => choose((opener) => onRunScript(agent, opener))} aria-haspopup="dialog"><SquareTerminal size={16} aria-hidden="true" />Run a script…</button>}
+          <button type="button" onClick={() => { close(); void navigate(devicePath(agent)); }}><Activity size={16} aria-hidden="true" />Resource usage</button>
           {hasScreen && <button type="button" onClick={() => choose(onShowScreen)} aria-haspopup="dialog"><Expand size={16} aria-hidden="true" />View screen</button>}
           {allowed.closeSession && <button type="button" disabled={state.anyClosing || state.connecting || state.deleting} onClick={() => choose(() => onCloseSession(agent))}><Square size={16} aria-hidden="true" />Close active session</button>}
           <button type="button" onClick={() => { void navigator.clipboard?.writeText(agent.id); close(); }}><Copy size={16} aria-hidden="true" />Copy device ID</button>

@@ -8,6 +8,7 @@ mod events;
 mod handoffs;
 mod instance;
 mod invitations;
+mod metrics;
 mod passkeys;
 mod password_resets;
 mod remote;
@@ -170,6 +171,7 @@ fn device_routes() -> Router<AppState> {
         .route("/agents/{id}", delete(devices::delete))
         .route("/agents/{id}/connect", get(agent::connect))
         .route("/agents/{id}/close-session", post(remote::close))
+        .route("/agents/{id}/metrics", get(metrics::get))
         .route(
             "/agents/{id}/rotate-credential",
             post(devices::rotate_credential),

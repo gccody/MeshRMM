@@ -298,6 +298,27 @@ CREATE TABLE agents (
 
 CREATE INDEX idx_agents_name ON agents (name);
 
+-- Each device's resource usage, one row per minute its Agent reported in.
+-- Rates and loads are averages over the minute's samples; storage is the
+-- minute's last sample, summed across the device's volumes.
+CREATE TABLE device_metrics (
+  device_id TEXT NOT NULL,
+  -- The minute's start, in Unix milliseconds.
+  minute BIGINT NOT NULL,
+  samples BIGINT NOT NULL CHECK (samples > 0),
+  cpu_percent DOUBLE PRECISION NOT NULL,
+  cpu_percent_max DOUBLE PRECISION NOT NULL,
+  memory_used_bytes BIGINT NOT NULL,
+  memory_total_bytes BIGINT NOT NULL,
+  network_received_bytes_per_second BIGINT NOT NULL,
+  network_sent_bytes_per_second BIGINT NOT NULL,
+  storage_used_bytes BIGINT NOT NULL,
+  storage_total_bytes BIGINT NOT NULL,
+  PRIMARY KEY (device_id, minute)
+);
+
+CREATE INDEX idx_device_metrics_minute ON device_metrics (minute);
+
 CREATE TABLE agent_install_tokens (
   id TEXT NOT NULL PRIMARY KEY,
   token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64),

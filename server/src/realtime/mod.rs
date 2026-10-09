@@ -1,7 +1,9 @@
-//! Live connections: Agents' control sockets, remote sessions' signaling
-//! sockets, and the website's presence stream.
+//! Live connections: Agents' control sockets and the resource usage they
+//! report, remote sessions' signaling sockets, and the website's presence
+//! stream.
 pub mod coordinator;
 mod hub;
+pub mod metrics;
 pub mod presence;
 pub mod sessions;
 
@@ -11,6 +13,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket};
 
 pub use self::{
     hub::{AgentConnection, AgentHub, ToAgent},
+    metrics::Metrics,
     presence::Presence,
     sessions::Sessions,
 };

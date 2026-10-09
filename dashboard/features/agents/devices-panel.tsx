@@ -100,6 +100,7 @@ export function DevicesPanel() {
         filteredAgents={filteredAgents}
         inventory={inventory}
         thumbnails={inventory.thumbnails}
+        metrics={inventory.metrics}
         onReconnect={inventory.reconnect}
         onRefresh={() => void inventory.refresh()}
         onAddDevice={(opener) => { enrollOpener.current = opener; installer.reset(); setIsEnrolling(true); }}

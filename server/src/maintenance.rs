@@ -13,10 +13,11 @@ use crate::{
     db::{
         self, Database,
         tables::{
-            AgentInstallTokens, Agents, FileDeliveries, Invitations, PasswordResets,
+            AgentInstallTokens, Agents, DeviceMetrics, FileDeliveries, Invitations, PasswordResets,
             RemoteHandoffs, RemoteSessions, ScriptRuns, ToolboxFiles, UserSessions,
         },
     },
+    realtime::metrics::HISTORY_MS,
     storage::Storage,
     time::{DAY_MS, MINUTE_MS, now_ms},
 };
@@ -41,6 +42,7 @@ pub struct Purged {
     pub remote_sessions: u64,
     pub script_runs: u64,
     pub file_deliveries: u64,
+    pub device_metrics: u64,
 }
 
 /// Purges every expired row and abandoned partial file once now and then
@@ -68,7 +70,8 @@ pub fn spawn(database: Database, storage: Storage) -> tokio::task::JoinHandle<()
 }
 
 /// Deletes tokens and sessions that expired more than [`EXPIRED_GRACE_MS`]
-/// before `now_ms`, and toolbox history older than [`TOOLBOX_HISTORY_MS`].
+/// before `now_ms`, toolbox history older than [`TOOLBOX_HISTORY_MS`], and
+/// devices' resource usage older than [`HISTORY_MS`].
 pub async fn purge(database: &Database, now_ms: i64) -> db::Result<Purged> {
     let expired = now_ms - EXPIRED_GRACE_MS;
     let history = now_ms - TOOLBOX_HISTORY_MS;
@@ -122,6 +125,13 @@ pub async fn purge(database: &Database, now_ms: i64) -> db::Result<Purged> {
             FileDeliveries::Table,
             FileDeliveries::CreatedAt,
             history,
+        )
+        .await?,
+        device_metrics: delete_before(
+            database,
+            DeviceMetrics::Table,
+            DeviceMetrics::Minute,
+            now_ms - HISTORY_MS,
         )
         .await?,
     })

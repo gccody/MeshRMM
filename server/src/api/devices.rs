@@ -79,6 +79,9 @@ pub async fn delete(
     if let Err(error) = state.storage.remove(&state.storage.thumbnail(&id)).await {
         tracing::warn!(device_id = id, %error, "could not remove a deleted device's thumbnail");
     }
+    if let Err(error) = state.metrics.forget(&id).await {
+        tracing::warn!(device_id = id, %error, "could not remove a deleted device's resource usage");
+    }
     if let Err(error) = state
         .sessions
         .end_for_device(&state, &id, "the device was removed")

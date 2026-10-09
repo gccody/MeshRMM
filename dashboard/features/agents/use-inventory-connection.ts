@@ -1,4 +1,5 @@
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
+import type { MetricsReading } from "../metrics/model";
 import { type InventoryConnection, STALE_GRACE_MS, eventsSocketUrl, inventoryStream } from "./inventory-stream";
 import type { Agent } from "./types";
 
@@ -7,6 +8,7 @@ type Options = {
   // Shared with the HTTP inventory load so neither applies older data.
   revisionRef: RefObject<number>;
   onAgents: (update: (current: Agent[]) => Agent[]) => void;
+  onMetrics: (readings: MetricsReading[]) => void;
   onRefused: () => void;
 };
 
@@ -14,7 +16,7 @@ type Options = {
 type Link = { connection: InventoryConnection; since: number | null };
 
 // The live inventory socket, and how long it has been down.
-export function useInventoryConnection({ enabled, revisionRef, onAgents, onRefused }: Options) {
+export function useInventoryConnection({ enabled, revisionRef, onAgents, onMetrics, onRefused }: Options) {
   const [link, setLink] = useState<Link>({ connection: "connecting", since: null });
   // Advanced by a timer when the stale grace period ends.
   const [clock, setClock] = useState(0);
@@ -29,6 +31,7 @@ export function useInventoryConnection({ enabled, revisionRef, onAgents, onRefus
       openSocket: () => new WebSocket(eventsSocketUrl(window.location)),
       revision: revisionRef,
       onAgents,
+      onMetrics,
       onConnection: (connection) => {
         const at = Date.now();
         setLink((previous) => {
@@ -45,7 +48,7 @@ export function useInventoryConnection({ enabled, revisionRef, onAgents, onRefus
       current.stop();
       stream.current = null;
     };
-  }, [enabled, onAgents, revisionRef]);
+  }, [enabled, onAgents, onMetrics, revisionRef]);
 
   // Resynchronize when the network returns or the tab becomes visible again,
   // for example after the computer wakes from sleep.

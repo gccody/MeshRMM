@@ -36,7 +36,7 @@ use crate::{
     db::Database,
     downloads::Downloads,
     http::AppState,
-    realtime::{AgentHub, Presence, Sessions, presence::UPDATE_GRACE, sessions::Timeouts},
+    realtime::{AgentHub, Metrics, Presence, Sessions, presence::UPDATE_GRACE, sessions::Timeouts},
     secrets::InstanceKey,
     storage::Storage,
     turn::Turn,
@@ -71,6 +71,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
     Ok(AppState {
         config: Arc::new(config),
         presence: Presence::new(database.clone(), agents.clone(), UPDATE_GRACE),
+        metrics: Metrics::new(database.clone()),
         sessions: Sessions::new(Timeouts::new(idle)),
         turn: Turn::new(&instance_key),
         database,

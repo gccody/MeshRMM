@@ -114,8 +114,8 @@ pub enum AgentCommand {
     },
 }
 
-/// Agent-to-coordinator lifecycle notifications.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Agent-to-coordinator lifecycle notifications and reports.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentStatusMessage {
     UninstallScheduled,
@@ -123,6 +123,10 @@ pub enum AgentStatusMessage {
     /// dashboard can say why it went offline.
     Updating {
         version: String,
+    },
+    /// The computer's resource usage, every [`crate::METRICS_INTERVAL_SECONDS`].
+    Metrics {
+        metrics: crate::SystemMetrics,
     },
 }
 
@@ -274,6 +278,26 @@ mod tests {
             })
             .unwrap(),
             r#"{"type":"updating","version":"0.3.1"}"#
+        );
+        let metrics = AgentStatusMessage::Metrics {
+            metrics: crate::SystemMetrics {
+                cpu_percent: 50.0,
+                memory_used_bytes: 1,
+                memory_total_bytes: 2,
+                network_received_bytes_per_second: 3,
+                network_sent_bytes_per_second: 4,
+                uptime_seconds: 5,
+                volumes: vec![],
+            },
+        };
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(
+            json.starts_with(r#"{"type":"metrics","metrics":{"cpu_percent":50.0,"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
+            metrics
         );
     }
 

@@ -327,3 +327,122 @@ async fn the_event_socket_needs_the_website_and_permission_to_see_devices() {
         app.finish().await;
     }
 }
+
+fn metrics_report(cpu: f64, memory: u64) -> Value {
+    json!({
+        "type": "metrics",
+        "metrics": {
+            "cpu_percent": cpu,
+            "memory_used_bytes": memory,
+            "memory_total_bytes": 16_000,
+            "network_received_bytes_per_second": 2_000,
+            "network_sent_bytes_per_second": 500,
+            "uptime_seconds": 3_600,
+            "volumes": [{ "name": "C:", "total_bytes": 1_000, "free_bytes": 250 }]
+        }
+    })
+}
+
+/// The device's stored minutes, as (samples, average CPU, peak CPU).
+async fn stored_minutes(app: &App, device_id: &str) -> Vec<(i64, f64, f64)> {
+    use sea_query::{Expr, ExprTrait, Query};
+    app.db()
+        .fetch_all(
+            &Query::select()
+                .columns(["samples", "cpu_percent", "cpu_percent_max"])
+                .from("device_metrics")
+                .and_where(Expr::col("device_id").eq(device_id))
+                .to_owned(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn agents_report_resource_usage_to_the_website_and_history() {
+    for app in apps().await {
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let agent = app.enroll(&mut admin, "Desk").await;
+        let path = format!("/v1/agents/{}/metrics", agent.device_id);
+        let empty = admin.get(&path).await;
+        assert_eq!(empty.status, 200, "{:?}", empty.body);
+        assert_eq!(empty.body["range"], "live");
+        assert!(empty.body["latest"].is_null());
+        assert_eq!(empty.body["points"], json!([]));
+
+        let mut events = admin.events(&server).await.unwrap();
+        receive_json(&mut events).await;
+        let mut control = agent.connect(&server).await.unwrap();
+        receive_json(&mut events).await;
+        send_json(&mut control, metrics_report(20.0, 4_000)).await;
+
+        // The event socket sends new readings every few seconds.
+        let event = receive_json(&mut events).await;
+        assert_eq!(event["type"], "metrics", "{}", app.name);
+        let reading = &event["readings"][0];
+        assert_eq!(reading["device_id"], agent.device_id.as_str());
+        assert_eq!(reading["cpu_percent"], 20.0);
+        assert_eq!(reading["volumes"][0]["name"], "C:");
+        assert!(reading["at"].is_i64());
+
+        let live = admin.get(&path).await;
+        assert_eq!(live.body["step_ms"], 5_000);
+        assert_eq!(live.body["latest"]["memory_used_bytes"], 4_000);
+        let point = &live.body["points"][0];
+        assert_eq!(point["cpu_percent"], 20.0);
+        assert_eq!(point["storage_used_bytes"], 750);
+        assert_eq!(point["storage_total_bytes"], 1_000);
+
+        // Going offline stores the unfinished minute and ends the live view.
+        drop(control);
+        receive_json(&mut events).await;
+        let mut stored = Vec::new();
+        for _ in 0..50 {
+            stored = stored_minutes(&app, &agent.device_id).await;
+            if !stored.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(stored, [(1, 20.0, 20.0)], "{}", app.name);
+        assert!(admin.get(&path).await.body["latest"].is_null());
+
+        // A second connection's readings in the same minute merge into it.
+        let mut control = agent.connect(&server).await.unwrap();
+        receive_json(&mut events).await;
+        send_json(&mut control, metrics_report(60.0, 8_000)).await;
+        assert_eq!(receive_json(&mut events).await["type"], "metrics");
+        drop(control);
+        receive_json(&mut events).await;
+        for _ in 0..50 {
+            stored = stored_minutes(&app, &agent.device_id).await;
+            if stored.iter().map(|minute| minute.0).sum::<i64>() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Unless the minute turned between the two readings.
+        if stored.len() == 1 {
+            assert_eq!(stored, [(2, 40.0, 60.0)], "{}", app.name);
+        } else {
+            assert_eq!(stored.len(), 2, "{stored:?}");
+        }
+        let hour = admin.get(&format!("{path}?range=hour")).await;
+        assert_eq!(hour.status, 200, "{:?}", hour.body);
+        assert_eq!(hour.body["step_ms"], 60_000);
+        let points = hour.body["points"].as_array().unwrap();
+        assert!(!points.is_empty() && points.len() <= 2, "{points:?}");
+        assert_eq!(points.last().unwrap()["cpu_percent_max"], 60.0);
+        assert_eq!(admin.get(&format!("{path}?range=year")).await.status, 400);
+
+        // Deleting the device removes its history.
+        let deleted = admin
+            .delete(&format!("/v1/agents/{}", agent.device_id))
+            .await;
+        assert_eq!(deleted.status, 204, "{:?}", deleted.body);
+        assert!(stored_minutes(&app, &agent.device_id).await.is_empty());
+        assert_eq!(admin.get(&path).await.status, 404);
+        app.finish().await;
+    }
+}

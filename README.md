@@ -187,6 +187,17 @@ device's Documents transfer folder, or to Public Documents from the background
 desktop. The server hands both to the Agent, so they work in background mode
 too. See [the toolbox](docs/toolbox.md).
 
+## Resource monitoring
+
+Every five seconds an online Agent reports its computer's CPU load, memory
+use, network throughput through its physical adapters, uptime, and the
+capacity of its local fixed volumes, over the control connection it already
+keeps open. Each device tile on the **Devices** page shows the CPU and memory
+gauges, and a device's name opens its own page: the latest reading, every
+volume's free space, and charts of the last 15 minutes live, or the last hour,
+24 hours or 7 days. The server keeps the live readings in memory and averages
+each minute into the database, where history is kept for 7 days.
+
 ## Configuration
 
 The installed Agent reads its protected configuration from
