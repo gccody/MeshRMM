@@ -162,6 +162,19 @@ fn status(since: Instant, phase: ReconnectPhase) -> Option<ReconnectStatus> {
     })
 }
 
+/// The probe window, the presenter state that drives its overlay, and the
+/// overlay's controls.
+struct ReconnectProbe {
+    overlay: ReconnectOverlay,
+    shared: Shared,
+    window: HWND,
+    panel: HWND,
+    label: HWND,
+    button: HWND,
+    title_before: String,
+    _presentation: super::pipeline::Presentation,
+}
+
 #[test]
 #[ignore = "needs an interactive desktop and a D3D11 video device"]
 fn reconnect_probe_shows_the_status_and_retry_now_reaches_the_owner() {
@@ -170,156 +183,199 @@ fn reconnect_probe_shows_the_status_and_retry_now_reaches_the_owner() {
 
 unsafe fn run_probe() {
     super::enable_dpi_awareness();
-    let sent = Arc::new(Mutex::new(Vec::new()));
-    let display = Display {
-        session: DesktopSession::Console,
-        id: DisplayId(1),
-        name: r"\\.\DISPLAY1".into(),
-        x: 0,
-        y: 0,
-        width: 1280,
-        height: 720,
-        primary: true,
-    };
-    let format = VideoFormat {
-        width: 1280,
-        height: 720,
-        frames_per_second: 60,
-        codec: Codec::H264,
-        pixel_format: PixelFormat::Nv12,
-        bitrate_bits_per_second: 12_000_000,
-    };
-    let chat = meshrmm_chat::ChatSession::default();
-    let mut presentation = unsafe {
-        super::pipeline::Presentation::new(
-            format,
-            display.clone(),
-            vec![display],
-            test_sink(Arc::clone(&sent), chat.clone()),
-            DebugInfo::new("reconnect-probe"),
-        )
-    }
-    .expect("the probe window and renderer");
-    let window = presentation.window();
-    unsafe { pump(window, Duration::from_millis(300)) };
-    unsafe { present_synthetic(&mut presentation, 1280, 720, PixelFormat::Nv12) }.unwrap();
-    // Launched without foreground rights, the window may open behind others.
-    let _ = unsafe {
-        SetWindowPos(
-            window,
-            Some(HWND_TOPMOST),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        )
-    };
-    let shared = Shared::new(test_sink(sent, chat), DebugInfo::new("reconnect-probe"));
-    let mut overlay = ReconnectOverlay::new();
-    let (panel, label, button) = unsafe { probe_reconnect_panel(window) }.expect("reconnect panel");
-    let title_before = unsafe { text(window) };
-    assert!(!unsafe { IsWindowVisible(panel) }.as_bool());
-
-    // Waiting out the backoff: reason, elapsed time, countdown, Retry now.
+    let mut probe = unsafe { ReconnectProbe::open() };
     let since = Instant::now() - Duration::from_secs(65);
-    let until = Instant::now() + Duration::from_millis(8_500);
-    shared.set_reconnect_status(status(since, ReconnectPhase::Waiting { until }));
-    unsafe { run(window, &shared, &mut overlay, Duration::from_millis(200)) };
-    let first = unsafe { text(label) };
-    println!("label: {first:?}");
-    println!("title: {:?}", unsafe { text(window) });
-    assert!(unsafe { IsWindowVisible(panel) }.as_bool());
-    assert!(unsafe { IsWindowVisible(button) }.as_bool());
-    assert!(first.contains("Network connection lost"), "{first:?}");
-    assert!(
-        first.contains("Disconnected for 1:05 · retrying in 9 s"),
-        "{first:?}"
-    );
-    assert_eq!(
-        unsafe { text(window) },
-        format!("{title_before} — Reconnecting…")
-    );
-    assert!(unsafe { IsWindowEnabled(button) }.as_bool());
-    assert_eq!(unsafe { text(button) }, "Retry now");
-    // The panel is owned by the window and hosts the button, whose clicks
-    // it forwards to the window.
-    assert_eq!(unsafe { GetWindow(panel, GW_OWNER) }.ok(), Some(window));
-    assert_eq!(unsafe { GetParent(button) }.ok(), Some(panel));
-    assert_eq!(unsafe { GetDlgCtrlID(button) }, 4030);
-    unsafe { save_screenshot(window, "1-waiting") };
-
-    // The counts update live.
-    unsafe { run(window, &shared, &mut overlay, Duration::from_millis(2_100)) };
-    let later = unsafe { text(label) };
-    println!("label 2.1 s later: {later:?}");
-    assert!(
-        later.contains("Disconnected for 1:07 · retrying in 7 s"),
-        "{later:?}"
-    );
-    unsafe { save_screenshot(window, "2-waiting-later") };
-
-    // BN_CLICKED from BM_CLICK reaches the owner.
-    let generation = retry_generation();
-    unsafe { SendMessageW(button, BM_CLICK, None, None) };
-    unsafe { run(window, &shared, &mut overlay, Duration::from_millis(100)) };
-    println!(
-        "BM_CLICK: retry generation {generation} -> {}",
-        retry_generation()
-    );
-    assert_eq!(retry_generation(), generation + 1);
-    // The click disables the button until the next wait.
-    assert!(!unsafe { IsWindowEnabled(button) }.as_bool());
-
-    // So does a real mouse click, in a panel that does not take activation.
-    let until = Instant::now() + Duration::from_secs(4);
-    shared.set_reconnect_status(status(since, ReconnectPhase::Waiting { until }));
-    unsafe { run(window, &shared, &mut overlay, Duration::from_millis(100)) };
-    assert!(unsafe { IsWindowEnabled(button) }.as_bool());
-    let generation = retry_generation();
-    let clicked = unsafe { click(button) };
-    unsafe { run(window, &shared, &mut overlay, Duration::from_millis(300)) };
-    println!(
-        "mouse click sent={clicked}: retry generation {generation} -> {}",
-        retry_generation()
-    );
-    assert!(
-        clicked,
-        "SendInput failed; run the probe on an interactive desktop"
-    );
-    assert_eq!(retry_generation(), generation + 1);
-
-    // While an attempt runs, the button is disabled and ignores clicks.
-    shared.set_reconnect_status(status(since, ReconnectPhase::Attempting));
-    unsafe { run(window, &shared, &mut overlay, Duration::from_millis(100)) };
-    let attempting = unsafe { text(label) };
-    println!("label while attempting: {attempting:?}");
-    assert!(attempting.contains("· reconnecting…"), "{attempting:?}");
-    assert!(!unsafe { IsWindowEnabled(button) }.as_bool());
-    let generation = retry_generation();
-    assert!(unsafe { click(button) });
-    unsafe { run(window, &shared, &mut overlay, Duration::from_millis(300)) };
-    assert_eq!(retry_generation(), generation);
-    unsafe { save_screenshot(window, "3-attempting") };
-
-    // Another reason replaces the text in place.
-    shared.set_reconnect_status(Some(ReconnectStatus {
-        reason: ReconnectReason::RemoteUnavailable,
-        since,
-        phase: ReconnectPhase::Waiting {
-            until: Instant::now() + Duration::from_secs(15),
-        },
-    }));
-    unsafe { run(window, &shared, &mut overlay, Duration::from_millis(200)) };
-    let offline = unsafe { text(label) };
-    println!("label for an offline Agent: {offline:?}");
-    assert!(offline.contains("The remote computer is restarting or offline"));
-    unsafe { save_screenshot(window, "4-remote-offline") };
+    unsafe { probe.check_waiting(since) };
+    unsafe { probe.check_live_counts() };
+    unsafe { probe.check_retry_from_bm_click() };
+    unsafe { probe.check_retry_from_mouse_click(since) };
+    unsafe { probe.check_attempting_ignores_clicks(since) };
+    unsafe { probe.check_reason_change(since) };
 
     // The first frame of the next connection hides the overlay.
-    shared.set_reconnect_status(None);
-    unsafe { run(window, &shared, &mut overlay, Duration::from_millis(100)) };
-    assert!(!unsafe { IsWindowVisible(panel) }.as_bool());
-    assert_eq!(unsafe { text(window) }, title_before);
+    probe.shared.set_reconnect_status(None);
+    unsafe { probe.run(Duration::from_millis(100)) };
+    assert!(!unsafe { IsWindowVisible(probe.panel) }.as_bool());
+    assert_eq!(unsafe { text(probe.window) }, probe.title_before);
     println!("reconnect probe passed");
+}
+
+impl ReconnectProbe {
+    unsafe fn open() -> Self {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let display = Display {
+            session: DesktopSession::Console,
+            id: DisplayId(1),
+            name: r"\\.\DISPLAY1".into(),
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+            primary: true,
+        };
+        let format = VideoFormat {
+            width: 1280,
+            height: 720,
+            frames_per_second: 60,
+            codec: Codec::H264,
+            pixel_format: PixelFormat::Nv12,
+            bitrate_bits_per_second: 12_000_000,
+        };
+        let chat = meshrmm_chat::ChatSession::default();
+        let mut presentation = unsafe {
+            super::pipeline::Presentation::new(
+                format,
+                display.clone(),
+                vec![display],
+                test_sink(Arc::clone(&sent), chat.clone()),
+                DebugInfo::new("reconnect-probe"),
+            )
+        }
+        .expect("the probe window and renderer");
+        let window = presentation.window();
+        unsafe { pump(window, Duration::from_millis(300)) };
+        unsafe { present_synthetic(&mut presentation, 1280, 720, PixelFormat::Nv12) }.unwrap();
+        // Launched without foreground rights, the window may open behind others.
+        let _ = unsafe {
+            SetWindowPos(
+                window,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        };
+        let shared = Shared::new(test_sink(sent, chat), DebugInfo::new("reconnect-probe"));
+        let overlay = ReconnectOverlay::new();
+        let (panel, label, button) =
+            unsafe { probe_reconnect_panel(window) }.expect("reconnect panel");
+        let title_before = unsafe { text(window) };
+        assert!(!unsafe { IsWindowVisible(panel) }.as_bool());
+        Self {
+            overlay,
+            shared,
+            window,
+            panel,
+            label,
+            button,
+            title_before,
+            _presentation: presentation,
+        }
+    }
+
+    unsafe fn run(&mut self, duration: Duration) {
+        unsafe { run(self.window, &self.shared, &mut self.overlay, duration) };
+    }
+
+    /// Waiting out the backoff: reason, elapsed time, countdown, Retry now.
+    unsafe fn check_waiting(&mut self, since: Instant) {
+        let (window, panel, button) = (self.window, self.panel, self.button);
+        let until = Instant::now() + Duration::from_millis(8_500);
+        self.shared
+            .set_reconnect_status(status(since, ReconnectPhase::Waiting { until }));
+        unsafe { self.run(Duration::from_millis(200)) };
+        let first = unsafe { text(self.label) };
+        println!("label: {first:?}");
+        println!("title: {:?}", unsafe { text(window) });
+        assert!(unsafe { IsWindowVisible(panel) }.as_bool());
+        assert!(unsafe { IsWindowVisible(button) }.as_bool());
+        assert!(first.contains("Network connection lost"), "{first:?}");
+        assert!(
+            first.contains("Disconnected for 1:05 · retrying in 9 s"),
+            "{first:?}"
+        );
+        assert_eq!(
+            unsafe { text(window) },
+            format!("{} — Reconnecting…", self.title_before)
+        );
+        assert!(unsafe { IsWindowEnabled(button) }.as_bool());
+        assert_eq!(unsafe { text(button) }, "Retry now");
+        // The panel is owned by the window and hosts the button, whose clicks
+        // it forwards to the window.
+        assert_eq!(unsafe { GetWindow(panel, GW_OWNER) }.ok(), Some(window));
+        assert_eq!(unsafe { GetParent(button) }.ok(), Some(panel));
+        assert_eq!(unsafe { GetDlgCtrlID(button) }, 4030);
+        unsafe { save_screenshot(window, "1-waiting") };
+    }
+
+    /// The counts update live.
+    unsafe fn check_live_counts(&mut self) {
+        unsafe { self.run(Duration::from_millis(2_100)) };
+        let later = unsafe { text(self.label) };
+        println!("label 2.1 s later: {later:?}");
+        assert!(
+            later.contains("Disconnected for 1:07 · retrying in 7 s"),
+            "{later:?}"
+        );
+        unsafe { save_screenshot(self.window, "2-waiting-later") };
+    }
+
+    /// BN_CLICKED from BM_CLICK reaches the owner.
+    unsafe fn check_retry_from_bm_click(&mut self) {
+        let generation = retry_generation();
+        unsafe { SendMessageW(self.button, BM_CLICK, None, None) };
+        unsafe { self.run(Duration::from_millis(100)) };
+        println!(
+            "BM_CLICK: retry generation {generation} -> {}",
+            retry_generation()
+        );
+        assert_eq!(retry_generation(), generation + 1);
+        // The click disables the button until the next wait.
+        assert!(!unsafe { IsWindowEnabled(self.button) }.as_bool());
+    }
+
+    /// So does a real mouse click, in a panel that does not take activation.
+    unsafe fn check_retry_from_mouse_click(&mut self, since: Instant) {
+        let until = Instant::now() + Duration::from_secs(4);
+        self.shared
+            .set_reconnect_status(status(since, ReconnectPhase::Waiting { until }));
+        unsafe { self.run(Duration::from_millis(100)) };
+        assert!(unsafe { IsWindowEnabled(self.button) }.as_bool());
+        let generation = retry_generation();
+        let clicked = unsafe { click(self.button) };
+        unsafe { self.run(Duration::from_millis(300)) };
+        println!(
+            "mouse click sent={clicked}: retry generation {generation} -> {}",
+            retry_generation()
+        );
+        assert!(
+            clicked,
+            "SendInput failed; run the probe on an interactive desktop"
+        );
+        assert_eq!(retry_generation(), generation + 1);
+    }
+
+    /// While an attempt runs, the button is disabled and ignores clicks.
+    unsafe fn check_attempting_ignores_clicks(&mut self, since: Instant) {
+        self.shared
+            .set_reconnect_status(status(since, ReconnectPhase::Attempting));
+        unsafe { self.run(Duration::from_millis(100)) };
+        let attempting = unsafe { text(self.label) };
+        println!("label while attempting: {attempting:?}");
+        assert!(attempting.contains("· reconnecting…"), "{attempting:?}");
+        assert!(!unsafe { IsWindowEnabled(self.button) }.as_bool());
+        let generation = retry_generation();
+        assert!(unsafe { click(self.button) });
+        unsafe { self.run(Duration::from_millis(300)) };
+        assert_eq!(retry_generation(), generation);
+        unsafe { save_screenshot(self.window, "3-attempting") };
+    }
+
+    /// Another reason replaces the text in place.
+    unsafe fn check_reason_change(&mut self, since: Instant) {
+        self.shared.set_reconnect_status(Some(ReconnectStatus {
+            reason: ReconnectReason::RemoteUnavailable,
+            since,
+            phase: ReconnectPhase::Waiting {
+                until: Instant::now() + Duration::from_secs(15),
+            },
+        }));
+        unsafe { self.run(Duration::from_millis(200)) };
+        let offline = unsafe { text(self.label) };
+        println!("label for an offline Agent: {offline:?}");
+        assert!(offline.contains("The remote computer is restarting or offline"));
+        unsafe { save_screenshot(self.window, "4-remote-offline") };
+    }
 }

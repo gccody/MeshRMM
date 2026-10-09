@@ -130,6 +130,12 @@ impl Shared {
         self.reset.lock().is_ok_and(|reset| reset.is_some())
     }
 
+    fn record_failure(&self, message: String) {
+        if let Ok(mut failure) = self.failure.lock() {
+            *failure = Some(message);
+        }
+    }
+
     fn set_reconnect_status(&self, status: Option<ReconnectStatus>) {
         if let Ok(mut current) = self.reconnect_status.lock() {
             *current = status;
@@ -432,76 +438,29 @@ fn run_worker(
         if unsafe { pump_window_messages(pipeline.window()) } {
             break;
         }
-        if let Some(PendingReset {
-            format,
-            display,
-            displays,
-            reply,
-        }) = shared
-            .reset
-            .lock()
-            .ok()
-            .and_then(|mut pending| pending.take())
-        {
-            let result = unsafe { pipeline.reset_stream(format, display, displays) };
+        if unsafe { apply_pending_reset(&shared, &mut pipeline) } {
             // The new decoder has not been offered any input yet.
             decoder_blocked_since = None;
-            let _ = reply.send(result);
         }
         unsafe { reconnect_overlay.refresh(pipeline.window(), &shared) };
         if let Some(layout) = unsafe { window::take_resize(pipeline.window()) }
             && let Err(error) = unsafe { pipeline.resize(&layout) }
         {
             tracing::error!(error = %error, "viewer swap chain resize failed");
-            if let Ok(mut failure) = shared.failure.lock() {
-                *failure = Some(error.to_string());
-            }
+            shared.record_failure(error.to_string());
             break;
         }
-        if let Some(display_id) = shared
-            .agent_pointer_display
-            .lock()
-            .ok()
-            .and_then(|mut pending| pending.take())
-        {
-            unsafe {
-                window::set_agent_pointer_display(pipeline.window(), display_id);
-            }
-        }
-        if let Some(shape) = shared
-            .cursor_shape
-            .lock()
-            .ok()
-            .and_then(|mut pending| pending.take())
-        {
-            unsafe { pipeline.set_cursor_shape(shape) };
-        }
+        unsafe { apply_pending_pointer_state(&shared, &pipeline) };
         if let Err(error) = unsafe { pipeline.poll(shared.replaced_frames.load(Ordering::Relaxed)) }
         {
             tracing::error!(error = %error, "video decoder polling failed");
-            if let Ok(mut failure) = shared.failure.lock() {
-                *failure = Some(error.to_string());
-            }
+            shared.record_failure(error.to_string());
             break;
         }
         if !pipeline.wants_input() {
-            let frames_are_waiting = shared.queued.lock().is_ok_and(|queued| !queued.is_empty());
-            if frames_are_waiting {
-                let blocked_since =
-                    decoder_blocked_since.get_or_insert_with(std::time::Instant::now);
-                if blocked_since.elapsed() >= DECODER_INPUT_STALL_TIMEOUT {
-                    let message = format!(
-                        "video decoder stopped requesting input for {} seconds while video frames were queued",
-                        DECODER_INPUT_STALL_TIMEOUT.as_secs()
-                    );
-                    tracing::error!(message, "video decoder input watchdog expired");
-                    if let Ok(mut failure) = shared.failure.lock() {
-                        *failure = Some(message);
-                    }
-                    break;
-                }
-            } else {
-                decoder_blocked_since = None;
+            if let Some(message) = decoder_input_stall(&shared, &mut decoder_blocked_since) {
+                shared.record_failure(message);
+                break;
             }
             // Keep the native window responsive while an asynchronous
             // Media Foundation decoder is between NeedInput events.
@@ -529,25 +488,8 @@ fn run_worker(
         let Some(queued) = queued else {
             continue;
         };
-        let frame_id = queued.frame.frame_id;
-        match unsafe { pipeline.process(queued, shared.replaced_frames.load(Ordering::Relaxed)) } {
-            Ok(None) => {}
-            Ok(Some(queued)) => {
-                tracing::warn!(
-                    frame_id,
-                    "video decoder readiness changed before frame submission"
-                );
-                if let Ok(mut pending) = shared.queued.lock() {
-                    pending.push_front(queued);
-                }
-            }
-            Err(error) => {
-                tracing::error!(error = %error, frame_id, "video decode/presentation failed");
-                if let Ok(mut failure) = shared.failure.lock() {
-                    *failure = Some(error.to_string());
-                }
-                break;
-            }
+        if !unsafe { process_frame(&shared, &mut pipeline, queued) } {
+            break;
         }
     }
     shared.running.store(false, Ordering::Release);
@@ -555,6 +497,99 @@ fn run_worker(
     if let Ok(mut pending) = shared.reset.lock() {
         pending.take();
     }
+}
+
+/// Applies a stream reset the caller is waiting for, if there is one, and
+/// reports whether it did.
+unsafe fn apply_pending_reset(shared: &Shared, pipeline: &mut WorkerPipeline) -> bool {
+    let Some(PendingReset {
+        format,
+        display,
+        displays,
+        reply,
+    }) = shared
+        .reset
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
+    else {
+        return false;
+    };
+    let result = unsafe { pipeline.reset_stream(format, display, displays) };
+    let _ = reply.send(result);
+    true
+}
+
+/// Shows the latest agent pointer display and cursor shape the session sent.
+unsafe fn apply_pending_pointer_state(shared: &Shared, pipeline: &WorkerPipeline) {
+    if let Some(display_id) = shared
+        .agent_pointer_display
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
+    {
+        unsafe {
+            window::set_agent_pointer_display(pipeline.window(), display_id);
+        }
+    }
+    if let Some(shape) = shared
+        .cursor_shape
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
+    {
+        unsafe { pipeline.set_cursor_shape(shape) };
+    }
+}
+
+/// Tracks how long the decoder has refused input while frames wait, and
+/// returns the failure once that reaches [`DECODER_INPUT_STALL_TIMEOUT`].
+fn decoder_input_stall(
+    shared: &Shared,
+    blocked_since: &mut Option<std::time::Instant>,
+) -> Option<String> {
+    let frames_are_waiting = shared.queued.lock().is_ok_and(|queued| !queued.is_empty());
+    if !frames_are_waiting {
+        *blocked_since = None;
+        return None;
+    }
+    let blocked_since = blocked_since.get_or_insert_with(std::time::Instant::now);
+    if blocked_since.elapsed() < DECODER_INPUT_STALL_TIMEOUT {
+        return None;
+    }
+    let message = format!(
+        "video decoder stopped requesting input for {} seconds while video frames were queued",
+        DECODER_INPUT_STALL_TIMEOUT.as_secs()
+    );
+    tracing::error!(message, "video decoder input watchdog expired");
+    Some(message)
+}
+
+/// Decodes and presents one frame. Returns false when the worker must stop.
+unsafe fn process_frame(
+    shared: &Shared,
+    pipeline: &mut WorkerPipeline,
+    queued: QueuedFrame,
+) -> bool {
+    let frame_id = queued.frame.frame_id;
+    match unsafe { pipeline.process(queued, shared.replaced_frames.load(Ordering::Relaxed)) } {
+        Ok(None) => {}
+        Ok(Some(queued)) => {
+            tracing::warn!(
+                frame_id,
+                "video decoder readiness changed before frame submission"
+            );
+            if let Ok(mut pending) = shared.queued.lock() {
+                pending.push_front(queued);
+            }
+        }
+        Err(error) => {
+            tracing::error!(error = %error, frame_id, "video decode/presentation failed");
+            shared.record_failure(error.to_string());
+            return false;
+        }
+    }
+    true
 }
 
 /// Opts the viewer into per-monitor DPI awareness so Windows does not

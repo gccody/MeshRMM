@@ -770,6 +770,59 @@ pub(super) unsafe fn create_toolbar(
         )
     }
     .context("debug overlay creation failed")?;
+    let (reconnect_panel, reconnecting_label, retry_button) =
+        unsafe { create_reconnect_panel(window, instance) }?;
+    let toolbar_class = w!("MeshRmmViewerToolbar");
+    let toolbar_window_class = WNDCLASSW {
+        lpfnWndProc: Some(toolbar_proc),
+        hInstance: instance,
+        lpszClassName: toolbar_class,
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }?,
+        ..Default::default()
+    };
+    unsafe { register_class(&toolbar_window_class) }
+        .context("viewer toolbar class registration failed")?;
+    let toolbar = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            toolbar_class,
+            w!(""),
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+            0,
+            0,
+            1,
+            1,
+            Some(window),
+            None,
+            Some(instance),
+            None,
+        )
+    }
+    .context("viewer toolbar creation failed")?;
+    unsafe {
+        windows::Win32::UI::Shell::DragAcceptFiles(window, true);
+    }
+    let tooltip = unsafe { create_tooltip(toolbar, instance, context.dpi.get(), font) };
+    for control in [overlay, reconnecting_label, retry_button] {
+        unsafe { set_font(control, font) };
+    }
+    Ok(Controls {
+        debug_overlay: overlay,
+        reconnect_panel,
+        reconnecting_label,
+        retry_button,
+        toolbar,
+        tooltip,
+        ..context.controls()
+    })
+}
+
+/// Creates the popup shown while the connection is restored. Returns the
+/// panel, its label and its retry button.
+unsafe fn create_reconnect_panel(
+    window: HWND,
+    instance: HINSTANCE,
+) -> anyhow::Result<(HWND, HWND, HWND)> {
     let panel_class = w!("MeshRmmReconnectPanel");
     let panel_window_class = WNDCLASSW {
         lpfnWndProc: Some(messages::reconnect_panel_proc),
@@ -832,36 +885,12 @@ pub(super) unsafe fn create_toolbar(
         )
     }
     .context("retry button creation failed")?;
-    let toolbar_class = w!("MeshRmmViewerToolbar");
-    let toolbar_window_class = WNDCLASSW {
-        lpfnWndProc: Some(toolbar_proc),
-        hInstance: instance,
-        lpszClassName: toolbar_class,
-        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }?,
-        ..Default::default()
-    };
-    unsafe { register_class(&toolbar_window_class) }
-        .context("viewer toolbar class registration failed")?;
-    let toolbar = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            toolbar_class,
-            w!(""),
-            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-            0,
-            0,
-            1,
-            1,
-            Some(window),
-            None,
-            Some(instance),
-            None,
-        )
-    }
-    .context("viewer toolbar creation failed")?;
-    unsafe {
-        windows::Win32::UI::Shell::DragAcceptFiles(window, true);
-    }
+    Ok((reconnect_panel, reconnecting_label, retry_button))
+}
+
+/// Creates the toolbar's tooltips, or returns a null window if the common
+/// controls are unavailable.
+unsafe fn create_tooltip(toolbar: HWND, instance: HINSTANCE, dpi: u32, font: HFONT) -> HWND {
     let initialized = unsafe {
         InitCommonControlsEx(&INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -895,23 +924,12 @@ pub(super) unsafe fn create_toolbar(
                 tooltip,
                 TTM_SETMAXTIPWIDTH,
                 None,
-                Some(LPARAM(scale(360, context.dpi.get()) as isize)),
+                Some(LPARAM(scale(360, dpi) as isize)),
             );
             set_font(tooltip, font);
         }
     }
-    for control in [overlay, reconnecting_label, retry_button] {
-        unsafe { set_font(control, font) };
-    }
-    Ok(Controls {
-        debug_overlay: overlay,
-        reconnect_panel,
-        reconnecting_label,
-        retry_button,
-        toolbar,
-        tooltip,
-        ..context.controls()
-    })
+    tooltip
 }
 
 /// Registers a window class unless an earlier window already did.
