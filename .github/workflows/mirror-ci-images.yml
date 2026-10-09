@@ -1,0 +1,40 @@
+name: Mirror CI images
+
+# CI and releases pull the Docker Hub images they need from these copies on
+# GHCR: Docker Hub rate-limits anonymous pulls by IP address, and the shared
+# runners' addresses run out. This copies them, logged in to Docker Hub, each
+# week to pick up patch releases. The copies are public, so pull requests from
+# forks can pull them too.
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Copy the images
+        run: |
+          # Every architecture, labeled with this repository so GHCR links
+          # each package to it.
+          copy() {
+            docker buildx imagetools create \
+              --annotation "index:org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+              --tag "ghcr.io/gccody/$2" "docker.io/$1"
+          }
+          copy library/postgres:17 meshrmm-ci-postgres:17
+          copy moby/buildkit:buildx-stable-1 meshrmm-ci-buildkit:buildx-stable-1
