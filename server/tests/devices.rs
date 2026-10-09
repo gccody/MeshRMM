@@ -6,7 +6,7 @@ use axum::{
     body::Body,
     http::{Method, StatusCode},
 };
-use common::{Agent, App, audit_events};
+use common::{Agent, App, Browser, audit_events};
 use meshrmm_protocol_types::AgentCommand;
 use serde_json::json;
 
@@ -162,6 +162,54 @@ async fn devices_list_online_first_and_deleting_one_uninstalls_its_agent() {
     }
 }
 
+async fn delete_mid_rotation(
+    name: &str,
+    app: &App,
+    admin: &mut Browser,
+    agent: &Agent,
+    third: &str,
+) {
+    let (mut deleter, _) = common::user_with(
+        app,
+        admin,
+        "deleter@example.com",
+        &["devices.view", "devices.delete"],
+    )
+    .await;
+    assert_eq!(
+        deleter
+            .delete(&format!("/v1/agents/{}", agent.device_id))
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+    assert!(authenticates(&agent.with_token(third)).await, "{name}");
+    assert_eq!(
+        credential_hashes(app, &agent.device_id).await,
+        (hash(third), None)
+    );
+}
+
+/// Rotating needs its own permission, and deleted devices aren't rotated.
+async fn refuse_rotation(app: &App, admin: &mut Browser, path: &str) {
+    let (mut technician, _) = common::user_with(
+        app,
+        admin,
+        "tech@example.com",
+        &["devices.view", "devices.delete"],
+    )
+    .await;
+    assert_eq!(
+        technician.post(path, json!({})).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        admin.post(path, json!({})).await.status,
+        StatusCode::NOT_FOUND,
+        "deleted devices aren't rotated"
+    );
+}
+
 #[tokio::test]
 async fn rotation_resends_the_pending_credential_until_the_agent_uses_it() {
     for app in common::apps().await {
@@ -276,43 +324,10 @@ async fn rotation_resends_the_pending_credential_until_the_agent_uses_it() {
 
         // Deleting the device mid-rotation leaves the Agent able to use the
         // new credential, so it can still hear the uninstall request.
-        let (mut deleter, _) = common::user_with(
-            &app,
-            &mut admin,
-            "deleter@example.com",
-            &["devices.view", "devices.delete"],
-        )
-        .await;
-        assert_eq!(
-            deleter
-                .delete(&format!("/v1/agents/{}", agent.device_id))
-                .await
-                .status,
-            StatusCode::NO_CONTENT
-        );
-        assert!(authenticates(&agent.with_token(&third)).await, "{name}");
-        assert_eq!(
-            credential_hashes(&app, &agent.device_id).await,
-            (hash(&third), None)
-        );
+        delete_mid_rotation(name, &app, &mut admin, &agent, &third).await;
         drop(connection);
 
-        let (mut technician, _) = common::user_with(
-            &app,
-            &mut admin,
-            "tech@example.com",
-            &["devices.view", "devices.delete"],
-        )
-        .await;
-        assert_eq!(
-            technician.post(&path, json!({})).await.status,
-            StatusCode::FORBIDDEN
-        );
-        assert_eq!(
-            admin.post(&path, json!({})).await.status,
-            StatusCode::NOT_FOUND,
-            "deleted devices aren't rotated"
-        );
+        refuse_rotation(&app, &mut admin, &path).await;
         app.finish().await;
     }
 }

@@ -14,7 +14,10 @@ use crate::{
     agents::{self, bearer_token, enrollment_token, hashes_match},
     audit::{self, Actor, Target},
     auth::{Authorized, limits::ip_key},
-    db::tables::{AgentInstallTokens, Agents},
+    db::{
+        Executor,
+        tables::{AgentInstallTokens, Agents},
+    },
     http::{ApiError, AppState, JsonBody, client_ip::ClientIp},
     rbac::Permission,
     secrets::{new_token, token_hash},
@@ -178,86 +181,10 @@ pub async fn redeem(
     let key_hash = token_hash(&request.redemption_key);
     let now = now_ms();
     let mut transaction = state.database.begin().await?;
-    transaction
-        .execute(
-            &Query::update()
-                .table(AgentInstallTokens::Table)
-                .value(AgentInstallTokens::UsedAt, now)
-                .value(AgentInstallTokens::DeviceId, new_id())
-                .value(AgentInstallTokens::ComputerName, name.as_str())
-                .value(AgentInstallTokens::RedemptionKeyHash, key_hash.as_str())
-                .and_where(Expr::col(AgentInstallTokens::TokenHash).eq(installer_hash.as_str()))
-                .and_where(Expr::col(AgentInstallTokens::ExpiresAt).gt(now))
-                .and_where(Expr::col(AgentInstallTokens::UsedAt).is_null())
-                .to_owned(),
-        )
-        .await?;
-    // Claimed by this request just now, or earlier by this computer.
-    let claim: ClaimRow = transaction
-        .fetch_optional(
-            &Query::select()
-                .columns([
-                    AgentInstallTokens::Id,
-                    AgentInstallTokens::CreatedByUserId,
-                    AgentInstallTokens::DeviceId,
-                ])
-                .from(AgentInstallTokens::Table)
-                .and_where(Expr::col(AgentInstallTokens::TokenHash).eq(installer_hash.as_str()))
-                .and_where(Expr::col(AgentInstallTokens::ExpiresAt).gt(now))
-                .and_where(Expr::col(AgentInstallTokens::RedemptionKeyHash).eq(key_hash.as_str()))
-                .and_where(Expr::col(AgentInstallTokens::ComputerName).eq(name.as_str()))
-                .to_owned(),
-        )
-        .await?
-        .ok_or_else(rejected)?;
+    let claim = claim_installer(&mut transaction, &installer_hash, &key_hash, &name, now).await?;
     let agent_token = enrollment_token(&install_token, &request.redemption_key);
     let agent_token_hash = token_hash(&agent_token);
-    let existing: Option<ExistingAgent> = transaction
-        .fetch_optional(
-            &Query::select()
-                .columns([Agents::AuthTokenHash, Agents::DeletionRequestedAt])
-                .from(Agents::Table)
-                .and_where(Expr::col(Agents::Id).eq(claim.device_id.as_str()))
-                .to_owned(),
-        )
-        .await?;
-    let recovered = match existing {
-        None => {
-            transaction
-                .execute(
-                    &Query::insert()
-                        .into_table(Agents::Table)
-                        .columns([
-                            Agents::Id,
-                            Agents::Name,
-                            Agents::AuthTokenHash,
-                            Agents::CreatedByUserId,
-                            Agents::CreatedAt,
-                            Agents::UpdatedAt,
-                        ])
-                        .values_panic([
-                            claim.device_id.as_str().into(),
-                            name.as_str().into(),
-                            agent_token_hash.as_str().into(),
-                            claim.created_by_user_id.as_str().into(),
-                            now.into(),
-                            now.into(),
-                        ])
-                        .to_owned(),
-                )
-                .await?;
-            false
-        }
-        // The credential was rotated or the device deleted since, so the
-        // installer's credential no longer works.
-        Some(agent)
-            if agent.deletion_requested_at.is_none()
-                && hashes_match(&agent.auth_token_hash, &agent_token_hash) =>
-        {
-            true
-        }
-        Some(_) => return Err(rejected()),
-    };
+    let recovered = enroll_device(&mut transaction, &claim, &name, &agent_token_hash, now).await?;
     audit::record(
         &mut transaction,
         &Actor {
@@ -288,4 +215,106 @@ pub async fn redeem(
         bitrate_bits_per_second: BITRATE_BITS_PER_SECOND,
         json_logs: false,
     }))
+}
+
+/// Claims the installer for this computer, or finds the claim this computer
+/// made earlier.
+async fn claim_installer(
+    executor: &mut impl Executor,
+    installer_hash: &str,
+    key_hash: &str,
+    name: &str,
+    now: i64,
+) -> Result<ClaimRow, ApiError> {
+    executor
+        .execute(
+            &Query::update()
+                .table(AgentInstallTokens::Table)
+                .value(AgentInstallTokens::UsedAt, now)
+                .value(AgentInstallTokens::DeviceId, new_id())
+                .value(AgentInstallTokens::ComputerName, name)
+                .value(AgentInstallTokens::RedemptionKeyHash, key_hash)
+                .and_where(Expr::col(AgentInstallTokens::TokenHash).eq(installer_hash))
+                .and_where(Expr::col(AgentInstallTokens::ExpiresAt).gt(now))
+                .and_where(Expr::col(AgentInstallTokens::UsedAt).is_null())
+                .to_owned(),
+        )
+        .await?;
+    // Claimed by this request just now, or earlier by this computer.
+    let claim: ClaimRow = executor
+        .fetch_optional(
+            &Query::select()
+                .columns([
+                    AgentInstallTokens::Id,
+                    AgentInstallTokens::CreatedByUserId,
+                    AgentInstallTokens::DeviceId,
+                ])
+                .from(AgentInstallTokens::Table)
+                .and_where(Expr::col(AgentInstallTokens::TokenHash).eq(installer_hash))
+                .and_where(Expr::col(AgentInstallTokens::ExpiresAt).gt(now))
+                .and_where(Expr::col(AgentInstallTokens::RedemptionKeyHash).eq(key_hash))
+                .and_where(Expr::col(AgentInstallTokens::ComputerName).eq(name))
+                .to_owned(),
+        )
+        .await?
+        .ok_or_else(rejected)?;
+    Ok(claim)
+}
+
+/// Adds the claimed device, or confirms the installer's credential still
+/// belongs to it. Returns whether the device already existed.
+async fn enroll_device(
+    executor: &mut impl Executor,
+    claim: &ClaimRow,
+    name: &str,
+    agent_token_hash: &str,
+    now: i64,
+) -> Result<bool, ApiError> {
+    let existing: Option<ExistingAgent> = executor
+        .fetch_optional(
+            &Query::select()
+                .columns([Agents::AuthTokenHash, Agents::DeletionRequestedAt])
+                .from(Agents::Table)
+                .and_where(Expr::col(Agents::Id).eq(claim.device_id.as_str()))
+                .to_owned(),
+        )
+        .await?;
+    let recovered = match existing {
+        None => {
+            executor
+                .execute(
+                    &Query::insert()
+                        .into_table(Agents::Table)
+                        .columns([
+                            Agents::Id,
+                            Agents::Name,
+                            Agents::AuthTokenHash,
+                            Agents::CreatedByUserId,
+                            Agents::CreatedAt,
+                            Agents::UpdatedAt,
+                        ])
+                        .values_panic([
+                            claim.device_id.as_str().into(),
+                            name.into(),
+                            agent_token_hash.into(),
+                            claim.created_by_user_id.as_str().into(),
+                            now.into(),
+                            now.into(),
+                        ])
+                        .to_owned(),
+                )
+                .await?;
+            false
+        }
+        // The credential was rotated or the device deleted since, so the
+        // installer's credential no longer works.
+        Some(agent)
+            if agent.deletion_requested_at.is_none()
+                && hashes_match(&agent.auth_token_hash, agent_token_hash) =>
+        {
+            true
+        }
+        Some(_) => return Err(rejected()),
+    };
+    Ok(recovered)
 }

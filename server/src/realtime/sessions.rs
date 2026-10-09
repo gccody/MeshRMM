@@ -143,6 +143,60 @@ struct Record {
 }
 
 impl Record {
+    fn new(
+        state: &AppState,
+        new: &NewSession<'_>,
+        policy: settings::Settings,
+        session_id: String,
+        timeouts: Timeouts,
+        expires_at: i64,
+        reason: &str,
+    ) -> Self {
+        Self {
+            device_id: new.device_id.to_owned(),
+            user_id: new.user.id.clone(),
+            client_token: new_token(),
+            idle_timeout_ms: millis(timeouts.idle),
+            idle_disconnect: IdleDisconnectPolicy {
+                minutes: policy
+                    .idle_disconnect_minutes
+                    .and_then(|minutes| u32::try_from(minutes).ok()),
+                allow_override: policy.allow_idle_disconnect_override,
+            },
+            display_border: policy.display_border,
+            agent_request: AgentSessionRequest {
+                start_in_background: new.start_in_background,
+                idle_policy: TogglePolicy {
+                    enabled: policy.prevent_idle_lock,
+                    allow_override: policy.allow_idle_override,
+                },
+                clear_clipboard_policy: TogglePolicy {
+                    enabled: policy.clear_clipboard_on_close,
+                    allow_override: policy.allow_clear_clipboard_override,
+                },
+                blackout_message: policy.blackout_message,
+                session_banner: policy.session_banner,
+                connection_notification: policy.connection_notification,
+                background_connection_notification: policy.background_connection_notification,
+                connection_notification_message: policy.connection_notification_message,
+                connection_approval: policy.connection_approval.then(|| ConnectionApproval {
+                    message: policy.connection_approval_message,
+                    timeout_seconds: u32::try_from(policy.connection_approval_timeout_seconds)
+                        .unwrap_or(30),
+                    lock_idle_seconds: u32::try_from(policy.connection_approval_lock_idle_seconds)
+                        .unwrap_or(0),
+                }),
+                connection_reason: reason.to_owned(),
+                viewer_name: meshrmm_protocol_types::session_viewer_name(&new.user.display_name),
+                session_id: RemoteSessionId::new(session_id.as_str()),
+                signaling_token: new_token(),
+                expires_at_unix_ms: unix_ms(expires_at),
+                ice_servers: state.turn.ice_servers(&session_id),
+            },
+            session_id,
+        }
+    }
+
     fn bootstrap(&self) -> SessionBootstrap {
         let request = &self.agent_request;
         SessionBootstrap {
@@ -180,6 +234,63 @@ impl Record {
         );
         Ok(record)
     }
+}
+
+/// Records the session as the device's one session, replacing an expired
+/// one.
+async fn claim_device(
+    executor: &mut impl Executor,
+    state: &AppState,
+    record: &Record,
+    now: i64,
+    expires_at: i64,
+) -> Result<(), ApiError> {
+    // A session that expired but whose row remains no longer holds the
+    // device.
+    executor
+        .execute(
+            &Query::delete()
+                .from_table(RemoteSessions::Table)
+                .and_where(Expr::col(RemoteSessions::DeviceId).eq(record.device_id.as_str()))
+                .and_where(Expr::col(RemoteSessions::ExpiresAt).lte(now))
+                .to_owned(),
+        )
+        .await?;
+    let inserted = executor
+        .execute(
+            &Query::insert()
+                .into_table(RemoteSessions::Table)
+                .columns([
+                    RemoteSessions::Id,
+                    RemoteSessions::DeviceId,
+                    RemoteSessions::UserId,
+                    RemoteSessions::RecordEncrypted,
+                    RemoteSessions::CreatedAt,
+                    RemoteSessions::ExpiresAt,
+                ])
+                .values_panic([
+                    record.session_id.as_str().into(),
+                    record.device_id.as_str().into(),
+                    record.user_id.as_str().into(),
+                    record.seal(state).into(),
+                    now.into(),
+                    expires_at.into(),
+                ])
+                .on_conflict(
+                    OnConflict::column(RemoteSessions::DeviceId)
+                        .do_nothing()
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+    if inserted == 0 {
+        return Err(
+            ApiError::conflict("the device already has an active remote session")
+                .with_code("session_in_progress"),
+        );
+    }
+    Ok(())
 }
 
 fn token_matches(supplied: &str, expected: &str) -> bool {
@@ -565,95 +676,17 @@ impl Sessions {
         let timeouts = self.inner.timeouts;
         let expires_at = now + millis(timeouts.start);
         let reason = meshrmm_protocol_types::connection_reason(new.reason);
-        let record = Record {
-            session_id: session_id.clone(),
-            device_id: new.device_id.to_owned(),
-            user_id: new.user.id.clone(),
-            client_token: new_token(),
-            idle_timeout_ms: millis(timeouts.idle),
-            idle_disconnect: IdleDisconnectPolicy {
-                minutes: policy
-                    .idle_disconnect_minutes
-                    .and_then(|minutes| u32::try_from(minutes).ok()),
-                allow_override: policy.allow_idle_disconnect_override,
-            },
-            display_border: policy.display_border,
-            agent_request: AgentSessionRequest {
-                start_in_background: new.start_in_background,
-                idle_policy: TogglePolicy {
-                    enabled: policy.prevent_idle_lock,
-                    allow_override: policy.allow_idle_override,
-                },
-                clear_clipboard_policy: TogglePolicy {
-                    enabled: policy.clear_clipboard_on_close,
-                    allow_override: policy.allow_clear_clipboard_override,
-                },
-                blackout_message: policy.blackout_message,
-                session_banner: policy.session_banner,
-                connection_notification: policy.connection_notification,
-                background_connection_notification: policy.background_connection_notification,
-                connection_notification_message: policy.connection_notification_message,
-                connection_approval: policy.connection_approval.then(|| ConnectionApproval {
-                    message: policy.connection_approval_message,
-                    timeout_seconds: u32::try_from(policy.connection_approval_timeout_seconds)
-                        .unwrap_or(30),
-                    lock_idle_seconds: u32::try_from(policy.connection_approval_lock_idle_seconds)
-                        .unwrap_or(0),
-                }),
-                connection_reason: reason.to_owned(),
-                viewer_name: meshrmm_protocol_types::session_viewer_name(&new.user.display_name),
-                session_id: RemoteSessionId::new(session_id.as_str()),
-                signaling_token: new_token(),
-                expires_at_unix_ms: unix_ms(expires_at),
-                ice_servers: state.turn.ice_servers(&session_id),
-            },
-        };
+        let record = Record::new(
+            state,
+            &new,
+            policy,
+            session_id.clone(),
+            timeouts,
+            expires_at,
+            reason,
+        );
         let mut transaction = state.database.begin().await?;
-        // A session that expired but whose row remains no longer holds the
-        // device.
-        transaction
-            .execute(
-                &Query::delete()
-                    .from_table(RemoteSessions::Table)
-                    .and_where(Expr::col(RemoteSessions::DeviceId).eq(new.device_id))
-                    .and_where(Expr::col(RemoteSessions::ExpiresAt).lte(now))
-                    .to_owned(),
-            )
-            .await?;
-        let inserted = transaction
-            .execute(
-                &Query::insert()
-                    .into_table(RemoteSessions::Table)
-                    .columns([
-                        RemoteSessions::Id,
-                        RemoteSessions::DeviceId,
-                        RemoteSessions::UserId,
-                        RemoteSessions::RecordEncrypted,
-                        RemoteSessions::CreatedAt,
-                        RemoteSessions::ExpiresAt,
-                    ])
-                    .values_panic([
-                        session_id.as_str().into(),
-                        new.device_id.into(),
-                        new.user.id.as_str().into(),
-                        record.seal(state).into(),
-                        now.into(),
-                        expires_at.into(),
-                    ])
-                    .on_conflict(
-                        OnConflict::column(RemoteSessions::DeviceId)
-                            .do_nothing()
-                            .to_owned(),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-        if inserted == 0 {
-            return Err(
-                ApiError::conflict("the device already has an active remote session")
-                    .with_code("session_in_progress"),
-            );
-        }
+        claim_device(&mut transaction, state, &record, now, expires_at).await?;
         audit::record(
             &mut transaction,
             &new.actor,

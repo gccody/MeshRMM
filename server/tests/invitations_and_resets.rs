@@ -22,6 +22,97 @@ async fn configure_smtp(admin: &mut Browser, smtp: &FakeSmtp) {
     assert_eq!(response.body["configured"], true);
 }
 
+/// Checks that invitations for invited or existing accounts, or with
+/// unknown roles, are refused.
+async fn refuse_bad_invitations(name: &str, admin: &mut Browser) {
+    let duplicate = admin
+        .post(
+            "/v1/invitations",
+            json!({ "email": "tess@example.com", "role_ids": [] }),
+        )
+        .await;
+    assert_eq!(duplicate.status, StatusCode::CONFLICT, "{name}");
+    let existing = admin
+        .post(
+            "/v1/invitations",
+            json!({ "email": ADMIN_EMAIL, "role_ids": [] }),
+        )
+        .await;
+    assert_eq!(existing.status, StatusCode::CONFLICT);
+    let unknown_role = admin
+        .post(
+            "/v1/invitations",
+            json!({ "email": "x@example.com", "role_ids": ["no-such-role"] }),
+        )
+        .await;
+    assert_eq!(unknown_role.status, StatusCode::BAD_REQUEST);
+}
+
+/// An expired invitation stays listed, and renewing it revives it.
+async fn renew_expired_invitation(name: &str, app: &App, admin: &mut Browser) {
+    let late = admin
+        .post(
+            "/v1/invitations",
+            json!({ "email": "late@example.com", "role_ids": [] }),
+        )
+        .await;
+    let late_id = late.body["invitation"]["id"].as_str().unwrap().to_owned();
+    let late_token = common::link_token(late.body["link"].as_str().unwrap());
+    app.db()
+        .execute(
+            &sea_query::Query::update()
+                .table(meshrmm_server::db::tables::Invitations::Table)
+                .value(meshrmm_server::db::tables::Invitations::ExpiresAt, 1)
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    let expired = app
+        .browser()
+        .post("/v1/auth/invitation", json!({ "token": late_token }))
+        .await;
+    assert_eq!(expired.code(), "invalid_token", "{name}");
+    let listed = admin.get("/v1/invitations").await;
+    assert_eq!(listed.body[0]["expired"], true, "{name}");
+    let renewed = admin
+        .post(&format!("/v1/invitations/{late_id}/renew"), json!({}))
+        .await;
+    assert_eq!(renewed.status, StatusCode::OK, "{name}: {:?}", renewed.body);
+    assert_eq!(renewed.body["invitation"]["expired"], false);
+    let revived = app
+        .browser()
+        .post(
+            "/v1/auth/invitation",
+            json!({ "token": common::link_token(renewed.body["link"].as_str().unwrap()) }),
+        )
+        .await;
+    assert_eq!(revived.body["email"], "late@example.com");
+}
+
+/// A revoked invitation's link stops working.
+async fn revoke_invitation(name: &str, app: &App, admin: &mut Browser) {
+    let revoked = admin
+        .post(
+            "/v1/invitations",
+            json!({ "email": "gone@example.com", "role_ids": [] }),
+        )
+        .await;
+    let revoked_token = common::link_token(revoked.body["link"].as_str().unwrap());
+    let revoked_id = revoked.body["invitation"]["id"].as_str().unwrap();
+    assert_eq!(
+        admin
+            .delete(&format!("/v1/invitations/{revoked_id}"))
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+    let gone = app
+        .browser()
+        .post("/v1/auth/invitation", json!({ "token": revoked_token }))
+        .await;
+    assert_eq!(gone.code(), "invalid_token", "{name}");
+}
+
 #[tokio::test]
 async fn invitations_without_email_are_links_to_pass_on() {
     for app in common::apps().await {
@@ -51,27 +142,7 @@ async fn invitations_without_email_are_links_to_pass_on() {
             .unwrap()
             .to_owned();
 
-        let duplicate = admin
-            .post(
-                "/v1/invitations",
-                json!({ "email": "tess@example.com", "role_ids": [] }),
-            )
-            .await;
-        assert_eq!(duplicate.status, StatusCode::CONFLICT, "{name}");
-        let existing = admin
-            .post(
-                "/v1/invitations",
-                json!({ "email": ADMIN_EMAIL, "role_ids": [] }),
-            )
-            .await;
-        assert_eq!(existing.status, StatusCode::CONFLICT);
-        let unknown_role = admin
-            .post(
-                "/v1/invitations",
-                json!({ "email": "x@example.com", "role_ids": ["no-such-role"] }),
-            )
-            .await;
-        assert_eq!(unknown_role.status, StatusCode::BAD_REQUEST);
+        refuse_bad_invitations(name, &mut admin).await;
         let pending = admin.get("/v1/invitations").await;
         assert_eq!(pending.body.as_array().unwrap().len(), 1, "{name}");
         assert_eq!(pending.body[0]["roles"][0]["id"], "technician");
@@ -139,66 +210,9 @@ async fn invitations_without_email_are_links_to_pass_on() {
                 .is_empty()
         );
 
-        // An expired invitation stays listed, and renewing it revives it.
-        let late = admin
-            .post(
-                "/v1/invitations",
-                json!({ "email": "late@example.com", "role_ids": [] }),
-            )
-            .await;
-        let late_id = late.body["invitation"]["id"].as_str().unwrap().to_owned();
-        let late_token = common::link_token(late.body["link"].as_str().unwrap());
-        app.db()
-            .execute(
-                &sea_query::Query::update()
-                    .table(meshrmm_server::db::tables::Invitations::Table)
-                    .value(meshrmm_server::db::tables::Invitations::ExpiresAt, 1)
-                    .to_owned(),
-            )
-            .await
-            .unwrap();
-        let expired = app
-            .browser()
-            .post("/v1/auth/invitation", json!({ "token": late_token }))
-            .await;
-        assert_eq!(expired.code(), "invalid_token", "{name}");
-        let listed = admin.get("/v1/invitations").await;
-        assert_eq!(listed.body[0]["expired"], true, "{name}");
-        let renewed = admin
-            .post(&format!("/v1/invitations/{late_id}/renew"), json!({}))
-            .await;
-        assert_eq!(renewed.status, StatusCode::OK, "{name}: {:?}", renewed.body);
-        assert_eq!(renewed.body["invitation"]["expired"], false);
-        let revived = app
-            .browser()
-            .post(
-                "/v1/auth/invitation",
-                json!({ "token": common::link_token(renewed.body["link"].as_str().unwrap()) }),
-            )
-            .await;
-        assert_eq!(revived.body["email"], "late@example.com");
+        renew_expired_invitation(name, &app, &mut admin).await;
 
-        // A revoked invitation's link stops working.
-        let revoked = admin
-            .post(
-                "/v1/invitations",
-                json!({ "email": "gone@example.com", "role_ids": [] }),
-            )
-            .await;
-        let revoked_token = common::link_token(revoked.body["link"].as_str().unwrap());
-        let revoked_id = revoked.body["invitation"]["id"].as_str().unwrap();
-        assert_eq!(
-            admin
-                .delete(&format!("/v1/invitations/{revoked_id}"))
-                .await
-                .status,
-            StatusCode::NO_CONTENT
-        );
-        let gone = app
-            .browser()
-            .post("/v1/auth/invitation", json!({ "token": revoked_token }))
-            .await;
-        assert_eq!(gone.code(), "invalid_token", "{name}");
+        revoke_invitation(name, &app, &mut admin).await;
         app.finish().await;
     }
 }

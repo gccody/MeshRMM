@@ -2,7 +2,7 @@
 // revision-ordered deltas, and reconnects with backoff. It never discards the
 // inventory it already has; the hook shows it as stale.
 import { applyAgentDelta, parseAgentEvent, sortAgents } from "./model.ts";
-import type { Agent, AgentDelta } from "./types";
+import type { Agent, AgentDelta, AgentEvent, AgentSnapshot } from "./types";
 
 const FIRST_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
@@ -46,141 +46,207 @@ type Options = {
   timers?: Timers;
 };
 
+// Reports the connection state, or "offline" while the browser is, once per
+// change.
+function connectionReporter(
+  onConnection: (connection: InventoryConnection) => void,
+  initiallyOnline: boolean,
+  stopped: () => boolean,
+) {
+  let state: Exclude<InventoryConnection, "offline"> = "connecting";
+  let online = initiallyOnline;
+  let reported: InventoryConnection | undefined;
+  const report = () => {
+    const next = online ? state : "offline";
+    if (stopped() || next === reported) return;
+    reported = next;
+    onConnection(next);
+  };
+  return {
+    report,
+    setState(next: typeof state) {
+      state = next;
+      report();
+    },
+    setOnline(next: boolean) {
+      online = next;
+      report();
+    },
+  };
+}
+
+// Waits before each reconnect, doubling the delay up to the maximum.
+function reconnectBackoff(timers: Timers, stopped: () => boolean, connect: () => void) {
+  let timer: unknown;
+  let delay = FIRST_RECONNECT_DELAY_MS;
+  return {
+    cancel() {
+      if (timer === undefined) return;
+      timers.clearTimeout(timer);
+      timer = undefined;
+    },
+    reset() {
+      delay = FIRST_RECONNECT_DELAY_MS;
+    },
+    schedule() {
+      if (stopped() || timer !== undefined) return;
+      timer = timers.setTimeout(() => {
+        timer = undefined;
+        connect();
+      }, delay);
+      delay = Math.min(delay * 2, MAX_RECONNECT_DELAY_MS);
+    },
+  };
+}
+
+// Applies one socket's events in revision order. Deltas wait for its first
+// snapshot, and a gap asks the server for a new one. Returns whether the
+// event brought the inventory up to date.
+function eventSequencer({ revision, onAgents, requestSnapshot, overflow }: {
+  revision: { current: number };
+  onAgents: (update: (current: Agent[]) => Agent[]) => void;
+  requestSnapshot: () => void;
+  overflow: () => void;
+}) {
+  let awaitingSnapshot = true;
+  let pendingEvents: AgentDelta[] = [];
+
+  const applySnapshot = (event: AgentSnapshot) => {
+    if (event.revision < revision.current) {
+      requestSnapshot();
+      return false;
+    }
+    let nextAgents = sortAgents(event.agents);
+    let nextRevision = event.revision;
+    for (const pending of pendingEvents.sort((left, right) => left.revision - right.revision)) {
+      if (pending.revision <= nextRevision) continue;
+      if (pending.revision !== nextRevision + 1) {
+        pendingEvents = [];
+        awaitingSnapshot = true;
+        requestSnapshot();
+        return false;
+      }
+      nextAgents = applyAgentDelta(nextAgents, pending);
+      nextRevision = pending.revision;
+    }
+    pendingEvents = [];
+    awaitingSnapshot = false;
+    revision.current = nextRevision;
+    onAgents(() => nextAgents);
+    return true;
+  };
+
+  const applyDelta = (event: AgentDelta) => {
+    if (awaitingSnapshot) {
+      pendingEvents.push(event);
+      if (pendingEvents.length > MAX_PENDING_EVENTS) overflow();
+      return false;
+    }
+    if (event.revision <= revision.current) return false;
+    if (event.revision !== revision.current + 1) {
+      awaitingSnapshot = true;
+      pendingEvents = [event];
+      requestSnapshot();
+      return false;
+    }
+    revision.current = event.revision;
+    onAgents((agents) => applyAgentDelta(agents, event));
+    return true;
+  };
+
+  return (event: AgentEvent | null) => {
+    if (!event) {
+      requestSnapshot();
+      return false;
+    }
+    return event.type === "snapshot" ? applySnapshot(event) : applyDelta(event);
+  };
+}
+
+// Handles one socket's events while it is the stream's current socket.
+// `onClose` learns whether the server refused the socket or revoked access.
+function watchSocket(socket: SocketLike, { revision, onAgents, current, onOpen, onLive, onClose }: {
+  revision: { current: number };
+  onAgents: (update: (current: Agent[]) => Agent[]) => void;
+  current: () => boolean;
+  onOpen: () => void;
+  onLive: () => void;
+  onClose: (refused: boolean) => void;
+}) {
+  let opened = false;
+  const requestSnapshot = () => {
+    if (socket.readyState === SOCKET_OPEN) socket.send("refresh");
+  };
+  const sequence = eventSequencer({
+    revision,
+    onAgents,
+    requestSnapshot,
+    overflow: () => socket.close(1009, "too many pending device events"),
+  });
+
+  socket.addEventListener("open", () => {
+    if (!current()) return;
+    opened = true;
+    onOpen();
+  });
+  socket.addEventListener("message", (message) => {
+    const data = (message as MessageEvent).data;
+    if (!current() || typeof data !== "string") return;
+    try {
+      if (sequence(parseAgentEvent(JSON.parse(data)))) onLive();
+    } catch {
+      requestSnapshot();
+    }
+  });
+  socket.addEventListener("error", () => socket.close());
+  socket.addEventListener("close", (event) => {
+    if (!current()) return;
+    onClose(!opened || (event as CloseEvent).code === ACCESS_REVOKED_CLOSE_CODE);
+  });
+}
+
 export function inventoryStream({
   openSocket,
   revision,
   onAgents,
   onConnection,
   onRefused,
-  online: initiallyOnline = true,
+  online = true,
   timers = globalTimers,
 }: Options) {
   let stopped = false;
   let socket: SocketLike | null = null;
-  let timer: unknown;
-  let delay = FIRST_RECONNECT_DELAY_MS;
-  let state: Exclude<InventoryConnection, "offline"> = "connecting";
-  let online = initiallyOnline;
-  let reported: InventoryConnection | undefined;
+  const connection = connectionReporter(onConnection, online, () => stopped);
+  const reconnect = reconnectBackoff(timers, () => stopped, () => connect());
 
-  const report = () => {
-    const next = online ? state : "offline";
-    if (stopped || next === reported) return;
-    reported = next;
-    onConnection(next);
-  };
-  const setState = (next: typeof state) => {
-    state = next;
-    report();
-  };
-
-  const clearTimer = () => {
-    if (timer === undefined) return;
-    timers.clearTimeout(timer);
-    timer = undefined;
-  };
-
-  const scheduleReconnect = () => {
-    if (stopped || timer !== undefined) return;
-    timer = timers.setTimeout(() => {
-      timer = undefined;
-      connect();
-    }, delay);
-    delay = Math.min(delay * 2, MAX_RECONNECT_DELAY_MS);
-  };
-
-  const listen = (nextSocket: SocketLike) => {
-    let opened = false;
-    let awaitingSnapshot = true;
-    let pendingEvents: AgentDelta[] = [];
-    const current = () => !stopped && socket === nextSocket;
-    const requestSnapshot = () => {
-      if (nextSocket.readyState === SOCKET_OPEN) nextSocket.send("refresh");
-    };
-
-    nextSocket.addEventListener("open", () => {
-      if (!current()) return;
-      opened = true;
-      delay = FIRST_RECONNECT_DELAY_MS;
-    });
-    nextSocket.addEventListener("message", (message) => {
-      const data = (message as MessageEvent).data;
-      if (!current() || typeof data !== "string") return;
-      try {
-        const event = parseAgentEvent(JSON.parse(data));
-        if (!event) {
-          requestSnapshot();
-          return;
-        }
-        if (event.type === "snapshot") {
-          if (event.revision < revision.current) {
-            requestSnapshot();
-            return;
-          }
-          let nextAgents = sortAgents(event.agents);
-          let nextRevision = event.revision;
-          for (const pending of pendingEvents.sort((left, right) => left.revision - right.revision)) {
-            if (pending.revision <= nextRevision) continue;
-            if (pending.revision !== nextRevision + 1) {
-              pendingEvents = [];
-              awaitingSnapshot = true;
-              requestSnapshot();
-              return;
-            }
-            nextAgents = applyAgentDelta(nextAgents, pending);
-            nextRevision = pending.revision;
-          }
-          pendingEvents = [];
-          awaitingSnapshot = false;
-          revision.current = nextRevision;
-          onAgents(() => nextAgents);
-        } else {
-          if (awaitingSnapshot) {
-            pendingEvents.push(event);
-            if (pendingEvents.length > MAX_PENDING_EVENTS) {
-              nextSocket.close(1009, "too many pending device events");
-            }
-            return;
-          }
-          if (event.revision <= revision.current) return;
-          if (event.revision !== revision.current + 1) {
-            awaitingSnapshot = true;
-            pendingEvents = [event];
-            requestSnapshot();
-            return;
-          }
-          revision.current = event.revision;
-          onAgents((agents) => applyAgentDelta(agents, event));
-        }
-        setState("live");
-      } catch {
-        requestSnapshot();
-      }
-    });
-    nextSocket.addEventListener("error", () => nextSocket.close());
-    nextSocket.addEventListener("close", (event) => {
-      if (!current()) return;
+  const listen = (nextSocket: SocketLike) => watchSocket(nextSocket, {
+    revision,
+    onAgents,
+    current: () => !stopped && socket === nextSocket,
+    onOpen: () => reconnect.reset(),
+    onLive: () => connection.setState("live"),
+    onClose: (refused) => {
       socket = null;
-      setState("reconnecting");
-      if (!opened || (event as CloseEvent).code === ACCESS_REVOKED_CLOSE_CODE) onRefused();
-      scheduleReconnect();
-    });
-  };
+      connection.setState("reconnecting");
+      if (refused) onRefused();
+      reconnect.schedule();
+    },
+  });
 
   const connect = () => {
     if (stopped || socket) return;
-    clearTimer();
+    reconnect.cancel();
     try {
       const nextSocket = openSocket();
       socket = nextSocket;
       listen(nextSocket);
     } catch {
-      setState("reconnecting");
-      scheduleReconnect();
+      connection.setState("reconnecting");
+      reconnect.schedule();
     }
   };
 
-  report();
+  connection.report();
   connect();
 
   return {
@@ -192,17 +258,16 @@ export function inventoryStream({
         if (socket.readyState === SOCKET_OPEN) socket.send("refresh");
         return;
       }
-      clearTimer();
-      delay = FIRST_RECONNECT_DELAY_MS;
+      reconnect.cancel();
+      reconnect.reset();
       connect();
     },
     setOnline(next: boolean) {
-      online = next;
-      report();
+      connection.setOnline(next);
     },
     stop() {
       stopped = true;
-      clearTimer();
+      reconnect.cancel();
       socket?.close(1000, "website closed the inventory");
       socket = null;
     },
