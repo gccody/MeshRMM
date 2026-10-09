@@ -35,7 +35,7 @@ jobs:
 
   validate:
     name: Validate release version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.release.outputs.version }}
       publish: ${{ steps.release.outputs.publish }}
@@ -153,7 +153,7 @@ jobs:
   server:
     name: Build the ${{ matrix.arch }} Linux server
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         arch: [x86_64, aarch64]
@@ -189,7 +189,7 @@ jobs:
     name: Sign the Agent and viewer builds
     needs: [validate, windows, macos]
     if: needs.validate.outputs.publish == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: production
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -224,7 +224,7 @@ jobs:
     needs: [validate, windows, macos, server, sign]
     # `sign` is skipped outside main.
     if: ${{ !cancelled() && !failure() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       VERSION: ${{ needs.validate.outputs.version }}
     steps:
@@ -264,6 +264,9 @@ jobs:
           (cd dist/release && sha256sum -- *.tar.gz > SHA256SUMS)
           cat dist/release/SHA256SUMS
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # BuildKit from CI's copy of Docker Hub's image (see mirror-ci-images.yml).
+          driver-opts: image=ghcr.io/gccody/meshrmm-ci-buildkit:buildx-stable-1
       - name: Test the tarball and Docker image
         run: sudo sh scripts/test-server-package.sh dist/release
       - name: Build the image for every architecture
@@ -282,7 +285,7 @@ jobs:
     name: Publish to GitHub Releases and GHCR
     needs: [checks, validate, package]
     if: needs.validate.outputs.publish == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       packages: write
@@ -295,6 +298,9 @@ jobs:
           name: release-${{ needs.validate.outputs.version }}
           path: dist/release
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # BuildKit from CI's copy of Docker Hub's image (see mirror-ci-images.yml).
+          driver-opts: image=ghcr.io/gccody/meshrmm-ci-buildkit:buildx-stable-1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
