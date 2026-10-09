@@ -1632,8 +1632,6 @@ fn preferred_desktop() -> DesktopTarget {
     }
 }
 
-// Session 0 cannot see the console's complete monitor topology. Query the same
-// desktop helper used by regular connections, without starting capture or input.
 fn rdp_display_id(session: u32, local: DisplayId) -> DisplayId {
     DisplayId(
         0x8000_0000
@@ -1684,6 +1682,8 @@ fn active_rdp_sessions() -> anyhow::Result<Vec<(u32, String)>> {
     Ok(result)
 }
 
+// Session 0 cannot see the console's complete monitor topology. Query the same
+// desktop helper used by regular connections, without starting capture or input.
 fn enumerate_console_displays() -> anyhow::Result<Vec<Display>> {
     let preferred = preferred_desktop();
     let mut last_error = None;

@@ -8,7 +8,7 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Variant::VARIANT;
-use windows::core::{Interface, Result as WindowsResult};
+use windows::core::Interface;
 
 use crate::converter::SURFACE_COUNT;
 use crate::{EncodedAccessUnit, VideoCodec, VideoPixelFormat};
@@ -739,9 +739,6 @@ pub(crate) fn performance_counter_us() -> Result<u64, Error> {
 fn counter_to_us(counter: u64, frequency: u64) -> u64 {
     u64::try_from(u128::from(counter) * 1_000_000 / u128::from(frequency)).unwrap_or(u64::MAX)
 }
-
-#[allow(dead_code)]
-fn _windows_result_type(_: WindowsResult<()>) {}
 
 #[cfg(test)]
 mod tests {

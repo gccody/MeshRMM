@@ -13,9 +13,11 @@ fn main_thread<T: Send + 'static>(f: impl FnOnce(MainThreadMarker) -> T + Send +
     }
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     dispatch2::DispatchQueue::main().exec_async(move || {
-        let _ = tx.send(f(MainThreadMarker::new().unwrap()));
+        let _ = tx.send(f(
+            MainThreadMarker::new().expect("the main queue runs on the main thread")
+        ));
     });
-    rx.recv().unwrap()
+    rx.recv().expect("the main-thread task panicked")
 }
 pub fn documents() -> anyhow::Result<PathBuf> {
     main_thread(|_| {
@@ -213,7 +215,9 @@ impl Progress {
                 window.setReleasedWhenClosed(false);
             }
             window.setTitle(&NSString::from_str("MeshRMM — Receiving files"));
-            let view = window.contentView().unwrap();
+            let view = window
+                .contentView()
+                .expect("a new window has a content view");
             let name =
                 NSTextField::labelWithString(&NSString::from_str("Preparing transfer…"), mtm);
             name.setFrame(rect(22., 88., 416., 24.));
