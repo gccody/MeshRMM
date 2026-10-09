@@ -6,15 +6,19 @@
 //! for the coordinator to stop, swaps the app bundle, restarts the launchd
 //! jobs, and puts the previous bundle back if the new coordinator does not
 //! stay up.
+//!
+//! An Agent signed with a Developer ID takes only the server's build signed
+//! by the same team; an ad-hoc signed one takes the release build, which the
+//! release key vouches for.
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use meshrmm_self_update::{AGENT_MACOS, CURRENT_VERSION, UpdateManifest};
+use meshrmm_self_update::{AGENT_MACOS, CURRENT_VERSION, UpdateManifest, macos};
 
-use super::installer::{APP, DAEMON_LABEL, HELPER_LABEL, SUPPORT_DIRECTORY};
+use super::installer::{APP, BUNDLE_IDENTIFIER, DAEMON_LABEL, HELPER_LABEL, SUPPORT_DIRECTORY};
 use crate::remote::config::Config;
 use crate::remote::service_link::ServiceLink;
 use crate::update_policy::{UpdateAttempts, UpdateSchedule, read_attempts};
@@ -75,9 +79,15 @@ fn stage(config: &Config) -> anyhow::Result<Option<String>> {
             .into_reader(),
         MAX_MANIFEST_BYTES,
     )?;
-    let Some(release) =
-        UpdateManifest::parse(&manifest)?.newer_release(AGENT_MACOS, CURRENT_VERSION)?
-    else {
+    let manifest = UpdateManifest::parse(&manifest)?;
+    // Without this team's signature, macOS would also forget the Agent's
+    // privacy permissions.
+    let team = macos::team_identifier(Path::new(APP));
+    let release = match &team {
+        Some(_) => manifest.newer_developer_id_release(AGENT_MACOS, CURRENT_VERSION)?,
+        None => manifest.newer_release(AGENT_MACOS, CURRENT_VERSION)?,
+    };
+    let Some(release) = release else {
         return Ok(None);
     };
     let updates = updates_directory()?;
@@ -116,7 +126,10 @@ fn stage(config: &Config) -> anyhow::Result<Option<String>> {
         ],
     )?;
     let app = staging.join("MeshRMM Agent.app");
-    verify_signature(&app, Path::new(APP))?;
+    match &team {
+        Some(team) => macos::verify_developer_id(&app, BUNDLE_IDENTIFIER, team, &release.version)?,
+        None => macos::verify_signature(&app)?,
+    }
     start_installer(&app, &staging)?;
     Ok(Some(release.version))
 }
@@ -126,42 +139,6 @@ fn read_limited(reader: impl Read, limit: u64) -> anyhow::Result<Vec<u8>> {
     reader.take(limit + 1).read_to_end(&mut bytes)?;
     anyhow::ensure!(bytes.len() as u64 <= limit, "the download is too large");
     Ok(bytes)
-}
-
-/// Requires a valid signature, and the installed Agent's developer team when
-/// the installed Agent has one, so a download cannot swap in someone else's code.
-fn verify_signature(staged: &Path, installed: &Path) -> anyhow::Result<()> {
-    command(
-        "/usr/bin/codesign",
-        &[
-            "--verify".as_ref(),
-            "--strict".as_ref(),
-            "--deep".as_ref(),
-            staged.as_os_str(),
-        ],
-    )
-    .context("the Agent update's code signature is invalid")?;
-    if let Some(team) = team_identifier(installed)
-        && team_identifier(staged).as_deref() != Some(team.as_str())
-    {
-        bail!("the Agent update is not signed by the installed Agent's developer team {team}");
-    }
-    Ok(())
-}
-
-fn team_identifier(app: &Path) -> Option<String> {
-    let output = std::process::Command::new("/usr/bin/codesign")
-        .args(["--display", "--verbose=2"])
-        .arg(app)
-        .output()
-        .ok()?;
-    // codesign describes the signature on standard error.
-    String::from_utf8_lossy(&output.stderr)
-        .lines()
-        .find_map(|line| line.strip_prefix("TeamIdentifier="))
-        .map(str::trim)
-        .filter(|team| !team.is_empty() && *team != "not set")
-        .map(str::to_owned)
 }
 
 fn start_installer(app: &Path, staging: &Path) -> anyhow::Result<()> {
@@ -297,46 +274,5 @@ mod tests {
     fn reads_downloads_up_to_the_limit() {
         assert_eq!(read_limited(&b"abc"[..], 3).unwrap(), b"abc");
         assert!(read_limited(&b"abcd"[..], 3).is_err());
-    }
-
-    #[test]
-    fn accepts_signed_updates_and_refuses_altered_ones() {
-        let directory = std::env::temp_dir().join(format!("meshrmm-update-{}", std::process::id()));
-        let app = directory.join("MeshRMM Agent.app");
-        let executable = app.join("Contents/MacOS/meshrmm-agent");
-        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
-        std::fs::copy("/usr/bin/true", &executable).unwrap();
-        std::fs::write(
-            app.join("Contents/Info.plist"),
-            super::super::installer::info_plist(),
-        )
-        .unwrap();
-        command(
-            "/usr/bin/codesign",
-            &[
-                "--force".as_ref(),
-                "--sign".as_ref(),
-                "-".as_ref(),
-                app.as_os_str(),
-            ],
-        )
-        .unwrap();
-        // An ad-hoc installed Agent has no team, so only the signature counts.
-        verify_signature(&app, Path::new("/nonexistent/MeshRMM Agent.app")).unwrap();
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&executable)
-            .and_then(|mut file| std::io::Write::write_all(&mut file, b"tampered"))
-            .unwrap();
-        assert!(verify_signature(&app, Path::new("/nonexistent/MeshRMM Agent.app")).is_err());
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn finds_no_team_for_an_unsigned_path() {
-        assert_eq!(
-            team_identifier(Path::new("/nonexistent/MeshRMM Agent.app")),
-            None
-        );
     }
 }

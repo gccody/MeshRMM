@@ -14,6 +14,10 @@ GitHub Releases or GHCR. No running server contacts either.
   - `share/meshrmm/downloads/`: the Windows Agent and viewer, the macOS Agent
     (universal) and viewer (Apple silicon), and `artifacts.json`, which lists
     each build with its SHA-256 and release signature;
+  - `libexec/meshrmm/rcodesign`, which signs the macOS builds with the
+    company's Developer ID when its server is set up to (see
+    [Code signing](#code-signing)), and its license in
+    `share/doc/meshrmm/rcodesign/`;
   - `lib/systemd/system/meshrmm-server.service`,
     `etc/meshrmm/server.example.toml`, and `install.sh`, which installs or
     upgrades all of it.
@@ -21,13 +25,32 @@ GitHub Releases or GHCR. No running server contacts either.
 - The Docker image `ghcr.io/gccody/meshrmm-server:<version>` (and `:latest`),
   for `linux/amd64` and `linux/arm64`, with the same files.
 
-The server serves the builds at `/downloads/<file>` and writes
-`/downloads/update-manifest.json` from `artifacts.json` at startup, with every
-URL on its own `public_url`. Upgrading the server therefore upgrades its
-Agents and viewers: Agents check the manifest at startup and every six hours,
-and viewers check it when a session starts. The server refuses to start if a
-listed build is missing or doesn't match its SHA-256, and logs a warning if a
-build isn't signed with the release key it was built with.
+The server serves each build at `/downloads/release/<file>` exactly as the
+release shipped it, and at `/downloads/<file>` as the build to install, which
+for macOS is the company's Developer ID build when the server signs them
+(`/downloads/developer-id/<file>`). It writes
+`/downloads/update-manifest.json` from `artifacts.json` and the signed builds,
+with every URL on its own `public_url`. Upgrading the server therefore
+upgrades its Agents and viewers: Agents check the manifest at startup and
+every six hours, and viewers check it when a session starts. The server
+refuses to start if a listed build is missing or doesn't match its SHA-256,
+and logs a warning if a build isn't signed with the release key it was built
+with.
+
+## Code signing
+
+Releases carry no code signing certificate. The Windows builds aren't
+Authenticode signed, and the macOS builds are signed only ad hoc. A Developer
+ID signature says who vouches for an app, and anyone can download a release,
+so a release signed with the maintainer's Developer ID would let anyone deploy
+a MeshRMM Agent under the maintainer's name, as attackers do with other remote
+access tools.
+
+Each company signs its own instead: with `downloads.macos_signing` set (see
+[self-hosting](self-hosting.md#sign-the-macos-builds)), its server signs and
+notarizes the macOS builds with the company's Developer ID when it first
+starts a release, using the bundled rcodesign, and keeps them in
+`<data_dir>/developer-id`. Until it finishes, the macOS installers answer 503.
 
 ## Release signatures
 
@@ -45,7 +68,17 @@ sign one, so:
   one;
 - Agents refuse updates that were changed in a server's downloads directory.
 
-The macOS Agent also checks the update's Developer ID team, as before.
+Signing a macOS build changes it, so the release signature doesn't cover a
+company's Developer ID builds. A macOS Agent or viewer signed with a
+Developer ID therefore trusts its team's signature instead: it takes only the
+manifest's `developer_id` build, and installs it only if `codesign` confirms
+that it's the same app (`com.meshrmm.agent` or `com.meshrmm.remote`) signed
+with a Developer ID issued to the same team, and that its bundle version is
+the version offered. Only that team can sign such a build, so this protects
+against a hostile server as the release signature does. An ad-hoc signed
+Mac app keeps taking the release build and checking the release signature,
+because anyone can make an ad-hoc signature. It can't move to a Developer ID
+build by updating; reinstall it from the server.
 
 The private key lives only in the `MESHRMM_RELEASE_SIGNING_KEY` secret. The
 `sign` job, which runs only on `main`, signs each build, so builds from other
@@ -61,22 +94,7 @@ In **Settings → Environments → production**:
   whose public key is in `release.json`.
 - Under **Deployment branches and tags**, allow only `main`.
 
-In **Settings → Secrets and variables → Actions**, the macOS builds need the
-Developer ID certificate. The workflow fails without these rather than
-publishing an ad-hoc build, because installed Agents accept only updates
-signed by their own team:
-
-- `MACOS_CERTIFICATE_P12_BASE64`: the exported `.p12`, base64 encoded as one
-  line.
-- `MACOS_CERTIFICATE_PASSWORD`: the `.p12` export password.
-- `MACOS_CODESIGN_IDENTITY`: the full certificate name, such as
-  `Developer ID Application: Example Company (TEAMID)`.
-
-To notarize, they also need:
-
-- `MACOS_NOTARY_APPLE_ID`
-- `MACOS_NOTARY_TEAM_ID`
-- `MACOS_NOTARY_PASSWORD`: an app-specific Apple ID password.
+The workflow needs no code signing certificate.
 
 The workflow pushes the Docker image with the run's own token. After the first
 push, make the `meshrmm-server` package public under the repository's
@@ -91,12 +109,12 @@ push, make the `meshrmm-server` package public under the repository's
 The workflow:
 
 1. runs CI and checks that the version increased and isn't published yet;
-2. builds the Windows Agent and viewer, the signed and notarized macOS Agent
-   and viewer, and the server for x86_64 and aarch64 Linux, in parallel;
+2. builds the Windows Agent and viewer, the ad-hoc signed macOS Agent and
+   viewer, and the server for x86_64 and aarch64 Linux, in parallel;
 3. signs the Agent and viewer builds and writes `artifacts.json`;
-4. packs both tarballs, installs the x86_64 one on the runner and runs it
-   under systemd, and runs the Docker image, checking that each serves every
-   build;
+4. packs both tarballs with rcodesign (a pinned release, checked against its
+   SHA-256), installs the x86_64 one on the runner and runs it under systemd,
+   and runs the Docker image, checking that each serves every build;
 5. pushes the Docker image and creates the `v<version>` GitHub release.
 
 A run on another branch (**Run workflow** with that branch selected) does

@@ -130,8 +130,8 @@ VideoToolbox has no 4:4:4 encoder, so Mac Agents always stream 4:2:0.
 
 The website's **Add device** dialog creates a one-time Terminal command
 for Macs. It runs `install-agent-macos.sh` from the server, which downloads
-the universal (Apple silicon and Intel) Agent named in the release manifest,
-checks its SHA-256, and runs `sudo meshrmm-agent --install <authorization>`.
+the server's universal (Apple silicon and Intel) Agent, checks its code
+signature, and runs `sudo meshrmm-agent --install <authorization>`.
 That enrolls the Mac with the hex-encoded installer authorization and installs
 the app bundle in
 `/Library/Application Support/MeshRMM`. A launchd daemon runs the root
@@ -143,10 +143,12 @@ processes running the Agent's own executable. A session follows the console:
 when another user takes it, capture moves to that user's helper.
 The coordinator updates the Agent like the Windows service does: every six
 hours, postponed while a remote session is live, it stages a newer
-`agent-macos` release once its SHA-256 and code signature (by the installed
-Agent's developer team) check out. The new Agent waits for the coordinator to
-stop, swaps the app bundle, restarts the launchd jobs, and puts the previous
-bundle back if the new coordinator does not keep running.
+`agent-macos` release once its SHA-256 and code signature check out: an
+Agent signed with a Developer ID takes only builds its own team signed, and
+an ad-hoc signed one only builds carrying the release signature. The new
+Agent waits for the coordinator to stop, swaps the app bundle, restarts the
+launchd jobs, and puts the previous bundle back if the new coordinator does
+not keep running.
 `sudo meshrmm-agent --uninstall` removes everything. The configuration and
 WebRTC identity live in `/Library/Application Support/MeshRMM/Agent`, which
 only root can read.
@@ -212,7 +214,9 @@ To publish a release, increase `version` and squash-merge the change into
 and viewers, signs them with the release key, packs them with the static Linux
 server into a tarball per architecture and a Docker image, tests both, and
 publishes them to GitHub Releases and GHCR. Each server serves its release's
-builds and update manifest itself. See [releases](docs/releases.md) for the
+builds and update manifest itself. Releases carry no code signing
+certificate: the macOS builds are signed only ad hoc, and each company's
+server can sign them with its own Developer ID. See [releases](docs/releases.md) for the
 contents, the signing scheme, the one-time setup and development keys.
 
 For local builds, these wrappers read the same `release.json`. They put the
@@ -274,14 +278,17 @@ configured sliding timeout.
 The macOS build scripts sign with the keychain's Developer ID Application
 certificate, which keeps the Agent's privacy permissions across rebuilds.
 If the keychain holds several, set `MESHRMM_CODESIGN_IDENTITY` to the one to
-use. Set it to `-` for an ad-hoc development signature; an installed Agent
-signed by a team refuses to update to an ad-hoc build. Only the release
-workflow notarizes, because locally built apps aren't quarantined.
+use. Set it to `-` for an ad-hoc signature, as the release workflow does; an
+installed Agent signed by a team refuses to update to an ad-hoc build.
+Locally built apps aren't quarantined, so they need no notarization.
 
 The native update version is compiled from `release.json`; Cargo package
 metadata is not used to decide whether an update is newer. Manifest and release
 URLs must use HTTPS. Each updater checks the release signature before
-downloading and the SHA-256 digest before replacing anything.
+downloading and the SHA-256 digest before replacing anything. A Mac app signed
+with a Developer ID instead takes only its server's build signed by the same
+team, and checks that signature and the build's version before replacing
+anything.
 
 Existing installations are repaired without replacing their device identity. New
 installations persist a private recovery key and pending configuration so a failed

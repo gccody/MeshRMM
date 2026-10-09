@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
 #[cfg(windows)]
 pub mod windows;
 
@@ -9,7 +11,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 3;
 pub const CURRENT_VERSION: &str = env!("MESHRMM_RELEASE_VERSION");
 /// The Ed25519 key, in hexadecimal, that every release this build updates
 /// to must be signed with. Servers only pass the signatures on, so a server
@@ -37,6 +39,18 @@ pub struct Release {
     /// hexadecimal. A server whose downloads are unsigned leaves it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// For a macOS target, the same build signed with the server operator's
+    /// Developer ID, once the server has signed it. The release key doesn't
+    /// vouch for it; the operator's code signature does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_id: Option<Build>,
+}
+
+/// A download and its SHA-256.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Build {
+    pub url: String,
+    pub sha256: String,
 }
 
 impl UpdateManifest {
@@ -72,11 +86,59 @@ impl UpdateManifest {
             return Ok(None);
         };
         release.validate_with_key(target, key)?;
-        let current =
-            Version::parse(current_version).context("invalid current application version")?;
-        let offered = Version::parse(&release.version).context("invalid release version")?;
-        Ok((offered > current).then(|| release.clone()))
+        Ok(is_newer(&release.version, current_version)?.then(|| release.clone()))
     }
+
+    /// For a macOS app signed with a Developer ID: the build of `target`
+    /// newer than `current_version` that the server signed with its
+    /// operator's Developer ID, as a release without a release signature.
+    /// The caller must check that the build's code signature names its own
+    /// identifier and team (see `macos::verify_developer_id`) before running
+    /// it. A newer release without such a build is an error, because the app
+    /// can't update until the server signs it.
+    pub fn newer_developer_id_release(
+        &self,
+        target: &str,
+        current_version: &str,
+    ) -> anyhow::Result<Option<Release>> {
+        let Some(release) = self.releases.get(target) else {
+            return Ok(None);
+        };
+        if !is_newer(&release.version, current_version)? {
+            return Ok(None);
+        }
+        let build = release.developer_id.as_ref().with_context(|| {
+            format!(
+                "the server offers {target} {} only without a Developer ID signature; it may still be signing it",
+                release.version
+            )
+        })?;
+        validate_build(&build.url, &build.sha256)?;
+        Ok(Some(Release {
+            version: release.version.clone(),
+            url: build.url.clone(),
+            sha256: build.sha256.clone(),
+            signature: None,
+            developer_id: None,
+        }))
+    }
+}
+
+fn is_newer(offered: &str, current: &str) -> anyhow::Result<bool> {
+    let current = Version::parse(current).context("invalid current application version")?;
+    let offered = Version::parse(offered).context("invalid release version")?;
+    Ok(offered > current)
+}
+
+fn validate_build(url: &str, sha256: &str) -> anyhow::Result<()> {
+    let url = url::Url::parse(url).context("invalid release URL")?;
+    if url.scheme() != "https" || url.host_str().is_none() {
+        bail!("release URL must use HTTPS");
+    }
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("release SHA-256 is invalid");
+    }
+    Ok(())
 }
 
 impl Release {
@@ -88,13 +150,7 @@ impl Release {
 
     fn validate_with_key(&self, target: &str, key: &VerifyingKey) -> anyhow::Result<()> {
         Version::parse(&self.version).context("invalid release version")?;
-        let url = url::Url::parse(&self.url).context("invalid release URL")?;
-        if url.scheme() != "https" || url.host_str().is_none() {
-            bail!("release URL must use HTTPS");
-        }
-        if self.sha256.len() != 64 || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            bail!("release SHA-256 is invalid");
-        }
+        validate_build(&self.url, &self.sha256)?;
         let signature = self
             .signature
             .as_deref()
@@ -203,6 +259,7 @@ mod tests {
             url: "https://downloads.example.com/agent.exe".to_owned(),
             sha256: format!("{:x}", Sha256::digest(b"agent")),
             signature: Some(TEST_SIGNATURE.to_owned()),
+            developer_id: None,
         }
     }
 
@@ -297,6 +354,52 @@ mod tests {
     }
 
     #[test]
+    fn offers_developer_id_builds_without_a_release_signature() {
+        let developer_id = Build {
+            url: "https://downloads.example.com/developer-id/agent.zip".to_owned(),
+            sha256: format!("{:x}", Sha256::digest(b"operator-signed")),
+        };
+        let signed = manifest(Release {
+            signature: None,
+            developer_id: Some(developer_id.clone()),
+            ..release("1.2.0")
+        });
+        let offered = signed
+            .newer_developer_id_release(AGENT_WINDOWS_X64, "1.1.0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (offered.version.as_str(), offered.url.as_str()),
+            ("1.2.0", developer_id.url.as_str())
+        );
+        offered.verify(b"operator-signed").unwrap();
+        assert!(
+            signed
+                .newer_developer_id_release(AGENT_WINDOWS_X64, "1.2.0")
+                .unwrap()
+                .is_none()
+        );
+        // A newer release the server hasn't signed yet is reported.
+        assert!(
+            manifest(release("1.2.0"))
+                .newer_developer_id_release(AGENT_WINDOWS_X64, "1.1.0")
+                .is_err()
+        );
+        let insecure = manifest(Release {
+            developer_id: Some(Build {
+                url: "http://downloads.example.com/agent.zip".to_owned(),
+                ..developer_id
+            }),
+            ..release("1.2.0")
+        });
+        assert!(
+            insecure
+                .newer_developer_id_release(AGENT_WINDOWS_X64, "1.1.0")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn verifies_release_bytes() {
         let release = release("1.2.0");
         release.verify(b"agent").unwrap();
@@ -313,7 +416,7 @@ mod tests {
         assert!(insecure.validate_with_key(AGENT_WINDOWS_X64, &key).is_err());
 
         let mut value = manifest(release("1.2.0"));
-        value.schema_version = 1;
+        value.schema_version = 2;
         assert!(UpdateManifest::parse(&serde_json::to_vec(&value).unwrap()).is_err());
     }
 

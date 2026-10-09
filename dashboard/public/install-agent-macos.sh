@@ -5,8 +5,9 @@
 #   curl -fsSL https://rmm.example.com/install-agent-macos.sh |
 #     sudo /bin/sh -s -- https://rmm.example.com <authorization>
 #
-# It downloads the published Agent, checks it against the release manifest's
-# SHA-256, and enrolls this Mac with the one-time authorization.
+# It downloads the server's Agent, which the server signs with the company's
+# Developer ID when it's set up to, checks its code signature, and enrolls
+# this Mac with the one-time authorization.
 set -eu
 
 if [ "$#" -ne 2 ]; then
@@ -26,18 +27,18 @@ fi
 
 WORK=$(mktemp -d /tmp/meshrmm-agent-install.XXXXXX)
 trap 'rm -rf -- "$WORK"' EXIT
-curl -fsSL --proto '=https' "$ORIGIN/downloads/update-manifest.json" -o "$WORK/manifest.json"
-URL=$(plutil -extract releases.agent-macos.url raw -o - "$WORK/manifest.json")
-SHA256=$(plutil -extract releases.agent-macos.sha256 raw -o - "$WORK/manifest.json")
-case "$URL" in
-    https://*) ;;
-    *) echo "The release manifest names an unsafe Agent download." >&2; exit 1 ;;
-esac
 echo "Downloading the MeshRMM Agent..."
-curl -fsSL --proto '=https' "$URL" -o "$WORK/agent.zip"
-if ! echo "$SHA256  $WORK/agent.zip" | shasum -a 256 -c - >/dev/null; then
-    echo "The downloaded Agent failed its SHA-256 integrity check." >&2
+STATUS=$(curl -sSL --proto '=https' -o "$WORK/agent.zip" -w '%{http_code}' \
+    "$ORIGIN/downloads/meshrmm-agent-macos.zip")
+if [ "$STATUS" != 200 ]; then
+    # The server explains itself in {"error": "..."}.
+    REASON=$(plutil -extract error raw -o - "$WORK/agent.zip" 2>/dev/null || true)
+    echo "The server didn't provide the Agent (HTTP $STATUS). $REASON" >&2
     exit 1
 fi
 ditto -x -k "$WORK/agent.zip" "$WORK"
+if ! codesign --verify --strict --deep "$WORK/MeshRMM Agent.app"; then
+    echo "The downloaded Agent's code signature is invalid." >&2
+    exit 1
+fi
 "$WORK/MeshRMM Agent.app/Contents/MacOS/meshrmm-agent" --install "$AUTHORIZATION"

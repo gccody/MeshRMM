@@ -53,6 +53,20 @@ contact_email = "admin@example.com"
 # manifest at /downloads/; Agents and viewers update from it.
 dir = "/usr/share/meshrmm/downloads"
 
+# Releases sign the macOS Agent and viewer only ad hoc. To sign them with your
+# company's Developer ID, which keeps the Agent's privacy permissions across
+# updates and lets macOS open the viewer without asking, set the files below.
+# The server signs each release's macOS builds once, in the background, with
+# rcodesign; see "Sign the macOS builds" in docs/self-hosting.md.
+# [downloads.macos_signing]
+# A .p12 holding only your Developer ID Application certificate and its key.
+# certificate = "/etc/meshrmm/developer-id.p12"
+# certificate_password_file = "/etc/meshrmm/developer-id.password"
+# An App Store Connect API key from `rcodesign encode-app-store-connect-api-key`,
+# to notarize the builds.
+# notary_api_key = "/etc/meshrmm/notary-api-key.json"
+# rcodesign = "/usr/libexec/meshrmm/rcodesign"
+
 [toolbox]
 # The largest file users may upload to the toolbox library, in bytes. Keep it
 # under any request body limit of a proxy in front of the server (Cloudflare's

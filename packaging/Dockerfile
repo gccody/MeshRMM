@@ -12,7 +12,9 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c
 
 ARG TARGETARCH
 COPY linux-${TARGETARCH}/bin/meshrmm-server /usr/bin/meshrmm-server
+COPY linux-${TARGETARCH}/libexec/meshrmm/ /usr/libexec/meshrmm/
 COPY linux-${TARGETARCH}/share/meshrmm/ /usr/share/meshrmm/
+COPY linux-${TARGETARCH}/share/doc/meshrmm/ /usr/share/doc/meshrmm/
 COPY linux-${TARGETARCH}/etc/meshrmm/server.example.toml /etc/meshrmm/server.example.toml
 # An empty directory, so a new volume here belongs to the server's user.
 COPY --chown=65532:65532 data/ /var/lib/meshrmm/

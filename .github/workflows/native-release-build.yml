@@ -5,6 +5,11 @@ name: Publish release
 # multi-architecture Docker image. On main it publishes them as a GitHub
 # release and to GHCR; a manual run on another branch builds and tests
 # everything without signing or publishing.
+#
+# No build is code signed with a certificate: the macOS builds are signed
+# only ad hoc, and each company's server signs them with its own Developer ID
+# (see server/src/downloads/developer_id.rs). A release therefore never
+# carries a MeshRMM Agent that someone else's certificate vouches for.
 on:
   push:
     branches: [main]
@@ -126,61 +131,18 @@ jobs:
           cache-targets: true
           cache-workspace-crates: true
           cache-on-failure: true
-      - name: Configure Developer ID signing
-        env:
-          CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
-        shell: bash
-        run: |
-          # Installed Agents accept only updates signed by their own team, so
-          # a release must never fall back to an ad-hoc signature.
-          if [ -z "$CERTIFICATE_P12_BASE64" ] || [ -z "$CERTIFICATE_PASSWORD" ] || [ -z "$CODESIGN_IDENTITY" ]; then
-            echo "::error::Configure the macOS Developer ID certificate, its password, and the signing identity secrets."
-            exit 1
-          fi
-          certificate_path="$RUNNER_TEMP/meshrmm-release.p12"
-          keychain_path="$RUNNER_TEMP/meshrmm-signing.keychain-db"
-          keychain_password=$(openssl rand -base64 24)
-          printf '%s' "$CERTIFICATE_P12_BASE64" | openssl base64 -d -A > "$certificate_path"
-          security create-keychain -p "$keychain_password" "$keychain_path"
-          security set-keychain-settings -lut 21600 "$keychain_path"
-          security unlock-keychain -p "$keychain_password" "$keychain_path"
-          security import "$certificate_path" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain_path"
-          security list-keychain -d user -s "$keychain_path"
-          echo "MESHRMM_CODESIGN_IDENTITY=$CODESIGN_IDENTITY" >> "$GITHUB_ENV"
       - name: Add the Intel macOS target for the universal Agent
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
-      - name: Build signed viewer archive
+      - name: Build the ad hoc signed viewer archive
+        env:
+          MESHRMM_CODESIGN_IDENTITY: "-"
         shell: bash
         run: sh scripts/build-remote-macos.sh
-      - name: Build signed universal Agent archive
+      - name: Build the ad hoc signed universal Agent archive
+        env:
+          MESHRMM_CODESIGN_IDENTITY: "-"
         shell: bash
         run: sh scripts/build-agent-macos.sh
-      - name: Notarize and staple the viewer and Agent
-        env:
-          NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
-          NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
-          NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
-        shell: bash
-        run: |
-          if [ -z "$NOTARY_APPLE_ID" ] || [ -z "$NOTARY_TEAM_ID" ] || [ -z "$NOTARY_PASSWORD" ]; then
-            echo "::error::Configure all three macOS notarization secrets."
-            exit 1
-          fi
-          for pair in "dist/downloads/meshrmm-remote-macos-arm64.zip=dist/remote-macos/MeshRMM Remote.app" "dist/downloads/meshrmm-agent-macos.zip=dist/agent-macos/MeshRMM Agent.app"; do
-            archive=${pair%%=*}
-            app_directory=${pair#*=}
-            xcrun notarytool submit "$archive" \
-              --apple-id "$NOTARY_APPLE_ID" \
-              --team-id "$NOTARY_TEAM_ID" \
-              --password "$NOTARY_PASSWORD" \
-              --wait
-            xcrun stapler staple "$app_directory"
-            rm -f -- "$archive"
-            ditto -c -k --sequesterRsrc --keepParent "$app_directory" "$archive"
-          done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-macos-arm64-${{ needs.validate.outputs.version }}
