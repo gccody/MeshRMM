@@ -194,6 +194,15 @@ unsafe fn click(window: HWND, action: Action, menu_capture: Option<&str>) {
     }
 }
 
+/// The probe window and the session state its toolbar acts on.
+struct ToolbarProbe {
+    sent: Arc<Mutex<Vec<SessionMessage>>>,
+    chat: meshrmm_chat::ChatSession,
+    control: ControlSink,
+    presentation: Presentation,
+    window: HWND,
+}
+
 #[test]
 #[ignore = "needs an interactive desktop and a D3D11 video device"]
 fn toolbar_probe_draws_and_handles_the_viewer_toolbar() {
@@ -202,113 +211,20 @@ fn toolbar_probe_draws_and_handles_the_viewer_toolbar() {
 
 unsafe fn run_probe() {
     super::enable_dpi_awareness();
-    let sent = Arc::new(Mutex::new(Vec::new()));
-    let chat = meshrmm_chat::ChatSession::default();
-    chat.set_available(true);
-    let console = |id, width, height| display(DesktopSession::Console, id, width, height);
-    let first = console(1, 1280, 720);
-    let displays = vec![
-        first.clone(),
-        console(2, 1920, 1080),
-        display(
-            DesktopSession::Rdp {
-                id: 2,
-                user: "probe".into(),
-            },
-            7,
-            1600,
-            900,
-        ),
-    ];
-    let format = VideoFormat {
-        width: 1280,
-        height: 720,
-        frames_per_second: 60,
-        codec: Codec::H264,
-        pixel_format: PixelFormat::Nv12,
-        bitrate_bits_per_second: 12_000_000,
-    };
-    let control = test_sink(Arc::clone(&sent), chat.clone());
-    let mut presentation = unsafe {
-        Presentation::new(
-            format,
-            first,
-            displays,
-            control.clone(),
-            DebugInfo::new("toolbar-probe"),
-        )
-    }
-    .expect("the probe window and renderer");
-    let window = presentation.window();
-    unsafe { pump(window, Duration::from_millis(300)) };
-    unsafe { present_synthetic(&mut presentation, 1280, 720, PixelFormat::Nv12) }.unwrap();
-    unsafe { pump(window, Duration::from_millis(200)) };
-
-    let (toolbar, tooltip, initial) = unsafe { probe_toolbar(window) }.unwrap();
-    let actions: Vec<Action> = initial.iter().map(|(item, _)| item.action).collect();
-    println!("items: {actions:?}");
-    assert_eq!(
-        actions,
-        [
-            Action::User,
-            Action::Display,
-            Action::Quality,
-            Action::Credentials,
-            Action::SecureAttention,
-            Action::Power,
-            Action::TypeClipboard,
-            Action::Annotate,
-            Action::Files,
-            Action::Chat,
-            Action::Diagnostics,
-            Action::Settings,
-            Action::Minimize,
-            Action::Maximize,
-            Action::Close,
-        ]
-    );
-    let dpi = unsafe { window::window_dpi(window) };
-    let (width, _) = {
-        let mut client = RECT::default();
-        unsafe { GetClientRect(window, &mut client) }.unwrap();
-        (client.right, client.bottom)
-    };
-    println!("dpi {dpi}, client width {width}");
-    let close = initial.last().unwrap().1;
-    assert_eq!(close.right, width, "the close button is in the corner");
-    assert_eq!(close.top, 0);
-    for pair in initial.windows(2) {
-        assert!(pair[0].1.right <= pair[1].1.left, "{pair:?}");
-    }
-    unsafe { save_window(window, "toolbar") };
-
-    // Items take clicks; the space between them moves the window.
-    let hit = |x: i32, y: i32| {
-        let mut point = windows::Win32::Foundation::POINT { x, y };
-        let _ = unsafe { ClientToScreen(window, &mut point) };
-        let position = lparam_at(point.x, point.y);
-        (
-            unsafe { SendMessageW(toolbar, WM_NCHITTEST, None, Some(position)) }.0,
-            unsafe { SendMessageW(window, WM_NCHITTEST, None, Some(position)) }.0,
-        )
-    };
-    let (x, y) = center(unsafe { rect_of(window, Action::Chat) });
-    assert_eq!(hit(x, y).0, HTCLIENT as isize);
-    let gap_x = (unsafe { rect_of(window, Action::Quality) }.right
-        + unsafe { rect_of(window, Action::Credentials) }.left)
-        / 2;
-    assert_eq!(hit(gap_x, y), (-1, HTCAPTION as isize));
+    let probe = unsafe { ToolbarProbe::open() };
+    let (toolbar, tooltip, item_count) = unsafe { probe.check_items() };
+    unsafe { probe.check_hit_testing(toolbar) };
 
     // One tooltip per item.
     if tooltip.is_invalid() {
         println!("no tooltip control");
     } else {
         let tools = unsafe { SendMessageW(tooltip, TTM_GETTOOLCOUNT, None, None) }.0;
-        assert_eq!(tools as usize, initial.len());
+        assert_eq!(tools as usize, item_count);
     }
 
     // Hover highlights an item.
-    let (x, y) = center(unsafe { rect_of(window, Action::Settings) });
+    let (x, y) = center(unsafe { rect_of(probe.window, Action::Settings) });
     unsafe {
         SendMessageW(
             toolbar,
@@ -316,139 +232,272 @@ unsafe fn run_probe() {
             Some(WPARAM(0)),
             Some(lparam_at(x, y)),
         );
-        pump(window, Duration::from_millis(100));
-        save_window(window, "toolbar_hover");
+        pump(probe.window, Duration::from_millis(100));
+        save_window(probe.window, "toolbar_hover");
     }
 
-    // Buttons act on click.
-    sent.lock().unwrap().clear();
-    unsafe { click(window, Action::SecureAttention, None) };
-    assert!(
-        sent.lock()
-            .unwrap()
-            .contains(&SessionMessage::SendSecureAttention),
-        "{:?}",
-        sent.lock().unwrap()
-    );
-    unsafe { click(window, Action::Diagnostics, None) };
-    assert!(unsafe { probe_toolbar_state(window) }.unwrap().diagnostics);
-    let diagnostics = unsafe { items(window) }
-        .into_iter()
-        .find(|(item, _)| item.action == Action::Diagnostics)
-        .unwrap()
-        .0;
-    assert!(diagnostics.active);
-    unsafe { click(window, Action::Diagnostics, None) };
-    assert!(!unsafe { probe_toolbar_state(window) }.unwrap().diagnostics);
-    unsafe { click(window, Action::Chat, None) };
-    assert!(chat.visible(), "the chat item opens the chat popup");
-    unsafe { click(window, Action::Chat, None) };
-    assert!(!chat.visible(), "the chat item closes the chat popup");
+    unsafe { probe.check_buttons() };
+    unsafe { probe.check_annotation() };
+    unsafe { probe.check_unread_badge_and_menus() };
+    unsafe { probe.check_caption_buttons() };
+    println!("toolbar probe passed");
+    drop(probe.presentation);
+}
 
-    // View-only sessions annotate: the mouse draws and erases, and sends
-    // no input.
-    control.set_technician_blocked(true);
-    sent.lock().unwrap().clear();
-    unsafe { click(window, Action::Annotate, None) };
-    assert!(unsafe { probe_toolbar_state(window) }.unwrap().annotating);
-    let video = unsafe { probe_state(window) }.unwrap().video.unwrap();
-    let at = |x: i32, y: i32| {
-        lparam_at(
-            video.left + video.width * x / 4,
-            video.top + video.height * y / 4,
-        )
-    };
-    unsafe {
-        SendMessageW(window, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(at(1, 1)));
-        SendMessageW(window, WM_MOUSEMOVE, Some(WPARAM(1)), Some(at(3, 1)));
-        SendMessageW(window, WM_LBUTTONUP, Some(WPARAM(0)), Some(at(3, 1)));
-        // Moving without the button draws nothing.
-        SendMessageW(window, WM_MOUSEMOVE, Some(WPARAM(0)), Some(at(3, 3)));
-        SendMessageW(window, WM_RBUTTONDOWN, Some(WPARAM(2)), Some(at(2, 2)));
-        SendMessageW(window, WM_RBUTTONUP, Some(WPARAM(0)), Some(at(2, 2)));
-        pump(window, Duration::from_millis(100));
-        save_window(window, "toolbar_annotating");
+impl ToolbarProbe {
+    unsafe fn open() -> Self {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let chat = meshrmm_chat::ChatSession::default();
+        chat.set_available(true);
+        let console = |id, width, height| display(DesktopSession::Console, id, width, height);
+        let first = console(1, 1280, 720);
+        let displays = vec![
+            first.clone(),
+            console(2, 1920, 1080),
+            display(
+                DesktopSession::Rdp {
+                    id: 2,
+                    user: "probe".into(),
+                },
+                7,
+                1600,
+                900,
+            ),
+        ];
+        let format = VideoFormat {
+            width: 1280,
+            height: 720,
+            frames_per_second: 60,
+            codec: Codec::H264,
+            pixel_format: PixelFormat::Nv12,
+            bitrate_bits_per_second: 12_000_000,
+        };
+        let control = test_sink(Arc::clone(&sent), chat.clone());
+        let mut presentation = unsafe {
+            Presentation::new(
+                format,
+                first,
+                displays,
+                control.clone(),
+                DebugInfo::new("toolbar-probe"),
+            )
+        }
+        .expect("the probe window and renderer");
+        let window = presentation.window();
+        unsafe { pump(window, Duration::from_millis(300)) };
+        unsafe { present_synthetic(&mut presentation, 1280, 720, PixelFormat::Nv12) }.unwrap();
+        unsafe { pump(window, Duration::from_millis(200)) };
+        Self {
+            sent,
+            chat,
+            control,
+            presentation,
+            window,
+        }
     }
-    unsafe { click(window, Action::Annotate, None) };
-    assert!(!unsafe { probe_toolbar_state(window) }.unwrap().annotating);
-    let annotations = sent
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|message| match message {
-            SessionMessage::Annotate(annotation) => *annotation,
-            other => panic!("annotating sent {other:?}"),
-        })
-        .collect::<Vec<_>>();
-    use meshrmm_protocol::Annotation;
-    assert!(
-        matches!(
-            annotations.as_slice(),
+
+    /// Checks the items and their layout. Returns the toolbar, its tooltip
+    /// control and the number of items.
+    unsafe fn check_items(&self) -> (HWND, HWND, usize) {
+        let window = self.window;
+        let (toolbar, tooltip, initial) = unsafe { probe_toolbar(window) }.unwrap();
+        let actions: Vec<Action> = initial.iter().map(|(item, _)| item.action).collect();
+        println!("items: {actions:?}");
+        assert_eq!(
+            actions,
             [
-                Annotation::Start {
-                    display_id: DisplayId(1),
-                    x: 16_200..=16_600,
-                    y: 16_200..=16_600
-                },
-                Annotation::Extend {
-                    display_id: DisplayId(1),
-                    x: 49_000..=49_400,
-                    ..
-                },
-                Annotation::Clear,
-                Annotation::Clear,
+                Action::User,
+                Action::Display,
+                Action::Quality,
+                Action::Credentials,
+                Action::SecureAttention,
+                Action::Power,
+                Action::TypeClipboard,
+                Action::Annotate,
+                Action::Files,
+                Action::Chat,
+                Action::Diagnostics,
+                Action::Settings,
+                Action::Minimize,
+                Action::Maximize,
+                Action::Close,
             ]
-        ),
-        "{annotations:?}"
-    );
-    control.set_technician_blocked(false);
+        );
+        let dpi = unsafe { window::window_dpi(window) };
+        let (width, _) = {
+            let mut client = RECT::default();
+            unsafe { GetClientRect(window, &mut client) }.unwrap();
+            (client.right, client.bottom)
+        };
+        println!("dpi {dpi}, client width {width}");
+        let close = initial.last().unwrap().1;
+        assert_eq!(close.right, width, "the close button is in the corner");
+        assert_eq!(close.top, 0);
+        for pair in initial.windows(2) {
+            assert!(pair[0].1.right <= pair[1].1.left, "{pair:?}");
+        }
+        unsafe { save_window(window, "toolbar") };
+        (toolbar, tooltip, initial.len())
+    }
 
-    // Unread messages badge the chat item.
-    chat.receive("Hello from the probe".into());
-    unsafe { pump(window, Duration::from_millis(100)) };
-    let chat_item = unsafe { items(window) }
-        .into_iter()
-        .find(|(item, _)| item.action == Action::Chat)
-        .unwrap()
-        .0;
-    assert_eq!(chat_item.badge, Some(crate::toolbar::Badge::Unread));
+    /// Items take clicks; the space between them moves the window.
+    unsafe fn check_hit_testing(&self, toolbar: HWND) {
+        let window = self.window;
+        let hit = |x: i32, y: i32| {
+            let mut point = windows::Win32::Foundation::POINT { x, y };
+            let _ = unsafe { ClientToScreen(window, &mut point) };
+            let position = lparam_at(point.x, point.y);
+            (
+                unsafe { SendMessageW(toolbar, WM_NCHITTEST, None, Some(position)) }.0,
+                unsafe { SendMessageW(window, WM_NCHITTEST, None, Some(position)) }.0,
+            )
+        };
+        let (x, y) = center(unsafe { rect_of(window, Action::Chat) });
+        assert_eq!(hit(x, y).0, HTCLIENT as isize);
+        let gap_x = (unsafe { rect_of(window, Action::Quality) }.right
+            + unsafe { rect_of(window, Action::Credentials) }.left)
+            / 2;
+        assert_eq!(hit(gap_x, y), (-1, HTCAPTION as isize));
+    }
 
-    // Menus open under their item and close without choosing.
-    sent.lock().unwrap().clear();
-    unsafe { click(window, Action::Display, Some("menu_display")) };
-    unsafe { click(window, Action::Quality, Some("menu_quality")) };
-    unsafe { click(window, Action::User, Some("menu_user")) };
-    assert!(
-        !sent
+    /// Buttons act on click.
+    unsafe fn check_buttons(&self) {
+        let (window, sent, chat) = (self.window, &self.sent, &self.chat);
+        sent.lock().unwrap().clear();
+        unsafe { click(window, Action::SecureAttention, None) };
+        assert!(
+            sent.lock()
+                .unwrap()
+                .contains(&SessionMessage::SendSecureAttention),
+            "{:?}",
+            sent.lock().unwrap()
+        );
+        unsafe { click(window, Action::Diagnostics, None) };
+        assert!(unsafe { probe_toolbar_state(window) }.unwrap().diagnostics);
+        let diagnostics = unsafe { items(window) }
+            .into_iter()
+            .find(|(item, _)| item.action == Action::Diagnostics)
+            .unwrap()
+            .0;
+        assert!(diagnostics.active);
+        unsafe { click(window, Action::Diagnostics, None) };
+        assert!(!unsafe { probe_toolbar_state(window) }.unwrap().diagnostics);
+        unsafe { click(window, Action::Chat, None) };
+        assert!(chat.visible(), "the chat item opens the chat popup");
+        unsafe { click(window, Action::Chat, None) };
+        assert!(!chat.visible(), "the chat item closes the chat popup");
+    }
+
+    /// View-only sessions annotate: the mouse draws and erases, and sends
+    /// no input.
+    unsafe fn check_annotation(&self) {
+        use meshrmm_protocol::Annotation;
+        let (window, sent) = (self.window, &self.sent);
+        self.control.set_technician_blocked(true);
+        sent.lock().unwrap().clear();
+        unsafe { click(window, Action::Annotate, None) };
+        assert!(unsafe { probe_toolbar_state(window) }.unwrap().annotating);
+        let video = unsafe { probe_state(window) }.unwrap().video.unwrap();
+        let at = |x: i32, y: i32| {
+            lparam_at(
+                video.left + video.width * x / 4,
+                video.top + video.height * y / 4,
+            )
+        };
+        unsafe {
+            SendMessageW(window, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(at(1, 1)));
+            SendMessageW(window, WM_MOUSEMOVE, Some(WPARAM(1)), Some(at(3, 1)));
+            SendMessageW(window, WM_LBUTTONUP, Some(WPARAM(0)), Some(at(3, 1)));
+            // Moving without the button draws nothing.
+            SendMessageW(window, WM_MOUSEMOVE, Some(WPARAM(0)), Some(at(3, 3)));
+            SendMessageW(window, WM_RBUTTONDOWN, Some(WPARAM(2)), Some(at(2, 2)));
+            SendMessageW(window, WM_RBUTTONUP, Some(WPARAM(0)), Some(at(2, 2)));
+            pump(window, Duration::from_millis(100));
+            save_window(window, "toolbar_annotating");
+        }
+        unsafe { click(window, Action::Annotate, None) };
+        assert!(!unsafe { probe_toolbar_state(window) }.unwrap().annotating);
+        let annotations = sent
             .lock()
             .unwrap()
             .iter()
-            .any(|message| matches!(message, SessionMessage::SelectDisplay { .. })),
-        "{:?}",
-        sent.lock().unwrap()
-    );
-    unsafe { save_window(window, "toolbar_badge") };
+            .map(|message| match message {
+                SessionMessage::Annotate(annotation) => *annotation,
+                other => panic!("annotating sent {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                annotations.as_slice(),
+                [
+                    Annotation::Start {
+                        display_id: DisplayId(1),
+                        x: 16_200..=16_600,
+                        y: 16_200..=16_600
+                    },
+                    Annotation::Extend {
+                        display_id: DisplayId(1),
+                        x: 49_000..=49_400,
+                        ..
+                    },
+                    Annotation::Clear,
+                    Annotation::Clear,
+                ]
+            ),
+            "{annotations:?}"
+        );
+        self.control.set_technician_blocked(false);
+    }
 
-    // The caption buttons maximize and restore the window.
-    unsafe { click(window, Action::Maximize, None) };
-    unsafe { pump(window, Duration::from_millis(300)) };
-    assert!(unsafe { IsZoomed(window) }.as_bool());
-    let restore = unsafe { items(window) }
-        .into_iter()
-        .find(|(item, _)| item.action == Action::Maximize)
-        .unwrap();
-    assert_eq!(restore.0.icon, Icon::Restore);
-    let mut client = RECT::default();
-    unsafe { GetClientRect(window, &mut client) }.unwrap();
-    assert_eq!(
-        unsafe { rect_of(window, Action::Close) }.right,
-        client.right
-    );
-    unsafe { save_window(window, "toolbar_maximized") };
-    unsafe { click(window, Action::Maximize, None) };
-    unsafe { pump(window, Duration::from_millis(300)) };
-    assert!(!unsafe { IsZoomed(window) }.as_bool());
+    unsafe fn check_unread_badge_and_menus(&self) {
+        let (window, sent) = (self.window, &self.sent);
+        // Unread messages badge the chat item.
+        self.chat.receive("Hello from the probe".into());
+        unsafe { pump(window, Duration::from_millis(100)) };
+        let chat_item = unsafe { items(window) }
+            .into_iter()
+            .find(|(item, _)| item.action == Action::Chat)
+            .unwrap()
+            .0;
+        assert_eq!(chat_item.badge, Some(crate::toolbar::Badge::Unread));
 
-    println!("toolbar probe passed");
-    drop(presentation);
+        // Menus open under their item and close without choosing.
+        sent.lock().unwrap().clear();
+        unsafe { click(window, Action::Display, Some("menu_display")) };
+        unsafe { click(window, Action::Quality, Some("menu_quality")) };
+        unsafe { click(window, Action::User, Some("menu_user")) };
+        assert!(
+            !sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|message| matches!(message, SessionMessage::SelectDisplay { .. })),
+            "{:?}",
+            sent.lock().unwrap()
+        );
+        unsafe { save_window(window, "toolbar_badge") };
+    }
+
+    /// The caption buttons maximize and restore the window.
+    unsafe fn check_caption_buttons(&self) {
+        let window = self.window;
+        unsafe { click(window, Action::Maximize, None) };
+        unsafe { pump(window, Duration::from_millis(300)) };
+        assert!(unsafe { IsZoomed(window) }.as_bool());
+        let restore = unsafe { items(window) }
+            .into_iter()
+            .find(|(item, _)| item.action == Action::Maximize)
+            .unwrap();
+        assert_eq!(restore.0.icon, Icon::Restore);
+        let mut client = RECT::default();
+        unsafe { GetClientRect(window, &mut client) }.unwrap();
+        assert_eq!(
+            unsafe { rect_of(window, Action::Close) }.right,
+            client.right
+        );
+        unsafe { save_window(window, "toolbar_maximized") };
+        unsafe { click(window, Action::Maximize, None) };
+        unsafe { pump(window, Duration::from_millis(300)) };
+        assert!(!unsafe { IsZoomed(window) }.as_bool());
+    }
 }
