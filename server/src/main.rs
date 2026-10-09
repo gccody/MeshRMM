@@ -57,13 +57,17 @@ fn main() -> anyhow::Result<()> {
     init_logging(&config);
     meshrmm_server::install_crypto_provider();
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
         match cli.command.unwrap_or(Command::Serve) {
             Command::Serve => meshrmm_server::run(config).await,
             Command::CheckConfig => meshrmm_server::check(config).await,
             Command::Admin(command) => admin(config, command).await,
         }
-    })
+    });
+    // Don't wait for macOS signing, which can take an hour; the next start
+    // signs again.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
 }
 
 async fn admin(config: Config, command: Admin) -> anyhow::Result<()> {

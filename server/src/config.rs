@@ -20,6 +20,7 @@ use url::{Host, Url};
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/meshrmm/server.toml";
 const DEFAULT_DATA_DIR: &str = "/var/lib/meshrmm";
 const DEFAULT_DOWNLOADS_DIR: &str = "/usr/share/meshrmm/downloads";
+const DEFAULT_RCODESIGN: &str = "/usr/libexec/meshrmm/rcodesign";
 const LETS_ENCRYPT_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
 
 /// The top-level keys environment variables may set. Anything else with the
@@ -124,14 +125,34 @@ pub struct DownloadsConfig {
     /// `artifacts.json` that lists them.
     #[serde(default = "default_downloads_dir")]
     pub dir: PathBuf,
+    /// Signs the macOS Agent and viewer with the company's own Developer ID.
+    /// Releases ship them signed only ad hoc.
+    pub macos_signing: Option<MacosSigningConfig>,
 }
 
 impl Default for DownloadsConfig {
     fn default() -> Self {
         Self {
             dir: default_downloads_dir(),
+            macos_signing: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MacosSigningConfig {
+    /// A PKCS #12 file whose first certificate is a Developer ID Application
+    /// certificate, with its private key.
+    pub certificate: PathBuf,
+    /// A file holding only the certificate file's password.
+    pub certificate_password_file: PathBuf,
+    /// An App Store Connect API key, as `rcodesign
+    /// encode-app-store-connect-api-key` writes it, to notarize the builds.
+    pub notary_api_key: Option<PathBuf>,
+    /// The rcodesign executable that signs and notarizes.
+    #[serde(default = "default_rcodesign")]
+    pub rcodesign: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -246,6 +267,10 @@ fn default_data_dir() -> PathBuf {
 
 fn default_downloads_dir() -> PathBuf {
     PathBuf::from(DEFAULT_DOWNLOADS_DIR)
+}
+
+fn default_rcodesign() -> PathBuf {
+    PathBuf::from(DEFAULT_RCODESIGN)
 }
 
 fn default_max_connections() -> u32 {
@@ -589,6 +614,24 @@ mod tests {
         assert_eq!(config.remote.idle_timeout_seconds, 900);
         assert!(config.turn.enabled);
         assert_eq!(config.turn.listen, default_turn_listen());
+        assert!(config.downloads.macos_signing.is_none());
+    }
+
+    #[test]
+    fn macos_signing_needs_a_certificate_and_its_password() {
+        let config = Config::from_toml(&format!(
+            "{ACME}\n[downloads.macos_signing]\ncertificate = \"/etc/meshrmm/id.p12\"\ncertificate_password_file = \"/etc/meshrmm/id.password\"\n"
+        ))
+        .unwrap();
+        let signing = config.downloads.macos_signing.unwrap();
+        assert_eq!(signing.rcodesign, PathBuf::from(DEFAULT_RCODESIGN));
+        assert_eq!(signing.notary_api_key, None);
+        assert!(
+            Config::from_toml(&format!(
+                "{ACME}\n[downloads.macos_signing]\ncertificate = \"/etc/meshrmm/id.p12\"\n"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

@@ -5,7 +5,9 @@ use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use meshrmm_self_update::{CLIENT_MACOS_ARM64, CLIENT_MACOS_X64, CURRENT_VERSION, UpdateManifest};
+use meshrmm_self_update::{
+    CLIENT_MACOS_ARM64, CLIENT_MACOS_X64, CURRENT_VERSION, UpdateManifest, macos,
+};
 
 use super::download;
 use crate::config::Config;
@@ -13,6 +15,8 @@ use crate::launch_status::{self, LaunchStatus};
 
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_UPDATE_BYTES: usize = 512 * 1024 * 1024;
+/// scripts/build-remote-macos.sh's CFBundleIdentifier.
+const BUNDLE_IDENTIFIER: &str = "com.meshrmm.remote";
 
 pub fn is_helper_invocation() -> bool {
     std::env::args_os()
@@ -50,7 +54,16 @@ pub async fn check_and_schedule(
     } else {
         CLIENT_MACOS_X64
     };
-    let Some(release) = manifest.newer_release(target, CURRENT_VERSION)? else {
+    let executable = std::env::current_exe().context("could not locate the client executable")?;
+    let app_bundle = app_bundle_for_executable(&executable)?;
+    // A viewer signed with a Developer ID takes only its team's builds; an
+    // ad-hoc signed one takes the release build the release key vouches for.
+    let team = macos::team_identifier(&app_bundle);
+    let release = match &team {
+        Some(_) => manifest.newer_developer_id_release(target, CURRENT_VERSION)?,
+        None => manifest.newer_release(target, CURRENT_VERSION)?,
+    };
+    let Some(release) = release else {
         return Ok(false);
     };
 
@@ -69,8 +82,6 @@ pub async fn check_and_schedule(
         version: release.version.clone(),
     });
 
-    let executable = std::env::current_exe().context("could not locate the client executable")?;
-    let app_bundle = app_bundle_for_executable(&executable)?;
     let suffix = unique_suffix();
     let helper_directory = std::env::temp_dir()
         .join("MeshRMM")
@@ -83,6 +94,17 @@ pub async fn check_and_schedule(
     })?;
     let archive_path = helper_directory.join("client-update.zip");
     write_new_file(&archive_path, &archive)?;
+    if let Some(team) = &team {
+        let verify_directory = helper_directory.join("verify");
+        extract(&archive_path, &verify_directory)?;
+        macos::verify_developer_id(
+            &find_app_bundle(&verify_directory)?,
+            BUNDLE_IDENTIFIER,
+            team,
+            &release.version,
+        )?;
+        let _ = std::fs::remove_dir_all(&verify_directory);
+    }
     // The helper runs from a copy of the whole bundle. macOS kills a signed
     // executable copied out of its bundle, because the signature covers the
     // bundle's Info.plist.
@@ -165,19 +187,7 @@ fn apply_update_inner() -> anyhow::Result<()> {
         .parent()
         .context("application has no parent")?
         .join(format!(".meshrmm-update-{}", unique_suffix()));
-    std::fs::create_dir(&extracted_directory)?;
-    let output = Command::new("/usr/bin/ditto")
-        .args([OsStr::new("-x"), OsStr::new("-k")])
-        .arg(&archive)
-        .arg(&extracted_directory)
-        .output()
-        .context("failed to extract the macOS client update")?;
-    if !output.status.success() {
-        bail!(
-            "could not extract the macOS client update: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+    extract(&archive, &extracted_directory)?;
     let replacement = find_app_bundle(&extracted_directory)?;
     let replacement_executable = replacement.join("Contents/MacOS/meshrmm-remote");
     if !replacement_executable.is_file() {
@@ -212,6 +222,23 @@ fn apply_update_inner() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(&extracted_directory);
     let _ = std::fs::remove_dir_all(backup);
     let _ = std::fs::remove_dir_all(helper_directory);
+    Ok(())
+}
+
+fn extract(archive: &Path, directory: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir(directory)?;
+    let output = Command::new("/usr/bin/ditto")
+        .args([OsStr::new("-x"), OsStr::new("-k")])
+        .arg(archive)
+        .arg(directory)
+        .output()
+        .context("failed to extract the macOS client update")?;
+    if !output.status.success() {
+        bail!(
+            "could not extract the macOS client update: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     Ok(())
 }
 

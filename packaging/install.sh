@@ -3,11 +3,11 @@
 #
 #   sudo ./install.sh
 #
-# It installs /usr/bin/meshrmm-server, replaces the Agent and viewer builds in
-# /usr/share/meshrmm/downloads, installs the systemd unit, and creates the
-# meshrmm user. An existing /etc/meshrmm/server.toml is left as it is; a new
-# install gets a copy of the example to edit. It doesn't start or restart the
-# server.
+# It installs /usr/bin/meshrmm-server and /usr/libexec/meshrmm/rcodesign,
+# replaces the Agent and viewer builds in /usr/share/meshrmm/downloads,
+# installs the systemd unit, and creates the meshrmm user. An existing
+# /etc/meshrmm/server.toml is left as it is; a new install gets a copy of the
+# example to edit. It doesn't start or restart the server.
 set -eu
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -15,7 +15,7 @@ if [ "$(id -u)" -ne 0 ]; then
     echo "Run the installer as root, for example with sudo." >&2
     exit 1
 fi
-for path in bin/meshrmm-server share/meshrmm/downloads/artifacts.json \
+for path in bin/meshrmm-server libexec/meshrmm/rcodesign share/meshrmm/downloads/artifacts.json \
     lib/systemd/system/meshrmm-server.service etc/meshrmm/server.example.toml; do
     if [ ! -e "$HERE/$path" ]; then
         echo "$HERE/$path is missing; run install.sh from the unpacked release." >&2
@@ -33,6 +33,9 @@ fi
 
 install -D -m 0755 "$HERE/bin/meshrmm-server" /usr/bin/meshrmm-server.new
 mv -f /usr/bin/meshrmm-server.new /usr/bin/meshrmm-server
+install -D -m 0755 "$HERE/libexec/meshrmm/rcodesign" /usr/libexec/meshrmm/rcodesign.new
+mv -f /usr/libexec/meshrmm/rcodesign.new /usr/libexec/meshrmm/rcodesign
+install -D -m 0644 -t /usr/share/doc/meshrmm/rcodesign "$HERE/share/doc/meshrmm/rcodesign"/*
 
 # Swap the whole downloads directory, so the server never sees a mix of two
 # releases' builds.
