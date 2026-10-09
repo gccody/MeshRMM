@@ -242,50 +242,8 @@ impl MediaFoundationVideoEncoder {
             let multithread: ID3D11Multithread = context.cast().map_err(Error::Configuration)?;
             let _ = multithread.SetMultithreadProtected(true);
         }
-        // Safety: MFT enumeration returns a COM-allocated array which is freed
-        // after every returned activation object has been cloned/dropped.
+        let transform = activate_hardware_transform(codec, pixel_format)?;
         unsafe {
-            let input_info = MFT_REGISTER_TYPE_INFO {
-                guidMajorType: MFMediaType_Video,
-                guidSubtype: pixel_format.media_foundation_subtype(),
-            };
-            let output_info = MFT_REGISTER_TYPE_INFO {
-                guidMajorType: MFMediaType_Video,
-                guidSubtype: codec.media_foundation_subtype(),
-            };
-            let mut activations_ptr: *mut Option<IMFActivate> = ptr::null_mut();
-            let mut activation_count = 0_u32;
-            MFTEnumEx(
-                MFT_CATEGORY_VIDEO_ENCODER,
-                // Hardware MFTs are their own enumeration category and are
-                // always asynchronous. Including ASYNCMFT here would also
-                // admit software asynchronous encoders.
-                MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0),
-                Some(&input_info),
-                Some(&output_info),
-                &mut activations_ptr,
-                &mut activation_count,
-            )
-            .map_err(Error::Configuration)?;
-            if activation_count == 0 || activations_ptr.is_null() {
-                return Err(Error::HardwareEncoderUnavailable {
-                    codec,
-                    pixel_format,
-                });
-            }
-            let activations =
-                std::slice::from_raw_parts_mut(activations_ptr, activation_count as usize);
-            let activation = activations.iter().find_map(Clone::clone);
-            for item in activations.iter_mut() {
-                let _ = item.take();
-            }
-            CoTaskMemFree(Some(activations_ptr.cast()));
-            let activation = activation.ok_or(Error::HardwareEncoderUnavailable {
-                codec,
-                pixel_format,
-            })?;
-            let transform: IMFTransform =
-                activation.ActivateObject().map_err(Error::Configuration)?;
             let attributes = transform.GetAttributes().map_err(Error::Configuration)?;
             if attributes.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0 {
                 attributes
@@ -295,60 +253,18 @@ impl MediaFoundationVideoEncoder {
             let event_generator: IMFMediaEventGenerator =
                 transform.cast().map_err(Error::Configuration)?;
             let codec_api: ICodecAPI = transform.cast().map_err(Error::Configuration)?;
-
-            let mut reset_token = 0_u32;
-            let mut device_manager = None;
-            MFCreateDXGIDeviceManager(&mut reset_token, &mut device_manager)
-                .map_err(Error::Configuration)?;
-            let device_manager = device_manager.ok_or(Error::HardwareEncoderUnavailable {
-                codec,
-                pixel_format,
-            })?;
-            device_manager
-                .ResetDevice(device, reset_token)
-                .map_err(Error::Configuration)?;
-            transform
-                .ProcessMessage(
-                    MFT_MESSAGE_SET_D3D_MANAGER,
-                    Interface::as_raw(&device_manager) as usize,
-                )
-                .map_err(Error::Configuration)?;
+            let device_manager = attach_device(&transform, device, codec, pixel_format)?;
 
             configure_codec(&codec_api, bitrate_bits_per_second, frames_per_second)?;
-            let output_type = make_video_type(
-                codec.media_foundation_subtype(),
+            set_media_types(
+                &transform,
                 width,
                 height,
                 frames_per_second,
-                Some(bitrate_bits_per_second),
+                bitrate_bits_per_second,
+                codec,
+                pixel_format,
             )?;
-            match (codec, pixel_format) {
-                (VideoCodec::H264, VideoPixelFormat::Yuv420) => output_type
-                    .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)
-                    .map_err(Error::Configuration)?,
-                (VideoCodec::H264, VideoPixelFormat::Yuv444) => output_type
-                    .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_444.0 as u32)
-                    .map_err(Error::Configuration)?,
-                (VideoCodec::H265, VideoPixelFormat::Yuv420) => output_type
-                    .SetUINT32(&MF_MT_VIDEO_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)
-                    .map_err(Error::Configuration)?,
-                (VideoCodec::H265, VideoPixelFormat::Yuv444) => output_type
-                    .SetUINT32(&MF_MT_VIDEO_PROFILE, eAVEncH265VProfile_Main_444_8.0 as u32)
-                    .map_err(Error::Configuration)?,
-            }
-            transform
-                .SetOutputType(0, &output_type, 0)
-                .map_err(Error::Configuration)?;
-            let input_type = make_video_type(
-                pixel_format.media_foundation_subtype(),
-                width,
-                height,
-                frames_per_second,
-                None,
-            )?;
-            transform
-                .SetInputType(0, &input_type, 0)
-                .map_err(Error::Configuration)?;
             let output_info = transform
                 .GetOutputStreamInfo(0)
                 .map_err(Error::Configuration)?;
@@ -503,6 +419,138 @@ impl Drop for MediaFoundationVideoEncoder {
         }
         let _keep_manager_alive = &self.device_manager;
     }
+}
+
+/// Activates the first hardware encoder that accepts `pixel_format` input and
+/// produces `codec` output.
+fn activate_hardware_transform(
+    codec: VideoCodec,
+    pixel_format: VideoPixelFormat,
+) -> Result<IMFTransform, Error> {
+    // Safety: MFT enumeration returns a COM-allocated array which is freed
+    // after every returned activation object has been cloned/dropped.
+    unsafe {
+        let input_info = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: pixel_format.media_foundation_subtype(),
+        };
+        let output_info = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: codec.media_foundation_subtype(),
+        };
+        let mut activations_ptr: *mut Option<IMFActivate> = ptr::null_mut();
+        let mut activation_count = 0_u32;
+        MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            // Hardware MFTs are their own enumeration category and are
+            // always asynchronous. Including ASYNCMFT here would also
+            // admit software asynchronous encoders.
+            MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0),
+            Some(&input_info),
+            Some(&output_info),
+            &mut activations_ptr,
+            &mut activation_count,
+        )
+        .map_err(Error::Configuration)?;
+        if activation_count == 0 || activations_ptr.is_null() {
+            return Err(Error::HardwareEncoderUnavailable {
+                codec,
+                pixel_format,
+            });
+        }
+        let activations =
+            std::slice::from_raw_parts_mut(activations_ptr, activation_count as usize);
+        let activation = activations.iter().find_map(Clone::clone);
+        for item in activations.iter_mut() {
+            let _ = item.take();
+        }
+        CoTaskMemFree(Some(activations_ptr.cast()));
+        let activation = activation.ok_or(Error::HardwareEncoderUnavailable {
+            codec,
+            pixel_format,
+        })?;
+        activation.ActivateObject().map_err(Error::Configuration)
+    }
+}
+
+/// Hands `device` to the transform through a DXGI device manager, which must
+/// outlive the transform's use of it.
+fn attach_device(
+    transform: &IMFTransform,
+    device: &ID3D11Device,
+    codec: VideoCodec,
+    pixel_format: VideoPixelFormat,
+) -> Result<IMFDXGIDeviceManager, Error> {
+    unsafe {
+        let mut reset_token = 0_u32;
+        let mut device_manager = None;
+        MFCreateDXGIDeviceManager(&mut reset_token, &mut device_manager)
+            .map_err(Error::Configuration)?;
+        let device_manager = device_manager.ok_or(Error::HardwareEncoderUnavailable {
+            codec,
+            pixel_format,
+        })?;
+        device_manager
+            .ResetDevice(device, reset_token)
+            .map_err(Error::Configuration)?;
+        transform
+            .ProcessMessage(
+                MFT_MESSAGE_SET_D3D_MANAGER,
+                Interface::as_raw(&device_manager) as usize,
+            )
+            .map_err(Error::Configuration)?;
+        Ok(device_manager)
+    }
+}
+
+fn set_media_types(
+    transform: &IMFTransform,
+    width: u32,
+    height: u32,
+    frames_per_second: u32,
+    bitrate_bits_per_second: u32,
+    codec: VideoCodec,
+    pixel_format: VideoPixelFormat,
+) -> Result<(), Error> {
+    let output_type = make_video_type(
+        codec.media_foundation_subtype(),
+        width,
+        height,
+        frames_per_second,
+        Some(bitrate_bits_per_second),
+    )?;
+    unsafe {
+        match (codec, pixel_format) {
+            (VideoCodec::H264, VideoPixelFormat::Yuv420) => output_type
+                .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)
+                .map_err(Error::Configuration)?,
+            (VideoCodec::H264, VideoPixelFormat::Yuv444) => output_type
+                .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_444.0 as u32)
+                .map_err(Error::Configuration)?,
+            (VideoCodec::H265, VideoPixelFormat::Yuv420) => output_type
+                .SetUINT32(&MF_MT_VIDEO_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)
+                .map_err(Error::Configuration)?,
+            (VideoCodec::H265, VideoPixelFormat::Yuv444) => output_type
+                .SetUINT32(&MF_MT_VIDEO_PROFILE, eAVEncH265VProfile_Main_444_8.0 as u32)
+                .map_err(Error::Configuration)?,
+        }
+        transform
+            .SetOutputType(0, &output_type, 0)
+            .map_err(Error::Configuration)?;
+    }
+    let input_type = make_video_type(
+        pixel_format.media_foundation_subtype(),
+        width,
+        height,
+        frames_per_second,
+        None,
+    )?;
+    unsafe {
+        transform
+            .SetInputType(0, &input_type, 0)
+            .map_err(Error::Configuration)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn make_video_type(
