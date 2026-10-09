@@ -5,6 +5,7 @@ import { formatDateTime, formatRelative } from "../../lib/format";
 import { ModalDialog } from "../../lib/modal-dialog";
 import { useResource } from "../../lib/use-resource";
 import { useSession } from "../auth/session";
+import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import { type CreatedInvitation, type GroupRoleRef, type InvitationView, type ResetLink, type Role, type UserView, groupRoleLabel, matchesUser, sortRoles, sortUsers } from "./model";
 import { OneTimeLink } from "./one-time-link";
@@ -94,18 +95,13 @@ export function UsersPanel() {
           <button onClick={() => setActionError(null)} aria-label="Dismiss"><X size={16} /></button>
         </div>
       )}
+      <HeaderActions>
+        <label className="search-field"><Search size={16} aria-hidden="true" /><input type="search" aria-label="Search users" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search users" /></label>
+        <button type="button" className="primary-button" onClick={(event) => open({ kind: "invite" }, event.currentTarget)} aria-haspopup="dialog"><MailPlus size={16} /> Invite user</button>
+      </HeaderActions>
       <section className="agent-panel">
-        <div className="panel-header">
-          <div><h2>Users</h2><span>{users.length === 1 ? "1 user" : `${users.length} users`}</span></div>
-          <div className="heading-actions">
-            <button type="button" className="primary-button" onClick={(event) => open({ kind: "invite" }, event.currentTarget)} aria-haspopup="dialog"><MailPlus size={16} /> Invite user</button>
-          </div>
-        </div>
-        <div className="table-toolbar">
-          <label className="agent-search"><Search size={18} /><input aria-label="Search users" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search by name, email or role" /></label>
-        </div>
         <table className="data-table" aria-label="Users">
-          <thead><tr><th scope="col">User</th><th scope="col">Roles</th><th scope="col">Two-factor</th><th scope="col">Last sign-in</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
+          <thead><tr><th scope="col">User</th><th scope="col">Roles</th><th scope="col">Two-factor</th><th scope="col">Last active</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
           <tbody>
             {visibleUsers.map((user) => (
               <tr key={user.id} className={user.disabled ? "row-disabled" : undefined}>
@@ -118,14 +114,14 @@ export function UsersPanel() {
                   {user.roles.length || user.group_roles.length ? user.roles.map((role) => role.name).join(", ") : <span className="muted-text">No roles</span>}
                   {user.group_roles.length > 0 && <GroupRoles roles={user.group_roles} />}
                 </td>
-                <td>{user.two_factor_enabled ? <span className="badge badge-good"><ShieldCheck size={13} aria-hidden="true" /> On</span> : <span className="muted-text">Off</span>}</td>
+                <td>{user.two_factor_enabled ? <span className="badge badge-good"><ShieldCheck size={13} aria-hidden="true" /> On</span> : <span className="badge badge-warn">Off</span>}</td>
                 <td>{user.last_sign_in_at === null ? <span className="muted-text">Never</span> : <span title={formatDateTime(user.last_sign_in_at)}>{formatRelative(user.last_sign_in_at)}</span>}</td>
                 <td className="row-actions"><button type="button" className="secondary-button" onClick={(event) => open({ kind: "user", user }, event.currentTarget)} aria-haspopup="dialog" aria-label={`Manage ${user.display_name}`}>Manage</button></td>
               </tr>
             ))}
           </tbody>
         </table>
-        {!visibleUsers.length && <div className="empty-state"><UserRound size={28} /><strong>No matching users</strong><span>Try another name, email or role.</span></div>}
+        {!visibleUsers.length && <div className="empty-state"><UserRound size={22} /><strong>No matching users</strong></div>}
       </section>
 
       {invitations.length > 0 && (
@@ -169,7 +165,7 @@ function InvitationsSection({ invitations, busyId, onRenew, onRevoke }: {
 }) {
   return (
     <section className="agent-panel">
-      <div className="panel-header"><div><h2>Pending invitations</h2><span>{invitations.length === 1 ? "1 invitation" : `${invitations.length} invitations`}</span></div></div>
+      <div className="panel-header"><h2>Pending invitations</h2></div>
       <table className="data-table" aria-label="Pending invitations">
         <thead><tr><th scope="col">Email</th><th scope="col">Roles</th><th scope="col">Expires</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
         <tbody>
@@ -268,9 +264,8 @@ function InviteDialog({ roles, returnFocus, onClose, onInvited }: {
   return (
     <ModalDialog className="settings-modal" labelledBy={titleId} onClose={onClose} returnFocus={returnFocus}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>
-      <div className="modal-icon"><MailPlus size={22} /></div>
       <h2 id={titleId}>Invite a user</h2>
-      <p>They get a link to choose their name and password. It works once, for 7 days.</p>
+      <p>They get a one-time link that works for 7 days.</p>
       <form onSubmit={(event) => void submit(event)}>
         <label htmlFor="invite-email">Email<input id="invite-email" type="email" required value={email} onChange={(event) => setEmail(event.target.value)} /></label>
         <RoleChoices roles={roles} selected={selected} onChange={setSelected} />
@@ -289,7 +284,6 @@ function InvitedDialog({ created, returnFocus, onClose }: { created: CreatedInvi
   return (
     <ModalDialog className="settings-modal" labelledBy={titleId} onClose={onClose} returnFocus={returnFocus}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>
-      <div className="modal-icon"><MailPlus size={22} /></div>
       <h2 id={titleId}>{created.emailed ? "Invitation sent" : "Invitation link"}</h2>
       <OneTimeLink delivery={created} recipient={created.invitation.email} expiresAt={created.invitation.expires_at} />
       <div className="connection-reason-actions"><button type="button" className="primary-button" onClick={onClose}>Done</button></div>
@@ -369,10 +363,8 @@ function UserDialog({ user, roles, returnFocus, onClose, onChanged }: {
   return (
     <ModalDialog className="settings-modal user-modal" labelledBy={titleId} onClose={onClose} returnFocus={returnFocus}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>
-      <div className="modal-icon"><UserRound size={22} /></div>
-      <p className="eyebrow">{user.disabled ? "Disabled user" : self ? "You" : "User"}</p>
-      <h2 id={titleId}>{user.display_name}</h2>
-      <p>{user.email} · joined {formatDateTime(user.created_at)} · {user.has_password ? "has a password" : "no password"}{user.passkeys > 0 && ` · ${user.passkeys === 1 ? "1 passkey" : `${user.passkeys} passkeys`}`}<IdentityBadges user={user} /></p>
+      <h2 id={titleId}>{user.display_name}{self && <span className="badge badge-muted">You</span>}{user.disabled && <span className="badge badge-warn">Disabled</span>}</h2>
+      <p>{user.email}<IdentityBadges user={user} /></p>
       <form onSubmit={save}>
         <fieldset className="script-editor-fields" disabled={busy !== null}>
           <label htmlFor="user-name">Name<input id="user-name" required value={name} onChange={(event) => setName(event.target.value)} /></label>

@@ -54,8 +54,6 @@ export function UploadFilesModal({ folders, initialFolder = "", maxBytes, sharin
   return (
     <ModalDialog className="settings-modal toolbox-modal" labelledBy="upload-files-title" onClose={uploading ? () => {} : onClose} returnFocus={returnFocus}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close" disabled={uploading}><X size={19} /></button>
-      <div className="modal-icon"><Upload size={22} /></div>
-      <p className="eyebrow">Toolbox files</p>
       <h2 id="upload-files-title">Upload files</h2>
       <p>Technicians can send library files to a device from the toolbox in a remote session. Each file can be up to {formatBytes(maxBytes ?? MAX_TOOLBOX_FILE_BYTES)}.</p>
       <form onSubmit={(event) => void submit(event)}>
@@ -132,8 +130,6 @@ export function FileDetailsModal({ file, folders, canShare, canKeepPrivate, onCl
   return (
     <ModalDialog className="settings-modal" labelledBy="file-details-title" onClose={onClose} returnFocus={returnFocus}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>
-      <div className="modal-icon"><FileIcon size={22} /></div>
-      <p className="eyebrow">Toolbox file</p>
       <h2 id="file-details-title">{readOnly ? file.name : "File details"}</h2>
       <p>{formatBytes(file.size_bytes)} · SHA-256 <code className="file-digest">{file.sha256}</code></p>
       <form onSubmit={(event) => void submit(event)}>

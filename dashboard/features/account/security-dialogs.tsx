@@ -1,4 +1,4 @@
-import { Check, Copy, Download, KeyRound, LoaderCircle, X } from "lucide-react";
+import { Check, Copy, Download, LoaderCircle, X } from "lucide-react";
 import { type FormEvent, type ReactNode, useId, useState } from "react";
 import { AuthenticationRequired, errorText } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
@@ -34,7 +34,6 @@ export function PasswordPrompt({ title, description, action, danger = false, onC
   return (
     <ModalDialog className="settings-modal" labelledBy={`${id}-title`} onClose={busy ? () => {} : onClose}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close" disabled={busy}><X size={19} /></button>
-      <div className="modal-icon"><KeyRound size={22} /></div>
       <h2 id={`${id}-title`}>{title}</h2>
       <p>{description}</p>
       <form onSubmit={(event) => void submit(event)}>

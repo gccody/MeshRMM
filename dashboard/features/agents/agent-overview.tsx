@@ -1,20 +1,24 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import {
-  ArrowUpRight,
-  ChevronDown,
-  Filter,
+  Copy,
+  Ellipsis,
+  Expand,
   Layers,
   LoaderCircle,
   Monitor,
-  Square,
+  MonitorOff,
+  Plus,
+  RefreshCw,
   Search,
+  Square,
   SquareTerminal,
   Trash2,
-  Wifi,
   WifiOff,
 } from "lucide-react";
+import { usePopover } from "../../lib/use-popover";
+import { HeaderActions } from "../workspace/header-actions";
 import type { AgentStatusFilter } from "./device-filters";
-import { DeviceThumbnail } from "./device-thumbnail";
+import { ScreenPreview, useDeviceScreen } from "./device-thumbnail";
 import type { InventoryConnection, InventoryStatus } from "./inventory-stream";
 import type { ThumbnailStore } from "./thumbnails";
 import type { Agent } from "./types";
@@ -24,6 +28,7 @@ type InventoryState = {
   connection: InventoryConnection;
   lastUpdated: Date | null;
   error: string | null;
+  isRefreshing: boolean;
 };
 
 type Props = {
@@ -32,6 +37,8 @@ type Props = {
   inventory: InventoryState;
   thumbnails: ThumbnailStore;
   onReconnect: () => void;
+  onRefresh: () => void;
+  onAddDevice: (opener: HTMLElement) => void;
   query: string;
   status: AgentStatusFilter;
   connectingId: string | null;
@@ -58,85 +65,20 @@ export type DeviceActions = {
   enroll: boolean;
 };
 
+type TileState = {
+  stale: boolean;
+  browserOffline: boolean;
+  connecting: boolean;
+  background: boolean;
+  deleting: boolean;
+  closing: boolean;
+  anyClosing: boolean;
+};
+
 const formatTime = (date: Date | null) =>
   date?.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) ?? "";
 
-function ConnectMenu({ agent, disabled, title, connecting, background, allowBackground, onRemote, onRemoteBackground }: {
-  agent: Agent;
-  disabled: boolean;
-  title?: string;
-  connecting: boolean;
-  background: boolean;
-  allowBackground: boolean;
-  onRemote: (agent: Agent) => void;
-  onRemoteBackground: (agent: Agent) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const menuId = useId();
-
-  useEffect(() => {
-    if (!open) return;
-    const closeOnOutsideClick = (event: PointerEvent) => {
-      if (!containerRef.current?.contains(event.target as Node)) setOpen(false);
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      setOpen(false);
-      triggerRef.current?.focus();
-    };
-    document.addEventListener("pointerdown", closeOnOutsideClick);
-    document.addEventListener("keydown", closeOnEscape);
-    return () => {
-      document.removeEventListener("pointerdown", closeOnOutsideClick);
-      document.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [open]);
-
-  const choose = (action: (agent: Agent) => void) => {
-    setOpen(false);
-    // The chosen option disappears with the menu; a dialog the action opens
-    // returns focus here.
-    triggerRef.current?.focus();
-    action(agent);
-  };
-
-  return (
-    <div className={`connect-menu${open ? " open" : ""}`} ref={containerRef}>
-      <button
-        ref={triggerRef}
-        type="button"
-        className="remote-button connect-trigger"
-        disabled={disabled}
-        title={title}
-        aria-label={`Connect to ${agent.name}`}
-        aria-expanded={open}
-        aria-controls={open ? menuId : undefined}
-        onClick={() => setOpen((current) => !current)}
-      >
-        {connecting ? <LoaderCircle size={16} className="spin" /> : <Monitor size={16} />}
-        {connecting ? (background ? "Opening…" : "Connecting…") : "Connect"}
-        {!connecting && <ChevronDown size={14} aria-hidden="true" />}
-      </button>
-      {open && <div id={menuId} className="connect-options" role="group" aria-label={`Connection options for ${agent.name}`}>
-        <button type="button" onClick={() => choose(onRemote)}><Monitor size={16} aria-hidden="true" />Connect</button>
-        {allowBackground && <button type="button" onClick={() => choose(onRemoteBackground)} title="Open the private background workspace without changing the user's desktop"><Layers size={16} aria-hidden="true" />Connect to background</button>}
-      </div>}
-    </div>
-  );
-}
-
-function StatusBadge({ agent, stale }: { agent: Agent; stale: boolean }) {
-  if (agent.connected) return <span className="status-badge online"><i />{stale ? <>Online<span className="status-badge-note"><span className="status-badge-separator"> · </span>last known</span></> : "Online"}</span>;
-  if (agent.updating_to) {
-    const detail = `Installing Agent ${agent.updating_to}. The device reconnects when the update finishes.`;
-    return <span className="status-badge updating" title={detail}><i />Updating<span className="sr-only">. {detail}</span></span>;
-  }
-  return <span className="status-badge offline"><i />Offline</span>;
-}
-
-// Explains why the list may be out of date and offers to reconnect.
+// Explains why the wall may be out of date and offers to reconnect.
 function InventoryStrip({ inventory, onReconnect }: { inventory: InventoryState; onReconnect: () => void }) {
   const { status, connection, lastUpdated, error } = inventory;
   const offline = connection === "offline";
@@ -146,16 +88,22 @@ function InventoryStrip({ inventory, onReconnect }: { inventory: InventoryState;
   if (!stale && !detail) return null;
   const time = formatTime(lastUpdated);
   const headline = !stale ? null
-    : offline ? `You’re offline. Showing devices from ${time}.`
-    : `Live updates are reconnecting. Showing devices as of ${time}.`;
+    : offline ? `You’re offline. Showing devices as of ${time}.`
+    : `Reconnecting. Showing devices as of ${time}.`;
   return (
     <div className="inventory-strip" role="status">
-      <WifiOff size={17} aria-hidden="true" />
-      <span>{headline}{headline && detail ? " " : null}{detail && <span className="inventory-strip-detail">{detail}</span>}</span>
-      {!offline && connection !== "live" && <button type="button" className="secondary-button" onClick={onReconnect}>Reconnect now</button>}
+      <WifiOff size={16} aria-hidden="true" />
+      <span>{headline}{headline && detail ? " " : null}{detail}</span>
+      {!offline && connection !== "live" && <button type="button" className="link-button" onClick={onReconnect}>Reconnect now</button>}
     </div>
   );
 }
+
+const FILTERS: { id: AgentStatusFilter; label: string }[] = [
+  { id: "all", label: "All" },
+  { id: "online", label: "Online" },
+  { id: "offline", label: "Offline" },
+];
 
 export function AgentOverview({
   agents,
@@ -163,6 +111,8 @@ export function AgentOverview({
   inventory,
   thumbnails,
   onReconnect,
+  onRefresh,
+  onAddDevice,
   query,
   status,
   connectingId,
@@ -179,65 +129,168 @@ export function AgentOverview({
   onRunScript,
 }: Props) {
   const online = agents.filter((agent) => agent.connected).length;
-  const offline = agents.length - online;
+  const counts: Record<AgentStatusFilter, number> = { all: agents.length, online, offline: agents.length - online };
   const hasFilters = Boolean(query.trim() || status !== "all");
   const hasData = inventory.status !== "loading";
   const stale = inventory.status === "stale";
-  const isOffline = inventory.connection === "offline";
-  const time = formatTime(inventory.lastUpdated);
-  const [footerTime, footerState] = !hasData ? ["Waiting for updates", isOffline ? "Offline" : "Connecting…"]
-    : !stale ? [`Updated ${time}`, "Updates automatically"]
-    : isOffline ? [`You’re offline · showing devices from ${time}`, "Offline"]
-    : [`Last updated ${time}`, "Reconnecting…"];
-  // The handoff API checks the device itself, so a stale list only warns.
-  const connectTitle = isOffline ? "You’re offline" : stale ? "Status may be out of date" : undefined;
+  const browserOffline = inventory.connection === "offline";
 
   return (
     <>
-      <InventoryStrip inventory={inventory} onReconnect={onReconnect} />
-      <section className="metrics-grid" aria-label="Device summary">
-        {([
-          ["all", "All devices", agents.length, Monitor, "purple"],
-          ["online", "Online", online, Wifi, "green"],
-          ["offline", "Offline", offline, WifiOff, "amber"],
-        ] as const).map(([filter, label, count, Icon, color]) => (
-          <button key={filter} className={`metric-card ${status === filter ? "metric-selected" : ""}`} onClick={() => onStatusChange(filter)} aria-pressed={status === filter}>
-            <div className={`metric-icon ${color}`}><Icon size={21} /></div>
-            <div><span>{label}</span><strong>{hasData ? count : "—"}</strong></div>
-            <ArrowUpRight size={17} className="metric-arrow" aria-hidden="true" />
-          </button>
-        ))}
-      </section>
-
-      <section className="agent-panel">
-        <div className="panel-header"><div><h2>Device inventory</h2><span>{hasData ? `${filteredAgents.length} of ${agents.length} devices` : "Loading…"}</span></div></div>
-        <div className="table-toolbar">
-          <label className="agent-search"><Search size={18} /><input aria-label="Search devices" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="Search by name or device ID" /></label>
-          <div className="status-filter"><Filter size={16} /><select value={status} onChange={(event) => onStatusChange(event.target.value as AgentStatusFilter)} aria-label="Filter by status"><option value="all">All statuses</option><option value="online">Online</option><option value="offline">Offline</option></select><ChevronDown size={14} /></div>
+      <HeaderActions>
+        <div className="segmented" role="group" aria-label="Show devices">
+          {FILTERS.map(({ id, label }) => (
+            <button key={id} type="button" aria-pressed={status === id} onClick={() => onStatusChange(id)}>
+              {id !== "all" && <i className={`led ${id}`} aria-hidden="true" />}{label}<span>{hasData ? counts[id] : "–"}</span>
+            </button>
+          ))}
         </div>
-        <table className="agent-table" aria-label="Managed devices">
-          <thead><tr className="table-head"><th scope="col">Device</th><th scope="col">Status</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
-          <tbody>
-            {filteredAgents.map((agent) => (
-              <tr className={`agent-row${stale ? " stale" : ""}`} key={agent.id}>
-                <td className="device-cell">
-                  <DeviceThumbnail agent={agent} store={thumbnails} />
-                  <div className="device-identity"><strong title={agent.name}>{agent.name}</strong><details className="device-details"><summary>Device ID</summary><code>{agent.id}</code></details></div>
-                </td>
-                <td className="device-status"><StatusBadge agent={agent} stale={stale} /></td>
-                <td className="row-actions">
-                  {allowed.connect && <ConnectMenu agent={agent} disabled={!agent.connected || isOffline || connectingId === agent.id || deletingId === agent.id || closingId === agent.id} title={agent.connected ? connectTitle : undefined} connecting={connectingId === agent.id} background={connectingBackgroundId === agent.id} allowBackground={allowed.connectBackground} onRemote={onRemote} onRemoteBackground={onRemoteBackground} />}
-                  {allowed.runScripts && <button className="close-session-button" disabled={!agent.connected || isOffline || deletingId === agent.id} onClick={(event) => onRunScript(agent, event.currentTarget)} aria-label={`Run a script on ${agent.name}`} aria-haspopup="dialog" title="Run a script"><SquareTerminal size={16} /><span className="sr-only">Run a script</span></button>}
-                  {allowed.closeSession && <button className="close-session-button" disabled={closingId !== null || connectingId === agent.id || deletingId === agent.id} onClick={() => onCloseSession(agent)} aria-label={`Close active session for ${agent.name}`} title="Close active session">{closingId === agent.id ? <LoaderCircle size={16} className="spin" /> : <Square size={16} />}<span className="sr-only">Close session</span></button>}
-                  {allowed.delete && <button className="agent-delete-button" disabled={deletingId === agent.id || closingId === agent.id} onClick={() => onDelete(agent)} aria-label={`Delete ${agent.name}`} title="Delete device">{deletingId === agent.id ? <LoaderCircle size={16} className="spin" /> : <Trash2 size={16} />}</button>}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {!filteredAgents.length && <div className="empty-state"><Monitor size={28} /><strong>{!hasData ? "Connecting to your devices…" : hasFilters ? "No matching devices" : "Your devices will appear here"}</strong><span>{!hasData ? "If this takes longer than expected, try Refresh." : hasFilters ? "Try another name or change the status filter." : allowed.enroll ? "Choose Add device to set up your first computer." : "Ask your administrator to add a device."}</span>{hasFilters && <button className="secondary-button" onClick={() => { onQueryChange(""); onStatusChange("all"); }}>Clear filters</button>}</div>}
-        <div className="panel-footer"><span>{footerTime}</span><span className={hasData && !stale ? "" : "disconnected"}><i />{footerState}</span></div>
-      </section>
+        <label className="search-field"><Search size={16} aria-hidden="true" /><input type="search" aria-label="Search devices" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="Search devices" /></label>
+        <button type="button" className="icon-button" onClick={onRefresh} aria-label="Refresh devices" title="Refresh"><RefreshCw size={16} className={inventory.isRefreshing ? "spin" : ""} /></button>
+        {allowed.enroll && <button type="button" className="primary-button" onClick={(event) => onAddDevice(event.currentTarget)} aria-haspopup="dialog"><Plus size={16} /> Add device</button>}
+      </HeaderActions>
+
+      <InventoryStrip inventory={inventory} onReconnect={onReconnect} />
+
+      {filteredAgents.length > 0 ? (
+        <ul className={`device-wall${stale ? " stale" : ""}`} aria-label="Devices">
+          {filteredAgents.map((agent) => (
+            <DeviceTile
+              key={agent.id}
+              agent={agent}
+              store={thumbnails}
+              allowed={allowed}
+              state={{
+                stale,
+                browserOffline,
+                connecting: connectingId === agent.id,
+                background: connectingBackgroundId === agent.id,
+                deleting: deletingId === agent.id,
+                closing: closingId === agent.id,
+                anyClosing: closingId !== null,
+              }}
+              onRemote={onRemote}
+              onRemoteBackground={onRemoteBackground}
+              onCloseSession={onCloseSession}
+              onDelete={onDelete}
+              onRunScript={onRunScript}
+            />
+          ))}
+        </ul>
+      ) : (
+        <div className="empty-state">
+          {!hasData ? <LoaderCircle size={22} className="spin" aria-hidden="true" /> : <Monitor size={22} aria-hidden="true" />}
+          <strong>{!hasData ? "Connecting to your devices…" : hasFilters ? "No matching devices" : "No devices yet"}</strong>
+          {hasData && !hasFilters && <span>{allowed.enroll ? "Add a computer to manage it from here." : "Ask an administrator to add one."}</span>}
+          {hasFilters && <button className="secondary-button" onClick={() => { onQueryChange(""); onStatusChange("all"); }}>Clear filters</button>}
+        </div>
+      )}
     </>
+  );
+}
+
+function DeviceTile({ agent, store, allowed, state, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript }: {
+  agent: Agent;
+  store: ThumbnailStore;
+  allowed: DeviceActions;
+  state: TileState;
+  onRemote: (agent: Agent) => void;
+  onRemoteBackground: (agent: Agent) => void;
+  onCloseSession: (agent: Agent) => void;
+  onDelete: (agent: Agent) => void;
+  onRunScript: (agent: Agent, opener: HTMLElement) => void;
+}) {
+  const [element, setElement] = useState<HTMLLIElement | null>(null);
+  const thumbnail = useDeviceScreen(store, agent, element);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const previewOpener = useRef<HTMLElement | null>(null);
+  const busy = state.connecting || state.deleting || state.closing;
+  const canConnect = allowed.connect && agent.connected && !state.browserOffline && !busy;
+  const tone = agent.connected ? "online" : agent.updating_to ? "updating" : "offline";
+  // The handoff API checks the device itself, so a stale wall only warns.
+  const connectTitle = state.browserOffline ? "You’re offline" : state.stale ? "Status may be out of date" : undefined;
+
+  const openPreview = (opener: HTMLElement) => {
+    previewOpener.current = opener;
+    setPreviewOpen(true);
+  };
+
+  const screen = (
+    <>
+      {thumbnail ? <img src={thumbnail.url} alt="" /> : <span className="screen-blank">{agent.connected ? <Monitor size={26} aria-hidden="true" /> : <MonitorOff size={26} aria-hidden="true" />}</span>}
+      <span className="screen-label" aria-hidden="true">
+        {state.connecting ? <><LoaderCircle size={15} className="spin" />{state.background ? "Opening…" : "Connecting…"}</>
+          : state.deleting ? <><LoaderCircle size={15} className="spin" />Deleting…</>
+          : agent.connected ? <><Monitor size={15} />Connect</>
+          : agent.updating_to ? `Updating to ${agent.updating_to}`
+          : "Offline"}
+      </span>
+    </>
+  );
+
+  return (
+    <li ref={setElement} className={`device-tile ${tone}${busy ? " busy" : ""}`}>
+      {canConnect
+        ? <button type="button" className="device-screen" onClick={() => onRemote(agent)} title={connectTitle} aria-label={`Connect to ${agent.name}`}>{screen}</button>
+        : thumbnail && !busy
+          ? <button type="button" className="device-screen" onClick={(event) => openPreview(event.currentTarget)} aria-label={`Show the screen of ${agent.name}`} aria-haspopup="dialog">{screen}</button>
+          : <div className="device-screen">{screen}</div>}
+      <div className="device-meta">
+        <i className={`led ${tone}`} aria-hidden="true" />
+        <strong title={agent.name}>{agent.name}</strong>
+        <span className="sr-only">{tone === "online" ? "Online" : tone === "updating" ? `Updating to ${agent.updating_to}` : "Offline"}</span>
+        <DeviceMenu
+          agent={agent}
+          allowed={allowed}
+          state={state}
+          hasScreen={Boolean(thumbnail)}
+          onShowScreen={openPreview}
+          onRemoteBackground={onRemoteBackground}
+          onCloseSession={onCloseSession}
+          onDelete={onDelete}
+          onRunScript={onRunScript}
+        />
+      </div>
+      {previewOpen && thumbnail && <ScreenPreview agent={agent} thumbnail={thumbnail} returnFocus={previewOpener} onClose={() => setPreviewOpen(false)} />}
+    </li>
+  );
+}
+
+function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onRemoteBackground, onCloseSession, onDelete, onRunScript }: {
+  agent: Agent;
+  allowed: DeviceActions;
+  state: TileState;
+  hasScreen: boolean;
+  onShowScreen: (opener: HTMLElement) => void;
+  onRemoteBackground: (agent: Agent) => void;
+  onCloseSession: (agent: Agent) => void;
+  onDelete: (agent: Agent) => void;
+  onRunScript: (agent: Agent, opener: HTMLElement) => void;
+}) {
+  const { open, setOpen, close, container, trigger } = usePopover();
+  const menuId = `device-menu-${agent.id}`;
+  const reachable = agent.connected && !state.browserOffline;
+  // A chosen item's dialog gives focus back to the menu's trigger.
+  const choose = (action: (opener: HTMLElement) => void) => {
+    close();
+    if (trigger.current) action(trigger.current);
+  };
+
+  return (
+    <div className="popover-anchor device-menu" ref={container}>
+      <button ref={trigger} type="button" className="icon-button ghost" onClick={() => setOpen(!open)} aria-expanded={open} aria-controls={open ? menuId : undefined} aria-label={`More actions for ${agent.name}`}>
+        <Ellipsis size={18} />
+      </button>
+      {open && (
+        <div id={menuId} className="popover menu" role="group" aria-label={`Actions for ${agent.name}`}>
+          {allowed.connectBackground && <button type="button" disabled={!reachable || state.connecting} onClick={() => choose(() => onRemoteBackground(agent))}><Layers size={16} aria-hidden="true" />Connect in background</button>}
+          {allowed.runScripts && <button type="button" disabled={!reachable || state.deleting} onClick={() => choose((opener) => onRunScript(agent, opener))} aria-haspopup="dialog"><SquareTerminal size={16} aria-hidden="true" />Run a script…</button>}
+          {hasScreen && <button type="button" onClick={() => choose(onShowScreen)} aria-haspopup="dialog"><Expand size={16} aria-hidden="true" />View screen</button>}
+          {allowed.closeSession && <button type="button" disabled={state.anyClosing || state.connecting || state.deleting} onClick={() => choose(() => onCloseSession(agent))}><Square size={16} aria-hidden="true" />Close active session</button>}
+          <button type="button" onClick={() => { void navigator.clipboard?.writeText(agent.id); close(); }}><Copy size={16} aria-hidden="true" />Copy device ID</button>
+          {allowed.delete && <button type="button" className="danger" disabled={state.deleting || state.closing} onClick={() => choose(() => onDelete(agent))}><Trash2 size={16} aria-hidden="true" />Delete device</button>}
+        </div>
+      )}
+    </div>
   );
 }

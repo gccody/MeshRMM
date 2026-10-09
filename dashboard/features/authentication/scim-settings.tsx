@@ -76,7 +76,7 @@ export function ScimSettingsSection() {
     <section className="management-panel">
       <div className="management-heading">
         <h2><Users size={15} aria-hidden="true" /> Directory sync (SCIM)</h2>
-        <p>Your identity provider keeps MeshRMM&apos;s accounts in step with its directory: it creates them, changes them and turns them off.</p>
+        <p>Let your identity provider create, update and disable accounts.</p>
       </div>
       {!settings ? (
         error
@@ -87,10 +87,8 @@ export function ScimSettingsSection() {
           <div className="form-stack form-narrow">
             <CopyField label="SCIM base URL" value={settings.base_url} />
             <ul className="field-help scim-notes">
-              <li>In your identity provider&apos;s SCIM app, enter this URL and a token from below.</li>
-              <li>Each user&apos;s userName must be their email address.</li>
-              <li>Deactivating a user at the provider disables their account here and ends their sessions and remote sessions.</li>
-              <li>Groups the provider pushes appear below; choose the role each one grants its members.</li>
+              <li>Enter this URL and a token in your provider&apos;s SCIM app.</li>
+              <li>userName must be the user&apos;s email address.</li>
             </ul>
           </div>
 
@@ -108,7 +106,7 @@ export function ScimSettingsSection() {
                   </li>
                 ))}
               </ul>
-            ) : <p className="field-help">No tokens yet, so no identity provider can sync.</p>}
+            ) : <p className="field-help">No tokens yet.</p>}
             {created && (
               <div className="one-time-link">
                 <p className="form-notice" role="status">Copy the token “{created.name}” into your identity provider now. It won&apos;t be shown again.</p>
@@ -144,7 +142,7 @@ export function ScimSettingsSection() {
                   ))}
                 </tbody>
               </table>
-            ) : <p className="field-help">No groups yet. They appear when your identity provider pushes them.</p>}
+            ) : <p className="field-help">Groups appear here when your provider pushes them.</p>}
           </div>
           {error && <p role="alert" className="form-error">{error}</p>}
         </div>

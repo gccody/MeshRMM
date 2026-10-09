@@ -1,5 +1,5 @@
 
-import { FileCode, LoaderCircle, X } from "lucide-react";
+import { LoaderCircle, X } from "lucide-react";
 import { type FormEvent, type RefObject, useEffect, useId, useState } from "react";
 import { AuthenticationRequired } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
@@ -87,8 +87,6 @@ export function ScriptEditor({ script, folders, initialFolder = "", sharing, onC
   return (
     <ModalDialog className="settings-modal toolbox-modal" labelledBy="script-editor-title" onClose={onClose} returnFocus={returnFocus}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>
-      <div className="modal-icon"><FileCode size={22} /></div>
-      <p className="eyebrow">Toolbox script</p>
       <h2 id="script-editor-title">{title}</h2>
       <p>{readOnly
         ? "You can run this script, but only its owner can change it, or someone who manages shared scripts while it is shared."

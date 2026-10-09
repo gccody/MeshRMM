@@ -460,7 +460,7 @@ Then, in the website:
 - **Devices → Add device** downloads a Windows installer or shows the macOS
   install command. Both enroll the device with this server.
 
-Technicians download the viewer from the links in the website's sidebar.
+Technicians download the viewer from the website's Remote app menu, in the top bar.
 Agents and viewers update themselves from the server.
 
 ### Locked out

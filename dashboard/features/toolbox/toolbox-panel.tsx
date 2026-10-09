@@ -23,6 +23,7 @@ import {
 import { type KeyboardEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AuthenticationRequired, type AuthorizedFetch, errorText } from "../../lib/http";
 import type { Agent } from "../agents/types";
+import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import {
   LANGUAGE_LABELS,
@@ -135,24 +136,18 @@ export function ToolboxPanel() {
         </div>
       )}
       <section className="agent-panel toolbox-panel">
+        <HeaderActions>
+          {tab === "scripts" && <>
+            {access.runScripts && <button className="secondary-button" onClick={(event) => open({ kind: "run" }, event)} disabled={!scripts.length}><SquareTerminal size={16} /> Run a script</button>}
+            {access.addScripts && <button className="primary-button" onClick={(event) => open({ kind: "script", script: null }, event)}><Plus size={16} /> New script</button>}
+          </>}
+          {tab === "files" && access.addFiles && <button className="primary-button" onClick={(event) => open({ kind: "upload" }, event)}><Upload size={16} /> Upload files</button>}
+          {tab === "runs" && <button className="icon-button" onClick={() => setRunsVersion((version) => version + 1)} aria-label="Refresh" title="Refresh"><RefreshCw size={16} /></button>}
+        </HeaderActions>
         <div className="panel-header">
           <ToolboxTabs tabs={tabs} selected={tab} onSelect={selectTab} counts={toolbox && { scripts: scripts.length, files: files.length }} />
-          <div className="heading-actions">
-            {tab === "scripts" && <>
-              {access.runScripts && <button className="secondary-button" onClick={(event) => open({ kind: "run" }, event)} disabled={!scripts.length}><SquareTerminal size={16} /> Run a script</button>}
-              {access.addScripts && <button className="primary-button" onClick={(event) => open({ kind: "script", script: null }, event)}><Plus size={16} /> New script</button>}
-            </>}
-            {tab === "files" && access.addFiles && <button className="primary-button" onClick={(event) => open({ kind: "upload" }, event)}><Upload size={16} /> Upload files</button>}
-            {tab === "runs" && <button className="secondary-button" onClick={() => setRunsVersion((version) => version + 1)}><RefreshCw size={16} /> Refresh</button>}
-          </div>
+          {tab !== "runs" && <label className="search-field"><Search size={16} aria-hidden="true" /><input type="search" aria-label={`Search ${tab}`} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${tab}`} /></label>}
         </div>
-
-        {tab !== "runs" && (
-          <div className="table-toolbar">
-            <label className="agent-search"><Search size={18} /><input aria-label={`Search ${tab}`} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search by name, folder or description" /></label>
-            <span className="toolbox-hint"><Lock size={14} aria-hidden="true" /> Private items are only yours. Shared items are everyone&apos;s.</span>
-          </div>
-        )}
 
         <div id="toolbox-scripts" role="tabpanel" aria-labelledby="toolbox-tab-scripts" hidden={tab !== "scripts"}>
           <ToolboxList
@@ -318,7 +313,7 @@ function FileRow({ file, busy, open, onDownload, onDelete }: { file: ToolboxFile
 
 function SharingBadge({ item }: { item: { shared: boolean; owned: boolean } }) {
   return item.shared
-    ? <span className="toolbox-badge toolbox-badge-shared" title="Everyone with access to the toolbox can see and use it"><Users size={13} aria-hidden="true" />{item.owned ? "Shared" : "Shared by a teammate"}</span>
+    ? <span className="toolbox-badge toolbox-badge-shared" title="Everyone with access to the toolbox can see and use it"><Users size={13} aria-hidden="true" />Shared</span>
     : <span className="toolbox-badge" title="Only you can see and use it"><Lock size={13} aria-hidden="true" />Private</span>;
 }
 
@@ -378,7 +373,7 @@ function RunHistory({ version, agents, onOpen }: { version: number; agents: Agen
       <tbody>
         {runs.map((run) => (
           <tr key={run.id}>
-            <td><strong>{run.script_name}</strong><span>{run.source === "session" ? "From a remote session" : "From the website"}{run.requested_by_you ? "" : " · by a teammate"}</span></td>
+            <td><strong>{run.script_name}</strong>{!run.requested_by_you && <span>By a teammate</span>}</td>
             <td>{names.get(run.device_id) ?? run.device_id}</td>
             <td>{ranAsLabel(run)}</td>
             <td><span className={`run-pill run-pill-${runTone(run)}`}>{runOutcome(run)}</span></td>

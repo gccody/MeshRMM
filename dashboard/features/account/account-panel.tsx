@@ -1,7 +1,7 @@
-import { CircleAlert, CircleCheck, KeyRound, LoaderCircle, LogOut, MonitorSmartphone, RefreshCw, ShieldCheck, ShieldOff, Smartphone, UserRound } from "lucide-react";
+import { CircleAlert, CircleCheck, KeyRound, LoaderCircle, LogOut, RefreshCw, ShieldCheck, ShieldOff, Smartphone } from "lucide-react";
 import { type FormEvent, useCallback, useState } from "react";
 import { AuthenticationRequired, errorText, expectJson, expectOk, jsonBody } from "../../lib/http";
-import { describeUserAgent, formatDateTime, formatRelative } from "../../lib/format";
+import { describeUserAgent, formatRelative } from "../../lib/format";
 import { QrCode } from "../../lib/qr-code";
 import { useResource } from "../../lib/use-resource";
 import { NewPasswordFields, newPasswordProblem } from "../auth/password-fields";
@@ -59,16 +59,14 @@ function ProfileSection() {
 
   return (
     <section className="management-panel">
-      <div className="management-heading"><h2><UserRound size={15} aria-hidden="true" /> Profile</h2><p>Your name appears to device users in session banners and prompts.</p></div>
+      <div className="management-heading"><h2>Profile</h2><p>Device users see your name in session banners.</p></div>
       <form className="form-stack form-narrow" onSubmit={(event) => void submit(event)}>
         <label htmlFor="profile-name">Name
           <input id="profile-name" autoComplete="name" required value={name} onChange={(event) => setName(event.target.value)} />
         </label>
         <label htmlFor="profile-email">Email
-          <input id="profile-email" value={account.user.email} readOnly aria-describedby="profile-email-help" />
+          <input id="profile-email" value={account.user.email} readOnly />
         </label>
-        <small id="profile-email-help" className="field-help">Only an administrator can change your email.</small>
-        <p className="field-help">Roles: {account.roles.length ? account.roles.map((role) => role.name).join(", ") : "none"}</p>
         {error && <p role="alert" className="form-error">{error}</p>}
         {notice && <p role="status" className="form-notice">{notice}</p>}
         <div><button className="primary-button" disabled={busy || name.trim() === account.user.display_name}>{busy && <LoaderCircle size={16} className="spin" />} Save name</button></div>
@@ -93,7 +91,7 @@ function PasswordSection() {
   if (!account.user.has_password) {
     return (
       <section className="management-panel">
-        <div className="management-heading"><h2><KeyRound size={15} aria-hidden="true" /> Password</h2></div>
+        <div className="management-heading"><h2>Password</h2></div>
         <p className="field-help">Your account has no password. To set one, ask an administrator for a password reset link.</p>
       </section>
     );
@@ -125,7 +123,7 @@ function PasswordSection() {
 
   return (
     <section className="management-panel">
-      <div className="management-heading"><h2><KeyRound size={15} aria-hidden="true" /> Password</h2><p>Changing it signs you out everywhere else.</p></div>
+      <div className="management-heading"><h2>Password</h2><p>Changing it signs you out everywhere else.</p></div>
       <form className="form-stack form-narrow" onSubmit={(event) => void submit(event)}>
         <input type="email" autoComplete="username" value={account.user.email} readOnly hidden />
         <label htmlFor="current-password">Current password
@@ -246,7 +244,7 @@ function TwoFactorSection() {
     } else if (twoFactor.totp) {
       totp = (
         <>
-          <p className="two-factor-status on"><CircleCheck size={16} aria-hidden="true" /> Set up.</p>
+          <p className="two-factor-status on"><CircleCheck size={16} aria-hidden="true" /> On</p>
           {totpRequired
             ? <p className="field-help">This server requires two-factor authentication. Add a passkey before removing your authenticator app.</p>
             : <div><button type="button" className="danger-button" onClick={() => setDialog("disable")}><ShieldOff size={15} /> Remove authenticator app</button></div>}
@@ -267,14 +265,13 @@ function TwoFactorSection() {
         <div className="two-factor-methods">
           <div className="two-factor-method">
             <h3><Smartphone size={15} aria-hidden="true" /> Authenticator app</h3>
-            <p className="field-help">A 6-digit code from an app on your phone.</p>
-            {totp}
+                        {totp}
           </div>
           <PasskeysSection onRecoveryCodes={showCodes} onNotice={setNotice} />
           {twoFactor.enabled && (
             <div className="two-factor-method">
               <h3><KeyRound size={15} aria-hidden="true" /> Recovery codes</h3>
-              <p className="field-help">Each signs you in once if you lose your phone and passkeys. {twoFactor.recovery_codes_remaining === 1 ? "1 code left." : `${twoFactor.recovery_codes_remaining} codes left.`}</p>
+              <p className="field-help">For when you lose your phone and passkeys. {twoFactor.recovery_codes_remaining === 1 ? "1 code left." : `${twoFactor.recovery_codes_remaining} codes left.`}</p>
               {twoFactor.recovery_codes_remaining <= 3 && <p className="field-help field-problem">You&apos;re running out of recovery codes. Get new ones so you can still sign in without your phone or passkeys.</p>}
               <div><button type="button" className="secondary-button" onClick={() => setDialog("regenerate")}><RefreshCw size={15} /> New recovery codes</button></div>
             </div>
@@ -286,7 +283,7 @@ function TwoFactorSection() {
 
   return (
     <section className="management-panel">
-      <div className="management-heading"><h2><ShieldCheck size={15} aria-hidden="true" /> Two-factor authentication</h2><p>A code from your phone or a passkey at sign-in, so a stolen password isn&apos;t enough.</p></div>
+      <div className="management-heading"><h2>Two-factor authentication</h2><p>So a stolen password isn&apos;t enough.</p></div>
       {notice && <p role="status" className="form-notice two-factor-notice">{notice}</p>}
       {body}
       {dialog === "start" && <PasswordPrompt title="Set up an authenticator app" description="Confirm it's you to add an authenticator app." action="Continue" onConfirm={startSetup} onClose={() => setDialog(null)} />}
@@ -349,7 +346,7 @@ function SessionsSection() {
 
   return (
     <section className="management-panel">
-      <div className="management-heading"><h2><MonitorSmartphone size={15} aria-hidden="true" /> Where you&apos;re signed in</h2><p>Sign out any browser you don&apos;t recognize, then change your password.</p></div>
+      <div className="management-heading"><h2>Where you&apos;re signed in</h2><p>Sign out anything you don&apos;t recognize.</p></div>
       {error && <p role="alert" className="form-error">{error}</p>}
       {!sessions ? <p role="status" className="field-help"><LoaderCircle size={14} className="spin" /> Loading…</p> : (
         <ul className="session-list">
@@ -357,7 +354,7 @@ function SessionsSection() {
             <li key={session.id}>
               <div>
                 <strong>{describeUserAgent(session.user_agent)}{session.current && <span className="badge">This browser</span>}<span className="badge badge-muted" title="How this session signed in">{signInMethodLabel(session.auth_method)}</span></strong>
-                <span>{session.ip ?? "Unknown address"} · active {formatRelative(session.last_seen_at)} · signed in {formatDateTime(session.created_at)}</span>
+                <span>{session.ip ?? "Unknown address"}, active {formatRelative(session.last_seen_at)}</span>
               </div>
               <button type="button" className="secondary-button" onClick={() => void end(session)} disabled={busyId === session.id}>
                 {busyId === session.id ? <LoaderCircle size={15} className="spin" /> : <LogOut size={15} />} Sign out
