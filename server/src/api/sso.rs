@@ -577,6 +577,76 @@ fn normalize_scopes(raw: Option<&str>) -> Result<String, ApiError> {
     Ok(scopes.join(" "))
 }
 
+/// A validated [`SsoUpdate`], trimmed and normalized.
+struct ProviderSettings<'a> {
+    display_name: &'a str,
+    issuer_url: &'a str,
+    client_id: &'a str,
+    scopes: String,
+    groups_claim: Option<&'a str>,
+    group_roles: BTreeSet<GroupRole>,
+}
+
+impl<'a> ProviderSettings<'a> {
+    fn validate(request: &'a SsoUpdate) -> Result<Self, ApiError> {
+        let display_name = request.display_name.trim();
+        check(
+            !display_name.is_empty()
+                && display_name.chars().count() <= MAX_DISPLAY_NAME
+                && !display_name.chars().any(char::is_control),
+            "the provider name must be 1 to 80 characters",
+        )?;
+        let issuer_url = request.issuer_url.trim();
+        oidc::parse_issuer(issuer_url).map_err(ApiError::bad_request)?;
+        let client_id = request.client_id.trim();
+        check(
+            !client_id.is_empty() && client_id.len() <= 512 && printable(client_id),
+            "enter the client ID the provider gave you",
+        )?;
+        let scopes = normalize_scopes(request.scopes.as_deref())?;
+        let groups_claim = request
+            .groups_claim
+            .as_deref()
+            .map(str::trim)
+            .filter(|claim| !claim.is_empty());
+        check(
+            groups_claim.is_none_or(|claim| claim.len() <= 256 && printable(claim)),
+            "the groups claim must be a claim name",
+        )?;
+        let mut group_roles = request
+            .group_roles
+            .iter()
+            .map(|mapping| GroupRole {
+                group: mapping.group.trim().to_owned(),
+                role_id: mapping.role_id.clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        check(
+            group_roles.iter().all(|mapping| {
+                !mapping.group.is_empty()
+                    && mapping.group.chars().count() <= MAX_GROUP_NAME_LENGTH
+                    && !mapping.group.chars().any(char::is_control)
+            }),
+            "group names must be 1 to 256 characters",
+        )?;
+        check(
+            group_roles.len() <= MAX_GROUP_MAPPINGS,
+            "map at most 200 groups",
+        )?;
+        if groups_claim.is_none() {
+            group_roles.clear();
+        }
+        Ok(Self {
+            display_name,
+            issuer_url,
+            client_id,
+            scopes,
+            groups_claim,
+            group_roles,
+        })
+    }
+}
+
 /// `PUT /v1/settings/sso`: sets up the provider. When it is turned on, its
 /// discovery document must load.
 pub async fn put_settings(
@@ -585,77 +655,82 @@ pub async fn put_settings(
     JsonBody(request): JsonBody<SsoUpdate>,
 ) -> Result<Json<SsoSettings>, ApiError> {
     require_administrator(&actor)?;
-    let display_name = request.display_name.trim();
-    check(
-        !display_name.is_empty()
-            && display_name.chars().count() <= MAX_DISPLAY_NAME
-            && !display_name.chars().any(char::is_control),
-        "the provider name must be 1 to 80 characters",
-    )?;
-    let issuer_url = request.issuer_url.trim();
-    oidc::parse_issuer(issuer_url).map_err(ApiError::bad_request)?;
-    let client_id = request.client_id.trim();
-    check(
-        !client_id.is_empty() && client_id.len() <= 512 && printable(client_id),
-        "enter the client ID the provider gave you",
-    )?;
-    let scopes = normalize_scopes(request.scopes.as_deref())?;
-    let groups_claim = request
-        .groups_claim
-        .as_deref()
-        .map(str::trim)
-        .filter(|claim| !claim.is_empty());
-    check(
-        groups_claim.is_none_or(|claim| claim.len() <= 256 && printable(claim)),
-        "the groups claim must be a claim name",
-    )?;
-    let mut group_roles = request
-        .group_roles
-        .iter()
-        .map(|mapping| GroupRole {
-            group: mapping.group.trim().to_owned(),
-            role_id: mapping.role_id.clone(),
-        })
-        .collect::<BTreeSet<_>>();
-    check(
-        group_roles.iter().all(|mapping| {
-            !mapping.group.is_empty()
-                && mapping.group.chars().count() <= MAX_GROUP_NAME_LENGTH
-                && !mapping.group.chars().any(char::is_control)
-        }),
-        "group names must be 1 to 256 characters",
-    )?;
-    check(
-        group_roles.len() <= MAX_GROUP_MAPPINGS,
-        "map at most 200 groups",
-    )?;
-    if groups_claim.is_none() {
-        group_roles.clear();
-    }
+    let settings = ProviderSettings::validate(&request)?;
     if request.enabled {
-        oidc::discover(issuer_url).await.map_err(|error| {
+        oidc::discover(settings.issuer_url).await.map_err(|error| {
             ApiError::bad_request(format!("{error:#}")).with_code("discovery_failed")
         })?;
     }
     let mut transaction = state.database.begin().await?;
+    check_roles_exist(&mut transaction, &settings.group_roles, &request).await?;
+    let previous = oidc::load(&mut transaction).await?;
+    let secret = client_secret(&state, &request, previous.as_ref())?;
+    let issuer_changed = previous
+        .as_ref()
+        .is_some_and(|provider| provider.issuer_url != settings.issuer_url);
+    if issuer_changed {
+        // Subjects are only unique per provider.
+        unlink_everyone(&mut transaction).await?;
+    }
+    store_provider(&mut transaction, &request, &settings, secret).await?;
+    store_group_roles(&mut transaction, &settings).await?;
+    // Unlinking or remapping can take away the role someone held as an
+    // administrator through an SSO group.
+    super::ensure_administrator_remains(&mut transaction).await?;
+    audit::record(
+        &mut transaction,
+        &actor.actor(),
+        "settings.sso_update",
+        Target::settings(),
+        json!({
+            "enabled": request.enabled,
+            "display_name": settings.display_name,
+            "issuer_url": settings.issuer_url,
+            "client_id": settings.client_id,
+            "client_secret_changed": request.client_secret.is_some(),
+            "scopes": settings.scopes,
+            "auto_provision": request.auto_provision,
+            "default_role_id": request.default_role_id,
+            "require_verified_email": request.require_verified_email,
+            "groups_claim": settings.groups_claim,
+            "group_roles": settings.group_roles,
+            "accounts_unlinked": issuer_changed,
+        }),
+    )
+    .await?;
+    let settings = view(&state, &mut transaction).await?;
+    transaction.commit().await?;
+    state.presence.recheck_access();
+    Ok(Json(settings))
+}
+
+/// Checks that the mapped and default roles all exist.
+async fn check_roles_exist(
+    executor: &mut impl Executor,
+    group_roles: &BTreeSet<GroupRole>,
+    request: &SsoUpdate,
+) -> Result<(), ApiError> {
     let mut role_ids = group_roles
         .iter()
         .map(|mapping| mapping.role_id.clone())
         .collect::<BTreeSet<_>>();
     role_ids.extend(request.default_role_id.iter().cloned());
     let role_ids = role_ids.into_iter().collect::<Vec<_>>();
-    if rbac::load_roles(&mut transaction, Some(&role_ids))
-        .await?
-        .len()
-        != role_ids.len()
-    {
+    if rbac::load_roles(executor, Some(&role_ids)).await?.len() != role_ids.len() {
         return Err(ApiError::bad_request("one of the roles doesn't exist"));
     }
-    let previous = oidc::load(&mut transaction).await?;
-    let secret = match &request.client_secret {
-        None => previous
-            .as_ref()
-            .and_then(|provider| provider.client_secret_encrypted.clone()),
+    Ok(())
+}
+
+/// The sealed client secret to store: the previous one unless the request
+/// replaces or removes it.
+fn client_secret(
+    state: &AppState,
+    request: &SsoUpdate,
+    previous: Option<&Provider>,
+) -> Result<Option<Vec<u8>>, ApiError> {
+    Ok(match &request.client_secret {
+        None => previous.and_then(|provider| provider.client_secret_encrypted.clone()),
         Some(None) => None,
         Some(Some(secret)) if secret.is_empty() => None,
         Some(Some(secret)) => {
@@ -666,18 +741,19 @@ pub async fn put_settings(
                     .encrypt(oidc::SECRET_CONTEXT, secret.as_bytes()),
             )
         }
-    };
-    let issuer_changed = previous
-        .as_ref()
-        .is_some_and(|provider| provider.issuer_url != issuer_url);
-    if issuer_changed {
-        // Subjects are only unique per provider.
-        unlink_everyone(&mut transaction).await?;
-    }
-    transaction
+    })
+}
+
+async fn store_provider(
+    executor: &mut impl Executor,
+    request: &SsoUpdate,
+    settings: &ProviderSettings<'_>,
+    secret: Option<Vec<u8>>,
+) -> crate::db::Result<()> {
+    executor
         .execute(&Sql::delete().from_table(OidcProvider::Table).to_owned())
         .await?;
-    transaction
+    executor
         .execute(
             &Sql::insert()
                 .into_table(OidcProvider::Table)
@@ -698,69 +774,51 @@ pub async fn put_settings(
                 .values_panic([
                     1.into(),
                     request.enabled.into(),
-                    display_name.into(),
-                    issuer_url.into(),
-                    client_id.into(),
-                    secret.clone().into(),
-                    scopes.as_str().into(),
+                    settings.display_name.into(),
+                    settings.issuer_url.into(),
+                    settings.client_id.into(),
+                    secret.into(),
+                    settings.scopes.as_str().into(),
                     request.auto_provision.into(),
                     request.default_role_id.clone().into(),
                     request.require_verified_email.into(),
-                    groups_claim.map(str::to_owned).into(),
+                    settings.groups_claim.map(str::to_owned).into(),
                     now_ms().into(),
                 ])
                 .to_owned(),
         )
         .await?;
-    transaction
+    Ok(())
+}
+
+/// Replaces the group mappings. Without a groups claim, everyone's stored
+/// groups go too.
+async fn store_group_roles(
+    executor: &mut impl Executor,
+    settings: &ProviderSettings<'_>,
+) -> crate::db::Result<()> {
+    executor
         .execute(&Sql::delete().from_table(OidcGroupRoles::Table).to_owned())
         .await?;
-    if !group_roles.is_empty() {
+    if !settings.group_roles.is_empty() {
         let mut insert = Sql::insert();
         insert
             .into_table(OidcGroupRoles::Table)
             .columns([OidcGroupRoles::GroupName, OidcGroupRoles::RoleId]);
-        for mapping in &group_roles {
+        for mapping in &settings.group_roles {
             insert.values_panic([
                 mapping.group.as_str().into(),
                 mapping.role_id.as_str().into(),
             ]);
         }
-        transaction.execute(&insert).await?;
+        executor.execute(&insert).await?;
     }
-    if groups_claim.is_none() {
-        transaction
+    if settings.groups_claim.is_none() {
+        executor
             .execute(&Sql::delete().from_table(UserOidcGroups::Table).to_owned())
             .await?;
     }
-    // Unlinking or remapping can take away the role someone held as an
-    // administrator through an SSO group.
-    super::ensure_administrator_remains(&mut transaction).await?;
-    audit::record(
-        &mut transaction,
-        &actor.actor(),
-        "settings.sso_update",
-        Target::settings(),
-        json!({
-            "enabled": request.enabled,
-            "display_name": display_name,
-            "issuer_url": issuer_url,
-            "client_id": client_id,
-            "client_secret_changed": request.client_secret.is_some(),
-            "scopes": scopes,
-            "auto_provision": request.auto_provision,
-            "default_role_id": request.default_role_id,
-            "require_verified_email": request.require_verified_email,
-            "groups_claim": groups_claim,
-            "group_roles": group_roles,
-            "accounts_unlinked": issuer_changed,
-        }),
-    )
-    .await?;
-    let settings = view(&state, &mut transaction).await?;
-    transaction.commit().await?;
-    state.presence.recheck_access();
-    Ok(Json(settings))
+    Ok(())
 }
 
 /// Forgets every account's SSO identity and groups.

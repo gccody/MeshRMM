@@ -64,6 +64,73 @@ fn names(items: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Creates Ada's private script and the manager's shared one, returning
+/// their IDs, and checks which scripts are refused.
+async fn create_scripts(name: &str, ada: &mut Browser, manager: &mut Browser) -> (String, String) {
+    let private = ada
+        .post("/v1/toolbox/scripts", script(" Ada private ", false))
+        .await;
+    assert_eq!(
+        private.status,
+        StatusCode::CREATED,
+        "{name}: {:?}",
+        private.body
+    );
+    assert_eq!(private.body["name"], "Ada private");
+    assert_eq!(private.body["folder"], "Disk/Cleanup");
+    assert_eq!(private.body["description"], "Frees space");
+    assert_eq!(private.body["timeout_seconds"], 300);
+    assert_eq!(private.body["body"], "Get-Date");
+    assert_eq!(
+        [
+            &private.body["shared"],
+            &private.body["owned"],
+            &private.body["can_edit"]
+        ],
+        [&json!(false), &json!(true), &json!(true)]
+    );
+    let private_id = private.body["id"].as_str().unwrap().to_owned();
+    let refused = ada
+        .post("/v1/toolbox/scripts", script("Ada shared", true))
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "{name}: sharing needs scripts.manage_shared"
+    );
+    let shared = manager
+        .post("/v1/toolbox/scripts", script("Team script", true))
+        .await;
+    assert_eq!(shared.status, StatusCode::CREATED);
+    let shared_id = shared.body["id"].as_str().unwrap().to_owned();
+    let mac = ada
+        .post(
+            "/v1/toolbox/scripts",
+            json!({ "name": "Mac", "language": "shell", "body": "uptime" }),
+        )
+        .await;
+    assert_eq!(mac.status, StatusCode::CREATED);
+    assert_eq!(mac.body["language"], "shell");
+    assert_eq!(mac.body["folder"], "");
+    for invalid in [
+        json!({ "name": "", "language": "cmd", "body": "dir" }),
+        json!({ "name": "x", "language": "cmd", "body": "  " }),
+        json!({ "name": "x", "language": "cmd", "body": "dir", "timeout_seconds": 5 }),
+        json!({ "name": "x", "language": "bash", "body": "ls" }),
+        json!({ "name": "x", "language": "cmd", "body": "dir", "folder": "a/".repeat(9) }),
+        json!({ "name": "x", "language": "cmd", "body": "dir", "owner": "bob" }),
+    ] {
+        assert_eq!(
+            ada.post("/v1/toolbox/scripts", invalid.clone())
+                .await
+                .status,
+            StatusCode::BAD_REQUEST,
+            "{name}: {invalid}"
+        );
+    }
+    (private_id, shared_id)
+}
+
 #[tokio::test]
 async fn scripts_are_private_until_shared_and_shared_ones_need_the_manage_permission() {
     for app in common::apps().await {
@@ -74,67 +141,7 @@ async fn scripts_are_private_until_shared_and_shared_ones_need_the_manage_permis
         let (mut manager, _) =
             common::user_with(&app, &mut admin, "manager@example.com", MANAGER).await;
 
-        let private = ada
-            .post("/v1/toolbox/scripts", script(" Ada private ", false))
-            .await;
-        assert_eq!(
-            private.status,
-            StatusCode::CREATED,
-            "{name}: {:?}",
-            private.body
-        );
-        assert_eq!(private.body["name"], "Ada private");
-        assert_eq!(private.body["folder"], "Disk/Cleanup");
-        assert_eq!(private.body["description"], "Frees space");
-        assert_eq!(private.body["timeout_seconds"], 300);
-        assert_eq!(private.body["body"], "Get-Date");
-        assert_eq!(
-            [
-                &private.body["shared"],
-                &private.body["owned"],
-                &private.body["can_edit"]
-            ],
-            [&json!(false), &json!(true), &json!(true)]
-        );
-        let private_id = private.body["id"].as_str().unwrap().to_owned();
-        let refused = ada
-            .post("/v1/toolbox/scripts", script("Ada shared", true))
-            .await;
-        assert_eq!(
-            refused.status,
-            StatusCode::FORBIDDEN,
-            "{name}: sharing needs scripts.manage_shared"
-        );
-        let shared = manager
-            .post("/v1/toolbox/scripts", script("Team script", true))
-            .await;
-        assert_eq!(shared.status, StatusCode::CREATED);
-        let shared_id = shared.body["id"].as_str().unwrap().to_owned();
-        let mac = ada
-            .post(
-                "/v1/toolbox/scripts",
-                json!({ "name": "Mac", "language": "shell", "body": "uptime" }),
-            )
-            .await;
-        assert_eq!(mac.status, StatusCode::CREATED);
-        assert_eq!(mac.body["language"], "shell");
-        assert_eq!(mac.body["folder"], "");
-        for invalid in [
-            json!({ "name": "", "language": "cmd", "body": "dir" }),
-            json!({ "name": "x", "language": "cmd", "body": "  " }),
-            json!({ "name": "x", "language": "cmd", "body": "dir", "timeout_seconds": 5 }),
-            json!({ "name": "x", "language": "bash", "body": "ls" }),
-            json!({ "name": "x", "language": "cmd", "body": "dir", "folder": "a/".repeat(9) }),
-            json!({ "name": "x", "language": "cmd", "body": "dir", "owner": "bob" }),
-        ] {
-            assert_eq!(
-                ada.post("/v1/toolbox/scripts", invalid.clone())
-                    .await
-                    .status,
-                StatusCode::BAD_REQUEST,
-                "{name}: {invalid}"
-            );
-        }
+        let (private_id, shared_id) = create_scripts(name, &mut ada, &mut manager).await;
 
         let listing = ada.get("/v1/toolbox").await.body;
         assert_eq!(
@@ -246,6 +253,56 @@ async fn scripts_are_private_until_shared_and_shared_ones_need_the_manage_permis
     }
 }
 
+/// Checks that uploads with a wrong digest or name, without the manage
+/// permission, or over the size limit are refused.
+async fn refuse_bad_uploads(
+    name: &str,
+    runner: &Browser,
+    manager: &mut Browser,
+    content: &[u8],
+    digest: &str,
+) {
+    let corrupted = upload(manager, "setup.exe", content, true, &sha256(b"other")).await;
+    assert_eq!(corrupted.status, StatusCode::BAD_REQUEST, "{name}");
+    assert_eq!(
+        upload(manager, "bad:name.exe", content, true, digest)
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        upload(manager, "CON.txt", content, true, digest)
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        upload(manager, "setup.exe", content, true, "not-a-digest")
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        upload(runner, "setup.exe", content, true, digest)
+            .await
+            .status,
+        StatusCode::FORBIDDEN,
+        "{name}: sharing needs files.manage_shared"
+    );
+    let declared_too_large = manager
+        .request(
+            Method::POST,
+            &format!("/v1/toolbox/files?name=big.bin&sha256={digest}"),
+        )
+        .header("content-length", (95 * 1024 * 1024 + 1).to_string())
+        .body(Body::from(content.to_vec()))
+        .unwrap();
+    assert_eq!(
+        manager.raw(declared_too_large).await.status,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+}
+
 #[tokio::test]
 async fn library_files_are_checked_on_upload_and_downloaded_whole() {
     for app in common::apps().await {
@@ -257,45 +314,7 @@ async fn library_files_are_checked_on_upload_and_downloaded_whole() {
         let content = b"MZ\x90\x00installer bytes".repeat(1000);
         let digest = sha256(&content);
 
-        let corrupted = upload(&manager, "setup.exe", &content, true, &sha256(b"other")).await;
-        assert_eq!(corrupted.status, StatusCode::BAD_REQUEST, "{name}");
-        assert_eq!(
-            upload(&manager, "bad:name.exe", &content, true, &digest)
-                .await
-                .status,
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            upload(&manager, "CON.txt", &content, true, &digest)
-                .await
-                .status,
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            upload(&manager, "setup.exe", &content, true, "not-a-digest")
-                .await
-                .status,
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            upload(&runner, "setup.exe", &content, true, &digest)
-                .await
-                .status,
-            StatusCode::FORBIDDEN,
-            "{name}: sharing needs files.manage_shared"
-        );
-        let declared_too_large = manager
-            .request(
-                Method::POST,
-                &format!("/v1/toolbox/files?name=big.bin&sha256={digest}"),
-            )
-            .header("content-length", (95 * 1024 * 1024 + 1).to_string())
-            .body(Body::from(content.clone()))
-            .unwrap();
-        assert_eq!(
-            manager.raw(declared_too_large).await.status,
-            StatusCode::PAYLOAD_TOO_LARGE
-        );
+        refuse_bad_uploads(name, &runner, &mut manager, &content, &digest).await;
         let toolbox_dir = app.state.config.data_dir.join("toolbox");
         assert_eq!(
             std::fs::read_dir(&toolbox_dir).unwrap().count(),
@@ -412,6 +431,104 @@ async fn create_script(browser: &mut Browser, name: &str) -> String {
     created.body["id"].as_str().unwrap().to_owned()
 }
 
+/// Checks that only the run's device reports its result, once.
+async fn report_run(
+    name: &str,
+    app: &App,
+    admin: &mut Browser,
+    agent: &common::Agent,
+    run_id: &str,
+) {
+    let other = app.enroll(admin, "DESKTOP-2").await;
+    let report = json!({
+        "status": "completed",
+        "ran_as": "DESKTOP-1\\ada",
+        "exit_code": 0,
+        // UTF-16 output piped through cmd brings NULs, which PostgreSQL
+        // text can't hold.
+        "stdout": "desktop-1\\ada\u{0}\r\n",
+        "stderr": "",
+    });
+    assert_eq!(
+        other
+            .report(&format!("script-runs/{run_id}/result"), report.clone())
+            .await
+            .status,
+        StatusCode::NOT_FOUND,
+        "{name}: another device can't report this run"
+    );
+    assert_eq!(
+        agent
+            .report(
+                &format!("script-runs/{run_id}/result"),
+                json!({ "status": "pending", "ran_as": "", "stdout": "", "stderr": "" })
+            )
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    let reported = agent
+        .report(&format!("script-runs/{run_id}/result"), report.clone())
+        .await;
+    assert_eq!(
+        reported.status,
+        StatusCode::NO_CONTENT,
+        "{name}: {:?}",
+        reported.body
+    );
+    assert_eq!(
+        agent
+            .report(&format!("script-runs/{run_id}/result"), report)
+            .await
+            .status,
+        StatusCode::NOT_FOUND,
+        "a run is reported once"
+    );
+}
+
+/// Others see their own runs; the audit log's readers see everyone's.
+async fn check_run_visibility(
+    name: &str,
+    app: &App,
+    admin: &mut Browser,
+    runs_path: &str,
+    start: &Value,
+    run_id: &str,
+) {
+    // Others see their own runs; the audit log's readers see everyone's.
+    let (mut bob, _) = common::user_with(app, admin, "bob@example.com", RUNNER).await;
+    assert!(
+        bob.get("/v1/script-runs").await.body["runs"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        bob.get(&format!("/v1/script-runs/{run_id}")).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        bob.post(runs_path, start.clone()).await.status,
+        StatusCode::NOT_FOUND,
+        "{name}: Ada's private script isn't Bob's to run"
+    );
+    let (mut auditor, _) =
+        common::user_with(app, admin, "auditor@example.com", &["audit.view"]).await;
+    let everyone = auditor.get("/v1/script-runs").await.body;
+    assert_eq!(everyone["runs"].as_array().unwrap().len(), 2, "{name}");
+    assert_eq!(everyone["runs"][0]["requested_by_you"], false);
+    assert_eq!(
+        auditor.get(&format!("/v1/script-runs/{run_id}")).await.body["stdout"],
+        "desktop-1\\ada\u{fffd}\r\n"
+    );
+    let (mut viewer, _) =
+        common::user_with(app, admin, "viewer@example.com", &["devices.view"]).await;
+    assert_eq!(
+        viewer.get("/v1/script-runs").await.status,
+        StatusCode::FORBIDDEN
+    );
+}
+
 #[tokio::test]
 async fn script_runs_reach_the_agent_and_record_its_report() {
     for app in common::apps().await {
@@ -458,51 +575,7 @@ async fn script_runs_reach_the_agent_and_record_its_report() {
         assert_eq!(run.body, "whoami");
         assert_eq!(run.timeout_seconds, 60);
 
-        let other = app.enroll(&mut admin, "DESKTOP-2").await;
-        let report = json!({
-            "status": "completed",
-            "ran_as": "DESKTOP-1\\ada",
-            "exit_code": 0,
-            // UTF-16 output piped through cmd brings NULs, which PostgreSQL
-            // text can't hold.
-            "stdout": "desktop-1\\ada\u{0}\r\n",
-            "stderr": "",
-        });
-        assert_eq!(
-            other
-                .report(&format!("script-runs/{run_id}/result"), report.clone())
-                .await
-                .status,
-            StatusCode::NOT_FOUND,
-            "{name}: another device can't report this run"
-        );
-        assert_eq!(
-            agent
-                .report(
-                    &format!("script-runs/{run_id}/result"),
-                    json!({ "status": "pending", "ran_as": "", "stdout": "", "stderr": "" })
-                )
-                .await
-                .status,
-            StatusCode::BAD_REQUEST
-        );
-        let reported = agent
-            .report(&format!("script-runs/{run_id}/result"), report.clone())
-            .await;
-        assert_eq!(
-            reported.status,
-            StatusCode::NO_CONTENT,
-            "{name}: {:?}",
-            reported.body
-        );
-        assert_eq!(
-            agent
-                .report(&format!("script-runs/{run_id}/result"), report)
-                .await
-                .status,
-            StatusCode::NOT_FOUND,
-            "a run is reported once"
-        );
+        report_run(name, &app, &mut admin, &agent, &run_id).await;
 
         let run = ada.get(&format!("/v1/script-runs/{run_id}")).await;
         assert_eq!(run.status, StatusCode::OK);
@@ -518,38 +591,7 @@ async fn script_runs_reach_the_agent_and_record_its_report() {
         assert_eq!(listed["runs"][0]["id"], run_id.as_str());
         assert_eq!(listed["runs"][0]["stdout"], "", "lists leave out output");
 
-        // Others see their own runs; the audit log's readers see everyone's.
-        let (mut bob, _) = common::user_with(&app, &mut admin, "bob@example.com", RUNNER).await;
-        assert!(
-            bob.get("/v1/script-runs").await.body["runs"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            bob.get(&format!("/v1/script-runs/{run_id}")).await.status,
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            bob.post(&runs_path, start.clone()).await.status,
-            StatusCode::NOT_FOUND,
-            "{name}: Ada's private script isn't Bob's to run"
-        );
-        let (mut auditor, _) =
-            common::user_with(&app, &mut admin, "auditor@example.com", &["audit.view"]).await;
-        let everyone = auditor.get("/v1/script-runs").await.body;
-        assert_eq!(everyone["runs"].as_array().unwrap().len(), 2, "{name}");
-        assert_eq!(everyone["runs"][0]["requested_by_you"], false);
-        assert_eq!(
-            auditor.get(&format!("/v1/script-runs/{run_id}")).await.body["stdout"],
-            "desktop-1\\ada\u{fffd}\r\n"
-        );
-        let (mut viewer, _) =
-            common::user_with(&app, &mut admin, "viewer@example.com", &["devices.view"]).await;
-        assert_eq!(
-            viewer.get("/v1/script-runs").await.status,
-            StatusCode::FORBIDDEN
-        );
+        check_run_visibility(name, &app, &mut admin, &runs_path, &start, &run_id).await;
 
         let audited = audit_events(&app, "script.run").await;
         assert_eq!(audited.len(), 2, "{name}");
@@ -609,6 +651,73 @@ async fn backdate(app: &App, table: &str, created_at: i64) {
         .unwrap();
 }
 
+/// Checks that only the delivery's device fetches the file, until it
+/// reports the delivery.
+async fn download_and_report(
+    name: &str,
+    ada: &mut Browser,
+    agent: &common::Agent,
+    other: &common::Agent,
+    delivery_id: &str,
+    content: &[u8],
+) {
+    let content_path =
+        |device_id: &str| format!("/v1/agents/{device_id}/file-deliveries/{delivery_id}/content");
+    let downloaded = fetch(agent, content_path(&agent.device_id)).await;
+    assert_eq!(downloaded.status, StatusCode::OK, "{name}");
+    assert_eq!(downloaded.body, content);
+    assert_eq!(
+        fetch(other, content_path(&other.device_id)).await.status,
+        StatusCode::NOT_FOUND,
+        "{name}: another device can't fetch it"
+    );
+    assert_eq!(
+        fetch(
+            &agent.with_token(&other.token),
+            content_path(&agent.device_id)
+        )
+        .await
+        .status,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let reported = agent
+        .report(
+            &format!("file-deliveries/{delivery_id}/result"),
+            json!({ "status": "delivered", "path": "C:\\Users\\Public\\Documents\\report.txt" }),
+        )
+        .await;
+    assert_eq!(
+        reported.status,
+        StatusCode::NO_CONTENT,
+        "{name}: {:?}",
+        reported.body
+    );
+    assert_eq!(
+        fetch(agent, content_path(&agent.device_id)).await.status,
+        StatusCode::NOT_FOUND,
+        "a finished delivery's file can't be fetched again"
+    );
+    let delivery = ada.get(&format!("/v1/file-deliveries/{delivery_id}")).await;
+    assert_eq!(delivery.body["status"], "delivered", "{name}");
+    assert_eq!(
+        delivery.body["path"],
+        "C:\\Users\\Public\\Documents\\report.txt"
+    );
+    let listed = ada.get("/v1/file-deliveries").await.body;
+    assert_eq!(listed["deliveries"].as_array().unwrap().len(), 2);
+    assert_eq!(listed["deliveries"][1]["status"], "failed");
+}
+
+/// Fetches `path` as `agent`.
+async fn fetch(agent: &common::Agent, path: String) -> common::RawResponse {
+    let request = agent
+        .request(Method::GET, &path)
+        .body(Body::empty())
+        .unwrap();
+    agent.send(request).await
+}
+
 #[tokio::test]
 async fn file_deliveries_let_the_agent_download_the_file_once() {
     for app in common::apps().await {
@@ -654,61 +763,7 @@ async fn file_deliveries_let_the_agent_download_the_file_once() {
         assert_eq!(delivery.sha256, sha256(&content));
         assert_eq!(delivery.destination, FileDeliveryDestination::Public);
 
-        let content_path = |device_id: &str| {
-            format!("/v1/agents/{device_id}/file-deliveries/{delivery_id}/content")
-        };
-        let fetch = |agent: &common::Agent, path: String| {
-            let request = agent
-                .request(Method::GET, &path)
-                .body(Body::empty())
-                .unwrap();
-            let agent = agent.clone();
-            async move { agent.send(request).await }
-        };
-        let downloaded = fetch(&agent, content_path(&agent.device_id)).await;
-        assert_eq!(downloaded.status, StatusCode::OK, "{name}");
-        assert_eq!(downloaded.body, content);
-        assert_eq!(
-            fetch(&other, content_path(&other.device_id)).await.status,
-            StatusCode::NOT_FOUND,
-            "{name}: another device can't fetch it"
-        );
-        assert_eq!(
-            fetch(
-                &agent.with_token(&other.token),
-                content_path(&agent.device_id)
-            )
-            .await
-            .status,
-            StatusCode::UNAUTHORIZED
-        );
-
-        let reported = agent
-            .report(
-                &format!("file-deliveries/{delivery_id}/result"),
-                json!({ "status": "delivered", "path": "C:\\Users\\Public\\Documents\\report.txt" }),
-            )
-            .await;
-        assert_eq!(
-            reported.status,
-            StatusCode::NO_CONTENT,
-            "{name}: {:?}",
-            reported.body
-        );
-        assert_eq!(
-            fetch(&agent, content_path(&agent.device_id)).await.status,
-            StatusCode::NOT_FOUND,
-            "a finished delivery's file can't be fetched again"
-        );
-        let delivery = ada.get(&format!("/v1/file-deliveries/{delivery_id}")).await;
-        assert_eq!(delivery.body["status"], "delivered", "{name}");
-        assert_eq!(
-            delivery.body["path"],
-            "C:\\Users\\Public\\Documents\\report.txt"
-        );
-        let listed = ada.get("/v1/file-deliveries").await.body;
-        assert_eq!(listed["deliveries"].as_array().unwrap().len(), 2);
-        assert_eq!(listed["deliveries"][1]["status"], "failed");
+        download_and_report(name, &mut ada, &agent, &other, &delivery_id, &content).await;
 
         // A pending delivery's file stops being available after its window.
         let second = ada.post(&deliveries_path, start.clone()).await;

@@ -1,5 +1,5 @@
 //! Native, session-scoped file copying. File data never passes through signaling.
-use anyhow::{Context, bail, ensure};
+use anyhow::{bail, ensure};
 use meshrmm_protocol::{FileDestination, FileMessage};
 use std::{
     collections::VecDeque,
@@ -19,6 +19,7 @@ use windows as native;
 mod receive;
 mod send;
 mod sweep;
+mod worker;
 
 use receive::Incoming;
 use send::{AckWindow, send_paths};
@@ -125,7 +126,9 @@ impl TransferSession {
         };
         let status = Arc::new(Mutex::new("Waiting for file-transfer support…".into()));
         let worker_status = status.clone();
-        std::thread::spawn(move || worker(role, commands, out, worker_status, clipboard_enabled));
+        std::thread::spawn(move || {
+            worker::run(role, commands, out, worker_status, clipboard_enabled)
+        });
         Self {
             tx,
             rx: Arc::new(Mutex::new(rx)),
@@ -156,7 +159,7 @@ impl TransferSession {
             clipboard_enabled: || true,
         };
         let transport = std::thread::spawn(move || client(session));
-        worker(Role::Agent, commands, out, status, || true);
+        worker::run(Role::Agent, commands, out, status, || true);
         transport.join().expect("file transport thread panicked")
     }
     pub fn command(&self, command: Command) {
@@ -271,346 +274,6 @@ impl Admission {
             FileDestination::ClipboardPaste { .. } | FileDestination::Drop { .. } => {
                 Err("The viewer does not accept pasted or dropped files")
             }
-        }
-    }
-}
-
-fn worker(
-    role: Role,
-    commands: mpsc::Receiver<Command>,
-    out: OutgoingFiles,
-    status: Arc<Mutex<String>>,
-    clipboard_enabled: fn() -> bool,
-) {
-    let _native = match native::initialize() {
-        Ok(v) => v,
-        Err(e) => {
-            *status.lock().unwrap() = format!("File transfers unavailable: {e:#}");
-            return;
-        }
-    };
-    sweep_transfer_folders();
-    let _ = out.send(FileMessage::Available);
-    let mut admission = Admission::new(role);
-    let mut incoming: Option<Incoming> = None;
-    // Transfers rejected or failed here, whose in-flight messages are dropped.
-    let mut ended = VecDeque::new();
-    let mut progress: Option<native::Progress> = None;
-    let mut progress_updated = Instant::now();
-    let mut sender: Option<(u64, mpsc::SyncSender<bool>)> = None;
-    let mut sender_thread: Option<std::thread::JoinHandle<()>> = None;
-    let mut pending = VecDeque::new();
-    let mut available = false;
-    let mut last_clipboard_sequence = native::clipboard_sequence();
-    // The sweep at startup covered the cache.
-    let mut last_cache_sweep = Instant::now();
-    let mut poll = Instant::now();
-    loop {
-        let command = match commands.recv_timeout(Duration::from_millis(20)) {
-            Ok(c) => Some(c),
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(_) => None,
-        };
-        let command = match command {
-            Some(Command::Peer(FileMessage::Begin { id, destination })) => {
-                // Rejecting a new transfer leaves the one in progress intact.
-                let admitted = if incoming.is_some() {
-                    if destination == FileDestination::Documents {
-                        admission.close_peer_pick();
-                    }
-                    Err("Another transfer is in progress")
-                } else {
-                    admission.admit(&destination, clipboard_enabled(), Instant::now())
-                };
-                match admitted {
-                    Ok(()) => Some(Command::Peer(FileMessage::Begin { id, destination })),
-                    Err(reason) => {
-                        tracing::info!(id, ?destination, reason, "rejected file transfer");
-                        end_transfer(&mut ended, id);
-                        if role == Role::Viewer && destination != FileDestination::Clipboard {
-                            *status.lock().unwrap() = reason.into();
-                        }
-                        let reason = reason.into();
-                        if out.send(FileMessage::Error { id, reason }).is_err() {
-                            break;
-                        }
-                        None
-                    }
-                }
-            }
-            command => command,
-        };
-        let mut send = None;
-        match command {
-            Some(Command::Pick) => {
-                if available {
-                    match native::pick() {
-                        Ok(paths) => send = Some((paths, FileDestination::Documents)),
-                        Err(error) => {
-                            tracing::warn!(%error, "file picker failed");
-                            *status.lock().unwrap() = format!("File picker failed: {error:#}");
-                        }
-                    }
-                }
-            }
-            Some(Command::RequestPeerPick) => {
-                if !available {
-                    *status.lock().unwrap() = "Waiting for file-transfer support…".into();
-                } else {
-                    admission.request_peer_pick(Instant::now());
-                    if out.send(FileMessage::Pick).is_err() {
-                        break;
-                    }
-                }
-            }
-            Some(Command::Send(paths, destination)) => {
-                if available {
-                    send = Some((paths, destination));
-                }
-            }
-            Some(Command::Peer(FileMessage::Available)) => {
-                available = true;
-                *status.lock().unwrap() = "Ready".into();
-            }
-            Some(Command::Peer(FileMessage::Pick)) if !admission.allows_peer_pick() => {
-                tracing::warn!("ignored a request to pick local files for the remote device");
-            }
-            Some(Command::Peer(FileMessage::Pick)) => {
-                let picked = if !available {
-                    Err("File transfers are not ready".to_owned())
-                } else {
-                    match native::pick() {
-                        Ok(paths) if paths.is_empty() => Err("No files were chosen".to_owned()),
-                        Ok(paths) => Ok(paths),
-                        Err(error) => {
-                            tracing::warn!(%error, "file picker failed");
-                            *status.lock().unwrap() = format!("File picker failed: {error:#}");
-                            Err(format!("File picker failed: {error:#}"))
-                        }
-                    }
-                };
-                match picked {
-                    Ok(paths) => send = Some((paths, FileDestination::Documents)),
-                    Err(reason) => {
-                        let reply = FileMessage::Error {
-                            id: PEER_PICK_ID,
-                            reason,
-                        };
-                        if out.send(reply).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-            Some(Command::Peer(FileMessage::Error { id, reason }))
-                if id == PEER_PICK_ID && role == Role::Viewer =>
-            {
-                admission.close_peer_pick();
-                *status.lock().unwrap() = format!("No files received: {reason}");
-            }
-            Some(Command::Peer(FileMessage::Ack { id })) => {
-                if let Some((active, tx)) = &sender
-                    && *active == id
-                {
-                    let _ = tx.try_send(true);
-                }
-            }
-            Some(Command::Peer(FileMessage::Error { id, reason })) => {
-                // Errors for transfers rejected before they began here are not ours to report.
-                if sender.as_ref().is_some_and(|(active, _)| *active == id)
-                    || incoming.as_ref().is_some_and(|i| i.id == id)
-                {
-                    *status.lock().unwrap() = format!("Transfer failed: {reason}");
-                }
-                if let Some((active, tx)) = &sender
-                    && *active == id
-                {
-                    let _ = tx.try_send(false);
-                }
-                if incoming.as_ref().is_some_and(|i| i.id == id) {
-                    incoming = None;
-                    progress = None;
-                }
-            }
-            // A sender has a window of messages in flight when it learns its
-            // transfer failed; answering each would only repeat the error.
-            Some(Command::Peer(message)) if ended.contains(&message_id(&message)) => {}
-            Some(Command::Peer(message)) => {
-                let packet_id = message_id(&message);
-                let result = (|| -> anyhow::Result<()> {
-                    if let FileMessage::Begin { id, destination } = message {
-                        tracing::info!(id, ?destination, "receiving file transfer");
-                        let storage = if destination == FileDestination::Documents {
-                            native::documents()?
-                        } else {
-                            native::cache()?
-                        };
-                        incoming = Some(Incoming::new(id, destination, storage)?);
-                        progress = native::Progress::new(id)
-                            .map_err(|error| {
-                                tracing::warn!(%error, "could not show file transfer progress");
-                            })
-                            .ok();
-                    } else {
-                        let state = incoming.as_mut().context("transfer has not started")?;
-                        ensure!(state.id == packet_id, "transfer ID mismatch");
-                        if let FileMessage::Finish { .. } = message {
-                            let paths = state.finish()?;
-                            // Hide before native delivery so the progress window cannot
-                            // obscure the user's Explorer/browser drop target.
-                            progress = None;
-                            match &state.destination {
-                                FileDestination::Clipboard
-                                | FileDestination::ClipboardPaste { .. } => {
-                                    native::set_clipboard_files(&paths)?;
-                                    last_clipboard_sequence = native::clipboard_sequence();
-                                    if let FileDestination::ClipboardPaste { display_id } =
-                                        state.destination
-                                    {
-                                        native::paste_files(display_id)?;
-                                    }
-                                }
-                                FileDestination::Drop { display_id, x, y } => {
-                                    let accepted = native::drop_files(&paths, *display_id, *x, *y)
-                                        .unwrap_or_else(|error| {
-                                            tracing::warn!(%error, "native drop unavailable; saving to Documents");
-                                            false
-                                        });
-                                    if !accepted {
-                                        commit_documents(paths.clone(), native::documents()?)?;
-                                        remove_batch(&paths);
-                                    }
-                                }
-                                FileDestination::Documents => {}
-                            }
-                            if state.destination != FileDestination::Documents
-                                && last_cache_sweep.elapsed() >= CACHE_SWEEP_INTERVAL
-                            {
-                                last_cache_sweep = Instant::now();
-                                // Off this thread, which acknowledges the peer's transfers.
-                                let base = state.base.clone();
-                                let keep = native::clipboard_files().unwrap_or_default();
-                                std::thread::spawn(move || sweep_cache(&base, &keep));
-                            }
-                            tracing::info!(id = packet_id, "file transfer received and verified");
-                            *status.lock().unwrap() = "Transfer complete".into();
-                            incoming = None;
-                        } else {
-                            let refresh = !matches!(message, FileMessage::Chunk { .. });
-                            state.accept(message)?;
-                            if refresh || progress_updated.elapsed() >= Duration::from_millis(100) {
-                                if let Some(progress) = &progress {
-                                    progress.update(
-                                        state.received_bytes,
-                                        state.total_bytes,
-                                        &state.current_name,
-                                        state.entries,
-                                        state.total_entries,
-                                    );
-                                }
-                                progress_updated = Instant::now();
-                            }
-                        }
-                    }
-                    Ok(())
-                })();
-                let response = match result {
-                    Ok(()) => FileMessage::Ack { id: packet_id },
-                    Err(e) => {
-                        incoming = None;
-                        progress = None;
-                        end_transfer(&mut ended, packet_id);
-                        let reason = format!("{e:#}");
-                        tracing::warn!(id = packet_id, %reason, "file transfer failed");
-                        *status.lock().unwrap() = reason.clone();
-                        FileMessage::Error {
-                            id: packet_id,
-                            reason,
-                        }
-                    }
-                };
-                if out.send(response).is_err() {
-                    break;
-                }
-            }
-            None => {}
-        }
-        if send.is_none() && available && poll.elapsed() >= Duration::from_millis(250) {
-            poll = Instant::now();
-            let sequence = native::clipboard_sequence();
-            if sequence != last_clipboard_sequence && !clipboard_enabled() {
-                // Copies made while clipboard sync is off stay local after re-enabling.
-                last_clipboard_sequence = sequence;
-            } else if sequence != last_clipboard_sequence
-                && let Ok(paths) = native::clipboard_files()
-            {
-                tracing::info!(files = paths.len(), "native file clipboard changed");
-                last_clipboard_sequence = sequence;
-                if !paths.is_empty() {
-                    send = Some((paths, FileDestination::Clipboard));
-                }
-            }
-        }
-        if let Some(job) = send
-            && !job.0.is_empty()
-        {
-            if pending.len() < 8 {
-                pending.push_back(job);
-            } else {
-                *status.lock().unwrap() =
-                    "Transfer queue is full; try again after completion".into();
-                if answers_peer_pick(role, &job.1) {
-                    let reason = "The remote transfer queue is full".into();
-                    let reply = FileMessage::Error {
-                        id: PEER_PICK_ID,
-                        reason,
-                    };
-                    if out.send(reply).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-        if sender_thread
-            .as_ref()
-            .is_none_or(|thread| thread.is_finished())
-            && let Some((paths, destination)) = pending.pop_front()
-        {
-            let transfer_id = id();
-            let (ack, acknowledgements) = mpsc::sync_channel(SEND_WINDOW + 1);
-            sender = Some((transfer_id, ack));
-            let out = out.clone();
-            let status = status.clone();
-            let answers_pick = answers_peer_pick(role, &destination);
-            sender_thread = Some(std::thread::spawn(move || {
-                let _native = native::initialize();
-                *status.lock().unwrap() = "Transferring files…".into();
-                let mut window = AckWindow::new(&acknowledgements, SEND_WINDOW);
-                let mut began = false;
-                let result = send_paths(transfer_id, paths, destination, |message| {
-                    began |= matches!(message, FileMessage::Begin { .. });
-                    let settle = window.settles(&message);
-                    out.send(message).context("session closed")?;
-                    window.sent(settle)
-                });
-                *status.lock().unwrap() = match &result {
-                    Ok(()) => "Transfer complete".into(),
-                    Err(e) => format!("Transfer failed: {e:#}"),
-                };
-                if let Err(e) = result {
-                    tracing::warn!(error = %format!("{e:#}"), "file transfer not sent");
-                    // A pick that failed before its transfer began still has to answer the request.
-                    let id = if answers_pick && !began {
-                        PEER_PICK_ID
-                    } else {
-                        transfer_id
-                    };
-                    let _ = out.send(FileMessage::Error {
-                        id,
-                        reason: format!("{e:#}"),
-                    });
-                }
-            }));
         }
     }
 }

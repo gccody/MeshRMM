@@ -43,6 +43,26 @@ use crate::{
 
 pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
+        .merge(auth_routes())
+        .merge(account_routes())
+        .merge(administration_routes())
+        .merge(device_routes())
+        .merge(toolbox_routes())
+        .merge(remote_routes())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            recheck_access,
+        ))
+        .layer(middleware::from_fn_with_state(state, csrf::check))
+        // Responses carry account data; browsers and proxies must not keep them.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
+}
+
+fn auth_routes() -> Router<AppState> {
+    Router::new()
         .route("/instance", get(instance::get))
         .route("/setup", post(setup::complete))
         .route("/auth/sign-in", post(sign_in::password))
@@ -60,6 +80,10 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/auth/password-reset/complete",
             post(password_resets::complete),
         )
+}
+
+fn account_routes() -> Router<AppState> {
+    Router::new()
         .route("/account", get(account::get).patch(account::update))
         .route("/account/password", post(account::change_password))
         .route("/account/two-factor/totp", post(account::start_totp))
@@ -87,6 +111,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/account/passkeys/{id}/remove", post(passkeys::remove))
         .route("/account/sessions", get(account::sessions))
         .route("/account/sessions/{id}", delete(account::end_session))
+}
+
+fn administration_routes() -> Router<AppState> {
+    Router::new()
         .route("/users", get(users::list))
         .route(
             "/users/{id}",
@@ -131,6 +159,10 @@ pub fn router(state: AppState) -> Router<AppState> {
                 .delete(sso::delete_settings),
         )
         .route("/audit", get(audit_log::list))
+}
+
+fn device_routes() -> Router<AppState> {
+    Router::new()
         .route("/agent-installers", post(enrollment::create))
         .route("/agent-installers/redeem", post(enrollment::redeem))
         .route("/events", get(events::subscribe))
@@ -160,6 +192,10 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/agents/{id}/file-deliveries/{delivery_id}/result",
             post(agent::report_file_delivery),
         )
+}
+
+fn toolbox_routes() -> Router<AppState> {
+    Router::new()
         .route("/toolbox", get(toolbox::list))
         .route("/toolbox/scripts", post(toolbox::create_script))
         .route(
@@ -178,6 +214,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/script-runs/{id}", get(runs::get_run))
         .route("/file-deliveries", get(runs::list_deliveries))
         .route("/file-deliveries/{id}", get(runs::get_delivery))
+}
+
+fn remote_routes() -> Router<AppState> {
+    Router::new()
         .route("/remote/handoffs", post(handoffs::create))
         .route("/remote/handoffs/redeem", post(remote::redeem))
         .route("/remote/sessions/{id}/signal", get(remote::signal))
@@ -203,16 +243,6 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/remote/sessions/{id}/file-deliveries/{delivery_id}",
             get(remote::session_file_delivery),
         )
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            recheck_access,
-        ))
-        .layer(middleware::from_fn_with_state(state, csrf::check))
-        // Responses carry account data; browsers and proxies must not keep them.
-        .layer(SetResponseHeaderLayer::if_not_present(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
-        ))
 }
 
 /// What a signed-in user changes may end sessions or change permissions,
