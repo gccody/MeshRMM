@@ -22,26 +22,22 @@ export type ViewerLaunch = {
   phase: "opening" | ViewerLaunchOutcome;
 };
 
-// Starts remote sessions through a one-time handoff to the native viewer, and
-// closes a device's active session.
-export function useRemoteHandoff({ authorizedFetch, reportError }: Options) {
-  const [launch, setLaunch] = useState<ViewerLaunch | null>(null);
+type Handoff = { handoff_token: string; api_url: string };
+
+async function requestHandoff(authorizedFetch: AuthorizedFetch, agent: Agent, startInBackground: boolean, reason: string) {
+  const response = await authorizedFetch("/v1/remote/handoffs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ device_id: agent.id, start_in_background: startInBackground, reason }),
+  });
+  if (!response.ok) throw new Error(await errorMessage(response, "The remote session could not be started."));
+  return (await response.json()) as Handoff;
+}
+
+// Closes a device's active remote session and says how that went.
+function useSessionClose({ authorizedFetch, reportError }: Options) {
   const [closingId, setClosingId] = useState<string | null>(null);
   const [sessionNotice, setSessionNotice] = useState<string | null>(null);
-  // Each Connect supersedes the previous one, including its launch watcher.
-  const attempts = useRef(0);
-  const cancelWatch = useRef<(() => void) | null>(null);
-
-  const stopWatching = () => {
-    cancelWatch.current?.();
-    cancelWatch.current = null;
-  };
-
-  useEffect(() => () => {
-    attempts.current += 1;
-    cancelWatch.current?.();
-    cancelWatch.current = null;
-  }, []);
 
   const closeSession = async (agent: Agent) => {
     setClosingId(agent.id);
@@ -63,6 +59,29 @@ export function useRemoteHandoff({ authorizedFetch, reportError }: Options) {
     }
   };
 
+  return { closingId, sessionNotice, setSessionNotice, closeSession };
+}
+
+// Starts remote sessions through a one-time handoff to the native viewer, and
+// closes a device's active session.
+export function useRemoteHandoff({ authorizedFetch, reportError }: Options) {
+  const [launch, setLaunch] = useState<ViewerLaunch | null>(null);
+  const { closingId, sessionNotice, setSessionNotice, closeSession } = useSessionClose({ authorizedFetch, reportError });
+  // Each Connect supersedes the previous one, including its launch watcher.
+  const attempts = useRef(0);
+  const cancelWatch = useRef<(() => void) | null>(null);
+
+  const stopWatching = () => {
+    cancelWatch.current?.();
+    cancelWatch.current = null;
+  };
+
+  useEffect(() => () => {
+    attempts.current += 1;
+    cancelWatch.current?.();
+    cancelWatch.current = null;
+  }, []);
+
   const connect = async (agent: Agent, startInBackground = false, reason = "") => {
     setSessionNotice(null);
     if (!agent.connected) return;
@@ -71,13 +90,7 @@ export function useRemoteHandoff({ authorizedFetch, reportError }: Options) {
     setLaunch({ attempt, agentId: agent.id, agentName: agent.name, background: startInBackground, reason, phase: "opening" });
     reportError(null);
     try {
-      const response = await authorizedFetch("/v1/remote/handoffs", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ device_id: agent.id, start_in_background: startInBackground, reason }),
-      });
-      if (!response.ok) throw new Error(await errorMessage(response, "The remote session could not be started."));
-      const handoff = (await response.json()) as { handoff_token: string; api_url: string };
+      const handoff = await requestHandoff(authorizedFetch, agent, startInBackground, reason);
       if (attempt !== attempts.current) return;
       // Watch first: a viewer that is already running can take focus before
       // assign() returns.

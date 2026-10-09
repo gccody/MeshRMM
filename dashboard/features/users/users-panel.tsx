@@ -109,7 +109,11 @@ export function UsersPanel() {
           <tbody>
             {visibleUsers.map((user) => (
               <tr key={user.id} className={user.disabled ? "row-disabled" : undefined}>
-                <td><strong>{user.display_name}</strong><span>{user.email}</span>{user.disabled && <span className="badge badge-muted">Disabled</span>}<IdentityBadges user={user} /></td>
+                <td>
+                  <strong>{user.display_name}</strong><span>{user.email}</span>
+                  {user.disabled && <span className="badge badge-muted">Disabled</span>}
+                  <IdentityBadges user={user} />
+                </td>
                 <td>
                   {user.roles.length || user.group_roles.length ? user.roles.map((role) => role.name).join(", ") : <span className="muted-text">No roles</span>}
                   {user.group_roles.length > 0 && <GroupRoles roles={user.group_roles} />}
@@ -125,25 +129,7 @@ export function UsersPanel() {
       </section>
 
       {invitations.length > 0 && (
-        <section className="agent-panel">
-          <div className="panel-header"><div><h2>Pending invitations</h2><span>{invitations.length === 1 ? "1 invitation" : `${invitations.length} invitations`}</span></div></div>
-          <table className="data-table" aria-label="Pending invitations">
-            <thead><tr><th scope="col">Email</th><th scope="col">Roles</th><th scope="col">Expires</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
-            <tbody>
-              {invitations.map((invitation) => (
-                <tr key={invitation.id}>
-                  <td><strong>{invitation.email}</strong></td>
-                  <td>{invitation.roles.map((role) => role.name).join(", ") || <span className="muted-text">No roles</span>}</td>
-                  <td>{invitation.expired ? <span className="badge badge-warn">Expired</span> : formatDateTime(invitation.expires_at)}</td>
-                  <td className="row-actions">
-                    <button type="button" className="secondary-button" disabled={busyId === invitation.id} onClick={(event) => void renew(invitation, event.currentTarget)} title="Send a new link; the old one stops working">{busyId === invitation.id ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />} New link</button>
-                    <button type="button" className="agent-delete-button" disabled={busyId === invitation.id} onClick={() => void revoke(invitation)} aria-label={`Revoke the invitation for ${invitation.email}`} title="Revoke"><Trash2 size={16} /></button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </section>
+        <InvitationsSection invitations={invitations} busyId={busyId} onRenew={(invitation, element) => void renew(invitation, element)} onRevoke={(invitation) => void revoke(invitation)} />
       )}
 
       {dialog?.kind === "invite" && (
@@ -172,6 +158,39 @@ export function UsersPanel() {
         />
       )}
     </>
+  );
+}
+
+function InvitationsSection({ invitations, busyId, onRenew, onRevoke }: {
+  invitations: InvitationView[];
+  busyId: string | null;
+  onRenew: (invitation: InvitationView, element: HTMLElement) => void;
+  onRevoke: (invitation: InvitationView) => void;
+}) {
+  return (
+    <section className="agent-panel">
+      <div className="panel-header"><div><h2>Pending invitations</h2><span>{invitations.length === 1 ? "1 invitation" : `${invitations.length} invitations`}</span></div></div>
+      <table className="data-table" aria-label="Pending invitations">
+        <thead><tr><th scope="col">Email</th><th scope="col">Roles</th><th scope="col">Expires</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
+        <tbody>
+          {invitations.map((invitation) => (
+            <tr key={invitation.id}>
+              <td><strong>{invitation.email}</strong></td>
+              <td>
+                {invitation.roles.map((role) => role.name).join(", ") || <span className="muted-text">No roles</span>}
+              </td>
+              <td>
+                {invitation.expired ? <span className="badge badge-warn">Expired</span> : formatDateTime(invitation.expires_at)}
+              </td>
+              <td className="row-actions">
+                <button type="button" className="secondary-button" disabled={busyId === invitation.id} onClick={(event) => onRenew(invitation, event.currentTarget)} title="Send a new link; the old one stops working">{busyId === invitation.id ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />} New link</button>
+                <button type="button" className="agent-delete-button" disabled={busyId === invitation.id} onClick={() => onRevoke(invitation)} aria-label={`Revoke the invitation for ${invitation.email}`} title="Revoke"><Trash2 size={16} /></button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
   );
 }
 
