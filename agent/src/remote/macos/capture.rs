@@ -17,6 +17,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_core_foundation::CFRetained;
+use objc2_core_graphics::CGPreflightScreenCaptureAccess;
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::{
     CVPixelBuffer, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
@@ -422,6 +423,15 @@ pub(crate) fn content_filter(
     display_id: u32,
     excluded: &[u32],
 ) -> anyhow::Result<Retained<SCContentFilter>> {
+    // Without the permission, ScreenCaptureKit may ask the user for it on
+    // every call, and thumbnails make this one in the background. The login
+    // window's helper runs as root, which macOS asks nothing.
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 && !CGPreflightScreenCaptureAccess() {
+        bail!(
+            "the MeshRMM Agent is not allowed to record the screen; allow it under Screen & System Audio Recording in System Settings"
+        );
+    }
     let excluded = excluded.to_vec();
     let (sender, receiver) = mpsc::channel();
     let handler = RcBlock::new(
