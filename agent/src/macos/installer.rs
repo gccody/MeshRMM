@@ -150,6 +150,8 @@ pub fn uninstall() -> anyhow::Result<()> {
     }
     let _ = std::fs::remove_dir_all(SUPPORT_DIRECTORY);
     let _ = std::fs::remove_dir_all("/Library/Logs/MeshRMM");
+    // A later installation may be another build, which they wouldn't apply to.
+    let _ = forget_permissions();
     let _ = launchctl(&["bootout", &format!("system/{DAEMON_LABEL}")]);
     let _ = std::fs::remove_file(HELPER_SOCKET);
     Ok(())
@@ -240,8 +242,41 @@ fn install_app() -> anyhow::Result<()> {
         }
     }
     secure_bundle(&staged)?;
+    if let Err(error) = forget_lost_permissions(&staged) {
+        eprintln!("{error:#}");
+    }
     let _ = std::fs::remove_dir_all(APP);
     std::fs::rename(&staged, APP).with_context(|| format!("could not install {APP}"))
+}
+
+/// Makes macOS forget the installed Agent's privacy permissions when
+/// `replacement` can't keep them. macOS grants them to a code signature's
+/// designated requirement. Developer ID builds share their team's, so updates
+/// keep the permissions. An ad-hoc build's is its own hash: the permissions
+/// of the build it replaces would stay switched on in System Settings without
+/// applying to it, and macOS would ask for them again every time the Agent
+/// tried to capture the screen.
+pub(crate) fn forget_lost_permissions(replacement: &Path) -> anyhow::Result<()> {
+    use meshrmm_self_update::macos::designated_requirement;
+
+    let installed = designated_requirement(Path::new(APP));
+    if installed.is_none() || installed == designated_requirement(replacement) {
+        return Ok(());
+    }
+    forget_permissions()
+}
+
+fn forget_permissions() -> anyhow::Result<()> {
+    let output = std::process::Command::new("/usr/bin/tccutil")
+        .args(["reset", "All", BUNDLE_IDENTIFIER])
+        .output()
+        .context("could not run tccutil")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "could not reset the MeshRMM Agent's privacy permissions: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }
 
 /// Gives root everything in an app bundle and takes write access away from
