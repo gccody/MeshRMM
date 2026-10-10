@@ -149,5 +149,8 @@ The Agents, viewers and server built this way trust only that key, so they
 won't update to real releases.
 
 `scripts/package-server.sh` packs a tarball from a server binary and a
-downloads directory. `scripts/test-server-package.sh` installs and runs one,
-which changes the machine it runs on, so it's meant for CI.
+downloads directory, on Linux. `scripts/test-server-package.sh` installs and
+runs one, which changes the machine it runs on, so it's meant for CI.
+`scripts/test-server-package-local.sh` builds, packs and tests a release on
+your own machine with Docker instead; see
+[development](development.md#checks).
