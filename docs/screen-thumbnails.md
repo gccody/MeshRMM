@@ -13,7 +13,7 @@ Agent coordinator (Session 0)
        Windows Imaging Component JPEG, quality 0.7 (normally 20–80 KiB)
   -> PUT /v1/agents/{device_id}/thumbnail   (Agent credential, HTTPS)
   -> server -> {data_dir}/thumbnails/{device_id}.jpg
-Website row on screen
+Website tile on screen
   -> GET /v1/agents/{device_id}/thumbnail  (session cookie, If-None-Match)
   -> server -> 200 with the image, 304, or 204 if none
 ```
@@ -27,13 +27,13 @@ Bandwidth is kept down at each step:
 - The Agent captures only while it is connected to the control plane, and one
   capture runs at a time. It does not upload an image that is identical to the
   last one the server accepted.
-- The dashboard loads images only for rows on or near the screen, only while
+- The website loads images only for tiles on or near the screen, only while
   the tab is visible, and only for devices that are online, apart from one
   load of an offline device's last image. It revalidates with the image's
   ETag, so an unchanged image costs a 304 without a body. Checks follow the
   Agent's schedule: shortly after the next upload is due, based on the
   image's `Last-Modified`.
-- Images are kept in memory for the dashboard session, so changing pages or
+- Images are kept in memory for the website session, so changing pages or
   filters does not download them again. Signing out or the idle lock discards
   them.
 
