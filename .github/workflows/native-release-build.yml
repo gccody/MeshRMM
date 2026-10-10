@@ -271,13 +271,17 @@ jobs:
         run: sudo sh scripts/test-server-package.sh dist/release
       - name: Build the image for every architecture
         run: docker buildx build --platform linux/amd64,linux/arm64 -f packaging/Dockerfile dist/release/image
+      - name: Pack the image's files
+        # An artifact keeps neither file modes nor empty directories, and the
+        # image needs its executables and its empty data directory.
+        run: tar -C dist/release -cf dist/release/image.tar image
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ needs.validate.outputs.version }}
           path: |
             dist/release/*.tar.gz
             dist/release/SHA256SUMS
-            dist/release/image/
+            dist/release/image.tar
           if-no-files-found: error
           retention-days: 30
 
@@ -297,6 +301,8 @@ jobs:
         with:
           name: release-${{ needs.validate.outputs.version }}
           path: dist/release
+      - name: Unpack the image's files
+        run: tar -C dist/release -xf dist/release/image.tar
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           # BuildKit from CI's copy of Docker Hub's image (see mirror-ci-images.yml).
