@@ -98,7 +98,7 @@ for Mac apps signed with a Developer ID, builds signed by the same team. A
 server cannot sign either, so a hostile or compromised server cannot push
 code to them. See [releases](releases.md#release-signatures).
 
-## Checking a public host
+## Checking a server's TLS
 
 `scripts/check-transport-security.py` probes a host from outside, without
 credentials:
@@ -107,10 +107,22 @@ credentials:
 python3 scripts/check-transport-security.py rmm.example.com
 ```
 
-It fails if the host accepts TLS below the minimum (1.3 by default,
-`--minimum-tls 1.2` to allow 1.2 with forward secrecy and AEAD only), has an
-invalid certificate, or a probe is inconclusive. It also expects port 80 to
-redirect to HTTPS, which a MeshRMM server does only when a proxy in front of
-it serves port 80. It needs a Python linked to an OpenSSL that can still
-attempt TLS 1.0 and 1.1. It tests what is negotiated, not every cipher a
-server might accept.
+It passes when the host offers TLS 1.3, accepts TLS 1.2 only with forward
+secrecy and an AEAD cipher, refuses TLS 1.0 and 1.1 and a list of weak
+ciphers, and has a valid certificate. That is what the server's own TLS does
+in its `acme` and `files` modes. `--minimum-tls 1.3` also fails a host that
+accepts TLS 1.2. Port 80 must be closed, as it is on a server without a proxy,
+or redirect to HTTPS on the same host. A probe that is inconclusive, such as
+a timeout, fails; `--skip-http` leaves out port 80 when a firewall drops it
+silently or something other than the server owns it.
+
+For a development server, `--port` names its HTTPS port and `--ca-file` its
+development CA or self-signed certificate:
+
+```sh
+python3 scripts/check-transport-security.py localhost --port 8443 --ca-file cert.pem
+```
+
+The script needs a Python linked to an OpenSSL that can still attempt
+TLS 1.0 and 1.1. It tests what is negotiated, not every cipher a server
+might accept.
