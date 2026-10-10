@@ -22,6 +22,26 @@ pub fn team_identifier(app: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The designated requirement of `app`'s code signature, or `None` when it's
+/// unsigned or missing. macOS grants an app's privacy permissions to it: a
+/// Developer ID build's names its team, so the team's later builds keep the
+/// permissions, while an ad-hoc build's names only that build's own hashes.
+pub fn designated_requirement(app: &Path) -> Option<String> {
+    let output = Command::new(CODESIGN)
+        .args(["--display", "--requirements", "-"])
+        .arg(app)
+        .output()
+        .ok()?;
+    // codesign marks a requirement it derived itself as a comment.
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            line.trim_start_matches("# ")
+                .strip_prefix("designated => ")
+                .map(str::to_owned)
+        })
+}
+
 /// Checks that `app`'s code signature is valid and seals every file.
 pub fn verify_signature(app: &Path) -> anyhow::Result<()> {
     codesign_verify(app, None).context("the update's code signature is invalid")
@@ -145,6 +165,23 @@ mod tests {
             .unwrap();
         assert!(verify_signature(&app).is_err());
         let _ = std::fs::remove_dir_all(app.parent().unwrap());
+    }
+
+    #[test]
+    fn an_ad_hoc_build_has_a_designated_requirement_of_its_own() {
+        let first = app("requirement-first", "1.2.0");
+        let second = app("requirement-second", "1.3.0");
+        let requirement = designated_requirement(&first).unwrap();
+        assert!(requirement.starts_with("cdhash "), "{requirement}");
+        assert_eq!(designated_requirement(&first).unwrap(), requirement);
+        assert_ne!(designated_requirement(&second).unwrap(), requirement);
+        assert_eq!(
+            designated_requirement(Path::new("/nonexistent/Test.app")),
+            None
+        );
+        for app in [first, second] {
+            let _ = std::fs::remove_dir_all(app.parent().unwrap());
+        }
     }
 
     #[test]
