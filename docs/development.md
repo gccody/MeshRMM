@@ -26,7 +26,13 @@ migrations or compatibility paths for old versions (see `AGENTS.md`).
 - For the macOS viewer: macOS 12 or newer. For the macOS Agent: 12.3 or
   newer.
 - For the server: Linux to run a release, though it builds and runs on macOS
-  for development. PostgreSQL is optional.
+  for development. PostgreSQL is optional, and so is Docker, which only the
+  packaging test uses.
+
+Every check below runs on your own machines, with no account anywhere. Builds
+download their dependencies (crates, npm packages and, for packaging,
+rcodesign and Docker base images); the tests reach nothing outside the
+machine they run on.
 
 ## What builds where
 
@@ -156,13 +162,25 @@ node --test scripts/*.test.mjs
 ```
 
 The server's integration tests start it in-process and drive its HTTP and
-WebSocket APIs with fake Agents and viewers. They run on SQLite, and also on
-PostgreSQL when `MESHRMM_TEST_POSTGRES_URL` names a server where they may
-create databases, for example
-`postgres://postgres:postgres@localhost:5432/postgres`. CI runs both.
+WebSocket APIs with fake Agents and viewers and a fake identity provider.
+They run on SQLite, and also on PostgreSQL when `MESHRMM_TEST_POSTGRES_URL`
+names a server where they may create databases, for example
+`postgres://postgres:postgres@localhost:5432/postgres`. Without it they skip
+PostgreSQL, except in CI, which runs both. To run both yourself:
+
+```sh
+sh scripts/test-server-postgres.sh   # arguments go to cargo test
+```
+
+It starts a throwaway PostgreSQL in a temporary directory, which needs only
+PostgreSQL's `initdb` and `pg_ctl` installed, and removes it afterwards.
 `tests/schema_parity.rs` checks that the two backends' migrations make the
 same tables and columns; change both `server/migrations/sqlite` and
 `server/migrations/postgres` together.
+
+`scripts/check-transport-security.py` checks the TLS a running server offers,
+a development server on your machine included; see
+[transport security](transport-security.md#checking-a-servers-tls).
 
 For the website and the marketing page:
 
@@ -178,8 +196,19 @@ Mac (it needs `cargo-xwin` and `ninja`); the tests still need Windows.
 
 Packaging has its own CI job, which builds the static server, packs it with
 stand-ins for the Agent and viewer builds, and installs and runs both the
-tarball and the Docker image. `scripts/test-server-package.sh` changes the
-machine it runs on, so leave it to CI.
+tarball and the Docker image. To do the same on your machine, on macOS or
+Linux with Docker and `cargo-zigbuild`:
+
+```sh
+sh scripts/test-server-package-local.sh                  # stand-in builds
+sh scripts/test-server-package-local.sh dist/downloads   # your own builds
+```
+
+It installs the tarball in a disposable container that runs systemd, so
+nothing is installed on your machine, and leaves the release in
+`dist/package-test` and the image as `meshrmm-server:package-test`. Don't run
+`scripts/test-server-package.sh` without `--image` yourself: it installs the
+server on the machine it runs on.
 
 ## Hardware and desktop tests
 

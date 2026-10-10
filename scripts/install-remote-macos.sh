@@ -7,7 +7,7 @@ ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 if [ "${1:-}" = "--help" ]; then
     echo "Usage: $0 [viewer-config.json]"
     echo "Builds a local viewer and installs it in ~/Applications for dashboard launches."
-    echo "Automatic updates are disabled; production download assets are untouched."
+    echo "Automatic updates are disabled, so a server's release can't replace it."
     exit 0
 fi
 if [ "$(uname -s)" != Darwin ] || [ "$#" -gt 1 ]; then
