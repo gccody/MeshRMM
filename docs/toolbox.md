@@ -1,9 +1,8 @@
 # Toolbox
 
-The toolbox keeps the scripts and files a technician uses on devices, much
-like ScreenConnect's. Scripts are written and edited on the dashboard's
-**Toolbox** page. They run on a device from the dashboard, or from the
-viewer's toolbox while connected. Library files are uploaded on the same page,
+The toolbox keeps the scripts and files a technician uses on devices.
+Scripts are written and edited on the website's **Toolbox** page. They run on
+a device from the website, or from the viewer's toolbox while connected. Library files are uploaded on the same page,
 and the viewer's toolbox sends them to the connected device.
 
 Each script and file is private to the user who added it, or shared with
@@ -48,8 +47,8 @@ offline or restarted, shows **No result** two minutes after its timeout.
 
 ### Running a script
 
-- **Dashboard:** choose **Run** on a script in the Toolbox, **Run a script** at
-  the top of it, or the terminal button on a device's row on the Devices page.
+- **Website:** choose **Run** on a script in the Toolbox, **Run a script** at
+  the top of it, or **Run a script…** in a device's menu on the Devices page.
   Pick the script, an online device, and the account. The dialog follows the
   run and shows its output when it finishes. **Run history** lists the last 50
   runs; users see their own, and users with `audit.view` see everyone's. Runs
@@ -58,7 +57,7 @@ offline or restarted, shows **No result** two minutes after its timeout.
   in its folder, then **As the signed-in user** or **As SYSTEM**. While it
   runs, the button is highlighted and its tooltip says so. When it finishes, a
   window opens with the outcome and output, which can be selected and copied.
-  Runs from the viewer also appear in the dashboard's run history.
+  Runs from the viewer also appear in the website's run history.
 
 ## Files
 
@@ -156,7 +155,7 @@ it up with the database; a file whose content is lost can't be downloaded or
 delivered. Behind a proxy that limits request bodies, keep
 `toolbox.max_file_bytes` under its limit.
 
-## Validation
+## Tests
 
 - `cargo test -p meshrmm-protocol-types`, `-p meshrmm-agent` and
   `-p meshrmm-remote` cover validation, the run and delivery helpers, the

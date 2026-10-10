@@ -43,60 +43,15 @@ field it fills both fields. Otherwise select the correct Windows account first.
 Review the selected account and submit the form yourself. Unsupported providers
 fail without a keystroke fallback. Passwordless/MFA workflows remain interactive.
 
-Older agents and foreground/background modes that do not support the credential
-broker leave the controls disabled. No server/dashboard deployment is required.
+Session modes that have no credential broker leave the controls disabled.
+Nothing about credentials involves the server.
 
-## Validation — September 30, 2026 (unfocused prompts)
+## Tests
 
-- macOS: 14 toolbar tests, including the always-listed, disabled autofill entry.
-- Windows `DESKTOP-85R6S28`: source synchronized and SHA-256 verified. Native
-  Clippy for the Agent and viewer with warnings denied, credential tests, and
-  viewer toolbar tests passed. The release Agent was installed with
-  `install-agent-local.ps1` (signaling connected).
-- With UAC temporarily set to request credentials (`ConsentPromptBehaviorAdmin`
-  3, restored to 5), a UAC prompt was opened from the console user's logon token
-  and Explorer kept the foreground. A LocalSystem input helper in the console
-  session received fake DPAPI-protected credentials. The previous build reported
-  no prompt and failed with "The foreground window is not a Windows credential
-  prompt". The installed build reported the prompt and filled the masked
-  password. Then the prompt was cancelled. The lock screen was not retested.
-
-## Validation — September 23, 2026
-
-- macOS: viewer Clippy with warnings denied, 32 viewer tests (one existing
-  ignored), 37 protocol tests, release build and local app installation.
-- Windows `DESKTOP-85R6S28`: dedicated source directory synchronized with all
-  working-tree source/new files and SHA-256 verified; Rust 1.97.1 tools checked.
-  Native Clippy with warnings denied; 87 agent tests (15 existing ignored),
-  one service-environment test, 37 protocol tests, and 24 Windows viewer tests
-  (one existing ignored) passed. DPAPI tampering, trusted process/field selection,
-  bounded helper IPC, and appended protocol tags have regression coverage.
-- Supported local service installation preserved configuration, retained a backup,
-  started the service, and verified signaling reconnection. The first connection
-  timed out before the agent received the request; restarting the service's
-  signaling connection recovered the live session.
-- A macOS viewer connected to the installed Windows service. Remote prompting,
-  successful Windows validation, masked lock-screen fill and successful unlock,
-  masked UAC password fill, button appearance/disappearance, cancellation,
-  failed validation without replacing the saved credential, and explicit forget
-  were exercised. UAC was cancelled after fill; no application was elevated.
-  The temporarily strengthened UAC credential-prompt policy was restored to its
-  original value (admin=5, user=3, secure-desktop=0).
-- Passwords were entered through the native Windows dialog. Failed-validation
-  testing used a nonexistent account to avoid failed attempts against the real
-  user. No test account was created.
-- Desktop transitions produced capture-access-loss/retry and clipboard-access
-  warnings; capture and input recovered, and the installed service remained
-  running. Windows viewer UI and third-party credential providers were not
-  manually tested. No server/dashboard changes, checks, or release publishing.
-
-Installed Windows agent SHA-256:
-`1A7EC58FD9047C5DA27DD4125B6FF3A1284FF109E1B36E5BE753923A4F160615`.
-
-Installed macOS viewer SHA-256:
-`86555a65dcaeae2e5cc0277995a12538c700dbe047c99dd327647a413f55608f`.
-
-Builds use working-tree changes on top of
-`93aed17f5873697c521a573e83764dd90145a960`. Local validation logs are retained at
-`/tmp/mesh-credentials-*.log`; endpoint sources and installer results are under
-`C:\Users\gccody\credentials-validation-20260923`.
+`cargo test -p meshrmm-agent credentials` covers which prompts and fields are
+accepted, saved credentials lasting until they are forgotten, and DPAPI
+round trips with tamper rejection. The DPAPI test fails with "Access is
+denied" in a key-based SSH session, which has no DPAPI master key; run it
+from a logged-in desktop. To try a password prompt behind another window, set
+UAC to ask for credentials (`ConsentPromptBehaviorAdmin` = 3) for the test
+and put it back afterwards.

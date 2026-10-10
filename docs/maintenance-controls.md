@@ -19,9 +19,10 @@ Advanced**, where they are named as below.
   The endpoint's mouse pointer is hidden until blackout ends. Choose
   **Restore agent monitors** to remove the notice and restore the pointer.
 
-Agent controls become available after the updated desktop helper announces support.
-The UI reflects acknowledged agent state. Failures show an error instead of silently
-claiming success. Blackout requires Windows 10 version 2004 or newer.
+Agent controls become available once the Agent's desktop helper announces
+them. The UI reflects the state the Agent acknowledged, and a failure shows an
+error instead of silently claiming success. Blackout requires Windows 10
+version 2004 or newer.
 
 These are session maintenance controls, not a Windows security boundary. Windows
 secure attention (Ctrl+Alt+Delete), secure desktop transitions, and privileged
@@ -73,24 +74,22 @@ Both use the same message. The default is:
 newlines and Unicode, must be nonempty, and is limited to 512 UTF-8 bytes. Only
 users with the settings permission can save the setting. There is no
 per-session or viewer override: the server resolves the setting and template
-from its settings. It sends them only in the authenticated Agent session request and keeps
-them in the session record. Requests from servers without the fields show no
-notification. Changes apply to new remote sessions.
+from its settings. It sends them only in the authenticated Agent session
+request and keeps them in the session record. Changes apply to new remote
+sessions.
 
 The notification appears once per remote session. Viewer reconnects and resumes
 of the same session do not repeat it. As a service, the Agent shows it from a
 separate LocalSystem helper on the interactive desktop (the console, or the
 viewed RDP session). Background-mode sessions can therefore notify the
 signed-in user, and desktop switches that replace the other helpers leave it
-open. The notification closes when the session ends. Apply
-migration `0015_connection_notification.sql` before deploying the updated server
-and dashboard; `/healthz` expects it.
+open. The notification closes when the session ends.
 
 ## Connection approval
 
 An administrator can make the Agent's user approve each connection under
 **Settings → Connection approval**. It is off by default. When it is on, the
-technician sees a dialog after choosing **Connect** or **Connect to
+technician sees a dialog after choosing **Connect** or **Connect in
 background** and may give a reason, up to 500 UTF-8 bytes. The Agent then shows
 a prompt in the middle of the console's primary monitor, above other windows:
 
@@ -131,8 +130,7 @@ The reason is stored with the one-time handoff, recorded in the
 reconnects and resumes of the same session do not ask again; a session the user
 declined stays declined. As a service, the Agent shows the prompt from a
 separate LocalSystem helper on the console's desktop, which also measures the
-session's input idle time. Apply migration `0018_connection_approval.sql`
-before deploying the updated server and dashboard; `/healthz` expects it.
+session's input idle time.
 
 ## Restart and Safe Mode
 
@@ -179,68 +177,30 @@ menu offers **Restart normally…**. The Agent makes Safe Mode work as follows:
 Other features degrade as Windows allows in Safe Mode; for example, system
 audio is unavailable because the Windows Audio service does not run.
 
-### Validation (2026-10-01)
+## Tests
 
-On `DESKTOP-85R6S28` (Windows 11, wired Ethernet, NVIDIA GPU), with the
-installed Agent service and the macOS viewer against production signaling:
+Unit tests cover the wire format, name and template rendering, keeping the
+session's policy and approval answer in the session record and across a
+restart, input gating across focus changes and reconnects, helper command
+serialization, and hook suppression.
 
-- **Restart:** Windows booted again 22 seconds after the click, and the
-  same viewer session reconnected 42 seconds after it.
-- **Restart in Safe Mode with Networking:** Windows booted into Safe Mode.
-  The service started, cleared the boot option and marker, and resumed the
-  session. H.265 failed as expected, and the stream fell back to software
-  H.264 at 1920×1080 and 30 FPS. The toolbar showed **Safe Mode**.
-- **Restart normally** from Safe Mode booted Windows normally, and the
-  session resumed with hardware H.265.
-- The opt-in software encoder test took about 9 ms per 1080p frame, both in
-  normal mode and in Safe Mode:
-
-  ```powershell
-  cargo test --release -p meshrmm-remote-screen software -- --ignored --nocapture
-  ```
-
-Connection approval was off for the test company. Unit tests cover keeping
-its answer across the restart.
-
-## Validation
-
-Automated checks cover protocol compatibility, name/template rendering, company
-isolation, legacy policy updates, session-record persistence, input gating across
-focus/reconnection, helper command serialization, and hook suppression.
-
-Interactive Windows tests are opt-in because they briefly block input and cover
-monitors. Run on the logged-in desktop, with no maintenance session active:
+The interactive Windows tests are ignored by default because they briefly
+block input and cover the monitors. Run them on the logged-in desktop with no
+maintenance session active:
 
 ```powershell
 cargo test -p meshrmm-agent live_ -- --ignored --nocapture --test-threads=1
 ```
 
-They verify that tagged remote key events pass, untagged events are suppressed,
-held input is released, input recovers on teardown, blackout covers the full
-virtual desktop with capture exclusion, and its window is destroyed on teardown.
-Also check visually that the endpoint pointer stays hidden while moving the remote
-mouse across applications and monitors, then returns after restoring monitors or
-disconnecting. The technician's viewer should continue to show cursor shapes.
+They check that tagged remote key events pass and untagged ones are
+suppressed, that held input is released and input recovers on teardown, and
+that blackout covers the whole virtual desktop, is excluded from capture, and
+is destroyed on teardown. Also check by eye that the device's pointer stays
+hidden while the remote mouse moves across applications and monitors, and
+comes back after restoring the monitors or disconnecting; the technician's
+viewer should keep showing cursor shapes. The software encoder Safe Mode
+relies on has its own test:
 
-### Test-machine validation (2026-09-14)
-
-- Installed the release agent on `192.168.1.152`; installer verified its SHA-256,
-  unchanged enrollment configuration, service startup, and signaling reconnection.
-- Windows: 29 agent tests and 19 viewer tests passed. Both opt-in desktop tests
-  passed, including release of a key held before blocking.
-- macOS viewer: 27 tests passed; built and installed the local application bundle.
-- Protocol: 20 binary-protocol and 3 shared-type tests passed.
-- Server: 10 Rust tests, 10 SQL regression tests, and the WebAssembly build passed.
-- Dashboard: typecheck, lint, production build, and 9 tests passed.
-- In an authenticated remote session, enabled all three controls, observed agent
-  acknowledgment, and confirmed the captured desktop remained visible with
-  blackout active. Closing the viewer removed the desktop helpers; a new session
-  reported agent restrictions off.
-- Saved a multiline custom template through the admin form, verified persistence,
-  and opened a new session with it. Restored the default template afterward.
-- Deployed database migration 0008, server, and dashboard. Native builds were
-  installed locally for testing; public native release assets were not republished.
-
-Local installation and desktop-test evidence is in the ignored
-`dist/maintenance-validation/` directory. The final test-agent SHA-256 was
-`FCF058704D5AC574F5FAA2BC8C2A85A7B4E88746E263C69AFD1022F75BD33B15`.
+```powershell
+cargo test --release -p meshrmm-remote-screen software -- --ignored --nocapture
+```
