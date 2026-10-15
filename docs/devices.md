@@ -50,11 +50,13 @@ being enrolled or deleted, as they happen. **Refresh** asks for a new
 snapshot; a snapshot never contacts an Agent. The server closes a user's
 socket when they sign out, are disabled, or lose `devices.view`.
 
-**Connect** opens a remote session. A device's menu has **Connect in
-background**, which opens [background mode](background-mode.md), and **Close
-active session**, which for users with `sessions.close_any` disconnects the
-device's viewer and clears a stale session reservation. The Agent stays online and can take a new connection at
-once. It is safe to repeat and is recorded in the audit log.
+Clicking a tile opens the device's resource usage. Hovering over an online
+device shows **Connect**, which opens a remote session on the console or in
+[background mode](background-mode.md), and **Scripts**, which runs a
+[script](toolbox.md) on it. A device's menu has **Close active session**,
+which for users with `sessions.close_any` disconnects the device's viewer and
+clears a stale session reservation. The Agent stays online and can take a new
+connection at once. It is safe to repeat and is recorded in the audit log.
 
 ## Resource monitoring
 
@@ -66,7 +68,7 @@ already keeps open:
 - uptime;
 - the capacity and free space of its local fixed volumes.
 
-A device's name opens its own page: the latest reading, every volume's free
+A device's tile or name opens its own page: the latest reading, every volume's free
 space, and charts of the last 15 minutes live, or the last hour, 24 hours or
 7 days. The server keeps the live readings in memory
 (`server/src/realtime/metrics.rs`) and averages each minute into the

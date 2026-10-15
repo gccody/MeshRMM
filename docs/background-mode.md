@@ -5,7 +5,7 @@ in Session 0 under SYSTEM, without capturing or changing the signed-in user's
 desktop. It is experimental, and meant for traditional Win32 administration
 tools, not a complete Explorer session.
 
-Open it with **Connect in background** in a device's menu on the website
+Open it with **Connect** > **Background** on a device's tile on the website
 (`sessions.connect_background`), or connect normally and choose
 **Background** in the viewer's session menu. Choosing a physical monitor goes
 back to the console.
