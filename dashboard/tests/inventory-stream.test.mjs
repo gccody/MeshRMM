@@ -59,7 +59,7 @@ function harness({ online } = {}) {
   const connections = [];
   const timers = fakeTimers();
   const revision = { current: -1 };
-  const state = { agents: [], refused: 0, readings: [] };
+  const state = { agents: [], companies: [], refused: 0, readings: [] };
   const stream = inventoryStream({
     openSocket: () => {
       const socket = new FakeSocket();
@@ -67,7 +67,7 @@ function harness({ online } = {}) {
       return socket;
     },
     revision,
-    onAgents: update => { state.agents = update(state.agents); },
+    onInventory: update => { ({ agents: state.agents, companies: state.companies } = update({ agents: state.agents, companies: state.companies })); },
     onMetrics: readings => { state.readings.push(...readings); },
     onConnection: connection => connections.push(connection),
     onRefused: () => { state.refused++; },
@@ -159,6 +159,25 @@ test('applies deltas buffered before the snapshot, then live deltas in order', (
   socket.receive({ type: 'snapshot', revision: 8, agents: [agent('a')], generated_at_unix_ms: 2 });
   assert.deepEqual(state.agents.map(item => item.id), ['a', 'z']);
   assert.equal(revision.current, 9);
+});
+
+test('companies arrive in the snapshot and change in order with devices', () => {
+  const { sockets, state } = harness();
+  const socket = sockets[0];
+  socket.open();
+  socket.receive({ type: 'company_upsert', revision: 3, company: { id: 'n', name: 'New' } });
+  socket.receive({
+    type: 'snapshot',
+    revision: 2,
+    agents: [{ ...agent('a'), company_id: 'g' }],
+    companies: [{ id: 'g', name: 'Globex' }, { id: 'c', name: 'Acme' }],
+    generated_at_unix_ms: 1,
+  });
+  assert.deepEqual(state.companies.map(company => company.name), ['Acme', 'Globex', 'New']);
+  socket.receive({ type: 'agent_upsert', revision: 4, agent: { ...agent('a'), company_id: null } });
+  socket.receive({ type: 'company_deleted', revision: 5, company_id: 'g' });
+  assert.deepEqual(state.companies.map(company => company.id), ['c', 'n']);
+  assert.equal(state.agents[0].company_id, null);
 });
 
 test('a snapshot older than the loaded inventory is refused and requested again', () => {

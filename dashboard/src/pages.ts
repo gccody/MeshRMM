@@ -5,6 +5,7 @@
 export const PAGES: readonly { path: string; title: string }[] = [
   { path: "/", title: "Devices" },
   { path: "/device", title: "Device" },
+  { path: "/companies", title: "Companies" },
   { path: "/toolbox", title: "Toolbox" },
   { path: "/users", title: "Users" },
   { path: "/roles", title: "Roles" },

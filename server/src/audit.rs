@@ -74,6 +74,13 @@ impl<'a> Target<'a> {
         Self { kind: "agent", id }
     }
 
+    pub fn company(id: &'a str) -> Self {
+        Self {
+            kind: "company",
+            id,
+        }
+    }
+
     pub fn agent_installer(id: &'a str) -> Self {
         Self {
             kind: "agent_installer",

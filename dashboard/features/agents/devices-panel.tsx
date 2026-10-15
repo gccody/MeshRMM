@@ -2,6 +2,7 @@
 import { CircleAlert, X } from "lucide-react";
 import { useSearchParams } from "react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { MoveDeviceDialog } from "../companies/company-dialogs";
 import { EnrollmentModal } from "../enrollment/enrollment-modal";
 import { useInstallerDownload } from "../enrollment/use-installer-download";
 import { ConnectionReasonModal } from "../session/connection-reason-modal";
@@ -13,7 +14,9 @@ import { AgentOverview, type DeviceActions } from "./agent-overview";
 import type { Agent } from "./types";
 import {
   type AgentStatusFilter,
+  type CompanyFilter,
   type DeviceFilters,
+  NO_COMPANY,
   clampDeviceQuery,
   filterAgents,
   parseDeviceFilters,
@@ -43,18 +46,22 @@ export function DevicesPanel() {
     runScripts: can("scripts.run"),
     delete: can("devices.delete"),
     enroll: can("devices.enroll"),
+    moveCompany: can("companies.manage"),
   };
   // A connection the device's user must approve, waiting for its reason.
   const [pendingConnect, setPendingConnect] = useState<{ agent: Agent; background: boolean } | null>(null);
   // The device a script is about to run on, and the button that asked.
   const [runScriptOn, setRunScriptOn] = useState<Agent | null>(null);
   const runScriptOpener = useRef<HTMLElement | null>(null);
+  // The device being moved to another company, and the menu that asked.
+  const [moving, setMoving] = useState<Agent | null>(null);
+  const moveOpener = useRef<HTMLElement | null>(null);
   const requestConnect = (agent: Agent, background: boolean) => {
     if (account.connection_approval) setPendingConnect({ agent, background });
     else void remote.connect(agent, background);
   };
   const filters = parseDeviceFilters(searchParams);
-  const status = filters.status;
+  const { status, company } = filters;
   // The search box updates at once; the URL follows after a pause in typing.
   const [queryInput, setQueryInput] = useState(filters.query);
   const [querySource, setQuerySource] = useState(filters.query);
@@ -67,23 +74,26 @@ export function DevicesPanel() {
 
   useEffect(() => {
     if (queryInput === filters.query) return;
-    const timer = window.setTimeout(() => writeFilters({ query: queryInput, status }), QUERY_WRITE_DELAY_MS);
+    const timer = window.setTimeout(() => writeFilters({ query: queryInput, status, company }), QUERY_WRITE_DELAY_MS);
     return () => window.clearTimeout(timer);
     // writeFilters changes with the URL, which this effect already follows.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters.query, queryInput, status]);
+  }, [filters.query, queryInput, status, company]);
 
   // The Devices link carries the filters, including any not yet in the URL.
-  const search = serializeDeviceFilters({ query: queryInput, status });
+  const search = serializeDeviceFilters({ query: queryInput, status, company });
   useEffect(() => {
     setDevicesSearch(search);
   }, [search, setDevicesSearch]);
 
-  const changeStatus = (next: AgentStatusFilter) => writeFilters({ query: queryInput, status: next });
+  const changeStatus = (next: AgentStatusFilter) => writeFilters({ query: queryInput, status: next, company });
+  const changeCompany = (next: CompanyFilter) => writeFilters({ query: queryInput, status, company: next });
   const filteredAgents = useMemo(
-    () => filterAgents(inventory.agents, { query: queryInput, status }),
-    [inventory.agents, queryInput, status],
+    () => filterAgents(inventory.agents, { query: queryInput, status, company }),
+    [inventory.agents, queryInput, status, company],
   );
+  // New devices join the company the page shows.
+  const enrollInto = company && company !== NO_COMPANY && inventory.companies.some((candidate) => candidate.id === company) ? company : "";
 
   return (
     <>
@@ -103,9 +113,11 @@ export function DevicesPanel() {
         metrics={inventory.metrics}
         onReconnect={inventory.reconnect}
         onRefresh={() => void inventory.refresh()}
-        onAddDevice={(opener) => { enrollOpener.current = opener; installer.reset(); setIsEnrolling(true); }}
+        onAddDevice={(opener) => { enrollOpener.current = opener; installer.reset(enrollInto); setIsEnrolling(true); }}
+        companies={inventory.companies}
         query={queryInput}
         status={status}
+        company={company}
         connectingId={remote.connectingId}
         connectingBackgroundId={remote.connectingBackgroundId}
         deletingId={deletingId}
@@ -113,6 +125,9 @@ export function DevicesPanel() {
         allowed={allowed}
         onQueryChange={(query) => setQueryInput(clampDeviceQuery(query))}
         onStatusChange={changeStatus}
+        onCompanyChange={changeCompany}
+        onClearFilters={() => { setQueryInput(""); writeFilters({ query: "", status: "all", company: "" }); }}
+        onMove={(agent, opener) => { moveOpener.current = opener; setMoving(agent); }}
         onRemote={(agent) => requestConnect(agent, false)}
         onRemoteBackground={(agent) => requestConnect(agent, true)}
         onCloseSession={(agent) => void remote.closeSession(agent)}
@@ -127,6 +142,9 @@ export function DevicesPanel() {
         command={installer.command}
         onClose={() => setIsEnrolling(false)}
         onPlatformChange={installer.setPlatform}
+        companies={inventory.companies}
+        companyId={installer.companyId}
+        onCompanyChange={installer.setCompanyId}
         onSubmit={(event) => void installer.download(event)}
         returnFocus={enrollOpener}
       />}
@@ -136,6 +154,7 @@ export function DevicesPanel() {
         onClose={() => setRunScriptOn(null)}
         returnFocus={runScriptOpener}
       />}
+      {moving && <MoveDeviceDialog agent={moving} returnFocus={moveOpener} onClose={() => setMoving(null)} />}
       {pendingConnect && <ConnectionReasonModal
         agentName={pendingConnect.agent.name}
         background={pendingConnect.background}

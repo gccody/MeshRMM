@@ -1,12 +1,14 @@
-//! Device presence for the website: the enrolled devices and which are
-//! online, as a snapshot followed by numbered changes.
+//! Device presence for the website: the enrolled devices, which are online,
+//! and the companies they belong to, as a snapshot followed by numbered
+//! changes.
 //!
 //! Whatever changes a device (its Agent connecting or disconnecting, an
-//! enrollment, a deletion) calls [`Presence::refresh`], which reads the
-//! device's current state and publishes it if it differs from what was last
-//! published. Reading the truth rather than trusting the caller keeps
-//! presence right however the changes interleave: the last refresh sees the
-//! last change. Snapshots publish whatever they find changed first, so every
+//! enrollment, a deletion, a move to another company) calls
+//! [`Presence::refresh`], which reads the device's current state and
+//! publishes it if it differs from what was last published. Changes to a
+//! company call [`Presence::refresh_company`] the same way. Reading the truth
+//! rather than trusting the caller keeps presence right however the changes
+//! interleave: the last refresh sees the last change. Snapshots publish whatever they find changed first, so every
 //! subscriber converges on the same state at the same revision.
 use std::{
     collections::HashMap,
@@ -20,7 +22,10 @@ use tokio::sync::{Mutex, broadcast, watch};
 
 use super::AgentHub;
 use crate::{
-    db::{self, Database, tables::Agents},
+    db::{
+        self, Database,
+        tables::{Agents, Companies},
+    },
     time::now_ms,
 };
 
@@ -40,7 +45,15 @@ pub struct PresenceAgent {
     /// The release an offline Agent said it is installing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updating_to: Option<String>,
+    /// The company the device belongs to, if any.
+    pub company_id: Option<String>,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
+pub struct PresenceCompany {
+    pub id: String,
+    pub name: String,
 }
 
 /// What the website's event socket sends.
@@ -50,6 +63,7 @@ pub enum PresenceEvent {
     Snapshot {
         revision: u64,
         agents: Vec<PresenceAgent>,
+        companies: Vec<PresenceCompany>,
         generated_at_unix_ms: i64,
     },
     AgentUpsert {
@@ -60,6 +74,14 @@ pub enum PresenceEvent {
         revision: u64,
         agent_id: String,
     },
+    CompanyUpsert {
+        revision: u64,
+        company: PresenceCompany,
+    },
+    CompanyDeleted {
+        revision: u64,
+        company_id: String,
+    },
 }
 
 impl PresenceEvent {
@@ -67,7 +89,9 @@ impl PresenceEvent {
         match self {
             Self::Snapshot { revision, .. }
             | Self::AgentUpsert { revision, .. }
-            | Self::AgentDeleted { revision, .. } => *revision,
+            | Self::AgentDeleted { revision, .. }
+            | Self::CompanyUpsert { revision, .. }
+            | Self::CompanyDeleted { revision, .. } => *revision,
         }
     }
 }
@@ -95,6 +119,8 @@ struct State {
     /// What subscribers were last told about each device; `None` once it
     /// was deleted.
     published: HashMap<String, Option<PresenceAgent>>,
+    /// The same for each company.
+    published_companies: HashMap<String, Option<PresenceCompany>>,
     /// Updates Agents announced before going offline.
     updating: HashMap<String, Update>,
 }
@@ -105,13 +131,25 @@ struct Update {
     until: Instant,
 }
 
-type AgentRow = (String, String, i64);
+type AgentRow = (String, String, Option<String>, i64);
 
 fn agent_select() -> sea_query::SelectStatement {
     Query::select()
-        .columns([Agents::Id, Agents::Name, Agents::CreatedAt])
+        .columns([
+            Agents::Id,
+            Agents::Name,
+            Agents::CompanyId,
+            Agents::CreatedAt,
+        ])
         .from(Agents::Table)
         .and_where(Expr::col(Agents::DeletionRequestedAt).is_null())
+        .to_owned()
+}
+
+fn company_select() -> sea_query::SelectStatement {
+    Query::select()
+        .columns([Companies::Id, Companies::Name])
+        .from(Companies::Table)
         .to_owned()
 }
 
@@ -135,11 +173,24 @@ impl Presence {
         self.inner.events.subscribe()
     }
 
-    /// Every device as it is now.
+    /// Every device and company as they are now.
     pub async fn snapshot(&self) -> db::Result<PresenceEvent> {
         let mut state = self.inner.state.lock().await;
         let rows: Vec<AgentRow> = self.inner.database.fetch_all(&agent_select()).await?;
+        let mut companies: Vec<PresenceCompany> =
+            self.inner.database.fetch_all(&company_select()).await?;
         state.prune_updates();
+        // New companies first and deleted ones last, so a device never names
+        // a company subscribers don't know.
+        let gone_companies = state
+            .published_companies
+            .iter()
+            .filter(|(id, company)| company.is_some() && !companies.iter().any(|c| &c.id == *id))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for company in &companies {
+            self.publish_company(&mut state, &company.id.clone(), Some(company.clone()));
+        }
         let mut agents = rows
             .into_iter()
             .map(|row| self.agent(&state, row))
@@ -156,10 +207,15 @@ impl Presence {
         for agent in &agents {
             self.publish(&mut state, &agent.id.clone(), Some(agent.clone()));
         }
+        for id in gone_companies {
+            self.publish_company(&mut state, &id, None);
+        }
         sort(&mut agents);
+        sort_companies(&mut companies);
         Ok(PresenceEvent::Snapshot {
             revision: state.revision,
             agents,
+            companies,
             generated_at_unix_ms: now_ms(),
         })
     }
@@ -184,6 +240,27 @@ impl Presence {
             }
             Err(error) => {
                 tracing::warn!(device_id, %error, "could not read a device to publish its presence")
+            }
+        }
+    }
+
+    /// Publishes the company's current state, if it changed. Refresh the
+    /// devices a change moved first, so no device names a deleted company.
+    pub async fn refresh_company(&self, company_id: &str) {
+        let mut state = self.inner.state.lock().await;
+        let row: db::Result<Option<PresenceCompany>> = self
+            .inner
+            .database
+            .fetch_optional(
+                &company_select()
+                    .and_where(Expr::col(Companies::Id).eq(company_id))
+                    .to_owned(),
+            )
+            .await;
+        match row {
+            Ok(company) => self.publish_company(&mut state, company_id, company),
+            Err(error) => {
+                tracing::warn!(company_id, %error, "could not read a company to publish it")
             }
         }
     }
@@ -236,7 +313,7 @@ impl Presence {
         self.inner.access.subscribe()
     }
 
-    fn agent(&self, state: &State, (id, name, created_at): AgentRow) -> PresenceAgent {
+    fn agent(&self, state: &State, (id, name, company_id, created_at): AgentRow) -> PresenceAgent {
         let connected = self.inner.hub.is_connected(&id);
         PresenceAgent {
             updating_to: (!connected)
@@ -245,6 +322,7 @@ impl Presence {
             connected,
             id,
             name,
+            company_id,
             created_at,
         }
     }
@@ -268,6 +346,32 @@ impl Presence {
         // Nobody listening is fine.
         let _ = self.inner.events.send(Arc::new(event));
     }
+
+    fn publish_company(
+        &self,
+        state: &mut State,
+        company_id: &str,
+        company: Option<PresenceCompany>,
+    ) {
+        if state.published_companies.get(company_id) == Some(&company) {
+            return;
+        }
+        state.revision += 1;
+        let event = match &company {
+            Some(company) => PresenceEvent::CompanyUpsert {
+                revision: state.revision,
+                company: company.clone(),
+            },
+            None => PresenceEvent::CompanyDeleted {
+                revision: state.revision,
+                company_id: company_id.to_owned(),
+            },
+        };
+        state
+            .published_companies
+            .insert(company_id.to_owned(), company);
+        let _ = self.inner.events.send(Arc::new(event));
+    }
 }
 
 impl State {
@@ -288,6 +392,11 @@ pub fn sort(agents: &mut [PresenceAgent]) {
     });
 }
 
+/// By name ignoring case, then by ID.
+pub fn sort_companies(companies: &mut [PresenceCompany]) {
+    companies.sort_by_cached_key(|company| (company.name.to_lowercase(), company.id.clone()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +407,7 @@ mod tests {
             name: name.into(),
             connected,
             updating_to: None,
+            company_id: None,
             created_at: 0,
         }
     }
@@ -335,8 +445,27 @@ mod tests {
             serde_json::json!({
                 "type": "agent_upsert",
                 "revision": 8,
-                "agent": { "id": "a", "name": "Desk", "connected": false, "updating_to": "1.2.3", "created_at": 0 }
+                "agent": { "id": "a", "name": "Desk", "connected": false, "updating_to": "1.2.3", "company_id": null, "created_at": 0 }
             })
+        );
+        let company = PresenceEvent::CompanyUpsert {
+            revision: 9,
+            company: PresenceCompany {
+                id: "c".into(),
+                name: "Acme".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(company).unwrap(),
+            serde_json::json!({ "type": "company_upsert", "revision": 9, "company": { "id": "c", "name": "Acme" } })
+        );
+        let removed = PresenceEvent::CompanyDeleted {
+            revision: 10,
+            company_id: "c".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(removed).unwrap(),
+            serde_json::json!({ "type": "company_deleted", "revision": 10, "company_id": "c" })
         );
     }
 }

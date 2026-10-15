@@ -2,6 +2,7 @@
 mod account;
 mod agent;
 mod audit_log;
+mod companies;
 mod devices;
 mod enrollment;
 mod events;
@@ -169,6 +170,12 @@ fn device_routes() -> Router<AppState> {
         .route("/events", get(events::subscribe))
         .route("/agents", get(devices::list))
         .route("/agents/{id}", delete(devices::delete))
+        .route("/agents/{id}/company", put(companies::assign))
+        .route("/companies", get(companies::list).post(companies::create))
+        .route(
+            "/companies/{id}",
+            patch(companies::update).delete(companies::delete),
+        )
         .route("/agents/{id}/connect", get(agent::connect))
         .route("/agents/{id}/close-session", post(remote::close))
         .route("/agents/{id}/metrics", get(metrics::get))

@@ -3,11 +3,12 @@
 // Imports carry the .ts extension so node:test can load this module directly.
 import { type Account, type Permission, canAny } from "../auth/types.ts";
 
-export type View = "devices" | "device" | "toolbox" | "users" | "roles" | "authentication" | "settings" | "audit" | "account";
+export type View = "devices" | "device" | "companies" | "toolbox" | "users" | "roles" | "authentication" | "settings" | "audit" | "account";
 
 export const VIEW_PATHS: Record<View, string> = {
   devices: "/",
   device: "/device",
+  companies: "/companies",
   toolbox: "/toolbox",
   users: "/users",
   roles: "/roles",
@@ -21,6 +22,7 @@ export const VIEW_PATHS: Record<View, string> = {
 export const VIEW_COPY: Record<View, { title: string }> = {
   devices: { title: "Devices" },
   device: { title: "Device" },
+  companies: { title: "Companies" },
   toolbox: { title: "Toolbox" },
   users: { title: "Users" },
   roles: { title: "Roles" },
@@ -35,6 +37,7 @@ export const VIEW_COPY: Record<View, { title: string }> = {
 const VIEW_ACCESS: Record<View, readonly Permission[]> = {
   devices: ["devices.view"],
   device: ["devices.view"],
+  companies: ["devices.view"],
   toolbox: ["scripts.run", "scripts.manage_shared", "files.deliver", "files.manage_shared"],
   users: ["users.manage"],
   roles: ["roles.manage"],

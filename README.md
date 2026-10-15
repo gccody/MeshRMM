@@ -46,6 +46,8 @@ MeshRMM is in heavy development and not production ready.
 
 - A live device wall: online state, a screen thumbnail, and CPU and memory
   gauges on every tile, updated over a WebSocket.
+- Companies to group devices by, such as each customer an MSP supports:
+  filter the wall by company and enroll new devices straight into one.
 - Resource monitoring: CPU, memory, network, uptime and disk space, live and
   as charts for the last hour, day or week.
 - Enrollment with a single-use installer (Windows) or install command
@@ -145,8 +147,8 @@ For developers:
   set up, and how the server and the Agent are built
 - [Development](docs/development.md): building, running, testing and
   installing local builds
-- [Devices](docs/devices.md): enrollment, the device list, resource
-  monitoring, updates and removal
+- [Devices](docs/devices.md): enrollment, companies, the device list,
+  resource monitoring, updates and removal
 - [Remote sessions](docs/remote-sessions.md): what the viewer does and how
   each feature behaves
 - [Video](docs/video.md): capture, encoding, negotiation and presentation
