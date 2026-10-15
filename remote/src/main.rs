@@ -7,13 +7,13 @@ mod annotation;
 mod clipboard;
 mod config;
 mod debug;
-#[cfg(windows)]
-mod deep_link;
 mod errors;
 mod h264;
 mod http;
 mod idle_disconnect;
 mod input;
+#[cfg(windows)]
+mod install;
 mod launch_status;
 mod matroska;
 mod platform;
@@ -49,7 +49,9 @@ const VIEWER_REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn initialize(launch_deep_link: Option<&str>) -> anyhow::Result<config::Config> {
     #[cfg(windows)]
-    let registration = deep_link::register();
+    let registration = std::env::current_exe()
+        .context("could not locate the viewer executable")
+        .and_then(|executable| install::register(&executable));
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install the Rustls ring crypto provider"))?;
@@ -63,7 +65,7 @@ fn initialize(launch_deep_link: Option<&str>) -> anyhow::Result<config::Config> 
     initialize_tracing(&config)?;
     #[cfg(windows)]
     if let Err(error) = registration {
-        tracing::warn!(error = ?error, "could not register the meshrmm: link handler");
+        tracing::warn!(error = ?error, "could not register the installed viewer");
     }
     if let Some(ready) = std::env::var_os("MESHRMM_UPDATE_READY_FILE") {
         std::fs::write(ready, b"ready").context("could not acknowledge viewer initialization")?;
@@ -468,6 +470,41 @@ fn main() -> std::process::ExitCode {
                 ExitCode::FAILURE
             }
         };
+    }
+    if install::is_uninstall_invocation() {
+        return match install::uninstall() {
+            Ok(removal) => {
+                platform::show_notice("MeshRMM Remote", "MeshRMM Remote was uninstalled.");
+                // It waits briefly for this process to exit, so it starts
+                // only once the notice is closed.
+                if let Some(mut removal) = removal
+                    && let Err(error) = removal.spawn()
+                {
+                    platform::show_fatal_error(&format!(
+                        "MeshRMM Remote could not remove its program file:\n\n{error}"
+                    ));
+                    return ExitCode::FAILURE;
+                }
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                platform::show_fatal_error(&format!(
+                    "MeshRMM Remote could not be uninstalled:\n\n{error:#}"
+                ));
+                ExitCode::FAILURE
+            }
+        };
+    }
+    match install::install_if_needed() {
+        // The installed viewer took over this launch.
+        Ok(true) => return ExitCode::SUCCESS,
+        Ok(false) => {}
+        Err(error) => {
+            platform::show_fatal_error(&format!(
+                "MeshRMM Remote could not be installed:\n\n{error:#}"
+            ));
+            return ExitCode::FAILURE;
+        }
     }
     let mut notices = Vec::new();
     let result = tokio::runtime::Builder::new_multi_thread()

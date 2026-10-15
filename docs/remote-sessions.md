@@ -6,6 +6,21 @@ differs, and each section says where. For how a session is set up, see
 [architecture](architecture.md#how-a-session-is-set-up); for the video
 itself, see [video](video.md).
 
+## Installing the viewer
+
+Technicians download the viewer from the website's **Remote app** menu.
+
+On Windows, the downloaded file installs the viewer for the current user the
+first time it's opened, without administrator rights: it copies itself to
+`%LOCALAPPDATA%\Programs\MeshRMM Remote`, registers the `meshrmm` link
+there and adds MeshRMM Remote to Apps & features, so the download can be
+deleted. Opening a downloaded viewer again, or one started by an older link
+registration, reinstalls it and passes its link to the installed copy.
+Uninstalling from Apps & features (`meshrmm-remote.exe --uninstall`)
+removes the program, the link and the entry, and keeps the viewer's
+settings and logs. The installed viewer updates itself in place (see
+[releases](releases.md#release-signatures)).
+
 ## Starting and ending
 
 **Connect** on a device opens the viewer with a single-use link. If the

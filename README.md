@@ -112,8 +112,8 @@ UDP 3478 and UDP 49160–49200 open from the internet.
    and run the Windows installer or the macOS command it gives you within 30
    minutes.
 5. On each technician's computer, download the viewer from the website's
-   **Remote app** menu and open it once. **Connect** on a device then opens
-   the session.
+   **Remote app** menu and open it once to install it. **Connect** on a
+   device then opens the session.
 
 [Running a MeshRMM server](docs/self-hosting.md) covers the rest: installing
 from the tarball with systemd, the other TLS modes, PostgreSQL, TURN, signing

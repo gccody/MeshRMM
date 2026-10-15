@@ -10,7 +10,7 @@ export const VIEWER_DOWNLOADS: Record<ViewerPlatform, { os: string; label: strin
     os: "Windows",
     label: "Windows 10/11 (x64)",
     href: "/downloads/meshrmm-remote-windows-x64.exe",
-    setup: "Open the downloaded MeshRMM Remote once so your browser can start it.",
+    setup: "Open the downloaded MeshRMM Remote once to install it. You can then delete the download.",
   },
   "macos-arm64": {
     // Safari cannot report the CPU, so the name says which build this is.
