@@ -73,6 +73,8 @@ pub fn show_notice(title: &'static str, message: &str) {
     let message = message.to_owned();
     DispatchQueue::main().exec_sync(move || {
         if let Some(mtm) = MainThreadMarker::new() {
+            // A notice replaces the connecting window shown at launch.
+            close_connecting_window();
             activate_application(mtm);
             let alert = NSAlert::new(mtm);
             alert.setMessageText(&NSString::from_str(title));

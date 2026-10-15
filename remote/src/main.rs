@@ -590,6 +590,24 @@ fn main() -> anyhow::Result<()> {
         return result;
     }
     platform::run_application(move |deep_link| {
+        // A downloaded viewer installs itself and hands this launch to the
+        // installed copy.
+        if let Some(installed) = platform::install_if_needed()? {
+            let link = deep_link.or_else(|| {
+                std::env::args_os()
+                    .skip(1)
+                    .filter_map(|argument| argument.into_string().ok())
+                    .find(|argument| argument.starts_with("meshrmm:"))
+            });
+            if link.is_none() {
+                platform::show_notice(
+                    "MeshRMM Remote",
+                    "MeshRMM Remote is installed in your Applications folder. Choose Connect on a \
+                     device in the MeshRMM website to start a session.",
+                );
+            }
+            return platform::launch_installed(&installed, link.as_deref());
+        }
         let mut config = initialize(deep_link.as_deref())?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()

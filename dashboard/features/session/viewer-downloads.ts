@@ -17,7 +17,7 @@ export const VIEWER_DOWNLOADS: Record<ViewerPlatform, { os: string; label: strin
     os: "macOS (Apple silicon)",
     label: "macOS (Apple silicon)",
     href: "/downloads/meshrmm-remote-macos-arm64.zip",
-    setup: "Unzip it, move MeshRMM Remote to Applications, and open it once.",
+    setup: "Unzip it and open MeshRMM Remote once to install it in your Applications folder.",
   },
 };
 

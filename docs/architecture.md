@@ -231,11 +231,14 @@ session helper in each graphical session. See [macOS Agent](macos-agent.md).
 ## The viewer
 
 The viewer takes its server from each link, so one install works with any
-server. On Windows it installs itself for the current user when first
-opened, and registers the `meshrmm` URL scheme there; on macOS the bundle's
-`Info.plist` registers the scheme. Network work, decoding and each
-session service run off the UI thread, with their own send queues, so local
-clipboard work cannot hold up input.
+server. Opened from anywhere but its install location, such as the
+Downloads folder, it installs itself for the current user first: on Windows
+in `%LOCALAPPDATA%\Programs\MeshRMM Remote`, where it registers the
+`meshrmm` URL scheme; on macOS in `~/Applications` (a viewer in
+`/Applications` stays there), where the bundle's `Info.plist` registers the
+scheme. See [remote sessions](remote-sessions.md#installing-the-viewer).
+Network work, decoding and each session service run off the UI thread, with
+their own send queues, so local clipboard work cannot hold up input.
 
 Before the remote display first appears, a failed connection is retried at
 most three times within a minute, then ends with an explanation. Afterwards

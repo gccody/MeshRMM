@@ -124,7 +124,8 @@ builds and signs a release-mode viewer, closes a running one, installs it in
 the local build; reinstall a release to get updates back. An existing install
 is kept in a `.meshrmm-backup.*` folder under `~/Applications`.
 `sh scripts/build-remote-macos.sh --local` makes the same bundle without
-installing it.
+installing it; opening it installs it as a downloaded viewer does (see
+[remote sessions](remote-sessions.md#installing-the-viewer)).
 
 The macOS build scripts sign with the keychain's Developer ID Application
 certificate, which keeps the Agent's privacy permissions across rebuilds. If
