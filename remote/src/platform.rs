@@ -607,8 +607,8 @@ pub use windows::{
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    Presenter, monotonic_timestamp_us, refresh_open_controls, run_application, show_launch_status,
-    show_notice, supported_video_profiles,
+    Presenter, install_if_needed, launch_installed, monotonic_timestamp_us, refresh_open_controls,
+    run_application, show_launch_status, show_notice, supported_video_profiles,
 };
 
 /// Windows pumps its window's messages every few milliseconds, which shows
