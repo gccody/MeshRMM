@@ -63,6 +63,7 @@ async fn installers_enroll_one_computer_that_can_recover_its_credential() {
                 "id": device_id,
                 "name": "DESKTOP-1",
                 "connected": false,
+                "company_id": null,
                 "created_at": devices.body["agents"][0]["created_at"],
             }])
         );

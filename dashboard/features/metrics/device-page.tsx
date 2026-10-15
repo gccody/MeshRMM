@@ -1,6 +1,9 @@
-import { Activity, ArrowLeft, CircleAlert, LoaderCircle, MonitorOff } from "lucide-react";
-import { useEffect } from "react";
+import { Activity, ArrowLeft, Building2, CircleAlert, LoaderCircle, MonitorOff } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
+import { NO_COMPANY, DEFAULT_DEVICE_FILTERS, serializeDeviceFilters } from "../agents/device-filters";
+import { companyName } from "../agents/model";
+import { MoveDeviceDialog } from "../companies/company-dialogs";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import { MetricChart, type Series } from "./metric-chart";
@@ -32,7 +35,9 @@ const isRange = (value: string | null): value is MetricsRange => METRICS_RANGES.
 
 // `/device?id=…`: one device's resource usage, live or over a range.
 export function DevicePage() {
-  const { inventory, authorizedFetch, setPageTitle } = useWorkspace();
+  const { inventory, authorizedFetch, can, setPageTitle } = useWorkspace();
+  const [moving, setMoving] = useState(false);
+  const moveOpener = useRef<HTMLButtonElement>(null);
   const [searchParams, setSearchParams] = useSearchParams();
   const deviceId = searchParams.get("id") ?? "";
   const requestedRange = searchParams.get("range");
@@ -89,6 +94,15 @@ export function DevicePage() {
         <div className="device-status">
           <Link to="/" className="back-link"><ArrowLeft size={15} aria-hidden="true" />Devices</Link>
           {agent && <StatusLine connected={agent.connected} updatingTo={agent.updating_to} latest={latest} />}
+          {agent && (
+            <p className="status-line">
+              <Building2 size={15} aria-hidden="true" />
+              <Link to={`/${serializeDeviceFilters({ ...DEFAULT_DEVICE_FILTERS, company: agent.company_id || NO_COMPANY })}`} className="back-link">
+                {companyName(inventory.companies, agent.company_id) ?? "No company"}
+              </Link>
+              {can("companies.manage") && <button ref={moveOpener} type="button" className="link-button" onClick={() => setMoving(true)} aria-haspopup="dialog">Move</button>}
+            </p>
+          )}
         </div>
 
         {error && <div className="error-banner" role="alert"><CircleAlert size={16} aria-hidden="true" /><span>{error}</span></div>}
@@ -121,6 +135,7 @@ export function DevicePage() {
 
         {latest && latest.volumes.length > 0 && <Volumes reading={latest} />}
       </div>
+      {moving && agent && <MoveDeviceDialog agent={agent} returnFocus={moveOpener} onClose={() => setMoving(false)} />}
     </>
   );
 }

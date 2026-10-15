@@ -1,4 +1,6 @@
-import type { Agent, AgentDelta, AgentEvent } from "./types";
+import type { Agent, AgentDelta, AgentEvent, Company, Inventory } from "./types";
+
+export const EMPTY_INVENTORY: Inventory = { agents: [], companies: [] };
 
 export const sortAgents = (items: Agent[]) =>
   [...items].sort(
@@ -8,13 +10,38 @@ export const sortAgents = (items: Agent[]) =>
       left.id.localeCompare(right.id),
   );
 
-export const applyAgentDelta = (items: Agent[], event: AgentDelta) =>
+export const sortCompanies = (items: Company[]) =>
+  [...items].sort(
+    (left, right) =>
+      left.name.localeCompare(right.name, undefined, { sensitivity: "base" }) ||
+      left.id.localeCompare(right.id),
+  );
+
+export const applyAgentDelta = (items: Agent[], event: Extract<AgentDelta, { type: "agent_upsert" | "agent_deleted" }>) =>
   event.type === "agent_upsert"
     ? sortAgents([
         ...items.filter((agent) => agent.id !== event.agent.id),
         event.agent,
       ])
     : items.filter((agent) => agent.id !== event.agent_id);
+
+export const applyInventoryDelta = (inventory: Inventory, event: AgentDelta): Inventory => {
+  switch (event.type) {
+    case "agent_upsert":
+    case "agent_deleted":
+      return { ...inventory, agents: applyAgentDelta(inventory.agents, event) };
+    case "company_upsert":
+      return {
+        ...inventory,
+        companies: sortCompanies([
+          ...inventory.companies.filter((company) => company.id !== event.company.id),
+          event.company,
+        ]),
+      };
+    case "company_deleted":
+      return { ...inventory, companies: inventory.companies.filter((company) => company.id !== event.company_id) };
+  }
+};
 
 const isAgent = (value: unknown): value is Agent => {
   if (!value || typeof value !== "object") return false;
@@ -23,22 +50,35 @@ const isAgent = (value: unknown): value is Agent => {
     typeof candidate.id === "string" &&
     typeof candidate.name === "string" &&
     typeof candidate.connected === "boolean" &&
-    (candidate.updating_to === undefined || typeof candidate.updating_to === "string")
+    (candidate.updating_to === undefined || typeof candidate.updating_to === "string") &&
+    (candidate.company_id === undefined || candidate.company_id === null || typeof candidate.company_id === "string")
   );
 };
 
+const isCompany = (value: unknown): value is Company => {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<Company>;
+  return typeof candidate.id === "string" && typeof candidate.name === "string";
+};
+
+// A snapshot's companies, or null when they're malformed.
+const parseCompanies = (value: unknown): Company[] | null =>
+  value === undefined ? [] : Array.isArray(value) && value.every(isCompany) ? value : null;
+
 export const parseAgentList = (
   value: unknown,
-): { agents: Agent[]; revision: number } | null => {
+): (Inventory & { revision: number }) | null => {
   if (!value || typeof value !== "object") return null;
-  const candidate = value as { agents?: unknown; revision?: unknown };
+  const candidate = value as { agents?: unknown; companies?: unknown; revision?: unknown };
   if (!Array.isArray(candidate.agents) || !candidate.agents.every(isAgent)) {
     return null;
   }
+  const companies = parseCompanies(candidate.companies);
+  if (!companies) return null;
   const revision = Number.isSafeInteger(candidate.revision)
     ? (candidate.revision as number)
     : -1;
-  return { agents: candidate.agents, revision };
+  return { agents: candidate.agents, companies, revision };
 };
 
 export const parseAgentEvent = (value: unknown): AgentEvent | null => {
@@ -47,16 +87,25 @@ export const parseAgentEvent = (value: unknown): AgentEvent | null => {
   if (!Number.isSafeInteger(candidate.revision) || (candidate.revision as number) < 0) {
     return null;
   }
-  if (candidate.type === "snapshot") {
-    if (!Array.isArray(candidate.agents) || !candidate.agents.every(isAgent)) return null;
-    return candidate as AgentEvent;
+  switch (candidate.type) {
+    case "snapshot":
+      return Array.isArray(candidate.agents) && candidate.agents.every(isAgent) && parseCompanies(candidate.companies)
+        ? candidate as AgentEvent
+        : null;
+    case "agent_upsert":
+      return isAgent(candidate.agent) ? candidate as AgentEvent : null;
+    case "agent_deleted":
+      return typeof candidate.agent_id === "string" ? candidate as AgentEvent : null;
+    case "company_upsert":
+      return isCompany(candidate.company) ? candidate as AgentEvent : null;
+    case "company_deleted":
+      return typeof candidate.company_id === "string" ? candidate as AgentEvent : null;
+    default:
+      return null;
   }
-  if (candidate.type === "agent_upsert" && isAgent(candidate.agent)) {
-    return candidate as AgentEvent;
-  }
-  if (candidate.type === "agent_deleted" && typeof candidate.agent_id === "string") {
-    return candidate as AgentEvent;
-  }
-  return null;
 };
 
+// The company's name, or null for a device in none (or one this browser
+// hasn't heard of yet).
+export const companyName = (companies: readonly Company[], id: string | null | undefined) =>
+  (id && companies.find((company) => company.id === id)?.name) || null;

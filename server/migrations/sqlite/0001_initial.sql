@@ -283,6 +283,14 @@ CREATE TABLE audit_events (
 CREATE INDEX idx_audit_events_created ON audit_events (created_at);
 CREATE INDEX idx_audit_events_actor ON audit_events (actor_user_id, created_at);
 
+-- The companies devices are sorted into, such as an MSP's customers.
+CREATE TABLE companies (
+  id TEXT NOT NULL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 120),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE agents (
   id TEXT NOT NULL PRIMARY KEY,
   name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 120),
@@ -293,12 +301,15 @@ CREATE TABLE agents (
   -- again until the Agent uses it. Cleared with the hash.
   pending_auth_token_encrypted BLOB,
   created_by_user_id TEXT,
+  -- NULL while the device belongs to no company.
+  company_id TEXT REFERENCES companies (id) ON DELETE SET NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   deletion_requested_at INTEGER
 );
 
 CREATE INDEX idx_agents_name ON agents (name);
+CREATE INDEX idx_agents_company ON agents (company_id);
 
 -- Each device's resource usage, one row per minute its Agent reported in.
 -- Rates and loads are averages over the minute's samples; storage is the
@@ -326,6 +337,8 @@ CREATE TABLE agent_install_tokens (
   token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64),
   created_by_user_id TEXT NOT NULL,
   platform TEXT NOT NULL CHECK (platform IN ('windows-x64', 'macos')),
+  -- The company the device it enrolls joins.
+  company_id TEXT REFERENCES companies (id) ON DELETE SET NULL,
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL,
   used_at INTEGER,

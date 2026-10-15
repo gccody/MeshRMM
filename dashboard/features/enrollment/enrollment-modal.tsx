@@ -2,6 +2,7 @@
 import { type FormEventHandler, type RefObject, useState } from "react";
 import { Check, Copy, Download, LoaderCircle, Terminal, X } from "lucide-react";
 import { ModalDialog } from "../../lib/modal-dialog";
+import type { Company } from "../agents/types";
 import type { AgentPlatform } from "./installer";
 
 type Props = {
@@ -13,6 +14,10 @@ type Props = {
   command: string | null;
   onClose: () => void;
   onPlatformChange: (platform: AgentPlatform) => void;
+  companies: Company[];
+  /** The company the device joins; "" for none. */
+  companyId: string;
+  onCompanyChange: (companyId: string) => void;
   onSubmit: FormEventHandler<HTMLFormElement>;
   returnFocus?: RefObject<HTMLElement | null>;
 };
@@ -25,6 +30,9 @@ export function EnrollmentModal({
   command,
   onClose,
   onPlatformChange,
+  companies,
+  companyId,
+  onCompanyChange,
   onSubmit,
   returnFocus,
 }: Props) {
@@ -44,6 +52,12 @@ export function EnrollmentModal({
         : "Run the installer on the computer. It appears here once set up."}</p>
       <form onSubmit={onSubmit}>
         <label>Operating system<select required value={platform} onChange={(event) => { setCopied(false); onPlatformChange(event.target.value as AgentPlatform); }}><option value="windows-x64">Windows 10/11 (x64)</option><option value="macos">macOS 12.3 or newer</option></select></label>
+        {companies.length > 0 && (
+          <label>Company<select value={companyId} onChange={(event) => { setCopied(false); onCompanyChange(event.target.value); }}>
+            <option value="">No company</option>
+            {companies.map((company) => <option key={company.id} value={company.id}>{company.name}</option>)}
+          </select></label>
+        )}
         {error && <div className="installer-error" role="alert">{error}</div>}
         {mac && command && (
           <div className="installer-command">
