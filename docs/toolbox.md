@@ -48,7 +48,7 @@ offline or restarted, shows **No result** two minutes after its timeout.
 ### Running a script
 
 - **Website:** choose **Run** on a script in the Toolbox, **Run a script** at
-  the top of it, or **Run a script…** in a device's menu on the Devices page.
+  the top of it, or **Scripts** on a device's tile on the Devices page.
   Pick the script, an online device, and the account. The dialog follows the
   run and shows its output when it finishes. **Run history** lists the last 50
   runs; users see their own, and users with `audit.view` see everyone's. Runs
