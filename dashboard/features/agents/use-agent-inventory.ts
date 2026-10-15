@@ -2,9 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AuthenticationRequired, type AuthorizedFetch, errorMessage } from "../../lib/http";
 import type { MetricsReading } from "../metrics/model";
 import { inventoryStatus } from "./inventory-stream";
-import { parseAgentList, sortAgents } from "./model";
+import { EMPTY_INVENTORY, parseAgentList, sortAgents, sortCompanies } from "./model";
 import { ThumbnailStore } from "./thumbnails";
-import type { Agent } from "./types";
+import type { Inventory } from "./types";
 import { useInventoryConnection } from "./use-inventory-connection";
 
 type Options = {
@@ -23,7 +23,7 @@ async function fetchAgentList(authorizedFetch: AuthorizedFetch) {
 }
 
 export function useAgentInventory({ enabled, authorizedFetch, onRefused }: Options) {
-  const [agents, setAgents] = useState<Agent[]>([]);
+  const [{ agents, companies }, setInventory] = useState<Inventory>(EMPTY_INVENTORY);
   const [hasData, setHasData] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
@@ -38,7 +38,7 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused }: Optio
   // Only sign-out and the session lock discard the inventory.
   const reset = useCallback(() => {
     thumbnails.clear();
-    setAgents([]);
+    setInventory(EMPTY_INVENTORY);
     setMetrics(new Map());
     setHasData(false);
     setLastUpdated(null);
@@ -64,7 +64,7 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused }: Optio
       setError(null);
       if (data.revision < revision.current) return true;
       revision.current = data.revision;
-      setAgents(sortAgents(data.agents));
+      setInventory({ agents: sortAgents(data.agents), companies: sortCompanies(data.companies) });
       setHasData(true);
       setLastUpdated(new Date());
       return true;
@@ -78,8 +78,8 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused }: Optio
     }
   }, [authorizedFetch, enabled]);
 
-  const applyStreamUpdate = useCallback((update: (current: Agent[]) => Agent[]) => {
-    setAgents(update);
+  const applyStreamUpdate = useCallback((update: (current: Inventory) => Inventory) => {
+    setInventory(update);
     setHasData(true);
     setLastUpdated(new Date());
     setError(null);
@@ -91,7 +91,7 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused }: Optio
       return next;
     });
   }, []);
-  const { connection, since, now, reconnect } = useInventoryConnection({ enabled, revisionRef: revision, onAgents: applyStreamUpdate, onMetrics: applyMetrics, onRefused });
+  const { connection, since, now, reconnect } = useInventoryConnection({ enabled, revisionRef: revision, onInventory: applyStreamUpdate, onMetrics: applyMetrics, onRefused });
 
   // Refresh reloads the list and, while the stream is down, skips the
   // reconnect wait. An open stream is already current.
@@ -104,6 +104,7 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused }: Optio
   const status = inventoryStatus({ hasData, connection, since, now });
   return {
     agents: enabled ? agents : [],
+    companies: enabled ? companies : [],
     metrics: onlineMetrics,
     hasData: enabled && hasData,
     status: enabled ? status : "loading",

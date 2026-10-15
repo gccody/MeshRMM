@@ -1,13 +1,13 @@
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 import type { MetricsReading } from "../metrics/model";
 import { type InventoryConnection, STALE_GRACE_MS, eventsSocketUrl, inventoryStream } from "./inventory-stream";
-import type { Agent } from "./types";
+import type { Inventory } from "./types";
 
 type Options = {
   enabled: boolean;
   // Shared with the HTTP inventory load so neither applies older data.
   revisionRef: RefObject<number>;
-  onAgents: (update: (current: Agent[]) => Agent[]) => void;
+  onInventory: (update: (current: Inventory) => Inventory) => void;
   onMetrics: (readings: MetricsReading[]) => void;
   onRefused: () => void;
 };
@@ -16,7 +16,7 @@ type Options = {
 type Link = { connection: InventoryConnection; since: number | null };
 
 // The live inventory socket, and how long it has been down.
-export function useInventoryConnection({ enabled, revisionRef, onAgents, onMetrics, onRefused }: Options) {
+export function useInventoryConnection({ enabled, revisionRef, onInventory, onMetrics, onRefused }: Options) {
   const [link, setLink] = useState<Link>({ connection: "connecting", since: null });
   // Advanced by a timer when the stale grace period ends.
   const [clock, setClock] = useState(0);
@@ -30,7 +30,7 @@ export function useInventoryConnection({ enabled, revisionRef, onAgents, onMetri
     const current = inventoryStream({
       openSocket: () => new WebSocket(eventsSocketUrl(window.location)),
       revision: revisionRef,
-      onAgents,
+      onInventory,
       onMetrics,
       onConnection: (connection) => {
         const at = Date.now();
@@ -48,7 +48,7 @@ export function useInventoryConnection({ enabled, revisionRef, onAgents, onMetri
       current.stop();
       stream.current = null;
     };
-  }, [enabled, onAgents, onMetrics, revisionRef]);
+  }, [enabled, onInventory, onMetrics, revisionRef]);
 
   // Resynchronize when the network returns or the tab becomes visible again,
   // for example after the computer wakes from sleep.

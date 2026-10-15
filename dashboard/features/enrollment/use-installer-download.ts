@@ -21,10 +21,13 @@ export function useInstallerDownload(authorizedFetch: AuthorizedFetch) {
   const [downloaded, setDownloaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [command, setCommand] = useState<string | null>(null);
+  // The company the device joins; "" for none.
+  const [companyId, setCompanyIdState] = useState("");
 
-  // Starts a fresh "Add device" flow.
-  const reset = useCallback(() => {
+  // Starts a fresh "Add device" flow, enrolling into `company` if given.
+  const reset = useCallback((company = "") => {
     setPlatform("windows-x64");
+    setCompanyIdState(company);
     setDownloaded(false);
     setError(null);
     setCommand(null);
@@ -32,6 +35,14 @@ export function useInstallerDownload(authorizedFetch: AuthorizedFetch) {
 
   const changePlatform = useCallback((next: AgentPlatform) => {
     setPlatform(next);
+    setDownloaded(false);
+    setError(null);
+    setCommand(null);
+  }, []);
+
+  // A command made for another company would enroll into that one.
+  const setCompanyId = useCallback((next: string) => {
+    setCompanyIdState(next);
     setDownloaded(false);
     setError(null);
     setCommand(null);
@@ -45,7 +56,7 @@ export function useInstallerDownload(authorizedFetch: AuthorizedFetch) {
       const bootstrapResponse = await authorizedFetch("/v1/agent-installers", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ platform }),
+        body: JSON.stringify({ platform, company_id: companyId || null }),
       });
       if (!bootstrapResponse.ok) {
         throw new Error(await errorMessage(bootstrapResponse, "The Agent installer could not be authorized."));
@@ -89,5 +100,5 @@ export function useInstallerDownload(authorizedFetch: AuthorizedFetch) {
     }
   };
 
-  return { platform, setPlatform: changePlatform, isDownloading, downloaded, error, command, reset, download };
+  return { platform, setPlatform: changePlatform, companyId, setCompanyId, isDownloading, downloaded, error, command, reset, download };
 }

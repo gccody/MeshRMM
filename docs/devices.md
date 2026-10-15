@@ -6,7 +6,8 @@ Windows; the [macOS Agent](macos-agent.md) differs where its page says.
 
 ## Enrollment
 
-**Add device** in the website asks for the platform. For Windows it downloads
+**Add device** in the website asks for the platform and, once companies
+exist, the [company](#companies) the device joins. For Windows it downloads
 a setup executable; for macOS it shows an install command. Each carries a
 random, single-use enrollment authorization that expires after 30 minutes
 (`INSTALLER_TTL_MS` in `server/src/api/enrollment.rs`). The browser appends
@@ -39,16 +40,37 @@ identity.
 The server stores only the SHA-256 hash of an Agent credential. No
 environment variables are needed on the device.
 
+## Companies
+
+Companies group devices, for example by the customer or site they belong
+to. A device belongs to at most one company, or to none. The **Companies**
+page lists them with how many devices each has; anyone with `devices.view`
+sees it. Users with `companies.manage` create, rename and delete companies
+there, and move a device with **Move to company…** in its menu or **Move**
+on its page (`PUT /v1/agents/{id}/company`, with `null` for no company).
+
+Deleting a company keeps its devices enrolled, in no company. An installer
+made for a company enrolls its device into it; if the company is deleted
+first, the device enrolls into none. Company names are unique, ignoring
+case. Creating, renaming and deleting a company, and moving a device, are
+recorded in the audit log.
+
 ## The device list
 
 The **Devices** page is a wall of tiles: each device's name, whether it is
 online, its [screen thumbnail](screen-thumbnails.md), and CPU and memory
 gauges. It doesn't poll. The website opens a WebSocket to `/v1/events`,
 authenticated by the sign-in cookie, and gets a snapshot followed by
-revision-numbered changes: Agents going online and offline, updating, and
-being enrolled or deleted, as they happen. **Refresh** asks for a new
+revision-numbered changes: Agents going online and offline, updating,
+being enrolled, deleted or moved to another company, and companies being
+created, renamed or deleted, as they happen. **Refresh** asks for a new
 snapshot; a snapshot never contacts an Agent. The server closes a user's
 socket when they sign out, are disabled, or lose `devices.view`.
+
+A tile names its device's company. The company menu beside the search box
+shows one company's devices, or those in none; like the search and the
+online filter, it is kept in the page's address (`?company=<id>`, or
+`?company=none`).
 
 Clicking a tile opens the device's resource usage. Hovering over an online
 device shows **Connect**, which opens a remote session on the console or in

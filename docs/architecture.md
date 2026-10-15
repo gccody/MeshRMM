@@ -137,8 +137,8 @@ task.
   deadline, resume, end and expiry. Its record is persisted in
   `remote_sessions`.
 - **Presence**: a broadcast channel. Coordinators publish Agents going
-  online, offline and updating; the enrollment and deletion handlers publish
-  catalog changes. Website sockets (`/v1/events`, authenticated by the
+  online, offline and updating; the enrollment, deletion and company
+  handlers publish catalog changes, including companies themselves. Website sockets (`/v1/events`, authenticated by the
   session cookie and `Origin`) get a snapshot, then revision-numbered changes.
   Disabling a user or removing their `devices.view` permission closes their
   sockets.
@@ -156,7 +156,7 @@ server stores only as a SHA-256 hash; viewers with handoff and session tokens.
 Roles are built from these permissions (`server/src/rbac.rs`):
 
 `devices.view`, `devices.enroll`, `devices.delete`,
-`devices.rotate_credentials`, `sessions.connect`,
+`devices.rotate_credentials`, `companies.manage`, `sessions.connect`,
 `sessions.connect_background`, `sessions.close_any`, `scripts.run`,
 `scripts.manage_shared`, `files.deliver`, `files.manage_shared`,
 `users.manage`, `roles.manage`, `settings.manage`, `authentication.manage`,

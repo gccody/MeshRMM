@@ -2,8 +2,8 @@
 // revision-ordered deltas, and reconnects with backoff. It never discards the
 // inventory it already has; the hook shows it as stale.
 import { type MetricsReading, parseMetricsEvent } from "../metrics/model.ts";
-import { applyAgentDelta, parseAgentEvent, sortAgents } from "./model.ts";
-import type { Agent, AgentDelta, AgentEvent, AgentSnapshot } from "./types";
+import { applyInventoryDelta, parseAgentEvent, sortAgents, sortCompanies } from "./model.ts";
+import type { AgentDelta, AgentEvent, AgentSnapshot, Inventory } from "./types";
 
 const FIRST_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
@@ -38,7 +38,7 @@ type Options = {
   openSocket: () => SocketLike;
   // Shared with the HTTP inventory load so neither applies older data.
   revision: { current: number };
-  onAgents: (update: (current: Agent[]) => Agent[]) => void;
+  onInventory: (update: (current: Inventory) => Inventory) => void;
   // Devices' latest resource usage, which carries no revision.
   onMetrics?: (readings: MetricsReading[]) => void;
   onConnection: (connection: InventoryConnection) => void;
@@ -105,9 +105,9 @@ function reconnectBackoff(timers: Timers, stopped: () => boolean, connect: () =>
 // Applies one socket's events in revision order. Deltas wait for its first
 // snapshot, and a gap asks the server for a new one. Returns whether the
 // event brought the inventory up to date.
-function eventSequencer({ revision, onAgents, requestSnapshot, overflow }: {
+function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
   revision: { current: number };
-  onAgents: (update: (current: Agent[]) => Agent[]) => void;
+  onInventory: (update: (current: Inventory) => Inventory) => void;
   requestSnapshot: () => void;
   overflow: () => void;
 }) {
@@ -119,7 +119,7 @@ function eventSequencer({ revision, onAgents, requestSnapshot, overflow }: {
       requestSnapshot();
       return false;
     }
-    let nextAgents = sortAgents(event.agents);
+    let next: Inventory = { agents: sortAgents(event.agents), companies: sortCompanies(event.companies ?? []) };
     let nextRevision = event.revision;
     for (const pending of pendingEvents.sort((left, right) => left.revision - right.revision)) {
       if (pending.revision <= nextRevision) continue;
@@ -129,13 +129,13 @@ function eventSequencer({ revision, onAgents, requestSnapshot, overflow }: {
         requestSnapshot();
         return false;
       }
-      nextAgents = applyAgentDelta(nextAgents, pending);
+      next = applyInventoryDelta(next, pending);
       nextRevision = pending.revision;
     }
     pendingEvents = [];
     awaitingSnapshot = false;
     revision.current = nextRevision;
-    onAgents(() => nextAgents);
+    onInventory(() => next);
     return true;
   };
 
@@ -153,7 +153,7 @@ function eventSequencer({ revision, onAgents, requestSnapshot, overflow }: {
       return false;
     }
     revision.current = event.revision;
-    onAgents((agents) => applyAgentDelta(agents, event));
+    onInventory((inventory) => applyInventoryDelta(inventory, event));
     return true;
   };
 
@@ -168,9 +168,9 @@ function eventSequencer({ revision, onAgents, requestSnapshot, overflow }: {
 
 // Handles one socket's events while it is the stream's current socket.
 // `onClose` learns whether the server refused the socket or revoked access.
-function watchSocket(socket: SocketLike, { revision, onAgents, onMetrics, current, onOpen, onLive, onClose }: {
+function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, current, onOpen, onLive, onClose }: {
   revision: { current: number };
-  onAgents: (update: (current: Agent[]) => Agent[]) => void;
+  onInventory: (update: (current: Inventory) => Inventory) => void;
   onMetrics?: (readings: MetricsReading[]) => void;
   current: () => boolean;
   onOpen: () => void;
@@ -183,7 +183,7 @@ function watchSocket(socket: SocketLike, { revision, onAgents, onMetrics, curren
   };
   const sequence = eventSequencer({
     revision,
-    onAgents,
+    onInventory,
     requestSnapshot,
     overflow: () => socket.close(1009, "too many pending device events"),
   });
@@ -215,7 +215,7 @@ function watchSocket(socket: SocketLike, { revision, onAgents, onMetrics, curren
 export function inventoryStream({
   openSocket,
   revision,
-  onAgents,
+  onInventory,
   onMetrics,
   onConnection,
   onRefused,
@@ -229,7 +229,7 @@ export function inventoryStream({
 
   const listen = (nextSocket: SocketLike) => watchSocket(nextSocket, {
     revision,
-    onAgents,
+    onInventory,
     onMetrics,
     current: () => !stopped && socket === nextSocket,
     onOpen: () => reconnect.reset(),

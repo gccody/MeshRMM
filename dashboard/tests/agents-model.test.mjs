@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   applyAgentDelta,
+  applyInventoryDelta,
+  companyName,
   parseAgentEvent,
   parseAgentList,
   sortAgents,
@@ -44,8 +46,16 @@ test("rejects malformed Agent API and event payloads", () => {
       agents: [{ id: "a", name: "Alpha", connected: true }],
       revision: 4,
     }),
-    { agents: [{ id: "a", name: "Alpha", connected: true }], revision: 4 },
+    { agents: [{ id: "a", name: "Alpha", connected: true }], companies: [], revision: 4 },
   );
+  assert.equal(parseAgentList({ agents: [], companies: [{ id: "c" }], revision: 1 }), null);
+  assert.equal(
+    parseAgentEvent({ type: "agent_upsert", revision: 5, agent: { id: "a", name: "A", connected: true, company_id: 7 } }),
+    null,
+  );
+  assert.equal(parseAgentEvent({ type: "company_upsert", revision: 5, company: { id: "c" } }), null);
+  assert.equal(parseAgentEvent({ type: "company_deleted", revision: 5 }), null);
+  assert.equal(parseAgentEvent({ type: "company_renamed", revision: 5 }), null);
   const updating = { id: "a", name: "Alpha", connected: false, updating_to: "0.3.1" };
   assert.deepEqual(parseAgentEvent({ type: "agent_upsert", revision: 5, agent: updating }), {
     type: "agent_upsert",
@@ -56,6 +66,22 @@ test("rejects malformed Agent API and event payloads", () => {
     parseAgentEvent({ type: "agent_upsert", revision: 5, agent: { ...updating, updating_to: 3 } }),
     null,
   );
+});
+
+test("applies company events and names a device's company", () => {
+  let inventory = { agents: [{ id: "a", name: "Alpha", connected: true, company_id: "g" }], companies: [] };
+  inventory = applyInventoryDelta(inventory, { type: "company_upsert", revision: 1, company: { id: "g", name: "globex" } });
+  inventory = applyInventoryDelta(inventory, { type: "company_upsert", revision: 2, company: { id: "a", name: "Acme" } });
+  assert.deepEqual(inventory.companies.map((company) => company.name), ["Acme", "globex"]);
+  assert.equal(companyName(inventory.companies, inventory.agents[0].company_id), "globex");
+
+  inventory = applyInventoryDelta(inventory, { type: "company_upsert", revision: 3, company: { id: "g", name: "Globex" } });
+  assert.equal(companyName(inventory.companies, "g"), "Globex");
+  inventory = applyInventoryDelta(inventory, { type: "company_deleted", revision: 4, company_id: "g" });
+  assert.deepEqual(inventory.companies, [{ id: "a", name: "Acme" }]);
+  assert.equal(companyName(inventory.companies, "g"), null);
+  assert.equal(companyName(inventory.companies, null), null);
+  assert.equal(inventory.agents.length, 1, "company events leave devices alone");
 });
 
 test("uses a four-hour idle timeout by default", () => {

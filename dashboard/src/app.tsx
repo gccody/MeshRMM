@@ -3,6 +3,7 @@ import { Link, Route, Routes } from "react-router";
 import { AccountPanel } from "../features/account/account-panel";
 import { DevicesPanel } from "../features/agents/devices-panel";
 import { DevicePage } from "../features/metrics/device-page";
+import { CompaniesPanel } from "../features/companies/companies-panel";
 import { AuditPanel } from "../features/audit/audit-panel";
 import { AuthenticationPanel } from "../features/authentication/authentication-panel";
 import { InvitePage } from "../features/auth/invite-page";
@@ -28,6 +29,7 @@ export function App() {
           <Route element={<WorkspaceShell />}>
             <Route index element={<DevicesPanel />} />
             <Route path="device" element={<DevicePage />} />
+            <Route path="companies" element={<CompaniesPanel />} />
             <Route path="toolbox" element={<ToolboxPanel />} />
             <Route path="users" element={<UsersPanel />} />
             <Route path="roles" element={<RolesPanel />} />

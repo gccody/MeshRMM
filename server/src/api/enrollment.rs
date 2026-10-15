@@ -9,7 +9,7 @@ use sea_query::{Expr, ExprTrait, Query};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::limit_token_attempts;
+use super::{companies, limit_token_attempts};
 use crate::{
     agents::{self, bearer_token, enrollment_token, hashes_match},
     audit::{self, Actor, Target},
@@ -39,6 +39,9 @@ const BITRATE_BITS_PER_SECOND: u32 = 12_000_000;
 #[serde(deny_unknown_fields)]
 pub struct InstallerRequest {
     platform: String,
+    /// The company the enrolled device joins, if any.
+    #[serde(default)]
+    company_id: Option<String>,
 }
 
 /// What the website embeds in the installer it downloads.
@@ -67,6 +70,10 @@ pub async fn create(
     let now = now_ms();
     let expires_at = now + INSTALLER_TTL_MS;
     let mut transaction = state.database.begin().await?;
+    let company_id = match &request.company_id {
+        Some(company_id) => Some(companies::ensure_exists(&mut transaction, company_id).await?),
+        None => None,
+    };
     transaction
         .execute(
             &Query::insert()
@@ -76,6 +83,7 @@ pub async fn create(
                     AgentInstallTokens::TokenHash,
                     AgentInstallTokens::CreatedByUserId,
                     AgentInstallTokens::Platform,
+                    AgentInstallTokens::CompanyId,
                     AgentInstallTokens::CreatedAt,
                     AgentInstallTokens::ExpiresAt,
                 ])
@@ -84,6 +92,7 @@ pub async fn create(
                     token_hash(&token).into(),
                     actor.user.id.as_str().into(),
                     request.platform.as_str().into(),
+                    company_id.clone().into(),
                     now.into(),
                     expires_at.into(),
                 ])
@@ -95,7 +104,7 @@ pub async fn create(
         &actor.actor(),
         "agent_installer.issue",
         Target::agent_installer(&id),
-        json!({ "platform": request.platform }),
+        json!({ "platform": request.platform, "company_id": company_id }),
     )
     .await?;
     transaction.commit().await?;
@@ -135,6 +144,7 @@ struct ClaimRow {
     id: String,
     created_by_user_id: String,
     device_id: String,
+    company_id: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -248,6 +258,7 @@ async fn claim_installer(
                     AgentInstallTokens::Id,
                     AgentInstallTokens::CreatedByUserId,
                     AgentInstallTokens::DeviceId,
+                    AgentInstallTokens::CompanyId,
                 ])
                 .from(AgentInstallTokens::Table)
                 .and_where(Expr::col(AgentInstallTokens::TokenHash).eq(installer_hash))
@@ -290,6 +301,7 @@ async fn enroll_device(
                             Agents::Name,
                             Agents::AuthTokenHash,
                             Agents::CreatedByUserId,
+                            Agents::CompanyId,
                             Agents::CreatedAt,
                             Agents::UpdatedAt,
                         ])
@@ -298,6 +310,7 @@ async fn enroll_device(
                             name.into(),
                             agent_token_hash.into(),
                             claim.created_by_user_id.as_str().into(),
+                            claim.company_id.clone().into(),
                             now.into(),
                             now.into(),
                         ])

@@ -252,6 +252,15 @@ pub enum AuditEvents {
 }
 
 #[derive(Iden)]
+pub enum Companies {
+    Table,
+    Id,
+    Name,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
 pub enum Agents {
     Table,
     Id,
@@ -260,6 +269,7 @@ pub enum Agents {
     PendingAuthTokenHash,
     PendingAuthTokenEncrypted,
     CreatedByUserId,
+    CompanyId,
     CreatedAt,
     UpdatedAt,
     DeletionRequestedAt,
@@ -288,6 +298,7 @@ pub enum AgentInstallTokens {
     TokenHash,
     CreatedByUserId,
     Platform,
+    CompanyId,
     CreatedAt,
     ExpiresAt,
     UsedAt,

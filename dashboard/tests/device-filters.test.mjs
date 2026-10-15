@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   DEFAULT_DEVICE_FILTERS,
+  NO_COMPANY,
   MAX_DEVICE_QUERY_LENGTH,
   filterAgents,
   parseDeviceFilters,
@@ -10,12 +11,12 @@ import {
 
 test("parses the defaults from an empty or missing search", () => {
   assert.deepEqual(parseDeviceFilters(new URLSearchParams()), DEFAULT_DEVICE_FILTERS);
-  assert.deepEqual(parseDeviceFilters(null), { query: "", status: "all" });
+  assert.deepEqual(parseDeviceFilters(null), { query: "", status: "all", company: "" });
 });
 
 test("reads the query and status, falling back to all for an unknown status", () => {
-  assert.deepEqual(parseDeviceFilters(new URLSearchParams("q=alpha&status=offline")), { query: "alpha", status: "offline" });
-  assert.deepEqual(parseDeviceFilters(new URLSearchParams("status=online")), { query: "", status: "online" });
+  assert.deepEqual(parseDeviceFilters(new URLSearchParams("q=alpha&status=offline")), { query: "alpha", status: "offline", company: "" });
+  assert.deepEqual(parseDeviceFilters(new URLSearchParams("status=online")), { query: "", status: "online", company: "" });
   for (const status of ["ONLINE", "idle", "", "all"]) {
     assert.equal(parseDeviceFilters(new URLSearchParams({ status })).status, "all", status);
   }
@@ -24,16 +25,16 @@ test("reads the query and status, falling back to all for an unknown status", ()
 test("caps a long query", () => {
   const query = "x".repeat(MAX_DEVICE_QUERY_LENGTH + 50);
   assert.equal(parseDeviceFilters(new URLSearchParams({ q: query })).query.length, MAX_DEVICE_QUERY_LENGTH);
-  assert.equal(serializeDeviceFilters({ query, status: "all" }), `?q=${"x".repeat(MAX_DEVICE_QUERY_LENGTH)}`);
+  assert.equal(serializeDeviceFilters({ query, status: "all", company: "" }), `?q=${"x".repeat(MAX_DEVICE_QUERY_LENGTH)}`);
 });
 
 test("serialization omits defaults and encodes reserved characters", () => {
   assert.equal(serializeDeviceFilters(DEFAULT_DEVICE_FILTERS), "");
-  assert.equal(serializeDeviceFilters({ query: "", status: "online" }), "?status=online");
-  assert.equal(serializeDeviceFilters({ query: "alpha", status: "all" }), "?q=alpha");
-  const search = serializeDeviceFilters({ query: "a&b=c #?/+%", status: "offline" });
+  assert.equal(serializeDeviceFilters({ query: "", status: "online", company: "" }), "?status=online");
+  assert.equal(serializeDeviceFilters({ query: "alpha", status: "all", company: "" }), "?q=alpha");
+  const search = serializeDeviceFilters({ query: "a&b=c #?/+%", status: "offline", company: "" });
   assert.equal(search, "?q=a%26b%3Dc+%23%3F%2F%2B%25&status=offline");
-  assert.deepEqual(parseDeviceFilters(new URLSearchParams(search)), { query: "a&b=c #?/+%", status: "offline" });
+  assert.deepEqual(parseDeviceFilters(new URLSearchParams(search)), { query: "a&b=c #?/+%", status: "offline", company: "" });
 });
 
 test("filters by case-insensitive name or ID and by connection status", () => {
@@ -44,10 +45,27 @@ test("filters by case-insensitive name or ID and by connection status", () => {
   ];
   const ids = (filters) => filterAgents(agents, filters).map((agent) => agent.id);
   assert.deepEqual(ids(DEFAULT_DEVICE_FILTERS), ["dev-001", "dev-002", "LAB-9"]);
-  assert.deepEqual(ids({ query: "front DESK", status: "all" }), ["dev-001"]);
-  assert.deepEqual(ids({ query: "lab-9", status: "all" }), ["LAB-9"]);
-  assert.deepEqual(ids({ query: "  DEV-00 ", status: "all" }), ["dev-001", "dev-002"]);
-  assert.deepEqual(ids({ query: "", status: "online" }), ["dev-001", "LAB-9"]);
-  assert.deepEqual(ids({ query: "dev", status: "offline" }), ["dev-002"]);
-  assert.deepEqual(ids({ query: "nothing", status: "all" }), []);
+  assert.deepEqual(ids({ query: "front DESK", status: "all", company: "" }), ["dev-001"]);
+  assert.deepEqual(ids({ query: "lab-9", status: "all", company: "" }), ["LAB-9"]);
+  assert.deepEqual(ids({ query: "  DEV-00 ", status: "all", company: "" }), ["dev-001", "dev-002"]);
+  assert.deepEqual(ids({ query: "", status: "online", company: "" }), ["dev-001", "LAB-9"]);
+  assert.deepEqual(ids({ query: "dev", status: "offline", company: "" }), ["dev-002"]);
+  assert.deepEqual(ids({ query: "nothing", status: "all", company: "" }), []);
+});
+
+test("filters by company, or by having none", () => {
+  const agents = [
+    { id: "a", name: "A", connected: true, company_id: "acme" },
+    { id: "b", name: "B", connected: false, company_id: null },
+    { id: "c", name: "C", connected: true },
+  ];
+  const ids = (company) => filterAgents(agents, { ...DEFAULT_DEVICE_FILTERS, company }).map((agent) => agent.id);
+  assert.deepEqual(ids(""), ["a", "b", "c"]);
+  assert.deepEqual(ids("acme"), ["a"]);
+  assert.deepEqual(ids(NO_COMPANY), ["b", "c"]);
+  assert.deepEqual(ids("other"), []);
+  const search = serializeDeviceFilters({ query: "", status: "online", company: "acme" });
+  assert.equal(search, "?status=online&company=acme");
+  assert.deepEqual(parseDeviceFilters(new URLSearchParams(search)), { query: "", status: "online", company: "acme" });
+  assert.equal(parseDeviceFilters(new URLSearchParams({ company: "x".repeat(65) })).company, "");
 });
