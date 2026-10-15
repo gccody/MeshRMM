@@ -107,8 +107,10 @@ release on the device's server can replace the local build.
 current session instead of as a service. Ctrl+Alt+Del, desktop switches and
 background mode need the installed service.
 
-For the viewer, copy `dist\remote\` anywhere and open `meshrmm-remote.exe`
-once to register the `meshrmm` link.
+For the viewer, open `dist\remote\meshrmm-remote.exe` once. Like a
+downloaded viewer, it installs itself over the installed one (see
+[remote sessions](remote-sessions.md#installing-the-viewer)), with a
+`remote.json` beside it if there is one.
 
 ### macOS
 

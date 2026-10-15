@@ -231,8 +231,9 @@ session helper in each graphical session. See [macOS Agent](macos-agent.md).
 ## The viewer
 
 The viewer takes its server from each link, so one install works with any
-server. It registers the `meshrmm` URL scheme (on Windows when first opened,
-on macOS through the bundle's `Info.plist`). Network work, decoding and each
+server. On Windows it installs itself for the current user when first
+opened, and registers the `meshrmm` URL scheme there; on macOS the bundle's
+`Info.plist` registers the scheme. Network work, decoding and each
 session service run off the UI thread, with their own send queues, so local
 clipboard work cannot hold up input.
 
