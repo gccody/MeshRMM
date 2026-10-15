@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
-import { Link, useNavigate } from "react-router";
+import { Link } from "react-router";
 import {
-  Activity,
+  ChevronDown,
   Copy,
   Ellipsis,
   Expand,
@@ -217,36 +217,39 @@ function DeviceTile({ agent, reading, store, allowed, state, onRemote, onRemoteB
   const [previewOpen, setPreviewOpen] = useState(false);
   const previewOpener = useRef<HTMLElement | null>(null);
   const busy = state.connecting || state.deleting || state.closing;
-  const canConnect = allowed.connect && agent.connected && !state.browserOffline && !busy;
+  const reachable = agent.connected && !state.browserOffline && !busy;
+  const canConnect = reachable && (allowed.connect || allowed.connectBackground);
+  const canRunScripts = reachable && allowed.runScripts;
   const tone = agent.connected ? "online" : agent.updating_to ? "updating" : "offline";
-  // The handoff API checks the device itself, so a stale wall only warns.
-  const connectTitle = state.browserOffline ? "You’re offline" : state.stale ? "Status may be out of date" : undefined;
 
   const openPreview = (opener: HTMLElement) => {
     previewOpener.current = opener;
     setPreviewOpen(true);
   };
 
-  const screen = (
-    <>
-      {thumbnail ? <img src={thumbnail.url} alt="" /> : <span className="screen-blank">{agent.connected ? <Monitor size={26} aria-hidden="true" /> : <MonitorOff size={26} aria-hidden="true" />}</span>}
-      <span className="screen-label" aria-hidden="true">
-        {state.connecting ? <><LoaderCircle size={15} className="spin" />{state.background ? "Opening…" : "Connecting…"}</>
-          : state.deleting ? <><LoaderCircle size={15} className="spin" />Deleting…</>
-          : agent.connected ? <><Monitor size={15} />Connect</>
-          : agent.updating_to ? `Updating to ${agent.updating_to}`
-          : "Offline"}
-      </span>
-    </>
-  );
-
+  // The device's name links to the same page, so the screen is for pointers only.
   return (
     <li ref={setElement} className={`device-tile ${tone}${busy ? " busy" : ""}`}>
-      {canConnect
-        ? <button type="button" className="device-screen" onClick={() => onRemote(agent)} title={connectTitle} aria-label={`Connect to ${agent.name}`}>{screen}</button>
-        : thumbnail && !busy
-          ? <button type="button" className="device-screen" onClick={(event) => openPreview(event.currentTarget)} aria-label={`Show the screen of ${agent.name}`} aria-haspopup="dialog">{screen}</button>
-          : <div className="device-screen">{screen}</div>}
+      <div className="device-screen">
+        <Link className="screen-link" to={devicePath(agent)} tabIndex={-1} aria-hidden="true">
+          {thumbnail ? <img src={thumbnail.url} alt="" /> : <span className="screen-blank">{agent.connected ? <Monitor size={26} /> : <MonitorOff size={26} />}</span>}
+          {(busy || !agent.connected) && (
+            <span className="screen-label">
+              {state.connecting ? <><LoaderCircle size={15} className="spin" />{state.background ? "Opening…" : "Connecting…"}</>
+                : state.deleting ? <><LoaderCircle size={15} className="spin" />Deleting…</>
+                : state.closing ? <><LoaderCircle size={15} className="spin" />Closing…</>
+                : agent.updating_to ? `Updating to ${agent.updating_to}`
+                : "Offline"}
+            </span>
+          )}
+        </Link>
+        {(canConnect || canRunScripts) && (
+          <div className="screen-actions">
+            {canConnect && <ConnectButton agent={agent} allowed={allowed} stale={state.stale} onRemote={onRemote} onRemoteBackground={onRemoteBackground} />}
+            {canRunScripts && <button type="button" className="screen-action" onClick={(event) => onRunScript(agent, event.currentTarget)} aria-haspopup="dialog" aria-label={`Run a script on ${agent.name}`}><SquareTerminal size={15} aria-hidden="true" />Scripts</button>}
+          </div>
+        )}
+      </div>
       <div className="device-meta">
         <i className={`led ${tone}`} aria-hidden="true" />
         <strong title={agent.name}><Link to={devicePath(agent)}>{agent.name}</Link></strong>
@@ -257,10 +260,8 @@ function DeviceTile({ agent, reading, store, allowed, state, onRemote, onRemoteB
           state={state}
           hasScreen={Boolean(thumbnail)}
           onShowScreen={openPreview}
-          onRemoteBackground={onRemoteBackground}
           onCloseSession={onCloseSession}
           onDelete={onDelete}
-          onRunScript={onRunScript}
         />
       </div>
       {reading && <DeviceUsage reading={reading} />}
@@ -269,21 +270,55 @@ function DeviceTile({ agent, reading, store, allowed, state, onRemote, onRemoteB
   );
 }
 
-function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onRemoteBackground, onCloseSession, onDelete, onRunScript }: {
+// Connects to the console, or to background mode, whichever the user may
+// open. With both allowed it asks which.
+function ConnectButton({ agent, allowed, stale, onRemote, onRemoteBackground }: {
+  agent: Agent;
+  allowed: DeviceActions;
+  stale: boolean;
+  onRemote: (agent: Agent) => void;
+  onRemoteBackground: (agent: Agent) => void;
+}) {
+  const { open, setOpen, close, container, trigger } = usePopover();
+  const menuId = `connect-menu-${agent.id}`;
+  // The handoff API checks the device itself, so a stale wall only warns.
+  const title = stale ? "Status may be out of date" : undefined;
+
+  if (!allowed.connect || !allowed.connectBackground) {
+    const background = !allowed.connect;
+    return (
+      <button type="button" className="screen-action" title={title} onClick={() => (background ? onRemoteBackground : onRemote)(agent)} aria-label={background ? `Connect to ${agent.name} in background` : `Connect to ${agent.name}`}>
+        {background ? <Layers size={15} aria-hidden="true" /> : <Monitor size={15} aria-hidden="true" />}Connect
+      </button>
+    );
+  }
+
+  return (
+    <div className="popover-anchor" ref={container}>
+      <button ref={trigger} type="button" className="screen-action" title={title} onClick={() => setOpen(!open)} aria-expanded={open} aria-controls={open ? menuId : undefined} aria-label={`Connect to ${agent.name}`}>
+        <Monitor size={15} aria-hidden="true" />Connect<ChevronDown size={14} aria-hidden="true" />
+      </button>
+      {open && (
+        <div id={menuId} className="popover menu" role="group" aria-label={`Connect to ${agent.name}`}>
+          <button type="button" onClick={() => { close(); onRemote(agent); }}><Monitor size={16} aria-hidden="true" />Console</button>
+          <button type="button" onClick={() => { close(); onRemoteBackground(agent); }}><Layers size={16} aria-hidden="true" />Background</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSession, onDelete }: {
   agent: Agent;
   allowed: DeviceActions;
   state: TileState;
   hasScreen: boolean;
   onShowScreen: (opener: HTMLElement) => void;
-  onRemoteBackground: (agent: Agent) => void;
   onCloseSession: (agent: Agent) => void;
   onDelete: (agent: Agent) => void;
-  onRunScript: (agent: Agent, opener: HTMLElement) => void;
 }) {
   const { open, setOpen, close, container, trigger } = usePopover();
-  const navigate = useNavigate();
   const menuId = `device-menu-${agent.id}`;
-  const reachable = agent.connected && !state.browserOffline;
   // A chosen item's dialog gives focus back to the menu's trigger.
   const choose = (action: (opener: HTMLElement) => void) => {
     close();
@@ -297,9 +332,6 @@ function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onRemoteBa
       </button>
       {open && (
         <div id={menuId} className="popover menu" role="group" aria-label={`Actions for ${agent.name}`}>
-          {allowed.connectBackground && <button type="button" disabled={!reachable || state.connecting} onClick={() => choose(() => onRemoteBackground(agent))}><Layers size={16} aria-hidden="true" />Connect in background</button>}
-          {allowed.runScripts && <button type="button" disabled={!reachable || state.deleting} onClick={() => choose((opener) => onRunScript(agent, opener))} aria-haspopup="dialog"><SquareTerminal size={16} aria-hidden="true" />Run a script…</button>}
-          <button type="button" onClick={() => { close(); void navigate(devicePath(agent)); }}><Activity size={16} aria-hidden="true" />Resource usage</button>
           {hasScreen && <button type="button" onClick={() => choose(onShowScreen)} aria-haspopup="dialog"><Expand size={16} aria-hidden="true" />View screen</button>}
           {allowed.closeSession && <button type="button" disabled={state.anyClosing || state.connecting || state.deleting} onClick={() => choose(() => onCloseSession(agent))}><Square size={16} aria-hidden="true" />Close active session</button>}
           <button type="button" onClick={() => { void navigator.clipboard?.writeText(agent.id); close(); }}><Copy size={16} aria-hidden="true" />Copy device ID</button>
