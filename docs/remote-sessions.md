@@ -21,6 +21,15 @@ removes the program, the link and the entry, and keeps the viewer's
 settings and logs. The installed viewer updates itself in place (see
 [releases](releases.md#release-signatures)).
 
+On macOS, a viewer opened from anywhere but `/Applications` or
+`~/Applications` installs itself in `~/Applications/MeshRMM Remote.app`,
+which needs no administrator rights, so it can update itself there. It
+copies its bundle without the download's quarantine (Gatekeeper has already
+checked it), registers the copy for `meshrmm` links, moves the downloaded
+copy in `~/Downloads` to the Trash, and passes its link to the installed
+copy. A bundle opened from anywhere else, such as a build folder, is copied
+and left in place. To uninstall, move `MeshRMM Remote.app` to the Trash.
+
 ## Starting and ending
 
 **Connect** on a device opens the viewer with a single-use link. If the
