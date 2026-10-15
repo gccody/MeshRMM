@@ -1,9 +1,9 @@
 //! Installs the macOS viewer for the current user. A viewer opened from
 //! anywhere but an Applications folder, such as the Downloads folder (where
 //! macOS runs a downloaded app from a randomized, read-only copy), copies its
-//! bundle to `~/Applications`, registers that copy for `meshrmm:` links, moves
-//! a downloaded original to the Trash and hands its launch to the installed
-//! copy. `~/Applications` needs no administrator rights, so the installed
+//! bundle to `~/Applications`, registers that copy for `meshrmm:` links, hands
+//! its launch to the installed copy and moves a downloaded original to the
+//! Trash. `~/Applications` needs no administrator rights, so the installed
 //! viewer can update itself in place.
 use std::ffi::{CStr, c_void};
 use std::path::{Path, PathBuf};
@@ -21,10 +21,19 @@ unsafe extern "C" {
     fn LSRegisterURL(url: *const NSURL, update: u8) -> i32;
 }
 
+/// A viewer this launch installed.
+pub struct Installed {
+    bundle: PathBuf,
+    /// The downloaded original, which is trashed once the installed copy
+    /// starts. Until then it is the running app's bundle, whose icon the
+    /// installed notice shows.
+    download: Option<PathBuf>,
+}
+
 /// Installs this viewer unless it already runs from an Applications folder,
 /// and returns the installed bundle when it did. A viewer that isn't in an
 /// app bundle, such as a `cargo run` build, is left where it is.
-pub fn install_if_needed() -> anyhow::Result<Option<PathBuf>> {
+pub fn install_if_needed() -> anyhow::Result<Option<Installed>> {
     let executable = std::env::current_exe().context("could not locate the viewer executable")?;
     let Some(bundle) = app_bundle(&executable) else {
         return Ok(None);
@@ -38,25 +47,31 @@ pub fn install_if_needed() -> anyhow::Result<Option<PathBuf>> {
     install_bundle(&bundle, &target)?;
     register(&target);
     let original = original_location(&bundle);
-    if is_download(&original, &home) {
-        trash(&original);
-    }
     tracing::info!(target = %target.display(), source = %original.display(), "installed the viewer");
-    Ok(Some(target))
+    Ok(Some(Installed {
+        bundle: target,
+        download: is_download(&original, &home).then_some(original),
+    }))
 }
 
-/// Starts the installed viewer with this launch's link.
-pub fn launch_installed(bundle: &Path, link: Option<&str>) -> anyhow::Result<()> {
-    let mut command = Command::new(bundle.join("Contents/MacOS/meshrmm-remote"));
-    command
-        .env_remove("MESHRMM_SESSION_BOOTSTRAP")
-        .env_remove("MESHRMM_UPDATE_READY_FILE");
+/// Starts the installed viewer with this launch's link, if it has one, then
+/// moves the download to the Trash. Without a link there is no session to
+/// start; the caller has said the viewer is installed.
+pub fn launch_installed(installed: &Installed, link: Option<&str>) -> anyhow::Result<()> {
     if let Some(link) = link {
-        command.arg(link);
+        let bundle = &installed.bundle;
+        Command::new(bundle.join("Contents/MacOS/meshrmm-remote"))
+            .env_remove("MESHRMM_SESSION_BOOTSTRAP")
+            .env_remove("MESHRMM_UPDATE_READY_FILE")
+            .arg(link)
+            .spawn()
+            .with_context(|| {
+                format!("could not start the installed viewer {}", bundle.display())
+            })?;
     }
-    command
-        .spawn()
-        .with_context(|| format!("could not start the installed viewer {}", bundle.display()))?;
+    if let Some(download) = &installed.download {
+        trash(download);
+    }
     Ok(())
 }
 

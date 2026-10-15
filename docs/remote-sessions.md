@@ -25,10 +25,11 @@ On macOS, a viewer opened from anywhere but `/Applications` or
 `~/Applications` installs itself in `~/Applications/MeshRMM Remote.app`,
 which needs no administrator rights, so it can update itself there. It
 copies its bundle without the download's quarantine (Gatekeeper has already
-checked it), registers the copy for `meshrmm` links, moves the downloaded
-copy in `~/Downloads` to the Trash, and passes its link to the installed
-copy. A bundle opened from anywhere else, such as a build folder, is copied
-and left in place. To uninstall, move `MeshRMM Remote.app` to the Trash.
+checked it), registers the copy for `meshrmm` links, and passes its link to
+the installed copy; opened without one, it says the viewer is installed.
+Then it moves the downloaded copy in `~/Downloads` to the Trash. A bundle
+opened from anywhere else, such as a build folder, is copied and left in
+place. To uninstall, move `MeshRMM Remote.app` to the Trash.
 
 ## Starting and ending
 
