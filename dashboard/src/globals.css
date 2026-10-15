@@ -207,9 +207,9 @@ h1, h2, h3 { margin: 0; font-weight: 600; font-stretch: 88%; letter-spacing: -0.
 .updating .screen-label { color: var(--warn); }
 .offline .device-screen:hover img { filter: grayscale(1) brightness(.55); }
 .busy .device-screen img { filter: brightness(.5); }
-/* Connect and Scripts float over the screen while it is hovered or focused. */
+/* Connect and Scripts float over the screen while it is hovered or keyboard focused. */
 .screen-actions { position: absolute; left: 50%; top: 50%; display: flex; gap: 8px; transform: translate(-50%, -50%); opacity: 0; transition: opacity .15s ease; }
-.device-screen:hover .screen-actions, .screen-actions:focus-within, .screen-actions:has([aria-expanded=true]) { opacity: 1; }
+.device-screen:hover .screen-actions, .screen-actions:has(:focus-visible), .screen-actions:has([aria-expanded=true]) { opacity: 1; }
 /* An open Connect menu stays above the tiles that follow. */
 .device-screen:has([aria-expanded=true]) { z-index: 2; }
 .screen-action { min-height: 32px; padding: 0 12px; display: inline-flex; align-items: center; gap: 7px; border: 0; border-radius: 999px; color: var(--text); background: rgb(7 9 13 / 78%); box-shadow: 0 0 0 1px rgb(255 255 255 / 12%); cursor: pointer; font: inherit; white-space: nowrap; backdrop-filter: blur(6px); }
