@@ -5,9 +5,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use meshrmm_self_update::windows::{
-    PreviousProcess, current_process_created, helper_cleanup_command,
-};
+use meshrmm_self_update::windows::{PreviousProcess, current_process_created};
 use meshrmm_self_update::{CLIENT_WINDOWS_X64, CURRENT_VERSION, UpdateManifest};
 
 use super::download;
@@ -21,6 +19,7 @@ const MAX_UPDATE_BYTES: usize = 256 * 1024 * 1024;
 /// The viewer exits as soon as the helper starts, so this only allows for a slow shutdown.
 const VIEWER_EXIT_TIMEOUT: Duration = Duration::from_secs(60);
 const TERMINATED_VIEWER_TIMEOUT: Duration = Duration::from_secs(10);
+const HELPER_DIRECTORY_PREFIX: &str = "client-update-";
 
 pub fn is_helper_invocation() -> bool {
     std::env::args_os()
@@ -81,9 +80,7 @@ pub async fn check_and_schedule(config: &Config) -> anyhow::Result<bool> {
         "meshrmm-remote-{}.update-{suffix}.exe",
         release.version
     ));
-    let helper_directory = std::env::temp_dir()
-        .join("MeshRMM")
-        .join(format!("client-update-{suffix}"));
+    let helper_directory = helpers_directory().join(format!("{HELPER_DIRECTORY_PREFIX}{suffix}"));
     let scheduled = write_new_file(&staged, &executable)
         .and_then(|()| start_helper(config, &current, &staged, &helper_directory));
     if let Err(error) = scheduled {
@@ -134,7 +131,8 @@ fn start_helper(
 }
 
 /// Runs as a copy of the previous viewer. Whatever fails, it relaunches the viewer that is left
-/// installed, removes the staged executable, and schedules its own removal.
+/// installed and removes the staged executable. A later viewer removes the helper itself; see
+/// [`remove_stale_files`].
 pub fn apply_scheduled_update() -> anyhow::Result<()> {
     let arguments = std::env::args_os().skip(2).collect::<Vec<_>>();
     let [target, staged, process_id, launch_arguments @ ..] = arguments.as_slice() else {
@@ -144,11 +142,6 @@ pub fn apply_scheduled_update() -> anyhow::Result<()> {
     };
     let target = PathBuf::from(target);
     let staged = PathBuf::from(staged);
-    let helper = std::env::current_exe().context("could not locate the client update helper")?;
-    let helper_directory = helper
-        .parent()
-        .context("client update helper has no parent directory")?
-        .to_owned();
     tracing::info!(
         target = %target.display(),
         staged = %staged.display(),
@@ -172,11 +165,75 @@ pub fn apply_scheduled_update() -> anyhow::Result<()> {
         }
     }
     remove_if_present(&staged);
-    let cleanup = schedule_cleanup(&helper, &helper_directory);
-    if let Err(error) = &cleanup {
-        tracing::warn!(error = ?error, "could not schedule removal of the client update helper");
+    result
+}
+
+/// Removes update helpers and staged executables that earlier updates left behind. A running
+/// executable cannot be deleted, so the helper that has just relaunched this viewer may be left
+/// for a later call.
+pub fn remove_stale_files() {
+    let installed = std::env::current_exe().ok();
+    let installed_directory = installed.as_deref().and_then(Path::parent);
+    remove_stale_files_in(&helpers_directory(), installed_directory);
+}
+
+fn remove_stale_files_in(helpers_directory: &Path, installed_directory: Option<&Path>) {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(helpers_directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir())
+            || !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(HELPER_DIRECTORY_PREFIX)
+        {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) => tracing::debug!(
+                path = %entry.path().display(),
+                %error,
+                "left a client update helper that is still in use"
+            ),
+        }
     }
-    result.and(cleanup)
+    let staged = installed_directory
+        .map(std::fs::read_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flatten();
+    for entry in staged {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file())
+            || !is_staged_update(&entry.file_name().to_string_lossy())
+        {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) => tracing::debug!(
+                path = %entry.path().display(),
+                %error,
+                "left a staged client update that is still in use"
+            ),
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "removed files left by earlier client updates");
+    }
+}
+
+fn helpers_directory() -> PathBuf {
+    std::env::temp_dir().join("MeshRMM")
+}
+
+fn is_staged_update(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("meshrmm-remote-") && name.contains(".update-") && name.ends_with(".exe")
 }
 
 /// Replaces the viewer once the process that scheduled the update has exited, and restores the
@@ -280,16 +337,6 @@ fn launch(target: &Path, arguments: &[OsString]) -> anyhow::Result<()> {
     super::launch_verified(command)
 }
 
-fn schedule_cleanup(helper: &Path, helper_directory: &Path) -> anyhow::Result<()> {
-    let working_directory = helper_directory
-        .parent()
-        .context("client update helper directory has no parent directory")?;
-    helper_cleanup_command(helper, helper_directory, working_directory)
-        .spawn()
-        .context("failed to schedule client update cleanup")?;
-    Ok(())
-}
-
 fn unique_suffix() -> String {
     format!(
         "{}-{}",
@@ -305,17 +352,87 @@ fn unique_suffix() -> String {
 mod tests {
     use super::*;
 
-    fn ping(count: u32) -> (PathBuf, std::process::Child) {
-        let ping = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+    fn ping_image() -> PathBuf {
+        PathBuf::from(std::env::var_os("SystemRoot").unwrap())
             .join("System32")
-            .join("PING.EXE");
-        let child = Command::new(&ping)
+            .join("PING.EXE")
+    }
+
+    fn ping(count: u32) -> (PathBuf, std::process::Child) {
+        let ping = ping_image();
+        let child = ping_from(&ping, count);
+        (ping, child)
+    }
+
+    fn ping_from(image: &Path, count: u32) -> std::process::Child {
+        Command::new(image)
             .args(["127.0.0.1", "-n", &count.to_string()])
             .stdout(std::process::Stdio::null())
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
-            .unwrap();
-        (ping, child)
+            .unwrap()
+    }
+
+    #[test]
+    fn recognizes_only_staged_updates() {
+        assert!(is_staged_update(
+            "meshrmm-remote-0.3.1.update-10188-1787741428068.exe"
+        ));
+        assert!(is_staged_update("MeshRMM-Remote-0.3.1.Update-1-2.EXE"));
+        assert!(!is_staged_update("meshrmm-remote.exe"));
+        assert!(!is_staged_update("meshrmm-remote.exe.previous"));
+        assert!(!is_staged_update("remote.json"));
+    }
+
+    #[test]
+    fn removes_leftover_update_files_only() {
+        let root =
+            std::env::temp_dir().join(format!("meshrmm-client-update-cleanup-{}", unique_suffix()));
+        let helpers = root.join("helpers");
+        let installed = root.join("installed");
+        for directory in ["client-update-1-2", "client-update-3-4", "recordings"] {
+            std::fs::create_dir_all(helpers.join(directory)).unwrap();
+        }
+        std::fs::write(
+            helpers.join("client-update-1-2").join("update-helper.exe"),
+            b"MZ",
+        )
+        .unwrap();
+        std::fs::write(helpers.join("client-update-5-6.exe"), b"MZ").unwrap();
+        std::fs::create_dir_all(&installed).unwrap();
+        for name in [
+            "meshrmm-remote.exe",
+            "meshrmm-remote-0.3.1.update-1-2.exe",
+            "remote.json",
+        ] {
+            std::fs::write(installed.join(name), b"MZ").unwrap();
+        }
+        // A running helper keeps its executable, and so its directory, in use.
+        let in_use = helpers.join("client-update-7-8");
+        std::fs::create_dir_all(&in_use).unwrap();
+        std::fs::copy(ping_image(), in_use.join("update-helper.exe")).unwrap();
+        let mut helper = ping_from(&in_use.join("update-helper.exe"), 60);
+
+        remove_stale_files_in(&helpers, Some(&installed));
+        let names = |directory: &Path| {
+            let mut names = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(&helpers),
+            ["client-update-5-6.exe", "client-update-7-8", "recordings"]
+        );
+        assert_eq!(names(&installed), ["meshrmm-remote.exe", "remote.json"]);
+
+        helper.kill().unwrap();
+        helper.wait().unwrap();
+        remove_stale_files_in(&helpers, Some(&installed));
+        assert_eq!(names(&helpers), ["client-update-5-6.exe", "recordings"]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
