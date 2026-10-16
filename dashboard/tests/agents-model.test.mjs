@@ -4,6 +4,7 @@ import {
   applyAgentDelta,
   applyInventoryDelta,
   companyName,
+  matchesCompanyName,
   parseAgentEvent,
   parseAgentList,
   sortAgents,
@@ -82,6 +83,13 @@ test("applies company events and names a device's company", () => {
   assert.equal(companyName(inventory.companies, "g"), null);
   assert.equal(companyName(inventory.companies, null), null);
   assert.equal(inventory.agents.length, 1, "company events leave devices alone");
+});
+
+test("matches company names to a search, ignoring case and spaces around it", () => {
+  assert.equal(matchesCompanyName("Globex Corporation", "  globex "), true);
+  assert.equal(matchesCompanyName("Globex Corporation", "CORP"), true);
+  assert.equal(matchesCompanyName("Globex Corporation", "acme"), false);
+  assert.equal(matchesCompanyName("Globex Corporation", ""), true);
 });
 
 test("uses a four-hour idle timeout by default", () => {
