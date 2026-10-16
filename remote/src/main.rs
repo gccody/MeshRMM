@@ -67,6 +67,8 @@ fn initialize(launch_deep_link: Option<&str>) -> anyhow::Result<config::Config> 
     if let Err(error) = registration {
         tracing::warn!(error = ?error, "could not register the installed viewer");
     }
+    #[cfg(windows)]
+    updater::remove_stale_files();
     if let Some(ready) = std::env::var_os("MESHRMM_UPDATE_READY_FILE") {
         std::fs::write(ready, b"ready").context("could not acknowledge viewer initialization")?;
     }

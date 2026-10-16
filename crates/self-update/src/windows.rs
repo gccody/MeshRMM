@@ -16,7 +16,6 @@ use windows::Win32::System::Threading::{
 use windows::core::PWSTR;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 /// A process an update helper waits for, and terminates if it does not exit in time.
 pub struct PreviousProcess(HANDLE);
@@ -100,7 +99,7 @@ fn from_file_time(time: FILETIME) -> u64 {
     (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
 }
 
-/// Builds a detached `cmd.exe` that waits about two seconds for `helper` to exit, then deletes it
+/// Builds a windowless `cmd.exe` that waits about two seconds for `helper` to exit, then deletes it
 /// and its now-empty directory. `working_directory` must be outside `helper_directory`.
 pub fn helper_cleanup_command(
     helper: &Path,
@@ -119,7 +118,10 @@ pub fn helper_cleanup_command(
         // removes only the outer pair of quotes.
         .raw_arg(format!("\"{cleanup}\""))
         .current_dir(working_directory)
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        // Not DETACHED_PROCESS: Windows ignores CREATE_NO_WINDOW alongside it, and cmd, left
+        // without a console, would open a visible one for ping. This gives cmd a hidden console
+        // that ping inherits.
+        .creation_flags(CREATE_NO_WINDOW);
     command
 }
 
