@@ -1,8 +1,9 @@
-import { Building2, CircleAlert, LoaderCircle, Pencil, Plus, Trash2, X } from "lucide-react";
+import { Building2, CircleAlert, LoaderCircle, Pencil, Plus, Search, Trash2, X } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import { AuthenticationRequired, errorText, expectOk } from "../../lib/http";
 import { NO_COMPANY, serializeDeviceFilters, DEFAULT_DEVICE_FILTERS } from "../agents/device-filters";
+import { matchesCompanyName } from "../agents/model";
 import type { Company } from "../agents/types";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
@@ -23,6 +24,7 @@ export function CompaniesPanel() {
   const [dialog, setDialog] = useState<{ company: Company | null } | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
   const opener = useRef<HTMLElement | null>(null);
   const { agents, companies, hasData } = inventory;
 
@@ -39,6 +41,8 @@ export function CompaniesPanel() {
   }, [agents]);
   const countOf = (key: string) => counts.get(key) ?? { total: 0, online: 0 };
   const unassigned = countOf(NO_COMPANY);
+  const shown = companies.filter((company) => matchesCompanyName(company.name, query));
+  const showUnassigned = unassigned.total > 0 && matchesCompanyName("No company", query);
 
   const open = (company: Company | null, button: HTMLElement) => {
     opener.current = button;
@@ -73,11 +77,10 @@ export function CompaniesPanel() {
           <button onClick={() => setActionError(null)} aria-label="Dismiss"><X size={16} /></button>
         </div>
       )}
-      {canManage && (
-        <HeaderActions>
-          <button type="button" className="primary-button" onClick={(event) => open(null, event.currentTarget)} aria-haspopup="dialog"><Plus size={16} /> New company</button>
-        </HeaderActions>
-      )}
+      <HeaderActions>
+        {companies.length > 0 && <label className="search-field"><Search size={16} aria-hidden="true" /><input type="search" aria-label="Search companies" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search companies" /></label>}
+        {canManage && <button type="button" className="primary-button" onClick={(event) => open(null, event.currentTarget)} aria-haspopup="dialog"><Plus size={16} /> New company</button>}
+      </HeaderActions>
       <section className="agent-panel">
         {companies.length === 0 ? (
           <div className="empty-state">
@@ -87,11 +90,17 @@ export function CompaniesPanel() {
               ? "Create a company for each customer or site, then move its devices into it or enroll them straight into it."
               : "Ask an administrator to create one."}</span>
           </div>
+        ) : shown.length === 0 && !showUnassigned ? (
+          <div className="empty-state">
+            <Building2 size={22} aria-hidden="true" />
+            <strong>No matching companies</strong>
+            <button type="button" className="secondary-button" onClick={() => setQuery("")}>Clear search</button>
+          </div>
         ) : (
           <table className="data-table company-table" aria-label="Companies">
             <thead><tr><th scope="col">Company</th><th scope="col">Devices</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
             <tbody>
-              {companies.map((company) => (
+              {shown.map((company) => (
                 <tr key={company.id}>
                   <td><strong><Link to={devicesIn(company.id)}>{company.name}</Link></strong></td>
                   <td>{describe(countOf(company.id))}</td>
@@ -103,7 +112,7 @@ export function CompaniesPanel() {
                   </td>
                 </tr>
               ))}
-              {unassigned.total > 0 && (
+              {showUnassigned && (
                 <tr>
                   <td><strong><Link to={devicesIn(NO_COMPANY)}>No company</Link></strong><span>Devices not in any company</span></td>
                   <td>{describe(unassigned)}</td>

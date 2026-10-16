@@ -109,3 +109,7 @@ export const parseAgentEvent = (value: unknown): AgentEvent | null => {
 // hasn't heard of yet).
 export const companyName = (companies: readonly Company[], id: string | null | undefined) =>
   (id && companies.find((company) => company.id === id)?.name) || null;
+
+// Whether a company's name matches a search box, ignoring case.
+export const matchesCompanyName = (name: string, query: string) =>
+  name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase());

@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { Link } from "react-router";
 import {
   Building2,
@@ -24,7 +24,7 @@ import type { MetricsReading } from "../metrics/model";
 import { DeviceUsage } from "../metrics/usage-meter";
 import { HeaderActions } from "../workspace/header-actions";
 import { type AgentStatusFilter, type CompanyFilter, NO_COMPANY } from "./device-filters";
-import { companyName } from "./model";
+import { companyName, matchesCompanyName } from "./model";
 import { ScreenPreview, useDeviceScreen } from "./device-thumbnail";
 import type { InventoryConnection, InventoryStatus } from "./inventory-stream";
 import type { ThumbnailStore } from "./thumbnails";
@@ -224,13 +224,10 @@ function CompanyFilterMenu({ companies, company, onChange }: {
   onChange: (company: CompanyFilter) => void;
 }) {
   const { open, setOpen, close, container, trigger } = usePopover();
-  const options = [
-    { id: "", label: "All companies" },
-    ...companies.map((candidate) => ({ id: candidate.id, label: candidate.name })),
-    { id: NO_COMPANY, label: "No company" },
-  ];
   // A link may name a company this browser doesn't know (yet).
-  const label = options.find((option) => option.id === company)?.label ?? "Unknown company";
+  const label = company === "" ? "All companies"
+    : company === NO_COMPANY ? "No company"
+    : companyName(companies, company) ?? "Unknown company";
   const choose = (id: CompanyFilter) => {
     close();
     onChange(id);
@@ -241,15 +238,66 @@ function CompanyFilterMenu({ companies, company, onChange }: {
       <button ref={trigger} type="button" className="company-filter" onClick={() => setOpen(!open)} aria-expanded={open} aria-controls={open ? "company-filter-menu" : undefined} aria-label={`Company: ${label}`}>
         <Building2 size={15} aria-hidden="true" /><span>{label}</span><ChevronDown size={14} aria-hidden="true" />
       </button>
-      {open && (
-        <div id="company-filter-menu" className="popover menu company-filter-menu" role="group" aria-label="Show devices in">
-          {options.map((option) => (
-            <button key={option.id || "all"} type="button" aria-pressed={option.id === company} onClick={() => choose(option.id)}>
-              <Check size={16} aria-hidden="true" className={option.id === company ? undefined : "invisible"} /><span>{option.label}</span>
-            </button>
-          ))}
-        </div>
-      )}
+      {open && <CompanyFilterList companies={companies} company={company} onChoose={choose} />}
+    </div>
+  );
+}
+
+// The open company menu, with a search box that starts empty each time.
+function CompanyFilterList({ companies, company, onChoose }: {
+  companies: Company[];
+  company: CompanyFilter;
+  onChoose: (company: CompanyFilter) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const list = useRef<HTMLDivElement>(null);
+  const search = useRef<HTMLInputElement>(null);
+  useEffect(() => search.current?.focus(), []);
+  const searching = Boolean(query.trim());
+  // While searching, only the companies that match.
+  const options = searching
+    ? companies.filter((candidate) => matchesCompanyName(candidate.name, query)).map((candidate) => ({ id: candidate.id, label: candidate.name }))
+    : [
+      { id: "", label: "All companies" },
+      ...companies.map((candidate) => ({ id: candidate.id, label: candidate.name })),
+      { id: NO_COMPANY, label: "No company" },
+    ];
+
+  // The arrow keys move between the search box and the options.
+  const moveFocus = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    const items = [search.current, ...(list.current?.querySelectorAll<HTMLButtonElement>("button") ?? [])];
+    const index = items.indexOf(document.activeElement as HTMLInputElement | HTMLButtonElement);
+    const next = items[Math.min(items.length - 1, Math.max(0, index + (event.key === "ArrowDown" ? 1 : -1)))];
+    if (!next) return;
+    event.preventDefault();
+    next.focus();
+  };
+
+  return (
+    <div id="company-filter-menu" className="popover menu company-filter-menu" role="group" aria-label="Show devices in">
+      <label className="menu-search"><Search size={15} aria-hidden="true" />
+        <input
+          ref={search}
+          type="search"
+          aria-label="Search companies"
+          placeholder="Search companies"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && searching && options[0]) onChoose(options[0].id);
+            else moveFocus(event);
+          }}
+        />
+      </label>
+      <div ref={list} className="menu-options">
+        {options.map((option) => (
+          <button key={option.id || "all"} type="button" aria-pressed={option.id === company} onClick={() => onChoose(option.id)} onKeyDown={moveFocus}>
+            <Check size={16} aria-hidden="true" className={option.id === company ? undefined : "invisible"} /><span>{option.label}</span>
+          </button>
+        ))}
+        {options.length === 0 && <p className="menu-empty" role="status">No matching companies</p>}
+      </div>
     </div>
   );
 }

@@ -324,7 +324,14 @@ h1, h2, h3 { margin: 0; font-weight: 600; font-stretch: 88%; letter-spacing: -0.
 .company-filter:hover, .company-filter[aria-expanded=true] { background: var(--hover); }
 .company-filter svg { flex: none; color: var(--text-3); }
 .company-filter span, .company-filter-menu span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.company-filter-menu { min-width: 200px; max-width: 300px; max-height: min(360px, 60vh); overflow-y: auto; }
+.company-filter-menu { min-width: 240px; max-width: 300px; max-height: min(400px, 60vh); display: flex; flex-direction: column; }
+.menu-search { height: 34px; margin-bottom: 4px; padding: 0 9px; display: flex; flex: none; align-items: center; gap: 8px; border: 1px solid var(--rule); border-radius: 7px; background: var(--well); }
+.menu-search:focus-within { border-color: var(--signal); box-shadow: 0 0 0 3px var(--signal-wash); }
+.menu-search input { width: 100%; min-width: 0; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 13.5px; }
+.menu-search input::placeholder { color: var(--text-3); }
+.menu-search input::-webkit-search-cancel-button { filter: invert(.7); }
+.menu-options { min-height: 0; display: grid; overflow-y: auto; }
+.menu-empty { margin: 0; padding: 8px 10px; color: var(--text-3); font-size: 13px; }
 .company-filter-menu button[aria-pressed=true] svg { color: var(--signal-strong); }
 .company-filter-menu .invisible { visibility: hidden; }
 .data-table, .run-table { width: 100%; border-collapse: collapse; }
