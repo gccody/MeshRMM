@@ -475,7 +475,8 @@ td.row-actions > * + * { margin-left: 6px; }
 }
 .app-root textarea { padding: 9px 11px; resize: vertical; }
 .app-root select { cursor: pointer; }
-.app-root input:focus, .app-root select:focus, .app-root textarea:focus { border-color: var(--signal); box-shadow: 0 0 0 3px var(--signal-wash); }
+.app-root input:not([type=search]):focus, .app-root select:focus, .app-root textarea:focus { border-color: var(--signal); box-shadow: 0 0 0 3px var(--signal-wash); }
+.app-root input[type=search]:focus-visible { outline: none; }
 .app-root input[readonly] { color: var(--text-3); }
 .app-root input[aria-invalid=true], .app-root textarea[aria-invalid=true] { border-color: var(--danger); }
 .app-root input[type=checkbox], .app-root input[type=radio] { width: 16px; height: 16px; flex: 0 0 16px; margin: 2px 0 0; accent-color: var(--signal); }
