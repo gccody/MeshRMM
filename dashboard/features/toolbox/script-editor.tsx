@@ -35,7 +35,7 @@ type Props = {
 const PLACEHOLDERS: Record<ScriptDraft["language"], string> = {
   powershell: "Get-Service -Name Spooler | Restart-Service -PassThru",
   cmd: "@echo off\nipconfig /flushdns",
-  shell: "dscacheutil -flushcache\nkillall -HUP mDNSResponder",
+  shell: "uname -a\ndf -h /",
 };
 
 /** Writes a new script, or edits or views one. */

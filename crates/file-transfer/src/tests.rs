@@ -1,8 +1,9 @@
 use sha2::{Digest, Sha256};
+#[cfg(any(windows, target_os = "macos"))]
+use std::path::Path;
 use std::{
     fs::{self, File},
     io,
-    path::Path,
 };
 
 use super::receive::{move_unique, rename_no_replace};
@@ -552,6 +553,8 @@ fn received_mark(path: &Path) -> Option<String> {
     stream.push(":Zone.Identifier");
     fs::read_to_string(stream).ok()
 }
+// Linux has no download quarantine to join.
+#[cfg(any(windows, target_os = "macos"))]
 #[test]
 fn received_files_are_marked_as_downloaded() {
     let source = Sandbox::new();

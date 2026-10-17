@@ -10,8 +10,8 @@ use std::{
 
 use crate::{
     AckWindow, Admission, CACHE_SWEEP_INTERVAL, Command, Incoming, OutgoingFiles, PEER_PICK_ID,
-    Role, SEND_WINDOW, answers_peer_pick, commit_documents, end_transfer, id, message_id, native,
-    remove_batch, send_paths, sweep_cache, sweep_transfer_folders,
+    PasteShortcut, Role, SEND_WINDOW, answers_peer_pick, commit_documents, end_transfer, id,
+    message_id, native, remove_batch, send_paths, sweep_cache, sweep_transfer_folders,
 };
 
 /// The session's outgoing channel closed, which ends the worker.
@@ -25,6 +25,7 @@ pub(super) fn run(
     out: OutgoingFiles,
     status: Arc<Mutex<String>>,
     clipboard_enabled: fn() -> bool,
+    paste: Option<PasteShortcut>,
 ) {
     let _native = match native::initialize() {
         Ok(v) => v,
@@ -35,7 +36,7 @@ pub(super) fn run(
     };
     sweep_transfer_folders();
     let _ = out.send(FileMessage::Available);
-    let mut worker = Worker::new(role, out, status, clipboard_enabled);
+    let mut worker = Worker::new(role, out, status, clipboard_enabled, paste);
     loop {
         let command = match commands.recv_timeout(Duration::from_millis(20)) {
             Ok(c) => Some(c),
@@ -53,6 +54,7 @@ struct Worker {
     out: OutgoingFiles,
     status: Arc<Mutex<String>>,
     clipboard_enabled: fn() -> bool,
+    paste: Option<PasteShortcut>,
     poll: Instant,
     last_cache_sweep: Instant,
     last_clipboard_sequence: u64,
@@ -74,12 +76,14 @@ impl Worker {
         out: OutgoingFiles,
         status: Arc<Mutex<String>>,
         clipboard_enabled: fn() -> bool,
+        paste: Option<PasteShortcut>,
     ) -> Self {
         Self {
             role,
             out,
             status,
             clipboard_enabled,
+            paste,
             admission: Admission::new(role),
             incoming: None,
             ended: VecDeque::new(),
@@ -336,6 +340,7 @@ impl Worker {
             &paths,
             &state.destination,
             &mut self.last_clipboard_sequence,
+            self.paste.as_ref(),
         )?;
         if state.destination != FileDestination::Documents
             && self.last_cache_sweep.elapsed() >= CACHE_SWEEP_INTERVAL
@@ -450,13 +455,14 @@ fn deliver(
     paths: &[PathBuf],
     destination: &FileDestination,
     last_clipboard_sequence: &mut u64,
+    paste: Option<&PasteShortcut>,
 ) -> anyhow::Result<()> {
     match destination {
         FileDestination::Clipboard | FileDestination::ClipboardPaste { .. } => {
             native::set_clipboard_files(paths)?;
             *last_clipboard_sequence = native::clipboard_sequence();
             if let FileDestination::ClipboardPaste { display_id } = destination {
-                native::paste_files(*display_id)?;
+                paste.context("this side does not paste files")?(*display_id)?;
             }
         }
         FileDestination::Drop { display_id, x, y } => {

@@ -156,7 +156,7 @@ export function ToolboxPanel() {
             onRetry={() => void load()}
             items={visibleScripts}
             filtered={Boolean(query.trim())}
-            empty={{ title: "No scripts yet", detail: "Write a PowerShell or Command Prompt script to run on your devices." }}
+            empty={{ title: "No scripts yet", detail: "Write a PowerShell, Command Prompt or shell script to run on your devices." }}
             renderRow={(script) => <ScriptRow key={script.id} script={script} canRun={access.runScripts} busy={busyId === script.id} open={open} onDelete={() => void removeScript(script)} />}
           />
         </div>

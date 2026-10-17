@@ -10,7 +10,7 @@ browser ── https ──────►  │ website (embedded, prerendered) 
 viewer  ── https/wss ──►  │ realtime: Agent coordinators · session actors · presence       │
 Agent   ── https/wss ──►  │ auth: passwords, TOTP, passkeys, OIDC, SCIM, roles, audit      │
 viewer/Agent ── udp ───►  │ STUN/TURN (3478 + relay port range)                            │
-                          │ downloads: installers, update manifest, macOS install script   │
+                          │ downloads: installers, update manifest, install scripts        │
                           │ TLS: ACME | certificate files | proxy       maintenance task   │
                           └─────────┬───────────────────────────┬──────────────────────────┘
                                 SQLite | PostgreSQL         data dir (files, ACME, keys)
@@ -30,7 +30,7 @@ One Cargo workspace. `cargo build` builds the Agent and the viewer
 
 | Path | What it is |
 |---|---|
-| `agent/` | `meshrmm-agent`: the Windows service and macOS daemon, their installers and updaters, and everything a remote session does on the device (`src/remote/`). |
+| `agent/` | `meshrmm-agent`: the Windows service, the macOS daemon and the Linux systemd service, their installers and updaters, and everything a remote session does on the device (`src/remote/`; the Unix session helpers in `src/remote/helper/`). |
 | `agent/protocol/` | `meshrmm-protocol`: the binary control, input and video protocol the Agent and viewer speak over WebRTC. |
 | `agent/windows/remote-screen/` | `meshrmm-remote-screen`: Windows capture, colour conversion and encoding, and the background desktop's window capture. |
 | `remote/` | `meshrmm-remote`: the viewer. `src/platform/windows` uses Media Foundation and D3D11; `src/platform/macos` uses AVFoundation, CoreMedia, Core Animation and AppKit. |
@@ -40,7 +40,7 @@ One Cargo workspace. `cargo build` builds the Agent and the viewer
 | `crates/protocol-types/` | JSON types shared by the server, Agent and viewer: IDs, signaling, settings, metrics, toolbox. |
 | `crates/signaling-client/` | The WebSocket client for the server's Agent and session sockets, with the shared TLS settings. |
 | `crates/session-transport/` | WebRTC data-channel plumbing shared by both peers: service channels, backpressure, and the persistent DTLS identity. |
-| `crates/audio/`, `chat/`, `clipboard/`, `file-transfer/` | One session service each, with its native parts for Windows and macOS. |
+| `crates/audio/`, `chat/`, `clipboard/`, `file-transfer/` | One session service each, with its native parts for Windows, macOS and Linux. |
 | `crates/self-update/` | Update manifest checks, release signatures and the platform updaters. |
 | `crates/log-file/` | The rotating log file writer. |
 | `vendor/dtls/`, `vendor/turn/` | Patched copies of two webrtc-rs crates. Each has a `MESHRMM.md` that says what changed and when to drop the patch. |
@@ -227,6 +227,13 @@ to check on a real device that the others keep working.
 
 A launchd daemon runs the root coordinator, and a launchd agent runs a
 session helper in each graphical session. See [macOS Agent](macos-agent.md).
+
+## The Linux Agent
+
+A systemd service runs the root coordinator, which asks logind for the
+graphical sessions and starts a session helper in each, as the session's
+user, over a socket pair. The helpers speak the macOS helpers' protocol
+(`agent/src/remote/helper/`). See [Linux Agent](linux-agent.md).
 
 ## The viewer
 

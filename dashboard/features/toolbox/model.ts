@@ -94,7 +94,7 @@ export const MAX_TOOLBOX_FILE_BYTES = 95 * 1024 * 1024;
 export const LANGUAGE_LABELS: Record<ScriptLanguage, string> = {
   powershell: "PowerShell",
   cmd: "Command Prompt",
-  shell: "Shell (zsh)",
+  shell: "Shell (zsh/bash)",
 };
 
 export const RUN_AS_LABELS: Record<RunAs, string> = {
@@ -260,7 +260,7 @@ export function runTone(run: Pick<ScriptRun, "status" | "exit_code">): "pending"
   return run.status === "completed" && run.exit_code === 0 ? "success" : "problem";
 }
 
-/** SYSTEM on Windows, root on a Mac. */
+/** SYSTEM on Windows, root on macOS and Linux. */
 const SYSTEM_ACCOUNT = /(?:\\SYSTEM|^root)$/iu;
 
 /** The account a run used, noting when nobody was signed in to run it as. */

@@ -113,6 +113,39 @@ pub fn initialize_helper(file_name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Logs a Linux session helper to `$XDG_STATE_HOME/meshrmm/<file_name>`
+/// (`~/.local/state/meshrmm`), or beside the Agent's configuration for the
+/// processes that run as root.
+#[cfg(target_os = "linux")]
+pub fn initialize_helper(file_name: &str) -> anyhow::Result<()> {
+    // SAFETY: geteuid has no preconditions.
+    let directory = if unsafe { libc::geteuid() } == 0 {
+        crate::installer::config_directory()?
+    } else {
+        match std::env::var_os("XDG_STATE_HOME").filter(|state| !state.is_empty()) {
+            Some(state) => std::path::PathBuf::from(state),
+            None => std::path::Path::new(
+                &std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?,
+            )
+            .join(".local/state"),
+        }
+        .join("meshrmm")
+    };
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(file_name);
+    let writer = AsyncLog::new(move || meshrmm_log_file::RotatingFile::open(&path))?;
+    set_process_log(writer.clone());
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(writer)
+        .with_ansi(false)
+        .init();
+    Ok(())
+}
+
 pub fn has_process_log() -> bool {
     PROCESS_LOG.get().is_some()
 }

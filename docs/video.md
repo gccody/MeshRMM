@@ -30,7 +30,9 @@ full-size images in D3D11 textures, and the macOS viewer hands compressed
 samples to `AVSampleBufferDisplayLayer` without making a CPU image.
 
 A Mac Agent captures with ScreenCaptureKit and encodes with VideoToolbox; see
-[macOS Agent](macos-agent.md).
+[macOS Agent](macos-agent.md). A Linux Agent captures through the session's
+display server and encodes H.264 4:2:0 in software with OpenH264, at up to 30
+frames a second; see [Linux Agent](linux-agent.md).
 
 ## Capture on Windows
 

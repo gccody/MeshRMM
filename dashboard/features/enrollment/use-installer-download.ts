@@ -6,6 +6,7 @@ import {
   type AgentPlatform,
   INSTALLER_ASSETS,
   enrolledInstaller,
+  linuxInstallCommand,
   macInstallCommand,
   publishedChecksum,
   sha256Hex,
@@ -13,8 +14,8 @@ import {
 } from "./installer";
 
 // Authorizes a one-time enrollment. For Windows it verifies the published
-// installer and downloads it with the enrollment appended; for macOS it shows
-// the Terminal command that installs the Agent.
+// installer and downloads it with the enrollment appended; for macOS and Linux
+// it shows the terminal command that installs the Agent.
 export function useInstallerDownload(authorizedFetch: AuthorizedFetch) {
   const [platform, setPlatform] = useState<AgentPlatform>("windows-x64");
   const [isDownloading, setIsDownloading] = useState(false);
@@ -62,8 +63,8 @@ export function useInstallerDownload(authorizedFetch: AuthorizedFetch) {
         throw new Error(await errorMessage(bootstrapResponse, "The Agent installer could not be authorized."));
       }
       const bootstrap = (await bootstrapResponse.json()) as AgentInstallerBootstrap;
-      if (platform === "macos") {
-        setCommand(macInstallCommand(bootstrap.server, bootstrap));
+      if (platform !== "windows-x64") {
+        setCommand((platform === "macos" ? macInstallCommand : linuxInstallCommand)(bootstrap.server, bootstrap));
         setDownloaded(true);
         return;
       }

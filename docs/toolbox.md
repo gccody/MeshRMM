@@ -15,7 +15,7 @@ administrators.
 ## Scripts
 
 A script has a name, an optional folder and description, an interpreter
-(PowerShell or Command Prompt for Windows, Shell (zsh) for Macs), a timeout from 10 to 3600 seconds (300 by
+(PowerShell or Command Prompt for Windows; Shell for Macs, which run it with zsh, and Linux, which run it with bash), a timeout from 10 to 3600 seconds (300 by
 default), and its source, up to 128 KiB. Folders are names separated by `/`,
 up to eight levels deep, so `Maintenance/Disk` nests `Disk` in `Maintenance`.
 
@@ -30,8 +30,11 @@ Each run chooses the account:
 
 On a Mac, the signed-in user is the one at the console, and the script runs
 in their login session with their home folder as its working folder; the
-system account is root, with `/` as the working folder. A device refuses a
-script for the other operating system's interpreters.
+system account is root, with `/` as the working folder. Linux works the same
+way, with the user of the console's graphical session (logind's active session
+on `seat0`), their groups and their session bus; on a server nobody is signed
+in, so scripts run as root. A device refuses a script for another operating
+system's interpreters.
 
 The script's input is empty, so a prompt for input ends or fails instead of
 waiting. When the timeout passes, the Agent stops the script and everything it
@@ -85,7 +88,8 @@ Choosing a file sends it to the connected device:
 On a Mac, the user's file goes to `~/Documents/MeshRMM Transferred Files`,
 written as the user, and the background or nobody-signed-in file goes to
 `/Users/Shared/MeshRMM Transferred Files`, which the Agent uses only while
-it owns that folder.
+it owns that folder. Linux does the same with `/srv/MeshRMM Transferred Files`
+in place of the shared folder.
 
 A file with the same name gets a number, as in `setup (2).exe`. The toolbar
 tooltip and the toolbox menu show where the file was saved; a failure opens an
@@ -140,7 +144,8 @@ On the Agent:
 - On a Mac, a script is written to a new folder in the temporary folder that
   only the account it runs as can read, and zsh runs it in its own process
   group, which a timeout stops as a whole. Downloads are staged in the
-  Agent's root-only support folder.
+  Agent's root-only support folder. Linux does the same with bash, keeping
+  root's scripts in `/var/lib/meshrmm-agent/scripts`.
 - An Agent runs at most 8 scripts and 4 downloads at once and refuses more.
   Reports are retried for about a minute while the server is unreachable.
 

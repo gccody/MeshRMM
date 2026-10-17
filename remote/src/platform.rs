@@ -276,10 +276,11 @@ impl ControlSink {
         self.maintenance_state().power
     }
 
-    /// Whether the agent runs on a Mac, which has no Ctrl+Alt+Del or Safe
-    /// Mode and uses Command where Windows uses the Windows key.
-    pub fn device_is_mac(&self) -> bool {
-        self.maintenance_state().platform == Some(meshrmm_protocol::DevicePlatform::Macos)
+    /// The agent's operating system, once it reports it. It decides what
+    /// the viewer offers: Ctrl+Alt+Del and Safe Mode only on Windows, and
+    /// Command for Command only on a Mac.
+    pub fn device_platform(&self) -> Option<meshrmm_protocol::DevicePlatform> {
+        self.maintenance_state().platform
     }
 
     /// Restarts the remote computer. The platform asks the technician first.

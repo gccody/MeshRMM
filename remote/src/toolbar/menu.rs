@@ -163,8 +163,9 @@ pub fn menu(action: Action, state: &State) -> Vec<MenuEntry> {
                 true,
                 Command::Restart { safe_mode: false },
             ));
-            // Apple silicon Macs start in Safe Mode only from the power button.
-            if !state.device_is_mac {
+            // Apple silicon Macs start in Safe Mode only from the power
+            // button, and Linux has none.
+            if state.windows_device() {
                 entries.push(entry(
                     "Restart in Safe Mode with Networking…",
                     false,

@@ -336,7 +336,7 @@ CREATE TABLE agent_install_tokens (
   id TEXT NOT NULL PRIMARY KEY,
   token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64),
   created_by_user_id TEXT NOT NULL,
-  platform TEXT NOT NULL CHECK (platform IN ('windows-x64', 'macos')),
+  platform TEXT NOT NULL CHECK (platform IN ('windows-x64', 'macos', 'linux')),
   -- The company the device it enrolls joins.
   company_id TEXT REFERENCES companies (id) ON DELETE SET NULL,
   created_at INTEGER NOT NULL,

@@ -96,6 +96,13 @@ pub(super) fn send() -> anyhow::Result<()> {
     anyhow::bail!("Ctrl+Alt+Del is not available on macOS")
 }
 
+/// Linux login screens need no secure attention sequence, and the keys would
+/// only open a desktop's log out dialog.
+#[cfg(target_os = "linux")]
+pub(super) fn send() -> anyhow::Result<()> {
+    anyhow::bail!("Ctrl+Alt+Del is not available on Linux")
+}
+
 #[cfg(windows)]
 mod registry {
     use super::Policy;

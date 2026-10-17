@@ -148,7 +148,7 @@ impl RemoteView {
             Some(control.show_remote_cursor()),
         ));
         // A Mac's Command key is Command's own.
-        if !control.device_is_mac() {
+        if control.device_platform() != Some(meshrmm_protocol::DevicePlatform::Macos) {
             menu.addItem(&self.menu_item(
                 "Command key sends Ctrl",
                 sel!(toggleCommandAsControl:),

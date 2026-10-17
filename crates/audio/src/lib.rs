@@ -14,9 +14,9 @@ pub const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD_PARTY_NOTICES
 const HEADER: usize = 6;
 const MAX_PACKET: usize = 16_000;
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod opus;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub use opus::OpusEncoder;
 #[cfg(any(windows, target_os = "macos"))]
 mod playback;
@@ -31,6 +31,11 @@ pub use capture::{Capture, capture};
 mod capture_macos;
 #[cfg(target_os = "macos")]
 pub use capture_macos::{Capture, capture};
+
+#[cfg(target_os = "linux")]
+mod capture_linux;
+#[cfg(target_os = "linux")]
+pub use capture_linux::{Capture, capture};
 
 struct Packet<'a> {
     rate: u32,

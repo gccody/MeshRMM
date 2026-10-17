@@ -14,7 +14,7 @@ mod icons;
 mod items;
 mod menu;
 
-use meshrmm_protocol::{ChromaMode, CredentialState, QualityPreset};
+use meshrmm_protocol::{ChromaMode, CredentialState, DevicePlatform, QualityPreset};
 
 pub use icons::icon;
 pub use items::items;
@@ -85,8 +85,8 @@ pub struct State {
     /// `Some(safe_mode)` once the agent reports it can restart its computer,
     /// with whether Windows is in Safe Mode.
     pub power: Option<bool>,
-    /// The agent runs on a Mac: no Ctrl+Alt+Del and no Safe Mode.
-    pub device_is_mac: bool,
+    /// The agent's operating system, once it reports it.
+    pub device: Option<DevicePlatform>,
     /// The latest file transfer's progress or result.
     pub file_status: String,
     /// The session can use the technician's toolbox, whether a run or file
@@ -100,6 +100,14 @@ pub struct State {
     pub settings_menu: bool,
     /// `Some(maximized)` when the toolbar draws the window's caption buttons.
     pub caption: Option<bool>,
+}
+
+impl State {
+    /// Whether the device has Windows's Ctrl+Alt+Del and Safe Mode. Until
+    /// the agent reports its platform, the toolbar offers them.
+    fn windows_device(&self) -> bool {
+        matches!(self.device, None | Some(DevicePlatform::Windows))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

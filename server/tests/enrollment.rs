@@ -99,7 +99,7 @@ async fn redemptions_are_validated_and_installers_expire() {
         let name = app.name;
         let mut admin = common::set_up(&app).await;
         for invalid in [
-            json!({ "platform": "linux" }),
+            json!({ "platform": "freebsd" }),
             json!({ "platform": "macos", "extra": 1 }),
         ] {
             assert_eq!(
@@ -109,6 +109,16 @@ async fn redemptions_are_validated_and_installers_expire() {
                     .status,
                 StatusCode::BAD_REQUEST,
                 "{name}: {invalid}"
+            );
+        }
+        for platform in ["windows-x64", "macos", "linux"] {
+            assert_eq!(
+                admin
+                    .post("/v1/agent-installers", json!({ "platform": platform }))
+                    .await
+                    .status,
+                StatusCode::CREATED,
+                "{name}: {platform}"
             );
         }
         let token = admin

@@ -33,12 +33,13 @@ pub async fn run(
     }
     let bitrate_bits_per_second =
         QualityPreset::BestQuality.bitrate(config.bitrate_bits_per_second);
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     let streamer: Arc<Mutex<Box<dyn ScreenStreamer>>> = {
-        // A Mac has no private desktop to work on without the user seeing it.
+        // A Mac or Linux computer has no private desktop to work on without
+        // the user seeing it.
         anyhow::ensure!(
             !request.start_in_background,
-            "background sessions are not available on macOS"
+            "background sessions are available on Windows only"
         );
         let notification =
             super::connection_notification::ConnectionNotification::for_request(&request)
@@ -50,7 +51,7 @@ pub async fn run(
             config.frames_per_second,
             bitrate_bits_per_second,
             mode == ExecutionMode::Service,
-            super::macos::SessionUi {
+            super::helper::protocol::SessionUi {
                 viewer_name: request.viewer_name.clone(),
                 show_banner: request.session_banner,
                 notification: notification.map(|notification| notification.text().to_owned()),

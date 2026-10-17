@@ -297,6 +297,7 @@ impl SessionMessage {
 pub enum DevicePlatform {
     Windows,
     Macos,
+    Linux,
 }
 
 impl DevicePlatform {
@@ -304,6 +305,8 @@ impl DevicePlatform {
     pub const fn current() -> Self {
         if cfg!(target_os = "macos") {
             Self::Macos
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
         } else {
             Self::Windows
         }
@@ -792,6 +795,13 @@ mod power_tests {
                     safe_mode: false,
                 },
                 vec![42, 1, 0],
+            ),
+            (
+                SessionMessage::DeviceState {
+                    platform: DevicePlatform::Linux,
+                    safe_mode: false,
+                },
+                vec![42, 2, 0],
             ),
         ] {
             assert_eq!(message.encode().unwrap(), bytes);

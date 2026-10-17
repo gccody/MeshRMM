@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   ENROLLMENT_MAGIC,
   enrolledInstaller,
+  linuxInstallCommand,
   macInstallCommand,
   publishedChecksum,
   sha256Hex,
@@ -53,4 +54,13 @@ test("the Mac install command passes the enrollment as hex JSON", () => {
   const match = command.match(/^curl -fsSL https:\/\/rmm\.example\.com\/install-agent-macos\.sh \| sudo \/bin\/sh -s -- https:\/\/rmm\.example\.com ([0-9a-f]+)$/);
   assert.ok(match, command);
   assert.deepEqual(JSON.parse(Buffer.from(match[1], "hex").toString("utf8")), bootstrap);
+});
+
+test("the Linux install command passes the same enrollment to the Linux script", () => {
+  const bootstrap = { server: "https://rmm.example.com", install_token: "ab".repeat(32), expires_at_unix_ms: 1 };
+  const command = linuxInstallCommand("https://rmm.example.com/", bootstrap);
+  const match = command.match(/^curl -fsSL https:\/\/rmm\.example\.com\/install-agent-linux\.sh \| sudo sh -s -- https:\/\/rmm\.example\.com ([0-9a-f]+)$/);
+  assert.ok(match, command);
+  assert.deepEqual(JSON.parse(Buffer.from(match[1], "hex").toString("utf8")), bootstrap);
+  assert.equal(match[1], macInstallCommand("https://rmm.example.com", bootstrap).split(" ").at(-1));
 });

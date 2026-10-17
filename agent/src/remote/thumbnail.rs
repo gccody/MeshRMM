@@ -12,14 +12,20 @@
 use std::time::Duration;
 
 /// How often the dashboard's image is refreshed.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 pub const INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// The image fits in this box. It is sharp at the dashboard's preview size
 /// and small enough to be a few dozen KiB as a JPEG.
 pub const MAX_WIDTH: u32 = 640;
 pub const MAX_HEIGHT: u32 = 400;
 /// The server refuses anything larger.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 pub const MAX_BYTES: usize = 512 * 1024;
 
 /// The thumbnail size for a `width` by `height` display: its aspect ratio,
@@ -40,9 +46,11 @@ pub fn scaled_size(width: u32, height: u32) -> (u32, u32) {
     (scaled_width.max(1) as u32, scaled_height.max(1) as u32)
 }
 
+#[cfg(target_os = "linux")]
+use self::linux as platform;
 #[cfg(target_os = "macos")]
 use self::macos as platform;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub use self::schedule::Thumbnails;
 #[cfg(windows)]
 use self::windows as platform;
@@ -297,7 +305,7 @@ mod windows {
 }
 
 /// The schedule and upload, around each platform's capture.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod schedule {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -499,7 +507,21 @@ mod macos {
     pub(super) fn capture_for(mode: ExecutionMode) -> anyhow::Result<Vec<u8>> {
         match mode {
             ExecutionMode::Console => crate::remote::macos::snapshot::main_display_jpeg(),
-            _ => crate::remote::macos::helper::coordinator::registry()?.thumbnail(),
+            _ => crate::remote::helper::coordinator::registry()?.thumbnail(),
+        }
+    }
+}
+
+/// As on a Mac: the console session's helper captures it. A computer with
+/// nobody at a graphical login, such as a server, has no thumbnail.
+#[cfg(target_os = "linux")]
+mod linux {
+    use crate::remote::config::ExecutionMode;
+
+    pub(super) fn capture_for(mode: ExecutionMode) -> anyhow::Result<Vec<u8>> {
+        match mode {
+            ExecutionMode::Console => crate::remote::linux::snapshot::main_display_jpeg(),
+            _ => crate::remote::helper::coordinator::registry()?.thumbnail(),
         }
     }
 }

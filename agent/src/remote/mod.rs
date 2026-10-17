@@ -1,6 +1,6 @@
 #[cfg(any(windows, target_os = "macos", test))]
 mod annotation;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod audio_mode;
 #[cfg(windows)]
 mod background;
@@ -8,7 +8,7 @@ mod background;
 pub(crate) mod background_files;
 #[cfg(windows)]
 pub(crate) mod background_tasks;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod bitrate;
 #[cfg(windows)]
 mod blackout;
@@ -17,9 +17,9 @@ pub(crate) mod capture_helper;
 #[cfg(windows)]
 mod clipboard;
 pub mod config;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod connection_approval;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod connection_notification;
 #[cfg(windows)]
 mod credentials;
@@ -27,6 +27,8 @@ mod credentials;
 mod display_border;
 #[cfg(windows)]
 mod drag_windows;
+#[cfg(unix)]
+pub(crate) mod helper;
 #[cfg(windows)]
 mod indicator;
 #[cfg(windows)]
@@ -35,64 +37,66 @@ mod input;
 mod input_block;
 #[cfg(windows)]
 mod keep_awake;
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
 #[cfg(target_os = "macos")]
-mod macos;
-#[cfg(any(windows, target_os = "macos"))]
+pub(crate) mod macos;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) mod metrics;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod native_task;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod platform;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod secure_attention;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod sender_failure;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod sender_progress;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) mod service_link;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod session;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 pub(crate) mod session_close;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod signaling;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod thumbnail;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod toolbox;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod transport;
 #[cfg(windows)]
 pub(crate) mod virtual_display;
 // The bitrate controller's tests share the encoded-frame queue bound.
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod video;
 #[cfg(windows)]
 pub(crate) mod wallpaper;
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use std::ops::ControlFlow;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use std::time::Duration;
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use anyhow::Context;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use meshrmm_protocol::{AgentCommand, AgentSessionRequest, AgentStatusMessage, RemoteSessionId};
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use meshrmm_signaling_client::SignalingConnection;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use tokio::time::sleep;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use tokio_tungstenite::tungstenite::Message;
 
 use self::config::{Config, ExecutionMode};
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use self::signaling::{agent_connection_url, authenticated_websocket};
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 struct ActiveSession {
     session_id: RemoteSessionId,
     request: AgentSessionRequest,
@@ -103,7 +107,7 @@ struct ActiveSession {
 /// Agent reconnects. Servers that renew the session's lease rewrite the expiry of the request they
 /// replay, so the expiry is ignored. A resume carries new TURN credentials, so it still restarts
 /// the session.
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn replays_session(
     active: &meshrmm_protocol::AgentSessionRequest,
     request: &meshrmm_protocol::AgentSessionRequest,
@@ -117,7 +121,7 @@ fn replays_session(
 
 /// Tells the server the Agent is going offline to install `version`, so the dashboard shows
 /// the update instead of an unexplained outage. The stop goes ahead if this fails.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn announce_update(socket: &SignalingConnection, version: String) {
     let status = AgentStatusMessage::Updating { version };
     let sent = match serde_json::to_string(&status) {
@@ -135,7 +139,7 @@ async fn announce_update(socket: &SignalingConnection, version: String) {
 /// Sends the computer's resource usage without waiting for it to be written.
 /// A report that does not fit in the send queue is dropped; the next one
 /// follows within seconds.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn report_metrics(socket: &SignalingConnection, metrics: meshrmm_protocol::SystemMetrics) {
     let status = AgentStatusMessage::Metrics {
         metrics: metrics.sanitized(),
@@ -149,7 +153,7 @@ fn report_metrics(socket: &SignalingConnection, metrics: meshrmm_protocol::Syste
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn uninstall(socket: &SignalingConnection) -> anyhow::Result<ControlFlow<bool>> {
     crate::installer::schedule_uninstall().context("failed to schedule Agent self-uninstall")?;
     socket
@@ -167,20 +171,35 @@ async fn uninstall(socket: &SignalingConnection) -> anyhow::Result<ControlFlow<b
 #[cfg(target_os = "macos")]
 pub fn run_session_helper() -> anyhow::Result<()> {
     crate::logging::initialize_helper("agent-session-helper.log")?;
-    macos::helper::host::run(&macos::helper::socket_path())
+    helper::host::run(&helper::socket_path())
 }
 
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(unused_variables))]
-pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
-    #[cfg(not(any(windows, target_os = "macos")))]
-    anyhow::bail!("the MeshRMM Agent requires Windows or macOS");
+/// Entry point of `--session-helper`, which the installed Linux coordinator
+/// starts in each graphical session, as the session's user.
+#[cfg(target_os = "linux")]
+pub fn run_session_helper() -> anyhow::Result<()> {
+    crate::logging::initialize_helper("agent-session-helper.log")?;
+    linux::sessions::run_helper()
+}
 
-    #[cfg(any(windows, target_os = "macos"))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(unused_variables)
+)]
+pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    anyhow::bail!("the MeshRMM Agent requires Windows, macOS or Linux");
+
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     {
         connection_approval::restore_after_restart();
         #[cfg(target_os = "macos")]
         if mode == ExecutionMode::Service {
-            macos::helper::coordinator::listen(&macos::helper::socket_path())?;
+            helper::coordinator::listen(&helper::socket_path())?;
+        }
+        #[cfg(target_os = "linux")]
+        if mode == ExecutionMode::Service {
+            linux::sessions::supervise()?;
         }
         let link = std::sync::Arc::new(service_link::ServiceLink::new(
             mode == ExecutionMode::Worker,
@@ -188,6 +207,13 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
         #[cfg(target_os = "macos")]
         if mode == ExecutionMode::Service {
             tokio::spawn(crate::macos_updater::run(
+                config.clone(),
+                std::sync::Arc::clone(&link),
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if mode == ExecutionMode::Service {
+            tokio::spawn(crate::linux_updater::run(
                 config.clone(),
                 std::sync::Arc::clone(&link),
             ));
@@ -210,7 +236,7 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
 }
 
 /// The Agent's connection to the server, and the remote session it runs.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 struct Coordinator {
     config: Config,
     mode: ExecutionMode,
@@ -223,7 +249,7 @@ struct Coordinator {
     session_close: Option<(RemoteSessionId, std::sync::Arc<session_close::SessionClose>)>,
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 impl Coordinator {
     async fn run(mut self) -> anyhow::Result<()> {
         let mut retry_delay = Duration::from_secs(1);

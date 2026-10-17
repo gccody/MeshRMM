@@ -126,6 +126,8 @@ pub trait ScreenInput: Send + Sync {
     fn chat_ready(&self) -> Arc<tokio::sync::Notify>;
 }
 
+#[cfg(target_os = "linux")]
+pub use super::linux::{PlatformScreenStreamer, monotonic_timestamp_us};
 #[cfg(target_os = "macos")]
 pub use super::macos::{PlatformScreenStreamer, monotonic_timestamp_us};
 
@@ -210,8 +212,11 @@ impl PlatformScreenStreamer {
             chroma: ChromaMode::Yuv420,
             capture_cursor: true,
             next_frame_id: Arc::new(AtomicU64::new(1)),
-            direct_files: (!capture_as_active_user)
-                .then(meshrmm_file_transfer::TransferSession::agent),
+            direct_files: (!capture_as_active_user).then(|| {
+                meshrmm_file_transfer::TransferSession::agent(Box::new(
+                    meshrmm_file_transfer::windows::paste_files,
+                ))
+            }),
             direct_chat: meshrmm_chat::ChatSession::with_peer("Viewer"),
             direct_input: Arc::new(Mutex::new(super::input::WindowsInputController::new())),
             // Service workers live in non-interactive Session 0. Their clipboard

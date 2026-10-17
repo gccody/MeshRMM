@@ -7,10 +7,14 @@ use std::{
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+#[cfg(target_os = "linux")]
+pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(windows)]
 pub mod windows;
+#[cfg(target_os = "linux")]
+use linux as native;
 #[cfg(target_os = "macos")]
 use macos as native;
 #[cfg(windows)]
@@ -33,6 +37,10 @@ pub fn clipboard_sequence() -> u64 {
 pub fn clipboard_has_files() -> bool {
     native::clipboard_files().is_ok_and(|paths| !paths.is_empty())
 }
+
+/// Presses the paste shortcut on a display, once files the viewer pasted are
+/// on this computer's clipboard.
+pub type PasteShortcut = Box<dyn Fn(meshrmm_protocol::DisplayId) -> anyhow::Result<()> + Send>;
 
 /// Folder, under Documents or the cache, that receives transferred files.
 pub const TRANSFER_FOLDER: &str = "MeshRMM Transferred Files";
@@ -106,17 +114,18 @@ pub struct TransferSession {
     clipboard_enabled: fn() -> bool,
 }
 impl TransferSession {
-    /// The endpoint's worker, which answers the viewer's pick requests.
-    pub fn agent() -> Self {
-        Self::spawn(Role::Agent, || true)
+    /// The endpoint's worker, which answers the viewer's pick requests and
+    /// presses `paste` for files the viewer pasted.
+    pub fn agent(paste: PasteShortcut) -> Self {
+        Self::spawn(Role::Agent, || true, Some(paste))
     }
     /// The technician's worker. Clipboard file copies are skipped, not sent,
     /// and rejected on receipt while `clipboard_enabled` returns false; other
     /// transfers are unaffected.
     pub fn viewer(clipboard_enabled: fn() -> bool) -> Self {
-        Self::spawn(Role::Viewer, clipboard_enabled)
+        Self::spawn(Role::Viewer, clipboard_enabled, None)
     }
-    fn spawn(role: Role, clipboard_enabled: fn() -> bool) -> Self {
+    fn spawn(role: Role, clipboard_enabled: fn() -> bool, paste: Option<PasteShortcut>) -> Self {
         let (tx, commands) = mpsc::sync_channel(COMMAND_QUEUE);
         let (sender, rx) = mpsc::sync_channel(8);
         let ready = Arc::new(tokio::sync::Notify::new());
@@ -127,7 +136,7 @@ impl TransferSession {
         let status = Arc::new(Mutex::new("Waiting for file-transfer support…".into()));
         let worker_status = status.clone();
         std::thread::spawn(move || {
-            worker::run(role, commands, out, worker_status, clipboard_enabled)
+            worker::run(role, commands, out, worker_status, clipboard_enabled, paste)
         });
         Self {
             tx,
@@ -141,6 +150,7 @@ impl TransferSession {
     /// thread while its pipe transport runs separately and remains responsive
     /// to cancellation.
     pub fn run_on_current_thread<T: Send + 'static>(
+        paste: PasteShortcut,
         client: impl FnOnce(Self) -> T + Send + 'static,
     ) -> T {
         let (tx, commands) = mpsc::sync_channel(COMMAND_QUEUE);
@@ -159,7 +169,7 @@ impl TransferSession {
             clipboard_enabled: || true,
         };
         let transport = std::thread::spawn(move || client(session));
-        worker::run(Role::Agent, commands, out, status, || true);
+        worker::run(Role::Agent, commands, out, status, || true, Some(paste));
         transport.join().expect("file transport thread panicked")
     }
     pub fn command(&self, command: Command) {
@@ -329,6 +339,8 @@ fn check_limit(destination: &FileDestination, bytes: u64) -> anyhow::Result<()> 
     )
 }
 
+// Linux shows no progress window of its own.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn progress_detail(bytes: u64, total: u64, entries: usize, total_entries: u64) -> String {
     let percent = if total == 0 {
         entries as f64 / total_entries.max(1) as f64

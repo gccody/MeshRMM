@@ -1,4 +1,4 @@
-use meshrmm_protocol::ChromaMode;
+use meshrmm_protocol::{ChromaMode, DevicePlatform};
 
 use super::{Action, Badge, Icon, Item, State, Tone, quality_label};
 
@@ -93,7 +93,7 @@ fn push_remote_control_items(items: &mut Vec<Item>, state: &State) {
     key.active = credentials.prompt_active;
     key.badge = credentials.can_autofill.then_some(Badge::Attention);
     items.push(key);
-    if !state.device_is_mac {
+    if state.windows_device() {
         let mut secure_attention = Item::new(
             Action::SecureAttention,
             Icon::Keyboard,
@@ -109,7 +109,7 @@ fn push_remote_control_items(items: &mut Vec<Item>, state: &State) {
         Icon::Power,
         match state.power {
             None => "Restart is unavailable until the agent connects",
-            Some(false) if state.device_is_mac => "Restart the remote Mac",
+            Some(false) if state.device == Some(DevicePlatform::Macos) => "Restart the remote Mac",
             Some(false) => "Restart the remote computer",
             Some(true) => "Restart the remote computer, which is in Safe Mode",
         },

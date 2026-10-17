@@ -28,7 +28,7 @@ use crate::{
 /// An installer works this long after it is issued, and an interrupted
 /// install can redeem it again until then.
 pub const INSTALLER_TTL_MS: i64 = 30 * MINUTE_MS;
-const PLATFORMS: &[&str] = &["windows-x64", "macos"];
+const PLATFORMS: &[&str] = &["windows-x64", "macos", "linux"];
 const MIN_REDEMPTION_KEY_LENGTH: usize = 32;
 const MAX_REDEMPTION_KEY_LENGTH: usize = 128;
 /// The capture settings a new Agent starts with.

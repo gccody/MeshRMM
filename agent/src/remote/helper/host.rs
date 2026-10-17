@@ -1,20 +1,24 @@
-//! The session helper process: launchd runs one in each graphical session,
-//! including the login window's, and it serves that session's screen and
-//! input to the coordinator.
+//! The session helper process: one runs in each graphical session,
+//! including the login window's, and serves that session's screen and input
+//! to the coordinator.
+#[cfg(target_os = "macos")]
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
 use anyhow::{Context, bail};
 use meshrmm_protocol::DisplayId;
 
+use super::platform::local::{LocalInput, LocalScreen};
 use super::protocol::{self, Call, Event, Frame, Hello, Reply, Request, StreamSettings};
-use crate::remote::macos::local::{LocalInput, LocalScreen};
 use crate::remote::platform::ScreenInput;
 
+#[cfg(target_os = "macos")]
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// How often input state, files and chat are checked during a session.
 const PUMP_INTERVAL: Duration = Duration::from_millis(16);
@@ -24,6 +28,7 @@ const CLIPBOARD_INTERVAL: Duration = Duration::from_millis(250);
 const QUEUED_EVENTS: usize = 64;
 
 /// Serves the coordinator at `socket` until the process is stopped.
+#[cfg(target_os = "macos")]
 pub fn run(socket: &Path) -> anyhow::Result<()> {
     // The login window's helper runs as root; users' helpers run as them.
     // SAFETY: geteuid has no preconditions.
@@ -47,8 +52,20 @@ pub fn run(socket: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Serves the coordinator that started this helper, over `stream`, until it
+/// closes the connection.
+#[cfg(target_os = "linux")]
+pub fn run_started(stream: UnixStream, login_window: bool) -> anyhow::Result<()> {
+    let input = Arc::new(LocalInput::new()?);
+    tracing::info!(login_window, "session helper started");
+    let result = serve(stream, &input, login_window);
+    input.end_session();
+    result
+}
+
 /// Asks the user for the permissions the helper needs, once: macOS shows each
 /// prompt only until the user answers it.
+#[cfg(target_os = "macos")]
 fn request_permissions() {
     use objc2_core_graphics::{
         CGPreflightListenEventAccess, CGPreflightPostEventAccess, CGPreflightScreenCaptureAccess,
@@ -69,15 +86,20 @@ fn request_permissions() {
 }
 
 fn serve(stream: UnixStream, input: &Arc<LocalInput>, login_window: bool) -> anyhow::Result<()> {
-    let mut uid = 0;
-    let mut gid = 0;
-    // SAFETY: the descriptor is a connected socket and the out pointers are valid.
-    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("could not identify the coordinator");
-    }
-    // SAFETY: geteuid has no preconditions.
-    if uid != 0 && uid != unsafe { libc::geteuid() } {
-        bail!("the coordinator socket belongs to user {uid}");
+    // A Linux helper's socket comes from the coordinator that started it.
+    #[cfg(target_os = "macos")]
+    {
+        let mut uid = 0;
+        let mut gid = 0;
+        // SAFETY: the descriptor is a connected socket and the out pointers are valid.
+        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("could not identify the coordinator");
+        }
+        // SAFETY: geteuid has no preconditions.
+        if uid != 0 && uid != unsafe { libc::geteuid() } {
+            bail!("the coordinator socket belongs to user {uid}");
+        }
     }
     let mut writer = stream.try_clone()?;
     protocol::write(
@@ -272,12 +294,12 @@ fn handle(request: Request, served: &Served) -> anyhow::Result<Reply> {
             timeout: Duration::from_secs(timeout_seconds.into()),
             lock_idle: Duration::from_secs(lock_idle_seconds.into()),
         })?,
-        Request::ClearClipboard => crate::remote::macos::session_close::clear_clipboard_here()?,
-        Request::LockScreen => crate::remote::macos::session_close::lock_here()?,
-        Request::LogOut => crate::remote::macos::session_close::log_out_here()?,
+        Request::ClearClipboard => super::platform::session_close::clear_clipboard_here()?,
+        Request::LockScreen => super::platform::session_close::lock_here()?,
+        Request::LogOut => super::platform::session_close::log_out_here()?,
         Request::Thumbnail => {
             return Ok(Reply::Thumbnail(
-                crate::remote::macos::snapshot::main_display_jpeg()?,
+                super::platform::snapshot::main_display_jpeg()?,
             ));
         }
         Request::CancelApproval => approval
