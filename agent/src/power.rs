@@ -22,6 +22,40 @@ pub use windows_impl::*;
 #[cfg(target_os = "macos")]
 pub use macos_impl::*;
 
+#[cfg(target_os = "linux")]
+pub use linux_impl::*;
+
+#[cfg(target_os = "linux")]
+mod linux_impl {
+    use std::process::Command;
+
+    use anyhow::{Context, bail};
+
+    /// Linux has no Safe Mode the Agent could start in.
+    pub fn booted_in_safe_mode() -> bool {
+        false
+    }
+
+    /// Restarts the computer through systemd, as root, at once.
+    pub fn restart(safe_mode: bool) -> anyhow::Result<()> {
+        if safe_mode {
+            bail!("Safe Mode restarts are not available on Linux");
+        }
+        let output = Command::new("systemctl")
+            .arg("reboot")
+            .output()
+            .context("could not start the restart command")?;
+        if !output.status.success() {
+            bail!(
+                "the restart command failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        tracing::info!("Linux is restarting for the technician");
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod macos_impl {
     use std::process::Command;

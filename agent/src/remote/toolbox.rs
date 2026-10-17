@@ -11,14 +11,21 @@
 //! Public Documents for the background desktop or when nobody is signed in.
 //! While a user is signed in, files are written with their token, so they
 //! own them and a folder they control cannot redirect a SYSTEM write.
-//! On a Mac, root takes SYSTEM's place and `/Users/Shared` Public Documents'.
+//! On a Mac, root takes SYSTEM's place and `/Users/Shared` Public Documents';
+//! on Linux, root and `/srv` do.
 
 use meshrmm_protocol::ScriptLanguage;
 
 /// Runs past this many at once are refused rather than queued.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 const MAX_RUNNING_SCRIPTS: usize = 8;
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 const MAX_RUNNING_DELIVERIES: usize = 4;
 
 /// The script file's name and its bytes as the interpreter reads them.
@@ -26,7 +33,10 @@ const MAX_RUNNING_DELIVERIES: usize = 4;
 /// without a byte-order mark in the ANSI code page, so the file gets one.
 /// `cmd` reads a batch file a line at a time in the console code page, so a
 /// first line switches it to UTF-8, which also makes the output UTF-8.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 fn script_file(language: ScriptLanguage, body: &str) -> (&'static str, Vec<u8>) {
     let body = body.replace("\r\n", "\n").replace('\n', "\r\n");
     match language {
@@ -60,13 +70,19 @@ fn interpreter_arguments(language: ScriptLanguage, script: &str) -> String {
 
 /// Output a script wrote, up to the limit the server keeps.
 #[derive(Debug, Default)]
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 struct Output {
     bytes: Vec<u8>,
     truncated: bool,
 }
 
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 impl Output {
     fn push(&mut self, chunk: &[u8]) {
         let room = meshrmm_protocol::MAX_SCRIPT_OUTPUT_BYTES.saturating_sub(self.bytes.len());
@@ -81,7 +97,10 @@ impl Output {
 /// Output bytes as text: UTF-8, which both interpreters are asked to write,
 /// else `fallback`'s decoding, for programs that write the OEM code page.
 /// A character cut at the end by the output limit is dropped.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 fn decode_output(bytes: &[u8], fallback: impl Fn(&[u8]) -> String) -> String {
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     match std::str::from_utf8(bytes) {
@@ -95,7 +114,10 @@ fn decode_output(bytes: &[u8], fallback: impl Fn(&[u8]) -> String) -> String {
 
 /// `name`, or `name (2)`, `name (3)`… before its extension, whichever
 /// `taken` says is free.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 fn unique_name(name: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
     if !taken(name) {
         return Some(name.to_owned());
@@ -110,7 +132,10 @@ fn unique_name(name: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
 }
 
 /// Run IDs name a directory, so they must be plain.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
@@ -122,7 +147,7 @@ fn valid_id(id: &str) -> bool {
 #[cfg(windows)]
 use self::windows as platform;
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod shared {
     use std::io::{Read, Write};
     use std::path::PathBuf;
@@ -386,9 +411,9 @@ mod shared {
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) use self::shared::{deliver_file, run_script};
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use self::shared::{download, failed};
 
 #[cfg(windows)]
@@ -403,6 +428,14 @@ mod macos;
 
 #[cfg(target_os = "macos")]
 use self::macos as platform;
+
+/// Scripts and files on Linux, as on a Mac but with bash, the console's
+/// logind session for the signed-in user, and /srv for shared files.
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(target_os = "linux")]
+use self::linux as platform;
 
 #[cfg(test)]
 mod tests {

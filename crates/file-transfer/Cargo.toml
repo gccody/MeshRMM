@@ -21,3 +21,10 @@ objc2-app-kit = "0.3.2"
 objc2-foundation = "0.3.2"
 dispatch2 = "0.3.1"
 libc = "0.2.189"
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard.workspace = true
+libc = "0.2.189"
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+x11rb = { version = "0.13.2", features = ["xfixes"] }

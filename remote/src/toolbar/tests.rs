@@ -368,27 +368,49 @@ fn power_waits_for_the_agent_and_offers_both_restarts() {
 }
 
 #[test]
-fn macs_have_no_ctrl_alt_del_or_safe_mode() {
-    let windows = State {
-        power: Some(false),
-        ..state()
-    };
-    assert!(find(&items(&windows), Action::SecureAttention).is_some());
-    let mac = State {
-        power: Some(false),
-        device_is_mac: true,
-        ..state()
-    };
-    let items = items(&mac);
-    assert!(find(&items, Action::SecureAttention).is_none());
-    assert_eq!(
-        find(&items, Action::Power).unwrap().tooltip,
-        "Restart the remote Mac"
-    );
-    assert_eq!(
-        commands(&menu(Action::Power, &mac)),
-        [Some(Command::Restart { safe_mode: false })]
-    );
+fn only_windows_has_ctrl_alt_del_and_safe_mode() {
+    let both_restarts = [
+        Some(Command::Restart { safe_mode: false }),
+        Some(Command::Restart { safe_mode: true }),
+    ];
+    // Until the agent reports its platform, the toolbar offers Windows's.
+    for device in [None, Some(DevicePlatform::Windows)] {
+        let windows = State {
+            power: Some(false),
+            device,
+            ..state()
+        };
+        let items = items(&windows);
+        assert!(
+            find(&items, Action::SecureAttention).is_some(),
+            "{device:?}"
+        );
+        assert_eq!(
+            find(&items, Action::Power).unwrap().tooltip,
+            "Restart the remote computer"
+        );
+        assert_eq!(commands(&menu(Action::Power, &windows)), both_restarts);
+    }
+    for (device, tooltip) in [
+        (DevicePlatform::Macos, "Restart the remote Mac"),
+        (DevicePlatform::Linux, "Restart the remote computer"),
+    ] {
+        let state = State {
+            power: Some(false),
+            device: Some(device),
+            ..state()
+        };
+        let items = items(&state);
+        assert!(
+            find(&items, Action::SecureAttention).is_none(),
+            "{device:?}"
+        );
+        assert_eq!(find(&items, Action::Power).unwrap().tooltip, tooltip);
+        assert_eq!(
+            commands(&menu(Action::Power, &state)),
+            [Some(Command::Restart { safe_mode: false })]
+        );
+    }
 }
 
 #[test]

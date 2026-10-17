@@ -36,7 +36,7 @@ MeshRMM is in heavy development and not production ready.
 - Background mode: a private desktop in Windows Session 0 with its own
   taskbar, Task Manager, File Explorer, Run dialog and the usual
   administration tools, which the signed-in user never sees.
-- A toolbox of PowerShell, Command Prompt and zsh scripts and a file library,
+- A toolbox of PowerShell, Command Prompt and shell (zsh or bash) scripts and a file library,
   private or shared, run and delivered from the website or the viewer as the
   signed-in user or as SYSTEM/root.
 - Saved Windows credentials, encrypted on the device, that fill sign-in and
@@ -51,8 +51,11 @@ MeshRMM is in heavy development and not production ready.
 - Resource monitoring: CPU, memory, network, uptime and disk space, live and
   as charts for the last hour, day or week.
 - Enrollment with a single-use installer (Windows) or install command
-  (macOS). Agents and viewers update themselves from the server and check a
-  release signature first.
+  (macOS and Linux). Agents and viewers update themselves from the server and
+  check a release signature first.
+- Linux computers with or without a desktop: servers get monitoring, scripts
+  and files, and X11, GNOME, KDE Plasma and wlroots desktops (sway,
+  Hyprland) remote sessions too.
 
 **Control for the company and the user**
 
@@ -85,7 +88,7 @@ MeshRMM is in heavy development and not production ready.
 | Component | Runs on |
 |---|---|
 | Server | Linux, x86_64 or arm64 |
-| Agent | Windows 10 version 1903 or newer; macOS 12.3 or newer (in development) |
+| Agent | Windows 10 version 1903 or newer; macOS 12.3 or newer (in development); Linux, x86_64 or arm64, with systemd and glibc 2.28 or newer |
 | Viewer | Windows 10 version 1903 or newer; macOS 12 or newer (releases ship an Apple silicon build) |
 | Website | A current browser |
 
@@ -111,8 +114,8 @@ UDP 3478 and UDP 49160–49200 open from the internet.
    first administrator.
 3. Invite technicians under **Users**.
 4. On each computer to manage, sign in to the website, choose **Add device**,
-   and run the Windows installer or the macOS command it gives you within 30
-   minutes.
+   and run the Windows installer or the macOS or Linux command it gives you
+   within 30 minutes.
 5. On each technician's computer, download the viewer from the website's
    **Remote app** menu and open it once to install it. **Connect** on a
    device then opens the session.
@@ -160,5 +163,6 @@ For developers:
 - [Credential autofill](docs/credential-autofill.md)
 - [Screen thumbnails](docs/screen-thumbnails.md)
 - [macOS Agent](docs/macos-agent.md)
+- [Linux Agent](docs/linux-agent.md)
 - [Transport security](docs/transport-security.md)
 - [The website](dashboard/README.md) and [the marketing page](site/README.md)

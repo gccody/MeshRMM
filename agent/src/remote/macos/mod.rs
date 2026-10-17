@@ -7,7 +7,6 @@ mod capture;
 mod cursor;
 pub(crate) mod display;
 mod encoder;
-pub(crate) mod helper;
 mod input;
 mod keep_awake;
 mod keymap;
@@ -24,11 +23,11 @@ use meshrmm_protocol::{
     ChromaMode, Codec, DisplayId, EncodedFrame, HeadlessResolution, QualityPreset, VideoStreamId,
 };
 
-pub(crate) use self::helper::protocol::SessionUi;
-use self::helper::protocol::StreamSettings;
 use super::platform;
 use super::platform::{ScreenInput, ScreenStreamer, StartedScreen};
 use super::video::LatestFrameSlot;
+pub(crate) use crate::remote::helper::protocol::SessionUi;
+use crate::remote::helper::protocol::StreamSettings;
 
 /// Microseconds of the host clock ScreenCaptureKit stamps frames with.
 pub fn monotonic_timestamp_us() -> u64 {
@@ -75,7 +74,7 @@ enum Backend {
         screen: Box<local::LocalScreen>,
         input: Arc<local::LocalInput>,
     },
-    Helper(Arc<helper::coordinator::Remote>),
+    Helper(Arc<crate::remote::helper::coordinator::Remote>),
 }
 
 impl PlatformScreenStreamer {
@@ -88,7 +87,7 @@ impl PlatformScreenStreamer {
         ui: SessionUi,
     ) -> anyhow::Result<Self> {
         let backend = if use_helpers {
-            Backend::Helper(helper::coordinator::Remote::new(ui)?)
+            Backend::Helper(crate::remote::helper::coordinator::Remote::new(ui)?)
         } else {
             let input = Arc::new(local::LocalInput::new()?);
             input.begin_session(&ui);
@@ -253,9 +252,9 @@ impl ScreenStreamer for PlatformScreenStreamer {
     fn input_controller(&self) -> Arc<dyn ScreenInput> {
         match &self.backend {
             Backend::Direct { input, .. } => Arc::clone(input) as Arc<dyn ScreenInput>,
-            Backend::Helper(remote) => {
-                Arc::new(helper::coordinator::HelperInput(Arc::clone(remote)))
-            }
+            Backend::Helper(remote) => Arc::new(crate::remote::helper::coordinator::HelperInput(
+                Arc::clone(remote),
+            )),
         }
     }
 }

@@ -26,6 +26,8 @@ export const ARTIFACTS = {
   "client-windows-x64": "meshrmm-remote-windows-x64.exe",
   "client-macos-arm64": "meshrmm-remote-macos-arm64.zip",
   "agent-macos": "meshrmm-agent-macos.zip",
+  "agent-linux-x64": "meshrmm-agent-linux-x64",
+  "agent-linux-arm64": "meshrmm-agent-linux-arm64",
 };
 
 // What a signature covers; crates/self-update's `signed_message` must match.

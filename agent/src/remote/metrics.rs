@@ -3,7 +3,8 @@
 //! dashboard can show it.
 //!
 //! The coordinator owns the control connection, so it reports: the Windows
-//! service's SYSTEM worker and the Mac's root launchd daemon. Readings come
+//! service's SYSTEM worker, the Mac's root launchd daemon and the Linux root
+//! systemd service. Readings come
 //! straight from the operating system. CPU load and network rates are averages
 //! since the previous sample. Volumes can sit on slow disks, so they are read
 //! at most every [`VOLUME_REFRESH`] and the last list is reported in between.
@@ -15,11 +16,15 @@ use meshrmm_protocol::{METRICS_INTERVAL_SECONDS, SystemMetrics, VolumeUsage};
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, MissedTickBehavior, interval_at};
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]
 pub(crate) mod windows;
 
+#[cfg(target_os = "linux")]
+use self::linux as platform;
 #[cfg(target_os = "macos")]
 use self::macos as platform;
 #[cfg(windows)]
@@ -352,10 +357,14 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].total_bytes >= pair[1].total_bytes)
         );
-        // Most computers have a processor busy at least now and then; a
-        // second reading proves the rate is measured, not left at zero.
+        // The test keeps a processor busy itself, since an idle virtual
+        // machine can go seconds without a busy tick; a second reading
+        // proves the rate is measured, not left at zero.
         let busy = (0..20).any(|_| {
-            std::thread::sleep(Duration::from_millis(100));
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_millis(100) {
+                std::hint::black_box(started.elapsed());
+            }
             sampler.sample().cpu_percent > 0.0
         });
         assert!(busy, "processor load never rose above zero");

@@ -12,9 +12,9 @@ use meshrmm_protocol::{
 
 use super::capture::{Capture, CaptureConfig};
 use super::encoder::EncodedAccessUnit;
-use super::helper::protocol::{InputState, SessionUi, StreamSettings};
 use super::platform::ScreenInput;
 use super::{display, input, keep_awake, ui, wallpaper};
+use crate::remote::helper::protocol::{InputState, SessionUi, StreamSettings};
 
 pub(crate) struct Started {
     pub displays: Vec<Display>,
@@ -186,8 +186,10 @@ impl LocalScreen {
 /// Keyboard, pointer, clipboard, files, chat and the maintenance controls of
 /// this session.
 pub(crate) struct LocalInput {
-    controller: Mutex<input::InputController>,
-    files: meshrmm_file_transfer::TransferSession,
+    controller: Arc<Mutex<input::InputController>>,
+    /// The remote session's file worker, which announces itself to each
+    /// viewer when it starts.
+    files: Mutex<Option<meshrmm_file_transfer::TransferSession>>,
     chat: meshrmm_chat::ChatSession,
     keep_awake: Mutex<Option<keep_awake::KeepAwake>>,
     wallpaper: Mutex<wallpaper::Wallpaper>,
@@ -202,12 +204,40 @@ pub(crate) struct LocalInput {
     annotations: Mutex<Option<(meshrmm_protocol::DisplayId, ui::AnnotationOverlay)>>,
 }
 
+/// Presses Command+V on the display the viewer pasted files on, once they are
+/// on the clipboard.
+fn paste_shortcut(
+    controller: &Arc<Mutex<input::InputController>>,
+) -> meshrmm_file_transfer::PasteShortcut {
+    let controller = Arc::clone(controller);
+    Box::new(move |display_id| {
+        let mut controller = controller
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input controller lock was poisoned"))?;
+        for (scan_code, extended, pressed) in [
+            (0x5b, true, true),
+            (0x2f, false, true),
+            (0x2f, false, false),
+            (0x5b, true, false),
+        ] {
+            controller.apply(RemoteInput::Key {
+                display_id,
+                scan_code,
+                extended,
+                pressed,
+            })?;
+        }
+        Ok(())
+    })
+}
+
 impl LocalInput {
     pub(crate) fn new() -> anyhow::Result<Self> {
         wallpaper::restore_interrupted();
+        let controller = Arc::new(Mutex::new(input::InputController::new()?));
         Ok(Self {
-            controller: Mutex::new(input::InputController::new()?),
-            files: meshrmm_file_transfer::TransferSession::agent(),
+            controller,
+            files: Mutex::default(),
             chat: meshrmm_chat::ChatSession::with_peer("Viewer"),
             keep_awake: Mutex::new(None),
             wallpaper: Mutex::default(),
@@ -229,6 +259,9 @@ impl LocalInput {
     /// chat, the banner when company policy shows it, and the connection
     /// notification once.
     pub(crate) fn begin_session(&self, session: &SessionUi) {
+        *self.files.lock().unwrap_or_else(|e| e.into_inner()) = Some(
+            meshrmm_file_transfer::TransferSession::agent(paste_shortcut(&self.controller)),
+        );
         *self
             .blackout_message
             .lock()
@@ -311,6 +344,7 @@ impl LocalInput {
         let _ = self.set_prevent_idle_lock(false);
         let _ = self.set_wallpaper_hidden(false);
         self.stop_chat();
+        self.files.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.indicator
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -384,14 +418,27 @@ impl ScreenInput for LocalInput {
         Ok(())
     }
     fn apply_files(&self, message: meshrmm_protocol::FileMessage) -> anyhow::Result<()> {
-        self.files.receive(message);
+        self.files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .context("file transfers need a remote session")?
+            .receive(message);
         Ok(())
     }
     fn poll_files(&self) -> Option<meshrmm_protocol::FileMessage> {
-        self.files.poll()
+        self.files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()?
+            .poll()
     }
     fn files_ready(&self) -> Arc<tokio::sync::Notify> {
-        self.files.outgoing_ready()
+        self.files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or_else(Arc::default, |files| files.outgoing_ready())
     }
     fn apply(&self, input: RemoteInput) -> anyhow::Result<()> {
         self.controller()?.apply(input)

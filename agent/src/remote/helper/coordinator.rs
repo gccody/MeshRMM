@@ -1,12 +1,19 @@
-//! The coordinator's end of the session helpers. launchd starts a helper in
-//! every graphical session, the login window's included; each connects to
-//! the coordinator's socket. A remote session uses the helper of the session
-//! on the console and moves to another helper when the console changes.
+//! The coordinator's end of the session helpers. Every graphical session,
+//! the login window's included, has a helper: on macOS launchd starts them
+//! and each connects to the coordinator's socket, and on Linux the
+//! coordinator starts them over a socket pair. A remote session uses the
+//! helper of the session on the console and moves to another helper when the
+//! console changes.
 use std::collections::{HashMap, VecDeque};
 use std::io::BufReader;
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "macos")]
 use std::os::unix::io::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(target_os = "macos")]
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -18,11 +25,11 @@ use meshrmm_protocol::{
 };
 use tokio::sync::Notify;
 
+use super::platform::local::Started;
 use super::protocol::{
     self, Call, Event, Frame, Hello, InputState, Reply, Request, SessionUi, StreamSettings,
 };
 use crate::remote::connection_approval::{ApprovalPrompt, Decision};
-use crate::remote::macos::local::Started;
 use crate::remote::platform::ScreenInput;
 
 /// How long a helper may take to answer a request. Starting capture is the
@@ -39,6 +46,7 @@ pub(crate) struct Registry {
 
 /// Starts accepting helpers on `path`. Only processes running this Agent's
 /// executable are accepted.
+#[cfg(target_os = "macos")]
 pub(crate) fn listen(path: &Path) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)
@@ -75,7 +83,14 @@ pub(crate) fn registry() -> anyhow::Result<Arc<Registry>> {
         .context("the coordinator does not accept session helpers")
 }
 
+/// The registry, created for a coordinator that starts its own helpers.
+#[cfg(target_os = "linux")]
+pub(crate) fn create_registry() -> Arc<Registry> {
+    Arc::clone(REGISTRY.get_or_init(Arc::default))
+}
+
 impl Registry {
+    #[cfg(target_os = "macos")]
     fn admit(self: &Arc<Self>, stream: UnixStream, executable: &Path) -> anyhow::Result<()> {
         let (uid, pid) = peer(&stream)?;
         let peer_executable = process_path(pid)?;
@@ -85,6 +100,17 @@ impl Registry {
                 peer_executable.display()
             );
         }
+        self.attach(stream, uid, None).map(|_| ())
+    }
+
+    /// Adds the helper at the other end of `stream`, which runs as `uid` in
+    /// `login_session` (logind's ID, on Linux), once it has said hello.
+    pub(crate) fn attach(
+        self: &Arc<Self>,
+        stream: UnixStream,
+        uid: u32,
+        login_session: Option<String>,
+    ) -> anyhow::Result<Arc<Connection>> {
         stream.set_read_timeout(Some(CALL_TIMEOUT))?;
         let hello: Hello = protocol::read(&mut &stream)?.context("the helper closed at once")?;
         stream.set_read_timeout(None)?;
@@ -98,6 +124,7 @@ impl Registry {
         let connection = Arc::new(Connection {
             uid,
             login_window: hello.login_window,
+            login_session,
             writer: Mutex::new(stream.try_clone()?),
             next_id: AtomicU64::new(1),
             pending: Mutex::default(),
@@ -107,8 +134,8 @@ impl Registry {
         });
         tracing::info!(
             uid,
-            pid,
             login_window = hello.login_window,
+            login_session = connection.login_session.as_deref(),
             "session helper connected"
         );
         self.helpers
@@ -116,22 +143,24 @@ impl Registry {
             .unwrap_or_else(|e| e.into_inner())
             .push(Arc::clone(&connection));
         let registry = Arc::clone(self);
+        let reader = Arc::clone(&connection);
         std::thread::Builder::new()
             .name("meshrmm-helper-reader".into())
             .spawn(move || {
-                connection.read_events(BufReader::new(stream));
+                reader.read_events(BufReader::new(stream));
                 registry
                     .helpers
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .retain(|helper| !Arc::ptr_eq(helper, &connection));
+                    .retain(|helper| !Arc::ptr_eq(helper, &reader));
                 tracing::info!(
                     uid,
-                    login_window = connection.login_window,
+                    login_window = reader.login_window,
+                    login_session = reader.login_session.as_deref(),
                     "session helper disconnected"
                 );
             })?;
-        Ok(())
+        Ok(connection)
     }
 
     /// The helper of `uid`'s graphical session.
@@ -155,8 +184,32 @@ impl Registry {
     }
 
     /// The helper of the session on the console.
+    #[cfg(target_os = "linux")]
     fn console_helper(&self) -> anyhow::Result<Arc<Connection>> {
-        let console = crate::remote::macos::session_close::console_user();
+        let console = super::platform::sessions::console_session()
+            .context("no graphical session is on the console")?;
+        self.session_helper(&console)
+    }
+
+    /// The helper of logind session `id`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn session_helper(&self, id: &str) -> anyhow::Result<Arc<Connection>> {
+        self.helpers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .find(|helper| {
+                helper.login_session.as_deref() == Some(id) && !helper.closed.load(Ordering::SeqCst)
+            })
+            .cloned()
+            .with_context(|| format!("no session helper is running in session {id}"))
+    }
+
+    /// The helper of the session on the console.
+    #[cfg(target_os = "macos")]
+    fn console_helper(&self) -> anyhow::Result<Arc<Connection>> {
+        let console = super::platform::session_close::console_user();
         self.helpers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -175,6 +228,7 @@ impl Registry {
 }
 
 /// The peer's user ID and process ID.
+#[cfg(target_os = "macos")]
 fn peer(stream: &UnixStream) -> anyhow::Result<(u32, i32)> {
     let mut uid = 0;
     let mut gid = 0;
@@ -200,6 +254,7 @@ fn peer(stream: &UnixStream) -> anyhow::Result<(u32, i32)> {
     Ok((uid, pid))
 }
 
+#[cfg(target_os = "macos")]
 fn process_path(pid: i32) -> anyhow::Result<PathBuf> {
     let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: the buffer is as large as the size passed.
@@ -217,6 +272,8 @@ fn process_path(pid: i32) -> anyhow::Result<PathBuf> {
 pub(crate) struct Connection {
     uid: u32,
     login_window: bool,
+    /// The logind session the helper serves, on Linux.
+    login_session: Option<String>,
     writer: Mutex<UnixStream>,
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, mpsc::SyncSender<Result<Reply, String>>>>,
@@ -283,6 +340,12 @@ impl Connection {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    /// Whether the helper went away.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     /// Runs `request` and waits for the helper to finish it.
@@ -446,6 +509,10 @@ pub(crate) struct Remote {
     desired: Mutex<Desired>,
     /// What every helper the session uses shows; the notification only once.
     ui: Mutex<SessionUi>,
+    /// The locked GNOME session the remote session unlocked, locked again
+    /// when the remote session ends.
+    #[cfg(target_os = "linux")]
+    unlocked: Mutex<Option<String>>,
 }
 
 impl Remote {
@@ -456,6 +523,8 @@ impl Remote {
             events: Arc::default(),
             desired: Mutex::default(),
             ui: Mutex::new(ui),
+            #[cfg(target_os = "linux")]
+            unlocked: Mutex::default(),
         }))
     }
 
@@ -551,10 +620,13 @@ impl Remote {
             .capture_ended
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
-        match helper.call(Request::Start {
+        let started = helper.call(Request::Start {
             display_id,
             settings,
-        })? {
+        });
+        #[cfg(target_os = "linux")]
+        let started = self.start_unlocked(&helper, started, display_id, settings);
+        match started? {
             Reply::Started {
                 displays,
                 active_display,
@@ -566,6 +638,54 @@ impl Remote {
             }),
             _ => bail!("the session helper did not start capture"),
         }
+    }
+
+    /// GNOME on Wayland refuses to capture a locked session, which would
+    /// leave the technician unable to see it. The coordinator unlocks the
+    /// session through logind, as root may, and tries again; the session is
+    /// locked again when the remote session ends. A login screen has no
+    /// session to unlock, so its refusal stands.
+    #[cfg(target_os = "linux")]
+    fn start_unlocked(
+        &self,
+        helper: &Connection,
+        started: anyhow::Result<Reply>,
+        display_id: Option<DisplayId>,
+        settings: StreamSettings,
+    ) -> anyhow::Result<Reply> {
+        let refused = started.as_ref().is_err_and(|error| {
+            error
+                .to_string()
+                .starts_with(super::platform::GNOME_CAPTURE_REFUSED)
+        });
+        let Some(session) = helper
+            .login_session
+            .clone()
+            .filter(|_| refused && !helper.login_window)
+        else {
+            return started;
+        };
+        super::platform::sessions::Logind::connect()?
+            .unlock_session(&session)
+            .context("could not unlock the session for the technician")?;
+        tracing::info!(
+            session,
+            "unlocked the GNOME session so the technician can see it"
+        );
+        *self.unlocked.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
+        // GNOME Shell lifts its inhibition once the lock screen is gone.
+        let mut started = started;
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(500));
+            started = helper.call(Request::Start {
+                display_id,
+                settings,
+            });
+            if started.is_ok() {
+                break;
+            }
+        }
+        started
     }
 
     pub(crate) fn stop(&self) -> anyhow::Result<()> {
@@ -639,6 +759,28 @@ impl Drop for Remote {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         self.detach(current);
+        #[cfg(target_os = "linux")]
+        if let Err(error) = super::platform::input_block::set_blocked(false) {
+            tracing::warn!(error = ?error, "could not unblock the local keyboard and pointer");
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(session) = self
+            .unlocked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            match super::platform::sessions::Logind::connect()
+                .and_then(|logind| logind.lock_session(&session))
+            {
+                Ok(()) => {
+                    tracing::info!(session, "locked the GNOME session the technician unlocked")
+                }
+                Err(error) => {
+                    tracing::warn!(session, error = ?error, "could not lock the session again")
+                }
+            }
+        }
     }
 }
 
@@ -769,12 +911,24 @@ impl ScreenInput for HelperInput {
             .input_state
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Only root can grab a Linux computer's keyboard and pointer, so the
+        // coordinator blocks them itself.
+        #[cfg(target_os = "linux")]
+        let agent_input_blocked = super::platform::input_block::blocked();
+        #[cfg(target_os = "macos")]
+        let agent_input_blocked = state.agent_input_blocked;
         Some(meshrmm_protocol::SessionMessage::MaintenanceState {
-            agent_input_blocked: state.agent_input_blocked,
+            agent_input_blocked,
             blacked_out: state.blacked_out,
         })
     }
     fn set_agent_input_blocked(&self, blocked: bool) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.0.helper()?.run(Request::ReleaseInput)?;
+            super::platform::input_block::set_blocked(blocked)
+        }
+        #[cfg(target_os = "macos")]
         self.0.done(Request::SetAgentInputBlocked(blocked))
     }
     fn apply_files(&self, message: FileMessage) -> anyhow::Result<()> {
@@ -872,7 +1026,7 @@ impl ScreenInput for HelperInput {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 

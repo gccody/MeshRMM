@@ -12,9 +12,12 @@ const MAX_PAYLOAD: usize = 1275;
 /// decoder over.
 const MAX_CONCEALED: u16 = 5;
 /// Samples (all channels) in the longest packet Opus allows, 120 ms.
+// Linux builds only encode: the Agent sends audio and has no player.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 const MAX_DECODED: usize = 5760 * CHANNELS;
 
 /// Whether `bytes` is shaped like an Opus channel packet.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn valid_packet(bytes: &[u8]) -> bool {
     (3..=2 + MAX_PAYLOAD).contains(&bytes.len())
 }
@@ -84,11 +87,13 @@ impl OpusEncoder {
 }
 
 /// Decodes Opus channel packets to 48 kHz stereo, concealing short losses.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) struct OpusDecoder {
     decoder: ::opus::Decoder,
     expected: Option<u16>,
     output: Vec<f32>,
 }
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 impl OpusDecoder {
     pub(crate) fn new() -> anyhow::Result<Self> {
         Ok(Self {

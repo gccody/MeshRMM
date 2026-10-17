@@ -1,10 +1,16 @@
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod enrollment;
 #[cfg(windows)]
 mod installer;
 #[cfg(target_os = "macos")]
 #[path = "macos/installer.rs"]
 mod installer;
+#[cfg(target_os = "linux")]
+#[path = "linux/installer.rs"]
+mod installer;
+#[cfg(target_os = "linux")]
+#[path = "linux/updater.rs"]
+mod linux_updater;
 mod logging;
 #[cfg(target_os = "macos")]
 #[path = "macos/app.rs"]
@@ -12,7 +18,7 @@ mod macos_app;
 #[cfg(target_os = "macos")]
 #[path = "macos/updater.rs"]
 mod macos_updater;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod power;
 #[cfg(windows)]
 mod private_directory;
@@ -21,7 +27,7 @@ mod remote;
 mod service;
 #[cfg(windows)]
 mod tray;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod update_policy;
 #[cfg(windows)]
 mod updater;
@@ -49,7 +55,7 @@ fn main() -> anyhow::Result<()> {
         return tray::run();
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     if meshrmm_session_transport::identity::handle_command(installer::identity_directory)? {
         return Ok(());
     }
@@ -75,6 +81,43 @@ fn main() -> anyhow::Result<()> {
                 );
                 if let Err(error) = &result {
                     tracing::error!(error = ?error, "Agent update failed");
+                }
+                logging::flush();
+                return result;
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+        match arguments
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            ["--install", authorization] => return installer::install(authorization),
+            ["--uninstall"] => return installer::uninstall(),
+            ["--apply-update", staged, coordinator] => {
+                logging::initialize_helper("agent-update.log")?;
+                let result = linux_updater::apply(
+                    std::path::Path::new(staged),
+                    coordinator
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("invalid coordinator process ID"))?,
+                );
+                if let Err(error) = &result {
+                    tracing::error!(error = ?error, "Agent update failed");
+                }
+                logging::flush();
+                return result;
+            }
+            ["--session-helper"] => {
+                let result = remote::run_session_helper();
+                if let Err(error) = &result {
+                    tracing::error!(error = ?error, "session helper stopped with an error");
                 }
                 logging::flush();
                 return result;
@@ -205,13 +248,13 @@ async fn run_agent() -> anyhow::Result<()> {
     match mode {
         #[cfg(windows)]
         ExecutionMode::Service => service::run(config),
-        // launchd supervises the macOS coordinator directly.
-        #[cfg(target_os = "macos")]
+        // launchd and systemd supervise the coordinator directly.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         ExecutionMode::Service => remote::run(config, mode).await,
         ExecutionMode::Worker | ExecutionMode::Console => remote::run(config, mode).await,
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         ExecutionMode::Service => {
-            anyhow::bail!("the MeshRMM Agent service requires Windows or macOS")
+            anyhow::bail!("the MeshRMM Agent service requires Windows, macOS or Linux")
         }
     }
 }

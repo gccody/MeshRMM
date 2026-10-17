@@ -25,6 +25,9 @@ migrations or compatibility paths for old versions (see `AGENTS.md`).
   them.
 - For the macOS viewer: macOS 12 or newer. For the macOS Agent: 12.3 or
   newer.
+- For the Linux Agent: `cargo-zigbuild` and zig, which build it against
+  glibc 2.28 from Linux or macOS, and `nasm` for OpenH264's x86 assembly
+  (without it OpenH264 builds slower C code). It runs on Linux with systemd.
 - For the server: Linux to run a release, though it builds and runs on macOS
   for development. PostgreSQL is optional, and so is Docker, which only the
   packaging test uses.
@@ -38,7 +41,7 @@ machine they run on.
 
 | Target | Windows | macOS | Linux |
 |---|---|---|---|
-| `meshrmm-agent` | yes | yes | no |
+| `meshrmm-agent` | yes | yes | yes (also cross-built from macOS) |
 | `meshrmm-remote` (viewer) | yes | yes | no |
 | `meshrmm-server` | not supported | development only | yes |
 | `dashboard/` | yes | yes | yes |
@@ -79,6 +82,7 @@ These scripts read the version from `release.json`, put the build in
 ```sh
 sh scripts/build-agent-macos.sh    # universal; also dist/agent-macos/
 sh scripts/build-remote-macos.sh   # this Mac's architecture; also dist/remote-macos/
+sh scripts/build-agent-linux.sh    # x64 and arm64, from Linux or macOS
 ```
 
 The builds are unsigned unless `MESHRMM_RELEASE_SIGNING_KEY` holds a key. A
@@ -135,6 +139,19 @@ then the permissions reset on every build, and an installed Agent signed by
 a team refuses to update to it. Locally built apps aren't quarantined, so
 they need no notarization.
 
+### Linux
+
+To try Agent changes on an enrolled Linux computer, copy a build over the
+installed one and restart the service:
+
+```sh
+sudo install -m 755 meshrmm-agent-linux-x64 /opt/meshrmm/meshrmm-agent
+sudo systemctl restart meshrmm-agent
+```
+
+`meshrmm-agent --console --config agent.json` runs the Agent in the current
+desktop session instead; see [Linux Agent](linux-agent.md#development).
+
 ## Checks
 
 CI (`.github/workflows/ci.yml`) runs each of these only when a path it
@@ -153,6 +170,22 @@ On macOS, for the viewer, the macOS Agent and the shared transport:
 ```sh
 cargo clippy --locked -p meshrmm-remote -p meshrmm-agent -p meshrmm-session-transport --all-targets -- -D warnings
 cargo test --locked -p meshrmm-remote -p meshrmm-agent -p meshrmm-session-transport
+```
+
+On Linux, for the Linux Agent and its session services:
+
+```sh
+cargo clippy --locked -p meshrmm-agent -p meshrmm-file-transfer -p meshrmm-clipboard -p meshrmm-audio -p meshrmm-chat --all-targets -- -D warnings
+cargo test --locked -p meshrmm-agent -p meshrmm-file-transfer -p meshrmm-clipboard -p meshrmm-audio -p meshrmm-chat
+```
+
+From a Mac, Clippy can check the Linux build through cargo-zigbuild, which
+has no Clippy command of its own:
+
+```sh
+RUSTC_WORKSPACE_WRAPPER=$(rustup which clippy-driver) \
+CLIPPY_ARGS=-D__CLIPPY_HACKERY__warnings__CLIPPY_HACKERY__ \
+cargo zigbuild -p meshrmm-agent --target x86_64-unknown-linux-gnu.2.28 --all-targets
 ```
 
 For the server:

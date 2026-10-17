@@ -35,7 +35,7 @@ tracing-subscriber.workspace = true
 url.workspace = true
 webrtc.workspace = true
 
-[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+[target.'cfg(any(windows, target_os = "macos", target_os = "linux"))'.dependencies]
 ureq = { version = "3.4.0", features = ["json", "platform-verifier"] }
 uuid = { version = "1.24.1", features = ["v4"] }
 
@@ -108,6 +108,22 @@ objc2-quartz-core = "0.3.2"
 objc2-screen-capture-kit = "0.3.2"
 objc2-video-toolbox = "0.3.2"
 postcard = { version = "1.1.3", features = ["use-std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard.workspace = true
+jpeg-encoder = "0.7.1"
+libc = "0.2.189"
+libloading = "0.8"
+# Software H.264, built from the bundled OpenH264 source (BSD-2-Clause).
+openh264 = "0.9.9"
+openh264-sys2 = "0.9.9"
+postcard = { version = "1.1.3", features = ["use-std"] }
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "unstable"] }
+wayland-protocols-plasma = { version = "0.3.12", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+x11rb = { version = "0.13.2", features = ["randr", "shm", "xfixes", "xtest"] }
+zbus = "5"
 
 [dev-dependencies]
 meshrmm-signaling-client = { workspace = true, features = ["test-support"] }

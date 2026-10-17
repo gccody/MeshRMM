@@ -42,6 +42,11 @@ screen and UAC prompts are captured as the person at the device sees them.
 Deleting a device removes its image, and a device being deleted cannot upload
 another.
 
+A Linux computer works the same way, with the helper of the console's
+graphical session, which captures one frame through its display server; see
+[Linux Agent](linux-agent.md). A server without a graphical session has no
+thumbnail.
+
 On a Mac, the root coordinator asks the session helper on the console for the
 image: the signed-in user's, or the login window's. The helper captures one
 frame of the main display with ScreenCaptureKit, already scaled to at most

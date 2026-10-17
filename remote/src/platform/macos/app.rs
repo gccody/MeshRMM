@@ -887,10 +887,12 @@ fn mac_cursor(shape: CursorShape) -> Retained<NSCursor> {
     }
 }
 
-/// What Command sends: Command itself to a Mac, and to Windows the Windows
-/// key unless the technician prefers Ctrl.
+/// What Command sends: Command itself to a Mac, and to Windows and Linux the
+/// Windows key unless the technician prefers Ctrl.
 fn command_key(control: &ControlSink) -> CommandKey {
-    if control.command_as_control() && !control.device_is_mac() {
+    if control.command_as_control()
+        && control.device_platform() != Some(meshrmm_protocol::DevicePlatform::Macos)
+    {
         CommandKey::Control
     } else {
         CommandKey::Windows

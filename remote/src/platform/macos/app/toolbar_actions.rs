@@ -40,7 +40,7 @@ impl RemoteView {
             chat_available: chat.available(),
             chat_unread: chat.unread(),
             power: control.power_state(),
-            device_is_mac: control.device_is_mac(),
+            device: control.device_platform(),
             file_status: control.files().status(),
             toolbox_available: toolbox.available,
             toolbox_busy: toolbox.busy,

@@ -85,7 +85,7 @@ impl SessionClose {
     /// signed in to it. Resolving the user queries Terminal Services, which can
     /// stall during a sign-in, so the periodic check of an unchanged session runs
     /// on a blocking thread instead of the caller's runtime worker.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub fn set_target(self: &std::sync::Arc<Self>, session: &DesktopSession) {
         let now = Instant::now();
         match self.refresh(session, now) {
@@ -195,14 +195,14 @@ impl SessionClose {
             })
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub fn run(&self, session_id: &meshrmm_protocol::RemoteSessionId) {
         self.spawn(session_id);
     }
 
     /// Runs the pending work like [`Self::run`] and waits for it, for a coordinator that is
     /// about to exit.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub async fn finish(&self, session_id: &meshrmm_protocol::RemoteSessionId) {
         if let Some(task) = self.spawn(session_id) {
             let _ = task.await;
@@ -259,8 +259,8 @@ impl SessionClose {
     }
 }
 
-/// The pending work, for the Mac user still signed in on the console.
-#[cfg(target_os = "macos")]
+/// The pending work, for the Mac or Linux user still signed in on the console.
+#[cfg(unix)]
 impl SessionClose {
     fn spawn(
         &self,
@@ -287,7 +287,7 @@ impl SessionClose {
             let (uid, user) = (current.session, current.user);
             // Clear first so a locked session does not keep the copied data.
             if clear_clipboard {
-                match crate::remote::macos::session_close::clear_clipboard(uid) {
+                match crate::remote::helper::platform::session_close::clear_clipboard(uid) {
                     Ok(()) => {
                         tracing::info!(%session_id, uid, %user, "cleared clipboard on session close")
                     }
@@ -298,8 +298,12 @@ impl SessionClose {
             }
             let result = match action {
                 SessionCloseAction::NoAction => return,
-                SessionCloseAction::Lock => crate::remote::macos::session_close::lock(uid),
-                SessionCloseAction::Logout => crate::remote::macos::session_close::log_out(uid),
+                SessionCloseAction::Lock => {
+                    crate::remote::helper::platform::session_close::lock(uid)
+                }
+                SessionCloseAction::Logout => {
+                    crate::remote::helper::platform::session_close::log_out(uid)
+                }
             };
             match result {
                 Ok(()) => {
@@ -313,15 +317,16 @@ impl SessionClose {
     }
 }
 
-/// The Mac user signed in on the console. A sign-in is told apart by the
-/// start of the user's loginwindow process.
-#[cfg(target_os = "macos")]
+/// The user signed in on the console. On a Mac a sign-in is told apart by
+/// the start of the user's loginwindow process, and on Linux by its logind
+/// session.
+#[cfg(unix)]
 fn resolve_logon(target: &DesktopSession) -> anyhow::Result<Logon> {
     anyhow::ensure!(
         *target == DesktopSession::Console,
-        "only the console has a Mac user"
+        "only the console has a signed-in user"
     );
-    let (uid, logon_id, user) = crate::remote::macos::session_close::console_logon()?;
+    let (uid, logon_id, user) = crate::remote::helper::platform::session_close::console_logon()?;
     Ok(Logon {
         session: uid,
         logon_id,
