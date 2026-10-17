@@ -148,12 +148,14 @@ The folder icon offers **Send files…** and **Receive files…**, each with a
 native multi-file and folder picker on the computer the files come from.
 Other ways to move files:
 
-- Drag files from Finder or Explorer onto the remote view. They arrive as a
-  native Windows drop at that position: in Explorer, on the desktop, or on a
-  browser's drop target. A target that declines them leaves them in the
-  transfer folder.
+- Drag files from Finder or Explorer onto the remote view. On a Windows
+  device they arrive as a native drop at that position: in Explorer, on the
+  desktop, or on a browser's drop target. A target that declines them, and
+  every Mac or Linux device, leaves them in the transfer folder.
 - Copy files on one computer and paste on the other, while **Sync
-  clipboard** is on. A remote paste shortcut waits for the transfer.
+  clipboard** is on. The viewer's paste shortcut sends the copied files
+  first, and the device presses paste (Ctrl+V, or Command+V on a Mac) once
+  they are on its clipboard.
 
 Sent and received files land in the signed-in user's
 `Documents/MeshRMM Transferred Files`. Nested and empty folders are kept, and

@@ -2,13 +2,14 @@
 
 A device is a computer with the MeshRMM Agent installed and enrolled with
 the server. This page covers a device's life from enrollment to removal on
-Windows; the [macOS Agent](macos-agent.md) differs where its page says.
+Windows; the [macOS Agent](macos-agent.md) and the
+[Linux Agent](linux-agent.md) differ where their pages say.
 
 ## Enrollment
 
 **Add device** in the website asks for the platform and, once companies
 exist, the [company](#companies) the device joins. For Windows it downloads
-a setup executable; for macOS it shows an install command. Each carries a
+a setup executable; for macOS and Linux it shows an install command. Each carries a
 random, single-use enrollment authorization that expires after 30 minutes
 (`INSTALLER_TTL_MS` in `server/src/api/enrollment.rs`). The browser appends
 the authorization to the Windows installer as a trailer, so the server never

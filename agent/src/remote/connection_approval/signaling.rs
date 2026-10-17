@@ -149,8 +149,8 @@ async fn report_declined(socket: Option<SignalingConnection>, signal_url: &Url, 
 enum Prompt {
     #[cfg(windows)]
     Helper(crate::remote::capture_helper::ApprovalHelper),
-    #[cfg(target_os = "macos")]
-    Helper(crate::remote::macos::helper::coordinator::ApprovalRequest),
+    #[cfg(unix)]
+    Helper(crate::remote::helper::coordinator::ApprovalRequest),
     InProcess {
         answer: tokio::task::JoinHandle<Option<Decision>>,
         cancelled: Arc<AtomicBool>,
@@ -165,9 +165,9 @@ impl Prompt {
         #[cfg(windows)]
         let helper = (mode == ExecutionMode::Worker)
             .then(|| crate::remote::capture_helper::ApprovalHelper::start(prompt));
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         let helper = (mode == ExecutionMode::Service)
-            .then(|| crate::remote::macos::helper::coordinator::ApprovalRequest::start(prompt));
+            .then(|| crate::remote::helper::coordinator::ApprovalRequest::start(prompt));
         if let Some(helper) = helper {
             return match helper {
                 Ok(helper) => Self::Helper(helper),

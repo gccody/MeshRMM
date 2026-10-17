@@ -57,6 +57,7 @@ The certificates survive restarts and upgrades:
 |---|---|---|
 | Windows Agent | `%ProgramData%\MeshRMM\Agent\identity` | The installer's SYSTEM and Administrators ACL |
 | macOS Agent | `/Library/Application Support/MeshRMM/Agent/identity` | Root only |
+| Linux Agent | `/var/lib/meshrmm-agent/identity` | Root only |
 | Windows viewer | `%APPDATA%\MeshRMM\viewer-identity` | The user's profile permissions |
 | macOS viewer | `~/Library/Application Support/MeshRMM/viewer-identity` | Owner-only directory, key file mode 0600 |
 

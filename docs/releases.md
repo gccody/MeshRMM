@@ -12,7 +12,8 @@ GitHub Releases or GHCR. No running server contacts either.
   - `bin/meshrmm-server`: the server, statically linked against musl, with
     the website built in;
   - `share/meshrmm/downloads/`: the Windows Agent and viewer, the macOS Agent
-    (universal) and viewer (Apple silicon), and `artifacts.json`, which lists
+    (universal) and viewer (Apple silicon), the Linux Agent for x64 and arm64,
+    and `artifacts.json`, which lists
     each build with its SHA-256 and release signature;
   - `libexec/meshrmm/rcodesign`, which signs the macOS builds with the
     company's Developer ID when its server is set up to (see

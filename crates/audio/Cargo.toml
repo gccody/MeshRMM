@@ -24,5 +24,10 @@ objc2-screen-capture-kit = "0.3.2"
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 cpal = "0.16.0"
+
+[target.'cfg(any(windows, target_os = "macos", target_os = "linux"))'.dependencies]
 # Builds the bundled libopus (BSD-3-Clause) with CMake.
 opus = "0.4.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = "0.8"

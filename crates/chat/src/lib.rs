@@ -21,6 +21,7 @@ struct State {
     available: bool,
     visible: bool,
     unread: usize,
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     draft: String,
 }
 impl State {
@@ -40,6 +41,7 @@ impl State {
         self.outgoing_ready.notify_one();
         true
     }
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     fn text(&self) -> String {
         self.transcript
             .iter()
@@ -104,6 +106,14 @@ impl ChatSession {
         if !state.visible {
             state.unread = state.unread.saturating_add(1);
         }
+    }
+    /// Queues the local user's message for the peer, as the chat window's
+    /// Send button does. Returns `false` for an invalid message or a full queue.
+    pub fn send(&self, text: String) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(text)
     }
     /// One transport consumer drains the queue after each notification.
     pub fn outgoing_ready(&self) -> Arc<tokio::sync::Notify> {

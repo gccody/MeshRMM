@@ -33,7 +33,7 @@ pub const MAX_FOLDER_NAME_CHARS: usize = 64;
 pub enum ScriptLanguage {
     Powershell,
     Cmd,
-    /// A zsh script, for Macs.
+    /// A shell script: zsh on macOS, bash on Linux.
     Shell,
 }
 
@@ -59,7 +59,7 @@ impl ScriptLanguage {
         match self {
             Self::Powershell => "PowerShell",
             Self::Cmd => "Command Prompt",
-            Self::Shell => "Shell (zsh)",
+            Self::Shell => "Shell (zsh/bash)",
         }
     }
 }

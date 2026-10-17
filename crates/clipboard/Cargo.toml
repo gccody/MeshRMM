@@ -11,5 +11,8 @@ anyhow.workspace = true
 arboard.workspace = true
 meshrmm-protocol.workspace = true
 meshrmm-file-transfer = { path = "../file-transfer" }
+[target.'cfg(target_os = "linux")'.dependencies]
+# Wayland compositors with a data-control protocol; others through Xwayland.
+arboard = { workspace = true, features = ["wayland-data-control"] }
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4.1"

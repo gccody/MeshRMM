@@ -1,8 +1,8 @@
 // Builds an enrolled Agent installer: for Windows, the published binary
 // followed by the bootstrap JSON and a trailer the Agent reads from the end of
-// its own file; for macOS, a Terminal command, since appending to a signed Mac
-// app would break its signature.
-export type AgentPlatform = "windows-x64" | "macos";
+// its own file; for macOS and Linux, a terminal command, since appending to a
+// signed Mac app would break its signature.
+export type AgentPlatform = "windows-x64" | "macos" | "linux";
 
 export type AgentInstallerBootstrap = {
   server: string;
@@ -24,14 +24,24 @@ export const INSTALLER_ASSETS: Record<"windows-x64", { label: string; binary: st
 
 export const ENROLLMENT_MAGIC = "MESHRMM-BOOTSTRAP-V1";
 
-// The command that installs the Mac Agent from the server at `origin`. The
-// Agent reads the authorization as hexadecimal JSON, which needs no quoting.
+// The commands that install the Mac and Linux Agents from the server at
+// `origin`. The Agent reads the authorization as hexadecimal JSON, which needs
+// no quoting.
 export function macInstallCommand(origin: string, bootstrap: AgentInstallerBootstrap): string {
+  const { base, authorization } = installArguments(origin, bootstrap);
+  return `curl -fsSL ${base}/install-agent-macos.sh | sudo /bin/sh -s -- ${base} ${authorization}`;
+}
+
+export function linuxInstallCommand(origin: string, bootstrap: AgentInstallerBootstrap): string {
+  const { base, authorization } = installArguments(origin, bootstrap);
+  return `curl -fsSL ${base}/install-agent-linux.sh | sudo sh -s -- ${base} ${authorization}`;
+}
+
+function installArguments(origin: string, bootstrap: AgentInstallerBootstrap) {
   const authorization = Array.from(new TextEncoder().encode(JSON.stringify(bootstrap)), (byte) =>
     byte.toString(16).padStart(2, "0"),
   ).join("");
-  const base = origin.replace(/\/+$/, "");
-  return `curl -fsSL ${base}/install-agent-macos.sh | sudo /bin/sh -s -- ${base} ${authorization}`;
+  return { base: origin.replace(/\/+$/, ""), authorization };
 }
 
 // The SHA-256 the update manifest gives `target`'s build, or null when it

@@ -11,15 +11,17 @@ use meshrmm_protocol::{AgentSessionRequest, RemoteSessionId};
 
 #[cfg(windows)]
 mod prompt;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod signaling;
 #[cfg(windows)]
 mod window;
+#[cfg(target_os = "linux")]
+pub(crate) use crate::remote::linux::approval::ask;
 #[cfg(target_os = "macos")]
 pub(crate) use crate::remote::macos::approval::ask;
 #[cfg(windows)]
 pub use prompt::ask;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub use signaling::obtain;
 
 /// The last session whose connection was answered, and whether it was
@@ -70,14 +72,20 @@ impl ConnectionApproval {
         })
     }
 
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(windows, target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
     pub fn prompt(&self) -> &ApprovalPrompt {
         &self.prompt
     }
 
     /// Whether this session's connection was already accepted, if it was
     /// answered.
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(windows, target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
     pub fn previous_answer(&self) -> Option<bool> {
         ANSWERED
             .lock()
@@ -87,7 +95,10 @@ impl ConnectionApproval {
             .map(|(_, accepted)| *accepted)
     }
 
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(windows, target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
     pub fn record(&self, accepted: bool) {
         *ANSWERED.lock().unwrap_or_else(|error| error.into_inner()) =
             Some((self.session_id.clone(), accepted));
@@ -97,7 +108,7 @@ impl ConnectionApproval {
 /// How long an accepted answer kept for a restart stays valid: long enough
 /// for Windows to restart and the technician to reconnect.
 const RESTART_ANSWER_LIFETIME: Duration = Duration::from_secs(30 * 60);
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 const RESTART_ANSWER_FILE: &str = "restart-approval";
 
 /// The session to keep accepted across a restart the technician requested
@@ -125,7 +136,7 @@ fn restore_answer(session_id: &str, age: Duration) -> bool {
 /// Keeps this session's accepted answer for the Agent that starts after the
 /// restart, so resuming the session does not ask the user again. The file
 /// sits in the Agent's administrator-only configuration directory.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub fn remember_across_restart(session_id: &RemoteSessionId) -> anyhow::Result<()> {
     let path = crate::installer::config_directory()?.join(RESTART_ANSWER_FILE);
     match answer_to_remember(session_id) {
@@ -138,7 +149,7 @@ pub fn remember_across_restart(session_id: &RemoteSessionId) -> anyhow::Result<(
 }
 
 /// Run once when the coordinator starts.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub fn restore_after_restart() {
     let Ok(path) = crate::installer::config_directory().map(|d| d.join(RESTART_ANSWER_FILE)) else {
         return;
@@ -169,7 +180,10 @@ pub enum Decision {
 }
 
 impl Decision {
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(windows, target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
     pub fn accepted(self) -> bool {
         self != Self::Declined
     }
@@ -199,7 +213,10 @@ impl Decision {
 /// The answer the policy gives for the user `elapsed` into the prompt, if it
 /// gives one yet. `locked` covers the lock screen and a console nobody is
 /// signed in to; `idle` is how long the console has had no input.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 pub fn automatic_decision(
     prompt: &ApprovalPrompt,
     elapsed: Duration,
@@ -217,7 +234,10 @@ pub fn automatic_decision(
 
 /// Whole seconds until the connection is accepted for the user, rounded up
 /// so the countdown reaches zero only when it is.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 pub fn remaining_seconds(timeout: Duration, elapsed: Duration) -> u32 {
     let remaining = timeout.saturating_sub(elapsed);
     u32::try_from(remaining.as_millis().div_ceil(1000)).unwrap_or(u32::MAX)

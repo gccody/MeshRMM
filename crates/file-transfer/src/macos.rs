@@ -107,10 +107,6 @@ pub fn drop_files(
     Ok(false)
 }
 
-pub fn paste_files(_: meshrmm_protocol::DisplayId) -> anyhow::Result<()> {
-    anyhow::bail!("Remote paste is supported on Windows agents")
-}
-
 fn c_path(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     Ok(std::ffi::CString::new(path.as_os_str().as_bytes())?)

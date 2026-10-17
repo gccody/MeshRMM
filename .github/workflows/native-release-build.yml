@@ -1,9 +1,10 @@
 name: Publish release
 
-# Builds a server release: the Agent and viewer for Windows and macOS, signed
-# with the release key, inside a server tarball per Linux architecture and a
-# multi-architecture Docker image. On main it publishes them as a GitHub
-# release and to GHCR; a manual run on another branch builds and tests
+# Builds a server release: the Agent and viewer for Windows and macOS and the
+# Agent for x64 and arm64 Linux, signed with the release key, inside a server
+# tarball per Linux architecture and a multi-architecture Docker image. On main
+# it publishes them as a GitHub release and to GHCR; a manual run on another
+# branch builds and tests
 # everything without signing or publishing.
 #
 # No build is code signed with a certificate: the macOS builds are signed
@@ -150,6 +151,46 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  linux:
+    name: Build the ${{ matrix.arch }} Linux Agent
+    needs: validate
+    # zig cross-compiles both against glibc 2.28.
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+      - name: Install the glibc cross-compiler, and nasm for OpenH264's x86 assembly
+        run: |
+          pip install --user ziglang==0.16.0 cargo-zigbuild==0.23.4
+          rustup target add ${{ matrix.target }}
+          sudo apt-get update && sudo apt-get install -y nasm
+      - name: Restore Linux Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: native-linux-${{ matrix.arch }}
+          workspaces: ". -> target"
+          cache-targets: true
+          cache-workspace-crates: true
+          cache-on-failure: true
+      - name: Build the Agent
+        run: sh scripts/build-agent-linux.sh ${{ matrix.arch }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-linux-${{ matrix.arch }}-${{ needs.validate.outputs.version }}
+          path: dist/downloads/meshrmm-agent-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 14
+
   server:
     name: Build the ${{ matrix.arch }} Linux server
     needs: validate
@@ -187,7 +228,7 @@ jobs:
 
   sign:
     name: Sign the Agent and viewer builds
-    needs: [validate, windows, macos]
+    needs: [validate, windows, macos, linux]
     if: needs.validate.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     environment: production
@@ -221,7 +262,7 @@ jobs:
 
   package:
     name: Package and test the server release
-    needs: [validate, windows, macos, server, sign]
+    needs: [validate, windows, macos, linux, server, sign]
     # `sign` is skipped outside main.
     if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-24.04
@@ -326,5 +367,5 @@ jobs:
         shell: bash
         run: |
           gh release create "v$VERSION" --target "$GITHUB_SHA" --title "MeshRMM $VERSION" \
-            --notes "Server tarballs for x86_64 and arm64 Linux, each with the Windows and macOS Agent and viewer. The Docker image is ghcr.io/${GITHUB_REPOSITORY,,}-server:$VERSION." \
+            --notes "Server tarballs for x86_64 and arm64 Linux, each with the Windows, macOS and Linux Agents and the Windows and macOS viewers. The Docker image is ghcr.io/${GITHUB_REPOSITORY,,}-server:$VERSION." \
             dist/release/*.tar.gz dist/release/SHA256SUMS

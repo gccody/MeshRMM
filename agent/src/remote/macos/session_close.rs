@@ -85,27 +85,35 @@ fn user_name(uid: u32) -> String {
 pub(crate) fn clear_clipboard(uid: u32) -> anyhow::Result<()> {
     in_session(
         uid,
-        super::helper::protocol::Request::ClearClipboard,
+        crate::remote::helper::protocol::Request::ClearClipboard,
         clear_clipboard_here,
     )
 }
 
 pub(crate) fn lock(uid: u32) -> anyhow::Result<()> {
-    in_session(uid, super::helper::protocol::Request::LockScreen, lock_here)
+    in_session(
+        uid,
+        crate::remote::helper::protocol::Request::LockScreen,
+        lock_here,
+    )
 }
 
 pub(crate) fn log_out(uid: u32) -> anyhow::Result<()> {
-    in_session(uid, super::helper::protocol::Request::LogOut, log_out_here)
+    in_session(
+        uid,
+        crate::remote::helper::protocol::Request::LogOut,
+        log_out_here,
+    )
 }
 
 /// Runs an action in `uid`'s session: through their session helper for the
 /// installed coordinator, or in this process, which runs in that session.
 fn in_session(
     uid: u32,
-    request: super::helper::protocol::Request,
+    request: crate::remote::helper::protocol::Request,
     here: fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    match super::helper::coordinator::registry() {
+    match crate::remote::helper::coordinator::registry() {
         Ok(registry) => registry.user_helper(uid)?.run(request),
         Err(_) => here(),
     }

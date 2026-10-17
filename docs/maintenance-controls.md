@@ -143,7 +143,8 @@ including in view-only sessions, since restarting is not input.
 The Agent tells the viewer its operating system when the session starts. A
 Mac offers only **Restart…**: Apple silicon Macs enter Safe Mode only from the
 power button at startup, and Macs have no Ctrl+Alt+Del, so that button is left
-out too.
+out too. Linux computers likewise offer only **Restart…**, which restarts them
+through systemd.
 
 The session survives the restart. The viewer keeps the window open and shows
 that the remote computer is restarting, the server keeps the session, and its
