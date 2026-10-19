@@ -164,5 +164,7 @@ For developers:
 - [Screen thumbnails](docs/screen-thumbnails.md)
 - [macOS Agent](docs/macos-agent.md)
 - [Linux Agent](docs/linux-agent.md)
+- [Platform parity](docs/platform-parity.md): what the Agent does on
+  Windows, macOS and Linux, and why the gaps exist
 - [Transport security](docs/transport-security.md)
 - [The website](dashboard/README.md) and [the marketing page](site/README.md)
