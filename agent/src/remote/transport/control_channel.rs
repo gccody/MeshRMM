@@ -31,6 +31,16 @@ pub(super) fn spawn_control_start(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         open.notified().await;
+        // First, so viewers know the platform when they answer the
+        // configuration with their settings.
+        let device = SessionMessage::DeviceState {
+            platform: meshrmm_protocol::DevicePlatform::current(),
+            safe_mode: crate::power::booted_in_safe_mode(),
+        };
+        if let Err(error) = send_control_message(&channel, device).await {
+            tracing::warn!(error = %error, %session_id, "failed to send the device state");
+            return;
+        }
         let message = SessionMessage::DisplayConfiguration {
             displays,
             active_display_id,
@@ -39,14 +49,6 @@ pub(super) fn spawn_control_start(
         };
         if let Err(error) = send_control_message(&channel, message).await {
             tracing::warn!(error = %error, %session_id, "failed to send stream configuration");
-            return;
-        }
-        let device = SessionMessage::DeviceState {
-            platform: meshrmm_protocol::DevicePlatform::current(),
-            safe_mode: crate::power::booted_in_safe_mode(),
-        };
-        if let Err(error) = send_control_message(&channel, device).await {
-            tracing::warn!(error = %error, %session_id, "failed to send the device state");
             return;
         }
         // Viewers answer this configuration with their audio preference and
