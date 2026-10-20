@@ -54,9 +54,9 @@ With a graphical session on the computer's screen, remote sessions too:
   console with no session at all, as on a server, counts as locked and idle.
 - **[Maintenance controls](maintenance-controls.md).** Blocking the user's
   keyboard and mouse grabs their input devices. Prevent idle lock inhibits
-  the session's idle timer. Hide wallpaper works on GNOME and Xfce. Linux
-  display servers can't show the user a window that capture leaves out, so
-  there is no blackout, display border or annotation drawing.
+  the session's idle timer. Hide wallpaper works on GNOME, KDE Plasma and
+  Xfce. Linux display servers can't show the user a window that capture
+  leaves out, so there is no blackout, display border or annotation drawing.
 - **Session close actions.** Locking goes through logind, which asks the
   session's screen locker; a desktop without one, such as Xfce without
   light-locker or xfce4-screensaver, stays unlocked. Logging out asks
