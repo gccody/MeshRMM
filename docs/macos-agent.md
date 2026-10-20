@@ -11,7 +11,8 @@ most of what the Windows Agent does, and this page says where it differs.
 - **Input.** Quartz events carry the viewer's keyboard and pointer input. The
   macOS viewer's Command key is Command, and so is the Windows viewer's
   Windows key.
-- **Audio.** ScreenCaptureKit captures the Mac's system audio.
+- **Audio.** ScreenCaptureKit captures the Mac's system audio, from macOS 13;
+  on macOS 12 sessions have no audio.
 - **Clipboard, file transfer and chat.** A menu bar item opens the chat during
   a session, and it opens by itself for the technician's messages.
 - **Company policy.** The session banner, the connection notification and the
