@@ -28,8 +28,11 @@ prompt. Setup:
    actions, and under `SafeBoot\Network` so it starts in Safe Mode with
    Networking, and starts it.
 
-No device record exists until setup redeems its authorization. Delete the
-downloaded installer once it succeeds.
+No device record exists until setup redeems its authorization. The Agent
+reports its operating system when it does, and the server keeps it with the
+device: the website then offers **Background** only for Windows devices and
+each device only the scripts it has an interpreter for, and the server
+refuses the rest. Delete the downloaded installer once it succeeds.
 
 Enrollment can be retried. A new install saves a private recovery key and its
 pending configuration before it touches the service, so a failed or

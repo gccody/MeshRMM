@@ -33,8 +33,9 @@ in their login session with their home folder as its working folder; the
 system account is root, with `/` as the working folder. Linux works the same
 way, with the user of the console's graphical session (logind's active session
 on `seat0`), their groups and their session bus; on a server nobody is signed
-in, so scripts run as root. A device refuses a script for another operating
-system's interpreters.
+in, so scripts run as root. The server refuses to run a script on a device
+without its interpreter, and the website and the viewer offer each device
+only the scripts it can run.
 
 The script's input is empty, so a prompt for input ends or fails instead of
 waiting. When the timeout passes, the Agent stops the script and everything it

@@ -62,8 +62,15 @@ pub async fn create(
     let now = now_ms();
     let expires_at = now + HANDOFF_TTL_MS;
     let mut transaction = state.database.begin().await?;
-    if !agents::is_active(&mut transaction, &device_id).await? {
-        return Err(ApiError::not_found("Device not found"));
+    let platform = agents::active_platform(&mut transaction, &device_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Device not found"))?;
+    if request.start_in_background && !platform.has_background_desktop() {
+        return Err(ApiError::bad_request(format!(
+            "background mode needs a Windows device; this one runs {}",
+            platform.label()
+        ))
+        .with_code("background_unsupported"));
     }
     transaction
         .execute(

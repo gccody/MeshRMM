@@ -86,7 +86,7 @@ async fn devices_list_online_first_and_deleting_one_uninstalls_its_agent() {
         let mut admin = common::set_up(&app).await;
         let zed = app.enroll(&mut admin, "zed").await;
         let alpha = app.enroll(&mut admin, "Alpha").await;
-        let beta = app.enroll(&mut admin, "beta").await;
+        let beta = app.enroll_on(&mut admin, "beta", "linux").await;
         let names = |body: &serde_json::Value| {
             body["agents"]
                 .as_array()
@@ -99,6 +99,13 @@ async fn devices_list_online_first_and_deleting_one_uninstalls_its_agent() {
             names(&admin.get("/v1/agents").await.body),
             ["Alpha", "beta", "zed"]
         );
+        let platforms = admin.get("/v1/agents").await.body["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|agent| agent["platform"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(platforms, ["windows", "linux", "windows"], "{name}");
         let mut connection = app.state.agents.connect(&zed.device_id);
         let listed = admin.get("/v1/agents").await.body;
         assert_eq!(names(&listed), ["zed", "Alpha", "beta"], "{name}");
@@ -507,6 +514,29 @@ async fn handoffs_need_the_connect_permissions_and_a_live_device() {
             .await;
         assert_eq!(in_background.status, StatusCode::OK);
         assert_eq!(in_background.body["start_in_background"], true);
+        // Only Windows has a background desktop.
+        for platform in ["macos", "linux"] {
+            let other = app.enroll_on(&mut admin, platform, platform).await;
+            let refused = admin
+                .post(
+                    "/v1/remote/handoffs",
+                    json!({ "device_id": other.device_id, "start_in_background": true }),
+                )
+                .await;
+            assert_eq!(
+                refused.status,
+                StatusCode::BAD_REQUEST,
+                "{name}: {platform}"
+            );
+            assert_eq!(refused.body["code"], "background_unsupported");
+            let console = admin
+                .post(
+                    "/v1/remote/handoffs",
+                    json!({ "device_id": other.device_id }),
+                )
+                .await;
+            assert_eq!(console.status, StatusCode::OK, "{name}: {platform}");
+        }
 
         let too_long = "x".repeat(501);
         for invalid in [

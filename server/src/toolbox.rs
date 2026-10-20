@@ -351,10 +351,18 @@ pub async fn start_script_run(
     let script = visible_script(&mut transaction, user, script_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Script not found"))?;
-    if !agents::is_active(&mut transaction, device_id).await? {
-        return Err(device_not_found());
-    }
+    let platform = agents::active_platform(&mut transaction, device_id)
+        .await?
+        .ok_or_else(device_not_found)?;
     let language = script.language()?;
+    if !language.runs_on(platform) {
+        return Err(ApiError::bad_request(format!(
+            "{} scripts don't run on {} devices",
+            language.label(),
+            platform.label()
+        ))
+        .with_code("language_unsupported"));
+    }
     let run_id = new_id();
     let now = now_ms();
     transaction

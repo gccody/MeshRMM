@@ -77,10 +77,9 @@ yet.
 | File delivery, user's folder | `Documents\MeshRMM Transferred Files` | `~/Documents/MeshRMM Transferred Files` | `~/Documents/MeshRMM Transferred Files` |
 | File delivery, shared folder | `C:\Users\Public\Documents\…` | `/Users/Shared/…` | `/srv/…` |
 
-- A device refuses a script for another platform's interpreter when it
-  arrives. The server doesn't record a device's platform (the `agents`
-  table has no such column), so the website offers every interpreter for
-  every device and the mistake shows only in the run's result.
+- The Agent reports its operating system when it enrolls, and the server
+  refuses a script for another platform's interpreter. The website and the
+  viewer offer each device only the scripts it can run.
 
 ## Remote session video
 
@@ -256,9 +255,8 @@ yet.
 - **Background mode** is a private desktop in Windows Session 0. A Mac or
   Linux computer has no desktop the technician could work on without the user
   seeing it, so the Agent refuses a background session
-  (`agent/src/remote/session.rs`). The website still offers **Connect** >
-  **Background** on every device, because the server doesn't record a
-  device's platform.
+  (`agent/src/remote/session.rs`), the server refuses to start one, and the
+  website offers **Connect** > **Background** only on Windows devices.
 - **Credential autofill** fills Windows sign-in and UAC prompts through UI
   Automation and keeps the credential with DPAPI. The macOS login window and
   `sudo` or authorization prompts would each need their own mechanism. Not

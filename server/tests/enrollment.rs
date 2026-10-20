@@ -2,7 +2,7 @@
 mod common;
 
 use axum::http::{Method, StatusCode};
-use common::{audit_events, random_hex, redeem};
+use common::{audit_events, random_hex, redeem, redeem_on};
 use serde_json::json;
 
 #[tokio::test]
@@ -62,6 +62,7 @@ async fn installers_enroll_one_computer_that_can_recover_its_credential() {
             json!([{
                 "id": device_id,
                 "name": "DESKTOP-1",
+                "platform": "windows",
                 "connected": false,
                 "company_id": null,
                 "created_at": devices.body["agents"][0]["created_at"],
@@ -141,13 +142,24 @@ async fn redemptions_are_validated_and_installers_expire() {
                 "{name}: {computer:?} {redemption_key:?}"
             );
         }
+        // The Agent reports its operating system, not the installer's download.
+        for platform in ["windows-x64", "freebsd", ""] {
+            assert_eq!(
+                redeem_on(&app, &token, "DESKTOP-1", &key, platform)
+                    .await
+                    .status,
+                StatusCode::BAD_REQUEST,
+                "{name}: {platform:?}"
+            );
+        }
         let missing_token = axum::http::Request::builder()
             .method(Method::POST)
             .uri("/v1/agent-installers/redeem")
             .header("authorization", "Basic dXNlcjpwYXNz")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(
-                json!({ "name": "DESKTOP-1", "redemption_key": key }).to_string(),
+                json!({ "name": "DESKTOP-1", "redemption_key": key, "platform": "windows" })
+                    .to_string(),
             ))
             .unwrap();
         assert_eq!(

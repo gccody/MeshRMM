@@ -1,6 +1,8 @@
 // The toolbox's data and the rules the server enforces, so forms can explain
 // a problem before saving. See docs/toolbox.md.
 
+import type { DevicePlatform } from "../agents/types.ts";
+
 export type ScriptLanguage = "powershell" | "cmd" | "shell";
 export type RunAs = "user" | "system";
 
@@ -96,6 +98,10 @@ export const LANGUAGE_LABELS: Record<ScriptLanguage, string> = {
   cmd: "Command Prompt",
   shell: "Shell (zsh/bash)",
 };
+
+/** PowerShell and Command Prompt run on Windows, a shell on macOS and Linux. */
+export const runsOn = (language: ScriptLanguage, platform: DevicePlatform) =>
+  (language === "shell") === (platform !== "windows");
 
 export const RUN_AS_LABELS: Record<RunAs, string> = {
   user: "Signed-in user",
