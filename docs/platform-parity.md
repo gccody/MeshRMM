@@ -135,8 +135,8 @@ yet.
   asking the user each time.
 - **Virtual monitor** relies on SudoVDA, a Windows Indirect Display Driver.
   macOS and Linux have no equivalent bundled, so a headless Mac or a Linux
-  computer without a graphical session can't be viewed. The viewer still
-  offers the size setting for them, and the Agent ignores it.
+  computer without a graphical session can't be viewed. The viewers offer
+  the size setting only for Windows devices.
 - **Cursors on Linux.** Only X11 (through XFixes) names the current cursor;
   the Wayland backends always report the default arrow. A Linux Agent also
   always reports that the technician controls input, because no Linux
@@ -260,8 +260,7 @@ yet.
 - **Credential autofill** fills Windows sign-in and UAC prompts through UI
   Automation and keeps the credential with DPAPI. The macOS login window and
   `sudo` or authorization prompts would each need their own mechanism. Not
-  implemented. The viewer still shows the key button for Mac and Linux
-  devices, with every item in its menu disabled.
+  implemented, so the viewers show the key button only for Windows devices.
 - **Tray icon.** The Windows Agent runs a notification-area icon for each
   signed-in user. The Mac Agent shows a menu bar item only during a session,
   for chat, and the Linux Agent shows only notifications. Not implemented.
