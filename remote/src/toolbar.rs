@@ -103,8 +103,8 @@ pub struct State {
 }
 
 impl State {
-    /// Whether the device has Windows's Ctrl+Alt+Del and Safe Mode. Until
-    /// the agent reports its platform, the toolbar offers them.
+    /// Whether the device has Windows's Ctrl+Alt+Del, Safe Mode and credential
+    /// autofill. Until the agent reports its platform, the toolbar offers them.
     fn windows_device(&self) -> bool {
         matches!(self.device, None | Some(DevicePlatform::Windows))
     }

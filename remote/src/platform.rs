@@ -283,6 +283,16 @@ impl ControlSink {
         self.maintenance_state().platform
     }
 
+    /// Whether the agent may be on Windows, which alone adds a virtual
+    /// monitor to a computer that has none. Until the agent reports its
+    /// platform, the viewer offers Windows's controls.
+    pub fn windows_device(&self) -> bool {
+        matches!(
+            self.device_platform(),
+            None | Some(meshrmm_protocol::DevicePlatform::Windows)
+        )
+    }
+
     /// Restarts the remote computer. The platform asks the technician first.
     pub fn restart(&self, safe_mode: bool) {
         if self.power_state().is_some() {

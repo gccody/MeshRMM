@@ -23,8 +23,6 @@ pub(super) unsafe fn show_settings_category(window: HWND, category: SettingsCate
         SETTINGS_DISPLAY_BORDER_ID as i32,
         SETTINGS_IDLE_ID as i32,
         SETTINGS_DISCONNECT_ID as i32,
-        SETTINGS_HEADLESS_TITLE_ID,
-        SETTINGS_HEADLESS_ID as i32,
     ];
     let advanced: Vec<i32> = [
         SETTINGS_ADVANCED_TITLE_ID,
@@ -112,6 +110,10 @@ pub(super) unsafe extern "system" fn settings_window_proc(
             ] {
                 if control_id == tab {
                     unsafe { show_settings_category(window, category) };
+                    // The display page shows the virtual monitor size only for Windows.
+                    if let Some(context) = unsafe { window_context(owner) } {
+                        context.refresh_headless_resolution();
+                    }
                     return LRESULT(0);
                 }
             }

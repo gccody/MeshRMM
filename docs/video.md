@@ -156,7 +156,8 @@ Driver bundled in the Agent executable (`agent/assets/sudovda`).
 - The virtual monitor lasts until the session ends. Its size is a viewer
   preference, 1280 × 720 by default, under **Display** in the Windows
   viewer's settings or **Remote computer** in the macOS viewer's session
-  menu. Changing it resizes a connected computer's virtual monitor at once.
+  menu, which both viewers show only for Windows devices. Changing it
+  resizes a connected computer's virtual monitor at once.
 - The setting does nothing while a real monitor is connected.
 
 ## Measuring

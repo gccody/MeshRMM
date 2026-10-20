@@ -223,20 +223,31 @@ impl WindowContext {
         }
     }
 
+    /// Selects the virtual monitor size, and shows it on the display page
+    /// only while the device may be on Windows, which alone adds one.
     fn refresh_headless_resolution(&self) {
+        let settings_window = self.controls().settings_window;
         let resolution = crate::preferences::headless_resolution();
         // A size outside the offered choices shows no selection.
         let index = HeadlessResolution::PRESETS
             .iter()
             .position(|choice| *choice == resolution)
             .unwrap_or(usize::MAX);
-        if let Ok(combo) = unsafe {
-            GetDlgItem(
-                Some(self.controls().settings_window),
-                SETTINGS_HEADLESS_ID as i32,
-            )
-        } {
+        if let Ok(combo) = unsafe { GetDlgItem(Some(settings_window), SETTINGS_HEADLESS_ID as i32) }
+        {
             unsafe { SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(index)), None) };
+        }
+        // The page's own visibility, whether or not the window is shown yet.
+        let display_page = unsafe { GetDlgItem(Some(settings_window), SETTINGS_DISPLAY_TITLE_ID) }
+            .is_ok_and(|title| {
+                let style = unsafe { GetWindowLongPtrW(title, GWL_STYLE) };
+                style & WS_VISIBLE.0 as isize != 0
+            });
+        let shown = display_page && self.control.windows_device();
+        for id in [SETTINGS_HEADLESS_TITLE_ID, SETTINGS_HEADLESS_ID as i32] {
+            if let Ok(control) = unsafe { GetDlgItem(Some(settings_window), id) } {
+                let _ = unsafe { ShowWindow(control, if shown { SW_SHOW } else { SW_HIDE }) };
+            }
         }
     }
 
