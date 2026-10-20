@@ -93,7 +93,6 @@ yet.
 | Frame rate | 60 FPS | 60 FPS | 30 FPS |
 | Largest picture | What the encoder accepts | What the encoder accepts | 3840 × 2160, cropped |
 | Live bitrate changes | H.264 live; H.265 restarts the encoder | H.264 live; H.265 restarts the encoder | Live (H.264 only) |
-| Static screen sharpened after a keyframe | Yes | Yes | Yes |
 | Quality presets, grayscale Ultra data saver | Yes | Yes | Yes |
 | Choose a monitor | Yes | Yes | Yes |
 | All displays in one view | Yes | No | No |
@@ -205,7 +204,7 @@ yet.
 | Session banner | Yes | Yes | Partly: a persistent notification |
 | Connection notification | Yes | Yes | Yes, as a notification |
 | Connection approval | Yes | Yes | Partly: needs zenity or kdialog |
-| Approval accepts at once when locked and idle | Yes, the login screen counts as locked | Yes | Partly: the login screen doesn't count as locked |
+| Approval accepts at once when locked and idle | Yes, the login screen counts as locked | Yes | Yes, the login screen and an empty console count as locked |
 | Border on the viewed monitor | Yes | Yes | No |
 | Annotations | Yes | Yes | No |
 | Black out the screens | Yes, Windows 10 2004 or newer | Yes | No |
@@ -225,9 +224,11 @@ yet.
 - **Blackout on Windows** needs `WDA_EXCLUDEFROMCAPTURE`, added in Windows
   10 2004 (`agent/src/remote/blackout.rs`).
 - **Linux approval** with no zenity or kdialog, or no helper on the console,
-  can't show the prompt, so it waits out the timeout and then accepts. The
-  lock check reads logind's `LockedHint`, which a greeter doesn't set, so a
-  console nobody is signed in to keeps asking where Windows would accept.
+  can't show the prompt, so it waits out the timeout and then accepts. A
+  login screen counts as locked, and seat0 with no session at all counts as
+  locked and idle. Greeters report no idle time to logind, so X11 sessions
+  use the X server's; a Wayland greeter that sets no idle hint keeps asking
+  until the timeout (`agent/src/remote/linux/approval.rs`).
 - **Hide wallpaper on Linux** is set through `gsettings` (GNOME, Unity) or
   `xfconf-query` (Xfce). KDE Plasma and the wlroots compositors are not
   implemented, and the Agent reports an error there.
@@ -268,6 +269,12 @@ yet.
 
 ## Features only some platforms have
 
+- **Windows and macOS:** after a keyframe, a static desktop is re-encoded
+  for a bounded number of frames to sharpen it
+  (`agent/windows/remote-screen/src/refinement.rs`, which the Mac Agent
+  shares). A Linux Agent re-encodes the last frame only to answer a keyframe
+  request, so a static Linux screen keeps the keyframe's quality until
+  something moves.
 - **Linux:** a locked GNOME session is unlocked for the session and locked
   again afterwards; copied files are offered in GNOME's clipboard format, the
   only one Thunar, Caja and Nemo paste; servers without a desktop are

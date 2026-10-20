@@ -49,7 +49,9 @@ With a graphical session on the computer's screen, remote sessions too:
 - **Company policy.** The session banner is a notification that stays until
   the session ends. The connection notification is a notification too, and
   the approval prompt a zenity or kdialog dialog. logind tells the Agent
-  whether the session is locked and idle.
+  whether the session is locked or at the login screen, and an X11 session's
+  X server how long it has had no input (otherwise logind's idle hint). A
+  console with no session at all, as on a server, counts as locked and idle.
 - **[Maintenance controls](maintenance-controls.md).** Blocking the user's
   keyboard and mouse grabs their input devices. Prevent idle lock inhibits
   the session's idle timer. Hide wallpaper works on GNOME and Xfce. Linux
