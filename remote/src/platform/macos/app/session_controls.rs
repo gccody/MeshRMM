@@ -113,13 +113,11 @@ impl RemoteView {
         );
         idle.setEnabled(control.allow_idle_override());
         menu.addItem(&idle);
-        let border = self.menu_item(
+        menu.addItem(&self.menu_item(
             "Highlight the monitor I'm viewing",
             sel!(toggleDisplayBorder:),
-            Some(control.display_border_available() && control.display_border()),
-        );
-        border.setEnabled(control.display_border_available());
-        menu.addItem(&border);
+            Some(control.display_border()),
+        ));
         menu.addItem(&self.menu_item(
             "Hide wallpaper",
             sel!(toggleWallpaper:),

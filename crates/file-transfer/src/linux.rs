@@ -54,50 +54,130 @@ pub fn cache() -> anyhow::Result<PathBuf> {
     Ok(cache.join("meshrmm"))
 }
 
-/// Asks with the desktop's own file chooser: zenity on GTK desktops, kdialog
-/// on KDE. Neither picks files and folders in one dialog, so this picks files.
+/// The desktop's own dialogs: zenity on GTK desktops, kdialog on KDE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dialogs {
+    Zenity,
+    Kdialog,
+}
+
+/// What the user chose to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Files,
+    Folders,
+}
+
+/// Asks with the desktop's own file chooser. Neither zenity nor kdialog picks
+/// files and folders in one dialog, so the user first chooses which to send.
 pub fn pick() -> anyhow::Result<Vec<PathBuf>> {
     let kde = std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktop| desktop.contains("KDE"));
-    let zenity = || {
-        std::process::Command::new("zenity")
-            .args([
-                "--file-selection",
-                "--multiple",
-                "--separator=\n",
-                "--title=Send files",
-            ])
-            .output()
-    };
-    let kdialog = || {
-        std::process::Command::new("kdialog")
-            .args([
-                "--getopenfilename",
-                ".",
-                "--multiple",
-                "--separate-output",
-                "--title",
-                "Send files",
-            ])
-            .output()
-    };
-    let output = if kde {
-        kdialog().or_else(|_| zenity())
+    let order = if kde {
+        [Dialogs::Kdialog, Dialogs::Zenity]
     } else {
-        zenity().or_else(|_| kdialog())
+        [Dialogs::Zenity, Dialogs::Kdialog]
     };
-    let output = match output {
-        Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bail!("this desktop has no file chooser the Agent can show (zenity or kdialog)")
+    for dialogs in order {
+        let choice = match ask_kind(dialogs) {
+            Ok(choice) => choice,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("could not show the file chooser"),
+        };
+        let Some(kind) = choice else {
+            return Ok(Vec::new());
+        };
+        let output = choose(dialogs, kind).context("could not show the file chooser")?;
+        // Both exit with 1 when the user cancels.
+        return Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect());
+    }
+    bail!("this desktop has no file chooser the Agent can show (zenity or kdialog)")
+}
+
+/// Asks whether to send files or a folder; `None` when the user cancels.
+fn ask_kind(dialogs: Dialogs) -> std::io::Result<Option<Kind>> {
+    const QUESTION: &str = "Send files, or a whole folder?";
+    match dialogs {
+        Dialogs::Zenity => {
+            // The extra button prints its label and exits with 1, as Cancel
+            // does without printing anything.
+            let output = std::process::Command::new("zenity")
+                .args([
+                    "--question",
+                    "--title=Send files",
+                    &format!("--text={QUESTION}"),
+                    "--ok-label=Files",
+                    "--extra-button=Folder",
+                    "--cancel-label=Cancel",
+                ])
+                .output()?;
+            Ok(if output.status.success() {
+                Some(Kind::Files)
+            } else if String::from_utf8_lossy(&output.stdout).trim() == "Folder" {
+                Some(Kind::Folders)
+            } else {
+                None
+            })
         }
-        Err(error) => return Err(error).context("could not show the file chooser"),
+        Dialogs::Kdialog => {
+            let status = std::process::Command::new("kdialog")
+                .args([
+                    "--title",
+                    "Send files",
+                    "--yes-label",
+                    "Files",
+                    "--no-label",
+                    "Folder",
+                    "--yesnocancel",
+                    QUESTION,
+                ])
+                .status()?;
+            Ok(match status.code() {
+                Some(0) => Some(Kind::Files),
+                Some(1) => Some(Kind::Folders),
+                _ => None,
+            })
+        }
+    }
+}
+
+/// Shows the chooser for `kind`; its output lists the paths, one per line.
+fn choose(dialogs: Dialogs, kind: Kind) -> std::io::Result<std::process::Output> {
+    let mut command = match dialogs {
+        Dialogs::Zenity => std::process::Command::new("zenity"),
+        Dialogs::Kdialog => std::process::Command::new("kdialog"),
     };
-    // Both exit with 1 when the user cancels.
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect())
+    match (dialogs, kind) {
+        (Dialogs::Zenity, Kind::Files) => command.args([
+            "--file-selection",
+            "--multiple",
+            "--separator=\n",
+            "--title=Send files",
+        ]),
+        (Dialogs::Zenity, Kind::Folders) => command.args([
+            "--file-selection",
+            "--directory",
+            "--multiple",
+            "--separator=\n",
+            "--title=Send folders",
+        ]),
+        (Dialogs::Kdialog, Kind::Files) => command.args([
+            "--getopenfilename",
+            ".",
+            "--multiple",
+            "--separate-output",
+            "--title",
+            "Send files",
+        ]),
+        // kdialog picks one folder at a time.
+        (Dialogs::Kdialog, Kind::Folders) => {
+            command.args(["--getexistingdirectory", ".", "--title", "Send a folder"])
+        }
+    };
+    command.output()
 }
 
 /// Counts the clipboard's changes, which the display server announces:

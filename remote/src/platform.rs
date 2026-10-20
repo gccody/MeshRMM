@@ -525,16 +525,7 @@ impl ControlSink {
             .unwrap_or(true)
     }
 
-    /// Whether the device can draw a border around the viewed monitor that
-    /// the capture leaves out. Linux display servers can't.
-    pub fn display_border_available(&self) -> bool {
-        self.device_platform() != Some(meshrmm_protocol::DevicePlatform::Linux)
-    }
-
     pub fn toggle_display_border(&self) {
-        if !self.display_border_available() {
-            return;
-        }
         let enabled = {
             let mut choice = self
                 .display_border
