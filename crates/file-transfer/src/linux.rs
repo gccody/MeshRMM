@@ -3,6 +3,7 @@
 //! clipboard and the file chooser are that user's.
 use anyhow::{Context, bail};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Instant;
 
 pub struct NativeGuard;
@@ -682,14 +683,154 @@ pub fn available_space(path: &Path) -> std::io::Result<u64> {
     Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
 }
 
-/// Received files show no progress window on Linux; the viewer shows the
-/// transfer's progress to the technician.
-pub struct Progress;
+const PROGRESS_TITLE: &str = "MeshRMM — Receiving files";
+const PROGRESS_START: &str = "Preparing transfer…";
+
+/// The window that shows the user files arriving: zenity's progress dialog,
+/// fed through its input, or kdialog's progress bar, driven over D-Bus. With
+/// neither, the viewer still shows the technician the transfer's progress.
+pub enum Progress {
+    Zenity(Mutex<std::process::Child>),
+    Kdialog {
+        bus: zbus::blocking::Connection,
+        service: String,
+        path: String,
+    },
+}
+
 impl Progress {
     pub fn new(_: u64) -> anyhow::Result<Self> {
-        Ok(Self)
+        let kde = std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktop| desktop.contains("KDE"));
+        let order = if kde {
+            [Dialogs::Kdialog, Dialogs::Zenity]
+        } else {
+            [Dialogs::Zenity, Dialogs::Kdialog]
+        };
+        for dialogs in order {
+            match Self::show(dialogs) {
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+                result => return result,
+            }
+        }
+        bail!("this desktop has no progress dialog the Agent can show (zenity or kdialog)")
     }
-    pub fn update(&self, _: u64, _: u64, _: &str, _: usize, _: u64) {}
+
+    fn show(dialogs: Dialogs) -> anyhow::Result<Self> {
+        match dialogs {
+            Dialogs::Zenity => {
+                let child = std::process::Command::new("zenity")
+                    .args([
+                        "--progress",
+                        &format!("--title={PROGRESS_TITLE}"),
+                        &format!("--text={PROGRESS_START}"),
+                        "--percentage=0",
+                        "--no-cancel",
+                        "--width=460",
+                    ])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()?;
+                Ok(Self::Zenity(Mutex::new(child)))
+            }
+            Dialogs::Kdialog => {
+                // kdialog starts the dialog in a helper process and prints the
+                // D-Bus service and object that control it. The helper keeps
+                // the output open, so only the first line is read.
+                use std::io::BufRead;
+                let mut kdialog = std::process::Command::new("kdialog")
+                    .args([
+                        "--title",
+                        PROGRESS_TITLE,
+                        "--progressbar",
+                        PROGRESS_START,
+                        "100",
+                    ])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()?;
+                let mut reference = String::new();
+                if let Some(output) = kdialog.stdout.take() {
+                    std::io::BufReader::new(output).read_line(&mut reference)?;
+                }
+                let _ = kdialog.wait();
+                let mut parts = reference.split_whitespace();
+                let (Some(service), Some(path)) = (parts.next(), parts.next()) else {
+                    bail!("kdialog did not start a progress dialog");
+                };
+                Ok(Self::Kdialog {
+                    bus: zbus::blocking::Connection::session()
+                        .context("could not connect to the session D-Bus")?,
+                    service: service.to_owned(),
+                    path: path.to_owned(),
+                })
+            }
+        }
+    }
+
+    pub fn update(&self, bytes: u64, total: u64, name: &str, entries: usize, total_entries: u64) {
+        let percent = crate::progress_percent(bytes, total, entries, total_entries).round() as u32;
+        let text = format!(
+            "{name}\n{}",
+            crate::progress_detail(bytes, total, entries, total_entries)
+        );
+        match self {
+            Self::Zenity(child) => {
+                use std::io::Write;
+                let mut child = child.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(input) = child.stdin.as_mut() {
+                    // A line starting with # replaces the text, which shows
+                    // a newline written as \n.
+                    let _ = write!(input, "{percent}\n# {}\n", text.replace('\n', r"\n"));
+                    let _ = input.flush();
+                }
+            }
+            Self::Kdialog { bus, service, path } => {
+                let _ = bus.call_method(
+                    Some(service.as_str()),
+                    path.as_str(),
+                    Some("org.freedesktop.DBus.Properties"),
+                    "Set",
+                    &(
+                        "org.kde.kdialog.ProgressDialog",
+                        "value",
+                        zbus::zvariant::Value::from(percent as i32),
+                    ),
+                );
+                let _ = bus.call_method(
+                    Some(service.as_str()),
+                    path.as_str(),
+                    Some("org.kde.kdialog.ProgressDialog"),
+                    "setLabelText",
+                    &(text,),
+                );
+            }
+        }
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        match self {
+            Self::Zenity(child) => {
+                let child = child.get_mut().unwrap_or_else(|e| e.into_inner());
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Self::Kdialog { bus, service, path } => {
+                let _ = bus.call_method(
+                    Some(service.as_str()),
+                    path.as_str(),
+                    Some("org.kde.kdialog.ProgressDialog"),
+                    "close",
+                    &(),
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

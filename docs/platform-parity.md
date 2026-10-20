@@ -175,7 +175,7 @@ yet.
 | Clipboard: copied files | Yes | Yes | Yes |
 | Device-side picker for **Receive files** | Files and folders | Files and folders | Files or folders, with zenity or kdialog |
 | Dropped files land at the drop position | Yes (OLE drag and drop) | No: transfer folder | No: transfer folder |
-| Progress window on the device | Yes | Yes | No |
+| Progress window on the device | Yes | Yes | Yes, with zenity or kdialog |
 | Received files marked as downloaded | Mark of the Web | Quarantine attribute | No |
 | Chat on the device | Notification-area icon and chat window | Menu bar item and popover | Notifications with **Reply** |
 
@@ -190,8 +190,9 @@ yet.
 - **The Linux picker** uses zenity or kdialog, neither of which picks files
   and folders in one dialog, so it first asks which to send. kdialog picks
   one folder at a time.
-- **No Linux progress window.** The viewer shows the transfer's progress
-  instead (`crates/file-transfer/src/linux.rs`). Not implemented.
+- **The Linux progress window** is zenity's or kdialog's progress dialog
+  (`crates/file-transfer/src/linux.rs`). Without either, only the viewer
+  shows the transfer's progress.
 - **No Linux download marking.** Linux has no quarantine mechanism for
   downloads that file managers or the shell honour.
 - **Chat on Linux** has no window of its own: messages are desktop
