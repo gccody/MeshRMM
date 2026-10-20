@@ -339,17 +339,22 @@ fn check_limit(destination: &FileDestination, bytes: u64) -> anyhow::Result<()> 
     )
 }
 
-// Linux shows no progress window of its own.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
-fn progress_detail(bytes: u64, total: u64, entries: usize, total_entries: u64) -> String {
-    let percent = if total == 0 {
+/// How far a transfer has got, from 0 to 100: by bytes, or by items when the
+/// files are empty.
+fn progress_percent(bytes: u64, total: u64, entries: usize, total_entries: u64) -> f64 {
+    let fraction = if total == 0 {
         entries as f64 / total_entries.max(1) as f64
     } else {
         bytes as f64 / total as f64
-    } * 100.;
+    };
+    (fraction * 100.).clamp(0., 100.)
+}
+
+fn progress_detail(bytes: u64, total: u64, entries: usize, total_entries: u64) -> String {
+    let percent = progress_percent(bytes, total, entries, total_entries);
     format!(
         "{:.0}% — {:.1} of {:.1} MiB · {entries}/{total_entries} items",
-        percent.clamp(0., 100.),
+        percent,
         bytes as f64 / 1_048_576.,
         total as f64 / 1_048_576.
     )

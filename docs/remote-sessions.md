@@ -170,7 +170,8 @@ a name that exists gets a number instead of being overwritten.
   transfer per request within 15 minutes. It ignores the device's own
   requests to pick files.
 - A progress window appears on the receiving computer with the file name,
-  percentage, size and item count.
+  percentage, size and item count. On Linux it is a zenity or kdialog
+  progress dialog.
 - Received files are tagged as downloads: the quarantine attribute on macOS,
   the Internet zone's Mark of the Web on Windows. Opening a received app or
   installer gets the Gatekeeper or SmartScreen check.
