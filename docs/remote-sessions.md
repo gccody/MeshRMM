@@ -145,7 +145,8 @@ keystrokes, for places a paste can't reach.
 ## Files
 
 The folder icon offers **Send files…** and **Receive files…**, each with a
-native multi-file and folder picker on the computer the files come from.
+native multi-file and folder picker on the computer the files come from. On
+Linux the picker first asks whether to send files or a folder.
 Other ways to move files:
 
 - Drag files from Finder or Explorer onto the remote view. On a Windows
@@ -256,8 +257,7 @@ Unless company policy turns them off, the person at the computer sees:
 - **A border** on the viewed monitor: a three-pixel red outline, or one on
   each monitor in **All displays**. It is left out of the video and cannot
   be clicked. **Highlight viewed monitor on agent** turns it off for a
-  session; the company sets the default. Linux devices have no border, so the
-  viewers leave the setting unchecked and disabled for them.
+  session; the company sets the default.
 - **A [connection notification](maintenance-controls.md#connection-notification)**
   when the technician connects.
 
