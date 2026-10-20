@@ -157,10 +157,18 @@ enum Prompt {
     },
     /// The prompt could not be shown.
     Unavailable,
+    /// Nobody can be at the console to answer, as at a Windows login screen
+    /// nobody has touched.
+    #[cfg(target_os = "linux")]
+    Unattended,
 }
 
 impl Prompt {
     fn start(prompt: &ApprovalPrompt, mode: ExecutionMode) -> Self {
+        #[cfg(target_os = "linux")]
+        if mode == ExecutionMode::Service && crate::remote::linux::sessions::console_unattended() {
+            return Self::Unattended;
+        }
         // The installed Agent asks through the helper in the console's session.
         #[cfg(windows)]
         let helper = (mode == ExecutionMode::Worker)
@@ -195,6 +203,8 @@ impl Prompt {
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("the connection approval prompt was cancelled")),
             Self::Unavailable => std::future::pending().await,
+            #[cfg(target_os = "linux")]
+            Self::Unattended => Ok(Decision::LockedAndIdle),
         }
     }
 }

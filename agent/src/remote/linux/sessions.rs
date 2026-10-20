@@ -197,6 +197,14 @@ pub(crate) fn console_session() -> Option<String> {
         .then_some(active)
 }
 
+/// Whether nobody can be at the console: seat0 has no active session at all,
+/// not even a login screen or a text console.
+pub(crate) fn console_unattended() -> bool {
+    Logind::connect()
+        .and_then(|logind| logind.active_session())
+        .is_ok_and(|active| active.is_none())
+}
+
 /// The console's session, with its user, when a user is signed in there.
 pub(crate) fn console_user_session() -> Option<Session> {
     let console = console_session()?;
