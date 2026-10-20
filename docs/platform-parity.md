@@ -93,6 +93,7 @@ yet.
 | Frame rate | 60 FPS | 60 FPS | 30 FPS |
 | Largest picture | What the encoder accepts | What the encoder accepts | 3840 × 2160, cropped |
 | Live bitrate changes | H.264 live; H.265 restarts the encoder | H.264 live; H.265 restarts the encoder | Live (H.264 only) |
+| Static screen sharpened after a keyframe | Yes | Yes | Yes |
 | Quality presets, grayscale Ultra data saver | Yes | Yes | Yes |
 | Choose a monitor | Yes | Yes | Yes |
 | All displays in one view | Yes | No | No |
@@ -267,12 +268,6 @@ yet.
 
 ## Features only some platforms have
 
-- **Windows and macOS:** after a keyframe, a static desktop is re-encoded
-  for a bounded number of frames to sharpen it
-  (`agent/windows/remote-screen/src/refinement.rs`, which the Mac Agent
-  shares). A Linux Agent re-encodes the last frame only to answer a keyframe
-  request, so a static Linux screen keeps the keyframe's quality until
-  something moves.
 - **Linux:** a locked GNOME session is unlocked for the session and locked
   again afterwards; copied files are offered in GNOME's clipboard format, the
   only one Thunar, Caja and Nemo paste; servers without a desktop are
