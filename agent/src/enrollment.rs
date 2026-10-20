@@ -1,5 +1,5 @@
 //! Enrollment of a new endpoint with the installer authorization the
-//! dashboard issued, shared by the Windows and macOS installers.
+//! dashboard issued, shared by the Windows, macOS and Linux installers.
 use std::path::Path;
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ pub(crate) struct InstallerBootstrap {
 struct RedeemInstallerRequest {
     name: String,
     redemption_key: String,
+    platform: meshrmm_protocol::DevicePlatform,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -137,6 +138,7 @@ fn redeem_installer(
         .send_json(&RedeemInstallerRequest {
             name: machine_name,
             redemption_key,
+            platform: meshrmm_protocol::DevicePlatform::current(),
         })
         .context("failed to contact the MeshRMM Agent enrollment service")?;
     if !response.status().is_success() {

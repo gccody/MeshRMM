@@ -5,6 +5,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
 };
+use meshrmm_protocol_types::DevicePlatform;
 use sea_query::{Expr, ExprTrait, Query};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -125,6 +126,8 @@ pub struct RedeemRequest {
     /// A random secret the endpoint generated and keeps, so only it can
     /// redeem the installer again after an interrupted install.
     redemption_key: String,
+    /// The operating system the Agent runs on.
+    platform: DevicePlatform,
 }
 
 /// The Agent's configuration file.
@@ -194,7 +197,15 @@ pub async fn redeem(
     let claim = claim_installer(&mut transaction, &installer_hash, &key_hash, &name, now).await?;
     let agent_token = enrollment_token(&install_token, &request.redemption_key);
     let agent_token_hash = token_hash(&agent_token);
-    let recovered = enroll_device(&mut transaction, &claim, &name, &agent_token_hash, now).await?;
+    let recovered = enroll_device(
+        &mut transaction,
+        &claim,
+        &name,
+        request.platform,
+        &agent_token_hash,
+        now,
+    )
+    .await?;
     audit::record(
         &mut transaction,
         &Actor {
@@ -208,6 +219,7 @@ pub async fn redeem(
             "installer_id": claim.id,
             "issued_by_user_id": claim.created_by_user_id,
             "name": name,
+            "platform": request.platform,
             "recovered": recovered,
         }),
     )
@@ -278,6 +290,7 @@ async fn enroll_device(
     executor: &mut impl Executor,
     claim: &ClaimRow,
     name: &str,
+    platform: DevicePlatform,
     agent_token_hash: &str,
     now: i64,
 ) -> Result<bool, ApiError> {
@@ -299,6 +312,7 @@ async fn enroll_device(
                         .columns([
                             Agents::Id,
                             Agents::Name,
+                            Agents::Platform,
                             Agents::AuthTokenHash,
                             Agents::CreatedByUserId,
                             Agents::CompanyId,
@@ -308,6 +322,7 @@ async fn enroll_device(
                         .values_panic([
                             claim.device_id.as_str().into(),
                             name.into(),
+                            platform.as_str().into(),
                             agent_token_hash.into(),
                             claim.created_by_user_id.as_str().into(),
                             claim.company_id.clone().into(),

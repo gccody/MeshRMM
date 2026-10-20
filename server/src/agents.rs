@@ -5,6 +5,7 @@
 //! first request that uses it promotes it and retires the old token, so an
 //! Agent that never received the new token keeps working with the old one.
 use axum::http::{HeaderMap, StatusCode, header};
+use meshrmm_protocol_types::DevicePlatform;
 use sea_query::{Expr, ExprTrait, Query};
 use subtle::ConstantTimeEq;
 
@@ -198,6 +199,30 @@ pub async fn is_active(executor: &mut impl Executor, device_id: &str) -> crate::
         )
         .await?;
     Ok(row.is_some())
+}
+
+/// The operating system of the device, if it is enrolled and not deleted.
+pub async fn active_platform(
+    executor: &mut impl Executor,
+    device_id: &str,
+) -> Result<Option<DevicePlatform>, ApiError> {
+    let row: Option<(String,)> = executor
+        .fetch_optional(
+            &Query::select()
+                .column(Agents::Platform)
+                .from(Agents::Table)
+                .and_where(Expr::col(Agents::Id).eq(device_id))
+                .and_where(Expr::col(Agents::DeletionRequestedAt).is_null())
+                .to_owned(),
+        )
+        .await?;
+    row.map(|(platform,)| {
+        DevicePlatform::parse(&platform).ok_or_else(|| {
+            tracing::error!(device_id, platform, "stored device has an unknown platform");
+            ApiError::internal()
+        })
+    })
+    .transpose()
 }
 
 /// The IDs of devices that are enrolled and not deleted.

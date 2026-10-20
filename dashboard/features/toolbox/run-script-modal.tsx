@@ -3,9 +3,9 @@ import { LoaderCircle, Play, X } from "lucide-react";
 import { type FormEvent, type RefObject, useEffect, useMemo, useState } from "react";
 import { AuthenticationRequired } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
-import type { Agent } from "../agents/types";
+import { type Agent, PLATFORM_LABELS } from "../agents/types";
 import { useWorkspace } from "../workspace/workspace-context";
-import { type RunAs, type ScriptRun, type ToolboxScript, LANGUAGE_LABELS, RUN_AS_LABELS, groupByFolder, isRunFinished } from "./model";
+import { type RunAs, type ScriptRun, type ToolboxScript, LANGUAGE_LABELS, RUN_AS_LABELS, groupByFolder, isRunFinished, runsOn } from "./model";
 import { RunResult, useScriptRun } from "./run-result";
 import { fetchToolbox, runScript } from "./toolbox-api";
 
@@ -50,7 +50,8 @@ export function RunScriptModal({ agents, scripts: givenScripts, initialAgentId, 
   const folders = useMemo(() => groupByFolder(scripts ?? []), [scripts]);
   const script = scripts?.find((candidate) => candidate.id === scriptId);
   const agent = agents.find((candidate) => candidate.id === agentId);
-  const canRun = Boolean(script && agent?.connected && !starting);
+  const compatible = !script || !agent || runsOn(script.language, agent.platform);
+  const canRun = Boolean(script && agent?.connected && compatible && !starting);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -89,19 +90,20 @@ export function RunScriptModal({ agents, scripts: givenScripts, initialAgentId, 
                 <option value="" disabled>{scripts ? (scripts.length ? "Choose a script" : "No scripts yet") : "Loading scripts…"}</option>
                 {folders.map(({ folder, items }) => (
                   <optgroup key={folder} label={folder || "Top level"}>
-                    {items.map((item) => <option key={item.id} value={item.id}>{item.name} ({LANGUAGE_LABELS[item.language]})</option>)}
+                    {items.map((item) => <option key={item.id} value={item.id} disabled={agent && !runsOn(item.language, agent.platform)}>{item.name} ({LANGUAGE_LABELS[item.language]})</option>)}
                   </optgroup>
                 ))}
               </select>
             </label>
             {script?.description && <small className="field-help">{script.description}</small>}
+            {!compatible && script && agent && <p role="alert" className="installer-error">{`${LANGUAGE_LABELS[script.language]} scripts don't run on ${PLATFORM_LABELS[agent.platform]}.`}</p>}
             {loadError && <p role="alert" className="installer-error">{loadError}</p>}
             <label htmlFor="run-device">Device
               <select id="run-device" value={agentId} onChange={(event) => setAgentId(event.target.value)}>
                 <option value="" disabled>Choose a device</option>
                 {sortedAgents.map((candidate) => (
-                  <option key={candidate.id} value={candidate.id} disabled={!candidate.connected}>
-                    {candidate.name}{candidate.connected ? "" : " (offline)"}
+                  <option key={candidate.id} value={candidate.id} disabled={!candidate.connected || (script && !runsOn(script.language, candidate.platform))}>
+                    {candidate.name} ({PLATFORM_LABELS[candidate.platform]}{candidate.connected ? "" : ", offline"})
                   </option>
                 ))}
               </select>

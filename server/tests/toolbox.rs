@@ -552,6 +552,25 @@ async fn script_runs_reach_the_agent_and_record_its_report() {
                 .unwrap()
                 .contains("offline")
         );
+        // A Mac has no Command Prompt, so the run is refused before it is recorded.
+        let mac = app.enroll_on(&mut admin, "MacBook", "macos").await;
+        let _mac_connection = app.state.agents.connect(&mac.device_id);
+        let refused = ada
+            .post(
+                &format!("/v1/agents/{}/script-runs", mac.device_id),
+                start.clone(),
+            )
+            .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!(refused.code(), "language_unsupported");
+        assert_eq!(
+            ada.get("/v1/script-runs").await.body["runs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{name}"
+        );
 
         let mut connection = app.state.agents.connect(&agent.device_id);
         let started = ada.post(&runs_path, start.clone()).await;

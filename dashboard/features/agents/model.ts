@@ -1,4 +1,6 @@
-import type { Agent, AgentDelta, AgentEvent, Company, Inventory } from "./types";
+import { type Agent, type AgentDelta, type AgentEvent, type Company, type Inventory, PLATFORM_LABELS } from "./types.ts";
+
+const PLATFORMS: string[] = Object.keys(PLATFORM_LABELS);
 
 export const EMPTY_INVENTORY: Inventory = { agents: [], companies: [] };
 
@@ -49,6 +51,7 @@ const isAgent = (value: unknown): value is Agent => {
   return (
     typeof candidate.id === "string" &&
     typeof candidate.name === "string" &&
+    PLATFORMS.includes(candidate.platform as string) &&
     typeof candidate.connected === "boolean" &&
     (candidate.updating_to === undefined || typeof candidate.updating_to === "string") &&
     (candidate.company_id === undefined || candidate.company_id === null || typeof candidate.company_id === "string")

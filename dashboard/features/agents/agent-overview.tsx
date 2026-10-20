@@ -28,7 +28,7 @@ import { companyName, matchesCompanyName } from "./model";
 import { ScreenPreview, useDeviceScreen } from "./device-thumbnail";
 import type { InventoryConnection, InventoryStatus } from "./inventory-stream";
 import type { ThumbnailStore } from "./thumbnails";
-import type { Agent, Company } from "./types";
+import { type Agent, type Company, hasBackgroundDesktop } from "./types";
 
 type InventoryState = {
   status: InventoryStatus;
@@ -322,7 +322,8 @@ function DeviceTile({ agent, companyName, reading, store, allowed, state, onRemo
   const previewOpener = useRef<HTMLElement | null>(null);
   const busy = state.connecting || state.deleting || state.closing;
   const reachable = agent.connected && !state.browserOffline && !busy;
-  const canConnect = reachable && (allowed.connect || allowed.connectBackground);
+  const connectActions = hasBackgroundDesktop(agent) ? allowed : { ...allowed, connectBackground: false };
+  const canConnect = reachable && (connectActions.connect || connectActions.connectBackground);
   const canRunScripts = reachable && allowed.runScripts;
   const tone = agent.connected ? "online" : agent.updating_to ? "updating" : "offline";
 
@@ -349,7 +350,7 @@ function DeviceTile({ agent, companyName, reading, store, allowed, state, onRemo
         </Link>
         {(canConnect || canRunScripts) && (
           <div className="screen-actions">
-            {canConnect && <ConnectButton agent={agent} allowed={allowed} stale={state.stale} onRemote={onRemote} onRemoteBackground={onRemoteBackground} />}
+            {canConnect && <ConnectButton agent={agent} allowed={connectActions} stale={state.stale} onRemote={onRemote} onRemoteBackground={onRemoteBackground} />}
             {canRunScripts && <button type="button" className="screen-action" onClick={(event) => onRunScript(agent, event.currentTarget)} aria-haspopup="dialog" aria-label={`Run a script on ${agent.name}`}><SquareTerminal size={15} aria-hidden="true" />Scripts</button>}
           </div>
         )}
@@ -377,7 +378,7 @@ function DeviceTile({ agent, companyName, reading, store, allowed, state, onRemo
 }
 
 // Connects to the console, or to background mode, whichever the user may
-// open. With both allowed it asks which.
+// open and the device has. With both allowed it asks which.
 function ConnectButton({ agent, allowed, stale, onRemote, onRemoteBackground }: {
   agent: Agent;
   allowed: DeviceActions;

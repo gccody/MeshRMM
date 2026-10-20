@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::DevicePlatform;
+
 /// A script's source, in UTF-8. The server stores it and sends it to the
 /// Agent inside one coordinator message.
 pub const MAX_SCRIPT_BODY_BYTES: usize = 128 * 1024;
@@ -60,6 +62,15 @@ impl ScriptLanguage {
             Self::Powershell => "PowerShell",
             Self::Cmd => "Command Prompt",
             Self::Shell => "Shell (zsh/bash)",
+        }
+    }
+
+    /// Whether an Agent on `platform` has the interpreter: PowerShell and
+    /// Command Prompt on Windows, a shell on macOS and Linux.
+    pub fn runs_on(self, platform: DevicePlatform) -> bool {
+        match self {
+            Self::Powershell | Self::Cmd => platform == DevicePlatform::Windows,
+            Self::Shell => platform != DevicePlatform::Windows,
         }
     }
 }

@@ -119,10 +119,18 @@ async fn transactions_commit_or_roll_back() {
         let insert = |id: &str| {
             Query::insert()
                 .into_table("agents")
-                .columns(["id", "name", "auth_token_hash", "created_at", "updated_at"])
+                .columns([
+                    "id",
+                    "name",
+                    "platform",
+                    "auth_token_hash",
+                    "created_at",
+                    "updated_at",
+                ])
                 .values_panic([
                     id.into(),
                     "Desk".into(),
+                    "windows".into(),
                     "a".repeat(64).into(),
                     NOW.into(),
                     NOW.into(),

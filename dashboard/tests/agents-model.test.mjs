@@ -18,15 +18,15 @@ import {
 
 test("sorts and applies live Agent events deterministically", () => {
   const agents = sortAgents([
-    { id: "b", name: "Zulu", connected: false },
-    { id: "a", name: "Alpha", connected: true },
+    { id: "b", name: "Zulu", platform: "windows", connected: false },
+    { id: "a", name: "Alpha", platform: "windows", connected: true },
   ]);
   assert.deepEqual(agents.map((agent) => agent.id), ["a", "b"]);
 
   const updated = applyAgentDelta(agents, {
     type: "agent_upsert",
     revision: 2,
-    agent: { id: "b", name: "Zulu", connected: true },
+    agent: { id: "b", name: "Zulu", platform: "windows", connected: true },
   });
   assert.deepEqual(updated.map((agent) => [agent.id, agent.connected]), [
     ["a", true],
@@ -35,7 +35,7 @@ test("sorts and applies live Agent events deterministically", () => {
 
   assert.deepEqual(
     applyAgentDelta(updated, { type: "agent_deleted", revision: 3, agent_id: "a" }),
-    [{ id: "b", name: "Zulu", connected: true }],
+    [{ id: "b", name: "Zulu", platform: "windows", connected: true }],
   );
 });
 
@@ -44,20 +44,23 @@ test("rejects malformed Agent API and event payloads", () => {
   assert.equal(parseAgentEvent({ type: "agent_deleted", revision: -1, agent_id: "a" }), null);
   assert.deepEqual(
     parseAgentList({
-      agents: [{ id: "a", name: "Alpha", connected: true }],
+      agents: [{ id: "a", name: "Alpha", platform: "windows", connected: true }],
       revision: 4,
     }),
-    { agents: [{ id: "a", name: "Alpha", connected: true }], companies: [], revision: 4 },
+    { agents: [{ id: "a", name: "Alpha", platform: "windows", connected: true }], companies: [], revision: 4 },
   );
   assert.equal(parseAgentList({ agents: [], companies: [{ id: "c" }], revision: 1 }), null);
+  for (const platform of [undefined, "windows-x64", "freebsd"]) {
+    assert.equal(parseAgentList({ agents: [{ id: "a", name: "Alpha", platform, connected: true }], revision: 1 }), null, String(platform));
+  }
   assert.equal(
-    parseAgentEvent({ type: "agent_upsert", revision: 5, agent: { id: "a", name: "A", connected: true, company_id: 7 } }),
+    parseAgentEvent({ type: "agent_upsert", revision: 5, agent: { id: "a", name: "A", platform: "windows", connected: true, company_id: 7 } }),
     null,
   );
   assert.equal(parseAgentEvent({ type: "company_upsert", revision: 5, company: { id: "c" } }), null);
   assert.equal(parseAgentEvent({ type: "company_deleted", revision: 5 }), null);
   assert.equal(parseAgentEvent({ type: "company_renamed", revision: 5 }), null);
-  const updating = { id: "a", name: "Alpha", connected: false, updating_to: "0.3.1" };
+  const updating = { id: "a", name: "Alpha", platform: "windows", connected: false, updating_to: "0.3.1" };
   assert.deepEqual(parseAgentEvent({ type: "agent_upsert", revision: 5, agent: updating }), {
     type: "agent_upsert",
     revision: 5,
@@ -70,7 +73,7 @@ test("rejects malformed Agent API and event payloads", () => {
 });
 
 test("applies company events and names a device's company", () => {
-  let inventory = { agents: [{ id: "a", name: "Alpha", connected: true, company_id: "g" }], companies: [] };
+  let inventory = { agents: [{ id: "a", name: "Alpha", platform: "windows", connected: true, company_id: "g" }], companies: [] };
   inventory = applyInventoryDelta(inventory, { type: "company_upsert", revision: 1, company: { id: "g", name: "globex" } });
   inventory = applyInventoryDelta(inventory, { type: "company_upsert", revision: 2, company: { id: "a", name: "Acme" } });
   assert.deepEqual(inventory.companies.map((company) => company.name), ["Acme", "globex"]);

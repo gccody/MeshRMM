@@ -511,9 +511,14 @@ impl Agent {
 }
 
 impl App {
-    /// Issues an installer as `browser` and redeems it as a computer called
-    /// `name`, returning the enrolled Agent.
+    /// Issues an installer as `browser` and redeems it as a Windows computer
+    /// called `name`, returning the enrolled Agent.
     pub async fn enroll(&self, browser: &mut Browser, name: &str) -> Agent {
+        self.enroll_on(browser, name, "windows").await
+    }
+
+    /// [`App::enroll`] for a computer running `platform`.
+    pub async fn enroll_on(&self, browser: &mut Browser, name: &str, platform: &str) -> Agent {
         let installer = browser
             .post(
                 "/v1/agent-installers",
@@ -521,11 +526,12 @@ impl App {
             )
             .await;
         assert_eq!(installer.status, 201, "{}: {:?}", self.name, installer.body);
-        let redeemed = redeem(
+        let redeemed = redeem_on(
             self,
             installer.body["install_token"].as_str().unwrap(),
             name,
             &random_hex(32),
+            platform,
         )
         .await;
         assert_eq!(redeemed.status, 200, "{}: {:?}", self.name, redeemed.body);
@@ -538,15 +544,27 @@ impl App {
     }
 }
 
-/// Redeems an installer the way the Agent installer does.
+/// Redeems an installer the way a Windows Agent installer does.
 pub async fn redeem(app: &App, install_token: &str, name: &str, redemption_key: &str) -> Response {
+    redeem_on(app, install_token, name, redemption_key, "windows").await
+}
+
+/// [`redeem`] from an Agent on `platform`.
+pub async fn redeem_on(
+    app: &App,
+    install_token: &str,
+    name: &str,
+    redemption_key: &str,
+    platform: &str,
+) -> Response {
     let request = axum::http::Request::builder()
         .method(axum::http::Method::POST)
         .uri("/v1/agent-installers/redeem")
         .header("authorization", format!("Bearer {install_token}"))
         .header("content-type", "application/json")
         .body(axum::body::Body::from(
-            serde_json::json!({ "name": name, "redemption_key": redemption_key }).to_string(),
+            serde_json::json!({ "name": name, "redemption_key": redemption_key, "platform": platform })
+                .to_string(),
         ))
         .unwrap();
     send(&app.router, request).await.json(app.name)

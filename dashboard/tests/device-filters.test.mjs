@@ -39,9 +39,9 @@ test("serialization omits defaults and encodes reserved characters", () => {
 
 test("filters by case-insensitive name or ID and by connection status", () => {
   const agents = [
-    { id: "dev-001", name: "Front Desk", connected: true },
-    { id: "dev-002", name: "Warehouse PC", connected: false },
-    { id: "LAB-9", name: "Lab", connected: true },
+    { id: "dev-001", name: "Front Desk", platform: "windows", connected: true },
+    { id: "dev-002", name: "Warehouse PC", platform: "windows", connected: false },
+    { id: "LAB-9", name: "Lab", platform: "windows", connected: true },
   ];
   const ids = (filters) => filterAgents(agents, filters).map((agent) => agent.id);
   assert.deepEqual(ids(DEFAULT_DEVICE_FILTERS), ["dev-001", "dev-002", "LAB-9"]);
@@ -55,9 +55,9 @@ test("filters by case-insensitive name or ID and by connection status", () => {
 
 test("filters by company, or by having none", () => {
   const agents = [
-    { id: "a", name: "A", connected: true, company_id: "acme" },
-    { id: "b", name: "B", connected: false, company_id: null },
-    { id: "c", name: "C", connected: true },
+    { id: "a", name: "A", platform: "windows", connected: true, company_id: "acme" },
+    { id: "b", name: "B", platform: "windows", connected: false, company_id: null },
+    { id: "c", name: "C", platform: "windows", connected: true },
   ];
   const ids = (company) => filterAgents(agents, { ...DEFAULT_DEVICE_FILTERS, company }).map((agent) => agent.id);
   assert.deepEqual(ids(""), ["a", "b", "c"]);

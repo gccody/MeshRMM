@@ -294,6 +294,8 @@ CREATE TABLE companies (
 CREATE TABLE agents (
   id TEXT NOT NULL PRIMARY KEY,
   name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 120),
+  -- The operating system the Agent reported when it enrolled.
+  platform TEXT NOT NULL CHECK (platform IN ('windows', 'macos', 'linux')),
   auth_token_hash TEXT NOT NULL CHECK (length(auth_token_hash) = 64),
   -- A rotated credential the Agent has not used yet; using it promotes it.
   pending_auth_token_hash TEXT CHECK (pending_auth_token_hash IS NULL OR length(pending_auth_token_hash) = 64),

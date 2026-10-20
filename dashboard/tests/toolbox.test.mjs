@@ -11,6 +11,7 @@ import {
   ranAsLabel,
   runOutcome,
   runTone,
+  runsOn,
   scriptBody,
   scriptDraftProblem,
   uploadProblem,
@@ -94,4 +95,15 @@ test("sizes read in binary units", () => {
   assert.equal(formatBytes(0), "0 B");
   assert.equal(formatBytes(1536), "1.5 KiB");
   assert.equal(formatBytes(95 * 1024 * 1024), "95 MiB");
+});
+
+test("scripts run only where their interpreter is", () => {
+  for (const language of ["powershell", "cmd"]) {
+    assert.equal(runsOn(language, "windows"), true);
+    assert.equal(runsOn(language, "macos"), false);
+    assert.equal(runsOn(language, "linux"), false);
+  }
+  assert.equal(runsOn("shell", "windows"), false);
+  assert.equal(runsOn("shell", "macos"), true);
+  assert.equal(runsOn("shell", "linux"), true);
 });

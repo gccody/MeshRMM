@@ -274,18 +274,26 @@ async fn session_user(
 }
 
 /// `GET /v1/remote/sessions/{id}/toolbox`: the scripts and files the
-/// session's technician may use.
+/// session's technician may use, leaving out scripts the device has no
+/// interpreter for.
 pub async fn session_toolbox(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     Path(session_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<ToolboxListing>, ApiError> {
-    let (user, _) = session_user(&state, &session_id, &headers, ip).await?;
+    let (user, device_id) = session_user(&state, &session_id, &headers, ip).await?;
     let mut database = &state.database;
+    let platform = agents::active_platform(&mut database, &device_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Device not found"))?;
     let scripts = toolbox::visible_scripts(&mut database, &user)
         .await?
         .into_iter()
+        .filter(|row| {
+            row.language()
+                .is_ok_and(|language| language.runs_on(platform))
+        })
         .map(|row| {
             Ok(ToolboxScript {
                 language: row.language()?,

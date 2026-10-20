@@ -40,6 +40,8 @@ const EVENT_BACKLOG: usize = 256;
 pub struct PresenceAgent {
     pub id: String,
     pub name: String,
+    /// The operating system: `windows`, `macos` or `linux`.
+    pub platform: String,
     /// The Agent's control connection is open.
     pub connected: bool,
     /// The release an offline Agent said it is installing.
@@ -131,13 +133,14 @@ struct Update {
     until: Instant,
 }
 
-type AgentRow = (String, String, Option<String>, i64);
+type AgentRow = (String, String, String, Option<String>, i64);
 
 fn agent_select() -> sea_query::SelectStatement {
     Query::select()
         .columns([
             Agents::Id,
             Agents::Name,
+            Agents::Platform,
             Agents::CompanyId,
             Agents::CreatedAt,
         ])
@@ -313,7 +316,11 @@ impl Presence {
         self.inner.access.subscribe()
     }
 
-    fn agent(&self, state: &State, (id, name, company_id, created_at): AgentRow) -> PresenceAgent {
+    fn agent(
+        &self,
+        state: &State,
+        (id, name, platform, company_id, created_at): AgentRow,
+    ) -> PresenceAgent {
         let connected = self.inner.hub.is_connected(&id);
         PresenceAgent {
             updating_to: (!connected)
@@ -322,6 +329,7 @@ impl Presence {
             connected,
             id,
             name,
+            platform,
             company_id,
             created_at,
         }
@@ -405,6 +413,7 @@ mod tests {
         PresenceAgent {
             id: id.into(),
             name: name.into(),
+            platform: "windows".into(),
             connected,
             updating_to: None,
             company_id: None,
@@ -445,7 +454,7 @@ mod tests {
             serde_json::json!({
                 "type": "agent_upsert",
                 "revision": 8,
-                "agent": { "id": "a", "name": "Desk", "connected": false, "updating_to": "1.2.3", "company_id": null, "created_at": 0 }
+                "agent": { "id": "a", "name": "Desk", "platform": "windows", "connected": false, "updating_to": "1.2.3", "company_id": null, "created_at": 0 }
             })
         );
         let company = PresenceEvent::CompanyUpsert {
