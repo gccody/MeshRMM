@@ -368,7 +368,7 @@ fn power_waits_for_the_agent_and_offers_both_restarts() {
 }
 
 #[test]
-fn only_windows_has_ctrl_alt_del_and_safe_mode() {
+fn only_windows_has_ctrl_alt_del_safe_mode_and_credentials() {
     let both_restarts = [
         Some(Command::Restart { safe_mode: false }),
         Some(Command::Restart { safe_mode: true }),
@@ -385,6 +385,7 @@ fn only_windows_has_ctrl_alt_del_and_safe_mode() {
             find(&items, Action::SecureAttention).is_some(),
             "{device:?}"
         );
+        assert!(find(&items, Action::Credentials).is_some(), "{device:?}");
         assert_eq!(
             find(&items, Action::Power).unwrap().tooltip,
             "Restart the remote computer"
@@ -405,6 +406,7 @@ fn only_windows_has_ctrl_alt_del_and_safe_mode() {
             find(&items, Action::SecureAttention).is_none(),
             "{device:?}"
         );
+        assert!(find(&items, Action::Credentials).is_none(), "{device:?}");
         assert_eq!(find(&items, Action::Power).unwrap().tooltip, tooltip);
         assert_eq!(
             commands(&menu(Action::Power, &state)),

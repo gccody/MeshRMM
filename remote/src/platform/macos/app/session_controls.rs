@@ -123,6 +123,10 @@ impl RemoteView {
             sel!(toggleWallpaper:),
             Some(control.wallpaper_hidden()),
         ));
+        // Only a Windows Agent adds a virtual monitor.
+        if !control.windows_device() {
+            return;
+        }
         let headless = crate::preferences::headless_resolution();
         let headless_labels = HeadlessResolution::PRESETS.map(HeadlessResolution::label);
         let headless_item = self.menu_choices(

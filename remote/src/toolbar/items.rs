@@ -77,23 +77,24 @@ fn push_view_items(items: &mut Vec<Item>, state: &State) {
 
 /// Credentials, Ctrl+Alt+Del, restart and typing the clipboard.
 fn push_remote_control_items(items: &mut Vec<Item>, state: &State) {
-    let credentials = &state.credentials;
-    let mut key = Item::new(
-        Action::Credentials,
-        Icon::Key,
-        if credentials.message.is_empty() {
-            "Credentials".to_owned()
-        } else {
-            format!("Credentials: {}", credentials.message)
-        },
-        2,
-    )
-    .with_menu();
-    key.enabled = !state.input_blocked;
-    key.active = credentials.prompt_active;
-    key.badge = credentials.can_autofill.then_some(Badge::Attention);
-    items.push(key);
     if state.windows_device() {
+        // Credential autofill fills Windows sign-in and UAC prompts only.
+        let credentials = &state.credentials;
+        let mut key = Item::new(
+            Action::Credentials,
+            Icon::Key,
+            if credentials.message.is_empty() {
+                "Credentials".to_owned()
+            } else {
+                format!("Credentials: {}", credentials.message)
+            },
+            2,
+        )
+        .with_menu();
+        key.enabled = !state.input_blocked;
+        key.active = credentials.prompt_active;
+        key.badge = credentials.can_autofill.then_some(Badge::Attention);
+        items.push(key);
         let mut secure_attention = Item::new(
             Action::SecureAttention,
             Icon::Keyboard,

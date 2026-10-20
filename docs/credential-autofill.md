@@ -1,8 +1,9 @@
 # Windows credential autofill
 
 The macOS and Windows viewers expose **Prompt for credentials** in the toolbar's
-credentials (key icon) menu in an installed-service session. It opens a native
-Windows dialog on the viewed endpoint. The remote user enters `DOMAIN\user`, `user@domain`, or `.\localuser`
+credentials (key icon) menu in an installed-service session. The key is there
+only for Windows devices, and until the Agent reports its operating system.
+The prompt opens a native Windows dialog on the viewed endpoint. The remote user enters `DOMAIN\user`, `user@domain`, or `.\localuser`
 and their Windows password (not a Hello PIN). The dialog explains how the
 credentials will be used. Cancel leaves any previous saved credentials intact.
 
