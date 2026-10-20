@@ -627,6 +627,14 @@ async fn the_session_toolbox_acts_for_its_technician() {
             )
             .await;
         assert_eq!(created.status, 201, "{:?}", created.body);
+        // Left out: Windows has no shell.
+        let shell = tech
+            .post(
+                "/v1/toolbox/scripts",
+                json!({ "name": "Uptime", "language": "shell", "body": "uptime" }),
+            )
+            .await;
+        assert_eq!(shell.status, 201, "{:?}", shell.body);
         let script_id = created.body["id"].as_str().unwrap().to_owned();
         let admins = admin
             .post(

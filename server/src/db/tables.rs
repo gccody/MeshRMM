@@ -265,6 +265,7 @@ pub enum Agents {
     Table,
     Id,
     Name,
+    Platform,
     AuthTokenHash,
     PendingAuthTokenHash,
     PendingAuthTokenEncrypted,

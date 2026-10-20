@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{CursorShape, DisplayId, RemoteInput, RemoteSessionId, VideoStreamId};
+use crate::{CursorShape, DevicePlatform, DisplayId, RemoteInput, RemoteSessionId, VideoStreamId};
 
 pub const CONTROL_CHANNEL_LABEL: &str = "meshrmm-control-v5";
 pub const CONTROL_CHANNEL_PROTOCOL: &str = "meshrmm.control.v5";
@@ -288,28 +288,6 @@ impl SessionMessage {
             return Err(postcard::Error::DeserializeBadEncoding);
         }
         Ok(message)
-    }
-}
-
-/// The operating system an Agent runs on, which decides the controls a
-/// viewer offers, such as Ctrl+Alt+Del and Safe Mode on Windows only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DevicePlatform {
-    Windows,
-    Macos,
-    Linux,
-}
-
-impl DevicePlatform {
-    /// The platform this Agent is built for.
-    pub const fn current() -> Self {
-        if cfg!(target_os = "macos") {
-            Self::Macos
-        } else if cfg!(target_os = "linux") {
-            Self::Linux
-        } else {
-            Self::Windows
-        }
     }
 }
 

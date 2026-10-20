@@ -52,7 +52,7 @@ function fakeTimers() {
   };
 }
 
-const agent = (id, connected = true) => ({ id, name: id.toUpperCase(), connected });
+const agent = (id, connected = true) => ({ id, name: id.toUpperCase(), platform: "windows", connected });
 
 function harness({ online } = {}) {
   const sockets = [];
