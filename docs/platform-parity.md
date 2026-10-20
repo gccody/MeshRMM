@@ -211,7 +211,7 @@ yet.
 | Black out the screens | Yes, Windows 10 2004 or newer | Yes | No |
 | Block the user's keyboard and mouse | Yes | Yes, needs Accessibility | Yes |
 | Prevent idle lock | Yes | Yes | Yes |
-| Hide wallpaper | Yes | Yes | Partly: GNOME, Unity and Xfce |
+| Hide wallpaper | Yes | Yes | Partly: GNOME, KDE Plasma, Unity and Xfce |
 | On close: lock | Yes | Yes | Partly: needs the desktop's screen locker |
 | On close: log out | Yes | Yes, apps with unsaved work can still ask | Yes |
 | On close: clear the clipboard | Yes | Yes | Yes |
@@ -231,8 +231,10 @@ yet.
   use the X server's; a Wayland greeter that sets no idle hint keeps asking
   until the timeout (`agent/src/remote/linux/approval.rs`).
 - **Hide wallpaper on Linux** is set through `gsettings` (GNOME, Unity) or
-  `xfconf-query` (Xfce). KDE Plasma and the wlroots compositors are not
-  implemented, and the Agent reports an error there.
+  `xfconf-query` (Xfce), and on KDE Plasma by switching each desktop to the
+  plain color wallpaper through a Plasma shell script. The wlroots
+  compositors leave the wallpaper to whichever program draws it, such as
+  swaybg, so the Agent reports an error there.
 - **Lock on close on Linux** asks logind, which asks the desktop's screen
   locker; a desktop without one, such as Xfce without light-locker or
   xfce4-screensaver, stays unlocked.

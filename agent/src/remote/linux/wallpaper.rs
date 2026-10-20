@@ -1,7 +1,8 @@
 //! Hides the desktop wallpaper behind a plain color while a technician works,
 //! which keeps the video small, and puts it back afterwards. GNOME and Xfce
-//! keep the setting in their configuration stores; the settings it replaced
-//! are saved in the user's cache first, so a helper that stopped mid-session
+//! keep the setting in their configuration stores, and KDE Plasma switches
+//! each desktop to its plain color wallpaper; the settings it replaced are
+//! saved in the user's cache first, so a helper that stopped mid-session
 //! restores them when it starts again.
 use std::path::PathBuf;
 use std::process::Command;
@@ -17,6 +18,9 @@ enum Saved {
     /// Xfce's image style properties and their values, `None` for those the
     /// Agent created.
     Xfce(Vec<(String, Option<String>)>),
+    /// Each Plasma desktop's ID and the wallpaper plugin it had, for the
+    /// desktops the Agent changed.
+    Kde(Vec<(i64, String)>),
 }
 
 #[derive(Default)]
@@ -135,7 +139,13 @@ fn hide() -> anyhow::Result<Saved> {
         }
         return Ok(Saved::Xfce(saved));
     }
-    bail!("hiding the wallpaper is available on GNOME and Xfce desktops")
+    if desktop.contains("KDE") {
+        let saved = plasma_script(KDE_HIDE)?;
+        return Ok(Saved::Kde(
+            serde_json::from_str(&saved).context("Plasma listed its desktops unreadably")?,
+        ));
+    }
+    bail!("hiding the wallpaper is available on GNOME, KDE Plasma and Xfce desktops")
 }
 
 /// The X server's monitor names, such as `Virtual-1`.
@@ -187,6 +197,51 @@ fn restore(saved: &Saved) -> anyhow::Result<()> {
                 };
             }
         }
+        Saved::Kde(desktops) => {
+            let saved = serde_json::to_string(desktops)?;
+            plasma_script(&format!("var saved = {saved};\n{KDE_RESTORE}"))?;
+        }
     }
     Ok(())
+}
+
+/// Switches each Plasma desktop that shows something else to the plain
+/// color plugin, in black, and prints the plugins it replaced. A plugin's
+/// own settings, such as the image, stay in its configuration group.
+const KDE_HIDE: &str = r#"var saved = [];
+desktops().forEach(function (desktop) {
+    if (desktop.wallpaperPlugin === "org.kde.color") {
+        return;
+    }
+    saved.push([desktop.id, desktop.wallpaperPlugin]);
+    desktop.wallpaperPlugin = "org.kde.color";
+    desktop.currentConfigGroup = ["Wallpaper", "org.kde.color", "General"];
+    desktop.writeConfig("Color", "0,0,0");
+});
+print(JSON.stringify(saved));"#;
+
+/// Puts back the plugins in `saved`, by desktop ID.
+const KDE_RESTORE: &str = r#"desktops().forEach(function (desktop) {
+    saved.forEach(function (entry) {
+        if (entry[0] === desktop.id) {
+            desktop.wallpaperPlugin = entry[1];
+        }
+    });
+});"#;
+
+/// Runs a Plasma desktop script in the session's Plasma shell and returns
+/// what it printed.
+fn plasma_script(script: &str) -> anyhow::Result<String> {
+    let bus =
+        zbus::blocking::Connection::session().context("could not connect to the session D-Bus")?;
+    let reply = bus
+        .call_method(
+            Some("org.kde.plasmashell"),
+            "/PlasmaShell",
+            Some("org.kde.PlasmaShell"),
+            "evaluateScript",
+            &(script,),
+        )
+        .context("the Plasma shell did not run the wallpaper script")?;
+    Ok(reply.body().deserialize::<String>()?.trim().to_owned())
 }
