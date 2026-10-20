@@ -220,8 +220,8 @@ yet.
   the capture leaves out. Windows has `WDA_EXCLUDEFROMCAPTURE`, and macOS
   windows can be left out of a ScreenCaptureKit stream; X11 and Wayland
   display servers have no such window (`agent/src/remote/linux/local.rs`).
-  The Agent refuses blackout and annotations with an error, but accepts the
-  border silently, so the viewer shows the border as on.
+  The Agent refuses each of them with an error, and the viewers show
+  **Highlight viewed monitor** unchecked and disabled for Linux devices.
 - **Blackout on Windows** needs `WDA_EXCLUDEFROMCAPTURE`, added in Windows
   10 2004 (`agent/src/remote/blackout.rs`).
 - **Linux approval** with no zenity or kdialog, or no helper on the console,
