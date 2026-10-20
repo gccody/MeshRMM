@@ -546,12 +546,9 @@ impl ControlHandler {
         viewer_control.send(SessionMessage::SetClearClipboardOnClose {
             enabled: sink.clear_clipboard_on_close(),
         });
-        // The Agent reported its platform before this configuration.
-        if sink.display_border_available() {
-            viewer_control.send(SessionMessage::SetDisplayBorder {
-                enabled: sink.display_border(),
-            });
-        }
+        viewer_control.send(SessionMessage::SetDisplayBorder {
+            enabled: sink.display_border(),
+        });
         viewer_control.send(SessionMessage::SetWallpaperHidden {
             hidden: sink.wallpaper_hidden(),
         });

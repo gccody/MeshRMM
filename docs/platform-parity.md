@@ -173,7 +173,7 @@ yet.
 | System audio | Yes | Partly: needs macOS 13 | Yes, through PulseAudio or `pipewire-pulse` |
 | Clipboard: text, HTML, images | Yes | Yes | Yes |
 | Clipboard: copied files | Yes | Yes | Yes |
-| Device-side picker for **Receive files** | Files and folders | Files and folders | Partly: files only, with zenity or kdialog |
+| Device-side picker for **Receive files** | Files and folders | Files and folders | Files or folders, with zenity or kdialog |
 | Dropped files land at the drop position | Yes (OLE drag and drop) | No: transfer folder | No: transfer folder |
 | Progress window on the device | Yes | Yes | No |
 | Received files marked as downloaded | Mark of the Web | Quarantine attribute | No |
@@ -187,8 +187,9 @@ yet.
   (`crates/file-transfer/src/windows.rs`). The macOS and Linux
   `drop_files` return `false`, so dropped files are saved to the transfer
   folder. Not implemented.
-- **The Linux picker** uses zenity or kdialog in file mode, which picks files
-  but not folders.
+- **The Linux picker** uses zenity or kdialog, neither of which picks files
+  and folders in one dialog, so it first asks which to send. kdialog picks
+  one folder at a time.
 - **No Linux progress window.** The viewer shows the transfer's progress
   instead (`crates/file-transfer/src/linux.rs`). Not implemented.
 - **No Linux download marking.** Linux has no quarantine mechanism for
@@ -219,8 +220,8 @@ yet.
   the capture leaves out. Windows has `WDA_EXCLUDEFROMCAPTURE`, and macOS
   windows can be left out of a ScreenCaptureKit stream; X11 and Wayland
   display servers have no such window (`agent/src/remote/linux/local.rs`).
-  The Agent refuses each of them with an error, and the viewers show
-  **Highlight viewed monitor** unchecked and disabled for Linux devices.
+  The Agent refuses blackout and annotations with an error, but accepts the
+  border silently, so the viewer shows the border as on.
 - **Blackout on Windows** needs `WDA_EXCLUDEFROMCAPTURE`, added in Windows
   10 2004 (`agent/src/remote/blackout.rs`).
 - **Linux approval** with no zenity or kdialog, or no helper on the console,
