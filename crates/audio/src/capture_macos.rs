@@ -11,7 +11,7 @@ use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{AnyThread, DefinedClass, define_class, msg_send};
+use objc2::{AnyThread, ClassType, DefinedClass, define_class, msg_send, sel};
 use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
 use objc2_core_media::{
     CMAudioFormatDescriptionGetStreamBasicDescription, CMBlockBuffer, CMSampleBuffer, CMTime,
@@ -114,7 +114,19 @@ impl Drop for Capture {
     }
 }
 
+/// Whether this macOS's ScreenCaptureKit can capture audio.
+fn captures_audio_available() -> bool {
+    SCStreamConfiguration::class()
+        .instance_method(sel!(setCapturesAudio:))
+        .is_some()
+}
+
 pub fn capture(send: impl Fn(Vec<u8>) + Send + 'static) -> anyhow::Result<Capture> {
+    // ScreenCaptureKit captures audio from macOS 13. Calling the method on
+    // macOS 12, which has ScreenCaptureKit without it, raises an exception.
+    if !captures_audio_available() {
+        bail!("system audio needs macOS 13 or newer");
+    }
     let shared = Arc::new(Shared {
         send: Mutex::new(Box::new(send)),
         failed: AtomicBool::new(false),
@@ -334,6 +346,22 @@ unsafe fn packets(sample: &CMSampleBuffer) -> anyhow::Result<Vec<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn this_macos_has_audio_capture_if_it_is_13_or_newer() {
+        let version = std::process::Command::new("/usr/bin/sw_vers")
+            .arg("-productVersion")
+            .output()
+            .unwrap();
+        let major: u32 = String::from_utf8_lossy(&version.stdout)
+            .split('.')
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(captures_audio_available(), major >= 13);
+    }
 
     #[test]
     #[ignore = "captures system audio; needs the Screen & System Audio Recording permission"]
