@@ -33,9 +33,9 @@ yet.
   implemented.
 - **macOS 12.3** is the first version with ScreenCaptureKit, which the Agent
   captures video and thumbnails with. System audio, though, uses
-  `SCStreamConfiguration.capturesAudio`, a macOS 13 API, and
-  `crates/audio/src/capture_macos.rs` does not check the version first, so
-  audio on macOS 12.3–12.x is untested and likely fails.
+  `SCStreamConfiguration.capturesAudio`, a macOS 13 API. On macOS 12 the Agent
+  finds the method missing and sessions go without audio
+  (`crates/audio/src/capture_macos.rs`).
 - **macOS privacy permissions.** macOS lets only the user grant them. An
   ad-hoc signed Agent loses them on every update, because macOS ties them to
   the code signature; a Developer ID signed Agent keeps them. See
