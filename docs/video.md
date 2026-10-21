@@ -160,6 +160,9 @@ Driver bundled in the Agent executable (`agent/assets/sudovda`).
   menu, which both viewers show only for Windows devices. Changing it
   resizes a connected computer's virtual monitor at once.
 - The setting does nothing while a real monitor is connected.
+- The bundled driver is x64 only, and Windows on ARM64 loads only ARM64
+  drivers, so the ARM64 Agent has no virtual monitor of its own. It uses an
+  ARM64 SudoVDA that another application installed.
 
 ## Measuring
 

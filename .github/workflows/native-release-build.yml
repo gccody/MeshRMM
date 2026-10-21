@@ -1,11 +1,11 @@
 name: Publish release
 
-# Builds a server release: the Agent and viewer for Windows and macOS and the
-# Agent for x64 and arm64 Linux, signed with the release key, inside a server
-# tarball per Linux architecture and a multi-architecture Docker image. On main
-# it publishes them as a GitHub release and to GHCR; a manual run on another
-# branch builds and tests
-# everything without signing or publishing.
+# Builds a server release: the Agent and viewer for Windows and macOS, the
+# Agent for ARM64 Windows and for x64 and arm64 Linux, signed with the release
+# key, inside a server tarball per Linux architecture and a multi-architecture
+# Docker image. On main it publishes them as a GitHub release and to GHCR; a
+# manual run on another branch builds and tests everything without signing or
+# publishing.
 #
 # No build is code signed with a certificate: the macOS builds are signed
 # only ad hoc, and each company's server signs them with its own Developer ID
@@ -111,6 +111,36 @@ jobs:
         with:
           name: native-windows-${{ needs.validate.outputs.version }}
           path: dist/downloads/*.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-arm64:
+    name: Build the ARM64 Windows Agent
+    needs: validate
+    # Built natively: the Agent's C dependencies build for the host.
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+      - name: Restore Windows ARM64 Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: native-windows-arm64
+          workspaces: ". -> target"
+          cache-targets: true
+          cache-workspace-crates: true
+          cache-on-failure: true
+      - name: Build the Agent
+        shell: pwsh
+        run: |
+          & .\scripts\build-agent.ps1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-windows-arm64-${{ needs.validate.outputs.version }}
+          path: dist/downloads/meshrmm-agent-windows-arm64.exe
           if-no-files-found: error
           retention-days: 14
 
@@ -228,7 +258,7 @@ jobs:
 
   sign:
     name: Sign the Agent and viewer builds
-    needs: [validate, windows, macos, linux]
+    needs: [validate, windows, windows-arm64, macos, linux]
     if: needs.validate.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     environment: production
@@ -262,7 +292,7 @@ jobs:
 
   package:
     name: Package and test the server release
-    needs: [validate, windows, macos, linux, server, sign]
+    needs: [validate, windows, windows-arm64, macos, linux, server, sign]
     # `sign` is skipped outside main.
     if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-24.04

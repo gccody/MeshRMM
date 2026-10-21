@@ -23,6 +23,7 @@ export const SCHEMA_VERSION = 1;
 // Each update target (see crates/self-update) and its file.
 export const ARTIFACTS = {
   "agent-windows-x64": "meshrmm-agent-windows-x64.exe",
+  "agent-windows-arm64": "meshrmm-agent-windows-arm64.exe",
   "client-windows-x64": "meshrmm-remote-windows-x64.exe",
   "client-macos-arm64": "meshrmm-remote-macos-arm64.zip",
   "agent-macos": "meshrmm-agent-macos.zip",

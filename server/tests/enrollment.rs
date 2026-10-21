@@ -112,7 +112,7 @@ async fn redemptions_are_validated_and_installers_expire() {
                 "{name}: {invalid}"
             );
         }
-        for platform in ["windows-x64", "macos", "linux"] {
+        for platform in ["windows-x64", "windows-arm64", "macos", "linux"] {
             assert_eq!(
                 admin
                     .post("/v1/agent-installers", json!({ "platform": platform }))

@@ -361,6 +361,12 @@ fn install_record_path() -> anyhow::Result<PathBuf> {
 /// SudoVDA device would already provide the interface, so this runs only when
 /// none is running.
 fn install_driver() -> anyhow::Result<()> {
+    // Windows runs only drivers built for its own architecture, and the
+    // bundled SudoVDA is x64.
+    anyhow::ensure!(
+        cfg!(target_arch = "x86_64"),
+        "the virtual display driver has no ARM64 build; connect a monitor or a display emulator"
+    );
     let path = install_record_path()?;
     let previous = read_record(&path).unwrap_or_default();
     // A device the Agent created can be retried, for example after the

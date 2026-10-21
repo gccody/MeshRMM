@@ -3,16 +3,18 @@ import { type FormEventHandler, type RefObject, useState } from "react";
 import { Check, Copy, Download, LoaderCircle, Terminal, X } from "lucide-react";
 import { ModalDialog } from "../../lib/modal-dialog";
 import type { Company } from "../agents/types";
-import type { AgentPlatform } from "./installer";
+import { type AgentPlatform, isWindowsPlatform } from "./installer";
 
 const INTRODUCTIONS: Record<AgentPlatform, string> = {
   "windows-x64": "Run the installer on the computer. It appears here once set up.",
+  "windows-arm64": "Run the installer on the computer. It appears here once set up.",
   macos: "Run an install command in Terminal on the Mac. It appears here once set up.",
   linux: "Run an install command in a terminal on the Linux computer. It appears here once set up.",
 };
 
 const NOTES: Record<AgentPlatform, string> = {
   "windows-x64": "Approve the Windows prompt when it runs. Works once, within 30 minutes.",
+  "windows-arm64": "Approve the Windows prompt when it runs. Works once, within 30 minutes.",
   macos: "Then allow MeshRMM Agent in Privacy & Security when asked. Works once, within 30 minutes.",
   linux: "It installs the Agent as a systemd service. Works once, within 30 minutes.",
 };
@@ -50,7 +52,7 @@ export function EnrollmentModal({
 }: Props) {
   const [copied, setCopied] = useState(false);
   // macOS and Linux install with a terminal command rather than a download.
-  const usesCommand = platform !== "windows-x64";
+  const usesCommand = !isWindowsPlatform(platform);
   const copy = async () => {
     if (!command) return;
     await navigator.clipboard.writeText(command);
@@ -62,7 +64,7 @@ export function EnrollmentModal({
       <h2 id="agent-title">Add a device</h2>
       <p>{INTRODUCTIONS[platform]}</p>
       <form onSubmit={onSubmit}>
-        <label>Operating system<select required value={platform} onChange={(event) => { setCopied(false); onPlatformChange(event.target.value as AgentPlatform); }}><option value="windows-x64">Windows 10/11 (x64)</option><option value="macos">macOS 12.3 or newer</option><option value="linux">Linux (x64 or arm64, systemd)</option></select></label>
+        <label>Operating system<select required value={platform} onChange={(event) => { setCopied(false); onPlatformChange(event.target.value as AgentPlatform); }}><option value="windows-x64">Windows 10/11 (x64)</option><option value="windows-arm64">Windows 11 (ARM64)</option><option value="macos">macOS 12.3 or newer</option><option value="linux">Linux (x64 or arm64, systemd)</option></select></label>
         {companies.length > 0 && (
           <label>Company<select value={companyId} onChange={(event) => { setCopied(false); onCompanyChange(event.target.value); }}>
             <option value="">No company</option>
