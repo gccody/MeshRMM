@@ -67,7 +67,8 @@ Three things that compilation does not catch, found on real hardware:
   command. Set the value directly, as a `VT_UI4`.
 
 The Agent streams the display's real resolution, cropped by at most one row
-or column for NV12, at 60 FPS by default.
+or column for NV12, at 60 FPS by default. A Linux Agent scales a display larger
+than 3840 × 2160 down to fit OpenH264, its software encoder.
 
 ## Codecs and negotiation
 
