@@ -284,7 +284,9 @@ impl Grabber {
                 .ok();
             if let Some(cursor) = &cursor {
                 *shared.cursor.lock().unwrap_or_else(|e| e.into_inner()) =
-                    shape(&String::from_utf8_lossy(&cursor.name));
+                    crate::remote::linux::cursor::shape_named(&String::from_utf8_lossy(
+                        &cursor.name,
+                    ));
                 if shared.capture_cursor.load(Ordering::SeqCst) {
                     self.draw_cursor(cursor);
                 }
@@ -397,49 +399,5 @@ impl Drop for Grabber {
             let _ = self.x11.connection.shm_detach(*segment);
             let _ = self.x11.connection.flush();
         }
-    }
-}
-
-/// The viewer's cursor for an X cursor name from the common themes.
-fn shape(name: &str) -> CursorShape {
-    match name {
-        "xterm" | "text" | "ibeam" | "vertical-text" => CursorShape::Text,
-        "watch" | "wait" => CursorShape::Wait,
-        "left_ptr_watch" | "progress" | "half-busy" => CursorShape::Progress,
-        "crosshair" | "cross" | "tcross" | "cell" => CursorShape::Crosshair,
-        "hand" | "hand1" | "hand2" | "pointer" | "pointing_hand" => CursorShape::Pointer,
-        "question_arrow" | "help" | "whats_this" => CursorShape::Help,
-        "fleur" | "move" | "all-scroll" | "grabbing" | "size_all" => CursorShape::Move,
-        "not-allowed" | "crossed_circle" | "no-drop" | "forbidden" | "circle" => {
-            CursorShape::NotAllowed
-        }
-        "sb_h_double_arrow" | "h_double_arrow" | "ew-resize" | "col-resize" | "size_hor"
-        | "left_side" | "right_side" | "e-resize" | "w-resize" => CursorShape::ResizeWestEast,
-        "sb_v_double_arrow" | "v_double_arrow" | "ns-resize" | "row-resize" | "size_ver"
-        | "top_side" | "bottom_side" | "n-resize" | "s-resize" => CursorShape::ResizeNorthSouth,
-        "nwse-resize"
-        | "size_fdiag"
-        | "top_left_corner"
-        | "bottom_right_corner"
-        | "nw-resize"
-        | "se-resize" => CursorShape::ResizeNorthWestSouthEast,
-        "nesw-resize" | "size_bdiag" | "top_right_corner" | "bottom_left_corner" | "ne-resize"
-        | "sw-resize" => CursorShape::ResizeNorthEastSouthWest,
-        "sb_up_arrow" | "up_arrow" | "center_ptr" => CursorShape::UpArrow,
-        _ => CursorShape::Default,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn names_from_cursor_themes_map_to_shapes() {
-        assert_eq!(shape("xterm"), CursorShape::Text);
-        assert_eq!(shape("hand2"), CursorShape::Pointer);
-        assert_eq!(shape("sb_h_double_arrow"), CursorShape::ResizeWestEast);
-        assert_eq!(shape("left_ptr"), CursorShape::Default);
-        assert_eq!(shape(""), CursorShape::Default);
     }
 }
