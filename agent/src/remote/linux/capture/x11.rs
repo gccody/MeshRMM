@@ -77,7 +77,7 @@ impl Backend for X11 {
                 primary: true,
             });
         }
-        Ok(outputs)
+        Ok(crate::remote::linux::display::with_all_displays(outputs))
     }
 
     fn start(

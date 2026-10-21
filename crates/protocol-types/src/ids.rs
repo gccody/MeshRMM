@@ -30,3 +30,7 @@ pub struct DisplayId(pub u32);
 
 /// The private Session 0 workspace advertised by the Windows Agent.
 pub const BACKGROUND_DISPLAY_ID: DisplayId = DisplayId(u32::MAX - 2);
+
+/// A display that shows every monitor at once, as the Windows and Linux Agents
+/// offer when there are several.
+pub const ALL_DISPLAYS_ID: DisplayId = DisplayId(u32::MAX - 1);
