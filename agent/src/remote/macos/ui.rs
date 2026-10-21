@@ -1,5 +1,5 @@
-//! What the Mac's user sees of a session: the menu bar item that opens the
-//! chat, the session banner, the connection notification, the display border
+//! What the Mac's user sees of the Agent and a session: the menu bar item,
+//! which shows the Agent runs and opens the chat during a session, the session banner, the connection notification, the display border
 //! and the technician's annotations.
 //!
 //! AppKit objects live on the main thread, in a registry keyed by the IDs the
@@ -36,10 +36,18 @@ const PEN_WIDTH: i32 = 5;
 const NOTIFICATION_WIDTH: f64 = 360.0;
 const NOTIFICATION_MARGIN: f64 = 16.0;
 const NOTIFICATION_VISIBLE_FOR: Duration = Duration::from_secs(15);
+/// The menu bar item's symbol and tooltip while no session runs.
+const IDLE_SYMBOL: &str = "display";
+const IDLE_TOOLTIP: &str = "MeshRMM Agent is running";
+/// Its symbol during a session.
+const SESSION_SYMBOL: &str = "display.and.arrow.down";
 
 thread_local! {
     /// Main-thread UI objects by handle ID.
     static OBJECTS: RefCell<HashMap<u64, Box<dyn Any>>> = RefCell::new(HashMap::new());
+    /// The Agent's menu bar item, shown while a user's helper runs. A
+    /// session's indicator takes it over.
+    static AGENT_ITEM: RefCell<Option<Retained<NSStatusItem>>> = const { RefCell::new(None) };
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -478,13 +486,49 @@ impl IndicatorTarget {
 
 struct Indicator {
     item: Retained<NSStatusItem>,
+    /// The item is the Agent's own, which stays after the session.
+    shared_item: bool,
     banner: Option<Retained<NSPanel>>,
     target: Retained<IndicatorTarget>,
     timer: Retained<NSTimer>,
 }
 
+/// Shows the Agent's menu bar item for as long as this process runs, as the
+/// Windows Agent keeps its icon in the notification area.
+pub(crate) fn show_agent_item() {
+    on_main(|mtm| {
+        AGENT_ITEM.with(|item| {
+            let mut item = item.borrow_mut();
+            if item.is_some() {
+                return;
+            }
+            let created =
+                NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
+            if let Some(button) = created.button(mtm) {
+                set_button(&button, IDLE_SYMBOL, IDLE_TOOLTIP);
+            }
+            *item = Some(created);
+        });
+    });
+}
+
+/// Shows `symbol` on a menu bar button, or the name where macOS has no such
+/// symbol, with `tooltip`.
+fn set_button(button: &objc2_app_kit::NSStatusBarButton, symbol: &str, tooltip: &str) {
+    let tooltip = NSString::from_str(tooltip);
+    match NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str(symbol),
+        Some(&tooltip),
+    ) {
+        Some(image) => button.setImage(Some(&image)),
+        None => button.setTitle(&NSString::from_str("MeshRMM")),
+    }
+    button.setToolTip(Some(&tooltip));
+}
+
 /// The session's menu bar item, which opens the chat, and the banner that
-/// says who is connected unless company policy hides it.
+/// says who is connected unless company policy hides it. It takes over the
+/// Agent's own item when there is one.
 pub(crate) struct SessionIndicator(MainThreadBox);
 
 impl SessionIndicator {
@@ -495,21 +539,19 @@ impl SessionIndicator {
     ) -> anyhow::Result<Self> {
         let name = meshrmm_protocol::session_viewer_name(viewer_name);
         let indicator = MainThreadBox::new(move |mtm| {
-            let item =
-                NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
+            let shared = AGENT_ITEM.with(|item| item.borrow().clone());
+            let shared_item = shared.is_some();
+            let item = shared.unwrap_or_else(|| {
+                NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength)
+            });
             let button = item
                 .button(mtm)
                 .ok_or_else(|| anyhow::anyhow!("the menu bar item has no button"))?;
-            let tooltip =
-                NSString::from_str(&format!("{name} is connected remotely; click to chat"));
-            match NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                &NSString::from_str("display.and.arrow.down"),
-                Some(&tooltip),
-            ) {
-                Some(image) => button.setImage(Some(&image)),
-                None => button.setTitle(&NSString::from_str("MeshRMM")),
-            }
-            button.setToolTip(Some(&tooltip));
+            set_button(
+                &button,
+                SESSION_SYMBOL,
+                &format!("{name} is connected remotely; click to chat"),
+            );
             let target = IndicatorTarget::alloc(mtm).set_ivars(IndicatorIvars {
                 popup: RefCell::new(None),
                 button: RefCell::new(Some(button.clone())),
@@ -538,6 +580,7 @@ impl SessionIndicator {
             let banner = show_banner.then(|| banner(mtm, &name));
             Ok(Indicator {
                 item,
+                shared_item,
                 banner,
                 target,
                 timer,
@@ -552,7 +595,19 @@ impl Drop for SessionIndicator {
         self.0.with(|indicator: &mut Indicator| {
             indicator.timer.invalidate();
             indicator.target.ivars().popup.borrow_mut().take();
-            NSStatusBar::systemStatusBar().removeStatusItem(&indicator.item);
+            if !indicator.shared_item {
+                NSStatusBar::systemStatusBar().removeStatusItem(&indicator.item);
+            } else if let Some(button) =
+                MainThreadMarker::new().and_then(|mtm| indicator.item.button(mtm))
+            {
+                // Back to the Agent's idle item, which does nothing when clicked.
+                // SAFETY: clearing the target and action is always valid.
+                unsafe {
+                    button.setTarget(None);
+                    button.setAction(None);
+                }
+                set_button(&button, IDLE_SYMBOL, IDLE_TOOLTIP);
+            }
             if let Some(banner) = &indicator.banner {
                 banner.close();
             }

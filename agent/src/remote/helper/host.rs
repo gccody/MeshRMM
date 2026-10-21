@@ -35,6 +35,8 @@ pub fn run(socket: &Path) -> anyhow::Result<()> {
     let login_window = unsafe { libc::geteuid() } == 0;
     if !login_window {
         request_permissions();
+        // The login window has no menu bar of its own to show it in.
+        crate::remote::macos::ui::show_agent_item();
     }
     let input = Arc::new(LocalInput::new()?);
     tracing::info!(login_window, socket = %socket.display(), "session helper started");
