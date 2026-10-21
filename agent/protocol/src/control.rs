@@ -172,8 +172,9 @@ pub enum SessionMessage {
     Restart {
         safe_mode: bool,
     },
-    /// Sent by the Agent when the control channel opens: its operating
-    /// system, and whether Windows started in Safe Mode.
+    /// Sent by the Agent when the control channel opens, before the first
+    /// `DisplayConfiguration`: its operating system, and whether Windows
+    /// started in Safe Mode.
     DeviceState {
         platform: DevicePlatform,
         safe_mode: bool,

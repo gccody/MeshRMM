@@ -3,7 +3,9 @@
 //! reordering and keyframes only on request. Frames are converted to 4:2:0
 //! with the BT.709 limited-range matrix the Windows software encoder uses,
 //! and encoded on their own thread, newest first: a frame that arrives while
-//! another is being encoded replaces any that is still waiting.
+//! another is being encoded replaces any that is still waiting. After a
+//! keyframe, a screen that stops changing is encoded again for a while to
+//! sharpen it, as on Windows and macOS (`StaticRefinement`).
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,6 +15,10 @@ use openh264::encoder::{
     SpsPpsStrategy, UsageType, VuiConfig,
 };
 use openh264::formats::YUVSlices;
+
+#[path = "../../../windows/remote-screen/src/refinement.rs"]
+mod refinement;
+use refinement::StaticRefinement;
 
 /// Software encoding keeps to this rate, as on Windows.
 pub(crate) const MAX_FRAMES_PER_SECOND: u32 = 30;
@@ -277,10 +283,11 @@ fn encode_frames(
     settings: EncoderSettings,
     sink: &FrameSink,
 ) -> anyhow::Result<()> {
-    let interval =
-        Duration::from_secs(1) / settings.frames_per_second.clamp(1, MAX_FRAMES_PER_SECOND);
+    let frames_per_second = settings.frames_per_second.clamp(1, MAX_FRAMES_PER_SECOND);
+    let interval = Duration::from_secs(1) / frames_per_second;
     let mut bits_per_second = settings.bitrate_bits_per_second.max(1);
     let mut encoder: Option<(Encoder, (usize, usize))> = None;
+    let mut refinement = StaticRefinement::new(0, 0, frames_per_second, bits_per_second);
     let mut last = Picture::default();
     let mut next_frame = Instant::now();
     let mut output = Vec::new();
@@ -292,7 +299,10 @@ fn encode_frames(
                     return Ok(());
                 }
                 let now = Instant::now();
-                let ready = state.pending.is_some() || (state.keyframe && last.width > 0);
+                // With no new frame, the last one is encoded again for a
+                // keyframe or to refine it.
+                let ready = state.pending.is_some()
+                    || ((state.keyframe || refinement.pending()) && last.width > 0);
                 if ready && now >= next_frame {
                     break;
                 }
@@ -312,6 +322,7 @@ fn encode_frames(
         };
         let started = Instant::now();
         next_frame = started + interval;
+        let refining = picture.is_none() && !keyframe;
         if let Some(picture) = picture {
             let previous = std::mem::replace(&mut last, picture);
             shared.state.lock().unwrap_or_else(|e| e.into_inner()).spare = Some(previous);
@@ -324,6 +335,12 @@ fn encode_frames(
             )
             .context("could not create the OpenH264 encoder")?;
             encoder = Some((created, size));
+            refinement = StaticRefinement::new(
+                size.0 as u32,
+                size.1 as u32,
+                frames_per_second,
+                bits_per_second,
+            );
         }
         let (encoder, _) = encoder.as_mut().expect("the encoder was just created");
         if let Some(bitrate) = bitrate
@@ -331,6 +348,10 @@ fn encode_frames(
         {
             bits_per_second = bitrate;
             set_bitrate(encoder, bits_per_second);
+            refinement.set_bitrate(bits_per_second);
+        }
+        if refining {
+            refinement.refined();
         }
         if keyframe {
             encoder.force_intra_frame();
@@ -352,10 +373,12 @@ fn encode_frames(
         if output.is_empty() {
             continue;
         }
+        let encoded_keyframe = matches!(frame_type, FrameType::IDR | FrameType::I);
+        refinement.encoded(encoded_keyframe);
         sink(EncodedAccessUnit {
             data: output.clone(),
             codec_config: None,
-            keyframe: matches!(frame_type, FrameType::IDR | FrameType::I),
+            keyframe: encoded_keyframe,
             capture_timestamp_us: last.timestamp_us,
             encode_complete_timestamp_us: super::monotonic_timestamp_us(),
         });
@@ -459,6 +482,16 @@ mod tests {
         assert!(first.keyframe);
         assert_eq!(&first.data[..4], &[0, 0, 0, 1]);
         assert_eq!(first.capture_timestamp_us, 7);
+        // The unchanged frame is refined for a bounded time: 250 ms at 30 FPS
+        // here, a frame of which OpenH264 may skip.
+        let refined = std::iter::from_fn(|| units.recv_timeout(Duration::from_millis(500)).ok())
+            .collect::<Vec<_>>();
+        assert!(
+            (1..=7).contains(&refined.len()),
+            "{} refined frames",
+            refined.len()
+        );
+        assert!(refined.iter().all(|unit| !unit.keyframe));
         encoder.request_keyframe();
         let again = units.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
