@@ -262,7 +262,7 @@ yet.
 | Approval answer kept across the restart | Yes | Yes | Yes |
 | [Background mode](background-mode.md) | Yes | No | No |
 | [Credential autofill](credential-autofill.md) | Yes | No | No |
-| Tray icon while the Agent runs | Yes | No | Yes, where the desktop shows StatusNotifierItems |
+| Tray icon while the Agent runs | Yes | Yes, in the menu bar | Yes, where the desktop shows StatusNotifierItems |
 
 - **Safe Mode.** Apple silicon Macs enter Safe Mode only from the startup
   options a person holds the power button for, and the Agent would not run
@@ -282,8 +282,9 @@ yet.
   (`agent/src/remote/linux/tray.rs`), which KDE Plasma, Ubuntu's GNOME
   (through its AppIndicator extension) and other StatusNotifierItem trays
   show; GNOME without the extension shows none. A click, or its menu's
-  **Reply** item, asks for a chat reply during a session. The Mac Agent
-  shows a menu bar item only during a session, for chat. Not implemented.
+  **Reply** item, asks for a chat reply during a session. Each Mac user's
+  helper keeps a menu bar item, which opens the chat during a session
+  (`agent/src/remote/macos/ui.rs`); the login window shows none.
 
 ## Features only some platforms have
 
