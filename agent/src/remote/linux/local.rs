@@ -12,7 +12,7 @@ use meshrmm_protocol::{
 use super::capture::{self, Backend, CaptureSettings, Stream};
 use super::display::Output;
 use super::encoder::{EncodedAccessUnit, EncoderSettings, FrameSink, RawFrame, VideoEncoder};
-use super::{input, keep_awake, ui, wallpaper};
+use super::{input, keep_awake, pointer, ui, wallpaper};
 use crate::remote::helper::protocol::{InputState, SessionUi, StreamSettings};
 use crate::remote::platform::ScreenInput;
 
@@ -229,6 +229,8 @@ pub(crate) struct LocalInput {
     clipboard: Option<Mutex<meshrmm_clipboard::ClipboardSync>>,
     indicator: Mutex<Option<ui::SessionIndicator>>,
     notification: Mutex<Option<ui::Notice>>,
+    /// Who uses the keyboard and pointer, in an X11 session.
+    pointer: Mutex<Option<pointer::PointerWatch>>,
     cursor: Mutex<CursorShape>,
     /// Whether the annotation warning was logged this session.
     annotations_refused: AtomicBool,
@@ -278,6 +280,7 @@ impl LocalInput {
             indicator: Mutex::default(),
             notification: Mutex::default(),
             cursor: Mutex::new(CursorShape::Default),
+            pointer: Mutex::default(),
             annotations_refused: AtomicBool::new(false),
         })
     }
@@ -285,6 +288,12 @@ impl LocalInput {
     /// Shows the user that a technician connected: the banner when company
     /// policy shows it, and the connection notification once.
     pub(crate) fn begin_session(&self, session: &SessionUi) {
+        if capture::x11_session() {
+            match pointer::PointerWatch::start() {
+                Ok(watch) => *self.pointer.lock().unwrap_or_else(|e| e.into_inner()) = Some(watch),
+                Err(error) => tracing::warn!(error = ?error, "could not watch the session's input"),
+            }
+        }
         *self.files.lock().unwrap_or_else(|e| e.into_inner()) = Some(
             meshrmm_file_transfer::TransferSession::agent(paste_shortcut(&self.controller)),
         );
@@ -326,15 +335,20 @@ impl LocalInput {
             .map_err(|_| anyhow::anyhow!("clipboard lock was poisoned"))
     }
 
+    /// Keeps the pointer's shape while the viewer controls input. While the
+    /// user does, the video shows their pointer and the viewer keeps the last
+    /// shape.
     fn set_cursor(&self, cursor: CursorShape) {
-        *self.cursor.lock().unwrap_or_else(|e| e.into_inner()) = cursor;
+        if self.viewer_controls_input() {
+            *self.cursor.lock().unwrap_or_else(|e| e.into_inner()) = cursor;
+        }
     }
 
     pub(crate) fn input_state(&self) -> InputState {
         InputState {
             cursor: *self.cursor.lock().unwrap_or_else(|e| e.into_inner()),
-            viewer_controls_input: true,
-            agent_pointer_display: None,
+            viewer_controls_input: self.viewer_controls_input(),
+            agent_pointer_display: self.agent_pointer_display(),
             agent_input_blocked: self.controller().is_ok_and(|input| input.blocked()),
             blacked_out: false,
         }
@@ -353,6 +367,10 @@ impl LocalInput {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         self.notification
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        self.pointer
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
@@ -432,11 +450,28 @@ impl ScreenInput for LocalInput {
     fn cursor_shape(&self) -> CursorShape {
         *self.cursor.lock().unwrap_or_else(|e| e.into_inner())
     }
+    /// The display with the user's pointer while they use it, in an X11
+    /// session.
     fn agent_pointer_display(&self) -> Option<DisplayId> {
-        None
+        if self.viewer_controls_input() {
+            return None;
+        }
+        let (x, y) = self
+            .pointer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()?
+            .position()?;
+        super::display::at(self.controller().ok()?.displays(), x, y)
     }
+    /// Wayland compositors don't tell whose input moved the pointer, so
+    /// there the viewer is always taken to control it.
     fn viewer_controls_input(&self) -> bool {
-        true
+        self.pointer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_none_or(pointer::PointerWatch::viewer_controls_input)
     }
     fn apply_clipboard(&self, content: ClipboardContent) -> anyhow::Result<()> {
         self.clipboard()?.apply(content)

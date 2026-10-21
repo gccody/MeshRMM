@@ -54,11 +54,21 @@ pub(crate) trait Backend: Send {
     ) -> anyhow::Result<Box<dyn Stream>>;
 }
 
+/// Whether this process's session runs on Wayland, where `DISPLAY` may
+/// still name Xwayland.
+fn wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && std::env::var("XDG_SESSION_TYPE").unwrap_or_default() != "x11"
+}
+
+/// Whether this process's session is an X11 session.
+pub(crate) fn x11_session() -> bool {
+    !wayland_session() && std::env::var_os("DISPLAY").is_some()
+}
+
 /// The capture backend for this process's session.
 pub(crate) fn detect() -> anyhow::Result<Box<dyn Backend>> {
-    let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
-    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some() && session_type != "x11";
-    if !wayland {
+    if !wayland_session() {
         if std::env::var_os("DISPLAY").is_some() {
             return Ok(Box::new(x11::X11::connect()?));
         }

@@ -19,6 +19,7 @@ pub(crate) mod input_block;
 mod keep_awake;
 mod keymap;
 pub(crate) mod local;
+mod pointer;
 pub(crate) mod session_close;
 pub(crate) mod sessions;
 pub(crate) mod snapshot;

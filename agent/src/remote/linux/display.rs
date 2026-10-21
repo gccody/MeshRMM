@@ -60,6 +60,17 @@ pub(crate) fn choose(outputs: &[Output], requested: Option<DisplayId>) -> anyhow
         .context("the display server reported no displays")
 }
 
+/// The display that holds a point of the desktop.
+pub(crate) fn at(displays: &[Display], x: i32, y: i32) -> Option<DisplayId> {
+    displays
+        .iter()
+        .find(|display| {
+            (display.x..display.x + display.width as i32).contains(&x)
+                && (display.y..display.y + display.height as i32).contains(&y)
+        })
+        .map(|display| display.id)
+}
+
 /// The smallest rectangle around every display: left, top, width, height.
 pub(crate) fn bounds(displays: &[Display]) -> Option<(i32, i32, u32, u32)> {
     let left = displays.iter().map(|display| display.x).min()?;
@@ -120,5 +131,17 @@ mod tests {
         ];
         assert_eq!(bounds(&displays), Some((-1920, -200, 3840, 1280)));
         assert_eq!(bounds(&[]), None);
+    }
+
+    #[test]
+    fn finds_the_display_under_a_point() {
+        let displays = [
+            output("A", -1920, 0, false).display(),
+            output("B", 0, 0, true).display(),
+        ];
+        assert_eq!(at(&displays, -1, 1079), Some(displays[0].id));
+        assert_eq!(at(&displays, 0, 0), Some(displays[1].id));
+        assert_eq!(at(&displays, 1920, 0), None);
+        assert_eq!(at(&displays, 5, 1080), None);
     }
 }

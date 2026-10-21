@@ -292,6 +292,11 @@ impl InputController {
         Ok(())
     }
 
+    /// The desktop's displays, as the viewer last saw them.
+    pub(crate) fn displays(&self) -> &[Display] {
+        &self.displays
+    }
+
     fn devices(&mut self) -> anyhow::Result<&Devices> {
         if self.devices.is_none() {
             let files = self
