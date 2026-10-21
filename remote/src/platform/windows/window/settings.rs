@@ -103,8 +103,8 @@ impl WindowContext {
             ),
             (
                 SETTINGS_DISPLAY_BORDER_ID,
-                self.control.display_border(),
-                true,
+                self.control.display_border_available() && self.control.display_border(),
+                self.control.display_border_available(),
             ),
             (SETTINGS_WALLPAPER_ID, self.control.wallpaper_hidden(), true),
             (SETTINGS_AUDIO_ID, self.control.audio_muted(), true),

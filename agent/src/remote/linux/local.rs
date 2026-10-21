@@ -61,9 +61,13 @@ impl LocalScreen {
             .expect("the backend was just connected"))
     }
 
-    /// Linux display servers draw nothing the capture could leave out, so the
-    /// border around the shared display is not shown.
-    pub(crate) fn set_display_border(&mut self, _enabled: bool) -> anyhow::Result<()> {
+    /// Linux display servers draw nothing the capture could leave out, so
+    /// there is no border around the shared display. Viewers don't ask for
+    /// one from a Linux device.
+    pub(crate) fn set_display_border(&mut self, enabled: bool) -> anyhow::Result<()> {
+        if enabled {
+            bail!("the border around the viewed monitor is not available on Linux");
+        }
         Ok(())
     }
 

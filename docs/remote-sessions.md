@@ -258,7 +258,8 @@ Unless company policy turns them off, the person at the computer sees:
 - **A border** on the viewed monitor: a three-pixel red outline, or one on
   each monitor in **All displays**. It is left out of the video and cannot
   be clicked. **Highlight viewed monitor on agent** turns it off for a
-  session; the company sets the default.
+  session; the company sets the default. Linux devices have no border, so the
+  viewers leave the setting unchecked and disabled for them.
 - **A [connection notification](maintenance-controls.md#connection-notification)**
   when the technician connects.
 
