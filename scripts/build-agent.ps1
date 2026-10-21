@@ -13,7 +13,10 @@ $sourceExecutable = Join-Path $repositoryRoot 'target\release\meshrmm-agent.exe'
 $distributionDirectory = Join-Path $repositoryRoot 'dist\agent'
 $destinationExecutable = Join-Path $distributionDirectory 'meshrmm-agent.exe'
 $downloadDirectory = Join-Path $repositoryRoot 'dist\downloads'
-$downloadExecutable = Join-Path $downloadDirectory 'meshrmm-agent-windows-x64.exe'
+# The build is for the host, x64 or ARM64.
+$hostTarget = (& rustc -vV | Select-String '^host: ').ToString().Substring(6)
+$architecture = if ($hostTarget -like 'aarch64-*') { 'arm64' } else { 'x64' }
+$downloadExecutable = Join-Path $downloadDirectory "meshrmm-agent-windows-$architecture.exe"
 $artifactsWriter = Join-Path $PSScriptRoot 'release-artifacts.mjs'
 
 . (Join-Path $PSScriptRoot 'use-cmake.ps1')
