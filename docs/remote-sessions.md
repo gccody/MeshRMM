@@ -72,10 +72,12 @@ The toolbar has a user-session menu (person icon) and a display menu
   display.
 
 **All displays** shows every monitor of the selected session in one view,
-keeping their positions, with black between them. It is captured with GDI
-instead of the GPU path, so its frame rate can be lower, and the combined
-size must be one the encoder and decoder support. A Linux Agent offers it in
-X11 sessions and scales a view larger than 3840 × 2160 down to fit.
+keeping their positions, with black between them. A Windows Agent captures
+it with GDI instead of the GPU path, so its frame rate can be lower, and the
+combined size must be one the encoder and decoder support. A Mac Agent
+captures each monitor in its own stream and draws them into one picture, and
+a Linux Agent offers it in X11 sessions; both scale a view larger than
+3840 × 2160 down to fit.
 
 Choosing a session selects its primary monitor. The service looks for
 arriving and departing sessions every five seconds. When the session

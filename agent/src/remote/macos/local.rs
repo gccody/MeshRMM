@@ -68,9 +68,10 @@ pub(crate) struct LocalScreen {
     capture: Option<Arc<Capture>>,
     input: Arc<LocalInput>,
     border_enabled: bool,
-    /// The border around the captured display, which capture leaves out.
-    border: Option<ui::DisplayBorder>,
-    active_display: Option<meshrmm_protocol::Display>,
+    /// The border around each captured display, which capture leaves out.
+    borders: Vec<ui::DisplayBorder>,
+    /// The displays the capture shows: one, or each of All displays.
+    members: Vec<meshrmm_protocol::Display>,
 }
 
 impl LocalScreen {
@@ -79,21 +80,31 @@ impl LocalScreen {
             capture: None,
             input,
             border_enabled: false,
-            border: None,
-            active_display: None,
+            borders: Vec::new(),
+            members: Vec::new(),
         }
     }
 
-    /// Shows or hides the outline around the shared display.
+    /// Shows or hides the outline around each shared display.
     pub(crate) fn set_display_border(&mut self, enabled: bool) -> anyhow::Result<()> {
         self.border_enabled = enabled;
-        self.border = None;
-        let mut windows = Vec::new();
-        if enabled && let Some(display) = &self.active_display {
-            let border = ui::DisplayBorder::show(display)?;
-            windows = border.window_ids().to_vec();
-            self.border = Some(border);
+        self.show_borders()
+    }
+
+    /// Shows the borders around the captured displays when they are on, and
+    /// leaves them out of the capture.
+    fn show_borders(&mut self) -> anyhow::Result<()> {
+        self.borders.clear();
+        if self.border_enabled {
+            for member in &self.members {
+                self.borders.push(ui::DisplayBorder::show(member)?);
+            }
         }
+        let windows = self
+            .borders
+            .iter()
+            .flat_map(|border| border.window_ids().iter().copied())
+            .collect();
         self.input.excluded.set("border", windows)
     }
 
@@ -104,24 +115,18 @@ impl LocalScreen {
         sink: impl Fn(EncodedAccessUnit) + Send + Sync + 'static,
     ) -> anyhow::Result<Started> {
         self.capture = None;
-        self.border = None;
+        self.borders.clear();
         let displays = display::enumerate()?;
         let active_display = display::choose(&displays, display_id)?;
         self.input
             .controller()?
             .set_active_display(active_display.clone())?;
         self.input.clear_annotations_unless(active_display.id);
-        let mut border_windows = Vec::new();
-        if self.border_enabled {
-            let border = ui::DisplayBorder::show(&active_display)?;
-            border_windows = border.window_ids().to_vec();
-            self.border = Some(border);
-        }
-        self.input.excluded.set("border", border_windows)?;
-        self.active_display = Some(active_display.clone());
+        self.members = display::members(&active_display, &displays);
+        self.show_borders()?;
         let excluded = self.input.excluded.all();
         let capture = Capture::start(
-            &active_display,
+            &self.members,
             CaptureConfig {
                 frames_per_second: settings.frames_per_second,
                 bitrate_bits_per_second: settings.bitrate_bits_per_second,
@@ -152,7 +157,7 @@ impl LocalScreen {
 
     pub(crate) fn stop(&mut self) {
         self.capture = None;
-        self.border = None;
+        self.borders.clear();
     }
 
     pub(crate) fn poll_ended(&mut self) -> Option<anyhow::Error> {

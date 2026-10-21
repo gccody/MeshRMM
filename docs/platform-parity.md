@@ -99,7 +99,7 @@ yet.
 | Static screen sharpened after a keyframe | Yes | Yes | Yes |
 | Quality presets, grayscale Ultra data saver | Yes | Yes | Yes |
 | Choose a monitor | Yes | Yes | Yes |
-| All displays in one view | Yes | No | X11 only |
+| All displays in one view | Yes | Yes | X11 only |
 | Sessions offered | Console, each active Remote Desktop session, Background | Console | Console |
 | Follows the user to sign-in, lock and UAC screens | Yes | Login window yes; lock screen not verified | X11 yes; GNOME Wayland by unlocking; KDE and wlroots greeters not handled |
 | Follows a switch of user at the console | Yes | Yes | Yes |
@@ -126,8 +126,10 @@ yet.
 - **All displays** is built on Windows' GDI capture of the whole virtual
   desktop, and on X11 capture of the root window's area around every
   monitor (`agent/src/remote/linux/display.rs`), scaled down to fit
-  3840 × 2160 when larger. Wayland compositors capture one output at a
-  time, and macOS is not implemented.
+  3840 × 2160 when larger. A Mac captures each display in its own
+  ScreenCaptureKit stream, scaled to its place in one picture that fits
+  3840 × 2160, and draws them together (`agent/src/remote/macos/capture.rs`).
+  Wayland compositors capture one output at a time.
 - **Sessions.** Remote Desktop sessions and the background desktop are
   Windows concepts. A Mac or Linux Agent starts helpers in every graphical
   session but offers only the console's (on Linux, logind's active session
