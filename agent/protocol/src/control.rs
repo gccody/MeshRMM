@@ -342,7 +342,7 @@ impl Display {
     }
 
     pub fn selection_label(&self, index: usize) -> String {
-        if self.id.0 == u32::MAX - 1 || self.name == "All monitors" {
+        if self.id == crate::ALL_DISPLAYS_ID || self.name == "All monitors" {
             "All displays".into()
         } else {
             format!("Display {}", index + 1)

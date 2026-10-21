@@ -4,6 +4,9 @@
 use anyhow::Context;
 use meshrmm_protocol::{DesktopSession, Display, DisplayId};
 
+/// The name of the output that shows every display at once.
+pub(crate) const ALL_DISPLAYS: &str = "All monitors";
+
 /// A display a capture backend found, with the output name it captures by.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Output {
@@ -19,6 +22,9 @@ pub(crate) struct Output {
 impl Output {
     /// The display's ID, the same for as long as the connector keeps its name.
     pub(crate) fn id(&self) -> DisplayId {
+        if self.name == ALL_DISPLAYS {
+            return meshrmm_protocol::ALL_DISPLAYS_ID;
+        }
         DisplayId(stable_id(&self.name))
     }
 
@@ -36,18 +42,41 @@ impl Output {
     }
 }
 
-/// FNV-1a of the connector name, which never collides with the background
-/// desktop's reserved ID in practice and stays the same across helpers.
+/// FNV-1a of the connector name, which stays the same across helpers and
+/// never takes a reserved ID.
 fn stable_id(name: &str) -> u32 {
     let hash = name.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
         (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
     });
-    // IDs 0 and the background desktop's are reserved.
+    // IDs 0, the background desktop's and All displays' are reserved.
     match hash {
         0 => 1,
-        hash if hash == meshrmm_protocol::BACKGROUND_DISPLAY_ID.0 => hash ^ 1,
+        hash if hash == meshrmm_protocol::BACKGROUND_DISPLAY_ID.0
+            || hash == meshrmm_protocol::ALL_DISPLAYS_ID.0 =>
+        {
+            hash ^ 4
+        }
         hash => hash,
     }
+}
+
+/// `outputs`, and when there are several, one more that covers them all, as
+/// Windows offers. Its picture shows the desktop's whole bounding box.
+pub(crate) fn with_all_displays(mut outputs: Vec<Output>) -> Vec<Output> {
+    if outputs.len() > 1 {
+        let displays: Vec<Display> = outputs.iter().map(Output::display).collect();
+        if let Some((x, y, width, height)) = bounds(&displays) {
+            outputs.push(Output {
+                name: ALL_DISPLAYS.to_owned(),
+                x,
+                y,
+                width,
+                height,
+                primary: false,
+            });
+        }
+    }
+    outputs
 }
 
 /// The requested display, or the primary one, or the first.
@@ -65,7 +94,8 @@ pub(crate) fn at(displays: &[Display], x: i32, y: i32) -> Option<DisplayId> {
     displays
         .iter()
         .find(|display| {
-            (display.x..display.x + display.width as i32).contains(&x)
+            display.id != meshrmm_protocol::ALL_DISPLAYS_ID
+                && (display.x..display.x + display.width as i32).contains(&x)
                 && (display.y..display.y + display.height as i32).contains(&y)
         })
         .map(|display| display.id)
@@ -131,6 +161,31 @@ mod tests {
         ];
         assert_eq!(bounds(&displays), Some((-1920, -200, 3840, 1280)));
         assert_eq!(bounds(&[]), None);
+    }
+
+    #[test]
+    fn several_displays_add_one_that_covers_them_all() {
+        let one = with_all_displays(vec![output("DP-1", 0, 0, true)]);
+        assert_eq!(one.len(), 1);
+        let outputs = with_all_displays(vec![
+            output("DP-1", 0, 0, true),
+            output("DP-2", 1920, -200, false),
+        ]);
+        let all = &outputs[2];
+        assert_eq!(all.id(), meshrmm_protocol::ALL_DISPLAYS_ID);
+        assert_eq!((all.x, all.y, all.width, all.height), (0, -200, 3840, 1280));
+        assert!(!all.primary);
+        assert_eq!(choose(&outputs, None).unwrap().name, "DP-1");
+        assert_eq!(
+            choose(&outputs, Some(meshrmm_protocol::ALL_DISPLAYS_ID))
+                .unwrap()
+                .name,
+            ALL_DISPLAYS
+        );
+        let displays: Vec<Display> = outputs.iter().map(Output::display).collect();
+        assert_eq!(displays[2].selection_label(2), "All displays");
+        // The pointer is on a real display, not on All displays.
+        assert_eq!(at(&displays, 1925, 0), Some(displays[1].id));
     }
 
     #[test]
