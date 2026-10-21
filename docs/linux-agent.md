@@ -49,6 +49,10 @@ With a graphical session on the computer's screen, remote sessions too:
   kdialog. Files dropped on the remote view go to the transfer folder.
 - **Chat.** The technician's messages show as desktop notifications with a
   **Reply** button, which asks for the answer in a dialog.
+- **Tray icon.** The Agent's icon stays in the desktop's tray while it
+  runs, where the desktop shows StatusNotifierItems, as KDE Plasma and Ubuntu's
+  GNOME do. During a session, clicking it, or its
+  menu's **Reply** item, asks for a chat reply.
 - **Company policy.** The session banner is a notification that stays until
   the session ends. The connection notification is a notification too, and
   the approval prompt a zenity or kdialog dialog. logind tells the Agent

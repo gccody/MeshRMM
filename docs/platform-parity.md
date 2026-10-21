@@ -182,7 +182,7 @@ yet.
 | Dropped files land at the drop position | Yes (OLE drag and drop) | No: transfer folder | No: transfer folder |
 | Progress window on the device | Yes | Yes | Yes, with zenity or kdialog |
 | Received files marked as downloaded | Mark of the Web | Quarantine attribute | No |
-| Chat on the device | Notification-area icon and chat window | Menu bar item and popover | Notifications with **Reply** |
+| Chat on the device | Notification-area icon and chat window | Menu bar item and popover | Notifications with **Reply**, and the tray icon |
 
 - **macOS audio** uses a ScreenCaptureKit option added in macOS 13; see
   [Platforms and installation](#platforms-and-installation).
@@ -202,7 +202,7 @@ yet.
   downloads that file managers or the shell honour.
 - **Chat on Linux** has no window of its own: messages are desktop
   notifications, and **Reply** asks for the answer in a zenity or kdialog
-  dialog. Without a notification daemon the user sees no messages.
+  dialog. Clicking the tray icon asks for a reply too. Without a notification daemon the user sees no messages.
 
 ## Company policy and maintenance controls
 
@@ -257,7 +257,7 @@ yet.
 | Approval answer kept across the restart | Yes | Yes | Yes |
 | [Background mode](background-mode.md) | Yes | No | No |
 | [Credential autofill](credential-autofill.md) | Yes | No | No |
-| Tray icon while the Agent runs | Yes | No | No |
+| Tray icon while the Agent runs | Yes | No | Yes, where the desktop shows StatusNotifierItems |
 
 - **Safe Mode.** Apple silicon Macs enter Safe Mode only from the startup
   options a person holds the power button for, and the Agent would not run
@@ -273,8 +273,12 @@ yet.
   `sudo` or authorization prompts would each need their own mechanism. Not
   implemented, so the viewers show the key button only for Windows devices.
 - **Tray icon.** The Windows Agent runs a notification-area icon for each
-  signed-in user. The Mac Agent shows a menu bar item only during a session,
-  for chat, and the Linux Agent shows only notifications. Not implemented.
+  signed-in user. Each Linux session helper shows a StatusNotifierItem
+  (`agent/src/remote/linux/tray.rs`), which KDE Plasma, Ubuntu's GNOME
+  (through its AppIndicator extension) and other StatusNotifierItem trays
+  show; GNOME without the extension shows none. A click, or its menu's
+  **Reply** item, asks for a chat reply during a session. The Mac Agent
+  shows a menu bar item only during a session, for chat. Not implemented.
 
 ## Features only some platforms have
 
