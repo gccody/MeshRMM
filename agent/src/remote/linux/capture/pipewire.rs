@@ -7,11 +7,13 @@
 //! here are declared by hand from the stable PipeWire 0.3 ABI.
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, bail};
+use meshrmm_protocol::CursorShape;
 
 use super::FrameSink;
+use crate::remote::linux::cursor::ThemeShapes;
 use crate::remote::linux::encoder::{PixelLayout, RawFrame};
 
 // SPA types, from spa/utils/type.h.
@@ -23,6 +25,7 @@ const SPA_TYPE_OBJECT: u32 = 15;
 const SPA_TYPE_CHOICE: u32 = 19;
 const SPA_TYPE_OBJECT_FORMAT: u32 = 0x40003;
 const SPA_TYPE_OBJECT_PARAM_BUFFERS: u32 = 0x40004;
+const SPA_TYPE_OBJECT_PARAM_META: u32 = 0x40005;
 // spa/pod/pod.h
 const SPA_CHOICE_NONE: u32 = 0;
 const SPA_CHOICE_RANGE: u32 = 1;
@@ -32,6 +35,7 @@ const SPA_CHOICE_FLAGS: u32 = 4;
 const SPA_PARAM_ENUM_FORMAT: u32 = 3;
 const SPA_PARAM_FORMAT: u32 = 4;
 const SPA_PARAM_BUFFERS: u32 = 5;
+const SPA_PARAM_META: u32 = 6;
 // spa/param/format.h
 const SPA_FORMAT_MEDIA_TYPE: u32 = 1;
 const SPA_FORMAT_MEDIA_SUBTYPE: u32 = 2;
@@ -51,6 +55,10 @@ const SPA_VIDEO_FORMAT_ARGB: u32 = 13;
 const SPA_VIDEO_FORMAT_ABGR: u32 = 14;
 // spa/param/buffers.h
 const SPA_PARAM_BUFFERS_DATA_TYPE: u32 = 6;
+const SPA_PARAM_META_TYPE: u32 = 1;
+const SPA_PARAM_META_SIZE: u32 = 2;
+// spa/buffer/meta.h
+const SPA_META_CURSOR: u32 = 5;
 // spa/buffer/buffer.h
 const SPA_DATA_MEM_PTR: u32 = 1;
 const SPA_DATA_MEM_FD: u32 = 2;
@@ -101,8 +109,34 @@ struct SpaData {
 struct SpaBuffer {
     meta_count: u32,
     data_count: u32,
-    metas: *mut c_void,
+    metas: *mut SpaMeta,
     datas: *mut SpaData,
+}
+
+#[repr(C)]
+struct SpaMeta {
+    kind: u32,
+    size: u32,
+    data: *mut c_void,
+}
+
+/// `struct spa_meta_cursor`.
+#[repr(C)]
+struct SpaMetaCursor {
+    id: u32,
+    flags: u32,
+    position: [i32; 2],
+    hotspot: [i32; 2],
+    bitmap_offset: u32,
+}
+
+/// `struct spa_meta_bitmap`.
+#[repr(C)]
+struct SpaMetaBitmap {
+    format: u32,
+    size: [u32; 2],
+    stride: i32,
+    offset: u32,
 }
 
 #[repr(C)]
@@ -329,6 +363,32 @@ fn buffers() -> Vec<u8> {
     pod.0
 }
 
+/// The largest cursor image the metadata may carry, in pixels a side.
+const LARGEST_CURSOR: u32 = 512;
+
+/// The cursor metadata to ask for, for a compositor that sends the pointer
+/// beside the frames rather than in them: room for a cursor of up to
+/// [`LARGEST_CURSOR`] pixels a side.
+fn cursor_meta() -> Vec<u8> {
+    let size = |side: u32| {
+        (std::mem::size_of::<SpaMetaCursor>() + std::mem::size_of::<SpaMetaBitmap>()) as u32
+            + side * side * 4
+    };
+    let mut pod = PodWriter::default();
+    pod.object(SPA_TYPE_OBJECT_PARAM_META, SPA_PARAM_META, |pod| {
+        pod.property(SPA_PARAM_META_TYPE);
+        pod.id(SPA_META_CURSOR);
+        pod.property(SPA_PARAM_META_SIZE);
+        pod.choice(
+            SPA_CHOICE_RANGE,
+            SPA_TYPE_INT,
+            4,
+            &[&[size(64)], &[size(1)], &[size(LARGEST_CURSOR)]],
+        );
+    });
+    pod.0
+}
+
 /// The pixel layout and size of a negotiated format pod.
 fn parse_format(pod: &[u8]) -> Option<(PixelLayout, u32, u32)> {
     let word = |offset: usize| -> Option<u32> {
@@ -380,6 +440,9 @@ struct Callbacks {
     stream: *mut Opaque,
     sink: FrameSink,
     format: Mutex<Option<(PixelLayout, u32, u32)>>,
+    /// The pointer's shape, from the cursor metadata.
+    cursor: Arc<Mutex<CursorShape>>,
+    shapes: Mutex<ThemeShapes>,
     ended: Mutex<Option<String>>,
     stopped: AtomicBool,
 }
@@ -422,11 +485,20 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
     let format = parse_format(pod);
     tracing::info!(?format, "the screencast's format is set");
     *callbacks.format.lock().unwrap_or_else(|e| e.into_inner()) = format;
-    let buffers = buffers();
-    let mut params = [buffers.as_ptr().cast::<c_void>()];
-    // SAFETY: called on the PipeWire thread with a live stream; the pod
-    // outlives the call, which copies it.
-    unsafe { (callbacks.api.stream_update_params)(callbacks.stream, params.as_mut_ptr(), 1) };
+    let (buffers, meta) = (buffers(), cursor_meta());
+    let mut params = [
+        buffers.as_ptr().cast::<c_void>(),
+        meta.as_ptr().cast::<c_void>(),
+    ];
+    // SAFETY: called on the PipeWire thread with a live stream; the pods
+    // outlive the call, which copies them.
+    unsafe {
+        (callbacks.api.stream_update_params)(
+            callbacks.stream,
+            params.as_mut_ptr(),
+            params.len() as u32,
+        )
+    };
 }
 
 unsafe extern "C" fn on_process(data: *mut c_void) {
@@ -441,6 +513,9 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
         if buffer.is_null() {
             break;
         }
+        // Each buffer may carry a new cursor, even one not delivered.
+        // SAFETY: a dequeued buffer stays valid until it is queued again.
+        unsafe { read_cursor(callbacks, &*buffer) };
         if !newest.is_null() {
             // SAFETY: the buffer was dequeued from this stream.
             unsafe { (api.stream_queue_buffer)(callbacks.stream, newest) };
@@ -454,6 +529,94 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
     unsafe { deliver(callbacks, &*newest) };
     // SAFETY: as above.
     unsafe { (api.stream_queue_buffer)(callbacks.stream, newest) };
+}
+
+/// Names the cursor in a buffer's metadata, when it carries a new image.
+///
+/// # Safety
+///
+/// `buffer` must be dequeued from the stream.
+unsafe fn read_cursor(callbacks: &Callbacks, buffer: &PwBuffer) {
+    // SAFETY: a dequeued buffer has a valid spa_buffer.
+    let spa = unsafe { &*buffer.buffer };
+    if spa.metas.is_null() {
+        return;
+    }
+    // SAFETY: the buffer has `meta_count` metadata entries.
+    let metas = unsafe { std::slice::from_raw_parts(spa.metas, spa.meta_count as usize) };
+    let Some(meta) = metas.iter().find(|meta| {
+        meta.kind == SPA_META_CURSOR
+            && !meta.data.is_null()
+            && meta.size as usize >= std::mem::size_of::<SpaMetaCursor>()
+    }) else {
+        return;
+    };
+    // SAFETY: the metadata holds `size` bytes, at least a cursor's.
+    let bytes = unsafe { std::slice::from_raw_parts(meta.data.cast::<u8>(), meta.size as usize) };
+    if let Some(shape) = cursor_image(bytes, |width, height, alpha| {
+        callbacks
+            .shapes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .classify(width, height, alpha)
+    }) {
+        *callbacks.cursor.lock().unwrap_or_else(|e| e.into_inner()) = shape;
+    }
+}
+
+/// The shape `classify` names a cursor metadata's new image, if it has one:
+/// its width, height and the alpha of each pixel.
+fn cursor_image(
+    meta: &[u8],
+    classify: impl FnOnce(usize, usize, &[u8]) -> CursorShape,
+) -> Option<CursorShape> {
+    let word = |offset: usize| -> Option<u32> {
+        Some(u32::from_ne_bytes(
+            meta.get(offset..offset + 4)?.try_into().ok()?,
+        ))
+    };
+    // An ID of 0 carries nothing new.
+    if word(std::mem::offset_of!(SpaMetaCursor, id))? == 0 {
+        return None;
+    }
+    let bitmap = word(std::mem::offset_of!(SpaMetaCursor, bitmap_offset))? as usize;
+    if bitmap < std::mem::size_of::<SpaMetaCursor>() {
+        return None;
+    }
+    let field = |name: usize| word(bitmap + name);
+    let format = field(std::mem::offset_of!(SpaMetaBitmap, format))?;
+    let width = field(std::mem::offset_of!(SpaMetaBitmap, size))? as usize;
+    let height = field(std::mem::offset_of!(SpaMetaBitmap, size) + 4)? as usize;
+    let stride = field(std::mem::offset_of!(SpaMetaBitmap, stride))? as i32;
+    let pixels = field(std::mem::offset_of!(SpaMetaBitmap, offset))? as usize;
+    // Which byte of a pixel is alpha. Formats without alpha can't be named.
+    let alpha = match format {
+        SPA_VIDEO_FORMAT_RGBA | SPA_VIDEO_FORMAT_BGRA => 3,
+        SPA_VIDEO_FORMAT_ARGB | SPA_VIDEO_FORMAT_ABGR => 0,
+        _ => return None,
+    };
+    // An offset of 0 is an invisible cursor, which keeps its last shape.
+    if pixels < std::mem::size_of::<SpaMetaBitmap>()
+        || width == 0
+        || height == 0
+        || width > LARGEST_CURSOR as usize
+        || height > LARGEST_CURSOR as usize
+    {
+        return None;
+    }
+    let stride = if stride > 0 {
+        stride as usize
+    } else {
+        width * 4
+    };
+    let start = bitmap + pixels;
+    let end = start + stride * (height - 1) + width * 4;
+    let image = meta.get(start..end)?;
+    let mask: Vec<u8> = (0..height)
+        .flat_map(|row| (0..width).map(move |column| row * stride + column * 4 + alpha))
+        .map(|index| image[index])
+        .collect();
+    Some(classify(width, height, &mask))
 }
 
 /// Sends a buffer's frame to the sink.
@@ -519,8 +682,14 @@ unsafe impl Send for Stream {}
 
 impl Stream {
     /// Connects to screencast node `node`, through `fd` when a portal handed
-    /// one out, or to the session's PipeWire daemon.
-    pub(crate) fn connect(fd: Option<c_int>, node: u32, sink: FrameSink) -> anyhow::Result<Self> {
+    /// one out, or to the session's PipeWire daemon. `cursor` follows the
+    /// pointer's shape when the compositor sends it as metadata.
+    pub(crate) fn connect(
+        fd: Option<c_int>,
+        node: u32,
+        sink: FrameSink,
+        cursor: Arc<Mutex<CursorShape>>,
+    ) -> anyhow::Result<Self> {
         let api = api()?;
         // SAFETY: the calls follow PipeWire's documented setup order; every
         // pointer is checked before it is used.
@@ -560,6 +729,8 @@ impl Stream {
                     stream: std::ptr::null_mut(),
                     sink,
                     format: Mutex::new(None),
+                    cursor,
+                    shapes: Mutex::default(),
                     ended: Mutex::new(None),
                     stopped: AtomicBool::new(false),
                 }),
@@ -682,5 +853,48 @@ mod tests {
         });
         assert_eq!(parse_format(&pod.0), Some((PixelLayout::Rgbx, 2560, 1440)));
         assert_eq!(parse_format(&buffers()), None);
+    }
+
+    #[test]
+    fn the_cursor_metadata_request_is_a_well_formed_pod() {
+        let pod = cursor_meta();
+        assert_eq!(pod.len() % 8, 0);
+        let size = u32::from_ne_bytes(pod[..4].try_into().unwrap()) as usize;
+        assert_eq!(size + 8, pod.len());
+    }
+
+    /// Cursor metadata with a `width` by `height` RGBA image whose alpha is
+    /// `alpha`.
+    fn cursor_meta_bytes(id: u32, width: u32, height: u32, alpha: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for word in [id, 0, 10, 20, 1, 1, 28] {
+            bytes.extend_from_slice(&word.to_ne_bytes());
+        }
+        for word in [SPA_VIDEO_FORMAT_RGBA, width, height, width * 4, 20] {
+            bytes.extend_from_slice(&word.to_ne_bytes());
+        }
+        for &value in alpha {
+            bytes.extend_from_slice(&[1, 2, 3, value]);
+        }
+        bytes
+    }
+
+    #[test]
+    fn reads_the_alpha_of_a_new_cursor_image() {
+        let alpha = [0, 255, 128, 7];
+        let meta = cursor_meta_bytes(1, 2, 2, &alpha);
+        let shape = cursor_image(&meta, |width, height, mask| {
+            assert_eq!((width, height, mask), (2, 2, &alpha[..]));
+            CursorShape::Text
+        });
+        assert_eq!(shape, Some(CursorShape::Text));
+        // No new cursor, or an image cut short.
+        let unnamed = |_: usize, _: usize, _: &[u8]| -> CursorShape { unreachable!() };
+        assert_eq!(
+            cursor_image(&cursor_meta_bytes(0, 2, 2, &alpha), unnamed),
+            None
+        );
+        assert_eq!(cursor_image(&meta[..meta.len() - 1], unnamed), None);
+        assert_eq!(cursor_image(&meta[..20], unnamed), None);
     }
 }

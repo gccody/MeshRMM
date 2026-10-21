@@ -3,10 +3,11 @@
 //! its screen-sharing indicator while a capture runs. Mutter sends the frames
 //! as a PipeWire stream, only when the screen changes.
 use std::collections::HashMap;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use meshrmm_protocol::CursorShape;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use super::pipewire;
@@ -177,10 +178,11 @@ impl Backend for Mutter {
             "org.gnome.Mutter.ScreenCast.Session",
         )?;
         let mut properties = HashMap::new();
-        // 0 leaves the pointer out of the frames; 1 draws it in.
+        // 1 draws the pointer into the frames; 2 sends it beside them, which
+        // names its shape for the viewer.
         properties.insert(
             "cursor-mode",
-            Value::from(u32::from(settings.capture_cursor)),
+            Value::from(if settings.capture_cursor { 1_u32 } else { 2 }),
         );
         let stream_path: OwnedObjectPath = session_proxy
             .call("RecordMonitor", &(output.name.as_str(), properties))
@@ -212,10 +214,12 @@ impl Backend for Mutter {
             }
         };
         tracing::info!(node, output = %output.name, "Mutter started a screencast");
-        let stream = pipewire::Stream::connect(None, node, sink)?;
+        let cursor = Arc::default();
+        let stream = pipewire::Stream::connect(None, node, sink, Arc::clone(&cursor))?;
         Ok(Box::new(MutterStream {
             session: session_proxy,
             stream: Some(stream),
+            cursor,
         }))
     }
 }
@@ -225,6 +229,7 @@ impl Backend for Mutter {
 struct MutterStream {
     session: zbus::blocking::Proxy<'static>,
     stream: Option<pipewire::Stream>,
+    cursor: Arc<Mutex<CursorShape>>,
 }
 
 impl Stream for MutterStream {
@@ -238,6 +243,10 @@ impl Stream for MutterStream {
     /// Mutter fixes the pointer mode when the screencast starts.
     fn set_cursor_capture(&mut self, _enabled: bool) -> bool {
         false
+    }
+
+    fn cursor_shape(&self) -> CursorShape {
+        *self.cursor.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

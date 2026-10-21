@@ -12,6 +12,7 @@
 //! keyboard and mouse.
 pub(crate) mod approval;
 mod capture;
+mod cursor;
 pub(crate) mod display;
 mod encoder;
 mod input;

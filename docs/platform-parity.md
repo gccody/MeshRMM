@@ -101,7 +101,7 @@ yet.
 | Follows the user to sign-in, lock and UAC screens | Yes | Login window yes; lock screen not verified | X11 yes; GNOME Wayland by unlocking; KDE and wlroots greeters not handled |
 | Follows a switch of user at the console | Yes | Yes | Yes |
 | Virtual monitor when none is connected | Yes (SudoVDA) | No | No |
-| Cursor shape shown in the viewer | Yes | Partly: standard AppKit cursors | Partly: X11 only |
+| Cursor shape shown in the viewer | Yes | Partly: standard AppKit cursors | Partly: theme cursors; none on wlroots |
 | User's own pointer drawn into the video while they move it | Yes | Yes | X11 only |
 | Display menu marks the monitor with the user's pointer (`➤`) | Yes | Yes | X11 only |
 
@@ -140,8 +140,13 @@ yet.
   macOS and Linux have no equivalent bundled, so a headless Mac or a Linux
   computer without a graphical session can't be viewed. The viewers offer
   the size setting only for Windows devices.
-- **Cursors on Linux.** Only X11 (through XFixes) names the current cursor;
-  the Wayland backends always report the default arrow. In X11 sessions,
+- **Cursors on Linux.** X11 (through XFixes) names the current cursor.
+  Mutter and KWin send only its image, beside the frames while the viewer
+  draws its own pointer, and the Agent names it by matching the image's
+  shape against the session's Xcursor theme
+  (`agent/src/remote/linux/cursor.rs`); a cursor an application draws
+  itself shows as the arrow. wlr-screencopy sends no cursor image, so
+  wlroots compositors show the arrow. In X11 sessions,
   XInput 2 raw events name the device behind each key and pointer event,
   which tells the viewer's uinput devices from the user's own, and the X
   server tells where the pointer is (`agent/src/remote/linux/pointer.rs`).

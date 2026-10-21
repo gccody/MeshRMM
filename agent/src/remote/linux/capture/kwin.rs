@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use meshrmm_protocol::CursorShape;
 use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_unstable_v1::Pointer;
 
 use super::wayland::Client;
@@ -73,6 +74,8 @@ impl Backend for KWin {
 struct Shared {
     stopped: AtomicBool,
     ended: Mutex<Option<String>>,
+    /// The pointer's shape, from the stream's cursor metadata.
+    cursor: Arc<Mutex<CursorShape>>,
 }
 
 /// Runs the screencast until it is stopped or ends.
@@ -90,10 +93,12 @@ fn capture(
     let screencast = client.state.kde_screencast.clone().context(
         "KWin did not offer its screencast interface; reinstall the MeshRMM Agent so KDE authorizes it",
     )?;
+    // Metadata sends the pointer beside the frames, which names its shape
+    // for the viewer.
     let pointer = if settings.capture_cursor {
         Pointer::Embedded
     } else {
-        Pointer::Hidden
+        Pointer::Metadata
     };
     let handle = client.handle();
     let stream = screencast.stream_output(&output, pointer as u32, &handle, ());
@@ -111,7 +116,7 @@ fn capture(
         }
     };
     tracing::info!(node, output = name, "KWin started a screencast");
-    let pipewire = pipewire::Stream::connect(None, node, sink)?;
+    let pipewire = pipewire::Stream::connect(None, node, sink, Arc::clone(&shared.cursor))?;
     let _ = started.send(Ok(()));
     let ended = loop {
         if shared.stopped.load(Ordering::SeqCst) {
@@ -154,6 +159,10 @@ impl Stream for KWinStream {
     /// KWin fixes the pointer mode when the screencast starts.
     fn set_cursor_capture(&mut self, _enabled: bool) -> bool {
         false
+    }
+
+    fn cursor_shape(&self) -> CursorShape {
+        *self.shared.cursor.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
