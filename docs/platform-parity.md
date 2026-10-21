@@ -91,7 +91,7 @@ yet.
 | 4:4:4 chroma | Yes, where the GPU can | No | No |
 | Software fallback | H.264 4:2:0, 30 FPS | VideoToolbox's own | Always: OpenH264 H.264 4:2:0 |
 | Frame rate | 60 FPS | 60 FPS | 30 FPS |
-| Largest picture | What the encoder accepts | What the encoder accepts | 3840 × 2160, cropped |
+| Largest picture | What the encoder accepts | What the encoder accepts | 3840 × 2160; larger displays are scaled down |
 | Live bitrate changes | H.264 live; H.265 restarts the encoder | H.264 live; H.265 restarts the encoder | Live (H.264 only) |
 | Static screen sharpened after a keyframe | Yes | Yes | Yes |
 | Quality presets, grayscale Ultra data saver | Yes | Yes | Yes |
@@ -111,10 +111,9 @@ yet.
   Software encoding is held to 30 FPS, as the Windows software fallback is
   (`agent/src/remote/linux/encoder.rs`). A hardware path through VA-API or
   NVENC is not implemented.
-- **Linux crops displays larger than 3840 × 2160**, OpenH264's largest
-  picture, instead of scaling them, while the stream still announces the
-  display's full size (`agent/src/remote/linux/encoder.rs`,
-  `agent/src/remote/linux/local.rs`).
+- **Linux scales displays larger than 3840 × 2160** down to OpenH264's
+  largest picture, keeping their shape, so a 5K or 8K display streams at
+  3840 × 2160 (`agent/src/remote/linux/encoder.rs`).
 - **4:4:4 on macOS.** VideoToolbox has no 4:4:4 hardware encoder, so Mac
   Agents encode 4:2:0 only.
 - **H.265 bitrate on macOS** restarts the encoder at every step, because the
