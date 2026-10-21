@@ -23,6 +23,7 @@ mod pointer;
 pub(crate) mod session_close;
 pub(crate) mod sessions;
 pub(crate) mod snapshot;
+pub(crate) mod tray;
 mod ui;
 mod wallpaper;
 

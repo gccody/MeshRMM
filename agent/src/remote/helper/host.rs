@@ -57,6 +57,14 @@ pub fn run(socket: &Path) -> anyhow::Result<()> {
 #[cfg(target_os = "linux")]
 pub fn run_started(stream: UnixStream, login_window: bool) -> anyhow::Result<()> {
     let input = Arc::new(LocalInput::new()?);
+    // The login screen has no tray, and nobody to chat with there.
+    let _tray = (!login_window)
+        .then(|| {
+            crate::remote::linux::tray::Tray::start(Arc::clone(&input) as _)
+                .inspect_err(|error| tracing::warn!(error = ?error, "could not show the tray icon"))
+                .ok()
+        })
+        .flatten();
     tracing::info!(login_window, "session helper started");
     let result = serve(stream, &input, login_window);
     input.end_session();
