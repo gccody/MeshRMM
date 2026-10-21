@@ -5,6 +5,7 @@ import {
   type AgentInstallerBootstrap,
   type AgentPlatform,
   INSTALLER_ASSETS,
+  isWindowsPlatform,
   enrolledInstaller,
   linuxInstallCommand,
   macInstallCommand,
@@ -63,7 +64,7 @@ export function useInstallerDownload(authorizedFetch: AuthorizedFetch) {
         throw new Error(await errorMessage(bootstrapResponse, "The Agent installer could not be authorized."));
       }
       const bootstrap = (await bootstrapResponse.json()) as AgentInstallerBootstrap;
-      if (platform !== "windows-x64") {
+      if (!isWindowsPlatform(platform)) {
         setCommand((platform === "macos" ? macInstallCommand : linuxInstallCommand)(bootstrap.server, bootstrap));
         setDownloaded(true);
         return;

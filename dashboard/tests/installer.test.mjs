@@ -3,7 +3,9 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   ENROLLMENT_MAGIC,
+  INSTALLER_ASSETS,
   enrolledInstaller,
+  isWindowsPlatform,
   linuxInstallCommand,
   macInstallCommand,
   publishedChecksum,
@@ -11,6 +13,15 @@ import {
 } from "../features/enrollment/installer.ts";
 
 const digest = "ab".repeat(32);
+
+test("Windows installs from an installer for its architecture; macOS and Linux from a command", () => {
+  assert.ok(isWindowsPlatform("windows-x64"));
+  assert.ok(isWindowsPlatform("windows-arm64"));
+  assert.ok(!isWindowsPlatform("macos"));
+  assert.ok(!isWindowsPlatform("linux"));
+  assert.equal(INSTALLER_ASSETS["windows-arm64"].target, "agent-windows-arm64");
+  assert.equal(INSTALLER_ASSETS["windows-arm64"].binary, "/downloads/meshrmm-agent-windows-arm64.exe");
+});
 
 test("the published checksum is the update manifest's SHA-256 for the target", () => {
   const manifest = (sha256) => ({ schema_version: 2, releases: { "agent-windows-x64": { sha256 } } });

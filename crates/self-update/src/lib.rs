@@ -18,6 +18,7 @@ pub const CURRENT_VERSION: &str = env!("MESHRMM_RELEASE_VERSION");
 /// can offer an update but cannot forge one.
 pub const RELEASE_PUBLIC_KEY: &str = env!("MESHRMM_RELEASE_PUBLIC_KEY");
 pub const AGENT_WINDOWS_X64: &str = "agent-windows-x64";
+pub const AGENT_WINDOWS_ARM64: &str = "agent-windows-arm64";
 /// The universal (Apple silicon and Intel) macOS Agent.
 pub const AGENT_MACOS: &str = "agent-macos";
 pub const AGENT_LINUX_X64: &str = "agent-linux-x64";

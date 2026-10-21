@@ -9,7 +9,7 @@ use anyhow::{Context, bail};
 use meshrmm_self_update::windows::{
     PreviousProcess, current_process_created, helper_cleanup_command,
 };
-use meshrmm_self_update::{AGENT_WINDOWS_X64, CURRENT_VERSION, UpdateManifest};
+use meshrmm_self_update::{CURRENT_VERSION, UpdateManifest};
 use tracing_subscriber::EnvFilter;
 use windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
 use windows_service::service::{Service, ServiceAccess, ServiceState};
@@ -34,13 +34,19 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_STARTUP_GRACE: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// This build's release target.
+#[cfg(target_arch = "x86_64")]
+const TARGET: &str = meshrmm_self_update::AGENT_WINDOWS_X64;
+#[cfg(target_arch = "aarch64")]
+const TARGET: &str = meshrmm_self_update::AGENT_WINDOWS_ARM64;
+
 /// Returns the version of the update it staged, after which the service must stop.
 pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
     let http = http_agent();
     let manifest_bytes = download(&http, &config.update_manifest_url, MAX_MANIFEST_BYTES)
         .context("failed to download the Agent update manifest")?;
     let manifest = UpdateManifest::parse(&manifest_bytes)?;
-    let Some(release) = manifest.newer_release(AGENT_WINDOWS_X64, CURRENT_VERSION)? else {
+    let Some(release) = manifest.newer_release(TARGET, CURRENT_VERSION)? else {
         return Ok(None);
     };
 

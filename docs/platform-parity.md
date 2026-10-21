@@ -17,7 +17,7 @@ yet.
 | | Windows | macOS | Linux |
 |---|---|---|---|
 | Minimum version | Windows 10 1903 | macOS 12.3 | systemd, glibc 2.28 |
-| Architectures | x64 | Universal (Apple silicon and Intel) | x64, arm64 |
+| Architectures | x64, arm64 | Universal (Apple silicon and Intel) | x64, arm64 |
 | Install | Setup executable with the authorization appended | One-time Terminal command (`install-agent-macos.sh`) | One-time shell command (`install-agent-linux.sh`) |
 | Runs as | LocalSystem service, plus helpers per session | launchd daemon (root), plus a launchd agent per graphical session | systemd service (root), plus a helper per graphical session |
 | Re-running the installer repairs and keeps the identity | Yes | Yes | Yes |
@@ -28,9 +28,12 @@ yet.
 | Console mode for development (`--console`) | Yes | Yes | Yes |
 | Privacy permissions the user must grant | None | Screen & System Audio Recording, Accessibility, Input Monitoring | None |
 
-- **Windows is x64 only.** `scripts/build-agent.ps1` builds for the host and
-  there is no ARM64 release target (`scripts/release-artifacts.mjs`). Not
-  implemented.
+- **Windows on ARM64** gets its own Agent, built natively on an ARM64
+  runner (`agent-windows-arm64`), and the website offers its installer. It
+  works as the x64 Agent does except for the virtual monitor: Windows loads
+  only drivers built for its own architecture and the bundled SudoVDA is x64,
+  so a headless ARM64 computer can't be viewed. The viewer has no ARM64
+  build and runs under Windows' x64 emulation.
 - **macOS 12.3** is the first version with ScreenCaptureKit, which the Agent
   captures video and thumbnails with. System audio, though, uses
   `SCStreamConfiguration.capturesAudio`, a macOS 13 API. On macOS 12 the Agent
@@ -100,7 +103,7 @@ yet.
 | Sessions offered | Console, each active Remote Desktop session, Background | Console | Console |
 | Follows the user to sign-in, lock and UAC screens | Yes | Login window yes; lock screen not verified | X11 yes; GNOME Wayland by unlocking; KDE and wlroots greeters not handled |
 | Follows a switch of user at the console | Yes | Yes | Yes |
-| Virtual monitor when none is connected | Yes (SudoVDA) | No | No |
+| Virtual monitor when none is connected | Yes (SudoVDA), x64 only | No | No |
 | Cursor shape shown in the viewer | Yes | Partly: standard AppKit cursors | Partly: theme cursors; none on wlroots |
 | User's own pointer drawn into the video while they move it | Yes | Yes | X11 only |
 | Display menu marks the monitor with the user's pointer (`➤`) | Yes | Yes | X11 only |

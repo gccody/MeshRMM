@@ -2,7 +2,13 @@
 // followed by the bootstrap JSON and a trailer the Agent reads from the end of
 // its own file; for macOS and Linux, a terminal command, since appending to a
 // signed Mac app would break its signature.
-export type AgentPlatform = "windows-x64" | "macos" | "linux";
+export type AgentPlatform = WindowsPlatform | "macos" | "linux";
+// Windows installs from a downloaded installer, one for each architecture.
+export type WindowsPlatform = "windows-x64" | "windows-arm64";
+
+export function isWindowsPlatform(platform: AgentPlatform): platform is WindowsPlatform {
+  return platform === "windows-x64" || platform === "windows-arm64";
+}
 
 export type AgentInstallerBootstrap = {
   server: string;
@@ -13,12 +19,18 @@ export type AgentInstallerBootstrap = {
 // The server's update manifest lists each build it ships with its SHA-256.
 export const UPDATE_MANIFEST = "/downloads/update-manifest.json";
 
-export const INSTALLER_ASSETS: Record<"windows-x64", { label: string; binary: string; target: string; fileName: string }> = {
+export const INSTALLER_ASSETS: Record<WindowsPlatform, { label: string; binary: string; target: string; fileName: string }> = {
   "windows-x64": {
     label: "Windows 10/11 (x64)",
     binary: "/downloads/meshrmm-agent-windows-x64.exe",
     target: "agent-windows-x64",
     fileName: "MeshRMM-Agent-Setup-Windows-x64.exe",
+  },
+  "windows-arm64": {
+    label: "Windows 11 (ARM64)",
+    binary: "/downloads/meshrmm-agent-windows-arm64.exe",
+    target: "agent-windows-arm64",
+    fileName: "MeshRMM-Agent-Setup-Windows-ARM64.exe",
   },
 };
 
