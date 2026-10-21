@@ -13,8 +13,9 @@ most of what the Windows Agent does, and this page says where it differs.
   Windows key.
 - **Audio.** ScreenCaptureKit captures the Mac's system audio, from macOS 13;
   on macOS 12 sessions have no audio.
-- **Clipboard, file transfer and chat.** A menu bar item opens the chat during
-  a session, and it opens by itself for the technician's messages.
+- **Clipboard, file transfer and chat.** The Agent keeps a menu bar item
+  while a user is signed in. During a session it opens the chat, which also
+  opens by itself for the technician's messages.
 - **Company policy.** The session banner, the connection notification and the
   connection approval prompt work as on Windows. The viewed-display border is
   left out of the capture, and the technician's annotations are drawn over
