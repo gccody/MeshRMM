@@ -35,7 +35,9 @@ With a graphical session on the computer's screen, remote sessions too:
   keys and pointer. The display server reads them like real devices, so
   input reaches the lock and login screens too, and the session's own
   keyboard layout applies. **Type clipboard** types the characters a US
-  keyboard has.
+  keyboard has. In X11 sessions, the Agent tells the user's own
+  keyboard and mouse from the viewer's, so the viewer shows the user's
+  pointer while they use it and marks the monitor it is on.
 - **Audio.** The default output's sound is captured through the PulseAudio
   protocol, which PulseAudio and PipeWire's `pipewire-pulse` both serve.
   Without `libpulse-simple` or a sound server, sessions have no audio.

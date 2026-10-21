@@ -102,8 +102,8 @@ yet.
 | Follows a switch of user at the console | Yes | Yes | Yes |
 | Virtual monitor when none is connected | Yes (SudoVDA) | No | No |
 | Cursor shape shown in the viewer | Yes | Partly: standard AppKit cursors | Partly: X11 only |
-| User's own pointer drawn into the video while they move it | Yes | Yes | No |
-| Display menu marks the monitor with the user's pointer (`➤`) | Yes | Yes | No |
+| User's own pointer drawn into the video while they move it | Yes | Yes | X11 only |
+| Display menu marks the monitor with the user's pointer (`➤`) | Yes | Yes | X11 only |
 
 - **Linux encodes in software.** The Agent bundles OpenH264, which encodes
   H.264 4:2:0 only, so H.265 and 4:4:4 are unavailable and
@@ -138,12 +138,14 @@ yet.
   computer without a graphical session can't be viewed. The viewers offer
   the size setting only for Windows devices.
 - **Cursors on Linux.** Only X11 (through XFixes) names the current cursor;
-  the Wayland backends always report the default arrow. A Linux Agent also
-  always reports that the technician controls input, because no Linux
-  backend tracks the local user's pointer
-  (`agent/src/remote/linux/local.rs`). So the user's own pointer is drawn
-  into the video only while the technician records, and the display menu
-  never marks the user's monitor.
+  the Wayland backends always report the default arrow. In X11 sessions,
+  XInput 2 raw events name the device behind each key and pointer event,
+  which tells the viewer's uinput devices from the user's own, and the X
+  server tells where the pointer is (`agent/src/remote/linux/pointer.rs`).
+  Wayland compositors tell clients neither, so on Wayland the Agent always
+  reports that the technician controls input: the user's own pointer is
+  drawn into the video only while the technician records, and the display
+  menu never marks the user's monitor.
 - **Cursors on macOS** are matched to AppKit's standard cursors by image;
   any other cursor shows as the arrow (`agent/src/remote/macos/cursor.rs`).
 
