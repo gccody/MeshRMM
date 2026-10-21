@@ -156,10 +156,12 @@ pub(crate) fn layout(members: &[Display], scales: &[f64]) -> Option<Layout> {
     let scale = finest
         .min(LARGEST_PICTURE.0 / f64::from(all.width))
         .min(LARGEST_PICTURE.1 / f64::from(all.height));
-    let even = |value: f64| ((value.round() as usize) & !1).max(2);
+    let even = |value: f64| (value.round() as usize) & !1;
+    // A size is at least one 4:2:0 block.
+    let size = |value: f64| even(value).max(2);
     let (width, height) = (
-        even(f64::from(all.width) * scale),
-        even(f64::from(all.height) * scale),
+        size(f64::from(all.width) * scale),
+        size(f64::from(all.height) * scale),
     );
     let rects = members
         .iter()
@@ -169,8 +171,8 @@ pub(crate) fn layout(members: &[Display], scales: &[f64]) -> Option<Layout> {
             (
                 left,
                 top,
-                even(f64::from(member.width) * scale).min(width - left),
-                even(f64::from(member.height) * scale).min(height - top),
+                size(f64::from(member.width) * scale).min(width - left),
+                size(f64::from(member.height) * scale).min(height - top),
             )
         })
         .collect();
