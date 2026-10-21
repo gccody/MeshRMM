@@ -217,6 +217,11 @@ impl SessionIndicator {
         })
     }
 
+    /// Asks the user for a reply to the technician.
+    pub(crate) fn ask_for_reply(&self) {
+        ask_for_reply(&self.viewer_name, &self.chat);
+    }
+
     /// Shows a message from the technician with a Reply button.
     pub(crate) fn show_message(&self, text: &str) {
         let replies = self.chat.clone();

@@ -378,6 +378,23 @@ impl LocalInput {
     }
 }
 
+/// The tray icon opens a chat reply while a session offers chat.
+impl super::tray::TrayChat for LocalInput {
+    fn chat_available(&self) -> bool {
+        self.chat.available()
+            && self
+                .indicator
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+    }
+    fn ask_for_reply(&self) {
+        if let Some(indicator) = &*self.indicator.lock().unwrap_or_else(|e| e.into_inner()) {
+            indicator.ask_for_reply();
+        }
+    }
+}
+
 impl ScreenInput for LocalInput {
     fn set_wallpaper_hidden(&self, hidden: bool) -> anyhow::Result<()> {
         self.wallpaper
