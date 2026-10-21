@@ -87,7 +87,7 @@ pub(crate) struct EncoderSettings {
 }
 
 /// A 4:2:0 picture with even dimensions, ready to encode.
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct Picture {
     width: usize,
     height: usize,
@@ -97,50 +97,201 @@ struct Picture {
     timestamp_us: u64,
 }
 
+/// The size a display of `width` by `height` is encoded at: cropped by at
+/// most a row and a column to even dimensions, and scaled down to fit
+/// OpenH264's largest picture, keeping its shape.
+pub(crate) fn encoded_size(width: u32, height: u32) -> (u32, u32) {
+    let (width, height) = if width <= MAX_WIDTH && height <= MAX_HEIGHT {
+        (width, height)
+    } else if u64::from(width) * u64::from(MAX_HEIGHT) >= u64::from(height) * u64::from(MAX_WIDTH) {
+        (
+            MAX_WIDTH,
+            (u64::from(height) * u64::from(MAX_WIDTH) / u64::from(width)) as u32,
+        )
+    } else {
+        (
+            (u64::from(width) * u64::from(MAX_HEIGHT) / u64::from(height)) as u32,
+            MAX_HEIGHT,
+        )
+    };
+    ((width & !1).max(2), (height & !1).max(2))
+}
+
+/// How a frame larger than the picture is sampled: for each picture column
+/// and row, the two source pixels around its centre and the second one's
+/// weight out of 256. Columns are byte offsets into a row.
+struct Scale {
+    columns: Vec<(usize, usize, u16)>,
+    rows: Vec<(usize, usize, u16)>,
+}
+
+impl Scale {
+    fn new(frame: &RawFrame<'_>, width: usize, height: usize) -> Self {
+        let samples = |source: usize, target: usize| {
+            (0..target).map(move |index| {
+                // The centre of target pixel `index`, in source pixels times
+                // 256, less half a pixel.
+                let centre = ((2 * index + 1) * source * 256 / (2 * target)).saturating_sub(128);
+                let first = (centre >> 8).min(source - 1);
+                (first, (first + 1).min(source - 1), (centre & 255) as u16)
+            })
+        };
+        Self {
+            columns: samples(frame.width as usize, width)
+                .map(|(left, right, weight)| (left * 4, right * 4, weight))
+                .collect(),
+            rows: samples(frame.height as usize, height).collect(),
+        }
+    }
+
+    /// Picture row `row` into `output`, in the frame's pixel layout:
+    /// blended down from the two source rows into `between`, then across.
+    fn row(&self, frame: &RawFrame<'_>, row: usize, between: &mut [u8], output: &mut [u8]) {
+        let (above, below, weight) = self.rows[row];
+        let length = between.len();
+        let line = |row: usize| &frame.data[row * frame.stride..][..length];
+        let source = if weight == 0 {
+            line(above)
+        } else {
+            // Byte by byte in 16 bits, which the products fit, so it
+            // vectorizes.
+            let keep = 256 - weight;
+            for ((out, &first), &second) in between.iter_mut().zip(line(above)).zip(line(below)) {
+                *out = ((u16::from(first) * keep + u16::from(second) * weight + 128) >> 8) as u8;
+            }
+            &*between
+        };
+        for (out, &(left, right, weight)) in output.chunks_exact_mut(4).zip(&self.columns) {
+            let keep = 256 - weight;
+            let (left, right) = (&source[left..left + 4], &source[right..right + 4]);
+            for byte in 0..4 {
+                out[byte] = ((u16::from(left[byte]) * keep + u16::from(right[byte]) * weight + 128)
+                    >> 8) as u8;
+            }
+        }
+    }
+}
+
 impl Picture {
-    /// Converts `frame`, cropped to even dimensions, reusing this picture's
-    /// buffers.
+    /// Converts `frame` at its [`encoded_size`], reusing this picture's
+    /// buffers. A larger frame is scaled down bilinearly. Bands of rows are
+    /// converted in parallel.
     fn convert(&mut self, frame: &RawFrame<'_>, grayscale: bool) {
-        let width = (frame.width.min(MAX_WIDTH) & !1) as usize;
-        let height = (frame.height.min(MAX_HEIGHT) & !1) as usize;
+        let (width, height) = encoded_size(frame.width, frame.height);
+        let (width, height) = (width as usize, height as usize);
         self.width = width;
         self.height = height;
         self.timestamp_us = frame.timestamp_us;
         self.y.resize(width * height, 0);
         self.u.resize(width * height / 4, 0);
         self.v.resize(width * height / 4, 0);
-        let (red, green, blue) = frame.layout.offsets();
+        let scale = ((width, height) != (frame.width as usize & !1, frame.height as usize & !1))
+            .then(|| Scale::new(frame, width, height));
+        let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get());
+        // Pairs of rows, as 4:2:0 needs.
+        let band = height.div_ceil(2).div_ceil(threads.clamp(1, 8)) * 2;
         let chroma_width = width / 2;
-        for row in (0..height).step_by(2) {
-            let top = &frame.data[row * frame.stride..];
-            let bottom = &frame.data[(row + 1) * frame.stride..];
-            for column in (0..width).step_by(2) {
-                let (mut sum_r, mut sum_g, mut sum_b) = (0_i32, 0_i32, 0_i32);
-                for (line, source) in [(row, top), (row + 1, bottom)] {
-                    for x in [column, column + 1] {
-                        let pixel = &source[x * 4..x * 4 + 4];
-                        let r = i32::from(pixel[red]);
-                        let g = i32::from(pixel[green]);
-                        let b = i32::from(pixel[blue]);
-                        self.y[line * width + x] =
-                            ((47 * r + 157 * g + 16 * b + 128) >> 8) as u8 + 16;
-                        sum_r += r;
-                        sum_g += g;
-                        sum_b += b;
-                    }
-                }
-                let index = row / 2 * chroma_width + column / 2;
-                if grayscale {
-                    self.u[index] = 128;
-                    self.v[index] = 128;
-                } else {
-                    // The sums are four pixels: shift by two more bits.
-                    self.u[index] =
-                        (((-26 * sum_r - 87 * sum_g + 112 * sum_b + 512) >> 10) + 128) as u8;
-                    self.v[index] =
-                        (((112 * sum_r - 102 * sum_g - 10 * sum_b + 512) >> 10) + 128) as u8;
-                }
+        std::thread::scope(|scope| {
+            let mut bands = self
+                .y
+                .chunks_mut(band * width)
+                .zip(self.u.chunks_mut(band / 2 * chroma_width))
+                .zip(self.v.chunks_mut(band / 2 * chroma_width))
+                .enumerate()
+                .map(|(index, ((y, u), v))| {
+                    let scale = scale.as_ref();
+                    move || convert_band(frame, scale, width, index * band, y, u, v, grayscale)
+                });
+            // This thread converts the first band while others do the rest.
+            let first = bands.next();
+            for convert in bands {
+                scope.spawn(convert);
             }
+            if let Some(mut convert) = first {
+                convert();
+            }
+        });
+    }
+}
+
+/// Converts picture rows `first_row` onwards into `y`, `u` and `v`, which
+/// hold a band of whole rows.
+#[allow(clippy::too_many_arguments)]
+fn convert_band(
+    frame: &RawFrame<'_>,
+    scale: Option<&Scale>,
+    width: usize,
+    first_row: usize,
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+    grayscale: bool,
+) {
+    let offsets = frame.layout.offsets();
+    let chroma_width = width / 2;
+    // Scaling needs a source row and two picture rows of its own.
+    let (mut between, mut lines) = match scale {
+        Some(_) => (
+            vec![0; frame.width as usize * 4],
+            [vec![0; width * 4], vec![0; width * 4]],
+        ),
+        None => Default::default(),
+    };
+    let pairs = y
+        .chunks_exact_mut(2 * width)
+        .zip(u.chunks_exact_mut(chroma_width))
+        .zip(v.chunks_exact_mut(chroma_width));
+    for (pair, ((y, u), v)) in pairs.enumerate() {
+        let row = first_row + pair * 2;
+        let source = match scale {
+            Some(scale) => {
+                let [top, bottom] = &mut lines;
+                scale.row(frame, row, &mut between, top);
+                scale.row(frame, row + 1, &mut between, bottom);
+                [&top[..], &bottom[..]]
+            }
+            None => [
+                &frame.data[row * frame.stride..],
+                &frame.data[(row + 1) * frame.stride..],
+            ],
+        };
+        convert_pair(source, offsets, y, u, v, grayscale);
+    }
+}
+
+/// Converts two rows of pixels, with red, green and blue at `offsets`, into
+/// two rows of `y` and a row each of `u` and `v`.
+fn convert_pair(
+    lines: [&[u8]; 2],
+    (red, green, blue): (usize, usize, usize),
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+    grayscale: bool,
+) {
+    let width = y.len() / 2;
+    for column in (0..width).step_by(2) {
+        let (mut sum_r, mut sum_g, mut sum_b) = (0_i32, 0_i32, 0_i32);
+        for (line, source) in lines.into_iter().enumerate() {
+            for x in [column, column + 1] {
+                let pixel = &source[x * 4..x * 4 + 4];
+                let r = i32::from(pixel[red]);
+                let g = i32::from(pixel[green]);
+                let b = i32::from(pixel[blue]);
+                y[line * width + x] = ((47 * r + 157 * g + 16 * b + 128) >> 8) as u8 + 16;
+                sum_r += r;
+                sum_g += g;
+                sum_b += b;
+            }
+        }
+        let index = column / 2;
+        if grayscale {
+            u[index] = 128;
+            v[index] = 128;
+        } else {
+            // The sums are four pixels: shift by two more bits.
+            u[index] = (((-26 * sum_r - 87 * sum_g + 112 * sum_b + 512) >> 10) + 128) as u8;
+            v[index] = (((112 * sum_r - 102 * sum_g - 10 * sum_b + 512) >> 10) + 128) as u8;
         }
     }
 }
@@ -451,6 +602,49 @@ mod tests {
         assert_eq!((picture.width, picture.height), (2, 2));
         assert!(frame(&data, 3, 3, PixelLayout::Bgrx).valid());
         assert!(!frame(&data[..20], 3, 3, PixelLayout::Bgrx).valid());
+    }
+
+    #[test]
+    fn displays_larger_than_4k_are_scaled_to_fit_keeping_their_shape() {
+        assert_eq!(encoded_size(1920, 1080), (1920, 1080));
+        assert_eq!(encoded_size(3840, 2160), (3840, 2160));
+        assert_eq!(encoded_size(5120, 2880), (3840, 2160));
+        assert_eq!(encoded_size(7680, 4320), (3840, 2160));
+        // 16:10 is held by its height, an ultrawide by its width.
+        assert_eq!(encoded_size(3840, 2400), (3456, 2160));
+        assert_eq!(encoded_size(5120, 1440), (3840, 1080));
+        assert_eq!(encoded_size(2160, 3840), (1214, 2160));
+        assert_eq!(encoded_size(40_000, 3), (3840, 2));
+    }
+
+    #[test]
+    fn scaling_down_averages_the_pixels_it_covers() {
+        // Black and white columns, at twice the width that fits.
+        let (width, height) = (7680_u32, 8_u32);
+        let mut data = vec![0_u8; width as usize * height as usize * 4];
+        for (index, pixel) in data.chunks_exact_mut(4).enumerate() {
+            if index % 2 == 1 {
+                pixel.copy_from_slice(&[255; 4]);
+            }
+        }
+        let mut picture = Picture::default();
+        picture.convert(&frame(&data, width, height, PixelLayout::Bgrx), false);
+        assert_eq!((picture.width, picture.height), (3840, 4));
+        assert!(
+            picture.y.iter().all(|&luma| (125..=126).contains(&luma)),
+            "every pixel is mid gray"
+        );
+        // A white left half stays white and a black right half black, apart
+        // from the column on the edge.
+        for (index, pixel) in data.chunks_exact_mut(4).enumerate() {
+            let white = (index % width as usize) < width as usize / 2;
+            pixel.copy_from_slice(&[if white { 255 } else { 0 }; 4]);
+        }
+        picture.convert(&frame(&data, width, height, PixelLayout::Bgrx), false);
+        assert_eq!(picture.y[0], 235);
+        assert_eq!(picture.y[1918], 235);
+        assert_eq!(picture.y[1921], 16);
+        assert_eq!(picture.y[3839], 16);
     }
 
     #[test]

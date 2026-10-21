@@ -23,7 +23,8 @@ With a graphical session on the computer's screen, remote sessions too:
   on Wayland through Mutter's screencast interface, KDE Plasma on Wayland
   through KWin's, and wlroots compositors such as sway and Hyprland through
   wlr-screencopy. OpenH264 encodes the frames in software as H.264 4:2:0, at
-  up to 30 frames a second. GNOME on Wayland refuses screen capture at its
+  up to 30 frames a second, scaling a display larger than 3840 × 2160 down
+  to fit. GNOME on Wayland refuses screen capture at its
   login screen and while its screen is locked. When the console's session
   is locked, the Agent unlocks it through logind, so the technician sees the
   desktop, and locks it again when the remote session ends; the session

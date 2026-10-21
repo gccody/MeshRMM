@@ -212,7 +212,7 @@ impl LocalScreen {
 
 fn active_display_size(running: &Option<Running>) -> (u32, u32) {
     running.as_ref().map_or((0, 0), |running| {
-        (running.output.width & !1, running.output.height & !1)
+        super::encoder::encoded_size(running.output.width, running.output.height)
     })
 }
 
