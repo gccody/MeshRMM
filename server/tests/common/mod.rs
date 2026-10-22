@@ -832,7 +832,19 @@ pub enum Received {
     Gone,
 }
 
+/// What a socket received next, skipping the alert counts the event socket
+/// sends after each snapshot, which only the alert tests check.
 pub async fn receive(socket: &mut Ws) -> Received {
+    loop {
+        match receive_any(socket).await {
+            Received::Json(value) if value["type"] == "alert_counts" => {}
+            other => return other,
+        }
+    }
+}
+
+/// What a socket received next, ignoring pings and pongs only.
+pub async fn receive_any(socket: &mut Ws) -> Received {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -857,6 +869,14 @@ pub async fn receive(socket: &mut Ws) -> Received {
 /// The next JSON message.
 pub async fn receive_json(socket: &mut Ws) -> serde_json::Value {
     match receive(socket).await {
+        Received::Json(value) => value,
+        other => panic!("expected a message, got {other:?}"),
+    }
+}
+
+/// The next JSON message, alert counts included.
+pub async fn receive_any_json(socket: &mut Ws) -> serde_json::Value {
+    match receive_any(socket).await {
         Received::Json(value) => value,
         other => panic!("expected a message, got {other:?}"),
     }
