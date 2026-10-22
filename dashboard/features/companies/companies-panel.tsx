@@ -7,6 +7,7 @@ import { matchesCompanyName } from "../agents/model";
 import type { Company } from "../agents/types";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
+import { GroupingTabs } from "./area-tabs";
 import { CompanyDialog } from "./company-dialogs";
 
 type Counts = { total: number; online: number };
@@ -81,6 +82,7 @@ export function CompaniesPanel() {
         {companies.length > 0 && <label className="search-field"><Search size={16} aria-hidden="true" /><input type="search" aria-label="Search companies" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search companies" /></label>}
         {canManage && <button type="button" className="primary-button" onClick={(event) => open(null, event.currentTarget)} aria-haspopup="dialog"><Plus size={16} /> New company</button>}
       </HeaderActions>
+      <GroupingTabs current="companies" />
       <section className="agent-panel">
         {companies.length === 0 ? (
           <div className="empty-state">

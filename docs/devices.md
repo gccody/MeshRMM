@@ -67,8 +67,8 @@ nine colors (gray, red, orange, amber, green, teal, blue, purple, pink); each
 color has a shade for a dark and a light page. A device can have up to 50
 tags.
 
-The **Tags** page lists them with how many devices have each (linking to
-the wall filtered by it) and how many automation policies and alert rules
+The **Tags** page (`/tags`, a tab beside **Companies**) lists them with how
+many devices have each (linking to the wall filtered by it) and how many automation policies and alert rules
 target it. Users with `tags.manage` create, rename, recolor and delete tags
 there. Deleting a tag takes it off its devices; policies and rules that
 targeted it no longer cover those devices, and the page says how many

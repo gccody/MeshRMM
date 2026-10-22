@@ -73,6 +73,7 @@ test("the Alerts area opens to who may see alerts, and its channels to who manag
   assert.equal(homeView(account(["alerts.view"])), "alerts");
   assert.equal(viewForPath("/alert-rules"), "alert-rules");
   assert.equal(navViewFor("alert-rules"), "alerts");
+  assert.equal(navViewFor("tags"), "companies");
   assert.equal(navViewFor("notification-channels"), "alerts");
   assert.equal(navViewFor("device"), "devices");
   assert.equal(navViewFor("users"), "users");

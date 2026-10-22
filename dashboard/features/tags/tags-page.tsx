@@ -8,6 +8,7 @@ import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import { type TagSummary, matchesTagName } from "./model";
 import { TagChip } from "./tag-chip";
+import { GroupingTabs } from "../companies/area-tabs";
 import { TagDialog } from "./tag-dialogs";
 import { deleteTag, fetchTags } from "./tags-api";
 
@@ -109,6 +110,7 @@ export function TagsPage() {
         {tags.length > 0 && <label className="search-field"><Search size={16} aria-hidden="true" /><input type="search" aria-label="Search tags" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search tags" /></label>}
         {canManage && <button type="button" className="primary-button" onClick={(event) => open(null, event.currentTarget)} aria-haspopup="dialog"><Plus size={16} /> New tag</button>}
       </HeaderActions>
+      <GroupingTabs current="tags" />
       <section className="agent-panel">
         {tags.length === 0 ? (
           <div className="empty-state">

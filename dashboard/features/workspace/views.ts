@@ -98,10 +98,11 @@ export function homeView(account: Pick<Account, "permissions" | "is_administrato
 }
 
 // The navigation entry a page sits under: a device and its terminals under
-// Devices, the alert rules and channels under Alerts, and a job and the
-// policies under Jobs.
+// Devices, tags under Companies, the alert rules and channels under Alerts,
+// and a job and the policies under Jobs.
 export function navViewFor(view: View): View {
   if (view === "device" || view === "terminal") return "devices";
+  if (view === "tags") return "companies";
   if (view === "job" || view === "policies") return "jobs";
   if (view === "alert-rules" || view === "notification-channels") return "alerts";
   return view;

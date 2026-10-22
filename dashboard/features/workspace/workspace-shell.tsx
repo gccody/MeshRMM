@@ -34,7 +34,7 @@ const CONNECTION_STATUS: Record<InventoryConnection, string> = {
 
 // Day-to-day pages, then administration, which the bar sets apart.
 const NAV_GROUPS: View[][] = [
-  ["devices", "companies", "tags", "software", "updates", "toolbox", "jobs", "alerts"],
+  ["devices", "companies", "software", "updates", "toolbox", "jobs", "alerts"],
   ["users", "roles", "authentication", "settings", "audit"],
 ];
 
