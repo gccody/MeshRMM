@@ -7,6 +7,7 @@ import { EnrollmentModal } from "../enrollment/enrollment-modal";
 import { useInstallerDownload } from "../enrollment/use-installer-download";
 import { ConnectionReasonModal } from "../session/connection-reason-modal";
 import { ViewerLaunchNotice } from "../session/viewer-launch-notice";
+import { StartJobModal } from "../automation/start-job-modal";
 import { RunScriptModal } from "../toolbox/run-script-modal";
 import { type ActionErrorSource, listActionErrors } from "../workspace/action-errors";
 import { useWorkspace } from "../workspace/workspace-context";
@@ -44,6 +45,7 @@ export function DevicesPanel() {
     connectBackground: can("sessions.connect_background"),
     closeSession: can("sessions.connect") || can("sessions.close_any"),
     runScripts: can("scripts.run"),
+    deliverFiles: can("files.deliver"),
     delete: can("devices.delete"),
     enroll: can("devices.enroll"),
     moveCompany: can("companies.manage"),
@@ -53,6 +55,10 @@ export function DevicesPanel() {
   // The device a script is about to run on, and the button that asked.
   const [runScriptOn, setRunScriptOn] = useState<Agent | null>(null);
   const runScriptOpener = useRef<HTMLElement | null>(null);
+  // The devices chosen for a job, the job being set up, and its opener.
+  const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
+  const [startingJob, setStartingJob] = useState<"script" | "file" | null>(null);
+  const jobOpener = useRef<HTMLElement | null>(null);
   // The device being moved to another company, and the menu that asked.
   const [moving, setMoving] = useState<Agent | null>(null);
   const moveOpener = useRef<HTMLElement | null>(null);
@@ -133,7 +139,25 @@ export function DevicesPanel() {
         onCloseSession={(agent) => void remote.closeSession(agent)}
         onDelete={(agent) => void deleteAgent(agent)}
         onRunScript={(agent, opener) => { runScriptOpener.current = opener; setRunScriptOn(agent); }}
+        selection={{
+          ids: selected,
+          onChange: (agent, chosen) => setSelected((current) => {
+            const next = new Set(current);
+            if (chosen) next.add(agent.id);
+            else next.delete(agent.id);
+            return next;
+          }),
+          onSelectAll: (agents) => setSelected((current) => new Set([...current, ...agents.map((agent) => agent.id)])),
+          onClear: () => setSelected(new Set()),
+          onStartJob: (kind, opener) => { jobOpener.current = opener; setStartingJob(kind); },
+        }}
       />
+      {startingJob && <StartJobModal
+        kind={startingJob}
+        deviceIds={inventory.agents.filter((agent) => selected.has(agent.id)).map((agent) => agent.id)}
+        onClose={() => setStartingJob(null)}
+        returnFocus={jobOpener}
+      />}
       {isEnrolling && <EnrollmentModal
         platform={installer.platform}
         error={installer.error}

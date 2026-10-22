@@ -67,6 +67,8 @@ permissions! {
     ScriptsManageShared = "scripts.manage_shared": "Create, edit and delete shared toolbox scripts.",
     FilesDeliver = "files.deliver": "Deliver toolbox files to devices.",
     FilesManageShared = "files.manage_shared": "Upload, edit and delete shared toolbox files.",
+    JobsRunWide = "jobs.run_wide": "Run scripts and send files on whole companies or on every device at once.",
+    AutomationManage = "automation.manage": "Create, edit and delete automation policies, which run shared scripts on a schedule or on newly enrolled devices.",
     AlertsView = "alerts.view": "See alerts and the rules that raise them.",
     AlertsRespond = "alerts.respond": "Acknowledge and resolve alerts.",
     AlertsManage = "alerts.manage": "Create, edit and delete alert rules and notification channels.",

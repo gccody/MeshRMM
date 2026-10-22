@@ -33,6 +33,8 @@ pub async fn serve(
     let mut socket = socket;
     let mut connection = state.agents.connect(&device_id);
     state.presence.connected(&device_id).await;
+    // Jobs waiting for the device start now.
+    state.automation.wake();
     tracing::info!(device_id, "Agent connected");
     if let Ok(replayed) = greet(&state, &device_id, ip, &mut socket).await {
         let mut last_session = replayed;

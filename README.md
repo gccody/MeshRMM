@@ -39,6 +39,12 @@ MeshRMM is in heavy development and not production ready.
 - A toolbox of PowerShell, Command Prompt and shell (zsh or bash) scripts and a file library,
   private or shared, run and delivered from the website or the viewer as the
   signed-in user or as SYSTEM/root.
+- Jobs that run a script or send a file on chosen devices, whole companies or
+  every device, skip devices without the script's interpreter, wait for
+  offline ones, and show each device's result and output live.
+- Automation policies that run shared scripts every few minutes or hours,
+  daily or weekly at a time in any time zone, once, or on each newly
+  enrolled device, and notify when their jobs fail.
 - Saved Windows credentials, encrypted on the device, that fill sign-in and
   UAC prompts with one click.
 
@@ -79,7 +85,7 @@ MeshRMM is in heavy development and not production ready.
 - Built-in accounts with passwords, authenticator apps, recovery codes and
   passkeys, plus optional single sign-on (OIDC) and SCIM provisioning.
 - Custom roles built from a list of permissions, and an audit log of
-  sign-ins, changes, sessions, script runs and file deliveries.
+  sign-ins, changes, sessions, script runs, file deliveries and jobs.
 - Email for invitations, resets and alerts is optional; without it the
   website gives one-time links to copy, and alerts go to webhooks.
 
@@ -168,6 +174,8 @@ For developers:
 - [Background mode](docs/background-mode.md): the Session 0 workspace and its
   built-in tools
 - [Toolbox](docs/toolbox.md): scripts and files
+- [Automation](docs/automation.md): jobs on many devices and scheduled
+  policies
 - [Hardware and software](docs/hardware-and-software.md): what the Agents
   collect, how the server stores and searches it, and its API
 - [Alerts](docs/alerts.md): rules, alerts and notification channels

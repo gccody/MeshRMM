@@ -711,6 +711,70 @@ td.row-actions > * + * { margin-left: 6px; }
 .nested-table { border: 1px solid var(--rule); border-radius: 10px; border-collapse: separate; border-spacing: 0; overflow: hidden; }
 .nested-table th, .nested-table td { padding: 8px 12px; }
 
+/* ── Jobs and policies ─────────────────────────────────── */
+/* Choosing devices on the wall for a job. */
+.tile-select { position: absolute; top: 8px; left: 8px; z-index: 1; width: 26px; height: 26px; display: grid; place-items: center; border-radius: 7px; background: rgb(7 9 13 / 78%); box-shadow: 0 0 0 1px rgb(255 255 255 / 12%); opacity: 0; transition: opacity .15s ease; cursor: pointer; }
+.tile-select input { width: 15px; height: 15px; margin: 0; accent-color: var(--signal); cursor: pointer; }
+.device-screen:hover .tile-select, .tile-select:has(:focus-visible), .device-wall.selecting .tile-select { opacity: 1; }
+.device-tile.selected .device-screen { box-shadow: 0 0 0 2px var(--signal), 0 10px 26px rgb(0 0 0 / 35%); }
+@media (hover: none) { .tile-select { opacity: 1; } }
+.selection-bar { position: sticky; top: 66px; z-index: 5; margin-bottom: 18px; padding: 8px 10px 8px 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; border: 1px solid rgb(142 152 255 / 35%); border-radius: 10px; background: #1d2330; box-shadow: var(--shadow); }
+.selection-bar strong { font-size: 13.5px; font-weight: 600; }
+.selection-actions { margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px; }
+/* A job's progress: results colored by outcome, over a faint track. */
+.job-progress { width: 100%; max-width: 240px; height: 6px; display: block; overflow: hidden; border-radius: 3px; }
+.job-progress-track { fill: var(--raised); }
+.job-progress-success { fill: var(--live); }
+.job-progress-problem { fill: var(--danger); }
+.job-progress-muted { fill: var(--text-3); }
+.job-progress-pending { fill: var(--signal); }
+.data-table td.job-progress-cell > span { margin-top: 6px; }
+.job-table td:last-child { color: var(--text-2); }
+.run-pill-muted { color: var(--text-2); background: var(--raised); }
+.data-table td > span.run-pill-muted { color: var(--text-2); }
+.filter-notice { margin-bottom: 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; color: var(--text-2); font-size: 13.5px; }
+.filter-notice .link-button { display: inline-flex; align-items: center; gap: 4px; }
+.job-summary { padding: 18px 20px; display: grid; gap: 16px; }
+.job-facts { margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px 20px; }
+.job-facts div { min-width: 0; }
+.job-facts dt { color: var(--text-3); font-size: 12.5px; }
+.job-facts dd { margin: 2px 0 0; overflow-wrap: anywhere; font-size: 13.5px; }
+.job-facts dd span { display: block; color: var(--text-3); font-size: 12.5px; }
+.job-summary-progress { display: grid; gap: 6px; color: var(--text-2); font-size: 13px; }
+.job-summary-progress .job-progress { max-width: none; height: 8px; }
+.outcome-chips { margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; list-style: none; }
+.outcome-chip { height: 30px; padding: 0 6px 0 11px; display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--rule-strong); border-radius: 999px; color: var(--text-2); background: transparent; font-size: 12.5px; font-weight: 500; }
+button.outcome-chip { cursor: pointer; }
+button.outcome-chip:hover { color: var(--text); background: var(--raised); }
+.outcome-chip[aria-pressed=true] { border-color: var(--signal); color: var(--text); background: var(--signal-wash); }
+.outcome-chip em { min-width: 20px; padding: 0 6px; border-radius: 999px; color: var(--text); background: var(--raised); font-style: normal; font-variant-numeric: tabular-nums; text-align: center; }
+.outcome-chip.outcome-success em { color: var(--live); background: var(--live-wash); }
+.outcome-chip.outcome-problem em { color: var(--danger); background: var(--danger-wash); }
+.outcome-chip.outcome-pending em { color: var(--signal-strong); background: var(--signal-wash); }
+.settings-modal .job-preview { margin: 0; padding: 10px 12px; border-radius: 9px; color: var(--text-2); background: var(--well); font-size: 13px; }
+.device-picker { display: grid; gap: 8px; }
+.device-picker-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.device-picker-tools .search-field { display: inline-flex; flex: 1 1 200px; width: auto; }
+.picker-list { max-height: 260px; padding-right: 4px; overflow-y: auto; }
+.settings-modal .picker-list label { padding: 7px 10px; }
+.weekday-choice { margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; border: 0; }
+.weekday-choice legend { margin-bottom: 6px; padding: 0; color: var(--text-2); font-size: 13px; font-weight: 500; }
+.settings-modal .weekday-choice label { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid var(--rule); border-radius: 8px; background: var(--well); cursor: pointer; color: var(--text); }
+.settings-modal .weekday-choice label:has(input:checked) { border-color: rgb(142 152 255 / 50%); background: var(--signal-wash); }
+.policy-table td:first-child { max-width: 320px; }
+.data-table td > span.policy-last-job { display: grid; gap: 4px; margin-top: 6px; }
+.data-table td > span.policy-problem { margin-top: 6px; display: flex; align-items: flex-start; gap: 6px; color: var(--warn); }
+.data-table td > span.policy-problem svg { flex: none; margin-top: 2px; }
+/* An on/off switch over a checkbox. */
+.switch { position: relative; width: 36px; height: 20px; display: inline-block; cursor: pointer; }
+.switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.switch span { position: absolute; inset: 0; border-radius: 999px; background: var(--rule-strong); transition: background .15s ease; pointer-events: none; }
+.switch span::after { content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: var(--text); transition: transform .15s ease; }
+.switch input:checked + span { background: var(--signal); }
+.switch input:checked + span::after { transform: translateX(16px); background: var(--signal-ink); }
+.switch input:focus-visible + span { outline: 2px solid var(--signal); outline-offset: 2px; }
+.switch input:disabled + span { opacity: .5; }
+
 @media (max-width: 1060px) {
   .topbar { gap: 12px; padding: 0 16px 0 10px; }
   .nav-toggle { display: grid; }

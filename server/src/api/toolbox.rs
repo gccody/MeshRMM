@@ -301,6 +301,8 @@ pub async fn update_script(
     require_edit(&user, Kind::Script, current.shared)?;
     if input.shared {
         user.require(Kind::Script.manage_permission())?;
+    } else if current.shared {
+        refuse_if_policies_use(&mut transaction, &id).await?;
     }
     let changed = transaction
         .execute(
@@ -347,6 +349,18 @@ pub async fn update_script(
 
 /// Another request shared, unshared or deleted the item after it was
 /// checked. Only PostgreSQL lets that happen; SQLite serializes the two.
+/// Policies run shared scripts only, so theirs can't be deleted or unshared.
+async fn refuse_if_policies_use(
+    executor: &mut impl crate::db::Executor,
+    script_id: &str,
+) -> Result<(), ApiError> {
+    let policies = crate::automation::policies::using_script(executor, script_id).await?;
+    match crate::automation::policies::script_used_message(&policies) {
+        Some(message) => Err(ApiError::conflict(message).with_code("script_in_use")),
+        None => Ok(()),
+    }
+}
+
 fn changed_meanwhile() -> ApiError {
     ApiError::conflict("someone else changed this item at the same time; reload and try again")
 }
@@ -374,6 +388,7 @@ pub async fn delete_script(
         .await?
         .ok_or_else(script_not_found)?;
     require_edit(&user, Kind::Script, current.shared)?;
+    refuse_if_policies_use(&mut transaction, &id).await?;
     let changed = transaction
         .execute(
             &Query::delete()
