@@ -334,6 +334,74 @@ CREATE TABLE device_metrics (
 
 CREATE INDEX idx_device_metrics_minute ON device_metrics (minute);
 
+-- The latest hardware and software snapshot each device's Agent sent. What
+-- the website and the API search on are columns; the rest of the snapshot,
+-- except its applications, is the Agent's JSON in `details`.
+CREATE TABLE device_system_info (
+  device_id TEXT NOT NULL PRIMARY KEY,
+  -- When the Agent collected it, by the device's clock, and when the server
+  -- received it, by its own.
+  collected_at BIGINT NOT NULL,
+  received_at BIGINT NOT NULL,
+  -- The address the Agent's control connection last came from.
+  public_ip TEXT,
+  os_id TEXT NOT NULL,
+  os_name TEXT NOT NULL,
+  os_version TEXT NOT NULL,
+  os_build TEXT,
+  architecture TEXT NOT NULL,
+  manufacturer TEXT,
+  model TEXT,
+  serial_number TEXT,
+  hostname TEXT NOT NULL,
+  -- Identifies the applications list, so an unchanged one isn't rewritten.
+  applications_hash TEXT NOT NULL,
+  details TEXT NOT NULL
+);
+
+-- The IP addresses on each device's network adapters, from its snapshot.
+CREATE TABLE device_ip_addresses (
+  device_id TEXT NOT NULL,
+  adapter TEXT NOT NULL,
+  address TEXT NOT NULL,
+  prefix_length BIGINT NOT NULL CHECK (prefix_length BETWEEN 0 AND 128),
+  mac_address TEXT,
+  PRIMARY KEY (device_id, adapter, address)
+);
+
+CREATE INDEX idx_device_ip_addresses_address ON device_ip_addresses (address);
+
+-- The applications and packages installed on each device, from its snapshot.
+CREATE TABLE device_applications (
+  device_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  version TEXT,
+  publisher TEXT,
+  architecture TEXT,
+  installed_at BIGINT,
+  source TEXT NOT NULL CHECK (source IN ('windows', 'windows_user', 'macos_app', 'dpkg', 'rpm', 'pacman', 'flatpak', 'snap'))
+);
+
+CREATE INDEX idx_device_applications_device ON device_applications (device_id);
+CREATE INDEX idx_device_applications_name ON device_applications (name);
+
+-- Applications installed, removed or updated between a device's snapshots.
+CREATE TABLE device_application_changes (
+  id TEXT NOT NULL PRIMARY KEY,
+  device_id TEXT NOT NULL,
+  -- When the server received the snapshot that showed the change.
+  observed_at BIGINT NOT NULL,
+  change TEXT NOT NULL CHECK (change IN ('installed', 'removed', 'updated')),
+  name TEXT NOT NULL,
+  version TEXT,
+  -- The version an update replaced.
+  previous_version TEXT,
+  source TEXT NOT NULL
+);
+
+CREATE INDEX idx_device_application_changes_device ON device_application_changes (device_id, observed_at);
+CREATE INDEX idx_device_application_changes_observed ON device_application_changes (observed_at);
+
 CREATE TABLE agent_install_tokens (
   id TEXT NOT NULL PRIMARY KEY,
   token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64),

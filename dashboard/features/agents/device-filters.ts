@@ -44,10 +44,22 @@ export function serializeDeviceFilters({ query, status, company }: DeviceFilters
   return search ? `?${search}` : "";
 }
 
-export function filterAgents<T extends Pick<Agent, "id" | "name" | "connected" | "company_id">>(agents: T[], { query, status, company }: DeviceFilters) {
+// What the search box matches: the device's name and ID, and from its system
+// information its operating system, manufacturer, model, serial number and
+// IP addresses.
+export function searchText(agent: Pick<Agent, "id" | "name" | "system">) {
+  const system = agent.system;
+  const parts = [agent.name, agent.id];
+  if (system) {
+    parts.push(system.os, system.manufacturer ?? "", system.model ?? "", system.serial_number ?? "", system.public_ip ?? "", ...system.ip_addresses);
+  }
+  return parts.join("\n").toLowerCase();
+}
+
+export function filterAgents<T extends Pick<Agent, "id" | "name" | "connected" | "company_id" | "system">>(agents: T[], { query, status, company }: DeviceFilters) {
   const search = query.trim().toLowerCase();
   return agents.filter((agent) => {
-    const matchesSearch = !search || `${agent.name} ${agent.id}`.toLowerCase().includes(search);
+    const matchesSearch = !search || searchText(agent).includes(search);
     const matchesStatus = status === "all" || (status === "online" ? agent.connected : !agent.connected);
     const matchesCompany = !company || (company === NO_COMPANY ? !agent.company_id : agent.company_id === company);
     return matchesSearch && matchesStatus && matchesCompany;

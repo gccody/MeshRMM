@@ -21,6 +21,23 @@ export type Agent = {
   company_id?: string | null;
   /** When the device enrolled. */
   created_at?: number;
+  /** The device list's summary of its latest system information, once it sent one. */
+  system?: SystemSummary | null;
+};
+
+/** What the device list shows and searches from a device's hardware and software. */
+export type SystemSummary = {
+  /** The operating system's name and version, such as "Windows 11 Pro 24H2". */
+  os: string;
+  manufacturer: string | null;
+  model: string | null;
+  serial_number: string | null;
+  /** The adapters' addresses, without loopback and link-local ones. */
+  ip_addresses: string[];
+  /** The address the Agent last connected from. */
+  public_ip: string | null;
+  /** When the server received the snapshot. */
+  received_at: number;
 };
 
 export type Company = {

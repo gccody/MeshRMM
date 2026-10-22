@@ -14,12 +14,14 @@ use crate::{
     db::{
         self, Database,
         tables::{
-            AgentInstallTokens, Agents, Alerts, DeviceMetrics, FileDeliveries, Invitations,
-            PasswordResets, RemoteHandoffs, RemoteSessions, ScriptRuns, ToolboxFiles, UserSessions,
+            AgentInstallTokens, Agents, Alerts, DeviceApplicationChanges, DeviceMetrics,
+            FileDeliveries, Invitations, PasswordResets, RemoteHandoffs, RemoteSessions,
+            ScriptRuns, ToolboxFiles, UserSessions,
         },
     },
     realtime::metrics::HISTORY_MS,
     storage::Storage,
+    system_info::CHANGES_RETENTION_MS,
     time::{DAY_MS, MINUTE_MS, now_ms},
 };
 
@@ -45,6 +47,7 @@ pub struct Purged {
     pub file_deliveries: u64,
     pub device_metrics: u64,
     pub resolved_alerts: u64,
+    pub application_changes: u64,
 }
 
 /// Purges every expired row and abandoned partial file once now and then
@@ -74,7 +77,8 @@ pub fn spawn(database: Database, storage: Storage) -> tokio::task::JoinHandle<()
 /// Deletes tokens and sessions that expired more than [`EXPIRED_GRACE_MS`]
 /// before `now_ms`, toolbox history older than [`TOOLBOX_HISTORY_MS`], and
 /// devices' resource usage older than [`HISTORY_MS`], and alerts resolved
-/// more than [`RESOLVED_RETENTION_MS`] ago.
+/// more than [`RESOLVED_RETENTION_MS`] ago, and application changes older
+/// than [`CHANGES_RETENTION_MS`].
 pub async fn purge(database: &Database, now_ms: i64) -> db::Result<Purged> {
     let expired = now_ms - EXPIRED_GRACE_MS;
     let history = now_ms - TOOLBOX_HISTORY_MS;
@@ -142,6 +146,13 @@ pub async fn purge(database: &Database, now_ms: i64) -> db::Result<Purged> {
             Alerts::Table,
             Alerts::ResolvedAt,
             now_ms - RESOLVED_RETENTION_MS,
+        )
+        .await?,
+        application_changes: delete_before(
+            database,
+            DeviceApplicationChanges::Table,
+            DeviceApplicationChanges::ObservedAt,
+            now_ms - CHANGES_RETENTION_MS,
         )
         .await?,
     })

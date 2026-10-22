@@ -50,6 +50,10 @@ MeshRMM is in heavy development and not production ready.
   filter the wall by company and enroll new devices straight into one.
 - Resource monitoring: CPU, memory, network, uptime and disk space, live and
   as charts for the last hour, day or week.
+- Hardware and software: operating system, model, serial number, processor,
+  memory, disks, network adapters and signed-in users, and the installed
+  applications with a change log, on each device's page; a fleet-wide search
+  for which devices have an application in which version.
 - Alerts: rules for devices going offline, low disk space, sustained CPU or
   memory load, and failed scripts, for every device or chosen companies.
   Alerts are acknowledged and resolved in the website, resolve themselves
@@ -164,6 +168,8 @@ For developers:
 - [Background mode](docs/background-mode.md): the Session 0 workspace and its
   built-in tools
 - [Toolbox](docs/toolbox.md): scripts and files
+- [Hardware and software](docs/hardware-and-software.md): what the Agents
+  collect, how the server stores and searches it, and its API
 - [Alerts](docs/alerts.md): rules, alerts and notification channels
 - [Credential autofill](docs/credential-autofill.md)
 - [Screen thumbnails](docs/screen-thumbnails.md)

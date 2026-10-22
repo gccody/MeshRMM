@@ -26,6 +26,7 @@ use crate::{
         self, Database,
         tables::{Agents, Companies},
     },
+    system_info,
     time::now_ms,
 };
 
@@ -50,6 +51,9 @@ pub struct PresenceAgent {
     /// The company the device belongs to, if any.
     pub company_id: Option<String>,
     pub created_at: i64,
+    /// What the device list shows and searches from the device's latest
+    /// system information snapshot, once it has one.
+    pub system: Option<Box<system_info::Summary>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
@@ -180,6 +184,7 @@ impl Presence {
     pub async fn snapshot(&self) -> db::Result<PresenceEvent> {
         let mut state = self.inner.state.lock().await;
         let rows: Vec<AgentRow> = self.inner.database.fetch_all(&agent_select()).await?;
+        let mut systems = system_info::summaries(&self.inner.database, None).await?;
         let mut companies: Vec<PresenceCompany> =
             self.inner.database.fetch_all(&company_select()).await?;
         state.prune_updates();
@@ -196,7 +201,10 @@ impl Presence {
         }
         let mut agents = rows
             .into_iter()
-            .map(|row| self.agent(&state, row))
+            .map(|row| {
+                let system = systems.remove(&row.0);
+                self.agent(&state, row, system)
+            })
             .collect::<Vec<_>>();
         let gone = state
             .published
@@ -235,10 +243,20 @@ impl Presence {
                     .to_owned(),
             )
             .await;
-        match row {
-            Ok(row) => {
+        let read: db::Result<Option<(AgentRow, Option<system_info::Summary>)>> = async {
+            let Some(row) = row? else {
+                return Ok(None);
+            };
+            let system = system_info::summaries(&self.inner.database, Some(device_id))
+                .await?
+                .remove(device_id);
+            Ok(Some((row, system)))
+        }
+        .await;
+        match read {
+            Ok(found) => {
                 state.prune_updates();
-                let agent = row.map(|row| self.agent(&state, row));
+                let agent = found.map(|(row, system)| self.agent(&state, row, system));
                 self.publish(&mut state, device_id, agent);
             }
             Err(error) => {
@@ -328,6 +346,7 @@ impl Presence {
         &self,
         state: &State,
         (id, name, platform, company_id, created_at): AgentRow,
+        system: Option<system_info::Summary>,
     ) -> PresenceAgent {
         let connected = self.inner.hub.is_connected(&id);
         PresenceAgent {
@@ -340,6 +359,7 @@ impl Presence {
             platform,
             company_id,
             created_at,
+            system: system.map(Box::new),
         }
     }
 
@@ -426,6 +446,7 @@ mod tests {
             updating_to: None,
             company_id: None,
             created_at: 0,
+            system: None,
         }
     }
 
@@ -462,7 +483,7 @@ mod tests {
             serde_json::json!({
                 "type": "agent_upsert",
                 "revision": 8,
-                "agent": { "id": "a", "name": "Desk", "platform": "windows", "connected": false, "updating_to": "1.2.3", "company_id": null, "created_at": 0 }
+                "agent": { "id": "a", "name": "Desk", "platform": "windows", "connected": false, "updating_to": "1.2.3", "company_id": null, "created_at": 0, "system": null }
             })
         );
         let company = PresenceEvent::CompanyUpsert {

@@ -19,3 +19,6 @@ pub use metrics::*;
 
 mod platform;
 pub use platform::*;
+
+mod system_info;
+pub use system_info::*;

@@ -292,6 +292,61 @@ pub enum DeviceMetrics {
     StorageTotalBytes,
 }
 
+#[derive(Iden, Clone, Copy)]
+pub enum DeviceSystemInfo {
+    Table,
+    DeviceId,
+    CollectedAt,
+    ReceivedAt,
+    PublicIp,
+    OsId,
+    OsName,
+    OsVersion,
+    OsBuild,
+    Architecture,
+    Manufacturer,
+    Model,
+    SerialNumber,
+    Hostname,
+    ApplicationsHash,
+    Details,
+}
+
+#[derive(Iden, Clone, Copy)]
+pub enum DeviceIpAddresses {
+    Table,
+    DeviceId,
+    Adapter,
+    Address,
+    PrefixLength,
+    MacAddress,
+}
+
+#[derive(Iden, Clone, Copy)]
+pub enum DeviceApplications {
+    Table,
+    DeviceId,
+    Name,
+    Version,
+    Publisher,
+    Architecture,
+    InstalledAt,
+    Source,
+}
+
+#[derive(Iden, Clone, Copy)]
+pub enum DeviceApplicationChanges {
+    Table,
+    Id,
+    DeviceId,
+    ObservedAt,
+    Change,
+    Name,
+    Version,
+    PreviousVersion,
+    Source,
+}
+
 #[derive(Iden)]
 pub enum AgentInstallTokens {
     Table,

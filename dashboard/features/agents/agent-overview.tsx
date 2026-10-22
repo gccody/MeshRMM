@@ -7,6 +7,7 @@ import {
   Copy,
   Ellipsis,
   Expand,
+  Laptop,
   Layers,
   LoaderCircle,
   Monitor,
@@ -170,7 +171,7 @@ export function AgentOverview({
           ))}
         </div>
         {(companies.length > 0 || company) && <CompanyFilterMenu companies={companies} company={company} onChange={onCompanyChange} />}
-        <label className="search-field"><Search size={16} aria-hidden="true" /><input type="search" aria-label="Search devices" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="Search devices" /></label>
+        <label className="search-field"><Search size={16} aria-hidden="true" /><input type="search" aria-label="Search devices" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="Search devices" title="Searches names, operating systems, models, serial numbers and IP addresses" /></label>
         <button type="button" className="icon-button" onClick={onRefresh} aria-label="Refresh devices" title="Refresh"><RefreshCw size={16} className={inventory.isRefreshing ? "spin" : ""} /></button>
         {allowed.enroll && <button type="button" className="primary-button" onClick={(event) => onAddDevice(event.currentTarget)} aria-haspopup="dialog"><Plus size={16} /> Add device</button>}
       </HeaderActions>
@@ -370,6 +371,7 @@ function DeviceTile({ agent, companyName, reading, store, allowed, state, onRemo
           onMove={onMove}
         />
       </div>
+      {agent.system?.os && <p className="device-company" title={agent.system.os}><Laptop size={13} aria-hidden="true" /><span><span className="sr-only">Operating system: </span>{agent.system.os}</span></p>}
       {companyName && <p className="device-company" title={companyName}><Building2 size={13} aria-hidden="true" /><span><span className="sr-only">Company: </span>{companyName}</span></p>}
       {reading && <DeviceUsage reading={reading} />}
       {previewOpen && thumbnail && <ScreenPreview agent={agent} thumbnail={thumbnail} returnFocus={previewOpener} onClose={() => setPreviewOpen(false)} />}
