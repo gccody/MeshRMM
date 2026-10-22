@@ -24,6 +24,7 @@ use crate::{
     },
     http::{ApiError, AppState, JsonBody},
     rbac::Permission,
+    targets::{Choice, TagMatch},
     time::{HOUR_MS, now_ms},
     toolbox,
 };
@@ -76,6 +77,10 @@ pub struct StartJob {
     device_ids: Vec<String>,
     #[serde(default)]
     company_ids: Vec<String>,
+    #[serde(default)]
+    tag_ids: Vec<String>,
+    #[serde(default)]
+    tag_match: TagMatch,
     offline: Offline,
     /// How long offline devices are waited for.
     #[serde(default = "default_wait_hours")]
@@ -93,14 +98,23 @@ fn viewer(actor: &Authorized) -> Result<Viewer, ApiError> {
 
 /// `POST /v1/jobs`: runs one of the user's scripts, sends one of their
 /// files, or scans for or installs updates, on chosen devices, whole
-/// companies or every device.
+/// companies, the devices with chosen tags, or every device.
 pub async fn start(
     State(state): State<AppState>,
     actor: Authorized,
     JsonBody(request): JsonBody<StartJob>,
 ) -> Result<(StatusCode, Json<JobDetail>), ApiError> {
     let user = toolbox_user(&actor);
-    let target = Target::from_request(request.target, request.device_ids, request.company_ids)?;
+    let target = Target::from_request(
+        request.target,
+        Choice {
+            device_ids: request.device_ids,
+            company_ids: request.company_ids,
+            tag_ids: request.tag_ids,
+            tag_match: request.tag_match,
+        },
+    )
+    .map_err(|error| error.with_code("invalid_job"))?;
     if target.kind().is_wide() {
         actor.require(Permission::JobsRunWide)?;
     }

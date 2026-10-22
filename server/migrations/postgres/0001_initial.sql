@@ -145,12 +145,13 @@ CREATE TABLE role_permissions (
 -- is an editable default.
 INSERT INTO roles (id, name, description, builtin, created_at, updated_at) VALUES
   ('administrator', 'Administrator', 'Every permission, including users, roles and settings.', 'administrator', 0, 0),
-  ('technician', 'Technician', 'Enrolls, connects to and wakes devices, opens terminals, runs toolbox scripts and files, installs updates, and responds to alerts.', 'technician', 0, 0);
+  ('technician', 'Technician', 'Enrolls, connects to and wakes devices, tags devices and keeps their notes, opens terminals, runs toolbox scripts and files, installs updates, and responds to alerts.', 'technician', 0, 0);
 
 INSERT INTO role_permissions (role_id, permission) VALUES
   ('technician', 'devices.view'),
   ('technician', 'devices.enroll'),
   ('technician', 'devices.wake'),
+  ('technician', 'devices.edit'),
   ('technician', 'sessions.connect'),
   ('technician', 'sessions.connect_background'),
   ('technician', 'terminal.connect'),
@@ -324,6 +325,37 @@ CREATE TABLE agents (
 
 CREATE INDEX idx_agents_name ON agents (name);
 CREATE INDEX idx_agents_company ON agents (company_id);
+
+-- Free-form labels for grouping devices besides their company. Names are
+-- unique ignoring case, which the server checks.
+CREATE TABLE tags (
+  id TEXT NOT NULL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 60),
+  color TEXT NOT NULL CHECK (color IN ('gray', 'red', 'orange', 'amber', 'green', 'teal', 'blue', 'purple', 'pink')),
+  created_at BIGINT NOT NULL,
+  updated_at BIGINT NOT NULL
+);
+
+CREATE TABLE device_tags (
+  device_id TEXT NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
+  tag_id TEXT NOT NULL REFERENCES tags (id) ON DELETE CASCADE,
+  created_at BIGINT NOT NULL,
+  PRIMARY KEY (device_id, tag_id)
+);
+
+CREATE INDEX idx_device_tags_tag ON device_tags (tag_id);
+
+-- Each version of each device's notes; the highest revision is the current
+-- one. Saving inserts revision + 1, so of two edits of the same version
+-- only the first is saved. Older versions past the last 20 are deleted.
+CREATE TABLE device_notes (
+  device_id TEXT NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
+  revision BIGINT NOT NULL CHECK (revision > 0),
+  body TEXT NOT NULL,
+  updated_at BIGINT NOT NULL,
+  updated_by_user_id TEXT,
+  PRIMARY KEY (device_id, revision)
+);
 
 -- Each device's resource usage, one row per minute its Agent reported in.
 -- Rates and loads are averages over the minute's samples; storage is the
@@ -592,8 +624,10 @@ CREATE TABLE alert_rules (
   nonzero_exit_fails BOOLEAN NOT NULL DEFAULT FALSE,
   update_category TEXT CHECK (update_category IS NULL OR update_category IN ('any', 'security', 'critical', 'definition', 'driver', 'feature_pack', 'service_pack', 'update_rollup', 'upgrade', 'tool', 'other')),
   days BIGINT CHECK (days IS NULL OR days BETWEEN 1 AND 365),
-  -- Every device, or only those of the companies in alert_rule_companies.
-  all_companies BOOLEAN NOT NULL DEFAULT TRUE,
+  -- Every device, the companies in alert_rule_companies, or the devices with
+  -- any or all (tag_match) of the tags in alert_rule_tags.
+  target TEXT NOT NULL DEFAULT 'all' CHECK (target IN ('all', 'companies', 'tags')),
+  tag_match TEXT NOT NULL DEFAULT 'any' CHECK (tag_match IN ('any', 'all')),
   notify_on_resolve BOOLEAN NOT NULL DEFAULT FALSE,
   created_at BIGINT NOT NULL,
   updated_at BIGINT NOT NULL,
@@ -604,6 +638,12 @@ CREATE TABLE alert_rule_companies (
   rule_id TEXT NOT NULL REFERENCES alert_rules (id) ON DELETE CASCADE,
   company_id TEXT NOT NULL REFERENCES companies (id) ON DELETE CASCADE,
   PRIMARY KEY (rule_id, company_id)
+);
+
+CREATE TABLE alert_rule_tags (
+  rule_id TEXT NOT NULL REFERENCES alert_rules (id) ON DELETE CASCADE,
+  tag_id TEXT NOT NULL REFERENCES tags (id) ON DELETE CASCADE,
+  PRIMARY KEY (rule_id, tag_id)
 );
 
 CREATE TABLE alert_rule_channels (
@@ -671,7 +711,7 @@ CREATE TABLE jobs (
   reboot TEXT CHECK (reboot IS NULL OR reboot IN ('never', 'if_required', 'always')),
   reboot_delay_minutes BIGINT,
   -- Which devices it was started on, and that in words, such as "Acme, Globex".
-  target TEXT NOT NULL CHECK (target IN ('devices', 'companies', 'all')),
+  target TEXT NOT NULL CHECK (target IN ('devices', 'companies', 'tags', 'all')),
   target_label TEXT NOT NULL,
   -- Offline devices are skipped, or waited for until expires_at.
   offline TEXT NOT NULL CHECK (offline IN ('skip', 'wait')),
@@ -723,9 +763,12 @@ CREATE TABLE automation_policies (
   update_categories TEXT,
   reboot TEXT CHECK (reboot IS NULL OR reboot IN ('never', 'if_required', 'always')),
   reboot_delay_minutes BIGINT,
-  -- Every device, the companies in automation_policy_companies, or the
-  -- devices in automation_policy_devices.
-  target TEXT NOT NULL CHECK (target IN ('devices', 'companies', 'all')),
+  -- Every device, the companies in automation_policy_companies, the devices
+  -- in automation_policy_devices, or the devices with any or all
+  -- (tag_match) of the tags in automation_policy_tags. Resolved each time
+  -- it fires.
+  target TEXT NOT NULL CHECK (target IN ('devices', 'companies', 'tags', 'all')),
+  tag_match TEXT NOT NULL DEFAULT 'any' CHECK (tag_match IN ('any', 'all')),
   -- 'interval' every interval_minutes; 'daily' at time_of_day; 'weekly' at
   -- time_of_day on weekdays (a bit per day, Monday = 1 to Sunday = 64);
   -- 'once' at run_at; all in time_zone. 'enroll' when a device enrolls.
@@ -766,6 +809,12 @@ CREATE TABLE automation_policy_devices (
   policy_id TEXT NOT NULL REFERENCES automation_policies (id) ON DELETE CASCADE,
   device_id TEXT NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
   PRIMARY KEY (policy_id, device_id)
+);
+
+CREATE TABLE automation_policy_tags (
+  policy_id TEXT NOT NULL REFERENCES automation_policies (id) ON DELETE CASCADE,
+  tag_id TEXT NOT NULL REFERENCES tags (id) ON DELETE CASCADE,
+  PRIMARY KEY (policy_id, tag_id)
 );
 
 -- Channels told when one of the policy's jobs finishes with failures.

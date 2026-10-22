@@ -33,13 +33,14 @@ use crate::{
     db::{
         self, Executor,
         tables::{
-            Agents, AutomationPolicies, AutomationPolicyChannels, AutomationPolicyCompanies,
-            AutomationPolicyDevices, Companies, JobDevices, Jobs, NotificationChannels,
+            AutomationPolicies, AutomationPolicyChannels, AutomationPolicyCompanies,
+            AutomationPolicyDevices, AutomationPolicyTags, JobDevices, Jobs, NotificationChannels,
             ToolboxScripts, Users,
         },
     },
     http::{ApiError, AppState},
     rbac::{self, Permission},
+    targets::{Choice, TagMatch},
     time::HOUR_MS,
     updates::runs::Install,
     users,
@@ -177,6 +178,10 @@ pub struct PolicyInput {
     pub device_ids: Vec<String>,
     #[serde(default)]
     pub company_ids: Vec<String>,
+    #[serde(default)]
+    pub tag_ids: Vec<String>,
+    #[serde(default)]
+    pub tag_match: TagMatch,
     pub trigger: TriggerKind,
     #[serde(default)]
     pub interval_minutes: Option<i64>,
@@ -312,14 +317,24 @@ impl PolicyInput {
             },
             TriggerKind::Enroll => Trigger::Enroll,
         };
-        let target = Target::from_request(self.target, self.device_ids, self.company_ids)
-            .map_err(|_| invalid("choose the devices or companies it runs on"))?;
+        let target = Target::from_request(
+            self.target,
+            Choice {
+                device_ids: self.device_ids,
+                company_ids: self.company_ids,
+                tag_ids: self.tag_ids,
+                tag_match: self.tag_match,
+            },
+        )
+        .map_err(|_| invalid("choose the devices, companies or tags it runs on"))?;
         if trigger == Trigger::Enroll && action == Action::Wake {
             return Err(invalid(
                 "a policy that wakes devices runs on a schedule: newly enrolled devices are online",
             ));
         }
-        if trigger == Trigger::Enroll && matches!(target, Target::Devices(_)) {
+        // A device that just enrolled has no tags yet.
+        if trigger == Trigger::Enroll && matches!(target, Target::Devices(_) | Target::Tags { .. })
+        {
             return Err(invalid(
                 "a policy for newly enrolled devices runs on every device or on companies",
             ));
@@ -383,30 +398,7 @@ impl Valid {
                 )))
             }
         };
-        let companies = self.target.company_ids();
-        if !companies.is_empty() {
-            let found: Vec<(String,)> = executor
-                .fetch_all(
-                    &Query::select()
-                        .column(Companies::Id)
-                        .from(Companies::Table)
-                        .and_where(Expr::col(Companies::Id).is_in(companies.iter().cloned()))
-                        .to_owned(),
-                )
-                .await?;
-            count(found.len(), companies.len(), "company")?;
-        }
-        let devices = self.target.device_ids();
-        for chunk in devices.chunks(500) {
-            let found: Vec<(String,)> = executor
-                .fetch_all(
-                    &crate::agents::active()
-                        .and_where(Expr::col(Agents::Id).is_in(chunk.iter().cloned()))
-                        .to_owned(),
-                )
-                .await?;
-            count(found.len(), chunk.len(), "device")?;
-        }
+        self.target.check_references(executor).await?;
         if !self.channel_ids.is_empty() {
             let found: Vec<(String,)> = executor
                 .fetch_all(
@@ -436,9 +428,7 @@ pub struct Policy {
     pub script_name: Option<String>,
     pub script_language: Option<ScriptLanguage>,
     pub script_shared: bool,
-    pub target: TargetKind,
-    pub device_ids: Vec<String>,
-    pub company_ids: Vec<String>,
+    pub target: Target,
     pub trigger: Trigger,
     pub offline: Offline,
     pub catch_up_hours: i64,
@@ -456,25 +446,6 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// Whether the policy covers a device in `company_id`.
-    pub fn covers(&self, device_id: &str, company_id: Option<&str>) -> bool {
-        match self.target {
-            TargetKind::All => true,
-            TargetKind::Companies => {
-                company_id.is_some_and(|company| self.company_ids.iter().any(|id| id == company))
-            }
-            TargetKind::Devices => self.device_ids.iter().any(|id| id == device_id),
-        }
-    }
-
-    fn job_target(&self) -> Target {
-        match self.target {
-            TargetKind::All => Target::All,
-            TargetKind::Companies => Target::Companies(self.company_ids.clone()),
-            TargetKind::Devices => Target::Devices(self.device_ids.clone()),
-        }
-    }
-
     /// Recorded in the audit log as starting the policy's jobs.
     pub fn actor(&self) -> Actor {
         Actor {
@@ -500,9 +471,8 @@ pub struct PolicyView {
     pub update_categories: Option<Vec<UpdateCategory>>,
     pub reboot: Option<RebootBehavior>,
     pub reboot_delay_minutes: Option<u32>,
-    pub target: TargetKind,
-    pub device_ids: Vec<String>,
-    pub company_ids: Vec<String>,
+    #[serde(flatten)]
+    pub target: Target,
     pub trigger: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interval_minutes: Option<i64>,
@@ -588,8 +558,6 @@ impl Policy {
             reboot,
             reboot_delay_minutes,
             target: self.target,
-            device_ids: self.device_ids,
-            company_ids: self.company_ids,
             interval_minutes,
             time,
             weekdays,
@@ -625,6 +593,7 @@ struct PolicyRow {
     reboot: Option<String>,
     reboot_delay_minutes: Option<i64>,
     target: String,
+    tag_match: String,
     trigger_type: String,
     interval_minutes: Option<i64>,
     time_of_day: Option<String>,
@@ -725,6 +694,7 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
                 AutomationPolicies::RebootDelayMinutes,
             ),
             (AutomationPolicies::Table, AutomationPolicies::Target),
+            (AutomationPolicies::Table, AutomationPolicies::TagMatch),
             (AutomationPolicies::Table, AutomationPolicies::TriggerType),
             (
                 AutomationPolicies::Table,
@@ -784,6 +754,9 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
             AutomationPolicyDevices::DeviceId,
         ])
         .from(AutomationPolicyDevices::Table);
+    let mut tags = Query::select();
+    tags.columns([AutomationPolicyTags::PolicyId, AutomationPolicyTags::TagId])
+        .from(AutomationPolicyTags::Table);
     let mut channels = Query::select();
     channels
         .columns([
@@ -792,6 +765,7 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
         ])
         .from(AutomationPolicyChannels::Table);
     if let Some(id) = id {
+        tags.and_where(Expr::col(AutomationPolicyTags::PolicyId).eq(id));
         select.and_where(Expr::col((AutomationPolicies::Table, AutomationPolicies::Id)).eq(id));
         companies.and_where(Expr::col(AutomationPolicyCompanies::PolicyId).eq(id));
         devices.and_where(Expr::col(AutomationPolicyDevices::PolicyId).eq(id));
@@ -800,22 +774,27 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
     let rows: Vec<PolicyRow> = executor.fetch_all(&select).await?;
     let companies = grouped(executor.fetch_all(&companies).await?);
     let devices = grouped(executor.fetch_all(&devices).await?);
+    let tags = grouped(executor.fetch_all(&tags).await?);
     let channels = grouped(executor.fetch_all(&channels).await?);
     Ok(rows
         .into_iter()
         .filter_map(|row| {
+            let choice = Choice {
+                device_ids: devices.get(&row.id).cloned().unwrap_or_default(),
+                company_ids: companies.get(&row.id).cloned().unwrap_or_default(),
+                tag_ids: tags.get(&row.id).cloned().unwrap_or_default(),
+                ..Choice::default()
+            };
             let (Some(trigger), Some(action), Some(target), Some(offline)) = (
                 trigger_of(&row),
                 action_of(&row),
-                TargetKind::parse(&row.target),
+                Target::from_stored(&row.target, &row.tag_match, choice),
                 Offline::parse(&row.offline),
             ) else {
                 tracing::error!(policy_id = row.id, "stored automation policy is invalid");
                 return None;
             };
             Some(Policy {
-                company_ids: companies.get(&row.id).cloned().unwrap_or_default(),
-                device_ids: devices.get(&row.id).cloned().unwrap_or_default(),
                 channel_ids: channels.get(&row.id).cloned().unwrap_or_default(),
                 script_language: row
                     .script_language
@@ -890,14 +869,15 @@ pub fn next_run(policy: &Valid, now: i64) -> Option<i64> {
 
 /// Writes the policy `id` from `policy`, owned by `owner_user_id`: a new
 /// one, or over the existing one. Its schedule starts over from `now`.
-/// The tables that link a policy to its companies, devices and channels,
-/// and the column each links to.
-const LINK_TABLES: [&str; 3] = [
+/// The tables that link a policy to its companies, devices, tags and
+/// channels, and the column each links to.
+const LINK_TABLES: [&str; 4] = [
     "automation_policy_companies",
     "automation_policy_devices",
+    "automation_policy_tags",
     "automation_policy_channels",
 ];
-const LINK_COLUMNS: [&str; 3] = ["company_id", "device_id", "channel_id"];
+const LINK_COLUMNS: [&str; 4] = ["company_id", "device_id", "tag_id", "channel_id"];
 
 pub async fn save(
     executor: &mut impl Executor,
@@ -948,7 +928,7 @@ pub async fn save(
         ),
         _ => (None, None, None),
     };
-    let values: [(AutomationPolicies, sea_query::Value); 21] = [
+    let values: [(AutomationPolicies, sea_query::Value); 22] = [
         (AutomationPolicies::Name, policy.name.as_str().into()),
         (AutomationPolicies::Enabled, policy.enabled.into()),
         (
@@ -966,6 +946,10 @@ pub async fn save(
         (
             AutomationPolicies::Target,
             policy.target.kind().as_str().into(),
+        ),
+        (
+            AutomationPolicies::TagMatch,
+            policy.target.tag_match().as_str().into(),
         ),
         (
             AutomationPolicies::TriggerType,
@@ -1029,6 +1013,7 @@ pub async fn save(
     let links = [
         policy.target.company_ids(),
         policy.target.device_ids(),
+        policy.target.tag_ids(),
         policy.channel_ids.as_slice(),
     ];
     for ((table, column), ids) in LINK_TABLES.into_iter().zip(LINK_COLUMNS).zip(links) {
@@ -1311,7 +1296,7 @@ async fn fire(state: &AppState, id: &str, due_at: i64, now: i64) -> anyhow::Resu
         transaction.commit().await?;
         return Ok(false);
     }
-    let target = policy.job_target();
+    let target = policy.target.clone();
     let started = match start_job(
         &mut transaction,
         state,
@@ -1350,7 +1335,7 @@ pub async fn run_now(
         &mut transaction,
         state,
         policy,
-        policy.job_target(),
+        policy.target.clone(),
         Starter::User { user_id, actor },
         policy.trigger.scheduled(),
         now,
@@ -1369,25 +1354,13 @@ pub async fn run_now(
 /// on it. Returns how many started.
 pub async fn device_enrolled(state: &AppState, device_id: &str, now: i64) -> anyhow::Result<usize> {
     let mut database = &state.database;
-    let company: Option<(Option<String>,)> = database
-        .fetch_optional(
-            &Query::select()
-                .column(Agents::CompanyId)
-                .from(Agents::Table)
-                .and_where(Expr::col(Agents::Id).eq(device_id))
-                .and_where(Expr::col(Agents::DeletionRequestedAt).is_null())
-                .to_owned(),
-        )
-        .await?;
-    let Some((company_id,)) = company else {
+    let Some(device) = crate::targets::device(&mut database, device_id).await? else {
         return Ok(0);
     };
     let policies = load(&mut database, None).await?;
     let mut started = 0;
     for policy in policies.iter().filter(|policy| {
-        policy.enabled
-            && policy.trigger == Trigger::Enroll
-            && policy.covers(device_id, company_id.as_deref())
+        policy.enabled && policy.trigger == Trigger::Enroll && policy.target.covers(&device)
     }) {
         let mut transaction = state.database.begin().await?;
         let mut enrolling = policy.clone();

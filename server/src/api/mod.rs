@@ -13,6 +13,7 @@ mod instance;
 mod invitations;
 mod jobs;
 mod metrics;
+mod notes;
 mod notification_channels;
 mod passkeys;
 mod password_resets;
@@ -25,6 +26,7 @@ mod setup;
 mod sign_in;
 mod sso;
 mod system_info;
+mod tags;
 mod terminals;
 mod toolbox;
 mod updates;
@@ -181,6 +183,11 @@ fn device_routes() -> Router<AppState> {
         .route("/agents", get(devices::list))
         .route("/agents/{id}", delete(devices::delete))
         .route("/agents/{id}/company", put(companies::assign))
+        .route("/agents/{id}/notes", get(notes::get).put(notes::save))
+        .route("/agents/{id}/notes/{revision}", get(notes::revision))
+        .route("/tags", get(tags::list).post(tags::create))
+        .route("/tags/{id}", patch(tags::update).delete(tags::delete))
+        .route("/device-tags", post(tags::change))
         .route("/companies", get(companies::list).post(companies::create))
         .route(
             "/companies/{id}",
