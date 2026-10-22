@@ -88,12 +88,11 @@ pub(super) fn prepare(
             }
             _ => {}
         }
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&partial_path)
-            .map_err(|error| io_error(&error, &path))?;
+        let file = open_partial(
+            OpenOptions::new().write(true).create(true).truncate(false),
+            &partial_path,
+        )
+        .map_err(|error| io_error(&error, &path))?;
         let mut received = file
             .metadata()
             .map_err(|error| io_error(&error, &path))?
@@ -148,7 +147,7 @@ pub(super) fn open(
 ) -> Result<File, FileError> {
     let (partial_path, path) = partial(id, text)?;
     account.run(|| {
-        let mut file = match OpenOptions::new().write(true).open(&partial_path) {
+        let mut file = match open_partial(OpenOptions::new().write(true), &partial_path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(gone(&path)),
             Err(error) => return Err(io_error(&error, &path)),
@@ -185,7 +184,7 @@ pub(super) fn finish(
     }
     let (partial_path, path) = partial(id, text)?;
     account.run(|| {
-        let mut file = match File::open(&partial_path) {
+        let mut file = match open_partial(OpenOptions::new().read(true), &partial_path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(gone(&path)),
             Err(error) => return Err(io_error(&error, &path)),
@@ -245,6 +244,21 @@ pub(super) fn cancel(account: &Account, id: &str, text: &str) -> Result<FileRepl
         forget(&partial_path);
         Ok(FileReply::Upload { received: 0 })
     })
+}
+
+/// Opens an upload's partial file, which must be a plain file of its own:
+/// never a link, and never a second name of another file. It sits in a
+/// folder that may be a user's, so as root the user could otherwise swap it
+/// for a link to a system file for root to write into.
+fn open_partial(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    let file = platform::open_plain(options, path)?;
+    if !platform::plain_file(&file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the upload's partial file was replaced by a link",
+        ));
+    }
+    Ok(file)
 }
 
 /// The SHA-256 of what's left to read in `file`, in lowercase hex.
@@ -434,6 +448,31 @@ mod tests {
             FileErrorCode::NotFound
         );
         assert!(partial("../x", &target).is_err());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// A partial file swapped for a link to another file, or for a second
+    /// name of one, is refused rather than written through.
+    #[cfg(unix)]
+    #[test]
+    fn partial_files_swapped_for_links_are_refused() {
+        let folder = std::env::temp_dir().join(format!("meshrmm-up-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&folder).unwrap();
+        let account = own();
+        let target = paths::text(&folder.join("data.bin"));
+        let id = "0195f3a2-7c1d-7e4b-9a3f-2b8c4d5e6f71";
+        let victim = folder.join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        prepare(&account, id, &target, 4, false).unwrap();
+        let (partial_path, _) = partial(id, &target).unwrap();
+        fs::remove_file(&partial_path).unwrap();
+        std::os::unix::fs::symlink(&victim, &partial_path).unwrap();
+        assert!(open(&account, id, &target, 0, 4).is_err());
+        assert!(prepare(&account, id, &target, 4, false).is_err());
+        fs::remove_file(&partial_path).unwrap();
+        fs::hard_link(&victim, &partial_path).unwrap();
+        assert!(open(&account, id, &target, 0, 4).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
         let _ = fs::remove_dir_all(&folder);
     }
 }

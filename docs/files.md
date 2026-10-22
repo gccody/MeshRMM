@@ -139,7 +139,11 @@ MiB, three files at a time. Meanwhile the browser works out the file's
 SHA-256, reading it a piece at a time. Once the device has every byte, it
 checks the partial file's SHA-256 against the browser's and only then
 renames it into place, so a file appears whole or not at all; a mismatch
-discards it and says so. Uploaded files get the Mark of the Web on Windows
+discards it and says so. The partial file is only ever opened as a plain
+file of its own: as root in a folder a user owns, the user could otherwise
+swap it for a link to a system file for root to write into, so a partial
+file replaced by a link, or a second name of another file, stops the
+upload. Uploaded files get the Mark of the Web on Windows
 and the quarantine attribute on macOS, as files received in a remote
 session do.
 

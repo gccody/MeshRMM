@@ -11,13 +11,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use meshrmm_protocol::{
     FileError, FileErrorCode, FilePlace, FilePlaceKind, FileRoot, FileRootKind, RunAs,
 };
-use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+use windows::Win32::Foundation::{FILETIME, HANDLE, SYSTEMTIME};
 use windows::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
 use windows::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_FLAGS_AND_ATTRIBUTES, FileTimeToLocalFileTime, GetDiskFreeSpaceExW, GetDriveTypeW,
-    GetFileAttributesW, GetLogicalDrives, GetVolumeInformationW, GetVolumePathNameW,
-    INVALID_FILE_ATTRIBUTES, SetFileAttributesW,
+    GetFileAttributesW, GetFileInformationByHandle, GetLogicalDrives, GetVolumeInformationW,
+    GetVolumePathNameW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
@@ -120,6 +121,28 @@ fn change_attributes(path: &Path, change: impl FnOnce(u32) -> u32) -> io::Result
         )
     }
     .map_err(io::Error::other)
+}
+
+/// Opens `path` with `options`: a link there is opened itself, not
+/// followed, for [`plain_file`] to refuse.
+pub(super) fn open_plain(options: &mut fs::OpenOptions, path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    options
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)
+}
+
+/// Whether an open file is a regular file, not a link, with no other names.
+pub(super) fn plain_file(file: &fs::File) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle as _;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Ok(false);
+    }
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+        .map_err(io::Error::other)?;
+    Ok(info.nNumberOfLinks == 1)
 }
 
 /// Hides an upload's partial file.

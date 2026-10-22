@@ -176,6 +176,18 @@ pub(super) fn read_only(metadata: &Metadata) -> bool {
     metadata.mode() & 0o222 == 0
 }
 
+/// Opens `path` with `options`, without following a link there.
+pub(super) fn open_plain(options: &mut fs::OpenOptions, path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    options.custom_flags(libc::O_NOFOLLOW).open(path)
+}
+
+/// Whether an open file is a regular file with no other names.
+pub(super) fn plain_file(file: &fs::File) -> io::Result<bool> {
+    let metadata = file.metadata()?;
+    Ok(metadata.is_file() && metadata.nlink() == 1)
+}
+
 /// Hides an upload's partial file; on macOS and Linux its name starts with
 /// a dot.
 pub(super) fn hide(_path: &Path) {}
