@@ -212,6 +212,7 @@ pub async fn redeem(
             user_id: None,
             label: "Agent installer".to_owned(),
             ip: Some(ip),
+            api_token: None,
         },
         "agent_installer.redeem",
         Target::device(&claim.device_id),

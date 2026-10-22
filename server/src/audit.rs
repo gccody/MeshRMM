@@ -19,6 +19,15 @@ pub struct Actor {
     /// event so it stays readable after the user is deleted.
     pub label: String,
     pub ip: Option<IpAddr>,
+    /// The personal API token the user acted with, if not the website.
+    pub api_token: Option<TokenRef>,
+}
+
+/// A personal API token, as the audit log names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TokenRef {
+    pub id: String,
+    pub name: String,
 }
 
 impl Actor {
@@ -27,6 +36,7 @@ impl Actor {
             user_id: Some(user_id.to_owned()),
             label: email.to_owned(),
             ip,
+            api_token: None,
         }
     }
 
@@ -35,6 +45,7 @@ impl Actor {
             user_id: None,
             label: "anonymous".to_owned(),
             ip: Some(ip),
+            api_token: None,
         }
     }
 
@@ -43,6 +54,7 @@ impl Actor {
             user_id: None,
             label: "admin CLI".to_owned(),
             ip: None,
+            api_token: None,
         }
     }
 }
@@ -149,6 +161,13 @@ impl<'a> Target<'a> {
         }
     }
 
+    pub fn api_token(id: &'a str) -> Self {
+        Self {
+            kind: "api_token",
+            id,
+        }
+    }
+
     pub fn settings() -> Self {
         Self {
             kind: "settings",
@@ -179,6 +198,8 @@ pub async fn record(
                     AuditEvents::TargetId,
                     AuditEvents::MetadataJson,
                     AuditEvents::Ip,
+                    AuditEvents::ApiTokenId,
+                    AuditEvents::ApiTokenName,
                     AuditEvents::CreatedAt,
                 ])
                 .values_panic([
@@ -192,6 +213,12 @@ pub async fn record(
                     target.id.into(),
                     metadata.to_string().into(),
                     actor.ip.map(|ip| ip.to_string()).into(),
+                    actor.api_token.as_ref().map(|token| token.id.clone()).into(),
+                    actor
+                        .api_token
+                        .as_ref()
+                        .map(|token| token.name.clone())
+                        .into(),
                     now_ms().into(),
                 ])
                 .to_owned(),
@@ -210,6 +237,8 @@ pub struct Event {
     pub target_id: String,
     pub metadata: Value,
     pub ip: Option<String>,
+    /// The personal API token the user acted with.
+    pub api_token: Option<TokenRef>,
     pub created_at: i64,
 }
 
@@ -223,6 +252,8 @@ struct EventRow {
     target_id: String,
     metadata_json: String,
     ip: Option<String>,
+    api_token_id: Option<String>,
+    api_token_name: Option<String>,
     created_at: i64,
 }
 
@@ -232,6 +263,8 @@ pub struct Filter {
     pub target: Option<(String, String)>,
     /// An exact action, or a prefix ending in `.` such as `user.`.
     pub action: Option<String>,
+    /// Only events done with this personal API token.
+    pub api_token_id: Option<String>,
     /// Only events before this one in the log's newest-first order.
     pub before: Option<(i64, String)>,
 }
@@ -253,6 +286,8 @@ pub async fn list(
             AuditEvents::TargetId,
             AuditEvents::MetadataJson,
             AuditEvents::Ip,
+            AuditEvents::ApiTokenId,
+            AuditEvents::ApiTokenName,
             AuditEvents::CreatedAt,
         ])
         .from(AuditEvents::Table)
@@ -261,6 +296,9 @@ pub async fn list(
         .limit(limit);
     if let Some(actor) = &filter.actor_user_id {
         select.and_where(Expr::col(AuditEvents::ActorUserId).eq(actor.as_str()));
+    }
+    if let Some(token) = &filter.api_token_id {
+        select.and_where(Expr::col(AuditEvents::ApiTokenId).eq(token.as_str()));
     }
     if let Some((kind, id)) = &filter.target {
         select
@@ -302,6 +340,10 @@ pub async fn list(
             target_type: row.target_type,
             target_id: row.target_id,
             ip: row.ip,
+            api_token: row.api_token_id.map(|id| TokenRef {
+                id,
+                name: row.api_token_name.unwrap_or_default(),
+            }),
             created_at: row.created_at,
         })
         .collect())

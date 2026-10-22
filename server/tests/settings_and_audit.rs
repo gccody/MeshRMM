@@ -73,7 +73,13 @@ async fn general_settings_validate_and_apply_partial_updates() {
             .await;
         assert_eq!(
             authentication.body,
-            json!({ "require_two_factor": false, "password_min_length": 16, "session_lifetime_hours": 8 }),
+            json!({
+                "require_two_factor": false,
+                "password_min_length": 16,
+                "session_lifetime_hours": 8,
+                "api_tokens_enabled": true,
+                "api_token_max_lifetime_days": 365,
+            }),
             "{name}"
         );
         assert_eq!(

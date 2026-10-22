@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     agents::{self, parse_id},
-    auth::{Authorized, session},
+    auth::{Authorized, SignedIn, session},
     http::{ApiError, AppState, JsonBody, client_ip::ClientIp},
     settings,
     terminals::{
@@ -123,12 +123,15 @@ pub async fn open(
 /// asked for. See [`relay`] for what it carries and how it closes.
 pub async fn connect(
     State(state): State<AppState>,
-    actor: Authorized,
+    signed_in: SignedIn,
     ClientIp(ip): ClientIp,
     Path(id): Path<String>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
+    // A website session only: the session cookie keeps the socket's
+    // access checked while it stays open.
+    let actor = Authorized::new(signed_in)?;
     // Browsers send any site's cookies with a WebSocket handshake, so only
     // the website's own pages may open one.
     let origin = state.config.public_origin();

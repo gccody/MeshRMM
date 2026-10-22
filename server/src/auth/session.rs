@@ -9,7 +9,8 @@ use axum::{
 use sea_query::{Expr, ExprTrait, Query};
 
 use crate::{
-    audit::Actor,
+    api_tokens,
+    audit::{Actor, TokenRef},
     db::{
         Executor,
         tables::{UserOidcGroups, UserSessions, Users},
@@ -197,8 +198,9 @@ struct SessionRow {
     expires_at: i64,
 }
 
-/// A request with a live session, even one whose user must still set up a
-/// second factor. Most routes take [`Authorized`] instead.
+/// A website request with a live session, even one whose user must still
+/// set up a second factor. API tokens are refused. Most routes take
+/// [`Authorized`] instead.
 #[derive(Debug, Clone)]
 pub struct SignedIn {
     pub session_id: String,
@@ -229,6 +231,17 @@ impl SignedIn {
     pub fn is_administrator(&self) -> bool {
         self.roles.iter().any(Role::is_administrator)
     }
+
+    /// Refuses a user who must still set up a second factor.
+    pub fn require_full_access(&self) -> Result<(), ApiError> {
+        if self.must_enroll_two_factor {
+            return Err(
+                ApiError::forbidden("set up two-factor authentication to continue")
+                    .with_code("two_factor_enrollment_required"),
+            );
+        }
+        Ok(())
+    }
 }
 
 fn unauthenticated() -> ApiError {
@@ -239,7 +252,12 @@ impl FromRequestParts<AppState> for SignedIn {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
-        let token = token(&parts.headers).ok_or_else(unauthenticated)?;
+        let Some(token) = token(&parts.headers) else {
+            if api_tokens::bearer(&parts.headers).is_some() {
+                return Err(api_token_not_allowed());
+            }
+            return Err(unauthenticated());
+        };
         let ClientIp(ip) = ClientIp::from_request_parts(parts, state)
             .await
             .unwrap_or_else(|never| match never {});
@@ -323,28 +341,70 @@ pub async fn load(
     })
 }
 
-/// A signed-in user with full access to the routes their permissions allow.
+/// A caller with full access to the routes their permissions allow: a
+/// website session, or a personal API token acting for its user.
 #[derive(Debug, Clone)]
-pub struct Authorized(pub SignedIn);
-
-impl std::ops::Deref for Authorized {
-    type Target = SignedIn;
-
-    fn deref(&self) -> &SignedIn {
-        &self.0
-    }
+pub struct Authorized {
+    pub user: User,
+    pub roles: Vec<Role>,
+    /// What the caller may do. For a token, only what its scope allows of
+    /// what the user's roles grant.
+    pub permissions: Permissions,
+    pub ip: IpAddr,
+    /// The token the request carries; `None` for the website.
+    pub api_token: Option<TokenRef>,
+    administrator: bool,
 }
 
 impl Authorized {
     /// Full access, unless the user must still set up a second factor.
     pub fn new(signed_in: SignedIn) -> Result<Self, ApiError> {
-        if signed_in.must_enroll_two_factor {
-            return Err(
-                ApiError::forbidden("set up two-factor authentication to continue")
-                    .with_code("two_factor_enrollment_required"),
-            );
+        signed_in.require_full_access()?;
+        Ok(Self {
+            administrator: signed_in.is_administrator(),
+            user: signed_in.user,
+            roles: signed_in.roles,
+            permissions: signed_in.permissions,
+            ip: signed_in.ip,
+            api_token: None,
+        })
+    }
+
+    /// A request authenticated by [`crate::api_tokens::authenticate`].
+    pub fn for_token(
+        user: User,
+        roles: Vec<Role>,
+        permissions: Permissions,
+        administrator: bool,
+        ip: IpAddr,
+        token: TokenRef,
+    ) -> Self {
+        Self {
+            user,
+            roles,
+            permissions,
+            ip,
+            api_token: Some(token),
+            administrator,
         }
-        Ok(Self(signed_in))
+    }
+
+    /// The user, and the token if they used one.
+    pub fn actor(&self) -> Actor {
+        Actor {
+            api_token: self.api_token.clone(),
+            ..Actor::user(&self.user.id, &self.user.email, Some(self.ip))
+        }
+    }
+
+    pub fn has(&self, permission: Permission) -> bool {
+        self.permissions.contains(&permission)
+    }
+
+    /// The user holds the Administrator role, and this isn't a token limited
+    /// to some permissions.
+    pub fn is_administrator(&self) -> bool {
+        self.administrator
     }
 
     pub fn require(&self, permission: Permission) -> Result<(), ApiError> {
@@ -357,12 +417,32 @@ impl Authorized {
             )
         }
     }
+
+    /// Refuses API tokens, for what only the website may do.
+    pub fn require_website(&self) -> Result<(), ApiError> {
+        match self.api_token {
+            Some(_) => Err(api_token_not_allowed()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The error for an API token on a route only the website may use.
+pub fn api_token_not_allowed() -> ApiError {
+    ApiError::forbidden("API tokens can't be used for this; sign in to the website instead")
+        .with_code("api_token_not_allowed")
 }
 
 impl FromRequestParts<AppState> for Authorized {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        if let Some(secret) = api_tokens::bearer(&parts.headers).map(str::to_owned) {
+            let ClientIp(ip) = ClientIp::from_request_parts(parts, state)
+                .await
+                .unwrap_or_else(|never| match never {});
+            return api_tokens::authenticate(state, &secret, ip).await;
+        }
         Self::new(SignedIn::from_request_parts(parts, state).await?)
     }
 }
