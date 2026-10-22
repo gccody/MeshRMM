@@ -231,7 +231,10 @@ fn device_routes() -> Router<AppState> {
             "/agents/{id}/terminals/{terminal_id}",
             get(terminals::agent_connect),
         )
-        .route("/terminals/{id}", website_only_route(get(terminals::connect)))
+        .route(
+            "/terminals/{id}",
+            website_only_route(get(terminals::connect)),
+        )
         .route("/agents/{id}/close-session", post(remote::close))
         .route("/agents/{id}/metrics", get(metrics::get))
         .route("/agents/{id}/system-info", get(system_info::get))
@@ -353,7 +356,10 @@ fn alert_routes() -> Router<AppState> {
 
 fn remote_routes() -> Router<AppState> {
     Router::new()
-        .route("/remote/handoffs", website_only_route(post(handoffs::create)))
+        .route(
+            "/remote/handoffs",
+            website_only_route(post(handoffs::create)),
+        )
         .route("/remote/handoffs/redeem", post(remote::redeem))
         .route("/remote/sessions/{id}/signal", get(remote::signal))
         .route("/remote/sessions/{id}/resume", post(remote::resume))
@@ -538,7 +544,11 @@ fn limit_token_attempts(state: &AppState, ip: std::net::IpAddr) -> Result<(), Ap
 /// beyond the actor's own would let them raise their own access. Grant
 /// the Administrator role, which gains every permission future releases add,
 /// with [`require_administrator`] as well.
-fn ensure_within(actor: &Authorized, permissions: &Permissions, what: &str) -> Result<(), ApiError> {
+fn ensure_within(
+    actor: &Authorized,
+    permissions: &Permissions,
+    what: &str,
+) -> Result<(), ApiError> {
     let missing = permissions
         .difference(&actor.permissions)
         .map(|permission| permission.as_str())

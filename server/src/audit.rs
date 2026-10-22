@@ -213,7 +213,11 @@ pub async fn record(
                     target.id.into(),
                     metadata.to_string().into(),
                     actor.ip.map(|ip| ip.to_string()).into(),
-                    actor.api_token.as_ref().map(|token| token.id.clone()).into(),
+                    actor
+                        .api_token
+                        .as_ref()
+                        .map(|token| token.id.clone())
+                        .into(),
                     actor
                         .api_token
                         .as_ref()

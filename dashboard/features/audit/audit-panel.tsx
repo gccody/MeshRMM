@@ -1,4 +1,4 @@
-import { ClipboardList, LoaderCircle, RefreshCw } from "lucide-react";
+import { ClipboardList, KeyRound, LoaderCircle, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AuthenticationRequired, errorText, expectJson } from "../../lib/http";
 import { formatDateTime } from "../../lib/format";
@@ -77,7 +77,7 @@ export function AuditPanel() {
             {events.map((event) => (
               <tr key={event.id}>
                 <td className="nowrap">{formatDateTime(event.created_at)}</td>
-                <td>{event.actor_label}</td>
+                <td>{event.actor_label}{event.api_token && <span title={`API token ${event.api_token.id}`}><KeyRound size={12} aria-hidden="true" /> API token “{event.api_token.name}”</span>}</td>
                 <td>
                   <strong>{eventLabel(event)}</strong>
                   <span>{targetLabel(event, deviceNames)}</span>

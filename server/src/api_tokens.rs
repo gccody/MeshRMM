@@ -189,7 +189,9 @@ async fn by_secret(executor: &mut impl Executor, secret: &str) -> db::Result<Opt
     let row: Option<Row> = executor
         .fetch_optional(
             &select()
-                .and_where(Expr::col((ApiTokens::Table, ApiTokens::TokenHash)).eq(token_hash(secret)))
+                .and_where(
+                    Expr::col((ApiTokens::Table, ApiTokens::TokenHash)).eq(token_hash(secret)),
+                )
                 .to_owned(),
         )
         .await?;
@@ -222,7 +224,11 @@ fn refused(message: &'static str, code: &'static str) -> ApiError {
 /// Authenticates a request carrying `secret`. Unknown tokens count against
 /// the client address like failed sign-ins; once it has used them all,
 /// every token from it is refused until the oldest failure ages out.
-pub async fn authenticate(state: &AppState, secret: &str, ip: IpAddr) -> Result<Authorized, ApiError> {
+pub async fn authenticate(
+    state: &AppState,
+    secret: &str,
+    ip: IpAddr,
+) -> Result<Authorized, ApiError> {
     let limits = &state.auth.api_token_failures;
     let key = ip_key(ip);
     limits.check(&key).map_err(ApiError::rate_limited)?;
@@ -275,7 +281,8 @@ pub async fn authenticate(state: &AppState, secret: &str, ip: IpAddr) -> Result<
     };
     // A scoped token isn't the Administrator role, which also stands for
     // permissions no list names.
-    let administrator = token.permissions.is_none() && roles.iter().any(rbac::Role::is_administrator);
+    let administrator =
+        token.permissions.is_none() && roles.iter().any(rbac::Role::is_administrator);
     Ok(Authorized::for_token(
         user,
         roles,

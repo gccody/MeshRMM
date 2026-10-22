@@ -14,7 +14,7 @@ use crate::{
     db::{
         self, Database,
         tables::{
-            AgentInstallTokens, Agents, ApiTokens, Alerts, DeviceApplicationChanges, DeviceMetrics,
+            AgentInstallTokens, Agents, Alerts, ApiTokens, DeviceApplicationChanges, DeviceMetrics,
             FileDeliveries, Invitations, Jobs, PasswordResets, RemoteHandoffs, RemoteSessions,
             ScriptRuns, ToolboxFiles, UpdateRuns, UserSessions, WakeRequests,
         },

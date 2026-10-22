@@ -13,6 +13,8 @@ export type AuditEvent = {
   target_id: string;
   metadata: Record<string, unknown>;
   ip: string | null;
+  // The personal API token the user acted with, rather than the website.
+  api_token: { id: string; name: string } | null;
   created_at: number;
 };
 
@@ -24,6 +26,7 @@ export const AUDIT_CATEGORIES: readonly { prefix: string; label: string }[] = [
   { prefix: "", label: "Everything" },
   { prefix: "auth.", label: "Sign-ins" },
   { prefix: "account.", label: "Account security" },
+  { prefix: "api_token.", label: "API tokens" },
   { prefix: "user.", label: "Users" },
   { prefix: "invitation.", label: "Invitations" },
   { prefix: "role.", label: "Roles" },
@@ -56,6 +59,8 @@ const ACTION_LABELS: Record<string, string> = {
   "account.passkey_rename": "Renamed a passkey",
   "account.passkey_remove": "Removed a passkey",
   "account.session_end": "Signed out a session",
+  "api_token.create": "Made an API token",
+  "api_token.revoke": "Revoked an API token",
   "user.create": "Created a user",
   "user.update": "Changed a user",
   "user.delete": "Deleted a user",
@@ -181,6 +186,7 @@ const TARGET_LABELS: Record<string, string> = {
   toolbox_file: "File",
   scim_group: "SCIM group",
   scim_token: "SCIM token",
+  api_token: "API token",
   settings: "Settings",
   alert: "Alert",
   alert_rule: "Alert rule",
