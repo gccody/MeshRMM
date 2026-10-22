@@ -31,3 +31,6 @@ pub use terminal::*;
 
 mod wake;
 pub use wake::*;
+
+mod files;
+pub use files::*;

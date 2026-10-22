@@ -98,6 +98,12 @@ pub(super) fn channels() -> (relay::Io, ShellEnds) {
     )
 }
 
+/// Shows the company's connection notification to the computer's user, as
+/// a terminal does when it opens; the file browser shows it too.
+pub(in crate::remote) fn show_notice(mode: ExecutionMode, text: String) {
+    notice::show(mode, text);
+}
+
 /// The shells a terminal can run on this computer, for its system
 /// information.
 pub(crate) fn available_shells() -> Vec<meshrmm_protocol::TerminalShell> {

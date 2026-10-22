@@ -7,6 +7,7 @@ import {
   Copy,
   Ellipsis,
   Expand,
+  FolderOpen,
   Laptop,
   Layers,
   LoaderCircle,
@@ -27,6 +28,7 @@ import {
 } from "lucide-react";
 import { usePopover } from "../../lib/use-popover";
 import { terminalPagePath } from "../terminal/model";
+import { filesPagePath } from "../files/model";
 import type { MetricsReading } from "../metrics/model";
 import { DeviceUsage } from "../metrics/usage-meter";
 import { HeaderActions } from "../workspace/header-actions";
@@ -107,6 +109,8 @@ export type DeviceActions = {
   runScripts: boolean;
   // Open a terminal as either account.
   terminal: boolean;
+  // Browse the device's files.
+  files: boolean;
   // Wake offline devices with Wake-on-LAN.
   wake: boolean;
   deliverFiles: boolean;
@@ -624,6 +628,7 @@ function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSes
           {hasScreen && <button type="button" onClick={() => choose(onShowScreen)} aria-haspopup="dialog"><Expand size={16} aria-hidden="true" />View screen</button>}
           {allowed.wake && !agent.connected && <button type="button" disabled={state.deleting} onClick={() => choose((opener) => onWake([agent], opener))} aria-haspopup="dialog"><Power size={16} aria-hidden="true" />Wake device</button>}
           {allowed.terminal && agent.connected && <a href={terminalPagePath(agent.id)} target="_blank" rel="noreferrer" onClick={close}><Terminal size={16} aria-hidden="true" />Open terminal</a>}
+          {allowed.files && agent.connected && <a href={filesPagePath(agent.id)} target="_blank" rel="noreferrer" onClick={close}><FolderOpen size={16} aria-hidden="true" />Browse files</a>}
           {allowed.closeSession && <button type="button" disabled={state.anyClosing || state.connecting || state.deleting} onClick={() => choose(() => onCloseSession(agent))}><Square size={16} aria-hidden="true" />Close active session</button>}
           {allowed.moveCompany && <button type="button" disabled={state.deleting} onClick={() => choose((opener) => onMove(agent, opener))} aria-haspopup="dialog"><Building2 size={16} aria-hidden="true" />Move to company…</button>}
           {allowed.editTags && <button type="button" disabled={state.deleting} onClick={() => choose((opener) => onEditTags([agent], opener))} aria-haspopup="dialog"><TagIcon size={16} aria-hidden="true" />Tags…</button>}

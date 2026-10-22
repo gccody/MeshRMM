@@ -38,6 +38,7 @@ pub enum Settings {
     SessionLifetimeHours,
     UpdateScanIntervalHours,
     TerminalIdleTimeoutMinutes,
+    FileTransferLimitMb,
     ApiTokensEnabled,
     ApiTokenMaxLifetimeDays,
     SmtpHost,

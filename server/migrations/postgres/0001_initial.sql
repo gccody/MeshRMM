@@ -43,6 +43,9 @@ CREATE TABLE settings (
   -- Remote terminals with no input for this long are closed.
   terminal_idle_timeout_minutes BIGINT NOT NULL DEFAULT 30
     CHECK (terminal_idle_timeout_minutes BETWEEN 5 AND 480),
+  -- The largest file the file browser downloads or uploads, in MiB.
+  file_transfer_limit_mb BIGINT NOT NULL DEFAULT 4096
+    CHECK (file_transfer_limit_mb BETWEEN 1 AND 1048576),
   -- Personal API tokens work, and how long a new one may last (NULL: no
   -- limit, so tokens may never expire).
   api_tokens_enabled BOOLEAN NOT NULL DEFAULT TRUE,
@@ -150,7 +153,7 @@ CREATE TABLE role_permissions (
 -- is an editable default.
 INSERT INTO roles (id, name, description, builtin, created_at, updated_at) VALUES
   ('administrator', 'Administrator', 'Every permission, including users, roles and settings.', 'administrator', 0, 0),
-  ('technician', 'Technician', 'Enrolls, connects to and wakes devices, tags devices and keeps their notes, opens terminals, runs toolbox scripts and files, installs updates, and responds to alerts.', 'technician', 0, 0);
+  ('technician', 'Technician', 'Enrolls, connects to and wakes devices, tags devices and keeps their notes, opens terminals, browses and manages their files, runs toolbox scripts and files, installs updates, and responds to alerts.', 'technician', 0, 0);
 
 INSERT INTO role_permissions (role_id, permission) VALUES
   ('technician', 'devices.view'),
@@ -161,6 +164,9 @@ INSERT INTO role_permissions (role_id, permission) VALUES
   ('technician', 'sessions.connect_background'),
   ('technician', 'terminal.connect'),
   ('technician', 'terminal.connect_system'),
+  ('technician', 'files.browse'),
+  ('technician', 'files.manage'),
+  ('technician', 'files.system'),
   ('technician', 'scripts.run'),
   ('technician', 'files.deliver'),
   ('technician', 'alerts.view'),

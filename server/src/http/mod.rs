@@ -53,6 +53,7 @@ pub struct AppState {
     pub wake: crate::wake::Engine,
     pub sessions: Sessions,
     pub terminals: crate::terminals::Terminals,
+    pub files: crate::files::Files,
     pub turn: Turn,
     pub website: Website,
     pub downloads: Downloads,

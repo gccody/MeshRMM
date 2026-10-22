@@ -11,6 +11,7 @@ pub mod automation;
 pub mod config;
 pub mod db;
 pub mod downloads;
+pub mod files;
 pub mod health;
 pub mod http;
 pub mod mail;
@@ -89,6 +90,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         wake: wake::Engine::default(),
         sessions: Sessions::new(Timeouts::new(idle)),
         terminals: terminals::Terminals::default(),
+        files: files::Files::default(),
         turn: Turn::new(&instance_key),
         database,
         instance_key,

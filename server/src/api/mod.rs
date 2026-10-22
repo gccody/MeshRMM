@@ -9,6 +9,7 @@ mod companies;
 mod devices;
 mod enrollment;
 mod events;
+mod files;
 mod handoffs;
 mod instance;
 mod invitations;
@@ -235,6 +236,30 @@ fn device_routes() -> Router<AppState> {
             "/terminals/{id}",
             website_only_route(get(terminals::connect)),
         )
+        .route("/agents/{id}/files", get(files::list))
+        .route("/agents/{id}/files/roots", get(files::roots))
+        .route("/agents/{id}/files/folders", post(files::create_folder))
+        .route("/agents/{id}/files/rename", post(files::rename))
+        .route("/agents/{id}/files/move", post(files::move_entries))
+        .route("/agents/{id}/files/delete", post(files::delete))
+        .route("/agents/{id}/files/downloads", post(files::create_download))
+        .route("/agents/{id}/files/uploads", post(files::create_upload))
+        .route(
+            "/agents/{id}/file-transfers/{transfer_id}",
+            get(files::agent_connect),
+        )
+        .route("/file-downloads/{id}", get(files::fetch_download))
+        .route(
+            "/file-downloads/{id}/progress",
+            get(files::download_progress),
+        )
+        .route(
+            "/file-uploads/{id}",
+            get(files::upload_status)
+                .put(files::send_upload)
+                .delete(files::cancel_upload),
+        )
+        .route("/file-uploads/{id}/finish", post(files::finish_upload))
         .route("/agents/{id}/close-session", post(remote::close))
         .route("/agents/{id}/metrics", get(metrics::get))
         .route("/agents/{id}/system-info", get(system_info::get))
