@@ -124,18 +124,20 @@ input.
 - `alerts`: alert rules, the engine that judges them and the alerts they
   raise. `notifications`: email and webhook channels. See
   [alerts](alerts.md).
-- `automation`: jobs (a script, file, update scan or update install on many
+- `automation`: jobs (a script, file, update scan, update install or wake on many
   devices), the dispatcher that starts them a few at a time, and policies
   that start jobs on a schedule or on enrollment. See
   [automation](automation.md).
 - `updates`: each device's pending operating system updates, update scans
   and installs and their history. See [patch management](patch-management.md).
+- `wake`: Wake-on-LAN requests, choosing the online devices that relay
+  them, and their reports. See [Wake-on-LAN](wake-on-lan.md).
 - `terminals`: remote terminals that are being opened or are open, and the
   relay between each one's browser and Agent sockets. See
   [remote terminal](terminal.md).
 - `maintenance`: the periodic task that purges expired tokens, old runs,
-  resolved alerts, old application changes, old update runs and leftover
-  partial files.
+  resolved alerts, old application changes, old update runs, old wake
+  requests and leftover partial files.
 - `admin`: the `meshrmm-server admin` commands for locked-out operators.
 
 ### Realtime
@@ -147,7 +149,8 @@ task.
 - **Coordinator**, one per connected Agent (`/v1/agents/{id}/connect`):
   authentication, superseding an older connection of the same Agent,
   revocation, commands (session requests, scripts, file deliveries,
-  uninstall, system information, update scans and installs, terminals),
+  uninstall, system information, update scans and installs, terminals,
+  wake packets),
   credential rotation, the session lease and update grace.
 - **Session actor**, one per remote session
   (`/v1/remote/sessions/{id}/signal`): the signaling relay, the idle

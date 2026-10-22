@@ -29,6 +29,7 @@ pub mod toolbox;
 pub mod turn;
 pub mod updates;
 pub mod users;
+pub mod wake;
 pub mod website;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -81,6 +82,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         alerts: alerts::Engine::default(),
         automation: automation::Engine::default(),
         updates: updates::Engine::default(),
+        wake: wake::Engine::default(),
         sessions: Sessions::new(Timeouts::new(idle)),
         terminals: terminals::Terminals::default(),
         turn: Turn::new(&instance_key),
@@ -130,6 +132,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             restored,
             "resumed remote sessions that were live at shutdown"
         );
+    }
+    if let Err(error) = wake::give_up_overdue(&state, time::now_ms()).await {
+        tracing::warn!(%error, "could not finish wake requests from before the restart");
     }
     state.turn.start(&state.config).await?;
     let maintenance = maintenance::spawn(state.database.clone(), state.storage.clone());

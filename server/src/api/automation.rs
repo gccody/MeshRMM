@@ -140,7 +140,7 @@ fn metadata(policy: &Policy) -> Value {
             metadata["script_name"] = policy.script_name.clone().into();
             metadata["run_as"] = run_as.as_str().into();
         }
-        Action::UpdateScan => {}
+        Action::UpdateScan | Action::Wake => {}
         Action::UpdateInstall {
             categories,
             reboot,

@@ -171,8 +171,11 @@ async fn agents_report_scans_the_website_shows() {
             scan("windows_update", vec![update("b", "security")], true),
         )
         .await;
+        // The status and the list are read separately, so a read during the
+        // store can see one new and the other old.
         let shown = eventually(&mut admin, &desk.device_id, |updates| {
             updates["updates"].as_array().unwrap().len() == 1
+                && updates["status"]["reboot_pending"] == true
         })
         .await;
         assert_eq!(shown["updates"][0]["first_seen_at"], first_seen, "{name}");

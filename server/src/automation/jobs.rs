@@ -1,5 +1,5 @@
-//! Jobs: one script run, file delivery, update scan or update install on
-//! many devices, and how far it has got on each.
+//! Jobs: one script run, file delivery, update scan, update install or
+//! wake on many devices, and how far it has got on each.
 //!
 //! A job is created with every device it covers. A device that can't run the
 //! script's interpreter, or has no update manager MeshRMM supports, is
@@ -7,7 +7,8 @@
 //! for its Agent to connect, or is missed at once if the job doesn't wait.
 //! Each device's run, delivery or update run is an ordinary one carrying the
 //! job's ID, so its result, output and alerts work as for one started by
-//! hand.
+//! hand. A wake job is the other way round: it skips online devices, and
+//! wakes each offline one through the devices on its network.
 use std::collections::{HashMap, HashSet};
 
 use meshrmm_protocol_types::{
@@ -23,7 +24,7 @@ use crate::{
         self, Executor,
         tables::{
             Agents, Companies, DeviceUpdateStatus, FileDeliveries, JobDevices, Jobs, ScriptRuns,
-            UpdateRuns, Users,
+            UpdateRuns, Users, WakeRequests,
         },
     },
     http::ApiError,
@@ -49,6 +50,7 @@ pub enum Kind {
     File,
     UpdateScan,
     UpdateInstall,
+    Wake,
 }
 
 impl Kind {
@@ -58,6 +60,7 @@ impl Kind {
             Self::File => "file",
             Self::UpdateScan => "update_scan",
             Self::UpdateInstall => "update_install",
+            Self::Wake => "wake",
         }
     }
 
@@ -67,6 +70,7 @@ impl Kind {
             "file" => Some(Self::File),
             "update_scan" => Some(Self::UpdateScan),
             "update_install" => Some(Self::UpdateInstall),
+            "wake" => Some(Self::Wake),
             _ => None,
         }
     }
@@ -231,6 +235,8 @@ pub enum Payload {
         reboot: RebootBehavior,
         reboot_delay_minutes: u32,
     },
+    /// Wakes the devices that are offline.
+    Wake,
 }
 
 impl Payload {
@@ -240,6 +246,7 @@ impl Payload {
             Self::File { .. } => Kind::File,
             Self::UpdateScan => Kind::UpdateScan,
             Self::UpdateInstall { .. } => Kind::UpdateInstall,
+            Self::Wake => Kind::Wake,
         }
     }
 
@@ -252,6 +259,7 @@ impl Payload {
             } => (script_id, name.clone()),
             Self::File { file_id, name, .. } => (file_id, name.clone()),
             Self::UpdateScan => ("", "Scan for updates".to_owned()),
+            Self::Wake => ("", "Wake devices".to_owned()),
             Self::UpdateInstall { categories, .. } => (
                 "",
                 format!("Install {}", Install::describe(&[], categories)),
@@ -705,13 +713,21 @@ pub async fn create(
     }
     let label = target_label(executor, &job.target, &devices).await?;
     let id = new_id();
-    let wait_ms = if job.offline == Offline::Wait {
+    // A wake job is for offline devices; it never waits for them.
+    let offline = if job.payload == Payload::Wake {
+        Offline::Skip
+    } else {
+        job.offline
+    };
+    let wait_ms = if offline == Offline::Wait {
         job.wait_ms.clamp(HOUR_MS, MAX_WAIT_HOURS * HOUR_MS)
     } else {
         0
     };
     let (language, body, timeout_seconds, run_as, destination) = match &job.payload {
-        Payload::UpdateScan | Payload::UpdateInstall { .. } => (None, None, None, None, None),
+        Payload::UpdateScan | Payload::UpdateInstall { .. } | Payload::Wake => {
+            (None, None, None, None, None)
+        }
         Payload::Script {
             language,
             body,
@@ -781,7 +797,7 @@ pub async fn create(
                     reboot_delay_minutes.into(),
                     job.target.kind().as_str().into(),
                     label.as_str().into(),
-                    job.offline.as_str().into(),
+                    offline.as_str().into(),
                     (now + wait_ms).into(),
                     job.requested_by_user_id.as_str().into(),
                     job.policy.as_ref().map(|(id, _)| id.as_str()).into(),
@@ -826,7 +842,7 @@ pub async fn create(
         "target": job.target.kind().as_str(),
         "target_label": label,
         "devices": devices.len(),
-        "offline": job.offline.as_str(),
+        "offline": offline.as_str(),
         "queued": counts.get(&DeviceState::Queued).copied().unwrap_or(0),
         "waiting": counts.get(&DeviceState::Waiting).copied().unwrap_or(0),
         "skipped": counts.get(&DeviceState::Skipped).copied().unwrap_or(0),
@@ -868,6 +884,16 @@ fn initial_state(
     device: Device<'_>,
     connected: &HashSet<String>,
 ) -> (DeviceState, Option<String>) {
+    if job.payload == Payload::Wake {
+        return if connected.contains(device.id) {
+            (
+                DeviceState::Skipped,
+                Some("The device is online already".to_owned()),
+            )
+        } else {
+            (DeviceState::Queued, None)
+        };
+    }
     if let Some(reason) = job
         .payload
         .unsupported_on(device.platform, device.updates_supported)
@@ -1077,20 +1103,31 @@ fn outcome_columns(select: &mut sea_query::SelectStatement, now: i64) {
         "script_runs.created_at + script_runs.timeout_seconds * {SECOND_MS} + {RUN_REPORT_GRACE_MS}"
     );
     let delivery_deadline = format!("file_deliveries.created_at + {DELIVERY_WINDOW_MS}");
+    let wake_deadline = format!(
+        "wake_requests.created_at + {}",
+        crate::wake::ONLINE_WINDOW_MS
+    );
     let update_deadline = format!(
         "update_runs.created_at + CASE update_runs.kind WHEN 'scan' THEN {SCAN_REPORT_WINDOW_MS} \
          ELSE {INSTALL_REPORT_WINDOW_MS} END"
     );
     select
         .expr_as(
-            Expr::cust("COALESCE(script_runs.status, file_deliveries.status, update_runs.status)"),
+            Expr::cust(
+                "COALESCE(script_runs.status, file_deliveries.status, update_runs.status, \
+                 CASE WHEN wake_requests.id IS NULL THEN NULL \
+                 WHEN wake_requests.online_at IS NOT NULL THEN 'succeeded' \
+                 WHEN wake_requests.status IN ('sending', 'sent') THEN 'pending' \
+                 ELSE 'failed' END)",
+            ),
             "status",
         )
         .expr_as(
             Expr::cust(
                 "CAST(CASE WHEN script_runs.status = 'completed' AND script_runs.exit_code = 0 THEN 1 \
                  WHEN file_deliveries.status = 'delivered' THEN 1 \
-                 WHEN update_runs.status = 'succeeded' THEN 1 ELSE 0 END AS BIGINT)",
+                 WHEN update_runs.status = 'succeeded' THEN 1 \
+                 WHEN wake_requests.online_at IS NOT NULL THEN 1 ELSE 0 END AS BIGINT)",
             ),
             "succeeded",
         )
@@ -1099,6 +1136,8 @@ fn outcome_columns(select: &mut sea_query::SelectStatement, now: i64) {
                 "CAST(CASE WHEN script_runs.status = 'pending' AND {run_deadline} < {now} THEN 1 \
                  WHEN file_deliveries.status = 'pending' AND {delivery_deadline} < {now} THEN 1 \
                  WHEN update_runs.status = 'pending' AND {update_deadline} < {now} THEN 1 \
+                 WHEN wake_requests.online_at IS NULL AND wake_requests.status IN ('sending', 'sent') \
+                 AND {wake_deadline} < {now} THEN 1 \
                  ELSE 0 END AS BIGINT)"
             )),
             "overdue",
@@ -1127,6 +1166,15 @@ fn outcome_columns(select: &mut sea_query::SelectStatement, now: i64) {
                 .equals((JobDevices::Table, JobDevices::JobId))
                 .and(
                     Expr::col((UpdateRuns::Table, UpdateRuns::DeviceId))
+                        .equals((JobDevices::Table, JobDevices::DeviceId)),
+                ),
+        )
+        .left_join(
+            WakeRequests::Table,
+            Expr::col((WakeRequests::Table, WakeRequests::JobId))
+                .equals((JobDevices::Table, JobDevices::JobId))
+                .and(
+                    Expr::col((WakeRequests::Table, WakeRequests::DeviceId))
                         .equals((JobDevices::Table, JobDevices::DeviceId)),
                 ),
         );
@@ -1203,6 +1251,8 @@ pub struct JobDevice {
     pub delivery_id: Option<String>,
     /// The device's update scan or install, at `/v1/update-runs/{id}`.
     pub update_run_id: Option<String>,
+    /// The device's wake request, at `/v1/wakes?ids={id}`.
+    pub wake_id: Option<String>,
     pub exit_code: Option<i64>,
     /// Where a delivered file was saved.
     pub path: Option<String>,
@@ -1220,6 +1270,7 @@ struct JobDeviceRow {
     run_id: Option<String>,
     delivery_id: Option<String>,
     update_run_id: Option<String>,
+    wake_id: Option<String>,
     updates_installed: Option<i64>,
     updates_failed: Option<i64>,
     exit_code: Option<i64>,
@@ -1253,6 +1304,7 @@ pub async fn devices(
             "delivery_id",
         )
         .expr_as(Expr::col((UpdateRuns::Table, UpdateRuns::Id)), "update_run_id")
+        .expr_as(Expr::col((WakeRequests::Table, WakeRequests::Id)), "wake_id")
         .expr_as(
             Expr::col((UpdateRuns::Table, UpdateRuns::Installed)),
             "updates_installed",
@@ -1263,19 +1315,23 @@ pub async fn devices(
         )
         .column((ScriptRuns::Table, ScriptRuns::ExitCode))
         .expr_as(
-            Expr::cust("COALESCE(script_runs.error, file_deliveries.error, update_runs.error)"),
+            Expr::cust(
+                "COALESCE(script_runs.error, file_deliveries.error, update_runs.error, wake_requests.detail)",
+            ),
             "error",
         )
         .column((FileDeliveries::Table, FileDeliveries::Path))
         .expr_as(
             Expr::cust(
-                "COALESCE(script_runs.created_at, file_deliveries.created_at, update_runs.created_at)",
+                "COALESCE(script_runs.created_at, file_deliveries.created_at, update_runs.created_at, \
+                 wake_requests.created_at)",
             ),
             "started_at",
         )
         .expr_as(
             Expr::cust(
-                "COALESCE(script_runs.completed_at, file_deliveries.completed_at, update_runs.completed_at)",
+                "COALESCE(script_runs.completed_at, file_deliveries.completed_at, update_runs.completed_at, \
+                 wake_requests.online_at)",
             ),
             "completed_at",
         );
@@ -1307,15 +1363,23 @@ pub async fn devices(
                 )),
                 _ => None,
             };
+            // A woken device that never came online has no error of its own.
+            let unwoken = (row.wake_id.is_some() && outcome == Outcome::NoResult).then(|| {
+                format!(
+                    "The packets were sent, but the device didn't come online within {} minutes",
+                    crate::wake::ONLINE_WINDOW_MS / crate::time::MINUTE_MS
+                )
+            });
             Some(JobDevice {
                 device_id: row.device_id,
                 device_name: row.device_name,
                 platform: row.platform.as_deref().and_then(DevicePlatform::parse),
                 outcome,
-                detail: row.error.or(installs).or(row.detail),
+                detail: row.error.or(installs).or(unwoken).or(row.detail),
                 run_id: row.run_id,
                 delivery_id: row.delivery_id,
                 update_run_id: row.update_run_id,
+                wake_id: row.wake_id,
                 exit_code: row.exit_code,
                 path: row.path,
                 started_at_unix_ms: row.started_at,

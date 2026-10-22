@@ -145,11 +145,12 @@ CREATE TABLE role_permissions (
 -- is an editable default.
 INSERT INTO roles (id, name, description, builtin, created_at, updated_at) VALUES
   ('administrator', 'Administrator', 'Every permission, including users, roles and settings.', 'administrator', 0, 0),
-  ('technician', 'Technician', 'Enrolls and connects to devices, opens terminals, runs toolbox scripts and files, installs updates, and responds to alerts.', 'technician', 0, 0);
+  ('technician', 'Technician', 'Enrolls, connects to and wakes devices, opens terminals, runs toolbox scripts and files, installs updates, and responds to alerts.', 'technician', 0, 0);
 
 INSERT INTO role_permissions (role_id, permission) VALUES
   ('technician', 'devices.view'),
   ('technician', 'devices.enroll'),
+  ('technician', 'devices.wake'),
   ('technician', 'sessions.connect'),
   ('technician', 'sessions.connect_background'),
   ('technician', 'terminal.connect'),
@@ -377,6 +378,9 @@ CREATE TABLE device_ip_addresses (
   address TEXT NOT NULL,
   prefix_length BIGINT NOT NULL CHECK (prefix_length BETWEEN 0 AND 128),
   mac_address TEXT,
+  -- The adapter's kind: Wake-on-LAN relays broadcast from hardware adapters'
+  -- subnets in preference to virtual ones'.
+  kind TEXT NOT NULL CHECK (kind IN ('ethernet', 'wireless', 'virtual', 'other')),
   PRIMARY KEY (device_id, adapter, address)
 );
 
@@ -649,7 +653,7 @@ CREATE INDEX idx_alerts_resolved ON alerts (resolved_at);
 -- changes while it waits for offline devices. See docs/automation.md.
 CREATE TABLE jobs (
   id TEXT NOT NULL PRIMARY KEY,
-  kind TEXT NOT NULL CHECK (kind IN ('script', 'file', 'update_scan', 'update_install')),
+  kind TEXT NOT NULL CHECK (kind IN ('script', 'file', 'update_scan', 'update_install', 'wake')),
   -- The toolbox script or file, and its name when the job started. Update
   -- jobs have an empty item_id and say what they do in item_name.
   item_id TEXT NOT NULL,
@@ -713,7 +717,7 @@ CREATE TABLE automation_policies (
   -- for operating system updates; 'update_install' installs the pending
   -- updates in update_categories (comma-separated; NULL for all), then
   -- restarts as reboot says.
-  action TEXT NOT NULL DEFAULT 'script' CHECK (action IN ('script', 'update_scan', 'update_install')),
+  action TEXT NOT NULL DEFAULT 'script' CHECK (action IN ('script', 'update_scan', 'update_install', 'wake')),
   script_id TEXT,
   run_as TEXT CHECK (run_as IS NULL OR run_as IN ('system', 'user')),
   update_categories TEXT,
@@ -859,4 +863,44 @@ CREATE TABLE update_run_items (
   outcome TEXT NOT NULL CHECK (outcome IN ('installed', 'failed')),
   error TEXT,
   PRIMARY KEY (run_id, update_id)
+);
+
+-- Wake-on-LAN: each asks online devices on an offline device's network (the
+-- relays) to broadcast magic packets for it, by a user or as the device's
+-- part of a job (job_id).
+CREATE TABLE wake_requests (
+  id TEXT NOT NULL PRIMARY KEY,
+  device_id TEXT NOT NULL,
+  requested_by_user_id TEXT NOT NULL,
+  job_id TEXT,
+  -- 'sending': relays haven't all reported; 'sent': at least one sent the
+  -- packets; 'failed': none did; 'no_relay': there was none, or nothing to
+  -- wake the device with, as detail says.
+  status TEXT NOT NULL CHECK (status IN ('sending', 'sent', 'failed', 'no_relay')),
+  detail TEXT,
+  -- The hardware addresses woken, comma-separated.
+  mac_addresses TEXT NOT NULL,
+  created_at BIGINT NOT NULL,
+  -- When the device's Agent connected within a few minutes of the packets.
+  online_at BIGINT
+);
+
+CREATE INDEX idx_wake_requests_device ON wake_requests (device_id, created_at);
+CREATE INDEX idx_wake_requests_created ON wake_requests (created_at);
+CREATE INDEX idx_wake_requests_job ON wake_requests (job_id, device_id);
+
+-- The relays of each wake request, one per subnet each shares with the
+-- device, and what each reported.
+CREATE TABLE wake_relays (
+  wake_id TEXT NOT NULL REFERENCES wake_requests (id) ON DELETE CASCADE,
+  relay_device_id TEXT NOT NULL,
+  relay_name TEXT NOT NULL,
+  broadcast TEXT NOT NULL,
+  prefix_length BIGINT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed')),
+  -- The relay's address it sent from.
+  source_address TEXT,
+  error TEXT,
+  reported_at BIGINT,
+  PRIMARY KEY (wake_id, relay_device_id, broadcast)
 );

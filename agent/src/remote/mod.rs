@@ -75,6 +75,8 @@ mod transport;
 mod updates;
 #[cfg(windows)]
 pub(crate) mod virtual_display;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+mod wake;
 // The bitrate controller's tests share the encoded-frame queue bound.
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -156,6 +158,24 @@ fn report_metrics(socket: &SignalingConnection, metrics: meshrmm_protocol::Syste
     };
     if let Err(error) = queued {
         tracing::debug!(error = %error, "dropped a resource usage report");
+    }
+}
+
+/// Reports what became of the server's wake packets, without waiting for it
+/// to be written. A report that can't be queued is lost; the server gives
+/// up on it after a few seconds.
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+fn report_wake_results(
+    socket: &SignalingConnection,
+    results: Vec<meshrmm_protocol::WakePacketResult>,
+) {
+    let status = AgentStatusMessage::WakePacketsSent { results };
+    let queued = match serde_json::to_string(&status) {
+        Ok(text) => socket.queue(Message::Text(text.into())),
+        Err(error) => Err(error.into()),
+    };
+    if let Err(error) = queued {
+        tracing::warn!(error = %error, "could not report the wake packets sent");
     }
 }
 
@@ -251,6 +271,7 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             // Likewise, so a result that arrives while offline is sent on
             // the next connection.
             updates: updates::Updates::new(),
+            wake: wake::Relay::new(),
             config,
             mode,
             link,
@@ -272,6 +293,7 @@ struct Coordinator {
     metrics: metrics::Reports,
     system_info: system_info::Collector,
     updates: updates::Updates,
+    wake: wake::Relay,
     active_session: Option<ActiveSession>,
     // Outlives session tasks, which end whenever the viewer drops its
     // connection, so the close action runs only once the session ends.
@@ -348,6 +370,7 @@ impl Coordinator {
                 () = self.thumbnails.due() => self.thumbnails.refresh(&self.config),
                 metrics = self.metrics.next() => report_metrics(socket, metrics),
                 system = self.system_info.next() => report_system_info(socket, system),
+                results = self.wake.next() => report_wake_results(socket, results),
                 report = self.updates.next() => {
                     let sent = match serde_json::to_string(&report) {
                         Ok(text) => socket.send(Message::Text(text.into())).await,
@@ -426,6 +449,11 @@ impl Coordinator {
                     // Automatic updates wait for open terminals, as for sessions.
                     let activity = self.link.session_started();
                     terminal::open(&self.config, self.mode, terminal, activity);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::SendWakePackets { packets } => {
+                    tracing::info!(packets = packets.len(), "the server asked for wake packets");
+                    self.wake.send(packets);
                     return Ok(ControlFlow::Continue(()));
                 }
             }

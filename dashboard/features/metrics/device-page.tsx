@@ -8,6 +8,7 @@ import { MoveDeviceDialog } from "../companies/company-dialogs";
 import { DeviceSystem, type SystemTab } from "../system-info/device-system";
 import { terminalPagePath } from "../terminal/model";
 import { DeviceUpdates } from "../updates/device-updates";
+import { DeviceWake } from "../wake/device-wake";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import { MetricChart, type Series } from "./metric-chart";
@@ -141,6 +142,7 @@ export function DevicePage() {
             </a>
           )}
         </div>
+        {agent && <DeviceWake key={agent.id} agent={agent} />}
 
         <nav className="toolbox-tabs area-tabs device-tabs" aria-label="Device">
           {tabs.map(({ id, label, icon: Icon }) => (

@@ -7,8 +7,10 @@
 //! than [`MAX_PER_DEVICE`] of its own. So a job on a thousand devices reaches
 //! them over a minute or so instead of all at once, and its results trickle
 //! in rather than arriving together. Waiting devices are queued when their
-//! Agent connects, and missed when the job expires first.
-use std::collections::{HashMap, HashSet};
+//! Agent connects, and missed when the job expires first. A wake job's
+//! queued devices are offline ones: they are woken together, through the
+//! relays the wake requests pick, and don't count against the limits.
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use meshrmm_protocol_types::{
     AgentCommand, FileDeliveryDestination, FileDeliveryRequest, RebootBehavior, RunAs,
@@ -311,27 +313,94 @@ pub async fn dispatch(state: &AppState, now: i64) -> anyhow::Result<bool> {
         .collect::<HashMap<_, _>>();
     let mut started = 0;
     let mut held_back = false;
+    let mut full = false;
+    let mut wakes: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for row in &queued {
         if started >= DISPATCH_BATCH || total >= MAX_IN_FLIGHT {
-            return Ok(true);
+            full = true;
+            break;
+        }
+        let Some(job) = jobs.get(&row.job_id) else {
+            continue;
+        };
+        if Kind::parse(&job.kind) == Some(Kind::Wake) {
+            wakes
+                .entry(&job.id)
+                .or_default()
+                .push(row.device_id.clone());
+            started += 1;
+            continue;
         }
         let busy = per_device.entry(row.device_id.clone()).or_default();
         if *busy >= MAX_PER_DEVICE {
             held_back = true;
             continue;
         }
-        let Some(job) = jobs.get(&row.job_id) else {
-            continue;
-        };
         if start(state, job, &row.device_id, now).await? {
             started += 1;
             total += 1;
             *busy += 1;
         }
     }
+    for (job_id, devices) in wakes {
+        if let Some(job) = jobs.get(job_id) {
+            start_wakes(state, job, &devices, now).await?;
+        }
+    }
     // Devices held back wait for their runs to finish; anything past the
     // batch is next.
-    Ok(queued.len() as u64 >= DISPATCH_BATCH * 4 || (held_back && started > 0))
+    Ok(full || queued.len() as u64 >= DISPATCH_BATCH * 4 || (held_back && started > 0))
+}
+
+/// Wakes a wake job's queued devices that are still offline, and skips
+/// those that came online meanwhile.
+async fn start_wakes(
+    state: &AppState,
+    job: &JobRow,
+    devices: &[String],
+    now: i64,
+) -> anyhow::Result<()> {
+    let connected = state.agents.connected();
+    let mut claimed = Vec::new();
+    let mut transaction = state.database.begin().await?;
+    for device_id in devices {
+        let online = connected.contains(device_id);
+        let (next, detail) = if online {
+            (DeviceState::Skipped, Some("The device is online already"))
+        } else {
+            (DeviceState::Started, None)
+        };
+        let updated = transaction
+            .execute(
+                &Query::update()
+                    .table(JobDevices::Table)
+                    .value(JobDevices::State, next.as_str())
+                    .value(JobDevices::Detail, detail)
+                    .value(JobDevices::UpdatedAt, now)
+                    .and_where(Expr::col(JobDevices::JobId).eq(job.id.as_str()))
+                    .and_where(Expr::col(JobDevices::DeviceId).eq(device_id.as_str()))
+                    .and_where(Expr::col(JobDevices::State).eq(DeviceState::Queued.as_str()))
+                    .to_owned(),
+            )
+            .await?;
+        if updated == 1 && !online {
+            claimed.push(device_id.clone());
+        }
+    }
+    transaction.commit().await?;
+    if !claimed.is_empty() {
+        crate::wake::start(
+            state,
+            &claimed,
+            crate::wake::Requester {
+                user_id: &job.requested_by_user_id,
+                job_id: Some(&job.id),
+                actor: None,
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Starts the job on a queued device: records the run or delivery and
@@ -488,6 +557,8 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
             .await?;
             Some(update_runs::command(&id, update_kind, install.as_ref()))
         }
+        // Started together by `start_wakes`.
+        Kind::Wake => return Ok(false),
     };
     let claimed = transaction
         .execute(
@@ -545,6 +616,7 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
         Kind::UpdateScan | Kind::UpdateInstall => {
             update_runs::discard(&mut transaction, &id).await?;
         }
+        Kind::Wake => {}
     }
     unqueue(&mut transaction, job, device_id, DeviceState::Started, now).await?;
     transaction.commit().await?;

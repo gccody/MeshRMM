@@ -13,6 +13,7 @@ import {
   Monitor,
   MonitorOff,
   Plus,
+  Power,
   RefreshCw,
   Search,
   Send,
@@ -71,6 +72,8 @@ type Props = {
   onCloseSession: (agent: Agent) => void;
   onDelete: (agent: Agent) => void;
   onRunScript: (agent: Agent, opener: HTMLElement) => void;
+  // Wakes offline devices.
+  onWake: (agents: Agent[], opener: HTMLElement) => void;
   // The devices chosen for a job, and what to do with them.
   selection: DeviceSelection;
 };
@@ -93,6 +96,8 @@ export type DeviceActions = {
   runScripts: boolean;
   // Open a terminal as either account.
   terminal: boolean;
+  // Wake offline devices with Wake-on-LAN.
+  wake: boolean;
   deliverFiles: boolean;
   delete: boolean;
   enroll: boolean;
@@ -170,6 +175,7 @@ export function AgentOverview({
   onCloseSession,
   onDelete,
   onRunScript,
+  onWake,
   selection,
 }: Props) {
   const online = agents.filter((agent) => agent.connected).length;
@@ -178,7 +184,7 @@ export function AgentOverview({
   const hasData = inventory.status !== "loading";
   const stale = inventory.status === "stale";
   const browserOffline = inventory.connection === "offline";
-  const selectable = allowed.runScripts || allowed.deliverFiles;
+  const selectable = allowed.runScripts || allowed.deliverFiles || allowed.wake;
   const selectedCount = agents.filter((agent) => selection.ids.has(agent.id)).length;
 
   return (
@@ -198,7 +204,7 @@ export function AgentOverview({
       </HeaderActions>
 
       <InventoryStrip inventory={inventory} onReconnect={onReconnect} />
-      {selectable && selectedCount > 0 && <SelectionBar count={selectedCount} allowed={allowed} selection={selection} shown={filteredAgents} />}
+      {selectable && selectedCount > 0 && <SelectionBar count={selectedCount} allowed={allowed} selection={selection} shown={filteredAgents} chosen={agents.filter((agent) => selection.ids.has(agent.id))} onWake={onWake} />}
 
       {filteredAgents.length > 0 ? (
         <ul className={`device-wall${stale ? " stale" : ""}${selectedCount > 0 ? " selecting" : ""}`} aria-label="Devices">
@@ -226,6 +232,7 @@ export function AgentOverview({
               onCloseSession={onCloseSession}
               onDelete={onDelete}
               onRunScript={onRunScript}
+              onWake={onWake}
               onMove={onMove}
             />
           ))}
@@ -243,13 +250,17 @@ export function AgentOverview({
 }
 
 // What to do with the devices chosen on the wall.
-function SelectionBar({ count, allowed, selection, shown }: {
+function SelectionBar({ count, allowed, selection, shown, chosen, onWake }: {
   count: number;
   allowed: DeviceActions;
   selection: DeviceSelection;
   shown: Agent[];
+  // The chosen devices still on the wall.
+  chosen: Agent[];
+  onWake: (agents: Agent[], opener: HTMLElement) => void;
 }) {
   const allShown = shown.every((agent) => selection.ids.has(agent.id));
+  const offline = chosen.filter((agent) => !agent.connected);
   return (
     <div className="selection-bar" role="region" aria-label="Chosen devices">
       <strong role="status">{count} {count === 1 ? "device" : "devices"} selected</strong>
@@ -258,6 +269,7 @@ function SelectionBar({ count, allowed, selection, shown }: {
       <span className="selection-actions">
         {allowed.runScripts && <button type="button" className="primary-button" onClick={(event) => selection.onStartJob("script", event.currentTarget)} aria-haspopup="dialog"><SquareTerminal size={16} aria-hidden="true" />Run script</button>}
         {allowed.deliverFiles && <button type="button" className="secondary-button" onClick={(event) => selection.onStartJob("file", event.currentTarget)} aria-haspopup="dialog"><Send size={16} aria-hidden="true" />Send file</button>}
+        {allowed.wake && offline.length > 0 && <button type="button" className="secondary-button" onClick={(event) => onWake(offline, event.currentTarget)} aria-haspopup="dialog"><Power size={16} aria-hidden="true" />Wake {offline.length} offline</button>}
       </span>
     </div>
   );
@@ -348,7 +360,7 @@ function CompanyFilterList({ companies, company, onChoose }: {
   );
 }
 
-function DeviceTile({ agent, companyName, reading, store, allowed, selected, onSelect, state, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript, onMove }: {
+function DeviceTile({ agent, companyName, reading, store, allowed, selected, onSelect, state, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript, onWake, onMove }: {
   agent: Agent;
   companyName: string | null;
   reading: MetricsReading | undefined;
@@ -363,6 +375,7 @@ function DeviceTile({ agent, companyName, reading, store, allowed, selected, onS
   onCloseSession: (agent: Agent) => void;
   onDelete: (agent: Agent) => void;
   onRunScript: (agent: Agent, opener: HTMLElement) => void;
+  onWake: (agents: Agent[], opener: HTMLElement) => void;
   onMove: (agent: Agent, opener: HTMLElement) => void;
 }) {
   const [element, setElement] = useState<HTMLLIElement | null>(null);
@@ -423,6 +436,7 @@ function DeviceTile({ agent, companyName, reading, store, allowed, selected, onS
           onShowScreen={openPreview}
           onCloseSession={onCloseSession}
           onDelete={onDelete}
+          onWake={onWake}
           onMove={onMove}
         />
       </div>
@@ -482,7 +496,7 @@ function ConnectButton({ agent, allowed, stale, onRemote, onRemoteBackground }: 
   );
 }
 
-function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSession, onDelete, onMove }: {
+function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSession, onDelete, onWake, onMove }: {
   agent: Agent;
   allowed: DeviceActions;
   state: TileState;
@@ -490,6 +504,7 @@ function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSes
   onShowScreen: (opener: HTMLElement) => void;
   onCloseSession: (agent: Agent) => void;
   onDelete: (agent: Agent) => void;
+  onWake: (agents: Agent[], opener: HTMLElement) => void;
   onMove: (agent: Agent, opener: HTMLElement) => void;
 }) {
   const { open, setOpen, close, container, trigger } = usePopover();
@@ -508,6 +523,7 @@ function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSes
       {open && (
         <div id={menuId} className="popover menu" role="group" aria-label={`Actions for ${agent.name}`}>
           {hasScreen && <button type="button" onClick={() => choose(onShowScreen)} aria-haspopup="dialog"><Expand size={16} aria-hidden="true" />View screen</button>}
+          {allowed.wake && !agent.connected && <button type="button" disabled={state.deleting} onClick={() => choose((opener) => onWake([agent], opener))} aria-haspopup="dialog"><Power size={16} aria-hidden="true" />Wake device</button>}
           {allowed.terminal && agent.connected && <a href={terminalPagePath(agent.id)} target="_blank" rel="noreferrer" onClick={close}><Terminal size={16} aria-hidden="true" />Open terminal</a>}
           {allowed.closeSession && <button type="button" disabled={state.anyClosing || state.connecting || state.deleting} onClick={() => choose(() => onCloseSession(agent))}><Square size={16} aria-hidden="true" />Close active session</button>}
           {allowed.moveCompany && <button type="button" disabled={state.deleting} onClick={() => choose((opener) => onMove(agent, opener))} aria-haspopup="dialog"><Building2 size={16} aria-hidden="true" />Move to company…</button>}

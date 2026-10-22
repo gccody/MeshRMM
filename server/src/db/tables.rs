@@ -322,6 +322,7 @@ pub enum DeviceIpAddresses {
     Address,
     PrefixLength,
     MacAddress,
+    Kind,
 }
 
 #[derive(Iden, Clone, Copy)]
@@ -708,4 +709,32 @@ pub enum UpdateRunItems {
     Category,
     Outcome,
     Error,
+}
+
+#[derive(Iden)]
+pub enum WakeRequests {
+    Table,
+    Id,
+    DeviceId,
+    RequestedByUserId,
+    JobId,
+    Status,
+    Detail,
+    MacAddresses,
+    CreatedAt,
+    OnlineAt,
+}
+
+#[derive(Iden)]
+pub enum WakeRelays {
+    Table,
+    WakeId,
+    RelayDeviceId,
+    RelayName,
+    Broadcast,
+    PrefixLength,
+    Status,
+    SourceAddress,
+    Error,
+    ReportedAt,
 }

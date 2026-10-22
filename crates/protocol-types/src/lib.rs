@@ -28,3 +28,6 @@ pub use updates::*;
 
 mod terminal;
 pub use terminal::*;
+
+mod wake;
+pub use wake::*;

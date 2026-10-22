@@ -80,6 +80,7 @@ pub enum ActionKind {
     Script,
     UpdateScan,
     UpdateInstall,
+    Wake,
 }
 
 impl ActionKind {
@@ -88,6 +89,7 @@ impl ActionKind {
             Self::Script => "script",
             Self::UpdateScan => "update_scan",
             Self::UpdateInstall => "update_install",
+            Self::Wake => "wake",
         }
     }
 
@@ -96,6 +98,7 @@ impl ActionKind {
             "script" => Some(Self::Script),
             "update_scan" => Some(Self::UpdateScan),
             "update_install" => Some(Self::UpdateInstall),
+            "wake" => Some(Self::Wake),
             _ => None,
         }
     }
@@ -107,6 +110,7 @@ impl ActionKind {
             Self::Script => Permission::ScriptsRun,
             Self::UpdateScan => Permission::UpdatesView,
             Self::UpdateInstall => Permission::UpdatesInstall,
+            Self::Wake => Permission::DevicesWake,
         }
     }
 }
@@ -125,6 +129,8 @@ pub enum Action {
         reboot: RebootBehavior,
         reboot_delay_minutes: u32,
     },
+    /// Wakes the devices that are offline.
+    Wake,
 }
 
 impl Action {
@@ -133,6 +139,7 @@ impl Action {
             Self::Script { .. } => ActionKind::Script,
             Self::UpdateScan => ActionKind::UpdateScan,
             Self::UpdateInstall { .. } => ActionKind::UpdateInstall,
+            Self::Wake => ActionKind::Wake,
         }
     }
 
@@ -234,6 +241,7 @@ impl PolicyInput {
                 }
             }
             ActionKind::UpdateScan => Action::UpdateScan,
+            ActionKind::Wake => Action::Wake,
             ActionKind::UpdateInstall => {
                 let reboot_delay_minutes = match self.reboot_delay_minutes {
                     None => DEFAULT_REBOOT_DELAY_MINUTES,
@@ -306,6 +314,11 @@ impl PolicyInput {
         };
         let target = Target::from_request(self.target, self.device_ids, self.company_ids)
             .map_err(|_| invalid("choose the devices or companies it runs on"))?;
+        if trigger == Trigger::Enroll && action == Action::Wake {
+            return Err(invalid(
+                "a policy that wakes devices runs on a schedule: newly enrolled devices are online",
+            ));
+        }
         if trigger == Trigger::Enroll && matches!(target, Target::Devices(_)) {
             return Err(invalid(
                 "a policy for newly enrolled devices runs on every device or on companies",
@@ -639,6 +652,7 @@ fn action_of(row: &PolicyRow) -> Option<Action> {
             run_as: RunAs::parse(row.run_as.as_deref()?)?,
         },
         ActionKind::UpdateScan => Action::UpdateScan,
+        ActionKind::Wake => Action::Wake,
         ActionKind::UpdateInstall => Action::UpdateInstall {
             categories: Install::parse_categories(row.update_categories.as_deref()),
             reboot: RebootBehavior::parse(row.reboot.as_deref()?)?,
@@ -1065,6 +1079,7 @@ async fn payload(executor: &mut impl Executor, policy: &Policy) -> db::Result<Op
     let (script_id, run_as) = match &policy.action {
         Action::Script { script_id, run_as } => (script_id, *run_as),
         Action::UpdateScan => return Ok(Some(Payload::UpdateScan)),
+        Action::Wake => return Ok(Some(Payload::Wake)),
         Action::UpdateInstall {
             categories,
             reboot,

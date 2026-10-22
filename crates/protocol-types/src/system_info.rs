@@ -178,6 +178,27 @@ pub enum AdapterKind {
     Other,
 }
 
+impl AdapterKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ethernet => "ethernet",
+            Self::Wireless => "wireless",
+            Self::Virtual => "virtual",
+            Self::Other => "other",
+        }
+    }
+
+    /// Unknown kinds are [`Self::Other`].
+    pub fn parse(text: &str) -> Self {
+        match text {
+            "ethernet" => Self::Ethernet,
+            "wireless" => Self::Wireless,
+            "virtual" => Self::Virtual,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// An IP address on an adapter, and its subnet as a prefix length.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdapterAddress {

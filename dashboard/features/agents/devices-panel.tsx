@@ -9,6 +9,7 @@ import { ConnectionReasonModal } from "../session/connection-reason-modal";
 import { ViewerLaunchNotice } from "../session/viewer-launch-notice";
 import { StartJobModal } from "../automation/start-job-modal";
 import { RunScriptModal } from "../toolbox/run-script-modal";
+import { WakeDialog } from "../wake/wake-dialog";
 import { type ActionErrorSource, listActionErrors } from "../workspace/action-errors";
 import { useWorkspace } from "../workspace/workspace-context";
 import { AgentOverview, type DeviceActions } from "./agent-overview";
@@ -46,6 +47,7 @@ export function DevicesPanel() {
     closeSession: can("sessions.connect") || can("sessions.close_any"),
     runScripts: can("scripts.run"),
     terminal: can("terminal.connect") || can("terminal.connect_system"),
+    wake: can("devices.wake"),
     deliverFiles: can("files.deliver"),
     delete: can("devices.delete"),
     enroll: can("devices.enroll"),
@@ -60,6 +62,9 @@ export function DevicesPanel() {
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
   const [startingJob, setStartingJob] = useState<"script" | "file" | null>(null);
   const jobOpener = useRef<HTMLElement | null>(null);
+  // The offline devices being woken, and the control that asked.
+  const [waking, setWaking] = useState<Agent[] | null>(null);
+  const wakeOpener = useRef<HTMLElement | null>(null);
   // The device being moved to another company, and the menu that asked.
   const [moving, setMoving] = useState<Agent | null>(null);
   const moveOpener = useRef<HTMLElement | null>(null);
@@ -140,6 +145,7 @@ export function DevicesPanel() {
         onCloseSession={(agent) => void remote.closeSession(agent)}
         onDelete={(agent) => void deleteAgent(agent)}
         onRunScript={(agent, opener) => { runScriptOpener.current = opener; setRunScriptOn(agent); }}
+        onWake={(agents, opener) => { wakeOpener.current = opener; setWaking(agents); }}
         selection={{
           ids: selected,
           onChange: (agent, chosen) => setSelected((current) => {
@@ -179,6 +185,7 @@ export function DevicesPanel() {
         onClose={() => setRunScriptOn(null)}
         returnFocus={runScriptOpener}
       />}
+      {waking && <WakeDialog agents={waking} returnFocus={wakeOpener} onClose={() => setWaking(null)} />}
       {moving && <MoveDeviceDialog agent={moving} returnFocus={moveOpener} onClose={() => setMoving(null)} />}
       {pendingConnect && <ConnectionReasonModal
         agentName={pendingConnect.agent.name}
