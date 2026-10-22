@@ -82,7 +82,7 @@ export type ApplicationSource = "windows" | "windows_user" | "macos_app" | "dpkg
 
 export const SOURCE_LABELS: Record<ApplicationSource, string> = {
   windows: "Windows",
-  windows_user: "Windows, one user",
+  windows_user: "Windows (user)",
   macos_app: "Application",
   dpkg: "dpkg",
   rpm: "RPM",

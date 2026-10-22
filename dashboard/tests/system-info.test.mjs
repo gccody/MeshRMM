@@ -53,7 +53,7 @@ test("clicking a heading sorts by it, and again reverses it", () => {
 test("operating systems, sources and link speeds read naturally", () => {
   assert.equal(describeOs({ name: "Windows 11 Pro", version: "24H2", build: "26100.4652" }), "Windows 11 Pro 24H2 (26100.4652)");
   assert.equal(describeOs({ name: "Arch Linux", version: "rolling", build: null }), "Arch Linux rolling");
-  assert.equal(sourceLabel("windows_user"), "Windows, one user");
+  assert.equal(sourceLabel("windows_user"), "Windows (user)");
   assert.equal(sourceLabel("something_new"), "something_new");
   assert.equal(formatLinkSpeed(10_000_000_000), "10 Gbps");
   assert.equal(formatLinkSpeed(2_500_000_000), "2.5 Gbps");

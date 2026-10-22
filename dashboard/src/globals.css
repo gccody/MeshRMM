@@ -665,6 +665,8 @@ td.row-actions > * + * { margin-left: 6px; }
 /* ── Hardware and software ─────────────────────────────── */
 .device-tabs { margin: 0; flex-wrap: wrap; }
 .system-info { display: grid; gap: 16px; }
+.system-info .agent-panel + .agent-panel { margin-top: 0; }
+.software-table td:last-child { white-space: nowrap; }
 .system-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; }
 .system-bar .secondary-button { min-height: 32px; padding: 0 12px; gap: 7px; font-size: 13px; }
 .system-notice { flex: 1 0 100%; margin: 0; color: var(--warn); font-size: 13px; }
