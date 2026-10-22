@@ -14,6 +14,7 @@ import {
   MAX_INSTANCE_NAME_LENGTH,
   MIN_CONNECTION_APPROVAL_TIMEOUT_SECONDS,
   SETTINGS_TABS,
+  TERMINAL_IDLE_TIMEOUT_MINUTES,
   UPDATE_SCAN_INTERVALS,
   type GeneralSettings,
   type SettingsDraft,
@@ -149,6 +150,16 @@ export function SettingsPanel() {
               <label>
                 <input type="checkbox" checked={draft.sessionBanner} onChange={(event) => updateDraft({ sessionBanner: event.target.checked })} aria-describedby="session-banner-help" /> Show a banner on the device while connected</label>
               <p id="session-banner-help">Technicians can’t turn it off. Chat still appears without it.</p>
+            </section>
+            <section className="settings-section" id="settings-terminals" role="tabpanel" aria-labelledby="settings-tab-terminals" hidden={settingsTab !== "terminals"} tabIndex={0}>
+              <h2>Terminals</h2>
+              <p>Shells technicians open on devices from the website.</p>
+              <label htmlFor="terminal-idle-timeout">Close idle terminals after<select id="terminal-idle-timeout" value={draft.terminalIdleTimeoutMinutes} onChange={(event) => updateDraft({ terminalIdleTimeoutMinutes: Number(event.target.value) })} aria-describedby="terminal-idle-timeout-help">
+                {(TERMINAL_IDLE_TIMEOUT_MINUTES.includes(draft.terminalIdleTimeoutMinutes as (typeof TERMINAL_IDLE_TIMEOUT_MINUTES)[number]) ? TERMINAL_IDLE_TIMEOUT_MINUTES : [...TERMINAL_IDLE_TIMEOUT_MINUTES, draft.terminalIdleTimeoutMinutes].sort((left, right) => left - right))
+                  .map((minutes) => <option key={minutes} value={minutes}>{formatIdleDisconnect(minutes)}</option>)}
+              </select>
+              </label>
+              <p id="terminal-idle-timeout-help">A terminal with no keyboard input for this long is closed, and its shell ends on the device. Output alone doesn’t keep it open.</p>
             </section>
             <section className="settings-section" id="settings-blackout" role="tabpanel" aria-labelledby="settings-tab-blackout" hidden={settingsTab !== "blackout"} tabIndex={0}>
               <h2>Blackout message</h2>

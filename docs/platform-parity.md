@@ -150,6 +150,27 @@ yet.
   refuses a script for another platform's interpreter. The website and the
   viewer offer each device only the scripts it can run.
 
+## Remote terminal
+
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| [Terminal](terminal.md) | ConPTY | Pseudo-terminal | Pseudo-terminal |
+| Shells | Windows PowerShell, Command Prompt, PowerShell 7 where installed | Login shell, bash, zsh, sh | Login shell, bash, zsh, sh, where installed |
+| As the system account | SYSTEM, in Session 0 | root | root |
+| As the signed-in user | Yes, with their unelevated token, in their session | Yes, through `login` | Yes, with their groups and session bus |
+| Nobody signed in | Only as SYSTEM | Only as root | Only as root |
+| Closing ends everything the shell started | Yes (job object) | Yes, except programs that leave the session | Yes, except programs that leave the session |
+| Notification for the computer's user | Yes | Yes | Yes, as a notification; none without a notification service |
+
+- **Windows** shells run on a pseudoconsole, which turns the console API
+  into VT sequences. A job object holds the shell and what it starts, so it
+  needs no session bookkeeping.
+- **macOS and Linux** end a terminal by hanging up the shell's session, so a
+  program that starts a session of its own (`setsid`, daemons) survives, as
+  after an SSH session. On a Mac the user's shell goes through `login`, which
+  puts it in the user's launchd context: `open`, the pasteboard and the
+  keychain work as over SSH.
+
 ## Remote session video
 
 | | Windows | macOS | Linux |
@@ -362,4 +383,4 @@ yet.
 - **Linux:** a locked GNOME session is unlocked for the session and locked
   again afterwards; copied files are offered in GNOME's clipboard format, the
   only one Thunar, Caja and Nemo paste; servers without a desktop are
-  supported for monitoring, scripts and files.
+  supported for monitoring, the terminal, scripts and files.

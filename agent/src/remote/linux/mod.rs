@@ -25,7 +25,7 @@ pub(crate) mod session_close;
 pub(crate) mod sessions;
 pub(crate) mod snapshot;
 pub(crate) mod tray;
-mod ui;
+pub(crate) mod ui;
 mod wallpaper;
 
 use std::sync::Arc;

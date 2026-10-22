@@ -161,6 +161,15 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     if std::env::args_os()
         .nth(1)
+        .is_some_and(|argument| argument == "--terminal-notice")
+    {
+        let text = std::env::args().nth(2).unwrap_or_default();
+        return remote::terminal::run_notice_helper(&text);
+    }
+
+    #[cfg(windows)]
+    if std::env::args_os()
+        .nth(1)
         .is_some_and(|argument| argument == "--background-task-manager")
     {
         return remote::background_tasks::run();

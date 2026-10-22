@@ -18,10 +18,12 @@ import {
   Send,
   Square,
   SquareTerminal,
+  Terminal,
   Trash2,
   WifiOff,
 } from "lucide-react";
 import { usePopover } from "../../lib/use-popover";
+import { terminalPagePath } from "../terminal/model";
 import type { MetricsReading } from "../metrics/model";
 import { DeviceUsage } from "../metrics/usage-meter";
 import { HeaderActions } from "../workspace/header-actions";
@@ -89,6 +91,8 @@ export type DeviceActions = {
   connectBackground: boolean;
   closeSession: boolean;
   runScripts: boolean;
+  // Open a terminal as either account.
+  terminal: boolean;
   deliverFiles: boolean;
   delete: boolean;
   enroll: boolean;
@@ -370,6 +374,7 @@ function DeviceTile({ agent, companyName, reading, store, allowed, selected, onS
   const connectActions = hasBackgroundDesktop(agent) ? allowed : { ...allowed, connectBackground: false };
   const canConnect = reachable && (connectActions.connect || connectActions.connectBackground);
   const canRunScripts = reachable && allowed.runScripts;
+  const canOpenTerminal = reachable && allowed.terminal;
   const tone = agent.connected ? "online" : agent.updating_to ? "updating" : "offline";
 
   const openPreview = (opener: HTMLElement) => {
@@ -398,10 +403,11 @@ function DeviceTile({ agent, companyName, reading, store, allowed, selected, onS
             </span>
           )}
         </Link>
-        {(canConnect || canRunScripts) && (
+        {(canConnect || canRunScripts || canOpenTerminal) && (
           <div className="screen-actions">
             {canConnect && <ConnectButton agent={agent} allowed={connectActions} stale={state.stale} onRemote={onRemote} onRemoteBackground={onRemoteBackground} />}
             {canRunScripts && <button type="button" className="screen-action" onClick={(event) => onRunScript(agent, event.currentTarget)} aria-haspopup="dialog" aria-label={`Run a script on ${agent.name}`}><SquareTerminal size={15} aria-hidden="true" />Scripts</button>}
+            {canOpenTerminal && <TerminalLink agent={agent} />}
           </div>
         )}
       </div>
@@ -425,6 +431,16 @@ function DeviceTile({ agent, companyName, reading, store, allowed, selected, onS
       {reading && <DeviceUsage reading={reading} />}
       {previewOpen && thumbnail && <ScreenPreview agent={agent} thumbnail={thumbnail} returnFocus={previewOpener} onClose={() => setPreviewOpen(false)} />}
     </li>
+  );
+}
+
+// Terminals open in a tab of their own, so several devices' can stay open
+// side by side while the devices list stays here.
+function TerminalLink({ agent }: { agent: Agent }) {
+  return (
+    <a className="screen-action" href={terminalPagePath(agent.id)} target="_blank" rel="noreferrer" aria-label={`Open a terminal on ${agent.name} in a new tab`}>
+      <Terminal size={15} aria-hidden="true" />Terminal
+    </a>
   );
 }
 
@@ -492,6 +508,7 @@ function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSes
       {open && (
         <div id={menuId} className="popover menu" role="group" aria-label={`Actions for ${agent.name}`}>
           {hasScreen && <button type="button" onClick={() => choose(onShowScreen)} aria-haspopup="dialog"><Expand size={16} aria-hidden="true" />View screen</button>}
+          {allowed.terminal && agent.connected && <a href={terminalPagePath(agent.id)} target="_blank" rel="noreferrer" onClick={close}><Terminal size={16} aria-hidden="true" />Open terminal</a>}
           {allowed.closeSession && <button type="button" disabled={state.anyClosing || state.connecting || state.deleting} onClick={() => choose(() => onCloseSession(agent))}><Square size={16} aria-hidden="true" />Close active session</button>}
           {allowed.moveCompany && <button type="button" disabled={state.deleting} onClick={() => choose((opener) => onMove(agent, opener))} aria-haspopup="dialog"><Building2 size={16} aria-hidden="true" />Move to company…</button>}
           <button type="button" onClick={() => { void navigator.clipboard?.writeText(agent.id); close(); }}><Copy size={16} aria-hidden="true" />Copy device ID</button>

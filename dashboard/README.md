@@ -28,6 +28,13 @@ origin as its API. Nothing runs on Node in production.
   enforces them regardless.
 - **Live devices.** `/v1/events` is a WebSocket authenticated by the cookie. It
   sends a snapshot, then revision-numbered changes (`features/agents/inventory-stream.ts`).
+- **One bundle, one lazy chunk.** Every page hydrates from a single entry
+  script (kept under 700 kB by `tests/prerender.test.mjs`). Only the
+  [terminal](../docs/terminal.md)'s xterm.js is split out, loaded with
+  `React.lazy` when a terminal opens (`features/terminal/terminal-view.tsx`).
+  xterm adds `<style>` elements, which the Content-Security-Policy refuses,
+  so while a terminal is open they become inert elements whose rules go into
+  constructed stylesheets.
 
 ## Local development
 

@@ -86,6 +86,7 @@ pub struct GeneralSettings {
     connection_approval_timeout_seconds: i64,
     connection_approval_lock_idle_seconds: i64,
     update_scan_interval_hours: i64,
+    terminal_idle_timeout_minutes: i64,
     updated_at: i64,
 }
 
@@ -111,6 +112,7 @@ impl From<Settings> for GeneralSettings {
             connection_approval_timeout_seconds: settings.connection_approval_timeout_seconds,
             connection_approval_lock_idle_seconds: settings.connection_approval_lock_idle_seconds,
             update_scan_interval_hours: settings.update_scan_interval_hours,
+            terminal_idle_timeout_minutes: settings.terminal_idle_timeout_minutes,
             updated_at: settings.updated_at,
         }
     }
@@ -173,6 +175,8 @@ pub struct GeneralUpdate {
     /// 0 leaves scans to users and policies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     update_scan_interval_hours: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_idle_timeout_minutes: Option<u32>,
 }
 
 fn check(valid: bool, message: &'static str) -> Result<(), ApiError> {
@@ -267,6 +271,16 @@ impl GeneralUpdate {
             values.push((
                 SettingsTable::UpdateScanIntervalHours,
                 i64::from(hours).into(),
+            ));
+        }
+        if let Some(minutes) = self.terminal_idle_timeout_minutes {
+            check(
+                protocol::valid_terminal_idle_minutes(minutes),
+                "terminals can close after 5, 10, 15 or 30 minutes or 1, 2, 4 or 8 hours without input",
+            )?;
+            values.push((
+                SettingsTable::TerminalIdleTimeoutMinutes,
+                i64::from(minutes).into(),
             ));
         }
         for (column, value) in [

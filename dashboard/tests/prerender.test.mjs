@@ -54,10 +54,30 @@ test("the sign-in page is a working form before any script runs", async () => {
 test("the build carries no hosted-service code and stays small", async () => {
   const assets = await readdir(new URL("assets/", dist));
   const scripts = assets.filter((name) => name.endsWith(".js"));
-  assert.equal(scripts.length, 1, "one bundle, so every page hydrates without waiting on chunks");
-  const bundle = await readFile(new URL(`assets/${scripts[0]}`, dist), "utf8");
+  // One entry, so every page hydrates without waiting on chunks.
+  const html = await page("/");
+  const entries = scripts.filter((name) => html.includes(`/assets/${name}`));
+  assert.equal(entries.length, 1, "one entry script");
+  const bundle = await readFile(new URL(`assets/${entries[0]}`, dist), "utf8");
   for (const name of ["workos", "radix-ui", "cloudflare", "meshrmm.com"]) {
     assert.doesNotMatch(bundle, new RegExp(name, "i"), name);
   }
   assert.ok(bundle.length < 700_000, `the bundle is ${bundle.length} bytes`);
+});
+
+// xterm.js is loaded only when a terminal opens.
+test("the terminal is a lazy chunk no page loads up front", async () => {
+  const assets = await readdir(new URL("assets/", dist));
+  const scripts = assets.filter((name) => name.endsWith(".js"));
+  const lazy = scripts.filter((name) => !name.startsWith("index-"));
+  assert.equal(lazy.length, 1, `only the terminal is split off: ${lazy}`);
+  assert.ok(lazy[0].startsWith("terminal-view-"), lazy[0]);
+  const chunk = await readFile(new URL(`assets/${lazy[0]}`, dist), "utf8");
+  assert.match(chunk, /xterm/);
+  const entry = await readFile(new URL(`assets/${scripts.find((name) => name.startsWith("index-"))}`, dist), "utf8");
+  assert.doesNotMatch(entry, /xterm-helper-textarea|WebglAddon/, "xterm stays out of the entry");
+  for (const path of [...PAGES.map((entry) => entry.path), "/404"]) {
+    const html = path === "/404" ? await readFile(new URL("404.html", dist), "utf8") : await page(path);
+    assert.ok(!html.includes(lazy[0]), `${path} doesn't load the terminal`);
+  }
 });

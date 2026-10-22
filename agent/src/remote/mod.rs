@@ -63,6 +63,8 @@ pub(crate) mod session_close;
 mod signaling;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) mod system_info;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+pub(crate) mod terminal;
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod thumbnail;
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
@@ -410,6 +412,20 @@ impl Coordinator {
                         "the server asked for an update install"
                     );
                     self.updates.install(install);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::OpenTerminal { terminal } => {
+                    tracing::info!(
+                        terminal_id = %terminal.terminal_id,
+                        shell = terminal.shell.as_str(),
+                        run_as = terminal.run_as.as_str(),
+                        columns = terminal.columns,
+                        rows = terminal.rows,
+                        "the server asked for a terminal"
+                    );
+                    // Automatic updates wait for open terminals, as for sessions.
+                    let activity = self.link.session_started();
+                    terminal::open(&self.config, self.mode, terminal, activity);
                     return Ok(ControlFlow::Continue(()));
                 }
             }

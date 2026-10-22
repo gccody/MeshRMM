@@ -63,6 +63,8 @@ permissions! {
     SessionsConnect = "sessions.connect": "Start remote sessions.",
     SessionsConnectBackground = "sessions.connect_background": "Start remote sessions in the background, without the user seeing them.",
     SessionsCloseAny = "sessions.close_any": "End other users' remote sessions.",
+    TerminalConnect = "terminal.connect": "Open terminals on devices as the signed-in user.",
+    TerminalConnectSystem = "terminal.connect_system": "Open terminals on devices as SYSTEM or root, the Agent's own account.",
     ScriptsRun = "scripts.run": "Run toolbox scripts on devices.",
     ScriptsManageShared = "scripts.manage_shared": "Create, edit and delete shared toolbox scripts.",
     FilesDeliver = "files.deliver": "Deliver toolbox files to devices.",

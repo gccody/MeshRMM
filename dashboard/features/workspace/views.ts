@@ -3,7 +3,7 @@
 // Imports carry the .ts extension so node:test can load this module directly.
 import { type Account, type Permission, canAny } from "../auth/types.ts";
 
-export type View = "devices" | "device" | "companies" | "software" | "updates" | "toolbox" | "alerts" | "alert-rules" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account" | "jobs" | "job" | "policies";
+export type View = "devices" | "device" | "companies" | "software" | "updates" | "toolbox" | "alerts" | "alert-rules" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account" | "jobs" | "job" | "policies" | "terminal";
 
 export const VIEW_PATHS: Record<View, string> = {
   devices: "/",
@@ -25,6 +25,8 @@ export const VIEW_PATHS: Record<View, string> = {
   job: "/job",
   policies: "/policies",
   account: "/account",
+  // Last, so nobody lands on it: it needs a device.
+  terminal: "/terminal",
 };
 
 // Each page's title, which its navigation entry shows too.
@@ -47,6 +49,7 @@ export const VIEW_COPY: Record<View, { title: string }> = {
   jobs: { title: "Jobs" },
   job: { title: "Job" },
   policies: { title: "Policies" },
+  terminal: { title: "Terminal" },
 };
 
 // Jobs show to those who start them, policies' managers and auditors.
@@ -73,6 +76,7 @@ const VIEW_ACCESS: Record<View, readonly Permission[]> = {
   jobs: JOB_ACCESS,
   job: JOB_ACCESS,
   policies: ["automation.manage"],
+  terminal: ["terminal.connect", "terminal.connect_system"],
 };
 
 export function canView(account: Pick<Account, "permissions" | "is_administrator"> | null, view: View) {
@@ -90,10 +94,11 @@ export function homeView(account: Pick<Account, "permissions" | "is_administrato
   return views.find((view) => canView(account, view)) ?? "account";
 }
 
-// The navigation entry a page sits under: a device under Devices, the alert
-// rules and channels under Alerts, and a job and the policies under Jobs.
+// The navigation entry a page sits under: a device and its terminals under
+// Devices, the alert rules and channels under Alerts, and a job and the
+// policies under Jobs.
 export function navViewFor(view: View): View {
-  if (view === "device") return "devices";
+  if (view === "device" || view === "terminal") return "devices";
   if (view === "job" || view === "policies") return "jobs";
   if (view === "alert-rules" || view === "notification-channels") return "alerts";
   return view;

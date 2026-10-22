@@ -417,7 +417,7 @@ pub(crate) use self::shared::{deliver_file, run_script};
 use self::shared::{download, failed};
 
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 
 /// Scripts and files on a Mac. Scripts run with zsh, as root or as the user
 /// signed in on the console, in their own process group so a timeout stops

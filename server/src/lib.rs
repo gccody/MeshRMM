@@ -23,6 +23,7 @@ pub mod serve;
 pub mod settings;
 pub mod storage;
 pub mod system_info;
+pub mod terminals;
 pub mod time;
 pub mod toolbox;
 pub mod turn;
@@ -81,6 +82,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         automation: automation::Engine::default(),
         updates: updates::Engine::default(),
         sessions: Sessions::new(Timeouts::new(idle)),
+        terminals: terminals::Terminals::default(),
         turn: Turn::new(&instance_key),
         database,
         instance_key,

@@ -130,6 +130,9 @@ input.
   [automation](automation.md).
 - `updates`: each device's pending operating system updates, update scans
   and installs and their history. See [patch management](patch-management.md).
+- `terminals`: remote terminals that are being opened or are open, and the
+  relay between each one's browser and Agent sockets. See
+  [remote terminal](terminal.md).
 - `maintenance`: the periodic task that purges expired tokens, old runs,
   resolved alerts, old application changes, old update runs and leftover
   partial files.
@@ -144,8 +147,8 @@ task.
 - **Coordinator**, one per connected Agent (`/v1/agents/{id}/connect`):
   authentication, superseding an older connection of the same Agent,
   revocation, commands (session requests, scripts, file deliveries,
-  uninstall, system information, update scans and installs), credential
-  rotation, the session lease and update grace.
+  uninstall, system information, update scans and installs, terminals),
+  credential rotation, the session lease and update grace.
 - **Session actor**, one per remote session
   (`/v1/remote/sessions/{id}/signal`): the signaling relay, the idle
   deadline, resume, end and expiry. Its record is persisted in
@@ -168,6 +171,10 @@ task.
   lost and asks connected devices with old scans for new ones; scans,
   progress and installs are broadcast to event sockets of users with
   `updates.view`. See [patch management](patch-management.md).
+- **Terminals**: each open terminal is the task of its browser socket
+  (`/v1/terminals/{id}`), which relays to the socket the Agent opened for it
+  (`/v1/agents/{id}/terminals/{terminal_id}`), so terminal traffic never
+  shares an Agent's control connection. See [remote terminal](terminal.md).
 
 ### Sign-in and permissions
 
@@ -181,7 +188,8 @@ Roles are built from these permissions (`server/src/rbac.rs`):
 
 `devices.view`, `devices.enroll`, `devices.delete`,
 `devices.rotate_credentials`, `companies.manage`, `sessions.connect`,
-`sessions.connect_background`, `sessions.close_any`, `scripts.run`,
+`sessions.connect_background`, `sessions.close_any`, `terminal.connect`,
+`terminal.connect_system`, `scripts.run`,
 `scripts.manage_shared`, `files.deliver`, `files.manage_shared`,
 `jobs.run_wide`, `automation.manage`, `updates.view`, `updates.install`,
 `alerts.view`, `alerts.respond`, `alerts.manage`, `users.manage`, `roles.manage`, `settings.manage`, `authentication.manage`,

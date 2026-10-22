@@ -120,7 +120,7 @@ pub(super) fn execute_script(mode: ExecutionMode, run: &ScriptRunRequest) -> Scr
     }
 }
 
-fn system_directory() -> anyhow::Result<PathBuf> {
+pub(crate) fn system_directory() -> anyhow::Result<PathBuf> {
     Ok(crate::win32::windows_directory()?.join("System32"))
 }
 
@@ -157,17 +157,17 @@ fn oem_text(bytes: &[u8]) -> String {
 }
 
 /// A signed-in user: their token, account and profile folder.
-struct UserLogon {
-    token: OwnedHandle,
-    name: String,
+pub(crate) struct UserLogon {
+    pub(crate) token: OwnedHandle,
+    pub(crate) name: String,
     sid: String,
-    profile: PathBuf,
+    pub(crate) profile: PathBuf,
 }
 
 /// The user signed in to the console, or else to an active Remote
 /// Desktop session. `None` when nobody is, or when the Agent runs for
 /// development without the right to act for other users.
-fn signed_in_user(mode: ExecutionMode) -> Option<UserLogon> {
+pub(crate) fn signed_in_user(mode: ExecutionMode) -> Option<UserLogon> {
     if mode == ExecutionMode::Console {
         return None;
     }
@@ -275,7 +275,7 @@ fn token_account(token: &OwnedHandle) -> anyhow::Result<(String, String)> {
 }
 
 /// The Agent's own account, which SYSTEM scripts run as.
-pub(super) fn own_account() -> String {
+pub(crate) fn own_account() -> String {
     let mut token = HANDLE::default();
     let account = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
         .map_err(anyhow::Error::from)
