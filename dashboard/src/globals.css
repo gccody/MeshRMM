@@ -453,12 +453,21 @@ td.row-actions > * + * { margin-left: 6px; }
 .severity-warning { color: var(--warn); }
 .severity-critical { color: var(--danger); }
 .severity-critical i { transform: rotate(45deg); }
+/* Table cells grey their spans; badges and pills keep their colors. */
+.data-table td > span.severity { display: inline-flex; margin: 0; font-size: 13px; }
+.data-table td > span.severity-info { color: var(--signal-strong); }
+.data-table td > span.severity-warning { color: var(--warn); }
+.data-table td > span.severity-critical { color: var(--danger); }
+.data-table td > span.run-pill { display: inline-block; margin: 0; font-size: 12.5px; }
+.data-table td > span.run-pill-pending { color: var(--signal-strong); }
+.data-table td > span.run-pill-success { color: var(--live); }
+.data-table td > span.run-pill-problem { color: var(--danger); }
 .alert-table td:first-child { width: 110px; }
 .alert-table td:nth-last-child(2) > .run-pill + span { display: block; margin-top: 3px; color: var(--text-3); font-size: 12.5px; }
 .alert-table td.row-actions .secondary-button { gap: 6px; }
 .data-table td > strong a { color: inherit; text-decoration: none; }
 .data-table td > strong a:hover { text-decoration: underline; text-decoration-color: var(--text-3); text-underline-offset: 3px; }
-.data-table td > .run-pill + span { margin-top: 3px; }
+.data-table td > span.run-pill + span { margin-top: 3px; }
 .channel-name { display: flex !important; align-items: center; gap: 7px; }
 .channel-name svg { flex: none; color: var(--text-3); }
 .channel-target { max-width: 280px; color: var(--text-2); }
