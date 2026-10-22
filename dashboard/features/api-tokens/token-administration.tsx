@@ -157,7 +157,7 @@ function EveryonesTokens() {
         <div className="form-stack">
           {data.tokens.length > 0 && (
             <label htmlFor="api-token-search" className="form-narrow">Find a token
-              <input id="api-token-search" type="search" placeholder="Name or user" value={query} onChange={(event) => setQuery(event.target.value)} />
+              <input id="api-token-search" autoComplete="off" placeholder="Name or user" value={query} onChange={(event) => setQuery(event.target.value)} />
             </label>
           )}
           {tokens.length > 0
