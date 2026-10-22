@@ -140,7 +140,7 @@ CREATE TABLE role_permissions (
 -- is an editable default.
 INSERT INTO roles (id, name, description, builtin, created_at, updated_at) VALUES
   ('administrator', 'Administrator', 'Every permission, including users, roles and settings.', 'administrator', 0, 0),
-  ('technician', 'Technician', 'Enrolls and connects to devices and runs toolbox scripts and files.', 'technician', 0, 0);
+  ('technician', 'Technician', 'Enrolls and connects to devices, runs toolbox scripts and files, and responds to alerts.', 'technician', 0, 0);
 
 INSERT INTO role_permissions (role_id, permission) VALUES
   ('technician', 'devices.view'),
@@ -148,7 +148,9 @@ INSERT INTO role_permissions (role_id, permission) VALUES
   ('technician', 'sessions.connect'),
   ('technician', 'sessions.connect_background'),
   ('technician', 'scripts.run'),
-  ('technician', 'files.deliver');
+  ('technician', 'files.deliver'),
+  ('technician', 'alerts.view'),
+  ('technician', 'alerts.respond');
 
 CREATE TABLE user_roles (
   user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
@@ -423,7 +425,7 @@ CREATE TABLE script_runs (
   source TEXT NOT NULL CHECK (source IN ('dashboard', 'session')),
   run_as TEXT NOT NULL CHECK (run_as IN ('system', 'user')),
   timeout_seconds INTEGER NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'failed', 'timed_out')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'failed', 'timed_out', 'lost')),
   ran_as TEXT,
   exit_code INTEGER,
   stdout TEXT NOT NULL DEFAULT '',
@@ -455,3 +457,101 @@ CREATE TABLE file_deliveries (
 
 CREATE INDEX idx_file_deliveries_device ON file_deliveries (device_id, created_at);
 CREATE INDEX idx_file_deliveries_created ON file_deliveries (created_at);
+
+-- Where notifications go: email to chosen users and everyone holding chosen
+-- roles, or a webhook. Alert rules name the channels they notify.
+CREATE TABLE notification_channels (
+  id TEXT NOT NULL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 80),
+  kind TEXT NOT NULL CHECK (kind IN ('email', 'webhook')),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+  -- A webhook's URL, and the secret its requests are signed with, sealed
+  -- with the instance key.
+  webhook_url TEXT,
+  webhook_secret_encrypted BLOB,
+  -- How the last delivery went: NULL error when it succeeded.
+  last_delivery_at INTEGER,
+  last_delivery_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE notification_channel_users (
+  channel_id TEXT NOT NULL REFERENCES notification_channels (id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  PRIMARY KEY (channel_id, user_id)
+);
+
+CREATE TABLE notification_channel_roles (
+  channel_id TEXT NOT NULL REFERENCES notification_channels (id) ON DELETE CASCADE,
+  role_id TEXT NOT NULL REFERENCES roles (id) ON DELETE CASCADE,
+  PRIMARY KEY (channel_id, role_id)
+);
+
+-- What raises alerts. `threshold` is a percentage, or gigabytes for a disk
+-- space rule in 'gb'; `duration_minutes` is how long a device must be offline
+-- or a load sustained.
+CREATE TABLE alert_rules (
+  id TEXT NOT NULL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 120),
+  severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+  condition TEXT NOT NULL CHECK (condition IN ('device_offline', 'disk_space', 'cpu', 'memory', 'script_failed')),
+  threshold REAL,
+  threshold_unit TEXT CHECK (threshold_unit IS NULL OR threshold_unit IN ('percent', 'gb')),
+  duration_minutes INTEGER,
+  -- For script_failed: a script that exits with a code other than 0 failed too.
+  nonzero_exit_fails INTEGER NOT NULL DEFAULT 0 CHECK (nonzero_exit_fails IN (0, 1)),
+  -- Every device, or only those of the companies in alert_rule_companies.
+  all_companies INTEGER NOT NULL DEFAULT 1 CHECK (all_companies IN (0, 1)),
+  notify_on_resolve INTEGER NOT NULL DEFAULT 0 CHECK (notify_on_resolve IN (0, 1)),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  updated_by_user_id TEXT
+);
+
+CREATE TABLE alert_rule_companies (
+  rule_id TEXT NOT NULL REFERENCES alert_rules (id) ON DELETE CASCADE,
+  company_id TEXT NOT NULL REFERENCES companies (id) ON DELETE CASCADE,
+  PRIMARY KEY (rule_id, company_id)
+);
+
+CREATE TABLE alert_rule_channels (
+  rule_id TEXT NOT NULL REFERENCES alert_rules (id) ON DELETE CASCADE,
+  channel_id TEXT NOT NULL REFERENCES notification_channels (id) ON DELETE CASCADE,
+  PRIMARY KEY (rule_id, channel_id)
+);
+
+-- Alerts rules raised. A rule has at most one unresolved alert per device and
+-- subject (the volume of a disk space alert; '' otherwise). Resolved alerts
+-- are kept for a while, then purged.
+CREATE TABLE alerts (
+  id TEXT NOT NULL PRIMARY KEY,
+  rule_id TEXT NOT NULL REFERENCES alert_rules (id) ON DELETE CASCADE,
+  device_id TEXT NOT NULL,
+  subject TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'acknowledged', 'resolved')),
+  -- What tripped the rule: a percentage, gigabytes or minutes, and in words.
+  value REAL,
+  detail TEXT NOT NULL,
+  -- The latest failed run of a script_failed alert, and how many failed.
+  script_run_id TEXT,
+  occurrences INTEGER NOT NULL DEFAULT 1,
+  raised_at INTEGER NOT NULL,
+  last_occurred_at INTEGER NOT NULL,
+  acknowledged_at INTEGER,
+  acknowledged_by_user_id TEXT,
+  acknowledged_by_label TEXT,
+  resolved_at INTEGER,
+  -- NULL user when the server resolved it.
+  resolved_by_user_id TEXT,
+  resolved_by_label TEXT,
+  -- 'cleared': the condition passed; 'manual': a user resolved it;
+  -- 'not_applicable': the rule was turned off or no longer covers the device.
+  resolution TEXT CHECK (resolution IS NULL OR resolution IN ('cleared', 'manual', 'not_applicable'))
+);
+
+CREATE UNIQUE INDEX idx_alerts_unresolved ON alerts (rule_id, device_id, subject) WHERE state <> 'resolved';
+CREATE INDEX idx_alerts_device ON alerts (device_id, raised_at);
+CREATE INDEX idx_alerts_raised ON alerts (raised_at);
+CREATE INDEX idx_alerts_resolved ON alerts (resolved_at);

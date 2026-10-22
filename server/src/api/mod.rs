@@ -1,6 +1,7 @@
 //! The `/v1` API used by the website, and by Agents and viewers.
 mod account;
 mod agent;
+mod alerts;
 mod audit_log;
 mod companies;
 mod devices;
@@ -10,6 +11,7 @@ mod handoffs;
 mod instance;
 mod invitations;
 mod metrics;
+mod notification_channels;
 mod passkeys;
 mod password_resets;
 mod remote;
@@ -51,6 +53,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(device_routes())
         .merge(toolbox_routes())
         .merge(remote_routes())
+        .merge(alert_routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             recheck_access,
@@ -223,6 +226,39 @@ fn toolbox_routes() -> Router<AppState> {
         .route("/script-runs/{id}", get(runs::get_run))
         .route("/file-deliveries", get(runs::list_deliveries))
         .route("/file-deliveries/{id}", get(runs::get_delivery))
+}
+
+fn alert_routes() -> Router<AppState> {
+    Router::new()
+        .route("/alerts", get(alerts::list))
+        .route("/alerts/counts", get(alerts::counts))
+        .route("/alerts/{id}", get(alerts::get))
+        .route("/alerts/{id}/acknowledge", post(alerts::acknowledge))
+        .route("/alerts/{id}/resolve", post(alerts::resolve))
+        .route(
+            "/alert-rules",
+            get(alerts::list_rules).post(alerts::create_rule),
+        )
+        .route(
+            "/alert-rules/{id}",
+            put(alerts::update_rule).delete(alerts::delete_rule),
+        )
+        .route(
+            "/notification-channels",
+            get(notification_channels::list).post(notification_channels::create),
+        )
+        .route(
+            "/notification-channels/recipients",
+            get(notification_channels::recipients),
+        )
+        .route(
+            "/notification-channels/{id}",
+            put(notification_channels::update).delete(notification_channels::delete),
+        )
+        .route(
+            "/notification-channels/{id}/test",
+            post(notification_channels::test),
+        )
 }
 
 fn remote_routes() -> Router<AppState> {

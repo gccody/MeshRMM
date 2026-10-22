@@ -50,6 +50,10 @@ MeshRMM is in heavy development and not production ready.
   filter the wall by company and enroll new devices straight into one.
 - Resource monitoring: CPU, memory, network, uptime and disk space, live and
   as charts for the last hour, day or week.
+- Alerts: rules for devices going offline, low disk space, sustained CPU or
+  memory load, and failed scripts, for every device or chosen companies.
+  Alerts are acknowledged and resolved in the website, resolve themselves
+  when the condition passes, and notify by email or signed webhook.
 - Enrollment with a single-use installer (Windows) or install command
   (macOS and Linux). Agents and viewers update themselves from the server and
   check a release signature first.
@@ -72,8 +76,8 @@ MeshRMM is in heavy development and not production ready.
   passkeys, plus optional single sign-on (OIDC) and SCIM provisioning.
 - Custom roles built from a list of permissions, and an audit log of
   sign-ins, changes, sessions, script runs and file deliveries.
-- Email for invitations and resets is optional; without it the website gives
-  one-time links to copy.
+- Email for invitations, resets and alerts is optional; without it the
+  website gives one-time links to copy, and alerts go to webhooks.
 
 **Self-hosting**
 
@@ -160,6 +164,7 @@ For developers:
 - [Background mode](docs/background-mode.md): the Session 0 workspace and its
   built-in tools
 - [Toolbox](docs/toolbox.md): scripts and files
+- [Alerts](docs/alerts.md): rules, alerts and notification channels
 - [Credential autofill](docs/credential-autofill.md)
 - [Screen thumbnails](docs/screen-thumbnails.md)
 - [macOS Agent](docs/macos-agent.md)

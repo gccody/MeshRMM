@@ -403,3 +403,88 @@ pub enum FileDeliveries {
     CreatedAt,
     CompletedAt,
 }
+
+#[derive(Iden)]
+pub enum NotificationChannels {
+    Table,
+    Id,
+    Name,
+    Kind,
+    Enabled,
+    WebhookUrl,
+    WebhookSecretEncrypted,
+    LastDeliveryAt,
+    LastDeliveryError,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+pub enum NotificationChannelUsers {
+    Table,
+    ChannelId,
+    UserId,
+}
+
+#[derive(Iden)]
+pub enum NotificationChannelRoles {
+    Table,
+    ChannelId,
+    RoleId,
+}
+
+#[derive(Iden)]
+pub enum AlertRules {
+    Table,
+    Id,
+    Name,
+    Severity,
+    Enabled,
+    Condition,
+    Threshold,
+    ThresholdUnit,
+    DurationMinutes,
+    NonzeroExitFails,
+    AllCompanies,
+    NotifyOnResolve,
+    CreatedAt,
+    UpdatedAt,
+    UpdatedByUserId,
+}
+
+#[derive(Iden)]
+pub enum AlertRuleCompanies {
+    Table,
+    RuleId,
+    CompanyId,
+}
+
+#[derive(Iden)]
+pub enum AlertRuleChannels {
+    Table,
+    RuleId,
+    ChannelId,
+}
+
+#[derive(Iden, Clone, Copy)]
+pub enum Alerts {
+    Table,
+    Id,
+    RuleId,
+    DeviceId,
+    Subject,
+    State,
+    Value,
+    Detail,
+    ScriptRunId,
+    Occurrences,
+    RaisedAt,
+    LastOccurredAt,
+    AcknowledgedAt,
+    AcknowledgedByUserId,
+    AcknowledgedByLabel,
+    ResolvedAt,
+    ResolvedByUserId,
+    ResolvedByLabel,
+    Resolution,
+}

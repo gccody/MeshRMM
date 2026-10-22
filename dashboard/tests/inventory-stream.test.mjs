@@ -59,7 +59,7 @@ function harness({ online } = {}) {
   const connections = [];
   const timers = fakeTimers();
   const revision = { current: -1 };
-  const state = { agents: [], companies: [], refused: 0, readings: [] };
+  const state = { agents: [], companies: [], refused: 0, readings: [], alerts: [] };
   const stream = inventoryStream({
     openSocket: () => {
       const socket = new FakeSocket();
@@ -69,6 +69,7 @@ function harness({ online } = {}) {
     revision,
     onInventory: update => { ({ agents: state.agents, companies: state.companies } = update({ agents: state.agents, companies: state.companies })); },
     onMetrics: readings => { state.readings.push(...readings); },
+    onAlerts: event => { state.alerts.push(event); },
     onConnection: connection => connections.push(connection),
     onRefused: () => { state.refused++; },
     online,
@@ -267,6 +268,19 @@ test('resource usage arrives beside the revisions without disturbing them', () =
   };
   sockets[0].receive({ type: 'metrics', readings: [reading, { device_id: 'b' }] });
   assert.deepEqual(state.readings, [reading], 'invalid readings are skipped');
+  assert.equal(revision.current, 3);
+  assert.deepEqual(sockets[0].sent, [], 'no snapshot is requested');
+});
+
+test('alert events arrive beside the revisions without disturbing them', () => {
+  const { sockets, state, revision } = harness();
+  sockets[0].open();
+  sockets[0].receive({ type: 'snapshot', revision: 3, agents: [agent('a')], generated_at_unix_ms: 0 });
+  const counts = { open: 1, acknowledged: 0, open_info: 0, open_warning: 1, open_critical: 0 };
+  sockets[0].receive({ type: 'alert_counts', counts });
+  const alert = { id: 'x', rule_id: 'r', device_id: 'a', state: 'open', raised_at: 5 };
+  sockets[0].receive({ type: 'alert_upsert', alert, counts });
+  assert.deepEqual(state.alerts, [{ type: 'alert_counts', counts }, { type: 'alert_upsert', alert, counts }]);
   assert.equal(revision.current, 3);
   assert.deepEqual(sockets[0].sent, [], 'no snapshot is requested');
 });

@@ -1,14 +1,17 @@
-//! `GET /v1/events`: the website's socket for device presence and resource
-//! usage.
+//! `GET /v1/events`: the website's socket for device presence, resource
+//! usage and alerts.
 //!
 //! It sends a snapshot of the devices, then each change with the next
 //! revision. The website sends `refresh` for a new snapshot when it missed a
 //! change. Every few seconds it also sends the latest resource usage of the
 //! devices that reported since it last did, which carries no revision: after
-//! each snapshot it sends every online device's. The socket stays authorized by the session cookie it opened with:
-//! it checks the session and the `devices.view` permission again every half
-//! minute, and at once after a signed-in user changes something, and closes
-//! with 4001 when either is gone.
+//! each snapshot it sends every online device's. A user who may see alerts
+//! also gets the unresolved alert counts after each snapshot, and each alert
+//! that is raised or changes ([`AlertEvent`]). The socket stays authorized by
+//! the session cookie it opened with: it checks the session and the
+//! `devices.view` permission again every half minute, and at once after a
+//! signed-in user changes something, and closes with 4001 when either is
+//! gone.
 use std::{
     net::IpAddr,
     time::{Duration, Instant},
@@ -25,6 +28,7 @@ use axum::{
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::{
+    alerts::{AlertEvent, store},
     auth::{Authorized, session},
     http::{ApiError, AppState, client_ip::ClientIp},
     rbac::Permission,
@@ -61,16 +65,24 @@ pub async fn subscribe(
         );
     }
     actor.require(Permission::DevicesView)?;
+    let alerts = actor.has(Permission::AlertsView);
     let token = session::token(&headers).expect("an authorized request has a session cookie");
     Ok(upgrade
         .max_message_size(1024)
-        .on_upgrade(move |socket| serve(state, token, ip, socket)))
+        .on_upgrade(move |socket| serve(state, token, ip, alerts, socket)))
 }
 
-async fn serve(state: AppState, token: String, ip: IpAddr, mut socket: WebSocket) {
+async fn serve(
+    state: AppState,
+    token: String,
+    ip: IpAddr,
+    mut alerts: bool,
+    mut socket: WebSocket,
+) {
     let mut events = state.presence.subscribe();
+    let mut alert_events = state.alerts.subscribe();
     let mut access = state.presence.access_changes();
-    let Some(mut revision) = send_snapshot(&state, &mut socket).await else {
+    let Some(mut revision) = send_snapshot(&state, &mut socket, alerts).await else {
         return;
     };
     let mut recheck = tokio::time::interval(RECHECK_INTERVAL);
@@ -93,7 +105,7 @@ async fn serve(state: AppState, token: String, ip: IpAddr, mut socket: WebSocket
                     }
                 }
                 Ok(_) => {}
-                Err(RecvError::Lagged(_)) => match send_snapshot(&state, &mut socket).await {
+                Err(RecvError::Lagged(_)) => match send_snapshot(&state, &mut socket, alerts).await {
                     Some(sent) => {
                         revision = sent;
                         metrics_sent = 0;
@@ -107,7 +119,7 @@ async fn serve(state: AppState, token: String, ip: IpAddr, mut socket: WebSocket
                 last_heard = Instant::now();
                 match frame {
                 Some(Ok(Message::Text(text))) if text.as_str() == "refresh" => {
-                    match send_snapshot(&state, &mut socket).await {
+                    match send_snapshot(&state, &mut socket, alerts).await {
                         Some(sent) => {
                             revision = sent;
                             metrics_sent = 0;
@@ -124,17 +136,35 @@ async fn serve(state: AppState, token: String, ip: IpAddr, mut socket: WebSocket
                 Some(Ok(Message::Close(_)) | Err(_)) | None => return,
             }
             },
-            changed = access.changed() => {
-                if changed.is_err() || !still_allowed(&state, &token, ip).await {
-                    send(&mut socket, close_frame(4001, "sign in again")).await;
+            event = alert_events.recv(), if alerts => {
+                let sent = match event {
+                    Ok(event) => send_json(&mut socket, &*event).await,
+                    Err(RecvError::Lagged(_)) => send_alert_counts(&state, &mut socket).await,
+                    Err(RecvError::Closed) => return,
+                };
+                if !sent {
                     return;
                 }
             }
-            _ = recheck.tick() => {
-                if !still_allowed(&state, &token, ip).await {
+            changed = access.changed() => {
+                let Some(allowed) = changed.ok().and(still_allowed(&state, &token, ip, alerts).await) else {
                     send(&mut socket, close_frame(4001, "sign in again")).await;
                     return;
+                };
+                if allowed.alerts && !alerts && !send_alert_counts(&state, &mut socket).await {
+                    return;
                 }
+                alerts = allowed.alerts;
+            }
+            _ = recheck.tick() => {
+                let Some(allowed) = still_allowed(&state, &token, ip, alerts).await else {
+                    send(&mut socket, close_frame(4001, "sign in again")).await;
+                    return;
+                };
+                if allowed.alerts && !alerts && !send_alert_counts(&state, &mut socket).await {
+                    return;
+                }
+                alerts = allowed.alerts;
             }
             _ = metrics.tick() => {
                 let (readings, sequence) = state.metrics.since(metrics_sent);
@@ -158,21 +188,47 @@ async fn serve(state: AppState, token: String, ip: IpAddr, mut socket: WebSocket
     }
 }
 
-/// Whether the socket's session is live and its user may still see devices.
-/// Checking doesn't count as the user's activity.
-async fn still_allowed(state: &AppState, token: &str, ip: IpAddr) -> bool {
+/// What a socket's user may still see.
+struct Allowed {
+    alerts: bool,
+}
+
+/// Whether the socket's session is live and its user may still see devices,
+/// and whether alerts too. Checking doesn't count as the user's activity.
+async fn still_allowed(state: &AppState, token: &str, ip: IpAddr, alerts: bool) -> Option<Allowed> {
     match session::load(state, token, ip, false).await {
         Ok(signed_in) => Authorized::new(signed_in)
-            .is_ok_and(|authorized| authorized.has(Permission::DevicesView)),
-        // A database outage doesn't sign anyone out.
-        Err(error) if error.status().is_server_error() => true,
-        Err(_) => false,
+            .ok()
+            .filter(|authorized| authorized.has(Permission::DevicesView))
+            .map(|authorized| Allowed {
+                alerts: authorized.has(Permission::AlertsView),
+            }),
+        // A database outage doesn't sign anyone out, or change their access.
+        Err(error) if error.status().is_server_error() => Some(Allowed { alerts }),
+        Err(_) => None,
     }
 }
 
-/// Sends a snapshot and returns its revision, or `None` if the socket or
-/// the database failed.
-async fn send_snapshot(state: &AppState, socket: &mut WebSocket) -> Option<u64> {
+/// Sends the unresolved alert counts. Returns whether the socket took them;
+/// a database failure sends nothing.
+async fn send_alert_counts(state: &AppState, socket: &mut WebSocket) -> bool {
+    match store::counts(&mut &state.database).await {
+        Ok(counts) => send_json(socket, &AlertEvent::AlertCounts { counts }).await,
+        Err(error) => {
+            tracing::warn!(%error, "could not count unresolved alerts");
+            true
+        }
+    }
+}
+
+async fn send_json(socket: &mut WebSocket, event: &impl serde::Serialize) -> bool {
+    let json = serde_json::to_string(event).expect("events serialize");
+    send(socket, Message::Text(json.into())).await
+}
+
+/// Sends a snapshot, and the alert counts if `alerts`, and returns the
+/// snapshot's revision, or `None` if the socket or the database failed.
+async fn send_snapshot(state: &AppState, socket: &mut WebSocket, alerts: bool) -> Option<u64> {
     let snapshot = match state.presence.snapshot().await {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -182,6 +238,9 @@ async fn send_snapshot(state: &AppState, socket: &mut WebSocket) -> Option<u64> 
         }
     };
     send_event(socket, &snapshot).await.then_some(())?;
+    if alerts {
+        send_alert_counts(state, socket).await.then_some(())?;
+    }
     Some(snapshot.revision())
 }
 

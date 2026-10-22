@@ -47,6 +47,7 @@ pub struct AppState {
     pub agents: AgentHub,
     pub presence: Presence,
     pub metrics: Metrics,
+    pub alerts: crate::alerts::Engine,
     pub sessions: Sessions,
     pub turn: Turn,
     pub website: Website,

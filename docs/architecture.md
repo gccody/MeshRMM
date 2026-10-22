@@ -118,8 +118,11 @@ input.
   signs TURN credentials.
 - `storage`: files in the data directory (thumbnails, toolbox library),
   written atomically.
-- `maintenance`: the periodic task that purges expired tokens, old runs and
-  leftover partial files.
+- `alerts`: alert rules, the engine that judges them and the alerts they
+  raise. `notifications`: email and webhook channels. See
+  [alerts](alerts.md).
+- `maintenance`: the periodic task that purges expired tokens, old runs,
+  resolved alerts and leftover partial files.
 - `admin`: the `meshrmm-server admin` commands for locked-out operators.
 
 ### Realtime
@@ -144,6 +147,9 @@ task.
   sockets.
 - **Metrics**: the latest resource readings of each Agent, held in memory.
   See [devices](devices.md#resource-monitoring).
+- **Alerts**: the engine's task reads presence and the metrics, raises and
+  resolves alerts, and broadcasts them; event sockets of users who may see
+  alerts pass them on. See [alerts](alerts.md).
 
 ### Sign-in and permissions
 
@@ -159,7 +165,7 @@ Roles are built from these permissions (`server/src/rbac.rs`):
 `devices.rotate_credentials`, `companies.manage`, `sessions.connect`,
 `sessions.connect_background`, `sessions.close_any`, `scripts.run`,
 `scripts.manage_shared`, `files.deliver`, `files.manage_shared`,
-`users.manage`, `roles.manage`, `settings.manage`, `authentication.manage`,
+`alerts.view`, `alerts.respond`, `alerts.manage`, `users.manage`, `roles.manage`, `settings.manage`, `authentication.manage`,
 `audit.view`.
 
 Administrator holds every permission and can't be deleted or emptied;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { VIEW_COPY, VIEW_PATHS, canView, homeView, viewForPath } from "../features/workspace/views.ts";
+import { VIEW_COPY, VIEW_PATHS, canView, homeView, navViewFor, viewForPath } from "../features/workspace/views.ts";
 
 const account = (permissions, is_administrator = false) => ({ permissions, is_administrator });
 
@@ -45,4 +45,19 @@ test("users land on Devices, or their first page without it", () => {
   assert.equal(homeView(account(["devices.view"])), "devices");
   assert.equal(homeView(account(["users.manage", "audit.view"])), "users");
   assert.equal(homeView(account([])), "account");
+});
+
+test("the Alerts area opens to who may see alerts, and its channels to who manages them", () => {
+  const responder = account(["devices.view", "alerts.view", "alerts.respond"]);
+  assert.equal(canView(responder, "alerts"), true);
+  assert.equal(canView(responder, "alert-rules"), true);
+  assert.equal(canView(responder, "notification-channels"), false);
+  assert.equal(canView(account(["alerts.manage"]), "notification-channels"), true);
+  assert.equal(canView(account(["devices.view"]), "alerts"), false);
+  assert.equal(homeView(account(["alerts.view"])), "alerts");
+  assert.equal(viewForPath("/alert-rules"), "alert-rules");
+  assert.equal(navViewFor("alert-rules"), "alerts");
+  assert.equal(navViewFor("notification-channels"), "alerts");
+  assert.equal(navViewFor("device"), "devices");
+  assert.equal(navViewFor("users"), "users");
 });

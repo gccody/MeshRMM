@@ -4,6 +4,8 @@ import { Link, Navigate, Outlet, useLocation } from "react-router";
 import { AuthenticationRequired, apiFetch, errorMessage } from "../../lib/http";
 import { usePopover } from "../../lib/use-popover";
 import { useAgentInventory } from "../agents/use-agent-inventory";
+import { topSeverity } from "../alerts/model";
+import { useAlertFeed } from "../alerts/use-alert-feed";
 import type { InventoryConnection } from "../agents/inventory-stream";
 import type { Agent } from "../agents/types";
 import { loginPath } from "../auth/next-path";
@@ -17,7 +19,7 @@ import { ViewerDownloadLinks } from "../session/viewer-download-links";
 import type { GeneralSettings } from "../settings/general-settings";
 import { useSettingsDraft } from "../settings/use-settings-draft";
 import { type ActionErrorSource, actionErrorsReducer } from "./action-errors";
-import { VIEW_COPY, VIEW_PATHS, type View, canView, homeView, viewForPath } from "./views";
+import { VIEW_COPY, VIEW_PATHS, type View, canView, homeView, navViewFor, viewForPath } from "./views";
 import { type Workspace, WorkspaceContext } from "./workspace-context";
 
 // The topbar status while the inventory on screen is out of date.
@@ -30,7 +32,7 @@ const CONNECTION_STATUS: Record<InventoryConnection, string> = {
 
 // Day-to-day pages, then administration, which the bar sets apart.
 const NAV_GROUPS: View[][] = [
-  ["devices", "companies", "toolbox"],
+  ["devices", "companies", "toolbox", "alerts"],
   ["users", "roles", "authentication", "settings", "audit"],
 ];
 
@@ -104,9 +106,11 @@ function SignedInWorkspace({ account, view, title, setPageTitle }: {
     return response;
   }, [lock, refresh]);
 
+  const alerts = useAlertFeed({ enabled: can("alerts.view") && !enrolling, authorizedFetch });
   const inventory = useAgentInventory({
     enabled: can("devices.view") && !enrolling,
     authorizedFetch,
+    onAlerts: alerts.handle,
     // A refused or revoked socket means the session or the user's access
     // changed; the account says which.
     onRefused: useCallback(() => void refresh().catch(() => {}), [refresh]),
@@ -171,6 +175,7 @@ function SignedInWorkspace({ account, view, title, setPageTitle }: {
     refreshAccount,
     authorizedFetch,
     inventory,
+    alerts,
     remote,
     deleteAgent,
     deletingId,
@@ -196,9 +201,12 @@ function SignedInWorkspace({ account, view, title, setPageTitle }: {
         return (
           <div key={group[0]} className="nav-group">
             {visible.map((candidate) => (
-              <NavItem key={candidate} view={candidate} current={view === "device" ? "devices" : view} disabled={enrolling} search={candidate === "devices" ? devicesSearch : ""}>
+              <NavItem key={candidate} view={candidate} current={navViewFor(view)} disabled={enrolling} search={candidate === "devices" ? devicesSearch : ""}>
                 {VIEW_COPY[candidate].title}
                 {candidate === "devices" && hasData ? <em>{agents.length}</em> : null}
+                {candidate === "alerts" && alerts.counts && alerts.counts.open > 0
+                  ? <em className={`alert-count ${topSeverity(alerts.counts) ?? ""}`} aria-label={`${alerts.counts.open} open`}>{alerts.counts.open}</em>
+                  : null}
               </NavItem>
             ))}
           </div>
