@@ -17,6 +17,7 @@ const GROUP_LABELS: Record<string, string> = {
   roles: "Roles",
   settings: "Settings",
   authentication: "Authentication",
+  api_tokens: "API tokens",
   audit: "Audit log",
 };
 

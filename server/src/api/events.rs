@@ -35,7 +35,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::{
     alerts::{AlertEvent, store},
-    auth::{Authorized, session},
+    auth::{Authorized, SignedIn, session},
     automation::jobs::Viewer,
     http::{ApiError, AppState, client_ip::ClientIp},
     rbac::Permission,
@@ -54,11 +54,14 @@ const METRICS_INTERVAL: Duration =
 
 pub async fn subscribe(
     State(state): State<AppState>,
-    actor: Authorized,
+    signed_in: SignedIn,
     ClientIp(ip): ClientIp,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
+    // A website session only: the session cookie keeps the socket's
+    // access checked while it stays open.
+    let actor = Authorized::new(signed_in)?;
     // Browsers send any site's cookies with a WebSocket handshake, so only
     // the website's own pages may open one.
     let origin = state.config.public_origin();

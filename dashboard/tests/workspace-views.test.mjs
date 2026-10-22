@@ -44,6 +44,8 @@ test("pages open to the permissions that use them", () => {
   assert.equal(viewForPath("/tags"), "tags");
   // Email settings are for administrators only, on the Authentication page.
   assert.equal(canView(account([], true), "authentication"), true);
+  // So is every user's API tokens, for whoever manages them.
+  assert.equal(canView(account(["api_tokens.manage"]), "authentication"), true);
   assert.equal(canView(null, "account"), false);
 });
 

@@ -33,6 +33,11 @@ pub struct Settings {
     pub update_scan_interval_hours: i64,
     /// Remote terminals with no input for this long are closed.
     pub terminal_idle_timeout_minutes: i64,
+    /// Personal API tokens authenticate requests.
+    pub api_tokens_enabled: bool,
+    /// The longest a new API token may last; `None` allows tokens that never
+    /// expire.
+    pub api_token_max_lifetime_days: Option<i64>,
     pub smtp_host: Option<String>,
     pub smtp_port: Option<i64>,
     pub smtp_security: String,
@@ -50,7 +55,7 @@ impl Settings {
     }
 }
 
-const COLUMNS: [SettingsTable; 31] = [
+const COLUMNS: [SettingsTable; 33] = [
     SettingsTable::InstanceName,
     SettingsTable::DashboardIdleTimeoutMinutes,
     SettingsTable::BlackoutMessage,
@@ -74,6 +79,8 @@ const COLUMNS: [SettingsTable; 31] = [
     SettingsTable::SessionLifetimeHours,
     SettingsTable::UpdateScanIntervalHours,
     SettingsTable::TerminalIdleTimeoutMinutes,
+    SettingsTable::ApiTokensEnabled,
+    SettingsTable::ApiTokenMaxLifetimeDays,
     SettingsTable::SmtpHost,
     SettingsTable::SmtpPort,
     SettingsTable::SmtpSecurity,

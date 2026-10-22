@@ -49,6 +49,8 @@ pub struct AuthState {
     pub reset_requests: RateLimiter,
     /// Passkey sign-ins and SSO redirects started per client address.
     pub ceremony_starts: RateLimiter,
+    /// Unknown personal API tokens tried per client address.
+    pub api_token_failures: RateLimiter,
     pub challenges: Challenges,
     pub setup: SetupGate,
     pub passkey_registrations: Ceremonies<PendingRegistration>,
@@ -65,6 +67,7 @@ impl Default for AuthState {
             token_attempts: RateLimiter::new(30, WINDOW),
             reset_requests: RateLimiter::new(5, WINDOW),
             ceremony_starts: RateLimiter::new(60, WINDOW),
+            api_token_failures: RateLimiter::new(30, WINDOW),
             challenges: Challenges::new(CHALLENGE_TTL, CHALLENGE_ATTEMPTS),
             setup: SetupGate::default(),
             passkey_registrations: Ceremonies::new(PASSKEY_TTL),

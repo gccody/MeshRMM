@@ -48,6 +48,7 @@ export type Permission =
   | "roles.manage"
   | "settings.manage"
   | "authentication.manage"
+  | "api_tokens.manage"
   | "audit.view";
 
 export type RoleRef = { id: string; name: string };

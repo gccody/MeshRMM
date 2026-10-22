@@ -452,6 +452,7 @@ impl Policy {
             user_id: None,
             label: format!("policy \u{201c}{}\u{201d}", self.name),
             ip: None,
+            api_token: None,
         }
     }
 }

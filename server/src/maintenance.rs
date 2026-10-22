@@ -14,7 +14,7 @@ use crate::{
     db::{
         self, Database,
         tables::{
-            AgentInstallTokens, Agents, Alerts, DeviceApplicationChanges, DeviceMetrics,
+            AgentInstallTokens, Agents, Alerts, ApiTokens, DeviceApplicationChanges, DeviceMetrics,
             FileDeliveries, Invitations, Jobs, PasswordResets, RemoteHandoffs, RemoteSessions,
             ScriptRuns, ToolboxFiles, UpdateRuns, UserSessions, WakeRequests,
         },
@@ -38,6 +38,7 @@ const ORPHAN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Purged {
     pub sessions: u64,
+    pub api_tokens: u64,
     pub invitations: u64,
     pub password_resets: u64,
     pub installers: u64,
@@ -78,7 +79,8 @@ pub fn spawn(database: Database, storage: Storage) -> tokio::task::JoinHandle<()
 }
 
 /// Deletes tokens and sessions that expired more than [`EXPIRED_GRACE_MS`]
-/// before `now_ms`, toolbox history older than [`TOOLBOX_HISTORY_MS`], and
+/// before `now_ms` (API tokens [`crate::api_tokens::EXPIRED_RETENTION_MS`]
+/// before, as their users still see them listed until then), toolbox history older than [`TOOLBOX_HISTORY_MS`], and
 /// devices' resource usage older than [`HISTORY_MS`], and alerts resolved
 /// more than [`RESOLVED_RETENTION_MS`] ago, and application changes older
 /// than [`CHANGES_RETENTION_MS`], and jobs (with their devices) and wake
@@ -92,6 +94,13 @@ pub async fn purge(database: &Database, now_ms: i64) -> db::Result<Purged> {
             UserSessions::Table,
             UserSessions::ExpiresAt,
             expired,
+        )
+        .await?,
+        api_tokens: delete_before(
+            database,
+            ApiTokens::Table,
+            ApiTokens::ExpiresAt,
+            now_ms - crate::api_tokens::EXPIRED_RETENTION_MS,
         )
         .await?,
         invitations: delete_before(

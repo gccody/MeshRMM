@@ -38,6 +38,8 @@ pub enum Settings {
     SessionLifetimeHours,
     UpdateScanIntervalHours,
     TerminalIdleTimeoutMinutes,
+    ApiTokensEnabled,
+    ApiTokenMaxLifetimeDays,
     SmtpHost,
     SmtpPort,
     SmtpSecurity,
@@ -222,6 +224,20 @@ pub enum ScimTokens {
 }
 
 #[derive(Iden)]
+pub enum ApiTokens {
+    Table,
+    Id,
+    UserId,
+    Name,
+    TokenHash,
+    PermissionsJson,
+    CreatedAt,
+    ExpiresAt,
+    LastUsedAt,
+    LastUsedIp,
+}
+
+#[derive(Iden)]
 pub enum ScimGroups {
     Table,
     Id,
@@ -250,6 +266,8 @@ pub enum AuditEvents {
     TargetId,
     MetadataJson,
     Ip,
+    ApiTokenId,
+    ApiTokenName,
     CreatedAt,
 }
 

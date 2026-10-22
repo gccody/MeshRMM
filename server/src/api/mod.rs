@@ -2,6 +2,7 @@
 mod account;
 mod agent;
 mod alerts;
+mod api_tokens;
 mod audit_log;
 mod automation;
 mod companies;
@@ -39,7 +40,7 @@ use axum::{
     http::{HeaderValue, Method, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post, put},
+    routing::{MethodRouter, delete, get, patch, post, put},
 };
 use serde::Serialize;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -47,7 +48,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 pub use self::password_resets::create_reset;
 pub(crate) use self::users::ensure_administrator_remains;
 use crate::{
-    auth::{Authorized, SignedIn, password},
+    auth::{Authorized, password, session::api_token_not_allowed},
     http::{ApiError, AppState, csrf},
     rbac::{Permissions, Role},
     users::User,
@@ -57,6 +58,7 @@ pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .merge(auth_routes())
         .merge(account_routes())
+        .merge(api_token_routes())
         .merge(administration_routes())
         .merge(device_routes())
         .merge(toolbox_routes())
@@ -125,6 +127,17 @@ fn account_routes() -> Router<AppState> {
         .route("/account/passkeys/{id}/remove", post(passkeys::remove))
         .route("/account/sessions", get(account::sessions))
         .route("/account/sessions/{id}", delete(account::end_session))
+        .route_layer(middleware::from_fn(website_only))
+}
+
+fn api_token_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api-tokens",
+            get(api_tokens::list).post(api_tokens::create),
+        )
+        .route("/api-tokens/current", get(api_tokens::current))
+        .route("/api-tokens/{id}", delete(api_tokens::revoke))
 }
 
 fn administration_routes() -> Router<AppState> {
@@ -136,9 +149,12 @@ fn administration_routes() -> Router<AppState> {
         )
         .route(
             "/users/{id}/reset-two-factor",
-            post(users::reset_two_factor),
+            website_only_route(post(users::reset_two_factor)),
         )
-        .route("/users/{id}/password-reset", post(users::password_reset))
+        .route(
+            "/users/{id}/password-reset",
+            website_only_route(post(users::password_reset)),
+        )
         .route("/users/{id}/sign-out", post(users::sign_out))
         .route("/users/{id}/unlink-sso", post(users::unlink_sso))
         .route(
@@ -153,7 +169,9 @@ fn administration_routes() -> Router<AppState> {
         .route("/settings", get(settings::get).patch(settings::update))
         .route(
             "/settings/authentication",
-            get(settings::get_authentication).patch(settings::update_authentication),
+            website_only_route(
+                get(settings::get_authentication).patch(settings::update_authentication),
+            ),
         )
         .route(
             "/settings/smtp",
@@ -162,15 +180,26 @@ fn administration_routes() -> Router<AppState> {
                 .delete(settings::delete_smtp),
         )
         .route("/settings/smtp/test", post(settings::test_smtp))
-        .route("/settings/scim", get(scim::get))
-        .route("/settings/scim/tokens", post(scim::create_token))
-        .route("/settings/scim/tokens/{id}", delete(scim::revoke_token))
-        .route("/settings/scim/groups/{id}", patch(scim::update_group))
+        .route("/settings/scim", website_only_route(get(scim::get)))
+        .route(
+            "/settings/scim/tokens",
+            website_only_route(post(scim::create_token)),
+        )
+        .route(
+            "/settings/scim/tokens/{id}",
+            website_only_route(delete(scim::revoke_token)),
+        )
+        .route(
+            "/settings/scim/groups/{id}",
+            website_only_route(patch(scim::update_group)),
+        )
         .route(
             "/settings/sso",
-            get(sso::get_settings)
-                .put(sso::put_settings)
-                .delete(sso::delete_settings),
+            website_only_route(
+                get(sso::get_settings)
+                    .put(sso::put_settings)
+                    .delete(sso::delete_settings),
+            ),
         )
         .route("/audit", get(audit_log::list))
 }
@@ -179,7 +208,7 @@ fn device_routes() -> Router<AppState> {
     Router::new()
         .route("/agent-installers", post(enrollment::create))
         .route("/agent-installers/redeem", post(enrollment::redeem))
-        .route("/events", get(events::subscribe))
+        .route("/events", website_only_route(get(events::subscribe)))
         .route("/agents", get(devices::list))
         .route("/agents/{id}", delete(devices::delete))
         .route("/agents/{id}/company", put(companies::assign))
@@ -194,12 +223,18 @@ fn device_routes() -> Router<AppState> {
             patch(companies::update).delete(companies::delete),
         )
         .route("/agents/{id}/connect", get(agent::connect))
-        .route("/agents/{id}/terminals", post(terminals::open))
+        .route(
+            "/agents/{id}/terminals",
+            website_only_route(post(terminals::open)),
+        )
         .route(
             "/agents/{id}/terminals/{terminal_id}",
             get(terminals::agent_connect),
         )
-        .route("/terminals/{id}", get(terminals::connect))
+        .route(
+            "/terminals/{id}",
+            website_only_route(get(terminals::connect)),
+        )
         .route("/agents/{id}/close-session", post(remote::close))
         .route("/agents/{id}/metrics", get(metrics::get))
         .route("/agents/{id}/system-info", get(system_info::get))
@@ -321,7 +356,10 @@ fn alert_routes() -> Router<AppState> {
 
 fn remote_routes() -> Router<AppState> {
     Router::new()
-        .route("/remote/handoffs", post(handoffs::create))
+        .route(
+            "/remote/handoffs",
+            website_only_route(post(handoffs::create)),
+        )
         .route("/remote/handoffs/redeem", post(remote::redeem))
         .route("/remote/sessions/{id}/signal", get(remote::signal))
         .route("/remote/sessions/{id}/resume", post(remote::resume))
@@ -348,6 +386,22 @@ fn remote_routes() -> Router<AppState> {
         )
 }
 
+/// Routes only the website may use, whatever the token's permissions:
+/// signing in and the account's own security, anything that makes
+/// credentials or changes how people sign in, and the website's sockets and
+/// remote session starts. So a leaked token can't make itself more tokens or
+/// take over an account.
+async fn website_only(request: axum::extract::Request, next: middleware::Next) -> Response {
+    if crate::api_tokens::bearer(request.headers()).is_some() {
+        return api_token_not_allowed().into_response();
+    }
+    next.run(request).await
+}
+
+fn website_only_route(route: MethodRouter<AppState>) -> MethodRouter<AppState> {
+    route.layer(middleware::from_fn(website_only))
+}
+
 /// What a signed-in user changes may end sessions or change permissions,
 /// and so may signing in (it can drop roles from SSO groups), so open event
 /// sockets and remote sessions check their own access again after either.
@@ -360,7 +414,8 @@ async fn recheck_access(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
     );
-    let signed_in = crate::auth::session::token(request.headers()).is_some();
+    let signed_in = crate::auth::session::token(request.headers()).is_some()
+        || crate::api_tokens::bearer(request.headers()).is_some();
     let response = next.run(request).await;
     let signs_in = response
         .headers()
@@ -489,7 +544,11 @@ fn limit_token_attempts(state: &AppState, ip: std::net::IpAddr) -> Result<(), Ap
 /// beyond the actor's own would let them raise their own access. Grant
 /// the Administrator role, which gains every permission future releases add,
 /// with [`require_administrator`] as well.
-fn ensure_within(actor: &SignedIn, permissions: &Permissions, what: &str) -> Result<(), ApiError> {
+fn ensure_within(
+    actor: &Authorized,
+    permissions: &Permissions,
+    what: &str,
+) -> Result<(), ApiError> {
     let missing = permissions
         .difference(&actor.permissions)
         .map(|permission| permission.as_str())
@@ -506,7 +565,7 @@ fn ensure_within(actor: &SignedIn, permissions: &Permissions, what: &str) -> Res
 }
 
 /// For changes as powerful as the Administrator role itself.
-fn require_administrator(actor: &SignedIn) -> Result<(), ApiError> {
+fn require_administrator(actor: &Authorized) -> Result<(), ApiError> {
     if actor.is_administrator() {
         Ok(())
     } else {

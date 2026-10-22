@@ -4,6 +4,7 @@ pub mod admin;
 pub mod agents;
 pub mod alerts;
 pub mod api;
+pub mod api_tokens;
 pub mod audit;
 pub mod auth;
 pub mod automation;

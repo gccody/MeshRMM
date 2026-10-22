@@ -317,9 +317,10 @@ pub async fn confirm_totp(
 /// app, unless it is the last second factor and the instance requires one.
 pub async fn disable_totp(
     State(state): State<AppState>,
-    signed_in: Authorized,
+    signed_in: SignedIn,
     JsonBody(request): JsonBody<PasswordConfirmation>,
 ) -> Result<StatusCode, ApiError> {
+    signed_in.require_full_access()?;
     if !signed_in.second_factors.totp {
         return Err(ApiError::conflict("no authenticator app is set up"));
     }
@@ -350,9 +351,10 @@ pub async fn disable_totp(
 /// `POST /v1/account/two-factor/recovery-codes`: replaces the recovery codes.
 pub async fn regenerate_recovery_codes(
     State(state): State<AppState>,
-    signed_in: Authorized,
+    signed_in: SignedIn,
     JsonBody(request): JsonBody<PasswordConfirmation>,
 ) -> Result<Json<RecoveryCodes>, ApiError> {
+    signed_in.require_full_access()?;
     if !signed_in.two_factor_enabled {
         return Err(ApiError::conflict(
             "turn on two-factor authentication to get recovery codes",

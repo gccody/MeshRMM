@@ -43,6 +43,11 @@ CREATE TABLE settings (
   -- Remote terminals with no input for this long are closed.
   terminal_idle_timeout_minutes BIGINT NOT NULL DEFAULT 30
     CHECK (terminal_idle_timeout_minutes BETWEEN 5 AND 480),
+  -- Personal API tokens work, and how long a new one may last (NULL: no
+  -- limit, so tokens may never expire).
+  api_tokens_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  api_token_max_lifetime_days BIGINT DEFAULT 365
+    CHECK (api_token_max_lifetime_days IS NULL OR api_token_max_lifetime_days BETWEEN 1 AND 3650),
   smtp_host TEXT,
   smtp_port BIGINT CHECK (smtp_port IS NULL OR smtp_port BETWEEN 1 AND 65535),
   smtp_security TEXT NOT NULL DEFAULT 'starttls' CHECK (smtp_security IN ('starttls', 'tls', 'none')),
@@ -250,6 +255,26 @@ CREATE TABLE scim_tokens (
   revoked_at BIGINT
 );
 
+-- Personal API tokens: bearer credentials a user makes for scripts and
+-- integrations. A token acts as its user, limited to its permissions.
+CREATE TABLE api_tokens (
+  id TEXT NOT NULL PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 80),
+  token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64),
+  -- A JSON array of the permissions the token is limited to; NULL for all
+  -- of its user's.
+  permissions_json TEXT,
+  created_at BIGINT NOT NULL,
+  -- NULL never expires.
+  expires_at BIGINT,
+  last_used_at BIGINT,
+  last_used_ip TEXT
+);
+
+CREATE INDEX idx_api_tokens_user ON api_tokens (user_id);
+CREATE INDEX idx_api_tokens_expiry ON api_tokens (expires_at);
+
 CREATE TABLE scim_groups (
   id TEXT NOT NULL PRIMARY KEY,
   display_name TEXT NOT NULL UNIQUE CHECK (length(display_name) BETWEEN 1 AND 256),
@@ -290,6 +315,10 @@ CREATE TABLE audit_events (
   target_id TEXT NOT NULL,
   metadata_json TEXT NOT NULL DEFAULT '{}',
   ip TEXT,
+  -- The personal API token the user acted with, if any. The name is kept so
+  -- the event stays readable after the token is revoked.
+  api_token_id TEXT,
+  api_token_name TEXT,
   created_at BIGINT NOT NULL
 );
 

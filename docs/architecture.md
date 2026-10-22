@@ -188,6 +188,16 @@ change something must carry the server's own `Origin` and an
 `X-MeshRMM-Request` header. Agents authenticate with a bearer credential the
 server stores only as a SHA-256 hash; viewers with handoff and session tokens.
 
+Scripts and integrations use personal [API tokens](api.md) (`Authorization:
+Bearer mrmm_pat_…`, also stored as SHA-256 hashes). The `Authorized` extractor
+(`server/src/auth/session.rs`) accepts a session or a token
+(`server/src/api_tokens.rs`); a token's permissions are its scope
+intersected with its user's roles at each request, and its requests skip the
+CSRF check, since a browser can't attach the header cross-site. `SignedIn`
+(account routes) takes sessions only, and `website_only` in
+`server/src/api/mod.rs` refuses tokens on account security, credential and
+sign-in settings, and the website's sockets.
+
 Roles are built from these permissions (`server/src/rbac.rs`):
 
 `devices.view`, `devices.edit`, `devices.enroll`, `devices.delete`,
@@ -198,7 +208,7 @@ Roles are built from these permissions (`server/src/rbac.rs`):
 `scripts.manage_shared`, `files.deliver`, `files.manage_shared`,
 `jobs.run_wide`, `automation.manage`, `updates.view`, `updates.install`,
 `alerts.view`, `alerts.respond`, `alerts.manage`, `users.manage`, `roles.manage`, `settings.manage`, `authentication.manage`,
-`audit.view`.
+`api_tokens.manage`, `audit.view`.
 
 Administrator holds every permission and can't be deleted or emptied;
 Technician is an editable default. Single sign-on, SCIM and email settings

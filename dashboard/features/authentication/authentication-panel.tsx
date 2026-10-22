@@ -2,6 +2,7 @@ import { LoaderCircle, RefreshCw, Send, Trash2 } from "lucide-react";
 import { type FormEvent, type ReactNode, useCallback, useState } from "react";
 import { AuthenticationRequired, errorText, expectJson, expectOk, jsonBody } from "../../lib/http";
 import { useResource } from "../../lib/use-resource";
+import { TokenAdministration } from "../api-tokens/token-administration";
 import { CategoryTabs } from "../workspace/category-tabs";
 import { useWorkspace } from "../workspace/workspace-context";
 import { ScimSettingsSection } from "./scim-settings";
@@ -39,8 +40,8 @@ const SECURITY_LABELS: Record<SmtpSecurity, string> = {
 };
 
 // The sign-in policy, and for administrators, single sign-on, directory
-// sync and how the server sends email.
-type Category = "policy" | "sso" | "scim" | "email";
+// sync and how the server sends email; and API tokens.
+type Category = "policy" | "sso" | "scim" | "email" | "api-tokens";
 
 export function AuthenticationPanel() {
   const { account, can } = useWorkspace();
@@ -49,6 +50,7 @@ export function AuthenticationPanel() {
     { id: "sso", label: "Single sign-on", visible: account.is_administrator },
     { id: "scim", label: "Directory sync", visible: account.is_administrator },
     { id: "email", label: "Email", visible: account.is_administrator },
+    { id: "api-tokens", label: "API tokens", visible: can("authentication.manage") || can("api_tokens.manage") },
   ] as const).filter((category) => category.visible);
   const [selected, setSelected] = useState<Category>(categories[0]?.id ?? "policy");
   // Every section stays mounted, so unsaved edits survive switching.
@@ -63,6 +65,7 @@ export function AuthenticationPanel() {
         {panel("sso", <SsoSettingsSection />)}
         {panel("scim", <ScimSettingsSection />)}
         {panel("email", <EmailSettings />)}
+        {panel("api-tokens", <TokenAdministration />)}
       </div>
     </div>
   );

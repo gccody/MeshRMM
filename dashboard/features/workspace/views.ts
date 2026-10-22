@@ -72,7 +72,7 @@ const VIEW_ACCESS: Record<View, readonly Permission[]> = {
   "notification-channels": ["alerts.manage"],
   users: ["users.manage"],
   roles: ["roles.manage"],
-  authentication: ["authentication.manage"],
+  authentication: ["authentication.manage", "api_tokens.manage"],
   settings: ["settings.manage"],
   audit: ["audit.view"],
   account: [],

@@ -42,6 +42,24 @@ impl RateLimiter {
         self.hit_at(key, Instant::now())
     }
 
+    /// Whether the key may try again, without counting an attempt: for
+    /// limits where only failures count and successes may run in parallel.
+    pub fn check(&self, key: &str) -> Result<(), u64> {
+        let now = Instant::now();
+        let mut attempts = self.lock();
+        let Some(times) = attempts.get_mut(key) else {
+            return Ok(());
+        };
+        Self::expire(times, now, self.window);
+        match times.front() {
+            Some(oldest) if times.len() >= self.limit => Err((*oldest + self.window)
+                .saturating_duration_since(now)
+                .as_secs()
+                .max(1)),
+            _ => Ok(()),
+        }
+    }
+
     /// Hands back the key's most recent attempt.
     pub fn refund(&self, key: &str) {
         if let Some(times) = self.lock().get_mut(key) {
@@ -261,6 +279,18 @@ mod tests {
         assert!(limiter.hit_at("a", start + Duration::from_secs(60)).is_ok());
         limiter.clear("a");
         assert!(limiter.hit_at("a", start + Duration::from_secs(20)).is_ok());
+    }
+
+    #[test]
+    fn checking_counts_nothing() {
+        let limiter = RateLimiter::new(2, Duration::from_secs(60));
+        assert!(limiter.check("a").is_ok());
+        assert!(limiter.hit("a").is_ok());
+        assert!(limiter.check("a").is_ok());
+        assert!(limiter.check("a").is_ok());
+        assert!(limiter.hit("a").is_ok());
+        assert!(matches!(limiter.check("a"), Err(seconds) if seconds > 0));
+        assert!(limiter.check("b").is_ok());
     }
 
     #[test]

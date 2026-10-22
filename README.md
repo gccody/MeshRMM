@@ -108,6 +108,10 @@ MeshRMM is in heavy development and not production ready.
 - Custom roles built from a list of permissions, and an audit log of
   sign-ins, changes, sessions, terminals, script runs, file deliveries,
   update installs, wakes and jobs.
+- Personal API tokens for scripts and integrations: each acts as its user,
+  optionally limited to some permissions, expires, and is named in the audit
+  log for everything done with it. Administrators can see and revoke every
+  token, cap their lifetime, or turn them off.
 - Email for invitations, resets and alerts is optional; without it the
   website gives one-time links to copy, and alerts go to webhooks.
 
@@ -174,9 +178,10 @@ cd dashboard && npm ci && npm run verify
 
 ## Documentation
 
-For operators:
+For operators and integrators:
 
 - [Running a MeshRMM server](docs/self-hosting.md)
+- [The API](docs/api.md): API tokens, errors, lists, and examples with curl
 - [Releases](docs/releases.md): what a release contains, signatures, and
   how to publish one
 

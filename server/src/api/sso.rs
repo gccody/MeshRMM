@@ -350,6 +350,7 @@ async fn account_for(
         user_id: None,
         label: format!("SSO ({})", provider.display_name),
         ip: Some(ip),
+        api_token: None,
     };
     if let Some(user) = users::by_email(transaction, &email).await? {
         if user.oidc_subject.is_some() {
