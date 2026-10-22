@@ -3,7 +3,7 @@
 // Imports carry the .ts extension so node:test can load this module directly.
 import { type Account, type Permission, canAny } from "../auth/types.ts";
 
-export type View = "devices" | "device" | "companies" | "software" | "toolbox" | "alerts" | "alert-rules" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account";
+export type View = "devices" | "device" | "companies" | "software" | "toolbox" | "alerts" | "alert-rules" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account" | "jobs" | "job" | "policies";
 
 export const VIEW_PATHS: Record<View, string> = {
   devices: "/",
@@ -19,6 +19,10 @@ export const VIEW_PATHS: Record<View, string> = {
   authentication: "/authentication",
   settings: "/settings",
   audit: "/audit",
+  // After the audit log, so its readers (who see jobs too) still land on it.
+  jobs: "/jobs",
+  job: "/job",
+  policies: "/policies",
   account: "/account",
 };
 
@@ -38,7 +42,13 @@ export const VIEW_COPY: Record<View, { title: string }> = {
   settings: { title: "Settings" },
   audit: { title: "Audit log" },
   account: { title: "Your account" },
+  jobs: { title: "Jobs" },
+  job: { title: "Job" },
+  policies: { title: "Policies" },
 };
+
+// Jobs show to those who start them, policies' managers and auditors.
+const JOB_ACCESS: readonly Permission[] = ["scripts.run", "files.deliver", "automation.manage", "audit.view"];
 
 // A user sees a page when they hold any of these permissions; an empty list
 // is open to everyone.
@@ -57,6 +67,9 @@ const VIEW_ACCESS: Record<View, readonly Permission[]> = {
   settings: ["settings.manage"],
   audit: ["audit.view"],
   account: [],
+  jobs: JOB_ACCESS,
+  job: JOB_ACCESS,
+  policies: ["automation.manage"],
 };
 
 export function canView(account: Pick<Account, "permissions" | "is_administrator"> | null, view: View) {
@@ -74,10 +87,11 @@ export function homeView(account: Pick<Account, "permissions" | "is_administrato
   return views.find((view) => canView(account, view)) ?? "account";
 }
 
-// The navigation entry a page sits under: a device under Devices, and the
-// alert rules and channels under Alerts.
+// The navigation entry a page sits under: a device under Devices, the alert
+// rules and channels under Alerts, and a job and the policies under Jobs.
 export function navViewFor(view: View): View {
   if (view === "device") return "devices";
+  if (view === "job" || view === "policies") return "jobs";
   if (view === "alert-rules" || view === "notification-channels") return "alerts";
   return view;
 }

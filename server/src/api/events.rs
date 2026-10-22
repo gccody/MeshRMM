@@ -7,7 +7,9 @@
 //! devices that reported since it last did, which carries no revision: after
 //! each snapshot it sends every online device's. A user who may see alerts
 //! also gets the unresolved alert counts after each snapshot, and each alert
-//! that is raised or changes ([`AlertEvent`]). The socket stays authorized by
+//! that is raised or changes ([`AlertEvent`]). A user who may see jobs gets
+//! `job_update` with each job they may see whose counts changed, and
+//! `jobs_resync` if they missed some. The socket stays authorized by
 //! the session cookie it opened with: it checks the session and the
 //! `devices.view` permission again every half minute, and at once after a
 //! signed-in user changes something, and closes with 4001 when either is
@@ -25,11 +27,13 @@ use axum::{
     http::{HeaderMap, header},
     response::Response,
 };
+use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::{
     alerts::{AlertEvent, store},
     auth::{Authorized, session},
+    automation::jobs::Viewer,
     http::{ApiError, AppState, client_ip::ClientIp},
     rbac::Permission,
     realtime::{close_frame, metrics::MetricsEvent, presence::PresenceEvent, send},
@@ -65,22 +69,27 @@ pub async fn subscribe(
         );
     }
     actor.require(Permission::DevicesView)?;
-    let alerts = actor.has(Permission::AlertsView);
+    let allowed = Allowed::of(&actor);
     let token = session::token(&headers).expect("an authorized request has a session cookie");
     Ok(upgrade
         .max_message_size(1024)
-        .on_upgrade(move |socket| serve(state, token, ip, alerts, socket)))
+        .on_upgrade(move |socket| serve(state, token, ip, allowed, socket)))
 }
 
 async fn serve(
     state: AppState,
     token: String,
     ip: IpAddr,
-    mut alerts: bool,
+    allowed: Allowed,
     mut socket: WebSocket,
 ) {
+    let Allowed {
+        mut alerts,
+        mut jobs,
+    } = allowed;
     let mut events = state.presence.subscribe();
     let mut alert_events = state.alerts.subscribe();
+    let mut job_events = state.automation.subscribe();
     let mut access = state.presence.access_changes();
     let Some(mut revision) = send_snapshot(&state, &mut socket, alerts).await else {
         return;
@@ -146,8 +155,23 @@ async fn serve(
                     return;
                 }
             }
+            event = job_events.recv(), if jobs.is_some() => {
+                let Some(viewer) = &jobs else { continue };
+                let sent = match event {
+                    Ok(job) if viewer.sees(&job) => {
+                        send_json(&mut socket, &json!({ "type": "job_update", "job": viewer.view(&job) })).await
+                    }
+                    Ok(_) => true,
+                    Err(RecvError::Lagged(_)) => send_json(&mut socket, &json!({ "type": "jobs_resync" })).await,
+                    Err(RecvError::Closed) => return,
+                };
+                if !sent {
+                    return;
+                }
+            }
             changed = access.changed() => {
-                let Some(allowed) = changed.ok().and(still_allowed(&state, &token, ip, alerts).await) else {
+                let current = Allowed { alerts, jobs: jobs.take() };
+                let Some(allowed) = changed.ok().and(still_allowed(&state, &token, ip, current).await) else {
                     send(&mut socket, close_frame(4001, "sign in again")).await;
                     return;
                 };
@@ -155,9 +179,11 @@ async fn serve(
                     return;
                 }
                 alerts = allowed.alerts;
+                jobs = allowed.jobs;
             }
             _ = recheck.tick() => {
-                let Some(allowed) = still_allowed(&state, &token, ip, alerts).await else {
+                let current = Allowed { alerts, jobs: jobs.take() };
+                let Some(allowed) = still_allowed(&state, &token, ip, current).await else {
                     send(&mut socket, close_frame(4001, "sign in again")).await;
                     return;
                 };
@@ -165,6 +191,7 @@ async fn serve(
                     return;
                 }
                 alerts = allowed.alerts;
+                jobs = allowed.jobs;
             }
             _ = metrics.tick() => {
                 let (readings, sequence) = state.metrics.since(metrics_sent);
@@ -188,23 +215,39 @@ async fn serve(
     }
 }
 
-/// What a socket's user may still see.
+/// What a socket's user may see besides devices.
 struct Allowed {
     alerts: bool,
+    /// Which jobs, if any.
+    jobs: Option<Viewer>,
+}
+
+impl Allowed {
+    fn of(actor: &Authorized) -> Self {
+        Self {
+            alerts: actor.has(Permission::AlertsView),
+            jobs: Viewer::may_list(&actor.permissions)
+                .then(|| Viewer::new(&actor.user.id, &actor.permissions)),
+        }
+    }
 }
 
 /// Whether the socket's session is live and its user may still see devices,
-/// and whether alerts too. Checking doesn't count as the user's activity.
-async fn still_allowed(state: &AppState, token: &str, ip: IpAddr, alerts: bool) -> Option<Allowed> {
+/// and what else they may see. Checking doesn't count as the user's
+/// activity.
+async fn still_allowed(
+    state: &AppState,
+    token: &str,
+    ip: IpAddr,
+    current: Allowed,
+) -> Option<Allowed> {
     match session::load(state, token, ip, false).await {
         Ok(signed_in) => Authorized::new(signed_in)
             .ok()
             .filter(|authorized| authorized.has(Permission::DevicesView))
-            .map(|authorized| Allowed {
-                alerts: authorized.has(Permission::AlertsView),
-            }),
+            .map(|authorized| Allowed::of(&authorized)),
         // A database outage doesn't sign anyone out, or change their access.
-        Err(error) if error.status().is_server_error() => Some(Allowed { alerts }),
+        Err(error) if error.status().is_server_error() => Some(current),
         Err(_) => None,
     }
 }

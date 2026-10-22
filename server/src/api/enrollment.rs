@@ -228,6 +228,9 @@ pub async fn redeem(
     state.auth.token_attempts.refund(&ip_key(ip));
     tracing::info!(device_id = claim.device_id, recovered, "Agent enrolled");
     state.presence.refresh(&claim.device_id).await;
+    if !recovered {
+        crate::automation::device_enrolled(&state, &claim.device_id).await;
+    }
     Ok(Json(AgentConfig {
         server: state.config.public_origin(),
         update_manifest_url: meshrmm_self_update::manifest_url(&state.config.public_origin()),

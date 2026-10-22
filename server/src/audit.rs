@@ -134,6 +134,17 @@ impl<'a> Target<'a> {
         }
     }
 
+    pub fn job(id: &'a str) -> Self {
+        Self { kind: "job", id }
+    }
+
+    pub fn automation_policy(id: &'a str) -> Self {
+        Self {
+            kind: "automation_policy",
+            id,
+        }
+    }
+
     pub fn settings() -> Self {
         Self {
             kind: "settings",

@@ -32,6 +32,8 @@ export type Permission =
   | "scripts.manage_shared"
   | "files.deliver"
   | "files.manage_shared"
+  | "jobs.run_wide"
+  | "automation.manage"
   | "alerts.view"
   | "alerts.respond"
   | "alerts.manage"

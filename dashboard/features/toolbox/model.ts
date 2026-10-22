@@ -65,7 +65,9 @@ export type ScriptRun = {
   error?: string;
   created_at_unix_ms: number;
   completed_at_unix_ms?: number;
-  source: "dashboard" | "session";
+  source: "dashboard" | "session" | "job";
+  /** The job the run is a device's part of. */
+  job_id?: string;
   requested_by_you: boolean;
 };
 

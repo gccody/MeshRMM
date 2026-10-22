@@ -14,6 +14,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Send,
   SquareTerminal,
   Trash2,
   Upload,
@@ -21,6 +22,7 @@ import {
   X,
 } from "lucide-react";
 import { type KeyboardEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router";
 import { AuthenticationRequired, type AuthorizedFetch, errorText } from "../../lib/http";
 import type { Agent } from "../agents/types";
 import { HeaderActions } from "../workspace/header-actions";
@@ -138,7 +140,7 @@ export function ToolboxPanel() {
       <section className="agent-panel toolbox-panel">
         <HeaderActions>
           {tab === "scripts" && <>
-            {access.runScripts && <button className="secondary-button" onClick={(event) => open({ kind: "run" }, event)} disabled={!scripts.length}><SquareTerminal size={16} /> Run a script</button>}
+            {access.runScripts && <button className="secondary-button" onClick={(event) => open({ kind: "run" }, event)} disabled={!scripts.length}><SquareTerminal size={16} /> Run on devices</button>}
             {access.addScripts && <button className="primary-button" onClick={(event) => open({ kind: "script", script: null }, event)}><Plus size={16} /> New script</button>}
           </>}
           {tab === "files" && access.addFiles && <button className="primary-button" onClick={(event) => open({ kind: "upload" }, event)}><Upload size={16} /> Upload files</button>}
@@ -169,7 +171,7 @@ export function ToolboxPanel() {
             items={visibleFiles}
             filtered={Boolean(query.trim())}
             empty={{ title: "No files yet", detail: "Upload installers and tools. In a remote session, the toolbox sends them to the device's Documents." }}
-            renderRow={(file) => <FileRow key={file.id} file={file} busy={busyId === file.id} open={open} onDownload={() => void download(file)} onDelete={() => void removeFile(file)} />}
+            renderRow={(file) => <FileRow key={file.id} file={file} canSend={access.deliverFiles} busy={busyId === file.id} open={open} onDownload={() => void download(file)} onDelete={() => void removeFile(file)} />}
           />
         </div>
 
@@ -182,12 +184,12 @@ export function ToolboxPanel() {
         dialog={dialog}
         access={access}
         scripts={scripts}
+        files={files}
         folders={folders}
         maxBytes={toolbox?.max_file_bytes ?? null}
         agents={inventory.agents}
         returnFocus={opener}
         onClose={close}
-        onRunClosed={() => { close(); setRunsVersion((version) => version + 1); }}
         replaceScript={replaceScript}
         replaceFile={replaceFile}
       />
@@ -293,7 +295,7 @@ function ScriptRow({ script, canRun, busy, open, onDelete }: { script: ToolboxSc
   );
 }
 
-function FileRow({ file, busy, open, onDownload, onDelete }: { file: ToolboxFile; busy: boolean; open: OpenDialog; onDownload: () => void; onDelete: () => void }) {
+function FileRow({ file, canSend, busy, open, onDownload, onDelete }: { file: ToolboxFile; canSend: boolean; busy: boolean; open: OpenDialog; onDownload: () => void; onDelete: () => void }) {
   return (
     <li className="toolbox-row">
       <FileIcon size={18} className="toolbox-row-icon" aria-hidden="true" />
@@ -303,6 +305,7 @@ function FileRow({ file, busy, open, onDownload, onDelete }: { file: ToolboxFile
       </div>
       <SharingBadge item={file} />
       <div className="row-actions">
+        {canSend && <button className="remote-button" onClick={(event) => open({ kind: "send", fileId: file.id }, event)}><Send size={15} /> Send</button>}
         <button className="close-session-button" onClick={onDownload} disabled={busy} aria-label={`Download ${file.name}`} title="Download">{busy ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}</button>
         <button className="close-session-button" onClick={(event) => open({ kind: "file", file }, event)} aria-label={`${file.can_edit ? "Edit" : "View"} ${file.name}`} title={file.can_edit ? "Edit" : "Details"}>{file.can_edit ? <Pencil size={16} /> : <Eye size={16} />}</button>
         {file.can_edit && <button className="agent-delete-button" onClick={onDelete} disabled={busy} aria-label={`Delete ${file.name}`} title="Delete"><Trash2 size={16} /></button>}
@@ -373,7 +376,7 @@ function RunHistory({ version, agents, onOpen }: { version: number; agents: Agen
       <tbody>
         {runs.map((run) => (
           <tr key={run.id}>
-            <td><strong>{run.script_name}</strong>{!run.requested_by_you && <span>By a teammate</span>}</td>
+            <td><strong>{run.script_name}</strong>{run.job_id ? <span><Link to={`/job?id=${encodeURIComponent(run.job_id)}`}>Part of a job</Link></span> : !run.requested_by_you && <span>By a teammate</span>}</td>
             <td>{names.get(run.device_id) ?? run.device_id}</td>
             <td>{ranAsLabel(run)}</td>
             <td><span className={`run-pill run-pill-${runTone(run)}`}>{runOutcome(run)}</span></td>
