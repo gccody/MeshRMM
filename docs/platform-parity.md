@@ -60,6 +60,8 @@ yet.
 | Thumbnail of the sign-in and lock screens | Yes, UAC prompts too | Login window yes; lock screen not verified | X11 yes; GNOME Wayland no |
 | [Alerts](alerts.md) | Yes | Yes | Yes |
 | [Jobs and automation policies](automation.md) | PowerShell and Command Prompt scripts, files, updates | Shell (zsh) scripts, files, updates | Shell (bash) scripts, files, updates |
+| [Relay Wake-on-LAN packets](wake-on-lan.md) | UDP | UDP | UDP and Ethernet frames (0x0842) |
+| [Be woken](wake-on-lan.md#what-the-device-needs) | Where firmware and adapter allow; not from Fast Startup's shutdown | Where **Wake for network access** is on | Where firmware and adapter allow (`ethtool … wol g`) |
 
 - **Linux thumbnails** come from the console's graphical session, so a
   server without one has no thumbnail. GNOME Shell refuses screen capture at
@@ -72,6 +74,13 @@ yet.
   command as a run by hand. A device whose platform has no interpreter for
   the script is skipped and counted as skipped, not failed.
   Disk space alerts cover the volumes in the table's Volumes row.
+- Any online Agent can [wake](wake-on-lan.md) devices on its networks. The
+  UDP magic packet is the same everywhere; on macOS the socket is also bound
+  to the interface (`IP_BOUND_IF`), since macOS sends 255.255.255.255 out of
+  its primary interface otherwise. Only Linux also sends the raw Ethernet
+  frame some adapters wake on, because a raw packet socket is a few lines
+  there and needs an NDIS protocol driver on Windows or a BPF device on macOS. Whether a computer
+  wakes depends on its firmware and adapter, not on its Agent.
 - Each platform counts memory the way its own task manager does: Windows
   leaves out the standby cache, macOS counts app, wired and compressed
   memory, Linux counts the total less `MemAvailable`.

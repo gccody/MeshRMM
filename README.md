@@ -45,8 +45,8 @@ MeshRMM is in heavy development and not production ready.
 - Jobs that run a script or send a file on chosen devices, whole companies or
   every device, skip devices without the script's interpreter, wait for
   offline ones, and show each device's result and output live.
-- Automation policies that run shared scripts, or scan for and install
-  updates, every few minutes or hours, daily or weekly at a time in any time
+- Automation policies that run shared scripts, scan for and install
+  updates, or wake offline devices, every few minutes or hours, daily or weekly at a time in any time
   zone, once, or on each newly enrolled device, and notify when their jobs
   fail.
 - Patch management: Agents scan for pending Windows Update, macOS Software
@@ -76,6 +76,10 @@ MeshRMM is in heavy development and not production ready.
   failed update installs, for every device or chosen companies.
   Alerts are acknowledged and resolved in the website, resolve themselves
   when the condition passes, and notify by email or signed webhook.
+- Wake-on-LAN: wake offline devices, one or many, from the website or a
+  policy before a patch window. Online Agents on the same network send the
+  magic packet, and the website shows which ones did and when the device
+  came online.
 - Enrollment with a single-use installer (Windows) or install command
   (macOS and Linux). Agents and viewers update themselves from the server and
   check a release signature first.
@@ -98,7 +102,7 @@ MeshRMM is in heavy development and not production ready.
   passkeys, plus optional single sign-on (OIDC) and SCIM provisioning.
 - Custom roles built from a list of permissions, and an audit log of
   sign-ins, changes, sessions, terminals, script runs, file deliveries,
-  update installs and jobs.
+  update installs, wakes and jobs.
 - Email for invitations, resets and alerts is optional; without it the
   website gives one-time links to copy, and alerts go to webhooks.
 
@@ -179,6 +183,8 @@ For developers:
   installing local builds
 - [Devices](docs/devices.md): enrollment, companies, the device list,
   resource monitoring, updates and removal
+- [Wake-on-LAN](docs/wake-on-lan.md): waking offline devices through online
+  ones on their network, and what the sleeping computer needs
 - [Remote sessions](docs/remote-sessions.md): what the viewer does and how
   each feature behaves
 - [Video](docs/video.md): capture, encoding, negotiation and presentation

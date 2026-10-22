@@ -94,7 +94,7 @@ fn join() -> anyhow::Result<(Option<String>, Option<String>)> {
     })
 }
 
-fn adapters() -> anyhow::Result<Vec<NetworkAdapter>> {
+pub(super) fn adapters() -> anyhow::Result<Vec<NetworkAdapter>> {
     // Hyper-V virtual switches and VPNs show up as Ethernet; only hardware
     // adapters have the hardware flag.
     let mut hardware = HashSet::new();

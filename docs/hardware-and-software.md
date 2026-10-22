@@ -76,7 +76,8 @@ for what each platform can't report.
   the Agent collected it by the device's clock and when the server received
   it by its own, the public address the Agent connects from, and the rest of
   the snapshot as JSON;
-- `device_ip_addresses`: each adapter's addresses, prefix lengths and MAC;
+- `device_ip_addresses`: each adapter's addresses, prefix lengths, MAC and
+  kind, which [Wake-on-LAN](wake-on-lan.md) chooses relays by;
 - `device_applications`: the applications, rewritten only when the list
   changed;
 - `device_application_changes`: what was installed, removed or updated

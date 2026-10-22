@@ -25,6 +25,7 @@ export type Permission =
   | "devices.delete"
   | "devices.rotate_credentials"
   | "companies.manage"
+  | "devices.wake"
   | "sessions.connect"
   | "sessions.connect_background"
   | "sessions.close_any"

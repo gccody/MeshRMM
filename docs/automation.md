@@ -108,10 +108,13 @@ runs (with the last job's result), and any problem that stopped the last
 run. A policy has:
 
 - a name and an **On** switch;
-- what it does: run a **shared** script as an account; scan for updates; or
+- what it does: run a **shared** script as an account; scan for updates;
   install the pending updates of chosen categories (or all), restarting
   never, if required or always, after a delay (see
-  [patch management](patch-management.md#installing));
+  [patch management](patch-management.md#installing)); or wake the devices
+  that are offline (see [Wake-on-LAN](wake-on-lan.md#outcomes)), which
+  skips online devices, never waits for offline ones, and can't run on
+  enrollment;
 - its devices: every device, chosen companies, or chosen devices;
 - when it runs (below);
 - what happens to offline devices: skip them, or catch them up when they
@@ -203,7 +206,7 @@ time out or never report, like runs started by hand.
 | `files.deliver` | Sending files to chosen devices. | Yes |
 | `updates.view`, `updates.install` | Scan and install [update](patch-management.md) jobs on chosen devices, and seeing one's own jobs. | Yes |
 | `jobs.run_wide` | Running scripts, sending files and updating on whole companies or every device. | No |
-| `automation.manage` | Seeing, creating, changing and deleting policies, and seeing their jobs. With what a policy does needs (`scripts.run`, `updates.view` or `updates.install`), saving and running it. | No |
+| `automation.manage` | Seeing, creating, changing and deleting policies, and seeing their jobs. With what a policy does needs (`scripts.run`, `updates.view`, `updates.install` or `devices.wake`), saving and running it. | No |
 | `audit.view` | Seeing everyone's jobs and runs. | No |
 
 Administrators have every permission. Grant `jobs.run_wide` and
@@ -232,10 +235,10 @@ All routes need a signed-in user.
 |---|---|
 | `POST /v1/jobs` | `{script_id, run_as}`, `{file_id, destination}` or `{updates: {action: "scan"}}` / `{updates: {action: "install", categories, reboot, reboot_delay_minutes}}`, with `target` (`devices`, `companies` or `all`), `device_ids` or `company_ids`, `offline` (`skip` or `wait`) and `wait_hours`. Returns the job with its devices. `400 no_devices` if the target covers none. |
 | `GET /v1/jobs?policy_id=&limit=` | Jobs the user may see, newest first, with counts (50 by default, at most 200). |
-| `GET /v1/jobs/{id}` | A job with `devices`: each one's `outcome`, `detail`, `run_id`, `delivery_id` or `update_run_id`, exit code, saved path and times. |
+| `GET /v1/jobs/{id}` | A job with `devices`: each one's `outcome`, `detail`, `run_id`, `delivery_id`, `update_run_id` or `wake_id`, exit code, saved path and times. |
 | `POST /v1/jobs/{id}/cancel` | Cancels the devices that haven't started. |
 | `GET /v1/automation-policies` | Policies with their latest job (`automation.manage`). |
-| `POST /v1/automation-policies`, `PUT /v1/automation-policies/{id}` | A whole policy: `name`, `enabled`, `action` (`script`, `update_scan` or `update_install`), `script_id` and `run_as` for a script, `update_categories`, `reboot` and `reboot_delay_minutes` for an install, `target` with `device_ids` or `company_ids`, `trigger` (`interval`, `daily`, `weekly`, `once`, `enroll`) with `interval_minutes`, `time` (`HH:MM`), `weekdays` (1 = Monday to 7), `run_at` (`YYYY-MM-DDTHH:MM`) and `time_zone` as it needs, `offline`, `catch_up_hours` and `channel_ids`. |
+| `POST /v1/automation-policies`, `PUT /v1/automation-policies/{id}` | A whole policy: `name`, `enabled`, `action` (`script`, `update_scan`, `update_install` or `wake`), `script_id` and `run_as` for a script, `update_categories`, `reboot` and `reboot_delay_minutes` for an install, `target` with `device_ids` or `company_ids`, `trigger` (`interval`, `daily`, `weekly`, `once`, `enroll`) with `interval_minutes`, `time` (`HH:MM`), `weekdays` (1 = Monday to 7), `run_at` (`YYYY-MM-DDTHH:MM`) and `time_zone` as it needs, `offline`, `catch_up_hours` and `channel_ids`. |
 | `DELETE /v1/automation-policies/{id}` | |
 | `POST /v1/automation-policies/{id}/run` | Run now; returns the job. |
 
@@ -264,7 +267,9 @@ should read the lists again.
   with `automation_policy_companies`, `_devices` and `_channels`. Runs,
   deliveries and update runs carry `job_id`; a job's runs have the source
   `job`. An update job's kind is `update_scan` or `update_install`, its
-  `item_name` says what it does, and its `item_id` is empty.
+  `item_name` says what it does, and its `item_id` is empty. A wake job's
+  kind is `wake`; its devices are woken together by the dispatcher, outside
+  its limits, and their outcomes come from `wake_requests`.
 - Each device's part is the same `run_script`, `deliver_file`,
   `scan_updates` or `install_updates` command as one started by hand.
 - The website: `dashboard/features/automation/`.

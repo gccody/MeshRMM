@@ -33,6 +33,7 @@ const ACTION_INTROS: Record<PolicyAction, string> = {
   script: "The server runs the policy's script by itself, as a job.",
   update_scan: "The server asks the devices to look for operating system updates, as a job, so their lists stay current between the server's own scans.",
   update_install: "The server has the devices install pending operating system updates of the chosen kinds, as a job, and restart as you choose.",
+  wake: "The server wakes the devices that are offline with Wake-on-LAN, as a job, through online devices on their network: before a patch window, for example.",
 };
 
 const browserZone = () => currentZoneName(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
@@ -69,6 +70,8 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
   const usesZone = draft.trigger === "daily" || draft.trigger === "weekly" || draft.trigger === "once";
   const enrolling = draft.trigger === "enroll";
   const isScript = draft.action === "script";
+  const isWake = draft.action === "wake";
+  const triggers = isWake ? TRIGGERS.filter((trigger) => trigger !== "enroll") : TRIGGERS;
   const missingPermission = can(SAVE_PERMISSION[draft.action]) ? null : `Saving a policy that does this needs the ${SAVE_PERMISSION[draft.action]} permission.`;
 
   const submit = async (event: FormEvent) => {
@@ -94,7 +97,7 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
           <label htmlFor="policy-name">Name<input id="policy-name" required maxLength={120} value={draft.name} onChange={(event) => update({ name: event.target.value })} placeholder="Nightly cleanup" /></label>
           {actions.length > 1 && (
             <div className="segmented action-choice" role="group" aria-label="What the policy does">
-              {actions.map((action) => <button key={action} type="button" aria-pressed={draft.action === action} onClick={() => update({ action })}>{ACTION_LABELS[action]}</button>)}
+              {actions.map((action) => <button key={action} type="button" aria-pressed={draft.action === action} onClick={() => update(action === "wake" && draft.trigger === "enroll" ? { action, trigger: "daily" } : { action })}>{ACTION_LABELS[action]}</button>)}
             </div>
           )}
           {isScript && <>
@@ -124,6 +127,7 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
             <CategoryChoice categories={draft.updateCategories} onToggle={(category, checked) => update({ updateCategories: checked ? [...draft.updateCategories, category] : draft.updateCategories.filter((candidate) => candidate !== category) })} />
             <RebootFields name="policy-reboot" reboot={draft.reboot} delay={draft.rebootDelayMinutes} onReboot={(reboot) => update({ reboot })} onDelay={(rebootDelayMinutes) => update({ rebootDelayMinutes })} />
           </>}
+          {isWake && <p className="field-help">Online devices are skipped. A device that comes online within 10 minutes of its packets counts as woken; one that no online device shares a network with fails. Run it a few minutes before the work that needs the devices.</p>}
           {draft.action === "update_scan" && <p className="field-help">Devices also scan on the server&apos;s own schedule, set under Settings. A scan policy adds scans at the times you choose.</p>}
 
           <label htmlFor="policy-trigger">Runs
@@ -131,7 +135,7 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
               const trigger = event.target.value as TriggerKind;
               update(trigger === "enroll" && draft.target === "devices" ? { trigger, target: "all" } : { trigger });
             }}>
-              {TRIGGERS.map((trigger) => <option key={trigger} value={trigger}>{TRIGGER_LABELS[trigger]}</option>)}
+              {triggers.map((trigger) => <option key={trigger} value={trigger}>{TRIGGER_LABELS[trigger]}</option>)}
             </select>
           </label>
           {draft.trigger === "interval" && (
@@ -191,14 +195,14 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
           )}
           {draft.target === "devices" && <DevicePicker agents={inventory.agents} chosen={draft.deviceIds} onChange={(deviceIds) => update({ deviceIds: [...deviceIds] })} language={isScript ? script?.language ?? null : null} />}
 
-          {!enrolling && (
+          {!enrolling && !isWake && (
             <fieldset className="choice-list">
               <legend>Offline devices</legend>
               <label><input type="radio" name="policy-offline" checked={draft.offline === "wait"} onChange={() => update({ offline: "wait" })} /><span><strong>Catch them up</strong>Run when they connect within the time below, unless the policy runs again first.</span></label>
               <label><input type="radio" name="policy-offline" checked={draft.offline === "skip"} onChange={() => update({ offline: "skip" })} /><span><strong>Skip them</strong>They wait for the next run.</span></label>
             </fieldset>
           )}
-          {(enrolling || draft.offline === "wait") && (
+          {!isWake && (enrolling || draft.offline === "wait") && (
             <label htmlFor="policy-catch-up">{enrolling ? "Wait for the new device up to" : "Catch up within"}
               <span className="input-with-unit">
                 <input id="policy-catch-up" type="number" inputMode="numeric" min={1} max={MAX_WAIT_HOURS} step={1} required value={draft.catchUpHours} onChange={(event) => update({ catchUpHours: event.target.value })} />

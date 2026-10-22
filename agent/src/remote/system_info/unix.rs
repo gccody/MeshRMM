@@ -113,6 +113,23 @@ pub(super) fn interfaces() -> anyhow::Result<BTreeMap<String, Interface>> {
     Ok(interfaces)
 }
 
+/// The IPv4 addresses of the interfaces that are up, without loopback ones.
+pub(super) fn local_ipv4_addresses() -> anyhow::Result<Vec<super::LocalAddress>> {
+    Ok(interfaces()?
+        .into_iter()
+        .filter(|(_, interface)| interface.up && !interface.loopback)
+        .flat_map(|(name, interface)| {
+            interface.addresses.into_iter().filter_map(move |address| {
+                Some(super::LocalAddress {
+                    interface: name.clone(),
+                    address: address.address.parse().ok()?,
+                    prefix_length: address.prefix_length,
+                })
+            })
+        })
+        .collect())
+}
+
 /// The IP address in an AF_INET or AF_INET6 `sockaddr` of `family`. macOS
 /// shortens subnet masks to the bytes up to their last nonzero one, and can
 /// leave their family zero, so only the bytes the sockaddr has are read and

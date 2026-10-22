@@ -130,6 +130,12 @@ pub enum AgentCommand {
     OpenTerminal {
         terminal: crate::TerminalRequest,
     },
+    /// Broadcasts magic packets to wake computers on the Agent's networks;
+    /// see [`crate::WakePacket`]. Answered by
+    /// [`AgentStatusMessage::WakePacketsSent`].
+    SendWakePackets {
+        packets: Vec<crate::WakePacket>,
+    },
 }
 
 /// Agent-to-coordinator lifecycle notifications and reports.
@@ -170,6 +176,10 @@ pub enum AgentStatusMessage {
     UpdateInstall {
         run_id: String,
         result: Box<crate::UpdateInstallResult>,
+    },
+    /// What became of each packet of a [`AgentCommand::SendWakePackets`].
+    WakePacketsSent {
+        results: Vec<crate::WakePacketResult>,
     },
 }
 

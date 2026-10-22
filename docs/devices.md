@@ -81,7 +81,8 @@ device shows **Connect**, which opens a remote session on the console or in
 [background mode](background-mode.md), and **Scripts**, which runs a
 [script](toolbox.md) on it. Ticking devices' checkboxes opens a selection
 bar that runs a script or sends a file on all of them as a
-[job](automation.md). A device's menu has **Close active session**,
+[job](automation.md), or wakes the offline ones. An offline device's menu
+has **Wake device** (see [below](#waking-offline-devices)). A device's menu has **Close active session**,
 which for users with `sessions.close_any` disconnects the device's viewer and
 clears a stale session reservation. The Agent stays online and can take a new
 connection at once. It is safe to repeat and is recorded in the audit log.
@@ -116,6 +117,14 @@ The device page's **Updates** tab lists the updates the computer has
 pending, scans it, installs chosen updates or all of them, and shows its
 update history; the **Updates** page gives the fleet's overview. See
 [patch management](patch-management.md).
+
+## Waking offline devices
+
+**Wake device** in an offline device's menu, **Wake** on its page, or
+**Wake N offline** in the selection bar sends Wake-on-LAN packets for it
+through online devices on its network, then watches for it to come online.
+Users with `devices.wake` can do it. See [Wake-on-LAN](wake-on-lan.md) for
+how relays are chosen and what the sleeping computer needs.
 
 ## Agent updates
 

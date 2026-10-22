@@ -78,6 +78,21 @@ pub(crate) fn unix_ms(time: SystemTime) -> Option<i64> {
         .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
 }
 
+/// An IPv4 address of one of the computer's interfaces that are up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalAddress {
+    /// The interface's name, such as `en0`, `eth0` or `Ethernet`.
+    pub(crate) interface: String,
+    pub(crate) address: std::net::Ipv4Addr,
+    pub(crate) prefix_length: u8,
+}
+
+/// The IPv4 addresses of the interfaces that are up, without loopback ones,
+/// as they are now. Blocks briefly, so call it off the async runtime.
+pub(crate) fn local_ipv4_addresses() -> anyhow::Result<Vec<LocalAddress>> {
+    platform::local_ipv4_addresses()
+}
+
 /// Collects a snapshot. Blocks for as long as reading the package databases
 /// takes, so run it off the async runtime.
 pub fn collect() -> SystemInfo {
