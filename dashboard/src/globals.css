@@ -754,7 +754,7 @@ button.outcome-chip:hover { color: var(--text); background: var(--raised); }
 .settings-modal .job-preview { margin: 0; padding: 10px 12px; border-radius: 9px; color: var(--text-2); background: var(--well); font-size: 13px; }
 .device-picker { display: grid; gap: 8px; }
 .device-picker-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
-.device-picker-tools .search-field { flex: 1 1 200px; width: auto; }
+.device-picker-tools .search-field { display: inline-flex; flex: 1 1 200px; width: auto; }
 .picker-list { max-height: 260px; padding-right: 4px; overflow-y: auto; }
 .settings-modal .picker-list label { padding: 7px 10px; }
 .weekday-choice { margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; border: 0; }
