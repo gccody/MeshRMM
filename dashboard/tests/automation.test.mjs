@@ -19,6 +19,7 @@ import {
   progressLabel,
   progressSegments,
   timeZones,
+  currentZoneName,
   waitHoursProblem,
 } from "../features/automation/model.ts";
 import { canView, homeView, navViewFor, viewForPath } from "../features/workspace/views.ts";
@@ -177,8 +178,12 @@ test("a saved policy's draft round-trips", () => {
     trigger: "interval", offline: "skip", catch_up_hours: 12, channel_ids: ["c"], interval_minutes: 90,
   });
   assert.equal(policyDraft({ ...policy, interval_minutes: 120 }, "UTC").intervalUnit, "hours");
-  assert.deepEqual(timeZones(["Europe/Paris"]), ["UTC", "Europe/Paris"]);
+  assert.deepEqual(timeZones(["Europe/Paris"]), ["Europe/Paris", "UTC"]);
   assert.deepEqual(timeZones(["UTC"]), ["UTC"]);
+  // Browsers list some zones by ICU's older names; the current ones are offered.
+  assert.deepEqual(timeZones(["Asia/Calcutta", "Asia/Kolkata", "Europe/Kiev"]), ["Asia/Kolkata", "Europe/Kyiv", "UTC"]);
+  assert.equal(currentZoneName("America/Godthab"), "America/Nuuk");
+  assert.equal(currentZoneName("Europe/London"), "Europe/London");
 });
 
 test("jobs and policies have pages under Jobs", () => {

@@ -307,6 +307,17 @@ mod tests {
             "2026-02-03T10:00"
         );
         assert!(parse_zone("Mars/Olympus").is_none());
-        assert!(parse_zone("Europe/London").is_some());
+        // The website offers current names; browsers' older ones work too.
+        for zone in [
+            "Europe/London",
+            "Asia/Kolkata",
+            "Asia/Calcutta",
+            "Europe/Kyiv",
+            "America/Nuuk",
+            "Pacific/Kanton",
+            "America/Argentina/Buenos_Aires",
+        ] {
+            assert!(parse_zone(zone).is_some(), "{zone}");
+        }
     }
 }

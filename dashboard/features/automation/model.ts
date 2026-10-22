@@ -461,7 +461,37 @@ export function policyInput(draft: PolicyDraft) {
   return body;
 }
 
-// The time zones to offer, with UTC, which some browsers leave out.
+// Browsers list some zones by the names ICU kept from older tz releases;
+// the tz database (and the server) know the current ones too.
+const CURRENT_ZONE_NAMES: Record<string, string> = {
+  "Africa/Asmera": "Africa/Asmara",
+  "America/Buenos_Aires": "America/Argentina/Buenos_Aires",
+  "America/Catamarca": "America/Argentina/Catamarca",
+  "America/Coral_Harbour": "America/Atikokan",
+  "America/Cordoba": "America/Argentina/Cordoba",
+  "America/Godthab": "America/Nuuk",
+  "America/Indianapolis": "America/Indiana/Indianapolis",
+  "America/Jujuy": "America/Argentina/Jujuy",
+  "America/Louisville": "America/Kentucky/Louisville",
+  "America/Mendoza": "America/Argentina/Mendoza",
+  "Asia/Calcutta": "Asia/Kolkata",
+  "Asia/Katmandu": "Asia/Kathmandu",
+  "Asia/Rangoon": "Asia/Yangon",
+  "Asia/Saigon": "Asia/Ho_Chi_Minh",
+  "Atlantic/Faeroe": "Atlantic/Faroe",
+  "Europe/Kiev": "Europe/Kyiv",
+  "Pacific/Enderbury": "Pacific/Kanton",
+  "Pacific/Ponape": "Pacific/Pohnpei",
+  "Pacific/Truk": "Pacific/Chuuk",
+};
+
+/** A zone by its current tz database name, such as Asia/Kolkata for Asia/Calcutta. */
+export const currentZoneName = (zone: string) => CURRENT_ZONE_NAMES[zone] ?? zone;
+
+// The time zones to offer, by their current names and in order, with UTC,
+// which some browsers leave out.
 export function timeZones(supported: readonly string[]) {
-  return supported.includes("UTC") ? [...supported] : ["UTC", ...supported];
+  const zones = new Set(supported.map(currentZoneName));
+  zones.add("UTC");
+  return [...zones].sort();
 }

@@ -14,6 +14,7 @@ import {
   TRIGGER_LABELS,
   type TriggerKind,
   WEEKDAY_LABELS,
+  currentZoneName,
   policyDraft,
   policyDraftProblem,
   policyInput,
@@ -22,7 +23,7 @@ import {
 
 const TRIGGERS = Object.keys(TRIGGER_LABELS) as TriggerKind[];
 
-const browserZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+const browserZone = () => currentZoneName(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
 
 // Creates a policy, or edits one. Saving makes the user its owner: it runs
 // with their access from then on.
