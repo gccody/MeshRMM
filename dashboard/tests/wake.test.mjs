@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { outcomeLabel, policyDraft, policyDraftProblem, policyInput } from "../features/automation/model.ts";
-import { relayText, wakeHeadline, wakeState, wakeTitle, wakeTone, wakeable } from "../features/wake/model.ts";
+import { isSettling, relayText, wakeHeadline, wakeState, wakeTitle, wakeTone, wakeable } from "../features/wake/model.ts";
 
 const NOW = 1_800_000_000_000;
 
@@ -71,4 +71,11 @@ test("wake policies run on a schedule and never wait for offline devices", () =>
   assert.equal(body.action, "wake");
   assert.equal(body.offline, "skip");
   assert.equal(body.script_id, undefined);
+});
+
+test("a wake settles once every relay reported", () => {
+  const relay = { device_id: "mac", name: "Mac", broadcast: "192.168.1.255", prefix_length: 24, status: "sent", source_address: "192.168.1.140", error: null, reported_at: NOW };
+  assert.equal(isSettling(wake({ relays: [relay] })), false);
+  assert.equal(isSettling(wake({ relays: [relay, { ...relay, device_id: "pc", status: "pending" }] })), true, "one relay is enough to be sent, not to be done");
+  assert.equal(isSettling(wake({ status: "sending" })), true);
 });

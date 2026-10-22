@@ -103,8 +103,8 @@ export function relayText(relay: WakeRelay) {
   }
 }
 
-// Whether the wake may still change without the device coming online.
-export const isSettling = (wake: Wake) => wake.status === "sending";
+// Whether a relay may still report.
+export const isSettling = (wake: Wake) => wake.status === "sending" || wake.relays.some((relay) => relay.status === "pending");
 
 // The chosen devices that can be woken: offline ones.
 export const wakeable = (agents: readonly Agent[]) => agents.filter((agent) => !agent.connected);

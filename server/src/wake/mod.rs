@@ -824,22 +824,23 @@ pub async fn wait_for_relays(
 ) -> db::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let mut sending = 0;
+        let mut pending = 0;
         for chunk in ids.chunks(CHUNK) {
             let rows: Vec<(String,)> = state
                 .database
                 .fetch_all(
                     &Query::select()
-                        .column(WakeRequests::Id)
-                        .from(WakeRequests::Table)
-                        .and_where(Expr::col(WakeRequests::Id).is_in(chunk.iter().cloned()))
-                        .and_where(Expr::col(WakeRequests::Status).eq(Status::Sending.as_str()))
+                        .column(WakeRelays::WakeId)
+                        .from(WakeRelays::Table)
+                        .and_where(Expr::col(WakeRelays::WakeId).is_in(chunk.iter().cloned()))
+                        .and_where(Expr::col(WakeRelays::Status).eq(RelayStatus::Pending.as_str()))
+                        .limit(1)
                         .to_owned(),
                 )
                 .await?;
-            sending += rows.len();
+            pending += rows.len();
         }
-        if sending == 0 {
+        if pending == 0 {
             return Ok(());
         }
         tokio::select! {
