@@ -3,12 +3,13 @@
 // Imports carry the .ts extension so node:test can load this module directly.
 import { type Account, type Permission, canAny } from "../auth/types.ts";
 
-export type View = "devices" | "device" | "companies" | "toolbox" | "alerts" | "alert-rules" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account";
+export type View = "devices" | "device" | "companies" | "software" | "toolbox" | "alerts" | "alert-rules" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account";
 
 export const VIEW_PATHS: Record<View, string> = {
   devices: "/",
   device: "/device",
   companies: "/companies",
+  software: "/software",
   toolbox: "/toolbox",
   alerts: "/alerts",
   "alert-rules": "/alert-rules",
@@ -26,6 +27,7 @@ export const VIEW_COPY: Record<View, { title: string }> = {
   devices: { title: "Devices" },
   device: { title: "Device" },
   companies: { title: "Companies" },
+  software: { title: "Software" },
   toolbox: { title: "Toolbox" },
   alerts: { title: "Alerts" },
   "alert-rules": { title: "Alert rules" },
@@ -44,6 +46,7 @@ const VIEW_ACCESS: Record<View, readonly Permission[]> = {
   devices: ["devices.view"],
   device: ["devices.view"],
   companies: ["devices.view"],
+  software: ["devices.view"],
   toolbox: ["scripts.run", "scripts.manage_shared", "files.deliver", "files.manage_shared"],
   alerts: ["alerts.view"],
   "alert-rules": ["alerts.view"],

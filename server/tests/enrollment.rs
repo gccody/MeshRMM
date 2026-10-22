@@ -66,6 +66,7 @@ async fn installers_enroll_one_computer_that_can_recover_its_credential() {
                 "connected": false,
                 "company_id": null,
                 "created_at": devices.body["agents"][0]["created_at"],
+                "system": null,
             }])
         );
 

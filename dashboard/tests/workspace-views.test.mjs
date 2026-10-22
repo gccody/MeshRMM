@@ -36,6 +36,9 @@ test("pages open to the permissions that use them", () => {
   assert.equal(canView(technician, "account"), true);
   assert.equal(canView(account(["files.manage_shared"]), "toolbox"), true);
   assert.equal(canView(account(["audit.view"]), "audit"), true);
+  assert.equal(canView(technician, "software"), true);
+  assert.equal(canView(account(["audit.view"]), "software"), false);
+  assert.equal(viewForPath("/software"), "software");
   // Email settings are for administrators only, on the Authentication page.
   assert.equal(canView(account([], true), "authentication"), true);
   assert.equal(canView(null, "account"), false);

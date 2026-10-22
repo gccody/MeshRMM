@@ -1,4 +1,4 @@
-import { type Agent, type AgentDelta, type AgentEvent, type Company, type Inventory, PLATFORM_LABELS } from "./types.ts";
+import { type Agent, type AgentDelta, type AgentEvent, type Company, type Inventory, PLATFORM_LABELS, type SystemSummary } from "./types.ts";
 
 const PLATFORMS: string[] = Object.keys(PLATFORM_LABELS);
 
@@ -45,6 +45,24 @@ export const applyInventoryDelta = (inventory: Inventory, event: AgentDelta): In
   }
 };
 
+const isText = (value: unknown) => value === null || value === undefined || typeof value === "string";
+
+const isSystemSummary = (value: unknown): value is SystemSummary | null | undefined => {
+  if (value === null || value === undefined) return true;
+  if (typeof value !== "object") return false;
+  const candidate = value as Partial<SystemSummary>;
+  return (
+    typeof candidate.os === "string" &&
+    isText(candidate.manufacturer) &&
+    isText(candidate.model) &&
+    isText(candidate.serial_number) &&
+    isText(candidate.public_ip) &&
+    Array.isArray(candidate.ip_addresses) &&
+    candidate.ip_addresses.every((address) => typeof address === "string") &&
+    typeof candidate.received_at === "number"
+  );
+};
+
 const isAgent = (value: unknown): value is Agent => {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<Agent>;
@@ -54,7 +72,8 @@ const isAgent = (value: unknown): value is Agent => {
     PLATFORMS.includes(candidate.platform as string) &&
     typeof candidate.connected === "boolean" &&
     (candidate.updating_to === undefined || typeof candidate.updating_to === "string") &&
-    (candidate.company_id === undefined || candidate.company_id === null || typeof candidate.company_id === "string")
+    (candidate.company_id === undefined || candidate.company_id === null || typeof candidate.company_id === "string") &&
+    isSystemSummary(candidate.system)
   );
 };
 

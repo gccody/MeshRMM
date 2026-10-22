@@ -21,6 +21,7 @@ pub mod secrets;
 pub mod serve;
 pub mod settings;
 pub mod storage;
+pub mod system_info;
 pub mod time;
 pub mod toolbox;
 pub mod turn;

@@ -72,6 +72,16 @@ test("rejects malformed Agent API and event payloads", () => {
   );
 });
 
+test("accepts a device's system summary and rejects a malformed one", () => {
+  const system = { os: "Ubuntu 24.04", manufacturer: null, model: "Virtual Machine", serial_number: null, ip_addresses: ["10.0.0.5"], public_ip: "203.0.113.4", received_at: 1 };
+  const agent = { id: "a", name: "Alpha", platform: "linux", connected: true, system };
+  assert.deepEqual(parseAgentEvent({ type: "agent_upsert", revision: 5, agent }).agent.system, system);
+  assert.ok(parseAgentEvent({ type: "agent_upsert", revision: 5, agent: { ...agent, system: null } }));
+  for (const broken of [{ ...system, os: 7 }, { ...system, ip_addresses: "10.0.0.5" }, { ...system, ip_addresses: [5] }, { ...system, received_at: "now" }, "Ubuntu"]) {
+    assert.equal(parseAgentEvent({ type: "agent_upsert", revision: 5, agent: { ...agent, system: broken } }), null, JSON.stringify(broken));
+  }
+});
+
 test("applies company events and names a device's company", () => {
   let inventory = { agents: [{ id: "a", name: "Alpha", platform: "windows", connected: true, company_id: "g" }], companies: [] };
   inventory = applyInventoryDelta(inventory, { type: "company_upsert", revision: 1, company: { id: "g", name: "globex" } });

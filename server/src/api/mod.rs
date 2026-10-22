@@ -22,6 +22,7 @@ mod settings;
 mod setup;
 mod sign_in;
 mod sso;
+mod system_info;
 mod toolbox;
 mod users;
 
@@ -182,6 +183,19 @@ fn device_routes() -> Router<AppState> {
         .route("/agents/{id}/connect", get(agent::connect))
         .route("/agents/{id}/close-session", post(remote::close))
         .route("/agents/{id}/metrics", get(metrics::get))
+        .route("/agents/{id}/system-info", get(system_info::get))
+        .route(
+            "/agents/{id}/system-info/refresh",
+            post(system_info::refresh),
+        )
+        .route("/agents/{id}/applications", get(system_info::applications))
+        .route(
+            "/agents/{id}/application-changes",
+            get(system_info::changes),
+        )
+        .route("/system-info", get(system_info::search_devices))
+        .route("/software", get(system_info::software))
+        .route("/software/devices", get(system_info::software_devices))
         .route(
             "/agents/{id}/rotate-credential",
             post(devices::rotate_credential),

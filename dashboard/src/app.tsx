@@ -16,6 +16,7 @@ import { SessionProvider, useDocumentTitle } from "../features/auth/session";
 import { SetupPage } from "../features/auth/setup-page";
 import { RolesPanel } from "../features/roles/roles-panel";
 import { SettingsPanel } from "../features/settings/settings-page";
+import { SoftwarePage } from "../features/system-info/software-page";
 import { ToolboxPanel } from "../features/toolbox/toolbox-panel";
 import { UsersPanel } from "../features/users/users-panel";
 import { WorkspaceShell } from "../features/workspace/workspace-shell";
@@ -32,6 +33,7 @@ export function App() {
             <Route index element={<DevicesPanel />} />
             <Route path="device" element={<DevicePage />} />
             <Route path="companies" element={<CompaniesPanel />} />
+            <Route path="software" element={<SoftwarePage />} />
             <Route path="toolbox" element={<ToolboxPanel />} />
             <Route path="alerts" element={<AlertsPage />} />
             <Route path="alert-rules" element={<RulesPage />} />
