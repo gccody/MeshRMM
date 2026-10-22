@@ -253,8 +253,10 @@ fn rule_metadata(input: &RuleInput, rule: &Rule) -> serde_json::Value {
         "description": rule.describe(),
         "severity": input.severity.as_str(),
         "enabled": input.enabled,
-        "all_companies": input.all_companies,
+        "target": input.target.as_str(),
         "company_ids": input.company_ids,
+        "tag_ids": input.tag_ids,
+        "tag_match": input.tag_match.as_str(),
         "channel_ids": input.channel_ids,
         "notify_on_resolve": input.notify_on_resolve,
     })

@@ -21,10 +21,12 @@ export type Instance = {
 
 export type Permission =
   | "devices.view"
+  | "devices.edit"
   | "devices.enroll"
   | "devices.delete"
   | "devices.rotate_credentials"
   | "companies.manage"
+  | "tags.manage"
   | "devices.wake"
   | "sessions.connect"
   | "sessions.connect_background"

@@ -19,6 +19,8 @@ import {
   Send,
   Square,
   SquareTerminal,
+  Tag as TagIcon,
+  Tags as TagsIcon,
   Terminal,
   Trash2,
   WifiOff,
@@ -28,12 +30,14 @@ import { terminalPagePath } from "../terminal/model";
 import type { MetricsReading } from "../metrics/model";
 import { DeviceUsage } from "../metrics/usage-meter";
 import { HeaderActions } from "../workspace/header-actions";
+import { type TagMatch, matchesTagName, tagsOf } from "../tags/model";
+import { TagChip, TagChips } from "../tags/tag-chip";
 import { type AgentStatusFilter, type CompanyFilter, NO_COMPANY } from "./device-filters";
 import { companyName, matchesCompanyName } from "./model";
 import { ScreenPreview, useDeviceScreen } from "./device-thumbnail";
 import type { InventoryConnection, InventoryStatus } from "./inventory-stream";
 import type { ThumbnailStore } from "./thumbnails";
-import { type Agent, type Company, hasBackgroundDesktop } from "./types";
+import { type Agent, type Company, type Tag, hasBackgroundDesktop } from "./types";
 
 type InventoryState = {
   status: InventoryStatus;
@@ -54,9 +58,13 @@ type Props = {
   onRefresh: () => void;
   onAddDevice: (opener: HTMLElement) => void;
   companies: Company[];
+  tags: Tag[];
   query: string;
   status: AgentStatusFilter;
   company: CompanyFilter;
+  // The tags the wall shows devices with, and whether they need any or all.
+  tagFilter: readonly string[];
+  tagMatch: TagMatch;
   connectingId: string | null;
   connectingBackgroundId: string | null;
   deletingId: string | null;
@@ -65,7 +73,10 @@ type Props = {
   onQueryChange: (query: string) => void;
   onStatusChange: (status: AgentStatusFilter) => void;
   onCompanyChange: (company: CompanyFilter) => void;
+  onTagsChange: (tags: string[], match: TagMatch) => void;
   onClearFilters: () => void;
+  // Adds and removes tags on one device or many.
+  onEditTags: (agents: Agent[], opener: HTMLElement) => void;
   onMove: (agent: Agent, opener: HTMLElement) => void;
   onRemote: (agent: Agent) => void;
   onRemoteBackground: (agent: Agent) => void;
@@ -102,6 +113,8 @@ export type DeviceActions = {
   delete: boolean;
   enroll: boolean;
   moveCompany: boolean;
+  // Add and remove devices' tags.
+  editTags: boolean;
 };
 
 type TileState = {
@@ -157,9 +170,12 @@ export function AgentOverview({
   onRefresh,
   onAddDevice,
   companies,
+  tags,
   query,
   status,
   company,
+  tagFilter,
+  tagMatch,
   connectingId,
   connectingBackgroundId,
   deletingId,
@@ -168,7 +184,9 @@ export function AgentOverview({
   onQueryChange,
   onStatusChange,
   onCompanyChange,
+  onTagsChange,
   onClearFilters,
+  onEditTags,
   onMove,
   onRemote,
   onRemoteBackground,
@@ -180,11 +198,11 @@ export function AgentOverview({
 }: Props) {
   const online = agents.filter((agent) => agent.connected).length;
   const counts: Record<AgentStatusFilter, number> = { all: agents.length, online, offline: agents.length - online };
-  const hasFilters = Boolean(query.trim() || status !== "all" || company);
+  const hasFilters = Boolean(query.trim() || status !== "all" || company || tagFilter.length);
   const hasData = inventory.status !== "loading";
   const stale = inventory.status === "stale";
   const browserOffline = inventory.connection === "offline";
-  const selectable = allowed.runScripts || allowed.deliverFiles || allowed.wake;
+  const selectable = allowed.runScripts || allowed.deliverFiles || allowed.wake || allowed.editTags;
   const selectedCount = agents.filter((agent) => selection.ids.has(agent.id)).length;
 
   return (
@@ -198,13 +216,14 @@ export function AgentOverview({
           ))}
         </div>
         {(companies.length > 0 || company) && <CompanyFilterMenu companies={companies} company={company} onChange={onCompanyChange} />}
-        <label className="search-field"><Search size={16} aria-hidden="true" /><input type="search" aria-label="Search devices" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="Search devices" title="Searches names, operating systems, models, serial numbers and IP addresses" /></label>
+        {(tags.length > 0 || tagFilter.length > 0) && <TagFilterMenu tags={tags} chosen={tagFilter} match={tagMatch} onChange={onTagsChange} />}
+        <label className="search-field"><Search size={16} aria-hidden="true" /><input type="search" aria-label="Search devices" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="Search devices" title="Searches names, tags, operating systems, models, serial numbers and IP addresses" /></label>
         <button type="button" className="icon-button" onClick={onRefresh} aria-label="Refresh devices" title="Refresh"><RefreshCw size={16} className={inventory.isRefreshing ? "spin" : ""} /></button>
         {allowed.enroll && <button type="button" className="primary-button" onClick={(event) => onAddDevice(event.currentTarget)} aria-haspopup="dialog"><Plus size={16} /> Add device</button>}
       </HeaderActions>
 
       <InventoryStrip inventory={inventory} onReconnect={onReconnect} />
-      {selectable && selectedCount > 0 && <SelectionBar count={selectedCount} allowed={allowed} selection={selection} shown={filteredAgents} chosen={agents.filter((agent) => selection.ids.has(agent.id))} onWake={onWake} />}
+      {selectable && selectedCount > 0 && <SelectionBar count={selectedCount} allowed={allowed} selection={selection} shown={filteredAgents} chosen={agents.filter((agent) => selection.ids.has(agent.id))} onWake={onWake} onEditTags={onEditTags} />}
 
       {filteredAgents.length > 0 ? (
         <ul className={`device-wall${stale ? " stale" : ""}${selectedCount > 0 ? " selecting" : ""}`} aria-label="Devices">
@@ -213,6 +232,7 @@ export function AgentOverview({
               key={agent.id}
               agent={agent}
               companyName={companyName(companies, agent.company_id)}
+              tags={tagsOf(agent.tag_ids, tags)}
               reading={metrics.get(agent.id)}
               store={thumbnails}
               allowed={allowed}
@@ -234,6 +254,7 @@ export function AgentOverview({
               onRunScript={onRunScript}
               onWake={onWake}
               onMove={onMove}
+              onEditTags={onEditTags}
             />
           ))}
         </ul>
@@ -250,7 +271,7 @@ export function AgentOverview({
 }
 
 // What to do with the devices chosen on the wall.
-function SelectionBar({ count, allowed, selection, shown, chosen, onWake }: {
+function SelectionBar({ count, allowed, selection, shown, chosen, onWake, onEditTags }: {
   count: number;
   allowed: DeviceActions;
   selection: DeviceSelection;
@@ -258,6 +279,7 @@ function SelectionBar({ count, allowed, selection, shown, chosen, onWake }: {
   // The chosen devices still on the wall.
   chosen: Agent[];
   onWake: (agents: Agent[], opener: HTMLElement) => void;
+  onEditTags: (agents: Agent[], opener: HTMLElement) => void;
 }) {
   const allShown = shown.every((agent) => selection.ids.has(agent.id));
   const offline = chosen.filter((agent) => !agent.connected);
@@ -270,6 +292,7 @@ function SelectionBar({ count, allowed, selection, shown, chosen, onWake }: {
         {allowed.runScripts && <button type="button" className="primary-button" onClick={(event) => selection.onStartJob("script", event.currentTarget)} aria-haspopup="dialog"><SquareTerminal size={16} aria-hidden="true" />Run script</button>}
         {allowed.deliverFiles && <button type="button" className="secondary-button" onClick={(event) => selection.onStartJob("file", event.currentTarget)} aria-haspopup="dialog"><Send size={16} aria-hidden="true" />Send file</button>}
         {allowed.wake && offline.length > 0 && <button type="button" className="secondary-button" onClick={(event) => onWake(offline, event.currentTarget)} aria-haspopup="dialog"><Power size={16} aria-hidden="true" />Wake {offline.length} offline</button>}
+        {allowed.editTags && <button type="button" className="secondary-button" onClick={(event) => onEditTags(chosen, event.currentTarget)} aria-haspopup="dialog"><TagIcon size={16} aria-hidden="true" />Tag</button>}
       </span>
     </div>
   );
@@ -360,9 +383,81 @@ function CompanyFilterList({ companies, company, onChoose }: {
   );
 }
 
-function DeviceTile({ agent, companyName, reading, store, allowed, selected, onSelect, state, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript, onWake, onMove }: {
+// The tags label: "All tags", one tag's name, or the first and how many more.
+function tagFilterLabel(tags: readonly Tag[], chosen: readonly string[]) {
+  if (!chosen.length) return "All tags";
+  const first = tags.find((tag) => tag.id === chosen[0])?.name ?? "Unknown tag";
+  return chosen.length === 1 ? first : `${first} +${chosen.length - 1}`;
+}
+
+// Shows the devices with any, or all, of chosen tags.
+function TagFilterMenu({ tags, chosen, match, onChange }: {
+  tags: Tag[];
+  chosen: readonly string[];
+  match: TagMatch;
+  onChange: (tags: string[], match: TagMatch) => void;
+}) {
+  const { open, setOpen, container, trigger } = usePopover();
+  const label = tagFilterLabel(tags, chosen);
+  return (
+    <div className="popover-anchor" ref={container}>
+      <button ref={trigger} type="button" className="company-filter" onClick={() => setOpen(!open)} aria-expanded={open} aria-controls={open ? "tag-filter-menu" : undefined} aria-label={`Tags: ${label}`}>
+        <TagsIcon size={15} aria-hidden="true" /><span>{label}</span><ChevronDown size={14} aria-hidden="true" />
+      </button>
+      {open && <TagFilterList tags={tags} chosen={chosen} match={match} onChange={onChange} />}
+    </div>
+  );
+}
+
+// The open tags menu: tick several, and whether devices need any or all.
+// It stays open while choosing, and its search box starts empty each time.
+function TagFilterList({ tags, chosen, match, onChange }: {
+  tags: Tag[];
+  chosen: readonly string[];
+  match: TagMatch;
+  onChange: (tags: string[], match: TagMatch) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const search = useRef<HTMLInputElement>(null);
+  useEffect(() => search.current?.focus(), []);
+  const shown = tags.filter((tag) => matchesTagName(tag.name, query));
+  // A link may name tags this browser doesn't know (yet); they stay chosen.
+  const unknown = chosen.filter((id) => !tags.some((tag) => tag.id === id));
+  const toggle = (id: string) => onChange(chosen.includes(id) ? chosen.filter((candidate) => candidate !== id) : [...chosen, id], match);
+
+  return (
+    <div id="tag-filter-menu" className="popover menu company-filter-menu tag-filter-menu" role="group" aria-label="Show devices with tags">
+      <label className="menu-search"><Search size={15} aria-hidden="true" />
+        <input ref={search} type="search" aria-label="Search tags" placeholder="Search tags" value={query} onChange={(event) => setQuery(event.target.value)} />
+      </label>
+      {chosen.length > 1 && (
+        <div className="segmented tag-match" role="group" aria-label="Devices need">
+          <button type="button" aria-pressed={match === "any"} onClick={() => onChange([...chosen], "any")}>Any of these</button>
+          <button type="button" aria-pressed={match === "all"} onClick={() => onChange([...chosen], "all")}>All of them</button>
+        </div>
+      )}
+      <div className="menu-options">
+        {shown.map((tag) => (
+          <button key={tag.id} type="button" aria-pressed={chosen.includes(tag.id)} onClick={() => toggle(tag.id)}>
+            <Check size={16} aria-hidden="true" className={chosen.includes(tag.id) ? undefined : "invisible"} /><TagChip tag={tag} />
+          </button>
+        ))}
+        {unknown.length > 0 && !query.trim() && (
+          <button type="button" aria-pressed="true" onClick={() => onChange(chosen.filter((id) => !unknown.includes(id)), match)}>
+            <Check size={16} aria-hidden="true" /><span>{unknown.length === 1 ? "An unknown tag" : `${unknown.length} unknown tags`}</span>
+          </button>
+        )}
+        {shown.length === 0 && <p className="menu-empty" role="status">{tags.length ? "No matching tags" : "No tags yet"}</p>}
+      </div>
+      {chosen.length > 0 && <button type="button" className="link-button tag-filter-clear" onClick={() => onChange([], "any")}>Clear tags</button>}
+    </div>
+  );
+}
+
+function DeviceTile({ agent, companyName, tags, reading, store, allowed, selected, onSelect, state, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript, onWake, onMove, onEditTags }: {
   agent: Agent;
   companyName: string | null;
+  tags: Tag[];
   reading: MetricsReading | undefined;
   store: ThumbnailStore;
   allowed: DeviceActions;
@@ -377,6 +472,7 @@ function DeviceTile({ agent, companyName, reading, store, allowed, selected, onS
   onRunScript: (agent: Agent, opener: HTMLElement) => void;
   onWake: (agents: Agent[], opener: HTMLElement) => void;
   onMove: (agent: Agent, opener: HTMLElement) => void;
+  onEditTags: (agents: Agent[], opener: HTMLElement) => void;
 }) {
   const [element, setElement] = useState<HTMLLIElement | null>(null);
   const thumbnail = useDeviceScreen(store, agent, element);
@@ -438,10 +534,12 @@ function DeviceTile({ agent, companyName, reading, store, allowed, selected, onS
           onDelete={onDelete}
           onWake={onWake}
           onMove={onMove}
+          onEditTags={onEditTags}
         />
       </div>
       {agent.system?.os && <p className="device-company" title={agent.system.os}><Laptop size={13} aria-hidden="true" /><span><span className="sr-only">Operating system: </span>{agent.system.os}</span></p>}
       {companyName && <p className="device-company" title={companyName}><Building2 size={13} aria-hidden="true" /><span><span className="sr-only">Company: </span>{companyName}</span></p>}
+      {tags.length > 0 && <div className="device-tags"><TagChips tags={tags} limit={3} /></div>}
       {reading && <DeviceUsage reading={reading} />}
       {previewOpen && thumbnail && <ScreenPreview agent={agent} thumbnail={thumbnail} returnFocus={previewOpener} onClose={() => setPreviewOpen(false)} />}
     </li>
@@ -496,7 +594,7 @@ function ConnectButton({ agent, allowed, stale, onRemote, onRemoteBackground }: 
   );
 }
 
-function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSession, onDelete, onWake, onMove }: {
+function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSession, onDelete, onWake, onMove, onEditTags }: {
   agent: Agent;
   allowed: DeviceActions;
   state: TileState;
@@ -506,6 +604,7 @@ function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSes
   onDelete: (agent: Agent) => void;
   onWake: (agents: Agent[], opener: HTMLElement) => void;
   onMove: (agent: Agent, opener: HTMLElement) => void;
+  onEditTags: (agents: Agent[], opener: HTMLElement) => void;
 }) {
   const { open, setOpen, close, container, trigger } = usePopover();
   const menuId = `device-menu-${agent.id}`;
@@ -527,6 +626,7 @@ function DeviceMenu({ agent, allowed, state, hasScreen, onShowScreen, onCloseSes
           {allowed.terminal && agent.connected && <a href={terminalPagePath(agent.id)} target="_blank" rel="noreferrer" onClick={close}><Terminal size={16} aria-hidden="true" />Open terminal</a>}
           {allowed.closeSession && <button type="button" disabled={state.anyClosing || state.connecting || state.deleting} onClick={() => choose(() => onCloseSession(agent))}><Square size={16} aria-hidden="true" />Close active session</button>}
           {allowed.moveCompany && <button type="button" disabled={state.deleting} onClick={() => choose((opener) => onMove(agent, opener))} aria-haspopup="dialog"><Building2 size={16} aria-hidden="true" />Move to company…</button>}
+          {allowed.editTags && <button type="button" disabled={state.deleting} onClick={() => choose((opener) => onEditTags([agent], opener))} aria-haspopup="dialog"><TagIcon size={16} aria-hidden="true" />Tags…</button>}
           <button type="button" onClick={() => { void navigator.clipboard?.writeText(agent.id); close(); }}><Copy size={16} aria-hidden="true" />Copy device ID</button>
           {allowed.delete && <button type="button" className="danger" disabled={state.deleting || state.closing} onClick={() => choose(() => onDelete(agent))}><Trash2 size={16} aria-hidden="true" />Delete device</button>}
         </div>

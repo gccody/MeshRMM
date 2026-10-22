@@ -28,6 +28,7 @@ async fn custom_roles_grant_their_permissions() {
             roles.body[1]["permissions"],
             json!([
                 "devices.view",
+                "devices.edit",
                 "devices.enroll",
                 "devices.wake",
                 "sessions.connect",
@@ -43,7 +44,7 @@ async fn custom_roles_grant_their_permissions() {
             ])
         );
         let permissions = admin.get("/v1/permissions").await;
-        assert_eq!(permissions.body.as_array().unwrap().len(), 27);
+        assert_eq!(permissions.body.as_array().unwrap().len(), 29);
 
         let invalid = admin
             .post(

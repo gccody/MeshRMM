@@ -28,7 +28,10 @@ Every page updates live over the website's event socket.
 ## Rules
 
 A rule has a name, a severity (info, warning or critical), a condition, and
-covers every device or the devices of chosen companies. It can be turned off.
+covers every device, the devices of chosen companies, or the devices with
+any (or all) of chosen [tags](devices.md#tags). Its devices are worked out
+each time it is judged, so a device tagged after the rule was saved is
+covered at once. It can be turned off.
 Its condition can't change after it's created.
 
 | Condition | Raises an alert when | Resolves itself when |
@@ -58,8 +61,9 @@ marked `lost` two minutes after its timeout, and counts as a failure then. A
 run refused at once because the device is offline isn't a failure: the user
 who started it already saw the error.
 
-Turning a rule off, or changing its companies so that it no longer covers a
-device, resolves its alerts (resolution `not_applicable`). Deleting a rule
+Turning a rule off, changing its companies or tags, or moving or untagging a
+device so that the rule no longer covers it, resolves its alerts
+(resolution `not_applicable`). Deleting a rule
 deletes its alerts. Deleting a device deletes its alerts.
 
 ## Alerts
@@ -168,7 +172,7 @@ host only, since its URL may carry a token), and `alert.acknowledge` and
 | `GET /v1/alerts/counts` | Unresolved counts: `open`, `acknowledged`, and open ones by severity |
 | `GET /v1/alerts/{id}` | One alert |
 | `POST /v1/alerts/{id}/acknowledge`, `/resolve` | |
-| `GET`, `POST /v1/alert-rules`; `PUT`, `DELETE /v1/alert-rules/{id}` | A rule's `threshold`, `threshold_unit`, `duration_minutes`, `nonzero_exit_fails`, `update_category` (`any` or a category) and `days` as its condition needs. An install failure alert carries `update_run_id`. |
+| `GET`, `POST /v1/alert-rules`; `PUT`, `DELETE /v1/alert-rules/{id}` | A rule's devices are `target` (`all`, `companies` or `tags`) with `company_ids`, or `tag_ids` and `tag_match` (`any` or `all`). Its `threshold`, `threshold_unit`, `duration_minutes`, `nonzero_exit_fails`, `update_category` (`any` or a category) and `days` as its condition needs. An install failure alert carries `update_run_id`. |
 | `GET`, `POST /v1/notification-channels`; `PUT`, `DELETE /v1/notification-channels/{id}` | A missing `webhook_secret` keeps the saved one; `null` removes it |
 | `POST /v1/notification-channels/{id}/test` | `{ "delivered": bool, "error": string or null }` |
 | `GET /v1/notification-channels/recipients` | Users and roles an email channel can reach |
@@ -181,7 +185,8 @@ and the website reads its lists again.
 
 ## Tables
 
-`alert_rules` with `alert_rule_companies` and `alert_rule_channels`;
+`alert_rules` (with `target` and `tag_match`) with `alert_rule_companies`,
+`alert_rule_tags` and `alert_rule_channels`;
 `alerts`; `notification_channels` with `notification_channel_users` and
 `notification_channel_roles`.
 

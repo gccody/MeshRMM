@@ -39,6 +39,9 @@ test("pages open to the permissions that use them", () => {
   assert.equal(canView(technician, "software"), true);
   assert.equal(canView(account(["audit.view"]), "software"), false);
   assert.equal(viewForPath("/software"), "software");
+  assert.equal(canView(technician, "tags"), true);
+  assert.equal(canView(account(["audit.view"]), "tags"), false);
+  assert.equal(viewForPath("/tags"), "tags");
   // Email settings are for administrators only, on the Authentication page.
   assert.equal(canView(account([], true), "authentication"), true);
   assert.equal(canView(null, "account"), false);
@@ -70,6 +73,7 @@ test("the Alerts area opens to who may see alerts, and its channels to who manag
   assert.equal(homeView(account(["alerts.view"])), "alerts");
   assert.equal(viewForPath("/alert-rules"), "alert-rules");
   assert.equal(navViewFor("alert-rules"), "alerts");
+  assert.equal(navViewFor("tags"), "companies");
   assert.equal(navViewFor("notification-channels"), "alerts");
   assert.equal(navViewFor("device"), "devices");
   assert.equal(navViewFor("users"), "users");

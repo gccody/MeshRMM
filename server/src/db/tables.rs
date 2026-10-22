@@ -278,6 +278,34 @@ pub enum Agents {
     DeletionRequestedAt,
 }
 
+#[derive(Iden)]
+pub enum Tags {
+    Table,
+    Id,
+    Name,
+    Color,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+pub enum DeviceTags {
+    Table,
+    DeviceId,
+    TagId,
+    CreatedAt,
+}
+
+#[derive(Iden)]
+pub enum DeviceNotes {
+    Table,
+    DeviceId,
+    Revision,
+    Body,
+    UpdatedAt,
+    UpdatedByUserId,
+}
+
 #[derive(Iden, Clone, Copy)]
 pub enum DeviceMetrics {
     Table,
@@ -507,7 +535,8 @@ pub enum AlertRules {
     NonzeroExitFails,
     UpdateCategory,
     Days,
-    AllCompanies,
+    Target,
+    TagMatch,
     NotifyOnResolve,
     CreatedAt,
     UpdatedAt,
@@ -519,6 +548,13 @@ pub enum AlertRuleCompanies {
     Table,
     RuleId,
     CompanyId,
+}
+
+#[derive(Iden)]
+pub enum AlertRuleTags {
+    Table,
+    RuleId,
+    TagId,
 }
 
 #[derive(Iden)]
@@ -601,6 +637,7 @@ pub enum AutomationPolicies {
     Reboot,
     RebootDelayMinutes,
     Target,
+    TagMatch,
     TriggerType,
     IntervalMinutes,
     TimeOfDay,
@@ -632,6 +669,13 @@ pub enum AutomationPolicyDevices {
     Table,
     PolicyId,
     DeviceId,
+}
+
+#[derive(Iden)]
+pub enum AutomationPolicyTags {
+    Table,
+    PolicyId,
+    TagId,
 }
 
 #[derive(Iden)]

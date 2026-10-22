@@ -20,7 +20,9 @@ use crate::{
     system_info::{
         self, ChangeRecord, Snapshot,
         changes::StoredApplication,
-        search::{self, CompanyFilter, DeviceFilter, DeviceMatch, FleetApplication, InstalledOn},
+        search::{
+            self, CompanyFilter, DeviceFilter, DeviceMatch, FleetApplication, InstalledOn, Scope,
+        },
     },
 };
 
@@ -55,6 +57,20 @@ fn search_text(text: Option<String>, name: &str) -> Result<Option<String>, ApiEr
         )));
     }
     Ok(text)
+}
+
+/// The devices in `company` (`none` for no company, or a company's ID)
+/// with the tag `tag`.
+fn scope(company: Option<String>, tag: Option<String>) -> Result<Scope, ApiError> {
+    Ok(Scope {
+        company: company_filter(company)?,
+        tag: tag
+            .as_deref()
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(|tag| parse_id(tag, "tag"))
+            .transpose()?,
+    })
 }
 
 /// `none` for devices in no company, or a company's ID.
@@ -172,6 +188,7 @@ pub struct DeviceParameters {
     ip: Option<String>,
     application: Option<String>,
     company: Option<String>,
+    tag: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -179,7 +196,7 @@ pub struct DeviceList {
     devices: Vec<DeviceMatch>,
 }
 
-/// `GET /v1/system-info?q=&os=&model=&serial=&ip=&application=&company=`:
+/// `GET /v1/system-info?q=&os=&model=&serial=&ip=&application=&company=&tag=`:
 /// the snapshots of the enrolled devices that match every given filter, by
 /// device name. Each text matches anywhere, ignoring case; `q` matches the
 /// name, operating system, model, serial number, IP addresses or host name.
@@ -197,7 +214,7 @@ pub async fn search_devices(
         serial_number: search_text(parameters.serial, "serial")?,
         ip: search_text(parameters.ip, "ip")?,
         application: search_text(parameters.application, "application")?,
-        company: company_filter(parameters.company)?,
+        scope: scope(parameters.company, parameters.tag)?,
     };
     Ok(Json(DeviceList {
         devices: search::devices(&state.database, &filter).await?,
@@ -209,6 +226,7 @@ pub async fn search_devices(
 pub struct SoftwareParameters {
     q: Option<String>,
     company: Option<String>,
+    tag: Option<String>,
     limit: Option<usize>,
 }
 
@@ -219,7 +237,7 @@ pub struct SoftwareList {
     truncated: bool,
 }
 
-/// `GET /v1/software?q=&company=&limit=`: the applications on enrolled
+/// `GET /v1/software?q=&company=&tag=&limit=`: the applications on enrolled
 /// devices whose name contains `q`, by name, with how many devices have each
 /// version; without `q`, those on the most devices.
 pub async fn software(
@@ -230,13 +248,13 @@ pub async fn software(
     actor.require(Permission::DevicesView)?;
     let parameters = parameters(query)?;
     let query = search_text(parameters.q, "q")?;
-    let company = company_filter(parameters.company)?;
+    let scope = scope(parameters.company, parameters.tag)?;
     let limit = parameters
         .limit
         .unwrap_or(DEFAULT_SOFTWARE)
         .clamp(1, MAX_SOFTWARE);
     let (applications, truncated) =
-        search::software(&state.database, query.as_deref(), company.as_ref(), limit).await?;
+        search::software(&state.database, query.as_deref(), &scope, limit).await?;
     Ok(Json(SoftwareList {
         applications,
         truncated,
@@ -252,6 +270,7 @@ pub struct InstalledParameters {
     #[serde(default)]
     unversioned: bool,
     company: Option<String>,
+    tag: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -259,7 +278,7 @@ pub struct InstalledList {
     devices: Vec<InstalledOn>,
 }
 
-/// `GET /v1/software/devices?name=&version=&unversioned=&company=`: the
+/// `GET /v1/software/devices?name=&version=&unversioned=&company=&tag=`: the
 /// enrolled devices that have the application named exactly `name`, in
 /// `version` if given, by device name.
 pub async fn software_devices(
@@ -282,10 +301,9 @@ pub async fn software_devices(
         (None, true) => Some(None),
         (None, false) => None,
     };
-    let company = company_filter(parameters.company)?;
+    let scope = scope(parameters.company, parameters.tag)?;
     Ok(Json(InstalledList {
-        devices: search::installed_on(&state.database, &parameters.name, version, company.as_ref())
-            .await?,
+        devices: search::installed_on(&state.database, &parameters.name, version, &scope).await?,
     }))
 }
 

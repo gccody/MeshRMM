@@ -65,6 +65,8 @@ async fn installers_enroll_one_computer_that_can_recover_its_credential() {
                 "platform": "windows",
                 "connected": false,
                 "company_id": null,
+                "tag_ids": [],
+                "notes_revision": 0,
                 "created_at": devices.body["agents"][0]["created_at"],
                 "system": null,
             }])

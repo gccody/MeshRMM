@@ -42,8 +42,8 @@ MeshRMM is in heavy development and not production ready.
 - A toolbox of PowerShell, Command Prompt and shell (zsh or bash) scripts and a file library,
   private or shared, run and delivered from the website or the viewer as the
   signed-in user or as SYSTEM/root.
-- Jobs that run a script or send a file on chosen devices, whole companies or
-  every device, skip devices without the script's interpreter, wait for
+- Jobs that run a script or send a file on chosen devices, whole companies,
+  tagged devices or every device, skip devices without the script's interpreter, wait for
   offline ones, and show each device's result and output live.
 - Automation policies that run shared scripts, scan for and install
   updates, or wake offline devices, every few minutes or hours, daily or weekly at a time in any time
@@ -65,6 +65,11 @@ MeshRMM is in heavy development and not production ready.
   gauges on every tile, updated over a WebSocket.
 - Companies to group devices by, such as each customer an MSP supports:
   filter the wall by company and enroll new devices straight into one.
+- Tags in nine colors for every other grouping: tag devices one at a time
+  or in bulk, filter the wall by any or all of some tags, and target jobs,
+  policies, alert rules and the Updates and Software pages at them.
+- Notes on each device, with who last edited them, a short history, and a
+  warning instead of a silent overwrite when two people edit at once.
 - Resource monitoring: CPU, memory, network, uptime and disk space, live and
   as charts for the last hour, day or week.
 - Hardware and software: operating system, model, serial number, processor,
@@ -73,7 +78,7 @@ MeshRMM is in heavy development and not production ready.
   for which devices have an application in which version.
 - Alerts: rules for devices going offline, low disk space, sustained CPU or
   memory load, failed scripts, updates or restarts pending too long, and
-  failed update installs, for every device or chosen companies.
+  failed update installs, for every device, chosen companies or tags.
   Alerts are acknowledged and resolved in the website, resolve themselves
   when the condition passes, and notify by email or signed webhook.
 - Wake-on-LAN: wake offline devices, one or many, from the website or a
@@ -181,8 +186,8 @@ For developers:
   set up, and how the server and the Agent are built
 - [Development](docs/development.md): building, running, testing and
   installing local builds
-- [Devices](docs/devices.md): enrollment, companies, the device list,
-  resource monitoring, updates and removal
+- [Devices](docs/devices.md): enrollment, companies, tags, notes, the
+  device list, resource monitoring, updates and removal
 - [Wake-on-LAN](docs/wake-on-lan.md): waking offline devices through online
   ones on their network, and what the sleeping computer needs
 - [Remote sessions](docs/remote-sessions.md): what the viewer does and how
