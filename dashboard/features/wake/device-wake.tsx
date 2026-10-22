@@ -8,7 +8,7 @@ import { type Wake, wakeState } from "./model";
 import { WakeDialog, WakeItem, useNow, useSettling } from "./wake-dialog";
 import { fetchRecentWakes } from "./wake-api";
 
-// How long the device page shows the last wake.
+// How long the device page shows the last wake of an offline device.
 const SHOWN_FOR_MS = 24 * 60 * 60_000;
 
 // The device page's Wake button, for an offline device, and the device's
@@ -30,7 +30,8 @@ export function DeviceWake({ agent }: { agent: Agent }) {
     wasConnected.current = agent.connected;
   }, [agent.connected, reload]);
 
-  const shown: Wake | undefined = latest && now - latest.created_at < SHOWN_FOR_MS ? latest : undefined;
+  // Once an online device's watch is over, its last wake is old news.
+  const shown: Wake | undefined = latest && now - latest.created_at < SHOWN_FOR_MS && (!agent.connected || now < latest.watch_until) ? latest : undefined;
   const canWake = !agent.connected && can("devices.wake");
   if (!shown && !canWake) return null;
   return (

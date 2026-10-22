@@ -80,6 +80,16 @@ export function WakeDialog({ agents, returnFocus, onClose }: {
   useSettling(wakes, (fresh) => setWakes((current) => current?.map((wake) => fresh.find((candidate) => candidate.id === wake.id) ?? wake) ?? null));
 
   const connected = new Set(inventory.agents.filter((agent) => agent.connected).map((agent) => agent.id));
+  // A device that came online is read again, so it stays woken if it goes
+  // offline before the dialog closes.
+  const cameOnline = (wakes ?? []).filter((wake) => wake.online_at === null && connected.has(wake.device_id)).map((wake) => wake.id).join(",");
+  useEffect(() => {
+    if (!cameOnline) return;
+    fetchWakes(authorizedFetch, cameOnline.split(",")).then(
+      (fresh) => setWakes((current) => current?.map((wake) => fresh.find((candidate) => candidate.id === wake.id) ?? wake) ?? null),
+      () => {},
+    );
+  }, [authorizedFetch, cameOnline]);
   const names = agents.map((agent) => agent.name);
   const single = agents.length === 1;
 

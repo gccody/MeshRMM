@@ -32,8 +32,10 @@ pub async fn serve(
     }
     let mut socket = socket;
     let mut connection = state.agents.connect(&device_id);
-    state.presence.connected(&device_id).await;
+    // Before presence, so a page that sees the device come online reads it
+    // as woken.
     wake::device_connected(&state, &device_id).await;
+    state.presence.connected(&device_id).await;
     // Jobs waiting for the device start now.
     state.automation.wake();
     tracing::info!(device_id, "Agent connected");
