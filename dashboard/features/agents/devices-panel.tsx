@@ -50,6 +50,7 @@ export function DevicesPanel() {
     closeSession: can("sessions.connect") || can("sessions.close_any"),
     runScripts: can("scripts.run"),
     terminal: can("terminal.connect") || can("terminal.connect_system"),
+    files: can("files.browse"),
     wake: can("devices.wake"),
     deliverFiles: can("files.deliver"),
     delete: can("devices.delete"),

@@ -39,6 +39,12 @@ MeshRMM is in heavy development and not production ready.
 - A remote terminal in the browser: PowerShell, Command Prompt, or a login
   shell, bash, zsh or sh, as SYSTEM/root or the signed-in user, in tabs, with
   no remote session needed, so headless servers get a shell too.
+- A file browser in the website, as SYSTEM/root or the signed-in user:
+  drives and users' folders, sortable listings that stay fast with tens of
+  thousands of entries, downloads of files and of folders as ZIP archives,
+  uploads of files and folders by drag and drop, new folders, rename, move,
+  and delete to the Recycle Bin or Trash, every transfer checked with
+  SHA-256 and resumable.
 - A toolbox of PowerShell, Command Prompt and shell (zsh or bash) scripts and a file library,
   private or shared, run and delivered from the website or the viewer as the
   signed-in user or as SYSTEM/root.
@@ -89,7 +95,7 @@ MeshRMM is in heavy development and not production ready.
   (macOS and Linux). Agents and viewers update themselves from the server and
   check a release signature first.
 - Linux computers with or without a desktop: servers get monitoring, a
-  terminal, scripts and files, and X11, GNOME, KDE Plasma and wlroots
+  terminal, the file browser, scripts and files, and X11, GNOME, KDE Plasma and wlroots
   desktops (sway, Hyprland) remote sessions too.
 
 **Control for the company and the user**
@@ -106,7 +112,8 @@ MeshRMM is in heavy development and not production ready.
 - Built-in accounts with passwords, authenticator apps, recovery codes and
   passkeys, plus optional single sign-on (OIDC) and SCIM provisioning.
 - Custom roles built from a list of permissions, and an audit log of
-  sign-ins, changes, sessions, terminals, script runs, file deliveries,
+  sign-ins, changes, sessions, terminals, file transfers and changes, script
+  runs, file deliveries,
   update installs, wakes and jobs.
 - Personal API tokens for scripts and integrations: each acts as its user,
   optionally limited to some permissions, expires, and is named in the audit
@@ -204,6 +211,8 @@ For developers:
   built-in tools
 - [Remote terminal](docs/terminal.md): shells in the browser, and how
   their traffic and flow control work
+- [File browser](docs/files.md): browsing and changing a device's files,
+  and how downloads and uploads stream and are checked
 - [Toolbox](docs/toolbox.md): scripts and files
 - [Patch management](docs/patch-management.md): scanning for and installing
   operating system updates

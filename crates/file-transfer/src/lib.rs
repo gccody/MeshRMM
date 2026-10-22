@@ -20,6 +20,11 @@ use macos as native;
 #[cfg(windows)]
 use windows as native;
 
+/// Filesystem helpers the Agent's file browser shares: an atomic rename
+/// that never replaces, a volume's free space, and marking a file as
+/// downloaded (Mark of the Web, the quarantine attribute).
+pub use native::{available_space, mark_received, rename_no_replace};
+
 mod receive;
 mod send;
 mod sweep;

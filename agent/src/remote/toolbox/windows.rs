@@ -164,6 +164,13 @@ pub(crate) struct UserLogon {
     pub(crate) profile: PathBuf,
 }
 
+impl UserLogon {
+    /// The user's SID, such as `S-1-5-21-…`.
+    pub(crate) fn sid(&self) -> &str {
+        &self.sid
+    }
+}
+
 /// The user signed in to the console, or else to an active Remote
 /// Desktop session. `None` when nobody is, or when the Agent runs for
 /// development without the right to act for other users.

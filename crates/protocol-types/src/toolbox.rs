@@ -416,7 +416,6 @@ const RESERVED_FILE_NAMES: [&str; 22] = [
 /// characters Windows forbids, no trailing dot or space, and not a device
 /// name.
 pub fn valid_file_name(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or_default().trim_end();
     !name.is_empty()
         && name.chars().count() <= MAX_FILE_NAME_CHARS
         && !name.ends_with(['.', ' '])
@@ -424,9 +423,16 @@ pub fn valid_file_name(name: &str) -> bool {
         && !name.chars().any(|c| {
             c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
         })
-        && !RESERVED_FILE_NAMES
-            .iter()
-            .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+        && !reserved_windows_name(name)
+}
+
+/// Whether Windows reserves `name` for a device, whatever its extension:
+/// `CON`, `nul.txt`, `COM1` and the like.
+pub fn reserved_windows_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default().trim_end();
+    RESERVED_FILE_NAMES
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
 }
 
 /// A SHA-256 digest in lowercase hex.

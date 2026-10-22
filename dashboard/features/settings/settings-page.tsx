@@ -15,6 +15,8 @@ import {
   MIN_CONNECTION_APPROVAL_TIMEOUT_SECONDS,
   SETTINGS_TABS,
   TERMINAL_IDLE_TIMEOUT_MINUTES,
+  FILE_TRANSFER_LIMITS_MB,
+  formatTransferLimit,
   UPDATE_SCAN_INTERVALS,
   type GeneralSettings,
   type SettingsDraft,
@@ -160,6 +162,16 @@ export function SettingsPanel() {
               </select>
               </label>
               <p id="terminal-idle-timeout-help">A terminal with no keyboard input for this long is closed, and its shell ends on the device. Output alone doesn’t keep it open.</p>
+            </section>
+            <section className="settings-section" id="settings-files" role="tabpanel" aria-labelledby="settings-tab-files" hidden={settingsTab !== "files"} tabIndex={0}>
+              <h2>Files</h2>
+              <p>Downloads and uploads in the file browser.</p>
+              <label htmlFor="file-transfer-limit">Largest transfer<select id="file-transfer-limit" value={draft.fileTransferLimitMb} onChange={(event) => updateDraft({ fileTransferLimitMb: Number(event.target.value) })} aria-describedby="file-transfer-limit-help">
+                {(FILE_TRANSFER_LIMITS_MB.includes(draft.fileTransferLimitMb as (typeof FILE_TRANSFER_LIMITS_MB)[number]) ? FILE_TRANSFER_LIMITS_MB : [...FILE_TRANSFER_LIMITS_MB, draft.fileTransferLimitMb].sort((left, right) => left - right))
+                  .map((megabytes) => <option key={megabytes} value={megabytes}>{formatTransferLimit(megabytes)}</option>)}
+              </select>
+              </label>
+              <p id="file-transfer-limit-help">The largest file a technician can download from a device or upload to one, and the most a folder downloaded as a ZIP archive can hold. Transfers stream through this server without being stored.</p>
             </section>
             <section className="settings-section" id="settings-blackout" role="tabpanel" aria-labelledby="settings-tab-blackout" hidden={settingsTab !== "blackout"} tabIndex={0}>
               <h2>Blackout message</h2>

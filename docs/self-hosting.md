@@ -237,7 +237,10 @@ for a proxy that handles HTTPS. The proxy must:
 - set `X-Forwarded-For`, which the server believes only from the addresses in
   `trusted_proxies`, for rate limits and the audit log;
 - allow request bodies as large as `toolbox.max_file_bytes` (95 MiB by
-  default), so toolbox uploads fit.
+  default), so toolbox uploads fit, and at least 64 MiB, the pieces the
+  [file browser](files.md#uploads) uploads in;
+- stream request and response bodies rather than buffer them, so large
+  downloads and uploads flow through as they arrive.
 
 The server leaves HSTS to the proxy in this mode.
 
@@ -271,6 +274,7 @@ server {
         proxy_read_timeout 1h;
         proxy_send_timeout 1h;
         proxy_request_buffering off;
+        proxy_buffering off;
     }
 }
 
@@ -292,7 +296,8 @@ behind a tunnel. Then:
 - Set the zone's minimum TLS version to 1.2 or 1.3 and keep TLS 1.3 on;
   Agents and viewers use only TLS 1.3.
 - Cloudflare limits request bodies (100 MB on the free plan), which caps
-  toolbox uploads. Keep `toolbox.max_file_bytes` below that limit.
+  toolbox uploads. Keep `toolbox.max_file_bytes` below that limit. The file
+  browser uploads in 64 MiB pieces, so its uploads fit.
 - A Cloudflare origin certificate is trusted only by Cloudflare. If you later
   turn the proxy off, Agents can't connect until the server has a publicly
   trusted certificate.

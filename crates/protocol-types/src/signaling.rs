@@ -136,6 +136,16 @@ pub enum AgentCommand {
     SendWakePackets {
         packets: Vec<crate::WakePacket>,
     },
+    /// Lists or changes the device's files; see [`crate::FileRequest`].
+    /// Answered by [`AgentStatusMessage::FileReply`].
+    FileRequest {
+        request: crate::FileRequest,
+    },
+    /// Connects a socket to stream a file's bytes; see
+    /// [`crate::FileTransferRequest`].
+    FileTransfer {
+        transfer: crate::FileTransferRequest,
+    },
 }
 
 /// Agent-to-coordinator lifecycle notifications and reports.
@@ -180,6 +190,11 @@ pub enum AgentStatusMessage {
     /// What became of each packet of a [`AgentCommand::SendWakePackets`].
     WakePacketsSent {
         results: Vec<crate::WakePacketResult>,
+    },
+    /// The answer to a [`AgentCommand::FileRequest`].
+    FileReply {
+        request_id: String,
+        reply: Box<crate::FileReply>,
     },
 }
 
