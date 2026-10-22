@@ -456,7 +456,8 @@ Then, in the website:
   two-factor), single sign-on with an OIDC provider, and SCIM provisioning
   tokens. Only administrators can change single sign-on, SCIM and email,
   because whoever controls them can sign in as anyone.
-- **Settings** holds the company's remote-session policy.
+- **Settings** holds the company's remote-session policy and how long an
+  idle [terminal](terminal.md) stays open.
 - **Alerts** holds the alert rules and the email and webhook channels they
   notify. Email channels need email set up. See [alerts](alerts.md).
 - **Devices → Add device** downloads a Windows installer or shows the macOS

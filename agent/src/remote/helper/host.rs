@@ -307,6 +307,7 @@ fn handle(request: Request, served: &Served) -> anyhow::Result<Reply> {
         Request::ClearClipboard => super::platform::session_close::clear_clipboard_here()?,
         Request::LockScreen => super::platform::session_close::lock_here()?,
         Request::LogOut => super::platform::session_close::log_out_here()?,
+        Request::ShowTerminalNotice(text) => crate::remote::terminal::show_notice_here(text)?,
         Request::Thumbnail => {
             return Ok(Reply::Thumbnail(
                 super::platform::snapshot::main_display_jpeg()?,

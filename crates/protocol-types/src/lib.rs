@@ -25,3 +25,6 @@ pub use system_info::*;
 
 mod updates;
 pub use updates::*;
+
+mod terminal;
+pub use terminal::*;

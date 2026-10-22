@@ -40,6 +40,9 @@ CREATE TABLE settings (
   -- scans to users and policies.
   update_scan_interval_hours BIGINT NOT NULL DEFAULT 24
     CHECK (update_scan_interval_hours BETWEEN 0 AND 168),
+  -- Remote terminals with no input for this long are closed.
+  terminal_idle_timeout_minutes BIGINT NOT NULL DEFAULT 30
+    CHECK (terminal_idle_timeout_minutes BETWEEN 5 AND 480),
   smtp_host TEXT,
   smtp_port BIGINT CHECK (smtp_port IS NULL OR smtp_port BETWEEN 1 AND 65535),
   smtp_security TEXT NOT NULL DEFAULT 'starttls' CHECK (smtp_security IN ('starttls', 'tls', 'none')),
@@ -142,13 +145,15 @@ CREATE TABLE role_permissions (
 -- is an editable default.
 INSERT INTO roles (id, name, description, builtin, created_at, updated_at) VALUES
   ('administrator', 'Administrator', 'Every permission, including users, roles and settings.', 'administrator', 0, 0),
-  ('technician', 'Technician', 'Enrolls and connects to devices, runs toolbox scripts and files, installs updates, and responds to alerts.', 'technician', 0, 0);
+  ('technician', 'Technician', 'Enrolls and connects to devices, opens terminals, runs toolbox scripts and files, installs updates, and responds to alerts.', 'technician', 0, 0);
 
 INSERT INTO role_permissions (role_id, permission) VALUES
   ('technician', 'devices.view'),
   ('technician', 'devices.enroll'),
   ('technician', 'sessions.connect'),
   ('technician', 'sessions.connect_background'),
+  ('technician', 'terminal.connect'),
+  ('technician', 'terminal.connect_system'),
   ('technician', 'scripts.run'),
   ('technician', 'files.deliver'),
   ('technician', 'alerts.view'),

@@ -36,6 +36,9 @@ MeshRMM is in heavy development and not production ready.
 - Background mode: a private desktop in Windows Session 0 with its own
   taskbar, Task Manager, File Explorer, Run dialog and the usual
   administration tools, which the signed-in user never sees.
+- A remote terminal in the browser: PowerShell, Command Prompt, or a login
+  shell, bash, zsh or sh, as SYSTEM/root or the signed-in user, in tabs, with
+  no remote session needed, so headless servers get a shell too.
 - A toolbox of PowerShell, Command Prompt and shell (zsh or bash) scripts and a file library,
   private or shared, run and delivered from the website or the viewer as the
   signed-in user or as SYSTEM/root.
@@ -76,9 +79,9 @@ MeshRMM is in heavy development and not production ready.
 - Enrollment with a single-use installer (Windows) or install command
   (macOS and Linux). Agents and viewers update themselves from the server and
   check a release signature first.
-- Linux computers with or without a desktop: servers get monitoring, scripts
-  and files, and X11, GNOME, KDE Plasma and wlroots desktops (sway,
-  Hyprland) remote sessions too.
+- Linux computers with or without a desktop: servers get monitoring, a
+  terminal, scripts and files, and X11, GNOME, KDE Plasma and wlroots
+  desktops (sway, Hyprland) remote sessions too.
 
 **Control for the company and the user**
 
@@ -94,8 +97,8 @@ MeshRMM is in heavy development and not production ready.
 - Built-in accounts with passwords, authenticator apps, recovery codes and
   passkeys, plus optional single sign-on (OIDC) and SCIM provisioning.
 - Custom roles built from a list of permissions, and an audit log of
-  sign-ins, changes, sessions, script runs, file deliveries, update installs
-  and jobs.
+  sign-ins, changes, sessions, terminals, script runs, file deliveries,
+  update installs and jobs.
 - Email for invitations, resets and alerts is optional; without it the
   website gives one-time links to copy, and alerts go to webhooks.
 
@@ -183,6 +186,8 @@ For developers:
   blackout, notification, approval, restart and Safe Mode
 - [Background mode](docs/background-mode.md): the Session 0 workspace and its
   built-in tools
+- [Remote terminal](docs/terminal.md): shells in the browser, and how
+  their traffic and flow control work
 - [Toolbox](docs/toolbox.md): scripts and files
 - [Patch management](docs/patch-management.md): scanning for and installing
   operating system updates

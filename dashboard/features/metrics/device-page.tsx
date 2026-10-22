@@ -1,4 +1,4 @@
-import { Activity, ArrowLeft, Building2, CircleAlert, Cpu, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package, ShieldCheck } from "lucide-react";
+import { Activity, ArrowLeft, Building2, CircleAlert, Cpu, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package, ShieldCheck, Terminal } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { NO_COMPANY, DEFAULT_DEVICE_FILTERS, serializeDeviceFilters } from "../agents/device-filters";
@@ -6,6 +6,7 @@ import { companyName } from "../agents/model";
 import { DeviceAlerts } from "../alerts/device-alerts";
 import { MoveDeviceDialog } from "../companies/company-dialogs";
 import { DeviceSystem, type SystemTab } from "../system-info/device-system";
+import { terminalPagePath } from "../terminal/model";
 import { DeviceUpdates } from "../updates/device-updates";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
@@ -133,6 +134,11 @@ export function DevicePage() {
               </Link>
               {can("companies.manage") && <button ref={moveOpener} type="button" className="link-button" onClick={() => setMoving(true)} aria-haspopup="dialog">Move</button>}
             </p>
+          )}
+          {agent?.connected && (can("terminal.connect") || can("terminal.connect_system")) && (
+            <a className="secondary-button device-terminal" href={terminalPagePath(agent.id)} target="_blank" rel="noreferrer" aria-label={`Open a terminal on ${agent.name} in a new tab`}>
+              <Terminal size={15} aria-hidden="true" />Terminal
+            </a>
           )}
         </div>
 

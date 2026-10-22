@@ -25,6 +25,7 @@ mod setup;
 mod sign_in;
 mod sso;
 mod system_info;
+mod terminals;
 mod toolbox;
 mod updates;
 mod users;
@@ -185,6 +186,12 @@ fn device_routes() -> Router<AppState> {
             patch(companies::update).delete(companies::delete),
         )
         .route("/agents/{id}/connect", get(agent::connect))
+        .route("/agents/{id}/terminals", post(terminals::open))
+        .route(
+            "/agents/{id}/terminals/{terminal_id}",
+            get(terminals::agent_connect),
+        )
+        .route("/terminals/{id}", get(terminals::connect))
         .route("/agents/{id}/close-session", post(remote::close))
         .route("/agents/{id}/metrics", get(metrics::get))
         .route("/agents/{id}/system-info", get(system_info::get))

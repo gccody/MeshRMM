@@ -121,6 +121,8 @@ fn operating_system(problems: &mut Problems) -> OperatingSystem {
             }),
         ),
         package_managers: managers,
+        // Filled in by the shared collector.
+        terminal_shells: Vec::new(),
     }
 }
 

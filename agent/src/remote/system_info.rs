@@ -84,6 +84,7 @@ pub fn collect() -> SystemInfo {
     let started = std::time::Instant::now();
     let mut problems = Problems::default();
     let mut info = platform::collect(&mut problems);
+    info.os.terminal_shells = super::terminal::available_shells();
     info.collected_at_unix_ms = unix_ms(SystemTime::now()).unwrap_or_default();
     info.problems.append(&mut problems.0);
     let info = fit(info.sanitized());

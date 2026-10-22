@@ -51,6 +51,7 @@ pub struct AppState {
     pub automation: crate::automation::Engine,
     pub updates: crate::updates::Engine,
     pub sessions: Sessions,
+    pub terminals: crate::terminals::Terminals,
     pub turn: Turn,
     pub website: Website,
     pub downloads: Downloads,

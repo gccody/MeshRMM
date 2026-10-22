@@ -81,6 +81,15 @@ impl NotificationWindow {
     }
 }
 
+impl NotificationWindow {
+    /// Waits until the notification has closed itself.
+    pub fn wait_closed(mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 impl Drop for NotificationWindow {
     fn drop(&mut self) {
         if let Some(thread) = self.thread.take() {

@@ -37,6 +37,7 @@ pub enum Settings {
     PasswordMinLength,
     SessionLifetimeHours,
     UpdateScanIntervalHours,
+    TerminalIdleTimeoutMinutes,
     SmtpHost,
     SmtpPort,
     SmtpSecurity,
