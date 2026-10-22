@@ -33,6 +33,8 @@ async fn custom_roles_grant_their_permissions() {
                 "sessions.connect_background",
                 "scripts.run",
                 "files.deliver",
+                "updates.view",
+                "updates.install",
                 "alerts.view",
                 "alerts.respond"
             ])
