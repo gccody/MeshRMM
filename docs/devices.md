@@ -59,6 +59,59 @@ first, the device enrolls into none. Company names are unique, ignoring
 case. Creating, renaming and deleting a company, and moving a device, are
 recorded in the audit log.
 
+## Tags
+
+Tags group devices any other way: by role, site, owner or anything else. A
+tag has a name, unique ignoring case and up to 60 characters, and one of
+nine colors (gray, red, orange, amber, green, teal, blue, purple, pink); each
+color has a shade for a dark and a light page. A device can have up to 50
+tags.
+
+The **Tags** page lists them with how many devices have each (linking to
+the wall filtered by it) and how many automation policies and alert rules
+target it. Users with `tags.manage` create, rename, recolor and delete tags
+there. Deleting a tag takes it off its devices; policies and rules that
+targeted it no longer cover those devices, and the page says how many
+before you confirm.
+
+Users with `devices.edit` add and remove tags on a device with **Edit
+tags** on its page or **Tags…** in its menu, and on many devices at once
+with **Tag** in the wall's selection bar. There a tag only some of the
+chosen devices have shows as mixed, and stays that way unless you tick or
+clear it. `POST /v1/device-tags` takes `{device_ids, add, remove}` (up to
+1,000 devices) and returns how many devices changed.
+
+Tags are targets too: [jobs and automation policies](automation.md),
+[alert rules](alerts.md), and the filters of the
+[Updates](patch-management.md) and [Software](hardware-and-software.md)
+pages can choose the devices with any, or all, of some tags. Targets are
+resolved when they are used, so a policy or rule also covers devices tagged
+after it was saved.
+
+Creating, renaming, recoloring and deleting a tag are recorded in the audit
+log (`tag.create`, `tag.update`, `tag.delete`), and so is each device whose
+tags change (`agent.tag`, with the names added and removed).
+
+## Notes
+
+Each device has notes: plain text of up to 20,000 characters, on its page.
+Web addresses in them become links; nothing else is interpreted, so notes
+can't carry HTML or scripts. The page shows who last edited them and when.
+Anyone with `devices.view` reads them; `devices.edit` edits them.
+
+Every save is a new revision, and the last 20 are kept: the page's
+**History** shows each one's author, time and length, and can show an old
+version's text and restore it into the editor. A save names the revision it
+edited (`PUT /v1/agents/{id}/notes` with `{body, revision}`). If someone
+saved in the meantime, the server refuses it with `409 notes_changed`
+rather than overwrite their edit; the page then shows the newer version
+beside yours and lets you discard yours or save it over theirs. The page
+also warns as soon as someone else saves while you are editing, because the
+device list's live updates carry each device's current notes revision.
+
+Note edits are recorded in the audit log as `agent.notes`, with the
+revision and the notes' length before and after, not their text.
+
 ## The device list
 
 The **Devices** page is a wall of tiles: each device's name, whether it is
@@ -66,22 +119,25 @@ online, its [screen thumbnail](screen-thumbnails.md), and CPU and memory
 gauges. It doesn't poll. The website opens a WebSocket to `/v1/events`,
 authenticated by the sign-in cookie, and gets a snapshot followed by
 revision-numbered changes: Agents going online and offline, updating,
-being enrolled, deleted or moved to another company, and companies being
-created, renamed or deleted, as they happen. **Refresh** asks for a new
+being enrolled, deleted, moved to another company, tagged or having their
+notes edited, and companies and tags being created, changed or deleted, as
+they happen. **Refresh** asks for a new
 snapshot; a snapshot never contacts an Agent. The server closes a user's
 socket when they sign out, are disabled, or lose `devices.view`.
 
-A tile names its device's company. The company menu beside the search box
-shows one company's devices, or those in none; like the search and the
-online filter, it is kept in the page's address (`?company=<id>`, or
-`?company=none`).
+A tile names its device's company and shows its tags. The company menu
+beside the search box shows one company's devices, or those in none; the
+tags menu shows the devices with any, or all, of the tags ticked. Like the
+search and the online filter, both are kept in the page's address
+(`?company=<id>` or `?company=none`, and `?tags=<id>,<id>` with
+`&tag_match=all` for all of them). The search also matches tag names.
 
 Clicking a tile opens the device's resource usage. Hovering over an online
 device shows **Connect**, which opens a remote session on the console or in
 [background mode](background-mode.md), and **Scripts**, which runs a
 [script](toolbox.md) on it. Ticking devices' checkboxes opens a selection
 bar that runs a script or sends a file on all of them as a
-[job](automation.md), or wakes the offline ones. An offline device's menu
+[job](automation.md), tags them, or wakes the offline ones. An offline device's menu
 has **Wake device** (see [below](#waking-offline-devices)). A device's menu has **Close active session**,
 which for users with `sessions.close_any` disconnects the device's viewer and
 clears a stale session reservation. The Agent stays online and can take a new

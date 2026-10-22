@@ -31,6 +31,7 @@ export const AUDIT_CATEGORIES: readonly { prefix: string; label: string }[] = [
   { prefix: "scim.", label: "Directory sync" },
   { prefix: "agent.", label: "Devices" },
   { prefix: "agent_installer.", label: "Enrollment" },
+  { prefix: "tag.", label: "Tags" },
   { prefix: "remote.", label: "Remote sessions" },
   { prefix: "terminal.", label: "Terminals" },
   { prefix: "script.", label: "Script runs" },
@@ -94,6 +95,11 @@ const ACTION_LABELS: Record<string, string> = {
   "agent.rotate_credential": "Rotated a device's credential",
   "agent.move": "Moved a device to another company",
   "agent.wake": "Woke a device",
+  "agent.tag": "Changed a device's tags",
+  "agent.notes": "Edited a device's notes",
+  "tag.create": "Created a tag",
+  "tag.update": "Changed a tag",
+  "tag.delete": "Deleted a tag",
   "company.create": "Created a company",
   "company.rename": "Renamed a company",
   "company.delete": "Deleted a company",
@@ -148,6 +154,18 @@ export function eventLabel(event: Pick<AuditEvent, "action" | "metadata">) {
   if (event.action === "auth.sign_in" && typeof method === "string" && SIGN_IN_METHODS[method]) return `${label} ${SIGN_IN_METHODS[method]}`;
   if (event.action === "auth.sign_in_failed" && typeof reason === "string" && SIGN_IN_FAILURES[reason]) return `${label}: ${SIGN_IN_FAILURES[reason]}`;
   if (event.action === "user.provision" && source === "sso") return `${label} with SSO`;
+  if (event.action === "agent.tag") {
+    const names = (value: unknown) => (Array.isArray(value) ? value.filter((name): name is string => typeof name === "string") : []);
+    const parts = [
+      names(event.metadata.added).length ? `added ${names(event.metadata.added).join(", ")}` : "",
+      names(event.metadata.removed).length ? `removed ${names(event.metadata.removed).join(", ")}` : "",
+    ].filter(Boolean);
+    return parts.length ? `${label}: ${parts.join("; ")}` : label;
+  }
+  // The audit log keeps the notes' length, never their text.
+  if (event.action === "agent.notes" && typeof event.metadata.length === "number") {
+    return event.metadata.length === 0 ? `${label}: cleared them` : `${label}: ${event.metadata.length.toLocaleString()} characters`;
+  }
   return label;
 }
 
@@ -158,6 +176,7 @@ const TARGET_LABELS: Record<string, string> = {
   agent: "Device",
   agent_installer: "Installer",
   company: "Company",
+  tag: "Tag",
   toolbox_script: "Script",
   toolbox_file: "File",
   scim_group: "SCIM group",

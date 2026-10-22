@@ -5,7 +5,7 @@ import { type AlertEvent, parseAlertEvent } from "../alerts/model.ts";
 import { type JobEvent, parseJobEvent } from "../automation/model.ts";
 import { type MetricsReading, parseMetricsEvent } from "../metrics/model.ts";
 import { type UpdateEvent, parseUpdateEvent } from "../updates/model.ts";
-import { applyInventoryDelta, parseAgentEvent, sortAgents, sortCompanies } from "./model.ts";
+import { applyInventoryDelta, parseAgentEvent, sortAgents, sortCompanies, sortTags } from "./model.ts";
 import type { AgentDelta, AgentEvent, AgentSnapshot, Inventory } from "./types";
 
 const FIRST_RECONNECT_DELAY_MS = 1_000;
@@ -129,7 +129,7 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
       requestSnapshot();
       return false;
     }
-    let next: Inventory = { agents: sortAgents(event.agents), companies: sortCompanies(event.companies ?? []) };
+    let next: Inventory = { agents: sortAgents(event.agents), companies: sortCompanies(event.companies ?? []), tags: sortTags(event.tags ?? []) };
     let nextRevision = event.revision;
     for (const pending of pendingEvents.sort((left, right) => left.revision - right.revision)) {
       if (pending.revision <= nextRevision) continue;

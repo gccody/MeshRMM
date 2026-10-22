@@ -19,6 +19,10 @@ export type Agent = {
   updating_to?: string;
   /** The company the device belongs to, or null for none. */
   company_id?: string | null;
+  /** The device's tags' IDs. */
+  tag_ids?: string[];
+  /** The current revision of the device's notes; 0 without notes. */
+  notes_revision?: number;
   /** When the device enrolled. */
   created_at?: number;
   /** The device list's summary of its latest system information, once it sent one. */
@@ -45,10 +49,21 @@ export type Company = {
   name: string;
 };
 
-// The devices and the companies they belong to, as the event socket keeps them.
+/** The colors a tag can have; globals.css has a light and a dark shade of each. */
+export const TAG_COLORS = ["gray", "red", "orange", "amber", "green", "teal", "blue", "purple", "pink"] as const;
+export type TagColor = (typeof TAG_COLORS)[number];
+
+export type Tag = {
+  id: string;
+  name: string;
+  color: TagColor;
+};
+
+// The devices and the companies and tags they have, as the event socket keeps them.
 export type Inventory = {
   agents: Agent[];
   companies: Company[];
+  tags: Tag[];
 };
 
 export type AgentSnapshot = {
@@ -56,6 +71,7 @@ export type AgentSnapshot = {
   revision: number;
   agents: Agent[];
   companies?: Company[];
+  tags?: Tag[];
   generated_at_unix_ms: number;
 };
 
@@ -64,6 +80,8 @@ export type AgentEvent =
   | { type: "agent_upsert"; revision: number; agent: Agent }
   | { type: "agent_deleted"; revision: number; agent_id: string }
   | { type: "company_upsert"; revision: number; company: Company }
-  | { type: "company_deleted"; revision: number; company_id: string };
+  | { type: "company_deleted"; revision: number; company_id: string }
+  | { type: "tag_upsert"; revision: number; tag: Tag }
+  | { type: "tag_deleted"; revision: number; tag_id: string };
 
 export type AgentDelta = Exclude<AgentEvent, AgentSnapshot>;

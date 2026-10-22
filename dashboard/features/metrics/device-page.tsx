@@ -1,11 +1,15 @@
-import { Activity, ArrowLeft, Building2, CircleAlert, Cpu, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package, ShieldCheck, Terminal } from "lucide-react";
+import { Activity, ArrowLeft, Building2, CircleAlert, Cpu, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package, ShieldCheck, Tag, Terminal } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { NO_COMPANY, DEFAULT_DEVICE_FILTERS, serializeDeviceFilters } from "../agents/device-filters";
 import { companyName } from "../agents/model";
 import { DeviceAlerts } from "../alerts/device-alerts";
 import { MoveDeviceDialog } from "../companies/company-dialogs";
+import { DeviceNotes } from "../notes/device-notes";
 import { DeviceSystem, type SystemTab } from "../system-info/device-system";
+import { tagsOf } from "../tags/model";
+import { TagChips } from "../tags/tag-chip";
+import { TagDevicesDialog } from "../tags/tag-dialogs";
 import { terminalPagePath } from "../terminal/model";
 import { DeviceUpdates } from "../updates/device-updates";
 import { DeviceWake } from "../wake/device-wake";
@@ -56,6 +60,8 @@ export function DevicePage() {
   const { inventory, authorizedFetch, can, setPageTitle } = useWorkspace();
   const [moving, setMoving] = useState(false);
   const moveOpener = useRef<HTMLButtonElement>(null);
+  const [tagging, setTagging] = useState(false);
+  const tagOpener = useRef<HTMLButtonElement>(null);
   const [searchParams, setSearchParams] = useSearchParams();
   const deviceId = searchParams.get("id") ?? "";
   const requestedRange = searchParams.get("range");
@@ -136,6 +142,13 @@ export function DevicePage() {
               {can("companies.manage") && <button ref={moveOpener} type="button" className="link-button" onClick={() => setMoving(true)} aria-haspopup="dialog">Move</button>}
             </p>
           )}
+          {agent && (
+            <p className="status-line device-page-tags">
+              <Tag size={15} aria-hidden="true" />
+              {agent.tag_ids?.length ? <TagChips tags={tagsOf(agent.tag_ids, inventory.tags)} /> : <span>No tags</span>}
+              {can("devices.edit") && <button ref={tagOpener} type="button" className="link-button" onClick={() => setTagging(true)} aria-haspopup="dialog">Edit tags</button>}
+            </p>
+          )}
           {agent?.connected && (can("terminal.connect") || can("terminal.connect_system")) && (
             <a className="secondary-button device-terminal" href={terminalPagePath(agent.id)} target="_blank" rel="noreferrer" aria-label={`Open a terminal on ${agent.name} in a new tab`}>
               <Terminal size={15} aria-hidden="true" />Terminal
@@ -143,6 +156,7 @@ export function DevicePage() {
           )}
         </div>
         {agent && <DeviceWake key={agent.id} agent={agent} />}
+        {agent && <DeviceNotes key={agent.id} agent={agent} />}
 
         <nav className="toolbox-tabs area-tabs device-tabs" aria-label="Device">
           {tabs.map(({ id, label, icon: Icon }) => (
@@ -188,6 +202,7 @@ export function DevicePage() {
         </>}
       </div>
       {moving && agent && <MoveDeviceDialog agent={agent} returnFocus={moveOpener} onClose={() => setMoving(false)} />}
+      {tagging && agent && <TagDevicesDialog agents={[agent]} returnFocus={tagOpener} onClose={() => setTagging(false)} />}
     </>
   );
 }

@@ -164,20 +164,22 @@ test("installs take the chosen updates, or categories, and a valid delay", () =>
   assert.ok(rebootDelayProblem(2.5));
 });
 
-test("the fleet filters by name, company, system and state", () => {
+test("the fleet filters by name, company, tag, system and state", () => {
   const devices = [
-    summary("web", { pending: 3, security: 1, company_id: "acme", oldest_pending_at: NOW - 4 * DAY }),
-    summary("mac", { platform: "macos", manager: "softwareupdate", reboot_pending: true, reboot_pending_since: NOW - DAY }),
+    summary("web", { pending: 3, security: 1, company_id: "acme", tag_ids: ["servers"], oldest_pending_at: NOW - 4 * DAY }),
+    summary("mac", { tag_ids: ["london"], platform: "macos", manager: "softwareupdate", reboot_pending: true, reboot_pending_since: NOW - DAY }),
     summary("old", { received_at: NOW - 5 * DAY, scanned_at: NOW - 5 * DAY, last_install: { id: "r", status: "partial", created_at: 1, completed_at: 2, installed: 1, failed: 1 } }),
     summary("new", { received_at: null, scanned_at: null }),
     summary("zypper", { supported: false, manager: null, received_at: NOW - 9 * DAY }),
   ];
-  const filters = (change) => ({ query: "", company: "", platform: "", status: "", ...change });
+  const filters = (change) => ({ query: "", company: "", tag: "", platform: "", status: "", ...change });
   const names = (change) => devices.filter((device) => matchesFleetFilters(device, filters(change), NOW)).map((device) => device.device_name);
   assert.deepEqual(names({}), ["web", "mac", "old", "new", "zypper"]);
   assert.deepEqual(names({ query: "WE" }), ["web"]);
   assert.deepEqual(names({ company: "acme" }), ["web"]);
   assert.deepEqual(names({ company: "none" }), ["mac", "old", "new", "zypper"]);
+  assert.deepEqual(names({ tag: "london" }), ["mac"]);
+  assert.deepEqual(names({ tag: "gone" }), []);
   assert.deepEqual(names({ platform: "macos" }), ["mac"]);
   assert.deepEqual(names({ status: "security" }), ["web"]);
   assert.deepEqual(names({ status: "reboot" }), ["mac"]);
@@ -189,11 +191,11 @@ test("the fleet filters by name, company, system and state", () => {
 });
 
 test("fleet filters round trip through the address", () => {
-  const filters = { query: " web ", company: "acme", platform: "linux", status: "reboot" };
+  const filters = { query: " web ", company: "acme", tag: "t1", platform: "linux", status: "reboot" };
   const params = fleetFilterParams(filters);
-  assert.equal(params.toString(), "q=web&company=acme&os=linux&status=reboot");
+  assert.equal(params.toString(), "q=web&company=acme&tag=t1&os=linux&status=reboot");
   assert.deepEqual(parseFleetFilters(params), { ...filters, query: "web" });
-  assert.deepEqual(parseFleetFilters(new URLSearchParams("os=beos&status=nope")), { query: "", company: "", platform: "", status: "" });
+  assert.deepEqual(parseFleetFilters(new URLSearchParams("os=beos&status=nope")), { query: "", company: "", tag: "", platform: "", status: "" });
 });
 
 test("socket events update the fleet and the history", () => {
@@ -269,7 +271,7 @@ test("update alert rules take a category and days", () => {
   assert.deepEqual([ruleInput(failed).update_category, ruleInput(failed).days], [null, null]);
   assert.equal(clearsItself("update_install_failed"), false);
   assert.equal(clearsItself("updates_pending"), true);
-  const loaded = ruleForm({ name: "R", severity: "warning", enabled: true, condition: "updates_pending", threshold: null, threshold_unit: null, duration_minutes: null, nonzero_exit_fails: false, update_category: "critical", days: 14, all_companies: true, company_ids: [], channel_ids: [], notify_on_resolve: false });
+  const loaded = ruleForm({ name: "R", severity: "warning", enabled: true, condition: "updates_pending", threshold: null, threshold_unit: null, duration_minutes: null, nonzero_exit_fails: false, update_category: "critical", days: 14, target: "all", company_ids: [], tag_ids: [], tag_match: "any", channel_ids: [], notify_on_resolve: false });
   assert.deepEqual([loaded.updateCategory, loaded.days], ["critical", "14"]);
 });
 

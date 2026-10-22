@@ -128,6 +128,15 @@ test("new audit events read as sentences, with how sign-ins happened", () => {
   assert.equal(targetLabel({ actor_user_id: null, target_type: "user", target_id: "u1", metadata: { email: "a@x", display_name: "A" } }), "User: a@x");
 });
 
+test("tag and notes events say what changed, never the notes' text", () => {
+  for (const action of ["tag.create", "tag.update", "tag.delete", "agent.tag", "agent.notes"]) assert.notEqual(actionLabel(action), action, action);
+  assert.equal(eventLabel({ action: "agent.tag", metadata: { name: "Desk", added: ["London"], removed: ["Servers", "Old"] } }), "Changed a device's tags: added London; removed Servers, Old");
+  assert.equal(eventLabel({ action: "agent.tag", metadata: { added: [], removed: ["Servers"] } }), "Changed a device's tags: removed Servers");
+  assert.equal(eventLabel({ action: "agent.notes", metadata: { revision: 3, length: 1200, previous_length: 4 } }), "Edited a device's notes: 1,200 characters");
+  assert.equal(eventLabel({ action: "agent.notes", metadata: { revision: 4, length: 0, previous_length: 4 } }), "Edited a device's notes: cleared them");
+  assert.equal(targetLabel({ actor_user_id: "u", target_type: "tag", target_id: "t1", metadata: { name: "Servers", color: "blue" } }), "Tag: Servers");
+});
+
 test("the account page sums up its second factors", () => {
   assert.equal(twoFactorSummary({ enabled: false, totp: false, passkeys: 0 }), "Off. Signing in takes only your password.");
   assert.equal(twoFactorSummary({ enabled: true, totp: true, passkeys: 0 }), "On, with an authenticator app.");

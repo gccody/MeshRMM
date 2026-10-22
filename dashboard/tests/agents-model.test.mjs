@@ -47,9 +47,13 @@ test("rejects malformed Agent API and event payloads", () => {
       agents: [{ id: "a", name: "Alpha", platform: "windows", connected: true }],
       revision: 4,
     }),
-    { agents: [{ id: "a", name: "Alpha", platform: "windows", connected: true }], companies: [], revision: 4 },
+    { agents: [{ id: "a", name: "Alpha", platform: "windows", connected: true }], companies: [], tags: [], revision: 4 },
   );
   assert.equal(parseAgentList({ agents: [], companies: [{ id: "c" }], revision: 1 }), null);
+  assert.equal(parseAgentList({ agents: [], tags: [{ id: "t", name: "Servers", color: "fuchsia" }], revision: 1 }), null);
+  assert.equal(parseAgentList({ agents: [{ id: "a", name: "Alpha", platform: "windows", connected: true, tag_ids: [1] }], revision: 1 }), null);
+  assert.equal(parseAgentEvent({ type: "tag_upsert", revision: 5, tag: { id: "t", name: "Servers" } }), null);
+  assert.equal(parseAgentEvent({ type: "tag_deleted", revision: 5 }), null);
   for (const platform of [undefined, "windows-x64", "freebsd"]) {
     assert.equal(parseAgentList({ agents: [{ id: "a", name: "Alpha", platform, connected: true }], revision: 1 }), null, String(platform));
   }

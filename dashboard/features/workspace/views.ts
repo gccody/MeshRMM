@@ -3,12 +3,13 @@
 // Imports carry the .ts extension so node:test can load this module directly.
 import { type Account, type Permission, canAny } from "../auth/types.ts";
 
-export type View = "devices" | "device" | "companies" | "software" | "updates" | "toolbox" | "alerts" | "alert-rules" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account" | "jobs" | "job" | "policies" | "terminal";
+export type View = "devices" | "device" | "companies" | "tags" | "software" | "updates" | "toolbox" | "alerts" | "alert-rules" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account" | "jobs" | "job" | "policies" | "terminal";
 
 export const VIEW_PATHS: Record<View, string> = {
   devices: "/",
   device: "/device",
   companies: "/companies",
+  tags: "/tags",
   software: "/software",
   updates: "/updates",
   toolbox: "/toolbox",
@@ -34,6 +35,7 @@ export const VIEW_COPY: Record<View, { title: string }> = {
   devices: { title: "Devices" },
   device: { title: "Device" },
   companies: { title: "Companies" },
+  tags: { title: "Tags" },
   software: { title: "Software" },
   updates: { title: "Updates" },
   toolbox: { title: "Toolbox" },
@@ -61,6 +63,7 @@ const VIEW_ACCESS: Record<View, readonly Permission[]> = {
   devices: ["devices.view"],
   device: ["devices.view"],
   companies: ["devices.view"],
+  tags: ["devices.view"],
   software: ["devices.view"],
   updates: ["updates.view"],
   toolbox: ["scripts.run", "scripts.manage_shared", "files.deliver", "files.manage_shared"],

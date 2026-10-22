@@ -5,6 +5,7 @@ import { ModalDialog } from "../../lib/modal-dialog";
 import type { Channel } from "../alerts/model";
 import { LANGUAGE_LABELS, RUN_AS_LABELS, type ToolboxScript, groupByFolder } from "../toolbox/model";
 import { CategoryChoice } from "../updates/bulk-install-dialog";
+import { TagTargetFields } from "../tags/tag-chip";
 import { RebootFields } from "../updates/reboot-fields";
 import { useWorkspace } from "../workspace/workspace-context";
 import { savePolicy } from "./automation-api";
@@ -133,7 +134,7 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
           <label htmlFor="policy-trigger">Runs
             <select id="policy-trigger" value={draft.trigger} onChange={(event) => {
               const trigger = event.target.value as TriggerKind;
-              update(trigger === "enroll" && draft.target === "devices" ? { trigger, target: "all" } : { trigger });
+              update(trigger === "enroll" && (draft.target === "devices" || draft.target === "tags") ? { trigger, target: "all" } : { trigger });
             }}>
               {triggers.map((trigger) => <option key={trigger} value={trigger}>{TRIGGER_LABELS[trigger]}</option>)}
             </select>
@@ -180,6 +181,7 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
             <legend>Devices</legend>
             <label><input type="radio" name="policy-target" checked={draft.target === "all"} onChange={() => update({ target: "all" })} /><span><strong>Every device</strong>As they are each time it runs.</span></label>
             <label><input type="radio" name="policy-target" checked={draft.target === "companies"} onChange={() => update({ target: "companies" })} disabled={!inventory.companies.length && draft.target !== "companies"} /><span><strong>Devices of chosen companies</strong>{inventory.companies.length ? "Choose them below." : "There are no companies yet."}</span></label>
+            {!enrolling && <label><input type="radio" name="policy-target" checked={draft.target === "tags"} onChange={() => update({ target: "tags" })} disabled={!inventory.tags.length && draft.target !== "tags"} /><span><strong>Devices with chosen tags</strong>{inventory.tags.length ? "The devices that have them each time it runs, including ones tagged later." : "There are no tags yet."}</span></label>}
             {!enrolling && <label><input type="radio" name="policy-target" checked={draft.target === "devices"} onChange={() => update({ target: "devices" })} /><span><strong>Chosen devices</strong>{draft.deviceIds.length ? `${draft.deviceIds.length} chosen` : "Choose them below."}</span></label>}
           </fieldset>
           {draft.target === "companies" && (
@@ -193,6 +195,7 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
               ))}
             </fieldset>
           )}
+          {draft.target === "tags" && <TagTargetFields tags={inventory.tags} chosen={draft.tagIds} match={draft.tagMatch} onChange={({ tagIds, tagMatch }) => update({ ...(tagIds && { tagIds }), ...(tagMatch && { tagMatch }) })} />}
           {draft.target === "devices" && <DevicePicker agents={inventory.agents} chosen={draft.deviceIds} onChange={(deviceIds) => update({ deviceIds: [...deviceIds] })} language={isScript ? script?.language ?? null : null} />}
 
           {!enrolling && !isWake && (

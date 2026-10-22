@@ -5,7 +5,7 @@ import type { JobEvent } from "../automation/model";
 import type { MetricsReading } from "../metrics/model";
 import type { UpdateEvent } from "../updates/model";
 import { inventoryStatus } from "./inventory-stream";
-import { EMPTY_INVENTORY, parseAgentList, sortAgents, sortCompanies } from "./model";
+import { EMPTY_INVENTORY, parseAgentList, sortAgents, sortCompanies, sortTags } from "./model";
 import { ThumbnailStore } from "./thumbnails";
 import type { Inventory } from "./types";
 import { useInventoryConnection } from "./use-inventory-connection";
@@ -32,7 +32,7 @@ async function fetchAgentList(authorizedFetch: AuthorizedFetch) {
 }
 
 export function useAgentInventory({ enabled, authorizedFetch, onRefused, onAlerts, onJobs, onUpdates }: Options) {
-  const [{ agents, companies }, setInventory] = useState<Inventory>(EMPTY_INVENTORY);
+  const [{ agents, companies, tags }, setInventory] = useState<Inventory>(EMPTY_INVENTORY);
   const [hasData, setHasData] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
@@ -73,7 +73,7 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused, onAlert
       setError(null);
       if (data.revision < revision.current) return true;
       revision.current = data.revision;
-      setInventory({ agents: sortAgents(data.agents), companies: sortCompanies(data.companies) });
+      setInventory({ agents: sortAgents(data.agents), companies: sortCompanies(data.companies), tags: sortTags(data.tags) });
       setHasData(true);
       setLastUpdated(new Date());
       return true;
@@ -114,6 +114,7 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused, onAlert
   return {
     agents: enabled ? agents : [],
     companies: enabled ? companies : [],
+    tags: enabled ? tags : [],
     metrics: onlineMetrics,
     hasData: enabled && hasData,
     status: enabled ? status : "loading",

@@ -23,7 +23,7 @@ import { fetchInstalledOn, fetchSoftware } from "./system-info-api";
 const QUERY_DELAY_MS = 300;
 
 // `/software`: which devices have an application installed, and in which
-// version, across every device or one company's.
+// version, across every device or one company's or tag's.
 export function SoftwarePage() {
   const { authorizedFetch, inventory } = useWorkspace();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -47,7 +47,7 @@ export function SoftwarePage() {
     return () => window.clearTimeout(timer);
     // choose changes with the address, which this effect already follows.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [queryInput, filters.query, filters.company]);
+  }, [queryInput, filters.query, filters.company, filters.tag]);
 
   const params = softwareParams(filters).toString();
   const load = useCallback(() => fetchSoftware(authorizedFetch, new URLSearchParams(params)), [authorizedFetch, params]);
@@ -70,6 +70,13 @@ export function SoftwarePage() {
             <option value={NO_COMPANY}>No company</option>
             {inventory.companies.map((company) => <option key={company.id} value={company.id}>{company.name}</option>)}
           </select>
+          {(inventory.tags.length > 0 || filters.tag) && (
+            <select aria-label="Tag" value={filters.tag} onChange={(event) => choose({ tag: event.target.value })}>
+              <option value="">Every tag</option>
+              {filters.tag && !inventory.tags.some((tag) => tag.id === filters.tag) && <option value={filters.tag}>Unknown tag</option>}
+              {inventory.tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}
+            </select>
+          )}
         </div>
         {!data ? (
           error
@@ -96,6 +103,7 @@ export function SoftwarePage() {
                       key={application.name}
                       application={application}
                       company={filters.company}
+                      tag={filters.tag}
                       open={open === application.name}
                       onToggle={() => setOpen(open === application.name ? null : application.name)}
                     />
@@ -114,9 +122,10 @@ export function SoftwarePage() {
 // At most this many versions show beside an application; the rest are counted.
 const SHOWN_VERSIONS = 4;
 
-function FleetRow({ application, company, open, onToggle }: {
+function FleetRow({ application, company, tag, open, onToggle }: {
   application: FleetApplication;
   company: string;
+  tag: string;
   open: boolean;
   onToggle: () => void;
 }) {
@@ -144,20 +153,20 @@ function FleetRow({ application, company, open, onToggle }: {
       </tr>
       {open && (
         <tr className="detail-row" id={detailsId}>
-          <td colSpan={3}><InstalledDevices name={application.name} company={company} /></td>
+          <td colSpan={3}><InstalledDevices name={application.name} company={company} tag={tag} /></td>
         </tr>
       )}
     </>
   );
 }
 
-function InstalledDevices({ name, company }: { name: string; company: string }) {
+function InstalledDevices({ name, company, tag }: { name: string; company: string; tag: string }) {
   const { authorizedFetch } = useWorkspace();
   const [state, setState] = useState<{ devices: InstalledOn[] | null; error: string | null }>({ devices: null, error: null });
 
   useEffect(() => {
     let cancelled = false;
-    fetchInstalledOn(authorizedFetch, installedOnParams(name, undefined, company)).then(
+    fetchInstalledOn(authorizedFetch, installedOnParams(name, undefined, company, tag)).then(
       (devices) => !cancelled && setState({ devices, error: null }),
       (error: unknown) => {
         if (!cancelled && !(error instanceof AuthenticationRequired)) setState({ devices: null, error: errorText(error, "The devices could not be loaded.") });
@@ -166,7 +175,7 @@ function InstalledDevices({ name, company }: { name: string; company: string }) 
     return () => {
       cancelled = true;
     };
-  }, [authorizedFetch, name, company]);
+  }, [authorizedFetch, name, company, tag]);
 
   if (state.error) return <p className="form-error" role="alert"><CircleAlert size={16} aria-hidden="true" />{state.error}</p>;
   if (!state.devices) return <p className="page-status" role="status"><LoaderCircle size={16} className="spin" aria-hidden="true" /> Loading devices…</p>;

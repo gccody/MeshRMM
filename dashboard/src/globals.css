@@ -939,3 +939,66 @@ button.outcome-chip:hover { color: var(--text); background: var(--raised); }
 .wake-meta { color: var(--text-3); font-size: 12.5px; }
 .device-wake { margin-top: 14px; display: grid; justify-items: start; gap: 10px; }
 .device-wake .wake-list { width: min(100%, 640px); }
+
+/* Tags: a chip per tag in its color. Each color has a shade for a light and
+   a dark page (light-dark() follows color-scheme), so the palette works if
+   the website gains a light theme. */
+.tag-gray { --tag-fg: light-dark(#4a5263, #c3c9d4); --tag-bg: light-dark(#e6e9ef, rgb(163 171 187 / 16%)); }
+.tag-red { --tag-fg: light-dark(#b42318, #ff9a94); --tag-bg: light-dark(#fde2e0, rgb(255 110 100 / 15%)); }
+.tag-orange { --tag-fg: light-dark(#b54708, #ffb27a); --tag-bg: light-dark(#fdead7, rgb(255 150 70 / 15%)); }
+.tag-amber { --tag-fg: light-dark(#8a6100, #f5c86a); --tag-bg: light-dark(#fbf0c9, rgb(240 190 70 / 14%)); }
+.tag-green { --tag-fg: light-dark(#18794e, #74dba5); --tag-bg: light-dark(#ddf3e6, rgb(79 214 140 / 13%)); }
+.tag-teal { --tag-fg: light-dark(#0e7470, #63d8cc); --tag-bg: light-dark(#d6f2ef, rgb(70 210 195 / 13%)); }
+.tag-blue { --tag-fg: light-dark(#175cd3, #8fbfff); --tag-bg: light-dark(#dde9fd, rgb(110 165 255 / 15%)); }
+.tag-purple { --tag-fg: light-dark(#6941c6, #c3abff); --tag-bg: light-dark(#ebe4ff, rgb(170 140 255 / 15%)); }
+.tag-pink { --tag-fg: light-dark(#c11574, #f9a0d0); --tag-bg: light-dark(#fce4f1, rgb(245 130 195 / 14%)); }
+.app-root .tag-chip { max-width: 16em; padding: 1px 8px 1px 6px; display: inline-flex; align-items: center; gap: 5px; overflow: hidden; border-radius: 999px; color: var(--tag-fg); background: var(--tag-bg); font-size: 12px; font-weight: 560; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
+.app-root .tag-chip i { width: 7px; height: 7px; flex: none; border-radius: 50%; background: currentColor; }
+.tag-chips { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.data-table td > span.tag-chips { display: flex; margin-top: 4px; }
+.tag-more { color: var(--text-3); font-size: 12px; font-weight: 600; }
+.device-tags { margin: 6px 0 0 17px; }
+.tag-checklist { display: grid; gap: 8px; }
+.tag-checklist .search-field, .settings-modal form > .search-field { width: 100%; }
+.settings-modal .picker-list label:has(.tag-chip) { align-items: center; }
+.tag-match { justify-self: start; }
+.tag-target { display: grid; gap: 8px; }
+.tag-colors { margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; border: 0; }
+.tag-colors legend { margin-bottom: 6px; padding: 0; color: var(--text-2); font-size: 13px; font-weight: 500; }
+.tag-swatch { position: relative; width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--rule-strong); border-radius: 50%; background: var(--tag-bg); cursor: pointer; }
+.tag-swatch input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; }
+.tag-swatch i { width: 12px; height: 12px; border-radius: 50%; background: var(--tag-fg); }
+.tag-swatch:has(input:checked) { border-color: var(--tag-fg); box-shadow: 0 0 0 2px var(--tag-bg), 0 0 0 3px var(--tag-fg); }
+.tag-swatch:has(input:focus-visible) { outline: 2px solid var(--signal); outline-offset: 3px; }
+.tag-preview { margin: 4px 0 0; }
+
+/* Device page tags and notes */
+.device-page-tags .tag-chips { flex: 0 1 auto; }
+.device-notes { margin-top: 14px; display: grid; gap: 8px; width: min(100%, 760px); }
+.device-notes .device-alerts-heading .link-button { display: inline-flex; align-items: center; gap: 5px; }
+.notes-text { margin: 0; padding: 10px 12px; overflow-wrap: anywhere; border: 1px solid var(--rule); border-radius: 8px; background: var(--panel); color: var(--text); font-size: 13.5px; white-space: pre-wrap; }
+.notes-meta { margin: 0; color: var(--text-3); font-size: 12.5px; }
+.notes-editor { display: grid; gap: 8px; }
+.notes-editor textarea { width: 100%; min-height: 9em; padding: 10px 12px; resize: vertical; border: 1px solid var(--rule-strong); border-radius: 8px; background: var(--well); font-size: 13.5px; line-height: 1.5; }
+.notes-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+.notes-count { margin-right: auto; color: var(--text-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+.notes-count.over { color: var(--danger); }
+.notes-conflict { padding: 10px 12px; display: grid; gap: 8px; border: 1px solid rgb(240 184 90 / 35%); border-radius: 8px; background: var(--warn-wash); }
+.notes-conflict > p { margin: 0; display: flex; align-items: flex-start; gap: 8px; color: var(--text); font-size: 13.5px; }
+.notes-conflict > p svg { flex: none; margin-top: 2px; color: var(--warn); }
+.notes-conflict .notes-actions { justify-content: flex-start; }
+.notes-history summary { display: inline-flex; align-items: center; gap: 6px; color: var(--text-2); cursor: pointer; font-size: 13px; }
+.notes-history ul { margin: 8px 0; padding: 0; display: grid; gap: 6px; list-style: none; }
+.notes-history li { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; color: var(--text-2); font-size: 12.5px; }
+.notes-version { width: 100%; display: grid; justify-items: start; gap: 8px; }
+.notes-version .notes-text { width: 100%; }
+
+/* Device wall tags and the Tags page */
+.tag-filter-menu .tag-match { height: 32px; margin-bottom: 4px; flex: none; }
+.tag-filter-menu .tag-match button { flex: 1; justify-content: center; }
+.tag-filter-menu .menu-options .tag-chip { max-width: 100%; }
+.tag-filter-clear { margin: 6px 4px 2px; align-self: flex-start; font-size: 13px; }
+.device-tile .device-tags .tag-chips { flex-wrap: nowrap; overflow: hidden; }
+.device-tile .device-tags .tag-chip { flex: 0 1 auto; min-width: 0; }
+.tag-link { display: inline-flex; max-width: 100%; text-decoration: none; }
+.tag-link:hover .tag-chip { filter: brightness(1.15); }
