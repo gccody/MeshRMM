@@ -399,7 +399,7 @@ async fn rules_cover_all_devices_or_chosen_companies() {
             &mut admin,
             json!({
                 "name": "Acme offline", "severity": "warning", "condition": "device_offline",
-                "duration_minutes": 1, "all_companies": false, "company_ids": [acme],
+                "duration_minutes": 1, "target": "companies", "company_ids": [acme],
             }),
         )
         .await;

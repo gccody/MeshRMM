@@ -68,12 +68,13 @@ test("hardware adapters come first, up before down", () => {
 });
 
 test("the software search keeps its filters in the address", () => {
-  assert.deepEqual(parseSoftwareFilters(new URLSearchParams("q=chrome&company=none")), { query: "chrome", company: "none" });
-  assert.deepEqual(parseSoftwareFilters(null), { query: "", company: "" });
+  assert.deepEqual(parseSoftwareFilters(new URLSearchParams("q=chrome&company=none&tag=t1")), { query: "chrome", company: "none", tag: "t1" });
+  assert.deepEqual(parseSoftwareFilters(null), { query: "", company: "", tag: "" });
   assert.equal(parseSoftwareFilters(new URLSearchParams({ q: "x".repeat(500) })).query.length, 200);
-  assert.equal(softwareParams({ query: "  7-zip ", company: "" }).toString(), "q=7-zip");
-  assert.equal(softwareParams({ query: "", company: "acme" }).toString(), "company=acme");
+  assert.equal(softwareParams({ query: "  7-zip ", company: "", tag: "" }).toString(), "q=7-zip");
+  assert.equal(softwareParams({ query: "", company: "acme", tag: "t1" }).toString(), "company=acme&tag=t1");
   assert.equal(installedOnParams("Notepad++", undefined, "").toString(), "name=Notepad%2B%2B");
   assert.equal(installedOnParams("App", "1.0", "none").toString(), "name=App&version=1.0&company=none");
   assert.equal(installedOnParams("App", null, "").toString(), "name=App&unversioned=true");
+  assert.equal(installedOnParams("App", undefined, "", "t1").toString(), "name=App&tag=t1");
 });

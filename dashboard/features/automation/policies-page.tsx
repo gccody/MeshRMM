@@ -144,7 +144,7 @@ export function PoliciesPage() {
                   <tr key={policy.id} className={policy.enabled ? undefined : "row-disabled"}>
                     <td>
                       <strong>{policy.name}</strong>
-                      <span>{describePolicyAction(policy)} on {describeTarget(policy, companyNames, deviceNames)}</span>
+                      <span>{describePolicyAction(policy)} on {describeTarget(policy, companyNames, deviceNames, inventory.tags)}</span>
                       <span>Runs with {policy.owned_by_you ? "your" : `${policy.owner}’s`} access</span>
                     </td>
                     <td>

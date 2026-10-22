@@ -146,10 +146,13 @@ device page **Install** is refused (`409 install_running`).
   security and critical counts, the oldest pending update's age, last scan,
   restart pending and last install; tiles and filters for devices with
   security updates pending, failed installs, restarts pending and devices not
-  scanned for three days, by company and operating system; and, for chosen
+  scanned for three days, by company, [tag](devices.md#tags) and operating
+  system; and, for chosen
   devices, **Scan now** and **Install updates…** as a job.
 - **Policies** can scan for updates or install them (chosen categories, or
-  all, with the restart choice), on any schedule and target policies have.
+  all, with the restart choice), on any schedule and target policies have,
+  tags included: an install policy on a tag such as "Pilot ring" covers the
+  devices tagged when it runs.
 - Both pages update live from the event socket.
 
 Bulk installs and scans are ordinary [jobs](automation.md): each device's
@@ -172,7 +175,7 @@ the device has no supported update manager. A policy's channels get
 |---|---|---|
 | `updates.view` | Seeing pending updates, scans, history and the fleet page; **Scan now**; scan jobs. | Yes |
 | `updates.install` | Installing updates and restarting for them; install jobs. | Yes |
-| `jobs.run_wide` | Jobs on whole companies or every device. | No |
+| `jobs.run_wide` | Jobs on whole companies, tags or every device. | No |
 | `automation.manage` | Policies; saving an update policy also needs `updates.view` (scan) or `updates.install` (install), which it then runs with. | No |
 
 The audit log records `update.scan` and `update.install` (with the

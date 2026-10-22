@@ -108,6 +108,8 @@ export type DeviceUpdateSummary = {
   device_id: string;
   device_name: string;
   company_id: string | null;
+  // The device's tags, from the live inventory; the server doesn't send them.
+  tag_ids?: string[];
   platform: DevicePlatform;
   connected: boolean;
   manager: UpdateManager | null;
@@ -354,12 +356,14 @@ export type FleetFilters = {
   query: string;
   // A company ID, NO_COMPANY_FILTER, or "" for every company.
   company: string;
+  // A tag ID, or "" for every device.
+  tag: string;
   platform: DevicePlatform | "";
   status: FleetStatusFilter;
 };
 
 export const NO_COMPANY_FILTER = "none";
-export const DEFAULT_FLEET_FILTERS: FleetFilters = { query: "", company: "", platform: "", status: "" };
+export const DEFAULT_FLEET_FILTERS: FleetFilters = { query: "", company: "", tag: "", platform: "", status: "" };
 
 const PLATFORMS: readonly string[] = ["windows", "macos", "linux"];
 const STATUSES: readonly string[] = Object.keys(FLEET_STATUS_LABELS);
@@ -370,6 +374,7 @@ export function parseFleetFilters(search: URLSearchParams): FleetFilters {
   return {
     query: search.get("q") ?? "",
     company: search.get("company") ?? "",
+    tag: search.get("tag") ?? "",
     platform: PLATFORMS.includes(platform) ? (platform as DevicePlatform) : "",
     status: STATUSES.includes(status) ? (status as FleetStatusFilter) : "",
   };
@@ -380,6 +385,7 @@ export function fleetFilterParams(filters: FleetFilters) {
   const params = new URLSearchParams();
   if (filters.query.trim()) params.set("q", filters.query.trim());
   if (filters.company) params.set("company", filters.company);
+  if (filters.tag) params.set("tag", filters.tag);
   if (filters.platform) params.set("os", filters.platform);
   if (filters.status) params.set("status", filters.status);
   return params;
@@ -409,6 +415,7 @@ export function matchesFleetFilters(device: DeviceUpdateSummary, filters: FleetF
     || (filters.company === NO_COMPANY_FILTER ? device.company_id === null : device.company_id === filters.company);
   return (!query || device.device_name.toLowerCase().includes(query))
     && company
+    && (!filters.tag || (device.tag_ids ?? []).includes(filters.tag))
     && (!filters.platform || device.platform === filters.platform)
     && matchesFleetStatus(device, filters.status, now);
 }

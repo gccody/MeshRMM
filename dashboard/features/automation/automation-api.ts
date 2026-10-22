@@ -19,9 +19,11 @@ export type StartJobInput = {
   run_as?: "user" | "system";
   file_id?: string;
   destination?: "user" | "public";
-  target: "devices" | "companies" | "all";
+  target: "devices" | "companies" | "tags" | "all";
   device_ids: string[];
   company_ids: string[];
+  tag_ids: string[];
+  tag_match: "any" | "all";
   offline: "skip" | "wait";
   wait_hours: number;
 };

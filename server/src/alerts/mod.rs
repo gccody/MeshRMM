@@ -40,7 +40,7 @@ use self::{
 };
 use crate::{
     audit::Actor,
-    db::tables::{Agents, ScriptRuns, UpdateRuns},
+    db::tables::{ScriptRuns, UpdateRuns},
     http::AppState,
     notifications::{self, Notification},
     realtime::Metrics,
@@ -173,15 +173,7 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
     sweep_lost_runs(state, now).await?;
     let mut database = &state.database;
     let rules = rules::load(&mut database, None).await?;
-    let devices: Vec<(String, Option<String>)> = database
-        .fetch_all(
-            &Query::select()
-                .columns([Agents::Id, Agents::CompanyId])
-                .from(Agents::Table)
-                .and_where(Expr::col(Agents::DeletionRequestedAt).is_null())
-                .to_owned(),
-        )
-        .await?;
+    let devices = crate::targets::devices(&mut database, None).await?;
     let unresolved = store::unresolved(&mut database).await?;
     let connected = state.agents.connected();
     let updating = state.presence.updating_devices().await;
@@ -216,16 +208,20 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
     let mut wanted = Vec::new();
     {
         let mut tracker = state.alerts.tracker();
-        let ids = devices.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        let ids = devices
+            .iter()
+            .map(|device| device.id.clone())
+            .collect::<Vec<_>>();
         tracker.presence(&ids, &connected, now);
         for rule in rules
             .iter()
             .filter(|rule| rule.enabled && rule.condition.clears_itself())
         {
-            for (device_id, company_id) in &devices {
-                if !rule.covers(company_id.as_deref()) {
+            for covered in &devices {
+                if !rule.covers(covered) {
                     continue;
                 }
+                let device_id = &covered.id;
                 let device = DeviceState {
                     id: device_id,
                     connected: connected.contains(device_id),
@@ -248,10 +244,7 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
         .iter()
         .map(|rule| (rule.id.as_str(), rule))
         .collect::<HashMap<_, _>>();
-    let companies = devices
-        .iter()
-        .map(|(id, company)| (id.as_str(), company.as_deref()))
-        .collect::<HashMap<_, _>>();
+    let devices_by_id = crate::targets::by_id(&devices);
     let wanted_keys = wanted
         .iter()
         .map(|(rule, device_id, breach)| {
@@ -267,9 +260,9 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
             continue;
         };
         let applies = rule.enabled
-            && companies
+            && devices_by_id
                 .get(alert.device_id.as_str())
-                .is_some_and(|company| rule.covers(*company));
+                .is_some_and(|device| rule.covers(device));
         let key = (
             alert.rule_id.as_str(),
             alert.device_id.as_str(),
@@ -558,23 +551,13 @@ async fn check_run(state: &AppState, run_id: &str, now: i64) -> anyhow::Result<(
     let Some((value, detail, by_exit_code)) = run_failure(&run) else {
         return Ok(());
     };
-    let Some((company_id,)): Option<(Option<String>,)> = database
-        .fetch_optional(
-            &Query::select()
-                .column(Agents::CompanyId)
-                .from(Agents::Table)
-                .and_where(Expr::col(Agents::Id).eq(run.device_id.as_str()))
-                .and_where(Expr::col(Agents::DeletionRequestedAt).is_null())
-                .to_owned(),
-        )
-        .await?
-    else {
+    let Some(device) = crate::targets::device(&mut database, &run.device_id).await? else {
         return Ok(());
     };
     for rule in rules::load(&mut database, None).await? {
         if !rule.enabled
             || rule.condition != Condition::ScriptFailed
-            || !rule.covers(company_id.as_deref())
+            || !rule.covers(&device)
             || (by_exit_code && !rule.nonzero_exit_fails)
         {
             continue;
@@ -667,23 +650,13 @@ async fn check_install(state: &AppState, run_id: &str, now: i64) -> anyhow::Resu
     let Some(detail) = install_failure(&install) else {
         return Ok(());
     };
-    let Some((company_id,)): Option<(Option<String>,)> = database
-        .fetch_optional(
-            &Query::select()
-                .column(Agents::CompanyId)
-                .from(Agents::Table)
-                .and_where(Expr::col(Agents::Id).eq(install.device_id.as_str()))
-                .and_where(Expr::col(Agents::DeletionRequestedAt).is_null())
-                .to_owned(),
-        )
-        .await?
-    else {
+    let Some(device) = crate::targets::device(&mut database, &install.device_id).await? else {
         return Ok(());
     };
     for rule in rules::load(&mut database, None).await? {
         if !rule.enabled
             || rule.condition != Condition::UpdateInstallFailed
-            || !rule.covers(company_id.as_deref())
+            || !rule.covers(&device)
         {
             continue;
         }

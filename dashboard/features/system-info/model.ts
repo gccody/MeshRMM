@@ -199,7 +199,8 @@ export function sortAdapters(adapters: readonly NetworkAdapter[]) {
   return [...adapters].sort((left, right) => rank(left) - rank(right) || collator.compare(left.name, right.name));
 }
 
-export type SoftwareFilters = { query: string; company: string };
+// A company ID, "none" or "" for every company; a tag ID or "" for every device.
+export type SoftwareFilters = { query: string; company: string; tag: string };
 
 export const MAX_SOFTWARE_QUERY_LENGTH = 200;
 
@@ -207,22 +208,25 @@ export function parseSoftwareFilters(params: { get(name: string): string | null 
   return {
     query: (params?.get("q") ?? "").slice(0, MAX_SOFTWARE_QUERY_LENGTH),
     company: params?.get("company") ?? "",
+    tag: params?.get("tag") ?? "",
   };
 }
 
 // The search string for a page's address and for `GET /v1/software`.
-export function softwareParams({ query, company }: SoftwareFilters) {
+export function softwareParams({ query, company, tag }: SoftwareFilters) {
   const params = new URLSearchParams();
   if (query.trim()) params.set("q", query.trim().slice(0, MAX_SOFTWARE_QUERY_LENGTH));
   if (company) params.set("company", company);
+  if (tag) params.set("tag", tag);
   return params;
 }
 
 // `GET /v1/software/devices` for one application, or one version of it.
-export function installedOnParams(name: string, version: string | null | undefined, company: string) {
+export function installedOnParams(name: string, version: string | null | undefined, company: string, tag = "") {
   const params = new URLSearchParams({ name });
   if (version === null) params.set("unversioned", "true");
   else if (version !== undefined) params.set("version", version);
   if (company) params.set("company", company);
+  if (tag) params.set("tag", tag);
   return params;
 }

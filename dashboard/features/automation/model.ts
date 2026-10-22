@@ -1,7 +1,8 @@
 // Jobs and automation policies as the server sends them, and how the website
 // words them. See docs/automation.md. Imports carry the .ts extension so
 // node:test can load this module directly.
-import type { Agent, DevicePlatform } from "../agents/types.ts";
+import type { Agent, DevicePlatform, Tag } from "../agents/types.ts";
+import { type TagMatch, describeTagTarget, hasTags } from "../tags/model.ts";
 import { type RunAs, type ScriptLanguage, LANGUAGE_LABELS, runsOn } from "../toolbox/model.ts";
 import type { Permission } from "../auth/types.ts";
 import { DEFAULT_REBOOT_DELAY_MINUTES, type RebootBehavior, type UpdateCategory, installName, rebootDelayProblem } from "../updates/model.ts";
@@ -16,7 +17,7 @@ export const JOB_KIND_LABELS: Record<JobKind, string> = {
   update_install: "Update install",
   wake: "Wake",
 };
-export type TargetKind = "devices" | "companies" | "all";
+export type TargetKind = "devices" | "companies" | "tags" | "all";
 export type OfflineChoice = "skip" | "wait";
 export type Destination = "user" | "public";
 
@@ -49,7 +50,7 @@ export type Job = {
   reboot?: RebootBehavior;
   reboot_delay_minutes?: number;
   target: TargetKind;
-  // The device's name, the companies' names, or how many devices.
+  // The device's name, the companies' or tags' names, or how many devices.
   target_label: string;
   offline: OfflineChoice;
   // When offline devices stop being waited for.
@@ -125,6 +126,8 @@ export type Policy = {
   target: TargetKind;
   device_ids: string[];
   company_ids: string[];
+  tag_ids: string[];
+  tag_match: TagMatch;
   trigger: TriggerKind;
   interval_minutes?: number;
   // HH:MM, for daily and weekly policies.
@@ -304,7 +307,13 @@ export function applyJobUpdate(jobs: readonly Job[], job: Job, policyId: string 
 
 // ── Starting a job ─────────────────────────────────────────
 
-export type JobTarget = { kind: TargetKind; deviceIds: readonly string[]; companyIds: readonly string[] };
+export type JobTarget = {
+  kind: TargetKind;
+  deviceIds: readonly string[];
+  companyIds: readonly string[];
+  tagIds?: readonly string[];
+  tagMatch?: TagMatch;
+};
 
 // The devices a target covers, from the browser's inventory.
 export function coveredAgents(agents: readonly Agent[], target: JobTarget) {
@@ -312,6 +321,10 @@ export function coveredAgents(agents: readonly Agent[], target: JobTarget) {
   if (target.kind === "companies") {
     const companies = new Set(target.companyIds);
     return agents.filter((agent) => agent.company_id && companies.has(agent.company_id));
+  }
+  if (target.kind === "tags") {
+    const tags = target.tagIds ?? [];
+    return tags.length ? agents.filter((agent) => hasTags(agent, tags, target.tagMatch ?? "any")) : [];
   }
   const chosen = new Set(target.deviceIds);
   return agents.filter((agent) => chosen.has(agent.id));
@@ -402,8 +415,14 @@ export const SAVE_PERMISSION: Record<PolicyAction, Permission> = {
 };
 
 // Which devices a policy runs on, in words.
-export function describeTarget(policy: Pick<Policy, "target" | "company_ids" | "device_ids">, companyNames: ReadonlyMap<string, string>, deviceNames: ReadonlyMap<string, string>) {
+export function describeTarget(
+  policy: Pick<Policy, "target" | "company_ids" | "device_ids"> & Partial<Pick<Policy, "tag_ids" | "tag_match">>,
+  companyNames: ReadonlyMap<string, string>,
+  deviceNames: ReadonlyMap<string, string>,
+  tags: readonly Tag[] = [],
+) {
   if (policy.target === "all") return "All devices";
+  if (policy.target === "tags") return describeTagTarget(policy.tag_ids ?? [], policy.tag_match ?? "any", tags);
   const ids = policy.target === "companies" ? policy.company_ids : policy.device_ids;
   const names = policy.target === "companies" ? companyNames : deviceNames;
   const what = policy.target === "companies" ? "companies" : "devices";
@@ -421,6 +440,8 @@ export type PolicyDraft = {
   target: TargetKind;
   deviceIds: string[];
   companyIds: string[];
+  tagIds: string[];
+  tagMatch: TagMatch;
   trigger: TriggerKind;
   intervalValue: string;
   intervalUnit: "minutes" | "hours";
@@ -449,6 +470,8 @@ export function policyDraft(policy: Policy | null, timeZone: string, action: Pol
     target: policy?.target ?? "all",
     deviceIds: [...(policy?.device_ids ?? [])],
     companyIds: [...(policy?.company_ids ?? [])],
+    tagIds: [...(policy?.tag_ids ?? [])],
+    tagMatch: policy?.tag_match ?? "any",
     trigger: policy?.trigger ?? "daily",
     intervalValue: String(inHours ? minutes / 60 : minutes),
     intervalUnit: inHours ? "hours" : "minutes",
@@ -500,8 +523,9 @@ export function policyDraftProblem(draft: PolicyDraft, zones: readonly string[] 
   }
   if (draft.target === "companies" && !draft.companyIds.length) return "Choose at least one company.";
   if (draft.target === "devices" && !draft.deviceIds.length) return "Choose at least one device.";
+  if (draft.target === "tags" && !draft.tagIds.length) return "Choose at least one tag.";
   if (draft.trigger === "enroll" && draft.action === "wake") return "A policy that wakes devices runs on a schedule: newly enrolled devices are online.";
-  if (draft.trigger === "enroll" && draft.target === "devices") return "A policy for newly enrolled devices runs on every device or on companies.";
+  if (draft.trigger === "enroll" && (draft.target === "devices" || draft.target === "tags")) return "A policy for newly enrolled devices runs on every device or on companies.";
   if (draft.trigger === "interval") {
     const minutes = intervalMinutes(draft);
     if (!Number.isInteger(minutes) || minutes < MIN_INTERVAL_MINUTES || minutes > MAX_INTERVAL_MINUTES) {
@@ -528,6 +552,8 @@ export function policyInput(draft: PolicyDraft) {
     target: draft.target,
     device_ids: draft.target === "devices" ? draft.deviceIds : [],
     company_ids: draft.target === "companies" ? draft.companyIds : [],
+    tag_ids: draft.target === "tags" ? draft.tagIds : [],
+    tag_match: draft.tagMatch,
     trigger: draft.trigger,
     // A wake policy is for offline devices; it never waits for them.
     offline: draft.action === "wake" ? "skip" : draft.offline,

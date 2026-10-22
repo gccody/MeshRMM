@@ -4,6 +4,8 @@ import { useNavigate } from "react-router";
 import { AuthenticationRequired, errorText } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
 import { LANGUAGE_LABELS, RUN_AS_LABELS, type RunAs, type Toolbox, formatBytes, groupByFolder } from "../toolbox/model";
+import type { TagMatch } from "../tags/model";
+import { TagTargetFields } from "../tags/tag-chip";
 import { fetchToolbox } from "../toolbox/toolbox-api";
 import { useWorkspace } from "../workspace/workspace-context";
 import { startJob } from "./automation-api";
@@ -28,8 +30,8 @@ type Props = {
 };
 
 /**
- * Runs a script, or sends a file, on chosen devices, whole companies or
- * every device, then opens the job's page.
+ * Runs a script, or sends a file, on chosen devices, whole companies, the
+ * devices with chosen tags or every device, then opens the job's page.
  */
 export function StartJobModal({ kind: initialKind, itemId, deviceIds, toolbox: givenToolbox, onClose, returnFocus }: Props) {
   const { authorizedFetch, inventory, can } = useWorkspace();
@@ -48,6 +50,8 @@ export function StartJobModal({ kind: initialKind, itemId, deviceIds, toolbox: g
   const [target, setTarget] = useState<TargetKind>("devices");
   const [chosenDevices, setChosenDevices] = useState<readonly string[]>(deviceIds ?? []);
   const [chosenCompanies, setChosenCompanies] = useState<readonly string[]>([]);
+  const [chosenTags, setChosenTags] = useState<string[]>([]);
+  const [tagMatch, setTagMatch] = useState<TagMatch>("any");
   const [offline, setOffline] = useState<OfflineChoice>("wait");
   const [waitHours, setWaitHours] = useState(String(DEFAULT_WAIT_HOURS));
   const [starting, setStarting] = useState(false);
@@ -67,13 +71,14 @@ export function StartJobModal({ kind: initialKind, itemId, deviceIds, toolbox: g
   const script = toolbox?.scripts.find((candidate) => candidate.id === scriptId);
   const file = toolbox?.files.find((candidate) => candidate.id === fileId);
   const language = kind === "script" ? script?.language ?? null : null;
-  const chosen = { kind: target, deviceIds: chosenDevices, companyIds: chosenCompanies };
+  const chosen = { kind: target, deviceIds: chosenDevices, companyIds: chosenCompanies, tagIds: chosenTags, tagMatch };
   const preview = jobPreview(inventory.agents, chosen, language);
   const waitProblem = offline === "wait" ? waitHoursProblem(waitHours) : null;
   const item = kind === "script" ? script : file;
   const problem = !item ? (kind === "script" ? "Choose a script." : "Choose a file.")
     : target === "devices" && !chosenDevices.length ? "Choose at least one device."
     : target === "companies" && !chosenCompanies.length ? "Choose at least one company."
+    : target === "tags" && !chosenTags.length ? "Choose at least one tag."
     : waitProblem;
 
   const submit = async (event: FormEvent) => {
@@ -87,6 +92,8 @@ export function StartJobModal({ kind: initialKind, itemId, deviceIds, toolbox: g
         target,
         device_ids: target === "devices" ? [...chosenDevices] : [],
         company_ids: target === "companies" ? [...chosenCompanies] : [],
+        tag_ids: target === "tags" ? chosenTags : [],
+        tag_match: tagMatch,
         offline,
         wait_hours: offline === "wait" ? Number(waitHours) : DEFAULT_WAIT_HOURS,
       });
@@ -167,10 +174,15 @@ export function StartJobModal({ kind: initialKind, itemId, deviceIds, toolbox: g
             <label><input type="radio" name="job-target" checked={target === "devices"} onChange={() => setTarget("devices")} /><span><strong>Chosen devices</strong>{chosenDevices.length ? `${chosenDevices.length} chosen` : "Choose them below."}</span></label>
             {wide && <>
               <label><input type="radio" name="job-target" checked={target === "companies"} onChange={() => setTarget("companies")} disabled={!inventory.companies.length} /><span><strong>Whole companies</strong>{inventory.companies.length ? "Every device in the companies chosen below, as they are when the job starts." : "There are no companies yet."}</span></label>
+              <label><input type="radio" name="job-target" checked={target === "tags"} onChange={() => setTarget("tags")} disabled={!inventory.tags.length} /><span><strong>Tagged devices</strong>{inventory.tags.length ? "Every device with the tags chosen below, as they are when the job starts." : "There are no tags yet."}</span></label>
               <label><input type="radio" name="job-target" checked={target === "all"} onChange={() => setTarget("all")} /><span><strong>Every device</strong>All {inventory.agents.length} devices.</span></label>
             </>}
           </fieldset>
           {target === "devices" && <DevicePicker agents={inventory.agents} chosen={chosenDevices} onChange={setChosenDevices} language={language} />}
+          {target === "tags" && <TagTargetFields tags={inventory.tags} chosen={chosenTags} match={tagMatch} onChange={(change) => {
+            if (change.tagIds) setChosenTags(change.tagIds);
+            if (change.tagMatch) setTagMatch(change.tagMatch);
+          }} />}
           {target === "companies" && (
             <fieldset className="choice-list picker-list">
               <legend className="sr-only">Companies</legend>

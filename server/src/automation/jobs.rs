@@ -23,8 +23,8 @@ use crate::{
     db::{
         self, Executor,
         tables::{
-            Agents, Companies, DeviceUpdateStatus, FileDeliveries, JobDevices, Jobs, ScriptRuns,
-            UpdateRuns, Users, WakeRequests,
+            Agents, DeviceUpdateStatus, FileDeliveries, JobDevices, Jobs, ScriptRuns, UpdateRuns,
+            Users, WakeRequests,
         },
     },
     http::ApiError,
@@ -38,8 +38,6 @@ use crate::{
 /// The longest a job waits for offline devices: a week.
 pub const MAX_WAIT_HOURS: i64 = 7 * 24;
 pub const DEFAULT_WAIT_HOURS: i64 = 24;
-/// The most devices a request may choose one by one.
-pub const MAX_CHOSEN_DEVICES: usize = 10_000;
 /// Rows written per statement.
 const INSERT_CHUNK: usize = 400;
 
@@ -76,110 +74,7 @@ impl Kind {
     }
 }
 
-/// Which devices a job or policy covers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TargetKind {
-    /// Chosen devices.
-    Devices,
-    /// Every device in chosen companies.
-    Companies,
-    /// Every device.
-    All,
-}
-
-impl TargetKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Devices => "devices",
-            Self::Companies => "companies",
-            Self::All => "all",
-        }
-    }
-
-    pub fn parse(text: &str) -> Option<Self> {
-        match text {
-            "devices" => Some(Self::Devices),
-            "companies" => Some(Self::Companies),
-            "all" => Some(Self::All),
-            _ => None,
-        }
-    }
-
-    /// Whole companies and every device need [`Permission::JobsRunWide`].
-    pub fn is_wide(self) -> bool {
-        self != Self::Devices
-    }
-}
-
-/// The devices a job covers, as chosen.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
-    Devices(Vec<String>),
-    Companies(Vec<String>),
-    All,
-}
-
-impl Target {
-    pub fn kind(&self) -> TargetKind {
-        match self {
-            Self::Devices(_) => TargetKind::Devices,
-            Self::Companies(_) => TargetKind::Companies,
-            Self::All => TargetKind::All,
-        }
-    }
-
-    /// From a request's fields: the kind, and the IDs it uses. Checks the
-    /// IDs' form and that a choice isn't empty.
-    pub fn from_request(
-        kind: TargetKind,
-        device_ids: Vec<String>,
-        company_ids: Vec<String>,
-    ) -> Result<Self, ApiError> {
-        let ids = |mut ids: Vec<String>, what: &str| {
-            for id in &ids {
-                crate::agents::parse_id(id, what)?;
-            }
-            ids.sort();
-            ids.dedup();
-            Ok::<_, ApiError>(ids)
-        };
-        match kind {
-            TargetKind::Devices => {
-                if device_ids.is_empty() {
-                    return Err(invalid("choose at least one device"));
-                }
-                if device_ids.len() > MAX_CHOSEN_DEVICES {
-                    return Err(invalid(format!(
-                        "choose at most {MAX_CHOSEN_DEVICES} devices, or whole companies"
-                    )));
-                }
-                Ok(Self::Devices(ids(device_ids, "device")?))
-            }
-            TargetKind::Companies => {
-                if company_ids.is_empty() {
-                    return Err(invalid("choose at least one company"));
-                }
-                Ok(Self::Companies(ids(company_ids, "company")?))
-            }
-            TargetKind::All => Ok(Self::All),
-        }
-    }
-
-    pub fn device_ids(&self) -> &[String] {
-        match self {
-            Self::Devices(ids) => ids,
-            _ => &[],
-        }
-    }
-
-    pub fn company_ids(&self) -> &[String] {
-        match self {
-            Self::Companies(ids) => ids,
-            _ => &[],
-        }
-    }
-}
+pub use crate::targets::{MAX_CHOSEN_DEVICES, Target, TargetKind};
 
 pub fn invalid(message: impl Into<std::borrow::Cow<'static, str>>) -> ApiError {
     ApiError::bad_request(message).with_code("invalid_job")
@@ -625,19 +520,6 @@ async fn resolve(executor: &mut impl Executor, target: &Target) -> db::Result<Ve
     };
     let mut rows: Vec<DeviceRow> = Vec::new();
     match target {
-        Target::All => rows = executor.fetch_all(&select()).await?,
-        Target::Companies(ids) => {
-            rows = executor
-                .fetch_all(
-                    &select()
-                        .and_where(
-                            Expr::col((Agents::Table, Agents::CompanyId))
-                                .is_in(ids.iter().cloned()),
-                        )
-                        .to_owned(),
-                )
-                .await?;
-        }
         Target::Devices(ids) => {
             for chunk in ids.chunks(500) {
                 rows.extend(
@@ -654,6 +536,13 @@ async fn resolve(executor: &mut impl Executor, target: &Target) -> db::Result<Ve
                 );
             }
         }
+        _ => {
+            let mut select = select();
+            if let Some(condition) = target.condition() {
+                select.and_where(condition);
+            }
+            rows = executor.fetch_all(&select).await?;
+        }
     }
     rows.sort_by(|left, right| {
         (left.name.to_lowercase(), &left.id).cmp(&(right.name.to_lowercase(), &right.id))
@@ -661,39 +550,20 @@ async fn resolve(executor: &mut impl Executor, target: &Target) -> db::Result<Ve
     Ok(rows)
 }
 
-/// The target in words: the device's name, the companies' names, or how
-/// many devices.
+/// The target in words: the device's name, the companies' or tags' names,
+/// or how many devices.
 async fn target_label(
     executor: &mut impl Executor,
     target: &Target,
     devices: &[DeviceRow],
 ) -> db::Result<String> {
+    if let Some(names) = target.names(executor).await? {
+        return Ok(names);
+    }
     Ok(match target {
-        Target::All => "All devices".to_owned(),
         Target::Devices(_) if devices.len() == 1 => devices[0].name.clone(),
         Target::Devices(_) => format!("{} devices", devices.len()),
-        Target::Companies(ids) => {
-            let mut names: Vec<(String,)> = executor
-                .fetch_all(
-                    &Query::select()
-                        .column(Companies::Name)
-                        .from(Companies::Table)
-                        .and_where(Expr::col(Companies::Id).is_in(ids.iter().cloned()))
-                        .order_by(Companies::Name, Order::Asc)
-                        .to_owned(),
-                )
-                .await?;
-            names.truncate(4);
-            let mut label = names
-                .iter()
-                .map(|(name,)| name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if ids.len() > names.len() {
-                label.push_str(&format!(" and {} more", ids.len() - names.len()));
-            }
-            label
-        }
+        _ => "All devices".to_owned(),
     })
 }
 
@@ -1507,23 +1377,5 @@ mod tests {
         assert_eq!(counts.total, 10);
         assert_eq!(counts.active(), 2);
         assert_eq!(counts.failures(), 1);
-    }
-
-    #[test]
-    fn targets_need_a_choice() {
-        let id = "0b5e8f5c-58a4-4a5e-9d7e-3c0c4d1c2b3a".to_owned();
-        assert!(Target::from_request(TargetKind::Devices, vec![], vec![]).is_err());
-        assert!(Target::from_request(TargetKind::Companies, vec![id.clone()], vec![]).is_err());
-        assert!(Target::from_request(TargetKind::Devices, vec!["x".into()], vec![]).is_err());
-        assert_eq!(
-            Target::from_request(TargetKind::Devices, vec![id.clone(), id.clone()], vec![])
-                .unwrap(),
-            Target::Devices(vec![id.clone()])
-        );
-        assert_eq!(
-            Target::from_request(TargetKind::All, vec![id], vec![]).unwrap(),
-            Target::All
-        );
-        assert!(TargetKind::All.is_wide() && !TargetKind::Devices.is_wide());
     }
 }

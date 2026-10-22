@@ -3,8 +3,8 @@
 Automation runs [toolbox](toolbox.md) scripts, sends library files, and
 scans for and installs [operating system updates](patch-management.md) on
 many devices at once. A **job** is one script run, file delivery, update scan
-or update install on a set of devices: chosen devices, whole companies, or
-every device. A **policy** starts jobs by itself, on a schedule or on each
+or update install on a set of devices: chosen devices, whole companies, the
+devices with chosen [tags](devices.md#tags), or every device. A **policy** starts jobs by itself, on a schedule or on each
 device that enrolls. Policies' jobs are ordinary jobs, so their history is
 the same job list.
 
@@ -27,9 +27,10 @@ The dialog chooses:
 - the script and the account it runs as (the signed-in user or
   SYSTEM/root), or the file and where it goes (the signed-in user's Documents
   or Public Documents, as in [the toolbox](toolbox.md#files));
-- the devices: chosen ones, every device in chosen companies, or every
-  device. Companies and every device need `jobs.run_wide`. They are resolved
-  when the job starts, so a device that enrolls later isn't part of it;
+- the devices: chosen ones, every device in chosen companies, every device
+  with any (or all) of chosen tags, or every device. Companies, tags and
+  every device need `jobs.run_wide`. They are resolved when the job starts,
+  so a device that enrolls or is tagged later isn't part of it;
 - what happens to devices that are offline: skip them, or run when they
   connect within 1 to 168 hours (24 by default).
 
@@ -115,7 +116,11 @@ run. A policy has:
   that are offline (see [Wake-on-LAN](wake-on-lan.md#outcomes)), which
   skips online devices, never waits for offline ones, and can't run on
   enrollment;
-- its devices: every device, chosen companies, or chosen devices;
+- its devices: every device, chosen companies, the devices with any (or
+  all) of chosen tags, or chosen devices. Companies and tags are resolved
+  each time it runs, so a device tagged after the policy was saved is
+  covered from its next run. A policy whose tags were all deleted covers no
+  devices, and says so as its problem when it next fires;
 - when it runs (below);
 - what happens to offline devices: skip them, or catch them up when they
   connect within 1 to 168 hours (24 by default);
@@ -132,7 +137,7 @@ without changing its schedule.
 | Daily | At a time of day in a chosen IANA time zone. |
 | Weekly | At a time of day on chosen days of the week, in a time zone. |
 | Once | At a date and time in a time zone, which must be in the future when it's saved. It stays on with nothing left to do afterwards. |
-| When a device enrolls | On each device that newly enrolls into its companies, or anywhere for every device. A device repaired with an installer again (keeping its ID) doesn't count. |
+| When a device enrolls | On each device that newly enrolls into its companies, or anywhere for every device. A device repaired with an installer again (keeping its ID) doesn't count. A new device has no tags yet, so these policies can't target tags or chosen devices. |
 
 Times of day follow the zone's clock, so 03:00 stays 03:00 across daylight
 saving changes. A time the clocks skip that day runs at the first minute
@@ -205,7 +210,7 @@ time out or never report, like runs started by hand.
 | `scripts.run` | Running scripts on chosen devices, and seeing one's own jobs. | Yes |
 | `files.deliver` | Sending files to chosen devices. | Yes |
 | `updates.view`, `updates.install` | Scan and install [update](patch-management.md) jobs on chosen devices, and seeing one's own jobs. | Yes |
-| `jobs.run_wide` | Running scripts, sending files and updating on whole companies or every device. | No |
+| `jobs.run_wide` | Running scripts, sending files and updating on whole companies, tags or every device. | No |
 | `automation.manage` | Seeing, creating, changing and deleting policies, and seeing their jobs. With what a policy does needs (`scripts.run`, `updates.view`, `updates.install` or `devices.wake`), saving and running it. | No |
 | `audit.view` | Seeing everyone's jobs and runs. | No |
 
@@ -233,12 +238,12 @@ All routes need a signed-in user.
 
 | Route | |
 |---|---|
-| `POST /v1/jobs` | `{script_id, run_as}`, `{file_id, destination}` or `{updates: {action: "scan"}}` / `{updates: {action: "install", categories, reboot, reboot_delay_minutes}}`, with `target` (`devices`, `companies` or `all`), `device_ids` or `company_ids`, `offline` (`skip` or `wait`) and `wait_hours`. Returns the job with its devices. `400 no_devices` if the target covers none. |
+| `POST /v1/jobs` | `{script_id, run_as}`, `{file_id, destination}` or `{updates: {action: "scan"}}` / `{updates: {action: "install", categories, reboot, reboot_delay_minutes}}`, with `target` (`devices`, `companies`, `tags` or `all`), `device_ids`, `company_ids` or `tag_ids` with `tag_match` (`any`, the default, or `all`), `offline` (`skip` or `wait`) and `wait_hours`. Returns the job with its devices. `400 no_devices` if the target covers none. |
 | `GET /v1/jobs?policy_id=&limit=` | Jobs the user may see, newest first, with counts (50 by default, at most 200). |
 | `GET /v1/jobs/{id}` | A job with `devices`: each one's `outcome`, `detail`, `run_id`, `delivery_id`, `update_run_id` or `wake_id`, exit code, saved path and times. |
 | `POST /v1/jobs/{id}/cancel` | Cancels the devices that haven't started. |
 | `GET /v1/automation-policies` | Policies with their latest job (`automation.manage`). |
-| `POST /v1/automation-policies`, `PUT /v1/automation-policies/{id}` | A whole policy: `name`, `enabled`, `action` (`script`, `update_scan`, `update_install` or `wake`), `script_id` and `run_as` for a script, `update_categories`, `reboot` and `reboot_delay_minutes` for an install, `target` with `device_ids` or `company_ids`, `trigger` (`interval`, `daily`, `weekly`, `once`, `enroll`) with `interval_minutes`, `time` (`HH:MM`), `weekdays` (1 = Monday to 7), `run_at` (`YYYY-MM-DDTHH:MM`) and `time_zone` as it needs, `offline`, `catch_up_hours` and `channel_ids`. |
+| `POST /v1/automation-policies`, `PUT /v1/automation-policies/{id}` | A whole policy: `name`, `enabled`, `action` (`script`, `update_scan`, `update_install` or `wake`), `script_id` and `run_as` for a script, `update_categories`, `reboot` and `reboot_delay_minutes` for an install, `target` with `device_ids`, `company_ids` or `tag_ids` and `tag_match`, `trigger` (`interval`, `daily`, `weekly`, `once`, `enroll`) with `interval_minutes`, `time` (`HH:MM`), `weekdays` (1 = Monday to 7), `run_at` (`YYYY-MM-DDTHH:MM`) and `time_zone` as it needs, `offline`, `catch_up_hours` and `channel_ids`. |
 | `DELETE /v1/automation-policies/{id}` | |
 | `POST /v1/automation-policies/{id}/run` | Run now; returns the job. |
 
@@ -262,9 +267,15 @@ should read the lists again.
   second while devices are queued, and at once when a job is created, an
   Agent connects or a device reports.
 - `server/src/api/jobs.rs` and `server/src/api/automation.rs`.
+- Targets: `server/src/targets.rs` resolves every kind of target (chosen
+  devices, companies, tags, every device) for jobs, policies and
+  [alert rules](alerts.md) alike: as an SQL condition when a job is
+  created, or against one device's company and tags when a policy or rule
+  checks it.
 - Tables: `jobs` (what it sends, its target and expiry, who or which policy
   started it), `job_devices` (each device's state), `automation_policies`
-  with `automation_policy_companies`, `_devices` and `_channels`. Runs,
+  (with `tag_match`) and `automation_policy_companies`, `_devices`, `_tags`
+  and `_channels`. Runs,
   deliveries and update runs carry `job_id`; a job's runs have the source
   `job`. An update job's kind is `update_scan` or `update_install`, its
   `item_name` says what it does, and its `item_id` is empty. A wake job's

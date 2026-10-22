@@ -7,9 +7,12 @@ use sea_query::{
 use serde::Serialize;
 
 use super::{Snapshot, snapshot};
-use crate::db::{
-    self, Database,
-    tables::{Agents, DeviceApplications, DeviceIpAddresses, DeviceSystemInfo},
+use crate::{
+    db::{
+        self, Database,
+        tables::{Agents, DeviceApplications, DeviceIpAddresses, DeviceSystemInfo},
+    },
+    targets::{TagMatch, tagged},
 };
 
 /// The longest search text.
@@ -20,6 +23,28 @@ pub const MAX_SEARCH_CHARS: usize = 200;
 pub enum CompanyFilter {
     Company(String),
     None,
+}
+
+/// Which devices a fleet-wide search looks at: those in a company, or in
+/// none, and those with a tag.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scope {
+    pub company: Option<CompanyFilter>,
+    pub tag: Option<String>,
+}
+
+impl Scope {
+    fn apply(&self, select: &mut SelectStatement) {
+        if let Some(company) = &self.company {
+            select.and_where(company_matches(company));
+        }
+        if let Some(tag) = &self.tag {
+            select.and_where(
+                Expr::col((Agents::Table, Agents::Id))
+                    .in_subquery(tagged(std::slice::from_ref(tag), TagMatch::Any)),
+            );
+        }
+    }
 }
 
 /// What devices must match; every text matches anywhere, ignoring case.
@@ -36,7 +61,7 @@ pub struct DeviceFilter {
     pub ip: Option<String>,
     /// Matches an installed application's name.
     pub application: Option<String>,
-    pub company: Option<CompanyFilter>,
+    pub scope: Scope,
 }
 
 /// A `LIKE` pattern that matches `text` anywhere, with its wildcards
@@ -216,9 +241,7 @@ pub async fn devices(database: &Database, filter: &DeviceFilter) -> db::Result<V
     if let Some(text) = &filter.application {
         select.and_where(application_matches(text));
     }
-    if let Some(company) = &filter.company {
-        select.and_where(company_matches(company));
-    }
+    filter.scope.apply(&mut select);
     let rows: Vec<MatchRow> = database.fetch_all(&select).await?;
     let counts = application_counts(database, None).await?;
     Ok(rows
@@ -284,8 +307,8 @@ pub struct FleetVersion {
     pub devices: i64,
 }
 
-/// Applications on enrolled devices of `company`, or of every company.
-fn fleet_applications(company: Option<&CompanyFilter>) -> SelectStatement {
+/// Applications on the enrolled devices in `scope`.
+fn fleet_applications(scope: &Scope) -> SelectStatement {
     let mut select = Query::select();
     select
         .from(DeviceApplications::Table)
@@ -295,9 +318,7 @@ fn fleet_applications(company: Option<&CompanyFilter>) -> SelectStatement {
                 .equals((DeviceApplications::Table, DeviceApplications::DeviceId)),
         )
         .and_where(Expr::col((Agents::Table, Agents::DeletionRequestedAt)).is_null());
-    if let Some(company) = company {
-        select.and_where(company_matches(company));
-    }
+    scope.apply(&mut select);
     select
 }
 
@@ -309,12 +330,12 @@ type VersionRow = (String, Option<String>, Option<String>, i64);
 pub async fn software(
     database: &Database,
     query: Option<&str>,
-    company: Option<&CompanyFilter>,
+    scope: &Scope,
     limit: usize,
 ) -> db::Result<(Vec<FleetApplication>, bool)> {
     let application = |column| (DeviceApplications::Table, column);
     let devices = Alias::new("devices");
-    let mut names = fleet_applications(company);
+    let mut names = fleet_applications(scope);
     names
         .column(application(DeviceApplications::Name))
         .expr_as(
@@ -346,7 +367,7 @@ pub async fn software(
     if rows.is_empty() {
         return Ok((Vec::new(), truncated));
     }
-    let mut versions = fleet_applications(company);
+    let mut versions = fleet_applications(scope);
     versions
         .column(application(DeviceApplications::Name))
         .column(application(DeviceApplications::Version))
@@ -409,10 +430,10 @@ pub async fn installed_on(
     database: &Database,
     name: &str,
     version: Option<Option<&str>>,
-    company: Option<&CompanyFilter>,
+    scope: &Scope,
 ) -> db::Result<Vec<InstalledOn>> {
     let application = |column| (DeviceApplications::Table, column);
-    let mut select = fleet_applications(company);
+    let mut select = fleet_applications(scope);
     select
         .expr_as(
             Expr::col(application(DeviceApplications::DeviceId)),

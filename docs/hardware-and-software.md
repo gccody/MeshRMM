@@ -104,7 +104,7 @@ deletes everything it sent.
   this summary (`system` on each device), so it updates live.
 - **Software** (`/software`): the applications on the most devices, or those
   whose name matches a search, with how many devices have each version,
-  optionally for one company. Opening an application lists its devices, each
+  optionally for one company and one [tag](devices.md#tags). Opening an application lists its devices, each
   linking to the device's Software tab.
 
 ## API
@@ -115,9 +115,9 @@ deletes everything it sent.
 | `POST /v1/agents/{id}/system-info/refresh` | Asks the online Agent for a new snapshot: 202, or 409 `device_offline`. |
 | `GET /v1/agents/{id}/applications` | The applications, by name. |
 | `GET /v1/agents/{id}/application-changes?limit=` | Changes, newest first (200 by default, at most 1,000). |
-| `GET /v1/system-info?q=&os=&model=&serial=&ip=&application=&company=` | The snapshots of the devices matching every filter given. Each matches anywhere in its field, ignoring case: `q` any of the name, operating system, model, serial number, IP addresses and host name; `model` the model or manufacturer; `ip` an adapter's or the public address; `application` an installed application's name. `company` is a company's ID or `none`. |
-| `GET /v1/software?q=&company=&limit=` | Applications by name with device counts per version, or without `q` those on the most devices; `truncated` when more matched. |
-| `GET /v1/software/devices?name=&version=&unversioned=&company=` | The devices that have the application named exactly `name`, in one version if given. |
+| `GET /v1/system-info?q=&os=&model=&serial=&ip=&application=&company=&tag=` | The snapshots of the devices matching every filter given. Each matches anywhere in its field, ignoring case: `q` any of the name, operating system, model, serial number, IP addresses and host name; `model` the model or manufacturer; `ip` an adapter's or the public address; `application` an installed application's name. `company` is a company's ID or `none`; `tag` a tag's ID. |
+| `GET /v1/software?q=&company=&tag=&limit=` | Applications by name with device counts per version, or without `q` those on the most devices; `truncated` when more matched. |
+| `GET /v1/software/devices?name=&version=&unversioned=&company=&tag=` | The devices that have the application named exactly `name`, in one version if given. |
 
 Patching uses the operating system's `id`, `id_like` and `package_managers`;
 Wake-on-LAN uses the adapters' MAC addresses and subnets, which

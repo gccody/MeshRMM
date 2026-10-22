@@ -56,11 +56,13 @@ macro_rules! permissions {
 
 permissions! {
     DevicesView = "devices.view": "See devices, their status and inventory.",
+    DevicesEdit = "devices.edit": "Add and remove devices' tags and edit their notes.",
     DevicesEnroll = "devices.enroll": "Create Agent installers to enroll devices.",
     DevicesDelete = "devices.delete": "Delete devices and uninstall their Agents.",
     DevicesRotateCredentials = "devices.rotate_credentials": "Rotate a device's Agent credential.",
     DevicesWake = "devices.wake": "Wake offline devices with Wake-on-LAN, through online devices on their network.",
     CompaniesManage = "companies.manage": "Create, rename and delete companies and move devices between them.",
+    TagsManage = "tags.manage": "Create, rename, recolor and delete tags.",
     SessionsConnect = "sessions.connect": "Start remote sessions.",
     SessionsConnectBackground = "sessions.connect_background": "Start remote sessions in the background, without the user seeing them.",
     SessionsCloseAny = "sessions.close_any": "End other users' remote sessions.",

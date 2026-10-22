@@ -10,10 +10,11 @@ use crate::{
     db::{
         self, Executor,
         tables::{
-            AlertRuleChannels, AlertRuleCompanies, AlertRules, Companies, NotificationChannels,
+            AlertRuleChannels, AlertRuleCompanies, AlertRuleTags, AlertRules, NotificationChannels,
         },
     },
     http::ApiError,
+    targets::{self, Choice, TagMatch, Target, TargetKind},
 };
 
 pub const MAX_NAME_LENGTH: usize = 120;
@@ -144,7 +145,7 @@ impl ThresholdUnit {
     }
 }
 
-/// A rule, with the companies it covers and the channels it notifies.
+/// A rule, with the devices it covers and the channels it notifies.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Rule {
     pub id: String,
@@ -160,8 +161,9 @@ pub struct Rule {
     pub update_category: Option<String>,
     /// For updates_pending and reboot_pending.
     pub days: Option<i64>,
-    pub all_companies: bool,
-    pub company_ids: Vec<String>,
+    /// Every device, chosen companies, or the devices with chosen tags.
+    #[serde(flatten)]
+    pub target: Target,
     pub channel_ids: Vec<String>,
     pub notify_on_resolve: bool,
     pub created_at: i64,
@@ -176,10 +178,9 @@ impl Rule {
             .and_then(UpdateCategory::parse)
     }
 
-    /// Whether the rule covers a device in `company_id`.
-    pub fn covers(&self, company_id: Option<&str>) -> bool {
-        self.all_companies
-            || company_id.is_some_and(|company| self.company_ids.iter().any(|id| id == company))
+    /// Whether the rule covers `device`.
+    pub fn covers(&self, device: &targets::Device) -> bool {
+        self.target.covers(device)
     }
 
     /// The condition in words, such as "CPU above 90% for 5 minutes".
@@ -249,10 +250,14 @@ pub struct RuleInput {
     pub update_category: Option<String>,
     #[serde(default)]
     pub days: Option<i64>,
-    #[serde(default = "enabled_by_default")]
-    pub all_companies: bool,
+    #[serde(default = "every_device")]
+    pub target: TargetKind,
     #[serde(default)]
     pub company_ids: Vec<String>,
+    #[serde(default)]
+    pub tag_ids: Vec<String>,
+    #[serde(default)]
+    pub tag_match: TagMatch,
     #[serde(default)]
     pub channel_ids: Vec<String>,
     #[serde(default)]
@@ -261,6 +266,10 @@ pub struct RuleInput {
 
 fn enabled_by_default() -> bool {
     true
+}
+
+fn every_device() -> TargetKind {
+    TargetKind::All
 }
 
 fn invalid(message: impl Into<std::borrow::Cow<'static, str>>) -> ApiError {
@@ -352,37 +361,47 @@ impl RuleInput {
             Condition::RebootPending => (None, Some(days(self.days)?)),
             _ => (None, None),
         };
-        if self.all_companies {
-            self.company_ids.clear();
-        } else if self.company_ids.is_empty() {
-            return Err(invalid("choose at least one company, or every device"));
+        if self.target == TargetKind::Devices {
+            return Err(invalid(
+                "a rule covers every device, chosen companies or the devices with chosen tags",
+            ));
         }
-        self.company_ids.sort();
-        self.company_ids.dedup();
+        let target = Target::from_request(
+            self.target,
+            Choice {
+                device_ids: Vec::new(),
+                company_ids: std::mem::take(&mut self.company_ids),
+                tag_ids: std::mem::take(&mut self.tag_ids),
+                tag_match: self.tag_match,
+            },
+        )
+        .map_err(|error| error.with_code("invalid_rule"))?;
+        self.company_ids = target.company_ids().to_vec();
+        self.tag_ids = target.tag_ids().to_vec();
+        self.tag_match = target.tag_match();
         self.channel_ids.sort();
         self.channel_ids.dedup();
         Ok(self)
     }
 
-    /// Checks that the companies and channels named exist.
+    /// The devices a validated rule covers.
+    pub fn scope(&self) -> Target {
+        match self.target {
+            TargetKind::Companies => Target::Companies(self.company_ids.clone()),
+            TargetKind::Tags => Target::Tags {
+                ids: self.tag_ids.clone(),
+                matching: self.tag_match,
+            },
+            TargetKind::All | TargetKind::Devices => Target::All,
+        }
+    }
+
+    /// Checks that the companies, tags and channels named exist.
     pub async fn check_references(&self, executor: &mut impl Executor) -> Result<(), ApiError> {
-        for id in self.company_ids.iter().chain(&self.channel_ids) {
-            crate::agents::parse_id(id, "company or channel")?;
+        for id in &self.channel_ids {
+            crate::agents::parse_id(id, "notification channel")?;
         }
-        if !self.company_ids.is_empty() {
-            let found: Vec<(String,)> = executor
-                .fetch_all(
-                    &Query::select()
-                        .column(Companies::Id)
-                        .from(Companies::Table)
-                        .and_where(Expr::col(Companies::Id).is_in(self.company_ids.clone()))
-                        .to_owned(),
-                )
-                .await?;
-            if found.len() != self.company_ids.len() {
-                return Err(ApiError::not_found("a chosen company no longer exists"));
-            }
-        }
+        self.scope().check_references(executor).await?;
         if !self.channel_ids.is_empty() {
             let found: Vec<(String,)> = executor
                 .fetch_all(
@@ -418,7 +437,8 @@ struct RuleRow {
     nonzero_exit_fails: bool,
     update_category: Option<String>,
     days: Option<i64>,
-    all_companies: bool,
+    target: String,
+    tag_match: String,
     notify_on_resolve: bool,
     created_at: i64,
     updated_at: i64,
@@ -440,7 +460,8 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
             AlertRules::NonzeroExitFails,
             AlertRules::UpdateCategory,
             AlertRules::Days,
-            AlertRules::AllCompanies,
+            AlertRules::Target,
+            AlertRules::TagMatch,
             AlertRules::NotifyOnResolve,
             AlertRules::CreatedAt,
             AlertRules::UpdatedAt,
@@ -451,6 +472,9 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
     companies
         .columns([AlertRuleCompanies::RuleId, AlertRuleCompanies::CompanyId])
         .from(AlertRuleCompanies::Table);
+    let mut tags = Query::select();
+    tags.columns([AlertRuleTags::RuleId, AlertRuleTags::TagId])
+        .from(AlertRuleTags::Table);
     let mut channels = Query::select();
     channels
         .columns([AlertRuleChannels::RuleId, AlertRuleChannels::ChannelId])
@@ -458,23 +482,31 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
     if let Some(id) = id {
         select.and_where(Expr::col(AlertRules::Id).eq(id));
         companies.and_where(Expr::col(AlertRuleCompanies::RuleId).eq(id));
+        tags.and_where(Expr::col(AlertRuleTags::RuleId).eq(id));
         channels.and_where(Expr::col(AlertRuleChannels::RuleId).eq(id));
     }
     let rows: Vec<RuleRow> = executor.fetch_all(&select).await?;
     let companies = grouped(executor.fetch_all(&companies).await?);
+    let tags = grouped(executor.fetch_all(&tags).await?);
     let channels = grouped(executor.fetch_all(&channels).await?);
     Ok(rows
         .into_iter()
         .filter_map(|row| {
-            let (Some(severity), Some(condition)) = (
+            let choice = Choice {
+                company_ids: companies.get(&row.id).cloned().unwrap_or_default(),
+                tag_ids: tags.get(&row.id).cloned().unwrap_or_default(),
+                ..Choice::default()
+            };
+            let (Some(severity), Some(condition), Some(target)) = (
                 Severity::parse(&row.severity),
                 Condition::parse(&row.condition),
+                Target::from_stored(&row.target, &row.tag_match, choice),
             ) else {
                 tracing::error!(rule_id = row.id, "stored alert rule is invalid");
                 return None;
             };
             Some(Rule {
-                company_ids: companies.get(&row.id).cloned().unwrap_or_default(),
+                target,
                 channel_ids: channels.get(&row.id).cloned().unwrap_or_default(),
                 threshold_unit: row.threshold_unit.as_deref().and_then(ThresholdUnit::parse),
                 id: row.id,
@@ -487,7 +519,6 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
                 nonzero_exit_fails: row.nonzero_exit_fails,
                 update_category: row.update_category,
                 days: row.days,
-                all_companies: row.all_companies,
                 notify_on_resolve: row.notify_on_resolve,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
@@ -520,7 +551,7 @@ pub async fn save(
     now: i64,
     create: bool,
 ) -> db::Result<()> {
-    let values: [(AlertRules, sea_query::Value); 14] = [
+    let values: [(AlertRules, sea_query::Value); 15] = [
         (AlertRules::Name, input.name.as_str().into()),
         (AlertRules::Severity, input.severity.as_str().into()),
         (AlertRules::Enabled, input.enabled.into()),
@@ -540,7 +571,8 @@ pub async fn save(
             input.update_category.clone().into(),
         ),
         (AlertRules::Days, input.days.into()),
-        (AlertRules::AllCompanies, input.all_companies.into()),
+        (AlertRules::Target, input.target.as_str().into()),
+        (AlertRules::TagMatch, input.tag_match.as_str().into()),
         (AlertRules::NotifyOnResolve, input.notify_on_resolve.into()),
         (AlertRules::UpdatedAt, now.into()),
         (AlertRules::UpdatedByUserId, user_id.into()),
@@ -582,6 +614,14 @@ pub async fn save(
         executor
             .execute(
                 &Query::delete()
+                    .from_table(AlertRuleTags::Table)
+                    .and_where(Expr::col(AlertRuleTags::RuleId).eq(id))
+                    .to_owned(),
+            )
+            .await?;
+        executor
+            .execute(
+                &Query::delete()
                     .from_table(AlertRuleChannels::Table)
                     .and_where(Expr::col(AlertRuleChannels::RuleId).eq(id))
                     .to_owned(),
@@ -595,6 +635,16 @@ pub async fn save(
             .columns([AlertRuleCompanies::RuleId, AlertRuleCompanies::CompanyId]);
         for company_id in &input.company_ids {
             insert.values_panic([id.into(), company_id.as_str().into()]);
+        }
+        executor.execute(&insert).await?;
+    }
+    if !input.tag_ids.is_empty() {
+        let mut insert = Query::insert();
+        insert
+            .into_table(AlertRuleTags::Table)
+            .columns([AlertRuleTags::RuleId, AlertRuleTags::TagId]);
+        for tag_id in &input.tag_ids {
+            insert.values_panic([id.into(), tag_id.as_str().into()]);
         }
         executor.execute(&insert).await?;
     }
@@ -641,7 +691,8 @@ mod tests {
         assert_eq!(rule.threshold_unit, None);
         assert_eq!(rule.duration_minutes, Some(30));
         assert!(!rule.nonzero_exit_fails);
-        assert!(rule.all_companies && rule.company_ids.is_empty());
+        assert_eq!(rule.scope(), Target::All);
+        assert!(rule.company_ids.is_empty());
 
         let disk = input(json!({
             "name": "Disk", "severity": "warning", "condition": "disk_space",
@@ -674,9 +725,31 @@ mod tests {
             "a disk rule needs a unit"
         );
         assert!(
-            input(json!({ "name": "R", "severity": "info", "condition": "script_failed", "all_companies": false }))
+            input(json!({ "name": "R", "severity": "info", "condition": "script_failed", "target": "companies" }))
                 .is_err(),
             "a rule for chosen companies needs one"
+        );
+        assert!(
+            input(json!({ "name": "R", "severity": "info", "condition": "script_failed", "target": "devices" }))
+                .is_err(),
+            "rules don't cover chosen devices"
+        );
+        let tagged = input(json!({
+            "name": "R", "severity": "info", "condition": "script_failed", "target": "tags",
+            "tag_ids": ["00000000-0000-4000-8000-00000000000b", "00000000-0000-4000-8000-00000000000a"],
+            "company_ids": ["00000000-0000-4000-8000-00000000000c"], "tag_match": "all",
+        }))
+        .unwrap();
+        assert!(tagged.company_ids.is_empty());
+        assert_eq!(
+            tagged.scope(),
+            Target::Tags {
+                ids: vec![
+                    "00000000-0000-4000-8000-00000000000a".into(),
+                    "00000000-0000-4000-8000-00000000000b".into()
+                ],
+                matching: TagMatch::All
+            }
         );
         assert!(
             input(json!({ "name": "", "severity": "info", "condition": "script_failed" })).is_err()
@@ -697,23 +770,27 @@ mod tests {
             nonzero_exit_fails: false,
             update_category: None,
             days: None,
-            all_companies: false,
-            company_ids: vec!["acme".into()],
+            target: Target::Companies(vec!["acme".into()]),
             channel_ids: vec![],
             notify_on_resolve: false,
             created_at: 0,
             updated_at: 0,
         };
         assert_eq!(rule.describe(), "CPU above 90.5% for 1 minute");
-        assert!(rule.covers(Some("acme")));
-        assert!(!rule.covers(Some("other")));
-        assert!(!rule.covers(None));
+        let device = |company: Option<&str>| targets::Device {
+            id: "d".into(),
+            company_id: company.map(Into::into),
+            tag_ids: vec![],
+        };
+        assert!(rule.covers(&device(Some("acme"))));
+        assert!(!rule.covers(&device(Some("other"))));
+        assert!(!rule.covers(&device(None)));
         assert!(
             Rule {
-                all_companies: true,
+                target: Target::All,
                 ..rule.clone()
             }
-            .covers(None)
+            .covers(&device(None))
         );
         let disk = Rule {
             condition: Condition::DiskSpace,

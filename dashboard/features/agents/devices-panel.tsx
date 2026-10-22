@@ -8,6 +8,8 @@ import { useInstallerDownload } from "../enrollment/use-installer-download";
 import { ConnectionReasonModal } from "../session/connection-reason-modal";
 import { ViewerLaunchNotice } from "../session/viewer-launch-notice";
 import { StartJobModal } from "../automation/start-job-modal";
+import { TagDevicesDialog } from "../tags/tag-dialogs";
+import type { TagMatch } from "../tags/model";
 import { RunScriptModal } from "../toolbox/run-script-modal";
 import { WakeDialog } from "../wake/wake-dialog";
 import { type ActionErrorSource, listActionErrors } from "../workspace/action-errors";
@@ -17,6 +19,7 @@ import type { Agent } from "./types";
 import {
   type AgentStatusFilter,
   type CompanyFilter,
+  DEFAULT_DEVICE_FILTERS,
   type DeviceFilters,
   NO_COMPANY,
   clampDeviceQuery,
@@ -52,6 +55,7 @@ export function DevicesPanel() {
     delete: can("devices.delete"),
     enroll: can("devices.enroll"),
     moveCompany: can("companies.manage"),
+    editTags: can("devices.edit"),
   };
   // A connection the device's user must approve, waiting for its reason.
   const [pendingConnect, setPendingConnect] = useState<{ agent: Agent; background: boolean } | null>(null);
@@ -68,12 +72,17 @@ export function DevicesPanel() {
   // The device being moved to another company, and the menu that asked.
   const [moving, setMoving] = useState<Agent | null>(null);
   const moveOpener = useRef<HTMLElement | null>(null);
+  // The devices whose tags are being edited, and the control that asked.
+  const [tagging, setTagging] = useState<Agent[] | null>(null);
+  const tagOpener = useRef<HTMLElement | null>(null);
   const requestConnect = (agent: Agent, background: boolean) => {
     if (account.connection_approval) setPendingConnect({ agent, background });
     else void remote.connect(agent, background);
   };
   const filters = parseDeviceFilters(searchParams);
-  const { status, company } = filters;
+  const { status, company, tags, tagMatch } = filters;
+  // A stable key for the chosen tags, which the URL parses afresh each render.
+  const tagKey = tags.join(",");
   // The search box updates at once; the URL follows after a pause in typing.
   const [queryInput, setQueryInput] = useState(filters.query);
   const [querySource, setQuerySource] = useState(filters.query);
@@ -86,23 +95,24 @@ export function DevicesPanel() {
 
   useEffect(() => {
     if (queryInput === filters.query) return;
-    const timer = window.setTimeout(() => writeFilters({ query: queryInput, status, company }), QUERY_WRITE_DELAY_MS);
+    const timer = window.setTimeout(() => writeFilters({ ...filters, query: queryInput }), QUERY_WRITE_DELAY_MS);
     return () => window.clearTimeout(timer);
     // writeFilters changes with the URL, which this effect already follows.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters.query, queryInput, status, company]);
+  }, [filters.query, queryInput, status, company, tagKey, tagMatch]);
 
   // The Devices link carries the filters, including any not yet in the URL.
-  const search = serializeDeviceFilters({ query: queryInput, status, company });
+  const search = serializeDeviceFilters({ ...filters, query: queryInput });
   useEffect(() => {
     setDevicesSearch(search);
   }, [search, setDevicesSearch]);
 
-  const changeStatus = (next: AgentStatusFilter) => writeFilters({ query: queryInput, status: next, company });
-  const changeCompany = (next: CompanyFilter) => writeFilters({ query: queryInput, status, company: next });
+  const changeStatus = (next: AgentStatusFilter) => writeFilters({ ...filters, query: queryInput, status: next });
+  const changeCompany = (next: CompanyFilter) => writeFilters({ ...filters, query: queryInput, company: next });
+  const changeTags = (next: string[], match: TagMatch) => writeFilters({ ...filters, query: queryInput, tags: next, tagMatch: match });
   const filteredAgents = useMemo(
-    () => filterAgents(inventory.agents, { query: queryInput, status, company }),
-    [inventory.agents, queryInput, status, company],
+    () => filterAgents(inventory.agents, { query: queryInput, status, company, tags: tagKey ? tagKey.split(",") : [], tagMatch }, inventory.tags),
+    [inventory.agents, inventory.tags, queryInput, status, company, tagKey, tagMatch],
   );
   // New devices join the company the page shows.
   const enrollInto = company && company !== NO_COMPANY && inventory.companies.some((candidate) => candidate.id === company) ? company : "";
@@ -127,9 +137,12 @@ export function DevicesPanel() {
         onRefresh={() => void inventory.refresh()}
         onAddDevice={(opener) => { enrollOpener.current = opener; installer.reset(enrollInto); setIsEnrolling(true); }}
         companies={inventory.companies}
+        tags={inventory.tags}
         query={queryInput}
         status={status}
         company={company}
+        tagFilter={tags}
+        tagMatch={tagMatch}
         connectingId={remote.connectingId}
         connectingBackgroundId={remote.connectingBackgroundId}
         deletingId={deletingId}
@@ -138,7 +151,9 @@ export function DevicesPanel() {
         onQueryChange={(query) => setQueryInput(clampDeviceQuery(query))}
         onStatusChange={changeStatus}
         onCompanyChange={changeCompany}
-        onClearFilters={() => { setQueryInput(""); writeFilters({ query: "", status: "all", company: "" }); }}
+        onTagsChange={changeTags}
+        onClearFilters={() => { setQueryInput(""); writeFilters(DEFAULT_DEVICE_FILTERS); }}
+        onEditTags={(agents, opener) => { tagOpener.current = opener; setTagging(agents); }}
         onMove={(agent, opener) => { moveOpener.current = opener; setMoving(agent); }}
         onRemote={(agent) => requestConnect(agent, false)}
         onRemoteBackground={(agent) => requestConnect(agent, true)}
@@ -186,6 +201,7 @@ export function DevicesPanel() {
         returnFocus={runScriptOpener}
       />}
       {waking && <WakeDialog agents={waking} returnFocus={wakeOpener} onClose={() => setWaking(null)} />}
+      {tagging && <TagDevicesDialog agents={tagging} returnFocus={tagOpener} onClose={() => setTagging(null)} />}
       {moving && <MoveDeviceDialog agent={moving} returnFocus={moveOpener} onClose={() => setMoving(null)} />}
       {pendingConnect && <ConnectionReasonModal
         agentName={pendingConnect.agent.name}

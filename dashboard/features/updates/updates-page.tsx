@@ -41,7 +41,7 @@ const TILES: { status: Exclude<FleetStatusFilter, "" | "pending">; label: string
 ];
 
 // `/updates`: every device's pending updates at a glance, filtered by
-// company, operating system and state, with installs on many devices.
+// company, tag, operating system and state, with installs on many devices.
 export function UpdatesPage() {
   const { authorizedFetch, inventory, can } = useWorkspace();
   const navigate = useNavigate();
@@ -85,14 +85,14 @@ export function UpdatesPage() {
       .filter((device) => !inventory.hasData || agents.has(device.device_id))
       .map((device) => {
         const agent = agents.get(device.device_id);
-        return agent ? { ...device, device_name: agent.name, company_id: agent.company_id ?? null, connected: agent.connected } : device;
+        return agent ? { ...device, device_name: agent.name, company_id: agent.company_id ?? null, tag_ids: agent.tag_ids ?? [], connected: agent.connected } : device;
       }));
   }, [data, inventory.agents, inventory.hasData]);
   const shown = (devices ?? []).filter((device) => matchesFleetFilters(device, filters, now));
   const totals = useMemo(() => fleetTotals(devices ?? [], now), [devices, now]);
   const chosenDevices = (devices ?? []).filter((device) => chosen.has(device.device_id));
   const allShownChosen = shown.length > 0 && shown.every((device) => chosen.has(device.device_id));
-  const filtered = Boolean(filters.query.trim() || filters.company || filters.platform || filters.status);
+  const filtered = Boolean(filters.query.trim() || filters.company || filters.tag || filters.platform || filters.status);
 
   const toggle = (id: string, checked: boolean) => setChosen((current) => {
     const next = new Set(current);
@@ -168,6 +168,13 @@ export function UpdatesPage() {
               <option value={NO_COMPANY_FILTER}>No company</option>
               {inventory.companies.map((company) => <option key={company.id} value={company.id}>{company.name}</option>)}
             </select>
+            {(inventory.tags.length > 0 || filters.tag) && (
+              <select aria-label="Tag" value={filters.tag} onChange={(event) => choose({ tag: event.target.value })}>
+                <option value="">Every tag</option>
+                {filters.tag && !inventory.tags.some((tag) => tag.id === filters.tag) && <option value={filters.tag}>Unknown tag</option>}
+                {inventory.tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}
+              </select>
+            )}
             <select aria-label="Operating system" value={filters.platform} onChange={(event) => choose({ platform: event.target.value as FleetFilters["platform"] })}>
               <option value="">Every system</option>
               {(["windows", "macos", "linux"] as const).map((platform) => <option key={platform} value={platform}>{PLATFORM_LABELS[platform]}</option>)}

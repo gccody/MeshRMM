@@ -100,6 +100,11 @@ test("the preview counts devices, skips and offline ones", () => {
   const agents = [agent("win", "windows"), agent("mac", "macos", false, "acme"), agent("linux", "linux", true, "acme"), agent("old", "windows", false)];
   assert.deepEqual(coveredAgents(agents, { kind: "companies", deviceIds: [], companyIds: ["acme"] }).map((item) => item.id), ["mac", "linux"]);
   assert.deepEqual(coveredAgents(agents, { kind: "devices", deviceIds: ["win", "gone"], companyIds: [] }).map((item) => item.id), ["win"]);
+  const tagged = [{ ...agents[0], tag_ids: ["s", "l"] }, { ...agents[1], tag_ids: ["l"] }, agents[2]];
+  const byTags = (tagIds, tagMatch) => coveredAgents(tagged, { kind: "tags", deviceIds: [], companyIds: [], tagIds, tagMatch }).map((item) => item.id);
+  assert.deepEqual(byTags(["s", "l"], "any"), ["win", "mac"]);
+  assert.deepEqual(byTags(["s", "l"], "all"), ["win"]);
+  assert.deepEqual(byTags([], "any"), [], "no tags cover no devices");
   const all = { kind: "all", deviceIds: [], companyIds: [] };
   const preview = jobPreview(agents, all, "shell");
   assert.deepEqual(preview, { devices: 4, skipped: 2, offline: 1 });
@@ -127,6 +132,8 @@ test("schedules and targets read as words", () => {
   assert.equal(describeTarget({ target: "all", company_ids: [], device_ids: [] }, companies, new Map()), "All devices");
   assert.equal(describeTarget({ target: "companies", company_ids: ["a", "b"], device_ids: [] }, companies, new Map()), "Acme, Deleted company");
   assert.equal(describeTarget({ target: "devices", company_ids: [], device_ids: ["1", "2", "3", "4"] }, companies, new Map()), "4 devices");
+  const tags = [{ id: "l", name: "London", color: "green" }, { id: "s", name: "Servers", color: "blue" }];
+  assert.equal(describeTarget({ target: "tags", company_ids: [], device_ids: [], tag_ids: ["s", "l"], tag_match: "any" }, companies, new Map(), tags), "Tagged London or Servers");
 });
 
 test("policy drafts check the server's rules and become its input", () => {
@@ -134,14 +141,16 @@ test("policy drafts check the server's rules and become its input", () => {
   assert.equal(policyDraftProblem(draft), null);
   assert.deepEqual(policyInput(draft), {
     name: "Nightly", enabled: true, action: "script", script_id: "s", run_as: "system", target: "all", device_ids: [], company_ids: [],
-    trigger: "daily", offline: "wait", catch_up_hours: 24, channel_ids: [], time: "03:00", time_zone: "Europe/Paris",
+    tag_ids: [], tag_match: "any", trigger: "daily", offline: "wait", catch_up_hours: 24, channel_ids: [], time: "03:00", time_zone: "Europe/Paris",
   });
   const problems = [
     { name: "" },
     { scriptId: "" },
     { target: "companies" },
     { target: "devices" },
+    { target: "tags" },
     { trigger: "enroll", target: "devices", deviceIds: ["d"] },
+    { trigger: "enroll", target: "tags", tagIds: ["t"] },
     { trigger: "interval", intervalValue: "4", intervalUnit: "minutes" },
     { trigger: "interval", intervalValue: "700", intervalUnit: "hours" },
     { time: "3:00" },
@@ -160,6 +169,8 @@ test("policy drafts check the server's rules and become its input", () => {
   const weekly = policyInput({ ...draft, trigger: "weekly", weekdays: [5, 1], target: "companies", companyIds: ["a"] });
   assert.deepEqual(weekly.weekdays, [1, 5]);
   assert.deepEqual(weekly.company_ids, ["a"]);
+  const tagged = policyInput({ ...draft, target: "tags", tagIds: ["t"], tagMatch: "all", companyIds: ["a"] });
+  assert.deepEqual([tagged.target, tagged.tag_ids, tagged.tag_match, tagged.company_ids], ["tags", ["t"], "all", []]);
   const once = policyInput({ ...draft, trigger: "once", runAt: "2026-11-01T06:15" });
   assert.equal(once.run_at, "2026-11-01T06:15");
   assert.equal(once.time, undefined);
@@ -175,7 +186,7 @@ test("a saved policy's draft round-trips", () => {
   assert.equal(draft.intervalUnit, "minutes");
   assert.deepEqual(policyInput(draft), {
     name: "Weekly", enabled: false, action: "script", script_id: "s", run_as: "user", target: "devices", device_ids: ["d"], company_ids: [],
-    trigger: "interval", offline: "skip", catch_up_hours: 12, channel_ids: ["c"], interval_minutes: 90,
+    tag_ids: [], tag_match: "any", trigger: "interval", offline: "skip", catch_up_hours: 12, channel_ids: ["c"], interval_minutes: 90,
   });
   assert.equal(policyDraft({ ...policy, interval_minutes: 120 }, "UTC").intervalUnit, "hours");
   assert.deepEqual(timeZones(["Europe/Paris"]), ["Europe/Paris", "UTC"]);

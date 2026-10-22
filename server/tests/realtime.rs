@@ -109,7 +109,9 @@ async fn an_agent_that_goes_offline_to_update_shows_as_updating() {
         state.presence = meshrmm_server::realtime::Presence::new(
             state.database.clone(),
             state.agents.clone(),
-            Duration::from_millis(500),
+            // Long enough for a slow runner to publish the disconnect
+            // inside it.
+            Duration::from_millis(1500),
         );
     }
     for app in apps_with(short_grace).await {
@@ -159,7 +161,7 @@ async fn an_agent_that_goes_offline_to_update_shows_as_updating() {
         let state = device(&back, &agent.device_id);
         assert_eq!(state["connected"], true);
         assert!(state["updating_to"].is_null());
-        quiet(&mut events, Duration::from_millis(700)).await;
+        quiet(&mut events, Duration::from_millis(1700)).await;
 
         app.finish().await;
     }

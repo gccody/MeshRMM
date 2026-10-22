@@ -2,6 +2,7 @@ import { LoaderCircle, X } from "lucide-react";
 import { type FormEvent, type RefObject, useId, useState } from "react";
 import { AuthenticationRequired, errorText } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
+import { TagTargetFields } from "../tags/tag-chip";
 import { useWorkspace } from "../workspace/workspace-context";
 import { saveRule } from "./alerts-api";
 import {
@@ -77,7 +78,7 @@ export function RuleEditor({ rule, channels, returnFocus, onClose, onSaved }: {
 
   const gigabytes = form.condition === "disk_space" && form.thresholdUnit === "gb";
   const thresholdLabel = form.condition === "disk_space" ? "Alert when free space is below" : "Alert when the average is above";
-  const { companies } = inventory;
+  const { companies, tags } = inventory;
 
   return (
     <ModalDialog className="settings-modal role-modal" labelledBy={titleId} onClose={onClose} returnFocus={returnFocus}>
@@ -150,10 +151,12 @@ export function RuleEditor({ rule, channels, returnFocus, onClose, onSaved }: {
 
           <fieldset className="choice-list">
             <legend>Applies to</legend>
-            <label><input type="radio" name="rule-scope" checked={form.allCompanies} onChange={() => update({ allCompanies: true })} /><span><strong>Every device</strong>Including devices in no company.</span></label>
-            <label><input type="radio" name="rule-scope" checked={!form.allCompanies} onChange={() => update({ allCompanies: false })} disabled={!companies.length && form.allCompanies} /><span><strong>Devices of chosen companies</strong>{companies.length ? "Choose them below." : "There are no companies yet."}</span></label>
+            <label><input type="radio" name="rule-scope" checked={form.target === "all"} onChange={() => update({ target: "all" })} /><span><strong>Every device</strong>Including devices in no company.</span></label>
+            <label><input type="radio" name="rule-scope" checked={form.target === "companies"} onChange={() => update({ target: "companies" })} disabled={!companies.length && form.target !== "companies"} /><span><strong>Devices of chosen companies</strong>{companies.length ? "Choose them below." : "There are no companies yet."}</span></label>
+            <label><input type="radio" name="rule-scope" checked={form.target === "tags"} onChange={() => update({ target: "tags" })} disabled={!tags.length && form.target !== "tags"} /><span><strong>Devices with chosen tags</strong>{tags.length ? "Including devices tagged after the rule is saved." : "There are no tags yet."}</span></label>
           </fieldset>
-          {!form.allCompanies && (
+          {form.target === "tags" && <TagTargetFields tags={tags} chosen={form.tagIds} match={form.tagMatch} onChange={({ tagIds, tagMatch }) => update({ ...(tagIds && { tagIds }), ...(tagMatch && { tagMatch }) })} />}
+          {form.target === "companies" && (
             <fieldset className="choice-list">
               <legend>Companies</legend>
               {companies.map((company) => (

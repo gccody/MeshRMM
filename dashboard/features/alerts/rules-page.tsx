@@ -101,7 +101,7 @@ export function RulesPage() {
                     <span>{rule.description}</span>
                   </td>
                   <td><SeverityBadge severity={rule.severity} /></td>
-                  <td>{scopeLabel(rule, companyNames)}</td>
+                  <td>{scopeLabel(rule, companyNames, inventory.tags)}</td>
                   <td>{notifies(rule)}{rule.channel_ids.length > 0 && rule.notify_on_resolve && <span>Also when resolved</span>}</td>
                   <td className="row-actions">
                     {canManage && <>

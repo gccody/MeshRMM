@@ -81,6 +81,10 @@ impl<'a> Target<'a> {
         }
     }
 
+    pub fn tag(id: &'a str) -> Self {
+        Self { kind: "tag", id }
+    }
+
     pub fn agent_installer(id: &'a str) -> Self {
         Self {
             kind: "agent_installer",

@@ -121,8 +121,10 @@ test("the rule form sends only what its condition uses", () => {
     nonzero_exit_fails: false,
     update_category: null,
     days: null,
-    all_companies: true,
+    target: "all",
     company_ids: [],
+    tag_ids: [],
+    tag_match: "any",
     channel_ids: [],
     notify_on_resolve: false,
   });
@@ -138,9 +140,12 @@ test("the rule form sends only what its condition uses", () => {
   const cpu = withCondition(offline, "cpu");
   assert.equal(ruleFormProblem({ ...cpu, duration: "61" }), "Enter 1 to 60 minutes.");
   assert.equal(ruleFormProblem({ ...cpu, duration: "1.5" }), "Enter 1 to 60 minutes.");
-  assert.equal(ruleFormProblem({ ...cpu, allCompanies: false }), "Choose at least one company, or every device.");
-  assert.deepEqual(ruleInput({ ...cpu, allCompanies: false, companyIds: ["c"] }).company_ids, ["c"]);
-  assert.deepEqual(ruleInput({ ...cpu, allCompanies: true, companyIds: ["c"] }).company_ids, []);
+  assert.equal(ruleFormProblem({ ...cpu, target: "companies" }), "Choose at least one company, or every device.");
+  assert.equal(ruleFormProblem({ ...cpu, target: "tags" }), "Choose at least one tag, or every device.");
+  assert.deepEqual(ruleInput({ ...cpu, target: "companies", companyIds: ["c"] }).company_ids, ["c"]);
+  assert.deepEqual(ruleInput({ ...cpu, target: "all", companyIds: ["c"], tagIds: ["t"] }).company_ids, []);
+  const tagged = ruleInput({ ...cpu, target: "tags", companyIds: ["c"], tagIds: ["t"], tagMatch: "all" });
+  assert.deepEqual([tagged.target, tagged.company_ids, tagged.tag_ids, tagged.tag_match], ["tags", [], ["t"], "all"]);
 
   const script = withCondition(offline, "script_failed");
   assert.equal(ruleInput({ ...script, nonzeroExitFails: true }).nonzero_exit_fails, true);
@@ -151,12 +156,16 @@ test("the rule form sends only what its condition uses", () => {
   assert.equal(saved.duration, "5");
 });
 
-test("rules name the companies they cover", () => {
+test("rules name the companies or tags they cover", () => {
   const names = new Map([["a", "Acme"], ["b", "Beta"], ["c", "Gamma"]]);
-  assert.equal(scopeLabel({ all_companies: true, company_ids: [] }, names), "Every device");
-  assert.equal(scopeLabel({ all_companies: false, company_ids: ["a", "b"] }, names), "Acme, Beta");
-  assert.equal(scopeLabel({ all_companies: false, company_ids: ["a", "b", "c"] }, names), "Acme, Beta and 1 more");
-  assert.equal(scopeLabel({ all_companies: false, company_ids: ["gone"] }, names), "No companies");
+  assert.equal(scopeLabel({ target: "all", company_ids: [] }, names), "Every device");
+  assert.equal(scopeLabel({ target: "companies", company_ids: ["a", "b"] }, names), "Acme, Beta");
+  assert.equal(scopeLabel({ target: "companies", company_ids: ["a", "b", "c"] }, names), "Acme, Beta and 1 more");
+  assert.equal(scopeLabel({ target: "companies", company_ids: ["gone"] }, names), "No companies");
+  const tags = [{ id: "l", name: "London", color: "green" }, { id: "s", name: "Servers", color: "blue" }];
+  assert.equal(scopeLabel({ target: "tags", company_ids: [], tag_ids: ["s", "l"], tag_match: "all" }, names, tags), "Tagged London and Servers");
+  assert.equal(scopeLabel({ target: "tags", company_ids: [], tag_ids: ["l"], tag_match: "any" }, names, tags), "Tagged London");
+  assert.equal(scopeLabel({ target: "tags", company_ids: [], tag_ids: ["gone"], tag_match: "any" }, names, tags), "Deleted tags");
 });
 
 test("the channel form keeps, replaces or removes a webhook's secret", () => {

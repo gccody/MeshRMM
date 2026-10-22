@@ -5,6 +5,7 @@ import type { PermissionInfo } from "../users/model.ts";
 const GROUP_LABELS: Record<string, string> = {
   devices: "Devices",
   companies: "Companies",
+  tags: "Tags",
   sessions: "Remote sessions",
   scripts: "Scripts",
   files: "Files",

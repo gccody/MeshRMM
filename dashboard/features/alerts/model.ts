@@ -1,6 +1,8 @@
 // Alerts, the rules that raise them and the channels they notify, as the
 // server sends them, and how the website words them. Imports carry the .ts
 // extension so node:test can load this module directly.
+import type { Tag } from "../agents/types.ts";
+import { type TagMatch, describeTagTarget } from "../tags/model.ts";
 import { CATEGORIES, CATEGORY_LABELS, type UpdateCategory } from "../updates/model.ts";
 
 export type Severity = "info" | "warning" | "critical";
@@ -81,8 +83,12 @@ export type AlertRule = {
   // may be pending.
   update_category?: UpdateCategoryChoice | null;
   days?: number | null;
-  all_companies: boolean;
+  // Every device, chosen companies, or the devices with any or all of
+  // chosen tags.
+  target: RuleTarget;
   company_ids: string[];
+  tag_ids: string[];
+  tag_match: TagMatch;
   channel_ids: string[];
   notify_on_resolve: boolean;
   // The condition in words.
@@ -267,6 +273,8 @@ export function resolutionLabel(alert: Pick<Alert, "resolution" | "resolved_by">
 export const clearsItself = (condition: Condition) => condition !== "script_failed" && condition !== "update_install_failed";
 
 // The rule editor's fields, as text while being edited.
+export type RuleTarget = "all" | "companies" | "tags";
+
 export type RuleForm = {
   name: string;
   severity: Severity;
@@ -278,8 +286,10 @@ export type RuleForm = {
   nonzeroExitFails: boolean;
   updateCategory: UpdateCategoryChoice;
   days: string;
-  allCompanies: boolean;
+  target: RuleTarget;
   companyIds: string[];
+  tagIds: string[];
+  tagMatch: TagMatch;
   channelIds: string[];
   notifyOnResolve: boolean;
 };
@@ -308,8 +318,10 @@ export function ruleForm(rule: AlertRule | null): RuleForm {
       nonzeroExitFails: false,
       updateCategory: "security",
       days: DEFAULTS.device_offline.days,
-      allCompanies: true,
+      target: "all",
       companyIds: [],
+      tagIds: [],
+      tagMatch: "any",
       channelIds: [],
       notifyOnResolve: false,
     };
@@ -325,8 +337,10 @@ export function ruleForm(rule: AlertRule | null): RuleForm {
     nonzeroExitFails: rule.nonzero_exit_fails,
     updateCategory: rule.update_category ?? "security",
     days: rule.days === null || rule.days === undefined ? DEFAULTS[rule.condition].days : String(rule.days),
-    allCompanies: rule.all_companies,
+    target: rule.target,
     companyIds: rule.company_ids,
+    tagIds: rule.tag_ids ?? [],
+    tagMatch: rule.tag_match ?? "any",
     channelIds: rule.channel_ids,
     notifyOnResolve: rule.notify_on_resolve,
   };
@@ -362,7 +376,8 @@ export function ruleFormProblem(form: RuleForm): string | null {
     const days = Number(form.days);
     if (!form.days.trim() || !Number.isInteger(days) || days < 1 || days > MAX_DAYS) return `Enter 1 to ${MAX_DAYS} days.`;
   }
-  if (!form.allCompanies && !form.companyIds.length) return "Choose at least one company, or every device.";
+  if (form.target === "companies" && !form.companyIds.length) return "Choose at least one company, or every device.";
+  if (form.target === "tags" && !form.tagIds.length) return "Choose at least one tag, or every device.";
   return null;
 }
 
@@ -379,16 +394,23 @@ export function ruleInput(form: RuleForm) {
     nonzero_exit_fails: form.condition === "script_failed" && form.nonzeroExitFails,
     update_category: form.condition === "updates_pending" ? form.updateCategory : null,
     days: usesDays(form.condition) ? Number(form.days) : null,
-    all_companies: form.allCompanies,
-    company_ids: form.allCompanies ? [] : form.companyIds,
+    target: form.target,
+    company_ids: form.target === "companies" ? form.companyIds : [],
+    tag_ids: form.target === "tags" ? form.tagIds : [],
+    tag_match: form.tagMatch,
     channel_ids: form.channelIds,
     notify_on_resolve: form.notifyOnResolve,
   };
 }
 
 // Which devices a rule covers, in words.
-export function scopeLabel(rule: Pick<AlertRule, "all_companies" | "company_ids">, companyNames: ReadonlyMap<string, string>) {
-  if (rule.all_companies) return "Every device";
+export function scopeLabel(
+  rule: Pick<AlertRule, "target" | "company_ids"> & Partial<Pick<AlertRule, "tag_ids" | "tag_match">>,
+  companyNames: ReadonlyMap<string, string>,
+  tags: readonly Tag[] = [],
+) {
+  if (rule.target === "all") return "Every device";
+  if (rule.target === "tags") return describeTagTarget(rule.tag_ids ?? [], rule.tag_match ?? "any", tags);
   const names = rule.company_ids.map((id) => companyNames.get(id)).filter((name): name is string => Boolean(name));
   if (!names.length) return "No companies";
   return names.length <= 2 ? names.join(", ") : `${names.slice(0, 2).join(", ")} and ${names.length - 2} more`;
