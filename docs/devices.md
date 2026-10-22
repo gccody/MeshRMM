@@ -94,11 +94,19 @@ already keeps open:
 - uptime;
 - the capacity and free space of its local fixed volumes.
 
-A device's tile or name opens its own page: the latest reading, every volume's free
+A device's tile or name opens its own page. Its **Usage** tab shows the latest reading, every volume's free
 space, and charts of the last 15 minutes live, or the last hour, 24 hours or
 7 days. The server keeps the live readings in memory
 (`server/src/realtime/metrics.rs`) and averages each minute into the
 database, where history is kept for 7 days.
+
+## Hardware and software
+
+The device page's **Hardware**, **Software** and **Network** tabs show what
+the Agent reports about its computer, and the **Software** page searches the
+installed applications of every device. The device wall's search matches
+the operating system, model, serial number and IP addresses too. See
+[hardware and software](hardware-and-software.md).
 
 ## Updates
 

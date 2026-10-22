@@ -82,6 +82,9 @@ pub async fn delete(
     if let Err(error) = state.metrics.forget(&id).await {
         tracing::warn!(device_id = id, %error, "could not remove a deleted device's resource usage");
     }
+    if let Err(error) = crate::system_info::forget(&state.database, &id).await {
+        tracing::warn!(device_id = id, %error, "could not remove a deleted device's system information");
+    }
     if let Err(error) = state
         .sessions
         .end_for_device(&state, &id, "the device was removed")

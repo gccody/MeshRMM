@@ -61,6 +61,8 @@ mod session;
 pub(crate) mod session_close;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod signaling;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+pub(crate) mod system_info;
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod thumbnail;
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
@@ -153,6 +155,23 @@ fn report_metrics(socket: &SignalingConnection, metrics: meshrmm_protocol::Syste
     }
 }
 
+/// Sends a system information snapshot without waiting for it to be
+/// written. One that can't be queued is dropped: the server asks for a new
+/// one when the Agent reconnects and the one it has is old.
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+fn report_system_info(socket: &SignalingConnection, system: meshrmm_protocol::SystemInfo) {
+    let status = AgentStatusMessage::SystemInfo {
+        system: Box::new(system),
+    };
+    let queued = match serde_json::to_string(&status) {
+        Ok(text) => socket.queue(Message::Text(text.into())),
+        Err(error) => Err(error.into()),
+    };
+    if let Err(error) = queued {
+        tracing::warn!(error = %error, "could not send the system information");
+    }
+}
+
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn uninstall(socket: &SignalingConnection) -> anyhow::Result<ControlFlow<bool>> {
     crate::installer::schedule_uninstall().context("failed to schedule Agent self-uninstall")?;
@@ -224,6 +243,7 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             // Likewise, so the first sample after a reconnect still measures
             // from the previous one.
             metrics: metrics::Reports::new(),
+            system_info: system_info::Collector::new(),
             config,
             mode,
             link,
@@ -243,6 +263,7 @@ struct Coordinator {
     link: std::sync::Arc<service_link::ServiceLink>,
     thumbnails: thumbnail::Thumbnails,
     metrics: metrics::Reports,
+    system_info: system_info::Collector,
     active_session: Option<ActiveSession>,
     // Outlives session tasks, which end whenever the viewer drops its
     // connection, so the close action runs only once the session ends.
@@ -318,6 +339,7 @@ impl Coordinator {
                 }
                 () = self.thumbnails.due() => self.thumbnails.refresh(&self.config),
                 metrics = self.metrics.next() => report_metrics(socket, metrics),
+                system = self.system_info.next() => report_system_info(socket, system),
                 () = self.link.stopped() => {
                     if let Some(version) = self.link.update_version() {
                         announce_update(socket, version).await;
@@ -351,6 +373,11 @@ impl Coordinator {
                 AgentCommand::DeliverFile { delivery } => {
                     tracing::info!(delivery_id = %delivery.delivery_id, size_bytes = delivery.size_bytes, "receiving a toolbox file");
                     toolbox::deliver_file(&self.config, self.mode, delivery);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::CollectSystemInfo => {
+                    tracing::info!("the server asked for the system information");
+                    self.system_info.request();
                     return Ok(ControlFlow::Continue(()));
                 }
             }

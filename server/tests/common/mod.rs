@@ -832,12 +832,18 @@ pub enum Received {
     Gone,
 }
 
-/// What a socket received next, skipping the alert counts the event socket
-/// sends after each snapshot, which only the alert tests check.
+/// Messages that only their own tests check: the alert counts the event
+/// socket sends after each snapshot, and the request for a system
+/// information snapshot a newly enrolled Agent gets.
+fn incidental(value: &serde_json::Value) -> bool {
+    value["type"] == "alert_counts" || value["type"] == "collect_system_info"
+}
+
+/// What a socket received next, skipping [`incidental`] messages.
 pub async fn receive(socket: &mut Ws) -> Received {
     loop {
         match receive_any(socket).await {
-            Received::Json(value) if value["type"] == "alert_counts" => {}
+            Received::Json(value) if incidental(&value) => {}
             other => return other,
         }
     }
@@ -893,7 +899,7 @@ pub async fn receive_close(socket: &mut Ws) -> u16 {
     }
 }
 
-/// Asserts the socket says nothing for a while.
+/// Asserts the socket says nothing but [`incidental`] messages for a while.
 pub async fn quiet(socket: &mut Ws, wait: std::time::Duration) {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
@@ -903,6 +909,8 @@ pub async fn quiet(socket: &mut Ws, wait: std::time::Duration) {
         match tokio::time::timeout_at(deadline, socket.next()).await {
             Err(_) => return,
             Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+            Ok(Some(Ok(Message::Text(text))))
+                if serde_json::from_str(&text).is_ok_and(|value| incidental(&value)) => {}
             Ok(other) => panic!("expected nothing, got {other:?}"),
         }
     }

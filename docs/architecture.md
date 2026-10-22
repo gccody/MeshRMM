@@ -118,11 +118,14 @@ input.
   signs TURN credentials.
 - `storage`: files in the data directory (thumbnails, toolbox library),
   written atomically.
+- `system_info`: devices' hardware and software snapshots, the application
+  change log and their searches. See
+  [hardware and software](hardware-and-software.md).
 - `alerts`: alert rules, the engine that judges them and the alerts they
   raise. `notifications`: email and webhook channels. See
   [alerts](alerts.md).
 - `maintenance`: the periodic task that purges expired tokens, old runs,
-  resolved alerts and leftover partial files.
+  resolved alerts, old application changes and leftover partial files.
 - `admin`: the `meshrmm-server admin` commands for locked-out operators.
 
 ### Realtime
@@ -134,7 +137,7 @@ task.
 - **Coordinator**, one per connected Agent (`/v1/agents/{id}/connect`):
   authentication, superseding an older connection of the same Agent,
   revocation, commands (session requests, scripts, file deliveries,
-  uninstall), credential rotation, the session lease and update grace.
+  uninstall, system information), credential rotation, the session lease and update grace.
 - **Session actor**, one per remote session
   (`/v1/remote/sessions/{id}/signal`): the signaling relay, the idle
   deadline, resume, end and expiry. Its record is persisted in

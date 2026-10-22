@@ -8,15 +8,15 @@ use axum::{
 };
 use futures_util::StreamExt;
 use meshrmm_protocol_types::{
-    FileDeliveryReport, FileDeliveryStatus, MAX_SCRIPT_OUTPUT_BYTES, ScriptRunReport,
-    ScriptRunStatus, truncate_output,
+    FileDeliveryReport, FileDeliveryStatus, MAX_SCRIPT_OUTPUT_BYTES, MAX_SYSTEM_INFO_BYTES,
+    ScriptRunReport, ScriptRunStatus, truncate_output,
 };
 use sea_query::{Expr, ExprTrait, Query};
 
 use crate::{
     agents::{self, AuthenticatedAgent, parse_id},
     db::tables::{FileDeliveries, ScriptRuns},
-    http::{ApiError, AppState},
+    http::{ApiError, AppState, client_ip::ClientIp},
     realtime::coordinator,
     time::now_ms,
     toolbox::{self, DELIVERY_WINDOW_MS},
@@ -89,15 +89,16 @@ fn storable(text: &str) -> String {
     text.replace('\0', "\u{fffd}")
 }
 
-/// The largest message an Agent sends on its control connection: a resource
-/// usage report listing the most volumes, each with the longest name.
-const MAX_CONTROL_MESSAGE_BYTES: usize = 16 * 1024;
+/// The largest message an Agent sends on its control connection: a system
+/// information snapshot at its limit, with room for the message around it.
+const MAX_CONTROL_MESSAGE_BYTES: usize = MAX_SYSTEM_INFO_BYTES + 64 * 1024;
 
 /// `GET /v1/agents/{id}/connect`: the Agent's control connection, which it
 /// keeps open while it runs. See [`coordinator`].
 pub async fn connect(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    ClientIp(ip): ClientIp,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
@@ -105,7 +106,7 @@ pub async fn connect(
     Ok(upgrade
         .max_message_size(MAX_CONTROL_MESSAGE_BYTES)
         .on_upgrade(move |socket| {
-            coordinator::serve(state, agent.device_id, agent.deletion_requested, socket)
+            coordinator::serve(state, agent.device_id, agent.deletion_requested, ip, socket)
         }))
 }
 

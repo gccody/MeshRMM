@@ -53,6 +53,25 @@ test("filters by case-insensitive name or ID and by connection status", () => {
   assert.deepEqual(ids({ query: "nothing", status: "all", company: "" }), []);
 });
 
+test("searches the operating system, model, serial number and addresses too", () => {
+  const system = (os, model, serial_number, ip_addresses, public_ip = null) => ({ os, manufacturer: "Dell Inc.", model, serial_number, ip_addresses, public_ip, received_at: 1 });
+  const agents = [
+    { id: "w", name: "Desk", platform: "windows", connected: true, system: system("Windows 11 Pro 24H2", "OptiPlex 7090", "ABC123", ["10.1.2.3"], "203.0.113.9") },
+    { id: "l", name: "Server", platform: "linux", connected: true, system: system("Ubuntu 24.04.3 LTS", "Virtual Machine", null, ["192.168.7.20", "2001:db8::20"]) },
+    { id: "n", name: "New", platform: "macos", connected: false, system: null },
+  ];
+  const ids = (query) => filterAgents(agents, { ...DEFAULT_DEVICE_FILTERS, query }).map((agent) => agent.id);
+  assert.deepEqual(ids("windows 11"), ["w"]);
+  assert.deepEqual(ids("ubuntu"), ["l"]);
+  assert.deepEqual(ids("optiplex"), ["w"]);
+  assert.deepEqual(ids("dell"), ["w", "l"]);
+  assert.deepEqual(ids("abc1"), ["w"]);
+  assert.deepEqual(ids("192.168.7"), ["l"]);
+  assert.deepEqual(ids("2001:DB8"), ["l"]);
+  assert.deepEqual(ids("203.0.113"), ["w"]);
+  assert.deepEqual(ids("new"), ["n"]);
+});
+
 test("filters by company, or by having none", () => {
   const agents = [
     { id: "a", name: "A", platform: "windows", connected: true, company_id: "acme" },

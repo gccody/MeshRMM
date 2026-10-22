@@ -269,6 +269,26 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
                 .unwrap();
         }
 
+        for (id, observed_at) in [("old", NOW - 91 * DAY_MS), ("recent", NOW - 89 * DAY_MS)] {
+            database
+                .execute(
+                    &Query::insert()
+                        .into_table("device_application_changes")
+                        .columns(["id", "device_id", "observed_at", "change", "name", "source"])
+                        .values_panic([
+                            id.into(),
+                            "device".into(),
+                            observed_at.into(),
+                            "installed".into(),
+                            "7-Zip".into(),
+                            "windows".into(),
+                        ])
+                        .to_owned(),
+                )
+                .await
+                .unwrap();
+        }
+
         database
             .execute(
                 &Query::insert()
@@ -338,6 +358,7 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
                 script_runs: 1,
                 device_metrics: 1,
                 resolved_alerts: 1,
+                application_changes: 1,
                 ..Purged::default()
             },
             "{}",
@@ -356,6 +377,12 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
             .unwrap();
         assert_eq!(remaining, [("recent".to_owned(),)], "{}", test.name);
         assert_eq!(count(database, "alerts").await, 2, "{}", test.name);
+        assert_eq!(
+            count(database, "device_application_changes").await,
+            1,
+            "{}",
+            test.name
+        );
         test.drop_database().await;
     }
 }

@@ -3,10 +3,11 @@
 //! The socket's task is the device's coordinator while it is connected: it
 //! registers with the [`super::AgentHub`], publishes the device's presence,
 //! gives the Agent its live remote session and any rotated credential it
-//! hasn't used yet, then forwards what the API sends, and records the
-//! resource usage the Agent reports, until the Agent disconnects or a newer
-//! connection from the device replaces it.
-use std::time::Instant;
+//! hasn't used yet, and asks for a system information snapshot if the one it
+//! has is old, then forwards what the API sends, and records the resource
+//! usage and snapshots the Agent reports, until the Agent disconnects or a
+//! newer connection from the device replaces it.
+use std::{net::IpAddr, time::Instant};
 
 use axum::extract::ws::{Message, WebSocket};
 use meshrmm_protocol_types::{
@@ -14,14 +15,15 @@ use meshrmm_protocol_types::{
 };
 
 use super::{LIVENESS, ToAgent, close_frame, send};
-use crate::{agents, http::AppState};
+use crate::{agents, http::AppState, system_info};
 
 /// Serves the control connection of an Agent that authenticated as
-/// `device_id`.
+/// `device_id`, connecting from `ip`.
 pub async fn serve(
     state: AppState,
     device_id: String,
     deletion_requested: bool,
+    ip: IpAddr,
     socket: WebSocket,
 ) {
     if deletion_requested {
@@ -32,7 +34,7 @@ pub async fn serve(
     let mut connection = state.agents.connect(&device_id);
     state.presence.connected(&device_id).await;
     tracing::info!(device_id, "Agent connected");
-    if let Ok(replayed) = greet(&state, &device_id, &mut socket).await {
+    if let Ok(replayed) = greet(&state, &device_id, ip, &mut socket).await {
         let mut last_session = replayed;
         let mut last_heard = Instant::now();
         loop {
@@ -76,6 +78,11 @@ pub async fn serve(
                                 state.metrics.record(&device_id, metrics).await;
                             }
                         }
+                        Ok(AgentStatusMessage::SystemInfo { system }) => {
+                            if state.agents.is_current(&device_id, connection.id) {
+                                record_system_info(&state, &device_id, ip, *system).await;
+                            }
+                        }
                         // Only a deleted device's Agent uninstalls.
                         Ok(AgentStatusMessage::UninstallScheduled) => {}
                         Err(_) => {
@@ -97,11 +104,33 @@ pub async fn serve(
     tracing::info!(device_id, "Agent disconnected");
 }
 
-/// What a newly connected Agent is owed: the session it should be in, and
-/// a rotated credential it hasn't used yet. Returns the session it replayed.
+/// Stores a snapshot and shows the device list what changed.
+async fn record_system_info(
+    state: &AppState,
+    device_id: &str,
+    ip: IpAddr,
+    system: meshrmm_protocol_types::SystemInfo,
+) {
+    match system_info::store(&state.database, device_id, ip, system).await {
+        Ok(true) => {
+            tracing::info!(device_id, "stored the device's system information");
+            state.presence.refresh(device_id).await;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(device_id, %error, "could not store the device's system information")
+        }
+    }
+}
+
+/// What a newly connected Agent is owed: the session it should be in, a
+/// rotated credential it hasn't used yet, and a request for a system
+/// information snapshot if the server's is missing or old. Returns the
+/// session it replayed.
 async fn greet(
     state: &AppState,
     device_id: &str,
+    ip: IpAddr,
     socket: &mut WebSocket,
 ) -> Result<Option<AgentSessionRequest>, ()> {
     let replayed = state.sessions.replay(state, device_id).await;
@@ -133,6 +162,24 @@ async fn greet(
             device_id,
             error = format!("{error:#}"),
             "could not read the Agent's rotated credential"
+        ),
+    }
+    match system_info::connected(&state.database, device_id, ip).await {
+        Ok(stale) => {
+            // The device list shows the address.
+            state.presence.refresh(device_id).await;
+            if stale {
+                let message = ToAgent::Command(AgentCommand::CollectSystemInfo).to_json();
+                socket
+                    .send(Message::Text(message.into()))
+                    .await
+                    .map_err(drop)?;
+            }
+        }
+        Err(error) => tracing::warn!(
+            device_id,
+            %error,
+            "could not record the device's address"
         ),
     }
     Ok(replayed)

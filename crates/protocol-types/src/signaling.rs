@@ -112,6 +112,8 @@ pub enum AgentCommand {
     DeliverFile {
         delivery: FileDeliveryRequest,
     },
+    /// Collects a new [`crate::SystemInfo`] snapshot now.
+    CollectSystemInfo,
 }
 
 /// Agent-to-coordinator lifecycle notifications and reports.
@@ -127,6 +129,11 @@ pub enum AgentStatusMessage {
     /// The computer's resource usage, every [`crate::METRICS_INTERVAL_SECONDS`].
     Metrics {
         metrics: crate::SystemMetrics,
+    },
+    /// The computer's hardware and software, when the Agent starts, every
+    /// [`crate::SYSTEM_INFO_INTERVAL_SECONDS`] and when the server asks.
+    SystemInfo {
+        system: Box<crate::SystemInfo>,
     },
 }
 
@@ -298,6 +305,22 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
             metrics
+        );
+        let system = AgentStatusMessage::SystemInfo {
+            system: Box::default(),
+        };
+        let json = serde_json::to_string(&system).unwrap();
+        assert!(
+            json.starts_with(r#"{"type":"system_info","system":{"collected_at_unix_ms":0,"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
+            system
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentCommand::CollectSystemInfo).unwrap(),
+            r#"{"type":"collect_system_info"}"#
         );
     }
 
