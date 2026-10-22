@@ -72,6 +72,34 @@ yet.
   leaves out the standby cache, macOS counts app, wired and compressed
   memory, Linux counts the total less `MemAvailable`.
 
+## Hardware and software
+
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| [Operating system, hardware, disks, adapters](hardware-and-software.md) | Yes | Yes | Yes |
+| Serial number | Yes, unless the firmware has only a placeholder | Yes | Yes |
+| Domain or workgroup | Yes | No | No |
+| DNS servers | Per adapter | System-wide | System-wide |
+| Adapter link speed | Yes | No | Yes |
+| Time zone | Windows' own name | IANA name | IANA name |
+| Signed-in users | Console and Remote Desktop sessions | Console and terminal logins | logind sessions |
+| Applications | Uninstall keys, machine-wide and per signed-in user | `.app` bundles | dpkg, rpm, pacman, Flatpak (system-wide), Snap |
+| Application publisher | Yes | From the code signature; none for Mac App Store apps | Package maintainer or vendor |
+| Application install date | Yes | The bundle's creation date | dpkg and pacman yes; rpm yes; Flatpak and Snap no |
+
+- **Windows** lists the programs in the registry's Uninstall keys, which is
+  what Settings' installed apps shows except Microsoft Store (MSIX) apps; those
+  are not implemented. Per-user programs show only for users whose registry
+  hive is loaded, usually those signed in.
+- **macOS** has no Active Directory binding check (not implemented) and
+  reports no link speed (not implemented). Mac App Store certificates don't
+  name the developer, so those apps have no publisher. An install date is
+  when the bundle was created on this Mac, which an archive can set earlier.
+- **Linux** has no Windows-style domain or workgroup. The install date is
+  the root file system's creation, which for a cloud image is when the image
+  was built. Flatpak apps installed per user aren't listed. Virtual disks
+  report themselves as rotational, so Hyper-V's show as hard disks.
+
 ## Toolbox
 
 | | Windows | macOS | Linux |
