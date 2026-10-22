@@ -622,6 +622,7 @@ fn install_failure(install: &FinishedInstall) -> Option<String> {
         )),
         "failed" => Some(match &install.error {
             Some(error) => format!("Installing updates failed: {error}"),
+            None if total == 1 => "The update failed to install".to_owned(),
             None if total > 0 => format!("All {total} updates failed to install"),
             None => "Installing updates failed".to_owned(),
         }),
