@@ -7,26 +7,27 @@ import type { toolboxAccess } from "./access";
 import { FileDetailsModal, UploadFilesModal } from "./file-dialogs";
 import type { ScriptRun, ToolboxFile, ToolboxScript } from "./model";
 import { RunResult, useScriptRun } from "./run-result";
-import { RunScriptModal } from "./run-script-modal";
+import { StartJobModal } from "../automation/start-job-modal";
 import { ScriptEditor } from "./script-editor";
 
 export type ToolboxDialog =
   | { kind: "script"; script: ToolboxScript | null }
   | { kind: "run"; scriptId?: string }
+  | { kind: "send"; fileId: string }
   | { kind: "upload" }
   | { kind: "file"; file: ToolboxFile }
   | { kind: "run-details"; run: ScriptRun };
 
-export function ToolboxDialogs({ dialog, access, scripts, folders, maxBytes, agents, returnFocus, onClose, onRunClosed, replaceScript, replaceFile }: {
+export function ToolboxDialogs({ dialog, access, scripts, files, folders, maxBytes, agents, returnFocus, onClose, replaceScript, replaceFile }: {
   dialog: ToolboxDialog | null;
   access: ReturnType<typeof toolboxAccess>;
   scripts: ToolboxScript[];
+  files: ToolboxFile[];
   folders: string[];
   maxBytes: number | null;
   agents: Agent[];
   returnFocus: RefObject<HTMLElement | null>;
   onClose: () => void;
-  onRunClosed: () => void;
   replaceScript: (saved: ToolboxScript | null, id: string | null) => void;
   replaceFile: (saved: ToolboxFile | null, id: string) => void;
 }) {
@@ -43,13 +44,10 @@ export function ToolboxDialogs({ dialog, access, scripts, folders, maxBytes, age
         />
       )}
       {dialog?.kind === "run" && (
-        <RunScriptModal
-          agents={agents}
-          scripts={scripts}
-          initialScriptId={dialog.scriptId}
-          onClose={onRunClosed}
-          returnFocus={returnFocus}
-        />
+        <StartJobModal kind="script" itemId={dialog.scriptId} toolbox={{ scripts, files }} onClose={onClose} returnFocus={returnFocus} />
+      )}
+      {dialog?.kind === "send" && (
+        <StartJobModal kind="file" itemId={dialog.fileId} toolbox={{ scripts, files }} onClose={onClose} returnFocus={returnFocus} />
       )}
       {dialog?.kind === "upload" && (
         <UploadFilesModal

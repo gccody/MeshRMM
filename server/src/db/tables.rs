@@ -440,6 +440,7 @@ pub enum ScriptRuns {
     Error,
     CreatedAt,
     CompletedAt,
+    JobId,
 }
 
 #[derive(Iden)]
@@ -457,6 +458,7 @@ pub enum FileDeliveries {
     Error,
     CreatedAt,
     CompletedAt,
+    JobId,
 }
 
 #[derive(Iden)]
@@ -542,4 +544,86 @@ pub enum Alerts {
     ResolvedByUserId,
     ResolvedByLabel,
     Resolution,
+}
+
+#[derive(Iden)]
+pub enum Jobs {
+    Table,
+    Id,
+    Kind,
+    ItemId,
+    ItemName,
+    Language,
+    Body,
+    TimeoutSeconds,
+    RunAs,
+    Destination,
+    Target,
+    TargetLabel,
+    Offline,
+    ExpiresAt,
+    RequestedByUserId,
+    PolicyId,
+    PolicyName,
+    CreatedAt,
+    FinishedAt,
+}
+
+#[derive(Iden)]
+pub enum JobDevices {
+    Table,
+    JobId,
+    DeviceId,
+    State,
+    Detail,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+pub enum AutomationPolicies {
+    Table,
+    Id,
+    Name,
+    Enabled,
+    ScriptId,
+    RunAs,
+    Target,
+    TriggerType,
+    IntervalMinutes,
+    TimeOfDay,
+    Weekdays,
+    RunAt,
+    TimeZone,
+    Offline,
+    CatchUpHours,
+    OwnerUserId,
+    NextRunAt,
+    IntervalAnchorAt,
+    LastRunAt,
+    LastJobId,
+    LastProblem,
+    LastProblemAt,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+pub enum AutomationPolicyCompanies {
+    Table,
+    PolicyId,
+    CompanyId,
+}
+
+#[derive(Iden)]
+pub enum AutomationPolicyDevices {
+    Table,
+    PolicyId,
+    DeviceId,
+}
+
+#[derive(Iden)]
+pub enum AutomationPolicyChannels {
+    Table,
+    PolicyId,
+    ChannelId,
 }

@@ -452,7 +452,7 @@ fn notification(alert: &Alert, rule: &Rule, instance_name: &str, origin: &str) -
     }
 }
 
-fn format_time(unix_ms: i64) -> String {
+pub fn format_time(unix_ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(unix_ms)
         .map(|time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         .unwrap_or_default()

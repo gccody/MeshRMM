@@ -314,6 +314,8 @@ pub async fn file_by_id(
 pub enum Source {
     Dashboard,
     Session,
+    /// A device's part of a job.
+    Job,
 }
 
 impl Source {
@@ -321,8 +323,112 @@ impl Source {
         match self {
             Self::Dashboard => "dashboard",
             Self::Session => "session",
+            Self::Job => "job",
         }
     }
+}
+
+/// A run to record before the Agent gets it.
+#[derive(Debug, Clone, Copy)]
+pub struct NewRun<'a> {
+    pub id: &'a str,
+    pub device_id: &'a str,
+    pub script_id: &'a str,
+    pub script_name: &'a str,
+    pub language: ScriptLanguage,
+    pub requested_by_user_id: &'a str,
+    pub source: Source,
+    pub run_as: RunAs,
+    pub timeout_seconds: i64,
+    pub job_id: Option<&'a str>,
+    pub created_at: i64,
+}
+
+pub async fn insert_run(executor: &mut impl Executor, run: NewRun<'_>) -> db::Result<()> {
+    executor
+        .execute(
+            &Query::insert()
+                .into_table(ScriptRuns::Table)
+                .columns([
+                    ScriptRuns::Id,
+                    ScriptRuns::DeviceId,
+                    ScriptRuns::ScriptId,
+                    ScriptRuns::ScriptName,
+                    ScriptRuns::Language,
+                    ScriptRuns::RequestedByUserId,
+                    ScriptRuns::Source,
+                    ScriptRuns::RunAs,
+                    ScriptRuns::TimeoutSeconds,
+                    ScriptRuns::JobId,
+                    ScriptRuns::CreatedAt,
+                ])
+                .values_panic([
+                    run.id.into(),
+                    run.device_id.into(),
+                    run.script_id.into(),
+                    run.script_name.into(),
+                    run.language.as_str().into(),
+                    run.requested_by_user_id.into(),
+                    run.source.as_str().into(),
+                    run.run_as.as_str().into(),
+                    run.timeout_seconds.into(),
+                    run.job_id.into(),
+                    run.created_at.into(),
+                ])
+                .to_owned(),
+        )
+        .await?;
+    Ok(())
+}
+
+/// A delivery to record before the Agent gets it.
+#[derive(Debug, Clone, Copy)]
+pub struct NewDelivery<'a> {
+    pub id: &'a str,
+    pub device_id: &'a str,
+    pub file_id: &'a str,
+    pub file_name: &'a str,
+    pub size_bytes: i64,
+    pub requested_by_user_id: &'a str,
+    pub destination: FileDeliveryDestination,
+    pub job_id: Option<&'a str>,
+    pub created_at: i64,
+}
+
+pub async fn insert_delivery(
+    executor: &mut impl Executor,
+    delivery: NewDelivery<'_>,
+) -> db::Result<()> {
+    executor
+        .execute(
+            &Query::insert()
+                .into_table(FileDeliveries::Table)
+                .columns([
+                    FileDeliveries::Id,
+                    FileDeliveries::DeviceId,
+                    FileDeliveries::FileId,
+                    FileDeliveries::FileName,
+                    FileDeliveries::SizeBytes,
+                    FileDeliveries::RequestedByUserId,
+                    FileDeliveries::Destination,
+                    FileDeliveries::JobId,
+                    FileDeliveries::CreatedAt,
+                ])
+                .values_panic([
+                    delivery.id.into(),
+                    delivery.device_id.into(),
+                    delivery.file_id.into(),
+                    delivery.file_name.into(),
+                    delivery.size_bytes.into(),
+                    delivery.requested_by_user_id.into(),
+                    delivery.destination.as_str().into(),
+                    delivery.job_id.into(),
+                    delivery.created_at.into(),
+                ])
+                .to_owned(),
+        )
+        .await?;
+    Ok(())
 }
 
 const OFFLINE_RUN: &str = "The device is offline, so the script did not run.";
@@ -365,37 +471,23 @@ pub async fn start_script_run(
     }
     let run_id = new_id();
     let now = now_ms();
-    transaction
-        .execute(
-            &Query::insert()
-                .into_table(ScriptRuns::Table)
-                .columns([
-                    ScriptRuns::Id,
-                    ScriptRuns::DeviceId,
-                    ScriptRuns::ScriptId,
-                    ScriptRuns::ScriptName,
-                    ScriptRuns::Language,
-                    ScriptRuns::RequestedByUserId,
-                    ScriptRuns::Source,
-                    ScriptRuns::RunAs,
-                    ScriptRuns::TimeoutSeconds,
-                    ScriptRuns::CreatedAt,
-                ])
-                .values_panic([
-                    run_id.as_str().into(),
-                    device_id.into(),
-                    script.id.as_str().into(),
-                    script.name.as_str().into(),
-                    language.as_str().into(),
-                    user.user_id.as_str().into(),
-                    source.as_str().into(),
-                    run_as.as_str().into(),
-                    script.timeout_seconds.into(),
-                    now.into(),
-                ])
-                .to_owned(),
-        )
-        .await?;
+    insert_run(
+        &mut transaction,
+        NewRun {
+            id: &run_id,
+            device_id,
+            script_id: &script.id,
+            script_name: &script.name,
+            language,
+            requested_by_user_id: &user.user_id,
+            source,
+            run_as,
+            timeout_seconds: script.timeout_seconds,
+            job_id: None,
+            created_at: now,
+        },
+    )
+    .await?;
     audit::record(
         &mut transaction,
         &user.actor,
@@ -465,33 +557,21 @@ pub async fn start_file_delivery(
     }
     let delivery_id = new_id();
     let now = now_ms();
-    transaction
-        .execute(
-            &Query::insert()
-                .into_table(FileDeliveries::Table)
-                .columns([
-                    FileDeliveries::Id,
-                    FileDeliveries::DeviceId,
-                    FileDeliveries::FileId,
-                    FileDeliveries::FileName,
-                    FileDeliveries::SizeBytes,
-                    FileDeliveries::RequestedByUserId,
-                    FileDeliveries::Destination,
-                    FileDeliveries::CreatedAt,
-                ])
-                .values_panic([
-                    delivery_id.as_str().into(),
-                    device_id.into(),
-                    file.id.as_str().into(),
-                    file.name.as_str().into(),
-                    file.size_bytes.into(),
-                    user.user_id.as_str().into(),
-                    destination.as_str().into(),
-                    now.into(),
-                ])
-                .to_owned(),
-        )
-        .await?;
+    insert_delivery(
+        &mut transaction,
+        NewDelivery {
+            id: &delivery_id,
+            device_id,
+            file_id: &file.id,
+            file_name: &file.name,
+            size_bytes: file.size_bytes,
+            requested_by_user_id: &user.user_id,
+            destination,
+            job_id: None,
+            created_at: now,
+        },
+    )
+    .await?;
     audit::record(
         &mut transaction,
         &user.actor,
@@ -578,6 +658,7 @@ pub struct RunRow {
     pub created_at: i64,
     pub completed_at: Option<i64>,
     pub requested_by_user_id: String,
+    pub job_id: Option<String>,
 }
 
 /// A run as the website shows it.
@@ -585,8 +666,11 @@ pub struct RunRow {
 pub struct RunView {
     #[serde(flatten)]
     pub run: ScriptRun,
-    /// `dashboard` or `session`.
+    /// `dashboard`, `session` or `job`.
     pub source: String,
+    /// The job it is a device's part of.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
     pub requested_by_you: bool,
 }
 
@@ -651,12 +735,14 @@ impl RunRow {
         })
     }
 
-    pub fn into_view(self, user_id: &str, now: i64) -> Result<RunView, ApiError> {
+    pub fn into_view(mut self, user_id: &str, now: i64) -> Result<RunView, ApiError> {
         let source = self.source.clone();
+        let job_id = self.job_id.take();
         let requested_by_you = self.requested_by_user_id == user_id;
         Ok(RunView {
             run: self.into_run(now)?,
             source,
+            job_id,
             requested_by_you,
         })
     }
@@ -692,6 +778,7 @@ pub fn run_select(with_output: bool) -> sea_query::SelectStatement {
             ScriptRuns::CreatedAt,
             ScriptRuns::CompletedAt,
             ScriptRuns::RequestedByUserId,
+            ScriptRuns::JobId,
         ])
         .from(ScriptRuns::Table)
         .order_by(ScriptRuns::CreatedAt, Order::Desc)
@@ -713,6 +800,7 @@ pub struct DeliveryRow {
     pub created_at: i64,
     pub completed_at: Option<i64>,
     pub requested_by_user_id: String,
+    pub job_id: Option<String>,
 }
 
 /// A delivery as the website shows it.
@@ -722,6 +810,8 @@ pub struct DeliveryView {
     pub delivery: FileDelivery,
     /// `user` or `public`.
     pub destination: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
     pub requested_by_you: bool,
 }
 
@@ -743,12 +833,14 @@ impl DeliveryRow {
         })
     }
 
-    pub fn into_view(self, user_id: &str, now: i64) -> Result<DeliveryView, ApiError> {
+    pub fn into_view(mut self, user_id: &str, now: i64) -> Result<DeliveryView, ApiError> {
         let destination = self.destination.clone();
+        let job_id = self.job_id.take();
         let requested_by_you = self.requested_by_user_id == user_id;
         Ok(DeliveryView {
             delivery: self.into_delivery(now)?,
             destination,
+            job_id,
             requested_by_you,
         })
     }
@@ -770,6 +862,7 @@ pub fn delivery_select() -> sea_query::SelectStatement {
             FileDeliveries::CreatedAt,
             FileDeliveries::CompletedAt,
             FileDeliveries::RequestedByUserId,
+            FileDeliveries::JobId,
         ])
         .from(FileDeliveries::Table)
         .order_by(FileDeliveries::CreatedAt, Order::Desc)

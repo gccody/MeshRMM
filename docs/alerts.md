@@ -36,7 +36,7 @@ Its condition can't change after it's created.
 | Low disk space | a volume's free space is below N percent, or below N GB (GiB, as the website shows sizes); one alert per volume | the volume has enough space again, or stops being reported |
 | High CPU | the CPU load, averaged over the last M minutes (1 to 60), is above N percent | the average over the last M minutes is at or below N |
 | High memory | the same for memory in use | the same |
-| Script failed | a toolbox run on the device couldn't start, timed out, or never reported back; optionally also a run that exited with a code other than 0 | never: a person resolves it |
+| Script failed | a toolbox run on the device, by hand or as part of a [job](automation.md), couldn't start, timed out, or never reported back; optionally also a run that exited with a code other than 0 | never: a person resolves it |
 
 The loads are averages so that a brief spike or dip neither raises nor
 clears an alert. A load rule needs readings covering its whole window, from
@@ -108,7 +108,9 @@ A channel is turned on or off, and is one of:
   with the instance key. Redirects aren't followed.
 
 A rule notifies its chosen channels when it raises an alert, and also when
-the alert is resolved if the rule says so. A failed webhook delivery (no
+the alert is resolved if the rule says so. An
+[automation policy](automation.md#failure-notifications) notifies its
+channels when one of its jobs finishes with failures. A failed webhook delivery (no
 answer, a 5xx, 408 or 429) is tried again after 10 seconds, a minute and five
 minutes; retries waiting when the server stops are lost. Each channel keeps
 when its last delivery happened and why it failed, if it did. **Send test**

@@ -24,6 +24,7 @@ export function toolboxAccess(can: (permission: Permission) => boolean) {
     addFiles: deliverFiles || shareFiles,
     shareFiles,
     keepPrivateFiles: deliverFiles,
+    deliverFiles,
   };
 }
 

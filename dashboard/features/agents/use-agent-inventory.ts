@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AuthenticationRequired, type AuthorizedFetch, errorMessage } from "../../lib/http";
 import type { AlertEvent } from "../alerts/model";
+import type { JobEvent } from "../automation/model";
 import type { MetricsReading } from "../metrics/model";
 import { inventoryStatus } from "./inventory-stream";
 import { EMPTY_INVENTORY, parseAgentList, sortAgents, sortCompanies } from "./model";
@@ -15,6 +16,8 @@ type Options = {
   onRefused: () => void;
   // What the socket says about alerts.
   onAlerts: (event: AlertEvent) => void;
+  // What the socket says about jobs.
+  onJobs: (event: JobEvent) => void;
 };
 
 async function fetchAgentList(authorizedFetch: AuthorizedFetch) {
@@ -25,7 +28,7 @@ async function fetchAgentList(authorizedFetch: AuthorizedFetch) {
   return data;
 }
 
-export function useAgentInventory({ enabled, authorizedFetch, onRefused, onAlerts }: Options) {
+export function useAgentInventory({ enabled, authorizedFetch, onRefused, onAlerts, onJobs }: Options) {
   const [{ agents, companies }, setInventory] = useState<Inventory>(EMPTY_INVENTORY);
   const [hasData, setHasData] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -94,7 +97,7 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused, onAlert
       return next;
     });
   }, []);
-  const { connection, since, now, reconnect } = useInventoryConnection({ enabled, revisionRef: revision, onInventory: applyStreamUpdate, onMetrics: applyMetrics, onAlerts, onRefused });
+  const { connection, since, now, reconnect } = useInventoryConnection({ enabled, revisionRef: revision, onInventory: applyStreamUpdate, onMetrics: applyMetrics, onAlerts, onJobs, onRefused });
 
   // Refresh reloads the list and, while the stream is down, skips the
   // reconnect wait. An open stream is already current.

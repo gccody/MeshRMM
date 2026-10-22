@@ -488,7 +488,9 @@ CREATE TABLE script_runs (
   script_name TEXT NOT NULL,
   language TEXT NOT NULL CHECK (language IN ('powershell', 'cmd', 'shell')),
   requested_by_user_id TEXT NOT NULL,
-  source TEXT NOT NULL CHECK (source IN ('dashboard', 'session')),
+  -- 'job' for a device's run of a job (jobs.id in job_id).
+  source TEXT NOT NULL CHECK (source IN ('dashboard', 'session', 'job')),
+  job_id TEXT,
   run_as TEXT NOT NULL CHECK (run_as IN ('system', 'user')),
   timeout_seconds BIGINT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'failed', 'timed_out', 'lost')),
@@ -505,6 +507,7 @@ CREATE TABLE script_runs (
 CREATE INDEX idx_script_runs_device ON script_runs (device_id, created_at);
 CREATE INDEX idx_script_runs_requester ON script_runs (requested_by_user_id, created_at);
 CREATE INDEX idx_script_runs_created ON script_runs (created_at);
+CREATE INDEX idx_script_runs_job ON script_runs (job_id, device_id);
 
 CREATE TABLE file_deliveries (
   id TEXT NOT NULL PRIMARY KEY,
@@ -514,6 +517,8 @@ CREATE TABLE file_deliveries (
   size_bytes BIGINT NOT NULL,
   requested_by_user_id TEXT NOT NULL,
   destination TEXT NOT NULL CHECK (destination IN ('user', 'public')),
+  -- The job this delivery is a device's part of, if any.
+  job_id TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'delivered', 'failed')),
   path TEXT,
   error TEXT,
@@ -523,6 +528,7 @@ CREATE TABLE file_deliveries (
 
 CREATE INDEX idx_file_deliveries_device ON file_deliveries (device_id, created_at);
 CREATE INDEX idx_file_deliveries_created ON file_deliveries (created_at);
+CREATE INDEX idx_file_deliveries_job ON file_deliveries (job_id, device_id);
 
 -- Where notifications go: email to chosen users and everyone holding chosen
 -- roles, or a webhook. Alert rules name the channels they notify.
@@ -621,3 +627,117 @@ CREATE UNIQUE INDEX idx_alerts_unresolved ON alerts (rule_id, device_id, subject
 CREATE INDEX idx_alerts_device ON alerts (device_id, raised_at);
 CREATE INDEX idx_alerts_raised ON alerts (raised_at);
 CREATE INDEX idx_alerts_resolved ON alerts (resolved_at);
+
+-- A script run or file delivery on many devices at once. The job keeps what
+-- it sends, so every device gets the same script even if the library
+-- changes while it waits for offline devices. See docs/automation.md.
+CREATE TABLE jobs (
+  id TEXT NOT NULL PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('script', 'file')),
+  -- The toolbox script or file, and its name when the job started.
+  item_id TEXT NOT NULL,
+  item_name TEXT NOT NULL,
+  -- Scripts: the interpreter, body, timeout and account.
+  language TEXT CHECK (language IS NULL OR language IN ('powershell', 'cmd', 'shell')),
+  body TEXT,
+  timeout_seconds BIGINT,
+  run_as TEXT CHECK (run_as IS NULL OR run_as IN ('system', 'user')),
+  -- Files: the folder they go to.
+  destination TEXT CHECK (destination IS NULL OR destination IN ('user', 'public')),
+  -- Which devices it was started on, and that in words, such as "Acme, Globex".
+  target TEXT NOT NULL CHECK (target IN ('devices', 'companies', 'all')),
+  target_label TEXT NOT NULL,
+  -- Offline devices are skipped, or waited for until expires_at.
+  offline TEXT NOT NULL CHECK (offline IN ('skip', 'wait')),
+  expires_at BIGINT NOT NULL,
+  -- Who started it: a user, or the user whose access a policy runs with.
+  requested_by_user_id TEXT NOT NULL,
+  -- The policy that started it, and its name then.
+  policy_id TEXT,
+  policy_name TEXT,
+  created_at BIGINT NOT NULL,
+  -- When the last device finished, ran out of time or was cancelled.
+  finished_at BIGINT
+);
+
+CREATE INDEX idx_jobs_created ON jobs (created_at);
+CREATE INDEX idx_jobs_policy ON jobs (policy_id, created_at);
+CREATE INDEX idx_jobs_finished ON jobs (finished_at);
+
+-- Each device a job covers. 'queued': online, its run starts soon;
+-- 'waiting': offline, it runs when the device connects; 'started': its run or
+-- delivery has the job's ID; 'skipped': the device has no interpreter for the
+-- script; 'missed': it was offline and the job didn't wait for it, or it
+-- didn't connect in time; 'cancelled'.
+CREATE TABLE job_devices (
+  job_id TEXT NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+  device_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('queued', 'waiting', 'started', 'skipped', 'missed', 'cancelled')),
+  -- Why it was skipped or missed.
+  detail TEXT,
+  updated_at BIGINT NOT NULL,
+  PRIMARY KEY (job_id, device_id)
+);
+
+CREATE INDEX idx_job_devices_state ON job_devices (state, device_id);
+
+-- Scripts the server runs by itself: on a schedule, or on each device that
+-- enrolls. Each time it fires it starts a job.
+CREATE TABLE automation_policies (
+  id TEXT NOT NULL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 120),
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  -- A shared toolbox script, and the account it runs as.
+  script_id TEXT NOT NULL,
+  run_as TEXT NOT NULL CHECK (run_as IN ('system', 'user')),
+  -- Every device, the companies in automation_policy_companies, or the
+  -- devices in automation_policy_devices.
+  target TEXT NOT NULL CHECK (target IN ('devices', 'companies', 'all')),
+  -- 'interval' every interval_minutes; 'daily' at time_of_day; 'weekly' at
+  -- time_of_day on weekdays (a bit per day, Monday = 1 to Sunday = 64);
+  -- 'once' at run_at; all in time_zone. 'enroll' when a device enrolls.
+  trigger_type TEXT NOT NULL CHECK (trigger_type IN ('interval', 'daily', 'weekly', 'once', 'enroll')),
+  interval_minutes BIGINT,
+  time_of_day TEXT,
+  weekdays BIGINT,
+  run_at TEXT,
+  time_zone TEXT,
+  -- Offline devices are skipped, or caught up when they connect within
+  -- catch_up_hours (and before the policy fires again).
+  offline TEXT NOT NULL CHECK (offline IN ('skip', 'wait')),
+  catch_up_hours BIGINT NOT NULL,
+  -- Whose access it runs with: the user who last saved it.
+  owner_user_id TEXT NOT NULL,
+  -- When it fires next; NULL when it's off, fires on enrollment, or has
+  -- nothing left to do. Interval schedules count from interval_anchor_at.
+  next_run_at BIGINT,
+  interval_anchor_at BIGINT,
+  last_run_at BIGINT,
+  last_job_id TEXT,
+  -- Why it last didn't fire when it was due, and when.
+  last_problem TEXT,
+  last_problem_at BIGINT,
+  created_at BIGINT NOT NULL,
+  updated_at BIGINT NOT NULL
+);
+
+CREATE INDEX idx_automation_policies_next ON automation_policies (next_run_at);
+
+CREATE TABLE automation_policy_companies (
+  policy_id TEXT NOT NULL REFERENCES automation_policies (id) ON DELETE CASCADE,
+  company_id TEXT NOT NULL REFERENCES companies (id) ON DELETE CASCADE,
+  PRIMARY KEY (policy_id, company_id)
+);
+
+CREATE TABLE automation_policy_devices (
+  policy_id TEXT NOT NULL REFERENCES automation_policies (id) ON DELETE CASCADE,
+  device_id TEXT NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
+  PRIMARY KEY (policy_id, device_id)
+);
+
+-- Channels told when one of the policy's jobs finishes with failures.
+CREATE TABLE automation_policy_channels (
+  policy_id TEXT NOT NULL REFERENCES automation_policies (id) ON DELETE CASCADE,
+  channel_id TEXT NOT NULL REFERENCES notification_channels (id) ON DELETE CASCADE,
+  PRIMARY KEY (policy_id, channel_id)
+);

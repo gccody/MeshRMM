@@ -15,6 +15,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Send,
   Square,
   SquareTerminal,
   Trash2,
@@ -68,6 +69,18 @@ type Props = {
   onCloseSession: (agent: Agent) => void;
   onDelete: (agent: Agent) => void;
   onRunScript: (agent: Agent, opener: HTMLElement) => void;
+  // The devices chosen for a job, and what to do with them.
+  selection: DeviceSelection;
+};
+
+// Devices chosen on the wall for a job. `ids` may name devices since
+// removed; only those still on the wall count.
+export type DeviceSelection = {
+  ids: ReadonlySet<string>;
+  onChange: (agent: Agent, selected: boolean) => void;
+  onSelectAll: (agents: Agent[]) => void;
+  onClear: () => void;
+  onStartJob: (kind: "script" | "file", opener: HTMLElement) => void;
 };
 
 // What the signed-in user may do with a device.
@@ -76,6 +89,7 @@ export type DeviceActions = {
   connectBackground: boolean;
   closeSession: boolean;
   runScripts: boolean;
+  deliverFiles: boolean;
   delete: boolean;
   enroll: boolean;
   moveCompany: boolean;
@@ -152,6 +166,7 @@ export function AgentOverview({
   onCloseSession,
   onDelete,
   onRunScript,
+  selection,
 }: Props) {
   const online = agents.filter((agent) => agent.connected).length;
   const counts: Record<AgentStatusFilter, number> = { all: agents.length, online, offline: agents.length - online };
@@ -159,6 +174,8 @@ export function AgentOverview({
   const hasData = inventory.status !== "loading";
   const stale = inventory.status === "stale";
   const browserOffline = inventory.connection === "offline";
+  const selectable = allowed.runScripts || allowed.deliverFiles;
+  const selectedCount = agents.filter((agent) => selection.ids.has(agent.id)).length;
 
   return (
     <>
@@ -177,9 +194,10 @@ export function AgentOverview({
       </HeaderActions>
 
       <InventoryStrip inventory={inventory} onReconnect={onReconnect} />
+      {selectable && selectedCount > 0 && <SelectionBar count={selectedCount} allowed={allowed} selection={selection} shown={filteredAgents} />}
 
       {filteredAgents.length > 0 ? (
-        <ul className={`device-wall${stale ? " stale" : ""}`} aria-label="Devices">
+        <ul className={`device-wall${stale ? " stale" : ""}${selectedCount > 0 ? " selecting" : ""}`} aria-label="Devices">
           {filteredAgents.map((agent) => (
             <DeviceTile
               key={agent.id}
@@ -188,6 +206,8 @@ export function AgentOverview({
               reading={metrics.get(agent.id)}
               store={thumbnails}
               allowed={allowed}
+              selected={selectable ? selection.ids.has(agent.id) : null}
+              onSelect={selection.onChange}
               state={{
                 stale,
                 browserOffline,
@@ -215,6 +235,27 @@ export function AgentOverview({
         </div>
       )}
     </>
+  );
+}
+
+// What to do with the devices chosen on the wall.
+function SelectionBar({ count, allowed, selection, shown }: {
+  count: number;
+  allowed: DeviceActions;
+  selection: DeviceSelection;
+  shown: Agent[];
+}) {
+  const allShown = shown.every((agent) => selection.ids.has(agent.id));
+  return (
+    <div className="selection-bar" role="region" aria-label="Chosen devices">
+      <strong role="status">{count} {count === 1 ? "device" : "devices"} selected</strong>
+      {!allShown && <button type="button" className="link-button" onClick={() => selection.onSelectAll(shown)}>Select all {shown.length} shown</button>}
+      <button type="button" className="link-button" onClick={selection.onClear}>Clear</button>
+      <span className="selection-actions">
+        {allowed.runScripts && <button type="button" className="primary-button" onClick={(event) => selection.onStartJob("script", event.currentTarget)} aria-haspopup="dialog"><SquareTerminal size={16} aria-hidden="true" />Run script</button>}
+        {allowed.deliverFiles && <button type="button" className="secondary-button" onClick={(event) => selection.onStartJob("file", event.currentTarget)} aria-haspopup="dialog"><Send size={16} aria-hidden="true" />Send file</button>}
+      </span>
+    </div>
   );
 }
 
@@ -303,12 +344,15 @@ function CompanyFilterList({ companies, company, onChoose }: {
   );
 }
 
-function DeviceTile({ agent, companyName, reading, store, allowed, state, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript, onMove }: {
+function DeviceTile({ agent, companyName, reading, store, allowed, selected, onSelect, state, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript, onMove }: {
   agent: Agent;
   companyName: string | null;
   reading: MetricsReading | undefined;
   store: ThumbnailStore;
   allowed: DeviceActions;
+  // Whether it's chosen for a job; null when the user can't start jobs.
+  selected: boolean | null;
+  onSelect: (agent: Agent, selected: boolean) => void;
   state: TileState;
   onRemote: (agent: Agent) => void;
   onRemoteBackground: (agent: Agent) => void;
@@ -335,8 +379,13 @@ function DeviceTile({ agent, companyName, reading, store, allowed, state, onRemo
 
   // The device's name links to the same page, so the screen is for pointers only.
   return (
-    <li ref={setElement} className={`device-tile ${tone}${busy ? " busy" : ""}`}>
+    <li ref={setElement} className={`device-tile ${tone}${busy ? " busy" : ""}${selected ? " selected" : ""}`}>
       <div className="device-screen">
+        {selected !== null && (
+          <label className="tile-select" title={selected ? "Chosen for a job" : "Choose for a job"}>
+            <input type="checkbox" checked={selected} onChange={(event) => onSelect(agent, event.target.checked)} aria-label={`Select ${agent.name}`} />
+          </label>
+        )}
         <Link className="screen-link" to={devicePath(agent)} tabIndex={-1} aria-hidden="true">
           {thumbnail ? <img src={thumbnail.url} alt="" /> : <span className="screen-blank">{agent.connected ? <Monitor size={26} /> : <MonitorOff size={26} />}</span>}
           {(busy || !agent.connected) && (

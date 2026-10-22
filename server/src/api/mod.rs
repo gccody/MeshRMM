@@ -3,6 +3,7 @@ mod account;
 mod agent;
 mod alerts;
 mod audit_log;
+mod automation;
 mod companies;
 mod devices;
 mod enrollment;
@@ -10,6 +11,7 @@ mod events;
 mod handoffs;
 mod instance;
 mod invitations;
+mod jobs;
 mod metrics;
 mod notification_channels;
 mod passkeys;
@@ -55,6 +57,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(toolbox_routes())
         .merge(remote_routes())
         .merge(alert_routes())
+        .merge(automation_routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             recheck_access,
@@ -240,6 +243,22 @@ fn toolbox_routes() -> Router<AppState> {
         .route("/script-runs/{id}", get(runs::get_run))
         .route("/file-deliveries", get(runs::list_deliveries))
         .route("/file-deliveries/{id}", get(runs::get_delivery))
+}
+
+fn automation_routes() -> Router<AppState> {
+    Router::new()
+        .route("/jobs", get(jobs::list).post(jobs::start))
+        .route("/jobs/{id}", get(jobs::get))
+        .route("/jobs/{id}/cancel", post(jobs::cancel))
+        .route(
+            "/automation-policies",
+            get(automation::list).post(automation::create),
+        )
+        .route(
+            "/automation-policies/{id}",
+            put(automation::update).delete(automation::delete),
+        )
+        .route("/automation-policies/{id}/run", post(automation::run))
 }
 
 fn alert_routes() -> Router<AppState> {

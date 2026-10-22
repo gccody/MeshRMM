@@ -1,5 +1,7 @@
 //! Toolbox script runs and file deliveries started from the website. Users
 //! see what they started; users who may read the audit log see everyone's.
+//! A job's runs and deliveries are listed on the job, and in a device's
+//! history; whoever may see the job may read them.
 use axum::{
     Json,
     extract::{Path, Query as QueryParameters, State},
@@ -13,6 +15,7 @@ use super::{require_any, toolbox::toolbox_user};
 use crate::{
     agents::parse_id,
     auth::Authorized,
+    automation::jobs::{self, Viewer},
     db::tables::{FileDeliveries, ScriptRuns},
     http::{ApiError, AppState, JsonBody},
     rbac::Permission,
@@ -54,6 +57,7 @@ pub async fn start_run(
         Json(RunView {
             run,
             source: Source::Dashboard.as_str().to_owned(),
+            job_id: None,
             requested_by_you: true,
         }),
     ))
@@ -66,9 +70,36 @@ pub struct ListFilter {
 }
 
 /// Users see their own runs and deliveries, or everyone's with `audit.view`.
+/// Users who manage automation read those of policies' jobs.
 fn require_history(actor: &Authorized, permission: Permission) -> Result<bool, ApiError> {
-    require_any(actor, &[permission, Permission::AuditView])?;
+    require_any(
+        actor,
+        &[
+            permission,
+            Permission::AuditView,
+            Permission::AutomationManage,
+        ],
+    )?;
     Ok(actor.has(Permission::AuditView))
+}
+
+/// Whether the user may read a run or delivery: theirs, everyone's, or one
+/// of a job they may see.
+async fn visible(
+    state: &AppState,
+    actor: &Authorized,
+    everyone: bool,
+    requested_by_user_id: &str,
+    job_id: Option<&str>,
+) -> Result<bool, ApiError> {
+    if everyone || requested_by_user_id == actor.user.id {
+        return Ok(true);
+    }
+    let Some(job_id) = job_id else {
+        return Ok(false);
+    };
+    let viewer = Viewer::new(&actor.user.id, &actor.permissions);
+    Ok(jobs::sees_job(&mut &state.database, &viewer, job_id).await?)
 }
 
 #[derive(Debug, Serialize)]
@@ -77,7 +108,7 @@ pub struct RunList {
 }
 
 /// `GET /v1/script-runs?device_id=`: recent runs, newest first, without
-/// their output.
+/// their output. Jobs' runs are left out unless a device is chosen.
 pub async fn list_runs(
     State(state): State<AppState>,
     actor: Authorized,
@@ -86,8 +117,13 @@ pub async fn list_runs(
     let everyone = require_history(&actor, Permission::ScriptsRun)?;
     let mut select = toolbox::run_select(false);
     select.limit(LIST_LIMIT);
-    if let Some(device_id) = &filter.device_id {
-        select.and_where(Expr::col(ScriptRuns::DeviceId).eq(parse_id(device_id, "device")?));
+    match &filter.device_id {
+        Some(device_id) => {
+            select.and_where(Expr::col(ScriptRuns::DeviceId).eq(parse_id(device_id, "device")?));
+        }
+        None => {
+            select.and_where(Expr::col(ScriptRuns::JobId).is_null());
+        }
     }
     if !everyone {
         select.and_where(Expr::col(ScriptRuns::RequestedByUserId).eq(actor.user.id.as_str()));
@@ -117,9 +153,21 @@ pub async fn get_run(
                 .to_owned(),
         )
         .await?;
-    let row = row
-        .filter(|row| everyone || row.requested_by_user_id == actor.user.id)
-        .ok_or_else(|| ApiError::not_found("Run not found"))?;
+    let row = match row {
+        Some(row)
+            if visible(
+                &state,
+                &actor,
+                everyone,
+                &row.requested_by_user_id,
+                row.job_id.as_deref(),
+            )
+            .await? =>
+        {
+            row
+        }
+        _ => return Err(ApiError::not_found("Run not found")),
+    };
     Ok(Json(row.into_view(&actor.user.id, now_ms())?))
 }
 
@@ -156,6 +204,7 @@ pub async fn start_delivery(
         Json(DeliveryView {
             delivery,
             destination: request.destination.as_str().to_owned(),
+            job_id: None,
             requested_by_you: true,
         }),
     ))
@@ -206,8 +255,20 @@ pub async fn get_delivery(
                 .to_owned(),
         )
         .await?;
-    let row = row
-        .filter(|row| everyone || row.requested_by_user_id == actor.user.id)
-        .ok_or_else(|| ApiError::not_found("Delivery not found"))?;
+    let row = match row {
+        Some(row)
+            if visible(
+                &state,
+                &actor,
+                everyone,
+                &row.requested_by_user_id,
+                row.job_id.as_deref(),
+            )
+            .await? =>
+        {
+            row
+        }
+        _ => return Err(ApiError::not_found("Delivery not found")),
+    };
     Ok(Json(row.into_view(&actor.user.id, now_ms())?))
 }

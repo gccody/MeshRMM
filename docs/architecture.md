@@ -124,6 +124,9 @@ input.
 - `alerts`: alert rules, the engine that judges them and the alerts they
   raise. `notifications`: email and webhook channels. See
   [alerts](alerts.md).
+- `automation`: jobs (a script or file on many devices), the dispatcher that
+  starts them a few at a time, and policies that start jobs on a schedule or
+  on enrollment. See [automation](automation.md).
 - `maintenance`: the periodic task that purges expired tokens, old runs,
   resolved alerts, old application changes and leftover partial files.
 - `admin`: the `meshrmm-server admin` commands for locked-out operators.
@@ -153,6 +156,9 @@ task.
 - **Alerts**: the engine's task reads presence and the metrics, raises and
   resolves alerts, and broadcasts them; event sockets of users who may see
   alerts pass them on. See [alerts](alerts.md).
+- **Automation**: the engine's task fires due policies, starts jobs' runs on
+  connected devices and broadcasts jobs whose counts changed; event sockets
+  pass on the jobs each user may see. See [automation](automation.md).
 
 ### Sign-in and permissions
 

@@ -59,7 +59,7 @@ function harness({ online } = {}) {
   const connections = [];
   const timers = fakeTimers();
   const revision = { current: -1 };
-  const state = { agents: [], companies: [], refused: 0, readings: [], alerts: [] };
+  const state = { agents: [], companies: [], refused: 0, readings: [], alerts: [], jobs: [] };
   const stream = inventoryStream({
     openSocket: () => {
       const socket = new FakeSocket();
@@ -70,6 +70,7 @@ function harness({ online } = {}) {
     onInventory: update => { ({ agents: state.agents, companies: state.companies } = update({ agents: state.agents, companies: state.companies })); },
     onMetrics: readings => { state.readings.push(...readings); },
     onAlerts: event => { state.alerts.push(event); },
+    onJobs: event => { state.jobs.push(event); },
     onConnection: connection => connections.push(connection),
     onRefused: () => { state.refused++; },
     online,
@@ -282,5 +283,17 @@ test('alert events arrive beside the revisions without disturbing them', () => {
   sockets[0].receive({ type: 'alert_upsert', alert, counts });
   assert.deepEqual(state.alerts, [{ type: 'alert_counts', counts }, { type: 'alert_upsert', alert, counts }]);
   assert.equal(revision.current, 3);
+  assert.deepEqual(sockets[0].sent, [], 'no snapshot is requested');
+});
+
+test('job events arrive beside the revisions without disturbing them', () => {
+  const { sockets, state, revision } = harness();
+  sockets[0].open();
+  sockets[0].receive({ type: 'snapshot', revision: 2, agents: [agent('a')], generated_at_unix_ms: 0 });
+  const job = { id: 'j', item_name: 'Clean up', counts: { total: 1, running: 1 } };
+  sockets[0].receive({ type: 'job_update', job });
+  sockets[0].receive({ type: 'jobs_resync' });
+  assert.deepEqual(state.jobs, [{ type: 'job_update', job }, { type: 'jobs_resync' }]);
+  assert.equal(revision.current, 2);
   assert.deepEqual(sockets[0].sent, [], 'no snapshot is requested');
 });

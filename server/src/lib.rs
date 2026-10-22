@@ -6,6 +6,7 @@ pub mod alerts;
 pub mod api;
 pub mod audit;
 pub mod auth;
+pub mod automation;
 pub mod config;
 pub mod db;
 pub mod downloads;
@@ -76,6 +77,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         presence: Presence::new(database.clone(), agents.clone(), UPDATE_GRACE),
         metrics: Metrics::new(database.clone()),
         alerts: alerts::Engine::default(),
+        automation: automation::Engine::default(),
         sessions: Sessions::new(Timeouts::new(idle)),
         turn: Turn::new(&instance_key),
         database,
@@ -128,6 +130,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     state.turn.start(&state.config).await?;
     let maintenance = maintenance::spawn(state.database.clone(), state.storage.clone());
     let alerting = alerts::spawn(state.clone());
+    let automating = automation::spawn(state.clone());
     let handle = Handle::<SocketAddr>::new();
     tokio::spawn({
         let handle = handle.clone();
@@ -140,6 +143,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let served = serve::serve(&state.config, http::router(state.clone()), handle).await;
     maintenance.abort();
     alerting.abort();
+    automating.abort();
     state.turn.stop().await;
     state.database.close().await;
     served

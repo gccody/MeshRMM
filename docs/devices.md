@@ -79,7 +79,9 @@ online filter, it is kept in the page's address (`?company=<id>`, or
 Clicking a tile opens the device's resource usage. Hovering over an online
 device shows **Connect**, which opens a remote session on the console or in
 [background mode](background-mode.md), and **Scripts**, which runs a
-[script](toolbox.md) on it. A device's menu has **Close active session**,
+[script](toolbox.md) on it. Ticking devices' checkboxes opens a selection
+bar that runs a script or sends a file on all of them as a
+[job](automation.md). A device's menu has **Close active session**,
 which for users with `sessions.close_any` disconnects the device's viewer and
 clears a stale session reservation. The Agent stays online and can take a new
 connection at once. It is safe to repeat and is recorded in the audit log.

@@ -2,8 +2,10 @@
 
 The toolbox keeps the scripts and files a technician uses on devices.
 Scripts are written and edited on the website's **Toolbox** page. They run on
-a device from the website, or from the viewer's toolbox while connected. Library files are uploaded on the same page,
-and the viewer's toolbox sends them to the connected device.
+a device from the website, or from the viewer's toolbox while connected, and
+on many devices at once as a [job](automation.md). Library files are uploaded
+on the same page; the viewer's toolbox sends them to the connected device,
+and a job sends them to many.
 
 Each script and file is private to the user who added it, or shared with
 everyone. Users with `scripts.run` keep their own private scripts and run
@@ -54,12 +56,15 @@ refused. Failed, timed-out and lost runs can raise
 
 ### Running a script
 
-- **Website:** choose **Run** on a script in the Toolbox, **Run a script** at
-  the top of it, or **Scripts** on a device's tile on the Devices page.
-  Pick the script, an online device, and the account. The dialog follows the
-  run and shows its output when it finishes. **Run history** lists the last 50
-  runs; users see their own, and users with `audit.view` see everyone's. Runs
-  and their output are kept for 30 days.
+- **Website:** choose **Scripts** on a device's tile on the Devices page.
+  Pick the script and the account. The dialog follows the run and shows its
+  output when it finishes. **Run** on a script in the Toolbox, **Run on
+  devices** at the top of it, and **Run script** for the devices ticked on
+  the Devices page start a [job](automation.md) instead, on one or many
+  devices, whole companies or every device. **Run history** lists the last 50
+  runs started on one device (a job's runs are on its page); users see their
+  own, and users with `audit.view` see everyone's. Runs and their output are
+  kept for 30 days.
 - **Viewer:** open the toolbar's toolbox button (beside Files), choose a script
   in its folder, then **As the signed-in user** or **As SYSTEM**. While it
   runs, the button is highlighted and its tooltip says so. When it finishes, a
@@ -76,8 +81,10 @@ match, and the Agent checks it again before saving. Files can be renamed,
 moved to another folder, shared or unshared, downloaded, and deleted. Their
 content cannot change; upload a new file instead.
 
-The website sends a file to a device with `POST /v1/agents/{id}/file-deliveries`,
-choosing the signed-in user's folder or Public Documents. In the viewer, the
+The website sends a file to devices as a [job](automation.md): **Send** on a
+file in the Toolbox, or **Send file** for the devices ticked on the Devices
+page, choosing the signed-in user's folder or Public Documents. One device's
+delivery is `POST /v1/agents/{id}/file-deliveries`. In the viewer, the
 toolbox's **Send a file to Documents** section lists the library by folder.
 Choosing a file sends it to the connected device:
 
@@ -154,8 +161,11 @@ On the Agent:
   Reports are retried for about a minute while the server is unreachable.
 
 Every script change, upload, run and delivery is recorded in the audit log (`toolbox.script_*`, `toolbox.file_*`, `script.run`,
-`file.deliver`). The scheduled maintenance task deletes runs and deliveries
-older than 30 days.
+`file.deliver`); a job is recorded once, as `job.start`. The scheduled
+maintenance task deletes runs, deliveries and jobs older than 30 days.
+
+A shared script that an [automation policy](automation.md#policies) runs
+can't be deleted or unshared until the policy changes or is deleted.
 
 ## Setup
 

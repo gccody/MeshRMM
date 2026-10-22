@@ -6,6 +6,7 @@ import { usePopover } from "../../lib/use-popover";
 import { useAgentInventory } from "../agents/use-agent-inventory";
 import { topSeverity } from "../alerts/model";
 import { useAlertFeed } from "../alerts/use-alert-feed";
+import { useJobFeed } from "../automation/use-job-feed";
 import type { InventoryConnection } from "../agents/inventory-stream";
 import type { Agent } from "../agents/types";
 import { loginPath } from "../auth/next-path";
@@ -32,7 +33,7 @@ const CONNECTION_STATUS: Record<InventoryConnection, string> = {
 
 // Day-to-day pages, then administration, which the bar sets apart.
 const NAV_GROUPS: View[][] = [
-  ["devices", "companies", "software", "toolbox", "alerts"],
+  ["devices", "companies", "software", "toolbox", "jobs", "alerts"],
   ["users", "roles", "authentication", "settings", "audit"],
 ];
 
@@ -107,10 +108,12 @@ function SignedInWorkspace({ account, view, title, setPageTitle }: {
   }, [lock, refresh]);
 
   const alerts = useAlertFeed({ enabled: can("alerts.view") && !enrolling, authorizedFetch });
+  const jobs = useJobFeed();
   const inventory = useAgentInventory({
     enabled: can("devices.view") && !enrolling,
     authorizedFetch,
     onAlerts: alerts.handle,
+    onJobs: jobs.handle,
     // A refused or revoked socket means the session or the user's access
     // changed; the account says which.
     onRefused: useCallback(() => void refresh().catch(() => {}), [refresh]),
@@ -176,6 +179,7 @@ function SignedInWorkspace({ account, view, title, setPageTitle }: {
     authorizedFetch,
     inventory,
     alerts,
+    jobs,
     remote,
     deleteAgent,
     deletingId,

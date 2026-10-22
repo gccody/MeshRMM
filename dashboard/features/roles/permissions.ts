@@ -8,6 +8,8 @@ const GROUP_LABELS: Record<string, string> = {
   sessions: "Remote sessions",
   scripts: "Scripts",
   files: "Files",
+  jobs: "Jobs",
+  automation: "Automation",
   alerts: "Alerts",
   users: "Users",
   roles: "Roles",

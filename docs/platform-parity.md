@@ -59,6 +59,7 @@ yet.
 | Screen thumbnail | Yes | Yes | Partly: none without a graphical session, none of GNOME's Wayland login or lock screen |
 | Thumbnail of the sign-in and lock screens | Yes, UAC prompts too | Login window yes; lock screen not verified | X11 yes; GNOME Wayland no |
 | [Alerts](alerts.md) | Yes | Yes | Yes |
+| [Jobs and automation policies](automation.md) | PowerShell and Command Prompt scripts, files | Shell (zsh) scripts, files | Shell (bash) scripts, files |
 
 - **Linux thumbnails** come from the console's graphical session, so a
   server without one has no thumbnail. GNOME Shell refuses screen capture at
@@ -67,6 +68,9 @@ yet.
   lock by unlocking it through logind (see below), but thumbnails don't.
 - Alerts are judged on the server from the online state, resource usage and
   toolbox runs every Agent reports, so they need nothing from the platform.
+- Jobs and policies are the server's: each device gets the same toolbox
+  command as a run by hand. A device whose platform has no interpreter for
+  the script is skipped and counted as skipped, not failed.
   Disk space alerts cover the volumes in the table's Volumes row.
 - Each platform counts memory the way its own task manager does: Windows
   leaves out the standby cache, macOS counts app, wired and compressed
