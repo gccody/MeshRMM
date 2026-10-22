@@ -6,7 +6,7 @@ import { type RunAs, type ScriptLanguage, LANGUAGE_LABELS, runsOn } from "../too
 import type { Permission } from "../auth/types.ts";
 import { DEFAULT_REBOOT_DELAY_MINUTES, type RebootBehavior, type UpdateCategory, installName, rebootDelayProblem } from "../updates/model.ts";
 
-export type JobKind = "script" | "file" | "update_scan" | "update_install";
+export type JobKind = "script" | "file" | "update_scan" | "update_install" | "wake";
 export const isUpdateJob = (kind: JobKind) => kind === "update_scan" || kind === "update_install";
 
 export const JOB_KIND_LABELS: Record<JobKind, string> = {
@@ -14,6 +14,7 @@ export const JOB_KIND_LABELS: Record<JobKind, string> = {
   file: "File",
   update_scan: "Update scan",
   update_install: "Update install",
+  wake: "Wake",
 };
 export type TargetKind = "devices" | "companies" | "all";
 export type OfflineChoice = "skip" | "wait";
@@ -77,6 +78,8 @@ export type JobDevice = {
   delivery_id: string | null;
   // The device's update scan or install, for update jobs.
   update_run_id?: string | null;
+  // The device's wake request, for wake jobs.
+  wake_id?: string | null;
   exit_code: number | null;
   // Where a delivered file was saved.
   path: string | null;
@@ -93,12 +96,13 @@ export type JobEvent = { type: "job_update"; job: Job } | { type: "jobs_resync" 
 export type TriggerKind = "interval" | "daily" | "weekly" | "once" | "enroll";
 
 // What a policy does each time it runs.
-export type PolicyAction = "script" | "update_scan" | "update_install";
+export type PolicyAction = "script" | "update_scan" | "update_install" | "wake";
 
 export const ACTION_LABELS: Record<PolicyAction, string> = {
   script: "Run a script",
   update_scan: "Scan for updates",
   update_install: "Install updates",
+  wake: "Wake devices",
 };
 
 // GET /v1/automation-policies
@@ -179,6 +183,20 @@ export const OUTCOME_LABELS: Record<Outcome, string> = {
   missed: "Missed",
   cancelled: "Cancelled",
 };
+
+// A wake job's device is "running" while the job waits for it to come
+// online, which is what succeeding means.
+const WAKE_OUTCOME_LABELS: Partial<Record<Outcome, string>> = {
+  queued: "Waking",
+  running: "Waiting to come online",
+  succeeded: "Came online",
+  no_result: "Didn’t come online",
+  skipped: "Online already",
+};
+
+// The outcome's label in a job of `kind`.
+export const outcomeLabel = (outcome: Outcome, kind?: JobKind) =>
+  (kind === "wake" ? WAKE_OUTCOME_LABELS[outcome] : undefined) ?? OUTCOME_LABELS[outcome];
 
 // Short words for counts: "3 failed".
 const COUNT_WORDS: Record<Outcome, string> = {
@@ -369,6 +387,7 @@ export function describePolicyAction(policy: Pick<Policy, "action" | "script_nam
   switch (policy.action) {
     case "update_scan": return "Scan for updates";
     case "update_install": return installName(policy.update_categories ?? []);
+    case "wake": return "Wake devices";
     default: return policy.script_name ?? "Deleted script";
   }
 }
@@ -379,6 +398,7 @@ export const SAVE_PERMISSION: Record<PolicyAction, Permission> = {
   script: "scripts.run",
   update_scan: "updates.view",
   update_install: "updates.install",
+  wake: "devices.wake",
 };
 
 // Which devices a policy runs on, in words.
@@ -480,6 +500,7 @@ export function policyDraftProblem(draft: PolicyDraft, zones: readonly string[] 
   }
   if (draft.target === "companies" && !draft.companyIds.length) return "Choose at least one company.";
   if (draft.target === "devices" && !draft.deviceIds.length) return "Choose at least one device.";
+  if (draft.trigger === "enroll" && draft.action === "wake") return "A policy that wakes devices runs on a schedule: newly enrolled devices are online.";
   if (draft.trigger === "enroll" && draft.target === "devices") return "A policy for newly enrolled devices runs on every device or on companies.";
   if (draft.trigger === "interval") {
     const minutes = intervalMinutes(draft);
@@ -491,7 +512,7 @@ export function policyDraftProblem(draft: PolicyDraft, zones: readonly string[] 
   if (draft.trigger === "weekly" && !draft.weekdays.length) return "Choose the days of the week it runs on.";
   if (draft.trigger === "once" && !validDate(draft.runAt)) return "Choose the date and time it runs.";
   if (usesZone(draft.trigger) && (!draft.timeZone || (zones.length > 0 && !zones.includes(draft.timeZone)))) return "Choose a time zone.";
-  if (draft.offline === "wait" || draft.trigger === "enroll") {
+  if (draft.action !== "wake" && (draft.offline === "wait" || draft.trigger === "enroll")) {
     const problem = waitHoursProblem(draft.catchUpHours);
     if (problem) return `Catch offline devices up for 1 to ${MAX_WAIT_HOURS} hours.`;
   }
@@ -508,7 +529,8 @@ export function policyInput(draft: PolicyDraft) {
     device_ids: draft.target === "devices" ? draft.deviceIds : [],
     company_ids: draft.target === "companies" ? draft.companyIds : [],
     trigger: draft.trigger,
-    offline: draft.offline,
+    // A wake policy is for offline devices; it never waits for them.
+    offline: draft.action === "wake" ? "skip" : draft.offline,
     catch_up_hours: waitHoursProblem(draft.catchUpHours) ? DEFAULT_WAIT_HOURS : Number(draft.catchUpHours),
     channel_ids: draft.channelIds,
   };

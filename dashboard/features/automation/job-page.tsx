@@ -126,7 +126,7 @@ function JobView({ id }: { id: string }) {
           <JobProgressBar counts={job.counts} />
           <span>{finished ? `Finished: ${countsSummary(job.counts)}` : progressLabel(job.counts)}</span>
         </div>
-        <OutcomeChips counts={job.counts} selected={filter} onSelect={setFilter} />
+        <OutcomeChips counts={job.counts} kind={job.kind} selected={filter} onSelect={setFilter} />
       </section>
       <section className="agent-panel">
         {devices.length === 0 ? (
@@ -148,7 +148,7 @@ function JobView({ id }: { id: string }) {
                     <strong>{device.device_name ? <Link to={`/device?id=${encodeURIComponent(device.device_id)}`}>{device.device_name}</Link> : "Deleted device"}</strong>
                     <span>{device.platform ? PLATFORM_LABELS[device.platform] : ""}</span>
                   </td>
-                  <td><OutcomePill outcome={device.outcome} />{deviceResult(device) && <span>{deviceResult(device)}</span>}</td>
+                  <td><OutcomePill outcome={device.outcome} kind={job.kind} />{deviceResult(device) && <span>{deviceResult(device)}</span>}</td>
                   <td className="nowrap">{device.completed_at_unix_ms ? formatDateTime(device.completed_at_unix_ms) : ""}</td>
                   <td className="row-actions">
                     {device.run_id && <button type="button" className="secondary-button" onClick={(event) => { opener.current = event.currentTarget; setOutput(device); }} aria-haspopup="dialog">View output</button>}
@@ -169,7 +169,9 @@ function JobView({ id }: { id: string }) {
 function JobFacts({ job }: { job: JobDetail }) {
   return (
     <dl className="job-facts">
-      {isUpdateJob(job.kind)
+      {job.kind === "wake"
+        ? <div><dt>Action</dt><dd>{job.item_name}<span>Offline devices are woken through online devices on their network</span></dd></div>
+        : isUpdateJob(job.kind)
         ? <div><dt>Updates</dt><dd>{job.item_name}{job.kind === "update_install" && <span>{describeSelection({ categories: job.categories ?? [] })}</span>}</dd></div>
         : <div><dt>{job.kind === "script" ? "Script" : "File"}</dt><dd>{job.item_name}{job.language && <span>{LANGUAGE_LABELS[job.language]}</span>}</dd></div>}
       {job.kind === "update_install" && <div><dt>Restart</dt><dd>{describeReboot(job.reboot ?? null, job.reboot_delay_minutes ?? null)}</dd></div>}
@@ -178,7 +180,9 @@ function JobFacts({ job }: { job: JobDetail }) {
       <div><dt>On</dt><dd>{job.target_label}</dd></div>
       <div><dt>Started by</dt><dd>{job.policy_id ? <Link to={`/jobs?policy=${encodeURIComponent(job.policy_id)}`}>{jobStarter(job)}</Link> : jobStarter(job)}{job.policy_id && <span>With {job.requested_by_you ? "your" : `${job.requested_by}’s`} access</span>}</dd></div>
       <div><dt>Started</dt><dd>{formatDateTime(job.created_at_unix_ms)}</dd></div>
-      <div><dt>Offline devices</dt><dd>{job.offline === "wait" ? `Run if they connect by ${formatDateTime(job.expires_at_unix_ms)}` : "Skipped"}</dd></div>
+      {job.kind === "wake"
+        ? <div><dt>Online devices</dt><dd>Skipped</dd></div>
+        : <div><dt>Offline devices</dt><dd>{job.offline === "wait" ? `Run if they connect by ${formatDateTime(job.expires_at_unix_ms)}` : "Skipped"}</dd></div>}
       {job.finished_at_unix_ms !== null && <div><dt>Finished</dt><dd>{formatDateTime(job.finished_at_unix_ms)}</dd></div>}
     </dl>
   );

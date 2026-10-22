@@ -93,6 +93,7 @@ const ACTION_LABELS: Record<string, string> = {
   "agent.delete": "Deleted a device",
   "agent.rotate_credential": "Rotated a device's credential",
   "agent.move": "Moved a device to another company",
+  "agent.wake": "Woke a device",
   "company.create": "Created a company",
   "company.rename": "Renamed a company",
   "company.delete": "Deleted a company",
