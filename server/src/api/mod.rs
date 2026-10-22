@@ -29,6 +29,7 @@ mod terminals;
 mod toolbox;
 mod updates;
 mod users;
+mod wake;
 
 use axum::{
     Json, Router,
@@ -213,6 +214,9 @@ fn device_routes() -> Router<AppState> {
         .route("/updates/devices", get(updates::devices))
         .route("/update-runs", get(updates::list_runs))
         .route("/update-runs/{id}", get(updates::get_run))
+        .route("/agents/{id}/wake", post(wake::wake_device))
+        .route("/agents/{id}/wakes", get(wake::recent))
+        .route("/wakes", get(wake::list).post(wake::wake_many))
         .route(
             "/agents/{id}/rotate-credential",
             post(devices::rotate_credential),

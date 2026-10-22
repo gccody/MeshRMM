@@ -16,7 +16,7 @@ use crate::{
         tables::{
             AgentInstallTokens, Agents, Alerts, DeviceApplicationChanges, DeviceMetrics,
             FileDeliveries, Invitations, Jobs, PasswordResets, RemoteHandoffs, RemoteSessions,
-            ScriptRuns, ToolboxFiles, UpdateRuns, UserSessions,
+            ScriptRuns, ToolboxFiles, UpdateRuns, UserSessions, WakeRequests,
         },
     },
     realtime::metrics::HISTORY_MS,
@@ -29,8 +29,8 @@ const INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Expired rows are kept this long, so a request racing the purge still sees
 /// a token it considers live.
 const EXPIRED_GRACE_MS: i64 = 10 * MINUTE_MS;
-/// How long toolbox script runs, with their output, file deliveries and jobs
-/// are kept. The audit log keeps that they happened.
+/// How long toolbox script runs, with their output, file deliveries, jobs
+/// and wake requests are kept. The audit log keeps that they happened.
 const TOOLBOX_HISTORY_MS: i64 = 30 * DAY_MS;
 /// A file this old belongs to no upload or deletion still in progress.
 const ORPHAN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -50,6 +50,7 @@ pub struct Purged {
     pub application_changes: u64,
     pub jobs: u64,
     pub update_runs: u64,
+    pub wakes: u64,
 }
 
 /// Purges every expired row and abandoned partial file once now and then
@@ -80,8 +81,8 @@ pub fn spawn(database: Database, storage: Storage) -> tokio::task::JoinHandle<()
 /// before `now_ms`, toolbox history older than [`TOOLBOX_HISTORY_MS`], and
 /// devices' resource usage older than [`HISTORY_MS`], and alerts resolved
 /// more than [`RESOLVED_RETENTION_MS`] ago, and application changes older
-/// than [`CHANGES_RETENTION_MS`], and jobs (with their devices) older than
-/// [`TOOLBOX_HISTORY_MS`].
+/// than [`CHANGES_RETENTION_MS`], and jobs (with their devices) and wake
+/// requests (with their relays) older than [`TOOLBOX_HISTORY_MS`].
 pub async fn purge(database: &Database, now_ms: i64) -> db::Result<Purged> {
     let expired = now_ms - EXPIRED_GRACE_MS;
     let history = now_ms - TOOLBOX_HISTORY_MS;
@@ -160,6 +161,13 @@ pub async fn purge(database: &Database, now_ms: i64) -> db::Result<Purged> {
         .await?,
         jobs: delete_before(database, Jobs::Table, Jobs::CreatedAt, history).await?,
         update_runs: purge_update_runs(database, now_ms).await?,
+        wakes: delete_before(
+            database,
+            WakeRequests::Table,
+            WakeRequests::CreatedAt,
+            history,
+        )
+        .await?,
     })
 }
 

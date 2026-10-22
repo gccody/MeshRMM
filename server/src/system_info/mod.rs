@@ -242,6 +242,7 @@ async fn replace_addresses(
             DeviceIpAddresses::Address,
             DeviceIpAddresses::PrefixLength,
             DeviceIpAddresses::MacAddress,
+            DeviceIpAddresses::Kind,
         ]);
         for (adapter, address) in chunk {
             insert.values_panic([
@@ -250,6 +251,7 @@ async fn replace_addresses(
                 address.address.as_str().into(),
                 i64::from(address.prefix_length).into(),
                 adapter.mac_address.clone().into(),
+                adapter.kind.as_str().into(),
             ]);
         }
         executor.execute(&insert).await?;

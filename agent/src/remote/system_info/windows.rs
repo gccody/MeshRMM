@@ -13,6 +13,23 @@ mod registry;
 mod smbios;
 mod users;
 
+/// The IPv4 addresses of the adapters that are up.
+pub(super) fn local_ipv4_addresses() -> anyhow::Result<Vec<super::LocalAddress>> {
+    Ok(network::adapters()?
+        .into_iter()
+        .filter(|adapter| adapter.up)
+        .flat_map(|adapter| {
+            adapter.addresses.into_iter().filter_map(move |address| {
+                Some(super::LocalAddress {
+                    interface: adapter.name.clone(),
+                    address: address.address.parse().ok()?,
+                    prefix_length: address.prefix_length,
+                })
+            })
+        })
+        .collect())
+}
+
 pub(super) fn collect(problems: &mut Problems) -> SystemInfo {
     let os = os::collect(problems);
     let applications = applications::list(problems, &os.architecture);

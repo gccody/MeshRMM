@@ -16,6 +16,8 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 use super::{Problems, unix, unix_ms};
 
+pub(super) use super::unix::local_ipv4_addresses;
+
 /// The package and update tools a distribution may have, as each is named.
 const PACKAGE_MANAGERS: &[(&str, &str)] = &[
     ("apt-get", "apt"),

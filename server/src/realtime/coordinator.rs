@@ -15,7 +15,7 @@ use meshrmm_protocol_types::{
 };
 
 use super::{LIVENESS, ToAgent, close_frame, send};
-use crate::{agents, http::AppState, system_info, updates};
+use crate::{agents, http::AppState, system_info, updates, wake};
 
 /// Serves the control connection of an Agent that authenticated as
 /// `device_id`, connecting from `ip`.
@@ -33,6 +33,7 @@ pub async fn serve(
     let mut socket = socket;
     let mut connection = state.agents.connect(&device_id);
     state.presence.connected(&device_id).await;
+    wake::device_connected(&state, &device_id).await;
     // Jobs waiting for the device start now.
     state.automation.wake();
     tracing::info!(device_id, "Agent connected");
@@ -98,6 +99,11 @@ pub async fn serve(
                         Ok(AgentStatusMessage::UpdateInstall { run_id, result }) => {
                             if state.agents.is_current(&device_id, connection.id) {
                                 updates::install_reported(&state, &device_id, &run_id, *result).await;
+                            }
+                        }
+                        Ok(AgentStatusMessage::WakePacketsSent { results }) => {
+                            if state.agents.is_current(&device_id, connection.id) {
+                                wake::reported(&state, &device_id, results).await;
                             }
                         }
                         // Only a deleted device's Agent uninstalls.

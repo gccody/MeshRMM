@@ -12,6 +12,8 @@ use objc2_core_foundation::{
 
 use super::{Problems, unix, unix_ms};
 
+pub(super) use super::unix::local_ipv4_addresses;
+
 mod applications;
 mod disks;
 mod network;

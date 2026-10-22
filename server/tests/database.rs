@@ -350,6 +350,57 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
                 .unwrap();
         }
 
+        for (id, created_at) in [("old-wake", NOW - 31 * DAY_MS), ("new-wake", NOW - DAY_MS)] {
+            database
+                .execute(
+                    &Query::insert()
+                        .into_table("wake_requests")
+                        .columns([
+                            "id",
+                            "device_id",
+                            "requested_by_user_id",
+                            "status",
+                            "mac_addresses",
+                            "created_at",
+                        ])
+                        .values_panic([
+                            id.into(),
+                            "device".into(),
+                            "user".into(),
+                            "sent".into(),
+                            "AA:00:00:00:00:01".into(),
+                            created_at.into(),
+                        ])
+                        .to_owned(),
+                )
+                .await
+                .unwrap();
+            database
+                .execute(
+                    &Query::insert()
+                        .into_table("wake_relays")
+                        .columns([
+                            "wake_id",
+                            "relay_device_id",
+                            "relay_name",
+                            "broadcast",
+                            "prefix_length",
+                            "status",
+                        ])
+                        .values_panic([
+                            id.into(),
+                            "relay".into(),
+                            "Relay".into(),
+                            "192.168.1.255".into(),
+                            24.into(),
+                            "sent".into(),
+                        ])
+                        .to_owned(),
+                )
+                .await
+                .unwrap();
+        }
+
         let purged = maintenance::purge(database, NOW).await.unwrap();
         assert_eq!(
             purged,
@@ -359,6 +410,7 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
                 device_metrics: 1,
                 resolved_alerts: 1,
                 application_changes: 1,
+                wakes: 1,
                 ..Purged::default()
             },
             "{}",
@@ -377,6 +429,12 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
             .unwrap();
         assert_eq!(remaining, [("recent".to_owned(),)], "{}", test.name);
         assert_eq!(count(database, "alerts").await, 2, "{}", test.name);
+        assert_eq!(
+            count(database, "wake_relays").await,
+            1,
+            "a purged wake request's relays go with it: {}",
+            test.name
+        );
         assert_eq!(
             count(database, "device_application_changes").await,
             1,
