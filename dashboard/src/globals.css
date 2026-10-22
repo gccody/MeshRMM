@@ -688,8 +688,10 @@ a.screen-action { text-decoration: none; }
 .terminal-notice { margin: 0; color: var(--text-3); font-size: 13px; }
 .terminal-actions { margin-left: auto; display: inline-flex; flex-wrap: wrap; gap: 8px; }
 .terminal-actions .primary-button, .terminal-actions .secondary-button { min-height: 32px; }
-.terminal-screen { min-height: 0; padding: 8px 0 8px 10px; overflow: hidden; border: 1px solid var(--rule); border-radius: 10px; background: #07090d; }
-.terminal-screen .xterm { height: 100%; }
+/* xterm's fit measures this box's content height and subtracts the padding of
+   .xterm itself, so the padding goes there and this box keeps none. */
+.terminal-screen { box-sizing: content-box; min-height: 0; overflow: hidden; border: 1px solid var(--rule); border-radius: 10px; background: #07090d; }
+.terminal-screen .xterm { box-sizing: border-box; height: 100%; padding: 8px 0 8px 10px; }
 /* xterm's style elements, made inert; see features/terminal/terminal-view.tsx. */
 meshrmm-style { display: none; }
 .terminal-loading { display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--text-3); }

@@ -349,15 +349,21 @@ async fn relay(
         }
     }
     .await;
-    if let Some((code, reason)) = end.browser_close() {
-        let _ = tokio::time::timeout(
-            SEND_TIMEOUT,
-            browser_tx.send(Message::Close(Some(CloseFrame {
-                code,
-                reason: reason.into(),
-            }))),
-        )
-        .await;
+    match end.browser_close() {
+        Some((code, reason)) => {
+            let _ = tokio::time::timeout(
+                SEND_TIMEOUT,
+                browser_tx.send(Message::Close(Some(CloseFrame {
+                    code,
+                    reason: reason.into(),
+                }))),
+            )
+            .await;
+        }
+        // Completes the browser's closing handshake.
+        None => {
+            let _ = tokio::time::timeout(SEND_TIMEOUT, browser_tx.close()).await;
+        }
     }
     if end != End::DeviceDisconnected {
         // The Agent ends the shell and everything it started.
