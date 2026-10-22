@@ -269,6 +269,67 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
                 .unwrap();
         }
 
+        database
+            .execute(
+                &Query::insert()
+                    .into_table("alert_rules")
+                    .columns([
+                        "id",
+                        "name",
+                        "severity",
+                        "condition",
+                        "created_at",
+                        "updated_at",
+                    ])
+                    .values_panic([
+                        "rule".into(),
+                        "Rule".into(),
+                        "info".into(),
+                        "script_failed".into(),
+                        0.into(),
+                        0.into(),
+                    ])
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        for (id, state, resolved_at) in [
+            ("old", "resolved", Some(NOW - 91 * DAY_MS)),
+            ("recent", "resolved", Some(NOW - 89 * DAY_MS)),
+            ("open", "open", None),
+        ] {
+            database
+                .execute(
+                    &Query::insert()
+                        .into_table("alerts")
+                        .columns([
+                            "id",
+                            "rule_id",
+                            "device_id",
+                            "subject",
+                            "state",
+                            "detail",
+                            "raised_at",
+                            "last_occurred_at",
+                            "resolved_at",
+                        ])
+                        .values_panic([
+                            id.into(),
+                            "rule".into(),
+                            "device".into(),
+                            id.into(),
+                            state.into(),
+                            "Failed".into(),
+                            (NOW - 100 * DAY_MS).into(),
+                            (NOW - 100 * DAY_MS).into(),
+                            resolved_at.into(),
+                        ])
+                        .to_owned(),
+                )
+                .await
+                .unwrap();
+        }
+
         let purged = maintenance::purge(database, NOW).await.unwrap();
         assert_eq!(
             purged,
@@ -276,6 +337,7 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
                 handoffs: 1,
                 script_runs: 1,
                 device_metrics: 1,
+                resolved_alerts: 1,
                 ..Purged::default()
             },
             "{}",
@@ -293,6 +355,7 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
             .await
             .unwrap();
         assert_eq!(remaining, [("recent".to_owned(),)], "{}", test.name);
+        assert_eq!(count(database, "alerts").await, 2, "{}", test.name);
         test.drop_database().await;
     }
 }

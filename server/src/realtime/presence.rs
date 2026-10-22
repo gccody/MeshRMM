@@ -307,6 +307,14 @@ impl Presence {
         );
     }
 
+    /// The devices whose Agent went offline to install an update and isn't
+    /// back yet.
+    pub async fn updating_devices(&self) -> std::collections::HashSet<String> {
+        let mut state = self.inner.state.lock().await;
+        state.prune_updates();
+        state.updating.keys().cloned().collect()
+    }
+
     /// Asks event sockets to check their user's access again.
     pub fn recheck_access(&self) {
         self.inner.access.send_modify(|generation| *generation += 1);

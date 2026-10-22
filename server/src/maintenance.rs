@@ -10,11 +10,12 @@ use std::{collections::HashSet, time::Duration};
 use sea_query::{Expr, ExprTrait, IntoIden, Query};
 
 use crate::{
+    alerts::RESOLVED_RETENTION_MS,
     db::{
         self, Database,
         tables::{
-            AgentInstallTokens, Agents, DeviceMetrics, FileDeliveries, Invitations, PasswordResets,
-            RemoteHandoffs, RemoteSessions, ScriptRuns, ToolboxFiles, UserSessions,
+            AgentInstallTokens, Agents, Alerts, DeviceMetrics, FileDeliveries, Invitations,
+            PasswordResets, RemoteHandoffs, RemoteSessions, ScriptRuns, ToolboxFiles, UserSessions,
         },
     },
     realtime::metrics::HISTORY_MS,
@@ -43,6 +44,7 @@ pub struct Purged {
     pub script_runs: u64,
     pub file_deliveries: u64,
     pub device_metrics: u64,
+    pub resolved_alerts: u64,
 }
 
 /// Purges every expired row and abandoned partial file once now and then
@@ -71,7 +73,8 @@ pub fn spawn(database: Database, storage: Storage) -> tokio::task::JoinHandle<()
 
 /// Deletes tokens and sessions that expired more than [`EXPIRED_GRACE_MS`]
 /// before `now_ms`, toolbox history older than [`TOOLBOX_HISTORY_MS`], and
-/// devices' resource usage older than [`HISTORY_MS`].
+/// devices' resource usage older than [`HISTORY_MS`], and alerts resolved
+/// more than [`RESOLVED_RETENTION_MS`] ago.
 pub async fn purge(database: &Database, now_ms: i64) -> db::Result<Purged> {
     let expired = now_ms - EXPIRED_GRACE_MS;
     let history = now_ms - TOOLBOX_HISTORY_MS;
@@ -132,6 +135,13 @@ pub async fn purge(database: &Database, now_ms: i64) -> db::Result<Purged> {
             DeviceMetrics::Table,
             DeviceMetrics::Minute,
             now_ms - HISTORY_MS,
+        )
+        .await?,
+        resolved_alerts: delete_before(
+            database,
+            Alerts::Table,
+            Alerts::ResolvedAt,
+            now_ms - RESOLVED_RETENTION_MS,
         )
         .await?,
     })

@@ -58,12 +58,16 @@ yet.
 | Volumes | Fixed drives with a letter | Local writable volumes and `/` | Local block devices, once each |
 | Screen thumbnail | Yes | Yes | Partly: none without a graphical session, none of GNOME's Wayland login or lock screen |
 | Thumbnail of the sign-in and lock screens | Yes, UAC prompts too | Login window yes; lock screen not verified | X11 yes; GNOME Wayland no |
+| [Alerts](alerts.md) | Yes | Yes | Yes |
 
 - **Linux thumbnails** come from the console's graphical session, so a
   server without one has no thumbnail. GNOME Shell refuses screen capture at
   its Wayland login screen and while the screen is locked
   (`agent/src/remote/linux/capture/mutter.rs`). Live sessions get around the
   lock by unlocking it through logind (see below), but thumbnails don't.
+- Alerts are judged on the server from the online state, resource usage and
+  toolbox runs every Agent reports, so they need nothing from the platform.
+  Disk space alerts cover the volumes in the table's Volumes row.
 - Each platform counts memory the way its own task manager does: Windows
   leaves out the standby cache, macOS counts app, wired and compressed
   memory, Linux counts the total less `MemAvailable`.

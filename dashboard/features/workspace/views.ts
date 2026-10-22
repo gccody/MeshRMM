@@ -3,13 +3,16 @@
 // Imports carry the .ts extension so node:test can load this module directly.
 import { type Account, type Permission, canAny } from "../auth/types.ts";
 
-export type View = "devices" | "device" | "companies" | "toolbox" | "users" | "roles" | "authentication" | "settings" | "audit" | "account";
+export type View = "devices" | "device" | "companies" | "toolbox" | "alerts" | "alert-rules" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account";
 
 export const VIEW_PATHS: Record<View, string> = {
   devices: "/",
   device: "/device",
   companies: "/companies",
   toolbox: "/toolbox",
+  alerts: "/alerts",
+  "alert-rules": "/alert-rules",
+  "notification-channels": "/notification-channels",
   users: "/users",
   roles: "/roles",
   authentication: "/authentication",
@@ -24,6 +27,9 @@ export const VIEW_COPY: Record<View, { title: string }> = {
   device: { title: "Device" },
   companies: { title: "Companies" },
   toolbox: { title: "Toolbox" },
+  alerts: { title: "Alerts" },
+  "alert-rules": { title: "Alert rules" },
+  "notification-channels": { title: "Notification channels" },
   users: { title: "Users" },
   roles: { title: "Roles" },
   authentication: { title: "Authentication" },
@@ -39,6 +45,9 @@ const VIEW_ACCESS: Record<View, readonly Permission[]> = {
   device: ["devices.view"],
   companies: ["devices.view"],
   toolbox: ["scripts.run", "scripts.manage_shared", "files.deliver", "files.manage_shared"],
+  alerts: ["alerts.view"],
+  "alert-rules": ["alerts.view"],
+  "notification-channels": ["alerts.manage"],
   users: ["users.manage"],
   roles: ["roles.manage"],
   authentication: ["authentication.manage"],
@@ -60,6 +69,14 @@ export function canView(account: Pick<Account, "permissions" | "is_administrator
 export function homeView(account: Pick<Account, "permissions" | "is_administrator"> | null): View {
   const views = Object.keys(VIEW_PATHS) as View[];
   return views.find((view) => canView(account, view)) ?? "account";
+}
+
+// The navigation entry a page sits under: a device under Devices, and the
+// alert rules and channels under Alerts.
+export function navViewFor(view: View): View {
+  if (view === "device") return "devices";
+  if (view === "alert-rules" || view === "notification-channels") return "alerts";
+  return view;
 }
 
 export function viewForPath(pathname: string | null | undefined): View | null {

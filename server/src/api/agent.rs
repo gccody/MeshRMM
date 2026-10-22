@@ -216,6 +216,7 @@ pub async fn report_script_run(
     if updated == 0 {
         return Err(ApiError::not_found("no pending run has this ID"));
     }
+    crate::alerts::script_run_finished(&state, &run_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

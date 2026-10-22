@@ -47,7 +47,10 @@ standard output and error, up to 512 KiB each. Both interpreters are asked to
 write UTF-8: PowerShell through `[Console]::OutputEncoding`, Command Prompt
 through `chcp 65001`. Output a program writes in the OEM code page is decoded
 as such. A run the device never reports on, for example because it went
-offline or restarted, shows **No result** two minutes after its timeout.
+offline or restarted, shows **No result** two minutes after its timeout; the
+alert engine then stores it as `lost`, and a report arriving later is
+refused. Failed, timed-out and lost runs can raise
+[alerts](alerts.md#rules).
 
 ### Running a script
 

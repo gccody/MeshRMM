@@ -1,4 +1,5 @@
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
+import type { AlertEvent } from "../alerts/model";
 import type { MetricsReading } from "../metrics/model";
 import { type InventoryConnection, STALE_GRACE_MS, eventsSocketUrl, inventoryStream } from "./inventory-stream";
 import type { Inventory } from "./types";
@@ -9,6 +10,7 @@ type Options = {
   revisionRef: RefObject<number>;
   onInventory: (update: (current: Inventory) => Inventory) => void;
   onMetrics: (readings: MetricsReading[]) => void;
+  onAlerts: (event: AlertEvent) => void;
   onRefused: () => void;
 };
 
@@ -16,13 +18,15 @@ type Options = {
 type Link = { connection: InventoryConnection; since: number | null };
 
 // The live inventory socket, and how long it has been down.
-export function useInventoryConnection({ enabled, revisionRef, onInventory, onMetrics, onRefused }: Options) {
+export function useInventoryConnection({ enabled, revisionRef, onInventory, onMetrics, onAlerts, onRefused }: Options) {
   const [link, setLink] = useState<Link>({ connection: "connecting", since: null });
   // Advanced by a timer when the stale grace period ends.
   const [clock, setClock] = useState(0);
   const stream = useRef<ReturnType<typeof inventoryStream> | null>(null);
   const refused = useRef(onRefused);
   useEffect(() => { refused.current = onRefused; }, [onRefused]);
+  const alerts = useRef(onAlerts);
+  useEffect(() => { alerts.current = onAlerts; }, [onAlerts]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -32,6 +36,7 @@ export function useInventoryConnection({ enabled, revisionRef, onInventory, onMe
       revision: revisionRef,
       onInventory,
       onMetrics,
+      onAlerts: (event) => alerts.current(event),
       onConnection: (connection) => {
         const at = Date.now();
         setLink((previous) => {

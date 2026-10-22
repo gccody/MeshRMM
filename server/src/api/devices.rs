@@ -89,6 +89,7 @@ pub async fn delete(
     {
         tracing::warn!(device_id = id, status = %error.status(), "could not end a deleted device's remote session");
     }
+    crate::alerts::device_removed(&state, &id).await;
     state.agents.send(&id, AgentCommand::Uninstall);
     state.presence.refresh(&id).await;
     Ok(StatusCode::NO_CONTENT)

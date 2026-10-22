@@ -2,6 +2,7 @@
 //! connections, and downloads, for one company.
 pub mod admin;
 pub mod agents;
+pub mod alerts;
 pub mod api;
 pub mod audit;
 pub mod auth;
@@ -12,6 +13,7 @@ pub mod health;
 pub mod http;
 pub mod mail;
 pub mod maintenance;
+pub mod notifications;
 pub mod rbac;
 pub mod realtime;
 pub mod scim;
@@ -72,6 +74,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         config: Arc::new(config),
         presence: Presence::new(database.clone(), agents.clone(), UPDATE_GRACE),
         metrics: Metrics::new(database.clone()),
+        alerts: alerts::Engine::default(),
         sessions: Sessions::new(Timeouts::new(idle)),
         turn: Turn::new(&instance_key),
         database,
@@ -123,6 +126,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
     state.turn.start(&state.config).await?;
     let maintenance = maintenance::spawn(state.database.clone(), state.storage.clone());
+    let alerting = alerts::spawn(state.clone());
     let handle = Handle::<SocketAddr>::new();
     tokio::spawn({
         let handle = handle.clone();
@@ -134,6 +138,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     });
     let served = serve::serve(&state.config, http::router(state.clone()), handle).await;
     maintenance.abort();
+    alerting.abort();
     state.turn.stop().await;
     state.database.close().await;
     served

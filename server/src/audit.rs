@@ -116,6 +116,24 @@ impl<'a> Target<'a> {
         }
     }
 
+    pub fn alert(id: &'a str) -> Self {
+        Self { kind: "alert", id }
+    }
+
+    pub fn alert_rule(id: &'a str) -> Self {
+        Self {
+            kind: "alert_rule",
+            id,
+        }
+    }
+
+    pub fn notification_channel(id: &'a str) -> Self {
+        Self {
+            kind: "notification_channel",
+            id,
+        }
+    }
+
     pub fn settings() -> Self {
         Self {
             kind: "settings",

@@ -1,6 +1,6 @@
 # MeshRMM website
 
-The website people use to manage a MeshRMM server: devices, the toolbox, users,
+The website people use to manage a MeshRMM server: devices, the toolbox, alerts, users,
 roles, sign-in policy, settings, the audit log and their own account. It's a
 Vite + React + React Router app. The build prerenders every page to HTML, and
 the server (`meshrmm-server`) embeds the result and serves it from the same

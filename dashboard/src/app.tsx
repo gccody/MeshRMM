@@ -1,7 +1,9 @@
-import {  } from "lucide-react";
 import { Link, Route, Routes } from "react-router";
 import { AccountPanel } from "../features/account/account-panel";
 import { DevicesPanel } from "../features/agents/devices-panel";
+import { AlertsPage } from "../features/alerts/alerts-page";
+import { ChannelsPage } from "../features/alerts/channels-page";
+import { RulesPage } from "../features/alerts/rules-page";
 import { DevicePage } from "../features/metrics/device-page";
 import { CompaniesPanel } from "../features/companies/companies-panel";
 import { AuditPanel } from "../features/audit/audit-panel";
@@ -31,6 +33,9 @@ export function App() {
             <Route path="device" element={<DevicePage />} />
             <Route path="companies" element={<CompaniesPanel />} />
             <Route path="toolbox" element={<ToolboxPanel />} />
+            <Route path="alerts" element={<AlertsPage />} />
+            <Route path="alert-rules" element={<RulesPage />} />
+            <Route path="notification-channels" element={<ChannelsPage />} />
             <Route path="users" element={<UsersPanel />} />
             <Route path="roles" element={<RolesPanel />} />
             <Route path="authentication" element={<AuthenticationPanel />} />

@@ -457,6 +457,8 @@ Then, in the website:
   tokens. Only administrators can change single sign-on, SCIM and email,
   because whoever controls them can sign in as anyone.
 - **Settings** holds the company's remote-session policy.
+- **Alerts** holds the alert rules and the email and webhook channels they
+  notify. Email channels need email set up. See [alerts](alerts.md).
 - **Devices → Add device** downloads a Windows installer or shows the macOS
   install command. Both enroll the device with this server.
 

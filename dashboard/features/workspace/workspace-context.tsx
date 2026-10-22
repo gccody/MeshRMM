@@ -1,6 +1,7 @@
 import { createContext, useContext } from "react";
 import type { AuthorizedFetch } from "../../lib/http";
 import type { Agent } from "../agents/types";
+import type { AlertFeed } from "../alerts/use-alert-feed";
 import type { useAgentInventory } from "../agents/use-agent-inventory";
 import type { Account, Permission } from "../auth/types";
 import type { useRemoteHandoff } from "../session/use-remote-handoff";
@@ -19,6 +20,8 @@ export type Workspace = {
   refreshAccount: () => Promise<void>;
   authorizedFetch: AuthorizedFetch;
   inventory: ReturnType<typeof useAgentInventory>;
+  // The unresolved alert counts, and alert events for pages to follow.
+  alerts: AlertFeed;
   remote: ReturnType<typeof useRemoteHandoff>;
   deleteAgent: (agent: Agent) => Promise<void>;
   deletingId: string | null;

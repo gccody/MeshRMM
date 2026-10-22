@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { NO_COMPANY, DEFAULT_DEVICE_FILTERS, serializeDeviceFilters } from "../agents/device-filters";
 import { companyName } from "../agents/model";
+import { DeviceAlerts } from "../alerts/device-alerts";
 import { MoveDeviceDialog } from "../companies/company-dialogs";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
@@ -108,6 +109,8 @@ export function DevicePage() {
         {error && <div className="error-banner" role="alert"><CircleAlert size={16} aria-hidden="true" /><span>{error}</span></div>}
 
         {(latest || agent?.connected) && <Summary latest={latest} />}
+
+        {agent && can("alerts.view") && <DeviceAlerts deviceId={agent.id} />}
 
         {!data ? (
           <div className="empty-state compact"><LoaderCircle size={22} className="spin" aria-hidden="true" /><strong>Loading resource usage…</strong></div>

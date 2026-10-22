@@ -35,6 +35,9 @@ export const AUDIT_CATEGORIES: readonly { prefix: string; label: string }[] = [
   { prefix: "script.", label: "Script runs" },
   { prefix: "file.", label: "File deliveries" },
   { prefix: "toolbox.", label: "Toolbox library" },
+  { prefix: "alert.", label: "Alerts" },
+  { prefix: "alert_rule.", label: "Alert rules" },
+  { prefix: "notification_channel.", label: "Notification channels" },
 ];
 
 const ACTION_LABELS: Record<string, string> = {
@@ -103,6 +106,15 @@ const ACTION_LABELS: Record<string, string> = {
   "toolbox.file_upload": "Uploaded a file",
   "toolbox.file_update": "Changed a file",
   "toolbox.file_delete": "Deleted a file",
+  "alert.acknowledge": "Acknowledged an alert",
+  "alert.resolve": "Resolved an alert",
+  "alert_rule.create": "Created an alert rule",
+  "alert_rule.update": "Changed an alert rule",
+  "alert_rule.delete": "Deleted an alert rule",
+  "notification_channel.create": "Added a notification channel",
+  "notification_channel.update": "Changed a notification channel",
+  "notification_channel.delete": "Deleted a notification channel",
+  "notification_channel.test": "Tested a notification channel",
 };
 
 // "Signed in", or the action itself for one this website doesn't know.
@@ -147,6 +159,9 @@ const TARGET_LABELS: Record<string, string> = {
   scim_group: "SCIM group",
   scim_token: "SCIM token",
   settings: "Settings",
+  alert: "Alert",
+  alert_rule: "Alert rule",
+  notification_channel: "Notification channel",
 };
 
 // `deviceNames` names devices still in the inventory, rather than their IDs.
