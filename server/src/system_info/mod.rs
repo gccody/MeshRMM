@@ -17,7 +17,7 @@ use std::{collections::HashMap, net::IpAddr};
 use meshrmm_protocol_types::{
     Hardware, Network, OperatingSystem, SYSTEM_INFO_INTERVAL_SECONDS, SignedInUser, SystemInfo,
 };
-use sea_query::{Expr, ExprTrait, Func, OnConflict, Order, Query};
+use sea_query::{Expr, ExprTrait, Func, LockType, OnConflict, Order, Query};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -129,6 +129,10 @@ pub async fn store(
                 .column(DeviceSystemInfo::ApplicationsHash)
                 .from(DeviceSystemInfo::Table)
                 .and_where(Expr::col(DeviceSystemInfo::DeviceId).eq(device_id))
+                // Another store for the device waits until this one
+                // commits, so it compares with this one's list. SQLite's
+                // write transactions are serialized anyway.
+                .lock(LockType::Update)
                 .to_owned(),
         )
         .await?;

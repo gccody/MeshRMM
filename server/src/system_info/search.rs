@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 
 use sea_query::{
-    Alias, Cond, Expr, ExprTrait, Func, LikeExpr, Order, Query, SelectStatement, SimpleExpr,
+    Alias, BinOper, Cond, Expr, ExprTrait, Func, Order, Query, SelectStatement, SimpleExpr,
 };
 use serde::Serialize;
 
@@ -39,19 +39,26 @@ pub struct DeviceFilter {
     pub company: Option<CompanyFilter>,
 }
 
-/// A `LIKE` pattern that matches `text` anywhere, with its wildcards escaped.
-fn contains(text: &str) -> LikeExpr {
+/// A `LIKE` pattern that matches `text` anywhere, with its wildcards
+/// escaped by `\`.
+fn contains(text: &str) -> String {
     let escaped = text
-        .to_lowercase()
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");
-    LikeExpr::new(format!("%{escaped}%")).escape('\\')
+    format!("%{escaped}%")
 }
 
-/// `lower(column) LIKE '%text%'`.
+/// `lower(column) LIKE lower('%text%')`. Each database folds both sides the
+/// same way, so SQLite, whose `lower` knows only ASCII letters, still
+/// matches other letters in their exact case.
 fn column_contains(column: impl sea_query::IntoColumnRef, text: &str) -> SimpleExpr {
-    Expr::expr(Func::lower(Expr::col(column))).like(contains(text))
+    let pattern = Expr::Binary(
+        Box::new(Func::lower(Expr::val(contains(text))).into()),
+        BinOper::Escape,
+        Box::new(Expr::Constant('\\'.into())),
+    );
+    Expr::expr(Func::lower(Expr::col(column))).binary(BinOper::Like, pattern)
 }
 
 fn info_column(column: DeviceSystemInfo) -> (DeviceSystemInfo, DeviceSystemInfo) {
@@ -449,20 +456,19 @@ mod tests {
 
     #[test]
     fn search_text_is_matched_literally() {
+        assert_eq!(contains("50%_off\\"), "%50\\%\\_off\\\\%");
         let select = Query::select()
             .expr(Expr::val(1))
-            .and_where(Expr::expr(Expr::val("a")).like(contains("50%_off\\")))
+            .and_where(column_contains(DeviceSystemInfo::Model, "Ab"))
             .to_owned();
-        let (_, values) = select.build(SqliteQueryBuilder);
-        assert_eq!(
-            values
-                .0
-                .into_iter()
-                .last()
-                .map(|value| format!("{value:?}")),
-            Some(format!("{:?}", sea_query::Value::from("%50\\%\\_off\\\\%")))
-        );
-        let sql = select.to_string(PostgresQueryBuilder);
-        assert!(sql.contains("ESCAPE"), "{sql}");
+        for sql in [
+            select.to_string(SqliteQueryBuilder),
+            select.to_string(PostgresQueryBuilder),
+        ] {
+            assert!(
+                sql.contains(r#"LOWER("model") LIKE LOWER('%Ab%') ESCAPE "#),
+                "{sql}"
+            );
+        }
     }
 }

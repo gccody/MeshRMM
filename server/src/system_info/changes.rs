@@ -43,6 +43,33 @@ pub struct Change {
     pub source: String,
 }
 
+/// Orders versions with their numbers compared as numbers, so `8.0.10`
+/// follows `8.0.9`, and a missing version first.
+fn compare_versions(first: Option<&str>, second: Option<&str>) -> std::cmp::Ordering {
+    fn parts(version: &str) -> Vec<Result<u64, &str>> {
+        let mut parts = Vec::new();
+        let mut rest = version;
+        while let Some(first) = rest.chars().next() {
+            let digit = first.is_ascii_digit();
+            let end = rest
+                .find(|c: char| c.is_ascii_digit() != digit)
+                .unwrap_or(rest.len());
+            let (part, tail) = rest.split_at(end);
+            parts.push(if digit {
+                part.parse().map_err(|_| part)
+            } else {
+                Err(part)
+            });
+            rest = tail;
+        }
+        parts
+    }
+    match (first, second) {
+        (Some(first), Some(second)) => parts(first).cmp(&parts(second)),
+        (first, second) => first.cmp(&second),
+    }
+}
+
 /// An application's identity: its name, source and architecture.
 type Key<'a> = (&'a str, &'a str, Option<&'a str>);
 
@@ -76,8 +103,8 @@ pub fn diff(old: &[StoredApplication], new: &[StoredApplication]) -> Vec<Change>
     for key in keys {
         let mut before = old.get(key).cloned().unwrap_or_default();
         let mut after = new.get(key).cloned().unwrap_or_default();
-        before.sort();
-        after.sort();
+        before.sort_by(|first, second| compare_versions(*first, *second));
+        after.sort_by(|first, second| compare_versions(*first, *second));
         // What both lists have is unchanged.
         let mut kept_before = Vec::new();
         for version in before {
@@ -183,6 +210,19 @@ mod tests {
             [
                 r#"updated .NET Runtime Some("8.0.2") Some("8.0.1")"#,
                 r#"installed .NET Runtime Some("9.0") None"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn leftover_versions_pair_in_numeric_order() {
+        let old = [app("SDK", Some("8.0.9"))];
+        let new = [app("SDK", Some("8.0.10")), app("SDK", Some("10.0"))];
+        assert_eq!(
+            summary(&diff(&old, &new)),
+            [
+                r#"updated SDK Some("8.0.10") Some("8.0.9")"#,
+                r#"installed SDK Some("10.0") None"#,
             ]
         );
     }

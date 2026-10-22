@@ -567,7 +567,14 @@ fn users() -> Vec<SignedInUser> {
 
 fn logind_users() -> anyhow::Result<Vec<SignedInUser>> {
     const LOGIN1: &str = "org.freedesktop.login1";
-    let bus = zbus::blocking::Connection::system().context("the system D-Bus")?;
+    // A hung logind mustn't hold up the snapshot.
+    let bus = zbus::blocking::connection::Builder::system()
+        .and_then(|builder| {
+            builder
+                .method_timeout(std::time::Duration::from_secs(10))
+                .build()
+        })
+        .context("the system D-Bus")?;
     let listed: Vec<(String, u32, String, String, OwnedObjectPath)> = bus
         .call_method(
             Some(LOGIN1),

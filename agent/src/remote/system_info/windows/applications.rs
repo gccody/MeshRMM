@@ -33,7 +33,10 @@ pub(super) fn list(problems: &mut Problems, architecture: &str) -> Vec<Applicati
     // loaded; the rest would have to be loaded from their profiles.
     if let Ok(users) = Key::open(HKEY_USERS, "", REG_SAM_FLAGS(0)) {
         for sid in users.subkeys() {
-            if !sid.starts_with("S-1-5-21-") || sid.ends_with("_Classes") {
+            // Local and domain accounts, and Microsoft Entra ID accounts.
+            if !(sid.starts_with("S-1-5-21-") || sid.starts_with("S-1-12-1-"))
+                || sid.ends_with("_Classes")
+            {
                 continue;
             }
             if let Ok(key) = Key::open(HKEY_USERS, &format!(r"{sid}\{UNINSTALL}"), REG_SAM_FLAGS(0))

@@ -112,15 +112,31 @@ fn descriptor(handle: &OwnedHandle) -> Option<(Option<String>, Option<&'static s
     if bytes.len() < std::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
         return None;
     }
-    // SAFETY: the bytes hold a whole descriptor; it is read unaligned.
-    let descriptor =
-        unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>()) };
-    let text = |offset: u32| ascii_at(&bytes, offset as usize);
+    // The fields are read from their offsets: the structure's `bool`s may
+    // hold any byte a driver wrote.
+    let text = |field: usize| ascii_at(&bytes, u32_at(&bytes, field)? as usize);
     let model = model(
-        text(descriptor.VendorIdOffset),
-        text(descriptor.ProductIdOffset),
+        text(std::mem::offset_of!(
+            STORAGE_DEVICE_DESCRIPTOR,
+            VendorIdOffset
+        )),
+        text(std::mem::offset_of!(
+            STORAGE_DEVICE_DESCRIPTOR,
+            ProductIdOffset
+        )),
     );
-    Some((model, bus_name(descriptor.BusType.0)))
+    let bus = u32_at(
+        &bytes,
+        std::mem::offset_of!(STORAGE_DEVICE_DESCRIPTOR, BusType),
+    )?;
+    Some((model, bus_name(bus as i32)))
+}
+
+/// The native-endian `u32` at `offset`.
+fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_ne_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
 }
 
 /// The NUL-terminated ASCII string at `offset`, trimmed; offset 0 means none.
@@ -187,11 +203,13 @@ fn seek_penalty(handle: &OwnedHandle) -> Option<bool> {
     if bytes.len() < std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() {
         return None;
     }
-    // SAFETY: the bytes hold a whole descriptor.
-    let descriptor = unsafe {
-        std::ptr::read_unaligned(bytes.as_ptr().cast::<DEVICE_SEEK_PENALTY_DESCRIPTOR>())
-    };
-    Some(descriptor.IncursSeekPenalty)
+    // Read as a byte, not the structure's `bool`, which a driver may fill
+    // with any value.
+    let penalty = bytes.get(std::mem::offset_of!(
+        DEVICE_SEEK_PENALTY_DESCRIPTOR,
+        IncursSeekPenalty
+    ))?;
+    Some(*penalty != 0)
 }
 
 fn size(handle: &OwnedHandle) -> Option<u64> {

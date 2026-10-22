@@ -41,6 +41,9 @@ pub const INTERVAL: Duration = Duration::from_secs(SYSTEM_INFO_INTERVAL_SECONDS)
 /// The first snapshot waits this long after the Agent starts, so it doesn't
 /// compete with connecting and the first sessions.
 const FIRST_DELAY: Duration = Duration::from_secs(10);
+/// A collection still running after this is given up on, so one stuck on a
+/// hung system service or file system doesn't stop every later snapshot.
+const COLLECT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// The parts of a snapshot that could not be read.
 #[derive(Debug, Default)]
@@ -115,7 +118,8 @@ fn fit(mut info: SystemInfo) -> SystemInfo {
 /// snapshot at a time and off the signaling task.
 pub struct Collector {
     timer: Interval,
-    task: Option<JoinHandle<SystemInfo>>,
+    /// The collection running, and when it is given up on.
+    task: Option<(JoinHandle<SystemInfo>, tokio::time::Instant)>,
     requested: bool,
 }
 
@@ -145,14 +149,20 @@ impl Collector {
     /// still being collected is kept for the next call.
     pub async fn next(&mut self) -> SystemInfo {
         loop {
-            if let Some(task) = &mut self.task {
-                let result = task.await;
+            if let Some((task, deadline)) = &mut self.task {
+                let result = tokio::time::timeout_at(*deadline, task).await;
                 self.task = None;
                 match result {
-                    Ok(info) => return info,
-                    Err(error) => {
+                    Ok(Ok(info)) => return info,
+                    Ok(Err(error)) => {
                         tracing::warn!(error = %error, "collecting the system information failed")
                     }
+                    // The blocking thread can't be stopped; it ends when
+                    // whatever it waits for answers.
+                    Err(_) => tracing::warn!(
+                        timeout_seconds = COLLECT_TIMEOUT.as_secs(),
+                        "collecting the system information took too long"
+                    ),
                 }
             }
             if self.requested {
@@ -162,7 +172,10 @@ impl Collector {
             } else {
                 self.timer.tick().await;
             }
-            self.task = Some(tokio::task::spawn_blocking(collect));
+            self.task = Some((
+                tokio::task::spawn_blocking(collect),
+                tokio::time::Instant::now() + COLLECT_TIMEOUT,
+            ));
         }
     }
 }

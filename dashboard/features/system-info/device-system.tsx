@@ -151,7 +151,7 @@ function Problems({ problems }: { problems: string[] }) {
   return (
     <details className="system-problems">
       <summary><TriangleAlert size={15} aria-hidden="true" />{problems.length === 1 ? "1 part couldn’t be collected" : `${problems.length} parts couldn’t be collected`}</summary>
-      <ul>{problems.map((problem) => <li key={problem}>{problem}</li>)}</ul>
+      <ul>{problems.map((problem, index) => <li key={`${index}-${problem}`}>{problem}</li>)}</ul>
     </details>
   );
 }
@@ -269,16 +269,16 @@ function NetworkPanel({ snapshot }: { snapshot: Snapshot }) {
             <table className="data-table adapter-table">
               <thead><tr><th scope="col">Adapter</th><th scope="col">MAC address</th><th scope="col">Addresses</th><th scope="col">Gateway</th><th scope="col">DNS</th></tr></thead>
               <tbody>
-                {adapters.map((adapter) => (
-                  <tr key={adapter.name} className={adapter.up ? undefined : "muted-row"}>
+                {adapters.map((adapter, index) => (
+                  <tr key={`${index}-${adapter.name}`} className={adapter.up ? undefined : "muted-row"}>
                     <td>
                       <strong>{adapter.name}</strong>
                       <span>{[ADAPTER_KIND_LABELS[adapter.kind] ?? adapter.kind, adapter.up ? formatLinkSpeed(adapter.speed_bits_per_second) ?? "Up" : "Down", adapter.description].filter(Boolean).join(" · ")}</span>
                     </td>
                     <td className="mono">{adapter.mac_address ?? "—"}</td>
-                    <td className="mono">{adapter.addresses.length ? adapter.addresses.map((entry) => <div key={entry.address}>{entry.address}/{entry.prefix_length}</div>) : "—"}</td>
-                    <td className="mono">{adapter.gateways.length ? adapter.gateways.map((gateway) => <div key={gateway}>{gateway}</div>) : "—"}</td>
-                    <td className="mono">{adapter.dns_servers.length ? adapter.dns_servers.map((server) => <div key={server}>{server}</div>) : "—"}</td>
+                    <td className="mono">{adapter.addresses.length ? adapter.addresses.map((entry, index) => <div key={`${index}-${entry.address}`}>{entry.address}/{entry.prefix_length}</div>) : "—"}</td>
+                    <td className="mono">{adapter.gateways.length ? adapter.gateways.map((gateway, index) => <div key={`${index}-${gateway}`}>{gateway}</div>) : "—"}</td>
+                    <td className="mono">{adapter.dns_servers.length ? adapter.dns_servers.map((server, index) => <div key={`${index}-${server}`}>{server}</div>) : "—"}</td>
                   </tr>
                 ))}
               </tbody>

@@ -60,13 +60,15 @@ pub(super) fn interfaces() -> anyhow::Result<BTreeMap<String, Interface>> {
         let family = i32::from(unsafe { (*current.ifa_addr).sa_family });
         match family {
             libc::AF_INET | libc::AF_INET6 => {
-                // SAFETY: the address and mask are of the family's type.
-                let address = unsafe { socket_address(current.ifa_addr) };
+                // SAFETY: the address is of its family's type, and a mask
+                // of its address's family.
+                let address = unsafe { socket_address(current.ifa_addr, family) };
                 let prefix_length = if current.ifa_netmask.is_null() {
                     None
                 } else {
-                    // SAFETY: as above; a mask has its address's family.
-                    unsafe { socket_address(current.ifa_netmask) }.map(|mask| prefix_length(&mask))
+                    // SAFETY: as above.
+                    unsafe { socket_address(current.ifa_netmask, family) }
+                        .map(|mask| prefix_length(&mask))
                 };
                 if let Some(address) = address {
                     interface.addresses.push(AdapterAddress {
@@ -83,15 +85,14 @@ pub(super) fn interfaces() -> anyhow::Result<BTreeMap<String, Interface>> {
             libc::AF_LINK => {
                 // SAFETY: an AF_LINK address is a sockaddr_dl.
                 let link = unsafe { &*current.ifa_addr.cast::<libc::sockaddr_dl>() };
-                if link.sdl_alen == 6 {
-                    let start = usize::from(link.sdl_nlen);
-                    // SAFETY: sdl_data holds the name and then the address,
-                    // which can run past the declared array's end.
+                // The name, then the address, start at sdl_data and can run
+                // past the declared array to the sockaddr's length.
+                let start =
+                    std::mem::offset_of!(libc::sockaddr_dl, sdl_data) + usize::from(link.sdl_nlen);
+                if link.sdl_alen == 6 && start + 6 <= usize::from(link.sdl_len) {
+                    // SAFETY: the sockaddr holds sdl_len bytes, checked above.
                     let bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            link.sdl_data.as_ptr().cast::<u8>().add(start),
-                            6,
-                        )
+                        std::slice::from_raw_parts(current.ifa_addr.cast::<u8>().add(start), 6)
                     };
                     interface.mac_address = Some(format_mac(bytes));
                 }
@@ -112,24 +113,47 @@ pub(super) fn interfaces() -> anyhow::Result<BTreeMap<String, Interface>> {
     Ok(interfaces)
 }
 
-/// The IP address in an AF_INET or AF_INET6 `sockaddr`.
+/// The IP address in an AF_INET or AF_INET6 `sockaddr` of `family`. macOS
+/// shortens subnet masks to the bytes up to their last nonzero one, and can
+/// leave their family zero, so only the bytes the sockaddr has are read and
+/// the rest are zero.
 ///
 /// # Safety
-/// `address` must point to a `sockaddr_in` or `sockaddr_in6`, as its family says.
-unsafe fn socket_address(address: *const libc::sockaddr) -> Option<std::net::IpAddr> {
-    // SAFETY: the caller's guarantee.
-    unsafe {
-        match i32::from((*address).sa_family) {
-            libc::AF_INET => {
-                let address = &*address.cast::<libc::sockaddr_in>();
-                Some(std::net::Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr)).into())
-            }
-            libc::AF_INET6 => {
-                let address = &*address.cast::<libc::sockaddr_in6>();
-                Some(std::net::Ipv6Addr::from(address.sin6_addr.s6_addr).into())
-            }
-            _ => None,
+/// `address` must point to a `sockaddr_in` or `sockaddr_in6` as `family`
+/// says, or on macOS to a shortened one whose `sa_len` says how long it is.
+unsafe fn socket_address(address: *const libc::sockaddr, family: i32) -> Option<std::net::IpAddr> {
+    /// # Safety
+    /// As [`socket_address`], for `T`.
+    unsafe fn read<T>(address: *const libc::sockaddr) -> T {
+        #[cfg(target_os = "macos")]
+        // SAFETY: every sockaddr starts with its length.
+        let available = usize::from(unsafe { (*address).sa_len });
+        #[cfg(not(target_os = "macos"))]
+        let available = std::mem::size_of::<T>();
+        let mut value = std::mem::MaybeUninit::<T>::zeroed();
+        // SAFETY: the sockaddr has `available` bytes, and at most the
+        // structure's size is copied into it. Zero is a valid sockaddr byte.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                address.cast::<u8>(),
+                value.as_mut_ptr().cast::<u8>(),
+                available.min(std::mem::size_of::<T>()),
+            );
+            value.assume_init()
         }
+    }
+    match family {
+        libc::AF_INET => {
+            // SAFETY: the caller's guarantee.
+            let address: libc::sockaddr_in = unsafe { read(address) };
+            Some(std::net::Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr)).into())
+        }
+        libc::AF_INET6 => {
+            // SAFETY: the caller's guarantee.
+            let address: libc::sockaddr_in6 = unsafe { read(address) };
+            Some(std::net::Ipv6Addr::from(address.sin6_addr.s6_addr).into())
+        }
+        _ => None,
     }
 }
 

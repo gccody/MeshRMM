@@ -47,7 +47,7 @@ export function SoftwarePage() {
     return () => window.clearTimeout(timer);
     // choose changes with the address, which this effect already follows.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [queryInput, filters.query]);
+  }, [queryInput, filters.query, filters.company]);
 
   const params = softwareParams(filters).toString();
   const load = useCallback(() => fetchSoftware(authorizedFetch, new URLSearchParams(params)), [authorizedFetch, params]);

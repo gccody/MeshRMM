@@ -140,7 +140,7 @@ export function DevicePage() {
           ))}
         </nav>
 
-        {tab !== "usage" ? agent && <DeviceSystem agent={agent} tab={tab} /> : <>
+        {tab !== "usage" ? agent && <DeviceSystem key={agent.id} agent={agent} tab={tab} /> : <>
         {error && <div className="error-banner" role="alert"><CircleAlert size={16} aria-hidden="true" /><span>{error}</span></div>}
 
         {(latest || agent?.connected) && <Summary latest={latest} />}
