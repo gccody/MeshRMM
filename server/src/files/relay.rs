@@ -135,13 +135,17 @@ async fn connect_agent(
         return Err(device_offline());
     }
     let arrived = claim.agent.take().expect("a new claim waits for the Agent");
-    match tokio::time::timeout(state.files.timeouts().agent_connect, arrived).await {
-        Ok(Ok(socket)) => Ok(socket),
-        _ => Err(ApiError::new(
-            StatusCode::GATEWAY_TIMEOUT,
-            "the device didn't start the transfer; try again",
-        )
-        .with_code("device_timeout")),
+    let offline = claim.offline.clone();
+    tokio::select! {
+        arrived = tokio::time::timeout(state.files.timeouts().agent_connect, arrived) => match arrived {
+            Ok(Ok(socket)) => Ok(socket),
+            _ => Err(ApiError::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "the device didn't start the transfer; try again",
+            )
+            .with_code("device_timeout")),
+        },
+        () = offline.cancelled() => Err(disconnected()),
     }
 }
 
@@ -313,7 +317,7 @@ pub async fn download(
     let sending = Sending {
         state: state.clone(),
         socket,
-        _claim: claim,
+        claim,
         download,
         offset,
         expected: size,
@@ -337,7 +341,7 @@ fn fail_progress(state: &AppState, id: &str, error: &str) {
 struct Sending {
     state: AppState,
     socket: WebSocket,
-    _claim: TransferClaim,
+    claim: TransferClaim,
     download: Download,
     offset: u64,
     expected: Option<u64>,
@@ -354,7 +358,11 @@ impl Sending {
             return None;
         }
         loop {
-            let frame = tokio::time::timeout(STALL, self.socket.recv()).await;
+            let offline = self.claim.offline.clone();
+            let frame = tokio::select! {
+                frame = tokio::time::timeout(STALL, self.socket.recv()) => frame,
+                () = offline.cancelled() => return self.fail("the device went offline"),
+            };
             match frame {
                 Ok(Some(Ok(Message::Binary(bytes)))) => {
                     let total = self.bytes + bytes.len() as u64;
@@ -423,7 +431,8 @@ impl Sending {
         let metadata = json!({
             "paths": download.paths.iter().take(AUDITED_PATHS).collect::<Vec<_>>(),
             "path_count": download.paths.len(),
-            "name": download.info.name,
+            // Not `name`, which the audit log reads as the target's.
+            "file_name": download.info.name,
             "kind": match download.info.kind {
                 FileDownloadKind::File => "file",
                 FileDownloadKind::Archive => "archive",
@@ -575,6 +584,7 @@ pub async fn upload(
             }
         }
     };
+    let offline = claim.offline.clone();
     let pumped = tokio::select! {
         pumped = pump => pumped,
         event = early => {
@@ -583,6 +593,7 @@ pub async fn upload(
                 _ => Err(disconnected()),
             };
         }
+        () = offline.cancelled() => return Err(disconnected()),
     };
     match pumped {
         Ok(()) => {}
@@ -602,8 +613,13 @@ pub async fn upload(
         Err(Pumped::AgentLeft) => {}
     }
     let finished = tokio::time::timeout(FINISH_WAIT, async {
+        let offline = claim.offline.clone();
         loop {
-            match agent_rx.next().await {
+            let frame = tokio::select! {
+                frame = agent_rx.next() => frame,
+                () = offline.cancelled() => return None,
+            };
+            match frame {
                 Some(Ok(Message::Text(text))) => {
                     return serde_json::from_str::<FileStreamEvent>(&text).ok();
                 }

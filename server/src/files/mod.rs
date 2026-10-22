@@ -30,6 +30,7 @@ use meshrmm_protocol_types::{
 };
 use serde::Serialize;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     audit::Actor,
@@ -200,6 +201,8 @@ struct Transfer {
     user_id: String,
     /// Where the Agent's socket goes, until it arrives.
     agent: Option<oneshot::Sender<WebSocket>>,
+    /// Cancelled when the device goes offline.
+    offline: CancellationToken,
 }
 
 /// A reserved transfer: its ID, and where the Agent's socket will arrive.
@@ -208,6 +211,10 @@ pub struct TransferClaim {
     files: Files,
     pub id: String,
     pub agent: Option<oneshot::Receiver<WebSocket>>,
+    /// Cancelled when the device's control connection ends, which notices
+    /// a device that vanished (powered off, off the network) within a
+    /// minute; its transfer socket may otherwise hang far longer.
+    pub offline: CancellationToken,
 }
 
 impl Drop for TransferClaim {
@@ -268,11 +275,18 @@ impl Files {
         }
     }
 
-    /// Fails the requests waiting on a device that disconnected.
+    /// Fails the requests waiting on a device that disconnected, and its
+    /// transfers.
     pub fn device_disconnected(&self, device_id: &str) {
-        self.lock()
+        let mut state = self.lock();
+        state
             .pending
             .retain(|_, pending| pending.device_id != device_id);
+        for transfer in state.transfers.values() {
+            if transfer.device_id == device_id {
+                transfer.offline.cancel();
+            }
+        }
     }
 
     fn forget_request(&self, request_id: &str) {
@@ -301,18 +315,21 @@ impl Files {
         }
         let id = uuid::Uuid::new_v4().to_string();
         let (agent, arrived) = oneshot::channel();
+        let offline = CancellationToken::new();
         state.transfers.insert(
             id.clone(),
             Transfer {
                 device_id: device_id.to_owned(),
                 user_id: user_id.to_owned(),
                 agent: Some(agent),
+                offline: offline.clone(),
             },
         );
         Ok(TransferClaim {
             files: self.clone(),
             id,
             agent: Some(arrived),
+            offline,
         })
     }
 
@@ -620,6 +637,16 @@ mod tests {
         let id = claim.id.clone();
         drop(claim);
         assert!(files.claim_agent(&id, "device").is_none());
+    }
+
+    #[test]
+    fn a_device_going_offline_stops_its_transfers() {
+        let files = Files::default();
+        let mine = files.reserve("device", "ada").unwrap();
+        let other = files.reserve("other", "ada").unwrap();
+        files.device_disconnected("device");
+        assert!(mine.offline.is_cancelled());
+        assert!(!other.offline.is_cancelled());
     }
 
     #[test]

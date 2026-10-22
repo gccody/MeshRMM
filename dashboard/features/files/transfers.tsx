@@ -12,6 +12,9 @@ import { type Picked, emptyFolders } from "./picked";
 const CONCURRENT_UPLOADS = 3;
 // Files up to this size are hashed by the browser's own crypto in one go.
 const NATIVE_HASH_BYTES = 64 * 1024 * 1024;
+// Each request carries this much of a file: under the 100 MB a proxy such
+// as Cloudflare allows in a request.
+const UPLOAD_PIECE_BYTES = 64 * 1024 * 1024;
 // Times an upload goes on by itself after its connection drops.
 const AUTOMATIC_RESUMES = 3;
 // A download the browser hasn't asked for in this long didn't start.
@@ -128,9 +131,15 @@ export function useTransfers({ authorizedFetch, deviceId, platform, connected, o
         hash.catch(() => hashes.current.delete(key));
       }
       update(key, { sent: received });
-      if (received < item.size) {
-        const done = await sendUpload(id, received, file.slice(received), (sent) => update(key, { sent: received + sent }), stop.signal);
-        if (done.received !== item.size) throw new RequestError("The device didn’t get the whole file.", 409, "incomplete");
+      // A piece at a time, so a proxy's limit on request bodies doesn't
+      // matter, and a dropped connection costs one piece at most.
+      while (received < item.size) {
+        const start = received;
+        const piece = file.slice(start, Math.min(item.size, start + UPLOAD_PIECE_BYTES));
+        const done = await sendUpload(id, start, piece, (sent) => update(key, { sent: start + sent }), stop.signal);
+        if (done.received <= start) throw new RequestError("The device didn’t take any of the file.", 409, "incomplete");
+        received = done.received;
+        update(key, { sent: received });
       }
       update(key, { state: "verifying", sent: item.size });
       const sha256 = await hash;

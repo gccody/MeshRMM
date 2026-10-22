@@ -46,6 +46,7 @@ import {
   errorHelp,
   joinPath,
   pagesFor,
+  parentPath,
 } from "./model";
 import { type Picked, fromDrop, fromFileList } from "./picked";
 import { TransfersPanel, useTransfers } from "./transfers";
@@ -394,7 +395,7 @@ function FileBrowser({ agent, account, accounts, path, authorizedFetch, canManag
     } else if (event.key === "F2" && canManage && chosen.length === 1) {
       event.preventDefault();
       setDialog({ kind: "rename", entry: chosen[0] });
-    } else if (event.key === "Backspace" && shown?.parent) {
+    } else if (event.key === "Backspace" && shown?.parent !== undefined) {
       event.preventDefault();
       go(shown.parent);
     } else if (event.key.toLowerCase() === "a" && (event.metaKey || event.ctrlKey)) {
@@ -454,7 +455,7 @@ function FileBrowser({ agent, account, accounts, path, authorizedFetch, canManag
 
           <section className="files-main" aria-label="Folder">
             <div className="file-pathbar">
-              <button type="button" className="icon-button" onClick={() => shown?.parent !== undefined ? go(shown.parent) : go("")} disabled={!path} aria-label="Up one folder" title="Up one folder"><ArrowUp size={16} /></button>
+              <button type="button" className="icon-button" onClick={() => go(shown?.parent ?? parentPath(platform, path) ?? "")} disabled={!path} aria-label="Up one folder" title="Up one folder"><ArrowUp size={16} /></button>
               <button type="button" className="icon-button" onClick={refresh} disabled={offline} aria-label="Refresh" title="Refresh"><RefreshCw size={16} /></button>
               {editingPath ? (
                 <form className="file-path-form" onSubmit={submitPath}>
@@ -493,7 +494,7 @@ function FileBrowser({ agent, account, accounts, path, authorizedFetch, canManag
                       <button type="button" className="secondary-button" disabled={!chosen.length || offline} onClick={() => setDialog({ kind: "move", entries: chosen })}><FolderInput size={15} aria-hidden="true" />Move</button>
                       <button type="button" className="danger-button" disabled={!chosen.length || offline} onClick={() => setDialog({ kind: "delete", entries: chosen })}><Trash2 size={15} aria-hidden="true" />Delete</button>
                     </>}
-                    <button type="button" className="secondary-button" onClick={() => copyPath(chosen.length === 1 ? chosen[0].path : folder)} title={chosen.length === 1 ? "Copy the selected entry’s path" : "Copy this folder’s path"}><ClipboardCopy size={15} aria-hidden="true" />Copy path</button>
+                    <button type="button" className="icon-button file-copy-path" onClick={() => copyPath(chosen.length === 1 ? chosen[0].path : folder)} title={chosen.length === 1 ? "Copy the selected entry’s path" : "Copy this folder’s path"} aria-label={chosen.length === 1 ? "Copy the selected entry’s path" : "Copy this folder’s path"}><ClipboardCopy size={15} /></button>
                   </span>
                   <span className="file-toolbar-end">
                     <label className="search-field file-filter">
@@ -524,7 +525,7 @@ function FileBrowser({ agent, account, accounts, path, authorizedFetch, canManag
                     problem={problem}
                     platform={platform}
                     account={account}
-                    parent={shown?.parent ?? null}
+                    parent={parentPath(platform, path)}
                     other={otherAccount}
                     onUp={(parent) => go(parent)}
                     onRetry={refresh}

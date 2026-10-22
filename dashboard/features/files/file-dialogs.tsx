@@ -211,7 +211,7 @@ export function DeleteDialog({ entries: chosen, account, platform, onDelete, onC
             <legend className="sr-only">How to delete</legend>
             <label>
               <input type="radio" name={`${id}-how`} checked={trash} onChange={() => setTrash(true)} />
-              <span><strong>Move to the {bin}</strong>The signed-in user can put {entries.length === 1 ? "it" : "them"} back.</span>
+              <span><strong>Move to the {bin}</strong>The signed-in user can get {entries.length === 1 ? "it" : "them"} back from there.</span>
             </label>
             <label>
               <input type="radio" name={`${id}-how`} checked={!trash} onChange={() => setTrash(false)} />

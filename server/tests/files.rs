@@ -981,3 +981,56 @@ async fn uploads_resume_and_land_only_when_verified() {
         app.finish().await;
     }
 }
+
+#[tokio::test]
+async fn transfers_end_when_their_device_goes_offline() {
+    for app in apps_with(quick).await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let (agent, mut control) = enrolled(&app, &mut admin, &server).await;
+        let call = post(
+            &admin,
+            format!("/v1/agents/{}/files/downloads", agent.device_id),
+            json!({ "paths": ["/srv/big"] }),
+        );
+        answer(
+            &mut control,
+            json!({ "reply": "download", "name": "big", "kind": "file", "size": 1000, "files": 1 }),
+        )
+        .await;
+        let url = call.await.unwrap().body["url"].as_str().unwrap().to_owned();
+        let request = admin
+            .request(Method::GET, &url)
+            .body(Body::empty())
+            .unwrap();
+        let state = app.state.clone();
+        let fetching = tokio::spawn(async move {
+            let router = meshrmm_server::http::router(state);
+            let response = router.oneshot(request).await.unwrap();
+            response
+                .into_body()
+                .collect()
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        });
+        // The transfer socket stays open, as when a device loses its
+        // network; its control connection ending is what's noticed.
+        let (_, mut socket) = next_transfer(&server, &agent, &mut control).await;
+        event(&mut socket, json!({ "type": "begin", "size": 1000 })).await;
+        send(&mut socket, Message::Binary(Bytes::from_static(b"abc"))).await;
+        drop(control);
+        let ended = tokio::time::timeout(Duration::from_secs(5), fetching).await;
+        assert!(
+            ended.expect("the download ends at once").unwrap().is_err(),
+            "{name}"
+        );
+        let recorded = wait_for_audit(&app, "files.download", 1).await;
+        assert_eq!(recorded[0].metadata["result"], "failed");
+        assert_eq!(recorded[0].metadata["error"], "the device went offline");
+        assert_eq!(app.state.files.transfers_on(&agent.device_id), 0, "{name}");
+        drop(socket);
+        app.finish().await;
+    }
+}
