@@ -8,7 +8,7 @@ import { useWorkspace } from "../workspace/workspace-context";
 import { AutomationAreaTabs } from "./area-tabs";
 import { fetchJobs } from "./automation-api";
 import { JobProgressBar } from "./job-progress";
-import { type Job, applyJobUpdate, countsSummary, isJobFinished, jobStarter } from "./model";
+import { JOB_KIND_LABELS, type Job, applyJobUpdate, countsSummary, isJobFinished, jobStarter } from "./model";
 import { useJobEvents } from "./use-job-feed";
 
 // `/jobs`: recent jobs, newest first, or one policy's with `?policy=`. The
@@ -48,7 +48,7 @@ export function JobsPage() {
           <div className="empty-state">
             <ListChecks size={22} aria-hidden="true" />
             <strong>No jobs yet</strong>
-            <span>Run a script or send a file on several devices from the Toolbox or the Devices page, or let a policy start one. Jobs are kept for 30 days.</span>
+            <span>Run a script or send a file on several devices from the Toolbox or the Devices page, install updates from the Updates page, or let a policy start one. Jobs are kept for 30 days.</span>
           </div>
         ) : (
           <>
@@ -80,7 +80,7 @@ function JobTable({ jobs }: { jobs: Job[] }) {
             <tr key={job.id}>
               <td>
                 <strong><Link to={`/job?id=${encodeURIComponent(job.id)}`}>{job.item_name}</Link></strong>
-                <span>{job.kind === "script" ? "Script" : "File"}{finished ? "" : " · Running"}</span>
+                <span>{JOB_KIND_LABELS[job.kind] ?? job.kind}{finished ? "" : " · Running"}</span>
               </td>
               <td>{job.target_label}<span>{job.counts.total} {job.counts.total === 1 ? "device" : "devices"}</span></td>
               <td>{jobStarter(job)}</td>

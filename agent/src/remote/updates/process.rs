@@ -45,6 +45,7 @@ impl Output {
 }
 
 /// The first of `names` in the usual system folders.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn find(names: &[&str]) -> Option<PathBuf> {
     const FOLDERS: [&str; 6] = [
         "/usr/sbin",

@@ -26,6 +26,7 @@ mod sign_in;
 mod sso;
 mod system_info;
 mod toolbox;
+mod updates;
 mod users;
 
 use axum::{
@@ -199,6 +200,12 @@ fn device_routes() -> Router<AppState> {
         .route("/system-info", get(system_info::search_devices))
         .route("/software", get(system_info::software))
         .route("/software/devices", get(system_info::software_devices))
+        .route("/agents/{id}/updates", get(updates::get))
+        .route("/agents/{id}/updates/scan", post(updates::scan))
+        .route("/agents/{id}/updates/install", post(updates::install))
+        .route("/updates/devices", get(updates::devices))
+        .route("/update-runs", get(updates::list_runs))
+        .route("/update-runs/{id}", get(updates::get_run))
         .route(
             "/agents/{id}/rotate-credential",
             post(devices::rotate_credential),

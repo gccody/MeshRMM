@@ -328,7 +328,7 @@ impl UpdateSelection {
     /// Whether `update` is chosen.
     pub fn covers(&self, update: &PendingUpdate) -> bool {
         if !self.ids.is_empty() {
-            return self.ids.iter().any(|id| *id == update.id);
+            return self.ids.contains(&update.id);
         }
         self.categories.is_empty() || self.categories.contains(&update.category)
     }

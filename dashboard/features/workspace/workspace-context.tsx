@@ -8,6 +8,7 @@ import type { Account, Permission } from "../auth/types";
 import type { useRemoteHandoff } from "../session/use-remote-handoff";
 import type { GeneralSettings } from "../settings/general-settings";
 import type { SettingsDraft } from "../settings/use-settings-draft";
+import type { UpdateFeed } from "../updates/use-update-feed";
 import type { ActionErrorSource, ActionErrors } from "./action-errors";
 
 // What the persistent workspace shell shares with the page beneath it. The
@@ -25,6 +26,8 @@ export type Workspace = {
   alerts: AlertFeed;
   // Job events for pages to follow.
   jobs: JobFeed;
+  // Update events for pages to follow.
+  updates: UpdateFeed;
   remote: ReturnType<typeof useRemoteHandoff>;
   deleteAgent: (agent: Agent) => Promise<void>;
   deletingId: string | null;

@@ -24,6 +24,7 @@ const MAX_IDLE_TIMEOUT_MINUTES: u32 = 24 * 60;
 const MIN_PASSWORD_LENGTH: u32 = 8;
 const MAX_PASSWORD_LENGTH: u32 = 128;
 const MAX_SESSION_LIFETIME_HOURS: u32 = 365 * 24;
+const MAX_UPDATE_SCAN_INTERVAL_HOURS: u32 = 7 * 24;
 
 /// Writes `values` to the settings row, recording who changed it.
 async fn save(
@@ -84,6 +85,7 @@ pub struct GeneralSettings {
     connection_approval_message: String,
     connection_approval_timeout_seconds: i64,
     connection_approval_lock_idle_seconds: i64,
+    update_scan_interval_hours: i64,
     updated_at: i64,
 }
 
@@ -108,6 +110,7 @@ impl From<Settings> for GeneralSettings {
             connection_approval_message: settings.connection_approval_message,
             connection_approval_timeout_seconds: settings.connection_approval_timeout_seconds,
             connection_approval_lock_idle_seconds: settings.connection_approval_lock_idle_seconds,
+            update_scan_interval_hours: settings.update_scan_interval_hours,
             updated_at: settings.updated_at,
         }
     }
@@ -167,6 +170,9 @@ pub struct GeneralUpdate {
     connection_approval_timeout_seconds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     connection_approval_lock_idle_seconds: Option<u32>,
+    /// 0 leaves scans to users and policies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    update_scan_interval_hours: Option<u32>,
 }
 
 fn check(valid: bool, message: &'static str) -> Result<(), ApiError> {
@@ -251,6 +257,16 @@ impl GeneralUpdate {
             values.push((
                 SettingsTable::ConnectionApprovalLockIdleSeconds,
                 i64::from(seconds).into(),
+            ));
+        }
+        if let Some(hours) = self.update_scan_interval_hours {
+            check(
+                hours <= MAX_UPDATE_SCAN_INTERVAL_HOURS,
+                "devices can scan for updates every 1 to 168 hours, or 0 for only when asked",
+            )?;
+            values.push((
+                SettingsTable::UpdateScanIntervalHours,
+                i64::from(hours).into(),
             ));
         }
         for (column, value) in [

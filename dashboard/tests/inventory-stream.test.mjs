@@ -59,7 +59,7 @@ function harness({ online } = {}) {
   const connections = [];
   const timers = fakeTimers();
   const revision = { current: -1 };
-  const state = { agents: [], companies: [], refused: 0, readings: [], alerts: [], jobs: [] };
+  const state = { agents: [], companies: [], refused: 0, readings: [], alerts: [], jobs: [], updates: [] };
   const stream = inventoryStream({
     openSocket: () => {
       const socket = new FakeSocket();
@@ -71,6 +71,7 @@ function harness({ online } = {}) {
     onMetrics: readings => { state.readings.push(...readings); },
     onAlerts: event => { state.alerts.push(event); },
     onJobs: event => { state.jobs.push(event); },
+    onUpdates: event => { state.updates.push(event); },
     onConnection: connection => connections.push(connection),
     onRefused: () => { state.refused++; },
     online,
@@ -294,6 +295,20 @@ test('job events arrive beside the revisions without disturbing them', () => {
   sockets[0].receive({ type: 'job_update', job });
   sockets[0].receive({ type: 'jobs_resync' });
   assert.deepEqual(state.jobs, [{ type: 'job_update', job }, { type: 'jobs_resync' }]);
+  assert.equal(revision.current, 2);
+  assert.deepEqual(sockets[0].sent, [], 'no snapshot is requested');
+});
+
+test('update events arrive beside the revisions without disturbing them', () => {
+  const { sockets, state, revision } = harness();
+  sockets[0].open();
+  sockets[0].receive({ type: 'snapshot', revision: 2, agents: [agent('a')], generated_at_unix_ms: 0 });
+  const device = { device_id: 'a', pending: 3 };
+  const run = { id: 'r', device_id: 'a', kind: 'install', status: 'pending' };
+  sockets[0].receive({ type: 'device_updates', device });
+  sockets[0].receive({ type: 'update_run', run });
+  sockets[0].receive({ type: 'updates_resync' });
+  assert.deepEqual(state.updates, [{ type: 'device_updates', device }, { type: 'update_run', run }, { type: 'updates_resync' }]);
   assert.equal(revision.current, 2);
   assert.deepEqual(sockets[0].sent, [], 'no snapshot is requested');
 });

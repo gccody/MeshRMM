@@ -26,6 +26,7 @@ pub mod system_info;
 pub mod time;
 pub mod toolbox;
 pub mod turn;
+pub mod updates;
 pub mod users;
 pub mod website;
 
@@ -78,6 +79,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         metrics: Metrics::new(database.clone()),
         alerts: alerts::Engine::default(),
         automation: automation::Engine::default(),
+        updates: updates::Engine::default(),
         sessions: Sessions::new(Timeouts::new(idle)),
         turn: Turn::new(&instance_key),
         database,
@@ -131,6 +133,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let maintenance = maintenance::spawn(state.database.clone(), state.storage.clone());
     let alerting = alerts::spawn(state.clone());
     let automating = automation::spawn(state.clone());
+    let updating = updates::spawn(state.clone());
     let handle = Handle::<SocketAddr>::new();
     tokio::spawn({
         let handle = handle.clone();
@@ -144,6 +147,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     maintenance.abort();
     alerting.abort();
     automating.abort();
+    updating.abort();
     state.turn.stop().await;
     state.database.close().await;
     served
