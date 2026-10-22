@@ -437,6 +437,8 @@ mod tests {
         }
         fs::create_dir(folder.0.join("zeta")).unwrap();
         fs::write(folder.0.join(".hidden"), b"x").unwrap();
+        // A dot hides it on macOS and Linux; Windows needs the flag.
+        platform::hide(&folder.0.join(".hidden"));
         let cache = Cache::default();
         let account = own();
         let path = paths::text(&folder.0);

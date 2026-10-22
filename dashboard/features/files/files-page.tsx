@@ -595,7 +595,7 @@ function FileBrowser({ agent, account, accounts, path, authorizedFetch, canManag
               <StartView roots={roots} problem={rootsProblem} offline={offline} platform={platform} onGo={go} />
             )}
 
-            <TransfersPanel transfers={transfers} platformLabel={agent.name} />
+            <TransfersPanel transfers={transfers} platformLabel={agent.name} connected={connected} />
           </section>
         </div>
       </div>

@@ -325,10 +325,10 @@ export function useTransfers({ authorizedFetch, deviceId, platform, connected, o
 
 export type Transfers = ReturnType<typeof useTransfers>;
 
-function uploadStatusText(item: UploadItem, now: number) {
+function uploadStatusText(item: UploadItem, now: number, connected: boolean) {
   switch (item.state) {
     case "queued":
-      return "Waiting";
+      return connected ? "Waiting" : "Waiting for the device to come back online";
     case "uploading": {
       const speed = rate(item.sent, item.startedAt, now);
       return `Uploading ${percent(item.sent, item.size).toFixed(0)}%${speed ? ` · ${formatBytes(speed)}/s` : ""}`;
@@ -365,7 +365,7 @@ function downloadStatusText(item: DownloadItem, now: number) {
 }
 
 // The list of transfers under the folder.
-export function TransfersPanel({ transfers, platformLabel }: { transfers: Transfers; platformLabel: string }) {
+export function TransfersPanel({ transfers, platformLabel, connected }: { transfers: Transfers; platformLabel: string; connected: boolean }) {
   const { items, cancel, resume, replace, skip, clearFinished } = transfers;
   const [now, setNow] = useState(() => Date.now());
   const [copied, setCopied] = useState<number | null>(null);
@@ -397,7 +397,7 @@ export function TransfersPanel({ transfers, platformLabel }: { transfers: Transf
           const progress = upload
             ? item.state === "verifying" ? percent(item.hashed, item.size) : percent(item.sent, item.size)
             : item.archive ? null : percent(bytes, item.size);
-          const status = upload ? uploadStatusText(item, now) : downloadStatusText(item, now);
+          const status = upload ? uploadStatusText(item, now, connected) : downloadStatusText(item, now);
           const failed = item.state === "failed";
           const done = item.state === "done";
           return (

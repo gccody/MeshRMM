@@ -659,6 +659,43 @@ mod tests {
         assert!(!system(&metadata));
     }
 
+    /// Needs root: a thread acting as `nobody` is refused a root-only
+    /// folder and sees itself as nobody, while the rest of the process
+    /// stays root.
+    #[test]
+    fn user_threads_are_checked_as_the_user_and_the_rest_stays_root() {
+        if effective_uid() != 0 {
+            eprintln!("skipped: needs root");
+            return;
+        }
+        let name = CString::new("nobody").unwrap();
+        // SAFETY: getpwnam returns static storage or null.
+        let entry = unsafe { libc::getpwnam(name.as_ptr()).as_ref() }.expect("a nobody account");
+        let (uid, gid) = (entry.pw_uid, entry.pw_gid);
+        let folder = std::env::temp_dir().join(format!("meshrmm-as-user-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&folder).unwrap();
+        fs::set_permissions(&folder, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let account = Account {
+            label: "nobody".into(),
+            home: None,
+            user: Some(User {
+                uid,
+                gid,
+                groups: vec![gid],
+            }),
+        };
+        let denied = account.run(|| {
+            fs::read_dir(&folder)
+                .map(drop)
+                .map_err(|error| io_error(&error, &folder))
+        });
+        assert_eq!(denied.unwrap_err().code, FileErrorCode::AccessDenied);
+        assert_eq!(account.run(|| Ok(effective_uid())).unwrap(), uid);
+        assert_eq!(effective_uid(), 0, "the rest of the process is still root");
+        assert!(fs::read_dir(&folder).is_ok());
+        fs::remove_dir(&folder).unwrap();
+    }
+
     #[test]
     fn root_is_always_a_root() {
         let roots = roots();
