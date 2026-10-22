@@ -436,6 +436,40 @@ td.row-actions > * + * { margin-left: 6px; }
 .upload-list li.upload-problem small { color: var(--danger); }
 .settings-modal p .file-digest { font-size: 11.5px; word-break: break-all; }
 
+/* ── Alerts ────────────────────────────────────────────── */
+.nav-item em.alert-count { min-width: 18px; padding: 0 5px; border-radius: 9px; color: var(--signal-ink); background: var(--signal); font-weight: 650; text-align: center; }
+.nav-item em.alert-count.warning { color: #2b1d05; background: var(--warn); }
+.nav-item em.alert-count.critical { color: #2a0a0d; background: var(--danger); }
+.area-tabs { margin: -8px 0 18px; }
+.area-tabs a { height: 34px; padding: 0 12px; display: inline-flex; align-items: center; gap: 7px; border-radius: 7px; color: var(--text-2); font-size: 13.5px; font-weight: 500; text-decoration: none; }
+.area-tabs a:hover { color: var(--text); background: var(--raised); }
+.area-tabs a[aria-current=page] { color: var(--text); background: var(--raised); box-shadow: inset 0 -2px 0 var(--signal); }
+.area-tabs + .error-banner, .page-notice { margin-bottom: 16px; }
+.alert-filter-selects { display: flex; flex-wrap: wrap; gap: 8px; }
+.app-root .alert-filter-selects select { min-height: 36px; max-width: 210px; font-size: 13.5px; }
+.severity { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 600; white-space: nowrap; }
+.severity i { width: 8px; height: 8px; border-radius: 2px; background: currentColor; }
+.severity-info { color: var(--signal-strong); }
+.severity-warning { color: var(--warn); }
+.severity-critical { color: var(--danger); }
+.severity-critical i { transform: rotate(45deg); }
+.alert-table td:first-child { width: 110px; }
+.alert-table td:nth-last-child(2) > .run-pill + span { display: block; margin-top: 3px; color: var(--text-3); font-size: 12.5px; }
+.alert-table td.row-actions .secondary-button { gap: 6px; }
+.data-table td > strong a { color: inherit; text-decoration: none; }
+.data-table td > strong a:hover { text-decoration: underline; text-decoration-color: var(--text-3); text-underline-offset: 3px; }
+.data-table td > .run-pill + span { margin-top: 3px; }
+.channel-name { display: flex !important; align-items: center; gap: 7px; }
+.channel-name svg { flex: none; color: var(--text-3); }
+.channel-target { max-width: 280px; color: var(--text-2); }
+.input-with-unit { display: flex; align-items: center; gap: 8px; color: var(--text-2); font-weight: 400; }
+.input-with-unit input { flex: 1 1 auto; min-width: 0; }
+.app-root .input-with-unit select { flex: 0 0 auto; width: auto; }
+.device-alerts { display: grid; gap: 10px; }
+.device-alerts-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.device-alerts-heading h3 { display: flex; align-items: center; font-size: 14px; }
+.device-alerts .table-message { display: flex; align-items: center; gap: 8px; }
+
 /* ── Dialogs ───────────────────────────────────────────── */
 .modal-backdrop { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 20px; background: rgb(5 7 11 / 70%); backdrop-filter: blur(3px); animation: fade-in .15s ease; }
 @keyframes fade-in { from { opacity: 0; } }

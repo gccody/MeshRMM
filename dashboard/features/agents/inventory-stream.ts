@@ -1,6 +1,7 @@
 // Keeps the live device inventory socket connected: applies the snapshot and
 // revision-ordered deltas, and reconnects with backoff. It never discards the
 // inventory it already has; the hook shows it as stale.
+import { type AlertEvent, parseAlertEvent } from "../alerts/model.ts";
 import { type MetricsReading, parseMetricsEvent } from "../metrics/model.ts";
 import { applyInventoryDelta, parseAgentEvent, sortAgents, sortCompanies } from "./model.ts";
 import type { AgentDelta, AgentEvent, AgentSnapshot, Inventory } from "./types";
@@ -41,6 +42,9 @@ type Options = {
   onInventory: (update: (current: Inventory) => Inventory) => void;
   // Devices' latest resource usage, which carries no revision.
   onMetrics?: (readings: MetricsReading[]) => void;
+  // Alerts raised or changed, and the unresolved counts, for users who may
+  // see them; these carry no revision either.
+  onAlerts?: (event: AlertEvent) => void;
   onConnection: (connection: InventoryConnection) => void;
   // The server refused the socket or closed it for lost access. A browser
   // can't see why a handshake failed, so the caller checks the session.
@@ -168,10 +172,11 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
 
 // Handles one socket's events while it is the stream's current socket.
 // `onClose` learns whether the server refused the socket or revoked access.
-function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, current, onOpen, onLive, onClose }: {
+function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onAlerts, current, onOpen, onLive, onClose }: {
   revision: { current: number };
   onInventory: (update: (current: Inventory) => Inventory) => void;
   onMetrics?: (readings: MetricsReading[]) => void;
+  onAlerts?: (event: AlertEvent) => void;
   current: () => boolean;
   onOpen: () => void;
   onLive: () => void;
@@ -199,7 +204,9 @@ function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, cur
     try {
       const event: unknown = JSON.parse(data);
       const readings = parseMetricsEvent(event);
+      const alert = readings ? null : parseAlertEvent(event);
       if (readings) onMetrics?.(readings);
+      else if (alert) onAlerts?.(alert);
       else if (sequence(parseAgentEvent(event))) onLive();
     } catch {
       requestSnapshot();
@@ -217,6 +224,7 @@ export function inventoryStream({
   revision,
   onInventory,
   onMetrics,
+  onAlerts,
   onConnection,
   onRefused,
   online = true,
@@ -231,6 +239,7 @@ export function inventoryStream({
     revision,
     onInventory,
     onMetrics,
+    onAlerts,
     current: () => !stopped && socket === nextSocket,
     onOpen: () => reconnect.reset(),
     onLive: () => connection.setState("live"),
