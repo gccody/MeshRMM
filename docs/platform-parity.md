@@ -180,6 +180,42 @@ yet.
   puts it in the user's launchd context: `open`, the pasteboard and the
   keychain work as over SSH.
 
+## File browser
+
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| [File browser](files.md) | Yes | Yes | Yes |
+| Starts at | Drive letters, with labels and free space | `/` and the volumes in `/Volumes` | `/` and the volumes under `/media`, `/mnt` and `/run/media` |
+| Signed-in user's folders | Known folders, wherever redirected (OneDrive, shares) | `~/Desktop`, `~/Documents`, `~/Downloads` | The XDG user folders, in the desktop's language |
+| As the system account | SYSTEM | root | root |
+| As the signed-in user | Impersonating their (unelevated) token | `pthread_setugid_np`, groups from the directory service | Per-thread user, groups and no capabilities |
+| Hidden entries | Hidden flag; system flag shown separately | Dot names and the hidden flag | Dot names |
+| Delete to the user's bin | Recycle Bin of the item's drive; Explorer restores it | `~/.Trash`, or the volume's `.Trashes/<uid>`; no **Put Back** | The freedesktop.org Trash (`~/.local/share/Trash`, or `.Trash-<uid>` on other volumes); file managers restore it |
+| Delete as the system account | Permanent | Permanent | Permanent |
+| New files' owner as the system account | Inherited permissions | The folder's owner and group | The folder's owner and group |
+| Moving links to another volume | Refused | Copied as links | Copied as links |
+| Downloaded and uploaded files marked | Mark of the Web on uploads | Quarantine on uploads | — |
+| Privacy protection | — | Root needs **Full Disk Access** for Desktop, Documents, Downloads and app data | — |
+
+- **Windows** puts a deleted item in the Recycle Bin the way Explorer does:
+  renamed to `$R…` in `<drive>\$Recycle.Bin\<user's SID>`, beside a `$I…`
+  record of its size, deletion time and original path, which Explorer
+  lists and restores from. Network drives have none, so a delete there is
+  permanent or refused. SYSTEM's own Recycle Bin is no one's to look in, so
+  as SYSTEM a delete is permanent.
+- **macOS** keeps no record of where a trashed item came from that the
+  Agent can write (Finder keeps its own, privately), so Finder shows it in
+  the Trash but can't put it back by itself. Root reads what any user can
+  except for privacy-protected folders, which need the Agent to have Full
+  Disk Access, granted by the Mac's user in **System Settings → Privacy &
+  Security** or by a configuration profile; without it those folders are
+  denied, and the page says why.
+- **Linux** writes a `.trashinfo` record beside each trashed item, as the
+  freedesktop.org Trash specification says, so GNOME Files, Dolphin, Thunar
+  and `gio trash --restore` put it back.
+- Every platform keeps a hidden partial file beside an upload until it's
+  checked, and the Agent's own record of them to delete abandoned ones.
+
 ## Remote session video
 
 | | Windows | macOS | Linux |
@@ -392,4 +428,5 @@ yet.
 - **Linux:** a locked GNOME session is unlocked for the session and locked
   again afterwards; copied files are offered in GNOME's clipboard format, the
   only one Thunar, Caja and Nemo paste; servers without a desktop are
-  supported for monitoring, the terminal, scripts and files.
+  supported for monitoring, the terminal, the file browser, scripts and
+  files.

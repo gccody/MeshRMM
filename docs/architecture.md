@@ -135,6 +135,9 @@ input.
 - `terminals`: remote terminals that are being opened or are open, and the
   relay between each one's browser and Agent sockets. See
   [remote terminal](terminal.md).
+- `files`: the file browser's requests to Agents, its downloads and uploads,
+  and the relay between each transfer's HTTP request and the socket its
+  Agent opened. See [file browser](files.md).
 - `maintenance`: the periodic task that purges expired tokens, old runs,
   resolved alerts, old application changes, old update runs, old wake
   requests and leftover partial files.
@@ -150,7 +153,7 @@ task.
   authentication, superseding an older connection of the same Agent,
   revocation, commands (session requests, scripts, file deliveries,
   uninstall, system information, update scans and installs, terminals,
-  wake packets),
+  wake packets, file requests and transfers),
   credential rotation, the session lease and update grace.
 - **Session actor**, one per remote session
   (`/v1/remote/sessions/{id}/signal`): the signaling relay, the idle
@@ -179,6 +182,11 @@ task.
   (`/v1/terminals/{id}`), which relays to the socket the Agent opened for it
   (`/v1/agents/{id}/terminals/{terminal_id}`), so terminal traffic never
   shares an Agent's control connection. See [remote terminal](terminal.md).
+- **File transfers**: each download or upload is the HTTP request that
+  carries it, relaying to the socket the Agent opened for it
+  (`/v1/agents/{id}/file-transfers/{transfer_id}`), one piece at a time.
+  Listings and changes are answered over the control connection, file
+  contents never. See [file browser](files.md).
 
 ### Sign-in and permissions
 
@@ -206,6 +214,7 @@ Roles are built from these permissions (`server/src/rbac.rs`):
 `sessions.connect_background`, `sessions.close_any`, `terminal.connect`,
 `terminal.connect_system`, `scripts.run`,
 `scripts.manage_shared`, `files.deliver`, `files.manage_shared`,
+`files.browse`, `files.manage`, `files.system`,
 `jobs.run_wide`, `automation.manage`, `updates.view`, `updates.install`,
 `alerts.view`, `alerts.respond`, `alerts.manage`, `users.manage`, `roles.manage`, `settings.manage`, `authentication.manage`,
 `api_tokens.manage`, `audit.view`.

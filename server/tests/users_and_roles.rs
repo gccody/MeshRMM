@@ -37,6 +37,9 @@ async fn custom_roles_grant_their_permissions() {
                 "terminal.connect_system",
                 "scripts.run",
                 "files.deliver",
+                "files.browse",
+                "files.manage",
+                "files.system",
                 "updates.view",
                 "updates.install",
                 "alerts.view",
@@ -44,7 +47,7 @@ async fn custom_roles_grant_their_permissions() {
             ])
         );
         let permissions = admin.get("/v1/permissions").await;
-        assert_eq!(permissions.body.as_array().unwrap().len(), 30);
+        assert_eq!(permissions.body.as_array().unwrap().len(), 33);
 
         let invalid = admin
             .post(

@@ -28,6 +28,8 @@ export type GeneralSettings = {
   update_scan_interval_hours: number;
   // Terminals with no input for this long are closed.
   terminal_idle_timeout_minutes: number;
+  // The largest file the file browser downloads or uploads, in MB.
+  file_transfer_limit_mb: number;
   updated_at: number;
 };
 
@@ -64,6 +66,16 @@ export const IDLE_DISCONNECT_MINUTES = [5, 10, 15, 30, 60, 120, 240, 480] as con
 export const TERMINAL_IDLE_TIMEOUT_MINUTES = [5, 10, 15, 30, 60, 120, 240, 480] as const;
 export const DEFAULT_TERMINAL_IDLE_TIMEOUT_MINUTES = 30;
 
+// The file browser's transfer limits on offer, in MB, up to 1 TB.
+export const FILE_TRANSFER_LIMITS_MB = [100, 512, 1024, 2048, 4096, 10240, 51200, 102400, 1048576] as const;
+export const DEFAULT_FILE_TRANSFER_LIMIT_MB = 4096;
+
+export function formatTransferLimit(megabytes: number) {
+  if (megabytes >= 1024 * 1024 && megabytes % (1024 * 1024) === 0) return `${megabytes / (1024 * 1024)} TB`;
+  if (megabytes >= 1024 && megabytes % 1024 === 0) return `${megabytes / 1024} GB`;
+  return `${megabytes} MB`;
+}
+
 export function formatIdleDisconnect(minutes: number | null) {
   if (minutes === null) return "Never";
   if (minutes < 60) return `${minutes} minutes`;
@@ -75,6 +87,7 @@ export const SETTINGS_TABS = [
   { id: "general", label: "General" },
   { id: "remote-sessions", label: "Remote sessions" },
   { id: "terminals", label: "Terminals" },
+  { id: "files", label: "Files" },
   { id: "blackout", label: "Blackout message" },
   { id: "connection-notification", label: "Connection notification" },
   { id: "connection-approval", label: "Connection approval" },
@@ -102,6 +115,7 @@ export type SettingsDraft = {
   connectionApprovalLockIdleSeconds: number;
   updateScanIntervalHours: number;
   terminalIdleTimeoutMinutes: number;
+  fileTransferLimitMb: number;
 };
 
 // The saved values, or the defaults a server starts with.
@@ -127,6 +141,7 @@ export function draftFromSettings(settings: GeneralSettings | null | undefined):
     connectionApprovalLockIdleSeconds: settings?.connection_approval_lock_idle_seconds ?? DEFAULT_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS,
     updateScanIntervalHours: settings?.update_scan_interval_hours ?? DEFAULT_UPDATE_SCAN_INTERVAL_HOURS,
     terminalIdleTimeoutMinutes: settings?.terminal_idle_timeout_minutes ?? DEFAULT_TERMINAL_IDLE_TIMEOUT_MINUTES,
+    fileTransferLimitMb: settings?.file_transfer_limit_mb ?? DEFAULT_FILE_TRANSFER_LIMIT_MB,
   };
 }
 
@@ -152,7 +167,8 @@ export function draftMatchesSettings(draft: SettingsDraft, settings: GeneralSett
     draft.connectionApprovalTimeoutSeconds === saved.connectionApprovalTimeoutSeconds &&
     draft.connectionApprovalLockIdleSeconds === saved.connectionApprovalLockIdleSeconds &&
     draft.updateScanIntervalHours === saved.updateScanIntervalHours &&
-    draft.terminalIdleTimeoutMinutes === saved.terminalIdleTimeoutMinutes
+    draft.terminalIdleTimeoutMinutes === saved.terminalIdleTimeoutMinutes &&
+    draft.fileTransferLimitMb === saved.fileTransferLimitMb
   );
 }
 
@@ -228,6 +244,7 @@ export function settingsBody(draft: SettingsDraft) {
     connection_approval_lock_idle_seconds: draft.connectionApprovalLockIdleSeconds,
     update_scan_interval_hours: draft.updateScanIntervalHours,
     terminal_idle_timeout_minutes: draft.terminalIdleTimeoutMinutes,
+    file_transfer_limit_mb: draft.fileTransferLimitMb,
   };
 }
 

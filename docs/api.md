@@ -74,6 +74,10 @@ credentials or take over its user's account:
 - the website's event socket (`/v1/events`), terminals, and starting remote
   sessions (`/v1/remote/handoffs`), which belong to a person at a browser.
 
+The [file browser](files.md#how-it-works)'s routes, downloads and uploads
+included, take tokens, so a script can fetch a device's logs or put a file
+on it.
+
 SCIM has its own tokens, made under **Authentication → Directory sync**; a
 personal API token doesn't work at `/scim/v2`, and a SCIM token doesn't work
 at `/v1`.

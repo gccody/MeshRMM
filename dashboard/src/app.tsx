@@ -22,6 +22,7 @@ import { RolesPanel } from "../features/roles/roles-panel";
 import { SettingsPanel } from "../features/settings/settings-page";
 import { SoftwarePage } from "../features/system-info/software-page";
 import { TerminalPage } from "../features/terminal/terminal-page";
+import { FilesPage } from "../features/files/files-page";
 import { ToolboxPanel } from "../features/toolbox/toolbox-panel";
 import { UpdatesPage } from "../features/updates/updates-page";
 import { UsersPanel } from "../features/users/users-panel";
@@ -39,6 +40,7 @@ export function App() {
             <Route index element={<DevicesPanel />} />
             <Route path="device" element={<DevicePage />} />
             <Route path="terminal" element={<TerminalPage />} />
+            <Route path="files" element={<FilesPage />} />
             <Route path="companies" element={<CompaniesPanel />} />
             <Route path="tags" element={<TagsPage />} />
             <Route path="software" element={<SoftwarePage />} />

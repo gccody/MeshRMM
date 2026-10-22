@@ -1,4 +1,4 @@
-import { Activity, ArrowLeft, Building2, CircleAlert, Cpu, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package, ShieldCheck, Tag, Terminal } from "lucide-react";
+import { Activity, ArrowLeft, Building2, CircleAlert, Cpu, FolderOpen, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package, ShieldCheck, Tag, Terminal } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { NO_COMPANY, DEFAULT_DEVICE_FILTERS, serializeDeviceFilters } from "../agents/device-filters";
@@ -11,6 +11,7 @@ import { tagsOf } from "../tags/model";
 import { TagChips } from "../tags/tag-chip";
 import { TagDevicesDialog } from "../tags/tag-dialogs";
 import { terminalPagePath } from "../terminal/model";
+import { filesPagePath } from "../files/model";
 import { DeviceUpdates } from "../updates/device-updates";
 import { DeviceWake } from "../wake/device-wake";
 import { HeaderActions } from "../workspace/header-actions";
@@ -149,10 +150,19 @@ export function DevicePage() {
               {can("devices.edit") && <button ref={tagOpener} type="button" className="link-button" onClick={() => setTagging(true)} aria-haspopup="dialog">Edit tags</button>}
             </p>
           )}
-          {agent?.connected && (can("terminal.connect") || can("terminal.connect_system")) && (
-            <a className="secondary-button device-terminal" href={terminalPagePath(agent.id)} target="_blank" rel="noreferrer" aria-label={`Open a terminal on ${agent.name} in a new tab`}>
-              <Terminal size={15} aria-hidden="true" />Terminal
-            </a>
+          {agent?.connected && (can("terminal.connect") || can("terminal.connect_system") || can("files.browse")) && (
+            <span className="device-links">
+              {(can("terminal.connect") || can("terminal.connect_system")) && (
+                <a className="secondary-button device-terminal" href={terminalPagePath(agent.id)} target="_blank" rel="noreferrer" aria-label={`Open a terminal on ${agent.name} in a new tab`}>
+                  <Terminal size={15} aria-hidden="true" />Terminal
+                </a>
+              )}
+              {can("files.browse") && (
+                <a className="secondary-button device-terminal" href={filesPagePath(agent.id)} target="_blank" rel="noreferrer" aria-label={`Browse the files on ${agent.name} in a new tab`}>
+                  <FolderOpen size={15} aria-hidden="true" />Files
+                </a>
+              )}
+            </span>
           )}
         </div>
         {agent && <DeviceWake key={agent.id} agent={agent} />}

@@ -1,6 +1,6 @@
 //! The company's connection notification, shown to the user signed in on the
-//! console when a terminal opens, so a shell on their computer isn't a
-//! secret from them. The server decides whether there is one; the Agent shows
+//! console when a terminal opens or a technician starts working with their
+//! files, so neither is a secret from them. The server decides whether there is one; the Agent shows
 //! it when somebody is signed in, without waiting for it, and a failure only
 //! logs. It uses the remote session's notification window and closes by
 //! itself.
@@ -16,11 +16,11 @@ pub(super) fn show(mode: ExecutionMode, text: String) {
         .name("meshrmm-terminal-notice".into())
         .spawn(move || {
             if let Err(error) = show_now(mode, text) {
-                tracing::warn!(error = %format!("{error:#}"), "could not tell the computer's user about a terminal");
+                tracing::warn!(error = %format!("{error:#}"), "could not tell the computer's user about remote access");
             }
         });
     if let Err(error) = shown {
-        tracing::warn!(%error, "could not tell the computer's user about a terminal");
+        tracing::warn!(%error, "could not tell the computer's user about remote access");
     }
 }
 
@@ -37,7 +37,7 @@ fn show_now(_mode: ExecutionMode, text: String) -> anyhow::Result<()> {
             #[cfg(target_os = "linux")]
             let uid = crate::remote::linux::session_close::console_user();
             let Some(uid) = uid else {
-                tracing::debug!("nobody is signed in to see the terminal notification");
+                tracing::debug!("nobody is signed in to see the connection notification");
                 return Ok(());
             };
             registry
@@ -79,7 +79,7 @@ fn show_now(mode: ExecutionMode, text: String) -> anyhow::Result<()> {
     use crate::win32::{OwnedHandle, wide};
 
     let Some(user) = crate::remote::toolbox::windows::signed_in_user(mode) else {
-        tracing::debug!("nobody is signed in to see the terminal notification");
+        tracing::debug!("nobody is signed in to see the connection notification");
         return Ok(());
     };
     let executable = std::env::current_exe().context("could not locate the Agent executable")?;

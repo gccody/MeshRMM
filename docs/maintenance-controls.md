@@ -78,9 +78,11 @@ from its settings. It sends them only in the authenticated Agent session
 request and keeps them in the session record. Changes apply to new remote
 sessions.
 
-[Remote terminals](terminal.md#what-the-computers-user-sees) follow the same
-two settings: a terminal as the signed-in user the first, one as SYSTEM or
-root the second.
+[Remote terminals](terminal.md#what-the-computers-user-sees) and the
+[file browser](files.md#what-the-computers-user-sees) follow the same two
+settings: working as the signed-in user the first, as SYSTEM or root the
+second. The file browser notifies once in 30 minutes per technician and
+device, not for every folder.
 
 The notification appears once per remote session. Viewer reconnects and resumes
 of the same session do not repeat it. As a service, the Agent shows it from a
@@ -127,8 +129,9 @@ retry. The connection is accepted without an answer when:
   unlocks it and answers, or the time runs out.
 
 The policy applies to every new session, including background mode, but
-not to [remote terminals](terminal.md#what-the-computers-user-sees), which
-never show or control the screen. It has no per-session or viewer override: the server resolves it from its settings
+not to [remote terminals](terminal.md#what-the-computers-user-sees) or the
+[file browser](files.md#what-the-computers-user-sees), which never show or
+control the screen. It has no per-session or viewer override: the server resolves it from its settings
 and sends it only in the authenticated Agent session request.
 The reason is stored with the one-time handoff, recorded in the
 `remote.handoff_create` audit event, and kept in the session record. Viewer

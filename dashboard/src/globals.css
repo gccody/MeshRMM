@@ -660,7 +660,8 @@ td.row-actions > * + * { margin-left: 6px; }
 
 /* ── Terminals ─────────────────────────────────────────── */
 a.screen-action { text-decoration: none; }
-.device-status .device-terminal { min-height: 32px; margin-left: auto; text-decoration: none; }
+.device-status .device-links { margin-left: auto; display: inline-flex; flex-wrap: wrap; gap: 8px; }
+.device-status .device-terminal { min-height: 32px; text-decoration: none; }
 .terminal-page { display: grid; gap: 14px; }
 .terminal-start { max-width: 560px; padding: 28px; display: grid; justify-items: start; gap: 10px; border: 1px solid var(--rule); border-radius: 14px; background: var(--panel); }
 .terminal-start > svg { color: var(--signal); }
@@ -696,6 +697,124 @@ a.screen-action { text-decoration: none; }
 /* xterm's style elements, made inert; see features/terminal/terminal-view.tsx. */
 meshrmm-style { display: none; }
 .terminal-loading { display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--text-3); }
+
+/* ── File browser ──────────────────────────────────────── */
+.files-page { display: grid; gap: 14px; }
+.files-layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); align-items: start; gap: 18px; }
+.file-places { position: sticky; top: 12px; display: grid; gap: 2px; }
+.file-places h3 { margin: 14px 10px 4px; color: var(--text-3); font-size: 11.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+.file-places button { min-height: 32px; padding: 6px 10px; display: flex; align-items: center; gap: 9px; border: 0; border-radius: 7px; color: var(--text-2); background: transparent; cursor: pointer; font-size: 13.5px; font-weight: 500; text-align: left; }
+.file-places button span { min-width: 0; display: grid; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-places button small { color: var(--text-3); font-size: 11.5px; font-weight: 400; }
+.file-places button:hover { color: var(--text); background: var(--hover); }
+.file-places button[aria-current=page] { color: var(--text); background: var(--raised); box-shadow: inset 2px 0 0 var(--signal); }
+.file-places svg { flex: 0 0 auto; color: var(--text-3); }
+.file-places .field-help { margin: 6px 10px; }
+.files-main { min-width: 0; display: grid; gap: 10px; }
+.file-pathbar { display: flex; align-items: center; gap: 8px; }
+.file-crumbs { min-width: 0; height: 36px; flex: 1; display: flex; align-items: center; border: 1px solid var(--rule); border-radius: 9px; background: var(--well); }
+.file-crumbs ol { min-width: 0; margin: 0; padding: 0 4px; display: flex; flex: 1; align-items: center; overflow-x: auto; list-style: none; scrollbar-width: none; }
+.file-crumbs li { display: flex; align-items: center; flex: 0 0 auto; }
+.file-crumbs li + li::before { content: "›"; padding: 0 2px; color: var(--text-3); }
+.file-crumbs li button { height: 28px; max-width: 260px; padding: 0 7px; display: inline-flex; align-items: center; gap: 6px; overflow: hidden; border: 0; border-radius: 6px; color: var(--text-2); background: transparent; cursor: pointer; font-size: 13.5px; text-overflow: ellipsis; white-space: nowrap; }
+.file-crumbs li button:hover { color: var(--text); background: var(--hover); }
+.file-crumbs li button[aria-current=page] { color: var(--text); font-weight: 600; }
+.file-crumbs-edit { width: 34px; height: 34px; flex: 0 0 auto; display: grid; place-items: center; border: 0; border-left: 1px solid var(--rule); border-radius: 0 8px 8px 0; color: var(--text-3); background: transparent; cursor: text; }
+.file-crumbs-edit:hover { color: var(--text); }
+.file-path-form { min-width: 0; flex: 1; display: flex; gap: 8px; }
+.file-path-form input { min-width: 0; height: 36px; flex: 1; padding: 0 11px; border: 1px solid var(--signal); border-radius: 9px; outline: 0; color: var(--text); background: var(--well); box-shadow: 0 0 0 3px var(--signal-wash); font: 13.5px var(--mono); }
+.file-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.file-toolbar-group { display: inline-flex; flex-wrap: wrap; gap: 8px; }
+.file-toolbar .secondary-button, .file-toolbar .danger-button { min-height: 32px; padding-inline: 11px; font-size: 13px; }
+.file-toolbar .secondary-button[aria-pressed=true] { border-color: rgb(142 152 255 / 50%); background: var(--signal-wash); }
+.file-toolbar .file-copy-path { width: 32px; height: 32px; }
+.file-toolbar-end { margin-left: auto; display: inline-flex; gap: 8px; }
+.file-filter { width: 200px; height: 32px; }
+.file-list { position: relative; max-height: max(320px, calc(100vh - 360px)); max-height: max(320px, calc(100dvh - 360px)); overflow: auto; border: 1px solid var(--rule); border-radius: 12px; background: var(--panel); }
+.file-list.drop-target, .file-empty:hover { outline: 2px dashed var(--signal); outline-offset: -4px; }
+.file-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 13.5px; }
+.file-table thead th { position: sticky; top: 0; z-index: 2; height: 36px; padding: 0 10px; color: var(--text-3); background: var(--panel); box-shadow: inset 0 -1px 0 var(--rule); font-size: 12.5px; font-weight: 500; text-align: left; white-space: nowrap; }
+.file-table td { height: 36px; padding: 0 10px; overflow: hidden; color: var(--text-2); text-overflow: ellipsis; white-space: nowrap; }
+.file-sort { padding: 0; display: inline-flex; align-items: center; gap: 4px; border: 0; color: inherit; background: none; cursor: pointer; font: inherit; }
+.file-sort:hover { color: var(--text); }
+.file-check-column { width: 38px; }
+.file-table input[type=checkbox] { accent-color: var(--signal); }
+.file-size-column { width: 96px; text-align: right; }
+.file-table th.file-size-column { text-align: right; }
+.file-modified-column { width: 176px; }
+.file-type-column { width: 150px; }
+.file-menu-column { width: 46px; }
+.file-table td.file-menu-column { overflow: visible; }
+.file-row { cursor: default; }
+.file-row:hover { background: rgb(255 255 255 / 3%); }
+.file-row.selected { background: var(--signal-wash); }
+.file-row:focus-visible { outline: 2px solid var(--signal); outline-offset: -2px; }
+.file-row.dimmed td { opacity: .62; }
+.file-row.drop-target { box-shadow: inset 0 0 0 2px var(--signal); }
+.file-row td.file-size-column { font-variant-numeric: tabular-nums; }
+.file-entry-name { max-width: 100%; display: inline-flex; align-items: center; gap: 9px; color: var(--text); vertical-align: middle; }
+.file-entry-name > span { overflow: hidden; text-overflow: ellipsis; }
+.file-entry-name svg { flex: 0 0 auto; color: var(--text-3); }
+.file-entry-name.directory svg { color: var(--signal); }
+.file-spacer td { height: 0; padding: 0; }
+.file-loading-row { color: var(--text-3); }
+.file-row-menu { right: 0; }
+.file-status { margin: 0; color: var(--text-3); font-size: 12.5px; }
+.file-problem-actions { display: inline-flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 6px; }
+.file-notice { padding: 9px 12px; display: flex; align-items: center; gap: 10px; border: 1px solid var(--rule); border-radius: 10px; color: var(--text-2); background: var(--panel); font-size: 13.5px; overflow-wrap: anywhere; }
+.file-notice button { margin-left: auto; padding: 4px; display: grid; border: 0; border-radius: 6px; color: inherit; background: none; cursor: pointer; }
+.file-start { display: grid; gap: 12px; }
+.file-start h2 { margin: 6px 0 0; color: var(--text-2); font-size: 14px; font-weight: 600; }
+.file-roots { margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; list-style: none; }
+.file-roots button { width: 100%; padding: 14px; display: flex; align-items: flex-start; gap: 12px; border: 1px solid var(--rule); border-radius: 12px; color: var(--text); background: var(--panel); cursor: pointer; text-align: left; }
+.file-roots button:hover { border-color: var(--rule-strong); background: var(--raised); }
+.file-roots button > svg { flex: 0 0 auto; color: var(--signal); }
+.file-roots button > span { min-width: 0; flex: 1; display: grid; gap: 6px; }
+.file-roots strong { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.file-roots small { overflow: hidden; color: var(--text-3); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.file-transfers { padding: 12px 14px; display: grid; gap: 8px; border: 1px solid var(--rule); border-radius: 12px; background: var(--panel); }
+.file-transfers header { display: flex; align-items: center; gap: 12px; }
+.file-transfers h2 { margin: 0; font-size: 14px; }
+.file-transfers header span { color: var(--text-3); font-size: 12.5px; }
+.file-transfers header .link-button { margin-left: auto; font-size: 12.5px; }
+.file-transfers ul { max-height: 260px; margin: 0; padding: 0; display: grid; gap: 4px; overflow-y: auto; list-style: none; }
+.file-transfer { padding: 8px 4px; display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; align-items: center; gap: 10px; border-top: 1px solid var(--rule); }
+.file-transfer:first-child { border-top: 0; }
+.file-transfer-icon { display: grid; color: var(--text-3); }
+.file-transfer.done .file-transfer-icon { color: var(--live); }
+.file-transfer.failed .file-transfer-icon, .file-transfer.failed .file-transfer-status { color: var(--danger); }
+.file-transfer.paused .file-transfer-icon, .file-transfer.paused .file-transfer-status, .file-transfer.conflict .file-transfer-status { color: var(--warn); }
+.file-transfer-body { min-width: 0; display: grid; gap: 4px; }
+.file-transfer-body > p { margin: 0; display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.file-transfer-body strong { overflow: hidden; font-size: 13.5px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.file-transfer-body small { flex: 0 0 auto; color: var(--text-3); font-size: 12px; }
+.file-transfer progress { width: 100%; height: 5px; border: 0; border-radius: 3px; background: var(--well); appearance: none; }
+.file-transfer progress::-webkit-progress-bar { border-radius: 3px; background: var(--well); }
+.file-transfer progress::-webkit-progress-value { border-radius: 3px; background: var(--signal); }
+.file-transfer progress::-moz-progress-bar { border-radius: 3px; background: var(--signal); }
+.file-transfer-status { flex-wrap: wrap; color: var(--text-2); font-size: 12.5px; }
+.file-digest-button { padding: 0; display: inline-flex; align-items: center; gap: 5px; border: 0; color: var(--text-3); background: none; cursor: pointer; font-size: 12px; }
+.file-digest-button:hover { color: var(--text); }
+.file-digest-button code { font: 11.5px var(--mono); }
+.file-transfer-actions { display: inline-flex; align-items: center; gap: 6px; }
+.file-transfer-actions .secondary-button { min-height: 28px; padding-inline: 9px; font-size: 12.5px; }
+.file-failures { margin: 10px 0 0; padding: 10px 12px; display: grid; gap: 6px; border: 1px solid rgb(242 123 132 / 30%); border-radius: 9px; color: #f7b1b6; background: var(--danger-wash); font-size: 13px; list-style: none; }
+.file-failures strong { display: block; color: var(--text); font: 12px var(--mono); overflow-wrap: anywhere; }
+.file-delete-list { margin: 0 0 10px; padding-left: 18px; color: var(--text-2); font-size: 13.5px; }
+.file-delete-list li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-delete-choice { margin: 4px 0 0; padding: 0; display: grid; gap: 8px; border: 0; }
+.file-delete-choice label { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 1px solid var(--rule); border-radius: 9px; background: var(--well); cursor: pointer; }
+.file-delete-choice label:has(input:checked) { border-color: rgb(142 152 255 / 50%); background: var(--signal-wash); }
+.file-delete-choice span { display: grid; gap: 2px; color: var(--text-2); font-size: 13px; }
+.file-delete-choice strong { color: var(--text); font-weight: 600; }
+.file-delete-warning { padding: 10px 12px; border: 1px solid rgb(240 184 90 / 30%); border-radius: 9px; color: var(--warn); background: var(--warn-wash); font-size: 13.5px; }
+@media (max-width: 900px) {
+  .files-layout { grid-template-columns: minmax(0, 1fr); }
+  .file-places { position: static; display: flex; flex-wrap: wrap; gap: 4px; }
+  .file-places h3 { display: none; }
+  .file-modified-column, .file-type-column { display: none; }
+  .file-toolbar-end { margin-left: 0; }
+}
 
 /* ── Smaller screens ───────────────────────────────────── */
 @media (max-width: 1240px) {

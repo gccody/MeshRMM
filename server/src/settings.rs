@@ -33,6 +33,8 @@ pub struct Settings {
     pub update_scan_interval_hours: i64,
     /// Remote terminals with no input for this long are closed.
     pub terminal_idle_timeout_minutes: i64,
+    /// The largest file the file browser transfers, in MiB.
+    pub file_transfer_limit_mb: i64,
     /// Personal API tokens authenticate requests.
     pub api_tokens_enabled: bool,
     /// The longest a new API token may last; `None` allows tokens that never
@@ -55,7 +57,7 @@ impl Settings {
     }
 }
 
-const COLUMNS: [SettingsTable; 33] = [
+const COLUMNS: [SettingsTable; 34] = [
     SettingsTable::InstanceName,
     SettingsTable::DashboardIdleTimeoutMinutes,
     SettingsTable::BlackoutMessage,
@@ -79,6 +81,7 @@ const COLUMNS: [SettingsTable; 33] = [
     SettingsTable::SessionLifetimeHours,
     SettingsTable::UpdateScanIntervalHours,
     SettingsTable::TerminalIdleTimeoutMinutes,
+    SettingsTable::FileTransferLimitMb,
     SettingsTable::ApiTokensEnabled,
     SettingsTable::ApiTokenMaxLifetimeDays,
     SettingsTable::SmtpHost,

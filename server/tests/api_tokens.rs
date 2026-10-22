@@ -112,7 +112,7 @@ async fn tokens_act_for_their_user_within_their_scope() {
         let current = get(&app, &secret, "/v1/api-tokens/current").await;
         assert_eq!(current.status, StatusCode::OK, "{name}");
         assert_eq!(current.body["token"]["id"], id.as_str());
-        assert_eq!(current.body["permissions"].as_array().unwrap().len(), 30);
+        assert_eq!(current.body["permissions"].as_array().unwrap().len(), 33);
         assert_eq!(
             admin.get("/v1/api-tokens/current").await.code(),
             "not_an_api_token"

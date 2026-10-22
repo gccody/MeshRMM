@@ -27,6 +27,8 @@ mod credentials;
 mod display_border;
 #[cfg(windows)]
 mod drag_windows;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+mod files;
 #[cfg(unix)]
 pub(crate) mod helper;
 #[cfg(windows)]
@@ -73,6 +75,8 @@ mod toolbox;
 mod transport;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod updates;
+#[cfg(unix)]
+pub(crate) mod user_database;
 #[cfg(windows)]
 pub(crate) mod virtual_display;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -179,6 +183,27 @@ fn report_wake_results(
     }
 }
 
+/// Sends a file operation's answer without waiting for it to be written.
+/// One that can't be queued is lost; the server gives up on it.
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+fn report_file_reply(
+    socket: &SignalingConnection,
+    request_id: String,
+    reply: meshrmm_protocol::FileReply,
+) {
+    let status = AgentStatusMessage::FileReply {
+        request_id,
+        reply: Box::new(reply),
+    };
+    let queued = match serde_json::to_string(&status) {
+        Ok(text) => socket.queue(Message::Text(text.into())),
+        Err(error) => Err(error.into()),
+    };
+    if let Err(error) = queued {
+        tracing::warn!(error = %error, "could not answer a file request");
+    }
+}
+
 /// Sends a system information snapshot without waiting for it to be
 /// written. One that can't be queued is dropped: the server asks for a new
 /// one when the Agent reconnects and the one it has is old.
@@ -272,6 +297,7 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             // the next connection.
             updates: updates::Updates::new(),
             wake: wake::Relay::new(),
+            files: files::Files::new(),
             config,
             mode,
             link,
@@ -294,6 +320,7 @@ struct Coordinator {
     system_info: system_info::Collector,
     updates: updates::Updates,
     wake: wake::Relay,
+    files: files::Files,
     active_session: Option<ActiveSession>,
     // Outlives session tasks, which end whenever the viewer drops its
     // connection, so the close action runs only once the session ends.
@@ -371,6 +398,7 @@ impl Coordinator {
                 metrics = self.metrics.next() => report_metrics(socket, metrics),
                 system = self.system_info.next() => report_system_info(socket, system),
                 results = self.wake.next() => report_wake_results(socket, results),
+                (request_id, reply) = self.files.next() => report_file_reply(socket, request_id, reply),
                 report = self.updates.next() => {
                     let sent = match serde_json::to_string(&report) {
                         Ok(text) => socket.send(Message::Text(text.into())).await,
@@ -454,6 +482,27 @@ impl Coordinator {
                 AgentCommand::SendWakePackets { packets } => {
                     tracing::info!(packets = packets.len(), "the server asked for wake packets");
                     self.wake.send(packets);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::FileRequest { request } => {
+                    tracing::debug!(
+                        request_id = %request.request_id,
+                        operation = request.operation.name(),
+                        run_as = request.run_as.as_str(),
+                        "the server asked for a file operation"
+                    );
+                    self.files.request(self.mode, request);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::FileTransfer { transfer } => {
+                    tracing::info!(
+                        transfer_id = %transfer.transfer_id,
+                        run_as = transfer.run_as.as_str(),
+                        "the server asked for a file transfer"
+                    );
+                    // Automatic updates wait for transfers, as for sessions.
+                    let activity = self.link.session_started();
+                    files::transfer::start(&self.config, self.mode, transfer, activity);
                     return Ok(ControlFlow::Continue(()));
                 }
             }

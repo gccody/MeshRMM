@@ -88,6 +88,7 @@ pub struct GeneralSettings {
     connection_approval_lock_idle_seconds: i64,
     update_scan_interval_hours: i64,
     terminal_idle_timeout_minutes: i64,
+    file_transfer_limit_mb: i64,
     updated_at: i64,
 }
 
@@ -114,6 +115,7 @@ impl From<Settings> for GeneralSettings {
             connection_approval_lock_idle_seconds: settings.connection_approval_lock_idle_seconds,
             update_scan_interval_hours: settings.update_scan_interval_hours,
             terminal_idle_timeout_minutes: settings.terminal_idle_timeout_minutes,
+            file_transfer_limit_mb: settings.file_transfer_limit_mb,
             updated_at: settings.updated_at,
         }
     }
@@ -178,6 +180,8 @@ pub struct GeneralUpdate {
     update_scan_interval_hours: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_idle_timeout_minutes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_transfer_limit_mb: Option<u32>,
 }
 
 fn check(valid: bool, message: &'static str) -> Result<(), ApiError> {
@@ -282,6 +286,16 @@ impl GeneralUpdate {
             values.push((
                 SettingsTable::TerminalIdleTimeoutMinutes,
                 i64::from(minutes).into(),
+            ));
+        }
+        if let Some(megabytes) = self.file_transfer_limit_mb {
+            check(
+                protocol::valid_file_transfer_limit_mb(megabytes),
+                "the file transfer limit is 1 MB to 1 TB",
+            )?;
+            values.push((
+                SettingsTable::FileTransferLimitMb,
+                i64::from(megabytes).into(),
             ));
         }
         for (column, value) in [

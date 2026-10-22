@@ -108,6 +108,9 @@ pub async fn serve(
                                 wake::reported(&state, &device_id, results).await;
                             }
                         }
+                        Ok(AgentStatusMessage::FileReply { request_id, reply }) => {
+                            state.files.answered(&device_id, &request_id, *reply);
+                        }
                         // Only a deleted device's Agent uninstalls.
                         Ok(AgentStatusMessage::UninstallScheduled) => {}
                         Err(_) => {
@@ -124,6 +127,8 @@ pub async fn serve(
     // A newer connection from the device keeps reporting.
     if !state.agents.is_connected(&device_id) {
         state.metrics.disconnected(&device_id).await;
+        // Requests sent on this connection won't be answered.
+        state.files.device_disconnected(&device_id);
     }
     state.presence.disconnected(&device_id).await;
     updates::publish_device(&state, &device_id).await;
