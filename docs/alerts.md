@@ -3,8 +3,9 @@
 Alert rules watch the devices and raise alerts; notification channels tell
 people about them by email or webhook. Everything happens on the server, from
 what Agents already report: their connection, their resource usage every five
-seconds, and the toolbox runs they finish. The Agent does nothing extra, so
-alerts work the same on Windows, macOS and Linux.
+seconds, the toolbox runs they finish, and their
+[update scans and installs](patch-management.md). The Agent does nothing
+extra, so alerts work the same on Windows, macOS and Linux.
 
 ## In the website
 
@@ -37,12 +38,17 @@ Its condition can't change after it's created.
 | High CPU | the CPU load, averaged over the last M minutes (1 to 60), is above N percent | the average over the last M minutes is at or below N |
 | High memory | the same for memory in use | the same |
 | Script failed | a toolbox run on the device, by hand or as part of a [job](automation.md), couldn't start, timed out, or never reported back; optionally also a run that exited with a code other than 0 | never: a person resolves it |
+| Updates pending | updates of a category, or of any, have been pending for at least N days (1 to 365), counted from the scan that first listed each | none of them is pending that long |
+| Update install failed | an [update install](patch-management.md), by hand or as part of a job, failed partly or entirely, or never reported back | never: a person resolves it |
+| Restart pending | the device's update scans have said for at least N days (1 to 365) that it must restart to finish installing updates | a scan says it no longer has to |
 
 The loads are averages so that a brief spike or dip neither raises nor
 clears an alert. A load rule needs readings covering its whole window, from
 a connection that hasn't dropped: until then, and while the device is
 offline, its alerts stay as they are. A disk space rule judges the latest
-reading, while the device is online.
+reading, while the device is online. The update rules judge the device's
+latest scan, online or not, and say nothing about a device that never
+scanned.
 
 A rule raises at most one unresolved alert per device (and per volume, for
 disk space). Another failure of a script on a device with an unresolved
@@ -76,8 +82,9 @@ the maintenance task deletes them.
 `server/src/alerts/` holds it all. The engine's task
 (`alerts::spawn`) takes in new resource readings every five seconds and
 judges the device-state rules every 15 seconds, and at once after a rule
-changes. Script failure rules are checked when an Agent reports a run, and
-when the engine finds a run lost.
+changes or a device reports an update scan. Script failure rules are checked
+when an Agent reports a run, and when the engine finds a run lost; install
+failure rules when an install is reported failed or found lost.
 
 Unresolved alerts live in the database, keyed by a partial unique index
 (`idx_alerts_unresolved`), so a restart neither forgets an alert nor notifies
@@ -161,7 +168,7 @@ host only, since its URL may carry a token), and `alert.acknowledge` and
 | `GET /v1/alerts/counts` | Unresolved counts: `open`, `acknowledged`, and open ones by severity |
 | `GET /v1/alerts/{id}` | One alert |
 | `POST /v1/alerts/{id}/acknowledge`, `/resolve` | |
-| `GET`, `POST /v1/alert-rules`; `PUT`, `DELETE /v1/alert-rules/{id}` | |
+| `GET`, `POST /v1/alert-rules`; `PUT`, `DELETE /v1/alert-rules/{id}` | A rule's `threshold`, `threshold_unit`, `duration_minutes`, `nonzero_exit_fails`, `update_category` (`any` or a category) and `days` as its condition needs. An install failure alert carries `update_run_id`. |
 | `GET`, `POST /v1/notification-channels`; `PUT`, `DELETE /v1/notification-channels/{id}` | A missing `webhook_secret` keeps the saved one; `null` removes it |
 | `POST /v1/notification-channels/{id}/test` | `{ "delivered": bool, "error": string or null }` |
 | `GET /v1/notification-channels/recipients` | Users and roles an email channel can reach |

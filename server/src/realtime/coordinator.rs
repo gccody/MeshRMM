@@ -15,7 +15,7 @@ use meshrmm_protocol_types::{
 };
 
 use super::{LIVENESS, ToAgent, close_frame, send};
-use crate::{agents, http::AppState, system_info};
+use crate::{agents, http::AppState, system_info, updates};
 
 /// Serves the control connection of an Agent that authenticated as
 /// `device_id`, connecting from `ip`.
@@ -85,6 +85,21 @@ pub async fn serve(
                                 record_system_info(&state, &device_id, ip, *system).await;
                             }
                         }
+                        Ok(AgentStatusMessage::UpdateScan { run_ids, scan }) => {
+                            if state.agents.is_current(&device_id, connection.id) {
+                                updates::scan_reported(&state, &device_id, run_ids, *scan).await;
+                            }
+                        }
+                        Ok(AgentStatusMessage::UpdateProgress { run_id, message, percent }) => {
+                            if state.agents.is_current(&device_id, connection.id) {
+                                updates::progress_reported(&state, &device_id, &run_id, &message, percent).await;
+                            }
+                        }
+                        Ok(AgentStatusMessage::UpdateInstall { run_id, result }) => {
+                            if state.agents.is_current(&device_id, connection.id) {
+                                updates::install_reported(&state, &device_id, &run_id, *result).await;
+                            }
+                        }
                         // Only a deleted device's Agent uninstalls.
                         Ok(AgentStatusMessage::UninstallScheduled) => {}
                         Err(_) => {
@@ -103,6 +118,7 @@ pub async fn serve(
         state.metrics.disconnected(&device_id).await;
     }
     state.presence.disconnected(&device_id).await;
+    updates::publish_device(&state, &device_id).await;
     tracing::info!(device_id, "Agent disconnected");
 }
 
@@ -126,8 +142,9 @@ async fn record_system_info(
 }
 
 /// What a newly connected Agent is owed: the session it should be in, a
-/// rotated credential it hasn't used yet, and a request for a system
-/// information snapshot if the server's is missing or old. Returns the
+/// rotated credential it hasn't used yet, a request for a system
+/// information snapshot if the server's is missing or old, and one for an
+/// update scan if the last is old or the device had to restart. Returns the
 /// session it replayed.
 async fn greet(
     state: &AppState,
@@ -184,6 +201,23 @@ async fn greet(
             "could not record the device's address"
         ),
     }
+    match updates::connected(state, device_id).await {
+        Ok(true) => {
+            let message = ToAgent::Command(AgentCommand::ScanUpdates { run_id: None }).to_json();
+            socket
+                .send(Message::Text(message.into()))
+                .await
+                .map_err(drop)?;
+        }
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            device_id,
+            %error,
+            "could not read the device's update status"
+        ),
+    }
+    // The website shows the device as online.
+    updates::publish_device(state, device_id).await;
     Ok(replayed)
 }
 

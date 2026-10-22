@@ -7,6 +7,7 @@ import { ModalDialog } from "../../lib/modal-dialog";
 import { useResource } from "../../lib/use-resource";
 import { PLATFORM_LABELS } from "../agents/types";
 import { LANGUAGE_LABELS, RUN_AS_LABELS } from "../toolbox/model";
+import { describeReboot, describeSelection } from "../updates/model";
 import { RunResult, useScriptRun } from "../toolbox/run-result";
 import { fetchRun } from "../toolbox/toolbox-api";
 import { HeaderActions } from "../workspace/header-actions";
@@ -14,7 +15,7 @@ import { useWorkspace } from "../workspace/workspace-context";
 import { AutomationAreaTabs } from "./area-tabs";
 import { cancelJob, fetchJob } from "./automation-api";
 import { JobProgressBar, OutcomeChips, OutcomePill } from "./job-progress";
-import { type JobDetail, type JobDevice, type Outcome, countsSummary, deviceResult, isJobFinished, jobStarter, progressLabel } from "./model";
+import { type JobDetail, type JobDevice, type Outcome, countsSummary, deviceResult, isJobFinished, isUpdateJob, jobStarter, progressLabel } from "./model";
 import { useJobEvents } from "./use-job-feed";
 
 // Unfinished jobs are read again this often, in case an event was missed.
@@ -80,7 +81,7 @@ function JobView({ id }: { id: string }) {
   const devices = useMemo(() => (job?.devices ?? []).filter((device) => filter === null || device.outcome === filter), [job, filter]);
 
   const cancel = async () => {
-    if (!job || !window.confirm("Cancel the devices that haven't started? Scripts already running finish.")) return;
+    if (!job || !window.confirm("Cancel the devices that haven't started? Scripts and installs already running finish.")) return;
     setCancelling(true);
     setActionError(null);
     try {
@@ -151,6 +152,7 @@ function JobView({ id }: { id: string }) {
                   <td className="nowrap">{device.completed_at_unix_ms ? formatDateTime(device.completed_at_unix_ms) : ""}</td>
                   <td className="row-actions">
                     {device.run_id && <button type="button" className="secondary-button" onClick={(event) => { opener.current = event.currentTarget; setOutput(device); }} aria-haspopup="dialog">View output</button>}
+                    {device.update_run_id && device.device_name && <Link className="secondary-button" to={`/device?${new URLSearchParams({ id: device.device_id, tab: "updates" })}`}>View updates</Link>}
                   </td>
                 </tr>
               ))}
@@ -167,7 +169,10 @@ function JobView({ id }: { id: string }) {
 function JobFacts({ job }: { job: JobDetail }) {
   return (
     <dl className="job-facts">
-      <div><dt>{job.kind === "script" ? "Script" : "File"}</dt><dd>{job.item_name}{job.language && <span>{LANGUAGE_LABELS[job.language]}</span>}</dd></div>
+      {isUpdateJob(job.kind)
+        ? <div><dt>Updates</dt><dd>{job.item_name}{job.kind === "update_install" && <span>{describeSelection({ categories: job.categories ?? [] })}</span>}</dd></div>
+        : <div><dt>{job.kind === "script" ? "Script" : "File"}</dt><dd>{job.item_name}{job.language && <span>{LANGUAGE_LABELS[job.language]}</span>}</dd></div>}
+      {job.kind === "update_install" && <div><dt>Restart</dt><dd>{describeReboot(job.reboot ?? null, job.reboot_delay_minutes ?? null)}</dd></div>}
       {job.run_as && <div><dt>Runs as</dt><dd>{RUN_AS_LABELS[job.run_as]}</dd></div>}
       {job.destination && <div><dt>Saved to</dt><dd>{DESTINATION_LABELS[job.destination]}</dd></div>}
       <div><dt>On</dt><dd>{job.target_label}</dd></div>

@@ -34,13 +34,13 @@ use serde_json::{Map, Value};
 use tokio::sync::{Notify, broadcast};
 
 use self::{
-    evaluate::{DeviceState, Tracker, Verdict, judge},
+    evaluate::{DeviceState, Tracker, UpdateFacts, Verdict, judge},
     rules::{Condition, Rule},
     store::{Alert, Counts, Raise, Resolution},
 };
 use crate::{
     audit::Actor,
-    db::tables::{Agents, ScriptRuns},
+    db::tables::{Agents, ScriptRuns, UpdateRuns},
     http::AppState,
     notifications::{self, Notification},
     realtime::Metrics,
@@ -194,6 +194,22 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
                 .map(|reading| (id.clone(), reading))
         })
         .collect::<HashMap<_, _>>();
+    let watches_updates = rules.iter().any(|rule| {
+        rule.enabled
+            && matches!(
+                rule.condition,
+                Condition::UpdatesPending | Condition::RebootPending
+            )
+    });
+    let (pending_updates, reboots, scanned) = if watches_updates {
+        (
+            crate::updates::store::pending_ages(&mut database).await?,
+            crate::updates::store::reboots_pending(&mut database).await?,
+            crate::updates::store::scanned_devices(&mut database).await?,
+        )
+    } else {
+        Default::default()
+    };
 
     // Which rule and device pairs have a verdict, and the alerts it wants.
     let mut judged = HashSet::new();
@@ -215,6 +231,10 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
                     connected: connected.contains(device_id),
                     updating: updating.contains(device_id),
                     latest: latest.get(device_id).map(|reading| &reading.metrics),
+                    updates: scanned.contains(device_id).then(|| UpdateFacts {
+                        pending: pending_updates.get(device_id).map_or(&[], Vec::as_slice),
+                        reboot_pending_since: reboots.get(device_id).copied(),
+                    }),
                 };
                 if let Verdict::Known(breaches) = judge(rule, device, &tracker, now) {
                     judged.insert((rule.id.as_str(), device_id.as_str()));
@@ -292,6 +312,7 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
             value: Some(breach.value),
             detail: &breach.detail,
             script_run_id: None,
+            update_run_id: None,
         };
         if let Some(id) = store::raise(&mut database, &raise, now).await? {
             tracing::info!(
@@ -565,6 +586,7 @@ async fn check_run(state: &AppState, run_id: &str, now: i64) -> anyhow::Result<(
             value,
             detail: &detail,
             script_run_id: Some(run_id),
+            update_run_id: None,
         };
         if let Some(id) = store::raise(&mut database, &raise, now).await? {
             tracing::info!(
@@ -572,6 +594,114 @@ async fn check_run(state: &AppState, run_id: &str, now: i64) -> anyhow::Result<(
                 run_id,
                 alert_id = id,
                 "raised a script failure alert"
+            );
+            announce(state, &rule, &id, true).await?;
+        } else if let Some(id) = store::recur(&mut database, &raise, now).await? {
+            announce(state, &rule, &id, false).await?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(sqlx::FromRow)]
+struct FinishedInstall {
+    device_id: String,
+    status: String,
+    error: Option<String>,
+    installed: i64,
+    failed: i64,
+}
+
+/// How an install failed, in words, or `None` if it didn't.
+fn install_failure(install: &FinishedInstall) -> Option<String> {
+    let total = install.installed + install.failed;
+    match install.status.as_str() {
+        "partial" => Some(format!(
+            "{} of {total} updates failed to install",
+            install.failed
+        )),
+        "failed" => Some(match &install.error {
+            Some(error) => format!("Installing updates failed: {error}"),
+            None if total == 1 => "The update failed to install".to_owned(),
+            None if total > 0 => format!("All {total} updates failed to install"),
+            None => "Installing updates failed".to_owned(),
+        }),
+        "lost" => Some("An update install never reported how it went".to_owned()),
+        _ => None,
+    }
+}
+
+/// Checks an install that failed, partly or entirely, or was found lost
+/// against the install failure rules.
+pub async fn update_install_finished(state: &AppState, run_id: &str) {
+    if let Err(error) = check_install(state, run_id, now_ms()).await {
+        tracing::warn!(
+            run_id,
+            error = format!("{error:#}"),
+            "could not check an update install against the alert rules"
+        );
+    }
+}
+
+async fn check_install(state: &AppState, run_id: &str, now: i64) -> anyhow::Result<()> {
+    let mut database = &state.database;
+    let Some(install): Option<FinishedInstall> = database
+        .fetch_optional(
+            &Query::select()
+                .columns([
+                    UpdateRuns::DeviceId,
+                    UpdateRuns::Status,
+                    UpdateRuns::Error,
+                    UpdateRuns::Installed,
+                    UpdateRuns::Failed,
+                ])
+                .from(UpdateRuns::Table)
+                .and_where(Expr::col(UpdateRuns::Id).eq(run_id))
+                .and_where(Expr::col(UpdateRuns::Kind).eq("install"))
+                .to_owned(),
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let Some(detail) = install_failure(&install) else {
+        return Ok(());
+    };
+    let Some((company_id,)): Option<(Option<String>,)> = database
+        .fetch_optional(
+            &Query::select()
+                .column(Agents::CompanyId)
+                .from(Agents::Table)
+                .and_where(Expr::col(Agents::Id).eq(install.device_id.as_str()))
+                .and_where(Expr::col(Agents::DeletionRequestedAt).is_null())
+                .to_owned(),
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    for rule in rules::load(&mut database, None).await? {
+        if !rule.enabled
+            || rule.condition != Condition::UpdateInstallFailed
+            || !rule.covers(company_id.as_deref())
+        {
+            continue;
+        }
+        let raise = Raise {
+            rule_id: &rule.id,
+            device_id: &install.device_id,
+            subject: "",
+            value: Some(install.failed as f64),
+            detail: &detail,
+            script_run_id: None,
+            update_run_id: Some(run_id),
+        };
+        if let Some(id) = store::raise(&mut database, &raise, now).await? {
+            tracing::info!(
+                rule_id = rule.id,
+                run_id,
+                alert_id = id,
+                "raised an update install failure alert"
             );
             announce(state, &rule, &id, true).await?;
         } else if let Some(id) = store::recur(&mut database, &raise, now).await? {

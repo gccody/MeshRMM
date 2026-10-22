@@ -41,6 +41,7 @@ const company = {
   connection_approval_message: "{user_name} asks to connect.",
   connection_approval_timeout_seconds: 45,
   connection_approval_lock_idle_seconds: 0,
+  update_scan_interval_hours: 12,
 };
 
 test("drafts start from the saved settings, or the defaults before they load", () => {
@@ -63,6 +64,7 @@ test("drafts start from the saved settings, or the defaults before they load", (
     connectionApprovalMessage: "{user_name} asks to connect.",
     connectionApprovalTimeoutSeconds: 45,
     connectionApprovalLockIdleSeconds: 0,
+    updateScanIntervalHours: 12,
   });
   assert.deepEqual(draftFromSettings(null), {
     instanceName: "",
@@ -83,6 +85,7 @@ test("drafts start from the saved settings, or the defaults before they load", (
     connectionApprovalMessage: DEFAULT_CONNECTION_APPROVAL_MESSAGE,
     connectionApprovalTimeoutSeconds: 30,
     connectionApprovalLockIdleSeconds: 60,
+    updateScanIntervalHours: 24,
   });
 });
 
@@ -105,6 +108,7 @@ test("saving is offered only when a draft differs from the saved settings", () =
     { connectionNotification: true },
     { backgroundConnectionNotification: false },
     { connectionNotificationMessage: "Hello" },
+    { updateScanIntervalHours: 0 },
     { connectionApproval: false },
     { connectionApprovalMessage: "Hello" },
     { connectionApprovalTimeoutSeconds: 30 },
@@ -181,6 +185,7 @@ test("the saved body uses the server's field names", () => {
     connection_approval_message: "{user_name} asks to connect.",
     connection_approval_timeout_seconds: 45,
     connection_approval_lock_idle_seconds: 0,
+    update_scan_interval_hours: 12,
   });
   // Never is sent as null, which the server requires rather than defaults.
   assert.equal(

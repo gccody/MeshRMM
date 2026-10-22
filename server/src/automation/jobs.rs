@@ -1,15 +1,18 @@
-//! Jobs: one script run or file delivery on many devices, and how far it
-//! has got on each.
+//! Jobs: one script run, file delivery, update scan or update install on
+//! many devices, and how far it has got on each.
 //!
 //! A job is created with every device it covers. A device that can't run the
-//! script's interpreter is skipped; an online one is queued for the
-//! dispatcher; an offline one waits for its Agent to connect, or is missed at
-//! once if the job doesn't wait. Each device's run or delivery is an ordinary
-//! one carrying the job's ID, so its result, output and alerts work as for a
-//! run started by hand.
+//! script's interpreter, or has no update manager MeshRMM supports, is
+//! skipped; an online one is queued for the dispatcher; an offline one waits
+//! for its Agent to connect, or is missed at once if the job doesn't wait.
+//! Each device's run, delivery or update run is an ordinary one carrying the
+//! job's ID, so its result, output and alerts work as for one started by
+//! hand.
 use std::collections::{HashMap, HashSet};
 
-use meshrmm_protocol_types::{DevicePlatform, FileDeliveryDestination, RunAs, ScriptLanguage};
+use meshrmm_protocol_types::{
+    DevicePlatform, FileDeliveryDestination, RebootBehavior, RunAs, ScriptLanguage, UpdateCategory,
+};
 use sea_query::{Expr, ExprTrait, Order, Query};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -18,12 +21,16 @@ use crate::{
     audit::{self, Actor, Target as AuditTarget},
     db::{
         self, Executor,
-        tables::{Agents, Companies, FileDeliveries, JobDevices, Jobs, ScriptRuns, Users},
+        tables::{
+            Agents, Companies, DeviceUpdateStatus, FileDeliveries, JobDevices, Jobs, ScriptRuns,
+            UpdateRuns, Users,
+        },
     },
     http::ApiError,
     rbac::{Permission, Permissions},
     time::{HOUR_MS, SECOND_MS},
     toolbox::{DELIVERY_WINDOW_MS, RUN_REPORT_GRACE_MS},
+    updates::runs::{INSTALL_REPORT_WINDOW_MS, Install, SCAN_REPORT_WINDOW_MS},
     users::new_id,
 };
 
@@ -40,6 +47,8 @@ const INSERT_CHUNK: usize = 400;
 pub enum Kind {
     Script,
     File,
+    UpdateScan,
+    UpdateInstall,
 }
 
 impl Kind {
@@ -47,6 +56,8 @@ impl Kind {
         match self {
             Self::Script => "script",
             Self::File => "file",
+            Self::UpdateScan => "update_scan",
+            Self::UpdateInstall => "update_install",
         }
     }
 
@@ -54,6 +65,8 @@ impl Kind {
         match text {
             "script" => Some(Self::Script),
             "file" => Some(Self::File),
+            "update_scan" => Some(Self::UpdateScan),
+            "update_install" => Some(Self::UpdateInstall),
             _ => None,
         }
     }
@@ -211,6 +224,13 @@ pub enum Payload {
         name: String,
         destination: FileDeliveryDestination,
     },
+    UpdateScan,
+    /// Installs the pending updates in `categories`, or every one.
+    UpdateInstall {
+        categories: Vec<UpdateCategory>,
+        reboot: RebootBehavior,
+        reboot_delay_minutes: u32,
+    },
 }
 
 impl Payload {
@@ -218,11 +238,34 @@ impl Payload {
         match self {
             Self::Script { .. } => Kind::Script,
             Self::File { .. } => Kind::File,
+            Self::UpdateScan => Kind::UpdateScan,
+            Self::UpdateInstall { .. } => Kind::UpdateInstall,
         }
     }
 
-    /// Why `platform` can't take it, or `None` if it can.
-    fn unsupported_on(&self, platform: Option<DevicePlatform>) -> Option<String> {
+    /// What it sends, by ID and name. Update jobs have no item; their name
+    /// says what they do.
+    fn item(&self) -> (&str, String) {
+        match self {
+            Self::Script {
+                script_id, name, ..
+            } => (script_id, name.clone()),
+            Self::File { file_id, name, .. } => (file_id, name.clone()),
+            Self::UpdateScan => ("", "Scan for updates".to_owned()),
+            Self::UpdateInstall { categories, .. } => (
+                "",
+                format!("Install {}", Install::describe(&[], categories)),
+            ),
+        }
+    }
+
+    /// Why a device can't take it, or `None` if it can: its platform, and
+    /// whether its last update scan found an update manager MeshRMM supports.
+    fn unsupported_on(
+        &self,
+        platform: Option<DevicePlatform>,
+        updates_supported: bool,
+    ) -> Option<String> {
         match (self, platform) {
             (Self::Script { language, .. }, Some(platform)) if !language.runs_on(platform) => {
                 Some(format!(
@@ -231,6 +274,9 @@ impl Payload {
                     language.label()
                 ))
             }
+            (Self::UpdateScan | Self::UpdateInstall { .. }, _) if !updates_supported => Some(
+                "The device has no update service or package manager MeshRMM supports".to_owned(),
+            ),
             _ => None,
         }
     }
@@ -341,8 +387,8 @@ pub fn outcome(
         DeviceState::Started => match status {
             Some("pending") if overdue => Outcome::NoResult,
             Some("pending") => Outcome::Running,
-            Some("completed" | "delivered") if succeeded => Outcome::Succeeded,
-            Some("completed" | "failed") => Outcome::Failed,
+            Some("completed" | "delivered" | "succeeded") if succeeded => Outcome::Succeeded,
+            Some("completed" | "failed" | "partial") => Outcome::Failed,
             Some("timed_out") => Outcome::TimedOut,
             // Lost, or purged with the toolbox history.
             _ => Outcome::NoResult,
@@ -407,6 +453,13 @@ pub struct Job {
     pub run_as: Option<RunAs>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub destination: Option<FileDeliveryDestination>,
+    /// An install's categories; empty for every pending update.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub categories: Option<Vec<UpdateCategory>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reboot: Option<RebootBehavior>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reboot_delay_minutes: Option<i64>,
     pub target: TargetKind,
     pub target_label: String,
     pub offline: Offline,
@@ -452,6 +505,8 @@ impl Viewer {
         [
             Permission::ScriptsRun,
             Permission::FilesDeliver,
+            Permission::UpdatesView,
+            Permission::UpdatesInstall,
             Permission::AutomationManage,
             Permission::AuditView,
         ]
@@ -507,6 +562,7 @@ pub struct JobView<'a> {
 struct Device<'a> {
     id: &'a str,
     platform: Option<DevicePlatform>,
+    updates_supported: bool,
 }
 
 /// A job to create.
@@ -536,15 +592,27 @@ struct DeviceRow {
     id: String,
     name: String,
     platform: String,
+    /// `None` before the device's first update scan.
+    supported: Option<bool>,
 }
 
 /// The devices `target` covers that are enrolled and not deleted, by name.
 async fn resolve(executor: &mut impl Executor, target: &Target) -> db::Result<Vec<DeviceRow>> {
     let select = || {
         Query::select()
-            .columns([Agents::Id, Agents::Name, Agents::Platform])
+            .columns([
+                (Agents::Table, Agents::Id),
+                (Agents::Table, Agents::Name),
+                (Agents::Table, Agents::Platform),
+            ])
+            .column((DeviceUpdateStatus::Table, DeviceUpdateStatus::Supported))
             .from(Agents::Table)
-            .and_where(Expr::col(Agents::DeletionRequestedAt).is_null())
+            .left_join(
+                DeviceUpdateStatus::Table,
+                Expr::col((DeviceUpdateStatus::Table, DeviceUpdateStatus::DeviceId))
+                    .equals((Agents::Table, Agents::Id)),
+            )
+            .and_where(Expr::col((Agents::Table, Agents::DeletionRequestedAt)).is_null())
             .to_owned()
     };
     let mut rows: Vec<DeviceRow> = Vec::new();
@@ -554,7 +622,10 @@ async fn resolve(executor: &mut impl Executor, target: &Target) -> db::Result<Ve
             rows = executor
                 .fetch_all(
                     &select()
-                        .and_where(Expr::col(Agents::CompanyId).is_in(ids.iter().cloned()))
+                        .and_where(
+                            Expr::col((Agents::Table, Agents::CompanyId))
+                                .is_in(ids.iter().cloned()),
+                        )
                         .to_owned(),
                 )
                 .await?;
@@ -565,7 +636,10 @@ async fn resolve(executor: &mut impl Executor, target: &Target) -> db::Result<Ve
                     executor
                         .fetch_all::<DeviceRow, _>(
                             &select()
-                                .and_where(Expr::col(Agents::Id).is_in(chunk.iter().cloned()))
+                                .and_where(
+                                    Expr::col((Agents::Table, Agents::Id))
+                                        .is_in(chunk.iter().cloned()),
+                                )
                                 .to_owned(),
                         )
                         .await?,
@@ -637,6 +711,7 @@ pub async fn create(
         0
     };
     let (language, body, timeout_seconds, run_as, destination) = match &job.payload {
+        Payload::UpdateScan | Payload::UpdateInstall { .. } => (None, None, None, None, None),
         Payload::Script {
             language,
             body,
@@ -652,11 +727,18 @@ pub async fn create(
         ),
         Payload::File { destination, .. } => (None, None, None, None, Some(destination.as_str())),
     };
-    let (item_id, item_name) = match &job.payload {
-        Payload::Script {
-            script_id, name, ..
-        } => (script_id, name),
-        Payload::File { file_id, name, .. } => (file_id, name),
+    let (item_id, item_name) = job.payload.item();
+    let (categories, reboot, reboot_delay_minutes) = match &job.payload {
+        Payload::UpdateInstall {
+            categories,
+            reboot,
+            reboot_delay_minutes,
+        } => (
+            Some(categories.as_slice()),
+            Some(reboot.as_str()),
+            Some(i64::from(*reboot_delay_minutes)),
+        ),
+        _ => (None, None, None),
     };
     executor
         .execute(
@@ -672,6 +754,9 @@ pub async fn create(
                     Jobs::TimeoutSeconds,
                     Jobs::RunAs,
                     Jobs::Destination,
+                    Jobs::UpdateCategories,
+                    Jobs::Reboot,
+                    Jobs::RebootDelayMinutes,
                     Jobs::Target,
                     Jobs::TargetLabel,
                     Jobs::Offline,
@@ -684,13 +769,16 @@ pub async fn create(
                 .values_panic([
                     id.as_str().into(),
                     job.payload.kind().as_str().into(),
-                    item_id.as_str().into(),
+                    item_id.into(),
                     item_name.as_str().into(),
                     language.into(),
                     body.into(),
                     timeout_seconds.into(),
                     run_as.into(),
                     destination.into(),
+                    categories.and_then(Install::categories_text).into(),
+                    reboot.into(),
+                    reboot_delay_minutes.into(),
                     job.target.kind().as_str().into(),
                     label.as_str().into(),
                     job.offline.as_str().into(),
@@ -717,6 +805,7 @@ pub async fn create(
             let device = Device {
                 id: &row.id,
                 platform: DevicePlatform::parse(&row.platform),
+                updates_supported: row.supported.unwrap_or(true),
             };
             let (state, detail) = initial_state(job, device, connected);
             *counts.entry(state).or_default() += 1;
@@ -748,6 +837,13 @@ pub async fn create(
     if let Some(destination) = destination {
         metadata["destination"] = destination.into();
     }
+    if let Some(categories) = categories {
+        metadata["categories"] = json!(categories);
+    }
+    if let Some(reboot) = reboot {
+        metadata["reboot"] = reboot.into();
+        metadata["reboot_delay_minutes"] = reboot_delay_minutes.into();
+    }
     if let Some((policy_id, policy_name)) = &job.policy {
         metadata["policy_id"] = policy_id.as_str().into();
         metadata["policy_name"] = policy_name.as_str().into();
@@ -772,7 +868,10 @@ fn initial_state(
     device: Device<'_>,
     connected: &HashSet<String>,
 ) -> (DeviceState, Option<String>) {
-    if let Some(reason) = job.payload.unsupported_on(device.platform) {
+    if let Some(reason) = job
+        .payload
+        .unsupported_on(device.platform, device.updates_supported)
+    {
         (DeviceState::Skipped, Some(reason))
     } else if connected.contains(device.id) {
         (DeviceState::Queued, None)
@@ -795,6 +894,9 @@ struct JobRow {
     language: Option<String>,
     run_as: Option<String>,
     destination: Option<String>,
+    update_categories: Option<String>,
+    reboot: Option<String>,
+    reboot_delay_minutes: Option<i64>,
     target: String,
     target_label: String,
     offline: String,
@@ -817,6 +919,9 @@ fn job_select() -> sea_query::SelectStatement {
             (Jobs::Table, Jobs::Language),
             (Jobs::Table, Jobs::RunAs),
             (Jobs::Table, Jobs::Destination),
+            (Jobs::Table, Jobs::UpdateCategories),
+            (Jobs::Table, Jobs::Reboot),
+            (Jobs::Table, Jobs::RebootDelayMinutes),
             (Jobs::Table, Jobs::Target),
             (Jobs::Table, Jobs::TargetLabel),
             (Jobs::Table, Jobs::Offline),
@@ -861,6 +966,10 @@ impl JobRow {
                 .destination
                 .as_deref()
                 .and_then(FileDeliveryDestination::parse),
+            categories: (kind == Kind::UpdateInstall)
+                .then(|| Install::parse_categories(self.update_categories.as_deref())),
+            reboot: self.reboot.as_deref().and_then(RebootBehavior::parse),
+            reboot_delay_minutes: self.reboot_delay_minutes,
             target,
             offline,
             item_id: self.item_id,
@@ -961,22 +1070,27 @@ async fn with_counts(
         .collect())
 }
 
-/// The columns that join a job's device to its run or delivery: the
-/// status, whether it succeeded, and whether it's overdue at `now`.
+/// The columns that join a job's device to its run, delivery or update run:
+/// the status, whether it succeeded, and whether it's overdue at `now`.
 fn outcome_columns(select: &mut sea_query::SelectStatement, now: i64) {
     let run_deadline = format!(
         "script_runs.created_at + script_runs.timeout_seconds * {SECOND_MS} + {RUN_REPORT_GRACE_MS}"
     );
     let delivery_deadline = format!("file_deliveries.created_at + {DELIVERY_WINDOW_MS}");
+    let update_deadline = format!(
+        "update_runs.created_at + CASE update_runs.kind WHEN 'scan' THEN {SCAN_REPORT_WINDOW_MS} \
+         ELSE {INSTALL_REPORT_WINDOW_MS} END"
+    );
     select
         .expr_as(
-            Expr::cust("COALESCE(script_runs.status, file_deliveries.status)"),
+            Expr::cust("COALESCE(script_runs.status, file_deliveries.status, update_runs.status)"),
             "status",
         )
         .expr_as(
             Expr::cust(
                 "CAST(CASE WHEN script_runs.status = 'completed' AND script_runs.exit_code = 0 THEN 1 \
-                 WHEN file_deliveries.status = 'delivered' THEN 1 ELSE 0 END AS BIGINT)",
+                 WHEN file_deliveries.status = 'delivered' THEN 1 \
+                 WHEN update_runs.status = 'succeeded' THEN 1 ELSE 0 END AS BIGINT)",
             ),
             "succeeded",
         )
@@ -984,6 +1098,7 @@ fn outcome_columns(select: &mut sea_query::SelectStatement, now: i64) {
             Expr::cust(format!(
                 "CAST(CASE WHEN script_runs.status = 'pending' AND {run_deadline} < {now} THEN 1 \
                  WHEN file_deliveries.status = 'pending' AND {delivery_deadline} < {now} THEN 1 \
+                 WHEN update_runs.status = 'pending' AND {update_deadline} < {now} THEN 1 \
                  ELSE 0 END AS BIGINT)"
             )),
             "overdue",
@@ -1003,6 +1118,15 @@ fn outcome_columns(select: &mut sea_query::SelectStatement, now: i64) {
                 .equals((JobDevices::Table, JobDevices::JobId))
                 .and(
                     Expr::col((FileDeliveries::Table, FileDeliveries::DeviceId))
+                        .equals((JobDevices::Table, JobDevices::DeviceId)),
+                ),
+        )
+        .left_join(
+            UpdateRuns::Table,
+            Expr::col((UpdateRuns::Table, UpdateRuns::JobId))
+                .equals((JobDevices::Table, JobDevices::JobId))
+                .and(
+                    Expr::col((UpdateRuns::Table, UpdateRuns::DeviceId))
                         .equals((JobDevices::Table, JobDevices::DeviceId)),
                 ),
         );
@@ -1077,6 +1201,8 @@ pub struct JobDevice {
     /// The device's run, for its output at `/v1/script-runs/{id}`.
     pub run_id: Option<String>,
     pub delivery_id: Option<String>,
+    /// The device's update scan or install, at `/v1/update-runs/{id}`.
+    pub update_run_id: Option<String>,
     pub exit_code: Option<i64>,
     /// Where a delivered file was saved.
     pub path: Option<String>,
@@ -1093,6 +1219,9 @@ struct JobDeviceRow {
     detail: Option<String>,
     run_id: Option<String>,
     delivery_id: Option<String>,
+    update_run_id: Option<String>,
+    updates_installed: Option<i64>,
+    updates_failed: Option<i64>,
     exit_code: Option<i64>,
     error: Option<String>,
     path: Option<String>,
@@ -1123,18 +1252,31 @@ pub async fn devices(
             Expr::col((FileDeliveries::Table, FileDeliveries::Id)),
             "delivery_id",
         )
+        .expr_as(Expr::col((UpdateRuns::Table, UpdateRuns::Id)), "update_run_id")
+        .expr_as(
+            Expr::col((UpdateRuns::Table, UpdateRuns::Installed)),
+            "updates_installed",
+        )
+        .expr_as(
+            Expr::col((UpdateRuns::Table, UpdateRuns::Failed)),
+            "updates_failed",
+        )
         .column((ScriptRuns::Table, ScriptRuns::ExitCode))
         .expr_as(
-            Expr::cust("COALESCE(script_runs.error, file_deliveries.error)"),
+            Expr::cust("COALESCE(script_runs.error, file_deliveries.error, update_runs.error)"),
             "error",
         )
         .column((FileDeliveries::Table, FileDeliveries::Path))
         .expr_as(
-            Expr::cust("COALESCE(script_runs.created_at, file_deliveries.created_at)"),
+            Expr::cust(
+                "COALESCE(script_runs.created_at, file_deliveries.created_at, update_runs.created_at)",
+            ),
             "started_at",
         )
         .expr_as(
-            Expr::cust("COALESCE(script_runs.completed_at, file_deliveries.completed_at)"),
+            Expr::cust(
+                "COALESCE(script_runs.completed_at, file_deliveries.completed_at, update_runs.completed_at)",
+            ),
             "completed_at",
         );
     outcome_columns(&mut select, now);
@@ -1157,14 +1299,23 @@ pub async fn devices(
                 row.succeeded != 0,
                 row.overdue != 0,
             );
+            // An install that went partly wrong says how much.
+            let installs = match (row.updates_installed, row.updates_failed) {
+                (Some(installed), Some(failed)) if failed > 0 => Some(format!(
+                    "{failed} of {} updates failed to install",
+                    installed + failed
+                )),
+                _ => None,
+            };
             Some(JobDevice {
                 device_id: row.device_id,
                 device_name: row.device_name,
                 platform: row.platform.as_deref().and_then(DevicePlatform::parse),
                 outcome,
-                detail: row.error.or(row.detail),
+                detail: row.error.or(installs).or(row.detail),
                 run_id: row.run_id,
                 delivery_id: row.delivery_id,
+                update_run_id: row.update_run_id,
                 exit_code: row.exit_code,
                 path: row.path,
                 started_at_unix_ms: row.started_at,
@@ -1271,6 +1422,15 @@ mod tests {
             Outcome::Succeeded
         );
         assert_eq!(outcome(Started, None, false, false), Outcome::NoResult);
+        // Update runs.
+        assert_eq!(
+            outcome(Started, Some("succeeded"), true, false),
+            Outcome::Succeeded
+        );
+        assert_eq!(
+            outcome(Started, Some("partial"), false, false),
+            Outcome::Failed
+        );
     }
 
     #[test]

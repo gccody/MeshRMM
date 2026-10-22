@@ -3,8 +3,18 @@
 // node:test can load this module directly.
 import type { Agent, DevicePlatform } from "../agents/types.ts";
 import { type RunAs, type ScriptLanguage, LANGUAGE_LABELS, runsOn } from "../toolbox/model.ts";
+import type { Permission } from "../auth/types.ts";
+import { DEFAULT_REBOOT_DELAY_MINUTES, type RebootBehavior, type UpdateCategory, installName, rebootDelayProblem } from "../updates/model.ts";
 
-export type JobKind = "script" | "file";
+export type JobKind = "script" | "file" | "update_scan" | "update_install";
+export const isUpdateJob = (kind: JobKind) => kind === "update_scan" || kind === "update_install";
+
+export const JOB_KIND_LABELS: Record<JobKind, string> = {
+  script: "Script",
+  file: "File",
+  update_scan: "Update scan",
+  update_install: "Update install",
+};
 export type TargetKind = "devices" | "companies" | "all";
 export type OfflineChoice = "skip" | "wait";
 export type Destination = "user" | "public";
@@ -33,6 +43,10 @@ export type Job = {
   language?: ScriptLanguage;
   run_as?: RunAs;
   destination?: Destination;
+  // An update install's categories (empty for every update) and restart.
+  categories?: UpdateCategory[];
+  reboot?: RebootBehavior;
+  reboot_delay_minutes?: number;
   target: TargetKind;
   // The device's name, the companies' names, or how many devices.
   target_label: string;
@@ -61,6 +75,8 @@ export type JobDevice = {
   detail: string | null;
   run_id: string | null;
   delivery_id: string | null;
+  // The device's update scan or install, for update jobs.
+  update_run_id?: string | null;
   exit_code: number | null;
   // Where a delivered file was saved.
   path: string | null;
@@ -76,17 +92,32 @@ export type JobEvent = { type: "job_update"; job: Job } | { type: "jobs_resync" 
 
 export type TriggerKind = "interval" | "daily" | "weekly" | "once" | "enroll";
 
+// What a policy does each time it runs.
+export type PolicyAction = "script" | "update_scan" | "update_install";
+
+export const ACTION_LABELS: Record<PolicyAction, string> = {
+  script: "Run a script",
+  update_scan: "Scan for updates",
+  update_install: "Install updates",
+};
+
 // GET /v1/automation-policies
 export type Policy = {
   id: string;
   name: string;
   enabled: boolean;
-  script_id: string;
+  action: PolicyAction;
+  // A script policy's script and account; null for update policies.
+  script_id: string | null;
   // Null once the script is gone.
   script_name: string | null;
   script_language: ScriptLanguage | null;
   script_shared: boolean;
-  run_as: RunAs;
+  run_as: RunAs | null;
+  // An install policy's categories (empty for every update) and restart.
+  update_categories?: UpdateCategory[] | null;
+  reboot?: RebootBehavior | null;
+  reboot_delay_minutes?: number | null;
   target: TargetKind;
   device_ids: string[];
   company_ids: string[];
@@ -333,6 +364,23 @@ export function describeSchedule(policy: Pick<Policy, "trigger" | "interval_minu
   }
 }
 
+// What a policy does, in words: its script, or the updates it scans or installs.
+export function describePolicyAction(policy: Pick<Policy, "action" | "script_name" | "update_categories">) {
+  switch (policy.action) {
+    case "update_scan": return "Scan for updates";
+    case "update_install": return installName(policy.update_categories ?? []);
+    default: return policy.script_name ?? "Deleted script";
+  }
+}
+
+// The permission saving a policy of `action` needs besides
+// automation.manage: the policy runs with its saver's access.
+export const SAVE_PERMISSION: Record<PolicyAction, Permission> = {
+  script: "scripts.run",
+  update_scan: "updates.view",
+  update_install: "updates.install",
+};
+
 // Which devices a policy runs on, in words.
 export function describeTarget(policy: Pick<Policy, "target" | "company_ids" | "device_ids">, companyNames: ReadonlyMap<string, string>, deviceNames: ReadonlyMap<string, string>) {
   if (policy.target === "all") return "All devices";
@@ -347,6 +395,7 @@ export function describeTarget(policy: Pick<Policy, "target" | "company_ids" | "
 export type PolicyDraft = {
   name: string;
   enabled: boolean;
+  action: PolicyAction;
   scriptId: string;
   runAs: RunAs;
   target: TargetKind;
@@ -362,15 +411,19 @@ export type PolicyDraft = {
   offline: OfflineChoice;
   catchUpHours: string;
   channelIds: string[];
+  updateCategories: UpdateCategory[];
+  reboot: RebootBehavior;
+  rebootDelayMinutes: number;
 };
 
 // The draft of a new policy, or of `policy` to edit.
-export function policyDraft(policy: Policy | null, timeZone: string): PolicyDraft {
+export function policyDraft(policy: Policy | null, timeZone: string, action: PolicyAction = "script"): PolicyDraft {
   const minutes = policy?.interval_minutes ?? 60;
   const inHours = minutes % 60 === 0;
   return {
     name: policy?.name ?? "",
     enabled: policy?.enabled ?? true,
+    action: policy?.action ?? action,
     scriptId: policy?.script_id ?? "",
     runAs: policy?.run_as ?? "system",
     target: policy?.target ?? "all",
@@ -386,6 +439,9 @@ export function policyDraft(policy: Policy | null, timeZone: string): PolicyDraf
     offline: policy?.offline ?? "wait",
     catchUpHours: String(policy?.catch_up_hours ?? DEFAULT_WAIT_HOURS),
     channelIds: [...(policy?.channel_ids ?? [])],
+    updateCategories: [...(policy?.update_categories ?? (policy ? [] : ["security", "critical"]))],
+    reboot: policy?.reboot ?? "if_required",
+    rebootDelayMinutes: policy?.reboot_delay_minutes ?? DEFAULT_REBOOT_DELAY_MINUTES,
   };
 }
 
@@ -417,7 +473,11 @@ export function policyDraftProblem(draft: PolicyDraft, zones: readonly string[] 
   if (!name || Array.from(name).length > MAX_POLICY_NAME_CHARS || CONTROL.test(name)) {
     return `Give the policy a name of up to ${MAX_POLICY_NAME_CHARS} characters.`;
   }
-  if (!draft.scriptId) return "Choose a shared script to run.";
+  if (draft.action === "script" && !draft.scriptId) return "Choose a shared script to run.";
+  if (draft.action === "update_install" && draft.reboot !== "never") {
+    const problem = rebootDelayProblem(draft.rebootDelayMinutes);
+    if (problem) return problem;
+  }
   if (draft.target === "companies" && !draft.companyIds.length) return "Choose at least one company.";
   if (draft.target === "devices" && !draft.deviceIds.length) return "Choose at least one device.";
   if (draft.trigger === "enroll" && draft.target === "devices") return "A policy for newly enrolled devices runs on every device or on companies.";
@@ -443,8 +503,7 @@ export function policyInput(draft: PolicyDraft) {
   const body: Record<string, unknown> = {
     name: draft.name.trim(),
     enabled: draft.enabled,
-    script_id: draft.scriptId,
-    run_as: draft.runAs,
+    action: draft.action,
     target: draft.target,
     device_ids: draft.target === "devices" ? draft.deviceIds : [],
     company_ids: draft.target === "companies" ? draft.companyIds : [],
@@ -453,6 +512,15 @@ export function policyInput(draft: PolicyDraft) {
     catch_up_hours: waitHoursProblem(draft.catchUpHours) ? DEFAULT_WAIT_HOURS : Number(draft.catchUpHours),
     channel_ids: draft.channelIds,
   };
+  if (draft.action === "script") {
+    body.script_id = draft.scriptId;
+    body.run_as = draft.runAs;
+  }
+  if (draft.action === "update_install") {
+    body.update_categories = [...draft.updateCategories];
+    body.reboot = draft.reboot;
+    body.reboot_delay_minutes = draft.rebootDelayMinutes;
+  }
   if (draft.trigger === "interval") body.interval_minutes = intervalMinutes(draft);
   if (draft.trigger === "daily" || draft.trigger === "weekly") body.time = draft.time;
   if (draft.trigger === "weekly") body.weekdays = [...draft.weekdays].sort((left, right) => left - right);

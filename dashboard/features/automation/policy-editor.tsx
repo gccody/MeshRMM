@@ -4,12 +4,17 @@ import { AuthenticationRequired, errorText } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
 import type { Channel } from "../alerts/model";
 import { LANGUAGE_LABELS, RUN_AS_LABELS, type ToolboxScript, groupByFolder } from "../toolbox/model";
+import { CategoryChoice } from "../updates/bulk-install-dialog";
+import { RebootFields } from "../updates/reboot-fields";
 import { useWorkspace } from "../workspace/workspace-context";
 import { savePolicy } from "./automation-api";
 import { DevicePicker } from "./device-picker";
 import {
+  ACTION_LABELS,
   MAX_WAIT_HOURS,
   type Policy,
+  type PolicyAction,
+  SAVE_PERMISSION,
   type PolicyDraft,
   TRIGGER_LABELS,
   type TriggerKind,
@@ -22,6 +27,13 @@ import {
 } from "./model";
 
 const TRIGGERS = Object.keys(TRIGGER_LABELS) as TriggerKind[];
+const ACTIONS = Object.keys(ACTION_LABELS) as PolicyAction[];
+
+const ACTION_INTROS: Record<PolicyAction, string> = {
+  script: "The server runs the policy's script by itself, as a job.",
+  update_scan: "The server asks the devices to look for operating system updates, as a job, so their lists stay current between the server's own scans.",
+  update_install: "The server has the devices install pending operating system updates of the chosen kinds, as a job, and restart as you choose.",
+};
 
 const browserZone = () => currentZoneName(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
 
@@ -37,10 +49,12 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
   onClose: () => void;
   onSaved: (policy: Policy) => void;
 }) {
-  const { authorizedFetch, inventory } = useWorkspace();
+  const { authorizedFetch, inventory, can } = useWorkspace();
   const titleId = useId();
   const zones = useMemo(() => timeZones(Intl.supportedValuesOf("timeZone")), []);
-  const [draft, setDraft] = useState<PolicyDraft>(() => policyDraft(policy, browserZone()));
+  // The actions the user may save: a policy runs with its saver's access.
+  const actions = ACTIONS.filter((action) => can(SAVE_PERMISSION[action]) || policy?.action === action);
+  const [draft, setDraft] = useState<PolicyDraft>(() => policyDraft(policy, browserZone(), actions[0] ?? "script"));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const problem = policyDraftProblem(draft, zones);
@@ -54,10 +68,12 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
   const folders = groupByFolder(scripts);
   const usesZone = draft.trigger === "daily" || draft.trigger === "weekly" || draft.trigger === "once";
   const enrolling = draft.trigger === "enroll";
+  const isScript = draft.action === "script";
+  const missingPermission = can(SAVE_PERMISSION[draft.action]) ? null : `Saving a policy that does this needs the ${SAVE_PERMISSION[draft.action]} permission.`;
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (problem) return;
+    if (problem || missingPermission) return;
     setBusy(true);
     setError(null);
     try {
@@ -72,10 +88,16 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
     <ModalDialog className="settings-modal role-modal" labelledBy={titleId} onClose={onClose} returnFocus={returnFocus}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>
       <h2 id={titleId}>{policy ? `Edit ${policy.name}` : "New policy"}</h2>
-      <p>The server runs the policy&apos;s script by itself, as a job. It runs with your access: saving makes you its owner{policy && !policy.owned_by_you ? ` in place of ${policy.owner}` : ""}.</p>
+      <p>{ACTION_INTROS[draft.action]} It runs with your access: saving makes you its owner{policy && !policy.owned_by_you ? ` in place of ${policy.owner}` : ""}.</p>
       <form onSubmit={(event) => void submit(event)}>
         <fieldset className="script-editor-fields" disabled={busy}>
           <label htmlFor="policy-name">Name<input id="policy-name" required maxLength={120} value={draft.name} onChange={(event) => update({ name: event.target.value })} placeholder="Nightly cleanup" /></label>
+          {actions.length > 1 && (
+            <div className="segmented action-choice" role="group" aria-label="What the policy does">
+              {actions.map((action) => <button key={action} type="button" aria-pressed={draft.action === action} onClick={() => update({ action })}>{ACTION_LABELS[action]}</button>)}
+            </div>
+          )}
+          {isScript && <>
           <label htmlFor="policy-script">Script
             <select id="policy-script" value={draft.scriptId} onChange={(event) => update({ scriptId: event.target.value })}>
               <option value="" disabled>{scripts.length ? "Choose a shared script" : "No shared scripts yet"}</option>
@@ -97,6 +119,12 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
               </label>
             ))}
           </fieldset>
+          </>}
+          {draft.action === "update_install" && <>
+            <CategoryChoice categories={draft.updateCategories} onToggle={(category, checked) => update({ updateCategories: checked ? [...draft.updateCategories, category] : draft.updateCategories.filter((candidate) => candidate !== category) })} />
+            <RebootFields name="policy-reboot" reboot={draft.reboot} delay={draft.rebootDelayMinutes} onReboot={(reboot) => update({ reboot })} onDelay={(rebootDelayMinutes) => update({ rebootDelayMinutes })} />
+          </>}
+          {draft.action === "update_scan" && <p className="field-help">Devices also scan on the server&apos;s own schedule, set under Settings. A scan policy adds scans at the times you choose.</p>}
 
           <label htmlFor="policy-trigger">Runs
             <select id="policy-trigger" value={draft.trigger} onChange={(event) => {
@@ -161,7 +189,7 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
               ))}
             </fieldset>
           )}
-          {draft.target === "devices" && <DevicePicker agents={inventory.agents} chosen={draft.deviceIds} onChange={(deviceIds) => update({ deviceIds: [...deviceIds] })} language={script?.language ?? null} />}
+          {draft.target === "devices" && <DevicePicker agents={inventory.agents} chosen={draft.deviceIds} onChange={(deviceIds) => update({ deviceIds: [...deviceIds] })} language={isScript ? script?.language ?? null : null} />}
 
           {!enrolling && (
             <fieldset className="choice-list">
@@ -198,10 +226,10 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
             <span><strong>Turned on</strong>A policy that&apos;s off doesn&apos;t run; turning it on again starts its schedule over.</span>
           </label>
         </fieldset>
-        {(error || (problem && draft.name.trim())) && <p role="alert" className="installer-error">{error ?? problem}</p>}
+        {(error || (problem && draft.name.trim()) || missingPermission) && <p role="alert" className="installer-error">{error ?? missingPermission ?? problem}</p>}
         <div className="connection-reason-actions">
           <button type="button" className="secondary-button" onClick={onClose}>Cancel</button>
-          <button className="primary-button" disabled={busy || problem !== null}>{busy && <LoaderCircle size={16} className="spin" />} {policy ? "Save policy" : "Create policy"}</button>
+          <button className="primary-button" disabled={busy || problem !== null || missingPermission !== null}>{busy && <LoaderCircle size={16} className="spin" />} {policy ? "Save policy" : "Create policy"}</button>
         </div>
       </form>
     </ModalDialog>

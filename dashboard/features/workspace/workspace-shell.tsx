@@ -7,6 +7,7 @@ import { useAgentInventory } from "../agents/use-agent-inventory";
 import { topSeverity } from "../alerts/model";
 import { useAlertFeed } from "../alerts/use-alert-feed";
 import { useJobFeed } from "../automation/use-job-feed";
+import { useUpdateFeed } from "../updates/use-update-feed";
 import type { InventoryConnection } from "../agents/inventory-stream";
 import type { Agent } from "../agents/types";
 import { loginPath } from "../auth/next-path";
@@ -33,7 +34,7 @@ const CONNECTION_STATUS: Record<InventoryConnection, string> = {
 
 // Day-to-day pages, then administration, which the bar sets apart.
 const NAV_GROUPS: View[][] = [
-  ["devices", "companies", "software", "toolbox", "jobs", "alerts"],
+  ["devices", "companies", "software", "updates", "toolbox", "jobs", "alerts"],
   ["users", "roles", "authentication", "settings", "audit"],
 ];
 
@@ -109,11 +110,13 @@ function SignedInWorkspace({ account, view, title, setPageTitle }: {
 
   const alerts = useAlertFeed({ enabled: can("alerts.view") && !enrolling, authorizedFetch });
   const jobs = useJobFeed();
+  const updates = useUpdateFeed();
   const inventory = useAgentInventory({
     enabled: can("devices.view") && !enrolling,
     authorizedFetch,
     onAlerts: alerts.handle,
     onJobs: jobs.handle,
+    onUpdates: updates.handle,
     // A refused or revoked socket means the session or the user's access
     // changed; the account says which.
     onRefused: useCallback(() => void refresh().catch(() => {}), [refresh]),
@@ -180,6 +183,7 @@ function SignedInWorkspace({ account, view, title, setPageTitle }: {
     inventory,
     alerts,
     jobs,
+    updates,
     remote,
     deleteAgent,
     deletingId,

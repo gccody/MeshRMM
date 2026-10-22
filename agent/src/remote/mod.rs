@@ -69,6 +69,8 @@ mod thumbnail;
 mod toolbox;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod transport;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+mod updates;
 #[cfg(windows)]
 pub(crate) mod virtual_display;
 // The bitrate controller's tests share the encoded-frame queue bound.
@@ -244,6 +246,9 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             // from the previous one.
             metrics: metrics::Reports::new(),
             system_info: system_info::Collector::new(),
+            // Likewise, so a result that arrives while offline is sent on
+            // the next connection.
+            updates: updates::Updates::new(),
             config,
             mode,
             link,
@@ -264,6 +269,7 @@ struct Coordinator {
     thumbnails: thumbnail::Thumbnails,
     metrics: metrics::Reports,
     system_info: system_info::Collector,
+    updates: updates::Updates,
     active_session: Option<ActiveSession>,
     // Outlives session tasks, which end whenever the viewer drops its
     // connection, so the close action runs only once the session ends.
@@ -340,6 +346,16 @@ impl Coordinator {
                 () = self.thumbnails.due() => self.thumbnails.refresh(&self.config),
                 metrics = self.metrics.next() => report_metrics(socket, metrics),
                 system = self.system_info.next() => report_system_info(socket, system),
+                report = self.updates.next() => {
+                    let sent = match serde_json::to_string(&report) {
+                        Ok(text) => socket.send(Message::Text(text.into())).await,
+                        Err(error) => Err(error.into()),
+                    };
+                    if let Err(error) = sent {
+                        self.updates.unsent(report);
+                        return Err(error).context("could not send an update report");
+                    }
+                }
                 () = self.link.stopped() => {
                     if let Some(version) = self.link.update_version() {
                         announce_update(socket, version).await;
@@ -378,6 +394,22 @@ impl Coordinator {
                 AgentCommand::CollectSystemInfo => {
                     tracing::info!("the server asked for the system information");
                     self.system_info.request();
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::ScanUpdates { run_id } => {
+                    tracing::info!(?run_id, "the server asked for an update scan");
+                    self.updates.scan(run_id);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::InstallUpdates { install } => {
+                    tracing::info!(
+                        run_id = %install.run_id,
+                        selection = ?install.selection,
+                        reboot = install.reboot.as_str(),
+                        reboot_delay_minutes = install.reboot_delay_minutes,
+                        "the server asked for an update install"
+                    );
+                    self.updates.install(install);
                     return Ok(ControlFlow::Continue(()));
                 }
             }

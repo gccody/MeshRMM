@@ -1,9 +1,21 @@
 // Alerts, the rules that raise them and the channels they notify, as the
 // server sends them, and how the website words them. Imports carry the .ts
 // extension so node:test can load this module directly.
+import { CATEGORIES, CATEGORY_LABELS, type UpdateCategory } from "../updates/model.ts";
 
 export type Severity = "info" | "warning" | "critical";
-export type Condition = "device_offline" | "disk_space" | "cpu" | "memory" | "script_failed";
+export type Condition =
+  | "device_offline"
+  | "disk_space"
+  | "cpu"
+  | "memory"
+  | "script_failed"
+  | "updates_pending"
+  | "update_install_failed"
+  | "reboot_pending";
+
+// Which pending updates an updates_pending rule counts.
+export type UpdateCategoryChoice = "any" | UpdateCategory;
 export type AlertState = "open" | "acknowledged" | "resolved";
 export type Resolution = "cleared" | "manual" | "not_applicable";
 export type ThresholdUnit = "percent" | "gb";
@@ -25,6 +37,8 @@ export type Alert = {
   value: number | null;
   detail: string;
   script_run_id: string | null;
+  // The failed install of an update_install_failed alert.
+  update_run_id?: string | null;
   occurrences: number;
   raised_at: number;
   last_occurred_at: number;
@@ -63,6 +77,10 @@ export type AlertRule = {
   threshold_unit: ThresholdUnit | null;
   duration_minutes: number | null;
   nonzero_exit_fails: boolean;
+  // An updates_pending rule's category, and the days updates or a restart
+  // may be pending.
+  update_category?: UpdateCategoryChoice | null;
+  days?: number | null;
   all_companies: boolean;
   company_ids: string[];
   channel_ids: string[];
@@ -112,7 +130,17 @@ export const CONDITION_LABELS: Record<Condition, string> = {
   cpu: "High CPU",
   memory: "High memory",
   script_failed: "Script failed",
+  updates_pending: "Updates pending",
+  update_install_failed: "Update install failed",
+  reboot_pending: "Restart pending",
 };
+
+export const UPDATE_CATEGORY_CHOICES: readonly UpdateCategoryChoice[] = ["any", ...CATEGORIES];
+
+export const updateCategoryChoiceLabel = (choice: UpdateCategoryChoice) =>
+  choice === "any" ? "Any update" : `${CATEGORY_LABELS[choice]} updates`;
+
+export const MAX_DAYS = 365;
 
 export const CONDITIONS = Object.keys(CONDITION_LABELS) as Condition[];
 
@@ -236,7 +264,7 @@ export function resolutionLabel(alert: Pick<Alert, "resolution" | "resolved_by">
 
 // Script failures stay until a person resolves them; the rest resolve
 // themselves.
-export const clearsItself = (condition: Condition) => condition !== "script_failed";
+export const clearsItself = (condition: Condition) => condition !== "script_failed" && condition !== "update_install_failed";
 
 // The rule editor's fields, as text while being edited.
 export type RuleForm = {
@@ -248,18 +276,23 @@ export type RuleForm = {
   thresholdUnit: ThresholdUnit;
   duration: string;
   nonzeroExitFails: boolean;
+  updateCategory: UpdateCategoryChoice;
+  days: string;
   allCompanies: boolean;
   companyIds: string[];
   channelIds: string[];
   notifyOnResolve: boolean;
 };
 
-const DEFAULTS: Record<Condition, { threshold: string; duration: string }> = {
-  device_offline: { threshold: "", duration: "15" },
-  disk_space: { threshold: "10", duration: "" },
-  cpu: { threshold: "90", duration: "10" },
-  memory: { threshold: "90", duration: "10" },
-  script_failed: { threshold: "", duration: "" },
+const DEFAULTS: Record<Condition, { threshold: string; duration: string; days: string }> = {
+  device_offline: { threshold: "", duration: "15", days: "" },
+  disk_space: { threshold: "10", duration: "", days: "" },
+  cpu: { threshold: "90", duration: "10", days: "" },
+  memory: { threshold: "90", duration: "10", days: "" },
+  script_failed: { threshold: "", duration: "", days: "" },
+  updates_pending: { threshold: "", duration: "", days: "7" },
+  update_install_failed: { threshold: "", duration: "", days: "" },
+  reboot_pending: { threshold: "", duration: "", days: "3" },
 };
 
 export function ruleForm(rule: AlertRule | null): RuleForm {
@@ -273,6 +306,8 @@ export function ruleForm(rule: AlertRule | null): RuleForm {
       thresholdUnit: "percent",
       duration: DEFAULTS.device_offline.duration,
       nonzeroExitFails: false,
+      updateCategory: "security",
+      days: DEFAULTS.device_offline.days,
       allCompanies: true,
       companyIds: [],
       channelIds: [],
@@ -288,6 +323,8 @@ export function ruleForm(rule: AlertRule | null): RuleForm {
     thresholdUnit: rule.threshold_unit ?? "percent",
     duration: rule.duration_minutes === null ? DEFAULTS[rule.condition].duration : String(rule.duration_minutes),
     nonzeroExitFails: rule.nonzero_exit_fails,
+    updateCategory: rule.update_category ?? "security",
+    days: rule.days === null || rule.days === undefined ? DEFAULTS[rule.condition].days : String(rule.days),
     allCompanies: rule.all_companies,
     companyIds: rule.company_ids,
     channelIds: rule.channel_ids,
@@ -297,8 +334,10 @@ export function ruleForm(rule: AlertRule | null): RuleForm {
 
 // A new rule's form after choosing another condition: its usual thresholds.
 export function withCondition(form: RuleForm, condition: Condition): RuleForm {
-  return { ...form, condition, threshold: DEFAULTS[condition].threshold, duration: DEFAULTS[condition].duration, thresholdUnit: "percent" };
+  return { ...form, condition, threshold: DEFAULTS[condition].threshold, duration: DEFAULTS[condition].duration, days: DEFAULTS[condition].days, thresholdUnit: "percent" };
 }
+
+export const usesDays = (condition: Condition) => condition === "updates_pending" || condition === "reboot_pending";
 
 export const usesThreshold = (condition: Condition) => condition === "disk_space" || condition === "cpu" || condition === "memory";
 export const usesDuration = (condition: Condition) => condition === "device_offline" || condition === "cpu" || condition === "memory";
@@ -319,6 +358,10 @@ export function ruleFormProblem(form: RuleForm): string | null {
     const max = MAX_DURATION[form.condition] ?? 60;
     if (!Number.isInteger(duration) || duration < 1 || duration > max) return `Enter 1 to ${max.toLocaleString()} minutes.`;
   }
+  if (usesDays(form.condition)) {
+    const days = Number(form.days);
+    if (!form.days.trim() || !Number.isInteger(days) || days < 1 || days > MAX_DAYS) return `Enter 1 to ${MAX_DAYS} days.`;
+  }
   if (!form.allCompanies && !form.companyIds.length) return "Choose at least one company, or every device.";
   return null;
 }
@@ -334,6 +377,8 @@ export function ruleInput(form: RuleForm) {
     threshold_unit: form.condition === "disk_space" ? form.thresholdUnit : null,
     duration_minutes: usesDuration(form.condition) ? Number(form.duration) : null,
     nonzero_exit_fails: form.condition === "script_failed" && form.nonzeroExitFails,
+    update_category: form.condition === "updates_pending" ? form.updateCategory : null,
+    days: usesDays(form.condition) ? Number(form.days) : null,
     all_companies: form.allCompanies,
     company_ids: form.allCompanies ? [] : form.companyIds,
     channel_ids: form.channelIds,

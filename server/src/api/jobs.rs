@@ -1,4 +1,5 @@
-//! Jobs from the website: a toolbox script or file on many devices at once.
+//! Jobs from the website: a toolbox script or file, or an update scan or
+//! install, on many devices at once.
 //! Users see the jobs they started; users who manage automation see
 //! policies' jobs; users who may read the audit log see everyone's.
 use axum::{
@@ -6,7 +7,9 @@ use axum::{
     extract::{Path, Query as QueryParameters, State},
     http::StatusCode,
 };
-use meshrmm_protocol_types::{FileDeliveryDestination, RunAs};
+use meshrmm_protocol_types::{
+    FileDeliveryDestination, MAX_REBOOT_DELAY_MINUTES, RebootBehavior, RunAs, UpdateCategory,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -32,6 +35,27 @@ fn default_wait_hours() -> i64 {
     DEFAULT_WAIT_HOURS
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UpdatesAction {
+    Scan,
+    Install,
+}
+
+/// An update scan, or an install of the pending updates in `categories` (or
+/// every one), on each device.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatesJob {
+    action: UpdatesAction,
+    #[serde(default)]
+    categories: Vec<UpdateCategory>,
+    #[serde(default)]
+    reboot: Option<RebootBehavior>,
+    #[serde(default)]
+    reboot_delay_minutes: Option<u32>,
+}
+
 /// A job as the website starts it: a script and the account it runs as, or
 /// a file and where it goes; the devices; and what happens to offline ones.
 #[derive(Debug, Deserialize)]
@@ -45,6 +69,8 @@ pub struct StartJob {
     file_id: Option<String>,
     #[serde(default)]
     destination: Option<FileDeliveryDestination>,
+    #[serde(default)]
+    updates: Option<UpdatesJob>,
     target: TargetKind,
     #[serde(default)]
     device_ids: Vec<String>,
@@ -65,8 +91,9 @@ fn viewer(actor: &Authorized) -> Result<Viewer, ApiError> {
     Ok(Viewer::new(&actor.user.id, &actor.permissions))
 }
 
-/// `POST /v1/jobs`: runs one of the user's scripts, or sends one of their
-/// files, on chosen devices, whole companies or every device.
+/// `POST /v1/jobs`: runs one of the user's scripts, sends one of their
+/// files, or scans for or installs updates, on chosen devices, whole
+/// companies or every device.
 pub async fn start(
     State(state): State<AppState>,
     actor: Authorized,
@@ -83,8 +110,35 @@ pub async fn start(
         )));
     }
     let mut transaction = state.database.begin().await?;
-    let payload = match (request.script_id, request.file_id) {
-        (Some(script_id), None) => {
+    let payload = match (request.script_id, request.file_id, request.updates) {
+        (None, None, Some(updates)) => match updates.action {
+            UpdatesAction::Scan => {
+                actor.require(Permission::UpdatesView)?;
+                Payload::UpdateScan
+            }
+            UpdatesAction::Install => {
+                actor.require(Permission::UpdatesInstall)?;
+                let reboot_delay_minutes = updates
+                    .reboot_delay_minutes
+                    .unwrap_or(crate::automation::policies::DEFAULT_REBOOT_DELAY_MINUTES);
+                if !(1..=MAX_REBOOT_DELAY_MINUTES).contains(&reboot_delay_minutes) {
+                    return Err(jobs::invalid(format!(
+                        "the restart can wait 1 to {MAX_REBOOT_DELAY_MINUTES} minutes"
+                    )));
+                }
+                let mut categories = updates.categories;
+                categories.sort();
+                categories.dedup();
+                Payload::UpdateInstall {
+                    categories,
+                    reboot: updates
+                        .reboot
+                        .ok_or_else(|| jobs::invalid("choose when the computers restart"))?,
+                    reboot_delay_minutes,
+                }
+            }
+        },
+        (Some(script_id), None, None) => {
             user.require(Permission::ScriptsRun)?;
             let run_as = request
                 .run_as
@@ -102,7 +156,7 @@ pub async fn start(
                 run_as,
             }
         }
-        (None, Some(file_id)) => {
+        (None, Some(file_id), None) => {
             user.require(Permission::FilesDeliver)?;
             let destination = request
                 .destination
@@ -116,7 +170,11 @@ pub async fn start(
                 destination,
             }
         }
-        _ => return Err(jobs::invalid("choose a script or a file")),
+        _ => {
+            return Err(jobs::invalid(
+                "choose a script, a file, or an update scan or install",
+            ));
+        }
     };
     let now = now_ms();
     let created = jobs::create(

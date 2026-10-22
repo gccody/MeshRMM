@@ -6,13 +6,14 @@ import { AuthenticationRequired, type AuthorizedFetch, RequestError, errorText }
 import { useResource } from "../../lib/use-resource";
 import { fetchChannels } from "../alerts/alerts-api";
 import type { Channel } from "../alerts/model";
+import type { ToolboxScript } from "../toolbox/model";
 import { fetchToolbox } from "../toolbox/toolbox-api";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import { AutomationAreaTabs } from "./area-tabs";
 import { deletePolicy, fetchPolicies, runPolicy, savePolicy } from "./automation-api";
 import { JobProgressBar } from "./job-progress";
-import { type Policy, countsSummary, describeSchedule, describeTarget, isJobFinished, policyDraft, policyInput } from "./model";
+import { type Policy, SAVE_PERMISSION, countsSummary, describePolicyAction, describeSchedule, describeTarget, isJobFinished, policyDraft, policyInput } from "./model";
 import { PolicyEditor } from "./policy-editor";
 
 const byName = (left: Policy, right: Policy) => left.name.localeCompare(right.name, undefined, { sensitivity: "base" });
@@ -27,25 +28,36 @@ async function channelsOrNull(authorizedFetch: AuthorizedFetch): Promise<Channel
   }
 }
 
-// `/policies`: scripts the server runs by itself, on a schedule or on newly
-// enrolled devices.
+// The shared scripts, or none when the user may not see the toolbox.
+async function sharedScripts(authorizedFetch: AuthorizedFetch): Promise<ToolboxScript[]> {
+  try {
+    return (await fetchToolbox(authorizedFetch)).scripts.filter((script) => script.shared);
+  } catch (error) {
+    if (error instanceof RequestError && error.status === 403) return [];
+    throw error;
+  }
+}
+
+// `/policies`: scripts the server runs by itself, and updates it has devices
+// scan for and install, on a schedule or on newly enrolled devices.
 export function PoliciesPage() {
   const { authorizedFetch, inventory, can } = useWorkspace();
   const navigate = useNavigate();
-  // A saved policy runs with its saver's access, which must run scripts.
-  const canSave = can("scripts.run");
+  // A saved policy runs with its saver's access, which must allow what it does.
+  const canSaveAny = Object.values(SAVE_PERMISSION).some((permission) => can(permission));
+  const canSave = (policy: Policy) => can(SAVE_PERMISSION[policy.action]);
   const [dialog, setDialog] = useState<{ policy: Policy | null } | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const opener = useRef<HTMLElement | null>(null);
 
   const load = useCallback(async () => {
-    const [policies, toolbox, channels] = await Promise.all([
+    const [policies, scripts, channels] = await Promise.all([
       fetchPolicies(authorizedFetch),
-      fetchToolbox(authorizedFetch),
+      sharedScripts(authorizedFetch),
       channelsOrNull(authorizedFetch),
     ]);
-    return { policies: policies.sort(byName), scripts: toolbox.scripts.filter((script) => script.shared), channels };
+    return { policies: policies.sort(byName), scripts, channels };
   }, [authorizedFetch]);
   const { data, error, reload, setData } = useResource(load, "The policies could not be loaded.");
   const companyNames = useMemo(() => new Map(inventory.companies.map((company) => [company.id, company.name])), [inventory.companies]);
@@ -94,7 +106,7 @@ export function PoliciesPage() {
     <>
       <HeaderActions>
         <button type="button" className="icon-button" onClick={reload} aria-label="Refresh" title="Refresh"><RefreshCw size={16} /></button>
-        {data && canSave && <button type="button" className="primary-button" onClick={(event) => open(null, event.currentTarget)} aria-haspopup="dialog"><Plus size={16} /> New policy</button>}
+        {data && canSaveAny && <button type="button" className="primary-button" onClick={(event) => open(null, event.currentTarget)} aria-haspopup="dialog"><Plus size={16} /> New policy</button>}
       </HeaderActions>
       <AutomationAreaTabs current="policies" />
       {actionError && (
@@ -112,7 +124,7 @@ export function PoliciesPage() {
           <div className="empty-state">
             <CalendarClock size={22} aria-hidden="true" />
             <strong>No policies yet</strong>
-            <span>A policy runs a shared script on a schedule, or on each device that enrolls, and keeps its runs on the Jobs tab.{canSave ? "" : " Creating one needs the scripts.run permission too."}</span>
+            <span>A policy runs a shared script, or scans for or installs operating system updates, on a schedule or on each device that enrolls, and keeps its runs on the Jobs tab.{canSaveAny ? "" : " Creating one needs the scripts.run, updates.view or updates.install permission too."}</span>
           </div>
         ) : (
           <table className="data-table policy-table" aria-label="Policies">
@@ -132,7 +144,7 @@ export function PoliciesPage() {
                   <tr key={policy.id} className={policy.enabled ? undefined : "row-disabled"}>
                     <td>
                       <strong>{policy.name}</strong>
-                      <span>{policy.script_name ?? "Deleted script"} on {describeTarget(policy, companyNames, deviceNames)}</span>
+                      <span>{describePolicyAction(policy)} on {describeTarget(policy, companyNames, deviceNames)}</span>
                       <span>Runs with {policy.owned_by_you ? "your" : `${policy.owner}’s`} access</span>
                     </td>
                     <td>
@@ -151,12 +163,12 @@ export function PoliciesPage() {
                     </td>
                     <td>
                       <label className="switch">
-                        <input type="checkbox" role="switch" checked={policy.enabled} disabled={busy || !canSave} onChange={() => void toggle(policy)} aria-label={`${policy.name} turned on`} />
+                        <input type="checkbox" role="switch" checked={policy.enabled} disabled={busy || !canSave(policy)} onChange={() => void toggle(policy)} aria-label={`${policy.name} turned on`} />
                         <span aria-hidden="true" />
                       </label>
                     </td>
                     <td className="row-actions">
-                      {canSave && <>
+                      {canSave(policy) && <>
                         <button type="button" className="close-session-button" disabled={busy} onClick={() => void run(policy)} aria-label={`Run ${policy.name} now`} title="Run now">{busy ? <LoaderCircle size={16} className="spin" /> : <Play size={16} />}</button>
                         <button type="button" className="close-session-button" onClick={(event) => open(policy, event.currentTarget)} aria-haspopup="dialog" aria-label={`Edit ${policy.name}`} title="Edit policy"><Pencil size={16} /></button>
                       </>}

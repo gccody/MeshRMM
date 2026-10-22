@@ -4,6 +4,7 @@
 import { type AlertEvent, parseAlertEvent } from "../alerts/model.ts";
 import { type JobEvent, parseJobEvent } from "../automation/model.ts";
 import { type MetricsReading, parseMetricsEvent } from "../metrics/model.ts";
+import { type UpdateEvent, parseUpdateEvent } from "../updates/model.ts";
 import { applyInventoryDelta, parseAgentEvent, sortAgents, sortCompanies } from "./model.ts";
 import type { AgentDelta, AgentEvent, AgentSnapshot, Inventory } from "./types";
 
@@ -48,6 +49,8 @@ type Options = {
   onAlerts?: (event: AlertEvent) => void;
   // Jobs whose progress changed, for users who may see them.
   onJobs?: (event: JobEvent) => void;
+  // Devices' updates and update runs, for users who may see them.
+  onUpdates?: (event: UpdateEvent) => void;
   onConnection: (connection: InventoryConnection) => void;
   // The server refused the socket or closed it for lost access. A browser
   // can't see why a handshake failed, so the caller checks the session.
@@ -175,12 +178,13 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
 
 // Handles one socket's events while it is the stream's current socket.
 // `onClose` learns whether the server refused the socket or revoked access.
-function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onAlerts, onJobs, current, onOpen, onLive, onClose }: {
+function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onAlerts, onJobs, onUpdates, current, onOpen, onLive, onClose }: {
   revision: { current: number };
   onInventory: (update: (current: Inventory) => Inventory) => void;
   onMetrics?: (readings: MetricsReading[]) => void;
   onAlerts?: (event: AlertEvent) => void;
   onJobs?: (event: JobEvent) => void;
+  onUpdates?: (event: UpdateEvent) => void;
   current: () => boolean;
   onOpen: () => void;
   onLive: () => void;
@@ -210,9 +214,11 @@ function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onA
       const readings = parseMetricsEvent(event);
       const alert = readings ? null : parseAlertEvent(event);
       const job = readings || alert ? null : parseJobEvent(event);
+      const update = readings || alert || job ? null : parseUpdateEvent(event);
       if (readings) onMetrics?.(readings);
       else if (alert) onAlerts?.(alert);
       else if (job) onJobs?.(job);
+      else if (update) onUpdates?.(update);
       else if (sequence(parseAgentEvent(event))) onLive();
     } catch {
       requestSnapshot();
@@ -232,6 +238,7 @@ export function inventoryStream({
   onMetrics,
   onAlerts,
   onJobs,
+  onUpdates,
   onConnection,
   onRefused,
   online = true,
@@ -248,6 +255,7 @@ export function inventoryStream({
     onMetrics,
     onAlerts,
     onJobs,
+    onUpdates,
     current: () => !stopped && socket === nextSocket,
     onOpen: () => reconnect.reset(),
     onLive: () => connection.setState("live"),

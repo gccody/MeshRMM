@@ -133,7 +133,7 @@ test("policy drafts check the server's rules and become its input", () => {
   const draft = { ...policyDraft(null, "Europe/Paris"), name: " Nightly ", scriptId: "s" };
   assert.equal(policyDraftProblem(draft), null);
   assert.deepEqual(policyInput(draft), {
-    name: "Nightly", enabled: true, script_id: "s", run_as: "system", target: "all", device_ids: [], company_ids: [],
+    name: "Nightly", enabled: true, action: "script", script_id: "s", run_as: "system", target: "all", device_ids: [], company_ids: [],
     trigger: "daily", offline: "wait", catch_up_hours: 24, channel_ids: [], time: "03:00", time_zone: "Europe/Paris",
   });
   const problems = [
@@ -174,7 +174,7 @@ test("a saved policy's draft round-trips", () => {
   assert.equal(draft.intervalValue, "90");
   assert.equal(draft.intervalUnit, "minutes");
   assert.deepEqual(policyInput(draft), {
-    name: "Weekly", enabled: false, script_id: "s", run_as: "user", target: "devices", device_ids: ["d"], company_ids: [],
+    name: "Weekly", enabled: false, action: "script", script_id: "s", run_as: "user", target: "devices", device_ids: ["d"], company_ids: [],
     trigger: "interval", offline: "skip", catch_up_hours: 12, channel_ids: ["c"], interval_minutes: 90,
   });
   assert.equal(policyDraft({ ...policy, interval_minutes: 120 }, "UTC").intervalUnit, "hours");

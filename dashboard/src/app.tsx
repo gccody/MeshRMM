@@ -21,6 +21,7 @@ import { RolesPanel } from "../features/roles/roles-panel";
 import { SettingsPanel } from "../features/settings/settings-page";
 import { SoftwarePage } from "../features/system-info/software-page";
 import { ToolboxPanel } from "../features/toolbox/toolbox-panel";
+import { UpdatesPage } from "../features/updates/updates-page";
 import { UsersPanel } from "../features/users/users-panel";
 import { WorkspaceShell } from "../features/workspace/workspace-shell";
 import { NOT_FOUND_TITLE } from "./pages";
@@ -37,6 +38,7 @@ export function App() {
             <Route path="device" element={<DevicePage />} />
             <Route path="companies" element={<CompaniesPanel />} />
             <Route path="software" element={<SoftwarePage />} />
+            <Route path="updates" element={<UpdatesPage />} />
             <Route path="toolbox" element={<ToolboxPanel />} />
             <Route path="jobs" element={<JobsPage />} />
             <Route path="job" element={<JobPage />} />

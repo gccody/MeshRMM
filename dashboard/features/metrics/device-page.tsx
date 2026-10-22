@@ -1,4 +1,4 @@
-import { Activity, ArrowLeft, Building2, CircleAlert, Cpu, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package } from "lucide-react";
+import { Activity, ArrowLeft, Building2, CircleAlert, Cpu, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package, ShieldCheck } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { NO_COMPANY, DEFAULT_DEVICE_FILTERS, serializeDeviceFilters } from "../agents/device-filters";
@@ -6,6 +6,7 @@ import { companyName } from "../agents/model";
 import { DeviceAlerts } from "../alerts/device-alerts";
 import { MoveDeviceDialog } from "../companies/company-dialogs";
 import { DeviceSystem, type SystemTab } from "../system-info/device-system";
+import { DeviceUpdates } from "../updates/device-updates";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import { MetricChart, type Series } from "./metric-chart";
@@ -35,19 +36,20 @@ const STORAGE: Series[] = [{ label: "Used", tone: "series-1", value: (point) => 
 
 const isRange = (value: string | null): value is MetricsRange => METRICS_RANGES.some((range) => range.id === value);
 
-type DeviceTab = "usage" | SystemTab;
+type DeviceTab = "usage" | SystemTab | "updates";
 
 const TABS: { id: DeviceTab; label: string; icon: typeof Gauge }[] = [
   { id: "usage", label: "Usage", icon: Gauge },
   { id: "hardware", label: "Hardware", icon: Cpu },
   { id: "software", label: "Software", icon: Package },
   { id: "network", label: "Network", icon: Network },
+  { id: "updates", label: "Updates", icon: ShieldCheck },
 ];
 
 const isTab = (value: string | null): value is DeviceTab => TABS.some((tab) => tab.id === value);
 
 // `/device?id=…&tab=…`: one device's resource usage, live or over a range,
-// and its hardware, software and network.
+// its hardware, software and network, and its operating system updates.
 export function DevicePage() {
   const { inventory, authorizedFetch, can, setPageTitle } = useWorkspace();
   const [moving, setMoving] = useState(false);
@@ -57,7 +59,9 @@ export function DevicePage() {
   const requestedRange = searchParams.get("range");
   const range: MetricsRange = isRange(requestedRange) ? requestedRange : "live";
   const requestedTab = searchParams.get("tab");
-  const tab: DeviceTab = isTab(requestedTab) ? requestedTab : "usage";
+  const canSeeUpdates = can("updates.view");
+  const tabs = TABS.filter(({ id }) => id !== "updates" || canSeeUpdates);
+  const tab: DeviceTab = isTab(requestedTab) && (requestedTab !== "updates" || canSeeUpdates) ? requestedTab : "usage";
   const agent = inventory.agents.find((candidate) => candidate.id === deviceId);
   const live = inventory.metrics.get(deviceId);
   const { data, loading, error } = useDeviceMetrics({ authorizedFetch, deviceId, range, latest: live });
@@ -133,14 +137,15 @@ export function DevicePage() {
         </div>
 
         <nav className="toolbox-tabs area-tabs device-tabs" aria-label="Device">
-          {TABS.map(({ id, label, icon: Icon }) => (
+          {tabs.map(({ id, label, icon: Icon }) => (
             <Link key={id} to={tabPath(id)} replace aria-current={tab === id ? "page" : undefined}>
               <Icon size={16} aria-hidden="true" />{label}
             </Link>
           ))}
         </nav>
 
-        {tab !== "usage" ? agent && <DeviceSystem key={agent.id} agent={agent} tab={tab} /> : <>
+        {tab === "updates" ? agent && <DeviceUpdates key={agent.id} agent={agent} />
+        : tab !== "usage" ? agent && <DeviceSystem key={agent.id} agent={agent} tab={tab} /> : <>
         {error && <div className="error-banner" role="alert"><CircleAlert size={16} aria-hidden="true" /><span>{error}</span></div>}
 
         {(latest || agent?.connected) && <Summary latest={latest} />}

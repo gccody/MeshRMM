@@ -1,4 +1,5 @@
-//! Starting jobs' runs and deliveries on their devices, a few at a time.
+//! Starting jobs' runs, deliveries and update runs on their devices, a few
+//! at a time.
 //!
 //! Queued devices are started in the order their jobs were created, at most
 //! [`DISPATCH_BATCH`] per pass, while fewer than [`MAX_IN_FLIGHT`] of all
@@ -10,8 +11,8 @@
 use std::collections::{HashMap, HashSet};
 
 use meshrmm_protocol_types::{
-    AgentCommand, FileDeliveryDestination, FileDeliveryRequest, RunAs, ScriptLanguage,
-    ScriptRunRequest,
+    AgentCommand, FileDeliveryDestination, FileDeliveryRequest, RebootBehavior, RunAs,
+    ScriptLanguage, ScriptRunRequest,
 };
 use sea_query::{Expr, ExprTrait, Order, Query};
 
@@ -19,11 +20,17 @@ use super::jobs::{DeviceState, Kind, Offline};
 use crate::{
     db::{
         self, Executor,
-        tables::{AutomationPolicyDevices, FileDeliveries, JobDevices, Jobs, ScriptRuns},
+        tables::{
+            AutomationPolicyDevices, FileDeliveries, JobDevices, Jobs, ScriptRuns, UpdateRuns,
+        },
     },
     http::AppState,
     time::SECOND_MS,
     toolbox::{self, DELIVERY_WINDOW_MS, NewDelivery, NewRun, RUN_REPORT_GRACE_MS, Source},
+    updates::runs::{
+        self as update_runs, INSTALL_REPORT_WINDOW_MS, Install, Kind as UpdateKind,
+        SCAN_REPORT_WINDOW_MS,
+    },
     users::new_id,
 };
 
@@ -139,8 +146,21 @@ fn awaiting_delivery(now: i64) -> sea_query::SimpleExpr {
     )
 }
 
-/// How many of the jobs' runs and deliveries await a report, in all and on
-/// each of `devices`.
+fn awaiting_update_run(now: i64) -> sea_query::SimpleExpr {
+    Expr::col(UpdateRuns::JobId)
+        .is_not_null()
+        .and(
+            Expr::col(UpdateRuns::Status)
+                .eq("pending")
+                .and(Expr::cust(format!(
+                    "created_at + CASE kind WHEN 'scan' THEN {SCAN_REPORT_WINDOW_MS} \
+                 ELSE {INSTALL_REPORT_WINDOW_MS} END >= {now}"
+                ))),
+        )
+}
+
+/// How many of the jobs' runs, deliveries and update runs await a report,
+/// in all and on each of `devices`.
 async fn in_flight(
     state: &AppState,
     devices: &[String],
@@ -171,8 +191,19 @@ async fn in_flight(
                 .to_owned(),
         )
         .await?;
+    let updates: Vec<(String, i64)> = database
+        .fetch_all(
+            &Query::select()
+                .column(UpdateRuns::DeviceId)
+                .expr(Expr::cust("CAST(COUNT(*) AS BIGINT)"))
+                .from(UpdateRuns::Table)
+                .and_where(awaiting_update_run(now))
+                .group_by_col(UpdateRuns::DeviceId)
+                .to_owned(),
+        )
+        .await?;
     let wanted = devices.iter().collect::<HashSet<_>>();
-    for (device_id, count) in runs.into_iter().chain(deliveries) {
+    for (device_id, count) in runs.into_iter().chain(deliveries).chain(updates) {
         total += count;
         if wanted.contains(&device_id) {
             *per_device.entry(device_id).or_default() += count;
@@ -199,9 +230,13 @@ struct JobRow {
     timeout_seconds: Option<i64>,
     run_as: Option<String>,
     destination: Option<String>,
+    update_categories: Option<String>,
+    reboot: Option<String>,
+    reboot_delay_minutes: Option<i64>,
     offline: String,
     expires_at: i64,
     requested_by_user_id: String,
+    policy_name: Option<String>,
 }
 
 /// Starts queued devices' runs and deliveries, within the limits. Returns
@@ -257,9 +292,13 @@ pub async fn dispatch(state: &AppState, now: i64) -> anyhow::Result<bool> {
                     Jobs::TimeoutSeconds,
                     Jobs::RunAs,
                     Jobs::Destination,
+                    Jobs::UpdateCategories,
+                    Jobs::Reboot,
+                    Jobs::RebootDelayMinutes,
                     Jobs::Offline,
                     Jobs::ExpiresAt,
                     Jobs::RequestedByUserId,
+                    Jobs::PolicyName,
                 ])
                 .from(Jobs::Table)
                 .and_where(Expr::col(Jobs::Id).is_in(job_ids))
@@ -314,6 +353,15 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
         tracing::error!(job_id = job.id, "stored job is invalid");
         return Ok(false);
     };
+    // A device installs one thing at a time; this waits for the install it
+    // is running.
+    if kind == Kind::UpdateInstall
+        && update_runs::pending(&mut &state.database, device_id, UpdateKind::Install)
+            .await?
+            .is_some()
+    {
+        return Ok(false);
+    }
     let id = new_id();
     let mut transaction = state.database.begin().await?;
     let command = match kind {
@@ -405,6 +453,41 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
                 }
             }
         }
+        Kind::UpdateScan | Kind::UpdateInstall => {
+            let (update_kind, install) = if kind == Kind::UpdateInstall {
+                let Some(reboot) = job.reboot.as_deref().and_then(RebootBehavior::parse) else {
+                    tracing::error!(job_id = job.id, "stored update job is invalid");
+                    return Ok(false);
+                };
+                (
+                    UpdateKind::Install,
+                    Some(Install {
+                        update_ids: Vec::new(),
+                        categories: Install::parse_categories(job.update_categories.as_deref()),
+                        reboot,
+                        reboot_delay_minutes: u32::try_from(job.reboot_delay_minutes.unwrap_or(5))
+                            .unwrap_or(5),
+                    }),
+                )
+            } else {
+                (UpdateKind::Scan, None)
+            };
+            update_runs::insert(
+                &mut transaction,
+                &update_runs::NewRun {
+                    id: &id,
+                    device_id,
+                    kind: update_kind,
+                    requested_by_user_id: &job.requested_by_user_id,
+                    policy_name: job.policy_name.as_deref(),
+                    job_id: Some(&job.id),
+                    install: install.as_ref(),
+                    created_at: now,
+                },
+            )
+            .await?;
+            Some(update_runs::command(&id, update_kind, install.as_ref()))
+        }
     };
     let claimed = transaction
         .execute(
@@ -428,6 +511,10 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
         return Ok(true);
     };
     if state.agents.send(device_id, command) {
+        if matches!(kind, Kind::UpdateScan | Kind::UpdateInstall) {
+            crate::updates::publish_run(state, &id).await;
+            crate::updates::publish_device(state, device_id).await;
+        }
         return Ok(true);
     }
     // The Agent went away before it got it: the run never existed.
@@ -454,6 +541,9 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
                         .to_owned(),
                 )
                 .await?;
+        }
+        Kind::UpdateScan | Kind::UpdateInstall => {
+            update_runs::discard(&mut transaction, &id).await?;
         }
     }
     unqueue(&mut transaction, job, device_id, DeviceState::Started, now).await?;

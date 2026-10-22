@@ -124,11 +124,15 @@ input.
 - `alerts`: alert rules, the engine that judges them and the alerts they
   raise. `notifications`: email and webhook channels. See
   [alerts](alerts.md).
-- `automation`: jobs (a script or file on many devices), the dispatcher that
-  starts them a few at a time, and policies that start jobs on a schedule or
-  on enrollment. See [automation](automation.md).
+- `automation`: jobs (a script, file, update scan or update install on many
+  devices), the dispatcher that starts them a few at a time, and policies
+  that start jobs on a schedule or on enrollment. See
+  [automation](automation.md).
+- `updates`: each device's pending operating system updates, update scans
+  and installs and their history. See [patch management](patch-management.md).
 - `maintenance`: the periodic task that purges expired tokens, old runs,
-  resolved alerts, old application changes and leftover partial files.
+  resolved alerts, old application changes, old update runs and leftover
+  partial files.
 - `admin`: the `meshrmm-server admin` commands for locked-out operators.
 
 ### Realtime
@@ -140,7 +144,8 @@ task.
 - **Coordinator**, one per connected Agent (`/v1/agents/{id}/connect`):
   authentication, superseding an older connection of the same Agent,
   revocation, commands (session requests, scripts, file deliveries,
-  uninstall, system information), credential rotation, the session lease and update grace.
+  uninstall, system information, update scans and installs), credential
+  rotation, the session lease and update grace.
 - **Session actor**, one per remote session
   (`/v1/remote/sessions/{id}/signal`): the signaling relay, the idle
   deadline, resume, end and expiry. Its record is persisted in
@@ -159,6 +164,10 @@ task.
 - **Automation**: the engine's task fires due policies, starts jobs' runs on
   connected devices and broadcasts jobs whose counts changed; event sockets
   pass on the jobs each user may see. See [automation](automation.md).
+- **Updates**: the engine's task marks update runs that never reported as
+  lost and asks connected devices with old scans for new ones; scans,
+  progress and installs are broadcast to event sockets of users with
+  `updates.view`. See [patch management](patch-management.md).
 
 ### Sign-in and permissions
 
@@ -174,6 +183,7 @@ Roles are built from these permissions (`server/src/rbac.rs`):
 `devices.rotate_credentials`, `companies.manage`, `sessions.connect`,
 `sessions.connect_background`, `sessions.close_any`, `scripts.run`,
 `scripts.manage_shared`, `files.deliver`, `files.manage_shared`,
+`jobs.run_wide`, `automation.manage`, `updates.view`, `updates.install`,
 `alerts.view`, `alerts.respond`, `alerts.manage`, `users.manage`, `roles.manage`, `settings.manage`, `authentication.manage`,
 `audit.view`.
 
@@ -274,4 +284,4 @@ serves its release's builds and writes their update manifest itself, so
 upgrading a server upgrades its Agents and viewers. Every updater checks the
 release signature and the SHA-256 before replacing anything, and rolls back
 if the new build does not start. See [releases](releases.md) for the signing
-scheme and [devices](devices.md#updates) for what the Agent does.
+scheme and [devices](devices.md#agent-updates) for what the Agent does.

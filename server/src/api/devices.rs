@@ -94,6 +94,7 @@ pub async fn delete(
     }
     crate::alerts::device_removed(&state, &id).await;
     crate::automation::device_removed(&state, &id).await;
+    crate::updates::device_removed(&state, &id).await;
     state.agents.send(&id, AgentCommand::Uninstall);
     state.presence.refresh(&id).await;
     Ok(StatusCode::NO_CONTENT)

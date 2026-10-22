@@ -59,5 +59,5 @@ test("the build carries no hosted-service code and stays small", async () => {
   for (const name of ["workos", "radix-ui", "cloudflare", "meshrmm.com"]) {
     assert.doesNotMatch(bundle, new RegExp(name, "i"), name);
   }
-  assert.ok(bundle.length < 650_000, `the bundle is ${bundle.length} bytes`);
+  assert.ok(bundle.length < 700_000, `the bundle is ${bundle.length} bytes`);
 });

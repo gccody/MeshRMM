@@ -14,11 +14,13 @@ import {
   MAX_INSTANCE_NAME_LENGTH,
   MIN_CONNECTION_APPROVAL_TIMEOUT_SECONDS,
   SETTINGS_TABS,
+  UPDATE_SCAN_INTERVALS,
   type GeneralSettings,
   type SettingsDraft,
   settingsBody,
   draftMatchesSettings,
   formatIdleDisconnect,
+  formatScanInterval,
   isBlackoutMessageValid,
   isConnectionApprovalDraftValid,
   isConnectionApprovalLockIdleValid,
@@ -116,6 +118,12 @@ export function SettingsPanel() {
                 <option value={1440}>24 hours</option>
               </select>
               </label>
+              <label htmlFor="update-scan-interval">Devices look for operating system updates<select id="update-scan-interval" value={draft.updateScanIntervalHours} onChange={(event) => updateDraft({ updateScanIntervalHours: Number(event.target.value) })} aria-describedby="update-scan-interval-help">
+                {(UPDATE_SCAN_INTERVALS.includes(draft.updateScanIntervalHours as (typeof UPDATE_SCAN_INTERVALS)[number]) ? UPDATE_SCAN_INTERVALS : [...UPDATE_SCAN_INTERVALS, draft.updateScanIntervalHours].sort((left, right) => left - right))
+                  .map((hours) => <option key={hours} value={hours}>{formatScanInterval(hours)}</option>)}
+              </select>
+              </label>
+              <p id="update-scan-interval-help">A device that’s offline at its time scans when it next connects. Scan policies and Scan now add scans of their own.</p>
             </section>
             <section className="settings-section" id="settings-remote-sessions" role="tabpanel" aria-labelledby="settings-tab-remote-sessions" hidden={settingsTab !== "remote-sessions"} tabIndex={0}>
               <h2>Remote sessions</h2>

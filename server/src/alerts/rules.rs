@@ -2,6 +2,7 @@
 //! cover and which notification channels they notify.
 use std::collections::HashMap;
 
+use meshrmm_protocol_types::UpdateCategory;
 use sea_query::{Expr, ExprTrait, Order, Query};
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,11 @@ pub const MAX_OFFLINE_MINUTES: i64 = 7 * 24 * 60;
 /// The longest a load must be sustained; the engine keeps this much of each
 /// device's readings.
 pub const MAX_SUSTAINED_MINUTES: i64 = 60;
+/// The longest updates or a restart may be pending before a rule raises an
+/// alert.
+pub const MAX_PENDING_DAYS: i64 = 365;
+/// An updates rule's category that counts every pending update.
+pub const ANY_CATEGORY: &str = "any";
 const MAX_GB: f64 = 1_000_000.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -71,6 +77,12 @@ pub enum Condition {
     Memory,
     /// A toolbox script run failed, timed out or never reported back.
     ScriptFailed,
+    /// Updates of `update_category` have been pending for `days`.
+    UpdatesPending,
+    /// An update install failed, partly or entirely, or never reported back.
+    UpdateInstallFailed,
+    /// The device has had to restart to finish installing updates for `days`.
+    RebootPending,
 }
 
 impl Condition {
@@ -81,6 +93,9 @@ impl Condition {
             Self::Cpu => "cpu",
             Self::Memory => "memory",
             Self::ScriptFailed => "script_failed",
+            Self::UpdatesPending => "updates_pending",
+            Self::UpdateInstallFailed => "update_install_failed",
+            Self::RebootPending => "reboot_pending",
         }
     }
 
@@ -91,14 +106,17 @@ impl Condition {
             "cpu" => Some(Self::Cpu),
             "memory" => Some(Self::Memory),
             "script_failed" => Some(Self::ScriptFailed),
+            "updates_pending" => Some(Self::UpdatesPending),
+            "update_install_failed" => Some(Self::UpdateInstallFailed),
+            "reboot_pending" => Some(Self::RebootPending),
             _ => None,
         }
     }
 
     /// Whether the server resolves the alert once the condition passes;
-    /// script failures stay until a person resolves them.
+    /// script and install failures stay until a person resolves them.
     pub fn clears_itself(self) -> bool {
-        self != Self::ScriptFailed
+        !matches!(self, Self::ScriptFailed | Self::UpdateInstallFailed)
     }
 }
 
@@ -138,6 +156,10 @@ pub struct Rule {
     pub threshold_unit: Option<ThresholdUnit>,
     pub duration_minutes: Option<i64>,
     pub nonzero_exit_fails: bool,
+    /// For updates_pending: `any`, or the category that counts.
+    pub update_category: Option<String>,
+    /// For updates_pending and reboot_pending.
+    pub days: Option<i64>,
     pub all_companies: bool,
     pub company_ids: Vec<String>,
     pub channel_ids: Vec<String>,
@@ -147,6 +169,13 @@ pub struct Rule {
 }
 
 impl Rule {
+    /// The category an updates rule counts; `None` for every one.
+    pub fn category(&self) -> Option<UpdateCategory> {
+        self.update_category
+            .as_deref()
+            .and_then(UpdateCategory::parse)
+    }
+
     /// Whether the rule covers a device in `company_id`.
     pub fn covers(&self, company_id: Option<&str>) -> bool {
         self.all_companies
@@ -169,6 +198,18 @@ impl Rule {
                 "A script fails or exits with an error code".to_owned()
             }
             Condition::ScriptFailed => "A script fails, times out or doesn't report".to_owned(),
+            Condition::UpdatesPending => {
+                let days = plural(self.days.unwrap_or_default(), "day");
+                match self.category() {
+                    Some(category) => format!("{} updates pending for {days}", category.label()),
+                    None => format!("Updates pending for {days}"),
+                }
+            }
+            Condition::UpdateInstallFailed => "An update install fails".to_owned(),
+            Condition::RebootPending => format!(
+                "Restart pending for {}",
+                plural(self.days.unwrap_or_default(), "day")
+            ),
         }
     }
 }
@@ -204,6 +245,10 @@ pub struct RuleInput {
     pub duration_minutes: Option<i64>,
     #[serde(default)]
     pub nonzero_exit_fails: bool,
+    #[serde(default)]
+    pub update_category: Option<String>,
+    #[serde(default)]
+    pub days: Option<i64>,
     #[serde(default = "enabled_by_default")]
     pub all_companies: bool,
     #[serde(default)]
@@ -274,7 +319,10 @@ impl RuleInput {
                 None,
                 Some(minutes(self.duration_minutes, MAX_SUSTAINED_MINUTES)?),
             ),
-            Condition::ScriptFailed => (None, None, None),
+            Condition::ScriptFailed
+            | Condition::UpdatesPending
+            | Condition::UpdateInstallFailed
+            | Condition::RebootPending => (None, None, None),
         };
         self.threshold = threshold;
         self.threshold_unit = unit;
@@ -282,6 +330,28 @@ impl RuleInput {
         if self.condition != Condition::ScriptFailed {
             self.nonzero_exit_fails = false;
         }
+        let days = |days: Option<i64>| match days {
+            Some(days) if (1..=MAX_PENDING_DAYS).contains(&days) => Ok(days),
+            _ => Err(invalid(format!(
+                "the number of days must be 1 to {MAX_PENDING_DAYS}"
+            ))),
+        };
+        (self.update_category, self.days) = match self.condition {
+            Condition::UpdatesPending => {
+                let category = self
+                    .update_category
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|category| {
+                        *category == ANY_CATEGORY || UpdateCategory::parse(category).is_some()
+                    })
+                    .ok_or_else(|| invalid("choose which updates count: any, or a category"))?
+                    .to_owned();
+                (Some(category), Some(days(self.days)?))
+            }
+            Condition::RebootPending => (None, Some(days(self.days)?)),
+            _ => (None, None),
+        };
         if self.all_companies {
             self.company_ids.clear();
         } else if self.company_ids.is_empty() {
@@ -346,6 +416,8 @@ struct RuleRow {
     threshold_unit: Option<String>,
     duration_minutes: Option<i64>,
     nonzero_exit_fails: bool,
+    update_category: Option<String>,
+    days: Option<i64>,
     all_companies: bool,
     notify_on_resolve: bool,
     created_at: i64,
@@ -366,6 +438,8 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
             AlertRules::ThresholdUnit,
             AlertRules::DurationMinutes,
             AlertRules::NonzeroExitFails,
+            AlertRules::UpdateCategory,
+            AlertRules::Days,
             AlertRules::AllCompanies,
             AlertRules::NotifyOnResolve,
             AlertRules::CreatedAt,
@@ -411,6 +485,8 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
                 threshold: row.threshold,
                 duration_minutes: row.duration_minutes,
                 nonzero_exit_fails: row.nonzero_exit_fails,
+                update_category: row.update_category,
+                days: row.days,
                 all_companies: row.all_companies,
                 notify_on_resolve: row.notify_on_resolve,
                 created_at: row.created_at,
@@ -444,7 +520,7 @@ pub async fn save(
     now: i64,
     create: bool,
 ) -> db::Result<()> {
-    let values: [(AlertRules, sea_query::Value); 12] = [
+    let values: [(AlertRules, sea_query::Value); 14] = [
         (AlertRules::Name, input.name.as_str().into()),
         (AlertRules::Severity, input.severity.as_str().into()),
         (AlertRules::Enabled, input.enabled.into()),
@@ -459,6 +535,11 @@ pub async fn save(
             AlertRules::NonzeroExitFails,
             input.nonzero_exit_fails.into(),
         ),
+        (
+            AlertRules::UpdateCategory,
+            input.update_category.clone().into(),
+        ),
+        (AlertRules::Days, input.days.into()),
         (AlertRules::AllCompanies, input.all_companies.into()),
         (AlertRules::NotifyOnResolve, input.notify_on_resolve.into()),
         (AlertRules::UpdatedAt, now.into()),
@@ -614,6 +695,8 @@ mod tests {
             threshold_unit: None,
             duration_minutes: Some(1),
             nonzero_exit_fails: false,
+            update_category: None,
+            days: None,
             all_companies: false,
             company_ids: vec!["acme".into()],
             channel_ids: vec![],

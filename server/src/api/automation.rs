@@ -1,6 +1,7 @@
-//! Automation policies, for users with `automation.manage`. Saving one also
-//! needs `scripts.run`: the policy runs with the access of whoever saved it
-//! last.
+//! Automation policies, for users with `automation.manage`. Saving or
+//! running one also needs what its action needs (`scripts.run`,
+//! `updates.view` or `updates.install`): the policy runs with the access of
+//! whoever saved it last.
 use axum::{
     Json,
     extract::{Path, State},
@@ -16,7 +17,7 @@ use crate::{
     auth::Authorized,
     automation::{
         jobs::{self, Viewer},
-        policies::{self, Policy, PolicyInput, PolicyView, Valid},
+        policies::{self, Action, ActionKind, Policy, PolicyInput, PolicyView, Valid},
         schedule::Trigger,
     },
     db::{Executor, tables::AutomationPolicies},
@@ -38,10 +39,10 @@ fn require_manage(actor: &Authorized) -> Result<(), ApiError> {
     actor.require(Permission::AutomationManage)
 }
 
-/// Saving a policy hands it the saver's access, which must run scripts.
-fn require_save(actor: &Authorized) -> Result<(), ApiError> {
+/// Saving a policy hands it the saver's access, which must do what it does.
+fn require_save(actor: &Authorized, action: ActionKind) -> Result<(), ApiError> {
     require_manage(actor)?;
-    actor.require(Permission::ScriptsRun)
+    actor.require(action.permission())
 }
 
 fn not_found() -> ApiError {
@@ -120,12 +121,10 @@ async fn check(
 }
 
 fn metadata(policy: &Policy) -> Value {
-    json!({
+    let mut metadata = json!({
         "name": policy.name,
         "enabled": policy.enabled,
-        "script_id": policy.script_id,
-        "script_name": policy.script_name,
-        "run_as": policy.run_as.as_str(),
+        "action": policy.action.kind().as_str(),
         "target": policy.target.as_str(),
         "companies": policy.company_ids.len(),
         "devices": policy.device_ids.len(),
@@ -134,7 +133,25 @@ fn metadata(policy: &Policy) -> Value {
         "offline": policy.offline.as_str(),
         "catch_up_hours": policy.catch_up_hours,
         "channels": policy.channel_ids.len(),
-    })
+    });
+    match &policy.action {
+        Action::Script { script_id, run_as } => {
+            metadata["script_id"] = script_id.as_str().into();
+            metadata["script_name"] = policy.script_name.clone().into();
+            metadata["run_as"] = run_as.as_str().into();
+        }
+        Action::UpdateScan => {}
+        Action::UpdateInstall {
+            categories,
+            reboot,
+            reboot_delay_minutes,
+        } => {
+            metadata["categories"] = json!(categories);
+            metadata["reboot"] = reboot.as_str().into();
+            metadata["reboot_delay_minutes"] = (*reboot_delay_minutes).into();
+        }
+    }
+    metadata
 }
 
 /// `POST /v1/automation-policies`.
@@ -143,8 +160,9 @@ pub async fn create(
     actor: Authorized,
     JsonBody(input): JsonBody<PolicyInput>,
 ) -> Result<(StatusCode, Json<PolicyView>), ApiError> {
-    require_save(&actor)?;
+    require_manage(&actor)?;
     let input = input.validate()?;
+    require_save(&actor, input.action.kind())?;
     let id = new_id();
     let now = now_ms();
     let mut transaction = state.database.begin().await?;
@@ -174,9 +192,10 @@ pub async fn update(
     Path(id): Path<String>,
     JsonBody(input): JsonBody<PolicyInput>,
 ) -> Result<Json<PolicyView>, ApiError> {
-    require_save(&actor)?;
+    require_manage(&actor)?;
     let id = parse_id(&id, "policy")?;
     let input = input.validate()?;
+    require_save(&actor, input.action.kind())?;
     let now = now_ms();
     let mut transaction = state.database.begin().await?;
     policies::by_id(&mut transaction, &id)
@@ -239,12 +258,13 @@ pub async fn run(
     actor: Authorized,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    require_save(&actor)?;
+    require_manage(&actor)?;
     let id = parse_id(&id, "policy")?;
     let mut database = &state.database;
     let policy = policies::by_id(&mut database, &id)
         .await?
         .ok_or_else(not_found)?;
+    require_save(&actor, policy.action.kind())?;
     let now = now_ms();
     let job_id = policies::run_now(&state, &policy, &actor.user.id, actor.actor(), now).await?;
     audit::record(

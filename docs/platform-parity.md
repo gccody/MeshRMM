@@ -59,7 +59,7 @@ yet.
 | Screen thumbnail | Yes | Yes | Partly: none without a graphical session, none of GNOME's Wayland login or lock screen |
 | Thumbnail of the sign-in and lock screens | Yes, UAC prompts too | Login window yes; lock screen not verified | X11 yes; GNOME Wayland no |
 | [Alerts](alerts.md) | Yes | Yes | Yes |
-| [Jobs and automation policies](automation.md) | PowerShell and Command Prompt scripts, files | Shell (zsh) scripts, files | Shell (bash) scripts, files |
+| [Jobs and automation policies](automation.md) | PowerShell and Command Prompt scripts, files, updates | Shell (zsh) scripts, files, updates | Shell (bash) scripts, files, updates |
 
 - **Linux thumbnails** come from the console's graphical session, so a
   server without one has no thumbnail. GNOME Shell refuses screen capture at
@@ -103,6 +103,36 @@ yet.
   the root file system's creation, which for a cloud image is when the image
   was built. Flatpak apps installed per user aren't listed. Virtual disks
   report themselves as rotational, so Hyper-V's show as hard disks.
+
+## Patch management
+
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| [Scan for pending updates](patch-management.md#scanning) | Yes (Windows Update Agent) | Yes (`softwareupdate`) | APT, DNF, YUM, pacman; no zypper |
+| Category | Windows Update's classification | Partly: by title | Partly: security or other; Arch: other only |
+| Severity | Yes (MSRC) | No | DNF/YUM advisories only |
+| Download size | No | Yes | APT only |
+| Restart pending | Yes | No | Yes |
+| Install chosen updates | Yes | Partly: not macOS itself on Apple silicon | Yes; pacman installs everything only |
+| Progress per update | Yes | Yes | Per install |
+| Restart after installing, with a delay | Yes, with Windows' countdown notification | Partly: terminal warning only | Partly: terminal warning only |
+
+- **Windows** reports no download size: Windows Update's `MaxDownloadSize`
+  is the largest of every package variant, tens of gigabytes for a
+  cumulative update, so it would mislead.
+- **macOS** has no reliable flag for a pending restart (not implemented
+  beyond each update's own restart flag). Apple silicon Macs install macOS
+  itself through `softwareupdate` only with a volume owner's password, which
+  a root Agent doesn't have; other updates install. Categories come from
+  update titles, since Apple doesn't classify updates.
+- **Linux:** zypper (openSUSE, SLES) is not implemented. Distributions say
+  only whether a package update fixes security issues; Arch Linux publishes no
+  advisories at all, and supports only upgrading everything at once. Only DNF
+  and YUM advisories rate severity. The package managers install in one
+  transaction, so progress is per install, not per package.
+- **macOS and Linux** warn signed-in users of the restart through
+  `shutdown`, which reaches terminals (`wall`) but shows nothing on the
+  desktop; a desktop notice would need the session helpers (not implemented).
 
 ## Toolbox
 

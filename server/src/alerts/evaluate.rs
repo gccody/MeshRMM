@@ -3,10 +3,10 @@
 //! and whether a rule's condition holds for a device now.
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use meshrmm_protocol_types::SystemMetrics;
+use meshrmm_protocol_types::{SystemMetrics, UpdateCategory};
 
 use super::rules::{Condition, MAX_SUSTAINED_MINUTES, Rule, ThresholdUnit, format_number, plural};
-use crate::time::{MINUTE_MS, SECOND_MS};
+use crate::time::{DAY_MS, MINUTE_MS, SECOND_MS};
 
 /// Readings this far apart still cover a window without a gap: two of the
 /// Agent's reporting intervals.
@@ -114,6 +114,17 @@ pub struct DeviceState<'a> {
     pub updating: bool,
     /// The latest reading, while the Agent is online.
     pub latest: Option<&'a SystemMetrics>,
+    /// What its last update scan found; `None` if it never reported one.
+    pub updates: Option<UpdateFacts<'a>>,
+}
+
+/// What a device's update scans say, for update rules.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UpdateFacts<'a> {
+    /// Each pending update's category, and when a scan first listed it.
+    pub pending: &'a [(UpdateCategory, i64)],
+    /// Since when the device has had to restart, if it has.
+    pub reboot_pending_since: Option<i64>,
 }
 
 /// An alert a rule's condition calls for.
@@ -212,7 +223,55 @@ pub fn judge(rule: &Rule, device: DeviceState<'_>, tracker: &Tracker, now: i64) 
                 Some(_) => Verdict::Known(Vec::new()),
             }
         }
-        Condition::ScriptFailed => Verdict::Unknown,
+        Condition::UpdatesPending => {
+            let Some(updates) = device.updates else {
+                return Verdict::Unknown;
+            };
+            let days = rule.days.unwrap_or(1);
+            let category = rule.category();
+            let overdue = updates
+                .pending
+                .iter()
+                .filter(|(pending, _)| category.is_none_or(|wanted| wanted == *pending))
+                .map(|(_, first_seen)| *first_seen)
+                .filter(|first_seen| now - first_seen >= days * DAY_MS)
+                .collect::<Vec<_>>();
+            let Some(oldest) = overdue.iter().min() else {
+                return Verdict::Known(Vec::new());
+            };
+            let noun = match category {
+                Some(category) => format!("{} update", category.label().to_lowercase()),
+                None => "update".to_owned(),
+            };
+            Verdict::Known(vec![Breach {
+                subject: String::new(),
+                value: overdue.len() as f64,
+                detail: format!(
+                    "{} pending for more than {}, the oldest since {}",
+                    plural(overdue.len() as i64, &noun),
+                    plural(days, "day"),
+                    super::format_time(*oldest)
+                ),
+            }])
+        }
+        Condition::RebootPending => {
+            let Some(updates) = device.updates else {
+                return Verdict::Unknown;
+            };
+            let days = rule.days.unwrap_or(1);
+            match updates.reboot_pending_since {
+                Some(since) if now - since >= days * DAY_MS => Verdict::Known(vec![Breach {
+                    subject: String::new(),
+                    value: ((now - since) / DAY_MS) as f64,
+                    detail: format!(
+                        "Has had to restart to finish installing updates since {}",
+                        super::format_time(since)
+                    ),
+                }]),
+                _ => Verdict::Known(Vec::new()),
+            }
+        }
+        Condition::ScriptFailed | Condition::UpdateInstallFailed => Verdict::Unknown,
     }
 }
 
@@ -240,6 +299,8 @@ mod tests {
             threshold_unit: (condition == Condition::DiskSpace).then_some(ThresholdUnit::Percent),
             duration_minutes: minutes,
             nonzero_exit_fails: false,
+            update_category: None,
+            days: None,
             all_companies: true,
             company_ids: vec![],
             channel_ids: vec![],
@@ -278,6 +339,7 @@ mod tests {
             connected: true,
             updating: false,
             latest,
+            updates: None,
         }
     }
 
@@ -287,6 +349,7 @@ mod tests {
             connected: false,
             updating: false,
             latest: None,
+            updates: None,
         }
     }
 
@@ -408,6 +471,79 @@ mod tests {
         assert_eq!(
             judge(&percent, offline(), &tracker, START),
             Verdict::Unknown
+        );
+    }
+
+    #[test]
+    fn updates_and_restarts_raise_alerts_once_pending_long_enough() {
+        let tracker = Tracker::default();
+        let pending = [
+            (UpdateCategory::Security, START - 8 * DAY_MS),
+            (UpdateCategory::Security, START - 2 * DAY_MS),
+            (UpdateCategory::Other, START - 30 * DAY_MS),
+        ];
+        let scanned = |reboot_pending_since| DeviceState {
+            updates: Some(UpdateFacts {
+                pending: &pending,
+                reboot_pending_since,
+            }),
+            ..offline()
+        };
+        let security = Rule {
+            update_category: Some("security".into()),
+            days: Some(7),
+            ..rule(Condition::UpdatesPending, None, None)
+        };
+        let Verdict::Known(breaches) = judge(&security, scanned(None), &tracker, START) else {
+            panic!("a scanned device is judged, online or not");
+        };
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].value, 1.0);
+        assert!(
+            breaches[0]
+                .detail
+                .starts_with("1 security update pending for more than 7 days, the oldest since "),
+            "{}",
+            breaches[0].detail
+        );
+        let any = Rule {
+            update_category: Some("any".into()),
+            days: Some(1),
+            ..security.clone()
+        };
+        assert!(matches!(
+            judge(&any, scanned(None), &tracker, START),
+            Verdict::Known(breaches) if breaches[0].value == 3.0
+        ));
+        let drivers = Rule {
+            update_category: Some("driver".into()),
+            ..security.clone()
+        };
+        assert_eq!(
+            judge(&drivers, scanned(None), &tracker, START),
+            Verdict::Known(vec![])
+        );
+        assert_eq!(
+            judge(&security, offline(), &tracker, START),
+            Verdict::Unknown,
+            "a device that never scanned says nothing"
+        );
+
+        let restart = Rule {
+            days: Some(3),
+            ..rule(Condition::RebootPending, None, None)
+        };
+        assert_eq!(
+            judge(&restart, scanned(Some(START - 2 * DAY_MS)), &tracker, START),
+            Verdict::Known(vec![])
+        );
+        assert!(matches!(
+            judge(&restart, scanned(Some(START - 4 * DAY_MS)), &tracker, START),
+            Verdict::Known(breaches) if breaches[0].value == 4.0
+        ));
+        assert_eq!(
+            judge(&restart, scanned(None), &tracker, START),
+            Verdict::Known(vec![])
         );
     }
 }

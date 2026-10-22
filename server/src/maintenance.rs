@@ -16,7 +16,7 @@ use crate::{
         tables::{
             AgentInstallTokens, Agents, Alerts, DeviceApplicationChanges, DeviceMetrics,
             FileDeliveries, Invitations, Jobs, PasswordResets, RemoteHandoffs, RemoteSessions,
-            ScriptRuns, ToolboxFiles, UserSessions,
+            ScriptRuns, ToolboxFiles, UpdateRuns, UserSessions,
         },
     },
     realtime::metrics::HISTORY_MS,
@@ -49,6 +49,7 @@ pub struct Purged {
     pub resolved_alerts: u64,
     pub application_changes: u64,
     pub jobs: u64,
+    pub update_runs: u64,
 }
 
 /// Purges every expired row and abandoned partial file once now and then
@@ -158,7 +159,29 @@ pub async fn purge(database: &Database, now_ms: i64) -> db::Result<Purged> {
         )
         .await?,
         jobs: delete_before(database, Jobs::Table, Jobs::CreatedAt, history).await?,
+        update_runs: purge_update_runs(database, now_ms).await?,
     })
+}
+
+/// Deletes scans older than [`crate::updates::SCAN_HISTORY_MS`] and installs
+/// (with their items) older than [`crate::updates::INSTALL_HISTORY_MS`].
+async fn purge_update_runs(database: &Database, now_ms: i64) -> db::Result<u64> {
+    let mut purged = 0;
+    for (kind, retention) in [
+        ("scan", crate::updates::SCAN_HISTORY_MS),
+        ("install", crate::updates::INSTALL_HISTORY_MS),
+    ] {
+        purged += database
+            .execute(
+                &Query::delete()
+                    .from_table(UpdateRuns::Table)
+                    .and_where(Expr::col(UpdateRuns::Kind).eq(kind))
+                    .and_where(Expr::col(UpdateRuns::CreatedAt).lt(now_ms - retention))
+                    .to_owned(),
+            )
+            .await?;
+    }
+    Ok(purged)
 }
 
 async fn delete_before(

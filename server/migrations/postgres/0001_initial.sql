@@ -36,6 +36,10 @@ CREATE TABLE settings (
   require_two_factor BOOLEAN NOT NULL DEFAULT FALSE,
   password_min_length BIGINT NOT NULL DEFAULT 12 CHECK (password_min_length BETWEEN 8 AND 128),
   session_lifetime_hours BIGINT NOT NULL DEFAULT 720 CHECK (session_lifetime_hours BETWEEN 1 AND 8760),
+  -- How often online devices scan for operating system updates; 0 leaves
+  -- scans to users and policies.
+  update_scan_interval_hours BIGINT NOT NULL DEFAULT 24
+    CHECK (update_scan_interval_hours BETWEEN 0 AND 168),
   smtp_host TEXT,
   smtp_port BIGINT CHECK (smtp_port IS NULL OR smtp_port BETWEEN 1 AND 65535),
   smtp_security TEXT NOT NULL DEFAULT 'starttls' CHECK (smtp_security IN ('starttls', 'tls', 'none')),
@@ -138,7 +142,7 @@ CREATE TABLE role_permissions (
 -- is an editable default.
 INSERT INTO roles (id, name, description, builtin, created_at, updated_at) VALUES
   ('administrator', 'Administrator', 'Every permission, including users, roles and settings.', 'administrator', 0, 0),
-  ('technician', 'Technician', 'Enrolls and connects to devices, runs toolbox scripts and files, and responds to alerts.', 'technician', 0, 0);
+  ('technician', 'Technician', 'Enrolls and connects to devices, runs toolbox scripts and files, installs updates, and responds to alerts.', 'technician', 0, 0);
 
 INSERT INTO role_permissions (role_id, permission) VALUES
   ('technician', 'devices.view'),
@@ -148,7 +152,9 @@ INSERT INTO role_permissions (role_id, permission) VALUES
   ('technician', 'scripts.run'),
   ('technician', 'files.deliver'),
   ('technician', 'alerts.view'),
-  ('technician', 'alerts.respond');
+  ('technician', 'alerts.respond'),
+  ('technician', 'updates.view'),
+  ('technician', 'updates.install');
 
 CREATE TABLE user_roles (
   user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
@@ -562,18 +568,21 @@ CREATE TABLE notification_channel_roles (
 
 -- What raises alerts. `threshold` is a percentage, or gigabytes for a disk
 -- space rule in 'gb'; `duration_minutes` is how long a device must be offline
--- or a load sustained.
+-- or a load sustained; `days` how long updates or a restart must be pending,
+-- and `update_category` which updates count ('any' or a category).
 CREATE TABLE alert_rules (
   id TEXT NOT NULL PRIMARY KEY,
   name TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 120),
   severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
   enabled BOOLEAN NOT NULL DEFAULT TRUE,
-  condition TEXT NOT NULL CHECK (condition IN ('device_offline', 'disk_space', 'cpu', 'memory', 'script_failed')),
+  condition TEXT NOT NULL CHECK (condition IN ('device_offline', 'disk_space', 'cpu', 'memory', 'script_failed', 'updates_pending', 'update_install_failed', 'reboot_pending')),
   threshold DOUBLE PRECISION,
   threshold_unit TEXT CHECK (threshold_unit IS NULL OR threshold_unit IN ('percent', 'gb')),
   duration_minutes BIGINT,
   -- For script_failed: a script that exits with a code other than 0 failed too.
   nonzero_exit_fails BOOLEAN NOT NULL DEFAULT FALSE,
+  update_category TEXT CHECK (update_category IS NULL OR update_category IN ('any', 'security', 'critical', 'definition', 'driver', 'feature_pack', 'service_pack', 'update_rollup', 'upgrade', 'tool', 'other')),
+  days BIGINT CHECK (days IS NULL OR days BETWEEN 1 AND 365),
   -- Every device, or only those of the companies in alert_rule_companies.
   all_companies BOOLEAN NOT NULL DEFAULT TRUE,
   notify_on_resolve BOOLEAN NOT NULL DEFAULT FALSE,
@@ -608,6 +617,8 @@ CREATE TABLE alerts (
   detail TEXT NOT NULL,
   -- The latest failed run of a script_failed alert, and how many failed.
   script_run_id TEXT,
+  -- The failed install of an update_install_failed alert.
+  update_run_id TEXT,
   occurrences BIGINT NOT NULL DEFAULT 1,
   raised_at BIGINT NOT NULL,
   last_occurred_at BIGINT NOT NULL,
@@ -633,8 +644,9 @@ CREATE INDEX idx_alerts_resolved ON alerts (resolved_at);
 -- changes while it waits for offline devices. See docs/automation.md.
 CREATE TABLE jobs (
   id TEXT NOT NULL PRIMARY KEY,
-  kind TEXT NOT NULL CHECK (kind IN ('script', 'file')),
-  -- The toolbox script or file, and its name when the job started.
+  kind TEXT NOT NULL CHECK (kind IN ('script', 'file', 'update_scan', 'update_install')),
+  -- The toolbox script or file, and its name when the job started. Update
+  -- jobs have an empty item_id and say what they do in item_name.
   item_id TEXT NOT NULL,
   item_name TEXT NOT NULL,
   -- Scripts: the interpreter, body, timeout and account.
@@ -644,6 +656,11 @@ CREATE TABLE jobs (
   run_as TEXT CHECK (run_as IS NULL OR run_as IN ('system', 'user')),
   -- Files: the folder they go to.
   destination TEXT CHECK (destination IS NULL OR destination IN ('user', 'public')),
+  -- Update installs: the categories installed (comma-separated; NULL for
+  -- every pending update), and when the computer restarts afterwards.
+  update_categories TEXT,
+  reboot TEXT CHECK (reboot IS NULL OR reboot IN ('never', 'if_required', 'always')),
+  reboot_delay_minutes BIGINT,
   -- Which devices it was started on, and that in words, such as "Acme, Globex".
   target TEXT NOT NULL CHECK (target IN ('devices', 'companies', 'all')),
   target_label TEXT NOT NULL,
@@ -681,15 +698,22 @@ CREATE TABLE job_devices (
 
 CREATE INDEX idx_job_devices_state ON job_devices (state, device_id);
 
--- Scripts the server runs by itself: on a schedule, or on each device that
--- enrolls. Each time it fires it starts a job.
+-- Scripts and update scans and installs the server runs by itself: on a
+-- schedule, or on each device that enrolls. Each time it fires it starts a job.
 CREATE TABLE automation_policies (
   id TEXT NOT NULL PRIMARY KEY,
   name TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 120),
   enabled BOOLEAN NOT NULL DEFAULT TRUE,
-  -- A shared toolbox script, and the account it runs as.
-  script_id TEXT NOT NULL,
-  run_as TEXT NOT NULL CHECK (run_as IN ('system', 'user')),
+  -- 'script' runs a shared toolbox script as run_as; 'update_scan' scans
+  -- for operating system updates; 'update_install' installs the pending
+  -- updates in update_categories (comma-separated; NULL for all), then
+  -- restarts as reboot says.
+  action TEXT NOT NULL DEFAULT 'script' CHECK (action IN ('script', 'update_scan', 'update_install')),
+  script_id TEXT,
+  run_as TEXT CHECK (run_as IS NULL OR run_as IN ('system', 'user')),
+  update_categories TEXT,
+  reboot TEXT CHECK (reboot IS NULL OR reboot IN ('never', 'if_required', 'always')),
+  reboot_delay_minutes BIGINT,
   -- Every device, the companies in automation_policy_companies, or the
   -- devices in automation_policy_devices.
   target TEXT NOT NULL CHECK (target IN ('devices', 'companies', 'all')),
@@ -740,4 +764,94 @@ CREATE TABLE automation_policy_channels (
   policy_id TEXT NOT NULL REFERENCES automation_policies (id) ON DELETE CASCADE,
   channel_id TEXT NOT NULL REFERENCES notification_channels (id) ON DELETE CASCADE,
   PRIMARY KEY (policy_id, channel_id)
+);
+
+-- Each device's latest update scan. See docs/patch-management.md.
+CREATE TABLE device_update_status (
+  device_id TEXT NOT NULL PRIMARY KEY,
+  -- The update service or package manager; NULL until a scan names one, or
+  -- when the device has none the Agent supports (supported = 0).
+  manager TEXT CHECK (manager IS NULL OR manager IN ('windows_update', 'softwareupdate', 'apt', 'dnf', 'yum', 'pacman')),
+  supported BOOLEAN NOT NULL DEFAULT TRUE,
+  -- The last scan that worked, by the device's clock.
+  scanned_at BIGINT,
+  -- When the last scan report arrived, worked or not, and why it failed.
+  received_at BIGINT,
+  scan_error TEXT,
+  reboot_pending BOOLEAN NOT NULL DEFAULT FALSE,
+  -- When a scan first said the device must restart.
+  reboot_pending_since BIGINT,
+  -- When the server last asked the Agent for a scan on its own schedule.
+  scan_requested_at BIGINT
+);
+
+-- The updates each device's latest scan found pending. first_seen_at is
+-- when a scan first listed the update, kept across scans.
+CREATE TABLE device_pending_updates (
+  device_id TEXT NOT NULL,
+  update_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  kb TEXT,
+  version TEXT,
+  current_version TEXT,
+  category TEXT NOT NULL CHECK (category IN ('security', 'critical', 'definition', 'driver', 'feature_pack', 'service_pack', 'update_rollup', 'upgrade', 'tool', 'other')),
+  severity TEXT CHECK (severity IS NULL OR severity IN ('critical', 'important', 'moderate', 'low')),
+  size_bytes BIGINT,
+  reboot_required BOOLEAN NOT NULL DEFAULT FALSE,
+  released_at BIGINT,
+  source TEXT,
+  first_seen_at BIGINT NOT NULL,
+  PRIMARY KEY (device_id, update_id)
+);
+
+CREATE INDEX idx_device_pending_updates_category ON device_pending_updates (category, device_id);
+
+-- Scans and installs the server asked a device for: by a user, or as a
+-- device's part of a job (job_id). Installs are the device's update history.
+CREATE TABLE update_runs (
+  id TEXT NOT NULL PRIMARY KEY,
+  device_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('scan', 'install')),
+  -- Who asked: a user, or the user whose access a policy runs with, and the
+  -- policy's name then.
+  requested_by_user_id TEXT NOT NULL,
+  policy_name TEXT,
+  job_id TEXT,
+  -- Installs: the chosen updates (a JSON array of IDs) or categories
+  -- (comma-separated), neither for every pending update, and the restart.
+  update_ids TEXT,
+  update_categories TEXT,
+  reboot TEXT CHECK (reboot IS NULL OR reboot IN ('never', 'if_required', 'always')),
+  reboot_delay_minutes BIGINT,
+  -- 'lost': the Agent never reported.
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'succeeded', 'partial', 'failed', 'lost')),
+  progress TEXT,
+  progress_percent BIGINT,
+  error TEXT,
+  installed BIGINT NOT NULL DEFAULT 0,
+  failed BIGINT NOT NULL DEFAULT 0,
+  reboot_required BOOLEAN NOT NULL DEFAULT FALSE,
+  -- When the Agent set the computer to restart, by its clock, or why it
+  -- couldn't.
+  reboot_scheduled_at BIGINT,
+  reboot_error TEXT,
+  created_at BIGINT NOT NULL,
+  completed_at BIGINT
+);
+
+CREATE INDEX idx_update_runs_device ON update_runs (device_id, created_at);
+CREATE INDEX idx_update_runs_created ON update_runs (created_at);
+CREATE INDEX idx_update_runs_job ON update_runs (job_id, device_id);
+CREATE INDEX idx_update_runs_status ON update_runs (status);
+
+-- How each update of an install went.
+CREATE TABLE update_run_items (
+  run_id TEXT NOT NULL REFERENCES update_runs (id) ON DELETE CASCADE,
+  update_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  kb TEXT,
+  category TEXT NOT NULL CHECK (category IN ('security', 'critical', 'definition', 'driver', 'feature_pack', 'service_pack', 'update_rollup', 'upgrade', 'tool', 'other')),
+  outcome TEXT NOT NULL CHECK (outcome IN ('installed', 'failed')),
+  error TEXT,
+  PRIMARY KEY (run_id, update_id)
 );
