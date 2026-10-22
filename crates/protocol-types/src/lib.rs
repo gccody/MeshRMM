@@ -22,3 +22,6 @@ pub use platform::*;
 
 mod system_info;
 pub use system_info::*;
+
+mod updates;
+pub use updates::*;

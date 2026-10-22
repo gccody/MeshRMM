@@ -114,6 +114,17 @@ pub enum AgentCommand {
     },
     /// Collects a new [`crate::SystemInfo`] snapshot now.
     CollectSystemInfo,
+    /// Scans for pending operating system updates. `run_id` names the
+    /// server's record of a scan it is waiting for; a scan the server asks
+    /// for on its own schedule has none.
+    ScanUpdates {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+    },
+    /// Installs pending operating system updates, then scans again.
+    InstallUpdates {
+        install: crate::UpdateInstallRequest,
+    },
 }
 
 /// Agent-to-coordinator lifecycle notifications and reports.
@@ -134,6 +145,26 @@ pub enum AgentStatusMessage {
     /// [`crate::SYSTEM_INFO_INTERVAL_SECONDS`] and when the server asks.
     SystemInfo {
         system: Box<crate::SystemInfo>,
+    },
+    /// The pending updates a scan found. `run_ids` are the server's scans
+    /// it answers: each one asked for while it ran. The scan after an install
+    /// answers those asked for during the install.
+    UpdateScan {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        run_ids: Vec<String>,
+        scan: Box<crate::UpdateScan>,
+    },
+    /// How far an install has got, such as `Installing 2 of 5: …`.
+    UpdateProgress {
+        run_id: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        percent: Option<u8>,
+    },
+    /// How an install went.
+    UpdateInstall {
+        run_id: String,
+        result: Box<crate::UpdateInstallResult>,
     },
 }
 
@@ -321,6 +352,60 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AgentCommand::CollectSystemInfo).unwrap(),
             r#"{"type":"collect_system_info"}"#
+        );
+    }
+
+    #[test]
+    fn update_messages_use_tagged_json() {
+        assert_eq!(
+            serde_json::to_string(&AgentCommand::ScanUpdates { run_id: None }).unwrap(),
+            r#"{"type":"scan_updates"}"#
+        );
+        let install = AgentCommand::InstallUpdates {
+            install: crate::UpdateInstallRequest {
+                run_id: "run-1".into(),
+                selection: crate::UpdateSelection {
+                    ids: vec![],
+                    categories: vec![crate::UpdateCategory::Security],
+                },
+                reboot: crate::RebootBehavior::IfRequired,
+                reboot_delay_minutes: 5,
+            },
+        };
+        let json = serde_json::to_string(&install).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"install_updates","install":{"run_id":"run-1","selection":{"categories":["security"]},"reboot":"if_required","reboot_delay_minutes":5}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentCommand>(&json).unwrap(),
+            install
+        );
+        let scan = AgentStatusMessage::UpdateScan {
+            run_ids: vec!["run-2".into()],
+            scan: Box::new(crate::UpdateScan {
+                scanned_at_unix_ms: 7,
+                manager: Some(crate::UpdateManager::Dnf),
+                ..Default::default()
+            }),
+        };
+        let json = serde_json::to_string(&scan).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"update_scan","run_ids":["run-2"],"scan":{"scanned_at_unix_ms":7,"manager":"dnf","updates":[],"reboot_pending":false}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
+            scan
+        );
+        let result = AgentStatusMessage::UpdateInstall {
+            run_id: "run-1".into(),
+            result: Box::new(crate::UpdateInstallResult::failed("locked")),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
+            result
         );
     }
 

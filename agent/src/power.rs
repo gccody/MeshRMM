@@ -54,6 +54,24 @@ mod linux_impl {
         tracing::info!("Linux is restarting for the technician");
         Ok(())
     }
+
+    /// Restarts the computer after `delay`, through systemd, which warns
+    /// signed-in users with `message`. A later call replaces it.
+    pub fn schedule_restart(delay: std::time::Duration, message: &str) -> anyhow::Result<()> {
+        let minutes = delay.as_secs().div_ceil(60).max(1);
+        let output = Command::new("shutdown")
+            .args(["-r", &format!("+{minutes}"), message])
+            .output()
+            .context("could not start the restart command")?;
+        if !output.status.success() {
+            bail!(
+                "the restart command failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        tracing::info!(minutes, "Linux will restart to finish installing updates");
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -106,6 +124,25 @@ mod macos_impl {
         tracing::info!("macOS is restarting for the technician");
         Ok(())
     }
+
+    /// Restarts the Mac after `delay`, as root, warning users signed in to a
+    /// terminal with `message`. `shutdown` stays in the background until then.
+    pub fn schedule_restart(delay: std::time::Duration, message: &str) -> anyhow::Result<()> {
+        let minutes = delay.as_secs().div_ceil(60).max(1);
+        let output = Command::new("/sbin/shutdown")
+            .args(["-r", &format!("+{minutes}"), message])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .context("could not start the restart command")?;
+        if !output.status.success() {
+            bail!(
+                "the restart command failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        tracing::info!(minutes, "macOS will restart to finish installing updates");
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -125,9 +162,9 @@ mod windows_impl {
         RegCloseKey, RegCreateKeyExW, RegDeleteKeyExW, RegSetValueExW,
     };
     use windows::Win32::System::Shutdown::{
-        InitiateShutdownW, SHTDN_REASON_FLAG_PLANNED, SHTDN_REASON_MAJOR_OTHER,
-        SHTDN_REASON_MINOR_OTHER, SHUTDOWN_FORCE_OTHERS, SHUTDOWN_FORCE_SELF,
-        SHUTDOWN_GRACE_OVERRIDE, SHUTDOWN_RESTART,
+        InitiateShutdownW, SHTDN_REASON_FLAG_PLANNED, SHTDN_REASON_MAJOR_OPERATINGSYSTEM,
+        SHTDN_REASON_MAJOR_OTHER, SHTDN_REASON_MINOR_HOTFIX, SHTDN_REASON_MINOR_OTHER,
+        SHUTDOWN_FORCE_OTHERS, SHUTDOWN_FORCE_SELF, SHUTDOWN_GRACE_OVERRIDE, SHUTDOWN_RESTART,
     };
     use windows::Win32::System::Threading::{
         CREATE_NO_WINDOW, GetCurrentProcess, OpenProcessToken,
@@ -295,6 +332,32 @@ mod windows_impl {
         windows::Win32::Foundation::WIN32_ERROR(result)
             .ok()
             .context("Windows refused to restart")
+    }
+
+    /// Restarts Windows after `delay`. Windows shows signed-in users
+    /// `message` and the time left, and closes applications when it is up.
+    /// The Safe Mode boot option is cleared first, as for any restart.
+    pub fn schedule_restart(delay: std::time::Duration, message: &str) -> anyhow::Result<()> {
+        clear_safe_boot().context("could not clear the Safe Mode boot option")?;
+        enable_shutdown_privilege()?;
+        let seconds = u32::try_from(delay.as_secs()).unwrap_or(u32::MAX).max(60);
+        let message = HSTRING::from(message);
+        let result = unsafe {
+            InitiateShutdownW(
+                PCWSTR::null(),
+                &message,
+                seconds,
+                SHUTDOWN_RESTART | SHUTDOWN_FORCE_OTHERS,
+                SHTDN_REASON_MAJOR_OPERATINGSYSTEM
+                    | SHTDN_REASON_MINOR_HOTFIX
+                    | SHTDN_REASON_FLAG_PLANNED,
+            )
+        };
+        windows::Win32::Foundation::WIN32_ERROR(result)
+            .ok()
+            .context("Windows refused to schedule the restart")?;
+        tracing::info!(seconds, "Windows will restart to finish installing updates");
+        Ok(())
     }
 
     /// LocalSystem holds the privilege disabled. The computer is about to
