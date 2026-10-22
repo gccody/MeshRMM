@@ -353,6 +353,15 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
         tracing::error!(job_id = job.id, "stored job is invalid");
         return Ok(false);
     };
+    // A device installs one thing at a time; this waits for the install it
+    // is running.
+    if kind == Kind::UpdateInstall
+        && update_runs::pending(&mut &state.database, device_id, UpdateKind::Install)
+            .await?
+            .is_some()
+    {
+        return Ok(false);
+    }
     let id = new_id();
     let mut transaction = state.database.begin().await?;
     let command = match kind {

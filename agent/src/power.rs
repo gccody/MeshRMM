@@ -126,19 +126,21 @@ mod macos_impl {
     }
 
     /// Restarts the Mac after `delay`, as root, warning users signed in to a
-    /// terminal with `message`. `shutdown` stays in the background until then.
+    /// terminal with `message`. `shutdown` forks a copy that waits until
+    /// then, which keeps any output pipe open, so it gets none.
     pub fn schedule_restart(delay: std::time::Duration, message: &str) -> anyhow::Result<()> {
+        use std::process::Stdio;
+
         let minutes = delay.as_secs().div_ceil(60).max(1);
-        let output = Command::new("/sbin/shutdown")
+        let status = Command::new("/sbin/shutdown")
             .args(["-r", &format!("+{minutes}"), message])
-            .stdin(std::process::Stdio::null())
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
             .context("could not start the restart command")?;
-        if !output.status.success() {
-            bail!(
-                "the restart command failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+        if !status.success() {
+            bail!("the restart command failed ({status})");
         }
         tracing::info!(minutes, "macOS will restart to finish installing updates");
         Ok(())
