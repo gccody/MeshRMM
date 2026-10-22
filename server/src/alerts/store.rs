@@ -70,6 +70,8 @@ pub struct Alert {
     pub value: Option<f64>,
     pub detail: String,
     pub script_run_id: Option<String>,
+    /// The failed install of an update install failure alert.
+    pub update_run_id: Option<String>,
     pub occurrences: i64,
     pub raised_at: i64,
     pub last_occurred_at: i64,
@@ -104,6 +106,7 @@ fn select() -> sea_query::SelectStatement {
             (Alerts::Table, Alerts::Value),
             (Alerts::Table, Alerts::Detail),
             (Alerts::Table, Alerts::ScriptRunId),
+            (Alerts::Table, Alerts::UpdateRunId),
             (Alerts::Table, Alerts::Occurrences),
             (Alerts::Table, Alerts::RaisedAt),
             (Alerts::Table, Alerts::LastOccurredAt),
@@ -281,6 +284,7 @@ pub struct Raise<'a> {
     pub value: Option<f64>,
     pub detail: &'a str,
     pub script_run_id: Option<&'a str>,
+    pub update_run_id: Option<&'a str>,
 }
 
 /// Opens an alert, unless the rule already has an unresolved one for the
@@ -304,6 +308,7 @@ pub async fn raise(
                     Alerts::Value,
                     Alerts::Detail,
                     Alerts::ScriptRunId,
+                    Alerts::UpdateRunId,
                     Alerts::RaisedAt,
                     Alerts::LastOccurredAt,
                 ])
@@ -316,6 +321,7 @@ pub async fn raise(
                     raise.value.into(),
                     raise.detail.into(),
                     raise.script_run_id.into(),
+                    raise.update_run_id.into(),
                     now.into(),
                     now.into(),
                 ])
@@ -354,6 +360,7 @@ pub async fn recur(
                 .value(Alerts::Value, raise.value)
                 .value(Alerts::Detail, raise.detail)
                 .value(Alerts::ScriptRunId, raise.script_run_id)
+                .value(Alerts::UpdateRunId, raise.update_run_id)
                 .value(Alerts::LastOccurredAt, now)
                 .and_where(unresolved())
                 .to_owned(),

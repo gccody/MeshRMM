@@ -9,7 +9,10 @@
 //! also gets the unresolved alert counts after each snapshot, and each alert
 //! that is raised or changes ([`AlertEvent`]). A user who may see jobs gets
 //! `job_update` with each job they may see whose counts changed, and
-//! `jobs_resync` if they missed some. The socket stays authorized by
+//! `jobs_resync` if they missed some. A user who may see updates gets
+//! `device_updates` with each device whose update status changes and
+//! `update_run` with each scan or install that starts, progresses or ends,
+//! and `updates_resync` if they missed some. The socket stays authorized by
 //! the session cookie it opened with: it checks the session and the
 //! `devices.view` permission again every half minute, and at once after a
 //! signed-in user changes something, and closes with 4001 when either is
@@ -86,10 +89,12 @@ async fn serve(
     let Allowed {
         mut alerts,
         mut jobs,
+        mut updates,
     } = allowed;
     let mut events = state.presence.subscribe();
     let mut alert_events = state.alerts.subscribe();
     let mut job_events = state.automation.subscribe();
+    let mut update_events = state.updates.subscribe();
     let mut access = state.presence.access_changes();
     let Some(mut revision) = send_snapshot(&state, &mut socket, alerts).await else {
         return;
@@ -169,8 +174,18 @@ async fn serve(
                     return;
                 }
             }
+            event = update_events.recv(), if updates => {
+                let sent = match event {
+                    Ok(event) => send_json(&mut socket, &*event).await,
+                    Err(RecvError::Lagged(_)) => send_json(&mut socket, &json!({ "type": "updates_resync" })).await,
+                    Err(RecvError::Closed) => return,
+                };
+                if !sent {
+                    return;
+                }
+            }
             changed = access.changed() => {
-                let current = Allowed { alerts, jobs: jobs.take() };
+                let current = Allowed { alerts, jobs: jobs.take(), updates };
                 let Some(allowed) = changed.ok().and(still_allowed(&state, &token, ip, current).await) else {
                     send(&mut socket, close_frame(4001, "sign in again")).await;
                     return;
@@ -180,9 +195,10 @@ async fn serve(
                 }
                 alerts = allowed.alerts;
                 jobs = allowed.jobs;
+                updates = allowed.updates;
             }
             _ = recheck.tick() => {
-                let current = Allowed { alerts, jobs: jobs.take() };
+                let current = Allowed { alerts, jobs: jobs.take(), updates };
                 let Some(allowed) = still_allowed(&state, &token, ip, current).await else {
                     send(&mut socket, close_frame(4001, "sign in again")).await;
                     return;
@@ -192,6 +208,7 @@ async fn serve(
                 }
                 alerts = allowed.alerts;
                 jobs = allowed.jobs;
+                updates = allowed.updates;
             }
             _ = metrics.tick() => {
                 let (readings, sequence) = state.metrics.since(metrics_sent);
@@ -220,12 +237,14 @@ struct Allowed {
     alerts: bool,
     /// Which jobs, if any.
     jobs: Option<Viewer>,
+    updates: bool,
 }
 
 impl Allowed {
     fn of(actor: &Authorized) -> Self {
         Self {
             alerts: actor.has(Permission::AlertsView),
+            updates: actor.has(Permission::UpdatesView),
             jobs: Viewer::may_list(&actor.permissions)
                 .then(|| Viewer::new(&actor.user.id, &actor.permissions)),
         }

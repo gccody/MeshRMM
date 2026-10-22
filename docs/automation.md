@@ -1,10 +1,12 @@
 # Automation
 
-Automation runs [toolbox](toolbox.md) scripts and sends library files on many
-devices at once. A **job** is one script run or file delivery on a set of
-devices: chosen devices, whole companies, or every device. A **policy** starts
-jobs by itself, on a schedule or on each device that enrolls. Policies' jobs
-are ordinary jobs, so their history is the same job list.
+Automation runs [toolbox](toolbox.md) scripts, sends library files, and
+scans for and installs [operating system updates](patch-management.md) on
+many devices at once. A **job** is one script run, file delivery, update scan
+or update install on a set of devices: chosen devices, whole companies, or
+every device. A **policy** starts jobs by itself, on a schedule or on each
+device that enrolls. Policies' jobs are ordinary jobs, so their history is
+the same job list.
 
 ## Jobs
 
@@ -16,6 +18,9 @@ are ordinary jobs, so their history is the same job list.
   filters show.
 - **Toolbox:** **Run** on a script, or **Run on devices** at the top of the
   Scripts tab; **Send** on a library file.
+- **Updates page:** tick devices, then **Scan now** or **Install updates…**
+  (the categories to install, or all, and the restart); see
+  [patch management](patch-management.md#the-website).
 
 The dialog chooses:
 
@@ -44,11 +49,11 @@ whose turn comes after the file was deleted from the library fails.
 | Queued | Online; its run starts in a moment (see [dispatching](#dispatching)). |
 | Waiting | Offline; it runs when its Agent connects, if the job hasn't expired. |
 | Running | Started; the device hasn't reported yet. |
-| Succeeded | The script exited with code 0, or the file was saved. |
-| Failed | The script couldn't run or exited with another code, or the file wasn't saved. |
+| Succeeded | The script exited with code 0, the file was saved, the scan finished, or every chosen update installed. |
+| Failed | The script couldn't run or exited with another code, the file wasn't saved, the scan failed, or an update didn't install. |
 | Timed out | The Agent stopped the script at its timeout. |
-| No result | The device never reported: two minutes after the script's timeout, or 30 minutes after a delivery started. |
-| Skipped | The device has no interpreter for the script: PowerShell and Command Prompt run on Windows only, shell scripts on macOS and Linux only. Files go to every platform. |
+| No result | The device never reported: two minutes after the script's timeout, 30 minutes after a delivery started, 45 minutes after a scan, or five hours after an install. |
+| Skipped | The device has no interpreter for the script: PowerShell and Command Prompt run on Windows only, shell scripts on macOS and Linux only. Files go to every platform. An update job skips devices whose last scan found no update manager MeshRMM supports. |
 | Missed | It was offline and the job skips offline devices, or it didn't connect before the job expired, or a newer run of the same policy replaced the wait, or the device was deleted. The detail says which. |
 | Cancelled | Someone cancelled the job before the device started. |
 
@@ -103,7 +108,10 @@ runs (with the last job's result), and any problem that stopped the last
 run. A policy has:
 
 - a name and an **On** switch;
-- a **shared** script and the account it runs as;
+- what it does: run a **shared** script as an account; scan for updates; or
+  install the pending updates of chosen categories (or all), restarting
+  never, if required or always, after a delay (see
+  [patch management](patch-management.md#installing));
 - its devices: every device, chosen companies, or chosen devices;
 - when it runs (below);
 - what happens to offline devices: skip them, or catch them up when they
@@ -139,8 +147,10 @@ once per run.
 ### Whose access a policy runs with
 
 A policy runs with the access of the user who last saved it, shown as its
-owner. Saving one needs `automation.manage` and `scripts.run`. When it is
-due, its owner must still be enabled and hold both permissions; otherwise it
+owner. Saving one needs `automation.manage` and what it does needs:
+`scripts.run` for a script, `updates.view` for a scan, `updates.install` for
+an install. When it is due, its owner must still be enabled and hold both
+permissions; otherwise it
 doesn't run, records why, and shows it on the policies page. Saving the
 policy again makes the saver its owner and clears the problem.
 
@@ -191,8 +201,9 @@ time out or never report, like runs started by hand.
 |---|---|---|
 | `scripts.run` | Running scripts on chosen devices, and seeing one's own jobs. | Yes |
 | `files.deliver` | Sending files to chosen devices. | Yes |
-| `jobs.run_wide` | Running scripts and sending files on whole companies or every device. | No |
-| `automation.manage` | Seeing, creating, changing and deleting policies, and seeing their jobs. With `scripts.run`, saving and running them. | No |
+| `updates.view`, `updates.install` | Scan and install [update](patch-management.md) jobs on chosen devices, and seeing one's own jobs. | Yes |
+| `jobs.run_wide` | Running scripts, sending files and updating on whole companies or every device. | No |
+| `automation.manage` | Seeing, creating, changing and deleting policies, and seeing their jobs. With what a policy does needs (`scripts.run`, `updates.view` or `updates.install`), saving and running it. | No |
 | `audit.view` | Seeing everyone's jobs and runs. | No |
 
 Administrators have every permission. Grant `jobs.run_wide` and
@@ -219,17 +230,17 @@ All routes need a signed-in user.
 
 | Route | |
 |---|---|
-| `POST /v1/jobs` | `{script_id, run_as}` or `{file_id, destination}`, with `target` (`devices`, `companies` or `all`), `device_ids` or `company_ids`, `offline` (`skip` or `wait`) and `wait_hours`. Returns the job with its devices. `400 no_devices` if the target covers none. |
+| `POST /v1/jobs` | `{script_id, run_as}`, `{file_id, destination}` or `{updates: {action: "scan"}}` / `{updates: {action: "install", categories, reboot, reboot_delay_minutes}}`, with `target` (`devices`, `companies` or `all`), `device_ids` or `company_ids`, `offline` (`skip` or `wait`) and `wait_hours`. Returns the job with its devices. `400 no_devices` if the target covers none. |
 | `GET /v1/jobs?policy_id=&limit=` | Jobs the user may see, newest first, with counts (50 by default, at most 200). |
-| `GET /v1/jobs/{id}` | A job with `devices`: each one's `outcome`, `detail`, `run_id` or `delivery_id`, exit code, saved path and times. |
+| `GET /v1/jobs/{id}` | A job with `devices`: each one's `outcome`, `detail`, `run_id`, `delivery_id` or `update_run_id`, exit code, saved path and times. |
 | `POST /v1/jobs/{id}/cancel` | Cancels the devices that haven't started. |
 | `GET /v1/automation-policies` | Policies with their latest job (`automation.manage`). |
-| `POST /v1/automation-policies`, `PUT /v1/automation-policies/{id}` | A whole policy: `name`, `enabled`, `script_id`, `run_as`, `target` with `device_ids` or `company_ids`, `trigger` (`interval`, `daily`, `weekly`, `once`, `enroll`) with `interval_minutes`, `time` (`HH:MM`), `weekdays` (1 = Monday to 7), `run_at` (`YYYY-MM-DDTHH:MM`) and `time_zone` as it needs, `offline`, `catch_up_hours` and `channel_ids`. |
+| `POST /v1/automation-policies`, `PUT /v1/automation-policies/{id}` | A whole policy: `name`, `enabled`, `action` (`script`, `update_scan` or `update_install`), `script_id` and `run_as` for a script, `update_categories`, `reboot` and `reboot_delay_minutes` for an install, `target` with `device_ids` or `company_ids`, `trigger` (`interval`, `daily`, `weekly`, `once`, `enroll`) with `interval_minutes`, `time` (`HH:MM`), `weekdays` (1 = Monday to 7), `run_at` (`YYYY-MM-DDTHH:MM`) and `time_zone` as it needs, `offline`, `catch_up_hours` and `channel_ids`. |
 | `DELETE /v1/automation-policies/{id}` | |
 | `POST /v1/automation-policies/{id}/run` | Run now; returns the job. |
 
 A job reads `{id, kind, item_id, item_name, language, run_as, destination,
-target, target_label, offline, expires_at_unix_ms, requested_by,
+categories, reboot, reboot_delay_minutes, target, target_label, offline, expires_at_unix_ms, requested_by,
 requested_by_you, policy_id, policy_name, created_at_unix_ms,
 finished_at_unix_ms, can_cancel, counts}`, where `counts` has `total` and one
 number per outcome. The event socket (`/v1/events`) sends
@@ -250,10 +261,12 @@ should read the lists again.
 - `server/src/api/jobs.rs` and `server/src/api/automation.rs`.
 - Tables: `jobs` (what it sends, its target and expiry, who or which policy
   started it), `job_devices` (each device's state), `automation_policies`
-  with `automation_policy_companies`, `_devices` and `_channels`. Runs and
-  deliveries carry `job_id`; a job's runs have the source `job`.
-- The Agent needs nothing new: each device's part is the same `run_script`
-  or `deliver_file` command as a run started by hand.
+  with `automation_policy_companies`, `_devices` and `_channels`. Runs,
+  deliveries and update runs carry `job_id`; a job's runs have the source
+  `job`. An update job's kind is `update_scan` or `update_install`, its
+  `item_name` says what it does, and its `item_id` is empty.
+- Each device's part is the same `run_script`, `deliver_file`,
+  `scan_updates` or `install_updates` command as one started by hand.
 - The website: `dashboard/features/automation/`.
 
 ## Tests

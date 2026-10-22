@@ -1,11 +1,13 @@
-//! Automation policies: a shared script the server runs by itself, on a
-//! schedule or on each newly enrolled device, as a job.
+//! Automation policies: a shared script, an update scan or an update install
+//! the server runs by itself, on a schedule or on each newly enrolled
+//! device, as a job.
 //!
 //! A policy runs with the access of the user who last saved it: when it
 //! fires, that user must still be enabled and hold `automation.manage` and
-//! `scripts.run`, and its script must still be shared. Otherwise it doesn't
-//! fire and says why. Policies use shared scripts only, so everyone who
-//! manages policies can see what each one runs.
+//! what its action needs (`scripts.run`, `updates.view` or
+//! `updates.install`), and a script policy's script must still be shared.
+//! Otherwise it doesn't fire and says why. Policies use shared scripts only,
+//! so everyone who manages policies can see what each one runs.
 //!
 //! Firing claims the due time in the same transaction that creates the job,
 //! so a restart (or a second pass) can't fire it twice. A firing missed while
@@ -15,7 +17,9 @@
 //! never run more than once.
 use std::collections::HashMap;
 
-use meshrmm_protocol_types::{RunAs, ScriptLanguage};
+use meshrmm_protocol_types::{
+    MAX_REBOOT_DELAY_MINUTES, RebootBehavior, RunAs, ScriptLanguage, UpdateCategory,
+};
 use sea_query::{Alias, Expr, ExprTrait, Order, Query};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -37,6 +41,7 @@ use crate::{
     http::{ApiError, AppState},
     rbac::{self, Permission},
     time::HOUR_MS,
+    updates::runs::Install,
     users,
 };
 
@@ -65,6 +70,80 @@ fn default_catch_up_hours() -> i64 {
     DEFAULT_CATCH_UP_HOURS
 }
 
+pub const DEFAULT_REBOOT_DELAY_MINUTES: u32 = 5;
+
+/// What a policy does when it fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    #[default]
+    Script,
+    UpdateScan,
+    UpdateInstall,
+}
+
+impl ActionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Script => "script",
+            Self::UpdateScan => "update_scan",
+            Self::UpdateInstall => "update_install",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "script" => Some(Self::Script),
+            "update_scan" => Some(Self::UpdateScan),
+            "update_install" => Some(Self::UpdateInstall),
+            _ => None,
+        }
+    }
+
+    /// The permission, besides `automation.manage`, whoever saves the policy
+    /// (and so whose access it runs with) must hold.
+    pub fn permission(self) -> Permission {
+        match self {
+            Self::Script => Permission::ScriptsRun,
+            Self::UpdateScan => Permission::UpdatesView,
+            Self::UpdateInstall => Permission::UpdatesInstall,
+        }
+    }
+}
+
+/// What a policy does, with what it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    Script {
+        script_id: String,
+        run_as: RunAs,
+    },
+    UpdateScan,
+    /// Installs the pending updates in `categories`, or every one.
+    UpdateInstall {
+        categories: Vec<UpdateCategory>,
+        reboot: RebootBehavior,
+        reboot_delay_minutes: u32,
+    },
+}
+
+impl Action {
+    pub fn kind(&self) -> ActionKind {
+        match self {
+            Self::Script { .. } => ActionKind::Script,
+            Self::UpdateScan => ActionKind::UpdateScan,
+            Self::UpdateInstall { .. } => ActionKind::UpdateInstall,
+        }
+    }
+
+    pub fn script_id(&self) -> Option<&str> {
+        match self {
+            Self::Script { script_id, .. } => Some(script_id),
+            _ => None,
+        }
+    }
+}
+
 /// A policy as the website sends it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,8 +151,20 @@ pub struct PolicyInput {
     pub name: String,
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
-    pub script_id: String,
-    pub run_as: RunAs,
+    #[serde(default)]
+    pub action: ActionKind,
+    /// For a script policy.
+    #[serde(default)]
+    pub script_id: Option<String>,
+    #[serde(default)]
+    pub run_as: Option<RunAs>,
+    /// For an install policy: none for every pending update.
+    #[serde(default)]
+    pub update_categories: Vec<UpdateCategory>,
+    #[serde(default)]
+    pub reboot: Option<RebootBehavior>,
+    #[serde(default)]
+    pub reboot_delay_minutes: Option<i64>,
     pub target: TargetKind,
     #[serde(default)]
     pub device_ids: Vec<String>,
@@ -106,8 +197,7 @@ pub struct PolicyInput {
 pub struct Valid {
     pub name: String,
     pub enabled: bool,
-    pub script_id: String,
-    pub run_as: RunAs,
+    pub action: Action,
     pub target: Target,
     pub trigger: Trigger,
     pub offline: Offline,
@@ -130,7 +220,44 @@ impl PolicyInput {
                 "the policy name must be 1 to {MAX_NAME_LENGTH} characters with no control characters"
             )));
         }
-        crate::agents::parse_id(&self.script_id, "script")?;
+        let action = match self.action {
+            ActionKind::Script => {
+                let script_id = self
+                    .script_id
+                    .ok_or_else(|| invalid("choose the script the policy runs"))?;
+                crate::agents::parse_id(&script_id, "script")?;
+                Action::Script {
+                    script_id,
+                    run_as: self
+                        .run_as
+                        .ok_or_else(|| invalid("choose the account the script runs as"))?,
+                }
+            }
+            ActionKind::UpdateScan => Action::UpdateScan,
+            ActionKind::UpdateInstall => {
+                let reboot_delay_minutes = match self.reboot_delay_minutes {
+                    None => DEFAULT_REBOOT_DELAY_MINUTES,
+                    Some(minutes) => u32::try_from(minutes)
+                        .ok()
+                        .filter(|minutes| (1..=MAX_REBOOT_DELAY_MINUTES).contains(minutes))
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "the restart can wait 1 to {MAX_REBOOT_DELAY_MINUTES} minutes"
+                            ))
+                        })?,
+                };
+                let mut categories = self.update_categories;
+                categories.sort();
+                categories.dedup();
+                Action::UpdateInstall {
+                    categories,
+                    reboot: self
+                        .reboot
+                        .ok_or_else(|| invalid("choose when the computer restarts"))?,
+                    reboot_delay_minutes,
+                }
+            }
+        };
         let zone = || {
             self.time_zone
                 .as_deref()
@@ -199,8 +326,7 @@ impl PolicyInput {
         Ok(Valid {
             name: name.to_owned(),
             enabled: self.enabled,
-            script_id: self.script_id,
-            run_as: self.run_as,
+            action,
             target,
             trigger,
             offline: self.offline,
@@ -211,27 +337,29 @@ impl PolicyInput {
 }
 
 impl Valid {
-    /// Checks that the script is shared and the companies, devices and
-    /// channels exist.
+    /// Checks that the script, if any, is shared and the companies, devices
+    /// and channels exist.
     pub async fn check_references(&self, executor: &mut impl Executor) -> Result<(), ApiError> {
-        let script: Option<(bool,)> = executor
-            .fetch_optional(
-                &Query::select()
-                    .column(ToolboxScripts::Shared)
-                    .from(ToolboxScripts::Table)
-                    .and_where(Expr::col(ToolboxScripts::Id).eq(self.script_id.as_str()))
-                    .to_owned(),
-            )
-            .await?;
-        match script {
-            None => return Err(ApiError::not_found("Script not found")),
-            Some((false,)) => {
-                return Err(ApiError::bad_request(
-                    "policies run shared scripts only; share the script first",
+        if let Some(script_id) = self.action.script_id() {
+            let script: Option<(bool,)> = executor
+                .fetch_optional(
+                    &Query::select()
+                        .column(ToolboxScripts::Shared)
+                        .from(ToolboxScripts::Table)
+                        .and_where(Expr::col(ToolboxScripts::Id).eq(script_id))
+                        .to_owned(),
                 )
-                .with_code("script_not_shared"));
+                .await?;
+            match script {
+                None => return Err(ApiError::not_found("Script not found")),
+                Some((false,)) => {
+                    return Err(ApiError::bad_request(
+                        "policies run shared scripts only; share the script first",
+                    )
+                    .with_code("script_not_shared"));
+                }
+                Some((true,)) => {}
             }
-            Some((true,)) => {}
         }
         let count = |found: usize, wanted: usize, what: &'static str| {
             if found == wanted {
@@ -290,12 +418,11 @@ pub struct Policy {
     pub id: String,
     pub name: String,
     pub enabled: bool,
-    pub script_id: String,
-    /// `None` once the script is gone.
+    pub action: Action,
+    /// `None` once the script is gone, or for an update policy.
     pub script_name: Option<String>,
     pub script_language: Option<ScriptLanguage>,
     pub script_shared: bool,
-    pub run_as: RunAs,
     pub target: TargetKind,
     pub device_ids: Vec<String>,
     pub company_ids: Vec<String>,
@@ -351,11 +478,15 @@ pub struct PolicyView {
     pub id: String,
     pub name: String,
     pub enabled: bool,
-    pub script_id: String,
+    pub action: ActionKind,
+    pub script_id: Option<String>,
     pub script_name: Option<String>,
     pub script_language: Option<ScriptLanguage>,
     pub script_shared: bool,
-    pub run_as: RunAs,
+    pub run_as: Option<RunAs>,
+    pub update_categories: Option<Vec<UpdateCategory>>,
+    pub reboot: Option<RebootBehavior>,
+    pub reboot_delay_minutes: Option<u32>,
     pub target: TargetKind,
     pub device_ids: Vec<String>,
     pub company_ids: Vec<String>,
@@ -412,17 +543,37 @@ impl Policy {
             ),
             Trigger::Enroll => (None, None, None, None, None),
         };
+        let (script_id, run_as) = match &self.action {
+            Action::Script { script_id, run_as } => (Some(script_id.clone()), Some(*run_as)),
+            _ => (None, None),
+        };
+        let (update_categories, reboot, reboot_delay_minutes) = match &self.action {
+            Action::UpdateInstall {
+                categories,
+                reboot,
+                reboot_delay_minutes,
+            } => (
+                Some(categories.clone()),
+                Some(*reboot),
+                Some(*reboot_delay_minutes),
+            ),
+            _ => (None, None, None),
+        };
         PolicyView {
             owned_by_you: self.owner_user_id == user_id,
             trigger: self.trigger.kind(),
+            action: self.action.kind(),
             id: self.id,
             name: self.name,
             enabled: self.enabled,
-            script_id: self.script_id,
+            script_id,
             script_name: self.script_name,
             script_language: self.script_language,
             script_shared: self.script_shared,
-            run_as: self.run_as,
+            run_as,
+            update_categories,
+            reboot,
+            reboot_delay_minutes,
             target: self.target,
             device_ids: self.device_ids,
             company_ids: self.company_ids,
@@ -451,11 +602,15 @@ struct PolicyRow {
     id: String,
     name: String,
     enabled: bool,
-    script_id: String,
+    action: String,
+    script_id: Option<String>,
     script_name: Option<String>,
     script_language: Option<String>,
     script_shared: Option<bool>,
-    run_as: String,
+    run_as: Option<String>,
+    update_categories: Option<String>,
+    reboot: Option<String>,
+    reboot_delay_minutes: Option<i64>,
     target: String,
     trigger_type: String,
     interval_minutes: Option<i64>,
@@ -475,6 +630,21 @@ struct PolicyRow {
     last_problem_at: Option<i64>,
     created_at: i64,
     updated_at: i64,
+}
+
+fn action_of(row: &PolicyRow) -> Option<Action> {
+    Some(match ActionKind::parse(&row.action)? {
+        ActionKind::Script => Action::Script {
+            script_id: row.script_id.clone()?,
+            run_as: RunAs::parse(row.run_as.as_deref()?)?,
+        },
+        ActionKind::UpdateScan => Action::UpdateScan,
+        ActionKind::UpdateInstall => Action::UpdateInstall {
+            categories: Install::parse_categories(row.update_categories.as_deref()),
+            reboot: RebootBehavior::parse(row.reboot.as_deref()?)?,
+            reboot_delay_minutes: u32::try_from(row.reboot_delay_minutes?).ok()?,
+        },
+    })
 }
 
 fn trigger_of(row: &PolicyRow) -> Option<Trigger> {
@@ -514,6 +684,7 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
             (AutomationPolicies::Table, AutomationPolicies::Id),
             (AutomationPolicies::Table, AutomationPolicies::Name),
             (AutomationPolicies::Table, AutomationPolicies::Enabled),
+            (AutomationPolicies::Table, AutomationPolicies::Action),
             (AutomationPolicies::Table, AutomationPolicies::ScriptId),
         ])
         .expr_as(
@@ -530,6 +701,15 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
         )
         .columns([
             (AutomationPolicies::Table, AutomationPolicies::RunAs),
+            (
+                AutomationPolicies::Table,
+                AutomationPolicies::UpdateCategories,
+            ),
+            (AutomationPolicies::Table, AutomationPolicies::Reboot),
+            (
+                AutomationPolicies::Table,
+                AutomationPolicies::RebootDelayMinutes,
+            ),
             (AutomationPolicies::Table, AutomationPolicies::Target),
             (AutomationPolicies::Table, AutomationPolicies::TriggerType),
             (
@@ -610,9 +790,9 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
     Ok(rows
         .into_iter()
         .filter_map(|row| {
-            let (Some(trigger), Some(run_as), Some(target), Some(offline)) = (
+            let (Some(trigger), Some(action), Some(target), Some(offline)) = (
                 trigger_of(&row),
-                RunAs::parse(&row.run_as),
+                action_of(&row),
                 TargetKind::parse(&row.target),
                 Offline::parse(&row.offline),
             ) else {
@@ -632,9 +812,8 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
                 id: row.id,
                 name: row.name,
                 enabled: row.enabled,
-                script_id: row.script_id,
+                action,
                 script_name: row.script_name,
-                run_as,
                 target,
                 trigger,
                 offline,
@@ -739,14 +918,37 @@ pub async fn save(
         ),
         Trigger::Enroll => (None, None, None, None, None),
     };
-    let values: [(AutomationPolicies, sea_query::Value); 17] = [
+    let (script_id, run_as) = match &policy.action {
+        Action::Script { script_id, run_as } => (Some(script_id.as_str()), Some(run_as.as_str())),
+        _ => (None, None),
+    };
+    let (categories, reboot, reboot_delay_minutes) = match &policy.action {
+        Action::UpdateInstall {
+            categories,
+            reboot,
+            reboot_delay_minutes,
+        } => (
+            Install::categories_text(categories),
+            Some(reboot.as_str()),
+            Some(i64::from(*reboot_delay_minutes)),
+        ),
+        _ => (None, None, None),
+    };
+    let values: [(AutomationPolicies, sea_query::Value); 21] = [
         (AutomationPolicies::Name, policy.name.as_str().into()),
         (AutomationPolicies::Enabled, policy.enabled.into()),
         (
-            AutomationPolicies::ScriptId,
-            policy.script_id.as_str().into(),
+            AutomationPolicies::Action,
+            policy.action.kind().as_str().into(),
         ),
-        (AutomationPolicies::RunAs, policy.run_as.as_str().into()),
+        (AutomationPolicies::ScriptId, script_id.into()),
+        (AutomationPolicies::RunAs, run_as.into()),
+        (AutomationPolicies::UpdateCategories, categories.into()),
+        (AutomationPolicies::Reboot, reboot.into()),
+        (
+            AutomationPolicies::RebootDelayMinutes,
+            reboot_delay_minutes.into(),
+        ),
         (
             AutomationPolicies::Target,
             policy.target.kind().as_str().into(),
@@ -833,7 +1035,9 @@ pub async fn save(
 /// Why the policy can't start a job now, if it can't: its owner lost the
 /// access it runs with, or its script was deleted or unshared.
 async fn problem(executor: &mut impl Executor, policy: &Policy) -> db::Result<Option<String>> {
-    if !policy.script_shared || policy.script_name.is_none() {
+    if matches!(policy.action, Action::Script { .. })
+        && (!policy.script_shared || policy.script_name.is_none())
+    {
         return Ok(Some(
             "Its script was deleted or is no longer shared".to_owned(),
         ));
@@ -846,19 +1050,33 @@ async fn problem(executor: &mut impl Executor, policy: &Policy) -> db::Result<Op
         )));
     };
     let permissions = rbac::permissions_of(&rbac::user_roles(executor, &owner.id).await?);
-    if !permissions.contains(&Permission::AutomationManage)
-        || !permissions.contains(&Permission::ScriptsRun)
-    {
+    let needed = policy.action.kind().permission();
+    if !permissions.contains(&Permission::AutomationManage) || !permissions.contains(&needed) {
         return Ok(Some(format!(
-            "{}, whose access it runs with, no longer has the automation.manage and scripts.run permissions; save the policy to run it with your access",
+            "{}, whose access it runs with, no longer has the automation.manage and {needed} permissions; save the policy to run it with your access",
             policy.owner
         )));
     }
     Ok(None)
 }
 
-/// The script the policy runs, as a job's payload.
+/// What the policy does, as a job's payload: `None` when its script is gone.
 async fn payload(executor: &mut impl Executor, policy: &Policy) -> db::Result<Option<Payload>> {
+    let (script_id, run_as) = match &policy.action {
+        Action::Script { script_id, run_as } => (script_id, *run_as),
+        Action::UpdateScan => return Ok(Some(Payload::UpdateScan)),
+        Action::UpdateInstall {
+            categories,
+            reboot,
+            reboot_delay_minutes,
+        } => {
+            return Ok(Some(Payload::UpdateInstall {
+                categories: categories.clone(),
+                reboot: *reboot,
+                reboot_delay_minutes: *reboot_delay_minutes,
+            }));
+        }
+    };
     let script: Option<(String, String, String, i64)> = executor
         .fetch_optional(
             &Query::select()
@@ -869,19 +1087,19 @@ async fn payload(executor: &mut impl Executor, policy: &Policy) -> db::Result<Op
                     ToolboxScripts::TimeoutSeconds,
                 ])
                 .from(ToolboxScripts::Table)
-                .and_where(Expr::col(ToolboxScripts::Id).eq(policy.script_id.as_str()))
+                .and_where(Expr::col(ToolboxScripts::Id).eq(script_id.as_str()))
                 .and_where(Expr::col(ToolboxScripts::Shared).eq(true))
                 .to_owned(),
         )
         .await?;
     Ok(script.and_then(|(name, language, body, timeout_seconds)| {
         Some(Payload::Script {
-            script_id: policy.script_id.clone(),
+            script_id: script_id.clone(),
             name,
             language: ScriptLanguage::parse(&language)?,
             body,
             timeout_seconds,
-            run_as: policy.run_as,
+            run_as,
         })
     }))
 }

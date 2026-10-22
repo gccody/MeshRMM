@@ -14,11 +14,16 @@ import {
   type RuleForm,
   SEVERITIES,
   SEVERITY_LABELS,
+  MAX_DAYS,
   type Severity,
   type ThresholdUnit,
+  UPDATE_CATEGORY_CHOICES,
+  type UpdateCategoryChoice,
   ruleForm,
   ruleFormProblem,
   ruleInput,
+  updateCategoryChoiceLabel,
+  usesDays,
   usesDuration,
   usesThreshold,
   withCondition,
@@ -30,6 +35,9 @@ const CONDITION_HELP: Record<Condition, string> = {
   cpu: "The device's CPU load, averaged over the duration, is above the threshold.",
   memory: "The device's memory use, averaged over the duration, is above the threshold.",
   script_failed: "A toolbox script run on the device couldn't start, timed out, or never reported back. Its alert stays until someone resolves it.",
+  updates_pending: "The device's last scan lists updates of the chosen kind that have been pending longer than this. It resolves itself once they're installed.",
+  update_install_failed: "An install of operating system updates on the device failed, partly failed, or never reported back. Its alert stays until someone resolves it.",
+  reboot_pending: "The device has needed a restart to finish installing updates for longer than this. It resolves itself after the restart.",
 };
 
 // Creates a rule, or edits one. A rule's condition can't change once saved.
@@ -114,6 +122,23 @@ export function RuleEditor({ rule, channels, returnFocus, onClose, onSaved }: {
                   </span>
                 </label>
               )}
+            </div>
+          )}
+          {usesDays(form.condition) && (
+            <div className="script-editor-row">
+              {form.condition === "updates_pending" && (
+                <label htmlFor="rule-update-category">Updates
+                  <select id="rule-update-category" value={form.updateCategory} onChange={(event) => update({ updateCategory: event.target.value as UpdateCategoryChoice })}>
+                    {UPDATE_CATEGORY_CHOICES.map((choice) => <option key={choice} value={choice}>{updateCategoryChoiceLabel(choice)}</option>)}
+                  </select>
+                </label>
+              )}
+              <label htmlFor="rule-days">Pending for more than
+                <span className="input-with-unit">
+                  <input id="rule-days" type="number" inputMode="numeric" min={1} max={MAX_DAYS} step={1} required value={form.days} onChange={(event) => update({ days: event.target.value })} />
+                  <span aria-hidden="true">days</span>
+                </span>
+              </label>
             </div>
           )}
           {form.condition === "script_failed" && (

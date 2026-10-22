@@ -42,9 +42,17 @@ MeshRMM is in heavy development and not production ready.
 - Jobs that run a script or send a file on chosen devices, whole companies or
   every device, skip devices without the script's interpreter, wait for
   offline ones, and show each device's result and output live.
-- Automation policies that run shared scripts every few minutes or hours,
-  daily or weekly at a time in any time zone, once, or on each newly
-  enrolled device, and notify when their jobs fail.
+- Automation policies that run shared scripts, or scan for and install
+  updates, every few minutes or hours, daily or weekly at a time in any time
+  zone, once, or on each newly enrolled device, and notify when their jobs
+  fail.
+- Patch management: Agents scan for pending Windows Update, macOS Software
+  Update, APT, DNF and pacman updates, with their category, severity and
+  whether they need a restart; install chosen updates, categories such as
+  security only, or everything, on one device or many, and restart never,
+  if required or always after a warning; per-update results and a history,
+  a fleet overview of pending security updates, failed installs and pending
+  restarts, and alerts when updates or restarts stay pending.
 - Saved Windows credentials, encrypted on the device, that fill sign-in and
   UAC prompts with one click.
 
@@ -61,7 +69,8 @@ MeshRMM is in heavy development and not production ready.
   applications with a change log, on each device's page; a fleet-wide search
   for which devices have an application in which version.
 - Alerts: rules for devices going offline, low disk space, sustained CPU or
-  memory load, and failed scripts, for every device or chosen companies.
+  memory load, failed scripts, updates or restarts pending too long, and
+  failed update installs, for every device or chosen companies.
   Alerts are acknowledged and resolved in the website, resolve themselves
   when the condition passes, and notify by email or signed webhook.
 - Enrollment with a single-use installer (Windows) or install command
@@ -85,7 +94,8 @@ MeshRMM is in heavy development and not production ready.
 - Built-in accounts with passwords, authenticator apps, recovery codes and
   passkeys, plus optional single sign-on (OIDC) and SCIM provisioning.
 - Custom roles built from a list of permissions, and an audit log of
-  sign-ins, changes, sessions, script runs, file deliveries and jobs.
+  sign-ins, changes, sessions, script runs, file deliveries, update installs
+  and jobs.
 - Email for invitations, resets and alerts is optional; without it the
   website gives one-time links to copy, and alerts go to webhooks.
 
@@ -174,6 +184,8 @@ For developers:
 - [Background mode](docs/background-mode.md): the Session 0 workspace and its
   built-in tools
 - [Toolbox](docs/toolbox.md): scripts and files
+- [Patch management](docs/patch-management.md): scanning for and installing
+  operating system updates
 - [Automation](docs/automation.md): jobs on many devices and scheduled
   policies
 - [Hardware and software](docs/hardware-and-software.md): what the Agents

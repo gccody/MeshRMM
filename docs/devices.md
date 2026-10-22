@@ -110,7 +110,14 @@ installed applications of every device. The device wall's search matches
 the operating system, model, serial number and IP addresses too. See
 [hardware and software](hardware-and-software.md).
 
-## Updates
+## Operating system updates
+
+The device page's **Updates** tab lists the updates the computer has
+pending, scans it, installs chosen updates or all of them, and shows its
+update history; the **Updates** page gives the fleet's overview. See
+[patch management](patch-management.md).
+
+## Agent updates
 
 The service checks the server's update manifest when it starts and every six
 hours after. For a newer release it:

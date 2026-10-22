@@ -119,6 +119,8 @@ test("the rule form sends only what its condition uses", () => {
     threshold_unit: null,
     duration_minutes: 15,
     nonzero_exit_fails: false,
+    update_category: null,
+    days: null,
     all_companies: true,
     company_ids: [],
     channel_ids: [],
