@@ -96,6 +96,8 @@ async fn agents_send_system_information_the_website_shows_and_searches() {
             receive_any_json(&mut control).await["type"],
             "collect_system_info"
         );
+        // And for an update scan.
+        assert_eq!(receive_any_json(&mut control).await["type"], "scan_updates");
         receive_json(&mut events).await;
 
         send_json(
@@ -298,13 +300,12 @@ async fn agents_send_system_information_the_website_shows_and_searches() {
         receive_json(&mut events).await;
         let mut control = desk.connect(&server).await.unwrap();
         receive_json(&mut events).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(500), receive_any_json(&mut control))
-                .await
-                .is_err(),
-            "{}",
-            app.name
-        );
+        // It is asked for an update scan, as it has never sent one.
+        while let Ok(message) =
+            tokio::time::timeout(Duration::from_millis(500), receive_any_json(&mut control)).await
+        {
+            assert_eq!(message["type"], "scan_updates", "{}", app.name);
+        }
         drop(control);
         receive_json(&mut events).await;
         app.db()
