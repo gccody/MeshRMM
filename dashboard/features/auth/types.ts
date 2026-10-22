@@ -28,6 +28,8 @@ export type Permission =
   | "sessions.connect"
   | "sessions.connect_background"
   | "sessions.close_any"
+  | "terminal.connect"
+  | "terminal.connect_system"
   | "scripts.run"
   | "scripts.manage_shared"
   | "files.deliver"

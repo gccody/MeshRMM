@@ -31,6 +31,8 @@ pub struct Settings {
     /// How often online devices scan for updates; 0 leaves it to users and
     /// policies.
     pub update_scan_interval_hours: i64,
+    /// Remote terminals with no input for this long are closed.
+    pub terminal_idle_timeout_minutes: i64,
     pub smtp_host: Option<String>,
     pub smtp_port: Option<i64>,
     pub smtp_security: String,
@@ -48,7 +50,7 @@ impl Settings {
     }
 }
 
-const COLUMNS: [SettingsTable; 30] = [
+const COLUMNS: [SettingsTable; 31] = [
     SettingsTable::InstanceName,
     SettingsTable::DashboardIdleTimeoutMinutes,
     SettingsTable::BlackoutMessage,
@@ -71,6 +73,7 @@ const COLUMNS: [SettingsTable; 30] = [
     SettingsTable::PasswordMinLength,
     SettingsTable::SessionLifetimeHours,
     SettingsTable::UpdateScanIntervalHours,
+    SettingsTable::TerminalIdleTimeoutMinutes,
     SettingsTable::SmtpHost,
     SettingsTable::SmtpPort,
     SettingsTable::SmtpSecurity,

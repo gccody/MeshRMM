@@ -42,6 +42,7 @@ const company = {
   connection_approval_timeout_seconds: 45,
   connection_approval_lock_idle_seconds: 0,
   update_scan_interval_hours: 12,
+  terminal_idle_timeout_minutes: 60,
 };
 
 test("drafts start from the saved settings, or the defaults before they load", () => {
@@ -65,6 +66,7 @@ test("drafts start from the saved settings, or the defaults before they load", (
     connectionApprovalTimeoutSeconds: 45,
     connectionApprovalLockIdleSeconds: 0,
     updateScanIntervalHours: 12,
+    terminalIdleTimeoutMinutes: 60,
   });
   assert.deepEqual(draftFromSettings(null), {
     instanceName: "",
@@ -86,6 +88,7 @@ test("drafts start from the saved settings, or the defaults before they load", (
     connectionApprovalTimeoutSeconds: 30,
     connectionApprovalLockIdleSeconds: 60,
     updateScanIntervalHours: 24,
+    terminalIdleTimeoutMinutes: 30,
   });
 });
 
@@ -109,6 +112,7 @@ test("saving is offered only when a draft differs from the saved settings", () =
     { backgroundConnectionNotification: false },
     { connectionNotificationMessage: "Hello" },
     { updateScanIntervalHours: 0 },
+    { terminalIdleTimeoutMinutes: 30 },
     { connectionApproval: false },
     { connectionApprovalMessage: "Hello" },
     { connectionApprovalTimeoutSeconds: 30 },
@@ -186,6 +190,7 @@ test("the saved body uses the server's field names", () => {
     connection_approval_timeout_seconds: 45,
     connection_approval_lock_idle_seconds: 0,
     update_scan_interval_hours: 12,
+    terminal_idle_timeout_minutes: 60,
   });
   // Never is sent as null, which the server requires rather than defaults.
   assert.equal(

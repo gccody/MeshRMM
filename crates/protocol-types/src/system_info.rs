@@ -70,6 +70,9 @@ pub struct OperatingSystem {
     /// `winget`, `softwareupdate`, `homebrew`, `apt`, `dnf` or `pacman`.
     #[serde(default)]
     pub package_managers: Vec<String>,
+    /// The shells a remote terminal can run here.
+    #[serde(default)]
+    pub terminal_shells: Vec<crate::TerminalShell>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +345,13 @@ impl SystemInfo {
         clean_field(&mut os.architecture);
         clean_option(&mut os.time_zone);
         clean_list(&mut os.package_managers);
+        let mut shells = Vec::new();
+        for shell in os.terminal_shells.drain(..) {
+            if !shells.contains(&shell) {
+                shells.push(shell);
+            }
+        }
+        os.terminal_shells = shells;
 
         let hardware = &mut self.hardware;
         clean_option(&mut hardware.manufacturer);
@@ -443,6 +453,7 @@ mod tests {
                 boot_time_unix_ms: Some(1_699_990_000_000),
                 time_zone: Some("Europe/Berlin".into()),
                 package_managers: vec!["apt".into(), "snap".into()],
+                terminal_shells: vec![crate::TerminalShell::Login, crate::TerminalShell::Bash],
             },
             hardware: Hardware {
                 manufacturer: Some("Microsoft Corporation".into()),

@@ -44,6 +44,16 @@ test("pages open to the permissions that use them", () => {
   assert.equal(canView(null, "account"), false);
 });
 
+test("the terminal page opens to either terminal permission and sits under Devices", () => {
+  assert.equal(viewForPath("/terminal"), "terminal");
+  assert.equal(canView(account(["devices.view", "terminal.connect"]), "terminal"), true);
+  assert.equal(canView(account(["devices.view", "terminal.connect_system"]), "terminal"), true);
+  assert.equal(canView(account(["devices.view", "scripts.run"]), "terminal"), false);
+  assert.equal(navViewFor("terminal"), "devices");
+  // It needs a device, so nobody lands on it.
+  assert.equal(homeView(account(["terminal.connect"])), "account");
+});
+
 test("users land on Devices, or their first page without it", () => {
   assert.equal(homeView(account(["devices.view"])), "devices");
   assert.equal(homeView(account(["users.manage", "audit.view"])), "users");

@@ -26,6 +26,8 @@ export type GeneralSettings = {
   // Devices look for operating system updates this often; 0 only when asked
   // or by policies.
   update_scan_interval_hours: number;
+  // Terminals with no input for this long are closed.
+  terminal_idle_timeout_minutes: number;
   updated_at: number;
 };
 
@@ -58,6 +60,10 @@ export function formatScanInterval(hours: number) {
 // The server accepts only these idle times, in minutes, or null for never.
 export const IDLE_DISCONNECT_MINUTES = [5, 10, 15, 30, 60, 120, 240, 480] as const;
 
+// Terminals close after one of these idle times, in minutes.
+export const TERMINAL_IDLE_TIMEOUT_MINUTES = [5, 10, 15, 30, 60, 120, 240, 480] as const;
+export const DEFAULT_TERMINAL_IDLE_TIMEOUT_MINUTES = 30;
+
 export function formatIdleDisconnect(minutes: number | null) {
   if (minutes === null) return "Never";
   if (minutes < 60) return `${minutes} minutes`;
@@ -68,6 +74,7 @@ export function formatIdleDisconnect(minutes: number | null) {
 export const SETTINGS_TABS = [
   { id: "general", label: "General" },
   { id: "remote-sessions", label: "Remote sessions" },
+  { id: "terminals", label: "Terminals" },
   { id: "blackout", label: "Blackout message" },
   { id: "connection-notification", label: "Connection notification" },
   { id: "connection-approval", label: "Connection approval" },
@@ -94,6 +101,7 @@ export type SettingsDraft = {
   connectionApprovalTimeoutSeconds: number;
   connectionApprovalLockIdleSeconds: number;
   updateScanIntervalHours: number;
+  terminalIdleTimeoutMinutes: number;
 };
 
 // The saved values, or the defaults a server starts with.
@@ -118,6 +126,7 @@ export function draftFromSettings(settings: GeneralSettings | null | undefined):
     connectionApprovalTimeoutSeconds: settings?.connection_approval_timeout_seconds ?? DEFAULT_CONNECTION_APPROVAL_TIMEOUT_SECONDS,
     connectionApprovalLockIdleSeconds: settings?.connection_approval_lock_idle_seconds ?? DEFAULT_CONNECTION_APPROVAL_LOCK_IDLE_SECONDS,
     updateScanIntervalHours: settings?.update_scan_interval_hours ?? DEFAULT_UPDATE_SCAN_INTERVAL_HOURS,
+    terminalIdleTimeoutMinutes: settings?.terminal_idle_timeout_minutes ?? DEFAULT_TERMINAL_IDLE_TIMEOUT_MINUTES,
   };
 }
 
@@ -142,7 +151,8 @@ export function draftMatchesSettings(draft: SettingsDraft, settings: GeneralSett
     draft.connectionApprovalMessage === saved.connectionApprovalMessage &&
     draft.connectionApprovalTimeoutSeconds === saved.connectionApprovalTimeoutSeconds &&
     draft.connectionApprovalLockIdleSeconds === saved.connectionApprovalLockIdleSeconds &&
-    draft.updateScanIntervalHours === saved.updateScanIntervalHours
+    draft.updateScanIntervalHours === saved.updateScanIntervalHours &&
+    draft.terminalIdleTimeoutMinutes === saved.terminalIdleTimeoutMinutes
   );
 }
 
@@ -217,6 +227,7 @@ export function settingsBody(draft: SettingsDraft) {
     connection_approval_timeout_seconds: draft.connectionApprovalTimeoutSeconds,
     connection_approval_lock_idle_seconds: draft.connectionApprovalLockIdleSeconds,
     update_scan_interval_hours: draft.updateScanIntervalHours,
+    terminal_idle_timeout_minutes: draft.terminalIdleTimeoutMinutes,
   };
 }
 

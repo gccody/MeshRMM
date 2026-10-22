@@ -125,6 +125,11 @@ pub enum AgentCommand {
     InstallUpdates {
         install: crate::UpdateInstallRequest,
     },
+    /// Starts a shell on a pseudo-terminal and connects its socket; see
+    /// [`crate::TerminalRequest`].
+    OpenTerminal {
+        terminal: crate::TerminalRequest,
+    },
 }
 
 /// Agent-to-coordinator lifecycle notifications and reports.
