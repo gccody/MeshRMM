@@ -455,7 +455,10 @@ Then, in the website:
 - **Authentication** sets the sign-in policy (password rules, required
   two-factor), single sign-on with an OIDC provider, and SCIM provisioning
   tokens. Only administrators can change single sign-on, SCIM and email,
-  because whoever controls them can sign in as anyone.
+  because whoever controls them can sign in as anyone. Its **API tokens**
+  tab turns users' [API tokens](api.md) on or off, limits how long they last
+  (365 days unless you change it), and lists everyone's tokens for whoever
+  holds `api_tokens.manage`.
 - **Settings** holds the company's remote-session policy and how long an
   idle [terminal](terminal.md) stays open.
 - **Alerts** holds the alert rules and the email and webhook channels they
@@ -610,7 +613,10 @@ restore the backup taken before the upgrade.
   `log.level` to a tracing filter such as `meshrmm_server=debug,info` to
   investigate a problem.
 - **Audit** in the website lists sign-ins, account and role changes, setting
-  changes, enrollments, remote sessions, script runs and file deliveries.
+  changes, enrollments, remote sessions, script runs and file deliveries,
+  and names the API token when someone acted with one.
+- API tokens, session cookies and Agent credentials travel in headers,
+  which the server doesn't log, so they never appear in its logs.
 - On `SIGTERM` the server stops taking new connections and gives open
   requests 10 seconds to finish.
 

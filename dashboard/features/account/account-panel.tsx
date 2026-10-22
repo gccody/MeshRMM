@@ -7,6 +7,7 @@ import { useResource } from "../../lib/use-resource";
 import { NewPasswordFields, newPasswordProblem } from "../auth/password-fields";
 import { useSession } from "../auth/session";
 import { signInMethodLabel } from "../auth/sign-in";
+import { ApiTokensSection } from "../api-tokens/api-tokens-section";
 import { useWorkspace } from "../workspace/workspace-context";
 import { twoFactorSummary } from "./model";
 import { PasskeysSection } from "./passkeys-section";
@@ -30,6 +31,7 @@ export function AccountPanel() {
       {!enrolling && <ProfileSection />}
       <PasswordSection />
       <SessionsSection />
+      {!enrolling && <ApiTokensSection />}
     </div>
   );
 }

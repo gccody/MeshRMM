@@ -401,10 +401,58 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
                 .unwrap();
         }
 
+        database
+            .execute(
+                &Query::insert()
+                    .into_table("users")
+                    .columns(["id", "email", "display_name", "created_at", "updated_at"])
+                    .values_panic([
+                        "token-user".into(),
+                        "tokens@example.com".into(),
+                        "Tokens".into(),
+                        0.into(),
+                        0.into(),
+                    ])
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        for (id, expires_at) in [
+            ("long-expired", Some(NOW - 31 * DAY_MS)),
+            ("expired", Some(NOW - DAY_MS)),
+            ("never", None),
+        ] {
+            database
+                .execute(
+                    &Query::insert()
+                        .into_table("api_tokens")
+                        .columns([
+                            "id",
+                            "user_id",
+                            "name",
+                            "token_hash",
+                            "created_at",
+                            "expires_at",
+                        ])
+                        .values_panic([
+                            id.into(),
+                            "token-user".into(),
+                            id.into(),
+                            format!("{id:0>64}").into(),
+                            0.into(),
+                            expires_at.into(),
+                        ])
+                        .to_owned(),
+                )
+                .await
+                .unwrap();
+        }
+
         let purged = maintenance::purge(database, NOW).await.unwrap();
         assert_eq!(
             purged,
             Purged {
+                api_tokens: 1,
                 handoffs: 1,
                 script_runs: 1,
                 device_metrics: 1,
@@ -429,6 +477,12 @@ async fn maintenance_purges_only_expired_rows_and_old_history() {
             .unwrap();
         assert_eq!(remaining, [("recent".to_owned(),)], "{}", test.name);
         assert_eq!(count(database, "alerts").await, 2, "{}", test.name);
+        assert_eq!(
+            count(database, "api_tokens").await,
+            2,
+            "expired API tokens stay listed for a while: {}",
+            test.name
+        );
         assert_eq!(
             count(database, "wake_relays").await,
             1,

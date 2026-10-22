@@ -2,6 +2,7 @@ import { CircleAlert, CircleCheck, LoaderCircle, X } from "lucide-react";
 import { type RefObject, useEffect, useId, useRef, useState } from "react";
 import { AuthenticationRequired, errorText } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
+import { useNow as useClock } from "../../lib/use-now";
 import type { Agent } from "../agents/types";
 import { useWorkspace } from "../workspace/workspace-context";
 import { NOT_ONLINE_HINT, type Wake, type WakeState, isSettling, relayText, wakeHeadline, wakeState, wakeTitle, wakeTone } from "./model";
@@ -14,13 +15,8 @@ const SETTLE_POLL_MS = 2_000;
 const TICK_MS = 5_000;
 
 // The current time, every few seconds.
-export function useNow(intervalMs = TICK_MS) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), intervalMs);
-    return () => window.clearInterval(timer);
-  }, [intervalMs]);
-  return now;
+export function useNow() {
+  return useClock(TICK_MS);
 }
 
 // Reads wakes again while their relays haven't all reported.

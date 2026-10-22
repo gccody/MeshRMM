@@ -607,6 +607,7 @@ td.row-actions > * + * { margin-left: 6px; }
 .category-panel .management-panel { padding: 0; display: block; border: 0; }
 .category-panel .management-panel > * + * { margin-top: 18px; }
 .category-panel .management-heading h2 { font-size: 20px; }
+.category-panel .management-panel + .management-panel { margin-top: 36px; padding-top: 28px; border-top: 1px solid var(--rule); }
 .settings-section[hidden] { display: none; }
 .settings-section:focus-visible { outline-offset: 8px; border-radius: 4px; }
 .settings-section h2 { font-size: 20px; }

@@ -9,6 +9,7 @@ use serde_json::json;
 
 use super::{double_option, require_administrator, setup::validate_instance_name};
 use crate::{
+    api_tokens,
     audit::{self, Target},
     auth::Authorized,
     db::tables::Settings as SettingsTable,
@@ -339,6 +340,9 @@ pub struct AuthenticationSettings {
     require_two_factor: bool,
     password_min_length: i64,
     session_lifetime_hours: i64,
+    api_tokens_enabled: bool,
+    /// `None`: no limit, so tokens may never expire.
+    api_token_max_lifetime_days: Option<i64>,
 }
 
 impl From<Settings> for AuthenticationSettings {
@@ -347,6 +351,8 @@ impl From<Settings> for AuthenticationSettings {
             require_two_factor: settings.require_two_factor,
             password_min_length: settings.password_min_length,
             session_lifetime_hours: settings.session_lifetime_hours,
+            api_tokens_enabled: settings.api_tokens_enabled,
+            api_token_max_lifetime_days: settings.api_token_max_lifetime_days,
         }
     }
 }
@@ -369,10 +375,20 @@ pub struct AuthenticationUpdate {
     password_min_length: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_lifetime_hours: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_tokens_enabled: Option<bool>,
+    /// `null` removes the limit.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    api_token_max_lifetime_days: Option<Option<u32>>,
 }
 
 /// `PATCH /v1/settings/authentication`. A new session lifetime applies to
-/// sessions started afterwards.
+/// sessions started afterwards; a lower API token lifetime cap shortens
+/// existing tokens too.
 pub async fn update_authentication(
     State(state): State<AppState>,
     actor: Authorized,
@@ -397,18 +413,36 @@ pub async fn update_authentication(
         )?;
         values.push((SettingsTable::SessionLifetimeHours, i64::from(hours).into()));
     }
+    if let Some(enabled) = request.api_tokens_enabled {
+        values.push((SettingsTable::ApiTokensEnabled, enabled.into()));
+    }
+    if let Some(days) = request.api_token_max_lifetime_days {
+        if let Some(days) = days {
+            check(
+                (1..=api_tokens::MAX_LIFETIME_DAYS).contains(&days),
+                "the longest API token lifetime must be between 1 and 3650 days",
+            )?;
+        }
+        values.push((
+            SettingsTable::ApiTokenMaxLifetimeDays,
+            days.map(i64::from).into(),
+        ));
+    }
     let metadata = serde_json::to_value(&request).unwrap_or_default();
-    Ok(Json(
-        save(
-            &state,
-            &actor,
-            "settings.authentication_update",
-            values,
-            metadata,
-        )
-        .await?
-        .into(),
-    ))
+    let settings = save(
+        &state,
+        &actor,
+        "settings.authentication_update",
+        values,
+        metadata,
+    )
+    .await?;
+    if request.api_token_max_lifetime_days.is_some()
+        && let Some(days) = settings.api_token_max_lifetime_days
+    {
+        api_tokens::apply_lifetime_cap(&mut &state.database, days).await?;
+    }
+    Ok(Json(settings.into()))
 }
 
 #[derive(Debug, Serialize)]

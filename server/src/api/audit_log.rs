@@ -32,6 +32,9 @@ pub struct AuditQuery {
     /// An action such as `user.update`, or a prefix such as `user.`.
     #[serde(default)]
     action: Option<String>,
+    /// Only what was done with this personal API token.
+    #[serde(default)]
+    api_token_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -72,6 +75,7 @@ pub async fn list(
         actor_user_id: query.actor_user_id,
         target,
         action: query.action,
+        api_token_id: query.api_token_id,
         before,
     };
     let events = audit::list(&mut &state.database, &filter, limit).await?;

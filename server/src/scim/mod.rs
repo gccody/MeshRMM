@@ -272,6 +272,7 @@ impl FromRequestParts<AppState> for ScimClient {
                 user_id: None,
                 label: format!("SCIM ({})", row.name),
                 ip: Some(ip),
+                api_token: None,
             },
         })
     }
