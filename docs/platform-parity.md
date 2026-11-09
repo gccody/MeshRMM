@@ -143,6 +143,34 @@ yet.
   `shutdown`, which reaches terminals (`wall`) but shows nothing on the
   desktop; a desktop notice would need the session helpers (not implemented).
 
+## Application deployment
+
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| [Package managers](application-deployment.md#package-managers) | winget, Chocolatey | Homebrew formulae and casks | Flatpak (system installation), Snap |
+| Runs as | SYSTEM | The Homebrew installation's owner | root |
+| List installed and outdated | Yes | Yes | Yes; Flatpak updates without a version show as "a newer build" |
+| Install a pinned version | Yes | No | No |
+| Custom installers | `.msi`, `.exe`, `.ps1`, `.cmd`, `.bat` | `.pkg`, `.sh` | `.deb`, `.rpm`, `.sh`, `.run`, `.bin` |
+| Detection rules | Application, file, registry | Application, file | Application, file |
+| Uninstall any listed program | Yes, installed for every user, with a quiet uninstaller or as a Windows Installer package | No | No |
+
+- **Windows:** winget is registered for signed-in users only, so the SYSTEM
+  service runs the App Installer package's `winget.exe` directly. Per-user
+  programs can't be uninstalled, since they live in a user's registry hive
+  and often need that user signed in.
+- **macOS:** Homebrew refuses to run as root, so the Agent runs it as the
+  owner of its installation with `sudo -n`; a Homebrew owned by root is
+  refused, and a cask whose installer asks for a password fails. Homebrew
+  installs only its current version, so a pinned version holds the
+  application back from updates but can't be installed.
+- **Linux:** distribution packages are
+  [patch management](patch-management.md)'s. Flatpak and Snap install their
+  current version only. Snap is used only where `snapd` runs.
+- Uninstalling a program that no package manager knows needs the Windows
+  registry's uninstall entries; macOS and Linux have no equivalent, so a
+  custom installer's uninstall command does it there.
+
 ## Toolbox
 
 | | Windows | macOS | Linux |

@@ -29,6 +29,7 @@ use super::{
     schedule::{self, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES, Trigger, Weekdays},
 };
 use crate::{
+    applications::policies::PolicySpec,
     audit::{self, Actor, Target as AuditTarget},
     db::{
         self, Executor,
@@ -82,6 +83,8 @@ pub enum ActionKind {
     UpdateScan,
     UpdateInstall,
     Wake,
+    AppInstall,
+    AppUpdate,
 }
 
 impl ActionKind {
@@ -91,6 +94,8 @@ impl ActionKind {
             Self::UpdateScan => "update_scan",
             Self::UpdateInstall => "update_install",
             Self::Wake => "wake",
+            Self::AppInstall => "app_install",
+            Self::AppUpdate => "app_update",
         }
     }
 
@@ -100,6 +105,8 @@ impl ActionKind {
             "update_scan" => Some(Self::UpdateScan),
             "update_install" => Some(Self::UpdateInstall),
             "wake" => Some(Self::Wake),
+            "app_install" => Some(Self::AppInstall),
+            "app_update" => Some(Self::AppUpdate),
             _ => None,
         }
     }
@@ -112,6 +119,7 @@ impl ActionKind {
             Self::UpdateScan => Permission::UpdatesView,
             Self::UpdateInstall => Permission::UpdatesInstall,
             Self::Wake => Permission::DevicesWake,
+            Self::AppInstall | Self::AppUpdate => Permission::ApplicationsDeploy,
         }
     }
 }
@@ -132,6 +140,11 @@ pub enum Action {
     },
     /// Wakes the devices that are offline.
     Wake,
+    /// Installs (`install`) or updates applications.
+    Applications {
+        install: bool,
+        spec: PolicySpec,
+    },
 }
 
 impl Action {
@@ -141,7 +154,15 @@ impl Action {
             Self::UpdateScan => ActionKind::UpdateScan,
             Self::UpdateInstall { .. } => ActionKind::UpdateInstall,
             Self::Wake => ActionKind::Wake,
+            Self::Applications { install: true, .. } => ActionKind::AppInstall,
+            Self::Applications { install: false, .. } => ActionKind::AppUpdate,
         }
+    }
+
+    /// Whether it keeps applications installed, which newly enrolled
+    /// devices it covers get whatever its trigger.
+    pub fn installs_applications(&self) -> bool {
+        matches!(self, Self::Applications { install: true, .. })
     }
 
     pub fn script_id(&self) -> Option<&str> {
@@ -173,6 +194,9 @@ pub struct PolicyInput {
     pub reboot: Option<RebootBehavior>,
     #[serde(default)]
     pub reboot_delay_minutes: Option<i64>,
+    /// For an application policy.
+    #[serde(default)]
+    pub applications: Option<PolicySpec>,
     pub target: TargetKind,
     #[serde(default)]
     pub device_ids: Vec<String>,
@@ -247,6 +271,13 @@ impl PolicyInput {
             }
             ActionKind::UpdateScan => Action::UpdateScan,
             ActionKind::Wake => Action::Wake,
+            ActionKind::AppInstall | ActionKind::AppUpdate => {
+                let install = self.action == ActionKind::AppInstall;
+                Action::Applications {
+                    install,
+                    spec: PolicySpec::validate(self.applications, install)?,
+                }
+            }
             ActionKind::UpdateInstall => {
                 let reboot_delay_minutes = match self.reboot_delay_minutes {
                     None => DEFAULT_REBOOT_DELAY_MINUTES,
@@ -398,6 +429,9 @@ impl Valid {
                 )))
             }
         };
+        if let Action::Applications { spec, .. } = &self.action {
+            spec.check_references(executor).await?;
+        }
         self.target.check_references(executor).await?;
         if !self.channel_ids.is_empty() {
             let found: Vec<(String,)> = executor
@@ -472,6 +506,7 @@ pub struct PolicyView {
     pub update_categories: Option<Vec<UpdateCategory>>,
     pub reboot: Option<RebootBehavior>,
     pub reboot_delay_minutes: Option<u32>,
+    pub applications: Option<PolicySpec>,
     #[serde(flatten)]
     pub target: Target,
     pub trigger: &'static str,
@@ -543,6 +578,10 @@ impl Policy {
             ),
             _ => (None, None, None),
         };
+        let applications = match &self.action {
+            Action::Applications { spec, .. } => Some(spec.clone()),
+            _ => None,
+        };
         PolicyView {
             owned_by_you: self.owner_user_id == user_id,
             trigger: self.trigger.kind(),
@@ -558,6 +597,7 @@ impl Policy {
             update_categories,
             reboot,
             reboot_delay_minutes,
+            applications,
             target: self.target,
             interval_minutes,
             time,
@@ -615,7 +655,7 @@ struct PolicyRow {
     updated_at: i64,
 }
 
-fn action_of(row: &PolicyRow) -> Option<Action> {
+fn action_of(row: &PolicyRow, applications: Option<&PolicySpec>) -> Option<Action> {
     Some(match ActionKind::parse(&row.action)? {
         ActionKind::Script => Action::Script {
             script_id: row.script_id.clone()?,
@@ -627,6 +667,10 @@ fn action_of(row: &PolicyRow) -> Option<Action> {
             categories: Install::parse_categories(row.update_categories.as_deref()),
             reboot: RebootBehavior::parse(row.reboot.as_deref()?)?,
             reboot_delay_minutes: u32::try_from(row.reboot_delay_minutes?).ok()?,
+        },
+        kind @ (ActionKind::AppInstall | ActionKind::AppUpdate) => Action::Applications {
+            install: kind == ActionKind::AppInstall,
+            spec: applications?.clone(),
         },
     })
 }
@@ -777,6 +821,7 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
     let devices = grouped(executor.fetch_all(&devices).await?);
     let tags = grouped(executor.fetch_all(&tags).await?);
     let channels = grouped(executor.fetch_all(&channels).await?);
+    let applications = crate::applications::policies::load(executor, id).await?;
     Ok(rows
         .into_iter()
         .filter_map(|row| {
@@ -788,7 +833,7 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
             };
             let (Some(trigger), Some(action), Some(target), Some(offline)) = (
                 trigger_of(&row),
-                action_of(&row),
+                action_of(&row, applications.get(&row.id)),
                 Target::from_stored(&row.target, &row.tag_match, choice),
                 Offline::parse(&row.offline),
             ) else {
@@ -1029,6 +1074,11 @@ pub async fn save(
             executor.execute(&insert).await?;
         }
     }
+    let applications = match &policy.action {
+        Action::Applications { spec, .. } => Some(spec),
+        _ => None,
+    };
+    crate::applications::policies::save(executor, id, applications).await?;
     Ok(())
 }
 
@@ -1066,6 +1116,19 @@ async fn payload(executor: &mut impl Executor, policy: &Policy) -> db::Result<Op
         Action::Script { script_id, run_as } => (script_id, *run_as),
         Action::UpdateScan => return Ok(Some(Payload::UpdateScan)),
         Action::Wake => return Ok(Some(Payload::Wake)),
+        Action::Applications { install, spec } => {
+            return Ok(match spec.spec(executor, *install).await {
+                Ok(spec) => Some(Payload::Applications(Box::new(spec))),
+                Err(error) => {
+                    tracing::warn!(
+                        policy_id = policy.id,
+                        error = error.message(),
+                        "an application policy's applications are unusable"
+                    );
+                    None
+                }
+            });
+        }
         Action::UpdateInstall {
             categories,
             reboot,
@@ -1132,7 +1195,11 @@ async fn start_job(
     }
     let Some(payload) = payload(executor, policy).await? else {
         return Ok(Err(
-            "Its script was deleted or is no longer shared".to_owned()
+            if matches!(policy.action, Action::Applications { .. }) {
+                "Its applications are no longer in the library".to_owned()
+            } else {
+                "Its script was deleted or is no longer shared".to_owned()
+            },
         ));
     };
     if supersede {
@@ -1361,7 +1428,9 @@ pub async fn device_enrolled(state: &AppState, device_id: &str, now: i64) -> any
     let policies = load(&mut database, None).await?;
     let mut started = 0;
     for policy in policies.iter().filter(|policy| {
-        policy.enabled && policy.trigger == Trigger::Enroll && policy.target.covers(&device)
+        policy.enabled
+            && (policy.trigger == Trigger::Enroll || policy.action.installs_applications())
+            && policy.target.covers(&device)
     }) {
         let mut transaction = state.database.begin().await?;
         let mut enrolling = policy.clone();

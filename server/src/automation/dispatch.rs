@@ -205,7 +205,13 @@ async fn in_flight(
         )
         .await?;
     let wanted = devices.iter().collect::<HashSet<_>>();
-    for (device_id, count) in runs.into_iter().chain(deliveries).chain(updates) {
+    let applications = crate::applications::runs::awaiting(&mut &state.database, now).await?;
+    for (device_id, count) in runs
+        .into_iter()
+        .chain(deliveries)
+        .chain(updates)
+        .chain(applications)
+    {
         total += count;
         if wanted.contains(&device_id) {
             *per_device.entry(device_id).or_default() += count;
@@ -431,6 +437,9 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
     {
         return Ok(false);
     }
+    if kind.is_application() && crate::applications::busy(&mut &state.database, device_id).await? {
+        return Ok(false);
+    }
     let id = new_id();
     let mut transaction = state.database.begin().await?;
     let command = match kind {
@@ -559,6 +568,51 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
         }
         // Started together by `start_wakes`.
         Kind::Wake => return Ok(false),
+        Kind::AppInstall | Kind::AppUpdate | Kind::AppUninstall => {
+            let started = crate::applications::start_job_run(
+                &mut transaction,
+                &crate::applications::Start {
+                    run_id: &id,
+                    device_id,
+                    requested_by_user_id: &job.requested_by_user_id,
+                    policy_name: job.policy_name.as_deref(),
+                    job_id: Some(&job.id),
+                    now,
+                },
+            )
+            .await;
+            match started {
+                Ok(crate::applications::JobStart::Run(command)) => command,
+                // Nothing in it is for the device: skipped, not failed.
+                Ok(crate::applications::JobStart::Skip(reason)) => {
+                    transaction
+                        .execute(
+                            &Query::update()
+                                .table(JobDevices::Table)
+                                .value(JobDevices::State, DeviceState::Skipped.as_str())
+                                .value(JobDevices::Detail, reason)
+                                .value(JobDevices::UpdatedAt, now)
+                                .and_where(Expr::col(JobDevices::JobId).eq(job.id.as_str()))
+                                .and_where(Expr::col(JobDevices::DeviceId).eq(device_id))
+                                .and_where(
+                                    Expr::col(JobDevices::State).eq(DeviceState::Queued.as_str()),
+                                )
+                                .to_owned(),
+                        )
+                        .await?;
+                    transaction.commit().await?;
+                    // Skipped, not started: the device is free for the next job.
+                    return Ok(false);
+                }
+                // A run started on the device since `busy` looked; the
+                // device's part waits for it.
+                Err(error) if crate::applications::runs::is_already_pending(&error) => {
+                    transaction.rollback().await?;
+                    return Ok(false);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     };
     let claimed = transaction
         .execute(
@@ -615,6 +669,9 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
         }
         Kind::UpdateScan | Kind::UpdateInstall => {
             update_runs::discard(&mut transaction, &id).await?;
+        }
+        Kind::AppInstall | Kind::AppUpdate | Kind::AppUninstall => {
+            crate::applications::runs::discard(&mut transaction, &id).await?;
         }
         Kind::Wake => {}
     }

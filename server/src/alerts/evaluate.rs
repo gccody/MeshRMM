@@ -271,7 +271,11 @@ pub fn judge(rule: &Rule, device: DeviceState<'_>, tracker: &Tracker, now: i64) 
                 _ => Verdict::Known(Vec::new()),
             }
         }
-        Condition::ScriptFailed | Condition::UpdateInstallFailed => Verdict::Unknown,
+        // Application rules are judged in super::applications.
+        Condition::ScriptFailed
+        | Condition::UpdateInstallFailed
+        | Condition::AppInstallFailed
+        | Condition::AppUpdatesPending => Verdict::Unknown,
     }
 }
 

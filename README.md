@@ -52,7 +52,7 @@ MeshRMM is in heavy development and not production ready.
   tagged devices or every device, skip devices without the script's interpreter, wait for
   offline ones, and show each device's result and output live.
 - Automation policies that run shared scripts, scan for and install
-  updates, or wake offline devices, every few minutes or hours, daily or weekly at a time in any time
+  updates, install and update applications, or wake offline devices, every few minutes or hours, daily or weekly at a time in any time
   zone, once, or on each newly enrolled device, and notify when their jobs
   fail.
 - Patch management: Agents scan for pending Windows Update, macOS Software
@@ -62,6 +62,14 @@ MeshRMM is in heavy development and not production ready.
   if required or always after a warning; per-update results and a history,
   a fleet overview of pending security updates, failed installs and pending
   restarts, and alerts when updates or restarts stay pending.
+- Application deployment: a library of applications to install with winget
+  or Chocolatey on Windows, Homebrew formulae and casks on macOS, Flatpak or
+  Snap on Linux, or a custom installer with silent arguments and a
+  detection rule; install, update and uninstall on one device or many with
+  per-application results; every device's outdated applications and a
+  fleet view of them; policies that keep applications installed (new
+  devices included) and up to date; alerts for failed installs and updates
+  left pending.
 - Saved Windows credentials, encrypted on the device, that fill sign-in and
   UAC prompts with one click.
 
@@ -83,8 +91,9 @@ MeshRMM is in heavy development and not production ready.
   applications with a change log, on each device's page; a fleet-wide search
   for which devices have an application in which version.
 - Alerts: rules for devices going offline, low disk space, sustained CPU or
-  memory load, failed scripts, updates or restarts pending too long, and
-  failed update installs, for every device, chosen companies or tags.
+  memory load, failed scripts, updates or restarts pending too long,
+  failed update installs, failed application installs and application
+  updates pending too long, for every device, chosen companies or tags.
   Alerts are acknowledged and resolved in the website, resolve themselves
   when the condition passes, and notify by email or signed webhook.
 - Wake-on-LAN: wake offline devices, one or many, from the website or a
@@ -114,7 +123,8 @@ MeshRMM is in heavy development and not production ready.
 - Custom roles built from a list of permissions, and an audit log of
   sign-ins, changes, sessions, terminals, file transfers and changes, script
   runs, file deliveries,
-  update installs, wakes and jobs.
+  update installs, application installs, updates and uninstalls, wakes and
+  jobs.
 - Personal API tokens for scripts and integrations: each acts as its user,
   optionally limited to some permissions, expires, and is named in the audit
   log for everything done with it. Administrators can see and revoke every
@@ -216,6 +226,9 @@ For developers:
 - [Toolbox](docs/toolbox.md): scripts and files
 - [Patch management](docs/patch-management.md): scanning for and installing
   operating system updates
+- [Application deployment](docs/application-deployment.md): the application
+  library, package managers and custom installers, and installing, updating
+  and uninstalling third-party applications
 - [Automation](docs/automation.md): jobs on many devices and scheduled
   policies
 - [Hardware and software](docs/hardware-and-software.md): what the Agents

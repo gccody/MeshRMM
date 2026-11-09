@@ -5,6 +5,7 @@ pub mod agents;
 pub mod alerts;
 pub mod api;
 pub mod api_tokens;
+pub mod applications;
 pub mod audit;
 pub mod auth;
 pub mod automation;
@@ -147,6 +148,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let alerting = alerts::spawn(state.clone());
     let automating = automation::spawn(state.clone());
     let updating = updates::spawn(state.clone());
+    let applying = applications::spawn(state.clone());
     let handle = Handle::<SocketAddr>::new();
     tokio::spawn({
         let handle = handle.clone();
@@ -161,6 +163,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     alerting.abort();
     automating.abort();
     updating.abort();
+    applying.abort();
     state.turn.stop().await;
     state.database.close().await;
     served

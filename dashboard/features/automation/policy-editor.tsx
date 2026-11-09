@@ -8,6 +8,7 @@ import { CategoryChoice } from "../updates/bulk-install-dialog";
 import { TagTargetFields } from "../tags/tag-chip";
 import { RebootFields } from "../updates/reboot-fields";
 import { useWorkspace } from "../workspace/workspace-context";
+import { ApplicationPolicyFields } from "../applications/policy-fields";
 import { savePolicy } from "./automation-api";
 import { DevicePicker } from "./device-picker";
 import {
@@ -35,6 +36,8 @@ const ACTION_INTROS: Record<PolicyAction, string> = {
   update_scan: "The server asks the devices to look for operating system updates, as a job, so their lists stay current between the server's own scans.",
   update_install: "The server has the devices install pending operating system updates of the chosen kinds, as a job, and restart as you choose.",
   wake: "The server wakes the devices that are offline with Wake-on-LAN, as a job, through online devices on their network: before a patch window, for example.",
+  app_install: "The server has the devices install the chosen library applications, as a job; devices that have them already are left as they are. It also runs on each device that enrolls, so new devices get them.",
+  app_update: "The server has the devices update outdated applications with their package managers, as a job: all of them, only chosen ones, or all but chosen ones.",
 };
 
 const browserZone = () => currentZoneName(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
@@ -128,6 +131,7 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
             <CategoryChoice categories={draft.updateCategories} onToggle={(category, checked) => update({ updateCategories: checked ? [...draft.updateCategories, category] : draft.updateCategories.filter((candidate) => candidate !== category) })} />
             <RebootFields name="policy-reboot" reboot={draft.reboot} delay={draft.rebootDelayMinutes} onReboot={(reboot) => update({ reboot })} onDelay={(rebootDelayMinutes) => update({ rebootDelayMinutes })} />
           </>}
+          {(draft.action === "app_install" || draft.action === "app_update") && <ApplicationPolicyFields install={draft.action === "app_install"} applicationIds={draft.applicationIds} packages={draft.packages} mode={draft.updateMode} onChange={update} />}
           {isWake && <p className="field-help">Online devices are skipped. A device that comes online within 10 minutes of its packets counts as woken; one that no online device shares a network with fails. Run it a few minutes before the work that needs the devices.</p>}
           {draft.action === "update_scan" && <p className="field-help">Devices also scan on the server&apos;s own schedule, set under Settings. A scan policy adds scans at the times you choose.</p>}
 

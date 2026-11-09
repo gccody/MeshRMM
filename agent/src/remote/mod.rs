@@ -1,5 +1,7 @@
 #[cfg(any(windows, target_os = "macos", test))]
 mod annotation;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+mod applications;
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod audio_mode;
 #[cfg(windows)]
@@ -296,6 +298,7 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             // Likewise, so a result that arrives while offline is sent on
             // the next connection.
             updates: updates::Updates::new(),
+            applications: applications::Applications::new(),
             wake: wake::Relay::new(),
             files: files::Files::new(),
             config,
@@ -319,6 +322,7 @@ struct Coordinator {
     metrics: metrics::Reports,
     system_info: system_info::Collector,
     updates: updates::Updates,
+    applications: applications::Applications,
     wake: wake::Relay,
     files: files::Files,
     active_session: Option<ActiveSession>,
@@ -368,6 +372,13 @@ impl Coordinator {
     /// Handles the server's messages until the connection ends, returning whether the Agent is
     /// stopping.
     async fn serve(&mut self, socket: &mut SignalingConnection) -> anyhow::Result<bool> {
+        // Before anything the server sends on this connection, so the
+        // server knows which application runs from before it ended.
+        let activity = serde_json::to_string(&self.applications.activity())?;
+        socket
+            .send(Message::Text(activity.into()))
+            .await
+            .context("could not send the application activity")?;
         loop {
             if self
                 .active_session
@@ -408,6 +419,21 @@ impl Coordinator {
                         self.updates.unsent(report);
                         return Err(error).context("could not send an update report");
                     }
+                }
+                report = self.applications.next() => {
+                    // A finished run changed what is installed.
+                    if matches!(report, AgentStatusMessage::ApplicationResult { .. }) {
+                        self.system_info.request();
+                    }
+                    let sent = match serde_json::to_string(&report) {
+                        Ok(text) => socket.send(Message::Text(text.into())).await,
+                        Err(error) => Err(error.into()),
+                    };
+                    if let Err(error) = sent {
+                        self.applications.unsent(report);
+                        return Err(error).context("could not send an application report");
+                    }
+                    self.applications.delivered(&report);
                 }
                 () = self.link.stopped() => {
                     if let Some(version) = self.link.update_version() {
@@ -452,6 +478,8 @@ impl Coordinator {
                 AgentCommand::ScanUpdates { run_id } => {
                     tracing::info!(?run_id, "the server asked for an update scan");
                     self.updates.scan(run_id);
+                    // Applications scan on the update scan's cadence.
+                    self.applications.scan(None);
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::InstallUpdates { install } => {
@@ -492,6 +520,16 @@ impl Coordinator {
                         "the server asked for a file operation"
                     );
                     self.files.request(self.mode, request);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::ScanApplications { run_id } => {
+                    tracing::info!(?run_id, "the server asked for an application scan");
+                    self.applications.scan(run_id);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::RunApplications { run } => {
+                    tracing::info!(run_id = %run.run_id, operation = ?run.operation, "the server asked for an application run");
+                    self.applications.run(&self.config, self.mode, run);
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::FileTransfer { transfer } => {

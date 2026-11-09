@@ -39,6 +39,8 @@ const CONDITION_HELP: Record<Condition, string> = {
   updates_pending: "The device's last scan lists updates of the chosen kind that have been pending longer than this. It resolves itself once they're installed.",
   update_install_failed: "An install of operating system updates on the device failed, partly failed, or never reported back. Its alert stays until someone resolves it.",
   reboot_pending: "The device has needed a restart to finish installing updates for longer than this. It resolves itself after the restart.",
+  app_install_failed: "An install or update of applications on the device failed, partly failed, or never reported back. Each failed application gets its own alert, which stays until someone resolves it.",
+  app_updates_pending: "Applications the device's package managers list as outdated have been outdated longer than this, leaving out those the library pins to a version. It resolves itself once they're updated.",
 };
 
 // Creates a rule, or edits one. A rule's condition can't change once saved.

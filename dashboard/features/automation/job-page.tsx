@@ -15,7 +15,7 @@ import { useWorkspace } from "../workspace/workspace-context";
 import { AutomationAreaTabs } from "./area-tabs";
 import { cancelJob, fetchJob } from "./automation-api";
 import { JobProgressBar, OutcomeChips, OutcomePill } from "./job-progress";
-import { type JobDetail, type JobDevice, type Outcome, countsSummary, deviceResult, isJobFinished, isUpdateJob, jobStarter, progressLabel } from "./model";
+import { type JobDetail, type JobDevice, type Outcome, applicationProblems, countsSummary, deviceResult, isApplicationJob, isJobFinished, isUpdateJob, jobStarter, progressLabel } from "./model";
 import { useJobEvents } from "./use-job-feed";
 
 // Unfinished jobs are read again this often, in case an event was missed.
@@ -148,11 +148,12 @@ function JobView({ id }: { id: string }) {
                     <strong>{device.device_name ? <Link to={`/device?id=${encodeURIComponent(device.device_id)}`}>{device.device_name}</Link> : "Deleted device"}</strong>
                     <span>{device.platform ? PLATFORM_LABELS[device.platform] : ""}</span>
                   </td>
-                  <td><OutcomePill outcome={device.outcome} kind={job.kind} />{deviceResult(device) && <span>{deviceResult(device)}</span>}</td>
+                  <td><OutcomePill outcome={device.outcome} kind={job.kind} />{deviceResult(device) && <span>{deviceResult(device)}</span>}<ApplicationProblems device={device} /></td>
                   <td className="nowrap">{device.completed_at_unix_ms ? formatDateTime(device.completed_at_unix_ms) : ""}</td>
                   <td className="row-actions">
                     {device.run_id && <button type="button" className="secondary-button" onClick={(event) => { opener.current = event.currentTarget; setOutput(device); }} aria-haspopup="dialog">View output</button>}
                     {device.update_run_id && device.device_name && <Link className="secondary-button" to={`/device?${new URLSearchParams({ id: device.device_id, tab: "updates" })}`}>View updates</Link>}
+                    {device.application_run_id && device.device_name && <Link className="secondary-button" to={`/device?${new URLSearchParams({ id: device.device_id, tab: "applications" })}`}>View applications</Link>}
                   </td>
                 </tr>
               ))}
@@ -165,12 +166,37 @@ function JobView({ id }: { id: string }) {
   );
 }
 
+const SHOWN_PROBLEMS = 3;
+
+// Which applications failed or were skipped on the device, and why; past a
+// few, the rest open below.
+function ApplicationProblems({ device }: { device: JobDevice }) {
+  const problems = applicationProblems(device);
+  if (problems.length === 0) return null;
+  const rest = problems.slice(SHOWN_PROBLEMS);
+  return (
+    <ul className="job-applications" aria-label="Applications that failed or were skipped">
+      {problems.slice(0, SHOWN_PROBLEMS).map((problem, index) => <li key={index}>{problem}</li>)}
+      {rest.length > 0 && (
+        <li>
+          <details>
+            <summary>{rest.length} more</summary>
+            <ul>{rest.map((problem, index) => <li key={index}>{problem}</li>)}</ul>
+          </details>
+        </li>
+      )}
+    </ul>
+  );
+}
+
 // What the job sends, where, for whom, and what happens to offline devices.
 function JobFacts({ job }: { job: JobDetail }) {
   return (
     <dl className="job-facts">
       {job.kind === "wake"
         ? <div><dt>Action</dt><dd>{job.item_name}<span>Offline devices are woken through online devices on their network</span></dd></div>
+        : isApplicationJob(job.kind)
+        ? <div><dt>Applications</dt><dd>{job.item_name}</dd></div>
         : isUpdateJob(job.kind)
         ? <div><dt>Updates</dt><dd>{job.item_name}{job.kind === "update_install" && <span>{describeSelection({ categories: job.categories ?? [] })}</span>}</dd></div>
         : <div><dt>{job.kind === "script" ? "Script" : "File"}</dt><dd>{job.item_name}{job.language && <span>{LANGUAGE_LABELS[job.language]}</span>}</dd></div>}

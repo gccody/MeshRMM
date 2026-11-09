@@ -31,6 +31,9 @@ pub async fn serve(
         return;
     }
     let mut socket = socket;
+    // Commands sent from here on reach this connection; application runs
+    // asked for before it are the ones its Agent may not have.
+    let connected_at = crate::time::now_ms();
     let mut connection = state.agents.connect(&device_id);
     // Before presence, so a page that sees the device come online reads it
     // as woken.
@@ -101,6 +104,26 @@ pub async fn serve(
                         Ok(AgentStatusMessage::UpdateInstall { run_id, result }) => {
                             if state.agents.is_current(&device_id, connection.id) {
                                 updates::install_reported(&state, &device_id, &run_id, *result).await;
+                            }
+                        }
+                        Ok(AgentStatusMessage::ApplicationActivity { run_ids }) => {
+                            if state.agents.is_current(&device_id, connection.id) {
+                                crate::applications::activity_reported(&state, &device_id, &run_ids, connected_at).await;
+                            }
+                        }
+                        Ok(AgentStatusMessage::ApplicationScan { run_ids, scan }) => {
+                            if state.agents.is_current(&device_id, connection.id) {
+                                crate::applications::scan_reported(&state, &device_id, run_ids, *scan).await;
+                            }
+                        }
+                        Ok(AgentStatusMessage::ApplicationProgress { run_id, message }) => {
+                            if state.agents.is_current(&device_id, connection.id) {
+                                crate::applications::progress_reported(&state, &device_id, &run_id, &message).await;
+                            }
+                        }
+                        Ok(AgentStatusMessage::ApplicationResult { run_id, result }) => {
+                            if state.agents.is_current(&device_id, connection.id) {
+                                crate::applications::result_reported(&state, &device_id, &run_id, *result).await;
                             }
                         }
                         Ok(AgentStatusMessage::WakePacketsSent { results }) => {

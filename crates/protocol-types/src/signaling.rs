@@ -146,6 +146,19 @@ pub enum AgentCommand {
     FileTransfer {
         transfer: crate::FileTransferRequest,
     },
+    /// Scans the device's package managers for installed and outdated
+    /// third-party applications. `run_id` names the server's record of a
+    /// scan it is waiting for. Answered by
+    /// [`AgentStatusMessage::ApplicationScan`].
+    ScanApplications {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+    },
+    /// Installs, updates or uninstalls third-party applications, then scans
+    /// again; see [`crate::ApplicationRunRequest`].
+    RunApplications {
+        run: crate::ApplicationRunRequest,
+    },
 }
 
 /// Agent-to-coordinator lifecycle notifications and reports.
@@ -195,6 +208,31 @@ pub enum AgentStatusMessage {
     FileReply {
         request_id: String,
         reply: Box<crate::FileReply>,
+    },
+    /// Sent first on every control connection: the server's application
+    /// scans and runs (by run ID) this Agent is doing or has yet to report.
+    /// Any other the server is waiting for from before the connection ended
+    /// with a restart or a lost connection, and won't be reported.
+    ApplicationActivity {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        run_ids: Vec<String>,
+    },
+    /// What an application scan found. `run_ids` are the server's scans it
+    /// answers.
+    ApplicationScan {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        run_ids: Vec<String>,
+        scan: Box<crate::ApplicationScan>,
+    },
+    /// How far an application run has got, such as `Installing 2 of 3: …`.
+    ApplicationProgress {
+        run_id: String,
+        message: String,
+    },
+    /// How an application run went.
+    ApplicationResult {
+        run_id: String,
+        result: Box<crate::ApplicationRunResult>,
     },
 }
 
@@ -436,6 +474,110 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
             result
+        );
+    }
+
+    #[test]
+    fn application_messages_use_tagged_json() {
+        assert_eq!(
+            serde_json::to_string(&AgentCommand::ScanApplications { run_id: None }).unwrap(),
+            r#"{"type":"scan_applications"}"#
+        );
+        let run = AgentCommand::RunApplications {
+            run: crate::ApplicationRunRequest {
+                run_id: "run-1".into(),
+                operation: crate::ApplicationOperation::Update {
+                    choice: crate::UpdateChoice {
+                        mode: crate::UpdateMode::Except,
+                        packages: vec![crate::PackageKey {
+                            source: crate::PackageSource::Winget,
+                            id: "Git.Git".into(),
+                        }],
+                        held: vec![],
+                    },
+                },
+            },
+        };
+        let json = serde_json::to_string(&run).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"run_applications","run":{"run_id":"run-1","operation":{"action":"update","choice":{"mode":"except","packages":[{"source":"winget","id":"Git.Git"}]}}}}"#
+        );
+        assert_eq!(serde_json::from_str::<AgentCommand>(&json).unwrap(), run);
+        let install = AgentCommand::RunApplications {
+            run: crate::ApplicationRunRequest {
+                run_id: "run-2".into(),
+                operation: crate::ApplicationOperation::Install {
+                    items: vec![crate::InstallItem {
+                        name: "7-Zip".into(),
+                        sources: vec![crate::PackageRef {
+                            source: crate::PackageSource::Custom,
+                            id: String::new(),
+                            version: None,
+                            custom: Some(crate::CustomInstaller {
+                                file_id: "f".into(),
+                                file_name: "7z.msi".into(),
+                                size_bytes: 3,
+                                sha256: "a".repeat(64),
+                                arguments: "/qn".into(),
+                                uninstall_command: None,
+                                detection: Some(crate::DetectionRule::Application {
+                                    name: "7-Zip*".into(),
+                                    min_version: None,
+                                }),
+                            }),
+                        }],
+                    }],
+                },
+            },
+        };
+        let json = serde_json::to_string(&install).unwrap();
+        assert!(
+            json.contains(r#""detection":{"kind":"application","name":"7-Zip*"}"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentCommand>(&json).unwrap(),
+            install
+        );
+        let result = AgentStatusMessage::ApplicationResult {
+            run_id: "run-1".into(),
+            result: Box::new(crate::ApplicationRunResult::failed("busy")),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"application_result","run_id":"run-1","result":{"status":"failed","error":"busy","items":[]}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
+            result
+        );
+        let scan = AgentStatusMessage::ApplicationScan {
+            run_ids: vec![],
+            scan: Box::default(),
+        };
+        assert_eq!(
+            serde_json::to_string(&scan).unwrap(),
+            r#"{"type":"application_scan","scan":{"scanned_at_unix_ms":0,"managers":[],"packages":[]}}"#
+        );
+        let activity = AgentStatusMessage::ApplicationActivity {
+            run_ids: vec!["run-1".into()],
+        };
+        let json = serde_json::to_string(&activity).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"application_activity","run_ids":["run-1"]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
+            activity
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentStatusMessage>(r#"{"type":"application_activity"}"#)
+                .unwrap(),
+            AgentStatusMessage::ApplicationActivity { run_ids: vec![] },
+            "an idle Agent"
         );
     }
 

@@ -151,6 +151,9 @@ fn metadata(policy: &Policy) -> Value {
             metadata["reboot"] = reboot.as_str().into();
             metadata["reboot_delay_minutes"] = (*reboot_delay_minutes).into();
         }
+        Action::Applications { spec, .. } => {
+            metadata["applications"] = json!(spec);
+        }
     }
     metadata
 }

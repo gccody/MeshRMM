@@ -12,7 +12,7 @@ use crate::win32::wide;
 /// version keys are far shorter.
 const MAX_STRING_UNITS: u32 = 4096;
 
-pub(super) struct Key(HKEY);
+pub(crate) struct Key(HKEY);
 
 impl Drop for Key {
     fn drop(&mut self) {
@@ -24,7 +24,7 @@ impl Drop for Key {
 impl Key {
     /// Opens `path` under `root` for reading, in the registry view `view`
     /// adds (`KEY_WOW64_64KEY`, `KEY_WOW64_32KEY`, or none).
-    pub(super) fn open(root: HKEY, path: &str, view: REG_SAM_FLAGS) -> anyhow::Result<Self> {
+    pub(crate) fn open(root: HKEY, path: &str, view: REG_SAM_FLAGS) -> anyhow::Result<Self> {
         let path = wide(path);
         let mut key = HKEY::default();
         // SAFETY: the path is NUL-terminated and `key` is writable.
@@ -34,13 +34,13 @@ impl Key {
     }
 
     /// Opens a subkey of this key.
-    pub(super) fn child(&self, name: &str, view: REG_SAM_FLAGS) -> anyhow::Result<Self> {
+    pub(crate) fn child(&self, name: &str, view: REG_SAM_FLAGS) -> anyhow::Result<Self> {
         Self::open(self.0, name, view)
     }
 
     /// A `REG_SZ` or `REG_EXPAND_SZ` value, unexpanded, or `None` if it is
     /// missing or of another type.
-    pub(super) fn string(&self, name: &str) -> Option<String> {
+    pub(crate) fn string(&self, name: &str) -> Option<String> {
         let name = wide(name);
         let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
         let mut size = 0u32;
@@ -85,7 +85,7 @@ impl Key {
     }
 
     /// A `REG_DWORD` value.
-    pub(super) fn dword(&self, name: &str) -> Option<u32> {
+    pub(crate) fn dword(&self, name: &str) -> Option<u32> {
         let name = wide(name);
         let mut value = 0u32;
         let mut size = 4u32;
@@ -107,7 +107,7 @@ impl Key {
     }
 
     /// The names of the key's subkeys.
-    pub(super) fn subkeys(&self) -> Vec<String> {
+    pub(crate) fn subkeys(&self) -> Vec<String> {
         let mut names = Vec::new();
         for index in 0..65_536u32 {
             // Key names are at most 255 characters.

@@ -3,7 +3,7 @@
 // Imports carry the .ts extension so node:test can load this module directly.
 import { type Account, type Permission, canAny } from "../auth/types.ts";
 
-export type View = "devices" | "device" | "companies" | "tags" | "software" | "updates" | "toolbox" | "alerts" | "alert-rules" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account" | "jobs" | "job" | "policies" | "terminal" | "files";
+export type View = "devices" | "device" | "companies" | "tags" | "software" | "updates" | "applications" | "toolbox" | "alerts" | "alert-rules" | "notification-channels" | "users" | "roles" | "authentication" | "settings" | "audit" | "account" | "jobs" | "job" | "policies" | "terminal" | "files";
 
 export const VIEW_PATHS: Record<View, string> = {
   devices: "/",
@@ -12,6 +12,7 @@ export const VIEW_PATHS: Record<View, string> = {
   tags: "/tags",
   software: "/software",
   updates: "/updates",
+  applications: "/applications",
   toolbox: "/toolbox",
   alerts: "/alerts",
   "alert-rules": "/alert-rules",
@@ -39,6 +40,7 @@ export const VIEW_COPY: Record<View, { title: string }> = {
   tags: { title: "Tags" },
   software: { title: "Software" },
   updates: { title: "Updates" },
+  applications: { title: "Applications" },
   toolbox: { title: "Toolbox" },
   alerts: { title: "Alerts" },
   "alert-rules": { title: "Alert rules" },
@@ -57,7 +59,7 @@ export const VIEW_COPY: Record<View, { title: string }> = {
 };
 
 // Jobs show to those who start them, policies' managers and auditors.
-const JOB_ACCESS: readonly Permission[] = ["scripts.run", "files.deliver", "updates.view", "updates.install", "automation.manage", "audit.view"];
+const JOB_ACCESS: readonly Permission[] = ["scripts.run", "files.deliver", "updates.view", "updates.install", "applications.view", "applications.deploy", "automation.manage", "audit.view"];
 
 // A user sees a page when they hold any of these permissions; an empty list
 // is open to everyone.
@@ -68,6 +70,7 @@ const VIEW_ACCESS: Record<View, readonly Permission[]> = {
   tags: ["devices.view"],
   software: ["devices.view"],
   updates: ["updates.view"],
+  applications: ["applications.view"],
   toolbox: ["scripts.run", "scripts.manage_shared", "files.deliver", "files.manage_shared"],
   alerts: ["alerts.view"],
   "alert-rules": ["alerts.view"],

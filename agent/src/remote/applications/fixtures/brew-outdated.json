@@ -1,0 +1,32 @@
+{
+  "formulae": [
+    {
+      "name": "openssl@3",
+      "installed_versions": [
+        "3.4.1"
+      ],
+      "current_version": "3.4.2",
+      "pinned": false,
+      "pinned_version": null
+    },
+    {
+      "name": "python@3.13",
+      "installed_versions": [
+        "3.13.1",
+        "3.13.2"
+      ],
+      "current_version": "3.13.3",
+      "pinned": true,
+      "pinned_version": "3.13.2"
+    }
+  ],
+  "casks": [
+    {
+      "name": "firefox",
+      "installed_versions": [
+        "135.0.1"
+      ],
+      "current_version": "136.0"
+    }
+  ]
+}

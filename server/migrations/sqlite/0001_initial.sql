@@ -155,7 +155,7 @@ CREATE TABLE role_permissions (
 -- is an editable default.
 INSERT INTO roles (id, name, description, builtin, created_at, updated_at) VALUES
   ('administrator', 'Administrator', 'Every permission, including users, roles and settings.', 'administrator', 0, 0),
-  ('technician', 'Technician', 'Enrolls, connects to and wakes devices, tags devices and keeps their notes, opens terminals, browses and manages their files, runs toolbox scripts and files, installs updates, and responds to alerts.', 'technician', 0, 0);
+  ('technician', 'Technician', 'Enrolls, connects to and wakes devices, tags devices and keeps their notes, opens terminals, browses and manages their files, runs toolbox scripts and files, installs updates, deploys and updates applications, and responds to alerts.', 'technician', 0, 0);
 
 INSERT INTO role_permissions (role_id, permission) VALUES
   ('technician', 'devices.view'),
@@ -174,7 +174,9 @@ INSERT INTO role_permissions (role_id, permission) VALUES
   ('technician', 'alerts.view'),
   ('technician', 'alerts.respond'),
   ('technician', 'updates.view'),
-  ('technician', 'updates.install');
+  ('technician', 'updates.install'),
+  ('technician', 'applications.view'),
+  ('technician', 'applications.deploy');
 
 CREATE TABLE user_roles (
   user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
@@ -653,7 +655,7 @@ CREATE TABLE alert_rules (
   name TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 120),
   severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
   enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-  condition TEXT NOT NULL CHECK (condition IN ('device_offline', 'disk_space', 'cpu', 'memory', 'script_failed', 'updates_pending', 'update_install_failed', 'reboot_pending')),
+  condition TEXT NOT NULL CHECK (condition IN ('device_offline', 'disk_space', 'cpu', 'memory', 'script_failed', 'updates_pending', 'update_install_failed', 'reboot_pending', 'app_install_failed', 'app_updates_pending')),
   threshold REAL,
   threshold_unit TEXT CHECK (threshold_unit IS NULL OR threshold_unit IN ('percent', 'gb')),
   duration_minutes INTEGER,
@@ -730,7 +732,7 @@ CREATE INDEX idx_alerts_resolved ON alerts (resolved_at);
 -- changes while it waits for offline devices. See docs/automation.md.
 CREATE TABLE jobs (
   id TEXT NOT NULL PRIMARY KEY,
-  kind TEXT NOT NULL CHECK (kind IN ('script', 'file', 'update_scan', 'update_install', 'wake')),
+  kind TEXT NOT NULL CHECK (kind IN ('script', 'file', 'update_scan', 'update_install', 'wake', 'app_install', 'app_update', 'app_uninstall')),
   -- The toolbox script or file, and its name when the job started. Update
   -- jobs have an empty item_id and say what they do in item_name.
   item_id TEXT NOT NULL,
@@ -794,7 +796,7 @@ CREATE TABLE automation_policies (
   -- for operating system updates; 'update_install' installs the pending
   -- updates in update_categories (comma-separated; NULL for all), then
   -- restarts as reboot says.
-  action TEXT NOT NULL DEFAULT 'script' CHECK (action IN ('script', 'update_scan', 'update_install', 'wake')),
+  action TEXT NOT NULL DEFAULT 'script' CHECK (action IN ('script', 'update_scan', 'update_install', 'wake', 'app_install', 'app_update')),
   script_id TEXT,
   run_as TEXT CHECK (run_as IS NULL OR run_as IN ('system', 'user')),
   update_categories TEXT,
@@ -989,4 +991,132 @@ CREATE TABLE wake_relays (
   error TEXT,
   reported_at INTEGER,
   PRIMARY KEY (wake_id, relay_device_id, broadcast)
+);
+
+-- Third-party applications: the library, what devices' package managers
+-- have installed and outdated, and the installs, updates and uninstalls
+-- asked of devices. See docs/application-deployment.md.
+
+-- The application library. Names are unique ignoring case, which the server
+-- checks. A pinned version is installed where the package manager can
+-- choose one, and its packages are never updated.
+CREATE TABLE applications (
+  id TEXT NOT NULL PRIMARY KEY,
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 120),
+  description TEXT NOT NULL DEFAULT '' CHECK (length(CAST(description AS BLOB)) <= 1000),
+  pinned_version TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  updated_by_user_id TEXT NOT NULL
+);
+
+-- Each application's ways to install, in order of preference on each
+-- platform: a package manager's package, or a shared toolbox file run as a
+-- custom installer with its silent arguments, uninstall command and
+-- detection rule (JSON).
+CREATE TABLE application_sources (
+  application_id TEXT NOT NULL REFERENCES applications (id) ON DELETE CASCADE,
+  position INTEGER NOT NULL,
+  source TEXT NOT NULL CHECK (source IN ('winget', 'chocolatey', 'homebrew', 'homebrew_cask', 'flatpak', 'snap', 'custom')),
+  platform TEXT NOT NULL CHECK (platform IN ('windows', 'macos', 'linux')),
+  -- Empty for a custom installer.
+  package_id TEXT NOT NULL,
+  file_id TEXT,
+  install_arguments TEXT,
+  uninstall_command TEXT,
+  detection TEXT,
+  PRIMARY KEY (application_id, position)
+);
+
+CREATE INDEX idx_application_sources_package ON application_sources (source, package_id);
+CREATE INDEX idx_application_sources_file ON application_sources (file_id);
+
+-- Each device's latest application scan: the package managers it has (JSON),
+-- when it scanned by its clock, and when the report arrived.
+CREATE TABLE device_application_status (
+  device_id TEXT NOT NULL PRIMARY KEY,
+  managers TEXT NOT NULL,
+  scanned_at INTEGER NOT NULL,
+  received_at INTEGER NOT NULL
+);
+
+-- The packages each device's latest scan found installed, with the newer
+-- version the manager offers. outdated_since is when a scan first found it
+-- outdated, kept across scans while it stays so.
+CREATE TABLE device_packages (
+  device_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  package_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  version TEXT,
+  available_version TEXT,
+  outdated_since INTEGER,
+  PRIMARY KEY (device_id, source, package_id)
+);
+
+CREATE INDEX idx_device_packages_package ON device_packages (source, package_id);
+CREATE INDEX idx_device_packages_outdated ON device_packages (outdated_since);
+
+-- Scans, installs, updates and uninstalls the server asked a device for: by
+-- a user, or as a device's part of a job (job_id). `request` is the JSON
+-- the Agent was sent; `summary` says what it does in words.
+CREATE TABLE application_runs (
+  id TEXT NOT NULL PRIMARY KEY,
+  device_id TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('scan', 'install', 'update', 'uninstall')),
+  summary TEXT NOT NULL,
+  request TEXT,
+  requested_by_user_id TEXT NOT NULL,
+  policy_name TEXT,
+  job_id TEXT,
+  -- 'lost': the Agent never reported. 'skipped': none of its applications
+  -- was for the device.
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'succeeded', 'partial', 'failed', 'skipped', 'lost')),
+  progress TEXT,
+  error TEXT,
+  succeeded INTEGER NOT NULL DEFAULT 0,
+  unchanged INTEGER NOT NULL DEFAULT 0,
+  skipped INTEGER NOT NULL DEFAULT 0,
+  failed INTEGER NOT NULL DEFAULT 0,
+  reboot_required INTEGER NOT NULL DEFAULT 0 CHECK (reboot_required IN (0, 1)),
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER
+);
+
+CREATE INDEX idx_application_runs_device ON application_runs (device_id, created_at);
+CREATE INDEX idx_application_runs_created ON application_runs (created_at);
+CREATE INDEX idx_application_runs_job ON application_runs (job_id, device_id);
+CREATE INDEX idx_application_runs_status ON application_runs (status);
+-- A device does one scan and one install, update or uninstall at a time; two
+-- requests at once can't both start one.
+CREATE UNIQUE INDEX idx_application_runs_one_pending ON application_runs (device_id, (action = 'scan')) WHERE status = 'pending';
+
+-- How each application of a run went, with the end of its output.
+CREATE TABLE application_run_items (
+  run_id TEXT NOT NULL REFERENCES application_runs (id) ON DELETE CASCADE,
+  position INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  source TEXT,
+  package_id TEXT,
+  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'unchanged', 'skipped', 'failed')),
+  version TEXT,
+  exit_code INTEGER,
+  error TEXT,
+  output TEXT NOT NULL,
+  reboot_required INTEGER NOT NULL DEFAULT 0 CHECK (reboot_required IN (0, 1)),
+  PRIMARY KEY (run_id, position)
+);
+
+-- What an application job installs, updates or uninstalls (JSON), kept with
+-- the job so every device gets the same even if the library changes.
+CREATE TABLE application_jobs (
+  job_id TEXT NOT NULL PRIMARY KEY REFERENCES jobs (id) ON DELETE CASCADE,
+  spec TEXT NOT NULL
+);
+
+-- What an application policy installs or updates (JSON): library
+-- applications by ID, resolved each time it fires.
+CREATE TABLE application_policies (
+  policy_id TEXT NOT NULL PRIMARY KEY REFERENCES automation_policies (id) ON DELETE CASCADE,
+  spec TEXT NOT NULL
 );

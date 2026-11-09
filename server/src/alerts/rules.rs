@@ -84,6 +84,10 @@ pub enum Condition {
     UpdateInstallFailed,
     /// The device has had to restart to finish installing updates for `days`.
     RebootPending,
+    /// An application install or update failed, or never reported back.
+    AppInstallFailed,
+    /// Application updates have been pending for `days`.
+    AppUpdatesPending,
 }
 
 impl Condition {
@@ -97,6 +101,8 @@ impl Condition {
             Self::UpdatesPending => "updates_pending",
             Self::UpdateInstallFailed => "update_install_failed",
             Self::RebootPending => "reboot_pending",
+            Self::AppInstallFailed => "app_install_failed",
+            Self::AppUpdatesPending => "app_updates_pending",
         }
     }
 
@@ -110,6 +116,8 @@ impl Condition {
             "updates_pending" => Some(Self::UpdatesPending),
             "update_install_failed" => Some(Self::UpdateInstallFailed),
             "reboot_pending" => Some(Self::RebootPending),
+            "app_install_failed" => Some(Self::AppInstallFailed),
+            "app_updates_pending" => Some(Self::AppUpdatesPending),
             _ => None,
         }
     }
@@ -117,7 +125,10 @@ impl Condition {
     /// Whether the server resolves the alert once the condition passes;
     /// script and install failures stay until a person resolves them.
     pub fn clears_itself(self) -> bool {
-        !matches!(self, Self::ScriptFailed | Self::UpdateInstallFailed)
+        !matches!(
+            self,
+            Self::ScriptFailed | Self::UpdateInstallFailed | Self::AppInstallFailed
+        )
     }
 }
 
@@ -209,6 +220,11 @@ impl Rule {
             Condition::UpdateInstallFailed => "An update install fails".to_owned(),
             Condition::RebootPending => format!(
                 "Restart pending for {}",
+                plural(self.days.unwrap_or_default(), "day")
+            ),
+            Condition::AppInstallFailed => "An application install or update fails".to_owned(),
+            Condition::AppUpdatesPending => format!(
+                "Application updates pending for {}",
                 plural(self.days.unwrap_or_default(), "day")
             ),
         }
@@ -331,7 +347,9 @@ impl RuleInput {
             Condition::ScriptFailed
             | Condition::UpdatesPending
             | Condition::UpdateInstallFailed
-            | Condition::RebootPending => (None, None, None),
+            | Condition::RebootPending
+            | Condition::AppInstallFailed
+            | Condition::AppUpdatesPending => (None, None, None),
         };
         self.threshold = threshold;
         self.threshold_unit = unit;
@@ -358,7 +376,9 @@ impl RuleInput {
                     .to_owned();
                 (Some(category), Some(days(self.days)?))
             }
-            Condition::RebootPending => (None, Some(days(self.days)?)),
+            Condition::RebootPending | Condition::AppUpdatesPending => {
+                (None, Some(days(self.days)?))
+            }
             _ => (None, None),
         };
         if self.target == TargetKind::Devices {

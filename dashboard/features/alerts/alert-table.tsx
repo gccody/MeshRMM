@@ -60,6 +60,7 @@ export function AlertTable({ alerts, showDevice, onChanged, onError, label }: {
               <strong>{alert.rule_name}</strong>
               <span>{alert.detail}{alert.occurrences > 1 ? ` · ${alert.occurrences} times, last ${formatRelative(alert.last_occurred_at)}` : ""}</span>
               {(alert.update_run_id || alert.condition === "updates_pending" || alert.condition === "reboot_pending") && can("updates.view") && <span><Link to={`/device?${new URLSearchParams({ id: alert.device_id, tab: "updates" })}`}>See the device’s updates</Link></span>}
+              {(alert.condition === "app_install_failed" || alert.condition === "app_updates_pending") && can("applications.view") && <span><Link to={`/device?${new URLSearchParams({ id: alert.device_id, tab: "applications" })}`}>See the device’s applications</Link></span>}
             </td>
             {showDevice && (
               <td>

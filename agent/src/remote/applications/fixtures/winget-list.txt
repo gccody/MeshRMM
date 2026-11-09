@@ -1,0 +1,17 @@
+Name                                                         Id                                                                                    Version                     Available     Source
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Aimlabs                                                      ARP\Machine\X64\Steam App 714010                                                      Unknown                                   
+App Installer                                                Microsoft.AppInstaller                                                                1.29.379.0                  1.29.380      winget
+AV1 Video Extension                                          MSIX\Microsoft.AV1VideoExtension_2.0.35.0_x64__8wekyb3d8bbwe                          2.0.35.0                                  
+Blender                                                      BlenderFoundation.Blender                                                             5.2.0                       5.2.3         winget
+Brave                                                        ARP\Machine\X86\BraveSoftware Brave-Browser                                           157.1.99.55                               
+Call of Duty®                                                ARP\Machine\X64\Steam App 1938090                                                     Unknown                                   
+chiaki-ng version 1.9.9                                      StreetPea.chiaki-ng                                                                   1.9.9                                     winget
+Git                                                          Git.Git                                                                               2.55.0.3                    2.56.0.4      winget
+Intel(R) Chipset Device Software                             ARP\Machine\X86\{2d8d3782-0c02-4681-87f4-e004b3d4a8f6}                                10.1.18838.8284                           
+Microsoft Windows Desktop Runtime - 8.0.30 (x64)             Microsoft.DotNet.DesktopRuntime.8                                                     8.0.30                      8.0.33        winget
+OpenAL                                                       CreativeTechnology.OpenAL                                                             Unknown                     1.1           winget
+Python Launcher                                              Python.Launcher                                                                       < 3.14.7                    3.15.2        winget
+Roblox Player for gccody                                     Roblox.Roblox                                                                         Unknown                     0.746         winget
+Roblox Studio for gccody                                     ARP\User\X64\roblox-studio                                                            Unknown                                   
+Wireshark 4.6.7 x64                                          WiresharkFoundation.Wireshark                                                         4.6.7                       4.6.9         winget

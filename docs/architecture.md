@@ -124,12 +124,15 @@ input.
 - `alerts`: alert rules, the engine that judges them and the alerts they
   raise. `notifications`: email and webhook channels. See
   [alerts](alerts.md).
-- `automation`: jobs (a script, file, update scan, update install or wake on many
-  devices), the dispatcher that starts them a few at a time, and policies
+- `automation`: jobs (a script, file, update scan, update install,
+  application install, update or uninstall, or wake on many devices), the dispatcher that starts them a few at a time, and policies
   that start jobs on a schedule or on enrollment. See
   [automation](automation.md).
 - `updates`: each device's pending operating system updates, update scans
   and installs and their history. See [patch management](patch-management.md).
+- `applications`: the application library, each device's third-party
+  packages, application runs and their history, and what application jobs
+  and policies do. See [application deployment](application-deployment.md).
 - `wake`: Wake-on-LAN requests, choosing the online devices that relay
   them, and their reports. See [Wake-on-LAN](wake-on-lan.md).
 - `terminals`: remote terminals that are being opened or are open, and the
@@ -178,6 +181,11 @@ task.
   lost and asks connected devices with old scans for new ones; scans,
   progress and installs are broadcast to event sockets of users with
   `updates.view`. See [patch management](patch-management.md).
+- **Applications**: the engine's task marks application runs that never
+  reported as lost and removes runs older than a year. Agents report scans,
+  progress and results on the control connection; the website reads them
+  again while a run is in progress. See
+  [application deployment](application-deployment.md).
 - **Terminals**: each open terminal is the task of its browser socket
   (`/v1/terminals/{id}`), which relays to the socket the Agent opened for it
   (`/v1/agents/{id}/terminals/{terminal_id}`), so terminal traffic never
@@ -216,6 +224,7 @@ Roles are built from these permissions (`server/src/rbac.rs`):
 `scripts.manage_shared`, `files.deliver`, `files.manage_shared`,
 `files.browse`, `files.manage`, `files.system`,
 `jobs.run_wide`, `automation.manage`, `updates.view`, `updates.install`,
+`applications.view`, `applications.deploy`, `applications.manage`,
 `alerts.view`, `alerts.respond`, `alerts.manage`, `users.manage`, `roles.manage`, `settings.manage`, `authentication.manage`,
 `api_tokens.manage`, `audit.view`.
 

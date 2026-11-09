@@ -1,0 +1,6 @@
+chocolatey|2.7.3|2.7.5|false
+microsoft-openjdk17|17.0.20.1|17.0.21.2|false
+python|3.14.6|3.15.2|false
+python3|3.14.6|3.15.2|false
+python314|3.14.6|3.14.10|false
+visualstudio2026buildtools|118.8.0|118.11.3|false

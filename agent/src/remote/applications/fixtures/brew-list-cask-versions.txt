@@ -1,0 +1,2 @@
+firefox 135.0.1
+visual-studio-code 1.97.2

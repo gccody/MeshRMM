@@ -34,3 +34,6 @@ pub use wake::*;
 
 mod files;
 pub use files::*;
+
+mod applications;
+pub use applications::*;

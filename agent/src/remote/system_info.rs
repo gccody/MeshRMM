@@ -27,7 +27,7 @@ mod macos;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 
 #[cfg(target_os = "linux")]
 use self::linux as platform;

@@ -21,6 +21,10 @@ the same job list.
 - **Updates page:** tick devices, then **Scan now** or **Install updates…**
   (the categories to install, or all, and the restart); see
   [patch management](patch-management.md#the-website).
+- **Applications page:** **Install on devices** on a library application,
+  or the **Outdated** tab's **Update on their devices…** and **Update
+  all…**; see
+  [application deployment](application-deployment.md#installing-updating-and-uninstalling).
 
 The dialog chooses:
 
@@ -50,11 +54,11 @@ whose turn comes after the file was deleted from the library fails.
 | Queued | Online; its run starts in a moment (see [dispatching](#dispatching)). |
 | Waiting | Offline; it runs when its Agent connects, if the job hasn't expired. |
 | Running | Started; the device hasn't reported yet. |
-| Succeeded | The script exited with code 0, the file was saved, the scan finished, or every chosen update installed. |
-| Failed | The script couldn't run or exited with another code, the file wasn't saved, the scan failed, or an update didn't install. |
+| Succeeded | The script exited with code 0, the file was saved, the scan finished, every chosen update installed, or no application failed. |
+| Failed | The script couldn't run or exited with another code, the file wasn't saved, the scan failed, an update didn't install, or an application failed (the detail says how many, and the job's page lists which and why). |
 | Timed out | The Agent stopped the script at its timeout. |
-| No result | The device never reported: two minutes after the script's timeout, 30 minutes after a delivery started, 45 minutes after a scan, or five hours after an install. |
-| Skipped | The device has no interpreter for the script: PowerShell and Command Prompt run on Windows only, shell scripts on macOS and Linux only. Files go to every platform. An update job skips devices whose last scan found no update manager MeshRMM supports. |
+| No result | The device never reported: two minutes after the script's timeout, 30 minutes after a delivery started, 45 minutes after a scan, five hours after an install, or five hours and 15 minutes after an application run. |
+| Skipped | The device has no interpreter for the script: PowerShell and Command Prompt run on Windows only, shell scripts on macOS and Linux only. Files go to every platform. An update job skips devices whose last scan found no update manager MeshRMM supports. An application job skips devices on a platform none of its applications is for, devices whose last scan found none of the package managers its applications install with, and devices where every application was skipped (pinned, or nothing the device can use); the detail gives the reason, and no alert is raised. |
 | Missed | It was offline and the job skips offline devices, or it didn't connect before the job expired, or a newer run of the same policy replaced the wait, or the device was deleted. The detail says which. |
 | Cancelled | Someone cancelled the job before the device started. |
 
@@ -112,7 +116,10 @@ run. A policy has:
 - what it does: run a **shared** script as an account; scan for updates;
   install the pending updates of chosen categories (or all), restarting
   never, if required or always, after a delay (see
-  [patch management](patch-management.md#installing)); or wake the devices
+  [patch management](patch-management.md#installing)); install chosen
+  library applications, or update outdated applications: all of them, only
+  chosen ones, or all but chosen ones (see
+  [application deployment](application-deployment.md#policies)); or wake the devices
   that are offline (see [Wake-on-LAN](wake-on-lan.md#outcomes)), which
   skips online devices, never waits for offline ones, and can't run on
   enrollment;
@@ -137,7 +144,7 @@ without changing its schedule.
 | Daily | At a time of day in a chosen IANA time zone. |
 | Weekly | At a time of day on chosen days of the week, in a time zone. |
 | Once | At a date and time in a time zone, which must be in the future when it's saved. It stays on with nothing left to do afterwards. |
-| When a device enrolls | On each device that newly enrolls into its companies, or anywhere for every device. A device repaired with an installer again (keeping its ID) doesn't count. A new device has no tags yet, so these policies can't target tags or chosen devices. |
+| When a device enrolls | On each device that newly enrolls into its companies, or anywhere for every device. A device repaired with an installer again (keeping its ID) doesn't count. A new device has no tags yet, so these policies can't target tags or chosen devices. An **Install applications** policy also runs on each newly enrolled device it covers, whatever its trigger. |
 
 Times of day follow the zone's clock, so 03:00 stays 03:00 across daylight
 saving changes. A time the clocks skip that day runs at the first minute
@@ -157,7 +164,8 @@ once per run.
 A policy runs with the access of the user who last saved it, shown as its
 owner. Saving one needs `automation.manage` and what it does needs:
 `scripts.run` for a script, `updates.view` for a scan, `updates.install` for
-an install. When it is due, its owner must still be enabled and hold both
+an install, `devices.wake` for a wake, `applications.deploy` for installing or
+updating applications. When it is due, its owner must still be enabled and hold both
 permissions; otherwise it
 doesn't run, records why, and shows it on the policies page. Saving the
 policy again makes the saver its owner and clears the problem.
@@ -210,8 +218,9 @@ time out or never report, like runs started by hand.
 | `scripts.run` | Running scripts on chosen devices, and seeing one's own jobs. | Yes |
 | `files.deliver` | Sending files to chosen devices. | Yes |
 | `updates.view`, `updates.install` | Scan and install [update](patch-management.md) jobs on chosen devices, and seeing one's own jobs. | Yes |
+| `applications.view`, `applications.deploy` | Seeing one's own [application](application-deployment.md) jobs; install, update and uninstall jobs on chosen devices. | Yes |
 | `jobs.run_wide` | Running scripts, sending files and updating on whole companies, tags or every device. | No |
-| `automation.manage` | Seeing, creating, changing and deleting policies, and seeing their jobs. With what a policy does needs (`scripts.run`, `updates.view`, `updates.install` or `devices.wake`), saving and running it. | No |
+| `automation.manage` | Seeing, creating, changing and deleting policies, and seeing their jobs. With what a policy does needs (`scripts.run`, `updates.view`, `updates.install`, `devices.wake` or `applications.deploy`), saving and running it. | No |
 | `audit.view` | Seeing everyone's jobs and runs. | No |
 
 Administrators have every permission. Grant `jobs.run_wide` and
@@ -238,12 +247,12 @@ All routes need a signed-in user.
 
 | Route | |
 |---|---|
-| `POST /v1/jobs` | `{script_id, run_as}`, `{file_id, destination}` or `{updates: {action: "scan"}}` / `{updates: {action: "install", categories, reboot, reboot_delay_minutes}}`, with `target` (`devices`, `companies`, `tags` or `all`), `device_ids`, `company_ids` or `tag_ids` with `tag_match` (`any`, the default, or `all`), `offline` (`skip` or `wait`) and `wait_hours`. Returns the job with its devices. `400 no_devices` if the target covers none. |
+| `POST /v1/jobs` | `{script_id, run_as}`, `{file_id, destination}` or `{updates: {action: "scan"}}` / `{updates: {action: "install", categories, reboot, reboot_delay_minutes}}` or `{applications: {action, application_ids, packages, mode, inventory}}` (see [application deployment](application-deployment.md#api)), with `target` (`devices`, `companies`, `tags` or `all`), `device_ids`, `company_ids` or `tag_ids` with `tag_match` (`any`, the default, or `all`), `offline` (`skip` or `wait`) and `wait_hours`. Returns the job with its devices. `400 no_devices` if the target covers none. |
 | `GET /v1/jobs?policy_id=&limit=` | Jobs the user may see, newest first, with counts (50 by default, at most 200). |
-| `GET /v1/jobs/{id}` | A job with `devices`: each one's `outcome`, `detail`, `run_id`, `delivery_id`, `update_run_id` or `wake_id`, exit code, saved path and times. |
+| `GET /v1/jobs/{id}` | A job with `devices`: each one's `outcome`, `detail`, `run_id`, `delivery_id`, `update_run_id`, `application_run_id` or `wake_id`, exit code, saved path and times, and for an application job `applications`: `[{name, outcome, error}]` for those that failed or were skipped. |
 | `POST /v1/jobs/{id}/cancel` | Cancels the devices that haven't started. |
 | `GET /v1/automation-policies` | Policies with their latest job (`automation.manage`). |
-| `POST /v1/automation-policies`, `PUT /v1/automation-policies/{id}` | A whole policy: `name`, `enabled`, `action` (`script`, `update_scan`, `update_install` or `wake`), `script_id` and `run_as` for a script, `update_categories`, `reboot` and `reboot_delay_minutes` for an install, `target` with `device_ids`, `company_ids` or `tag_ids` and `tag_match`, `trigger` (`interval`, `daily`, `weekly`, `once`, `enroll`) with `interval_minutes`, `time` (`HH:MM`), `weekdays` (1 = Monday to 7), `run_at` (`YYYY-MM-DDTHH:MM`) and `time_zone` as it needs, `offline`, `catch_up_hours` and `channel_ids`. |
+| `POST /v1/automation-policies`, `PUT /v1/automation-policies/{id}` | A whole policy: `name`, `enabled`, `action` (`script`, `update_scan`, `update_install`, `wake`, `app_install` or `app_update`), `script_id` and `run_as` for a script, `update_categories`, `reboot` and `reboot_delay_minutes` for an install, `applications` (`{application_ids, packages, mode}`) for an application policy, `target` with `device_ids`, `company_ids` or `tag_ids` and `tag_match`, `trigger` (`interval`, `daily`, `weekly`, `once`, `enroll`) with `interval_minutes`, `time` (`HH:MM`), `weekdays` (1 = Monday to 7), `run_at` (`YYYY-MM-DDTHH:MM`) and `time_zone` as it needs, `offline`, `catch_up_hours` and `channel_ids`. |
 | `DELETE /v1/automation-policies/{id}` | |
 | `POST /v1/automation-policies/{id}/run` | Run now; returns the job. |
 
@@ -280,9 +289,13 @@ should read the lists again.
   `job`. An update job's kind is `update_scan` or `update_install`, its
   `item_name` says what it does, and its `item_id` is empty. A wake job's
   kind is `wake`; its devices are woken together by the dispatcher, outside
-  its limits, and their outcomes come from `wake_requests`.
+  its limits, and their outcomes come from `wake_requests`. An application
+  job's kind is `app_install`, `app_update` or `app_uninstall`; what it does
+  is kept in `application_jobs`, a device's part waits while the device runs
+  another application run, and its outcome comes from `application_runs`.
 - Each device's part is the same `run_script`, `deliver_file`,
-  `scan_updates` or `install_updates` command as one started by hand.
+  `scan_updates`, `install_updates` or `run_applications` command as one
+  started by hand.
 - The website: `dashboard/features/automation/`.
 
 ## Tests
