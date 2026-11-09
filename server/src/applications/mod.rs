@@ -165,7 +165,8 @@ pub async fn result_reported(
     run_id: &str,
     result: ApplicationRunResult,
 ) {
-    let failed = result.status != RunStatus::Succeeded;
+    // Skipped applications weren't for the device: not failures.
+    let failed = matches!(result.status, RunStatus::Failed | RunStatus::Partial);
     let mut transaction = match state.database.begin().await {
         Ok(transaction) => transaction,
         Err(error) => {
@@ -256,12 +257,36 @@ pub async fn record_run(
     }
 }
 
-/// Starts a job's run on a queued device, for the dispatcher: `None` when
-/// the device has nothing to do, which is recorded as a failed run.
+/// How a job's device starts.
+pub enum JobStart {
+    /// The run is recorded; the command for its Agent, if it has one.
+    Run(Option<AgentCommand>),
+    /// Nothing in the job is for the device, and why: no run.
+    Skip(String),
+}
+
+/// Why the device can't use anything `spec` installs, from the package
+/// managers its last scan found; `None` if it can, or it never scanned.
+pub async fn unusable(
+    executor: &mut impl Executor,
+    device_id: &str,
+    spec: &jobs::Spec,
+) -> crate::db::Result<Option<String>> {
+    let Some(platform) = platform(executor, device_id).await? else {
+        return Ok(None);
+    };
+    Ok(store::managers(executor, device_id)
+        .await?
+        .and_then(|managers| spec.unusable_with(platform, &managers)))
+}
+
+/// Starts a job's run on a queued device, for the dispatcher: skipped when
+/// nothing in it is for the device; a run without a command when the device
+/// has nothing to do, which is recorded as a failed run.
 pub async fn start_job_run(
     executor: &mut impl Executor,
     start: &Start<'_>,
-) -> crate::db::Result<Option<AgentCommand>> {
+) -> crate::db::Result<JobStart> {
     let spec = match start.job_id {
         Some(job_id) => jobs::load(executor, job_id).await?,
         None => None,
@@ -286,9 +311,12 @@ pub async fn start_job_run(
             start.now,
         )
         .await?;
-        return Ok(None);
+        return Ok(JobStart::Run(None));
     };
-    record_run(executor, start, &spec).await
+    if let Some(reason) = unusable(executor, start.device_id, &spec).await? {
+        return Ok(JobStart::Skip(reason));
+    }
+    Ok(JobStart::Run(record_run(executor, start, &spec).await?))
 }
 
 /// Whether the device is installing, updating or uninstalling.

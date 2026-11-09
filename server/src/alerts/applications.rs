@@ -242,6 +242,8 @@ mod tests {
             job_id: None,
             error: None,
             succeeded: 1,
+            unchanged: 0,
+            skipped: 0,
             failed: 1,
             reboot_required: false,
             created_at: 0,

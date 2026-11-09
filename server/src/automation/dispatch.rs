@@ -582,7 +582,28 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
             )
             .await;
             match started {
-                Ok(command) => command,
+                Ok(crate::applications::JobStart::Run(command)) => command,
+                // Nothing in it is for the device: skipped, not failed.
+                Ok(crate::applications::JobStart::Skip(reason)) => {
+                    transaction
+                        .execute(
+                            &Query::update()
+                                .table(JobDevices::Table)
+                                .value(JobDevices::State, DeviceState::Skipped.as_str())
+                                .value(JobDevices::Detail, reason)
+                                .value(JobDevices::UpdatedAt, now)
+                                .and_where(Expr::col(JobDevices::JobId).eq(job.id.as_str()))
+                                .and_where(Expr::col(JobDevices::DeviceId).eq(device_id))
+                                .and_where(
+                                    Expr::col(JobDevices::State).eq(DeviceState::Queued.as_str()),
+                                )
+                                .to_owned(),
+                        )
+                        .await?;
+                    transaction.commit().await?;
+                    // Skipped, not started: the device is free for the next job.
+                    return Ok(false);
+                }
                 // A run started on the device since `busy` looked; the
                 // device's part waits for it.
                 Err(error) if crate::applications::runs::is_already_pending(&error) => {

@@ -65,7 +65,7 @@ export function ApplicationPolicyFields({ install, applicationIds, packages, mod
           <small className="field-help">One a line, as source:id. The sources are winget, chocolatey, homebrew, homebrew_cask, flatpak and snap.</small>
         </label>
       )}
-      {install && <p className="field-help">Devices on an operating system none of the applications is for are skipped. With winget and Chocolatey, applications the library pins install at that version.</p>}
+      {install && <p className="field-help">Devices that can’t use any of the applications’ sources, on another operating system or without the package manager, are skipped with the reason, not failed, and raise no alert. With winget and Chocolatey, applications the library pins install at that version.</p>}
       {!install && <p className="field-help">Applications the library pins to a version are never updated.</p>}
     </>
   );

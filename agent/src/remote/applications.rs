@@ -76,6 +76,17 @@ impl Attempt {
         }
     }
 
+    /// Not for this device, and why.
+    pub(crate) fn skipped(reason: impl Into<String>) -> Self {
+        Self {
+            outcome: ItemOutcome::Skipped,
+            exit_code: None,
+            error: Some(reason.into()),
+            output: String::new(),
+            reboot_required: false,
+        }
+    }
+
     pub(crate) fn unchanged(note: impl Into<String>) -> Self {
         Self {
             outcome: ItemOutcome::Unchanged,
@@ -480,15 +491,17 @@ fn work(
         }
         ApplicationOperation::Update { choice } => {
             let chosen = choose_updates(choice, before);
-            for (index, (package, outdated)) in chosen.iter().enumerate() {
+            for (index, (package, chosen_as)) in chosen.iter().enumerate() {
                 let name = &package.name;
-                if !outdated {
-                    items.push(result(
-                        index,
-                        name,
-                        Some(package.key()),
-                        Attempt::unchanged("It is up to date."),
-                    ));
+                let note = match chosen_as {
+                    Chosen::Outdated => None,
+                    Chosen::Current => Some(Attempt::unchanged("It is up to date.")),
+                    Chosen::Pinned(version) => Some(Attempt::skipped(format!(
+                        "It is pinned to {version} in the library."
+                    ))),
+                };
+                if let Some(note) = note {
+                    items.push(result(index, name, Some(package.key()), note));
                     continue;
                 }
                 progress.report(format!(
@@ -551,12 +564,27 @@ fn finish(
             item.version = package.version.clone();
         }
     }
+    let status = RunStatus::of(&items);
+    // A run that skipped everything says why, as its job shows.
+    let error = (status == RunStatus::Skipped).then(|| skipped_reasons(&items));
     let result = ApplicationRunResult {
-        status: RunStatus::of(&items),
-        error: None,
+        status,
+        error,
         items,
     };
     (result, after)
+}
+
+/// Why a run's applications were skipped, each reason once.
+fn skipped_reasons(items: &[ItemResult]) -> String {
+    let mut reasons = Vec::new();
+    for item in items {
+        let reason = item.error.as_deref().unwrap_or("It isn't for this device.");
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+    reasons.join(" ")
 }
 
 const TOO_LONG: &str = "The run took too long and was stopped before this application.";
@@ -584,26 +612,44 @@ fn result(index: usize, name: &str, package: Option<PackageKey>, attempt: Attemp
     }
 }
 
-/// The packages an update covers, each with whether it is outdated: every
-/// outdated one it covers, and the ones it names that are installed and up
-/// to date, so asking for those says so. A named one whose installed
-/// version the manager doesn't know (winget's "Unknown") isn't outdated, but
-/// is handed to the manager, which knows whether it has a newer one. At most [`MAX_RUN_ITEMS`]: the
-/// rest wait for the next update.
-fn choose_updates(choice: &UpdateChoice, scan: &ApplicationScan) -> Vec<(ScannedPackage, bool)> {
+/// Why an update chose a package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Chosen {
+    /// It is outdated, or named with a version the manager doesn't know.
+    Outdated,
+    /// Named, and up to date.
+    Current,
+    /// Named, but the library pins it to this version.
+    Pinned(String),
+}
+
+/// The packages an update covers: every outdated one it covers, and the
+/// ones it names that are installed, so asking for one that is up to date
+/// or pinned says so. A named one whose installed version the manager
+/// doesn't know (winget's "Unknown") isn't outdated, but is handed to the
+/// manager, which knows whether it has a newer one. At most
+/// [`MAX_RUN_ITEMS`]: the rest wait for the next update.
+fn choose_updates(choice: &UpdateChoice, scan: &ApplicationScan) -> Vec<(ScannedPackage, Chosen)> {
     let mut chosen = scan
         .packages
         .iter()
         .filter(|package| package.outdated() && choice.covers(&package.key()))
-        .map(|package| (package.clone(), true))
+        .map(|package| (package.clone(), Chosen::Outdated))
         .collect::<Vec<_>>();
     if choice.mode == UpdateMode::Only {
         for key in &choice.packages {
-            if let Some(package) = installed(scan, key)
-                && !package.outdated()
-                && !choice.held.contains(key)
-            {
-                chosen.push((package.clone(), package.version.is_none()));
+            let Some(package) = installed(scan, key) else {
+                continue;
+            };
+            if let Some(version) = choice.pinned(key) {
+                chosen.push((package.clone(), Chosen::Pinned(version.to_owned())));
+            } else if !package.outdated() {
+                let why = if package.version.is_none() {
+                    Chosen::Outdated
+                } else {
+                    Chosen::Current
+                };
+                chosen.push((package.clone(), why));
             }
         }
     }
@@ -667,7 +713,8 @@ fn install(
 ) -> ItemResult {
     let source = match usable(item, tools) {
         Ok(source) => source,
-        Err(reason) => return result(index, &item.name, None, Attempt::failed(reason)),
+        // None of its ways to install is for this device: not a failure.
+        Err(reason) => return result(index, &item.name, None, Attempt::skipped(reason)),
     };
     if let Some(custom) = &source.custom {
         let attempt = install_custom(config, mode, request, index, custom);
@@ -770,7 +817,7 @@ fn uninstall(
             }
             let attempt = match tool_for(tools, package.source) {
                 Some(tool) => platform::uninstall(tool, package),
-                None => Attempt::failed(format!(
+                None => Attempt::skipped(format!(
                     "{} isn't installed on this device.",
                     package.source.label()
                 )),
@@ -935,12 +982,19 @@ mod tests {
         let ids = |choice: UpdateChoice| {
             choose_updates(&choice, &scan)
                 .into_iter()
-                .map(|(package, outdated)| (package.id, outdated))
+                .map(|(package, chosen)| (package.id, chosen))
                 .collect::<Vec<_>>()
+        };
+        let pinned = |id: &str| meshrmm_protocol::Held {
+            package: key(id),
+            version: "2.10".into(),
         };
         assert_eq!(
             ids(UpdateChoice::default()),
-            [("a".into(), true), ("c".into(), true)]
+            [
+                ("a".into(), Chosen::Outdated),
+                ("c".into(), Chosen::Outdated)
+            ]
         );
         assert_eq!(
             ids(UpdateChoice {
@@ -948,16 +1002,59 @@ mod tests {
                 packages: vec![key("b"), key("c"), key("missing")],
                 held: vec![],
             }),
-            [("c".into(), true), ("b".into(), false)]
+            [
+                ("c".into(), Chosen::Outdated),
+                ("b".into(), Chosen::Current)
+            ]
         );
         assert_eq!(
             ids(UpdateChoice {
                 mode: UpdateMode::Except,
                 packages: vec![key("a")],
-                held: vec![key("c")],
+                held: vec![pinned("c")],
             }),
-            Vec::<(String, bool)>::new()
+            Vec::<(String, Chosen)>::new()
         );
+        // A pinned package asked for by name says so.
+        assert_eq!(
+            ids(UpdateChoice {
+                mode: UpdateMode::Only,
+                packages: vec![key("a"), key("c")],
+                held: vec![pinned("c")],
+            }),
+            [
+                ("a".into(), Chosen::Outdated),
+                ("c".into(), Chosen::Pinned("2.10".into()))
+            ]
+        );
+    }
+
+    #[test]
+    fn runs_skip_what_isnt_for_the_device_and_say_why() {
+        let skipped = |reason: &str| result(0, "Hello", None, Attempt::skipped(reason));
+        let (run, _) = finish(
+            vec![
+                skipped("Snap isn't installed on this device."),
+                skipped("Snap isn't installed on this device."),
+            ],
+            ApplicationScan::default(),
+        );
+        assert_eq!(run.status, RunStatus::Skipped);
+        assert_eq!(
+            run.error.as_deref(),
+            Some("Snap isn't installed on this device."),
+            "each reason once"
+        );
+        let (run, _) = finish(
+            vec![
+                skipped("It is pinned to 2.10 in the library."),
+                result(1, "Git", None, Attempt::unchanged("It is up to date.")),
+            ],
+            ApplicationScan::default(),
+        );
+        assert_eq!(run.status, RunStatus::Succeeded);
+        assert_eq!(run.error, None);
+        assert_eq!(run.items[0].outcome, ItemOutcome::Skipped);
     }
 
     #[test]
@@ -983,7 +1080,7 @@ mod tests {
         );
         assert_eq!(chosen.len(), 1);
         assert_eq!(chosen[0].0.id, "Roblox.Roblox", "as the device lists it");
-        assert!(chosen[0].1, "handed to winget");
+        assert_eq!(chosen[0].1, Chosen::Outdated, "handed to winget");
     }
 
     #[test]

@@ -19,7 +19,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    applications::{jobs::RunAction, tables::ApplicationRuns},
+    applications::{
+        jobs::RunAction,
+        tables::{ApplicationRunItems, ApplicationRuns},
+    },
     audit::{self, Actor, Target as AuditTarget},
     db::{
         self, Executor,
@@ -319,6 +322,8 @@ pub fn outcome(
             Some("pending") => Outcome::Running,
             Some("completed" | "delivered" | "succeeded") if succeeded => Outcome::Succeeded,
             Some("completed" | "failed" | "partial") => Outcome::Failed,
+            // None of the applications was for the device.
+            Some("skipped") => Outcome::Skipped,
             Some("timed_out") => Outcome::TimedOut,
             // Lost, or purged with the toolbox history.
             _ => Outcome::NoResult,
@@ -1179,11 +1184,25 @@ pub struct JobDevice {
     pub wake_id: Option<String>,
     /// The device's application run, at `/v1/application-runs/{id}`.
     pub application_run_id: Option<String>,
+    /// The applications that failed or were skipped on its application
+    /// run, in order, with why.
+    pub applications: Vec<ApplicationProblem>,
     pub exit_code: Option<i64>,
     /// Where a delivered file was saved.
     pub path: Option<String>,
     pub started_at_unix_ms: Option<i64>,
     pub completed_at_unix_ms: Option<i64>,
+}
+
+/// An application that failed or was skipped on a device's run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
+pub struct ApplicationProblem {
+    #[serde(skip)]
+    pub run_id: String,
+    pub name: String,
+    /// `failed` or `skipped`.
+    pub outcome: String,
+    pub error: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1328,6 +1347,7 @@ pub async fn devices(
                 update_run_id: row.update_run_id,
                 wake_id: row.wake_id,
                 application_run_id: row.application_run_id,
+                applications: Vec::new(),
                 exit_code: row.exit_code,
                 path: row.path,
                 started_at_unix_ms: row.started_at,
@@ -1345,6 +1365,51 @@ pub async fn devices(
             device.device_id.clone(),
         )
     });
+    let problems: Vec<ApplicationProblem> = executor
+        .fetch_all(
+            &Query::select()
+                .columns([
+                    (ApplicationRunItems::Table, ApplicationRunItems::RunId),
+                    (ApplicationRunItems::Table, ApplicationRunItems::Name),
+                    (ApplicationRunItems::Table, ApplicationRunItems::Outcome),
+                    (ApplicationRunItems::Table, ApplicationRunItems::Error),
+                ])
+                .from(ApplicationRunItems::Table)
+                .inner_join(
+                    ApplicationRuns::Table,
+                    Expr::col((ApplicationRuns::Table, ApplicationRuns::Id))
+                        .equals((ApplicationRunItems::Table, ApplicationRunItems::RunId)),
+                )
+                .and_where(Expr::col((ApplicationRuns::Table, ApplicationRuns::JobId)).eq(job_id))
+                .and_where(
+                    Expr::col((ApplicationRunItems::Table, ApplicationRunItems::Outcome))
+                        .is_in(["failed", "skipped"]),
+                )
+                .order_by(
+                    (ApplicationRunItems::Table, ApplicationRunItems::Position),
+                    Order::Asc,
+                )
+                .to_owned(),
+        )
+        .await?;
+    if !problems.is_empty() {
+        let mut by_run = HashMap::<String, Vec<ApplicationProblem>>::new();
+        for problem in problems {
+            by_run
+                .entry(problem.run_id.clone())
+                .or_default()
+                .push(problem);
+        }
+        for device in &mut devices {
+            if let Some(problems) = device
+                .application_run_id
+                .as_deref()
+                .and_then(|id| by_run.remove(id))
+            {
+                device.applications = problems;
+            }
+        }
+    }
     Ok(devices)
 }
 
@@ -1438,6 +1503,10 @@ mod tests {
         assert_eq!(
             outcome(Started, Some("succeeded"), true, false),
             Outcome::Succeeded
+        );
+        assert_eq!(
+            outcome(Started, Some("skipped"), false, false),
+            Outcome::Skipped
         );
         assert_eq!(
             outcome(Started, Some("partial"), false, false),

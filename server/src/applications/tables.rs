@@ -65,6 +65,8 @@ pub enum ApplicationRuns {
     Progress,
     Error,
     Succeeded,
+    Unchanged,
+    Skipped,
     Failed,
     RebootRequired,
     CreatedAt,

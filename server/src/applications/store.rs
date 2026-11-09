@@ -2,7 +2,7 @@
 //! packages they have installed, and the updates they offer.
 use std::collections::{HashMap, HashSet};
 
-use meshrmm_protocol_types::{ApplicationScan, ManagerState, PackageKey, PackageSource};
+use meshrmm_protocol_types::{ApplicationScan, Held, ManagerState, PackageKey, PackageSource};
 use sea_query::{Expr, ExprTrait, OnConflict, Query};
 use serde::Serialize;
 
@@ -25,7 +25,7 @@ fn storable(text: &str) -> String {
 }
 
 /// The manager whose scan lists a source's packages: Homebrew lists casks.
-fn manager_of(source: PackageSource) -> PackageSource {
+pub fn manager_of(source: PackageSource) -> PackageSource {
     if source == PackageSource::HomebrewCask {
         PackageSource::Homebrew
     } else {
@@ -61,6 +61,21 @@ pub async fn status(executor: &mut impl Executor, device_id: &str) -> db::Result
         managers: serde_json::from_str(&managers).unwrap_or_default(),
         scanned_at,
         received_at,
+    }))
+}
+
+/// The package managers the device's last scan found, whether or not their
+/// scan worked; `None` before its first scan.
+pub async fn managers(
+    executor: &mut impl Executor,
+    device_id: &str,
+) -> db::Result<Option<Vec<PackageSource>>> {
+    Ok(status(executor, device_id).await?.map(|status| {
+        status
+            .managers
+            .iter()
+            .map(|manager| manager.source)
+            .collect()
     }))
 }
 
@@ -264,14 +279,24 @@ impl<'a> Matches<'a> {
 
     /// The pinned library applications' packages.
     pub fn held_keys(&self) -> Vec<PackageKey> {
-        let mut keys = self
+        self.pinned().into_iter().map(|held| held.package).collect()
+    }
+
+    /// The pinned library applications' packages, with the versions they
+    /// are pinned to.
+    pub fn pinned(&self) -> Vec<Held> {
+        let mut held = self
             .by_key
             .iter()
-            .filter(|(_, application)| application.pinned_version.is_some())
-            .map(|(key, _)| key.clone())
+            .filter_map(|(key, application)| {
+                Some(Held {
+                    package: key.clone(),
+                    version: application.pinned_version.clone()?,
+                })
+            })
             .collect::<Vec<_>>();
-        keys.sort();
-        keys
+        held.sort_by(|a, b| a.package.cmp(&b.package));
+        held
     }
 
     fn annotate(&self, package: &mut Package) {

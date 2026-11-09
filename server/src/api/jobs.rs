@@ -135,9 +135,11 @@ pub async fn start(
     ) {
         (None, None, None, Some(applications)) => {
             actor.require(Permission::ApplicationsDeploy)?;
-            Payload::Applications(Box::new(
-                crate::applications::jobs::build(&mut transaction, applications).await?,
-            ))
+            let spec = crate::applications::jobs::build(&mut transaction, applications).await?;
+            if let Some(reason) = spec.all_pinned() {
+                return Err(crate::applications::jobs::pinned(reason));
+            }
+            Payload::Applications(Box::new(spec))
         }
         (None, None, Some(updates), None) => match updates.action {
             UpdatesAction::Scan => {

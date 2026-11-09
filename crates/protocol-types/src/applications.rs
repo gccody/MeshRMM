@@ -475,6 +475,15 @@ impl UpdateMode {
     }
 }
 
+/// A package a pinned library application holds back from updates, and
+/// the version the library pins it to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Held {
+    #[serde(flatten)]
+    pub package: PackageKey,
+    pub version: String,
+}
+
 /// The outdated packages an update covers.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct UpdateChoice {
@@ -484,13 +493,21 @@ pub struct UpdateChoice {
     pub packages: Vec<PackageKey>,
     /// Packages the library pins: never updated past their version.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub held: Vec<PackageKey>,
+    pub held: Vec<Held>,
 }
 
 impl UpdateChoice {
+    /// The version the library pins `package` to, if it does.
+    pub fn pinned(&self, package: &PackageKey) -> Option<&str> {
+        self.held
+            .iter()
+            .find(|held| held.package == *package)
+            .map(|held| held.version.as_str())
+    }
+
     /// Whether the update covers `package`.
     pub fn covers(&self, package: &PackageKey) -> bool {
-        if self.held.contains(package) {
+        if self.pinned(package).is_some() {
             return false;
         }
         match self.mode {
@@ -647,6 +664,10 @@ pub enum ItemOutcome {
     Succeeded,
     /// Nothing to do: already installed, up to date, or not installed.
     Unchanged,
+    /// Not for this device, and why: none of its ways to install is for a
+    /// package manager the device has, or the library pins it. Not a
+    /// failure.
+    Skipped,
     Failed,
 }
 
@@ -655,6 +676,7 @@ impl ItemOutcome {
         match self {
             Self::Succeeded => "succeeded",
             Self::Unchanged => "unchanged",
+            Self::Skipped => "skipped",
             Self::Failed => "failed",
         }
     }
@@ -663,6 +685,7 @@ impl ItemOutcome {
         match text {
             "succeeded" => Some(Self::Succeeded),
             "unchanged" => Some(Self::Unchanged),
+            "skipped" => Some(Self::Skipped),
             "failed" => Some(Self::Failed),
             _ => None,
         }
@@ -700,12 +723,14 @@ pub struct ItemResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
-    /// Every application succeeded or had nothing to do.
+    /// Every application succeeded, had nothing to do, or was skipped.
     Succeeded,
     /// Some failed.
     Partial,
-    /// All failed, or the run couldn't start.
+    /// Every one it tried failed, or the run couldn't start.
     Failed,
+    /// Every application was skipped: none was for this device.
+    Skipped,
 }
 
 impl RunStatus {
@@ -714,6 +739,7 @@ impl RunStatus {
             Self::Succeeded => "succeeded",
             Self::Partial => "partial",
             Self::Failed => "failed",
+            Self::Skipped => "skipped",
         }
     }
 
@@ -723,9 +749,20 @@ impl RunStatus {
             .iter()
             .filter(|item| item.outcome == ItemOutcome::Failed)
             .count();
-        if failed == 0 {
+        if !items.is_empty()
+            && items
+                .iter()
+                .all(|item| item.outcome == ItemOutcome::Skipped)
+        {
+            Self::Skipped
+        } else if failed == 0 {
             Self::Succeeded
-        } else if failed == items.len() {
+        } else if failed
+            == items
+                .iter()
+                .filter(|item| item.outcome != ItemOutcome::Skipped)
+                .count()
+        {
             Self::Failed
         } else {
             Self::Partial
@@ -737,7 +774,7 @@ impl RunStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicationRunResult {
     pub status: RunStatus,
-    /// Why the run as a whole failed.
+    /// Why the run as a whole failed, or was skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default)]
@@ -877,7 +914,10 @@ mod tests {
         let choice = UpdateChoice {
             mode: UpdateMode::Except,
             packages: vec![key(PackageSource::Chocolatey, "googlechrome")],
-            held: vec![pinned],
+            held: vec![Held {
+                package: pinned,
+                version: "130.0".into(),
+            }],
         };
         assert!(!choice.covers(&scanned), "held whatever the case");
         assert!(!choice.covers(&key(PackageSource::Chocolatey, "GoogleChrome")));
@@ -1055,15 +1095,21 @@ mod tests {
             source: PackageSource::Winget,
             id: id.into(),
         };
+        let held = |id: &str| Held {
+            package: key(id),
+            version: "1.0".into(),
+        };
         let all = UpdateChoice {
-            held: vec![key("pinned")],
+            held: vec![held("pinned")],
             ..Default::default()
         };
         assert!(all.covers(&key("a")) && !all.covers(&key("pinned")));
+        assert_eq!(all.pinned(&key("PINNED")), Some("1.0"));
+        assert_eq!(all.pinned(&key("a")), None);
         let only = UpdateChoice {
             mode: UpdateMode::Only,
             packages: vec![key("a"), key("pinned")],
-            held: vec![key("pinned")],
+            held: vec![held("pinned")],
         };
         assert!(only.covers(&key("a")) && !only.covers(&key("b")) && !only.covers(&key("pinned")));
         let except = UpdateChoice {
@@ -1149,6 +1195,21 @@ mod tests {
         assert_eq!(
             RunStatus::of(&[item(ItemOutcome::Failed)]),
             RunStatus::Failed
+        );
+        // Skipped applications aren't failures, and a run that skipped
+        // every one was for another device.
+        assert_eq!(
+            RunStatus::of(&[item(ItemOutcome::Skipped), item(ItemOutcome::Skipped)]),
+            RunStatus::Skipped
+        );
+        assert_eq!(
+            RunStatus::of(&[item(ItemOutcome::Skipped), item(ItemOutcome::Succeeded)]),
+            RunStatus::Succeeded
+        );
+        assert_eq!(
+            RunStatus::of(&[item(ItemOutcome::Skipped), item(ItemOutcome::Failed)]),
+            RunStatus::Failed,
+            "every one it tried failed"
         );
     }
 

@@ -14,6 +14,8 @@ import {
   outdatedTotals,
   packageKey,
   platformsOf,
+  itemTone,
+  runCounts,
   runTone,
   sourceDraft,
   uninstallableInventory,
@@ -169,6 +171,8 @@ test("library applications, packages and runs read as words", () => {
   assert.equal(runTone("succeeded"), "success");
   assert.equal(runTone("pending"), "pending");
   for (const status of ["partial", "failed", "lost"]) assert.equal(runTone(status), "problem");
+  assert.equal(runTone("skipped"), "muted");
+  assert.deepEqual(["succeeded", "unchanged", "skipped", "failed"].map(itemTone), ["success", "success", "muted", "problem"]);
 });
 
 test("device packages and the fleet's outdated ones filter and total", () => {
@@ -253,4 +257,15 @@ test("the Applications page is for those who may see applications", () => {
   assert.equal(canView(account(["applications.view"]), "applications"), true);
   assert.equal(canView(account(["updates.view"]), "applications"), false);
   assert.equal(canView(account(["applications.deploy"]), "jobs"), true);
+});
+
+test("a run's counts say what it did, and when it had nothing to do", () => {
+  const run = (action, counts, status = "succeeded") => ({ action, status, succeeded: 0, unchanged: 0, skipped: 0, failed: 0, ...counts });
+  assert.equal(runCounts(run("update", { unchanged: 2 })), "Nothing to do: 2 applications already up to date");
+  assert.equal(runCounts(run("install", { unchanged: 1 })), "Nothing to do: 1 application already installed");
+  assert.equal(runCounts(run("uninstall", { unchanged: 3 })), "Nothing to do: 3 applications already not installed");
+  assert.equal(runCounts(run("update", {})), "Nothing to do: nothing was outdated");
+  assert.equal(runCounts(run("install", {}, "failed")), "");
+  assert.equal(runCounts(run("install", { skipped: 2 }, "skipped")), "2 skipped");
+  assert.equal(runCounts(run("update", { succeeded: 2, unchanged: 1, skipped: 1, failed: 1 }, "partial")), "2 done, 1 already up to date, 1 skipped, 1 failed");
 });

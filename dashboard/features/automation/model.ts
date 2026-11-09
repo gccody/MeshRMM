@@ -88,12 +88,21 @@ export type JobDevice = {
   wake_id?: string | null;
   // The device's application run, for application jobs.
   application_run_id?: string | null;
+  // The applications that failed or were skipped on it, in order.
+  applications?: ApplicationProblem[];
   exit_code: number | null;
   // Where a delivered file was saved.
   path: string | null;
   started_at_unix_ms: number | null;
   completed_at_unix_ms: number | null;
 };
+
+// An application that failed or was skipped on a device, and why.
+export type ApplicationProblem = { name: string; outcome: "failed" | "skipped"; error: string | null };
+
+// "Firefox failed: winget exited with 1", one line per application.
+export const applicationProblems = (device: Pick<JobDevice, "applications">) =>
+  (device.applications ?? []).map((problem) => `${problem.name} ${problem.outcome}${problem.error ? `: ${problem.error}` : ""}`);
 
 // GET /v1/jobs/{id}
 export type JobDetail = Job & { devices: JobDevice[] };

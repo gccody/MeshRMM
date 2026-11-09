@@ -235,7 +235,11 @@ pub struct Run {
     pub policy_name: Option<String>,
     pub job_id: Option<String>,
     pub error: Option<String>,
+    /// How many of its applications were done, had nothing to do, were
+    /// skipped as not for the device, and failed.
     pub succeeded: i64,
+    pub unchanged: i64,
+    pub skipped: i64,
     pub failed: i64,
     pub reboot_required: bool,
     pub created_at: i64,
@@ -259,6 +263,8 @@ struct RunRow {
     job_id: Option<String>,
     error: Option<String>,
     succeeded: i64,
+    unchanged: i64,
+    skipped: i64,
     failed: i64,
     reboot_required: bool,
     created_at: i64,
@@ -287,6 +293,8 @@ impl RunRow {
             job_id: self.job_id,
             error: self.error,
             succeeded: self.succeeded,
+            unchanged: self.unchanged,
+            skipped: self.skipped,
             failed: self.failed,
             reboot_required: self.reboot_required,
             created_at: self.created_at,
@@ -319,6 +327,8 @@ fn select() -> sea_query::SelectStatement {
             (ApplicationRuns::Table, ApplicationRuns::JobId),
             (ApplicationRuns::Table, ApplicationRuns::Error),
             (ApplicationRuns::Table, ApplicationRuns::Succeeded),
+            (ApplicationRuns::Table, ApplicationRuns::Unchanged),
+            (ApplicationRuns::Table, ApplicationRuns::Skipped),
             (ApplicationRuns::Table, ApplicationRuns::Failed),
             (ApplicationRuns::Table, ApplicationRuns::RebootRequired),
             (ApplicationRuns::Table, ApplicationRuns::CreatedAt),
@@ -575,6 +585,8 @@ pub async fn finish(
                     }),
                 )
                 .value(ApplicationRuns::Succeeded, count(ItemOutcome::Succeeded))
+                .value(ApplicationRuns::Unchanged, count(ItemOutcome::Unchanged))
+                .value(ApplicationRuns::Skipped, count(ItemOutcome::Skipped))
                 .value(ApplicationRuns::Failed, count(ItemOutcome::Failed))
                 .value(
                     ApplicationRuns::RebootRequired,

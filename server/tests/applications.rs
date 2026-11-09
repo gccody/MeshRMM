@@ -690,6 +690,10 @@ async fn application_jobs_and_policies_run_on_each_device() {
         let job = admin.get(&format!("/v1/jobs/{job_id}")).await.body;
         assert_eq!(outcome(&job, "Desk")["outcome"], "failed", "{name}");
         assert_eq!(outcome(&job, "Desk")["detail"], "1 application failed");
+        assert_eq!(
+            outcome(&job, "Desk")["applications"],
+            json!([{ "name": "Firefox", "outcome": "failed", "error": "winget failed" }])
+        );
 
         // An install policy, on a schedule, also covers newly enrolled
         // devices; the library application it names can't be deleted.
@@ -1345,6 +1349,159 @@ async fn technicians_see_and_deploy_applications() {
         );
         assert!(permissions.contains(&json!("applications.deploy")));
         assert!(!permissions.contains(&json!("applications.manage")));
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn what_a_device_cant_use_is_skipped_without_alerts() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let firefox_id = add_application(&mut admin, firefox()).await;
+        let hello_id = add_application(
+            &mut admin,
+            json!({
+                "name": "GNU Hello",
+                "pinned_version": "2.10",
+                "sources": [{ "source": "winget", "package_id": "GNU.Hello" }],
+            }),
+        )
+        .await;
+        let created = admin
+            .post(
+                "/v1/alert-rules",
+                json!({ "name": "App failed", "severity": "critical", "condition": "app_install_failed" }),
+            )
+            .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+        let outcome = |job: &Value, device: &str| {
+            job["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["device_name"] == device)
+                .unwrap()
+                .clone()
+        };
+
+        // A Linux device without Flatpak can't install Firefox from the
+        // library: its job is skipped, and the API says why.
+        let tux = app.enroll_on(&mut admin, "Tux", "linux").await;
+        let mut tux_control = tux.connect(&server).await.unwrap();
+        report_scan(
+            &mut tux_control,
+            &[],
+            scan(json!([{ "source": "snap", "version": "2.66" }]), Vec::new()),
+        )
+        .await;
+        packages_where(&mut admin, &tux.device_id, |body| !body["status"].is_null()).await;
+        let refused = admin
+            .post(
+                &format!("/v1/agents/{}/application-runs", tux.device_id),
+                json!({ "action": "install", "application_ids": [firefox_id] }),
+            )
+            .await;
+        assert_eq!(
+            refused.code(),
+            "not_applicable",
+            "{name}: {:?}",
+            refused.body
+        );
+        let job = admin
+            .post(
+                "/v1/jobs",
+                json!({
+                    "applications": { "action": "install", "application_ids": [firefox_id] },
+                    "target": "devices", "device_ids": [tux.device_id], "offline": "skip",
+                }),
+            )
+            .await;
+        assert_eq!(job.status, StatusCode::CREATED, "{:?}", job.body);
+        let job_id = job.body["id"].as_str().unwrap().to_owned();
+        automation::pass(&app.state, now_ms()).await.unwrap();
+        let job = admin.get(&format!("/v1/jobs/{job_id}")).await.body;
+        let tux_outcome = outcome(&job, "Tux");
+        assert_eq!(tux_outcome["outcome"], "skipped", "{name}: {tux_outcome:?}");
+        assert_eq!(
+            tux_outcome["detail"],
+            "The device has no Flatpak, which the application installs with"
+        );
+
+        // An Agent that finds nothing it can use skips every item: the run
+        // and the job's device are skipped, with its reasons, and no alert.
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let mut control = desk.connect(&server).await.unwrap();
+        let job = admin
+            .post(
+                "/v1/jobs",
+                json!({
+                    "applications": { "action": "install", "application_ids": [firefox_id] },
+                    "target": "devices", "device_ids": [desk.device_id], "offline": "skip",
+                }),
+            )
+            .await;
+        assert_eq!(job.status, StatusCode::CREATED, "{:?}", job.body);
+        let job_id = job.body["id"].as_str().unwrap().to_owned();
+        automation::pass(&app.state, now_ms()).await.unwrap();
+        let command = command_of(&mut control, "run_applications").await;
+        let run_id = command["run"]["run_id"].as_str().unwrap().to_owned();
+        let reason = "winget and Chocolatey aren't installed";
+        send_json(
+            &mut control,
+            json!({ "type": "application_result", "run_id": run_id, "result": {
+                "status": "skipped",
+                "error": reason,
+                "items": [{ "index": 0, "name": "Firefox", "outcome": "skipped", "error": reason, "output": "" }],
+            } }),
+        )
+        .await;
+        let finished = run_where(&mut admin, &run_id, |run| run["status"] == "skipped").await;
+        assert_eq!(finished["skipped"], 1, "{name}: {finished:?}");
+        assert_eq!(finished["failed"], 0);
+        assert_eq!(finished["items"][0]["outcome"], "skipped");
+        let job = admin.get(&format!("/v1/jobs/{job_id}")).await.body;
+        let desk_outcome = outcome(&job, "Desk");
+        assert_eq!(
+            desk_outcome["outcome"], "skipped",
+            "{name}: {desk_outcome:?}"
+        );
+        assert_eq!(desk_outcome["detail"], reason);
+        assert_eq!(
+            desk_outcome["applications"],
+            json!([{ "name": "Firefox", "outcome": "skipped", "error": reason }])
+        );
+        alerts::evaluate(&app.state, now_ms()).await.unwrap();
+        assert!(alerts_of(&mut admin).await.is_empty(), "{name}");
+
+        // Updating only pinned applications has nothing to run.
+        for (path, body) in [
+            (
+                format!("/v1/agents/{}/application-runs", desk.device_id),
+                json!({ "action": "update", "mode": "only", "application_ids": [hello_id] }),
+            ),
+            (
+                "/v1/jobs".to_owned(),
+                json!({
+                    "applications": { "action": "update", "mode": "only", "application_ids": [hello_id] },
+                    "target": "devices", "device_ids": [desk.device_id], "offline": "skip",
+                }),
+            ),
+        ] {
+            let pinned = admin.post(&path, body).await;
+            assert_eq!(
+                pinned.status,
+                StatusCode::CONFLICT,
+                "{name}: {:?}",
+                pinned.body
+            );
+            assert_eq!(pinned.code(), "application_pinned");
+            assert_eq!(
+                pinned.body["error"],
+                "GNU Hello is pinned to 2.10 in the library; unpin it to update it"
+            );
+        }
         app.finish().await;
     }
 }

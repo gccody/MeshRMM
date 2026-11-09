@@ -9,8 +9,8 @@
 //! [`ApplicationOperation`] is made from the spec for its platform, and for
 //! uninstalls from what its last scan found installed.
 use meshrmm_protocol_types::{
-    ApplicationOperation, DevicePlatform, MAX_RUN_ITEMS, PackageKey, UninstallItem, UpdateChoice,
-    UpdateMode,
+    ApplicationOperation, DevicePlatform, Held, MAX_RUN_ITEMS, PackageKey, PackageSource,
+    UninstallItem, UpdateChoice, UpdateMode,
 };
 use sea_query::{Expr, ExprTrait, Query};
 use serde::{Deserialize, Serialize};
@@ -93,7 +93,7 @@ pub struct Spec {
     pub mode: UpdateMode,
     /// The packages pinned library applications hold back from updates.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub held: Vec<PackageKey>,
+    pub held: Vec<Held>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inventory: Vec<InventoryProgram>,
 }
@@ -122,6 +122,12 @@ pub fn parse_packages(packages: &[String]) -> Result<Vec<PackageKey>, ApiError> 
     keys.sort();
     keys.dedup();
     Ok(keys)
+}
+
+/// The error for an update of only pinned applications, which would do
+/// nothing: see [`Spec::all_pinned`].
+pub fn pinned(reason: String) -> ApiError {
+    ApiError::conflict(reason).with_code("application_pinned")
 }
 
 /// Checks a request and takes its snapshot of the library.
@@ -199,7 +205,7 @@ pub async fn build(executor: &mut impl Executor, request: Request) -> Result<Spe
                     names(&application_names)
                 ),
             };
-            let held = store::Matches::new(&library).held_keys();
+            let held = store::Matches::new(&library).pinned();
             (summary, request.mode, held)
         }
         RunAction::Uninstall => {
@@ -254,6 +260,86 @@ impl Spec {
             }
         };
         (!usable).then(|| format!("None of the applications is for {}", platform.label()))
+    }
+
+    /// Why an install has nothing a device on `platform` whose package
+    /// managers are `managers` can use, if so: every way to install it on
+    /// the platform is a package manager the device doesn't have. A device
+    /// on another platform is skipped already (see [`Spec::unsupported_on`]).
+    pub fn unusable_with(
+        &self,
+        platform: DevicePlatform,
+        managers: &[PackageSource],
+    ) -> Option<String> {
+        if self.action != RunAction::Install {
+            return None;
+        }
+        let mut missing = Vec::new();
+        for application in &self.applications {
+            for source in application.sources_on(platform) {
+                let manager = store::manager_of(source.source);
+                if source.source == PackageSource::Custom || managers.contains(&manager) {
+                    return None;
+                }
+                if !missing.contains(&manager.label()) {
+                    missing.push(manager.label());
+                }
+            }
+        }
+        let (last, rest) = missing.split_last()?;
+        let needed = if rest.is_empty() {
+            (*last).to_owned()
+        } else {
+            format!("{} or {last}", rest.join(", "))
+        };
+        Some(format!(
+            "The device has no {needed}, which {} with",
+            if self.applications.len() == 1 {
+                "the application installs"
+            } else {
+                "the applications install"
+            }
+        ))
+    }
+
+    /// Why an update of only chosen applications has nothing to do, if
+    /// every one it names is pinned in the library, so updates leave it
+    /// alone: `GNU Hello is pinned to 2.10 in the library`.
+    pub fn all_pinned(&self) -> Option<String> {
+        if self.action != RunAction::Update || self.mode != UpdateMode::Only {
+            return None;
+        }
+        let pinned_package = |key: &PackageKey| {
+            self.held
+                .iter()
+                .find(|held| held.package == *key)
+                .map(|held| held.version.clone())
+        };
+        let mut pinned = Vec::new();
+        for application in &self.applications {
+            pinned.push((
+                application.name.clone(),
+                application.pinned_version.clone()?,
+            ));
+        }
+        for key in &self.packages {
+            pinned.push((key.id.clone(), pinned_package(key)?));
+        }
+        Some(match pinned.as_slice() {
+            [] => return None,
+            [(name, version)] => {
+                format!("{name} is pinned to {version} in the library; unpin it to update it")
+            }
+            _ => format!(
+                "{} are all pinned in the library; unpin them to update them",
+                names(
+                    &pinned
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .collect::<Vec<_>>()
+                )
+            ),
+        })
     }
 
     /// The packages an update covers, for the Agent.

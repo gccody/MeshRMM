@@ -333,6 +333,7 @@ mod tests {
 
     fn device(name: &str, outcome: Outcome, exit_code: Option<i64>) -> JobDevice {
         JobDevice {
+            applications: Vec::new(),
             device_id: name.to_lowercase(),
             device_name: Some(name.into()),
             platform: None,

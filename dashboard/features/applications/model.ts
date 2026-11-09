@@ -106,8 +106,11 @@ export type DevicePackage = {
 };
 
 export type RunAction = "scan" | "install" | "update" | "uninstall";
-export type RunStatus = "pending" | "succeeded" | "partial" | "failed" | "lost";
-export type ItemOutcome = "succeeded" | "unchanged" | "failed";
+// A run is skipped when nothing in it was for the device.
+export type RunStatus = "pending" | "succeeded" | "partial" | "failed" | "skipped" | "lost";
+// An item is skipped when it isn't for the device: no source it can use, or
+// pinned in the library.
+export type ItemOutcome = "succeeded" | "unchanged" | "skipped" | "failed";
 export type UpdateMode = "all" | "only" | "except";
 
 export type RunItem = {
@@ -139,6 +142,9 @@ export type ApplicationRun = {
   job_id: string | null;
   error: string | null;
   succeeded: number;
+  // Already as asked: up to date, installed, or not installed.
+  unchanged: number;
+  skipped: number;
   failed: number;
   reboot_required: boolean;
   created_at: number;
@@ -199,12 +205,14 @@ export const RUN_STATUS_LABELS: Record<RunStatus, string> = {
   succeeded: "Succeeded",
   partial: "Partly failed",
   failed: "Failed",
+  skipped: "Skipped",
   lost: "No result",
 };
 
 export const OUTCOME_LABELS: Record<ItemOutcome, string> = {
   succeeded: "Done",
   unchanged: "Nothing to do",
+  skipped: "Skipped",
   failed: "Failed",
 };
 
@@ -215,7 +223,35 @@ export const MODE_LABELS: Record<UpdateMode, string> = {
 };
 
 export const runTone = (status: RunStatus) =>
-  status === "succeeded" ? "success" : status === "pending" ? "pending" : "problem";
+  status === "succeeded" ? "success" : status === "pending" ? "pending" : status === "skipped" ? "muted" : "problem";
+
+export const itemTone = (outcome: ItemOutcome) =>
+  outcome === "failed" ? "problem" : outcome === "skipped" ? "muted" : "success";
+
+const ALREADY: Record<RunAction, string> = {
+  scan: "up to date",
+  install: "installed",
+  update: "up to date",
+  uninstall: "not installed",
+};
+
+const applicationsCount = (count: number) => count === 1 ? "1 application" : `${count} applications`;
+
+// A finished run's counts, as its History row shows them: "2 done, 1 failed",
+// or "Nothing to do: 2 applications already up to date".
+export function runCounts(run: Pick<ApplicationRun, "action" | "status" | "succeeded" | "unchanged" | "skipped" | "failed">) {
+  const already = ALREADY[run.action];
+  if (!run.succeeded && !run.skipped && !run.failed) {
+    if (run.unchanged) return `Nothing to do: ${applicationsCount(run.unchanged)} already ${already}`;
+    return run.status === "succeeded" && run.action === "update" ? "Nothing to do: nothing was outdated" : "";
+  }
+  return [
+    run.succeeded ? `${run.succeeded} done` : null,
+    run.unchanged ? `${run.unchanged} already ${already}` : null,
+    run.skipped ? `${run.skipped} skipped` : null,
+    run.failed ? `${run.failed} failed` : null,
+  ].filter(Boolean).join(", ");
+}
 
 export const MAX_RUN_ITEMS = 50;
 export const MAX_NAME_CHARS = 120;

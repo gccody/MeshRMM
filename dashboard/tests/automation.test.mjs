@@ -6,6 +6,7 @@ import {
   coveredAgents,
   describeSchedule,
   describeTarget,
+  applicationProblems,
   deviceResult,
   isJobFinished,
   jobPreview,
@@ -210,4 +211,12 @@ test("jobs and policies have pages under Jobs", () => {
   assert.equal(navViewFor("policies"), "jobs");
   assert.equal(homeView({ permissions: ["audit.view"], is_administrator: false }), "audit");
   assert.equal(homeView({ permissions: ["automation.manage"], is_administrator: false }), "jobs");
+});
+
+test("a job device names the applications that failed or were skipped", () => {
+  assert.deepEqual(applicationProblems({}), []);
+  assert.deepEqual(
+    applicationProblems({ applications: [{ name: "Firefox", outcome: "failed", error: "winget exited with 1" }, { name: "Zoom", outcome: "skipped", error: null }] }),
+    ["Firefox failed: winget exited with 1", "Zoom skipped"],
+  );
 });

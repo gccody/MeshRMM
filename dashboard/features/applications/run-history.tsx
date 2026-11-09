@@ -5,7 +5,7 @@ import { formatDateTime, formatRelative } from "../../lib/format";
 import { useResource } from "../../lib/use-resource";
 import { useWorkspace } from "../workspace/workspace-context";
 import { fetchApplicationRun, fetchApplicationRuns } from "./applications-api";
-import { type ApplicationRun, OUTCOME_LABELS, RUN_STATUS_LABELS, SOURCE_LABELS, runTone } from "./model";
+import { type ApplicationRun, OUTCOME_LABELS, RUN_STATUS_LABELS, SOURCE_LABELS, itemTone, runCounts, runTone } from "./model";
 
 const HISTORY_LIMIT = 25;
 
@@ -51,7 +51,7 @@ export function RunHistory({ deviceId, reloadKey }: { deviceId: string; reloadKe
                     </td>
                     <td>
                       <span className={`run-pill run-pill-${runTone(run.status)}`}>{RUN_STATUS_LABELS[run.status]}</span>
-                      {run.status !== "pending" && run.action !== "scan" && <span>{runCounts(run)}</span>}
+                      {run.status !== "pending" && run.action !== "scan" && runCounts(run) && <span>{runCounts(run)}</span>}
                       {run.reboot_required && <span className="badge badge-warn"><RotateCcw size={11} aria-hidden="true" />Restart needed</span>}
                     </td>
                     <td title={formatDateTime(run.created_at)}>{formatRelative(run.created_at)}</td>
@@ -67,9 +67,6 @@ export function RunHistory({ deviceId, reloadKey }: { deviceId: string; reloadKe
     </section>
   );
 }
-
-const runCounts = (run: ApplicationRun) =>
-  [run.succeeded ? `${run.succeeded} done` : null, run.failed ? `${run.failed} failed` : null].filter(Boolean).join(", ");
 
 // One run's applications, with their output, read when opened.
 export function RunDetail({ run }: { run: ApplicationRun }) {
@@ -88,7 +85,7 @@ export function RunDetail({ run }: { run: ApplicationRun }) {
           {items.map((item) => (
             <li key={item.position}>
               <strong>{item.name}</strong>
-              <span className={`run-pill run-pill-${item.outcome === "failed" ? "problem" : "success"}`}>{OUTCOME_LABELS[item.outcome]}</span>
+              <span className={`run-pill run-pill-${itemTone(item.outcome)}`}>{OUTCOME_LABELS[item.outcome]}</span>
               {item.source && <span className="mono-detail">{SOURCE_LABELS[item.source]}{item.package_id ? ` ${item.package_id}` : ""}</span>}
               {item.version && <span>Version {item.version}</span>}
               {item.exit_code !== null && <span>Exit code {item.exit_code}</span>}

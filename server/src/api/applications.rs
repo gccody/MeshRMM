@@ -438,6 +438,9 @@ pub async fn start_run(
         return Err(running());
     }
     let spec = jobs::build(&mut transaction, request).await?;
+    if let Some(reason) = spec.all_pinned() {
+        return Err(jobs::pinned(reason));
+    }
     let platform = applications::platform(&mut transaction, &id)
         .await?
         .ok_or_else(|| jobs::invalid("the device's operating system is unknown"))?;
@@ -445,6 +448,9 @@ pub async fn start_run(
     let operation = spec
         .operation(platform, &installed)
         .map_err(|reason| jobs::invalid(reason).with_code("not_applicable"))?;
+    if let Some(reason) = applications::unusable(&mut transaction, &id, &spec).await? {
+        return Err(jobs::invalid(reason).with_code("not_applicable"));
+    }
     let run_id = new_id();
     let command = applications::record_run(
         &mut transaction,

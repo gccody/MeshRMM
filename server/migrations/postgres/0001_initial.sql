@@ -1067,11 +1067,14 @@ CREATE TABLE application_runs (
   requested_by_user_id TEXT NOT NULL,
   policy_name TEXT,
   job_id TEXT,
-  -- 'lost': the Agent never reported.
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'succeeded', 'partial', 'failed', 'lost')),
+  -- 'lost': the Agent never reported. 'skipped': none of its applications
+  -- was for the device.
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'succeeded', 'partial', 'failed', 'skipped', 'lost')),
   progress TEXT,
   error TEXT,
   succeeded BIGINT NOT NULL DEFAULT 0,
+  unchanged BIGINT NOT NULL DEFAULT 0,
+  skipped BIGINT NOT NULL DEFAULT 0,
   failed BIGINT NOT NULL DEFAULT 0,
   reboot_required BOOLEAN NOT NULL DEFAULT FALSE,
   created_at BIGINT NOT NULL,
@@ -1093,7 +1096,7 @@ CREATE TABLE application_run_items (
   name TEXT NOT NULL,
   source TEXT,
   package_id TEXT,
-  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'unchanged', 'failed')),
+  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'unchanged', 'skipped', 'failed')),
   version TEXT,
   exit_code BIGINT,
   error TEXT,

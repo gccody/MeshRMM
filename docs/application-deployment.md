@@ -49,10 +49,25 @@ itself; a device without one lists no packages.
   - Package names are given to it in lowercase, as Homebrew writes them.
   - A cask whose installer needs an administrator's password fails, as it
     would for that user without a terminal.
-- **Flatpak** works on the system installation (`--system`), with `LC_ALL=C`.
-  An update whose remote doesn't give a version shows as "a newer build".
+- **Flatpak** works on the system installation (`--system`). When several
+  remotes have the application ("Multiple remotes have refs matching"), the
+  install is tried with each system remote in turn, Flathub first, skipping
+  those that don't have it. `flatpak remote-ls --updates` gives the newer
+  version only when the remote's appstream data has one, which Flathub
+  generally doesn't, so a Flathub update generally shows as "a newer build"
+  with no version.
 - **Snap** is used when `/run/snapd.socket` exists. An install that the
   store says needs classic confinement is tried again with `--classic`.
+  Only application snaps are listed: the Agent asks snapd (`GET /v2/snaps`
+  on its socket) for each snap's type and apps, and leaves out `base`,
+  `os`, `snapd`, `kernel` and `gadget` snaps, and snaps of type `app`
+  with no apps, such as the content snaps `gnome-46-2404` and
+  `gtk-common-themes`, which only provide libraries and themes to other
+  snaps. If snapd can't be asked, `snap list`'s notes column still drops
+  the system types and disabled revisions, but content snaps are listed.
+- Flatpak and snap run in the `C.UTF-8` locale, so their output is in
+  English without losing non-ASCII names; the Agent uses `C` where
+  `locale -a` doesn't list `C.UTF-8`.
 
 ## Scanning
 
@@ -107,7 +122,12 @@ name.
   - winget and Chocolatey install exactly that version;
   - updates leave the application alone everywhere: it shows as **Pinned**,
     isn't chosen by **Update all**, and doesn't count toward
-    [Application updates pending](#alerts).
+    [Application updates pending](#alerts) or the **Outdated** tab's
+    totals;
+  - updating it by name skips it ("It is pinned to 2.10 in the library").
+    A request in which everything chosen is pinned is refused
+    (`409 application_pinned`, "GNU Hello is pinned to 2.10 in the
+    library; unpin it to update it").
 
 A device installs an application with the first way listed for its platform
 that it can use: a custom installer, or a package whose manager the device
@@ -215,10 +235,23 @@ Each application ends as one of:
 |---|---|
 | Done | Installed, updated or uninstalled. |
 | Nothing to do | Already installed, already up to date, or not installed. |
-| Failed | The manager or installer failed, timed out, or isn't on the device; the error and the end of the output say why. |
+| Skipped | Not for this device: none of its ways to install is for the device's platform or uses a package manager the device has, or it's pinned in the library. The reason says which. |
+| Failed | The manager or installer failed or timed out; the error and the end of the output say why. |
 
-The run succeeds when nothing failed, partly fails when some did, and fails
-when all did or it couldn't start. A run that needs a restart says so. MeshRMM
+The run is skipped when every application was, succeeds when nothing
+failed, partly fails when some did, and fails when all those not skipped
+did or it couldn't start. A skipped run is not a failure: it raises no
+alert, and its job's device shows as **Skipped** with the reasons. The
+server also skips a job's device without asking it when the device's last
+scan found none of the package managers the applications install with
+("The device has no Flatpak, which the application installs with"), and
+refuses such a run on one device (`400 not_applicable`).
+
+A run's row in the device's **History** counts what it did ("2 done,
+1 failed"), or says it had nothing to do ("Nothing to do: 2 applications
+already up to date"). The job's page lists, under each device, the
+applications that failed or were skipped and why, the first three inline
+and the rest behind **N more**. A run that needs a restart says so. MeshRMM
 doesn't restart for applications; use [patch management](patch-management.md)
 or a script for that. A result that finishes while the device is offline is
 reported when it reconnects. A run that hasn't reported five hours and 15
@@ -244,8 +277,9 @@ Two policy actions, under **Jobs → Policies**:
 - **Install applications** installs chosen library applications. It runs on
   its schedule, and also on each newly enrolled device it covers, whatever
   its trigger, so new devices get the standard applications. Devices that
-  have them already are left as they are. Devices on a platform none of the
-  applications is for are skipped.
+  have them already are left as they are. Devices that can't use any of the
+  applications' ways to install (another platform, or no package manager
+  they install with) are skipped with the reason, not failed.
 - **Update applications** updates every outdated application, only chosen
   ones, or every one except chosen ones. The chosen ones are library
   applications, and other packages written as `source:id` (such as
@@ -305,17 +339,19 @@ log records:
 | `DELETE /v1/applications/{id}` | `409 application_in_use` while a policy names it. |
 | `GET /v1/agents/{id}/packages` | `{device_id, status: {managers, scanned_at, received_at}, scanning, running, packages}`: each package's `source`, `package_id`, `name`, `version`, `available_version`, `outdated_since`, `application_id`, `application_name` and `held`. |
 | `POST /v1/agents/{id}/packages/scan` | Asks the online device to scan; returns the scan's run, or the scan already asked for. |
-| `POST /v1/agents/{id}/application-runs` | `{action: "install", application_ids}`, `{action: "update", mode: "all"}` or `{action: "update", mode: "only" or "except", application_ids, packages}`, or `{action: "uninstall", application_ids, packages, inventory: [{name, version}]}`, with packages as `source:id`. Returns the run. `409 device_offline`, `409 application_run_running`, `400 not_applicable`. |
+| `POST /v1/agents/{id}/application-runs` | `{action: "install", application_ids}`, `{action: "update", mode: "all"}` or `{action: "update", mode: "only" or "except", application_ids, packages}`, or `{action: "uninstall", application_ids, packages, inventory: [{name, version}]}`, with packages as `source:id`. Returns the run. `409 device_offline`, `409 application_run_running`, `409 application_pinned` when everything an update names is pinned, `400 not_applicable` when nothing is for the device. |
 | `GET /v1/application-runs?device_id=&action=&limit=` | Runs, newest first (50 by default, at most 200). |
 | `GET /v1/application-runs/{id}` | A run with each application's `outcome`, `version`, `exit_code`, `error` and `output`. |
-| `GET /v1/packages/outdated` | Every outdated package in the fleet, with the devices it's outdated on, most devices first. |
-| `POST /v1/jobs` | `{applications: {…as for a run…}}` with the [job's target](automation.md#api). |
+| `GET /v1/packages/outdated` | Every outdated package in the fleet, with the devices it's outdated on, most devices first, and whether it's `held` (pinned). The website's totals and **Update all…** leave held packages out. |
+| `POST /v1/jobs` | `{applications: {…as for a run…}}` with the [job's target](automation.md#api). `409 application_pinned` as for a run. Each job device has `applications`: `[{name, outcome, error}]` for those that failed or were skipped. |
 
 A run reads `{id, device_id, device_name, action, summary, status, progress,
-requested_by, policy_name, job_id, error, succeeded, failed, reboot_required,
-created_at, completed_at, items}`, where `action` is `scan`, `install`,
-`update` or `uninstall`, and `status` is `pending`, `succeeded`, `partial`,
-`failed` or `lost`.
+requested_by, policy_name, job_id, error, succeeded, unchanged, skipped, failed,
+reboot_required, created_at, completed_at, items}`, where `action` is `scan`,
+`install`, `update` or `uninstall`, `status` is `pending`, `succeeded`,
+`partial`, `failed`, `skipped` or `lost`, and each item's `outcome` is
+`succeeded`, `unchanged`, `skipped` or `failed`. A skipped run's `error`
+gives the reasons.
 
 ```sh
 # Install Firefox (a library application) on one device.
