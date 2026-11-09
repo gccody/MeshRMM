@@ -120,7 +120,7 @@ function SourceFields({ index, source, files, editsInstallers, removable, onChan
   const changeSource = (next: PackageSource) =>
     onChange(next === "custom" ? { source: next } : { source: next, platform: SOURCE_PLATFORM[next] });
   return (
-    <fieldset className="choice-list application-source">
+    <fieldset className="application-source">
       <legend>Way {index + 1}</legend>
       <fieldset className="application-source-fields" disabled={locked}>
       <div className="script-editor-row">

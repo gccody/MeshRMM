@@ -1125,7 +1125,8 @@ button.outcome-chip:hover { color: var(--text); background: var(--raised); }
 
 /* Applications: the library, devices' packages and runs. */
 .application-actions { margin: 0 0 14px; justify-content: flex-end; }
-.application-source { padding: 12px 14px; border: 1px solid var(--rule); border-radius: 8px; }
+.application-source { display: grid; gap: 6px; min-width: 0; margin: 0; padding: 12px 14px; border: 1px solid var(--rule); border-radius: 8px; }
+.application-source legend { padding: 0 4px; color: var(--text-2); font-size: 13px; font-weight: 500; }
 .application-source-fields { display: grid; gap: 6px; margin: 0; padding: 0; border: 0; min-width: 0; }
 .outdated-version { color: var(--signal-strong); font-weight: 600; }
 .run-detail { padding: 6px 4px 10px; display: grid; gap: 8px; }
