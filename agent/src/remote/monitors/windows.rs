@@ -459,6 +459,9 @@ pub(super) fn events(
             }
         }
     }
+    // Reverse direction is record order, which isn't strictly time order:
+    // an event can be written with an earlier time than the one before it.
+    found.sort_by_key(|event| std::cmp::Reverse(event.at_ms));
     Ok(LogRead {
         truncated: found.len() >= MAX_EVENTS,
         events: found,
