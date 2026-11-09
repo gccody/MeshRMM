@@ -174,6 +174,16 @@ pending, scans it, installs chosen updates or all of them, and shows its
 update history; the **Updates** page gives the fleet's overview. See
 [patch management](patch-management.md).
 
+## Third-party applications
+
+The device page's **Applications** tab lists what its package managers
+(winget, Chocolatey, Homebrew, Flatpak, Snap) have installed, outdated ones
+first. It scans, updates and uninstalls them, installs applications from
+the library, uninstalls Windows programs from the software list, and shows
+the device's application history. The **Applications** page has the library
+and the fleet's outdated applications. See
+[application deployment](application-deployment.md).
+
 ## Waking offline devices
 
 **Wake device** in an offline device's menu, **Wake** on its page, or

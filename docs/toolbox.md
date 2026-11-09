@@ -165,7 +165,9 @@ Every script change, upload, run and delivery is recorded in the audit log (`too
 maintenance task deletes runs, deliveries and jobs older than 30 days.
 
 A shared script that an [automation policy](automation.md#policies) runs
-can't be deleted or unshared until the policy changes or is deleted.
+can't be deleted or unshared until the policy changes or is deleted. A
+shared file that the [application library](application-deployment.md#custom-installers)
+installs with can't be deleted or unshared either (`409 file_in_use`).
 
 ## Setup
 

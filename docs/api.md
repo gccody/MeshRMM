@@ -286,6 +286,22 @@ curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" -H "Content-Type: applicatio
 `GET /v1/updates/devices` summarizes every device; a job with
 `"updates": {"action": "install", …}` installs on many.
 
+### Applications
+
+```sh
+# A device's outdated third-party applications.
+curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/agents/$DEVICE/packages" |
+  jq '[.packages[] | select(.available_version) | {source, package_id, version, available_version}]'
+# Update two of them (applications.deploy).
+curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" -H "Content-Type: application/json" \
+  -d '{"action": "update", "mode": "only", "packages": ["winget:Mozilla.Firefox", "winget:Git.Git"]}' \
+  "$MESHRMM/v1/agents/$DEVICE/application-runs"
+```
+
+`GET /v1/packages/outdated` lists the fleet's outdated applications; a job
+with `"applications": {…}` installs, updates or uninstalls on many. See
+[application deployment](application-deployment.md#api).
+
 ### Wake-on-LAN
 
 ```sh

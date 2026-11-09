@@ -44,6 +44,8 @@ Its condition can't change after it's created.
 | Updates pending | updates of a category, or of any, have been pending for at least N days (1 to 365), counted from the scan that first listed each | none of them is pending that long |
 | Update install failed | an [update install](patch-management.md), by hand or as part of a job, failed partly or entirely, or never reported back | never: a person resolves it |
 | Restart pending | the device's update scans have said for at least N days (1 to 365) that it must restart to finish installing updates | a scan says it no longer has to |
+| Application install failed | an [application](application-deployment.md) install or update, by hand, in a job or by a policy, failed for an application, or never reported back; one alert per failed application | never: a person resolves it |
+| Application updates pending | applications the device's package managers list as outdated, other than those the library pins, have been outdated for more than N days (1 to 365), counted from the scan that first found each | none of them is outdated that long |
 
 The loads are averages so that a brief spike or dip neither raises nor
 clears an alert. A load rule needs readings covering its whole window, from
@@ -54,7 +56,7 @@ latest scan, online or not, and say nothing about a device that never
 scanned.
 
 A rule raises at most one unresolved alert per device (and per volume, for
-disk space). Another failure of a script on a device with an unresolved
+disk space, and per application, for application installs). Another failure of a script on a device with an unresolved
 script alert counts on that alert (`occurrences`) and makes it describe the
 latest failure, without notifying again. A run the Agent never reports on is
 marked `lost` two minutes after its timeout, and counts as a failure then. A
@@ -172,7 +174,7 @@ host only, since its URL may carry a token), and `alert.acknowledge` and
 | `GET /v1/alerts/counts` | Unresolved counts: `open`, `acknowledged`, and open ones by severity |
 | `GET /v1/alerts/{id}` | One alert |
 | `POST /v1/alerts/{id}/acknowledge`, `/resolve` | |
-| `GET`, `POST /v1/alert-rules`; `PUT`, `DELETE /v1/alert-rules/{id}` | A rule's devices are `target` (`all`, `companies` or `tags`) with `company_ids`, or `tag_ids` and `tag_match` (`any` or `all`). Its `threshold`, `threshold_unit`, `duration_minutes`, `nonzero_exit_fails`, `update_category` (`any` or a category) and `days` as its condition needs. An install failure alert carries `update_run_id`. |
+| `GET`, `POST /v1/alert-rules`; `PUT`, `DELETE /v1/alert-rules/{id}` | A rule's devices are `target` (`all`, `companies` or `tags`) with `company_ids`, or `tag_ids` and `tag_match` (`any` or `all`). Its `threshold`, `threshold_unit`, `duration_minutes`, `nonzero_exit_fails`, `update_category` (`any` or a category) and `days` as its condition needs. An install failure alert carries `update_run_id`. An application alert's `subject` is the application's name. |
 | `GET`, `POST /v1/notification-channels`; `PUT`, `DELETE /v1/notification-channels/{id}` | A missing `webhook_secret` keeps the saved one; `null` removes it |
 | `POST /v1/notification-channels/{id}/test` | `{ "delivered": bool, "error": string or null }` |
 | `GET /v1/notification-channels/recipients` | Users and roles an email channel can reach |
@@ -198,6 +200,7 @@ and the website reads its lists again.
 - `cargo test -p meshrmm-server --test alerts` runs on SQLite and
   PostgreSQL: raising, acknowledging and resolving, notifications to a
   webhook receiver, restarts, company scope, script failures and lost runs,
-  permissions, and email and webhook channels.
+  permissions, and email and webhook channels. `--test applications` covers
+  the application rules.
 - `npm test` in `dashboard` covers the alert filters and lists, the rule and
   channel forms, and alert events on the socket.
