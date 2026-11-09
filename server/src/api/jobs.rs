@@ -72,6 +72,9 @@ pub struct StartJob {
     destination: Option<FileDeliveryDestination>,
     #[serde(default)]
     updates: Option<UpdatesJob>,
+    /// Installs, updates or uninstalls applications.
+    #[serde(default)]
+    applications: Option<crate::applications::jobs::Request>,
     target: TargetKind,
     #[serde(default)]
     device_ids: Vec<String>,
@@ -124,8 +127,19 @@ pub async fn start(
         )));
     }
     let mut transaction = state.database.begin().await?;
-    let payload = match (request.script_id, request.file_id, request.updates) {
-        (None, None, Some(updates)) => match updates.action {
+    let payload = match (
+        request.script_id,
+        request.file_id,
+        request.updates,
+        request.applications,
+    ) {
+        (None, None, None, Some(applications)) => {
+            actor.require(Permission::ApplicationsDeploy)?;
+            Payload::Applications(Box::new(
+                crate::applications::jobs::build(&mut transaction, applications).await?,
+            ))
+        }
+        (None, None, Some(updates), None) => match updates.action {
             UpdatesAction::Scan => {
                 actor.require(Permission::UpdatesView)?;
                 Payload::UpdateScan
@@ -152,7 +166,7 @@ pub async fn start(
                 }
             }
         },
-        (Some(script_id), None, None) => {
+        (Some(script_id), None, None, None) => {
             user.require(Permission::ScriptsRun)?;
             let run_as = request
                 .run_as
@@ -170,7 +184,7 @@ pub async fn start(
                 run_as,
             }
         }
-        (None, Some(file_id), None) => {
+        (None, Some(file_id), None, None) => {
             user.require(Permission::FilesDeliver)?;
             let destination = request
                 .destination
@@ -186,7 +200,7 @@ pub async fn start(
         }
         _ => {
             return Err(jobs::invalid(
-                "choose a script, a file, or an update scan or install",
+                "choose a script, a file, an update scan or install, or applications",
             ));
         }
     };

@@ -342,6 +342,7 @@ mod tests {
             delivery_id: None,
             update_run_id: None,
             wake_id: None,
+            application_run_id: None,
             exit_code,
             path: None,
             started_at_unix_ms: None,

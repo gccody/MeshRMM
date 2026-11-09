@@ -103,6 +103,21 @@ pub async fn serve(
                                 updates::install_reported(&state, &device_id, &run_id, *result).await;
                             }
                         }
+                        Ok(AgentStatusMessage::ApplicationScan { run_ids, scan }) => {
+                            if state.agents.is_current(&device_id, connection.id) {
+                                crate::applications::scan_reported(&state, &device_id, run_ids, *scan).await;
+                            }
+                        }
+                        Ok(AgentStatusMessage::ApplicationProgress { run_id, message }) => {
+                            if state.agents.is_current(&device_id, connection.id) {
+                                crate::applications::progress_reported(&state, &device_id, &run_id, &message).await;
+                            }
+                        }
+                        Ok(AgentStatusMessage::ApplicationResult { run_id, result }) => {
+                            if state.agents.is_current(&device_id, connection.id) {
+                                crate::applications::result_reported(&state, &device_id, &run_id, *result).await;
+                            }
+                        }
                         Ok(AgentStatusMessage::WakePacketsSent { results }) => {
                             if state.agents.is_current(&device_id, connection.id) {
                                 wake::reported(&state, &device_id, results).await;

@@ -589,6 +589,8 @@ pub async fn update_file(
     require_edit(&user, Kind::File, current.shared)?;
     if input.shared {
         user.require(Kind::File.manage_permission())?;
+    } else if current.shared {
+        crate::applications::library::refuse_if_file_used(&mut transaction, &id).await?;
     }
     let changed = transaction
         .execute(
@@ -637,6 +639,7 @@ pub async fn delete_file(
         .await?
         .ok_or_else(file_not_found)?;
     require_edit(&user, Kind::File, current.shared)?;
+    crate::applications::library::refuse_if_file_used(&mut transaction, &id).await?;
     let changed = transaction
         .execute(
             &Query::delete()

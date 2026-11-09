@@ -205,7 +205,13 @@ async fn in_flight(
         )
         .await?;
     let wanted = devices.iter().collect::<HashSet<_>>();
-    for (device_id, count) in runs.into_iter().chain(deliveries).chain(updates) {
+    let applications = crate::applications::runs::awaiting(&mut &state.database, now).await?;
+    for (device_id, count) in runs
+        .into_iter()
+        .chain(deliveries)
+        .chain(updates)
+        .chain(applications)
+    {
         total += count;
         if wanted.contains(&device_id) {
             *per_device.entry(device_id).or_default() += count;
@@ -431,6 +437,9 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
     {
         return Ok(false);
     }
+    if kind.is_application() && crate::applications::busy(&mut &state.database, device_id).await? {
+        return Ok(false);
+    }
     let id = new_id();
     let mut transaction = state.database.begin().await?;
     let command = match kind {
@@ -559,6 +568,20 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
         }
         // Started together by `start_wakes`.
         Kind::Wake => return Ok(false),
+        Kind::AppInstall | Kind::AppUpdate | Kind::AppUninstall => {
+            crate::applications::start_job_run(
+                &mut transaction,
+                &crate::applications::Start {
+                    run_id: &id,
+                    device_id,
+                    requested_by_user_id: &job.requested_by_user_id,
+                    policy_name: job.policy_name.as_deref(),
+                    job_id: Some(&job.id),
+                    now,
+                },
+            )
+            .await?
+        }
     };
     let claimed = transaction
         .execute(
@@ -615,6 +638,9 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
         }
         Kind::UpdateScan | Kind::UpdateInstall => {
             update_runs::discard(&mut transaction, &id).await?;
+        }
+        Kind::AppInstall | Kind::AppUpdate | Kind::AppUninstall => {
+            crate::applications::runs::discard(&mut transaction, &id).await?;
         }
         Kind::Wake => {}
     }

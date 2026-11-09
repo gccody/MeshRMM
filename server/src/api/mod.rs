@@ -3,6 +3,7 @@ mod account;
 mod agent;
 mod alerts;
 mod api_tokens;
+mod applications;
 mod audit_log;
 mod automation;
 mod companies;
@@ -66,6 +67,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(remote_routes())
         .merge(alert_routes())
         .merge(automation_routes())
+        .merge(application_routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             recheck_access,
@@ -306,6 +308,33 @@ fn device_routes() -> Router<AppState> {
             "/agents/{id}/file-deliveries/{delivery_id}/result",
             post(agent::report_file_delivery),
         )
+}
+
+fn application_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/applications",
+            get(applications::list).post(applications::create),
+        )
+        .route(
+            "/applications/{id}",
+            get(applications::get)
+                .put(applications::update)
+                .delete(applications::delete),
+        )
+        .route("/agents/{id}/packages", get(applications::device_packages))
+        .route("/agents/{id}/packages/scan", post(applications::scan))
+        .route(
+            "/agents/{id}/application-runs",
+            post(applications::start_run),
+        )
+        .route(
+            "/agents/{id}/application-runs/{run_id}/files/{file_id}",
+            get(applications::installer),
+        )
+        .route("/application-runs", get(applications::list_runs))
+        .route("/application-runs/{id}", get(applications::get_run))
+        .route("/packages/outdated", get(applications::outdated))
 }
 
 fn toolbox_routes() -> Router<AppState> {

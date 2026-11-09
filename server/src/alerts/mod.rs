@@ -17,6 +17,7 @@
 //! counts as offline from the first evaluation after a start, so a restart
 //! delays offline alerts instead of raising one for every device, and loads
 //! need a full window of new readings.
+pub mod applications;
 mod evaluate;
 pub mod rules;
 pub mod store;
@@ -202,6 +203,7 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
     } else {
         Default::default()
     };
+    let outdated_packages = applications::outdated(&mut database, &rules).await?;
 
     // Which rule and device pairs have a verdict, and the alerts it wants.
     let mut judged = HashSet::new();
@@ -232,7 +234,12 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
                         reboot_pending_since: reboots.get(device_id).copied(),
                     }),
                 };
-                if let Verdict::Known(breaches) = judge(rule, device, &tracker, now) {
+                let verdict = if rule.condition == Condition::AppUpdatesPending {
+                    applications::judge(rule, outdated_packages.get(device_id), now)
+                } else {
+                    judge(rule, device, &tracker, now)
+                };
+                if let Verdict::Known(breaches) = verdict {
                     judged.insert((rule.id.as_str(), device_id.as_str()));
                     wanted.extend(breaches.into_iter().map(|breach| (rule, device_id, breach)));
                 }

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
+    applications::{jobs::RunAction, tables::ApplicationRuns},
     audit::{self, Actor, Target as AuditTarget},
     db::{
         self, Executor,
@@ -49,6 +50,9 @@ pub enum Kind {
     UpdateScan,
     UpdateInstall,
     Wake,
+    AppInstall,
+    AppUpdate,
+    AppUninstall,
 }
 
 impl Kind {
@@ -59,6 +63,9 @@ impl Kind {
             Self::UpdateScan => "update_scan",
             Self::UpdateInstall => "update_install",
             Self::Wake => "wake",
+            Self::AppInstall => "app_install",
+            Self::AppUpdate => "app_update",
+            Self::AppUninstall => "app_uninstall",
         }
     }
 
@@ -69,8 +76,19 @@ impl Kind {
             "update_scan" => Some(Self::UpdateScan),
             "update_install" => Some(Self::UpdateInstall),
             "wake" => Some(Self::Wake),
+            "app_install" => Some(Self::AppInstall),
+            "app_update" => Some(Self::AppUpdate),
+            "app_uninstall" => Some(Self::AppUninstall),
             _ => None,
         }
+    }
+
+    /// Whether it installs, updates or uninstalls applications.
+    pub fn is_application(self) -> bool {
+        matches!(
+            self,
+            Self::AppInstall | Self::AppUpdate | Self::AppUninstall
+        )
     }
 }
 
@@ -132,6 +150,8 @@ pub enum Payload {
     },
     /// Wakes the devices that are offline.
     Wake,
+    /// Installs, updates or uninstalls applications.
+    Applications(Box<crate::applications::jobs::Spec>),
 }
 
 impl Payload {
@@ -142,6 +162,11 @@ impl Payload {
             Self::UpdateScan => Kind::UpdateScan,
             Self::UpdateInstall { .. } => Kind::UpdateInstall,
             Self::Wake => Kind::Wake,
+            Self::Applications(spec) => match spec.action {
+                RunAction::Install => Kind::AppInstall,
+                RunAction::Update => Kind::AppUpdate,
+                RunAction::Uninstall => Kind::AppUninstall,
+            },
         }
     }
 
@@ -159,6 +184,7 @@ impl Payload {
                 "",
                 format!("Install {}", Install::describe(&[], categories)),
             ),
+            Self::Applications(spec) => ("", spec.summary.clone()),
         }
     }
 
@@ -180,6 +206,7 @@ impl Payload {
             (Self::UpdateScan | Self::UpdateInstall { .. }, _) if !updates_supported => Some(
                 "The device has no update service or package manager MeshRMM supports".to_owned(),
             ),
+            (Self::Applications(spec), platform) => spec.unsupported_on(platform),
             _ => None,
         }
     }
@@ -410,6 +437,8 @@ impl Viewer {
             Permission::FilesDeliver,
             Permission::UpdatesView,
             Permission::UpdatesInstall,
+            Permission::ApplicationsView,
+            Permission::ApplicationsDeploy,
             Permission::AutomationManage,
             Permission::AuditView,
         ]
@@ -595,9 +624,10 @@ pub async fn create(
         0
     };
     let (language, body, timeout_seconds, run_as, destination) = match &job.payload {
-        Payload::UpdateScan | Payload::UpdateInstall { .. } | Payload::Wake => {
-            (None, None, None, None, None)
-        }
+        Payload::UpdateScan
+        | Payload::UpdateInstall { .. }
+        | Payload::Wake
+        | Payload::Applications(_) => (None, None, None, None, None),
         Payload::Script {
             language,
             body,
@@ -677,6 +707,9 @@ pub async fn create(
                 .to_owned(),
         )
         .await?;
+    if let Payload::Applications(spec) = &job.payload {
+        crate::applications::jobs::save(executor, &id, spec).await?;
+    }
     let mut counts: HashMap<DeviceState, i64> = HashMap::new();
     for chunk in devices.chunks(INSERT_CHUNK) {
         let mut insert = Query::insert();
@@ -729,6 +762,9 @@ pub async fn create(
     if let Some(reboot) = reboot {
         metadata["reboot"] = reboot.into();
         metadata["reboot_delay_minutes"] = reboot_delay_minutes.into();
+    }
+    if let Payload::Applications(spec) = &job.payload {
+        metadata["applications"] = spec.audit();
     }
     if let Some((policy_id, policy_name)) = &job.policy {
         metadata["policy_id"] = policy_id.as_str().into();
@@ -981,10 +1017,17 @@ fn outcome_columns(select: &mut sea_query::SelectStatement, now: i64) {
         "update_runs.created_at + CASE update_runs.kind WHEN 'scan' THEN {SCAN_REPORT_WINDOW_MS} \
          ELSE {INSTALL_REPORT_WINDOW_MS} END"
     );
+    let application_deadline = format!(
+        "application_runs.created_at + CASE application_runs.action WHEN 'scan' THEN {} \
+         ELSE {} END",
+        crate::applications::runs::SCAN_REPORT_WINDOW_MS,
+        crate::applications::runs::RUN_REPORT_WINDOW_MS
+    );
     select
         .expr_as(
             Expr::cust(
                 "COALESCE(script_runs.status, file_deliveries.status, update_runs.status, \
+                 application_runs.status, \
                  CASE WHEN wake_requests.id IS NULL THEN NULL \
                  WHEN wake_requests.online_at IS NOT NULL THEN 'succeeded' \
                  WHEN wake_requests.status IN ('sending', 'sent') THEN 'pending' \
@@ -997,6 +1040,7 @@ fn outcome_columns(select: &mut sea_query::SelectStatement, now: i64) {
                 "CAST(CASE WHEN script_runs.status = 'completed' AND script_runs.exit_code = 0 THEN 1 \
                  WHEN file_deliveries.status = 'delivered' THEN 1 \
                  WHEN update_runs.status = 'succeeded' THEN 1 \
+                 WHEN application_runs.status = 'succeeded' THEN 1 \
                  WHEN wake_requests.online_at IS NOT NULL THEN 1 ELSE 0 END AS BIGINT)",
             ),
             "succeeded",
@@ -1006,6 +1050,7 @@ fn outcome_columns(select: &mut sea_query::SelectStatement, now: i64) {
                 "CAST(CASE WHEN script_runs.status = 'pending' AND {run_deadline} < {now} THEN 1 \
                  WHEN file_deliveries.status = 'pending' AND {delivery_deadline} < {now} THEN 1 \
                  WHEN update_runs.status = 'pending' AND {update_deadline} < {now} THEN 1 \
+                 WHEN application_runs.status = 'pending' AND {application_deadline} < {now} THEN 1 \
                  WHEN wake_requests.online_at IS NULL AND wake_requests.status IN ('sending', 'sent') \
                  AND {wake_deadline} < {now} THEN 1 \
                  ELSE 0 END AS BIGINT)"
@@ -1045,6 +1090,15 @@ fn outcome_columns(select: &mut sea_query::SelectStatement, now: i64) {
                 .equals((JobDevices::Table, JobDevices::JobId))
                 .and(
                     Expr::col((WakeRequests::Table, WakeRequests::DeviceId))
+                        .equals((JobDevices::Table, JobDevices::DeviceId)),
+                ),
+        )
+        .left_join(
+            ApplicationRuns::Table,
+            Expr::col((ApplicationRuns::Table, ApplicationRuns::JobId))
+                .equals((JobDevices::Table, JobDevices::JobId))
+                .and(
+                    Expr::col((ApplicationRuns::Table, ApplicationRuns::DeviceId))
                         .equals((JobDevices::Table, JobDevices::DeviceId)),
                 ),
         );
@@ -1123,6 +1177,8 @@ pub struct JobDevice {
     pub update_run_id: Option<String>,
     /// The device's wake request, at `/v1/wakes?ids={id}`.
     pub wake_id: Option<String>,
+    /// The device's application run, at `/v1/application-runs/{id}`.
+    pub application_run_id: Option<String>,
     pub exit_code: Option<i64>,
     /// Where a delivered file was saved.
     pub path: Option<String>,
@@ -1141,8 +1197,10 @@ struct JobDeviceRow {
     delivery_id: Option<String>,
     update_run_id: Option<String>,
     wake_id: Option<String>,
+    application_run_id: Option<String>,
     updates_installed: Option<i64>,
     updates_failed: Option<i64>,
+    applications_failed: Option<i64>,
     exit_code: Option<i64>,
     error: Option<String>,
     path: Option<String>,
@@ -1176,6 +1234,14 @@ pub async fn devices(
         .expr_as(Expr::col((UpdateRuns::Table, UpdateRuns::Id)), "update_run_id")
         .expr_as(Expr::col((WakeRequests::Table, WakeRequests::Id)), "wake_id")
         .expr_as(
+            Expr::col((ApplicationRuns::Table, ApplicationRuns::Id)),
+            "application_run_id",
+        )
+        .expr_as(
+            Expr::col((ApplicationRuns::Table, ApplicationRuns::Failed)),
+            "applications_failed",
+        )
+        .expr_as(
             Expr::col((UpdateRuns::Table, UpdateRuns::Installed)),
             "updates_installed",
         )
@@ -1186,7 +1252,8 @@ pub async fn devices(
         .column((ScriptRuns::Table, ScriptRuns::ExitCode))
         .expr_as(
             Expr::cust(
-                "COALESCE(script_runs.error, file_deliveries.error, update_runs.error, wake_requests.detail)",
+                "COALESCE(script_runs.error, file_deliveries.error, update_runs.error, \
+                 application_runs.error, wake_requests.detail)",
             ),
             "error",
         )
@@ -1194,14 +1261,14 @@ pub async fn devices(
         .expr_as(
             Expr::cust(
                 "COALESCE(script_runs.created_at, file_deliveries.created_at, update_runs.created_at, \
-                 wake_requests.created_at)",
+                 application_runs.created_at, wake_requests.created_at)",
             ),
             "started_at",
         )
         .expr_as(
             Expr::cust(
                 "COALESCE(script_runs.completed_at, file_deliveries.completed_at, update_runs.completed_at, \
-                 wake_requests.online_at)",
+                 application_runs.completed_at, wake_requests.online_at)",
             ),
             "completed_at",
         );
@@ -1233,6 +1300,11 @@ pub async fn devices(
                 )),
                 _ => None,
             };
+            let applications = match row.applications_failed {
+                Some(1) => Some("1 application failed".to_owned()),
+                Some(failed) if failed > 1 => Some(format!("{failed} applications failed")),
+                _ => None,
+            };
             // A woken device that never came online has no error of its own.
             let unwoken = (row.wake_id.is_some() && outcome == Outcome::NoResult).then(|| {
                 format!(
@@ -1245,11 +1317,17 @@ pub async fn devices(
                 device_name: row.device_name,
                 platform: row.platform.as_deref().and_then(DevicePlatform::parse),
                 outcome,
-                detail: row.error.or(installs).or(unwoken).or(row.detail),
+                detail: row
+                    .error
+                    .or(installs)
+                    .or(applications)
+                    .or(unwoken)
+                    .or(row.detail),
                 run_id: row.run_id,
                 delivery_id: row.delivery_id,
                 update_run_id: row.update_run_id,
                 wake_id: row.wake_id,
+                application_run_id: row.application_run_id,
                 exit_code: row.exit_code,
                 path: row.path,
                 started_at_unix_ms: row.started_at,
