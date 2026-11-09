@@ -423,6 +423,18 @@ pub(crate) fn flatpak_updates(output: &str) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
+/// `flatpak remotes --system --columns=name`: one remote per line. A name
+/// that could be read as an option is left out.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn flatpak_remotes(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !name.starts_with('-'))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// `snap list --unicode=never`: name, version, revision, tracking,
 /// publisher and notes under a header. Disabled revisions are left out.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -898,6 +910,14 @@ Bar   Bar.Bar  3.0     4.0       winget\n";
                 ("org.mozilla.firefox".to_owned(), Some("136.0".to_owned())),
                 ("org.gimp.GIMP".to_owned(), None)
             ]
+        );
+    }
+
+    #[test]
+    fn flatpak_lists_remotes() {
+        assert_eq!(
+            flatpak_remotes("fedora\nflathub\n\n--bad\n"),
+            ["fedora", "flathub"]
         );
     }
 

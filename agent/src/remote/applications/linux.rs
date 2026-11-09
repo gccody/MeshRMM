@@ -173,7 +173,26 @@ pub(super) fn install(tool: &Tool, package: &PackageRef) -> Attempt {
     let id = package.id.as_str();
     match tool.source {
         PackageSource::Flatpak => {
-            attempt(tool, &["install", "--system", "--noninteractive", "-y", id])
+            let first = attempt(tool, &["install", "--system", "--noninteractive", "-y", id]);
+            // With several remotes that have it, such as Fedora's own and
+            // Flathub, Flatpak asks which to use, and fails without a
+            // terminal. Name one: Flathub first, then the others in the
+            // installation's order, past those that don't have it.
+            if first.outcome != meshrmm_protocol::ItemOutcome::Failed
+                || !first.output.contains("Multiple remotes")
+            {
+                return first;
+            }
+            for remote in flatpak_remotes(tool) {
+                let tried = attempt(
+                    tool,
+                    &["install", "--system", "--noninteractive", "-y", &remote, id],
+                );
+                if !tried.output.contains("Nothing matches") {
+                    return tried;
+                }
+            }
+            first
         }
         _ => {
             let first = attempt(tool, &["install", id]);
@@ -185,6 +204,19 @@ pub(super) fn install(tool: &Tool, package: &PackageRef) -> Attempt {
             first
         }
     }
+}
+
+/// The system installation's remotes, Flathub first.
+fn flatpak_remotes(tool: &Tool) -> Vec<String> {
+    let Ok(ran) = tool.run(&["remotes", "--system", "--columns=name"], SCAN_TIMEOUT) else {
+        return Vec::new();
+    };
+    if !ran.success() {
+        return Vec::new();
+    }
+    let mut remotes = parse::flatpak_remotes(&ran.stdout);
+    remotes.sort_by_key(|remote| remote != "flathub");
+    remotes
 }
 
 pub(super) fn update(tool: &Tool, package: &ScannedPackage) -> Attempt {
