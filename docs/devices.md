@@ -184,6 +184,12 @@ the device's application history. The **Applications** page has the library
 and the fleet's outdated applications. See
 [application deployment](application-deployment.md).
 
+## Monitors
+
+The device page's **Monitors** tab lists the [monitor](monitors.md) rules
+that apply to the device, what each last found and when, its output and
+alert, and **Check now**. Users with `alerts.view` see it.
+
 ## Waking offline devices
 
 **Wake device** in an offline device's menu, **Wake** on its page, or

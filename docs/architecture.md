@@ -124,6 +124,9 @@ input.
 - `alerts`: alert rules, the engine that judges them and the alerts they
   raise. `notifications`: email and webhook channels. See
   [alerts](alerts.md).
+- `monitors`: monitor rules' settings, sending each Agent the monitors that
+  apply to it, taking in their results, and self-healing (`remediation`).
+  See [monitors and self-healing](monitors.md).
 - `automation`: jobs (a script, file, update scan, update install,
   application install, update or uninstall, or wake on many devices), the dispatcher that starts them a few at a time, and policies
   that start jobs on a schedule or on enrollment. See
@@ -156,7 +159,8 @@ task.
   authentication, superseding an older connection of the same Agent,
   revocation, commands (session requests, scripts, file deliveries,
   uninstall, system information, update scans and installs, terminals,
-  wake packets, file requests and transfers),
+  wake packets, file requests and transfers, monitors and self-healing
+  actions),
   credential rotation, the session lease and update grace.
 - **Session actor**, one per remote session
   (`/v1/remote/sessions/{id}/signal`): the signaling relay, the idle
@@ -174,6 +178,11 @@ task.
 - **Alerts**: the engine's task reads presence and the metrics, raises and
   resolves alerts, and broadcasts them; event sockets of users who may see
   alerts pass them on. See [alerts](alerts.md).
+- **Monitors**: the engine's task sends each connected Agent its monitors
+  when they change, comparing what each was last sent on presence changes,
+  rule changes and every minute. The Agent's results are judged as they
+  arrive; self-healing attempts are made on the alert engine's passes. See
+  [monitors](monitors.md).
 - **Automation**: the engine's task fires due policies, starts jobs' runs on
   connected devices and broadcasts jobs whose counts changed; event sockets
   pass on the jobs each user may see. See [automation](automation.md).
@@ -243,7 +252,8 @@ arguments:
 
 - **The service** (`MeshRMMAgent`, LocalSystem, Session 0) keeps the control
   connection, supervises everything else, runs scripts and file deliveries,
-  and checks for updates.
+  runs [monitors](monitors.md) on their own scheduler thread, and checks for
+  updates.
 - **A worker** with the same LocalSystem token runs in the active console
   session, so Windows.Graphics.Capture and `SendInput` reach the interactive
   desktop without the Agent running as the signed-in user. When nobody is

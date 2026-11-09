@@ -6,7 +6,8 @@ integrator needs: authenticating with an API token, errors, lists, and the
 main flows with `curl`. The feature pages hold every route and field:
 [devices](devices.md), [hardware and software](hardware-and-software.md#api),
 [automation](automation.md#api), [patch management](patch-management.md#api),
-[alerts](alerts.md#api), [Wake-on-LAN](wake-on-lan.md#api) and
+[alerts](alerts.md#api), [monitors and self-healing](monitors.md#api),
+[Wake-on-LAN](wake-on-lan.md#api) and
 [the toolbox](toolbox.md).
 
 The API is not versioned beyond `/v1` yet, and MeshRMM is still in heavy
@@ -253,6 +254,11 @@ curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/alerts?state=ac
 # Acknowledge one, then resolve it (alerts.respond).
 curl -fsS -X POST -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/alerts/<alert id>/acknowledge" | jq .state
 curl -fsS -X POST -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/alerts/<alert id>/resolve" | jq .state
+# What a device's monitors last found, and an alert's self-healing attempts.
+curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/agents/<device id>/monitors" |
+  jq '.[] | {rule_name, passing: .state.passing, detail: .state.detail}'
+curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/alerts/<alert id>/remediations" |
+  jq '.[] | {attempt, action, status, exit_code, detail}'
 ```
 
 ### Tags

@@ -159,6 +159,22 @@ pub enum AgentCommand {
     RunApplications {
         run: crate::ApplicationRunRequest,
     },
+    /// Replaces the monitors the Agent runs; see [`crate::MonitorDefinition`].
+    /// A monitor whose definition didn't change keeps its count of failures.
+    SetMonitors {
+        monitors: Vec<crate::MonitorDefinition>,
+    },
+    /// Runs the monitors now, or all of them when `monitor_ids` is empty, and
+    /// reports their results.
+    CheckMonitors {
+        #[serde(default)]
+        monitor_ids: Vec<String>,
+    },
+    /// Takes a self-healing action; answered by
+    /// [`AgentStatusMessage::MonitorActionDone`].
+    RunMonitorAction {
+        action: crate::MonitorAction,
+    },
 }
 
 /// Agent-to-coordinator lifecycle notifications and reports.
@@ -233,6 +249,14 @@ pub enum AgentStatusMessage {
     ApplicationResult {
         run_id: String,
         result: Box<crate::ApplicationRunResult>,
+    },
+    /// Monitor results: see [`crate::MonitorResult`].
+    MonitorResults {
+        results: Vec<crate::MonitorResult>,
+    },
+    /// How a [`AgentCommand::RunMonitorAction`] went.
+    MonitorActionDone {
+        result: crate::MonitorActionResult,
     },
 }
 

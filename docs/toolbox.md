@@ -164,10 +164,14 @@ Every script change, upload, run and delivery is recorded in the audit log (`too
 `file.deliver`); a job is recorded once, as `job.start`. The scheduled
 maintenance task deletes runs, deliveries and jobs older than 30 days.
 
-A shared script that an [automation policy](automation.md#policies) runs
-can't be deleted or unshared until the policy changes or is deleted. A
-shared file that the [application library](application-deployment.md#custom-installers)
-installs with can't be deleted or unshared either (`409 file_in_use`).
+A shared script that an [automation policy](automation.md#policies) or an
+[alert rule](monitors.md#whose-access-it-runs-with) runs, as a script check
+or to heal its alerts, can't be deleted or unshared until the policy or rule
+changes or is deleted. A shared file that the
+[application library](application-deployment.md#custom-installers) installs
+with can't be deleted or unshared either (`409 file_in_use`). A rule's
+self-healing runs are ordinary runs with the source `remediation`, recorded
+on the alert as well.
 
 ## Setup
 

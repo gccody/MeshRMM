@@ -316,6 +316,8 @@ pub enum Source {
     Session,
     /// A device's part of a job.
     Job,
+    /// An alert rule's self-healing.
+    Remediation,
 }
 
 impl Source {
@@ -324,6 +326,7 @@ impl Source {
             Self::Dashboard => "dashboard",
             Self::Session => "session",
             Self::Job => "job",
+            Self::Remediation => "remediation",
         }
     }
 }

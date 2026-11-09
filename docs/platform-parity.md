@@ -59,6 +59,11 @@ yet.
 | Screen thumbnail | Yes | Yes | Partly: none without a graphical session, none of GNOME's Wayland login or lock screen |
 | Thumbnail of the sign-in and lock screens | Yes, UAC prompts too | Login window yes; lock screen not verified | X11 yes; GNOME Wayland no |
 | [Alerts](alerts.md) | Yes | Yes | Yes |
+| [Service monitors and restarts](monitors.md) | Service Control Manager, by name or display name | launchd system domain only | systemd units |
+| Process monitors and ending processes | Yes | Yes | Yes |
+| Event log monitors | Event Log, with event IDs | Unified log, no event IDs | systemd journal, no event IDs |
+| Ping, TCP port, website and certificate monitors | Yes | Yes; IPv6 ping without a time limit of its own | Yes |
+| Script check monitors and self-healing scripts | PowerShell and Command Prompt | Shell (zsh) | Shell (bash) |
 | [Jobs and automation policies](automation.md) | PowerShell and Command Prompt scripts, files, updates | Shell (zsh) scripts, files, updates | Shell (bash) scripts, files, updates |
 | [Relay Wake-on-LAN packets](wake-on-lan.md) | UDP | UDP | UDP and Ethernet frames (0x0842) |
 | [Be woken](wake-on-lan.md#what-the-device-needs) | Where firmware and adapter allow; not from Fast Startup's shutdown | Where **Wake for network access** is on | Where firmware and adapter allow (`ethtool … wol g`) |
@@ -70,6 +75,13 @@ yet.
   lock by unlocking it through logind (see below), but thumbnails don't.
 - Alerts are judged on the server from the online state, resource usage and
   toolbox runs every Agent reports, so they need nothing from the platform.
+  [Monitors](monitors.md) are the exception: the Agent checks them with each
+  platform's own service manager, process list and log, without parsing
+  localized text on Windows (the Service Control Manager, Event Log and ICMP
+  APIs) and with `LC_ALL=C` elsewhere. macOS watches and restarts launchd's
+  system domain only, since per-user agents run in each user's own domain;
+  its unified log and the journal have no event IDs; and macOS's `ping6`
+  has no overall time limit, so the check's own limit stands in.
 - Jobs and policies are the server's: each device gets the same toolbox
   command as a run by hand. A device whose platform has no interpreter for
   the script is skipped and counted as skipped, not failed.

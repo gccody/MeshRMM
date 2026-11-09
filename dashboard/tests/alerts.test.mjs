@@ -127,6 +127,9 @@ test("the rule form sends only what its condition uses", () => {
     tag_match: "any",
     channel_ids: [],
     notify_on_resolve: false,
+    monitor: null,
+    remediation: null,
+    notify_when: "raised",
   });
 
   const disk = withCondition(offline, "disk_space");

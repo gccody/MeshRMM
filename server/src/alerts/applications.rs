@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use super::{
     announce,
+    raised,
     evaluate::{Breach, Verdict},
     rules::{self, Condition, Rule, plural},
     store::{self, Raise},
@@ -144,6 +145,7 @@ async fn check(state: &AppState, run_id: &str, now: i64) -> anyhow::Result<()> {
                 detail,
                 script_run_id: None,
                 update_run_id: None,
+                output: "",
             };
             if let Some(id) = store::raise(&mut database, &raise, now).await? {
                 tracing::info!(
@@ -152,9 +154,9 @@ async fn check(state: &AppState, run_id: &str, now: i64) -> anyhow::Result<()> {
                     alert_id = id,
                     "raised an application install failure alert"
                 );
-                announce(state, &rule, &id, true).await?;
+                raised(state, &rule, &id, now).await?;
             } else if let Some(id) = store::recur(&mut database, &raise, now).await? {
-                announce(state, &rule, &id, false).await?;
+                announce(state, &rule, &id, None).await?;
             }
         }
     }
@@ -182,6 +184,12 @@ mod tests {
             target: Target::All,
             channel_ids: Vec::new(),
             notify_on_resolve: false,
+            monitor: None,
+            remediation: None,
+            notify_when: Default::default(),
+            owner_user_id: None,
+            check_script: None,
+            remediation_script: None,
             created_at: 0,
             updated_at: 0,
         }

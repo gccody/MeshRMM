@@ -15,7 +15,7 @@ use meshrmm_protocol_types::{
 };
 
 use super::{LIVENESS, ToAgent, close_frame, send};
-use crate::{agents, http::AppState, system_info, updates, wake};
+use crate::{agents, http::AppState, monitors, system_info, updates, wake};
 
 /// Serves the control connection of an Agent that authenticated as
 /// `device_id`, connecting from `ip`.
@@ -134,6 +134,14 @@ pub async fn serve(
                         Ok(AgentStatusMessage::FileReply { request_id, reply }) => {
                             state.files.answered(&device_id, &request_id, *reply);
                         }
+                        Ok(AgentStatusMessage::MonitorResults { results }) => {
+                            if state.agents.is_current(&device_id, connection.id) {
+                                monitors::reported(&state, &device_id, results).await;
+                            }
+                        }
+                        Ok(AgentStatusMessage::MonitorActionDone { result }) => {
+                            monitors::remediation::action_reported(&state, &device_id, result).await;
+                        }
                         // Only a deleted device's Agent uninstalls.
                         Ok(AgentStatusMessage::UninstallScheduled) => {}
                         Err(_) => {
@@ -250,6 +258,21 @@ async fn greet(
             device_id,
             %error,
             "could not read the device's update status"
+        ),
+    }
+    match monitors::greeting(state, device_id).await {
+        Ok(Some(command)) => {
+            let message = ToAgent::Command(command).to_json();
+            socket
+                .send(Message::Text(message.into()))
+                .await
+                .map_err(drop)?;
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            device_id,
+            error = format!("{error:#}"),
+            "could not read the device's monitors"
         ),
     }
     // The website shows the device as online.

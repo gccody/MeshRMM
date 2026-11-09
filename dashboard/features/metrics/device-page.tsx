@@ -1,10 +1,11 @@
-import { Activity, AppWindow, ArrowLeft, Building2, CircleAlert, Cpu, FolderOpen, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package, ShieldCheck, Tag, Terminal } from "lucide-react";
+import { Activity, AppWindow, ArrowLeft, Building2, CircleAlert, Cpu, FolderOpen, Gauge, Laptop, LoaderCircle, MonitorOff, Network, Package, Radar, ShieldCheck, Tag, Terminal } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { NO_COMPANY, DEFAULT_DEVICE_FILTERS, serializeDeviceFilters } from "../agents/device-filters";
 import { companyName } from "../agents/model";
 import { DeviceAlerts } from "../alerts/device-alerts";
 import { MoveDeviceDialog } from "../companies/company-dialogs";
+import { DeviceMonitors } from "../monitors/device-monitors";
 import { DeviceNotes } from "../notes/device-notes";
 import { DeviceSystem, type SystemTab } from "../system-info/device-system";
 import { tagsOf } from "../tags/model";
@@ -44,7 +45,7 @@ const STORAGE: Series[] = [{ label: "Used", tone: "series-1", value: (point) => 
 
 const isRange = (value: string | null): value is MetricsRange => METRICS_RANGES.some((range) => range.id === value);
 
-type DeviceTab = "usage" | SystemTab | "updates" | "applications";
+type DeviceTab = "usage" | SystemTab | "updates" | "applications" | "monitors";
 
 const TABS: { id: DeviceTab; label: string; icon: typeof Gauge }[] = [
   { id: "usage", label: "Usage", icon: Gauge },
@@ -53,6 +54,7 @@ const TABS: { id: DeviceTab; label: string; icon: typeof Gauge }[] = [
   { id: "network", label: "Network", icon: Network },
   { id: "updates", label: "Updates", icon: ShieldCheck },
   { id: "applications", label: "Applications", icon: AppWindow },
+  { id: "monitors", label: "Monitors", icon: Radar },
 ];
 
 const isTab = (value: string | null): value is DeviceTab => TABS.some((tab) => tab.id === value);
@@ -72,7 +74,9 @@ export function DevicePage() {
   const requestedTab = searchParams.get("tab");
   const canSeeUpdates = can("updates.view");
   const canSeeApplications = can("applications.view");
-  const allowed = (id: DeviceTab) => (id !== "updates" || canSeeUpdates) && (id !== "applications" || canSeeApplications);
+  const canSeeMonitors = can("alerts.view");
+  const allowed = (id: DeviceTab) =>
+    (id !== "updates" || canSeeUpdates) && (id !== "applications" || canSeeApplications) && (id !== "monitors" || canSeeMonitors);
   const tabs = TABS.filter(({ id }) => allowed(id));
   const tab: DeviceTab = isTab(requestedTab) && allowed(requestedTab) ? requestedTab : "usage";
   const agent = inventory.agents.find((candidate) => candidate.id === deviceId);
@@ -180,7 +184,8 @@ export function DevicePage() {
           ))}
         </nav>
 
-        {tab === "updates" ? agent && <DeviceUpdates key={agent.id} agent={agent} />
+        {tab === "monitors" ? agent && <DeviceMonitors key={agent.id} agent={agent} />
+        : tab === "updates" ? agent && <DeviceUpdates key={agent.id} agent={agent} />
         : tab === "applications" ? agent && <DeviceApplications key={agent.id} agent={agent} />
         : tab !== "usage" ? agent && <DeviceSystem key={agent.id} agent={agent} tab={tab} /> : <>
         {error && <div className="error-banner" role="alert"><CircleAlert size={16} aria-hidden="true" /><span>{error}</span></div>}

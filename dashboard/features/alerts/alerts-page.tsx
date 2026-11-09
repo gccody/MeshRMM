@@ -42,7 +42,7 @@ export function AlertsPage() {
   useAlertEvents((event) => {
     if (event.type === "alert_upsert") {
       setData((current) => ({ ...current, alerts: applyAlertChange(current.alerts, event.alert, filters) }));
-    } else {
+    } else if (event.type === "alert_counts") {
       reload();
     }
   });

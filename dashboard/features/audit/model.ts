@@ -43,6 +43,7 @@ export const AUDIT_CATEGORIES: readonly { prefix: string; label: string }[] = [
   { prefix: "toolbox.", label: "Toolbox library" },
   { prefix: "alert.", label: "Alerts" },
   { prefix: "alert_rule.", label: "Alert rules" },
+  { prefix: "monitor.", label: "Monitors" },
   { prefix: "notification_channel.", label: "Notification channels" },
 ];
 
@@ -130,6 +131,8 @@ const ACTION_LABELS: Record<string, string> = {
   "toolbox.file_delete": "Deleted a file",
   "alert.acknowledge": "Acknowledged an alert",
   "alert.resolve": "Resolved an alert",
+  "alert.remediate": "Tried to fix an alert automatically",
+  "monitor.check": "Had a device check its monitors",
   "alert_rule.create": "Created an alert rule",
   "alert_rule.update": "Changed an alert rule",
   "alert_rule.delete": "Deleted an alert rule",

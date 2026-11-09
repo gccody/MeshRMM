@@ -271,11 +271,20 @@ pub fn judge(rule: &Rule, device: DeviceState<'_>, tracker: &Tracker, now: i64) 
                 _ => Verdict::Known(Vec::new()),
             }
         }
-        // Application rules are judged in super::applications.
+        // Failures are checked as runs finish, application rules in
+        // super::applications, and monitors as their Agents report.
         Condition::ScriptFailed
         | Condition::UpdateInstallFailed
         | Condition::AppInstallFailed
-        | Condition::AppUpdatesPending => Verdict::Unknown,
+        | Condition::AppUpdatesPending
+        | Condition::Service
+        | Condition::Process
+        | Condition::EventLog
+        | Condition::Ping
+        | Condition::TcpPort
+        | Condition::Http
+        | Condition::Certificate
+        | Condition::ScriptCheck => Verdict::Unknown,
     }
 }
 
@@ -308,6 +317,12 @@ mod tests {
             target: crate::targets::Target::All,
             channel_ids: vec![],
             notify_on_resolve: false,
+            monitor: None,
+            remediation: None,
+            notify_when: Default::default(),
+            owner_user_id: None,
+            check_script: None,
+            remediation_script: None,
             created_at: 0,
             updated_at: 0,
         }
