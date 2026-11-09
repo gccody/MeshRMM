@@ -1084,6 +1084,9 @@ CREATE INDEX idx_application_runs_device ON application_runs (device_id, created
 CREATE INDEX idx_application_runs_created ON application_runs (created_at);
 CREATE INDEX idx_application_runs_job ON application_runs (job_id, device_id);
 CREATE INDEX idx_application_runs_status ON application_runs (status);
+-- A device does one scan and one install, update or uninstall at a time; two
+-- requests at once can't both start one.
+CREATE UNIQUE INDEX idx_application_runs_one_pending ON application_runs (device_id, (action = 'scan')) WHERE status = 'pending';
 
 -- How each application of a run went, with the end of its output.
 CREATE TABLE application_run_items (

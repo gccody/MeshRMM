@@ -569,7 +569,7 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
         // Started together by `start_wakes`.
         Kind::Wake => return Ok(false),
         Kind::AppInstall | Kind::AppUpdate | Kind::AppUninstall => {
-            crate::applications::start_job_run(
+            let started = crate::applications::start_job_run(
                 &mut transaction,
                 &crate::applications::Start {
                     run_id: &id,
@@ -580,7 +580,17 @@ async fn start(state: &AppState, job: &JobRow, device_id: &str, now: i64) -> any
                     now,
                 },
             )
-            .await?
+            .await;
+            match started {
+                Ok(command) => command,
+                // A run started on the device since `busy` looked; the
+                // device's part waits for it.
+                Err(error) if crate::applications::runs::is_already_pending(&error) => {
+                    transaction.rollback().await?;
+                    return Ok(false);
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
     };
     let claimed = transaction

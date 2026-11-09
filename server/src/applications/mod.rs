@@ -84,6 +84,43 @@ pub async fn sweep(state: &AppState, now: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The device's Agent connected at `connected_at` and said which of the
+/// server's scans and runs it still has: the device's other pending ones
+/// from before then are lost at once, rather than when their report window
+/// closes, so the device is free for the next.
+pub async fn activity_reported(
+    state: &AppState,
+    device_id: &str,
+    run_ids: &[String],
+    connected_at: i64,
+) {
+    let lost = match runs::interrupted(
+        &mut &state.database,
+        device_id,
+        run_ids,
+        connected_at,
+        now_ms(),
+    )
+    .await
+    {
+        Ok(lost) => lost,
+        Err(error) => {
+            tracing::warn!(device_id, %error, "could not settle a device's interrupted application runs");
+            return;
+        }
+    };
+    for (run_id, action) in &lost {
+        tracing::info!(run_id, device_id, "an application run was interrupted");
+        if matches!(action, Action::Install | Action::Update) {
+            crate::alerts::applications::run_finished(state, run_id).await;
+        }
+    }
+    if !lost.is_empty() {
+        state.automation.wake();
+        state.alerts.wake();
+    }
+}
+
 /// Stores a scan the device's Agent reported and finishes the scan runs it
 /// answers.
 pub async fn scan_reported(

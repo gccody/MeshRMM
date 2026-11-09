@@ -372,6 +372,13 @@ impl Coordinator {
     /// Handles the server's messages until the connection ends, returning whether the Agent is
     /// stopping.
     async fn serve(&mut self, socket: &mut SignalingConnection) -> anyhow::Result<bool> {
+        // Before anything the server sends on this connection, so the
+        // server knows which application runs from before it ended.
+        let activity = serde_json::to_string(&self.applications.activity())?;
+        socket
+            .send(Message::Text(activity.into()))
+            .await
+            .context("could not send the application activity")?;
         loop {
             if self
                 .active_session
@@ -426,6 +433,7 @@ impl Coordinator {
                         self.applications.unsent(report);
                         return Err(error).context("could not send an application report");
                     }
+                    self.applications.delivered(&report);
                 }
                 () = self.link.stopped() => {
                     if let Some(version) = self.link.update_version() {

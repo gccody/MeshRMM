@@ -2,7 +2,7 @@
 //! asked devices for, by a user or as a device's part of a job, and how
 //! each application went. They are a device's application history.
 use meshrmm_protocol_types::{
-    APPLICATION_RUN_TIMEOUT_SECONDS, APPLICATION_SCAN_TIMEOUT_SECONDS, AgentCommand,
+    APPLICATION_RUN_TIMEOUT_SECONDS, APPLICATION_SCAN_TOTAL_SECONDS, AgentCommand,
     ApplicationOperation, ApplicationRunRequest, ApplicationRunResult, ItemOutcome,
 };
 use sea_query::{Expr, ExprTrait, Order, Query};
@@ -18,12 +18,13 @@ use crate::{
 };
 
 /// A scan the Agent hasn't reported this long after it was asked for is
-/// lost: two package managers' limits, and a margin for reconnecting.
+/// lost: the Agent's limit for a whole scan, and a margin for reconnecting.
 pub const SCAN_REPORT_WINDOW_MS: i64 =
-    2 * APPLICATION_SCAN_TIMEOUT_SECONDS as i64 * SECOND_MS + 15 * MINUTE_MS;
-/// Likewise for a run, which scans before and after.
+    APPLICATION_SCAN_TOTAL_SECONDS as i64 * SECOND_MS + 15 * MINUTE_MS;
+/// Likewise for a run: its applications' limit, and a whole scan before
+/// and after.
 pub const RUN_REPORT_WINDOW_MS: i64 = APPLICATION_RUN_TIMEOUT_SECONDS as i64 * SECOND_MS
-    + 4 * APPLICATION_SCAN_TIMEOUT_SECONDS as i64 * SECOND_MS
+    + 2 * APPLICATION_SCAN_TOTAL_SECONDS as i64 * SECOND_MS
     + 15 * MINUTE_MS;
 /// The most text of a progress message kept.
 const MAX_PROGRESS_CHARS: usize = 256;
@@ -104,6 +105,16 @@ impl NewRun<'_> {
     }
 }
 
+/// Whether `error` is the database refusing a second pending scan, or a
+/// second pending install, update or uninstall, for one device
+/// (`idx_application_runs_one_pending`): another request started one first.
+pub fn is_already_pending(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(error) if error.is_unique_violation())
+}
+
+/// Records a pending run. A device has at most one pending scan and one
+/// pending other run, which the database enforces: see
+/// [`is_already_pending`].
 pub async fn insert(executor: &mut impl Executor, run: &NewRun<'_>) -> db::Result<()> {
     executor
         .execute(
@@ -654,24 +665,77 @@ pub async fn sweep_lost(
         if created_at + action.report_window_ms() >= now {
             continue;
         }
-        let updated = executor
-            .execute(
-                &Query::update()
-                    .table(ApplicationRuns::Table)
-                    .value(ApplicationRuns::Status, "lost")
-                    .value(ApplicationRuns::Progress, Option::<String>::None)
-                    .value(
-                        ApplicationRuns::Error,
-                        "The device never reported how it went",
-                    )
-                    .value(ApplicationRuns::CompletedAt, now)
-                    .and_where(Expr::col(ApplicationRuns::Id).eq(id.as_str()))
-                    .and_where(Expr::col(ApplicationRuns::Status).eq("pending"))
-                    .to_owned(),
-            )
-            .await?;
-        if updated == 1 {
+        if mark_lost(executor, &id, "The device never reported how it went", now).await? {
             lost.push((id, device_id, action));
+        }
+    }
+    Ok(lost)
+}
+
+/// Marks a pending run lost, with why; false if it isn't pending.
+async fn mark_lost(
+    executor: &mut impl Executor,
+    id: &str,
+    error: &str,
+    now: i64,
+) -> db::Result<bool> {
+    let updated = executor
+        .execute(
+            &Query::update()
+                .table(ApplicationRuns::Table)
+                .value(ApplicationRuns::Status, "lost")
+                .value(ApplicationRuns::Progress, Option::<String>::None)
+                .value(ApplicationRuns::Error, error)
+                .value(ApplicationRuns::CompletedAt, now)
+                .and_where(Expr::col(ApplicationRuns::Id).eq(id))
+                .and_where(Expr::col(ApplicationRuns::Status).eq("pending"))
+                .to_owned(),
+        )
+        .await?;
+    Ok(updated == 1)
+}
+
+pub const INTERRUPTED: &str = "The device's Agent restarted, or the device did, before it finished; it may have done part of it";
+
+/// A run is handed to the Agent just after it's recorded. One recorded this
+/// close before a connection may have been handed to that connection, after
+/// the Agent said what it has; it's left to its report window.
+pub const HANDED_OVER_MS: i64 = 30 * SECOND_MS;
+
+/// The device's Agent reconnected and still has `known`, the scans and runs
+/// it is doing or has yet to report. Marks the device's other pending runs,
+/// asked for well before it connected at `connected_at`, as lost: a
+/// restart or a connection that dropped before it got them ended them. Runs
+/// asked for since are on the new connection. Returns them, with their
+/// actions.
+pub async fn interrupted(
+    executor: &mut impl Executor,
+    device_id: &str,
+    known: &[String],
+    connected_at: i64,
+    now: i64,
+) -> db::Result<Vec<(String, Action)>> {
+    let pending: Vec<(String, String)> = executor
+        .fetch_all(
+            &Query::select()
+                .columns([ApplicationRuns::Id, ApplicationRuns::Action])
+                .from(ApplicationRuns::Table)
+                .and_where(Expr::col(ApplicationRuns::DeviceId).eq(device_id))
+                .and_where(Expr::col(ApplicationRuns::Status).eq("pending"))
+                .and_where(Expr::col(ApplicationRuns::CreatedAt).lt(connected_at - HANDED_OVER_MS))
+                .to_owned(),
+        )
+        .await?;
+    let mut lost = Vec::new();
+    for (id, action) in pending {
+        let Some(action) = Action::parse(&action) else {
+            continue;
+        };
+        if known.contains(&id) {
+            continue;
+        }
+        if mark_lost(executor, &id, INTERRUPTED, now).await? {
+            lost.push((id, action));
         }
     }
     Ok(lost)

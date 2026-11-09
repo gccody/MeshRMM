@@ -213,6 +213,114 @@ async fn the_library_checks_what_it_installs() {
                 .status,
             StatusCode::FORBIDDEN
         );
+
+        // Custom installers run as SYSTEM or root: adding or changing one
+        // needs scripts.run as well as applications.manage.
+        let (mut librarian, _) = user_with(
+            &app,
+            &mut admin,
+            "librarian@example.com",
+            &["applications.view", "applications.manage"],
+        )
+        .await;
+        let refused = librarian
+            .post("/v1/applications", {
+                let mut body = custom(&shared);
+                body["name"] = "Vendor Agent 2".into();
+                body
+            })
+            .await;
+        assert_eq!(refused.status, StatusCode::FORBIDDEN, "{name}");
+        assert!(
+            refused.body.to_string().contains("scripts.run"),
+            "{name}: {:?}",
+            refused.body
+        );
+        let mut edited = custom(&shared);
+        edited["sources"][0]["install_arguments"] = "/qn & calc.exe".into();
+        let refused = librarian
+            .put(&format!("/v1/applications/{vendor}"), edited.clone())
+            .await;
+        assert_eq!(refused.status, StatusCode::FORBIDDEN, "{name}");
+        let mut detected = custom(&shared);
+        detected["sources"][0]["detection"] = json!({ "kind": "file", "path": "C:\\x" });
+        assert_eq!(
+            librarian
+                .put(&format!("/v1/applications/{vendor}"), detected)
+                .await
+                .status,
+            StatusCode::FORBIDDEN,
+            "{name}: the detection rule is the installer's too"
+        );
+        // Package managers' sources, and the rest of an application with a
+        // custom installer it leaves as it is, stay applications.manage's.
+        let mut described = custom(&shared);
+        described["description"] = "Unchanged installer".into();
+        described["sources"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "source": "chocolatey", "package_id": "vendor-agent" }));
+        let saved = librarian
+            .put(&format!("/v1/applications/{vendor}"), described)
+            .await;
+        assert_eq!(saved.status, StatusCode::OK, "{name}: {:?}", saved.body);
+        let packaged = librarian
+            .post(
+                "/v1/applications",
+                json!({ "name": "7-Zip", "sources": [{ "source": "winget", "package_id": "7zip.7zip" }] }),
+            )
+            .await;
+        assert_eq!(
+            packaged.status,
+            StatusCode::CREATED,
+            "{name}: {:?}",
+            packaged.body
+        );
+        // So does an API token limited to applications.manage.
+        let token = admin
+            .post(
+                "/v1/api-tokens",
+                json!({ "name": "Library", "expires_in_days": 30, "permissions": ["applications.view", "applications.manage"] }),
+            )
+            .await;
+        assert_eq!(
+            token.status,
+            StatusCode::CREATED,
+            "{name}: {:?}",
+            token.body
+        );
+        let secret = token.body["secret"].as_str().unwrap().to_owned();
+        let request = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/v1/applications/{vendor}"))
+            .header("authorization", format!("Bearer {secret}"))
+            .header("content-type", "application/json")
+            .body(Body::from(edited.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.browser().raw(request).await.status,
+            StatusCode::FORBIDDEN,
+            "{name}: a limited token"
+        );
+        assert_eq!(
+            admin
+                .put(&format!("/v1/applications/{vendor}"), edited)
+                .await
+                .status,
+            StatusCode::OK,
+            "{name}: administrators have scripts.run"
+        );
+        assert_eq!(
+            librarian
+                .delete(&format!(
+                    "/v1/applications/{}",
+                    packaged.body["id"].as_str().unwrap()
+                ))
+                .await
+                .status,
+            StatusCode::NO_CONTENT
+        );
+
         let renamed = admin
             .put(
                 &format!("/v1/applications/{id}"),
@@ -236,9 +344,11 @@ async fn the_library_checks_what_it_installs() {
             StatusCode::NO_CONTENT,
             "{name}: free again"
         );
-        assert_eq!(audit_events(&app, "application.create").await.len(), 2);
-        assert_eq!(audit_events(&app, "application.update").await.len(), 1);
-        assert_eq!(audit_events(&app, "application.delete").await.len(), 1);
+        // Library edits and update runs are different audit kinds.
+        assert_eq!(audit_events(&app, "application.create").await.len(), 3);
+        assert_eq!(audit_events(&app, "application.edit").await.len(), 3);
+        assert!(audit_events(&app, "application.update").await.is_empty());
+        assert_eq!(audit_events(&app, "application.delete").await.len(), 2);
         app.finish().await;
     }
 }
@@ -824,6 +934,305 @@ async fn outdated_and_failed_applications_raise_alerts() {
         );
         alerts::evaluate(&app.state, now_ms()).await.unwrap();
         assert_eq!(alerts_of(&mut admin).await.len(), 1, "{name}: stays open");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn package_ids_match_as_their_manager_reads_them() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        // winget ignores case; Flatpak doesn't.
+        let firefox_id = add_application(
+            &mut admin,
+            json!({
+                "name": "Firefox",
+                "pinned_version": "130.0",
+                "sources": [
+                    { "source": "winget", "package_id": "mozilla.firefox" },
+                    { "source": "flatpak", "package_id": "Org.Mozilla.Firefox" },
+                ],
+            }),
+        )
+        .await;
+        let created = admin
+            .post(
+                "/v1/alert-rules",
+                json!({ "name": "Stale apps", "severity": "warning", "condition": "app_updates_pending", "days": 7 }),
+            )
+            .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let laptop = app.enroll(&mut admin, "Laptop").await;
+        for (device, id) in [(&desk, "Mozilla.Firefox"), (&laptop, "MOZILLA.FIREFOX")] {
+            let mut control = device.connect(&server).await.unwrap();
+            report_scan(
+                &mut control,
+                &[],
+                scan(
+                    json!([{ "source": "winget" }, { "source": "flatpak" }]),
+                    vec![
+                        package("winget", id, "Mozilla Firefox", "130.0", Some("131.0")),
+                        package(
+                            "flatpak",
+                            "org.mozilla.firefox",
+                            "Firefox",
+                            "130.0",
+                            Some("131.0"),
+                        ),
+                    ],
+                ),
+            )
+            .await;
+            let packages = packages_where(&mut admin, &device.device_id, |body| {
+                !body["status"].is_null()
+            })
+            .await;
+            let of = |source: &str| {
+                packages["packages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|package| package["source"] == source)
+                    .unwrap()
+                    .clone()
+            };
+            assert_eq!(of("winget")["application_id"], firefox_id, "{name}: {id}");
+            assert_eq!(of("winget")["held"], true, "{name}: {id}");
+            assert!(of("flatpak")["application_id"].is_null(), "{name}");
+            assert_eq!(of("flatpak")["held"], false, "{name}");
+        }
+
+        // One outdated package on two devices, held back by the pin.
+        let outdated = admin.get("/v1/packages/outdated").await.body;
+        let winget = outdated["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|package| package["source"] == "winget")
+            .collect::<Vec<_>>();
+        assert_eq!(winget.len(), 1, "{name}: {outdated}");
+        assert_eq!(winget[0]["devices"].as_array().unwrap().len(), 2);
+        assert_eq!(winget[0]["held"], true);
+        let read = admin.get(&format!("/v1/applications/{firefox_id}")).await;
+        assert_eq!(read.body["installed"], 2, "{name}: {:?}", read.body);
+        assert_eq!(read.body["outdated"], 2);
+
+        // The pinned package raises no alert; the unmatched Flatpak does.
+        for device in [&desk, &laptop] {
+            age(&app, &device.device_id, 8).await;
+        }
+        alerts::evaluate(&app.state, now_ms()).await.unwrap();
+        let open = alerts_of(&mut admin).await;
+        assert_eq!(open.len(), 2, "{name}: {open:?}");
+        for alert in &open {
+            assert!(
+                alert["detail"].as_str().unwrap().starts_with(
+                    "1 application update pending for more than 7 days, the oldest (Firefox)"
+                ),
+                "{name}: {}",
+                alert["detail"]
+            );
+        }
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn two_requests_at_once_start_one_run() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let firefox_id = add_application(&mut admin, firefox()).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let _control = desk.connect(&server).await.unwrap();
+
+        let path = format!("/v1/agents/{}/application-runs", desk.device_id);
+        let body = json!({ "action": "install", "application_ids": [firefox_id] });
+        let (mut first, mut second) = (admin.clone(), admin.clone());
+        let (a, b) = tokio::join!(first.post(&path, body.clone()), second.post(&path, body));
+        let mut statuses = [a.status, b.status];
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            [StatusCode::ACCEPTED, StatusCode::CONFLICT],
+            "{name}: {:?} {:?}",
+            a.body,
+            b.body
+        );
+        let refused = if a.status == StatusCode::CONFLICT {
+            &a
+        } else {
+            &b
+        };
+        assert_eq!(refused.code(), "application_run_running", "{name}");
+
+        // Scans: both get the one scan.
+        let path = format!("/v1/agents/{}/packages/scan", desk.device_id);
+        let (a, b) = tokio::join!(first.post(&path, json!({})), second.post(&path, json!({})));
+        assert_eq!(a.status, StatusCode::ACCEPTED, "{name}: {:?}", a.body);
+        assert_eq!(b.status, StatusCode::ACCEPTED, "{name}: {:?}", b.body);
+        assert_eq!(a.body["id"], b.body["id"], "{name}");
+
+        // The database holds the line by itself.
+        let again = applications::runs::insert(
+            &mut app.db(),
+            &applications::runs::NewRun {
+                id: &meshrmm_server::users::new_id(),
+                device_id: &desk.device_id,
+                summary: "Scan for applications",
+                operation: None,
+                requested_by_user_id: "nobody",
+                policy_name: None,
+                job_id: None,
+                created_at: now_ms(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            applications::runs::is_already_pending(&again),
+            "{name}: {again}"
+        );
+        app.finish().await;
+    }
+}
+
+/// Makes the device's runs a minute older.
+async fn backdate_runs(app: &App, device_id: &str) {
+    app.db()
+        .execute(
+            &sea_query::Query::update()
+                .table(sea_query::Alias::new("application_runs"))
+                .value(
+                    sea_query::Alias::new("created_at"),
+                    sea_query::Expr::col(sea_query::Alias::new("created_at")).sub(60_000),
+                )
+                .and_where(sea_query::Expr::col(sea_query::Alias::new("device_id")).eq(device_id))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn runs_a_restarted_agent_no_longer_has_are_lost_at_once() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let firefox_id = add_application(&mut admin, firefox()).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let first = desk.connect(&server).await.unwrap();
+        let scan = admin
+            .post(
+                &format!("/v1/agents/{}/packages/scan", desk.device_id),
+                json!({}),
+            )
+            .await;
+        let scan_id = scan.body["id"].as_str().unwrap().to_owned();
+        let install = admin
+            .post(
+                &format!("/v1/agents/{}/application-runs", desk.device_id),
+                json!({ "action": "install", "application_ids": [firefox_id] }),
+            )
+            .await;
+        assert_eq!(
+            install.status,
+            StatusCode::ACCEPTED,
+            "{name}: {:?}",
+            install.body
+        );
+        let install_id = install.body["id"].as_str().unwrap().to_owned();
+        drop(first);
+        // Runs asked for just before a connection may be handed to it, so
+        // only older ones are settled.
+        let mut control = desk.connect(&server).await.unwrap();
+        send_json(&mut control, json!({ "type": "application_activity" })).await;
+        // Reports are handled in order: once this shows, so has the above.
+        send_json(
+            &mut control,
+            json!({ "type": "application_progress", "run_id": install_id, "message": "Installing 1 of 1: Firefox" }),
+        )
+        .await;
+        run_where(&mut admin, &install_id, |run| {
+            run["progress"] == "Installing 1 of 1: Firefox"
+        })
+        .await;
+        assert_eq!(
+            run(&mut admin, &scan_id).await["status"],
+            "pending",
+            "{name}: too recent"
+        );
+        drop(control);
+        backdate_runs(&app, &desk.device_id).await;
+
+        // The Agent reconnects still installing, but without the scan.
+        let mut control = desk.connect(&server).await.unwrap();
+        send_json(
+            &mut control,
+            json!({ "type": "application_activity", "run_ids": [install_id] }),
+        )
+        .await;
+        let lost = run_where(&mut admin, &scan_id, |run| run["status"] != "pending").await;
+        assert_eq!(lost["status"], "lost", "{name}");
+        assert_eq!(lost["error"], applications::runs::INTERRUPTED);
+        assert_eq!(
+            run(&mut admin, &install_id).await["status"],
+            "pending",
+            "{name}"
+        );
+        // So Scan now asks for a new scan.
+        let again = admin
+            .post(
+                &format!("/v1/agents/{}/packages/scan", desk.device_id),
+                json!({}),
+            )
+            .await;
+        assert_ne!(again.body["id"], scan_id.as_str(), "{name}");
+        drop(control);
+        backdate_runs(&app, &desk.device_id).await;
+
+        // It restarted: nothing is going on, so the device is free at once,
+        // and the failed install raises its alert.
+        let created = admin
+            .post(
+                "/v1/alert-rules",
+                json!({ "name": "App failed", "severity": "critical", "condition": "app_install_failed" }),
+            )
+            .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+        let mut control = desk.connect(&server).await.unwrap();
+        send_json(&mut control, json!({ "type": "application_activity" })).await;
+        let lost = run_where(&mut admin, &install_id, |run| run["status"] != "pending").await;
+        assert_eq!(lost["status"], "lost", "{name}");
+        let packages = packages(&mut admin, &desk.device_id).await;
+        assert!(packages["running"].is_null(), "{name}: {packages}");
+        assert!(packages["scanning"].is_null(), "{name}: {packages}");
+        let mut raised = Vec::new();
+        for _ in 0..100 {
+            raised = alerts_of(&mut admin).await;
+            if !raised.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(raised.len(), 1, "{name}: {raised:?}");
+        let started = admin
+            .post(
+                &format!("/v1/agents/{}/application-runs", desk.device_id),
+                json!({ "action": "install", "application_ids": [firefox_id] }),
+            )
+            .await;
+        assert_eq!(
+            started.status,
+            StatusCode::ACCEPTED,
+            "{name}: {:?}",
+            started.body
+        );
         app.finish().await;
     }
 }

@@ -15,7 +15,7 @@ use meshrmm_protocol_types::{
     CustomInstaller, DetectionRule, DevicePlatform, InstallItem, MAX_COMMAND_CHARS, PackageKey,
     PackageRef, PackageSource, valid_version,
 };
-use sea_query::{Expr, ExprTrait, Order, Query};
+use sea_query::{Expr, ExprTrait, Func, Order, Query};
 use serde::{Deserialize, Serialize};
 
 use super::tables::{ApplicationSources, Applications, DevicePackages};
@@ -192,11 +192,49 @@ pub struct Valid {
     pub sources: Vec<Source>,
 }
 
+/// What a custom installer runs on a device: its file, platform, arguments,
+/// uninstall command and detection rule.
+type Installer<'a> = (
+    DevicePlatform,
+    &'a Option<String>,
+    &'a Option<String>,
+    &'a Option<String>,
+    &'a Option<DetectionRule>,
+);
+
+fn installers(sources: &[Source]) -> Vec<Installer<'_>> {
+    sources
+        .iter()
+        .filter(|source| source.source == PackageSource::Custom)
+        .map(|source| {
+            (
+                source.platform,
+                &source.file_id,
+                &source.install_arguments,
+                &source.uninstall_command,
+                &source.detection,
+            )
+        })
+        .collect()
+}
+
 impl Valid {
     pub fn has_custom_installer(&self) -> bool {
         self.sources
             .iter()
             .any(|source| source.source == PackageSource::Custom)
+    }
+
+    /// Whether saving this over `old` (`None` for a new application) adds
+    /// or changes a custom installer. Its file and commands run as SYSTEM or
+    /// root on every device a policy installs it on, so that needs
+    /// `scripts.run`, not only `applications.manage`. Removing or reordering
+    /// ways to install doesn't.
+    pub fn changes_installers(&self, old: Option<&Application>) -> bool {
+        let before = old.map(|old| installers(&old.sources)).unwrap_or_default();
+        installers(&self.sources)
+            .iter()
+            .any(|installer| !before.contains(installer))
     }
 }
 
@@ -760,24 +798,39 @@ pub async fn usage(
                     (DevicePackages::Table, DevicePackages::AvailableVersion),
                 ])
                 .from(DevicePackages::Table)
+                // Ignoring case here finds the candidates; PackageKey's
+                // comparison below keeps case for the managers that do.
                 .inner_join(
                     ApplicationSources::Table,
                     Expr::col((ApplicationSources::Table, ApplicationSources::Source))
                         .equals((DevicePackages::Table, DevicePackages::Source))
                         .and(
-                            Expr::col((ApplicationSources::Table, ApplicationSources::PackageId))
-                                .equals((DevicePackages::Table, DevicePackages::PackageId)),
+                            Func::lower(Expr::col((
+                                ApplicationSources::Table,
+                                ApplicationSources::PackageId,
+                            )))
+                            .eq(Func::lower(Expr::col((
+                                DevicePackages::Table,
+                                DevicePackages::PackageId,
+                            )))),
                         ),
                 )
+                .distinct()
                 .to_owned(),
         )
         .await?;
     // A package can be in more than one application, and an application on
     // a device in more than one package; each device counts once.
-    let mut devices: HashMap<(String, String), Vec<(String, bool)>> = HashMap::new();
+    let mut devices: HashMap<PackageKey, Vec<(String, bool)>> = HashMap::new();
     for (device_id, source, package_id, available) in rows {
+        let Some(source) = PackageSource::parse(&source) else {
+            continue;
+        };
         devices
-            .entry((source, package_id))
+            .entry(PackageKey {
+                source,
+                id: package_id,
+            })
             .or_default()
             .push((device_id, available.is_some()));
     }
@@ -785,11 +838,7 @@ pub async fn usage(
     for application in applications {
         let mut installed: HashMap<&str, bool> = HashMap::new();
         for key in application.keys() {
-            for (device_id, outdated) in devices
-                .get(&(key.source.as_str().to_owned(), key.id))
-                .into_iter()
-                .flatten()
-            {
+            for (device_id, outdated) in devices.get(&key).into_iter().flatten() {
                 *installed.entry(device_id).or_default() |= outdated;
             }
         }

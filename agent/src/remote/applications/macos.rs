@@ -158,8 +158,10 @@ fn attempt(tool: &Tool, args: &[&str]) -> Attempt {
 
 /// Homebrew installs a formula's or cask's current version; a version the
 /// library pins can't be chosen.
+// Homebrew's names and taps are lowercase; it is given them so.
 pub(super) fn install(tool: &Tool, package: &PackageRef) -> Attempt {
-    attempt(tool, &["install", kind(package.source), &package.id])
+    let id = package.id.to_ascii_lowercase();
+    attempt(tool, &["install", kind(package.source), &id])
 }
 
 pub(super) fn update(tool: &Tool, package: &ScannedPackage) -> Attempt {
@@ -167,7 +169,8 @@ pub(super) fn update(tool: &Tool, package: &ScannedPackage) -> Attempt {
 }
 
 pub(super) fn uninstall(tool: &Tool, package: &PackageKey) -> Attempt {
-    attempt(tool, &["uninstall", kind(package.source), &package.id])
+    let id = package.id.to_ascii_lowercase();
+    attempt(tool, &["uninstall", kind(package.source), &id])
 }
 
 /// Runs an installer package with `installer` onto the startup disk (its

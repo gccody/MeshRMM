@@ -1126,6 +1126,7 @@ button.outcome-chip:hover { color: var(--text); background: var(--raised); }
 /* Applications: the library, devices' packages and runs. */
 .application-actions { margin: 0 0 14px; justify-content: flex-end; }
 .application-source { padding: 12px 14px; border: 1px solid var(--rule); border-radius: 8px; }
+.application-source-fields { display: grid; gap: 6px; margin: 0; padding: 0; border: 0; min-width: 0; }
 .outdated-version { color: var(--signal-strong); font-weight: 600; }
 .run-detail { padding: 6px 4px 10px; display: grid; gap: 8px; }
 .run-items { margin: 0; padding: 0; display: grid; gap: 8px; list-style: none; }

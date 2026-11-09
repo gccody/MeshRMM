@@ -451,6 +451,20 @@ function sourceInput(draft: SourceDraft) {
   };
 }
 
+const installers = (sources: readonly SourceDraft[]) =>
+  sources.filter((source) => source.source === "custom").map((source) => JSON.stringify(sourceInput(source)));
+
+// Whether saving the draft over `application` (null for a new one) adds or
+// changes a custom installer, as the server sees it: that needs scripts.run
+// as well as applications.manage, since custom installers run as SYSTEM or
+// root. Removing or reordering ways to install doesn't.
+export function installersChanged(application: Application | null, draft: ApplicationDraft): boolean {
+  const before = new Set(installers(application?.sources.map(sourceDraft) ?? []));
+  return installers(draft.sources).some((installer) => !before.has(installer));
+}
+
+export const INSTALLERS_NEED_SCRIPTS = "Adding or changing a custom installer needs the scripts.run permission too, because it runs as SYSTEM or root.";
+
 // The request body that saves the draft. Call only when it has no problem.
 export function applicationInput(draft: ApplicationDraft) {
   return {

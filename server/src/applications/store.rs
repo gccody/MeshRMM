@@ -133,7 +133,10 @@ pub async fn store_scan(
         .await?;
     let outdated_since = previous
         .into_iter()
-        .filter_map(|(source, id, since)| Some(((source, id), since?)))
+        .filter_map(|(source, id, since)| {
+            let source = PackageSource::parse(&source)?;
+            Some((PackageKey { source, id }, since?))
+        })
         .collect::<HashMap<_, _>>();
     transaction
         .execute(
@@ -167,7 +170,10 @@ pub async fn store_scan(
             let id = storable(&package.id);
             let since = package.outdated().then(|| {
                 outdated_since
-                    .get(&(package.source.as_str().to_owned(), id.clone()))
+                    .get(&PackageKey {
+                        source: package.source,
+                        id: id.clone(),
+                    })
                     .copied()
                     .unwrap_or(now)
             });
@@ -372,33 +378,40 @@ pub async fn outdated(
                 .to_owned(),
         )
         .await?;
-    let mut grouped: HashMap<(String, String), Outdated> = HashMap::new();
+    // Devices can list a package in different cases (`Git.Git`, `git.git`)
+    // where its manager ignores case: one package.
+    let mut grouped: HashMap<PackageKey, Outdated> = HashMap::new();
     for row in rows {
-        let entry = grouped
-            .entry((row.source.clone(), row.package_id.clone()))
-            .or_insert_with(|| {
-                let mut package = Package {
-                    source: row.source.clone(),
-                    package_id: row.package_id.clone(),
-                    name: row.name.clone(),
-                    version: None,
-                    available_version: None,
-                    outdated_since: None,
-                    application_id: None,
-                    application_name: None,
-                    held: false,
-                };
-                matches.annotate(&mut package);
-                Outdated {
-                    source: package.source,
-                    package_id: package.package_id,
-                    name: package.name,
-                    application_id: package.application_id,
-                    application_name: package.application_name,
-                    held: package.held,
-                    devices: Vec::new(),
-                }
-            });
+        let Some(source) = PackageSource::parse(&row.source) else {
+            continue;
+        };
+        let key = PackageKey {
+            source,
+            id: row.package_id.clone(),
+        };
+        let entry = grouped.entry(key).or_insert_with(|| {
+            let mut package = Package {
+                source: row.source.clone(),
+                package_id: row.package_id.clone(),
+                name: row.name.clone(),
+                version: None,
+                available_version: None,
+                outdated_since: None,
+                application_id: None,
+                application_name: None,
+                held: false,
+            };
+            matches.annotate(&mut package);
+            Outdated {
+                source: package.source,
+                package_id: package.package_id,
+                name: package.name,
+                application_id: package.application_id,
+                application_name: package.application_name,
+                held: package.held,
+                devices: Vec::new(),
+            }
+        });
         entry.devices.push(OutdatedDevice {
             device_id: row.device_id,
             device_name: row.device_name,
@@ -460,9 +473,12 @@ pub async fn outdated_ages(
         .await?;
     for (device_id, source, package_id, name, since) in rows {
         // Pinned library applications are held back on purpose.
-        let is_held = held
-            .iter()
-            .any(|key| key.source.as_str() == source && key.id == package_id);
+        let is_held = PackageSource::parse(&source).is_some_and(|source| {
+            held.contains(&PackageKey {
+                source,
+                id: package_id,
+            })
+        });
         if is_held {
             continue;
         }

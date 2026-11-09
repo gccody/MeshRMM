@@ -8,6 +8,7 @@ import {
   describeSource,
   describeUpdate,
   filterPackages,
+  installersChanged,
   namesText,
   oldestOutdated,
   outdatedTotals,
@@ -131,6 +132,23 @@ test("applications are edited as they are stored", () => {
   assert.equal(draft.sources[2].detectionPath, "/opt/app");
   assert.equal(applicationDraftProblem(draft), null);
   assert.equal(applicationInput(draft).sources[2].uninstall_command, "apt-get remove -y app");
+});
+
+test("adding or changing a custom installer is told apart, as it needs scripts.run", () => {
+  const vendor = {
+    ...firefox,
+    sources: [...firefox.sources, { source: "custom", platform: "windows", package_id: "", file_id: "f", file_name: "vendor.msi", install_arguments: "/qn", detection: { kind: "application", name: "Vendor*" } }],
+  };
+  const draft = applicationDraft(vendor);
+  assert.equal(installersChanged(vendor, draft), false, "unchanged");
+  assert.equal(installersChanged(vendor, { ...draft, name: "Renamed", sources: [draft.sources[2], { ...draft.sources[0], packageId: "Other.App" }] }), false, "packages and order");
+  assert.equal(installersChanged(vendor, { ...draft, sources: draft.sources.slice(0, 2) }), false, "removed");
+  const custom = draft.sources[2];
+  for (const change of [{ installArguments: "/qn & calc" }, { uninstallCommand: "calc" }, { fileId: "g" }, { platform: "linux" }, { detectionName: "Other*" }, { detection: "file", detectionPath: "C:\\App\\app.exe" }]) {
+    assert.equal(installersChanged(vendor, { ...draft, sources: [...draft.sources.slice(0, 2), { ...custom, ...change }] }), true, JSON.stringify(change));
+  }
+  assert.equal(installersChanged(null, draft), true, "a new application with one");
+  assert.equal(installersChanged(null, applicationDraft(firefox)), false, "packages only");
 });
 
 test("library applications, packages and runs read as words", () => {

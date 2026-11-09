@@ -26,6 +26,8 @@ use super::{Attempt, ITEM_TIMEOUT, Verdict, extension, parse};
 use crate::remote::system_info::windows::registry::Key;
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(APPLICATION_SCAN_TIMEOUT_SECONDS);
+/// How long looking up the ID a package is listed by may take.
+const SHOW_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
 /// winget's arguments for running without anyone to answer it.
 const WINGET_QUIET: [&str; 2] = ["--accept-source-agreements", "--disable-interactivity"];
@@ -181,7 +183,11 @@ pub(super) fn scan(tool: &Tool) -> anyhow::Result<(Option<String>, Vec<ScannedPa
                 "winget list",
                 &[NOT_INSTALLED],
             )?;
-            Ok((version, parse::winget_list(&ran.stdout)))
+            if ran.code == Some(NOT_INSTALLED) {
+                return Ok((version, Vec::new()));
+            }
+            let packages = parse::winget_list(&ran.stdout).map_err(anyhow::Error::msg)?;
+            Ok((version, packages))
         }
         _ => {
             let version = tool
@@ -241,31 +247,53 @@ fn chocolatey_verdict(ran: &Ran) -> Verdict {
     }
 }
 
+/// The ID winget's sources write `id` as, when they write it differently:
+/// winget's `--exact` matches case, while the library ignores it.
+fn winget_listed_id(tool: &Tool, id: &str) -> Option<String> {
+    let ran = tool.run(&["show", "--id", id], SHOW_TIMEOUT).ok()?;
+    if !ran.success() {
+        return None;
+    }
+    parse::winget_shown_id(&ran.stdout)
+        .filter(|listed| listed != id && listed.eq_ignore_ascii_case(id))
+}
+
+fn winget_install(tool: &Tool, id: &str, version: Option<&str>) -> Attempt {
+    let mut args = vec![
+        "install",
+        "--id",
+        id,
+        "--exact",
+        "--silent",
+        "--accept-package-agreements",
+    ];
+    if let Some(version) = version {
+        args.extend(["--version", version]);
+    }
+    let machine = [args.as_slice(), &["--scope", "machine"]].concat();
+    let ran = tool.run(&machine, ITEM_TIMEOUT);
+    if ran
+        .as_ref()
+        .is_ok_and(|ran| ran.code == Some(NO_APPLICABLE_INSTALLER))
+    {
+        // The package has no machine-scope installer; use its default.
+        return Attempt::of(tool.run(&args, ITEM_TIMEOUT), winget_verdict);
+    }
+    Attempt::of(ran, winget_verdict)
+}
+
 pub(super) fn install(tool: &Tool, package: &PackageRef) -> Attempt {
     let id = package.id.as_str();
     match tool.source {
         PackageSource::Winget => {
-            let mut args = vec![
-                "install",
-                "--id",
-                id,
-                "--exact",
-                "--silent",
-                "--accept-package-agreements",
-            ];
-            if let Some(version) = &package.version {
-                args.extend(["--version", version]);
-            }
-            let machine = [args.as_slice(), &["--scope", "machine"]].concat();
-            let ran = tool.run(&machine, ITEM_TIMEOUT);
-            if ran
-                .as_ref()
-                .is_ok_and(|ran| ran.code == Some(NO_APPLICABLE_INSTALLER))
+            let version = package.version.as_deref();
+            let attempt = winget_install(tool, id, version);
+            if attempt.exit_code == Some(NOT_INSTALLED)
+                && let Some(listed) = winget_listed_id(tool, id)
             {
-                // The package has no machine-scope installer; use its default.
-                return Attempt::of(tool.run(&args, ITEM_TIMEOUT), winget_verdict);
+                return winget_install(tool, &listed, version);
             }
-            Attempt::of(ran, winget_verdict)
+            attempt
         }
         _ => {
             let mut args = vec!["install", id, "-y", "--no-progress", "-r"];
@@ -335,8 +363,44 @@ fn system32(name: &str) -> PathBuf {
 /// programs directly, and PowerShell and batch scripts through their
 /// interpreters.
 pub(super) fn run_installer(path: &Path, arguments: &str) -> Attempt {
+    let kind = extension(path);
+    if !matches!(kind.as_str(), "msi" | "exe" | "ps1" | "cmd" | "bat") {
+        return Attempt::failed(format!(
+            "Windows runs .msi, .exe, .ps1, .cmd and .bat installers, not .{kind} files"
+        ));
+    }
+    installing(
+        || installer_command(path, &kind, arguments),
+        Verdict::by_code,
+    )
+}
+
+/// Windows Installer does one install at a time. A program that exits with
+/// 1618, another installation in progress, is run again a few times, half a
+/// minute apart, while the run's time lasts.
+fn installing(command: impl Fn() -> Command, judge: impl Fn(&Ran) -> Verdict) -> Attempt {
+    const TRIES: usize = 4;
+    const APART: Duration = Duration::from_secs(30);
+    for _ in 1..TRIES {
+        let ran = process::run(command(), ITEM_TIMEOUT);
+        if !ran
+            .as_ref()
+            .is_ok_and(|ran| ran.code == Some(INSTALL_IN_PROGRESS))
+        {
+            return Attempt::of(ran, &judge);
+        }
+        tracing::info!("another installation is in progress; trying again shortly");
+        std::thread::sleep(APART);
+    }
+    Attempt::of(process::run(command(), ITEM_TIMEOUT), &judge)
+}
+
+/// Windows Installer's "another installation is in progress".
+const INSTALL_IN_PROGRESS: i64 = 1618;
+
+fn installer_command(path: &Path, kind: &str, arguments: &str) -> Command {
     let quoted = format!("\"{}\"", path.display());
-    let mut command = match extension(path).as_str() {
+    let mut command = match kind {
         "msi" => {
             let mut command = Command::new(system32("msiexec.exe"));
             let arguments = if arguments.trim().is_empty() {
@@ -366,25 +430,26 @@ pub(super) fn run_installer(path: &Path, arguments: &str) -> Attempt {
             command.raw_arg(format!("/d /s /c \"{quoted} {arguments}\""));
             command
         }
-        other => {
-            return Attempt::failed(format!(
-                "Windows runs .msi, .exe, .ps1, .cmd and .bat installers, not .{other} files"
-            ));
-        }
+        _ => Command::new(path),
     };
     if let Some(folder) = path.parent() {
         command.current_dir(folder);
     }
-    Attempt::of(process::run(command, ITEM_TIMEOUT), Verdict::by_code)
+    command
 }
 
 /// Runs a command line with `cmd.exe`, as a library entry's uninstall
 /// command.
 pub(super) fn run_command(line: &str) -> Attempt {
-    let mut command = Command::new(system32("cmd.exe"));
-    command.raw_arg(format!("/d /s /c \"{line}\""));
-    command.current_dir(system32(""));
-    Attempt::of(process::run(command, ITEM_TIMEOUT), Verdict::by_code)
+    installing(
+        || {
+            let mut command = Command::new(system32("cmd.exe"));
+            command.raw_arg(format!("/d /s /c \"{line}\""));
+            command.current_dir(system32(""));
+            command
+        },
+        Verdict::by_code,
+    )
 }
 
 /// An installed program's Uninstall entry.
@@ -460,13 +525,17 @@ pub(super) fn uninstall_inventory(name: &str, version: Option<&str>) -> Attempt 
     let Some(entry) = found.first() else {
         return Attempt::unchanged("It isn't installed for every user on this device.");
     };
-    let Some(mut command) = quiet_command(entry) else {
+    if quiet_command(entry).is_none() {
         return Attempt::failed(
             "It has no quiet uninstaller and isn't a Windows Installer package. Uninstall it with a script, or add it to the application library with an uninstall command.",
         );
+    }
+    let command = || {
+        let mut command = quiet_command(entry).expect("checked above");
+        command.current_dir(system32(""));
+        command
     };
-    command.current_dir(system32(""));
-    let mut attempt = Attempt::of(process::run(command, ITEM_TIMEOUT), |ran| match ran.code {
+    let mut attempt = installing(command, |ran| match ran.code {
         // Windows Installer: the product isn't installed.
         Some(1605) => Verdict::Unchanged("It isn't installed.".to_owned()),
         _ => Verdict::by_code(ran),

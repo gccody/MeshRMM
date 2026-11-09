@@ -31,11 +31,21 @@ pub const MAX_VERSION_CHARS: usize = 64;
 pub const MAX_COMMAND_CHARS: usize = 2_000;
 /// The most output kept from installing one application.
 pub const MAX_ITEM_OUTPUT_CHARS: usize = 16 * 1024;
-/// How long an Agent lets one package manager's scan run.
+/// The most output, in bytes, a run's result keeps for all its
+/// applications together, shared evenly, so the result stays well inside
+/// the control connection's message limit.
+pub const MAX_RUN_OUTPUT_BYTES: usize = 1024 * 1024;
+/// How long an Agent lets one package manager's scan run, all of its
+/// commands together.
 pub const APPLICATION_SCAN_TIMEOUT_SECONDS: u64 = 15 * 60;
+/// How long an Agent lets a whole scan run, every package manager
+/// together. A device has at most two.
+pub const APPLICATION_SCAN_TOTAL_SECONDS: u64 = 2 * APPLICATION_SCAN_TIMEOUT_SECONDS;
 /// How long an Agent lets one install, update or uninstall run.
 pub const APPLICATION_ITEM_TIMEOUT_SECONDS: u64 = 30 * 60;
-/// How long an Agent works on one run before failing what is left of it.
+/// How long an Agent works on one run's applications before failing what
+/// is left of them; the scans before and after are on top. An application
+/// started near the end gets only what is left.
 pub const APPLICATION_RUN_TIMEOUT_SECONDS: u64 = 4 * 60 * 60;
 
 /// Where an application comes from: a package manager, or an installer from
@@ -105,6 +115,17 @@ impl PackageSource {
             Self::Flatpak | Self::Snap => Some(DevicePlatform::Linux),
             Self::Custom => None,
         }
+    }
+
+    /// Whether the manager reads package IDs ignoring case, so
+    /// `mozilla.firefox` and `Mozilla.Firefox` are one package: winget,
+    /// Chocolatey and Homebrew do. Flatpak application IDs are
+    /// case-sensitive, and snap names are lowercase.
+    pub fn ignores_case(self) -> bool {
+        matches!(
+            self,
+            Self::Winget | Self::Chocolatey | Self::Homebrew | Self::HomebrewCask
+        )
     }
 
     /// Whether `id` is a package ID this manager could have: 1 to
@@ -339,13 +360,66 @@ pub struct PackageRef {
 }
 
 /// A package by manager and ID, as scans report and updates choose them.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+///
+/// Keys compare, hash and sort as their manager reads IDs: ignoring ASCII
+/// case for winget, Chocolatey and Homebrew
+/// ([`PackageSource::ignores_case`]), exactly otherwise. The ID keeps the
+/// case it was written with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageKey {
     pub source: PackageSource,
     pub id: String,
 }
 
+impl PartialEq for PackageKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source && self.folded() == other.folded()
+    }
+}
+
+impl Eq for PackageKey {}
+
+impl std::hash::Hash for PackageKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.source.hash(state);
+        self.folded().hash(state);
+    }
+}
+
+impl PartialOrd for PackageKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PackageKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.source
+            .cmp(&other.source)
+            .then_with(|| self.folded().cmp(&other.folded()))
+    }
+}
+
 impl PackageKey {
+    /// The ID as keys compare it.
+    fn folded(&self) -> std::borrow::Cow<'_, str> {
+        if self.source.ignores_case() {
+            std::borrow::Cow::Owned(self.id.to_ascii_lowercase())
+        } else {
+            std::borrow::Cow::Borrowed(&self.id)
+        }
+    }
+
+    /// Whether `source` and `id` name this package.
+    pub fn is(&self, source: PackageSource, id: &str) -> bool {
+        self.source == source
+            && if source.ignores_case() {
+                self.id.eq_ignore_ascii_case(id)
+            } else {
+                self.id == id
+            }
+    }
+
     /// `winget:Mozilla.Firefox`, as the API names packages.
     pub fn text(&self) -> String {
         format!("{}:{}", self.source.as_str(), self.id)
@@ -680,8 +754,12 @@ impl ApplicationRunResult {
         }
     }
 
+    /// The result with clean text, at most [`MAX_RUN_ITEMS`] applications,
+    /// and each one's output cut to its end and to its share of
+    /// [`MAX_RUN_OUTPUT_BYTES`].
     pub fn sanitized(mut self) -> Self {
-        self.items.truncate(MAX_SCANNED_PACKAGES);
+        self.items.truncate(MAX_RUN_ITEMS);
+        let share = MAX_RUN_OUTPUT_BYTES / self.items.len().max(1);
         for item in &mut self.items {
             item.name = clean_text(&item.name);
             item.package_id = clean_optional(item.package_id.as_deref());
@@ -691,11 +769,23 @@ impl ApplicationRunResult {
                 .as_deref()
                 .map(clean_text)
                 .filter(|error| !error.is_empty());
-            item.output = clean_output(&item.output);
+            item.output = tail_bytes(clean_output(&item.output), share);
         }
         self.error = clean_optional(self.error.as_deref());
         self
     }
+}
+
+/// The end of `text`, at most `bytes` long, cut between characters.
+fn tail_bytes(text: String, bytes: usize) -> String {
+    if text.len() <= bytes {
+        return text;
+    }
+    let mut start = text.len() - bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_owned()
 }
 
 /// Program output as a result keeps it: its last [`MAX_ITEM_OUTPUT_CHARS`]
@@ -748,6 +838,58 @@ pub fn clean_output(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(source: PackageSource, id: &str) -> PackageKey {
+        PackageKey {
+            source,
+            id: id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn keys_compare_as_their_manager_reads_ids() {
+        use std::collections::HashSet;
+        let pinned = key(PackageSource::Winget, "mozilla.firefox");
+        let scanned = key(PackageSource::Winget, "Mozilla.Firefox");
+        assert_eq!(pinned, scanned);
+        assert_eq!(pinned.cmp(&scanned), Ordering::Equal);
+        assert!(HashSet::from([pinned.clone()]).contains(&scanned));
+        assert_eq!(scanned.id, "Mozilla.Firefox", "the ID keeps its case");
+        assert_eq!(
+            key(PackageSource::Chocolatey, "googlechrome"),
+            key(PackageSource::Chocolatey, "GoogleChrome")
+        );
+        assert_eq!(
+            key(PackageSource::HomebrewCask, "Firefox"),
+            key(PackageSource::HomebrewCask, "firefox")
+        );
+        assert_ne!(
+            key(PackageSource::Flatpak, "org.mozilla.Firefox"),
+            key(PackageSource::Flatpak, "org.mozilla.firefox")
+        );
+        assert_ne!(
+            key(PackageSource::Winget, "Git.Git"),
+            key(PackageSource::Chocolatey, "git.git")
+        );
+        assert!(scanned.is(PackageSource::Winget, "MOZILLA.FIREFOX"));
+        assert!(!key(PackageSource::Flatpak, "a.B").is(PackageSource::Flatpak, "a.b"));
+
+        let choice = UpdateChoice {
+            mode: UpdateMode::Except,
+            packages: vec![key(PackageSource::Chocolatey, "googlechrome")],
+            held: vec![pinned],
+        };
+        assert!(!choice.covers(&scanned), "held whatever the case");
+        assert!(!choice.covers(&key(PackageSource::Chocolatey, "GoogleChrome")));
+        assert!(choice.covers(&key(PackageSource::Chocolatey, "git")));
+        let mut keys = vec![
+            key(PackageSource::Winget, "Git.Git"),
+            key(PackageSource::Winget, "git.git"),
+        ];
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 1);
+    }
 
     #[test]
     fn names_round_trip() {
@@ -1008,5 +1150,58 @@ mod tests {
             RunStatus::of(&[item(ItemOutcome::Failed)]),
             RunStatus::Failed
         );
+    }
+
+    #[test]
+    fn results_fit_a_control_message() {
+        // Every application wrote its most, in characters that take four
+        // bytes, and more applications than a run has.
+        let output = format!(
+            "first line
+{}
+the end",
+            "😀".repeat(MAX_ITEM_OUTPUT_CHARS)
+        );
+        let items = (0..MAX_SCANNED_PACKAGES)
+            .map(|index| ItemResult {
+                index: index as u32,
+                name: "A".repeat(10_000),
+                source: Some(PackageSource::Winget),
+                package_id: Some("A.B".into()),
+                outcome: ItemOutcome::Failed,
+                version: None,
+                exit_code: Some(1),
+                error: Some("e".repeat(10_000)),
+                output: output.clone(),
+                reboot_required: false,
+            })
+            .collect();
+        let result = ApplicationRunResult {
+            status: RunStatus::Failed,
+            error: None,
+            items,
+        }
+        .sanitized();
+        assert_eq!(result.items.len(), MAX_RUN_ITEMS);
+        for item in &result.items {
+            assert!(item.output.len() <= MAX_RUN_OUTPUT_BYTES / MAX_RUN_ITEMS);
+            assert!(item.output.ends_with("the end"), "the end is kept");
+            assert!(output.ends_with(&item.output));
+        }
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            json.len() < crate::MAX_SYSTEM_INFO_BYTES / 2,
+            "{} bytes",
+            json.len()
+        );
+        // One application keeps its whole output, up to its own limit.
+        let one = ApplicationRunResult {
+            items: result.items[..1].to_vec(),
+            ..result
+        };
+        let mut one = one;
+        one.items[0].output = output.clone();
+        let one = one.sanitized();
+        assert_eq!(one.items[0].output.chars().count(), MAX_ITEM_OUTPUT_CHARS);
     }
 }

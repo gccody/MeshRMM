@@ -10,6 +10,7 @@ import {
   type Application,
   type ApplicationDraft,
   type DetectionKind,
+  INSTALLERS_NEED_SCRIPTS,
   INSTALLER_KINDS,
   MAX_SOURCES,
   type PackageSource,
@@ -21,6 +22,7 @@ import {
   applicationDraft,
   applicationDraftProblem,
   applicationInput,
+  installersChanged,
   sourceDraft,
 } from "./model";
 
@@ -45,13 +47,15 @@ export function ApplicationEditor({ application, files, returnFocus, onClose, on
   const [draft, setDraft] = useState<ApplicationDraft>(() => applicationDraft(application));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const problem = applicationDraftProblem(draft);
+  // Custom installers run as SYSTEM or root: adding or changing one needs
+  // scripts.run too, so without it they show but can't be edited.
+  const editsInstallers = can("scripts.run");
+  const problem = applicationDraftProblem(draft) ?? (!editsInstallers && installersChanged(application, draft) ? INSTALLERS_NEED_SCRIPTS : null);
   const update = (change: Partial<ApplicationDraft>) => setDraft((current) => ({ ...current, ...change }));
   const updateSource = (index: number, change: Partial<SourceDraft>) =>
     setDraft((current) => ({ ...current, sources: current.sources.map((source, at) => (at === index ? { ...source, ...change } : source)) }));
   const removeSource = (index: number) => setDraft((current) => ({ ...current, sources: current.sources.filter((_, at) => at !== index) }));
   const addSource = () => setDraft((current) => ({ ...current, sources: [...current.sources, sourceDraft({ source: "winget" })] }));
-  // Custom installers run as SYSTEM or root; adding one needs more access.
   const usesCustom = draft.sources.some((source) => source.source === "custom");
 
   const submit = async (event: FormEvent) => {
@@ -82,10 +86,11 @@ export function ApplicationEditor({ application, files, returnFocus, onClose, on
           <small className="field-help">A pinned version installs exactly that version with winget and Chocolatey, and holds the application back from updates everywhere. Leave it empty to install and keep the latest.</small>
 
           {draft.sources.map((source, index) => (
-            <SourceFields key={index} index={index} source={source} files={files} removable={draft.sources.length > 1} onChange={(change) => updateSource(index, change)} onRemove={() => removeSource(index)} />
+            <SourceFields key={index} index={index} source={source} files={files} editsInstallers={editsInstallers} removable={draft.sources.length > 1} onChange={(change) => updateSource(index, change)} onRemove={() => removeSource(index)} />
           ))}
           {draft.sources.length < MAX_SOURCES && <button type="button" className="secondary-button" onClick={addSource}><Plus size={15} /> Add another way to install</button>}
           {usesCustom && <p className="field-help">Custom installers run as SYSTEM on Windows and root on macOS and Linux, with the arguments and uninstall command exactly as written here.</p>}
+          {!editsInstallers && can("applications.manage") && <p className="field-help">{INSTALLERS_NEED_SCRIPTS} You can still change package manager sources, and remove custom installers.</p>}
         </fieldset>
         {(error || (problem && draft.name.trim())) && <p role="alert" className="installer-error">{error ?? problem}</p>}
         <div className="connection-reason-actions">
@@ -97,10 +102,12 @@ export function ApplicationEditor({ application, files, returnFocus, onClose, on
   );
 }
 
-function SourceFields({ index, source, files, removable, onChange, onRemove }: {
+function SourceFields({ index, source, files, editsInstallers, removable, onChange, onRemove }: {
   index: number;
   source: SourceDraft;
   files: ToolboxFile[] | null;
+  // Whether the user may add or change custom installers (scripts.run).
+  editsInstallers: boolean;
   removable: boolean;
   onChange: (change: Partial<SourceDraft>) => void;
   onRemove: () => void;
@@ -108,15 +115,18 @@ function SourceFields({ index, source, files, removable, onChange, onRemove }: {
   const id = (name: string) => `application-source-${index}-${name}`;
   const custom = source.source === "custom";
   const missingFile = custom && source.fileId && files !== null && !files.some((file) => file.id === source.fileId);
+  // A custom installer the user may not change is shown as it is.
+  const locked = custom && !editsInstallers;
   const changeSource = (next: PackageSource) =>
     onChange(next === "custom" ? { source: next } : { source: next, platform: SOURCE_PLATFORM[next] });
   return (
     <fieldset className="choice-list application-source">
       <legend>Way {index + 1}</legend>
+      <fieldset className="application-source-fields" disabled={locked}>
       <div className="script-editor-row">
         <label htmlFor={id("source")}>Source
           <select id={id("source")} value={source.source} onChange={(event) => changeSource(event.target.value as PackageSource)}>
-            {SOURCES.map((candidate) => <option key={candidate} value={candidate}>{SOURCE_LABELS[candidate]}{candidate === "custom" ? "" : ` (${PLATFORM_LABELS[SOURCE_PLATFORM[candidate]]})`}</option>)}
+            {SOURCES.map((candidate) => <option key={candidate} value={candidate} disabled={candidate === "custom" && !editsInstallers && !custom}>{SOURCE_LABELS[candidate]}{candidate === "custom" ? (editsInstallers ? "" : " (needs scripts.run)") : ` (${PLATFORM_LABELS[SOURCE_PLATFORM[candidate]]})`}</option>)}
           </select>
         </label>
         {custom ? (
@@ -189,6 +199,7 @@ function SourceFields({ index, source, files, removable, onChange, onRemove }: {
         )}
         <small className="field-help">{source.detection === "application" ? "As the device’s software list names it; * matches any text." : "The installer counts as installed while this exists."}</small>
       </>}
+      </fieldset>
       {removable && <button type="button" className="link-button" onClick={onRemove}><Trash2 size={14} /> Remove this way</button>}
     </fieldset>
   );

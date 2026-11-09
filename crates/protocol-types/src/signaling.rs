@@ -209,6 +209,14 @@ pub enum AgentStatusMessage {
         request_id: String,
         reply: Box<crate::FileReply>,
     },
+    /// Sent first on every control connection: the server's application
+    /// scans and runs (by run ID) this Agent is doing or has yet to report.
+    /// Any other the server is waiting for from before the connection ended
+    /// with a restart or a lost connection, and won't be reported.
+    ApplicationActivity {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        run_ids: Vec<String>,
+    },
     /// What an application scan found. `run_ids` are the server's scans it
     /// answers.
     ApplicationScan {
@@ -552,6 +560,24 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&scan).unwrap(),
             r#"{"type":"application_scan","scan":{"scanned_at_unix_ms":0,"managers":[],"packages":[]}}"#
+        );
+        let activity = AgentStatusMessage::ApplicationActivity {
+            run_ids: vec!["run-1".into()],
+        };
+        let json = serde_json::to_string(&activity).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"application_activity","run_ids":["run-1"]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentStatusMessage>(&json).unwrap(),
+            activity
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentStatusMessage>(r#"{"type":"application_activity"}"#)
+                .unwrap(),
+            AgentStatusMessage::ApplicationActivity { run_ids: vec![] },
+            "an idle Agent"
         );
     }
 

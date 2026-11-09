@@ -37,12 +37,33 @@ fn settled(line: &str) -> String {
     last.chars().filter(|c| !c.is_control()).collect()
 }
 
+/// Whether display column `column` of `line` holds something other than a
+/// space.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn occupied(line: &str, column: usize) -> bool {
+    let mut at = 0;
+    for character in line.chars() {
+        let width = display_width(character);
+        if column < at + width {
+            return character != ' ';
+        }
+        at += width;
+    }
+    false
+}
+
 /// The cells of winget's tables, as `winget list` and `winget upgrade`
 /// print them: a header line, a line of dashes, then rows whose cells start
-/// at the columns where the header's words do. The header is in the
-/// device's language, so cells are found by position, not by name. Output
-/// can hold several tables, such as upgrades that need explicit targeting,
-/// and lines between them.
+/// at the columns where the header's labels do, each column one space
+/// after the last. The header is in the device's language, so cells are
+/// found by position, not by name. Output can hold several tables, such as
+/// upgrades that need explicit targeting, and lines between them.
+///
+/// A label can have a space in it (Korean's 사용 가능, "available"), which
+/// reads as two columns. A line that runs into the second column (the ID)
+/// isn't a row but a note such as "3 upgrades available."; a later column
+/// start that a row's text runs across isn't a column. A label split that
+/// no row crosses stays split; [`winget_list`] reads around it.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn winget_tables(output: &str) -> Vec<Vec<String>> {
     let lines = output.lines().map(settled).collect::<Vec<_>>();
@@ -71,11 +92,26 @@ pub(crate) fn winget_tables(output: &str) -> Vec<Vec<String>> {
             column += display_width(character);
         }
         index += 2;
+        let mut body = Vec::new();
         while index < lines.len() {
             let line = &lines[index];
             if line.trim().is_empty() || lines.get(index + 1).is_some_and(|next| dashes(next)) {
                 break;
             }
+            body.push(line.as_str());
+            index += 1;
+        }
+        let crosses = |line: &str, start: usize| start > 0 && occupied(line, start - 1);
+        body.retain(|line| starts.get(1).is_none_or(|id| !crosses(line, *id)));
+        let starts = starts
+            .iter()
+            .enumerate()
+            .filter(|(column, start)| {
+                *column < 2 || !body.iter().any(|line| crosses(line, **start))
+            })
+            .map(|(_, start)| *start)
+            .collect::<Vec<_>>();
+        for line in body {
             let mut cells = vec![String::new(); starts.len()];
             let mut column = 0;
             for character in line.chars() {
@@ -92,7 +128,6 @@ pub(crate) fn winget_tables(output: &str) -> Vec<Vec<String>> {
                     .map(|cell| cell.trim().to_owned())
                     .collect(),
             );
-            index += 1;
         }
     }
     rows
@@ -109,32 +144,77 @@ fn winget_version(cell: &str) -> Option<String> {
 /// source. Programs winget can't match to a package of one of its sources
 /// (an empty source, IDs such as `ARP\Machine\X64\…` or `MSIX\…`) are left
 /// out, as are IDs winget cut short with `…`.
+///
+/// A package whose installed version winget doesn't know isn't outdated,
+/// as plain `winget upgrade` sees it: updating it must be asked for by
+/// name.
+///
+/// Output with rows that have a source but no package read from it is an
+/// error, so a table this can't read never passes for an empty list.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn winget_list(output: &str) -> Vec<ScannedPackage> {
-    winget_tables(output)
-        .into_iter()
-        .filter_map(|cells| {
-            // Name, Id, Version, then Available and Source; with nothing
-            // available winget leaves the Available column out.
-            let (name, id, version, available, source) = match cells.as_slice() {
-                [name, id, version, available, source] => {
-                    (name, id, version, Some(available), source)
-                }
-                [name, id, version, source] => (name, id, version, None, source),
-                _ => return None,
-            };
-            if source.is_empty() || id.ends_with('…') || !PackageSource::Winget.valid_id(id) {
-                return None;
-            }
-            Some(ScannedPackage {
-                source: PackageSource::Winget,
-                id: id.clone(),
-                name: name.trim_end_matches('…').trim().to_owned(),
-                version: winget_version(version),
-                available_version: available.and_then(|available| winget_version(available)),
-            })
-        })
-        .collect()
+pub(crate) fn winget_list(output: &str) -> Result<Vec<ScannedPackage>, String> {
+    let rows = winget_tables(output);
+    let mut packages = Vec::new();
+    let mut readable = 0;
+    let mut sourced = 0;
+    for cells in &rows {
+        // Name, Id, Version, then Available and Source; with nothing
+        // available winget leaves the Available column out, and a label
+        // with a space in it can leave an extra one in.
+        let [name, id, version, .., source] = cells.as_slice() else {
+            continue;
+        };
+        readable += 1;
+        if source.is_empty() {
+            continue;
+        }
+        sourced += 1;
+        if id.ends_with('…') || !PackageSource::Winget.valid_id(id) {
+            continue;
+        }
+        let available = cells[3..cells.len() - 1]
+            .iter()
+            .filter(|cell| !cell.is_empty())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let version = winget_version(version);
+        let available_version = if version.is_some() {
+            winget_version(&available)
+        } else {
+            None
+        };
+        packages.push(ScannedPackage {
+            source: PackageSource::Winget,
+            id: id.clone(),
+            name: name.trim_end_matches('…').trim().to_owned(),
+            version,
+            available_version,
+        });
+    }
+    if packages.is_empty() && (sourced > 0 || (readable == 0 && !output.trim().is_empty())) {
+        return Err("winget's list couldn't be read".to_owned());
+    }
+    Ok(packages)
+}
+
+/// The ID from `winget show`'s first line, `Found Mozilla Firefox
+/// [Mozilla.Firefox]` in the device's language: the last bracketed word.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn winget_shown_id(output: &str) -> Option<String> {
+    output.lines().map(settled).find_map(|line| {
+        let line = line.trim();
+        let inner = line.strip_suffix(']')?;
+        let id = &inner[inner.rfind('[')? + 1..];
+        PackageSource::Winget.valid_id(id).then(|| id.to_owned())
+    })
+}
+
+/// Whether a file starting with `head` is a program (ELF), rather than a
+/// script.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn is_elf(head: &[u8]) -> bool {
+    head.starts_with(b"ELF")
 }
 
 /// `winget --version`: `v1.29.380`.
@@ -406,9 +486,11 @@ pub(crate) fn merge(
     outdated: Vec<ScannedPackage>,
 ) -> Vec<ScannedPackage> {
     for update in outdated {
-        match installed.iter_mut().find(|package| {
-            package.source == update.source && package.id.eq_ignore_ascii_case(&update.id)
-        }) {
+        let key = update.key();
+        match installed
+            .iter_mut()
+            .find(|package| key.is(package.source, &package.id))
+        {
             Some(package) => {
                 package.available_version = update.available_version;
                 if package.version.is_none() {
@@ -536,6 +618,7 @@ mod tests {
     /// packages with updates.
     fn winget_upgrades(output: &str) -> Vec<ScannedPackage> {
         winget_list(output)
+            .unwrap()
             .into_iter()
             .filter(|package| package.available_version.is_some())
             .collect()
@@ -550,7 +633,7 @@ mod tests {
 
     #[test]
     fn winget_lists_packages_from_its_sources_only() {
-        let packages = winget_list(WINGET_LIST);
+        let packages = winget_list(WINGET_LIST).unwrap();
         let ids = packages
             .iter()
             .map(|package| package.id.as_str())
@@ -583,7 +666,10 @@ mod tests {
         );
         let roblox = find(&packages, "Roblox.Roblox");
         assert_eq!(roblox.version, None, "Unknown is no version");
-        assert_eq!(roblox.available_version.as_deref(), Some("0.746"));
+        assert_eq!(
+            roblox.available_version, None,
+            "an unknown version isn't outdated, as plain winget upgrade sees it"
+        );
         assert_eq!(
             find(&packages, "Python.Launcher").version.as_deref(),
             Some("< 3.14.7")
@@ -593,7 +679,12 @@ mod tests {
     #[test]
     fn winget_upgrades_list_outdated_packages() {
         let packages = winget_upgrades(WINGET_UPGRADE);
-        assert_eq!(packages.len(), 8, "{packages:#?}");
+        // OpenAL and Roblox have an unknown installed version, which plain
+        // winget upgrade doesn't count as outdated either.
+        assert_eq!(packages.len(), 6, "{packages:#?}");
+        assert!(!packages.iter().any(|package| {
+            package.id == "Roblox.Roblox" || package.id == "CreativeTechnology.OpenAL"
+        }));
         let hwinfo = find(&packages, "REALiX.HWiNFO");
         assert_eq!(hwinfo.name, "HWiNFO® 64");
         assert_eq!(hwinfo.version.as_deref(), Some("8.50"));
@@ -606,14 +697,37 @@ mod tests {
                 .as_deref(),
             Some("17.14.44")
         );
-        let git = winget_list(WINGET_LIST_ONE);
+        let git = winget_list(WINGET_LIST_ONE).unwrap();
         assert_eq!(git.len(), 1);
         assert_eq!(git[0].version.as_deref(), Some("2.55.0.3"));
-        assert!(winget_list("No installed package found matching input criteria.").is_empty());
+        assert!(
+            winget_list("No installed package found matching input criteria.").is_err(),
+            "text that isn't a table is no list"
+        );
+        assert_eq!(winget_list(""), Ok(Vec::new()));
         assert_eq!(
             winget_version_text("v1.29.380\r\n").as_deref(),
             Some("1.29.380")
         );
+        assert_eq!(
+            winget_shown_id(
+                "   - \r\nFound Mozilla Firefox [Mozilla.Firefox]\r\nVersion: 129.0\r\n"
+            )
+            .as_deref(),
+            Some("Mozilla.Firefox")
+        );
+        assert_eq!(
+            winget_shown_id("No package found matching input criteria."),
+            None
+        );
+        // Linux .bin and .run installers: programs run themselves, scripts
+        // run with sh.
+        assert!(is_elf(b"ELF"));
+        assert!(!is_elf(
+            b"#!/bin/sh
+"
+        ));
+        assert!(!is_elf(b"EL"));
     }
 
     #[test]
@@ -639,12 +753,81 @@ Bar   Bar.Bar  3.0     4.0       winget\n";
         assert_eq!(rows[0][0], "微信");
         assert_eq!(rows[0][1], "Tencent.WeChat");
         // A cut-short ID can't be installed by.
-        let cut = "Name Id          Version Source\n------------------------------\nA    Very.Long.I… 1.0     winget\n";
-        assert!(winget_list(cut).is_empty());
+        let cut = "Name Id           Version Source\n-------------------------------\nA    Very.Long.I… 1.0     winget\nB    B.B          2.0     winget\n";
+        assert_eq!(
+            winget_list(cut)
+                .unwrap()
+                .iter()
+                .map(|package| package.id.as_str())
+                .collect::<Vec<_>>(),
+            ["B.B"]
+        );
         assert_eq!(
             winget_exit_code(0x8A15_0061),
             Some("The package is installed already")
         );
+    }
+
+    #[test]
+    fn winget_tables_read_labels_with_spaces_and_refuse_unreadable_output() {
+        // Korean winget's header has a label with a space in it, 사용 가능
+        // ("available"); columns are padded by display width, one space
+        // apart.
+        fn pad(text: &str, width: usize) -> String {
+            let used = text.chars().map(display_width).sum::<usize>();
+            format!("{text}{}", " ".repeat(width - used))
+        }
+        fn line(cells: [&str; 5]) -> String {
+            cells
+                .iter()
+                .zip([9, 15, 7, 9, 6])
+                .map(|(cell, width)| pad(cell, width))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim_end()
+                .to_owned()
+        }
+        fn table(rows: &[[&str; 5]]) -> String {
+            let mut text = format!(
+                "{}\n{}\n",
+                line(["이름", "ID", "버전", "사용 가능", "원본"]),
+                "-".repeat(50)
+            );
+            for row in rows {
+                text.push_str(&line(*row));
+                text.push('\n');
+            }
+            text.push_str("2 업그레이드를 사용할 수 있습니다.\n");
+            text
+        }
+        // A row runs across the label's space, so it isn't a column.
+        let packages = winget_list(&table(&[
+            ["Git", "Git.Git", "2.45.0", "2.46.0", "winget"],
+            ["7-Zip", "7zip.7zip", "23.01", "", "winget"],
+        ]))
+        .unwrap();
+        assert_eq!(packages.len(), 2, "{packages:#?}");
+        assert_eq!(
+            find(&packages, "Git.Git").available_version.as_deref(),
+            Some("2.46.0")
+        );
+        assert_eq!(find(&packages, "7zip.7zip").available_version, None);
+        // No row does: the extra column is read around.
+        let packages = winget_list(&table(&[["Foo", "Foo.Foo", "1.0", "1.1", "winget"]])).unwrap();
+        assert_eq!(packages[0].available_version.as_deref(), Some("1.1"));
+        assert_eq!(packages[0].version.as_deref(), Some("1.0"));
+
+        // Output that holds no row this can read is a failed scan, not an
+        // empty one, so the server keeps the device's last list.
+        let garbled = "Name Id Version Source\n----------------------\nThis line is not a row of the table at all, winget\n";
+        assert!(winget_list(garbled).is_err());
+        let shifted =
+            "Name Id Version Source\n----------------------\nA    not an id here    winget\n";
+        assert!(winget_list(shifted).is_err());
+        // Rows without a source are programs winget can't manage: an empty
+        // list is right.
+        let unmanaged = "Name   Id                 Version Source\n----------------------------------------\nGame   ARP\\Machine\\X64\\G  1.0\n";
+        assert_eq!(winget_list(unmanaged), Ok(Vec::new()));
     }
 
     #[test]

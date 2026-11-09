@@ -19,10 +19,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use meshrmm_protocol::{
-    APPLICATION_ITEM_TIMEOUT_SECONDS, APPLICATION_RUN_TIMEOUT_SECONDS, AgentStatusMessage,
+    APPLICATION_ITEM_TIMEOUT_SECONDS, APPLICATION_RUN_TIMEOUT_SECONDS,
+    APPLICATION_SCAN_TIMEOUT_SECONDS, APPLICATION_SCAN_TOTAL_SECONDS, AgentStatusMessage,
     ApplicationOperation, ApplicationRunRequest, ApplicationRunResult, ApplicationScan,
-    CustomInstaller, DetectionRule, InstallItem, ItemOutcome, ItemResult, ManagerState, PackageKey,
-    PackageRef, PackageSource, RunStatus, ScannedPackage, UninstallItem, UpdateChoice, UpdateMode,
+    CustomInstaller, DetectionRule, InstallItem, ItemOutcome, ItemResult, MAX_RUN_ITEMS,
+    ManagerState, PackageKey, PackageRef, PackageSource, RunStatus, ScannedPackage, UninstallItem,
+    UpdateChoice, UpdateMode,
 };
 use tokio::sync::mpsc;
 
@@ -174,6 +176,12 @@ pub struct Applications {
     receiver: mpsc::UnboundedReceiver<AgentStatusMessage>,
     unsent: Option<AgentStatusMessage>,
     waiting: Arc<Mutex<Waiting>>,
+    /// The server's scans and runs this Agent has yet to report: going on,
+    /// or done with the report waiting to be sent. Each connection starts
+    /// by telling the server (see [`Applications::activity`]); one the
+    /// server waits for that isn't here won't be reported, because the
+    /// Agent restarted or never got it.
+    owed: Vec<String>,
 }
 
 impl Applications {
@@ -184,12 +192,35 @@ impl Applications {
             receiver,
             unsent: None,
             waiting: Arc::default(),
+            owed: Vec::new(),
+        }
+    }
+
+    /// The first report on a connection: what the server still gets
+    /// reports for.
+    pub fn activity(&self) -> AgentStatusMessage {
+        AgentStatusMessage::ApplicationActivity {
+            run_ids: self.owed.clone(),
+        }
+    }
+
+    /// `report` reached the connection: the server has what it answers.
+    pub fn delivered(&mut self, report: &AgentStatusMessage) {
+        match report {
+            AgentStatusMessage::ApplicationScan { run_ids, .. } => {
+                self.owed.retain(|id| !run_ids.contains(id));
+            }
+            AgentStatusMessage::ApplicationResult { run_id, .. } => {
+                self.owed.retain(|id| id != run_id);
+            }
+            _ => {}
         }
     }
 
     /// The server asked for a scan, or for an update scan, which brings an
     /// application scan along.
     pub fn scan(&mut self, run_id: Option<String>) {
+        self.owed.extend(run_id.clone());
         let mut waiting = lock(&self.waiting);
         if let Some((_, runs)) = &mut waiting.run {
             runs.extend(run_id);
@@ -218,12 +249,14 @@ impl Applications {
             });
         if let Err(error) = spawned {
             tracing::error!(%error, "could not start a thread for an application scan");
-            lock(&self.waiting).scan = None;
+            let unanswered = lock(&self.waiting).scan.take().unwrap_or_default();
+            self.owed.retain(|id| !unanswered.contains(id));
         }
     }
 
     /// The server asked for a run.
     pub fn run(&mut self, config: &Config, mode: ExecutionMode, request: ApplicationRunRequest) {
+        self.owed.push(request.run_id.clone());
         let mut waiting = lock(&self.waiting);
         if let Some((running, _)) = &waiting.run {
             let result = ApplicationRunResult::failed(format!(
@@ -314,13 +347,22 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Scans every package manager the device has, logging how it went.
+/// Scans every package manager the device has, logging how it went. Each
+/// manager has [`APPLICATION_SCAN_TIMEOUT_SECONDS`] for all its commands,
+/// and the whole scan [`APPLICATION_SCAN_TOTAL_SECONDS`], which the server's
+/// report windows allow for.
 fn scan_now() -> ApplicationScan {
     let started = Instant::now();
+    let scan_deadline = started + Duration::from_secs(APPLICATION_SCAN_TOTAL_SECONDS);
     let mut managers = Vec::new();
     let mut packages = Vec::new();
     for tool in platform::tools() {
-        match platform::scan(&tool) {
+        let manager_deadline =
+            Instant::now() + Duration::from_secs(APPLICATION_SCAN_TIMEOUT_SECONDS);
+        let scanned = process::by(scan_deadline.min(manager_deadline), || {
+            platform::scan(&tool)
+        });
+        match scanned {
             Ok((version, found)) => {
                 managers.push(ManagerState {
                     source: tool.source(),
@@ -372,7 +414,7 @@ fn tool_for(tools: &[platform::Tool], source: PackageSource) -> Option<&platform
 fn installed<'a>(scan: &'a ApplicationScan, key: &PackageKey) -> Option<&'a ScannedPackage> {
     scan.packages
         .iter()
-        .find(|package| package.source == key.source && package.id.eq_ignore_ascii_case(&key.id))
+        .find(|package| key.is(package.source, &package.id))
 }
 
 /// Whether the manager of `source` reported a failed scan, so its packages
@@ -398,6 +440,26 @@ fn run_now(
     let before = scan_now();
     let tools = platform::tools();
     let deadline = Instant::now() + Duration::from_secs(APPLICATION_RUN_TIMEOUT_SECONDS);
+    // Every program an application runs stops by the deadline too, so the
+    // last one can't run past it.
+    let items = process::by(deadline, || {
+        work(config, mode, request, progress, &tools, &before, deadline)
+    });
+    progress.report("Checking what is installed now");
+    let after = scan_now();
+    finish(items, after)
+}
+
+/// Works through a run's applications, until `deadline`.
+fn work(
+    config: &Config,
+    mode: ExecutionMode,
+    request: &ApplicationRunRequest,
+    progress: &Progress,
+    tools: &[platform::Tool],
+    before: &ApplicationScan,
+    deadline: Instant,
+) -> Vec<ItemResult> {
     let mut items = Vec::new();
     match &request.operation {
         ApplicationOperation::Install { items: wanted } => {
@@ -411,13 +473,13 @@ fn run_now(
                 let result = if Instant::now() > deadline {
                     overdue(index, &item.name)
                 } else {
-                    install(config, mode, request, index, item, &tools, &before)
+                    install(config, mode, request, index, item, tools, before)
                 };
                 items.push(result);
             }
         }
         ApplicationOperation::Update { choice } => {
-            let chosen = choose_updates(choice, &before);
+            let chosen = choose_updates(choice, before);
             for (index, (package, outdated)) in chosen.iter().enumerate() {
                 let name = &package.name;
                 if !outdated {
@@ -437,7 +499,7 @@ fn run_now(
                 let attempt = if Instant::now() > deadline {
                     Attempt::failed(TOO_LONG)
                 } else {
-                    match tool_for(&tools, package.source) {
+                    match tool_for(tools, package.source) {
                         Some(tool) => platform::update(tool, package),
                         None => Attempt::failed(format!(
                             "{} is no longer installed",
@@ -459,14 +521,20 @@ fn run_now(
                 let result = if Instant::now() > deadline {
                     overdue(index, item.name())
                 } else {
-                    uninstall(index, item, &tools, &before)
+                    uninstall(index, item, tools, before)
                 };
                 items.push(result);
             }
         }
     }
-    progress.report("Checking what is installed now");
-    let after = scan_now();
+    items
+}
+
+/// The run's result, with the version each application has after it.
+fn finish(
+    mut items: Vec<ItemResult>,
+    after: ApplicationScan,
+) -> (ApplicationRunResult, ApplicationScan) {
     for item in &mut items {
         if item.outcome != ItemOutcome::Succeeded {
             continue;
@@ -518,7 +586,10 @@ fn result(index: usize, name: &str, package: Option<PackageKey>, attempt: Attemp
 
 /// The packages an update covers, each with whether it is outdated: every
 /// outdated one it covers, and the ones it names that are installed and up
-/// to date, so asking for those says so.
+/// to date, so asking for those says so. A named one whose installed
+/// version the manager doesn't know (winget's "Unknown") isn't outdated, but
+/// is handed to the manager, which knows whether it has a newer one. At most [`MAX_RUN_ITEMS`]: the
+/// rest wait for the next update.
 fn choose_updates(choice: &UpdateChoice, scan: &ApplicationScan) -> Vec<(ScannedPackage, bool)> {
     let mut chosen = scan
         .packages
@@ -532,9 +603,16 @@ fn choose_updates(choice: &UpdateChoice, scan: &ApplicationScan) -> Vec<(Scanned
                 && !package.outdated()
                 && !choice.held.contains(key)
             {
-                chosen.push((package.clone(), false));
+                chosen.push((package.clone(), package.version.is_none()));
             }
         }
+    }
+    if chosen.len() > MAX_RUN_ITEMS {
+        tracing::info!(
+            outdated = chosen.len(),
+            "updating the first {MAX_RUN_ITEMS} outdated applications; the rest wait for the next update"
+        );
+        chosen.truncate(MAX_RUN_ITEMS);
     }
     chosen
 }
@@ -679,6 +757,9 @@ fn uninstall(
             if let Some(attempt) = refused(package.source, &package.id, None) {
                 return result(index, name, None, attempt);
             }
+            // The ID as the device lists it: winget's --exact matches case.
+            let listed = installed(before, package).map(ScannedPackage::key);
+            let package = listed.as_ref().unwrap_or(package);
             if installed(before, package).is_none() && !scan_failed(before, package.source) {
                 return result(
                     index,
@@ -795,6 +876,35 @@ pub(crate) fn extension(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn connections_start_with_the_runs_still_owed() {
+        let mut applications = Applications::new();
+        assert_eq!(
+            applications.activity(),
+            AgentStatusMessage::ApplicationActivity { run_ids: vec![] },
+            "a new Agent owes nothing"
+        );
+        applications.owed = vec!["run".into(), "scan-1".into(), "scan-2".into()];
+        applications.delivered(&AgentStatusMessage::ApplicationProgress {
+            run_id: "run".into(),
+            message: "Installing".into(),
+        });
+        applications.delivered(&AgentStatusMessage::ApplicationResult {
+            run_id: "run".into(),
+            result: Box::new(ApplicationRunResult::failed("x")),
+        });
+        applications.delivered(&AgentStatusMessage::ApplicationScan {
+            run_ids: vec!["scan-1".into()],
+            scan: Box::default(),
+        });
+        assert_eq!(
+            applications.activity(),
+            AgentStatusMessage::ApplicationActivity {
+                run_ids: vec!["scan-2".into()]
+            }
+        );
+    }
+
     fn package(id: &str, version: &str, available: Option<&str>) -> ScannedPackage {
         ScannedPackage {
             source: PackageSource::Winget,
@@ -848,6 +958,45 @@ mod tests {
             }),
             Vec::<(String, bool)>::new()
         );
+    }
+
+    #[test]
+    fn updates_leave_unknown_versions_alone_unless_named() {
+        // As winget's list reads Roblox: installed version Unknown.
+        let unknown = ScannedPackage {
+            version: None,
+            ..package("Roblox.Roblox", "1", None)
+        };
+        let scan = ApplicationScan {
+            packages: vec![unknown, package("a", "1", Some("2"))],
+            ..Default::default()
+        };
+        let chosen = choose_updates(&UpdateChoice::default(), &scan);
+        assert_eq!(chosen.len(), 1, "update all: {chosen:?}");
+        let chosen = choose_updates(
+            &UpdateChoice {
+                mode: UpdateMode::Only,
+                packages: vec![key("roblox.roblox")],
+                held: vec![],
+            },
+            &scan,
+        );
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].0.id, "Roblox.Roblox", "as the device lists it");
+        assert!(chosen[0].1, "handed to winget");
+    }
+
+    #[test]
+    fn updates_do_at_most_a_run_of_applications() {
+        let scan = ApplicationScan {
+            packages: (0..MAX_RUN_ITEMS + 10)
+                .map(|n| package(&format!("app.n{n}"), "1", Some("2")))
+                .collect(),
+            ..Default::default()
+        };
+        let chosen = choose_updates(&UpdateChoice::default(), &scan);
+        assert_eq!(chosen.len(), MAX_RUN_ITEMS);
+        assert_eq!(chosen[0].0.id, "app.n0");
     }
 
     #[test]

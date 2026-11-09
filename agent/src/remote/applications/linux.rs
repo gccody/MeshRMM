@@ -214,8 +214,8 @@ pub(super) fn uninstall(tool: &Tool, package: &PackageKey) -> Attempt {
 }
 
 /// Installs a `.deb` with APT (or dpkg), an `.rpm` with DNF, YUM, zypper
-/// (or rpm), and runs `.sh` and `.run` installers with `sh`. The arguments
-/// follow.
+/// (or rpm), and runs `.sh`, `.run` and `.bin` installers: a program
+/// (ELF) itself, a script with `sh`. The arguments follow.
 pub(super) fn run_installer(path: &Path, arguments: &str) -> Attempt {
     let arguments = match parse::split_arguments(arguments) {
         Ok(arguments) => arguments,
@@ -265,19 +265,42 @@ pub(super) fn run_installer(path: &Path, arguments: &str) -> Attempt {
                 );
             }
         }
-        "sh" | "run" | "bin" => {
-            let mut command = Command::new("/bin/sh");
-            command.arg(path);
-            command
-        }
+        "sh" | "run" | "bin" => match executable(path) {
+            Ok(true) => Command::new(path),
+            Ok(false) => {
+                let mut command = Command::new("/bin/sh");
+                command.arg(path);
+                command
+            }
+            Err(error) => return Attempt::failed(format!("{error:#}")),
+        },
         other => {
             return Attempt::failed(format!(
-                "Linux installs .deb and .rpm packages and runs .sh and .run installers, not .{other} files"
+                "Linux installs .deb and .rpm packages and runs .sh, .run and .bin installers, not .{other} files"
             ));
         }
     };
     command.args(arguments).current_dir("/");
     Attempt::of(process::run(command, ITEM_TIMEOUT), Verdict::by_code)
+}
+
+/// Whether the installer at `path` is a program, which is made executable
+/// for its owner (the Agent) to run; otherwise it's a script for `sh`.
+fn executable(path: &Path) -> anyhow::Result<bool> {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+
+    use anyhow::Context as _;
+    let mut head = [0_u8; 4];
+    let read = std::fs::File::open(path)
+        .and_then(|mut file| file.read(&mut head))
+        .context("could not read the installer")?;
+    if !parse::is_elf(&head[..read]) {
+        return Ok(false);
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .context("could not make the installer executable")?;
+    Ok(true)
 }
 
 pub(super) fn run_command(line: &str) -> Attempt {

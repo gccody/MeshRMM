@@ -2,7 +2,8 @@
 //! fleet's outdated ones, and installs, updates and uninstalls on one
 //! device. Seeing them and asking for scans needs `applications.view`;
 //! installing, updating and uninstalling needs `applications.deploy`;
-//! changing the library needs `applications.manage`. Runs on many devices
+//! changing the library needs `applications.manage`, and adding or changing
+//! a custom installer `scripts.run` as well. Runs on many devices
 //! are jobs (`POST /v1/jobs` with `applications`). See
 //! docs/application-deployment.md.
 use axum::{
@@ -115,6 +116,23 @@ fn name_taken() -> ApiError {
         .with_code("application_name_taken")
 }
 
+/// Adding or changing a custom installer needs `scripts.run` too: it runs
+/// its file and commands as SYSTEM or root, on every device a policy that
+/// names the application installs it on.
+fn require_installers(
+    actor: &Authorized,
+    valid: &library::Valid,
+    old: Option<&Application>,
+) -> Result<(), ApiError> {
+    if valid.changes_installers(old) && !actor.has(Permission::ScriptsRun) {
+        return Err(ApiError::forbidden(
+            "adding or changing a custom installer needs the scripts.run permission too, as it runs as SYSTEM or root",
+        )
+        .with_code("permission_denied"));
+    }
+    Ok(())
+}
+
 fn audit_metadata(valid: &library::Valid) -> Value {
     json!({
         "name": valid.name,
@@ -143,6 +161,7 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<ApplicationView>), ApiError> {
     actor.require(Permission::ApplicationsManage)?;
     let valid = input.validate()?;
+    require_installers(&actor, &valid, None)?;
     let id = new_id();
     let now = now_ms();
     let mut transaction = state.database.begin().await?;
@@ -179,9 +198,10 @@ pub async fn update(
     let id = parse_id(&id, "application")?;
     let valid = input.validate()?;
     let mut transaction = state.database.begin().await?;
-    if library::get(&mut transaction, &id).await?.is_none() {
-        return Err(not_found());
-    }
+    let old = library::get(&mut transaction, &id)
+        .await?
+        .ok_or_else(not_found)?;
+    require_installers(&actor, &valid, Some(&old))?;
     library::check_files(&mut transaction, &valid).await?;
     if library::name_taken(&mut transaction, &valid.name, Some(&id)).await? {
         return Err(name_taken());
@@ -201,7 +221,7 @@ pub async fn update(
     audit::record(
         &mut transaction,
         &actor.actor(),
-        "application.update",
+        "application.edit",
         application_target(&id),
         audit_metadata(&valid),
     )
@@ -263,6 +283,13 @@ async fn device(state: &AppState, id: &str) -> Result<String, ApiError> {
         return Err(ApiError::not_found("Device not found"));
     }
     Ok(id)
+}
+
+fn running() -> ApiError {
+    ApiError::conflict(
+        "the device is already installing, updating or uninstalling applications; wait for it to finish",
+    )
+    .with_code("application_run_running")
 }
 
 fn offline() -> ApiError {
@@ -331,7 +358,7 @@ pub async fn scan(
     }
     let run_id = new_id();
     let mut transaction = state.database.begin().await?;
-    runs::insert(
+    let inserted = runs::insert(
         &mut transaction,
         &NewRun {
             id: &run_id,
@@ -344,7 +371,22 @@ pub async fn scan(
             created_at: now_ms(),
         },
     )
-    .await?;
+    .await;
+    match inserted {
+        Ok(()) => {}
+        // Another request asked for one since `pending` looked: that one.
+        Err(error) if runs::is_already_pending(&error) => {
+            transaction.rollback().await?;
+            let run = match runs::pending(&mut database, &id, true).await? {
+                Some(run_id) => runs::get(&mut database, &run_id, false).await?,
+                None => None,
+            };
+            return run
+                .map(|run| (StatusCode::ACCEPTED, Json(run)))
+                .ok_or_else(ApiError::internal);
+        }
+        Err(error) => return Err(error.into()),
+    }
     audit::record(
         &mut transaction,
         &actor.actor(),
@@ -393,10 +435,7 @@ pub async fn start_run(
     }
     let mut transaction = state.database.begin().await?;
     if applications::busy(&mut transaction, &id).await? {
-        return Err(ApiError::conflict(
-            "the device is already installing, updating or uninstalling applications; wait for it to finish",
-        )
-        .with_code("application_run_running"));
+        return Err(running());
     }
     let spec = jobs::build(&mut transaction, request).await?;
     let platform = applications::platform(&mut transaction, &id)
@@ -419,7 +458,15 @@ pub async fn start_run(
         },
         &spec,
     )
-    .await?;
+    .await
+    // Another request started one since `busy` looked.
+    .map_err(|error| {
+        if runs::is_already_pending(&error) {
+            running()
+        } else {
+            error.into()
+        }
+    })?;
     let mut metadata = spec.audit();
     metadata["run_id"] = run_id.as_str().into();
     audit::record(
