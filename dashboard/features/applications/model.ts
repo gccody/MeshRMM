@@ -300,15 +300,20 @@ export function filterPackages(packages: readonly DevicePackage[], query: string
     && (!needle || [pkg.name, pkg.package_id, pkg.application_name ?? ""].some((text) => text.toLocaleLowerCase().includes(needle))));
 }
 
-// Fleet totals for the outdated view's heading.
+// Fleet totals for the outdated view's heading. Pinned packages are held
+// back on purpose, so they count as pending nowhere: not here, not on the
+// device's tab, not for alerts.
 export function outdatedTotals(packages: readonly OutdatedPackage[]) {
   const devices = new Set<string>();
   let updates = 0;
+  let count = 0;
   for (const pkg of packages) {
+    if (pkg.held) continue;
+    count += 1;
     for (const device of pkg.devices) devices.add(device.device_id);
     updates += pkg.devices.length;
   }
-  return { packages: packages.length, devices: devices.size, updates };
+  return { packages: count, devices: devices.size, updates };
 }
 
 // The oldest time a package became outdated on any device.

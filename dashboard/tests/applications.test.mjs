@@ -189,6 +189,10 @@ test("device packages and the fleet's outdated ones filter and total", () => {
     ] },
   ];
   assert.deepEqual(outdatedTotals(outdated), { packages: 2, devices: 2, updates: 3 });
+  const pinned = { source: "snap", package_id: "hello", name: "hello", application_id: "h", application_name: "GNU Hello", held: true, devices: [
+    { device_id: "d3", device_name: "Three", version: "2.10.1", available_version: "2.10", outdated_since: 5 },
+  ] };
+  assert.deepEqual(outdatedTotals([...outdated, pinned]), { packages: 2, devices: 2, updates: 3 }, "pinned packages aren't pending");
   assert.equal(oldestOutdated(outdated[0]), 10);
   assert.equal(oldestOutdated(outdated[1]), null);
   assert.deepEqual(uninstallableInventory([{ name: "a", source: "windows" }, { name: "b", source: "windows_user" }, { name: "c", source: "dpkg" }]).map((program) => program.name), ["a"]);

@@ -241,7 +241,7 @@ function OutdatedTab() {
       intro: "Each device updates every outdated application its package managers list, except those the library pins to a version.",
       request: { action: "update", mode: "all" },
       platforms: ["windows", "macos", "linux"],
-      deviceIds: devicesOf(data ?? []),
+      deviceIds: devicesOf((data ?? []).filter((pkg) => !pkg.held)),
     });
   };
 
