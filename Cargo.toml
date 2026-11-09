@@ -42,7 +42,7 @@ meshrmm-protocol = { version = "0.2.0", path = "agent/protocol" }
 meshrmm-protocol-types = { version = "0.2.0", path = "crates/protocol-types" }
 meshrmm-self-update = { version = "0.2.0", path = "crates/self-update" }
 meshrmm-signaling-client = { version = "0.2.0", path = "crates/signaling-client" }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"
