@@ -1,0 +1,6 @@
+Name      Version          Rev    Tracking         Publisher   Notes
+code      1.97.2           185    latest/stable    vscode**    classic
+core22    20250110         1748   latest/stable    canonical**  base
+firefox   135.0.1-1        5751   latest/stable/…  mozilla**    -
+lxd       5.21.2-2f4ba6b   30131  5.21/stable      canonical**  disabled
+snapd     2.67.1           23771  latest/stable    canonical**  snapd

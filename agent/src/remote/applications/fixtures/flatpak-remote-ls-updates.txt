@@ -1,0 +1,2 @@
+org.mozilla.firefox	136.0
+org.gimp.GIMP	

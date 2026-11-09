@@ -1,0 +1,3 @@
+Name     Version  Rev   Size   Publisher  Notes
+code     1.98.0   186   104MB  vscode**   classic
+firefox  136.0-1  5800  286MB  mozilla**  -

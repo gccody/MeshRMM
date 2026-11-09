@@ -1,0 +1,3 @@
+org.mozilla.firefox	Firefox	135.0.1
+org.gimp.GIMP	GNU Image Manipulation Program	2.10.38
+com.example.NoVersion		

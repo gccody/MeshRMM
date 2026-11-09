@@ -9,7 +9,7 @@ mod disks;
 mod hardware;
 mod network;
 mod os;
-mod registry;
+pub(crate) mod registry;
 mod smbios;
 mod users;
 
