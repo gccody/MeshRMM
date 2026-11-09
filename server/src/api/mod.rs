@@ -16,6 +16,7 @@ mod instance;
 mod invitations;
 mod jobs;
 mod metrics;
+mod monitors;
 mod notes;
 mod notification_channels;
 mod passkeys;
@@ -66,6 +67,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(toolbox_routes())
         .merge(remote_routes())
         .merge(alert_routes())
+        .merge(monitor_routes())
         .merge(automation_routes())
         .merge(application_routes())
         .layer(middleware::from_fn_with_state(
@@ -373,6 +375,14 @@ fn automation_routes() -> Router<AppState> {
             put(automation::update).delete(automation::delete),
         )
         .route("/automation-policies/{id}/run", post(automation::run))
+}
+
+fn monitor_routes() -> Router<AppState> {
+    Router::new()
+        .route("/agents/{id}/monitors", get(monitors::device_monitors))
+        .route("/agents/{id}/monitors/check", post(monitors::check))
+        .route("/monitor-states", get(monitors::rule_states))
+        .route("/alerts/{id}/remediations", get(monitors::remediations))
 }
 
 fn alert_routes() -> Router<AppState> {

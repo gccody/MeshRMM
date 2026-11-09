@@ -22,7 +22,7 @@ export function DeviceAlerts({ deviceId }: { deviceId: string }) {
 
   useAlertEvents((event) => {
     if (event.type === "alert_counts") reload();
-    else if (event.alert.device_id === deviceId) {
+    else if (event.type === "alert_upsert" && event.alert.device_id === deviceId) {
       setData((current) => ({ ...current, alerts: applyAlertChange(current.alerts, event.alert, filters).slice(0, SHOWN) }));
     }
   });

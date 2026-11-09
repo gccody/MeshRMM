@@ -71,6 +71,11 @@ pub enum AlertEvent {
     /// How many alerts are unresolved: when the socket opens, and after
     /// changes to many alerts at once, after which lists should be read again.
     AlertCounts { counts: Counts },
+    /// A device's monitors reported: their latest results.
+    MonitorUpdate {
+        device_id: String,
+        states: Vec<crate::monitors::store::MonitorState>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +139,7 @@ impl Engine {
         next
     }
 
-    fn publish(&self, event: AlertEvent) {
+    pub(crate) fn publish(&self, event: AlertEvent) {
         // Nobody listening is fine.
         let _ = self.inner.events.send(Arc::new(event));
     }
@@ -172,6 +177,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
 pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
     let _one_at_a_time = state.alerts.inner.evaluating.lock().await;
     sweep_lost_runs(state, now).await?;
+    crate::monitors::remediation::tick(state, now).await?;
     let mut database = &state.database;
     let rules = rules::load(&mut database, None).await?;
     let devices = crate::targets::devices(&mut database, None).await?;
@@ -262,14 +268,34 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
             )
         })
         .collect::<HashSet<_>>();
+    // Monitor rules whose check devices no longer get, because it runs with
+    // an owner who lost that access: their alerts can't update or clear.
+    let mut unchecked = HashMap::new();
     for alert in &unresolved {
         let Some(rule) = rules_by_id.get(alert.rule_id.as_str()) else {
             continue;
         };
-        let applies = rule.enabled
+        let mut applies = rule.enabled
             && devices_by_id
                 .get(alert.device_id.as_str())
                 .is_some_and(|device| rule.covers(device));
+        if applies && rule.monitor.is_some() && rule.condition.runs_with_owner_access() {
+            let blocked = match unchecked.get(rule.id.as_str()) {
+                Some(blocked) => *blocked,
+                None => {
+                    let blocked = crate::monitors::check_problem(&mut database, rule)
+                        .await?
+                        .is_some();
+                    if blocked {
+                        // Devices may still have the check: take it off.
+                        state.monitors.wake();
+                    }
+                    unchecked.insert(rule.id.as_str(), blocked);
+                    blocked
+                }
+            };
+            applies = !blocked;
+        }
         let key = (
             alert.rule_id.as_str(),
             alert.device_id.as_str(),
@@ -313,6 +339,7 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
             detail: &breach.detail,
             script_run_id: None,
             update_run_id: None,
+            output: "",
         };
         if let Some(id) = store::raise(&mut database, &raise, now).await? {
             tracing::info!(
@@ -321,14 +348,42 @@ pub async fn evaluate(state: &AppState, now: i64) -> anyhow::Result<()> {
                 alert_id = id,
                 "raised an alert"
             );
-            announce(state, rule, &id, true).await?;
+            raised(state, rule, &id, now).await?;
         }
     }
     Ok(())
 }
 
+/// Announces an alert `rule` just raised: its channels hear of it unless the
+/// rule waits for self-healing to fail, which starts now.
+pub(crate) async fn raised(
+    state: &AppState,
+    rule: &Rule,
+    id: &str,
+    now: i64,
+) -> anyhow::Result<()> {
+    let notify = rule.notifies_at_once();
+    if notify {
+        store::mark_notified(&mut &state.database, id).await?;
+    }
+    // Self-healing that stops at once is told as one notice, which carries
+    // the alert, rather than a raise and a failure that might arrive in
+    // either order.
+    let stopped = rule.remediation.is_some()
+        && crate::monitors::remediation::begin(state, rule, id, now).await?;
+    let notice = if stopped {
+        Some(Notice::RemediationFailed)
+    } else {
+        notify.then_some(Notice::Raised)
+    };
+    announce(state, rule, id, notice).await
+}
+
 /// Resolves an unresolved alert of `rule`, as `actor` or (with `None`) the
-/// server, and notifies if the rule asks. Returns whether it was unresolved.
+/// server, and notifies if the rule asks and its channels heard of the
+/// alert. An alert that clears just after a self-healing attempt succeeded
+/// is `remediated` ([`crate::monitors::remediation::healed`]). Returns
+/// whether it was unresolved.
 pub async fn resolve(
     state: &AppState,
     id: &str,
@@ -337,32 +392,71 @@ pub async fn resolve(
     actor: Option<&Actor>,
     now: i64,
 ) -> anyhow::Result<bool> {
-    if !store::resolve(&mut &state.database, id, resolution, actor, now).await? {
+    let mut database = &state.database;
+    let Some(alert) = store::get(&mut database, id).await? else {
         return Ok(false);
+    };
+    let resolution = if resolution == Resolution::Cleared
+        && crate::monitors::remediation::healed(&mut database, &alert, rule, now).await?
+    {
+        Resolution::Remediated
+    } else {
+        resolution
+    };
+    if !store::resolve(&mut database, id, resolution, actor, now).await? {
+        return Ok(false);
+    }
+    if alert.remediation_state.is_some() {
+        crate::monitors::remediation::resolved(state, id, resolution == Resolution::Remediated)
+            .await?;
     }
     tracing::info!(
         alert_id = id,
         resolution = resolution.as_str(),
         "resolved an alert"
     );
-    announce(state, rule, id, rule.notify_on_resolve).await?;
+    let notify = rule.notify_on_resolve && alert.notified;
+    announce(state, rule, id, notify.then_some(Notice::Resolved)).await?;
     Ok(true)
 }
 
-/// Tells event sockets about the alert, and its rule's channels if `notify`.
-async fn announce(state: &AppState, rule: &Rule, id: &str, notify: bool) -> anyhow::Result<()> {
+/// What a rule's channels are told about an alert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Notice {
+    Raised,
+    Resolved,
+    /// Self-healing gave up on it, for a rule that waits for that.
+    RemediationFailed,
+}
+
+/// Tells event sockets about the alert, and its rule's channels `notice`.
+pub(crate) async fn announce(
+    state: &AppState,
+    rule: &Rule,
+    id: &str,
+    notice: Option<Notice>,
+) -> anyhow::Result<()> {
     let mut database = &state.database;
     let Some(alert) = store::get(&mut database, id).await? else {
         return Ok(());
     };
-    if notify && !rule.channel_ids.is_empty() {
+    if let Some(notice) = notice
+        && !rule.channel_ids.is_empty()
+    {
         let settings = settings::load(&mut database).await?;
+        let last = if notice == Notice::RemediationFailed {
+            crate::monitors::remediation::last_attempt(&mut database, id).await?
+        } else {
+            None
+        };
         notifications::dispatch(
             state,
             rule.channel_ids.clone(),
             notification(
                 &alert,
                 rule,
+                notice,
+                last.as_ref(),
                 &settings.instance_name,
                 &state.config.public_origin(),
             ),
@@ -400,6 +494,11 @@ pub async fn changed(state: &AppState, id: &str) -> anyhow::Result<()> {
 /// The device was deleted: its alerts go with it.
 pub async fn device_removed(state: &AppState, device_id: &str) {
     state.alerts.tracker().forget(device_id);
+    if let Err(error) =
+        crate::monitors::store::delete_for_device(&mut &state.database, device_id).await
+    {
+        tracing::warn!(device_id, %error, "could not delete a deleted device's monitor results");
+    }
     match store::delete_for_device(&mut &state.database, device_id).await {
         Ok(0) => {}
         Ok(_) => announce_counts(state).await,
@@ -409,38 +508,61 @@ pub async fn device_removed(state: &AppState, device_id: &str) {
     }
 }
 
-/// The email and webhook for a raised or resolved alert.
-fn notification(alert: &Alert, rule: &Rule, instance_name: &str, origin: &str) -> Notification {
-    let resolved = alert.state == store::State::Resolved.as_str();
+/// The email and webhook for a raised or resolved alert. `last` is the
+/// last self-healing attempt, for a notice that self-healing failed.
+fn notification(
+    alert: &Alert,
+    rule: &Rule,
+    notice: Notice,
+    last: Option<&crate::monitors::remediation::Attempt>,
+    instance_name: &str,
+    origin: &str,
+) -> Notification {
     let device = match &alert.company_name {
         Some(company) => format!("{} ({company})", alert.device_name),
         None => alert.device_name.clone(),
     };
-    let summary = if resolved {
-        format!("Resolved: {} on {}", alert.rule_name, alert.device_name)
-    } else {
-        format!(
+    let summary = match notice {
+        Notice::Resolved => format!("Resolved: {} on {}", alert.rule_name, alert.device_name),
+        Notice::Raised => format!(
             "{}: {} on {}",
             rule.severity.label(),
             alert.rule_name,
             alert.device_name
-        )
+        ),
+        Notice::RemediationFailed => format!(
+            "{}: {} on {} (self-healing failed)",
+            rule.severity.label(),
+            alert.rule_name,
+            alert.device_name
+        ),
     };
-    let mut body = if resolved {
-        format!(
+    let mut body = match notice {
+        Notice::Resolved => format!(
             "The alert \"{}\" on {device} is resolved{}.\n\n",
             alert.rule_name,
             match alert.resolution.as_deref() {
                 Some("cleared") => ": the condition passed",
+                Some("remediated") => ": the condition passed after self-healing",
                 Some("not_applicable") => ": the rule no longer covers the device",
                 _ => "",
             }
-        )
-    } else {
-        format!(
+        ),
+        Notice::Raised => format!(
             "{instance_name} raised a {} alert on {device}.\n\n",
             rule.severity.as_str()
-        )
+        ),
+        Notice::RemediationFailed => match last.and_then(|last| last.skipped_because()) {
+            Some(why) => format!(
+                "{instance_name} raised a {} alert on {device}, and self-healing stopped. {why}.\n\n",
+                rule.severity.as_str(),
+            ),
+            None => format!(
+                "{instance_name} raised a {} alert on {device}, and self-healing didn't fix it after {}.\n\n",
+                rule.severity.as_str(),
+                rules::plural(alert.remediation_attempts, "attempt")
+            ),
+        },
     };
     body.push_str(&format!(
         "{}\nRule: {} ({})\nRaised: {}\n",
@@ -449,6 +571,12 @@ fn notification(alert: &Alert, rule: &Rule, instance_name: &str, origin: &str) -
         rule.describe(),
         format_time(alert.raised_at)
     ));
+    if let Some(remediation) = rule.describe_remediation() {
+        body.push_str(&format!("Self-healing: {remediation}\n"));
+    }
+    if let Some(last) = last.filter(|_| notice == Notice::RemediationFailed) {
+        body.push_str(&format!("Last attempt: {}\n", last.describe()));
+    }
     if let Some(at) = alert.resolved_at {
         body.push_str(&format!("Resolved: {}\n", format_time(at)));
     }
@@ -461,11 +589,20 @@ fn notification(alert: &Alert, rule: &Rule, instance_name: &str, origin: &str) -
         "alert".into(),
         serde_json::to_value(alert).unwrap_or(Value::Null),
     );
+    if let Some(last) = last.filter(|_| notice == Notice::RemediationFailed) {
+        if let Some(why) = last.skipped_because() {
+            data.insert("remediation_stopped".into(), Value::String(why.to_owned()));
+        }
+        data.insert(
+            "last_attempt".into(),
+            serde_json::to_value(last).unwrap_or(Value::Null),
+        );
+    }
     Notification {
-        event: if resolved {
-            "alert.resolved"
-        } else {
-            "alert.raised"
+        event: match notice {
+            Notice::Raised => "alert.raised",
+            Notice::Resolved => "alert.resolved",
+            Notice::RemediationFailed => "alert.remediation_failed",
         },
         summary,
         body,
@@ -491,6 +628,7 @@ struct FinishedRun {
 /// Checks a run that just finished, failed to start or was found lost
 /// against the script failure rules.
 pub async fn script_run_finished(state: &AppState, run_id: &str) {
+    crate::monitors::remediation::run_finished(state, run_id).await;
     if let Err(error) = check_run(state, run_id, now_ms()).await {
         tracing::warn!(
             run_id,
@@ -577,6 +715,7 @@ async fn check_run(state: &AppState, run_id: &str, now: i64) -> anyhow::Result<(
             detail: &detail,
             script_run_id: Some(run_id),
             update_run_id: None,
+            output: "",
         };
         if let Some(id) = store::raise(&mut database, &raise, now).await? {
             tracing::info!(
@@ -585,9 +724,9 @@ async fn check_run(state: &AppState, run_id: &str, now: i64) -> anyhow::Result<(
                 alert_id = id,
                 "raised a script failure alert"
             );
-            announce(state, &rule, &id, true).await?;
+            raised(state, &rule, &id, now).await?;
         } else if let Some(id) = store::recur(&mut database, &raise, now).await? {
-            announce(state, &rule, &id, false).await?;
+            announce(state, &rule, &id, None).await?;
         }
     }
     Ok(())
@@ -675,6 +814,7 @@ async fn check_install(state: &AppState, run_id: &str, now: i64) -> anyhow::Resu
             detail: &detail,
             script_run_id: None,
             update_run_id: Some(run_id),
+            output: "",
         };
         if let Some(id) = store::raise(&mut database, &raise, now).await? {
             tracing::info!(
@@ -683,9 +823,9 @@ async fn check_install(state: &AppState, run_id: &str, now: i64) -> anyhow::Resu
                 alert_id = id,
                 "raised an update install failure alert"
             );
-            announce(state, &rule, &id, true).await?;
+            raised(state, &rule, &id, now).await?;
         } else if let Some(id) = store::recur(&mut database, &raise, now).await? {
-            announce(state, &rule, &id, false).await?;
+            announce(state, &rule, &id, None).await?;
         }
     }
     Ok(())
@@ -726,6 +866,8 @@ async fn sweep_lost_runs(state: &AppState, now: i64) -> anyhow::Result<()> {
             )
             .await?;
         if marked == 1 {
+            // A self-healing script's attempt is lost with it.
+            crate::monitors::remediation::run_finished(state, &id).await;
             check_run(state, &id, now).await?;
         }
     }

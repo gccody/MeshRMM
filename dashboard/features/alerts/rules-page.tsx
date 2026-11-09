@@ -99,10 +99,12 @@ export function RulesPage() {
                   <td>
                     <strong>{rule.name}{!rule.enabled && <span className="badge badge-muted">Off</span>}</strong>
                     <span>{rule.description}</span>
+                    {rule.remediation_description && <span>Self-healing: {rule.remediation_description}{rule.owner ? `, with ${rule.owner}’s access` : ""}</span>}
+                    {rule.problem && <span className="form-error"><CircleAlert size={14} aria-hidden="true" /> {rule.problem}</span>}
                   </td>
                   <td><SeverityBadge severity={rule.severity} /></td>
                   <td>{scopeLabel(rule, companyNames, inventory.tags)}</td>
-                  <td>{notifies(rule)}{rule.channel_ids.length > 0 && rule.notify_on_resolve && <span>Also when resolved</span>}</td>
+                  <td>{notifies(rule)}{rule.channel_ids.length > 0 && rule.notify_when === "remediation_failed" && <span>Only if self-healing fails</span>}{rule.channel_ids.length > 0 && rule.notify_on_resolve && <span>Also when resolved</span>}</td>
                   <td className="row-actions">
                     {canManage && <>
                       <button type="button" className="close-session-button" onClick={(event) => open(rule, event.currentTarget)} aria-haspopup="dialog" aria-label={`Edit ${rule.name}`} title="Edit rule"><Pencil size={16} /></button>

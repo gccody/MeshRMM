@@ -96,6 +96,12 @@ MeshRMM is in heavy development and not production ready.
   updates pending too long, for every device, chosen companies or tags.
   Alerts are acknowledged and resolved in the website, resolve themselves
   when the condition passes, and notify by email or signed webhook.
+- Monitors: the Agent watches services, processes, the event log, the
+  journal or the unified log, other computers by ping, TCP port, website and
+  certificate expiry, and toolbox script checks, on its own schedule. Rules
+  heal their alerts themselves by restarting the service, ending the process
+  or running a shared script, recording every attempt, and can notify only
+  when that fails.
 - Wake-on-LAN: wake offline devices, one or many, from the website or a
   policy before a patch window. Online Agents on the same network send the
   magic packet, and the website shows which ones did and when the device
@@ -234,6 +240,8 @@ For developers:
 - [Hardware and software](docs/hardware-and-software.md): what the Agents
   collect, how the server stores and searches it, and its API
 - [Alerts](docs/alerts.md): rules, alerts and notification channels
+- [Monitors and self-healing](docs/monitors.md): checks the Agent runs, and
+  fixing problems automatically
 - [Credential autofill](docs/credential-autofill.md)
 - [Screen thumbnails](docs/screen-thumbnails.md)
 - [macOS Agent](docs/macos-agent.md)

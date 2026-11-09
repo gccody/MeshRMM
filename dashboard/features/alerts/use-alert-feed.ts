@@ -22,7 +22,7 @@ export function useAlertFeed({ enabled, authorizedFetch }: { enabled: boolean; a
   const [listeners] = useState(() => new Set<(event: AlertEvent) => void>());
 
   const handle = useCallback((event: AlertEvent) => {
-    setCounts(event.counts);
+    if (event.type !== "monitor_update") setCounts(event.counts);
     for (const listener of listeners) listener(event);
   }, [listeners]);
 

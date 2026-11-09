@@ -39,6 +39,8 @@ pub enum Resolution {
     Manual,
     /// The rule was turned off or no longer covers the device.
     NotApplicable,
+    /// The condition passed after self-healing acted.
+    Remediated,
 }
 
 impl Resolution {
@@ -47,6 +49,32 @@ impl Resolution {
             Self::Cleared => "cleared",
             Self::Manual => "manual",
             Self::NotApplicable => "not_applicable",
+            Self::Remediated => "remediated",
+        }
+    }
+}
+
+/// Where an alert's self-healing is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemediationState {
+    /// Waiting for the next attempt, or for the verdict on the last.
+    Waiting,
+    /// An attempt is running.
+    Running,
+    /// It gave up: every attempt was made, or it couldn't act.
+    Failed,
+    /// The condition passed after an attempt.
+    Succeeded,
+}
+
+impl RemediationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Running => "running",
+            Self::Failed => "failed",
+            Self::Succeeded => "succeeded",
         }
     }
 }
@@ -72,6 +100,15 @@ pub struct Alert {
     pub script_run_id: Option<String>,
     /// The failed install of an update install failure alert.
     pub update_run_id: Option<String>,
+    /// A monitor's output: a script check's, or the events that matched.
+    pub output: String,
+    /// Whether the rule's channels were told it was raised.
+    pub notified: bool,
+    /// `waiting`, `running`, `failed` or `succeeded`; `None` without
+    /// self-healing.
+    pub remediation_state: Option<String>,
+    pub remediation_attempts: i64,
+    pub next_remediation_at: Option<i64>,
     pub occurrences: i64,
     pub raised_at: i64,
     pub last_occurred_at: i64,
@@ -107,6 +144,11 @@ fn select() -> sea_query::SelectStatement {
             (Alerts::Table, Alerts::Detail),
             (Alerts::Table, Alerts::ScriptRunId),
             (Alerts::Table, Alerts::UpdateRunId),
+            (Alerts::Table, Alerts::Output),
+            (Alerts::Table, Alerts::Notified),
+            (Alerts::Table, Alerts::RemediationState),
+            (Alerts::Table, Alerts::RemediationAttempts),
+            (Alerts::Table, Alerts::NextRemediationAt),
             (Alerts::Table, Alerts::Occurrences),
             (Alerts::Table, Alerts::RaisedAt),
             (Alerts::Table, Alerts::LastOccurredAt),
@@ -285,6 +327,8 @@ pub struct Raise<'a> {
     pub detail: &'a str,
     pub script_run_id: Option<&'a str>,
     pub update_run_id: Option<&'a str>,
+    /// A monitor's output.
+    pub output: &'a str,
 }
 
 /// Opens an alert, unless the rule already has an unresolved one for the
@@ -309,6 +353,7 @@ pub async fn raise(
                     Alerts::Detail,
                     Alerts::ScriptRunId,
                     Alerts::UpdateRunId,
+                    Alerts::Output,
                     Alerts::RaisedAt,
                     Alerts::LastOccurredAt,
                 ])
@@ -322,6 +367,7 @@ pub async fn raise(
                     raise.detail.into(),
                     raise.script_run_id.into(),
                     raise.update_run_id.into(),
+                    raise.output.into(),
                     now.into(),
                     now.into(),
                 ])
@@ -376,6 +422,67 @@ pub async fn recur(
         )
         .await?;
     Ok(row.map(|(id,)| id))
+}
+
+/// The rule's unresolved alert for the device and subject, if any.
+pub async fn unresolved_for(
+    executor: &mut impl Executor,
+    rule_id: &str,
+    device_id: &str,
+    subject: &str,
+) -> db::Result<Option<Alert>> {
+    executor
+        .fetch_optional(
+            &select()
+                .and_where(Expr::col((Alerts::Table, Alerts::RuleId)).eq(rule_id))
+                .and_where(Expr::col((Alerts::Table, Alerts::DeviceId)).eq(device_id))
+                .and_where(Expr::col((Alerts::Table, Alerts::Subject)).eq(subject))
+                .and_where(Expr::col((Alerts::Table, Alerts::State)).ne(State::Resolved.as_str()))
+                .to_owned(),
+        )
+        .await
+}
+
+/// Makes an unresolved alert describe the latest failed check, without
+/// counting another occurrence. Returns whether it was unresolved.
+pub async fn refresh(
+    executor: &mut impl Executor,
+    id: &str,
+    value: Option<f64>,
+    detail: &str,
+    output: &str,
+    now: i64,
+) -> db::Result<bool> {
+    let updated = executor
+        .execute(
+            &Query::update()
+                .table(Alerts::Table)
+                .value(Alerts::Value, value)
+                .value(Alerts::Detail, detail)
+                .value(Alerts::Output, output)
+                .value(Alerts::LastOccurredAt, now)
+                .and_where(Expr::col(Alerts::Id).eq(id))
+                .and_where(Expr::col(Alerts::State).ne(State::Resolved.as_str()))
+                .to_owned(),
+        )
+        .await?;
+    Ok(updated == 1)
+}
+
+/// Records that the rule's channels were told about the alert. Returns
+/// whether they hadn't been yet.
+pub async fn mark_notified(executor: &mut impl Executor, id: &str) -> db::Result<bool> {
+    let updated = executor
+        .execute(
+            &Query::update()
+                .table(Alerts::Table)
+                .value(Alerts::Notified, true)
+                .and_where(Expr::col(Alerts::Id).eq(id))
+                .and_where(Expr::col(Alerts::Notified).eq(false))
+                .to_owned(),
+        )
+        .await?;
+    Ok(updated == 1)
 }
 
 /// Marks an unacknowledged open alert acknowledged. Returns whether it was.

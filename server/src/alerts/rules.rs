@@ -11,9 +11,11 @@ use crate::{
         self, Executor,
         tables::{
             AlertRuleChannels, AlertRuleCompanies, AlertRuleTags, AlertRules, NotificationChannels,
+            ToolboxScripts,
         },
     },
     http::ApiError,
+    monitors::settings::{Monitor, NotifyWhen, Remediation, RemediationKind},
     targets::{self, Choice, TagMatch, Target, TargetKind},
 };
 
@@ -88,6 +90,15 @@ pub enum Condition {
     AppInstallFailed,
     /// Application updates have been pending for `days`.
     AppUpdatesPending,
+    /// Monitors, which the device's Agent checks: see docs/monitors.md.
+    Service,
+    Process,
+    EventLog,
+    Ping,
+    TcpPort,
+    Http,
+    Certificate,
+    ScriptCheck,
 }
 
 impl Condition {
@@ -103,6 +114,14 @@ impl Condition {
             Self::RebootPending => "reboot_pending",
             Self::AppInstallFailed => "app_install_failed",
             Self::AppUpdatesPending => "app_updates_pending",
+            Self::Service => "service",
+            Self::Process => "process",
+            Self::EventLog => "event_log",
+            Self::Ping => "ping",
+            Self::TcpPort => "tcp_port",
+            Self::Http => "http",
+            Self::Certificate => "certificate",
+            Self::ScriptCheck => "script_check",
         }
     }
 
@@ -118,6 +137,14 @@ impl Condition {
             "reboot_pending" => Some(Self::RebootPending),
             "app_install_failed" => Some(Self::AppInstallFailed),
             "app_updates_pending" => Some(Self::AppUpdatesPending),
+            "service" => Some(Self::Service),
+            "process" => Some(Self::Process),
+            "event_log" => Some(Self::EventLog),
+            "ping" => Some(Self::Ping),
+            "tcp_port" => Some(Self::TcpPort),
+            "http" => Some(Self::Http),
+            "certificate" => Some(Self::Certificate),
+            "script_check" => Some(Self::ScriptCheck),
             _ => None,
         }
     }
@@ -130,6 +157,45 @@ impl Condition {
             Self::ScriptFailed | Self::UpdateInstallFailed | Self::AppInstallFailed
         )
     }
+
+    /// Whether the device's Agent checks the condition, as a monitor. The
+    /// server raises and resolves its alerts from what the Agent reports.
+    pub fn is_monitor(self) -> bool {
+        matches!(
+            self,
+            Self::Service
+                | Self::Process
+                | Self::EventLog
+                | Self::Ping
+                | Self::TcpPort
+                | Self::Http
+                | Self::Certificate
+                | Self::ScriptCheck
+        )
+    }
+
+    /// Whether the Agent checks the condition with the access of the rule's
+    /// owner, which needs `scripts.run`: it runs a script, reaches hosts
+    /// from inside the device's network, or reads the device's logs.
+    /// Service and process checks only look at the device itself.
+    pub fn runs_with_owner_access(self) -> bool {
+        matches!(
+            self,
+            Self::EventLog
+                | Self::Ping
+                | Self::TcpPort
+                | Self::Http
+                | Self::Certificate
+                | Self::ScriptCheck
+        )
+    }
+}
+
+/// A toolbox script a rule runs, as it is now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScriptRef {
+    pub name: String,
+    pub shared: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,11 +243,45 @@ pub struct Rule {
     pub target: Target,
     pub channel_ids: Vec<String>,
     pub notify_on_resolve: bool,
+    /// What a monitor rule's Agent checks.
+    pub monitor: Option<Monitor>,
+    /// What the rule does to heal the alerts it raises.
+    pub remediation: Option<Remediation>,
+    pub notify_when: NotifyWhen,
+    /// Who last saved the rule: its script checks and self-healing run with
+    /// their access.
+    pub owner_user_id: Option<String>,
+    /// The scripts it runs, as they are now; `None` once deleted.
+    pub check_script: Option<ScriptRef>,
+    pub remediation_script: Option<ScriptRef>,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
 impl Rule {
+    /// Whether the rule runs with its owner's access, which needs
+    /// `scripts.run`: it heals itself, or its check runs a script, reaches
+    /// hosts from inside the network or reads the device's logs.
+    pub fn acts_on_devices(&self) -> bool {
+        self.remediation.is_some() || self.condition.runs_with_owner_access()
+    }
+
+    /// Whether channels hear of an alert as soon as it is raised.
+    pub fn notifies_at_once(&self) -> bool {
+        self.remediation.is_none() || self.notify_when == NotifyWhen::Raised
+    }
+
+    /// What self-healing does, in words.
+    pub fn describe_remediation(&self) -> Option<String> {
+        self.remediation.as_ref().map(|remediation| {
+            remediation.describe(
+                self.remediation_script
+                    .as_ref()
+                    .map(|script| script.name.as_str()),
+            )
+        })
+    }
+
     /// The category an updates rule counts; `None` for every one.
     pub fn category(&self) -> Option<UpdateCategory> {
         self.update_category
@@ -198,6 +298,13 @@ impl Rule {
     pub fn describe(&self) -> String {
         let threshold = format_number(self.threshold.unwrap_or_default());
         let minutes = plural(self.duration_minutes.unwrap_or_default(), "minute");
+        if let Some(monitor) = &self.monitor {
+            return monitor.describe(
+                self.check_script
+                    .as_ref()
+                    .map(|script| script.name.as_str()),
+            );
+        }
         match self.condition {
             Condition::DeviceOffline => format!("Offline for {minutes}"),
             Condition::DiskSpace => match self.threshold_unit {
@@ -227,6 +334,7 @@ impl Rule {
                 "Application updates pending for {}",
                 plural(self.days.unwrap_or_default(), "day")
             ),
+            _ => "A monitor fails".to_owned(),
         }
     }
 }
@@ -278,6 +386,12 @@ pub struct RuleInput {
     pub channel_ids: Vec<String>,
     #[serde(default)]
     pub notify_on_resolve: bool,
+    #[serde(default)]
+    pub monitor: Option<Monitor>,
+    #[serde(default)]
+    pub remediation: Option<Remediation>,
+    #[serde(default)]
+    pub notify_when: NotifyWhen,
 }
 
 fn enabled_by_default() -> bool {
@@ -349,7 +463,15 @@ impl RuleInput {
             | Condition::UpdateInstallFailed
             | Condition::RebootPending
             | Condition::AppInstallFailed
-            | Condition::AppUpdatesPending => (None, None, None),
+            | Condition::AppUpdatesPending
+            | Condition::Service
+            | Condition::Process
+            | Condition::EventLog
+            | Condition::Ping
+            | Condition::TcpPort
+            | Condition::Http
+            | Condition::Certificate
+            | Condition::ScriptCheck => (None, None, None),
         };
         self.threshold = threshold;
         self.threshold_unit = unit;
@@ -401,7 +523,37 @@ impl RuleInput {
         self.tag_match = target.tag_match();
         self.channel_ids.sort();
         self.channel_ids.dedup();
+        self.monitor = match (self.condition.is_monitor(), self.monitor.take()) {
+            (true, Some(monitor)) => Some(monitor.validate(self.condition)?),
+            (true, None) => return Err(invalid("say what the monitor checks")),
+            (false, _) => None,
+        };
+        self.remediation = self
+            .remediation
+            .take()
+            .map(|remediation| remediation.validate(self.condition, self.monitor.as_ref()))
+            .transpose()?;
+        if self.remediation.is_none() {
+            self.notify_when = NotifyWhen::Raised;
+        }
         Ok(self)
+    }
+
+    /// The toolbox scripts the rule runs.
+    pub fn script_ids(&self) -> Vec<&str> {
+        let check = self.monitor.as_ref().and_then(Monitor::script_id);
+        let remediation = self
+            .remediation
+            .as_ref()
+            .and_then(|remediation| remediation.script_id.as_deref());
+        check.into_iter().chain(remediation).collect()
+    }
+
+    /// Whether saving the rule needs `scripts.run`: it heals itself, or its
+    /// check runs with the saver's access
+    /// ([`Condition::runs_with_owner_access`]).
+    pub fn acts_on_devices(&self) -> bool {
+        self.remediation.is_some() || self.condition.runs_with_owner_access()
     }
 
     /// The devices a validated rule covers.
@@ -418,6 +570,27 @@ impl RuleInput {
 
     /// Checks that the companies, tags and channels named exist.
     pub async fn check_references(&self, executor: &mut impl Executor) -> Result<(), ApiError> {
+        for script_id in self.script_ids() {
+            let script: Option<(bool,)> = executor
+                .fetch_optional(
+                    &Query::select()
+                        .column(ToolboxScripts::Shared)
+                        .from(ToolboxScripts::Table)
+                        .and_where(Expr::col(ToolboxScripts::Id).eq(script_id))
+                        .to_owned(),
+                )
+                .await?;
+            match script {
+                None => return Err(ApiError::not_found("Script not found")),
+                Some((false,)) => {
+                    return Err(ApiError::bad_request(
+                        "rules run shared scripts only; share the script first",
+                    )
+                    .with_code("script_not_shared"));
+                }
+                Some((true,)) => {}
+            }
+        }
         for id in &self.channel_ids {
             crate::agents::parse_id(id, "notification channel")?;
         }
@@ -460,8 +633,59 @@ struct RuleRow {
     target: String,
     tag_match: String,
     notify_on_resolve: bool,
+    monitor_check: Option<String>,
+    monitor_interval_seconds: Option<i64>,
+    monitor_timeout_seconds: Option<i64>,
+    monitor_failures: Option<i64>,
+    remediation_action: Option<String>,
+    remediation_script_id: Option<String>,
+    remediation_run_as: Option<String>,
+    remediation_attempts: Option<i64>,
+    remediation_retry_minutes: Option<i64>,
+    notify_when: String,
+    updated_by_user_id: Option<String>,
     created_at: i64,
     updated_at: i64,
+}
+
+impl RuleRow {
+    /// The stored monitor; `None` when the row's isn't valid.
+    fn monitor(&self) -> Option<Option<Monitor>> {
+        let Some(check) = &self.monitor_check else {
+            return Some(None);
+        };
+        Some(Some(Monitor {
+            interval_seconds: u32::try_from(self.monitor_interval_seconds?).ok()?,
+            timeout_seconds: u32::try_from(self.monitor_timeout_seconds?).ok()?,
+            failures: u32::try_from(self.monitor_failures?).ok()?,
+            check: serde_json::from_str(check).ok()?,
+        }))
+    }
+
+    /// The stored self-healing; `None` when the row's isn't valid.
+    fn remediation(&self) -> Option<Option<Remediation>> {
+        let Some(action) = &self.remediation_action else {
+            return Some(None);
+        };
+        Some(Some(Remediation {
+            action: RemediationKind::parse(action)?,
+            script_id: self.remediation_script_id.clone(),
+            run_as: self
+                .remediation_run_as
+                .as_deref()
+                .and_then(meshrmm_protocol_types::RunAs::parse),
+            attempts: u32::try_from(self.remediation_attempts?).ok()?,
+            retry_minutes: u32::try_from(self.remediation_retry_minutes?).ok()?,
+        }))
+    }
+
+    fn check_script_id(&self) -> Option<String> {
+        let check = serde_json::from_str(self.monitor_check.as_deref()?).ok()?;
+        match check {
+            meshrmm_protocol_types::MonitorCheck::ScriptCheck { script_id, .. } => Some(script_id),
+            _ => None,
+        }
+    }
 }
 
 /// Every rule, by name, or only `id`'s.
@@ -483,6 +707,17 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
             AlertRules::Target,
             AlertRules::TagMatch,
             AlertRules::NotifyOnResolve,
+            AlertRules::MonitorCheck,
+            AlertRules::MonitorIntervalSeconds,
+            AlertRules::MonitorTimeoutSeconds,
+            AlertRules::MonitorFailures,
+            AlertRules::RemediationAction,
+            AlertRules::RemediationScriptId,
+            AlertRules::RemediationRunAs,
+            AlertRules::RemediationAttempts,
+            AlertRules::RemediationRetryMinutes,
+            AlertRules::NotifyWhen,
+            AlertRules::UpdatedByUserId,
             AlertRules::CreatedAt,
             AlertRules::UpdatedAt,
         ])
@@ -509,6 +744,8 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
     let companies = grouped(executor.fetch_all(&companies).await?);
     let tags = grouped(executor.fetch_all(&tags).await?);
     let channels = grouped(executor.fetch_all(&channels).await?);
+    let scripts = scripts(executor, &rows).await?;
+    let script = |id: Option<&str>| id.and_then(|id| scripts.get(id).cloned());
     Ok(rows
         .into_iter()
         .filter_map(|row| {
@@ -517,15 +754,36 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
                 tag_ids: tags.get(&row.id).cloned().unwrap_or_default(),
                 ..Choice::default()
             };
-            let (Some(severity), Some(condition), Some(target)) = (
+            let (
+                Some(severity),
+                Some(condition),
+                Some(target),
+                Some(monitor),
+                Some(remediation),
+                Some(notify_when),
+            ) = (
                 Severity::parse(&row.severity),
                 Condition::parse(&row.condition),
                 Target::from_stored(&row.target, &row.tag_match, choice),
-            ) else {
+                row.monitor(),
+                row.remediation(),
+                NotifyWhen::parse(&row.notify_when),
+            )
+            else {
                 tracing::error!(rule_id = row.id, "stored alert rule is invalid");
                 return None;
             };
             Some(Rule {
+                check_script: script(monitor.as_ref().and_then(Monitor::script_id)),
+                remediation_script: script(
+                    remediation
+                        .as_ref()
+                        .and_then(|remediation| remediation.script_id.as_deref()),
+                ),
+                monitor,
+                remediation,
+                notify_when,
+                owner_user_id: row.updated_by_user_id,
                 target,
                 channel_ids: channels.get(&row.id).cloned().unwrap_or_default(),
                 threshold_unit: row.threshold_unit.as_deref().and_then(ThresholdUnit::parse),
@@ -545,6 +803,65 @@ pub async fn load(executor: &mut impl Executor, id: Option<&str>) -> db::Result<
             })
         })
         .collect())
+}
+
+/// The scripts the rules run, by ID.
+async fn scripts(
+    executor: &mut impl Executor,
+    rows: &[RuleRow],
+) -> db::Result<HashMap<String, ScriptRef>> {
+    let mut ids = rows
+        .iter()
+        .filter_map(RuleRow::check_script_id)
+        .chain(
+            rows.iter()
+                .filter_map(|row| row.remediation_script_id.clone()),
+        )
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let found: Vec<(String, String, bool)> = executor
+        .fetch_all(
+            &Query::select()
+                .columns([
+                    ToolboxScripts::Id,
+                    ToolboxScripts::Name,
+                    ToolboxScripts::Shared,
+                ])
+                .from(ToolboxScripts::Table)
+                .and_where(Expr::col(ToolboxScripts::Id).is_in(ids))
+                .to_owned(),
+        )
+        .await?;
+    Ok(found
+        .into_iter()
+        .map(|(id, name, shared)| (id, ScriptRef { name, shared }))
+        .collect())
+}
+
+/// The names of the rules that run `script_id`.
+pub async fn using_script(
+    executor: &mut impl Executor,
+    script_id: &str,
+) -> db::Result<Vec<String>> {
+    let rows: Vec<(String,)> = executor
+        .fetch_all(
+            &Query::select()
+                .column(AlertRules::Name)
+                .from(AlertRules::Table)
+                .cond_where(
+                    sea_query::Cond::any()
+                        .add(Expr::col(AlertRules::CheckScriptId).eq(script_id))
+                        .add(Expr::col(AlertRules::RemediationScriptId).eq(script_id)),
+                )
+                .order_by(AlertRules::Name, Order::Asc)
+                .to_owned(),
+        )
+        .await?;
+    Ok(rows.into_iter().map(|(name,)| name).collect())
 }
 
 fn grouped(pairs: Vec<(String, String)>) -> HashMap<String, Vec<String>> {
@@ -571,7 +888,9 @@ pub async fn save(
     now: i64,
     create: bool,
 ) -> db::Result<()> {
-    let values: [(AlertRules, sea_query::Value); 15] = [
+    let monitor = input.monitor.as_ref();
+    let remediation = input.remediation.as_ref();
+    let values: [(AlertRules, sea_query::Value); 26] = [
         (AlertRules::Name, input.name.as_str().into()),
         (AlertRules::Severity, input.severity.as_str().into()),
         (AlertRules::Enabled, input.enabled.into()),
@@ -594,6 +913,67 @@ pub async fn save(
         (AlertRules::Target, input.target.as_str().into()),
         (AlertRules::TagMatch, input.tag_match.as_str().into()),
         (AlertRules::NotifyOnResolve, input.notify_on_resolve.into()),
+        (
+            AlertRules::MonitorCheck,
+            monitor
+                .map(|monitor| serde_json::to_string(&monitor.check).expect("checks serialize"))
+                .into(),
+        ),
+        (
+            AlertRules::MonitorIntervalSeconds,
+            monitor
+                .map(|monitor| i64::from(monitor.interval_seconds))
+                .into(),
+        ),
+        (
+            AlertRules::MonitorTimeoutSeconds,
+            monitor
+                .map(|monitor| i64::from(monitor.timeout_seconds))
+                .into(),
+        ),
+        (
+            AlertRules::MonitorFailures,
+            monitor.map(|monitor| i64::from(monitor.failures)).into(),
+        ),
+        (
+            AlertRules::CheckScriptId,
+            monitor
+                .and_then(Monitor::script_id)
+                .map(str::to_owned)
+                .into(),
+        ),
+        (
+            AlertRules::RemediationAction,
+            remediation
+                .map(|remediation| remediation.action.as_str())
+                .into(),
+        ),
+        (
+            AlertRules::RemediationScriptId,
+            remediation
+                .and_then(|remediation| remediation.script_id.clone())
+                .into(),
+        ),
+        (
+            AlertRules::RemediationRunAs,
+            remediation
+                .and_then(|remediation| remediation.run_as)
+                .map(meshrmm_protocol_types::RunAs::as_str)
+                .into(),
+        ),
+        (
+            AlertRules::RemediationAttempts,
+            remediation
+                .map(|remediation| i64::from(remediation.attempts))
+                .into(),
+        ),
+        (
+            AlertRules::RemediationRetryMinutes,
+            remediation
+                .map(|remediation| i64::from(remediation.retry_minutes))
+                .into(),
+        ),
+        (AlertRules::NotifyWhen, input.notify_when.as_str().into()),
         (AlertRules::UpdatedAt, now.into()),
         (AlertRules::UpdatedByUserId, user_id.into()),
     ];
@@ -793,6 +1173,12 @@ mod tests {
             target: Target::Companies(vec!["acme".into()]),
             channel_ids: vec![],
             notify_on_resolve: false,
+            monitor: None,
+            remediation: None,
+            notify_when: NotifyWhen::Raised,
+            owner_user_id: None,
+            check_script: None,
+            remediation_script: None,
             created_at: 0,
             updated_at: 0,
         };

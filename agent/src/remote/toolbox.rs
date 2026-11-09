@@ -228,6 +228,22 @@ mod shared {
         }
     }
 
+    /// Runs a monitor's script check on the caller's thread and returns how
+    /// it went. Script checks have their own limit, so they never take a
+    /// toolbox run's place, and their result goes back with the monitor's.
+    pub(crate) fn run_check(mode: ExecutionMode, run: &ScriptRunRequest) -> ScriptRunReport {
+        if !platform::runs(run.language) {
+            return failed(
+                platform::own_account(),
+                format!(
+                    "{} scripts do not run on this device's operating system.",
+                    run.language.label()
+                ),
+            );
+        }
+        platform::execute_script(mode, run)
+    }
+
     /// Saves `delivery`'s file on its own thread and reports how it went.
     pub(crate) fn deliver_file(
         config: &Config,
@@ -412,7 +428,7 @@ mod shared {
 }
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-pub(crate) use self::shared::{deliver_file, run_script};
+pub(crate) use self::shared::{deliver_file, run_check, run_script};
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use self::shared::{download, failed};
 

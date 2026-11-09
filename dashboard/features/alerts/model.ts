@@ -4,6 +4,26 @@
 import type { Tag } from "../agents/types.ts";
 import { type TagMatch, describeTagTarget } from "../tags/model.ts";
 import { CATEGORIES, CATEGORY_LABELS, type UpdateCategory } from "../updates/model.ts";
+import {
+  MONITOR_CONDITION_LABELS,
+  type MonitorCondition,
+  type MonitorForm,
+  type MonitorSettings,
+  type MonitorUpdate,
+  type NotifyWhen,
+  type RemediationForm,
+  type RemediationSettings,
+  type RemediationState,
+  isMonitorCondition,
+  monitorForm,
+  monitorFormProblem,
+  monitorInput,
+  parseMonitorUpdate,
+  remediationChoices,
+  remediationForm,
+  remediationFormProblem,
+  remediationInput,
+} from "../monitors/model.ts";
 
 export type Severity = "info" | "warning" | "critical";
 export type Condition =
@@ -16,12 +36,13 @@ export type Condition =
   | "update_install_failed"
   | "reboot_pending"
   | "app_install_failed"
-  | "app_updates_pending";
+  | "app_updates_pending"
+  | MonitorCondition;
 
 // Which pending updates an updates_pending rule counts.
 export type UpdateCategoryChoice = "any" | UpdateCategory;
 export type AlertState = "open" | "acknowledged" | "resolved";
-export type Resolution = "cleared" | "manual" | "not_applicable";
+export type Resolution = "cleared" | "manual" | "not_applicable" | "remediated";
 export type ThresholdUnit = "percent" | "gb";
 
 // GET /v1/alerts
@@ -52,6 +73,11 @@ export type Alert = {
   // Who resolved it; null when the server did.
   resolved_by: string | null;
   resolution: Resolution | null;
+  // A monitor's output when it failed, such as a script check's.
+  output?: string;
+  // Self-healing's progress, and its attempts so far.
+  remediation_state?: RemediationState | null;
+  remediation_attempts?: number;
 };
 
 // How many alerts are unresolved; open ones by severity too.
@@ -68,7 +94,8 @@ export type AlertList = { alerts: Alert[]; counts: AlertCounts; truncated: boole
 // What the event socket sends about alerts.
 export type AlertEvent =
   | { type: "alert_upsert"; alert: Alert; counts: AlertCounts }
-  | { type: "alert_counts"; counts: AlertCounts };
+  | { type: "alert_counts"; counts: AlertCounts }
+  | MonitorUpdate;
 
 // GET /v1/alert-rules
 export type AlertRule = {
@@ -93,6 +120,16 @@ export type AlertRule = {
   tag_match: TagMatch;
   channel_ids: string[];
   notify_on_resolve: boolean;
+  // What the device's Agent checks, for a monitor condition.
+  monitor?: MonitorSettings | null;
+  // What the rule does about its alerts, and when its channels hear.
+  remediation?: RemediationSettings | null;
+  notify_when?: NotifyWhen;
+  remediation_description?: string | null;
+  // Whose access its scripts and self-healing run with, and why they
+  // can't, if they can't.
+  owner?: string | null;
+  problem?: string | null;
   // The condition in words.
   description: string;
   created_at: number;
@@ -143,6 +180,7 @@ export const CONDITION_LABELS: Record<Condition, string> = {
   reboot_pending: "Restart pending",
   app_install_failed: "Application install failed",
   app_updates_pending: "Application updates pending",
+  ...MONITOR_CONDITION_LABELS,
 };
 
 export const UPDATE_CATEGORY_CHOICES: readonly UpdateCategoryChoice[] = ["any", ...CATEGORIES];
@@ -184,7 +222,7 @@ export function parseAlertEvent(event: unknown): AlertEvent | null {
   if (event.type === "alert_upsert" && isCounts(event.counts) && isAlert(event.alert)) {
     return { type: "alert_upsert", alert: event.alert, counts: event.counts };
   }
-  return null;
+  return parseMonitorUpdate(event);
 }
 
 // The most severe open alert's severity, for the navigation's count.
@@ -268,6 +306,7 @@ export function resolutionLabel(alert: Pick<Alert, "resolution" | "resolved_by">
     case "manual": return alert.resolved_by ? `Resolved by ${alert.resolved_by}` : "Resolved";
     case "cleared": return "Resolved itself: the condition passed";
     case "not_applicable": return "Resolved: the rule no longer covers it";
+    case "remediated": return "Resolved itself after self-healing";
     default: return "Resolved";
   }
 }
@@ -296,7 +335,11 @@ export type RuleForm = {
   tagMatch: TagMatch;
   channelIds: string[];
   notifyOnResolve: boolean;
+  monitor: MonitorForm;
+  remediation: RemediationForm;
 };
+
+const MONITOR_DEFAULTS = { threshold: "", duration: "", days: "" };
 
 const DEFAULTS: Record<Condition, { threshold: string; duration: string; days: string }> = {
   device_offline: { threshold: "", duration: "15", days: "" },
@@ -309,6 +352,14 @@ const DEFAULTS: Record<Condition, { threshold: string; duration: string; days: s
   reboot_pending: { threshold: "", duration: "", days: "3" },
   app_install_failed: { threshold: "", duration: "", days: "" },
   app_updates_pending: { threshold: "", duration: "", days: "14" },
+  service: MONITOR_DEFAULTS,
+  process: MONITOR_DEFAULTS,
+  event_log: MONITOR_DEFAULTS,
+  ping: MONITOR_DEFAULTS,
+  tcp_port: MONITOR_DEFAULTS,
+  http: MONITOR_DEFAULTS,
+  certificate: MONITOR_DEFAULTS,
+  script_check: MONITOR_DEFAULTS,
 };
 
 export function ruleForm(rule: AlertRule | null): RuleForm {
@@ -330,6 +381,8 @@ export function ruleForm(rule: AlertRule | null): RuleForm {
       tagMatch: "any",
       channelIds: [],
       notifyOnResolve: false,
+      monitor: monitorForm(null, "service"),
+      remediation: remediationForm(null, "raised", "device_offline"),
     };
   }
   return {
@@ -349,12 +402,26 @@ export function ruleForm(rule: AlertRule | null): RuleForm {
     tagMatch: rule.tag_match ?? "any",
     channelIds: rule.channel_ids,
     notifyOnResolve: rule.notify_on_resolve,
+    monitor: monitorForm(rule.monitor, isMonitorCondition(rule.condition) ? rule.condition : "service"),
+    remediation: remediationForm(rule.remediation, rule.notify_when, rule.condition),
   };
 }
 
+// The self-healing actions the form's condition allows.
+export const formRemediationChoices = (form: RuleForm) => remediationChoices(form.condition, form.monitor.alertWhen);
+
 // A new rule's form after choosing another condition: its usual thresholds.
 export function withCondition(form: RuleForm, condition: Condition): RuleForm {
-  return { ...form, condition, threshold: DEFAULTS[condition].threshold, duration: DEFAULTS[condition].duration, days: DEFAULTS[condition].days, thresholdUnit: "percent" };
+  return {
+    ...form,
+    condition,
+    threshold: DEFAULTS[condition].threshold,
+    duration: DEFAULTS[condition].duration,
+    days: DEFAULTS[condition].days,
+    thresholdUnit: "percent",
+    monitor: isMonitorCondition(condition) ? monitorForm(null, condition) : form.monitor,
+    remediation: remediationForm(null, form.remediation.notifyWhen, condition),
+  };
 }
 
 export const usesDays = (condition: Condition) => condition === "updates_pending" || condition === "reboot_pending" || condition === "app_updates_pending";
@@ -384,7 +451,11 @@ export function ruleFormProblem(form: RuleForm): string | null {
   }
   if (form.target === "companies" && !form.companyIds.length) return "Choose at least one company, or every device.";
   if (form.target === "tags" && !form.tagIds.length) return "Choose at least one tag, or every device.";
-  return null;
+  if (isMonitorCondition(form.condition)) {
+    const problem = monitorFormProblem(form.monitor, form.condition);
+    if (problem) return problem;
+  }
+  return remediationFormProblem(form.remediation, formRemediationChoices(form));
 }
 
 // The form as the server takes it.
@@ -406,6 +477,8 @@ export function ruleInput(form: RuleForm) {
     tag_match: form.tagMatch,
     channel_ids: form.channelIds,
     notify_on_resolve: form.notifyOnResolve,
+    monitor: isMonitorCondition(form.condition) ? monitorInput(form.monitor, form.condition) : null,
+    ...remediationInput(form.remediation, formRemediationChoices(form)),
   };
 }
 

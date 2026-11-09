@@ -1,0 +1,9 @@
+LoadState=loaded
+ActiveState=active
+SubState=running
+UnitFileState=enabled
+
+LoadState=not-found
+ActiveState=inactive
+SubState=dead
+UnitFileState=

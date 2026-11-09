@@ -575,7 +575,7 @@ CREATE TABLE script_runs (
   language TEXT NOT NULL CHECK (language IN ('powershell', 'cmd', 'shell')),
   requested_by_user_id TEXT NOT NULL,
   -- 'job' for a device's run of a job (jobs.id in job_id).
-  source TEXT NOT NULL CHECK (source IN ('dashboard', 'session', 'job')),
+  source TEXT NOT NULL CHECK (source IN ('dashboard', 'session', 'job', 'remediation')),
   job_id TEXT,
   run_as TEXT NOT NULL CHECK (run_as IN ('system', 'user')),
   timeout_seconds INTEGER NOT NULL,
@@ -655,7 +655,7 @@ CREATE TABLE alert_rules (
   name TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 120),
   severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
   enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-  condition TEXT NOT NULL CHECK (condition IN ('device_offline', 'disk_space', 'cpu', 'memory', 'script_failed', 'updates_pending', 'update_install_failed', 'reboot_pending', 'app_install_failed', 'app_updates_pending')),
+  condition TEXT NOT NULL CHECK (condition IN ('device_offline', 'disk_space', 'cpu', 'memory', 'script_failed', 'updates_pending', 'update_install_failed', 'reboot_pending', 'app_install_failed', 'app_updates_pending', 'service', 'process', 'event_log', 'ping', 'tcp_port', 'http', 'certificate', 'script_check')),
   threshold REAL,
   threshold_unit TEXT CHECK (threshold_unit IS NULL OR threshold_unit IN ('percent', 'gb')),
   duration_minutes INTEGER,
@@ -668,8 +668,29 @@ CREATE TABLE alert_rules (
   target TEXT NOT NULL DEFAULT 'all' CHECK (target IN ('all', 'companies', 'tags')),
   tag_match TEXT NOT NULL DEFAULT 'any' CHECK (tag_match IN ('any', 'all')),
   notify_on_resolve INTEGER NOT NULL DEFAULT 0 CHECK (notify_on_resolve IN (0, 1)),
+  -- Monitors (the conditions from 'service' to 'script_check'): the check the
+  -- Agent runs, as JSON, how often and for how long at most, and how many
+  -- failures in a row raise an alert. See docs/monitors.md.
+  monitor_check TEXT,
+  monitor_interval_seconds INTEGER,
+  monitor_timeout_seconds INTEGER,
+  monitor_failures INTEGER,
+  -- The toolbox script a script_check runs.
+  check_script_id TEXT,
+  -- Self-healing: what the server has done when the rule raises an alert,
+  -- with the access of the user who last saved the rule, at most how many
+  -- times and how many minutes apart.
+  remediation_action TEXT CHECK (remediation_action IS NULL OR remediation_action IN ('restart_service', 'end_process', 'script')),
+  remediation_script_id TEXT,
+  remediation_run_as TEXT CHECK (remediation_run_as IS NULL OR remediation_run_as IN ('system', 'user')),
+  remediation_attempts INTEGER,
+  remediation_retry_minutes INTEGER,
+  -- 'raised': channels hear of each alert at once; 'remediation_failed':
+  -- only once self-healing has given up on it.
+  notify_when TEXT NOT NULL DEFAULT 'raised' CHECK (notify_when IN ('raised', 'remediation_failed')),
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
+  -- Who last saved the rule; self-healing and script checks run with their access.
   updated_by_user_id TEXT
 );
 
@@ -707,6 +728,17 @@ CREATE TABLE alerts (
   script_run_id TEXT,
   -- The failed install of an update_install_failed alert.
   update_run_id TEXT,
+  -- A monitor's output: a script check's, or the events that matched.
+  output TEXT NOT NULL DEFAULT '',
+  -- Whether the rule's channels were told it was raised. A rule that notifies
+  -- only when self-healing fails tells them later, or never.
+  notified INTEGER NOT NULL DEFAULT 0 CHECK (notified IN (0, 1)),
+  -- Self-healing: 'waiting' for the next attempt, or for the verdict, at
+  -- next_remediation_at; 'running' an attempt; 'failed' (it gave up); or
+  -- 'succeeded' (the condition passed after an attempt). NULL without any.
+  remediation_state TEXT CHECK (remediation_state IS NULL OR remediation_state IN ('waiting', 'running', 'failed', 'succeeded')),
+  remediation_attempts INTEGER NOT NULL DEFAULT 0,
+  next_remediation_at INTEGER,
   occurrences INTEGER NOT NULL DEFAULT 1,
   raised_at INTEGER NOT NULL,
   last_occurred_at INTEGER NOT NULL,
@@ -718,8 +750,9 @@ CREATE TABLE alerts (
   resolved_by_user_id TEXT,
   resolved_by_label TEXT,
   -- 'cleared': the condition passed; 'manual': a user resolved it;
-  -- 'not_applicable': the rule was turned off or no longer covers the device.
-  resolution TEXT CHECK (resolution IS NULL OR resolution IN ('cleared', 'manual', 'not_applicable'))
+  -- 'not_applicable': the rule was turned off or no longer covers the device;
+  -- 'remediated': the condition passed after self-healing acted.
+  resolution TEXT CHECK (resolution IS NULL OR resolution IN ('cleared', 'manual', 'not_applicable', 'remediated'))
 );
 
 CREATE UNIQUE INDEX idx_alerts_unresolved ON alerts (rule_id, device_id, subject) WHERE state <> 'resolved';
@@ -1120,3 +1153,48 @@ CREATE TABLE application_policies (
   policy_id TEXT NOT NULL PRIMARY KEY REFERENCES automation_policies (id) ON DELETE CASCADE,
   spec TEXT NOT NULL
 );
+
+-- Monitors and self-healing. See docs/monitors.md.
+
+-- The latest result of each monitor on each device, as its Agent reported it.
+CREATE TABLE monitor_states (
+  rule_id TEXT NOT NULL REFERENCES alert_rules (id) ON DELETE CASCADE,
+  device_id TEXT NOT NULL,
+  -- By the device's clock, but never after received_at.
+  checked_at INTEGER NOT NULL,
+  received_at INTEGER NOT NULL,
+  passing INTEGER NOT NULL CHECK (passing IN (0, 1)),
+  -- Failed checks in a row, counting the latest.
+  failures INTEGER NOT NULL,
+  value REAL,
+  detail TEXT NOT NULL,
+  output TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (rule_id, device_id)
+);
+
+CREATE INDEX idx_monitor_states_device ON monitor_states (device_id);
+
+-- Each self-healing attempt on an alert, and how it went.
+CREATE TABLE alert_remediations (
+  id TEXT NOT NULL PRIMARY KEY,
+  alert_id TEXT NOT NULL REFERENCES alerts (id) ON DELETE CASCADE,
+  attempt INTEGER NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('restart_service', 'end_process', 'script')),
+  -- What it acted on: the service, the process, or the script's name.
+  target TEXT NOT NULL,
+  run_as TEXT CHECK (run_as IS NULL OR run_as IN ('system', 'user')),
+  script_run_id TEXT,
+  -- 'running'; 'succeeded' or 'failed' as the device reported; 'lost' when it
+  -- never reported; 'skipped' when it couldn't start, as detail says.
+  status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'lost', 'skipped')),
+  exit_code INTEGER,
+  detail TEXT NOT NULL DEFAULT '',
+  output TEXT NOT NULL DEFAULT '',
+  -- The user whose access it ran with.
+  requested_by_user_id TEXT,
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER
+);
+
+CREATE INDEX idx_alert_remediations_alert ON alert_remediations (alert_id, attempt);
+CREATE INDEX idx_alert_remediations_run ON alert_remediations (script_run_id);

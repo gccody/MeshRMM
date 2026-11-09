@@ -297,6 +297,10 @@ needs `automation.manage` and `applications.deploy`.
 | Application install failed | An install or update of applications, by hand, in a job or by a policy, failed partly or entirely, or never reported back. Each failed application gets its own alert; a lost run gets one. | Never: a person resolves it. |
 | Application updates pending | The device's last scan lists outdated applications, other than pinned ones, that have been outdated for more than N days. | When none has been outdated that long. |
 
+An "Application updates pending" rule can [heal itself](monitors.md#self-healing)
+with a shared script that updates the applications, since its alert clears once
+they're updated. "Application install failed" can't: a person has to look.
+
 ## Permissions and audit
 
 | Permission | Allows | Technician |

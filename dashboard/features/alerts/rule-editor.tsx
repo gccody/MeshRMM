@@ -2,6 +2,9 @@ import { LoaderCircle, X } from "lucide-react";
 import { type FormEvent, type RefObject, useId, useState } from "react";
 import { AuthenticationRequired, errorText } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
+import { MONITOR_CONDITION_HELP, isMonitorCondition, needsScriptsRun, scriptsRunReason } from "../monitors/model";
+import { MonitorFields, useSharedScripts } from "../monitors/monitor-fields";
+import { RemediationFields } from "../monitors/remediation-fields";
 import { TagTargetFields } from "../tags/tag-chip";
 import { useWorkspace } from "../workspace/workspace-context";
 import { saveRule } from "./alerts-api";
@@ -20,6 +23,7 @@ import {
   type ThresholdUnit,
   UPDATE_CATEGORY_CHOICES,
   type UpdateCategoryChoice,
+  formRemediationChoices,
   ruleForm,
   ruleFormProblem,
   ruleInput,
@@ -41,6 +45,7 @@ const CONDITION_HELP: Record<Condition, string> = {
   reboot_pending: "The device has needed a restart to finish installing updates for longer than this. It resolves itself after the restart.",
   app_install_failed: "An install or update of applications on the device failed, partly failed, or never reported back. Each failed application gets its own alert, which stays until someone resolves it.",
   app_updates_pending: "Applications the device's package managers list as outdated have been outdated longer than this, leaving out those the library pins to a version. It resolves itself once they're updated.",
+  ...MONITOR_CONDITION_HELP,
 };
 
 // Creates a rule, or edits one. A rule's condition can't change once saved.
@@ -51,13 +56,14 @@ export function RuleEditor({ rule, channels, returnFocus, onClose, onSaved }: {
   onClose: () => void;
   onSaved: (rule: AlertRule) => void;
 }) {
-  const { authorizedFetch, inventory } = useWorkspace();
+  const { authorizedFetch, can, inventory } = useWorkspace();
   const titleId = useId();
   const [form, setForm] = useState<RuleForm>(() => ruleForm(rule));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const problem = ruleFormProblem(form);
   const update = (change: Partial<RuleForm>) => setForm((current) => ({ ...current, ...change }));
+  const { scripts, error: scriptsError } = useSharedScripts(form.condition === "script_check" || form.remediation.enabled);
   const toggle = (list: "companyIds" | "channelIds", id: string, checked: boolean) => {
     setForm((current) => ({
       ...current,
@@ -81,6 +87,8 @@ export function RuleEditor({ rule, channels, returnFocus, onClose, onSaved }: {
   const gigabytes = form.condition === "disk_space" && form.thresholdUnit === "gb";
   const thresholdLabel = form.condition === "disk_space" ? "Alert when free space is below" : "Alert when the average is above";
   const { companies, tags } = inventory;
+  const canRunScripts = can("scripts.run");
+  const accessReason = scriptsRunReason(form.condition);
 
   return (
     <ModalDialog className="settings-modal role-modal" labelledBy={titleId} onClose={onClose} returnFocus={returnFocus}>
@@ -92,7 +100,10 @@ export function RuleEditor({ rule, channels, returnFocus, onClose, onSaved }: {
           <div className="script-editor-row">
             <label htmlFor="rule-condition">Condition
               <select id="rule-condition" value={form.condition} disabled={rule !== null} onChange={(event) => setForm((current) => withCondition(current, event.target.value as Condition))}>
-                {CONDITIONS.map((condition) => <option key={condition} value={condition}>{CONDITION_LABELS[condition]}</option>)}
+                {CONDITIONS.map((condition) => {
+                  const locked = !canRunScripts && needsScriptsRun(condition) && condition !== form.condition;
+                  return <option key={condition} value={condition} disabled={locked}>{CONDITION_LABELS[condition]}{locked ? " (needs scripts.run)" : ""}</option>;
+                })}
               </select>
             </label>
             <label htmlFor="rule-severity">Severity
@@ -102,6 +113,11 @@ export function RuleEditor({ rule, channels, returnFocus, onClose, onSaved }: {
             </label>
           </div>
           <p className="field-help">{CONDITION_HELP[form.condition]}</p>
+          {accessReason && (
+            <p className={canRunScripts ? "field-help" : "form-error"}>
+              {accessReason}{!canRunScripts && (rule ? " You don’t have it, so you can only turn this rule off." : " You don’t have it, so you can’t save this rule.")}
+            </p>
+          )}
           {(usesThreshold(form.condition) || usesDuration(form.condition)) && (
             <div className="script-editor-row">
               {usesThreshold(form.condition) && (
@@ -150,6 +166,15 @@ export function RuleEditor({ rule, channels, returnFocus, onClose, onSaved }: {
               <span><strong>Count exit codes other than 0 as failures</strong>A script that runs to the end but exits with an error code raises the alert too.</span>
             </label>
           )}
+          {isMonitorCondition(form.condition) && (
+            <MonitorFields
+              condition={form.condition}
+              form={form.monitor}
+              scripts={scripts}
+              scriptsError={scriptsError}
+              onChange={(change) => setForm((current) => ({ ...current, monitor: { ...current.monitor, ...change } }))}
+            />
+          )}
 
           <fieldset className="choice-list">
             <legend>Applies to</legend>
@@ -186,6 +211,15 @@ export function RuleEditor({ rule, channels, returnFocus, onClose, onSaved }: {
               <span><strong>Notify when alerts resolve too</strong>Otherwise only raised alerts notify.</span>
             </label>
           )}
+          <RemediationFields
+            form={form.remediation}
+            choices={formRemediationChoices(form)}
+            scripts={scripts}
+            scriptsError={scriptsError}
+            canRunScripts={canRunScripts}
+            hasChannels={form.channelIds.length > 0}
+            onChange={(change) => setForm((current) => ({ ...current, remediation: { ...current.remediation, ...change } }))}
+          />
           <label className="checkbox-row">
             <input type="checkbox" checked={form.enabled} onChange={(event) => update({ enabled: event.target.checked })} />
             <span><strong>Turned on</strong>A rule that&apos;s off raises nothing, and its unresolved alerts resolve.</span>

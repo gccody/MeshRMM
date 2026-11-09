@@ -1,11 +1,13 @@
 # Alerts
 
 Alert rules watch the devices and raise alerts; notification channels tell
-people about them by email or webhook. Everything happens on the server, from
-what Agents already report: their connection, their resource usage every five
-seconds, the toolbox runs they finish, and their
-[update scans and installs](patch-management.md). The Agent does nothing
-extra, so alerts work the same on Windows, macOS and Linux.
+people about them by email or webhook. Most rules are judged on the server,
+from what Agents already report: their connection, their resource usage every
+five seconds, the toolbox runs they finish, and their
+[update scans and installs](patch-management.md). [Monitor](monitors.md)
+rules are checked by the device's Agent itself, and any rule whose alerts
+resolve themselves, but device offline, can try to fix them automatically
+([self-healing](monitors.md#self-healing)).
 
 ## In the website
 
@@ -46,6 +48,7 @@ Its condition can't change after it's created.
 | Restart pending | the device's update scans have said for at least N days (1 to 365) that it must restart to finish installing updates | a scan says it no longer has to |
 | Application install failed | an [application](application-deployment.md) install or update, by hand, in a job or by a policy, failed for an application, or never reported back; one alert per failed application | never: a person resolves it |
 | Application updates pending | applications the device's package managers list as outdated, other than those the library pins, have been outdated for more than N days (1 to 365), counted from the scan that first found each | none of them is outdated that long |
+| Monitors: service, process, event log, ping, TCP port, website, certificate, script check | the device's Agent finds the check failing N times in a row; see [Monitors](monitors.md) | a check passes |
 
 The loads are averages so that a brief spike or dip neither raises nor
 clears an alert. A load rule needs readings covering its whole window, from
@@ -75,7 +78,11 @@ when it was raised, the value that raised it (minutes offline, free percent or
 GB, average load, or a script's exit code) and a sentence describing it. Its
 state is `open`, `acknowledged` or `resolved`; acknowledging and resolving
 record who and when, and a resolution says why: `cleared` (the condition
-passed), `manual` (a person) or `not_applicable`. An acknowledged alert still
+passed), `remediated` (it passed just after a
+[self-healing](monitors.md#self-healing) attempt succeeded), `manual` (a
+person) or `not_applicable` (the rule no longer covers the device, or devices
+no longer get its check because its owner lost their access). A monitor's
+alert also keeps the latest failure's `output`. An acknowledged alert still
 resolves itself when its condition passes. A person can resolve any alert,
 but if its condition still holds the rule raises a new one at the next
 evaluation.
@@ -120,8 +127,9 @@ A channel is turned on or off, and is one of:
   request. The server never shows the secret again; it is stored encrypted
   with the instance key. Redirects aren't followed.
 
-A rule notifies its chosen channels when it raises an alert, and also when
-the alert is resolved if the rule says so. An
+A rule notifies its chosen channels when it raises an alert, or only once
+its self-healing has failed if it says so, and also when the alert is
+resolved if the rule says so and its channels heard about the alert. An
 [automation policy](automation.md#failure-notifications) notifies its
 channels when one of its jobs finishes with failures. A failed webhook delivery (no
 answer, a 5xx, 408 or 429) is tried again after 10 seconds, a minute and five
@@ -143,10 +151,26 @@ A webhook's body:
 }
 ```
 
-`event` is `alert.raised`, `alert.resolved` or `test`, and is also in the
+`event` is `alert.raised`, `alert.resolved`, `alert.remediation_failed` or
+`test`, and is also in the
 `X-MeshRMM-Event` header, as `delivery_id` is in `X-MeshRMM-Delivery`. `text`
 repeats the summary for chat services, such as Slack's and Mattermost's
 incoming webhooks, that show that field.
+
+An `alert.remediation_failed` also carries the alert's last self-healing
+attempt as `last_attempt` (how it ended in `status`, `detail` and
+`exit_code`, and what it acted on), and, when self-healing stopped rather
+than ran out of attempts, why as `remediation_stopped`. Its email says the
+same on a `Last attempt:` line.
+
+```json
+{
+  "event": "alert.remediation_failed",
+  "summary": "Critical: Web server on WEB-01 (self-healing failed)",
+  "alert": { "id": "…", "rule_name": "Web server", "remediation_state": "failed", "remediation_attempts": 3, "…": "…" },
+  "last_attempt": { "attempt": 3, "action": "restart_service", "target": "nginx", "status": "failed", "exit_code": null, "detail": "Restarted “nginx”, but it stopped again within 3 seconds (failed (failed)).", "started_at": 1761100300000, "finished_at": 1761100304000, "…": "…" }
+}
+```
 
 Channels are generic: `notifications::dispatch` takes channel IDs and a
 `Notification` (an event name, a summary, an email body and the webhook's
@@ -163,8 +187,13 @@ data), so other features can notify the same channels.
 The Technician role starts with `alerts.view` and `alerts.respond`. The
 audit log records `alert_rule.create`, `.update` and `.delete`,
 `notification_channel.create`, `.update`, `.delete` and `.test` (a webhook's
-host only, since its URL may carry a token), and `alert.acknowledge` and
-`alert.resolve`.
+host only, since its URL may carry a token), `alert.acknowledge` and
+`alert.resolve`, and, for monitors, `monitor.check` and `alert.remediate`.
+A rule with self-healing, or with a script, ping, port, website, certificate
+or event log check, also needs `scripts.run` to create, change or turn on,
+and runs with its owner's access; turning it off or deleting it needs only
+`alerts.manage`. See
+[Whose access it runs with](monitors.md#whose-access-it-runs-with).
 
 ## API
 
@@ -179,17 +208,21 @@ host only, since its URL may carry a token), and `alert.acknowledge` and
 | `POST /v1/notification-channels/{id}/test` | `{ "delivered": bool, "error": string or null }` |
 | `GET /v1/notification-channels/recipients` | Users and roles an email channel can reach |
 
+A rule's `monitor`, `remediation` and `notify_when`, and the monitor and
+self-healing routes, are in [Monitors](monitors.md#api).
+
 The event socket (`/v1/events`) sends users who hold `alerts.view` an
 `alert_counts` message after each snapshot, and an `alert_upsert` (the alert
 and the new counts) whenever an alert is raised or changes. After changes to
 many alerts at once, such as deleting a rule, it sends `alert_counts` alone,
-and the website reads its lists again.
+and the website reads its lists again. Monitor results arrive as
+`monitor_update`.
 
 ## Tables
 
 `alert_rules` (with `target` and `tag_match`) with `alert_rule_companies`,
 `alert_rule_tags` and `alert_rule_channels`;
-`alerts`; `notification_channels` with `notification_channel_users` and
+`alerts`, with `monitor_states` and `alert_remediations` ([Monitors](monitors.md#tables)); `notification_channels` with `notification_channel_users` and
 `notification_channel_roles`.
 
 ## Tests

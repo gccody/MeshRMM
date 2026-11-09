@@ -201,14 +201,30 @@ pub struct RuleView {
     rule: Rule,
     /// The condition in words.
     description: String,
+    /// What self-healing does, in words.
+    remediation_description: Option<String>,
+    /// The user whose access its script checks and self-healing run with.
+    owner: Option<String>,
+    /// Why it can't run its scripts or heal, if it can't.
+    problem: Option<String>,
 }
 
-impl From<Rule> for RuleView {
-    fn from(rule: Rule) -> Self {
-        Self {
+impl RuleView {
+    async fn new(executor: &mut impl Executor, rule: Rule) -> Result<Self, ApiError> {
+        let owner = match &rule.owner_user_id {
+            Some(id) => crate::users::by_id(executor, id)
+                .await?
+                .map(|user| crate::monitors::owner_label(&user))
+                .or_else(|| Some("A removed user".to_owned())),
+            None => None,
+        };
+        Ok(Self {
             description: rule.describe(),
+            remediation_description: rule.describe_remediation(),
+            problem: crate::monitors::problem(executor, &rule).await?,
+            owner,
             rule,
-        }
+        })
     }
 }
 
@@ -218,8 +234,36 @@ pub async fn list_rules(
     actor: Authorized,
 ) -> Result<Json<Vec<RuleView>>, ApiError> {
     actor.require(Permission::AlertsView)?;
-    let rules = rules::load(&mut &state.database, None).await?;
-    Ok(Json(rules.into_iter().map(RuleView::from).collect()))
+    let mut database = &state.database;
+    let mut views = Vec::new();
+    for rule in rules::load(&mut database, None).await? {
+        views.push(RuleView::new(&mut database, rule).await?);
+    }
+    Ok(Json(views))
+}
+
+/// Whether `saved` is `previous` turned off, and otherwise the same.
+fn same_but_off(previous: &Rule, saved: &Rule) -> bool {
+    let compared = |rule: &Rule| {
+        let mut value = serde_json::to_value(rule).unwrap_or_default();
+        if let Some(fields) = value.as_object_mut() {
+            for field in ["enabled", "updated_at", "owner_user_id"] {
+                fields.remove(field);
+            }
+        }
+        value
+    };
+    !saved.enabled && compared(previous) == compared(saved)
+}
+
+/// Saving a rule that heals itself, or whose check runs a script, reaches
+/// hosts from inside the device's network or reads its logs, needs
+/// `scripts.run`: they run with the saver's access.
+fn require_access(actor: &Authorized, input: &RuleInput) -> Result<(), ApiError> {
+    if input.acts_on_devices() {
+        actor.require(Permission::ScriptsRun)?;
+    }
+    Ok(())
 }
 
 async fn ensure_name_free(
@@ -259,6 +303,10 @@ fn rule_metadata(input: &RuleInput, rule: &Rule) -> serde_json::Value {
         "tag_match": input.tag_match.as_str(),
         "channel_ids": input.channel_ids,
         "notify_on_resolve": input.notify_on_resolve,
+        "monitor": input.monitor,
+        "remediation": input.remediation,
+        "remediation_description": rule.describe_remediation(),
+        "notify_when": input.notify_when.as_str(),
     })
 }
 
@@ -270,6 +318,7 @@ pub async fn create_rule(
 ) -> Result<(StatusCode, Json<RuleView>), ApiError> {
     actor.require(Permission::AlertsManage)?;
     let input = input.validate()?;
+    require_access(&actor, &input)?;
     let id = new_id();
     let mut transaction = state.database.begin().await?;
     ensure_name_free(&mut transaction, &input.name, None).await?;
@@ -296,7 +345,9 @@ pub async fn create_rule(
     .await?;
     transaction.commit().await?;
     state.alerts.wake();
-    Ok((StatusCode::CREATED, Json(rule.into())))
+    state.monitors.wake();
+    let view = RuleView::new(&mut &state.database, rule).await?;
+    Ok((StatusCode::CREATED, Json(view)))
 }
 
 /// `PUT /v1/alert-rules/{id}`: replaces the rule. Its alerts stay; the next
@@ -310,6 +361,14 @@ pub async fn update_rule(
     actor.require(Permission::AlertsManage)?;
     let id = parse_id(&id, "rule")?;
     let input = input.validate()?;
+    // Without scripts.run, a rule that runs with its owner's access may
+    // still be turned off, which only takes power away: it keeps its owner,
+    // and nothing else may change.
+    let only_turning_off =
+        input.acts_on_devices() && !input.enabled && !actor.has(Permission::ScriptsRun);
+    if !only_turning_off {
+        require_access(&actor, &input)?;
+    }
     let mut transaction = state.database.begin().await?;
     let previous = rules::by_id(&mut transaction, &id)
         .await?
@@ -322,18 +381,18 @@ pub async fn update_rule(
     }
     ensure_name_free(&mut transaction, &input.name, Some(&id)).await?;
     input.check_references(&mut transaction).await?;
-    rules::save(
-        &mut transaction,
-        &id,
-        &input,
-        &actor.user.id,
-        now_ms(),
-        false,
-    )
-    .await?;
+    let owner = match &previous.owner_user_id {
+        Some(owner) if only_turning_off => owner.as_str(),
+        _ => actor.user.id.as_str(),
+    };
+    rules::save(&mut transaction, &id, &input, owner, now_ms(), false).await?;
     let rule = rules::by_id(&mut transaction, &id)
         .await?
         .ok_or_else(ApiError::internal)?;
+    if only_turning_off && !same_but_off(&previous, &rule) {
+        // Dropping the transaction undoes the save.
+        actor.require(Permission::ScriptsRun)?;
+    }
     let mut metadata = rule_metadata(&input, &rule);
     metadata["previous_name"] = json!(previous.name);
     audit::record(
@@ -346,7 +405,15 @@ pub async fn update_rule(
     .await?;
     transaction.commit().await?;
     state.alerts.wake();
-    Ok(Json(rule.into()))
+    crate::monitors::rule_changed(&state, &previous, &rule).await;
+    if let Err(error) = crate::monitors::remediation::rule_saved(&state, &rule).await {
+        tracing::warn!(
+            rule_id = rule.id,
+            error = format!("{error:#}"),
+            "could not bring a saved rule's alerts up to date"
+        );
+    }
+    Ok(Json(RuleView::new(&mut &state.database, rule).await?))
 }
 
 /// `DELETE /v1/alert-rules/{id}`: deletes the rule and its alerts.
@@ -380,5 +447,6 @@ pub async fn delete_rule(
     .await?;
     transaction.commit().await?;
     alerts::announce_counts(&state).await;
+    state.monitors.wake();
     Ok(StatusCode::NO_CONTENT)
 }

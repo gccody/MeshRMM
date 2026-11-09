@@ -355,8 +355,16 @@ async fn refuse_if_policies_use(
     script_id: &str,
 ) -> Result<(), ApiError> {
     let policies = crate::automation::policies::using_script(executor, script_id).await?;
-    match crate::automation::policies::script_used_message(&policies) {
-        Some(message) => Err(ApiError::conflict(message).with_code("script_in_use")),
+    if let Some(message) = crate::automation::policies::script_used_message(&policies) {
+        return Err(ApiError::conflict(message).with_code("script_in_use"));
+    }
+    // Alert rules run shared scripts only too, as checks and to heal.
+    let rules = crate::alerts::rules::using_script(executor, script_id).await?;
+    match rules.first() {
+        Some(first) => Err(ApiError::conflict(format!(
+            "The alert rule “{first}” runs this script. Change or delete it first."
+        ))
+        .with_code("script_in_use")),
         None => Ok(()),
     }
 }

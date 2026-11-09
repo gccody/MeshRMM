@@ -17,6 +17,7 @@ pub mod health;
 pub mod http;
 pub mod mail;
 pub mod maintenance;
+pub mod monitors;
 pub mod notes;
 pub mod notifications;
 pub mod rbac;
@@ -86,6 +87,7 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
         presence: Presence::new(database.clone(), agents.clone(), UPDATE_GRACE),
         metrics: Metrics::new(database.clone()),
         alerts: alerts::Engine::default(),
+        monitors: monitors::Engine::default(),
         automation: automation::Engine::default(),
         updates: updates::Engine::default(),
         wake: wake::Engine::default(),
@@ -146,6 +148,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     state.turn.start(&state.config).await?;
     let maintenance = maintenance::spawn(state.database.clone(), state.storage.clone());
     let alerting = alerts::spawn(state.clone());
+    let monitoring = monitors::spawn(state.clone());
     let automating = automation::spawn(state.clone());
     let updating = updates::spawn(state.clone());
     let applying = applications::spawn(state.clone());
@@ -161,6 +164,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let served = serve::serve(&state.config, http::router(state.clone()), handle).await;
     maintenance.abort();
     alerting.abort();
+    monitoring.abort();
     automating.abort();
     updating.abort();
     applying.abort();

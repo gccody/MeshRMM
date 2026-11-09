@@ -37,3 +37,5 @@ pub use files::*;
 
 mod applications;
 pub use applications::*;
+mod monitors;
+pub use monitors::*;

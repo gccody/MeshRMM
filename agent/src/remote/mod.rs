@@ -47,6 +47,8 @@ pub(crate) mod linux;
 pub(crate) mod macos;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) mod metrics;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+mod monitors;
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod native_task;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -185,6 +187,30 @@ fn report_wake_results(
     }
 }
 
+/// Sends monitor results and self-healing outcomes without waiting for them
+/// to be written. Those that can't be queued go again.
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+fn report_monitors(
+    socket: &SignalingConnection,
+    monitors: &monitors::Monitors,
+    messages: Vec<AgentStatusMessage>,
+) {
+    let mut unsent = Vec::new();
+    for message in messages {
+        let queued = match serde_json::to_string(&message) {
+            Ok(text) => socket.queue(Message::Text(text.into())),
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = queued {
+            tracing::warn!(error = %error, "could not report monitor results");
+            unsent.push(message);
+        }
+    }
+    if !unsent.is_empty() {
+        monitors.unsent(unsent);
+    }
+}
+
 /// Sends a file operation's answer without waiting for it to be written.
 /// One that can't be queued is lost; the server gives up on it.
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -301,6 +327,8 @@ pub async fn run(config: Config, mode: ExecutionMode) -> anyhow::Result<()> {
             applications: applications::Applications::new(),
             wake: wake::Relay::new(),
             files: files::Files::new(),
+            // Likewise, so monitors keep running while the Agent reconnects.
+            monitors: monitors::Monitors::new(mode),
             config,
             mode,
             link,
@@ -325,6 +353,7 @@ struct Coordinator {
     applications: applications::Applications,
     wake: wake::Relay,
     files: files::Files,
+    monitors: monitors::Monitors,
     active_session: Option<ActiveSession>,
     // Outlives session tasks, which end whenever the viewer drops its
     // connection, so the close action runs only once the session ends.
@@ -379,6 +408,7 @@ impl Coordinator {
             .send(Message::Text(activity.into()))
             .await
             .context("could not send the application activity")?;
+        self.monitors.connected();
         loop {
             if self
                 .active_session
@@ -410,6 +440,7 @@ impl Coordinator {
                 system = self.system_info.next() => report_system_info(socket, system),
                 results = self.wake.next() => report_wake_results(socket, results),
                 (request_id, reply) = self.files.next() => report_file_reply(socket, request_id, reply),
+                messages = self.monitors.next() => report_monitors(socket, &self.monitors, messages),
                 report = self.updates.next() => {
                     let sent = match serde_json::to_string(&report) {
                         Ok(text) => socket.send(Message::Text(text.into())).await,
@@ -530,6 +561,28 @@ impl Coordinator {
                 AgentCommand::RunApplications { run } => {
                     tracing::info!(run_id = %run.run_id, operation = ?run.operation, "the server asked for an application run");
                     self.applications.run(&self.config, self.mode, run);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::SetMonitors { monitors } => {
+                    self.monitors.set(monitors);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::CheckMonitors { monitor_ids } => {
+                    tracing::info!(
+                        monitors = monitor_ids.len(),
+                        "the server asked for monitor checks"
+                    );
+                    self.monitors.check_now(monitor_ids);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                AgentCommand::RunMonitorAction { action } => {
+                    tracing::info!(
+                        action_id = %action.action_id,
+                        monitor_id = %action.monitor_id,
+                        action = ?action.action,
+                        "the server asked for a self-healing action"
+                    );
+                    self.monitors.act(action);
                     return Ok(ControlFlow::Continue(()));
                 }
                 AgentCommand::FileTransfer { transfer } => {
