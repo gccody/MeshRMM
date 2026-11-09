@@ -94,15 +94,15 @@ pub async fn activity_reported(
     run_ids: &[String],
     connected_at: i64,
 ) {
-    let lost = match runs::interrupted(
-        &mut &state.database,
-        device_id,
-        run_ids,
-        connected_at,
-        now_ms(),
-    )
-    .await
-    {
+    // One transaction, so nobody sees some of them settled and not others.
+    let settle = async {
+        let mut transaction = state.database.begin().await?;
+        let lost =
+            runs::interrupted(&mut transaction, device_id, run_ids, connected_at, now_ms()).await?;
+        transaction.commit().await?;
+        anyhow::Ok(lost)
+    };
+    let lost = match settle.await {
         Ok(lost) => lost,
         Err(error) => {
             tracing::warn!(device_id, %error, "could not settle a device's interrupted application runs");
