@@ -319,6 +319,11 @@ pub async fn device_packages(
     actor.require(Permission::ApplicationsView)?;
     let id = device(&state, &id).await?;
     let mut database = &state.database;
+    // The status first: a scan stores its status and packages together, so
+    // the packages read after it are from that scan or a newer one. (Read
+    // the other way round, a scan that lands in between shows its status
+    // with the packages from before it.)
+    let status = store::status(&mut database, &id).await?;
     let library = library::load(&mut database, None).await?;
     let packages = store::packages(&mut database, &id, &Matches::new(&library)).await?;
     let scanning = match runs::pending(&mut database, &id, true).await? {
@@ -330,7 +335,7 @@ pub async fn device_packages(
         None => None,
     };
     Ok(Json(DevicePackages {
-        status: store::status(&mut database, &id).await?,
+        status,
         device_id: id,
         scanning,
         running,
