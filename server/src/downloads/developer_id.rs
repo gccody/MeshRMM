@@ -366,9 +366,13 @@ fn unpack(archive: &Path, into: &Path) -> anyhow::Result<PathBuf> {
     let mut archive = ZipArchive::new(fs::File::open(archive)?)?;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
+        let name = entry
+            .name()
+            .with_context(|| format!("entry {index}'s name isn't valid"))?
+            .into_owned();
         let relative = entry
             .enclosed_name()
-            .with_context(|| format!("{:?} is outside the archive", entry.name()))?;
+            .with_context(|| format!("{name:?} is outside the archive"))?;
         // ditto keeps extended attributes there.
         if relative.starts_with("__MACOSX") {
             continue;
@@ -379,7 +383,7 @@ fn unpack(archive: &Path, into: &Path) -> anyhow::Result<PathBuf> {
             continue;
         }
         if entry.is_symlink() {
-            bail!("{} is a symbolic link", entry.name());
+            bail!("{name} is a symbolic link");
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
