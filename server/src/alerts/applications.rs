@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 use super::{
     announce,
-    raised,
     evaluate::{Breach, Verdict},
+    raised,
     rules::{self, Condition, Rule, plural},
     store::{self, Raise},
 };

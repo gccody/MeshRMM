@@ -1277,7 +1277,12 @@ async fn monitors_and_self_healing_need_their_permissions() {
                     "remediation": { "action": "script", "script_id": shared } }),
             )
             .await;
-        assert_eq!(pending.status, StatusCode::CREATED, "{name}: {:?}", pending.body);
+        assert_eq!(
+            pending.status,
+            StatusCode::CREATED,
+            "{name}: {:?}",
+            pending.body
+        );
 
         // A rule runs with its owner's access: once they lose it, it keeps
         // watching but skips self-healing, and says why.
