@@ -1122,3 +1122,14 @@ button.outcome-chip:hover { color: var(--text); background: var(--raised); }
 .device-tile .device-tags .tag-chip { flex: 0 1 auto; min-width: 0; }
 .tag-link { display: inline-flex; max-width: 100%; text-decoration: none; }
 .tag-link:hover .tag-chip { filter: brightness(1.15); }
+
+/* Applications: the library, devices' packages and runs. */
+.application-actions { margin: 0 0 14px; justify-content: flex-end; }
+.application-source { padding: 12px 14px; border: 1px solid var(--rule); border-radius: 8px; }
+.outdated-version { color: var(--signal-strong); font-weight: 600; }
+.run-detail { padding: 6px 4px 10px; display: grid; gap: 8px; }
+.run-items { margin: 0; padding: 0; display: grid; gap: 8px; list-style: none; }
+.run-items li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; }
+.run-items details { flex-basis: 100%; }
+.application-output { max-height: 320px; margin: 6px 0 0; padding: 10px 12px; overflow: auto; border-radius: 6px; background: var(--well); font: 12.5px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; }
+.run-items .error-text { color: var(--danger); }

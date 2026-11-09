@@ -124,7 +124,7 @@ export function PoliciesPage() {
           <div className="empty-state">
             <CalendarClock size={22} aria-hidden="true" />
             <strong>No policies yet</strong>
-            <span>A policy runs a shared script, scans for or installs operating system updates, or wakes offline devices, on a schedule or on each device that enrolls, and keeps its runs on the Jobs tab.{canSaveAny ? "" : " Creating one needs the scripts.run, updates.view, updates.install or devices.wake permission too."}</span>
+            <span>A policy runs a shared script, scans for or installs operating system updates,, wakes offline devices, or installs or updates applications, on a schedule or on each device that enrolls, and keeps its runs on the Jobs tab.{canSaveAny ? "" : " Creating one needs the scripts.run, updates.view, updates.install, devices.wake or applications.deploy permission too."}</span>
           </div>
         ) : (
           <table className="data-table policy-table" aria-label="Policies">

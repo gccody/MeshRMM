@@ -15,7 +15,7 @@ import { useWorkspace } from "../workspace/workspace-context";
 import { AutomationAreaTabs } from "./area-tabs";
 import { cancelJob, fetchJob } from "./automation-api";
 import { JobProgressBar, OutcomeChips, OutcomePill } from "./job-progress";
-import { type JobDetail, type JobDevice, type Outcome, countsSummary, deviceResult, isJobFinished, isUpdateJob, jobStarter, progressLabel } from "./model";
+import { type JobDetail, type JobDevice, type Outcome, countsSummary, deviceResult, isApplicationJob, isJobFinished, isUpdateJob, jobStarter, progressLabel } from "./model";
 import { useJobEvents } from "./use-job-feed";
 
 // Unfinished jobs are read again this often, in case an event was missed.
@@ -153,6 +153,7 @@ function JobView({ id }: { id: string }) {
                   <td className="row-actions">
                     {device.run_id && <button type="button" className="secondary-button" onClick={(event) => { opener.current = event.currentTarget; setOutput(device); }} aria-haspopup="dialog">View output</button>}
                     {device.update_run_id && device.device_name && <Link className="secondary-button" to={`/device?${new URLSearchParams({ id: device.device_id, tab: "updates" })}`}>View updates</Link>}
+                    {device.application_run_id && device.device_name && <Link className="secondary-button" to={`/device?${new URLSearchParams({ id: device.device_id, tab: "applications" })}`}>View applications</Link>}
                   </td>
                 </tr>
               ))}
@@ -171,6 +172,8 @@ function JobFacts({ job }: { job: JobDetail }) {
     <dl className="job-facts">
       {job.kind === "wake"
         ? <div><dt>Action</dt><dd>{job.item_name}<span>Offline devices are woken through online devices on their network</span></dd></div>
+        : isApplicationJob(job.kind)
+        ? <div><dt>Applications</dt><dd>{job.item_name}</dd></div>
         : isUpdateJob(job.kind)
         ? <div><dt>Updates</dt><dd>{job.item_name}{job.kind === "update_install" && <span>{describeSelection({ categories: job.categories ?? [] })}</span>}</dd></div>
         : <div><dt>{job.kind === "script" ? "Script" : "File"}</dt><dd>{job.item_name}{job.language && <span>{LANGUAGE_LABELS[job.language]}</span>}</dd></div>}

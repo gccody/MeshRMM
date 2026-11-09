@@ -6,9 +6,11 @@ import { type TagMatch, describeTagTarget, hasTags } from "../tags/model.ts";
 import { type RunAs, type ScriptLanguage, LANGUAGE_LABELS, runsOn } from "../toolbox/model.ts";
 import type { Permission } from "../auth/types.ts";
 import { DEFAULT_REBOOT_DELAY_MINUTES, type RebootBehavior, type UpdateCategory, installName, rebootDelayProblem } from "../updates/model.ts";
+import { MAX_RUN_ITEMS, type UpdateMode } from "../applications/model.ts";
 
-export type JobKind = "script" | "file" | "update_scan" | "update_install" | "wake";
+export type JobKind = "script" | "file" | "update_scan" | "update_install" | "wake" | "app_install" | "app_update" | "app_uninstall";
 export const isUpdateJob = (kind: JobKind) => kind === "update_scan" || kind === "update_install";
+export const isApplicationJob = (kind: JobKind) => kind === "app_install" || kind === "app_update" || kind === "app_uninstall";
 
 export const JOB_KIND_LABELS: Record<JobKind, string> = {
   script: "Script",
@@ -16,6 +18,9 @@ export const JOB_KIND_LABELS: Record<JobKind, string> = {
   update_scan: "Update scan",
   update_install: "Update install",
   wake: "Wake",
+  app_install: "Application install",
+  app_update: "Application update",
+  app_uninstall: "Application uninstall",
 };
 export type TargetKind = "devices" | "companies" | "tags" | "all";
 export type OfflineChoice = "skip" | "wait";
@@ -81,6 +86,8 @@ export type JobDevice = {
   update_run_id?: string | null;
   // The device's wake request, for wake jobs.
   wake_id?: string | null;
+  // The device's application run, for application jobs.
+  application_run_id?: string | null;
   exit_code: number | null;
   // Where a delivered file was saved.
   path: string | null;
@@ -97,13 +104,15 @@ export type JobEvent = { type: "job_update"; job: Job } | { type: "jobs_resync" 
 export type TriggerKind = "interval" | "daily" | "weekly" | "once" | "enroll";
 
 // What a policy does each time it runs.
-export type PolicyAction = "script" | "update_scan" | "update_install" | "wake";
+export type PolicyAction = "script" | "update_scan" | "update_install" | "wake" | "app_install" | "app_update";
 
 export const ACTION_LABELS: Record<PolicyAction, string> = {
   script: "Run a script",
   update_scan: "Scan for updates",
   update_install: "Install updates",
   wake: "Wake devices",
+  app_install: "Install applications",
+  app_update: "Update applications",
 };
 
 // GET /v1/automation-policies
@@ -123,6 +132,9 @@ export type Policy = {
   update_categories?: UpdateCategory[] | null;
   reboot?: RebootBehavior | null;
   reboot_delay_minutes?: number | null;
+  // An application policy's library applications and packages (as
+  // source:id), and for an update which outdated ones it covers.
+  applications?: ApplicationPolicySpec | null;
   target: TargetKind;
   device_ids: string[];
   company_ids: string[];
@@ -395,9 +407,25 @@ export function describeSchedule(policy: Pick<Policy, "trigger" | "interval_minu
   }
 }
 
-// What a policy does, in words: its script, or the updates it scans or installs.
-export function describePolicyAction(policy: Pick<Policy, "action" | "script_name" | "update_categories">) {
+export type ApplicationPolicySpec = { application_ids: string[]; packages: string[]; mode: UpdateMode };
+
+// What an application update policy covers, in words.
+function describeApplicationUpdate(spec: ApplicationPolicySpec | null | undefined) {
+  const count = (spec?.application_ids.length ?? 0) + (spec?.packages.length ?? 0);
+  const what = count === 1 ? "1 application" : `${count} applications`;
+  if (!spec || spec.mode === "all") return "Update all applications";
+  return spec.mode === "only" ? `Update ${what}` : `Update all applications except ${what}`;
+}
+
+// What a policy does, in words: its script, the updates it scans or
+// installs, or the applications it installs or updates.
+export function describePolicyAction(policy: Pick<Policy, "action" | "script_name" | "update_categories"> & Partial<Pick<Policy, "applications">>) {
   switch (policy.action) {
+    case "app_install": {
+      const count = policy.applications?.application_ids.length ?? 0;
+      return count === 1 ? "Install 1 application" : `Install ${count} applications`;
+    }
+    case "app_update": return describeApplicationUpdate(policy.applications);
     case "update_scan": return "Scan for updates";
     case "update_install": return installName(policy.update_categories ?? []);
     case "wake": return "Wake devices";
@@ -412,6 +440,8 @@ export const SAVE_PERMISSION: Record<PolicyAction, Permission> = {
   update_scan: "updates.view",
   update_install: "updates.install",
   wake: "devices.wake",
+  app_install: "applications.deploy",
+  app_update: "applications.deploy",
 };
 
 // Which devices a policy runs on, in words.
@@ -455,6 +485,10 @@ export type PolicyDraft = {
   updateCategories: UpdateCategory[];
   reboot: RebootBehavior;
   rebootDelayMinutes: number;
+  applicationIds: string[];
+  // Packages as source:id, one a line.
+  packages: string;
+  updateMode: UpdateMode;
 };
 
 // The draft of a new policy, or of `policy` to edit.
@@ -485,6 +519,9 @@ export function policyDraft(policy: Policy | null, timeZone: string, action: Pol
     updateCategories: [...(policy?.update_categories ?? (policy ? [] : ["security", "critical"]))],
     reboot: policy?.reboot ?? "if_required",
     rebootDelayMinutes: policy?.reboot_delay_minutes ?? DEFAULT_REBOOT_DELAY_MINUTES,
+    applicationIds: [...(policy?.applications?.application_ids ?? [])],
+    packages: (policy?.applications?.packages ?? []).join("\n"),
+    updateMode: policy?.applications?.mode ?? "all",
   };
 }
 
@@ -517,6 +554,14 @@ export function policyDraftProblem(draft: PolicyDraft, zones: readonly string[] 
     return `Give the policy a name of up to ${MAX_POLICY_NAME_CHARS} characters.`;
   }
   if (draft.action === "script" && !draft.scriptId) return "Choose a shared script to run.";
+  if (draft.action === "app_install" && !draft.applicationIds.length) return "Choose the library applications to install.";
+  if (draft.action === "app_update" && draft.updateMode !== "all") {
+    const packages = packageLines(draft.packages);
+    if (packages.some((line) => !PACKAGE_LINE.test(line))) return "Write each package as source:id, such as winget:Mozilla.Firefox.";
+    if (!draft.applicationIds.length && !packages.length) return draft.updateMode === "only" ? "Choose the applications to update." : "Choose the applications to leave out.";
+    if (draft.applicationIds.length + packages.length > MAX_RUN_ITEMS) return `Choose at most ${MAX_RUN_ITEMS} applications.`;
+  }
+  if (draft.action === "app_install" && draft.applicationIds.length > MAX_RUN_ITEMS) return `Choose at most ${MAX_RUN_ITEMS} applications.`;
   if (draft.action === "update_install" && draft.reboot !== "never") {
     const problem = rebootDelayProblem(draft.rebootDelayMinutes);
     if (problem) return problem;
@@ -543,6 +588,10 @@ export function policyDraftProblem(draft: PolicyDraft, zones: readonly string[] 
   return null;
 }
 
+// An update policy's packages, one `source:id` a line.
+export const packageLines = (text: string) => text.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+const PACKAGE_LINE = /^(winget|chocolatey|homebrew|homebrew_cask|flatpak|snap):[A-Za-z0-9][A-Za-z0-9._+@/-]*$/u;
+
 // The request body that saves the draft. Call only when it has no problem.
 export function policyInput(draft: PolicyDraft) {
   const body: Record<string, unknown> = {
@@ -568,6 +617,12 @@ export function policyInput(draft: PolicyDraft) {
     body.update_categories = [...draft.updateCategories];
     body.reboot = draft.reboot;
     body.reboot_delay_minutes = draft.rebootDelayMinutes;
+  }
+  if (draft.action === "app_install") body.applications = { application_ids: draft.applicationIds, packages: [], mode: "all" };
+  if (draft.action === "app_update") {
+    body.applications = draft.updateMode === "all"
+      ? { application_ids: [], packages: [], mode: "all" }
+      : { application_ids: draft.applicationIds, packages: packageLines(draft.packages), mode: draft.updateMode };
   }
   if (draft.trigger === "interval") body.interval_minutes = intervalMinutes(draft);
   if (draft.trigger === "daily" || draft.trigger === "weekly") body.time = draft.time;

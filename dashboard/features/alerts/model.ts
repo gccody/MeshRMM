@@ -14,7 +14,9 @@ export type Condition =
   | "script_failed"
   | "updates_pending"
   | "update_install_failed"
-  | "reboot_pending";
+  | "reboot_pending"
+  | "app_install_failed"
+  | "app_updates_pending";
 
 // Which pending updates an updates_pending rule counts.
 export type UpdateCategoryChoice = "any" | UpdateCategory;
@@ -139,6 +141,8 @@ export const CONDITION_LABELS: Record<Condition, string> = {
   updates_pending: "Updates pending",
   update_install_failed: "Update install failed",
   reboot_pending: "Restart pending",
+  app_install_failed: "Application install failed",
+  app_updates_pending: "Application updates pending",
 };
 
 export const UPDATE_CATEGORY_CHOICES: readonly UpdateCategoryChoice[] = ["any", ...CATEGORIES];
@@ -270,7 +274,7 @@ export function resolutionLabel(alert: Pick<Alert, "resolution" | "resolved_by">
 
 // Script failures stay until a person resolves them; the rest resolve
 // themselves.
-export const clearsItself = (condition: Condition) => condition !== "script_failed" && condition !== "update_install_failed";
+export const clearsItself = (condition: Condition) => condition !== "script_failed" && condition !== "update_install_failed" && condition !== "app_install_failed";
 
 // The rule editor's fields, as text while being edited.
 export type RuleTarget = "all" | "companies" | "tags";
@@ -303,6 +307,8 @@ const DEFAULTS: Record<Condition, { threshold: string; duration: string; days: s
   updates_pending: { threshold: "", duration: "", days: "7" },
   update_install_failed: { threshold: "", duration: "", days: "" },
   reboot_pending: { threshold: "", duration: "", days: "3" },
+  app_install_failed: { threshold: "", duration: "", days: "" },
+  app_updates_pending: { threshold: "", duration: "", days: "14" },
 };
 
 export function ruleForm(rule: AlertRule | null): RuleForm {
@@ -351,7 +357,7 @@ export function withCondition(form: RuleForm, condition: Condition): RuleForm {
   return { ...form, condition, threshold: DEFAULTS[condition].threshold, duration: DEFAULTS[condition].duration, days: DEFAULTS[condition].days, thresholdUnit: "percent" };
 }
 
-export const usesDays = (condition: Condition) => condition === "updates_pending" || condition === "reboot_pending";
+export const usesDays = (condition: Condition) => condition === "updates_pending" || condition === "reboot_pending" || condition === "app_updates_pending";
 
 export const usesThreshold = (condition: Condition) => condition === "disk_space" || condition === "cpu" || condition === "memory";
 export const usesDuration = (condition: Condition) => condition === "device_offline" || condition === "cpu" || condition === "memory";

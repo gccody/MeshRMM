@@ -4,6 +4,7 @@ import { DevicesPanel } from "../features/agents/devices-panel";
 import { AlertsPage } from "../features/alerts/alerts-page";
 import { ChannelsPage } from "../features/alerts/channels-page";
 import { RulesPage } from "../features/alerts/rules-page";
+import { ApplicationsPage } from "../features/applications/applications-page";
 import { JobPage } from "../features/automation/job-page";
 import { JobsPage } from "../features/automation/jobs-page";
 import { PoliciesPage } from "../features/automation/policies-page";
@@ -45,6 +46,7 @@ export function App() {
             <Route path="tags" element={<TagsPage />} />
             <Route path="software" element={<SoftwarePage />} />
             <Route path="updates" element={<UpdatesPage />} />
+            <Route path="applications" element={<ApplicationsPage />} />
             <Route path="toolbox" element={<ToolboxPanel />} />
             <Route path="jobs" element={<JobsPage />} />
             <Route path="job" element={<JobPage />} />
