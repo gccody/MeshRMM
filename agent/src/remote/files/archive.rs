@@ -220,7 +220,10 @@ mod tests {
         assert_eq!(summary.bytes, 300_008);
         assert_eq!(summary.skipped.len(), usize::from(cfg!(unix)));
         let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
-        let mut names = archive.file_names().map(str::to_owned).collect::<Vec<_>>();
+        let mut names = archive
+            .file_names()
+            .map(|name| name.unwrap().into_owned())
+            .collect::<Vec<_>>();
         names.sort();
         let mut expected = vec![
             "single.txt",
