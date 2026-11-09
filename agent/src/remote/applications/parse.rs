@@ -214,7 +214,16 @@ pub(crate) fn winget_shown_id(output: &str) -> Option<String> {
 /// script.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn is_elf(head: &[u8]) -> bool {
-    head.starts_with(b"ELF")
+    head.starts_with(b"\x7fELF")
+}
+
+/// Whether `locale -a` lists the C locale in UTF-8, which glibc spells
+/// `C.utf8` and others `C.UTF-8`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn has_c_utf8(output: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.trim().to_ascii_lowercase().replace('-', "") == "c.utf8")
 }
 
 /// `winget --version`: `v1.29.380`.
@@ -435,8 +444,14 @@ pub(crate) fn flatpak_remotes(output: &str) -> Vec<String> {
         .collect()
 }
 
+/// The snap types that are the system rather than applications, as
+/// `snap list`'s notes name them (the `os` type reads as `core`).
+const SYSTEM_SNAPS: [&str; 5] = ["base", "core", "snapd", "gadget", "kernel"];
+
 /// `snap list --unicode=never`: name, version, revision, tracking,
-/// publisher and notes under a header. Disabled revisions are left out.
+/// publisher and notes under a header. Disabled revisions are left out, and
+/// so are snaps the notes say are the system: bases, the core, snapd, gadgets
+/// and kernels.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn snap_list(output: &str) -> Vec<ScannedPackage> {
     output
@@ -447,9 +462,10 @@ pub(crate) fn snap_list(output: &str) -> Vec<ScannedPackage> {
             let [id, version, ..] = fields[..] else {
                 return None;
             };
-            if fields
-                .get(5)
-                .is_some_and(|notes| notes.contains("disabled"))
+            let notes = fields.get(5).copied().unwrap_or_default();
+            if notes
+                .split(',')
+                .any(|note| note == "disabled" || SYSTEM_SNAPS.contains(&note))
             {
                 return None;
             }
@@ -462,6 +478,36 @@ pub(crate) fn snap_list(output: &str) -> Vec<ScannedPackage> {
             })
         })
         .collect()
+}
+
+/// The snaps that are applications, from snapd's `GET /v2/snaps`: of type
+/// `app`, with at least one app (a command or service). Snaps without one
+/// are runtimes and themes that other snaps use, such as `gnome-46-2404`
+/// or `gtk-common-themes`, which snapd keeps up to date with them. `None`
+/// when the answer isn't snapd's list.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn snapd_applications(body: &str) -> Option<std::collections::HashSet<String>> {
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        result: Vec<Snap>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Snap {
+        name: String,
+        #[serde(rename = "type")]
+        kind: String,
+        #[serde(default)]
+        apps: Vec<serde::de::IgnoredAny>,
+    }
+    let answer = serde_json::from_str::<Answer>(body).ok()?;
+    Some(
+        answer
+            .result
+            .into_iter()
+            .filter(|snap| snap.kind == "app" && !snap.apps.is_empty())
+            .map(|snap| snap.name)
+            .collect(),
+    )
 }
 
 /// `snap refresh --list --unicode=never`: the snaps with updates and the
@@ -625,6 +671,7 @@ mod tests {
     const FLATPAK_UPDATES: &str = include_str!("fixtures/flatpak-remote-ls-updates.txt");
     const SNAP_LIST: &str = include_str!("fixtures/snap-list.txt");
     const SNAP_REFRESH: &str = include_str!("fixtures/snap-refresh-list.txt");
+    const SNAPD_SNAPS: &str = include_str!("fixtures/snapd-snaps.json");
 
     /// `winget upgrade` prints the same columns as `winget list`, for the
     /// packages with updates.
@@ -734,12 +781,13 @@ mod tests {
         );
         // Linux .bin and .run installers: programs run themselves, scripts
         // run with sh.
-        assert!(is_elf(b"ELF"));
-        assert!(!is_elf(
-            b"#!/bin/sh
-"
-        ));
-        assert!(!is_elf(b"EL"));
+        assert!(is_elf(b"\x7fELF\x02\x01"));
+        assert!(!is_elf(b"#!/bin/sh\n"));
+        assert!(!is_elf(b"\x7fEL"));
+        // Flatpak and snap run in C.UTF-8 where it exists.
+        assert!(has_c_utf8("C\nC.utf8\nPOSIX\nen_US.utf8\n"));
+        assert!(has_c_utf8("C.UTF-8\n"));
+        assert!(!has_c_utf8("C\nPOSIX\nen_US.UTF-8\n"));
     }
 
     #[test]
@@ -929,14 +977,29 @@ Bar   Bar.Bar  3.0     4.0       winget\n";
                 .iter()
                 .map(|package| package.id.as_str())
                 .collect::<Vec<_>>(),
-            ["code", "core22", "firefox", "snapd"]
+            ["code", "firefox", "gnome-46-2404"],
+            "bases, the core and snapd are the system"
+        );
+        let applications = snapd_applications(SNAPD_SNAPS).unwrap();
+        let mut names = applications.iter().map(String::as_str).collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["code", "firefox", "lxd"],
+            "content snaps, bases, kernels and gadgets aren't applications"
+        );
+        assert_eq!(snapd_applications("<html>"), None);
+        assert_eq!(
+            snapd_applications(r#"{"type":"error","result":{"message":"x"}}"#),
+            None
         );
         let updates = snap_updates(SNAP_REFRESH);
         assert_eq!(
             updates,
             [
                 ("code".to_owned(), "1.98.0".to_owned()),
-                ("firefox".to_owned(), "136.0-1".to_owned())
+                ("firefox".to_owned(), "136.0-1".to_owned()),
+                ("core22".to_owned(), "20250301".to_owned())
             ]
         );
         assert!(snap_updates("All snaps up to date.\n").is_empty());

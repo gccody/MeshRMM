@@ -48,11 +48,30 @@ impl Tool {
         let mut command = Command::new(&self.program);
         command
             .args(args)
-            .env("LC_ALL", "C")
-            .env("LANG", "C")
+            .env("LC_ALL", locale())
+            .env("LANG", locale())
             .current_dir("/");
         process::run(command, timeout)
     }
+}
+
+/// The locale Flatpak and snap run in: `C.UTF-8` where the device has it,
+/// so their messages keep their quotation marks and non-ASCII names, else
+/// `C`. Both are English, which is what the output is read as.
+fn locale() -> &'static str {
+    static LOCALE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    LOCALE.get_or_init(|| {
+        let listed = find("locale").and_then(|program| {
+            let mut command = Command::new(program);
+            command.arg("-a").env("LC_ALL", "C").current_dir("/");
+            process::run(command, Duration::from_secs(30)).ok()
+        });
+        if listed.is_some_and(|ran| ran.success() && parse::has_c_utf8(&ran.stdout)) {
+            "C.UTF-8"
+        } else {
+            "C"
+        }
+    })
 }
 
 pub(super) fn tools() -> Vec<Tool> {
@@ -136,19 +155,31 @@ pub(super) fn scan(tool: &Tool) -> anyhow::Result<(Option<String>, Vec<ScannedPa
                 .map(str::to_owned);
             let listed = tool.run(&["list", "--unicode=never"], SCAN_TIMEOUT)?;
             // With no snaps installed, `snap list` says so and fails.
-            let packages = if listed.success() {
+            let mut packages = if listed.success() {
                 parse::snap_list(&listed.stdout)
             } else if listed.stderr.contains("No snaps") {
                 Vec::new()
             } else {
                 anyhow::bail!("snap list failed: {}", listed.complaint());
             };
+            // snapd says which are applications; without its answer, the
+            // notes have left out the system's snaps already.
+            match snapd_applications() {
+                Ok(applications) => packages.retain(|package| applications.contains(&package.id)),
+                Err(error) => tracing::debug!(
+                    error = format!("{error:#}"),
+                    "could not ask snapd which snaps are applications"
+                ),
+            }
             let refresh = checked(
                 tool.run(&["refresh", "--list", "--unicode=never"], SCAN_TIMEOUT)?,
                 "snap refresh --list",
             )?;
+            // Updates of snaps that aren't listed, such as bases, aren't
+            // applications' updates.
             let updates = parse::snap_updates(&refresh.stdout)
                 .into_iter()
+                .filter(|(id, _)| packages.iter().any(|package| &package.id == id))
                 .map(|(id, version)| ScannedPackage {
                     source: PackageSource::Snap,
                     name: id.clone(),
@@ -160,6 +191,40 @@ pub(super) fn scan(tool: &Tool) -> anyhow::Result<(Option<String>, Vec<ScannedPa
             Ok((version, parse::merge(packages, updates)))
         }
     }
+}
+
+/// The names of the snaps that are applications, from snapd's REST API on
+/// its socket: `GET /v2/snaps`, over HTTP/1.0 so the answer is the body
+/// as is, to the end of the connection.
+fn snapd_applications() -> anyhow::Result<std::collections::HashSet<String>> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    use anyhow::Context as _;
+
+    const SNAPD_TIMEOUT: Duration = Duration::from_secs(30);
+    /// snapd's answer for a few hundred snaps is well under this.
+    const MOST: u64 = 16 * 1024 * 1024;
+    let mut stream =
+        UnixStream::connect("/run/snapd.socket").context("could not connect to snapd")?;
+    stream.set_read_timeout(Some(SNAPD_TIMEOUT))?;
+    stream.set_write_timeout(Some(SNAPD_TIMEOUT))?;
+    stream
+        .write_all(b"GET /v2/snaps HTTP/1.0\r\nHost: snapd\r\nAccept: application/json\r\n\r\n")?;
+    let mut answer = Vec::new();
+    stream.take(MOST).read_to_end(&mut answer)?;
+    let answer = String::from_utf8_lossy(&answer);
+    let (head, body) = answer
+        .split_once("\r\n\r\n")
+        .context("snapd's answer has no body")?;
+    anyhow::ensure!(
+        head.lines()
+            .next()
+            .is_some_and(|status| status.split_whitespace().nth(1) == Some("200")),
+        "snapd answered {}",
+        head.lines().next().unwrap_or_default()
+    );
+    parse::snapd_applications(body).context("snapd's answer isn't its list of snaps")
 }
 
 fn attempt(tool: &Tool, args: &[&str]) -> Attempt {

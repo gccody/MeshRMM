@@ -4,3 +4,6 @@ core22    20250110         1748   latest/stable    canonical**  base
 firefox   135.0.1-1        5751   latest/stable/…  mozilla**    -
 lxd       5.21.2-2f4ba6b   30131  5.21/stable      canonical**  disabled
 snapd     2.67.1           23771  latest/stable    canonical**  snapd
+bare      1.0              5      latest/stable    canonical**  base
+gnome-46-2404  0+git.b31ceab  90  latest/stable/…  canonical**  -
+core      16-2.61.4-20260225  17212  latest/stable  canonical**  core
