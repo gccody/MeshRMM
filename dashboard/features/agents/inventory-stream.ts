@@ -14,6 +14,16 @@ const MAX_RECONNECT_DELAY_MS = 30_000;
 // check no more often than this; each check is two HTTP requests per tab.
 const SESSION_CHECK_INTERVAL_MS = 60_000;
 const MAX_PENDING_EVENTS = 1_000;
+// Browsers don't show the page the server's pings, so a live socket that
+// has heard nothing for this long may be dead, as after the computer slept.
+// While any device is online the server sends resource readings every 5 s,
+// so this is six missed readings; with none online it may rightly stay
+// silent, and such a tab reconnects on its next wake: a full snapshot, but
+// only for a fleet with nothing online. Measured against the clock when
+// each message is handled, not with a timer, so a background tab's
+// throttled timers can't make a healthy socket look dead; handlers that run
+// late only make it look fresher.
+export const SILENT_SOCKET_MS = 30_000;
 // A short gap, such as a server restart, must not mark the inventory stale.
 export const STALE_GRACE_MS = 5_000;
 const SOCKET_OPEN = 1;
@@ -208,7 +218,7 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
 type SocketEnd = "refused" | "revoked" | "dropped";
 
 // Handles one socket's events while it is the stream's current socket.
-function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onAlerts, onJobs, onUpdates, current, onLive, onClose }: {
+function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onAlerts, onJobs, onUpdates, current, onHeard, onLive, onClose }: {
   revision: { current: number };
   onInventory: (update: (current: Inventory) => Inventory) => void;
   onMetrics?: (readings: MetricsReading[]) => void;
@@ -216,6 +226,7 @@ function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onA
   onJobs?: (event: JobEvent) => void;
   onUpdates?: (event: UpdateEvent) => void;
   current: () => boolean;
+  onHeard: () => void;
   onLive: () => void;
   onClose: (end: SocketEnd) => void;
 }) {
@@ -236,7 +247,9 @@ function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onA
   });
   socket.addEventListener("message", (message) => {
     const data = (message as MessageEvent).data;
-    if (!current() || typeof data !== "string") return;
+    if (!current()) return;
+    onHeard();
+    if (typeof data !== "string") return;
     try {
       const event: unknown = JSON.parse(data);
       const readings = parseMetricsEvent(event);
@@ -276,6 +289,9 @@ export function inventoryStream({
 }: Options) {
   let stopped = false;
   let socket: SocketLike | null = null;
+  // Whether the socket delivered its snapshot, and when it last sent anything.
+  let live = false;
+  let heardAt = 0;
   // When a refused socket last asked for a session check; null once the
   // stream is live, so the next outage's first refusal checks at once.
   let sessionCheckedAt: number | null = null;
@@ -291,6 +307,15 @@ export function inventoryStream({
     onRefused();
   };
 
+  const lose = () => {
+    socket = null;
+    live = false;
+    // The server may have restarted its revisions; an HTTP load until the
+    // next socket must not be measured against the lost one's.
+    revision.current = -1;
+    connection.setState("reconnecting");
+  };
+
   const listen = (nextSocket: SocketLike) => watchSocket(nextSocket, {
     revision,
     onInventory,
@@ -299,20 +324,20 @@ export function inventoryStream({
     onJobs,
     onUpdates,
     current: () => !stopped && socket === nextSocket,
+    onHeard: () => {
+      heardAt = timers.now();
+    },
     // Only a socket that delivered its snapshot resets the backoff; one the
     // server accepts and then fails, before or while sending it, keeps
     // backing off.
     onLive: () => {
+      live = true;
       reconnect.reset();
       sessionCheckedAt = null;
       connection.setState("live");
     },
     onClose: (end) => {
-      socket = null;
-      // The server may have restarted its revisions; an HTTP load until the
-      // next socket must not be measured against the lost one's.
-      revision.current = -1;
-      connection.setState("reconnecting");
+      lose();
       if (end !== "dropped") checkSession(end);
       reconnect.schedule();
     },
@@ -335,16 +360,25 @@ export function inventoryStream({
   connect();
 
   return {
-    // Resynchronizes now: asks an open socket for a fresh snapshot, or skips
-    // the backoff wait and reconnects with the step reset to 1 s.
+    // Called when the tab is shown, the network returns or Refresh is
+    // pressed while the stream is down. A live socket kept receiving changes
+    // in the background, and one still connecting or awaiting its snapshot
+    // is about to deliver it, so neither asks the server to send the whole
+    // fleet again. A live socket that went silent is replaced, since a dead
+    // one would deliver no snapshot. Without a socket it skips the backoff
+    // wait but keeps the step: only going live restarts it.
     wake() {
       if (stopped) return;
-      if (socket) {
-        if (socket.readyState === SOCKET_OPEN) socket.send("refresh");
+      if (!socket) {
+        connect();
         return;
       }
-      reconnect.cancel();
-      reconnect.reset();
+      if (!live || timers.now() - heardAt <= SILENT_SOCKET_MS) return;
+      const silent = socket;
+      lose();
+      // It is no longer the current socket, so its close event, whenever a
+      // dead connection sends one, is ignored.
+      silent.close(1000, "website replaced a silent socket");
       connect();
     },
     setOnline(next: boolean) {

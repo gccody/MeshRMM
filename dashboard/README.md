@@ -36,6 +36,10 @@ origin as its API. Nothing runs on Node in production.
   socket delivers its snapshot. A refused socket checks whether the user is
   still signed in at once, then at most about once a minute while the server
   stays unreachable; a socket closed for lost access (4001) always checks.
+  A background tab's socket keeps receiving changes, so showing the tab or
+  the network returning asks the server for nothing: it only reconnects at
+  once when the socket is down, or replaces one that is live but has heard
+  nothing for 30 s and may be dead.
 - **One bundle, one lazy chunk.** Every page hydrates from a single entry
   script (kept under 800 kB by `tests/prerender.test.mjs`). Only the
   [terminal](../docs/terminal.md)'s xterm.js is split out, loaded with

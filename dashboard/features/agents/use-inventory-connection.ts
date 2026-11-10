@@ -65,8 +65,9 @@ export function useInventoryConnection({ enabled, revisionRef, onInventory, onMe
     };
   }, [enabled, onInventory, onMetrics, revisionRef]);
 
-  // Resynchronize when the network returns or the tab becomes visible again,
-  // for example after the computer wakes from sleep.
+  // Check the stream when the network returns or the tab becomes visible
+  // again, for example after the computer wakes from sleep: reconnect at
+  // once if it is down or its socket went silent.
   useEffect(() => {
     if (!enabled) return;
     const handleOnline = () => {
