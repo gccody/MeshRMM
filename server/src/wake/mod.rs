@@ -806,7 +806,7 @@ pub async fn device_connected(state: &AppState, device_id: &str) {
         Ok(_) => {
             tracing::info!(device_id, "a device came online after it was woken");
             // Its jobs' outcomes changed.
-            state.automation.wake();
+            state.automation.device_changed(device_id);
         }
         Err(error) => {
             tracing::warn!(device_id, %error, "could not record that a woken device came online")

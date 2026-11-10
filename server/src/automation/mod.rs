@@ -2,22 +2,29 @@
 //! policies that start jobs on a schedule or when devices enroll. See
 //! docs/automation.md.
 //!
-//! The engine's task makes a pass every few seconds, every second while
-//! devices are queued, and at once when woken: it fires the policies that are
-//! due, misses the waiting devices of expired jobs, queues waiting devices
-//! whose Agent connected, starts queued devices within the dispatcher's
-//! limits, and then marks the jobs with nothing left to do as finished. The
-//! website's event socket gets each job whose counts changed. Everything the
-//! engine decides is in the database, so a restart picks up where it left
-//! off.
+//! The engine's task steps every few seconds, every second while devices
+//! are queued, and at once when woken. A step costs as much as what changed:
+//! it queues the waiting parts of the devices whose Agent connected, fires
+//! the policies that are due and starts queued devices within the
+//! dispatcher's limits. At most once per [`SETTLE_SPACING_MS`] it also
+//! misses the waiting devices of jobs that expired since it last looked and
+//! recounts the jobs whose devices changed, marking those with nothing left
+//! to do as finished. Every [`RECONCILE_INTERVAL_MS`], after a restart and
+//! when a policy fires, it makes a full pass instead, which looks at every
+//! waiting device and recounts every unfinished job. The website's event
+//! socket gets each job whose counts changed. Everything the engine decides
+//! is in the database, so a restart picks up where it left off.
 pub mod dispatch;
 pub mod jobs;
 pub mod policies;
 pub mod schedule;
 
 use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -31,14 +38,26 @@ use crate::{
     http::AppState,
     notifications::{self, Notification},
     settings,
-    time::now_ms,
+    time::{MINUTE_MS, SECOND_MS, now_ms},
 };
 
-/// How often the engine looks for due policies and connected devices when
+/// How often the engine looks for due policies and expired jobs when
 /// nothing wakes it.
 const IDLE_INTERVAL: Duration = Duration::from_secs(5);
-/// How soon it makes another pass while devices are queued.
+/// How soon it steps again while devices are queued.
 const BUSY_INTERVAL: Duration = Duration::from_secs(1);
+/// The least time between two recounts, however often the engine is woken:
+/// while thousands of Agents reconnect, their devices start as they connect
+/// and their jobs' counts follow once a second.
+pub const SETTLE_SPACING_MS: i64 = SECOND_MS;
+/// How often a full pass looks at every waiting device and unfinished job.
+/// Steps act on every change announced to the engine, so this only catches
+/// what wasn't announced: an Agent that connected while a policy was
+/// creating its job, a change by a server that stopped before announcing
+/// it, and runs that passed their report deadline unreported. Those wait at
+/// most a minute, and the full pass, whose cost grows with the fleet, runs
+/// once a minute rather than once per Agent.
+pub const RECONCILE_INTERVAL_MS: i64 = MINUTE_MS;
 /// Changes a subscriber may fall behind by before it misses some.
 const EVENT_BACKLOG: usize = 256;
 /// Devices a failure notification names.
@@ -57,6 +76,68 @@ struct Inner {
     published: Mutex<HashMap<String, Counts>>,
     /// One pass at a time.
     passing: tokio::sync::Mutex<()>,
+    /// What changed since the engine last looked.
+    pending: Mutex<Pending>,
+    /// Full passes made and jobs recounted, which tests read to measure the
+    /// engine's work.
+    full_passes: AtomicU64,
+    recounted: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct Pending {
+    /// Devices whose Agent connected: their waiting parts are queued.
+    connected: HashSet<String>,
+    /// Jobs created or cancelled: their waiting parts on connected devices
+    /// are queued, and they are recounted.
+    changed_jobs: HashSet<String>,
+    /// Devices whose part in a job changed: their unfinished jobs are
+    /// recounted.
+    devices: HashSet<String>,
+    /// Jobs to recount.
+    jobs: HashSet<String>,
+    /// Whether a full pass was asked for.
+    reconcile: bool,
+    /// When the engine last recounted, and last made a full pass.
+    settled_at: Option<i64>,
+    reconciled_at: Option<i64>,
+}
+
+impl Pending {
+    fn settle_due(&self, now: i64) -> bool {
+        self.settled_at
+            .is_none_or(|at| !(0..SETTLE_SPACING_MS).contains(&(now - at)))
+    }
+
+    fn reconcile_due(&self, now: i64) -> bool {
+        let Some(at) = self.reconciled_at else {
+            return true;
+        };
+        let since = now - at;
+        let spacing = if self.reconcile {
+            SETTLE_SPACING_MS
+        } else {
+            RECONCILE_INTERVAL_MS
+        };
+        !(0..spacing).contains(&since)
+    }
+
+    /// How long until spaced work is due, in milliseconds.
+    fn next_due(&self, now: i64) -> Option<i64> {
+        let reconciled_at = self.reconciled_at?;
+        let mut due = reconciled_at
+            + if self.reconcile {
+                SETTLE_SPACING_MS
+            } else {
+                RECONCILE_INTERVAL_MS
+            };
+        if let Some(settled_at) = self.settled_at
+            && !(self.devices.is_empty() && self.jobs.is_empty())
+        {
+            due = std::cmp::min(due, settled_at + SETTLE_SPACING_MS);
+        }
+        Some(std::cmp::max(due - now, 0))
+    }
 }
 
 impl Default for Engine {
@@ -67,16 +148,71 @@ impl Default for Engine {
                 events: broadcast::channel(EVENT_BACKLOG).0,
                 published: Mutex::default(),
                 passing: tokio::sync::Mutex::new(()),
+                pending: Mutex::default(),
+                full_passes: AtomicU64::new(0),
+                recounted: AtomicU64::new(0),
             }),
         }
     }
 }
 
 impl Engine {
-    /// Makes a pass soon, such as after a job was created, a device
-    /// connected or a run was reported.
+    /// Steps soon: fires the policies that are due and starts queued
+    /// devices, such as after a policy was saved.
     pub fn wake(&self) {
         self.inner.wake.notify_one();
+    }
+
+    /// The device's Agent connected: its waiting parts are queued and start
+    /// soon. Agents that connect together are queued together.
+    pub fn device_connected(&self, device_id: &str) {
+        self.pending().connected.insert(device_id.to_owned());
+        self.wake();
+    }
+
+    /// The device's part in a job changed, such as when its run or delivery
+    /// reported: its unfinished jobs are recounted soon, and it may take its
+    /// next run.
+    pub fn device_changed(&self, device_id: &str) {
+        self.pending().devices.insert(device_id.to_owned());
+        self.wake();
+    }
+
+    /// A job was created or cancelled: its waiting devices whose Agent is
+    /// connected are queued, and it is recounted soon.
+    pub fn job_changed(&self, job_id: &str) {
+        self.pending().changed_jobs.insert(job_id.to_owned());
+        self.wake();
+    }
+
+    /// Something changed that could touch any job, such as a policy's run
+    /// replacing its older jobs' waits: a full pass soon.
+    pub fn reconcile(&self) {
+        self.pending().reconcile = true;
+        self.wake();
+    }
+
+    /// Recounts the job when the engine next does.
+    fn recount(&self, job_id: &str) {
+        self.pending().jobs.insert(job_id.to_owned());
+    }
+
+    /// How many full passes the engine has made.
+    pub fn full_passes(&self) -> u64 {
+        self.inner.full_passes.load(Ordering::Relaxed)
+    }
+
+    /// How many times it has recounted a job.
+    pub fn jobs_recounted(&self) -> u64 {
+        self.inner.recounted.load(Ordering::Relaxed)
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, Pending> {
+        // Nothing panics while holding the lock, so a poisoned one is whole.
+        self.inner
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Jobs whose counts changed. The event socket shows each to the users
@@ -98,14 +234,13 @@ impl Engine {
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let busy = match pass(&state, now_ms()).await {
-                Ok(busy) => busy,
+            let wait = match step(&state, now_ms()).await {
+                Ok(wait) => wait,
                 Err(error) => {
                     tracing::warn!(error = format!("{error:#}"), "automation pass failed");
-                    false
+                    IDLE_INTERVAL
                 }
             };
-            let wait = if busy { BUSY_INTERVAL } else { IDLE_INTERVAL };
             tokio::select! {
                 () = state.automation.inner.wake.notified() => {}
                 () = tokio::time::sleep(wait) => {}
@@ -114,23 +249,172 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// One pass of the engine at `now`. Returns whether queued devices remain.
+/// What the engine does at `now` when woken or when it has waited: the work
+/// for what changed, or a full pass when one is due. Returns how soon it
+/// wants to step again.
+pub async fn step(state: &AppState, now: i64) -> anyhow::Result<Duration> {
+    let engine = &state.automation;
+    let _one_at_a_time = engine.inner.passing.lock().await;
+    let (full, settle) = {
+        let pending = engine.pending();
+        (pending.reconcile_due(now), pending.settle_due(now))
+    };
+    let busy = if full {
+        full_pass(state, now).await?
+    } else {
+        let busy = quick_pass(state, now).await?;
+        if settle {
+            settle_pass(state, now).await?;
+        }
+        busy
+    };
+    let wait = if busy { BUSY_INTERVAL } else { IDLE_INTERVAL };
+    Ok(engine.pending().next_due(now).map_or(wait, |ms| {
+        wait.min(Duration::from_millis(u64::try_from(ms).unwrap_or(0)))
+    }))
+}
+
+/// A full pass of the engine at `now`, whatever was announced. Returns
+/// whether queued devices remain.
 pub async fn pass(state: &AppState, now: i64) -> anyhow::Result<bool> {
     let _one_at_a_time = state.automation.inner.passing.lock().await;
-    policies::fire_due(state, now).await?;
-    dispatch::expire(state, now).await?;
-    dispatch::queue_connected(state, now).await?;
-    let busy = dispatch::dispatch(state, now).await?;
-    report(state, now).await?;
-    Ok(busy)
+    full_pass(state, now).await
+}
+
+async fn full_pass(state: &AppState, now: i64) -> anyhow::Result<bool> {
+    let engine = &state.automation;
+    engine.inner.full_passes.fetch_add(1, Ordering::Relaxed);
+    {
+        // It covers everything announced before it starts.
+        let mut pending = engine.pending();
+        pending.connected.clear();
+        pending.changed_jobs.clear();
+        pending.devices.clear();
+        pending.jobs.clear();
+        pending.reconcile = false;
+        pending.settled_at = Some(now);
+        pending.reconciled_at = Some(now);
+    }
+    let passed = async {
+        policies::fire_due(state, now).await?;
+        dispatch::expire(state, None, now).await?;
+        dispatch::miss_deleted(state, now).await?;
+        dispatch::queue_connected(state, now).await?;
+        let busy = dispatch::dispatch(state, now).await?;
+        report(state, now, None).await?;
+        anyhow::Ok(busy)
+    }
+    .await;
+    if passed.is_err() {
+        engine.pending().reconcile = true;
+    }
+    passed
+}
+
+/// Queues the waiting parts of the devices that connected and of the
+/// connected devices of changed jobs, fires due policies and starts queued
+/// devices. Returns whether queued devices remain.
+async fn quick_pass(state: &AppState, now: i64) -> anyhow::Result<bool> {
+    let engine = &state.automation;
+    let (connected, changed_jobs) = {
+        let mut pending = engine.pending();
+        (
+            std::mem::take(&mut pending.connected),
+            std::mem::take(&mut pending.changed_jobs),
+        )
+    };
+    let queued = async {
+        let mut online = connected
+            .iter()
+            .filter(|device_id| state.agents.is_connected(device_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !changed_jobs.is_empty() {
+            // An Agent that connected while its job was being created.
+            let ids = changed_jobs.iter().cloned().collect::<Vec<_>>();
+            online.extend(
+                dispatch::waiting_devices(state, &ids)
+                    .await?
+                    .into_iter()
+                    .filter(|device_id| state.agents.is_connected(device_id)),
+            );
+        }
+        online.sort();
+        online.dedup();
+        dispatch::queue_devices(state, &online, now).await
+    }
+    .await;
+    {
+        let mut pending = engine.pending();
+        match &queued {
+            Ok(devices) => pending.devices.extend(devices.iter().cloned()),
+            // Tried again on the next step.
+            Err(_) => {
+                pending.connected.extend(connected);
+                pending.changed_jobs.extend(changed_jobs.iter().cloned());
+            }
+        }
+        pending.jobs.extend(changed_jobs);
+    }
+    queued?;
+    if policies::fire_due(state, now).await? {
+        // A full pass counts the new job and the older ones whose waits it
+        // replaced.
+        engine.pending().reconcile = true;
+    }
+    dispatch::dispatch(state, now).await
+}
+
+/// Misses the waiting devices of the jobs that expired since the last
+/// recount, and recounts the jobs that changed.
+async fn settle_pass(state: &AppState, now: i64) -> anyhow::Result<()> {
+    let engine = &state.automation;
+    let (devices, mut ids, since) = {
+        let mut pending = engine.pending();
+        let since = pending.settled_at.replace(now);
+        (
+            std::mem::take(&mut pending.devices),
+            std::mem::take(&mut pending.jobs),
+            since,
+        )
+    };
+    let settled = async {
+        let devices = devices.iter().cloned().collect::<Vec<_>>();
+        ids.extend(jobs::unfinished_of_devices(&mut &state.database, &devices).await?);
+        ids.extend(dispatch::expire(state, since, now).await?);
+        report(state, now, Some(&ids)).await
+    }
+    .await;
+    if settled.is_err() {
+        let mut pending = engine.pending();
+        pending.devices.extend(devices);
+        pending.jobs.extend(ids);
+        pending.settled_at = since;
+    }
+    settled
 }
 
 /// Publishes the unfinished jobs whose counts changed, and finishes those
-/// with nothing left to do, notifying a policy's channels of failures.
-async fn report(state: &AppState, now: i64) -> anyhow::Result<()> {
+/// with nothing left to do, notifying a policy's channels of failures: the
+/// jobs of `ids`, or every unfinished job.
+async fn report(state: &AppState, now: i64, ids: Option<&HashSet<String>>) -> anyhow::Result<()> {
     let mut database = &state.database;
-    let ids = jobs::unfinished(&mut database).await?;
-    let unfinished = jobs::by_ids(&mut database, &ids, now).await?;
+    let every = ids.is_none();
+    let ids = match ids {
+        Some(ids) if ids.is_empty() => return Ok(()),
+        Some(ids) => ids.iter().cloned().collect(),
+        None => jobs::unfinished(&mut database).await?,
+    };
+    let unfinished = jobs::by_ids(&mut database, &ids, now)
+        .await?
+        .into_iter()
+        .filter(|job| job.finished_at_unix_ms.is_none())
+        .collect::<Vec<_>>();
+    state
+        .automation
+        .inner
+        .recounted
+        .fetch_add(unfinished.len() as u64, Ordering::Relaxed);
     for mut job in unfinished {
         if job.counts.active() == 0 {
             let finished = database
@@ -168,11 +452,13 @@ async fn report(state: &AppState, now: i64) -> anyhow::Result<()> {
             publish(state, job);
         }
     }
-    let unfinished = ids.into_iter().collect::<std::collections::HashSet<_>>();
-    state
-        .automation
-        .published()
-        .retain(|id, _| unfinished.contains(id));
+    if every {
+        let unfinished = ids.into_iter().collect::<HashSet<_>>();
+        state
+            .automation
+            .published()
+            .retain(|id, _| unfinished.contains(id));
+    }
     Ok(())
 }
 
@@ -279,7 +565,7 @@ fn failure_notification(
 pub async fn device_enrolled(state: &AppState, device_id: &str) {
     match policies::device_enrolled(state, device_id, now_ms()).await {
         Ok(0) => {}
-        Ok(_) => state.automation.wake(),
+        Ok(_) => state.automation.device_changed(device_id),
         Err(error) => tracing::warn!(
             device_id,
             error = format!("{error:#}"),
@@ -291,8 +577,13 @@ pub async fn device_enrolled(state: &AppState, device_id: &str) {
 /// A device was deleted: it misses the jobs it hasn't started.
 pub async fn device_removed(state: &AppState, device_id: &str) {
     match dispatch::device_removed(&mut &state.database, device_id, now_ms()).await {
-        Ok(0) => {}
-        Ok(_) => state.automation.wake(),
+        Ok(job_ids) if job_ids.is_empty() => {}
+        Ok(job_ids) => {
+            for job_id in &job_ids {
+                state.automation.recount(job_id);
+            }
+            state.automation.wake();
+        }
         Err(error) => tracing::warn!(
             device_id,
             %error,

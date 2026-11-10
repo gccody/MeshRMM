@@ -279,7 +279,9 @@ pub async fn run(
         json!({ "name": policy.name, "job_id": job_id }),
     )
     .await?;
-    state.automation.wake();
+    // Its job may have replaced the waits of the policy's older ones.
+    state.automation.job_changed(&job_id);
+    state.automation.reconcile();
     let viewer = Viewer::new(&actor.user.id, &actor.permissions);
     let job = jobs::get(&mut database, &job_id, now)
         .await?

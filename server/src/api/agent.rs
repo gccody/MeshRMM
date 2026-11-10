@@ -219,7 +219,7 @@ pub async fn report_script_run(
     }
     crate::alerts::script_run_finished(&state, &run_id).await;
     // A job's counts changed, and its device may take the next run.
-    state.automation.wake();
+    state.automation.device_changed(&agent.device_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -330,7 +330,7 @@ pub async fn report_file_delivery(
     if updated == 0 {
         return Err(ApiError::not_found("no pending delivery has this ID"));
     }
-    state.automation.wake();
+    state.automation.device_changed(&agent.device_id);
     Ok(StatusCode::NO_CONTENT)
 }
 

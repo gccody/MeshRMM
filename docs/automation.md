@@ -108,6 +108,21 @@ disconnects between being queued and being started waits again (or is
 missed, if the job skips offline devices); a run that never reached its
 Agent is removed rather than reported as failed.
 
+The work for an Agent that connects is that device's alone: the server
+queues its waiting parts by its ID, and Agents that connect together are
+queued in one statement, so a fleet reconnecting after a server restart
+while a fleet-wide job waits doesn't make the server reread the job for each
+of them. A job's counts, shown on its page and pushed to the website, are
+recounted at most once a second, and only for the jobs whose devices
+changed: those queued or started, and those whose devices reported. A job
+is marked finished on the first recount after its last device reports, and
+its waiting devices are missed within a few seconds of it expiring. Once a
+minute, and when the server starts or a policy fires, the server also looks
+at every waiting device and recounts every unfinished job, which catches
+what the steps can't see: an Agent that connected while a policy was
+creating its job, or a run that passed its report deadline without a report
+(it shows as **No result**, and its job finishes, within a minute).
+
 All of this state is in the database, so a server restart carries on with
 queued and waiting devices. Runs that were on a device when the server
 stopped report when it is back, or end up with no result.
@@ -278,9 +293,18 @@ should read the lists again.
   runs and deliveries within the limits), `policies.rs` (policies, firing,
   enrollment), `schedule.rs` (triggers and time zones, with `chrono-tz`),
   and `mod.rs` (the engine's task, publishing changes, finishing jobs and
-  failure notifications). The engine makes a pass every 5 seconds, every
-  second while devices are queued, and at once when a job is created, an
-  Agent connects or a device reports.
+  failure notifications). The engine steps every 5 seconds, every second
+  while devices are queued, and at once when told what changed: an Agent
+  connected (`device_connected`), a device's run reported
+  (`device_changed`), or a job was created or cancelled (`job_changed`). A
+  step queues the connected devices' waiting parts by device ID and starts
+  queued devices; at most once per `SETTLE_SPACING_MS` (a second) it
+  misses the waiting devices of jobs that expired since the last and
+  recounts the jobs it was told of. A full pass, every
+  `RECONCILE_INTERVAL_MS` (a minute), after a restart and when a policy
+  fires, also queues every waiting device whose Agent is connected, misses
+  deleted devices' parts (deleting a device misses them at once; this is
+  for a server that stopped in between) and recounts every unfinished job.
 - `server/src/api/jobs.rs` and `server/src/api/automation.rs`.
 - Targets: `server/src/targets.rs` resolves every kind of target (chosen
   devices, companies, tags, every device) for jobs, policies and
