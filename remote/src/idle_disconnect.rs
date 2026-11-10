@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use meshrmm_protocol::{IDLE_DISCONNECT_MINUTES, IdleDisconnectPolicy};
+use meshrmm_protocol::{IDLE_DISCONNECT_MINUTES, IdleDisconnectPolicy, SessionMessage};
 
 /// How often the session checks whether it has been idle too long.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -62,6 +62,67 @@ impl IdleDisconnect {
     }
 }
 
+/// Whether the viewer window sending `message` shows that a person is using
+/// the session, so that it restarts the idle time. Only a person's action
+/// sends these: keyboard and pointer input, drawing, and the toolbar, menu
+/// and settings commands. What the viewer sends by itself (keyframe
+/// requests, bitrate feedback, statistics, clipboard synchronisation, file
+/// transfer traffic, negotiation) is not activity, and neither is anything
+/// only the Agent sends. When the viewer sends one of the person's message
+/// types on its own, such as releasing held keys or re-applying the quality
+/// to a new window, it does so through
+/// [`ControlSink::send_automatic`](crate::platform::ControlSink::send_automatic).
+pub fn is_activity(message: &SessionMessage) -> bool {
+    match message {
+        SessionMessage::Input(_)
+        | SessionMessage::Annotate(_)
+        | SessionMessage::SelectDisplay { .. }
+        | SessionMessage::SetQuality { .. }
+        | SessionMessage::SetChroma { .. }
+        | SessionMessage::Chat { .. }
+        | SessionMessage::SetAgentInputBlocked { .. }
+        | SessionMessage::SetBlackout { .. }
+        | SessionMessage::SendSecureAttention
+        | SessionMessage::SetCursorCapture { .. }
+        | SessionMessage::SetWallpaperHidden { .. }
+        | SessionMessage::SetDisplayBorder { .. }
+        | SessionMessage::SetPreventIdleLock { .. }
+        | SessionMessage::SetRecording { .. }
+        | SessionMessage::SetSessionCloseAction { .. }
+        | SessionMessage::SetClearClipboardOnClose { .. }
+        | SessionMessage::PromptForCredentials
+        | SessionMessage::AutofillCredentials
+        | SessionMessage::ForgetCredentials
+        | SessionMessage::SetAudio { .. }
+        | SessionMessage::Restart { .. }
+        | SessionMessage::SetHeadlessResolution { .. } => true,
+        // The viewer sends these by itself.
+        SessionMessage::RequestKeyframe { .. }
+        | SessionMessage::SetBitrate { .. }
+        | SessionMessage::Stats(_)
+        | SessionMessage::Start { .. }
+        | SessionMessage::Stop { .. }
+        | SessionMessage::ViewerCapabilities { .. }
+        | SessionMessage::VideoProfileRejected { .. }
+        | SessionMessage::ServiceChannelReady
+        | SessionMessage::ChatAvailable
+        | SessionMessage::Clipboard { .. }
+        | SessionMessage::ClipboardChunk { .. }
+        | SessionMessage::FileTransfer(_) => false,
+        // Only the Agent sends these.
+        SessionMessage::Accepted { .. }
+        | SessionMessage::Rejected { .. }
+        | SessionMessage::StreamConfiguration { .. }
+        | SessionMessage::DisplayConfiguration { .. }
+        | SessionMessage::CursorShape { .. }
+        | SessionMessage::MaintenanceState { .. }
+        | SessionMessage::MaintenanceError { .. }
+        | SessionMessage::AgentPointerDisplay { .. }
+        | SessionMessage::CredentialState(_)
+        | SessionMessage::DeviceState { .. } => false,
+    }
+}
+
 /// The idle times a technician can choose from, in menu order.
 pub fn choices() -> impl Iterator<Item = Option<u32>> {
     std::iter::once(None).chain(IDLE_DISCONNECT_MINUTES.map(Some))
@@ -105,6 +166,174 @@ mod tests {
             None
         );
         assert_eq!(idle.expired(start + fifteen * 2), Some(15));
+    }
+
+    #[test]
+    fn only_messages_a_person_causes_are_activity() {
+        use meshrmm_protocol::{
+            Annotation, AudioFormat, ChromaMode, Codec, ConnectionStats, CredentialState,
+            CursorShape, DesktopSession, DevicePlatform, Display, DisplayId, FileMessage,
+            HeadlessResolution, PixelFormat, PointerButton, QualityPreset, RemoteInput,
+            RemoteSessionId, SessionCloseAction, VideoFormat, VideoProfile, VideoStreamId,
+        };
+        let stream_id = VideoStreamId(1);
+        let display_id = DisplayId(1);
+        let format = VideoFormat {
+            width: 1920,
+            height: 1080,
+            frames_per_second: 60,
+            codec: Codec::H264,
+            pixel_format: PixelFormat::Nv12,
+            bitrate_bits_per_second: 8_000_000,
+        };
+        let profile = format.profile();
+        let display = Display {
+            session: DesktopSession::Console,
+            id: display_id,
+            name: "Display 1".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+        };
+        let resolution = HeadlessResolution::PRESETS[0];
+        let key = RemoteInput::Key {
+            display_id,
+            scan_code: 30,
+            extended: false,
+            pressed: true,
+        };
+        let pointer = RemoteInput::PointerMove {
+            display_id,
+            x: 10,
+            y: 10,
+        };
+        let click = RemoteInput::PointerButtonAt {
+            display_id,
+            x: 10,
+            y: 10,
+            button: PointerButton::Left,
+            pressed: true,
+        };
+        let person = [
+            SessionMessage::Input(key),
+            SessionMessage::Input(pointer),
+            SessionMessage::Input(click),
+            SessionMessage::Annotate(Annotation::Clear),
+            SessionMessage::SelectDisplay { display_id },
+            SessionMessage::SetQuality {
+                preset: QualityPreset::BestQuality,
+            },
+            SessionMessage::SetChroma {
+                mode: ChromaMode::Yuv444,
+            },
+            SessionMessage::Chat { text: "hi".into() },
+            SessionMessage::SetAgentInputBlocked { blocked: true },
+            SessionMessage::SetBlackout { enabled: true },
+            SessionMessage::SendSecureAttention,
+            SessionMessage::SetCursorCapture { enabled: true },
+            SessionMessage::SetWallpaperHidden { hidden: true },
+            SessionMessage::SetDisplayBorder { enabled: false },
+            SessionMessage::SetPreventIdleLock { enabled: true },
+            SessionMessage::SetRecording { enabled: true },
+            SessionMessage::SetSessionCloseAction {
+                action: SessionCloseAction::Lock,
+            },
+            SessionMessage::SetClearClipboardOnClose { enabled: true },
+            SessionMessage::PromptForCredentials,
+            SessionMessage::AutofillCredentials,
+            SessionMessage::ForgetCredentials,
+            SessionMessage::SetAudio {
+                enabled: true,
+                formats: vec![AudioFormat::Opus],
+            },
+            SessionMessage::Restart { safe_mode: false },
+            SessionMessage::SetHeadlessResolution { resolution },
+        ];
+        let viewer = [
+            SessionMessage::RequestKeyframe { stream_id },
+            SessionMessage::SetBitrate {
+                bits_per_second: 4_000_000,
+            },
+            SessionMessage::Stats(ConnectionStats::default()),
+            SessionMessage::Start {
+                session_id: RemoteSessionId::new("session"),
+                format,
+            },
+            SessionMessage::Stop {
+                reason: "closed".into(),
+            },
+            SessionMessage::ViewerCapabilities {
+                profiles: vec![profile],
+                quality: QualityPreset::Balanced,
+                chroma: ChromaMode::Yuv420,
+                headless_resolution: resolution,
+            },
+            SessionMessage::VideoProfileRejected {
+                profile: VideoProfile {
+                    codec: Codec::H265,
+                    chroma: ChromaMode::Yuv444,
+                },
+                reason: "decoder".into(),
+            },
+            SessionMessage::ServiceChannelReady,
+            SessionMessage::ChatAvailable,
+            SessionMessage::Clipboard {
+                text: "copied".into(),
+            },
+            SessionMessage::ClipboardChunk {
+                offset: 0,
+                total: 1,
+                data: vec![0],
+            },
+            SessionMessage::FileTransfer(FileMessage::Chunk {
+                id: 1,
+                data: vec![0],
+            }),
+            SessionMessage::FileTransfer(FileMessage::Available),
+        ];
+        let agent = [
+            SessionMessage::Accepted { stream_id, format },
+            SessionMessage::Rejected {
+                reason: "busy".into(),
+            },
+            SessionMessage::StreamConfiguration {
+                stream_id,
+                format,
+                codec_config: Vec::new(),
+            },
+            SessionMessage::DisplayConfiguration {
+                displays: vec![display],
+                active_display_id: display_id,
+                stream_id,
+                format,
+            },
+            SessionMessage::CursorShape {
+                shape: CursorShape::Default,
+            },
+            SessionMessage::MaintenanceState {
+                agent_input_blocked: false,
+                blacked_out: false,
+            },
+            SessionMessage::MaintenanceError {
+                reason: "failed".into(),
+            },
+            SessionMessage::AgentPointerDisplay {
+                display_id: Some(display_id),
+            },
+            SessionMessage::CredentialState(CredentialState::default()),
+            SessionMessage::DeviceState {
+                platform: DevicePlatform::Windows,
+                safe_mode: false,
+            },
+        ];
+        for message in &person {
+            assert!(is_activity(message), "{message:?} should be activity");
+        }
+        for message in viewer.iter().chain(&agent) {
+            assert!(!is_activity(message), "{message:?} should not be activity");
+        }
     }
 
     #[test]

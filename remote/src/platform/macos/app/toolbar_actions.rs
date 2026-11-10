@@ -71,6 +71,7 @@ impl RemoteView {
 
     /// A click on the toolbar item for `action`, at `rect` in the toolbar.
     pub(in crate::platform::macos) fn toolbar_action(&self, action: Action, rect: toolbar::Rect) {
+        self.ivars().control.note_activity();
         let Some(toolbar_view) = self.ivars().toolbar.borrow().clone() else {
             return;
         };
@@ -124,11 +125,16 @@ impl RemoteView {
             // The window's own buttons stand in for the caption buttons.
             Action::Minimize | Action::Maximize | Action::Close => {}
         }
+        // A menu pops up modally, so it has closed by now: the technician
+        // chose an item, the session controls' included, or dismissed it.
+        self.ivars().control.note_activity();
         self.refresh_toolbar();
     }
 
     /// A choice from a toolbar menu.
     pub(in crate::platform::macos) fn toolbar_command(&self, command: Command) {
+        // A menu can stay open for a while before the choice.
+        self.ivars().control.note_activity();
         match command {
             Command::Session(index) => {
                 let target = {

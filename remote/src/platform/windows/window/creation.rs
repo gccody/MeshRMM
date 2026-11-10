@@ -74,8 +74,7 @@ pub(in crate::platform::windows) unsafe fn create_window(
         let _ = unsafe { EnableWindow(controls.chroma_buttons[1].0, false) };
     }
     context.layout_toolbar(window);
-    context.set_quality(context.control.quality_preset());
-    context.set_chroma(context.control.chroma_mode());
+    context.reapply_quality();
     let _ = unsafe { ShowWindow(window, SW_SHOW) };
     close_launch_status();
     Ok(window)

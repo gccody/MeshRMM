@@ -72,6 +72,21 @@ impl WindowContext {
         self.show_chroma(self.control.chroma_mode());
     }
 
+    /// Applies the session's quality and chroma to a new window. The viewer
+    /// does this by itself, so it is not activity.
+    pub(super) fn reapply_quality(&self) {
+        let preset = self.control.quality_preset();
+        self.control
+            .send_automatic(SessionMessage::SetQuality { preset });
+        self.show_quality(preset);
+        let mode = self.control.chroma_mode();
+        if self.control.supports_chroma(mode) {
+            self.control
+                .send_automatic(SessionMessage::SetChroma { mode });
+        }
+        self.show_chroma(self.control.chroma_mode());
+    }
+
     /// Shows `mode` in the toolbar and settings without sending it.
     pub(super) fn show_chroma(&self, mode: ChromaMode) {
         for (button, candidate) in self.controls().chroma_buttons {
@@ -374,6 +389,7 @@ impl WindowContext {
 
     /// A click on the toolbar item for `action`, at `rect` in the toolbar.
     fn toolbar_action(&self, action: Action, rect: Rect) {
+        self.control.note_activity();
         let window = self.window.get();
         match action {
             Action::User
@@ -465,6 +481,8 @@ impl WindowContext {
 
     /// A choice from a toolbar menu.
     fn toolbar_command(&self, command: Command) {
+        // A menu can stay open for a while before the choice.
+        self.control.note_activity();
         match command {
             Command::Session(index) => {
                 self.release_input();

@@ -103,12 +103,16 @@ impl RemoteView {
         });
     }
 
+    /// Releases every key and button held on the device. The viewer does
+    /// this by itself, on losing focus among others, so it is not activity.
     pub(in crate::platform::macos) fn release_input(&self) {
         self.ivars().keyboard.borrow_mut().reset();
         let display_id = self.ivars().active_display.borrow().id;
         let released = self.ivars().held.borrow_mut().release_all(display_id);
         for input in released {
-            self.send(SessionMessage::Input(input));
+            self.ivars()
+                .control
+                .send_automatic(SessionMessage::Input(input));
         }
     }
 

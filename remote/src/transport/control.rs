@@ -181,6 +181,41 @@ impl ViewerControlQueue {
             .send(SessionMessage::RequestKeyframe { stream_id });
     }
 
+    /// What the viewer window and its presenter send through. Only the
+    /// sink's messages can count as the technician's activity; what the
+    /// transport sends itself through this queue never does.
+    fn control_sink(&self, profiles: &Arc<Vec<VideoProfile>>) -> ControlSink {
+        #[cfg(not(windows))]
+        let _ = profiles;
+        let message_queue = self.clone();
+        let input_gate = self.clone();
+        let resume_state = &self.resume_state;
+        ControlSink::new(ControlSinkParts {
+            idle: Arc::clone(&resume_state.idle),
+            idle_disconnect: Arc::clone(&resume_state.idle_disconnect),
+            clear_clipboard: Arc::clone(&resume_state.clear_clipboard),
+            display_border: Arc::clone(&resume_state.display_border),
+            files: self.files.clone(),
+            chat: self.chat.clone(),
+            audio: resume_state.audio.clone(),
+            recording: self.recording.clone(),
+            send: Arc::new(move |message| message_queue.send(message)),
+            set_input_enabled: Arc::new(move |enabled| input_gate.set_input_enabled(enabled)),
+            maintenance: Arc::clone(&self.maintenance),
+            credentials: Arc::clone(&self.credentials),
+            technician_blocked: Arc::clone(&resume_state.technician_blocked),
+            wallpaper_hidden: Arc::clone(&resume_state.wallpaper_hidden),
+            remote_cursor_hidden: Arc::clone(&resume_state.remote_cursor_hidden),
+            session_close_action: Arc::clone(&resume_state.session_close_action),
+            restarting: Arc::clone(&resume_state.restarting),
+            toolbox: resume_state.toolbox.clone(),
+            quality: Arc::clone(&resume_state.quality),
+            chroma: Arc::clone(&resume_state.chroma),
+            #[cfg(windows)]
+            profiles: Arc::clone(profiles),
+        })
+    }
+
     fn flush_pointer(&self) {
         let pending = self.input.lock().ok().and_then(|mut input| {
             input
@@ -433,7 +468,7 @@ impl ControlHandler {
             .clone();
         let resumed_display =
             self.resumed_display(configuration_sequence, active_display_id, &displays);
-        let sink = self.control_sink(&profiles);
+        let sink = self.viewer_control.control_sink(&profiles);
         self.debug.configure_stream(
             active_display.name.clone(),
             format.width,
@@ -492,39 +527,6 @@ impl ControlHandler {
             *selected = Some(active_display_id);
         }
         resumed_display
-    }
-
-    fn control_sink(&self, profiles: &Arc<Vec<VideoProfile>>) -> ControlSink {
-        #[cfg(not(windows))]
-        let _ = profiles;
-        let viewer_control = &self.viewer_control;
-        let message_queue = viewer_control.clone();
-        let input_gate = viewer_control.clone();
-        let resume_state = &viewer_control.resume_state;
-        ControlSink::new(ControlSinkParts {
-            idle: Arc::clone(&resume_state.idle),
-            idle_disconnect: Arc::clone(&resume_state.idle_disconnect),
-            clear_clipboard: Arc::clone(&resume_state.clear_clipboard),
-            display_border: Arc::clone(&resume_state.display_border),
-            files: viewer_control.files.clone(),
-            chat: viewer_control.chat.clone(),
-            audio: resume_state.audio.clone(),
-            recording: viewer_control.recording.clone(),
-            send: Arc::new(move |message| message_queue.send(message)),
-            set_input_enabled: Arc::new(move |enabled| input_gate.set_input_enabled(enabled)),
-            maintenance: Arc::clone(&viewer_control.maintenance),
-            credentials: Arc::clone(&viewer_control.credentials),
-            technician_blocked: Arc::clone(&resume_state.technician_blocked),
-            wallpaper_hidden: Arc::clone(&resume_state.wallpaper_hidden),
-            remote_cursor_hidden: Arc::clone(&resume_state.remote_cursor_hidden),
-            session_close_action: Arc::clone(&resume_state.session_close_action),
-            restarting: Arc::clone(&resume_state.restarting),
-            toolbox: resume_state.toolbox.clone(),
-            quality: Arc::clone(&resume_state.quality),
-            chroma: Arc::clone(&resume_state.chroma),
-            #[cfg(windows)]
-            profiles: Arc::clone(profiles),
-        })
     }
 
     /// Resets the active presenter for a replacement stream, keeping its
@@ -1013,6 +1015,111 @@ mod tests {
             SessionMessage::SetRecording { enabled: true }
         );
         assert!(first_rx.try_recv().is_err());
+    }
+
+    const IDLE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+    /// A window's sink on a streaming session that disconnects after five
+    /// idle minutes, idle since `start`.
+    fn idle_session(
+        start: std::time::Instant,
+    ) -> (
+        ViewerResumeState,
+        ControlSink,
+        mpsc::UnboundedReceiver<SessionMessage>,
+    ) {
+        let (queue, rx) = active_queue();
+        let state = queue.resume_state.clone();
+        state
+            .idle_disconnect()
+            .set_policy(meshrmm_protocol::IdleDisconnectPolicy {
+                minutes: Some(5),
+                allow_override: true,
+            });
+        state.begin_attempt();
+        state.progress().mark_frame_presented(start);
+        state.idle_disconnect().note_activity(start);
+        (state, queue.control_sink(&Arc::new(Vec::new())), rx)
+    }
+
+    /// What the viewer sends by itself every second while the remote screen
+    /// keeps changing: recovery keyframes, feedback, clipboard and file
+    /// traffic, and the release of keys held when the window lost focus.
+    fn send_machine_messages(sink: &ControlSink, now: std::time::Instant) {
+        let stream_id = meshrmm_protocol::VideoStreamId(1);
+        for message in [
+            SessionMessage::RequestKeyframe { stream_id },
+            SessionMessage::SetBitrate {
+                bits_per_second: 4_000_000,
+            },
+            SessionMessage::Stats(Default::default()),
+            SessionMessage::Clipboard {
+                text: "copied on the device".into(),
+            },
+            SessionMessage::FileTransfer(meshrmm_protocol::FileMessage::Available),
+        ] {
+            sink.send_at(message, now);
+        }
+        sink.send_automatic(SessionMessage::Input(RemoteInput::Key {
+            display_id: DisplayId(1),
+            scan_code: 30,
+            extended: false,
+            pressed: false,
+        }));
+    }
+
+    #[test]
+    fn a_session_with_only_machine_messages_disconnects_when_idle() {
+        let start = std::time::Instant::now();
+        let (state, sink, mut rx) = idle_session(start);
+        for second in 0..IDLE.as_secs() {
+            let now = start + std::time::Duration::from_secs(second);
+            send_machine_messages(&sink, now);
+            assert_eq!(state.idle_disconnect_expired(now), None);
+        }
+        send_machine_messages(&sink, start + IDLE);
+        assert_eq!(state.idle_disconnect_expired(start + IDLE), Some(5));
+        // The messages still went to the device.
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SessionMessage::RequestKeyframe {
+                stream_id: meshrmm_protocol::VideoStreamId(1)
+            }
+        );
+    }
+
+    #[test]
+    fn a_keystroke_or_a_pointer_move_restarts_the_idle_time() {
+        let minute = std::time::Duration::from_secs(60);
+        let key = SessionMessage::Input(RemoteInput::Key {
+            display_id: DisplayId(1),
+            scan_code: 30,
+            extended: false,
+            pressed: true,
+        });
+        for person in [key, pointer(10, 20)] {
+            let start = std::time::Instant::now();
+            let (state, sink, _rx) = idle_session(start);
+            let typed = start + IDLE - minute;
+            send_machine_messages(&sink, typed - minute);
+            sink.send_at(person.clone(), typed);
+            send_machine_messages(&sink, typed + minute);
+            assert_eq!(
+                state.idle_disconnect_expired(start + IDLE),
+                None,
+                "{person:?}"
+            );
+            assert_eq!(
+                state.idle_disconnect_expired(typed + IDLE - std::time::Duration::from_secs(1)),
+                None,
+                "{person:?}"
+            );
+            assert_eq!(
+                state.idle_disconnect_expired(typed + IDLE),
+                Some(5),
+                "{person:?}"
+            );
+        }
     }
 
     #[tokio::test]
