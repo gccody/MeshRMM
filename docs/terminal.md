@@ -70,7 +70,8 @@ A terminal lasts as long as its browser socket. It ends, and the Agent stops
 the shell and everything it started, when:
 
 - the user closes its tab, the page, or the browser, or the browser loses its
-  connection;
+  connection or sends nothing, not even an answer to a ping, for 75 seconds
+  (a laptop closed or a network gone without the connection closing);
 - the shell exits;
 - nobody has typed in it for the company's idle time: **Settings →
   Terminals → Close idle terminals after** (5 minutes to 8 hours, 30 minutes
@@ -78,8 +79,10 @@ the shell and everything it started, when:
 - the user signs out, is signed out, or loses the permission the terminal
   needs (checked every 30 seconds, and at once after a change that can take
   access away: see [architecture](architecture.md#access-changes));
-- the device goes offline, or its Agent restarts or updates. Automatic Agent
-  updates wait while a terminal is open, as they do for remote sessions.
+- the device goes offline, its Agent restarts or updates, or its terminal
+  socket sends nothing, not even an answer to a ping, for 60 seconds.
+  Automatic Agent updates wait while a terminal is open, as they do for
+  remote sessions.
 
 On Windows the shell runs in a job object that kills every process in it when
 the terminal closes. On macOS and Linux every process in the shell's session
@@ -142,8 +145,9 @@ Each terminal is recorded on its device:
 - `terminal.open` when the website asks the Agent for it: who, from where,
   `terminal_id`, `shell` and `run_as`.
 - `terminal.close` when it ends, with `reason` (`exited`, `failed`, `closed`,
-  `idle`, `signed_out`, `permission_removed`, `device_offline`,
-  `device_timeout`, `device_disconnected` or `protocol_error`), the
+  `browser_quiet`, `idle`, `signed_out`, `permission_removed`,
+  `device_offline`, `device_timeout`, `device_disconnected`, `device_quiet`
+  or `protocol_error`), the
   `account` and `program` the Agent reported, the `exit_code`, the `error` of
   a shell that couldn't start, and `duration_ms`.
 
@@ -203,7 +207,10 @@ The browser socket closes with a code that says why: 1000 when the shell
 exited or couldn't start, or the terminal was closed; 1003 for a message a
 terminal doesn't take; 4001 sign in again; 4003 the permission was removed;
 4004 the device is offline or didn't open the terminal; 4008 idle; 4009 the
-device disconnected. Both sides ping every 20 seconds.
+device disconnected or stopped answering. The server pings both sockets
+every 20 seconds and judges each side only by what that side sends, pongs
+included, however busy the other side is: it gives up on a browser after 75
+seconds of nothing and on an Agent after 60.
 
 Server: `server/src/terminals/` (the registry of terminals and their limits,
 and the relay), `server/src/api/terminals.rs`. Agent:
