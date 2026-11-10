@@ -4,11 +4,12 @@
 //! rewrite the DACL at any time. These helpers only reuse directories owned by SYSTEM or an
 //! administrator, replace the owner and DACL through a handle that never follows reparse points,
 //! and verify the stored security descriptor before callers write credentials or executables.
-//! State left by an older installation is only read when the same accounts control it.
+//! State left by an older installation is only read when the same accounts control it, and
+//! another product's program is only run when Windows' own accounts control it.
 
 use std::ffi::OsStr;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context, bail};
@@ -20,7 +21,7 @@ use windows::Win32::Security::Authorization::{
     AUTHZ_CLIENT_CONTEXT_HANDLE, AUTHZ_RESOURCE_MANAGER_HANDLE, AUTHZ_RM_FLAG_NO_AUDIT,
     AuthzContextInfoGroupsSids, AuthzFreeContext, AuthzFreeResourceManager,
     AuthzGetInformationFromContext, AuthzInitializeContextFromSid, AuthzInitializeResourceManager,
-    ConvertSecurityDescriptorToStringSecurityDescriptorW,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
     SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
@@ -278,27 +279,16 @@ pub fn read_protected_file(file: &Path) -> anyhow::Result<Option<Vec<u8>>> {
         } else {
             READ_CONTROL | FILE_READ_DATA
         };
-        let Some((handle, information)) = inspect(path, access)? else {
+        let Some(handle) = inspect_protected(
+            path,
+            is_directory,
+            access,
+            forbidden,
+            Trusted::Administrators,
+        )?
+        else {
             return Ok(None);
         };
-        let untrusted = |reason| UntrustedPath {
-            path: path.to_owned(),
-            reason,
-        };
-        // Report planted links as untrusted rather than failing, since a standard user can
-        // create entries in a product folder that inherited the ProgramData ACL.
-        if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-            return Err(untrusted("is a junction, symbolic link, or other reparse point").into());
-        }
-        if (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0) != is_directory {
-            return Err(untrusted(if is_directory {
-                "is not a directory"
-            } else {
-                "is a directory"
-            })
-            .into());
-        }
-        ensure_protected(&handle, path, forbidden)?;
         opened = Some(handle);
     }
     let handle = opened.context("no file was opened")?;
@@ -311,7 +301,47 @@ pub fn read_protected_file(file: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     Ok(Some(contents))
 }
 
-/// Why a file from an older installation cannot be trusted.
+/// Fails with [`UntrustedPath`] unless only SYSTEM, Administrators and TrustedInstaller could have
+/// written `program` or put it in place, for another product's program that the LocalSystem Agent
+/// runs. The program and every folder from it up to `install`, the product's folder, must be owned
+/// by those accounts and let no other account change them or add entries, where a planted library
+/// would load. The folders above `install`, up to the volume root, must not let another account
+/// rename or replace their entries; ProgramData and the root let Users create new ones. None may
+/// be a reparse point, so a planted junction cannot borrow a trusted folder's security.
+pub fn ensure_trusted_program(install: &Path, program: &Path) -> anyhow::Result<()> {
+    let mut components = program.components();
+    let on_local_disk = matches!(
+        components.next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+    ) && components.next() == Some(Component::RootDir)
+        && components.all(|component| matches!(component, Component::Normal(_)));
+    if !on_local_disk || program == install || !program.starts_with(install) {
+        bail!(
+            "{} is not a program in {} on a local disk",
+            program.display(),
+            install.display()
+        );
+    }
+    let _privileges = Privileges::enable()?;
+    for (index, path) in program.ancestors().enumerate() {
+        let forbidden = if path.starts_with(install) {
+            MODIFY_RIGHTS
+        } else {
+            REPLACE_RIGHTS
+        };
+        let found = inspect_protected(path, index > 0, READ_CONTROL, forbidden, Trusted::System)?;
+        if found.is_none() {
+            return Err(UntrustedPath {
+                path: path.to_owned(),
+                reason: "does not exist",
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Why a file from an older installation, or a program the Agent would run, cannot be trusted.
 #[derive(Debug)]
 pub struct UntrustedPath {
     path: PathBuf,
@@ -369,9 +399,104 @@ fn inspect(
     }
 }
 
-/// Fails with [`UntrustedPath`] unless SYSTEM or an administrator owns the object and no ACE that
-/// applies to it grants any `forbidden` right to another account.
-fn ensure_protected(handle: &OwnedHandle, path: &Path, forbidden: u32) -> anyhow::Result<()> {
+/// The accounts that may own and change what the Agent trusts.
+#[derive(Clone, Copy)]
+enum Trusted {
+    /// SYSTEM, Administrators, any of its members and the Agent's own account, which leave the
+    /// Agent's own state.
+    Administrators,
+    /// SYSTEM, Administrators and TrustedInstaller only, for another product's files, which
+    /// Windows' and Chocolatey's installers give to these accounts rather than to a person's.
+    System,
+}
+
+impl Trusted {
+    fn includes(self, sid: PSID) -> anyhow::Result<bool> {
+        match self {
+            Self::Administrators => is_trusted_account(sid),
+            Self::System => Ok(unsafe {
+                IsWellKnownSid(sid, WinLocalSystemSid).as_bool()
+                    || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool()
+            } || sid_string(sid)? == TRUSTED_INSTALLER_SID),
+        }
+    }
+
+    fn untrusted_owner(self) -> &'static str {
+        match self {
+            Self::Administrators => "is owned by an account other than SYSTEM or an administrator",
+            Self::System => {
+                "is owned by an account other than SYSTEM, Administrators or TrustedInstaller"
+            }
+        }
+    }
+
+    fn untrusted_access(self) -> &'static str {
+        match self {
+            Self::Administrators => {
+                "lets an account other than SYSTEM or an administrator modify it"
+            }
+            Self::System => {
+                "lets an account other than SYSTEM, Administrators or TrustedInstaller modify it"
+            }
+        }
+    }
+}
+
+/// NT SERVICE\TrustedInstaller, which owns Windows' own files.
+const TRUSTED_INSTALLER_SID: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+fn sid_string(sid: PSID) -> anyhow::Result<String> {
+    let mut string = PWSTR::null();
+    unsafe { ConvertSidToStringSidW(sid, &mut string) }.context("failed to read a SID")?;
+    let text = unsafe { string.to_string() };
+    unsafe {
+        LocalFree(Some(HLOCAL(string.0.cast())));
+    }
+    Ok(text?)
+}
+
+/// Opens `path` without following reparse points and checks it with [`ensure_protected`], or
+/// returns `None` if it does not exist.
+fn inspect_protected(
+    path: &Path,
+    is_directory: bool,
+    access: FILE_ACCESS_RIGHTS,
+    forbidden: u32,
+    trusted: Trusted,
+) -> anyhow::Result<Option<OwnedHandle>> {
+    let Some((handle, information)) = inspect(path, access)? else {
+        return Ok(None);
+    };
+    let untrusted = |reason| UntrustedPath {
+        path: path.to_owned(),
+        reason,
+    };
+    // Report planted links as untrusted rather than failing, since a standard user can create
+    // entries in ProgramData and in product folders that inherited its ACL.
+    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err(untrusted("is a junction, symbolic link, or other reparse point").into());
+    }
+    if (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0) != is_directory {
+        return Err(untrusted(if is_directory {
+            "is not a directory"
+        } else {
+            "is a directory"
+        })
+        .into());
+    }
+    ensure_protected(&handle, path, forbidden, trusted)?;
+    Ok(Some(handle))
+}
+
+/// Fails with [`UntrustedPath`] unless a `trusted` account owns the object and no ACE that applies
+/// to it grants any `forbidden` right to another account.
+fn ensure_protected(
+    handle: &OwnedHandle,
+    path: &Path,
+    forbidden: u32,
+    trusted: Trusted,
+) -> anyhow::Result<()> {
     let untrusted = |reason| UntrustedPath {
         path: path.to_owned(),
         reason,
@@ -394,10 +519,8 @@ fn ensure_protected(handle: &OwnedHandle, path: &Path, forbidden: u32) -> anyhow
     .ok()
     .with_context(|| format!("failed to read the security of {}", path.display()))?;
     let _descriptor = LocalDescriptor(descriptor);
-    if !is_trusted_account(owner)? {
-        return Err(
-            untrusted("is owned by an account other than SYSTEM or an administrator").into(),
-        );
+    if !trusted.includes(owner)? {
+        return Err(untrusted(trusted.untrusted_owner()).into());
     }
     if dacl.is_null() {
         return Err(untrusted("has no DACL, so every account can modify it").into());
@@ -413,12 +536,12 @@ fn ensure_protected(handle: &OwnedHandle, path: &Path, forbidden: u32) -> anyhow
         if u32::from(header.AceFlags) & INHERIT_ONLY_ACE.0 != 0 {
             continue;
         }
-        let trusted = match header.AceType {
+        let allowed = match header.AceType {
             ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => {
                 // Callback ACEs only append condition data after the SID.
                 let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
                 allowed.Mask & forbidden == 0
-                    || is_trusted_account(PSID((&raw const allowed.SidStart).cast_mut().cast()))?
+                    || trusted.includes(PSID((&raw const allowed.SidStart).cast_mut().cast()))?
             }
             // Object and compound ACEs place the SID elsewhere; Agent files never carry them.
             ACCESS_ALLOWED_COMPOUND_ACE_TYPE
@@ -429,11 +552,8 @@ fn ensure_protected(handle: &OwnedHandle, path: &Path, forbidden: u32) -> anyhow
             // Deny, audit, and label ACEs grant nothing.
             _ => true,
         };
-        if !trusted {
-            return Err(untrusted(
-                "lets an account other than SYSTEM or an administrator modify it",
-            )
-            .into());
+        if !allowed {
+            return Err(untrusted(trusted.untrusted_access()).into());
         }
     }
     Ok(())

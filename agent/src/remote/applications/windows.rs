@@ -124,13 +124,35 @@ fn winget() -> Option<PathBuf> {
     alias.exists().then_some(alias)
 }
 
+/// Chocolatey's `bin\choco.exe`, if it is installed and only SYSTEM,
+/// Administrators and TrustedInstaller could have put it there. Standard
+/// users may create folders in ProgramData, so on a computer without
+/// Chocolatey one could plant a `choco.exe` for the service to run.
 fn chocolatey() -> Option<PathBuf> {
-    let program_data = std::env::var_os("ChocolateyInstall")
+    let install = std::env::var_os("ChocolateyInstall")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("ProgramData").map(|data| Path::new(&data).join("chocolatey")))
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData\chocolatey"));
-    let choco = program_data.join(r"bin\choco.exe");
-    choco.is_file().then_some(choco)
+    let choco = install.join(r"bin\choco.exe");
+    if !choco.is_file() {
+        return None;
+    }
+    // The shim in `bin` runs the `choco.exe` in the Chocolatey folder.
+    let trusted = [choco.clone(), install.join("choco.exe")]
+        .iter()
+        .try_for_each(|program| {
+            crate::private_directory::ensure_trusted_program(&install, program)
+        });
+    match trusted {
+        Ok(()) => Some(choco),
+        Err(error) => {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "not using Chocolatey, since an account other than SYSTEM, Administrators or TrustedInstaller could have changed it"
+            );
+            None
+        }
+    }
 }
 
 /// The package managers this computer has.
