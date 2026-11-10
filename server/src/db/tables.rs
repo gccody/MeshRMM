@@ -733,6 +733,16 @@ pub enum DeviceUpdateStatus {
     RebootPending,
     RebootPendingSince,
     PendingHash,
+    PendingCount,
+    SecurityCount,
+    CriticalCount,
+    OldestPendingAt,
+    LastInstallId,
+    LastInstallStatus,
+    LastInstallCreatedAt,
+    LastInstallCompletedAt,
+    LastInstallInstalled,
+    LastInstallFailed,
 }
 
 #[derive(Iden)]

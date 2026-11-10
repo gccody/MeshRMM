@@ -5,10 +5,12 @@
 //! are jobs (`POST /v1/jobs`).
 use axum::{
     Json,
-    extract::{Path, Query as QueryParameters, State},
+    extract::{Path, Query as QueryParameters, State, rejection::QueryRejection},
     http::StatusCode,
 };
-use meshrmm_protocol_types::{MAX_REBOOT_DELAY_MINUTES, RebootBehavior, UpdateCategory};
+use meshrmm_protocol_types::{
+    DevicePlatform, MAX_REBOOT_DELAY_MINUTES, RebootBehavior, UpdateCategory,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -22,7 +24,7 @@ use crate::{
     updates::{
         self,
         runs::{self, Filter, Install, Kind, NewRun, Run},
-        store::{self, Pending},
+        store::{self, FleetFilter, FleetPage, FleetStatus, Pending},
     },
     users::new_id,
 };
@@ -60,10 +62,8 @@ pub async fn get(
     actor.require(Permission::UpdatesView)?;
     let id = device(&state, &id).await?;
     let mut database = &state.database;
-    let summary = store::summaries(&mut database, Some(&id), &state.agents.connected())
+    let summary = store::summary(&mut database, &id, state.agents.is_connected(&id))
         .await?
-        .into_iter()
-        .next()
         .ok_or_else(|| ApiError::not_found("Device not found"))?;
     let scanning = match runs::pending(&mut database, &id, Kind::Scan).await? {
         Some(run_id) => runs::get(&mut database, &run_id, false)
@@ -141,8 +141,9 @@ async fn start(
         .agents
         .send(device_id, runs::command(&id, kind, install))
     {
-        let mut database = &state.database;
-        runs::discard(&mut database, &id).await?;
+        let mut transaction = state.database.begin().await?;
+        runs::discard(&mut transaction, &id).await?;
+        transaction.commit().await?;
         return Err(offline());
     }
     updates::publish_run(state, &id).await;
@@ -319,12 +320,61 @@ pub async fn get_run(
         .ok_or_else(|| ApiError::not_found("Update run not found"))
 }
 
-/// `GET /v1/updates/devices`: every device's updates at a glance.
+const DEFAULT_FLEET_LIMIT: u64 = 100;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetParameters {
+    /// Part of the device's name, in any case.
+    query: Option<String>,
+    /// A company ID, or `none` for devices in no company.
+    company: Option<String>,
+    tag: Option<String>,
+    platform: Option<DevicePlatform>,
+    status: Option<FleetStatus>,
+    /// 0 for only the counts.
+    limit: Option<u64>,
+    offset: Option<u64>,
+}
+
+/// `GET /v1/updates/devices?query=&company=&tag=&platform=&status=&limit=&offset=`:
+/// a page of the devices' updates at a glance, most urgent first, with how
+/// many devices match and the whole fleet's totals.
 pub async fn devices(
     State(state): State<AppState>,
     actor: Authorized,
-) -> Result<Json<Value>, ApiError> {
+    parameters: Result<QueryParameters<FleetParameters>, QueryRejection>,
+) -> Result<Json<FleetPage>, ApiError> {
     actor.require(Permission::UpdatesView)?;
-    let devices = store::summaries(&mut &state.database, None, &state.agents.connected()).await?;
-    Ok(Json(json!({ "devices": devices })))
+    // Refused, like any other mistake, as an error the website can show.
+    let QueryParameters(parameters) =
+        parameters.map_err(|rejection| ApiError::bad_request(rejection.body_text()))?;
+    let filter = FleetFilter {
+        query: parameters.query,
+        company_id: match parameters.company.as_deref() {
+            None | Some("") => None,
+            Some("none") => Some(None),
+            Some(id) => Some(Some(parse_id(id, "company")?)),
+        },
+        tag_id: match parameters.tag.as_deref() {
+            None | Some("") => None,
+            Some(id) => Some(parse_id(id, "tag")?),
+        },
+        platform: parameters.platform,
+        status: parameters.status,
+    };
+    let limit = parameters
+        .limit
+        .unwrap_or(DEFAULT_FLEET_LIMIT)
+        .min(MAX_LIMIT);
+    let page = store::fleet_page(
+        &mut &state.database,
+        &filter,
+        now_ms(),
+        limit,
+        parameters.offset.unwrap_or(0),
+        |id| state.agents.is_connected(id),
+    )
+    .await?;
+    Ok(Json(page))
 }

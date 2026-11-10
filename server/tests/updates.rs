@@ -294,6 +294,11 @@ async fn scans_that_list_the_same_updates_write_only_their_status() {
         );
         let first_seen =
             device_updates(&mut admin, id).await["updates"][0]["first_seen_at"].clone();
+        assert_eq!(
+            counts_of(&mut admin, id).await,
+            json!([2, 1, 0, now]),
+            "{name}"
+        );
         mark(&app, id, "a").await;
 
         // The same updates in another order: the list stays, the status
@@ -316,6 +321,11 @@ async fn scans_that_list_the_same_updates_write_only_their_status() {
         assert_eq!(shown["updates"][0]["first_seen_at"], first_seen);
         assert_eq!(shown["status"]["scanned_at"], 2, "{name}");
         assert_eq!(shown["status"]["received_at"], now + 1_000);
+        assert_eq!(
+            counts_of(&mut admin, id).await,
+            json!([2, 1, 0, now]),
+            "{name}: an unchanged list keeps its counts"
+        );
 
         // A restart pending is the scan's own, not the list's.
         assert_eq!(
@@ -353,6 +363,11 @@ async fn scans_that_list_the_same_updates_write_only_their_status() {
         assert_eq!(shown["status"]["scan_error"], "dnf failed", "{name}");
         assert_eq!(shown["status"]["received_at"], now + 4_000);
         assert_eq!(
+            counts_of(&mut admin, id).await,
+            json!([2, 1, 0, now]),
+            "{name}"
+        );
+        assert_eq!(
             store(&app, id, scan_at(6, listed(), true), now + 5_000).await,
             Stored::Unchanged {
                 reboot_changed: false
@@ -379,6 +394,31 @@ async fn scans_that_list_the_same_updates_write_only_their_status() {
         let shown = device_updates(&mut admin, id).await;
         assert_eq!(titles(&shown), ["Update a"], "{name}");
         assert_eq!(shown["updates"][0]["first_seen_at"], first_seen);
+        assert_eq!(
+            counts_of(&mut admin, id).await,
+            json!([1, 1, 0, now]),
+            "{name}"
+        );
+        assert_eq!(
+            store(
+                &app,
+                id,
+                scan_at(
+                    7,
+                    vec![update("a", "security"), update("n", "critical")],
+                    true
+                ),
+                now + 6_500
+            )
+            .await,
+            Stored::Replaced,
+            "{name}"
+        );
+        assert_eq!(
+            counts_of(&mut admin, id).await,
+            json!([2, 1, 1, now]),
+            "{name}"
+        );
 
         // Once the device's updates are removed, the same scan stores them
         // again.
@@ -396,8 +436,49 @@ async fn scans_that_list_the_same_updates_write_only_their_status() {
         );
         let shown = device_updates(&mut admin, id).await;
         assert_eq!(titles(&shown), ["Update a"], "{name}");
+        assert_eq!(
+            counts_of(&mut admin, id).await,
+            json!([1, 1, 0, now + 7_000]),
+            "{name}"
+        );
+
+        // Nothing pending counts nothing.
+        assert_eq!(
+            store(&app, id, scan_at(9, vec![], false), now + 8_000).await,
+            Stored::Replaced,
+            "{name}"
+        );
+        assert_eq!(
+            counts_of(&mut admin, id).await,
+            json!([0, 0, 0, null]),
+            "{name}"
+        );
         app.finish().await;
     }
+}
+
+/// The device's pending, security and critical counts and its oldest
+/// pending update's first sighting, which its Updates tab and the fleet
+/// show alike.
+async fn counts_of(browser: &mut Browser, device_id: &str) -> Value {
+    let counts = |summary: &Value| {
+        json!([
+            summary["pending"],
+            summary["security"],
+            summary["critical"],
+            summary["oldest_pending_at"]
+        ])
+    };
+    let status = device_updates(browser, device_id).await["status"].clone();
+    let page = fleet(browser, "").await;
+    let row = page["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["device_id"] == device_id)
+        .unwrap();
+    assert_eq!(counts(&status), counts(row));
+    counts(row)
 }
 
 #[tokio::test]
@@ -497,6 +578,11 @@ async fn users_scan_and_install_on_a_device_and_see_its_history() {
         assert_eq!(progress["run"]["progress_percent"], 50);
         let shown = device_updates(&mut tech, &desk.device_id).await;
         assert_eq!(shown["status"]["installing"]["id"], install_id);
+        let page = fleet(&mut tech, "").await;
+        assert_eq!(page["devices"][0]["installing"], true, "{name}");
+        assert_eq!(page["devices"][0]["pending"], 2);
+        assert_eq!(page["devices"][0]["security"], 1);
+        assert_eq!(page["totals"]["security"], 1);
 
         send_json(
             &mut control,
@@ -535,6 +621,16 @@ async fn users_scan_and_install_on_a_device_and_see_its_history() {
         .await;
         assert_eq!(titles(&shown), ["Update vim"]);
         assert_eq!(shown["status"]["installing"], Value::Null);
+        // The fleet counts what the scan after the install left.
+        let page = fleet(&mut tech, "").await;
+        let row = &page["devices"][0];
+        assert_eq!(row["pending"], 1, "{name}");
+        assert_eq!(row["security"], 0);
+        assert_eq!(row["installing"], false);
+        assert_eq!(row["connected"], true);
+        assert_eq!(row["last_install"]["status"], "partial");
+        assert_eq!(page["totals"]["security"], 0, "{name}");
+        assert_eq!(page["totals"]["failed"], 1);
 
         let history = tech
             .get(&format!(
@@ -1186,6 +1282,401 @@ async fn technicians_see_and_install_updates() {
         let permissions = technician["permissions"].as_array().unwrap();
         assert!(permissions.contains(&json!("updates.view")), "{}", app.name);
         assert!(permissions.contains(&json!("updates.install")));
+        app.finish().await;
+    }
+}
+
+/// A page of the Updates page's fleet.
+async fn fleet(browser: &mut Browser, query: &str) -> Value {
+    let response = browser.get(&format!("/v1/updates/devices{query}")).await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "{query}: {:?}",
+        response.body
+    );
+    response.body
+}
+
+/// The names of a fleet page's devices, in order.
+fn names(page: &Value) -> Vec<String> {
+    page["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|device| device["device_name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// A fleet page's device named `name`.
+fn named<'a>(page: &'a Value, name: &str) -> &'a Value {
+    page["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["device_name"] == name)
+        .unwrap()
+}
+
+/// Removes the pending run `run_id`, as if its Agent had never got it.
+async fn discard(app: &App, run_id: &str) {
+    let mut transaction = app.db().begin().await.unwrap();
+    updates::runs::discard(&mut transaction, run_id)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+}
+
+/// Records an install on the device, as if a user had started it at
+/// `created_at`, and, unless `outcome` is None, the Agent's report of it.
+async fn install(app: &App, device_id: &str, created_at: i64, outcome: Option<&str>) {
+    use updates::runs;
+    let id = format!("run-{device_id}-{created_at}");
+    let mut transaction = app.db().begin().await.unwrap();
+    runs::insert(
+        &mut transaction,
+        &runs::NewRun {
+            id: &id,
+            device_id,
+            kind: runs::Kind::Install,
+            requested_by_user_id: "user",
+            policy_name: None,
+            job_id: None,
+            install: Some(&runs::Install {
+                update_ids: Vec::new(),
+                categories: Vec::new(),
+                reboot: meshrmm_protocol_types::RebootBehavior::Never,
+                reboot_delay_minutes: 5,
+            }),
+            created_at,
+        },
+    )
+    .await
+    .unwrap();
+    if let Some(outcome) = outcome {
+        let result = serde_json::from_value(json!({ "status": outcome })).unwrap();
+        assert!(
+            runs::finish_install(&mut transaction, device_id, &id, result, created_at + 1)
+                .await
+                .unwrap()
+        );
+    }
+    transaction.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_fleet_is_filtered_counted_and_ordered_by_the_server() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let now = now_ms();
+        let acme = admin
+            .post("/v1/companies", json!({ "name": "Acme" }))
+            .await
+            .body["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let servers = admin
+            .post("/v1/tags", json!({ "name": "Servers", "color": "blue" }))
+            .await
+            .body["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let web = app.enroll(&mut admin, "web").await;
+        let crit = app.enroll(&mut admin, "crit").await;
+        let db = app.enroll(&mut admin, "db").await;
+        let mac = app.enroll_on(&mut admin, "Mac", "macos").await;
+        let old = app.enroll_on(&mut admin, "old", "linux").await;
+        let new = app.enroll_on(&mut admin, "new", "linux").await;
+        let zypper = app.enroll_on(&mut admin, "zypper", "linux").await;
+        let moved = admin
+            .put(
+                &format!("/v1/agents/{}/company", web.device_id),
+                json!({ "company_id": acme }),
+            )
+            .await;
+        assert_eq!(moved.status, StatusCode::NO_CONTENT, "{name}");
+        let tagged = admin
+            .post(
+                "/v1/device-tags",
+                json!({ "device_ids": [web.device_id], "add": [servers], "remove": [] }),
+            )
+            .await;
+        assert_eq!(tagged.status, StatusCode::OK, "{:?}", tagged.body);
+
+        let three = vec![
+            update("a", "security"),
+            update("b", "other"),
+            update("c", "other"),
+        ];
+        store(&app, &web.device_id, scan_at(1, three, false), now).await;
+        store(
+            &app,
+            &crit.device_id,
+            scan_at(1, vec![update("k", "critical")], false),
+            now,
+        )
+        .await;
+        store(
+            &app,
+            &db.device_id,
+            scan_at(1, vec![update("x", "other"), update("y", "driver")], false),
+            now,
+        )
+        .await;
+        store(&app, &mac.device_id, scan_at(1, vec![], true), now).await;
+        store(
+            &app,
+            &old.device_id,
+            scan_at(1, vec![], false),
+            now - 5 * DAY_MS,
+        )
+        .await;
+        install(&app, &old.device_id, now - 5 * DAY_MS, Some("partial")).await;
+        store(
+            &app,
+            &zypper.device_id,
+            json!({ "scanned_at_unix_ms": 1, "updates": [], "reboot_pending": false }),
+            now - 9 * DAY_MS,
+        )
+        .await;
+
+        // The most security and critical updates first, then the most
+        // pending, then by name in any case.
+        let all = fleet(&mut admin, "").await;
+        assert_eq!(
+            names(&all),
+            ["web", "crit", "db", "Mac", "new", "old", "zypper"],
+            "{name}"
+        );
+        assert_eq!(all["matching"], 7, "{name}");
+        let totals = json!({ "devices": 7, "pending": 3, "security": 2, "failed": 1, "reboot": 1, "stale": 2 });
+        assert_eq!(
+            all["totals"], totals,
+            "{name}: unsupported devices aren't stale"
+        );
+        let shown = named(&all, "web");
+        assert_eq!(shown["pending"], 3, "{name}");
+        assert_eq!(shown["security"], 1);
+        assert_eq!(shown["critical"], 0);
+        assert_eq!(shown["oldest_pending_at"], now);
+        assert_eq!(shown["company_id"], acme.as_str());
+        assert_eq!(shown["connected"], false);
+        assert_eq!(named(&all, "crit")["critical"], 1);
+        assert_eq!(named(&all, "old")["last_install"]["status"], "partial");
+        assert_eq!(named(&all, "old")["installing"], false);
+        let never = named(&all, "new");
+        assert_eq!(never["pending"], 0, "{name}: never scanned");
+        assert_eq!(never["received_at"], Value::Null);
+        assert_eq!(never["supported"], true);
+        assert_eq!(named(&all, "zypper")["supported"], false);
+
+        // Each filter narrows the list and what matches, never the totals.
+        let by_company = format!("?company={acme}");
+        let by_tag = format!("?tag={servers}");
+        let filters: [(&str, &[&str]); 14] = [
+            ("?query=WE", &["web"]),
+            ("?query=%20ma%20", &["Mac"]),
+            ("?query=%25", &[]),
+            (&by_company, &["web"]),
+            (
+                "?company=none",
+                &["crit", "db", "Mac", "new", "old", "zypper"],
+            ),
+            (&by_tag, &["web"]),
+            ("?platform=macos", &["Mac"]),
+            ("?status=pending", &["web", "crit", "db"]),
+            ("?status=security", &["web", "crit"]),
+            ("?status=failed", &["old"]),
+            ("?status=reboot", &["Mac"]),
+            ("?status=stale", &["new", "old"]),
+            ("?platform=linux&status=stale", &["new", "old"]),
+            ("?platform=windows&status=pending&query=d", &["db"]),
+        ];
+        for (query, expected) in filters {
+            let page = fleet(&mut admin, query).await;
+            assert_eq!(names(&page), expected, "{name}: {query}");
+            assert_eq!(page["matching"], expected.len(), "{name}: {query}");
+            assert_eq!(page["totals"], totals, "{name}: {query}");
+        }
+
+        // Pages, and only the counts.
+        let mut paged = Vec::new();
+        for offset in [0, 3, 6, 9] {
+            let page = fleet(&mut admin, &format!("?limit=3&offset={offset}")).await;
+            assert_eq!(page["matching"], 7, "{name}");
+            paged.extend(names(&page));
+        }
+        assert_eq!(paged, names(&all), "{name}");
+        let counts = fleet(&mut admin, "?limit=0&status=failed").await;
+        assert_eq!(counts["devices"], json!([]), "{name}");
+        assert_eq!(counts["matching"], 1);
+        assert_eq!(counts["totals"], totals);
+
+        // The latest install is the one that counts.
+        install(&app, &old.device_id, now, None).await;
+        let page = fleet(&mut admin, "?status=failed").await;
+        assert!(names(&page).is_empty(), "{name}");
+        assert_eq!(page["totals"]["failed"], 0);
+        let page = fleet(&mut admin, "?query=old").await;
+        assert_eq!(page["devices"][0]["installing"], true, "{name}");
+        assert_eq!(page["devices"][0]["last_install"]["status"], "pending");
+
+        // A device that never scanned has no status row until its first
+        // install, here one that never reported: lost, so failed, and still
+        // never scanned.
+        install(&app, &new.device_id, now - 10 * DAY_MS, None).await;
+        updates::sweep(&app.state, now).await.unwrap();
+        let page = fleet(&mut admin, "?status=failed").await;
+        assert_eq!(names(&page), ["new"], "{name}");
+        let row = &page["devices"][0];
+        assert_eq!(row["last_install"]["status"], "lost", "{name}");
+        assert_eq!(row["received_at"], Value::Null, "{name}");
+        assert_eq!(row["supported"], true);
+        assert_eq!(row["pending"], 0);
+        let stale = fleet(&mut admin, "?status=stale").await;
+        assert_eq!(names(&stale), ["new", "old"], "{name}");
+
+        // An install the Agent never got is discarded: the one before it is
+        // the latest again, or none.
+        install(&app, &new.device_id, now, None).await;
+        assert_eq!(
+            fleet(&mut admin, "?status=failed").await["matching"],
+            0,
+            "{name}"
+        );
+        discard(&app, &format!("run-{}-{now}", new.device_id)).await;
+        let page = fleet(&mut admin, "?status=failed").await;
+        assert_eq!(names(&page), ["new"], "{name}");
+        assert_eq!(page["devices"][0]["last_install"]["status"], "lost");
+        install(&app, &crit.device_id, now, None).await;
+        discard(&app, &format!("run-{}-{now}", crit.device_id)).await;
+        let page = fleet(&mut admin, "?query=crit").await;
+        assert_eq!(page["devices"][0]["last_install"], Value::Null, "{name}");
+        assert_eq!(page["devices"][0]["installing"], false);
+
+        // An install older than the history keeps counts no more.
+        install(&app, &db.device_id, now - 366 * DAY_MS, Some("failed")).await;
+        let page = fleet(&mut admin, "?query=db").await;
+        assert_eq!(page["devices"][0]["last_install"], Value::Null, "{name}");
+        assert_eq!(page["totals"]["failed"], 1, "{name}");
+
+        // Unknown or wrong parameters are refused.
+        for query in [
+            "?nope=1",
+            "?status=broken",
+            "?platform=beos",
+            "?limit=-1",
+            "?company=..%2Fx",
+        ] {
+            let refused = admin.get(&format!("/v1/updates/devices{query}")).await;
+            assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{name}: {query}");
+        }
+        app.finish().await;
+    }
+}
+
+/// Adds `count` devices from the `first`th, named `{prefix} {n % 37}` so
+/// some share names, straight to the database, each with a scan listing a
+/// few updates, some of them security updates.
+async fn add_devices(app: &App, prefix: &str, first: usize, count: usize, now: i64) {
+    let numbers = (first..first + count).collect::<Vec<_>>();
+    for chunk in numbers.chunks(100) {
+        let mut insert = sea_query::Query::insert();
+        insert.into_table(sea_query::Alias::new("agents")).columns(
+            [
+                "id",
+                "name",
+                "platform",
+                "auth_token_hash",
+                "created_at",
+                "updated_at",
+            ]
+            .map(sea_query::Alias::new),
+        );
+        for n in chunk {
+            insert.values_panic([
+                format!("{prefix}-{n:04}").into(),
+                format!("{prefix} {}", n % 37).into(),
+                "linux".into(),
+                "a".repeat(64).into(),
+                now.into(),
+                now.into(),
+            ]);
+        }
+        app.db().execute(&insert).await.unwrap();
+    }
+    for n in numbers {
+        let updates = (0..n % 5)
+            .map(|i| update(&format!("s{i}"), "security"))
+            .chain((0..n % 3).map(|i| update(&format!("o{i}"), "other")))
+            .collect();
+        store(
+            app,
+            &format!("{prefix}-{n:04}"),
+            scan_at(1, updates, false),
+            now,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn fleet_pages_cost_the_same_for_any_fleet_and_miss_no_device() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let now = now_ms();
+        // Authenticating the browser's first request is its own work.
+        fleet(&mut admin, "?limit=2").await;
+        let mut costs = Vec::new();
+        for (first, count) in [(0, 3), (3, 500)] {
+            add_devices(&app, "device", first, count, now).await;
+            let before = app.db().counts();
+            let page = fleet(&mut admin, "?limit=2").await;
+            costs.push(app.db().counts() - before);
+            assert_eq!(page["devices"].as_array().unwrap().len(), 2, "{name}");
+            assert_eq!(page["totals"]["devices"], first + count, "{name}");
+        }
+        assert_eq!(costs[0], costs[1], "{name}");
+        assert_eq!(costs[0].writes, 0, "{name}: {costs:?}");
+
+        // Paging through the fleet sees each device once, in order.
+        let mut seen = Vec::new();
+        loop {
+            let page = fleet(&mut admin, &format!("?offset={}", seen.len())).await;
+            let devices = page["devices"].as_array().unwrap().clone();
+            if devices.is_empty() {
+                break;
+            }
+            assert!(devices.len() <= 100, "{name}: 100 by default");
+            seen.extend(devices);
+        }
+        assert_eq!(seen.len(), 503, "{name}");
+        let ids = seen
+            .iter()
+            .map(|device| device["device_id"].as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 503, "{name}: no device twice");
+        let key = |device: &Value| {
+            (
+                -(device["security"].as_i64().unwrap() + device["critical"].as_i64().unwrap()),
+                -device["pending"].as_i64().unwrap(),
+                device["device_name"].as_str().unwrap().to_lowercase(),
+                device["device_id"].as_str().unwrap().to_owned(),
+            )
+        };
+        let mut sorted = seen.clone();
+        sorted.sort_by_key(key);
+        assert_eq!(seen, sorted, "{name}");
+        let biggest = fleet(&mut admin, "?limit=500").await;
+        assert_eq!(
+            biggest["devices"].as_array().unwrap().len(),
+            200,
+            "{name}: at most 200 a page"
+        );
         app.finish().await;
     }
 }

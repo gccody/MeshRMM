@@ -1,7 +1,7 @@
 // Requests to the updates API.
 import { type AuthorizedFetch, expectJson, jsonBody } from "../../lib/http";
 import type { JobDetail } from "../automation/model";
-import { type DeviceUpdateSummary, type DeviceUpdates, type InstallChoice, type RebootBehavior, type RunKind, type UpdateCategory, type UpdateRun, installBody } from "./model";
+import { type DeviceUpdates, type FleetFilters, type FleetPage, type InstallChoice, type RebootBehavior, type RunKind, type UpdateCategory, type UpdateRun, fleetPagePath, installBody } from "./model";
 
 const device = (id: string) => `/v1/agents/${encodeURIComponent(id)}/updates`;
 
@@ -32,9 +32,10 @@ export async function fetchRun(authorizedFetch: AuthorizedFetch, id: string) {
   return expectJson<UpdateRun>(await authorizedFetch(`/v1/update-runs/${encodeURIComponent(id)}`), "The install could not be loaded.");
 }
 
-export async function fetchFleet(authorizedFetch: AuthorizedFetch) {
-  const { devices } = await expectJson<{ devices: DeviceUpdateSummary[] }>(await authorizedFetch("/v1/updates/devices"), "The devices’ updates could not be loaded.");
-  return devices;
+// The filters' page of the fleet from `offset`, or with a `limit` of 0 the
+// counts alone.
+export async function fetchFleetPage(authorizedFetch: AuthorizedFetch, filters: FleetFilters, offset: number, limit?: number) {
+  return expectJson<FleetPage>(await authorizedFetch(fleetPagePath(filters, offset, limit)), "The devices’ updates could not be loaded.");
 }
 
 // A job that scans, or installs updates, on chosen devices.

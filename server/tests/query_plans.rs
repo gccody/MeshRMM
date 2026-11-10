@@ -4,10 +4,13 @@
 //! the engine builds it, with the same bound parameters.
 mod common;
 
+use meshrmm_protocol_types::DevicePlatform;
 use meshrmm_server::{
     applications::tables::{ApplicationRunItems, ApplicationRuns},
     db::tables::{AlertRemediations, Alerts, FileDeliveries, ScriptRuns, UpdateRuns},
-    maintenance, wake,
+    maintenance,
+    updates::store::{self, FleetFilter, FleetStatus},
+    wake,
 };
 use sea_query::{
     DeleteStatement, Expr, ExprTrait, PostgresQueryBuilder, Query, QueryBuilder, SelectStatement,
@@ -288,6 +291,7 @@ fn statements() -> Vec<(&'static str, Statement, &'static [&'static str])> {
             &["idx_device_ip_addresses_network"],
         ),
     ];
+    statements.extend(fleet_statements());
     statements.extend(
         maintenance::batch_statements(NOW)
             .into_iter()
@@ -300,6 +304,89 @@ fn statements() -> Vec<(&'static str, Statement, &'static [&'static str])> {
             }),
     );
     statements
+}
+
+/// The Updates page's reads of the fleet: each looks up the devices' status
+/// rows by their key, which keep their pending counts and latest installs.
+fn fleet_statements() -> Vec<(&'static str, Statement, &'static [&'static str])> {
+    let narrowed = FleetFilter {
+        query: Some("web".into()),
+        company_id: Some(None),
+        tag_id: Some("tag".into()),
+        platform: Some(DevicePlatform::Windows),
+        status: Some(FleetStatus::Failed),
+    };
+    let status_key: &[&str] = &[
+        "sqlite_autoindex_device_update_status_1",
+        "device_update_status_pkey",
+    ];
+    vec![
+        (
+            "the Updates page's totals",
+            Statement::Select(store::fleet_counts_query(&FleetFilter::default(), NOW)),
+            status_key,
+        ),
+        (
+            "the Updates page's totals and the devices a filter matches",
+            Statement::Select(store::fleet_counts_query(&narrowed, NOW)),
+            status_key,
+        ),
+        (
+            "a page of the Updates page's devices",
+            Statement::Select(store::fleet_page_query(
+                &FleetFilter::default(),
+                NOW,
+                100,
+                200,
+            )),
+            status_key,
+        ),
+        (
+            "a page of the Updates page's devices with failed installs",
+            Statement::Select(store::fleet_page_query(&narrowed, NOW, 100, 0)),
+            status_key,
+        ),
+    ]
+}
+
+/// The tables that grow with each device's updates and runs, which the
+/// fleet's reads leave alone.
+const HISTORY: &[&str] = &["device_pending_updates", "update_runs"];
+
+#[tokio::test]
+async fn the_updates_page_reads_neither_pending_updates_nor_runs() {
+    let mut misses = Vec::new();
+    let mut note = |backend: &str, query: &str, plan: &str| {
+        if let Some(table) = HISTORY.iter().find(|table| plan.contains(*table)) {
+            misses.push(format!("on {backend}, {query} reads {table}:\n{plan}"));
+        }
+    };
+    let sqlite = common::sqlite().await;
+    let mut connection = SqliteConnection::connect(&sqlite.url).await.unwrap();
+    for (query, statement, _) in fleet_statements() {
+        note(
+            "SQLite",
+            query,
+            &sqlite_plan(&mut connection, &statement).await,
+        );
+    }
+    connection.close().await.unwrap();
+    sqlite.drop_database().await;
+
+    if let Some(admin_url) = common::postgres_admin_url() {
+        let postgres = common::postgres(&admin_url).await;
+        let mut connection = PgConnection::connect(&postgres.url).await.unwrap();
+        for (query, statement, _) in fleet_statements() {
+            note(
+                "PostgreSQL",
+                query,
+                &postgres_plan(&mut connection, &statement).await,
+            );
+        }
+        connection.close().await.unwrap();
+        postgres.drop_database().await;
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n\n"));
 }
 
 /// Each table the maintenance task purges, and the index its batches find

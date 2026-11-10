@@ -170,7 +170,13 @@ device page **Install** is refused (`409 install_running`).
   security updates pending, failed installs, restarts pending and devices not
   scanned for three days, by company, [tag](devices.md#tags) and operating
   system; and, for chosen
-  devices, **Scan now** and **Install updates…** as a job.
+  devices, **Scan now** and **Install updates…** as a job. The server
+  filters, orders and counts the fleet and sends it 100 devices at a time,
+  **Show more** for the next; a search asks 300 ms after the last
+  keystroke. Events patch the rows loaded, and the tiles' counts are read
+  again at most every 10 seconds while changes arrive. **Choose all**
+  chooses the devices loaded, and chosen devices stay chosen as the
+  filters change and pages load.
 - **Policies** can scan for updates or install them (chosen categories, or
   all, with the restart choice), on any schedule and target policies have,
   tags included: an install policy on a tag such as "Pilot ring" covers the
@@ -219,7 +225,7 @@ with it.
 | `POST /v1/agents/{id}/updates/install` | `{update_ids, categories, reboot, reboot_delay_minutes}`; IDs win over categories, neither means everything. 202 with the run. `409 device_offline`, `409 install_running`, `400 not_scanned`, `400 unsupported`, `400 selection_unsupported`, `400 invalid_install`. |
 | `GET /v1/update-runs?device_id=&kind=&limit=` | Runs, newest first (50 by default, at most 200); installs with `items`. |
 | `GET /v1/update-runs/{id}` | |
-| `GET /v1/updates/devices` | Every enrolled device's summary. |
+| `GET /v1/updates/devices?query=&company=&tag=&platform=&status=&limit=&offset=` | `{devices, matching, totals}`: a page of enrolled devices' summaries, most security and critical updates first, then most pending, then by name; `matching`, how many devices the filters match; and `totals` (`{devices, pending, security, failed, reboot, stale}`), the whole fleet's counts whatever the filters. `query` is part of the name in any case, `company` an ID or `none`, `status` one of `pending`, `security` (security or critical), `failed` (the latest install failed, partly failed or never reported), `reboot` and `stale` (supported, and no scan report for three days, or never). 100 a page by default, at most 200; `limit=0` for the counts alone. Unknown parameters are refused. |
 | `POST /v1/jobs` | With `updates: {action: "scan"}` or `{action: "install", categories, reboot, reboot_delay_minutes}` instead of a script or file. |
 | `POST/PUT /v1/automation-policies` | With `action` `update_scan` or `update_install` (`update_categories`, `reboot`, `reboot_delay_minutes`). |
 
@@ -256,8 +262,13 @@ reboot_error, created_at, completed_at, items}`. The event socket sends
   events) and `server/src/api/updates.rs`. Jobs and policies gained update
   kinds in `server/src/automation/`; the alert conditions are in
   `server/src/alerts/`.
-- Tables: `device_update_status`, `device_pending_updates`, `update_runs`,
-  `update_run_items`; `jobs` and `automation_policies` have the install's
+- Tables: `device_update_status` (which also keeps each device's pending,
+  security and critical counts and its oldest pending update, written with
+  the pending list, and its latest install, written in the transaction that
+  starts, finishes, loses or discards it, so the Updates page counts,
+  filters and orders the fleet from its devices and status rows alone; a
+  latest install older than the install history is left out, as the purge
+  removes it), `device_pending_updates`, `update_runs`, `update_run_items`; `jobs` and `automation_policies` have the install's
   categories and restart; `alert_rules` has `update_category` and `days`;
   `alerts` has `update_run_id`; `settings` has `update_scan_interval_hours`.
 - Website: `dashboard/features/updates/`.
@@ -269,7 +280,11 @@ reboot_error, created_at, completed_at, items}`. The event socket sends
   website with progress and outcomes, pacman and unsupported devices, update
   jobs and policies, the three alert conditions, lost runs, the setting and
   the schedule Agents are told (on connecting and when the interval
-  changes), and that the engine's pass does no work per device.
+  changes), that the engine's pass does no work per device, and the
+  Updates page's fleet: its filters, states, order, counts and pages, and
+  that a page costs as many statements for any fleet. `--test query_plans`
+  checks the fleet's reads use the status rows' key and read neither
+  pending updates nor runs.
 - `cargo test -p meshrmm-agent updates` runs the parsers of every platform's
   tool output and the schedule's arithmetic (`updates::schedule`: on time,
   overdue, after a restart, off, changed, the jitter, and 10,000 overdue

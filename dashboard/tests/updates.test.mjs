@@ -1,26 +1,29 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  applyFleetAnswer,
   applyRunUpdate,
-  applySummaryUpdate,
   categoryCounts,
+  chooseDevices,
+  countsRefreshDelay,
   describeReboot,
   describeSelection,
   fleetFilterParams,
-  fleetTotals,
+  fleetKey,
+  fleetPagePath,
   formatAge,
   formatDelay,
   installBody,
   installName,
   isStale,
-  matchesFleetFilters,
   parseFleetFilters,
   parseUpdateEvent,
+  patchFleetRow,
   rebootDelayProblem,
+  refreshChosen,
   runRebootText,
   runSummary,
   runTone,
-  sortFleet,
   sortPendingUpdates,
   updateDetail,
 } from "../features/updates/model.ts";
@@ -164,30 +167,101 @@ test("installs take the chosen updates, or categories, and a valid delay", () =>
   assert.ok(rebootDelayProblem(2.5));
 });
 
-test("the fleet filters by name, company, tag, system and state", () => {
-  const devices = [
-    summary("web", { pending: 3, security: 1, company_id: "acme", tag_ids: ["servers"], oldest_pending_at: NOW - 4 * DAY }),
-    summary("mac", { tag_ids: ["london"], platform: "macos", manager: "softwareupdate", reboot_pending: true, reboot_pending_since: NOW - DAY }),
-    summary("old", { received_at: NOW - 5 * DAY, scanned_at: NOW - 5 * DAY, last_install: { id: "r", status: "partial", created_at: 1, completed_at: 2, installed: 1, failed: 1 } }),
-    summary("new", { received_at: null, scanned_at: null }),
-    summary("zypper", { supported: false, manager: null, received_at: NOW - 9 * DAY }),
-  ];
-  const filters = (change) => ({ query: "", company: "", tag: "", platform: "", status: "", ...change });
-  const names = (change) => devices.filter((device) => matchesFleetFilters(device, filters(change), NOW)).map((device) => device.device_name);
-  assert.deepEqual(names({}), ["web", "mac", "old", "new", "zypper"]);
-  assert.deepEqual(names({ query: "WE" }), ["web"]);
-  assert.deepEqual(names({ company: "acme" }), ["web"]);
-  assert.deepEqual(names({ company: "none" }), ["mac", "old", "new", "zypper"]);
-  assert.deepEqual(names({ tag: "london" }), ["mac"]);
-  assert.deepEqual(names({ tag: "gone" }), []);
-  assert.deepEqual(names({ platform: "macos" }), ["mac"]);
-  assert.deepEqual(names({ status: "security" }), ["web"]);
-  assert.deepEqual(names({ status: "reboot" }), ["mac"]);
-  assert.deepEqual(names({ status: "failed" }), ["old"]);
-  assert.deepEqual(names({ status: "stale" }), ["old", "new"], "unsupported devices aren't stale");
-  assert.equal(isStale(devices[0], NOW), false);
-  assert.deepEqual(fleetTotals(devices, NOW), { devices: 5, pending: 1, security: 1, failed: 1, reboot: 1, stale: 2 });
-  assert.deepEqual(sortFleet(devices).map((device) => device.device_name), ["web", "mac", "new", "old", "zypper"]);
+test("a device's last scan is old after three days, unless it has no update manager", () => {
+  assert.equal(isStale(summary("web"), NOW), false);
+  assert.equal(isStale(summary("old", { received_at: NOW - 3 * DAY - 1 }), NOW), true);
+  assert.equal(isStale(summary("new", { received_at: null }), NOW), true);
+  assert.equal(isStale(summary("zypper", { supported: false, received_at: null }), NOW), false);
+});
+
+const NO_FILTERS = { query: "", company: "", tag: "", platform: "", status: "" };
+const TOTALS = { devices: 3, pending: 1, security: 1, failed: 0, reboot: 0, stale: 0 };
+const page = (names, change = {}) => ({ devices: names.map((name) => summary(name)), matching: names.length, totals: TOTALS, ...change });
+
+test("the fleet is asked for a page at a time with the filters", () => {
+  assert.equal(fleetPagePath(NO_FILTERS, 0), "/v1/updates/devices?limit=100");
+  assert.equal(
+    fleetPagePath({ query: " web 1 ", company: "none", tag: "t1", platform: "linux", status: "stale" }, 200),
+    "/v1/updates/devices?query=web+1&company=none&tag=t1&platform=linux&status=stale&limit=100&offset=200",
+  );
+  assert.equal(fleetPagePath({ ...NO_FILTERS, status: "failed" }, 0, 0), "/v1/updates/devices?status=failed&limit=0", "the counts alone");
+  assert.equal(fleetKey({ ...NO_FILTERS, query: "web " }), fleetKey({ ...NO_FILTERS, query: " web" }));
+  assert.notEqual(fleetKey(NO_FILTERS), fleetKey({ ...NO_FILTERS, tag: "t1" }));
+});
+
+test("further pages join the list they were asked for", () => {
+  const all = fleetKey(NO_FILTERS);
+  const first = applyFleetAnswer(null, { kind: "page", key: all, ticket: 1, offset: 0, page: page(["a", "b"], { matching: 5 }) }, all);
+  assert.deepEqual(first.devices.map((device) => device.device_id), ["a", "b"]);
+  assert.equal(first.matching, 5);
+  assert.deepEqual(first.totals, TOTALS);
+  // The fleet moved between pages: "b" comes again, and stays where it was.
+  const second = applyFleetAnswer(first, { kind: "page", key: all, ticket: 2, offset: 2, page: page(["b", "c", "d"], { matching: 6 }) }, all);
+  assert.deepEqual(second.devices.map((device) => device.device_id), ["a", "b", "c", "d"]);
+  assert.equal(second.matching, 6);
+  // A page of other filters doesn't join, nor one asked for before the
+  // list was loaded again.
+  const other = fleetKey({ ...NO_FILTERS, status: "pending" });
+  assert.equal(applyFleetAnswer(second, { kind: "page", key: other, ticket: 3, offset: 4, page: page(["x"]) }, all), second);
+  const reloaded = applyFleetAnswer(second, { kind: "page", key: all, ticket: 5, offset: 0, page: page(["d", "a"]) }, all);
+  assert.deepEqual(reloaded.devices.map((device) => device.device_id), ["d", "a"], "a reload starts over");
+  assert.equal(applyFleetAnswer(reloaded, { kind: "page", key: all, ticket: 4, offset: 4, page: page(["y"]) }, all), reloaded);
+  // New filters start a new list.
+  const narrowed = applyFleetAnswer(reloaded, { kind: "page", key: other, ticket: 6, offset: 0, page: page(["c"]) }, other);
+  assert.equal(narrowed.key, other);
+  assert.deepEqual(narrowed.devices.map((device) => device.device_id), ["c"]);
+});
+
+test("a newer request's answer always wins over an older one's", () => {
+  const all = fleetKey(NO_FILTERS);
+  const security = fleetKey({ ...NO_FILTERS, status: "security" });
+  // Filters changed while the first answer was on its way: only the
+  // answer for the filters wanted now is shown.
+  assert.equal(applyFleetAnswer(null, { kind: "page", key: all, ticket: 1, offset: 0, page: page(["a", "b"]) }, security), null);
+  const shown = applyFleetAnswer(null, { kind: "page", key: security, ticket: 2, offset: 0, page: page(["a"]) }, security);
+  assert.equal(applyFleetAnswer(shown, { kind: "page", key: all, ticket: 1, offset: 0, page: page(["a", "b"]) }, security), shown);
+  // Two loads of the same list: the older answer, arriving last, is dropped.
+  const newer = applyFleetAnswer(shown, { kind: "page", key: security, ticket: 4, offset: 0, page: page(["b"]) }, security);
+  assert.equal(applyFleetAnswer(newer, { kind: "page", key: security, ticket: 3, offset: 0, page: page(["a"]) }, security), newer);
+  // Counts: the newest shown wins; the fleet's totals come from any
+  // filters, how many match only from the list's own.
+  const counted = applyFleetAnswer(newer, { kind: "counts", key: security, ticket: 6, page: page([], { matching: 7, totals: { ...TOTALS, devices: 9 } }) }, security);
+  assert.equal(counted.matching, 7);
+  assert.equal(counted.totals.devices, 9);
+  assert.deepEqual(counted.devices, newer.devices, "counts leave the rows");
+  assert.equal(applyFleetAnswer(counted, { kind: "counts", key: security, ticket: 5, page: page([], { matching: 1, totals: TOTALS }) }, security), counted);
+  const elsewhere = applyFleetAnswer(counted, { kind: "counts", key: all, ticket: 7, page: page([], { matching: 2, totals: { ...TOTALS, devices: 10 } }) }, security);
+  assert.equal(elsewhere.matching, 7);
+  assert.equal(elsewhere.totals.devices, 10);
+  // A page asked for before the newest counts keeps them.
+  const more = applyFleetAnswer(elsewhere, { kind: "page", key: security, ticket: 6, offset: 1, page: page(["c"], { matching: 3 }) }, security);
+  assert.deepEqual(more.devices.map((device) => device.device_id), ["b", "c"]);
+  assert.equal(more.totals.devices, 10);
+  assert.equal(more.matching, 7);
+});
+
+test("events patch loaded rows in place and the counts are read again at most every 10 seconds", () => {
+  const all = fleetKey(NO_FILTERS);
+  const list = applyFleetAnswer(null, { kind: "page", key: all, ticket: 1, offset: 0, page: page(["a", "b"]) }, all);
+  const patched = patchFleetRow(list, summary("b", { pending: 4, installing: true }));
+  assert.deepEqual(patched.devices.map((device) => [device.device_id, device.pending]), [["a", 0], ["b", 4]]);
+  assert.equal(patched.devices[1].installing, true);
+  assert.equal(patchFleetRow(list, summary("unloaded", { pending: 9 })), list, "a device not loaded stays out");
+  assert.equal(patchFleetRow(null, summary("a")), null);
+
+  assert.equal(countsRefreshDelay(0, NOW), 0, "the first change after a quiet while");
+  assert.equal(countsRefreshDelay(NOW - 4_000, NOW), 6_000);
+  assert.equal(countsRefreshDelay(NOW - 10_000, NOW), 0);
+});
+
+test("chosen devices outlive pages and filters, with their newest summaries", () => {
+  const chosen = chooseDevices(new Map(), [summary("a"), summary("b")], true);
+  assert.deepEqual([...chosen.keys()], ["a", "b"]);
+  assert.deepEqual([...chooseDevices(chosen, [summary("a")], false).keys()], ["b"]);
+  const refreshed = refreshChosen(chosen, [summary("b", { pending: 3 }), summary("z", { pending: 1 })]);
+  assert.equal(refreshed.get("b").pending, 3);
+  assert.equal(refreshed.has("z"), false, "refreshing chooses nothing new");
+  assert.equal(refreshChosen(chosen, [summary("z")]), chosen);
 });
 
 test("fleet filters round trip through the address", () => {
@@ -207,9 +281,6 @@ test("socket events update the fleet and the history", () => {
   const changed = run("b", { status: "pending" });
   assert.deepEqual(parseUpdateEvent({ type: "update_run", run: changed }), { type: "update_run", run: changed });
 
-  const fleet = [summary("web"), summary("db")];
-  assert.equal(applySummaryUpdate(fleet, device)[0].pending, 2);
-  assert.equal(applySummaryUpdate(fleet, summary("new")).length, 3);
 
   const items = [{ update_id: "a", title: "A", kb: null, category: "other", outcome: "installed", error: null }];
   const history = [run("a", { created_at: 1, items }), run("b", { created_at: 2, status: "pending" })];
