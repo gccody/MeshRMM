@@ -1234,3 +1234,272 @@ async fn transfers_end_when_their_device_goes_offline() {
         app.finish().await;
     }
 }
+
+/// Sets up a download of a `size`-byte file on `device_id`, and returns its
+/// URL.
+async fn new_download(admin: &Browser, control: &mut Ws, device_id: &str, size: u64) -> String {
+    let call = post(
+        admin,
+        format!("/v1/agents/{device_id}/files/downloads"),
+        json!({ "paths": ["/srv/f.bin"] }),
+    );
+    answer(
+        control,
+        json!({ "reply": "download", "name": "f.bin", "kind": "file", "size": size, "modified": 7, "files": 1 }),
+    )
+    .await;
+    call.await.unwrap().body["url"].as_str().unwrap().to_owned()
+}
+
+/// Sends `request` to `app` in the background; the response's body is left
+/// unread.
+fn respond(
+    app: &App,
+    request: Request<Body>,
+) -> tokio::task::JoinHandle<axum::http::Response<Body>> {
+    let state = app.state.clone();
+    tokio::spawn(async move {
+        meshrmm_server::http::router(state)
+            .oneshot(request)
+            .await
+            .unwrap()
+    })
+}
+
+/// How the latest attempt of the download at `url` went.
+async fn progress(admin: &Browser, url: &str) -> Value {
+    admin.clone().get(&format!("{url}/progress")).await.body["progress"].clone()
+}
+
+#[tokio::test]
+async fn abandoned_requests_and_downloads_leave_nothing_behind() {
+    for app in apps_with(quick).await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let (agent, mut control) = enrolled(&app, &mut admin, &server).await;
+
+        // The browser goes away while the device works on a listing.
+        let call = get(
+            &admin,
+            format!("/v1/agents/{}/files?path=/", agent.device_id),
+        );
+        assert_eq!(receive_json(&mut control).await["type"], "file_request");
+        assert_eq!(app.state.files.pending_requests(), 1, "{name}");
+        call.abort();
+        assert!(matches!(call.await, Err(error) if error.is_cancelled()));
+        assert_eq!(
+            app.state.files.pending_requests(),
+            0,
+            "{name}: the request is forgotten"
+        );
+
+        // Or while the device starts a download.
+        let url = new_download(&admin, &mut control, &agent.device_id, 1000).await;
+        let fetching = respond(
+            &app,
+            admin
+                .request(Method::GET, &url)
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let (_, socket) = next_transfer(&server, &agent, &mut control).await;
+        assert_eq!(progress(&admin, &url).await["state"], "sending", "{name}");
+        fetching.abort();
+        assert!(matches!(fetching.await, Err(error) if error.is_cancelled()));
+        let progress = progress(&admin, &url).await;
+        assert_eq!(progress["state"], "failed", "{name}: {progress}");
+        assert_eq!(app.state.files.transfers_on(&agent.device_id), 0, "{name}");
+        drop(socket);
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn transfers_refuse_what_the_device_misreports() {
+    for app in apps_with(quick).await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let (agent, mut control) = enrolled(&app, &mut admin, &server).await;
+        let url = new_download(&admin, &mut control, &agent.device_id, 1000).await;
+
+        // A file without a size, sizes past the end or the limit, and a part
+        // other than the one asked for: each a plain error, and failed.
+        let cases = [
+            (json!({ "type": "begin" }), None),
+            (
+                json!({ "type": "begin", "size": u64::MAX }),
+                Some("bytes=10-"),
+            ),
+            (
+                json!({ "type": "begin", "size": u64::MAX - 5 }),
+                Some("bytes=10-"),
+            ),
+            (json!({ "type": "begin", "size": 5_u64 << 40 }), None),
+            (json!({ "type": "begin", "size": 900 }), Some("bytes=10-19")),
+        ];
+        for (begin, range) in cases {
+            let mut request = admin.request(Method::GET, &url);
+            if let Some(range) = range {
+                request = request.header("range", range);
+            }
+            let fetching = respond(&app, request.body(Body::empty()).unwrap());
+            let (_, mut socket) = next_transfer(&server, &agent, &mut control).await;
+            event(&mut socket, begin.clone()).await;
+            let response = tokio::time::timeout(common::SOCKET_WAIT, fetching)
+                .await
+                .expect("the download answers")
+                .expect("the server doesn't panic");
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_GATEWAY,
+                "{name}: {begin}"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], "bad_device_reply", "{name}: {begin}");
+            let progress = progress(&admin, &url).await;
+            assert_eq!(progress["state"], "failed", "{name}: {begin}: {progress}");
+            assert_eq!(app.state.files.transfers_on(&agent.device_id), 0);
+        }
+
+        // More bytes than it announced abort the response.
+        let fetching = respond(
+            &app,
+            admin
+                .request(Method::GET, &url)
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let (_, mut socket) = next_transfer(&server, &agent, &mut control).await;
+        event(&mut socket, json!({ "type": "begin", "size": 3 })).await;
+        send(&mut socket, Message::Binary(Bytes::from_static(b"abcde"))).await;
+        let response = fetching.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        assert!(response.into_body().collect().await.is_err(), "{name}");
+        let progress = progress(&admin, &url).await;
+        assert_eq!(progress["state"], "failed", "{name}: {progress}");
+        assert_eq!(
+            progress["error"],
+            "the device sent more than the file holds"
+        );
+
+        // An upload's device can't have more than it was sent, or than the
+        // upload holds.
+        let upload = new_upload(&admin, &mut control, &agent.device_id, "/srv/u", 3).await;
+        let request = admin
+            .request(Method::PUT, &format!("{upload}?offset=0"))
+            .body(Body::from(b"abc".to_vec()))
+            .unwrap();
+        let sending = {
+            let mut browser = admin.clone();
+            tokio::spawn(async move { browser.raw(request).await })
+        };
+        let (_, mut socket) = next_transfer(&server, &agent, &mut control).await;
+        event(&mut socket, json!({ "type": "ready", "received": 0 })).await;
+        assert_eq!(uploaded(&mut socket).await, (b"abc".to_vec(), true));
+        event(&mut socket, json!({ "type": "done", "bytes": u64::MAX })).await;
+        let sent = sending.await.unwrap();
+        assert_eq!(sent.status, 502, "{name}: {:?}", sent.body);
+        assert_eq!(sent.code(), "bad_device_reply");
+        let call = get(&admin, upload.clone());
+        answer(&mut control, json!({ "reply": "upload", "received": 4 })).await;
+        assert_eq!(call.await.unwrap().status, 502, "{name}");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn downloads_whose_browser_stops_reading_end() {
+    for app in apps_with(stalls_quickly).await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let (agent, mut control) = enrolled(&app, &mut admin, &server).await;
+        let content: Vec<u8> = (0..5_000u32).map(|index| (index % 251) as u8).collect();
+        let url = new_download(&admin, &mut control, &agent.device_id, content.len() as u64).await;
+
+        // The browser keeps its connection but takes nothing.
+        let fetching = respond(
+            &app,
+            admin
+                .request(Method::GET, &url)
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let (_, mut socket) = next_transfer(&server, &agent, &mut control).await;
+        event(
+            &mut socket,
+            json!({ "type": "begin", "size": content.len(), "modified": 7 }),
+        )
+        .await;
+        for piece in content.chunks(1_000) {
+            send(&mut socket, Message::Binary(piece.to_vec().into())).await;
+        }
+        let response = fetching.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        loop {
+            match tokio::time::timeout(common::SOCKET_WAIT, socket.next())
+                .await
+                .expect("the server lets the Agent's socket go")
+            {
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                Some(Ok(other)) => panic!("{name}: {other:?}"),
+            }
+        }
+        assert_eq!(
+            app.state.files.transfers_on(&agent.device_id),
+            0,
+            "{name}: the transfer's place is free"
+        );
+        let progress_now = progress(&admin, &url).await;
+        assert_eq!(progress_now["state"], "failed", "{name}: {progress_now}");
+        assert_eq!(
+            progress_now["error"],
+            "the browser stopped taking the download"
+        );
+        let recorded = wait_for_audit(&app, "files.download", 1).await;
+        assert_eq!(recorded[0].metadata["result"], "failed", "{name}");
+        // What it reads later doesn't pass for the whole file.
+        assert!(response.into_body().collect().await.is_err(), "{name}");
+
+        // One that reads slowly, each pause shorter than the limit, gets it.
+        let fetching = respond(
+            &app,
+            admin
+                .request(Method::GET, &url)
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let (_, mut socket) = next_transfer(&server, &agent, &mut control).await;
+        event(
+            &mut socket,
+            json!({ "type": "begin", "size": content.len(), "modified": 7 }),
+        )
+        .await;
+        for piece in content.chunks(1_000) {
+            send(&mut socket, Message::Binary(piece.to_vec().into())).await;
+        }
+        event(
+            &mut socket,
+            json!({ "type": "done", "bytes": content.len(), "sha256": hex(&content) }),
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        let mut body = fetching.await.unwrap().into_body();
+        let mut got = Vec::new();
+        while let Some(frame) = body.frame().await {
+            got.extend_from_slice(&frame.unwrap().into_data().unwrap());
+            tokio::time::sleep(STALL / 3).await;
+        }
+        assert_eq!(got, content, "{name}");
+        assert!(
+            started.elapsed() > STALL,
+            "{name}: the reading outlasted the limit"
+        );
+        assert_eq!(progress(&admin, &url).await["state"], "done", "{name}");
+        app.finish().await;
+    }
+}

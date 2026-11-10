@@ -500,6 +500,9 @@ pub async fn create_upload(
     else {
         return Err(unexpected());
     };
+    if received > upload.size {
+        return Err(unexpected());
+    }
     state.files.add_upload(upload.clone())?;
     Ok((StatusCode::CREATED, Json(upload_view(&upload, received))))
 }
@@ -527,7 +530,10 @@ pub async fn upload_status(
         path: upload.path.clone(),
     };
     match files::ask(&state, &actor, &upload.device_id, upload.run_as, operation).await? {
-        FileReply::Upload { received } => Ok(Json(upload_view(&upload, received))),
+        // A device can't have more of an upload than it holds.
+        FileReply::Upload { received } if received <= upload.size => {
+            Ok(Json(upload_view(&upload, received)))
+        }
         _ => Err(unexpected()),
     }
 }
