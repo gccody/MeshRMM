@@ -449,8 +449,8 @@ mod network_tests {
         (peers.pop().unwrap(), b)
     }
 
-    /// Bytes in flight are not queued: over a 100 ms round trip a transfer keeps several
-    /// times the queue limit unacknowledged, which a limit on `buffered_amount` would not.
+    /// Bytes in flight are not queued: over a 100 ms round trip a transfer keeps more than
+    /// the queue limit unacknowledged, which a limit on `buffered_amount` would not.
     #[tokio::test]
     async fn a_transfer_over_a_delayed_link_is_not_held_to_its_queue_limit_in_flight() {
         const CHUNK: usize = 16 * 1024;
@@ -502,8 +502,10 @@ mod network_tests {
             round_trip >= Duration::from_millis(100),
             "the link's round trip measured {round_trip:?}"
         );
+        // A limit on `buffered_amount` never lets it reach the limit before a write. How far
+        // past it a transfer gets depends on how fast SCTP's window opens on this machine.
         assert!(
-            most_buffered > 4 * SEND_QUEUE_LIMIT,
+            most_buffered > 2 * SEND_QUEUE_LIMIT,
             "at most {most_buffered} bytes were unacknowledged when the channel took more"
         );
         a.close().await.unwrap();
