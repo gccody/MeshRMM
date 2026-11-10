@@ -1,7 +1,8 @@
 use super::*;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum SettingsCategory {
+    #[default]
     Display,
     Advanced,
     Keyboard,
@@ -103,10 +104,13 @@ pub(super) unsafe extern "system" fn settings_window_proc(
         WM_COMMAND => {
             let control_id = wparam.0 & 0xffff;
             let notification = (wparam.0 >> 16) & 0xffff;
+            let Some(context) = (unsafe { window_context(owner) }) else {
+                return unsafe { DefWindowProcW(window, message, wparam, lparam) };
+            };
+            // The control may show what the session has not taken.
+            context.forget_settings_view();
             // A click or a choice in the settings is the technician's.
-            if (notification == BN_CLICKED as usize || notification == CBN_SELCHANGE as usize)
-                && let Some(context) = unsafe { window_context(owner) }
-            {
+            if notification == BN_CLICKED as usize || notification == CBN_SELCHANGE as usize {
                 context.control.note_activity();
             }
             for (tab, category) in [
@@ -115,17 +119,11 @@ pub(super) unsafe extern "system" fn settings_window_proc(
                 (SETTINGS_KEYBOARD_TAB_ID, SettingsCategory::Keyboard),
             ] {
                 if control_id == tab {
-                    unsafe { show_settings_category(window, category) };
-                    // The display page shows the virtual monitor size only for Windows.
-                    if let Some(context) = unsafe { window_context(owner) } {
-                        context.refresh_headless_resolution();
-                    }
+                    context.show_settings_page(category);
                     return LRESULT(0);
                 }
             }
-            if let Some(context) = unsafe { window_context(owner) }
-                && context.settings_command(owner, control_id, notification, lparam)
-            {
+            if context.settings_command(owner, control_id, notification, lparam) {
                 return LRESULT(0);
             }
             unsafe { DefWindowProcW(window, message, wparam, lparam) }
