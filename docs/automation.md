@@ -88,14 +88,43 @@ own run list (`GET /v1/script-runs?device_id=`).
 
 ### Dispatching
 
-The server starts queued devices in the order their jobs were created, at
-most 25 every second, while fewer than 500 jobs' runs and deliveries await a
-report across the server, and while the device has fewer than two of its
-own. A thousand-device job therefore reaches its devices over about 40
-seconds, and their results arrive spread out rather than at once. The
-per-device limit stays well under the eight scripts an Agent runs at a time,
-leaving room for runs started by hand. A run or delivery counts against the
-limits until it reports or has no result.
+The server starts queued devices a batch every second, while their kind's
+class has fewer runs awaiting a report than its ceiling, and while the
+device has fewer than two of its own. Both limits grow with the Agents
+connected to the server: a device per second for every 100 connected, and
+a run in flight of each class for every 4, never fewer than 25 a second and
+500 in flight (what a small server has always had) and never more than 250
+a second and 5,000 in flight:
+
+| Agents connected | Started a second | In flight, each class |
+|---|---|---|
+| 100 | 25 | 500 |
+| 1,000 | 25 | 500 |
+| 10,000 | 100 | 2,500 |
+| 100,000 | 250 | 5,000 |
+
+A thousand-device job on a small server therefore reaches its devices over
+about 40 seconds, a job on 100,000 devices over about seven minutes, and
+their results arrive spread out rather than at once. The two classes are
+**quick** (scripts, file deliveries and update scans) and **long** (update
+installs and application installs, updates and uninstalls), each with its
+own ceiling, so a fleet-wide install that fills its class leaves the quick
+class's slots for a script run on one device. The per-device limit stays
+well under the eight scripts an Agent runs at a time, leaving room for runs
+started by hand. A run or delivery counts against the limits until it
+reports or has no result.
+
+Each second's batch takes devices from the queued jobs in turn: one from
+every job, then a second from every job, and so on, and in each round the
+jobs with fewer devices left to start go first, the older first among
+equals. So a job on a few devices starts within a second or two even
+behind a fleet-wide one, and gets the first slot its class frees; within a
+job, devices start in the same order as ever.
+
+A wake job's devices hold no run, so they don't count against either
+ceiling: a queued wake job's devices are woken on the next pass (up to a
+batch of them a second, besides the batch of runs) however full the
+dispatcher is.
 
 A queued device that can't start yet doesn't hold up the others: one at its
 limit, one installing updates (for an update install job) or one running an
@@ -179,6 +208,17 @@ When a recurring policy runs again, its earlier jobs stop waiting for offline
 devices (they are missed: "the policy ran again before the device
 connected"), so a device that was away for several runs catches up once, not
 once per run.
+
+A recurring policy doesn't run while its earlier jobs still have devices
+queued: online, but not started yet because the dispatcher hasn't reached
+them or they are at their limits. That time is skipped instead, the
+policies page says so ("Skipped its run at … because 3 devices from its
+last run hadn't started yet") and the audit log records
+`automation_policy.skip`; the next time runs as usual once they have
+started. So a policy on a short interval over a large fleet runs as often as
+its jobs can be handed out, rather than piling up jobs faster than they
+start, and every device gets each run it does start. **Run now** always
+starts a job.
 
 ### Whose access a policy runs with
 
@@ -294,7 +334,9 @@ should read the lists again.
   enrollment), `schedule.rs` (triggers and time zones, with `chrono-tz`),
   and `mod.rs` (the engine's task, publishing changes, finishing jobs and
   failure notifications). The engine steps every 5 seconds, every second
-  while devices are queued, and at once when told what changed: an Agent
+  while queued devices could start (the last pass stopped at its batch,
+  not at a class's ceiling, which only a report frees), and at once when
+  told what changed: an Agent
   connected (`device_connected`), a device's run reported
   (`device_changed`), or a job was created or cancelled (`job_changed`). A
   step queues the connected devices' waiting parts by device ID and starts
@@ -305,6 +347,16 @@ should read the lists again.
   fires, also queues every waiting device whose Agent is connected, misses
   deleted devices' parts (deleting a device misses them at once; this is
   for a server that stopped in between) and recounts every unfinished job.
+  The dispatcher's limits come from `dispatch::limits` with the count of
+  connected Agents (`AgentHub::count`); its floors and caps are the
+  constants `MIN_BATCH`, `MAX_BATCH`, `MIN_IN_FLIGHT` and `MAX_IN_FLIGHT`.
+  The caps keep the starts within what SQLite's single writer takes
+  alongside everything else: 250 starts a second, each a transaction of a
+  few statements, and their reports later, are about 500 small write
+  transactions a second. A pass counts the runs in flight per class in the
+  same four queries as before (update runs grouped by kind too), and reads
+  the queued parts in the order above with `ROW_NUMBER()` and `COUNT(*)`
+  windows over each job's startable parts.
 - `server/src/api/jobs.rs` and `server/src/api/automation.rs`.
 - Targets: `server/src/targets.rs` resolves every kind of target (chosen
   devices, companies, tags, every device) for jobs, policies and
@@ -318,8 +370,9 @@ should read the lists again.
   deliveries and update runs carry `job_id`; a job's runs have the source
   `job`. An update job's kind is `update_scan` or `update_install`, its
   `item_name` says what it does, and its `item_id` is empty. A wake job's
-  kind is `wake`; its devices are woken together by the dispatcher, outside
-  its limits, and their outcomes come from `wake_requests`. An application
+  kind is `wake`; its devices are woken together by the dispatcher, read
+  apart from the other jobs' and outside their limits, and their outcomes
+  come from `wake_requests`. An application
   job's kind is `app_install`, `app_update` or `app_uninstall`; what it does
   is kept in `application_jobs`, a device's part waits while the device runs
   another application run, and its outcome comes from `application_runs`.
@@ -334,7 +387,9 @@ should read the lists again.
   schedules, outcomes and policy checks.
 - `cargo test -p meshrmm-server --test automation`, on SQLite and
   PostgreSQL: jobs across platforms with skips, waiting and expiry,
-  cancelling, the dispatcher's limits, file jobs, policies firing once across
-  a restart, missed times, owners' access, enrollment policies, alerts and
-  failure notifications, and retention.
+  cancelling, the dispatcher's limits (growing with the connected Agents,
+  each class's ceiling, small jobs beside large ones, wakes however full),
+  file jobs, policies firing once across a restart, skipping a run while
+  the last one's devices are queued, missed times, owners' access,
+  enrollment policies, alerts and failure notifications, and retention.
 - `npm test` in `dashboard` covers the job and policy models.
