@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -74,6 +74,9 @@ const RECONNECT_REFRESH: Duration = Duration::from_millis(250);
 /// How long a stream reset waits for the worker thread before the caller
 /// replaces the presenter instead.
 const STREAM_RESET_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a stopped presenter's worker thread has to end before its window
+/// is hidden and the thread is left to end by itself.
+const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const VIEWER_TOOLBAR_HEIGHT: u32 = crate::toolbar::HEIGHT as u32;
 
 struct QueuedFrame {
@@ -86,7 +89,7 @@ struct PendingReset {
     format: VideoFormat,
     display: Display,
     displays: Vec<Display>,
-    reply: std::sync::mpsc::SyncSender<anyhow::Result<()>>,
+    reply: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
 }
 
 /// An auto-reset Win32 event, which the worker can wait on together with
@@ -147,6 +150,12 @@ struct Shared {
     recovering: AtomicBool,
     resetting: AtomicBool,
     reset: Mutex<Option<PendingReset>>,
+    /// The worker's window, as an `HWND` (0 when there is none), for hiding
+    /// it from another thread.
+    window: AtomicUsize,
+    /// Set once the worker's thread has ended, however it ended.
+    worker_ended: Mutex<bool>,
+    worker_ended_changed: Condvar,
     control: ControlSink,
     debug: DebugInfo,
 }
@@ -170,6 +179,9 @@ impl Shared {
             recovering: AtomicBool::new(false),
             resetting: AtomicBool::new(false),
             reset: Mutex::new(None),
+            window: AtomicUsize::new(0),
+            worker_ended: Mutex::new(false),
+            worker_ended_changed: Condvar::new(),
             control,
             debug,
         }
@@ -196,6 +208,65 @@ impl Shared {
             *current = status;
         }
         self.reconnect_changed.store(true, Ordering::Release);
+    }
+
+    /// Hides the worker's window. The request is posted to its thread, so
+    /// it takes effect also while a modal loop holds the thread: those
+    /// dispatch it.
+    fn hide_window(&self) {
+        let window = self.window.load(Ordering::Acquire);
+        if window != 0 {
+            let _ = unsafe { ShowWindowAsync(HWND(window as *mut c_void), SW_HIDE) };
+        }
+    }
+}
+
+/// Marks the worker's thread ended when dropped, as it is when the thread
+/// returns or unwinds.
+struct WorkerEnded(Arc<Shared>);
+
+impl Drop for WorkerEnded {
+    fn drop(&mut self) {
+        let mut ended = self
+            .0
+            .worker_ended
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *ended = true;
+        self.0.worker_ended_changed.notify_all();
+    }
+}
+
+/// The caller's side of a stream reset handed to the worker. Dropping it,
+/// answered or not, withdraws a reset the worker has not taken, which it
+/// must not apply once the caller has fallen back, and lets frames through
+/// again.
+struct ResetWait {
+    shared: Arc<Shared>,
+    response: tokio::sync::oneshot::Receiver<anyhow::Result<()>>,
+}
+
+impl ResetWait {
+    async fn answer(mut self, timeout: Duration) -> anyhow::Result<()> {
+        match tokio::time::timeout(timeout, &mut self.response).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(anyhow::anyhow!(
+                "the Windows presentation thread stopped before resetting the stream"
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "the Windows presentation thread did not reset the stream within {} ms",
+                timeout.as_millis()
+            )),
+        }
+    }
+}
+
+impl Drop for ResetWait {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.shared.reset.lock() {
+            pending.take();
+        }
+        self.shared.resetting.store(false, Ordering::Release);
     }
 }
 
@@ -254,6 +325,7 @@ impl Presenter {
         let worker = std::thread::Builder::new()
             .name("meshrmm-decode-present".into())
             .spawn(move || {
+                let _ended = WorkerEnded(Arc::clone(&worker_shared));
                 run_worker(
                     worker_shared,
                     format,
@@ -342,14 +414,19 @@ impl Presenter {
 
     /// Moves the window, device and swap chain to a replacement stream
     /// instead of opening a new window. The worker thread owns them and
-    /// applies the reset between window messages. While it shows a modal
-    /// message box it cannot, and the reset times out.
+    /// applies the reset between window messages, so a modal loop on it,
+    /// such as a drag of the window or a message box, holds the reset up and
+    /// it may time out.
+    ///
+    /// The reset is handed to the worker before this returns; the future
+    /// only waits for the answer and borrows nothing, so the caller can
+    /// release the presenter first. Frames published meanwhile are dropped.
     pub fn reset_stream(
         &self,
         format: VideoFormat,
         display: Display,
         displays: Vec<Display>,
-    ) -> anyhow::Result<()> {
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
         self.reset_stream_within(format, display, displays, STREAM_RESET_TIMEOUT)
     }
 
@@ -359,7 +436,17 @@ impl Presenter {
         display: Display,
         displays: Vec<Display>,
         timeout: Duration,
-    ) -> anyhow::Result<()> {
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
+        let handed_over = self.hand_over_reset(format, display, displays);
+        async move { handed_over?.answer(timeout).await }
+    }
+
+    fn hand_over_reset(
+        &self,
+        format: VideoFormat,
+        display: Display,
+        displays: Vec<Display>,
+    ) -> anyhow::Result<ResetWait> {
         if !self.shared.running.load(Ordering::Acquire) {
             bail!("the Windows decode/presentation worker is not running");
         }
@@ -371,9 +458,13 @@ impl Presenter {
                 .fetch_add(queued.len() as u64, Ordering::Relaxed);
             queued.clear();
         }
-        let (reply, response) = std::sync::mpsc::sync_channel(1);
+        let (reply, response) = tokio::sync::oneshot::channel();
+        // From here on, dropping it ends the reset.
+        let wait = ResetWait {
+            shared: Arc::clone(&self.shared),
+            response,
+        };
         let Ok(mut pending) = self.shared.reset.lock() else {
-            self.shared.resetting.store(false, Ordering::Release);
             bail!("the Windows presenter's reset state is unavailable");
         };
         *pending = Some(PendingReset {
@@ -384,25 +475,7 @@ impl Presenter {
         });
         drop(pending);
         self.shared.ready.notify_all();
-        let result = match response.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // The caller falls back to a new presenter; the worker must
-                // not apply this reset afterwards.
-                if let Ok(mut pending) = self.shared.reset.lock() {
-                    pending.take();
-                }
-                Err(anyhow::anyhow!(
-                    "the Windows presentation thread did not reset the stream within {} ms",
-                    timeout.as_millis()
-                ))
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
-                "the Windows presentation thread stopped before resetting the stream"
-            )),
-        };
-        self.shared.resetting.store(false, Ordering::Release);
-        result
+        Ok(wait)
     }
 
     pub fn set_agent_pointer_display(&self, display_id: Option<meshrmm_protocol::DisplayId>) {
@@ -427,18 +500,24 @@ impl Presenter {
         }
     }
 
+    /// Tells the worker to close its window and end, without waiting for
+    /// it: a modal loop can hold its thread for as long as a person drags
+    /// the window or leaves a message box open. A thread of its own waits
+    /// for it instead; see [`retire_worker`].
     pub fn stop(&mut self) {
         self.shared.stopping.store(true, Ordering::Release);
         self.shared.ready.notify_all();
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
+        self.shared.frame_queued.signal();
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        let shared = Arc::clone(&self.shared);
+        if let Err(error) = std::thread::Builder::new()
+            .name("meshrmm-presenter-stop".into())
+            .spawn(move || retire_worker(&shared, worker, WORKER_STOP_TIMEOUT))
         {
-            tracing::warn!("Windows decode/presentation worker panicked");
+            tracing::warn!(error = %error, "could not wait for the Windows presentation thread to stop");
         }
-        tracing::info!(
-            latest_frames_dropped = self.shared.replaced_frames.load(Ordering::Relaxed),
-            "video presenter stopped"
-        );
     }
 
     pub fn first_presented_at(&self) -> Option<std::time::Instant> {
@@ -465,6 +544,40 @@ impl Drop for Presenter {
     }
 }
 
+/// Waits up to `timeout` for a stopping worker's thread to end, and returns
+/// whether it did. A thread held longer by a modal loop ends once that loop
+/// returns, since it is stopping; until then its window is hidden, so no
+/// stale picture stays on screen, and the thread is left to end by itself.
+/// A message box it shows stays up until the person closes it, and a viewer
+/// that exits meanwhile ends the thread with it.
+fn retire_worker(shared: &Shared, worker: JoinHandle<()>, timeout: Duration) -> bool {
+    let ended = shared
+        .worker_ended
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let (ended, _) = shared
+        .worker_ended_changed
+        .wait_timeout_while(ended, timeout, |ended| !*ended)
+        .unwrap_or_else(|error| error.into_inner());
+    let ended = *ended;
+    if !ended {
+        tracing::warn!(
+            timeout_ms = timeout.as_millis(),
+            "the Windows presentation thread did not stop in time; hiding its window until it does"
+        );
+        shared.hide_window();
+        return false;
+    }
+    if worker.join().is_err() {
+        tracing::warn!("Windows decode/presentation worker panicked");
+    }
+    tracing::info!(
+        latest_frames_dropped = shared.replaced_frames.load(Ordering::Relaxed),
+        "video presenter stopped"
+    );
+    true
+}
+
 fn run_worker(
     shared: Arc<Shared>,
     format: VideoFormat,
@@ -486,6 +599,9 @@ fn run_worker(
     };
     let mut pipeline = match initialized {
         Ok(pipeline) => {
+            shared
+                .window
+                .store(pipeline.window().0 as usize, Ordering::Release);
             shared.running.store(true, Ordering::Release);
             let _ = started.send(Ok(()));
             pipeline
@@ -566,6 +682,8 @@ fn run_worker(
         }
     }
     shared.running.store(false, Ordering::Release);
+    // The window goes with the pipeline.
+    shared.window.store(0, Ordering::Release);
     // A reset stored after the last check fails now instead of timing out.
     if let Ok(mut pending) = shared.reset.lock() {
         pending.take();
@@ -759,6 +877,85 @@ fn test_sink(
     })
 }
 
+/// A stand-in for a presenter's worker thread, for tests: it waits for a
+/// stream reset and then stays held, as by a modal loop, until the test
+/// answers the reset or drops it.
+#[cfg(test)]
+pub(crate) struct HeldWorker {
+    requested: Option<tokio::sync::oneshot::Receiver<()>>,
+    answer: std::sync::mpsc::SyncSender<anyhow::Result<()>>,
+    thread: JoinHandle<Option<(VideoFormat, meshrmm_protocol::DisplayId)>>,
+}
+
+#[cfg(test)]
+impl Presenter {
+    /// A presenter whose worker is a [`HeldWorker`].
+    pub(crate) fn held_for_test() -> (Self, HeldWorker) {
+        let shared = Arc::new(Shared::new(
+            test_sink(Default::default(), Default::default()),
+            DebugInfo::new("test"),
+        ));
+        shared.running.store(true, Ordering::Release);
+        let (requested_tx, requested) = tokio::sync::oneshot::channel();
+        let (answer, answers) = std::sync::mpsc::sync_channel(1);
+        let worker_shared = Arc::clone(&shared);
+        let thread = std::thread::spawn(move || {
+            let shared = worker_shared;
+            // Woken for the reset as `run_worker` is.
+            let queued = shared.queued.lock().unwrap();
+            let (queued, _) = shared
+                .ready
+                .wait_timeout_while(queued, Duration::from_secs(10), |_| !shared.reset_pending())
+                .unwrap();
+            drop(queued);
+            if !shared.reset_pending() {
+                return None;
+            }
+            let _ = requested_tx.send(());
+            let answer = answers.recv().ok()?;
+            // Withdrawn meanwhile when the caller timed out.
+            let reset = shared.reset.lock().unwrap().take()?;
+            let _ = reset.reply.send(answer);
+            Some((reset.format, reset.display.id))
+        });
+        let presenter = Self {
+            shared,
+            worker: None,
+        };
+        let worker = HeldWorker {
+            requested: Some(requested),
+            answer,
+            thread,
+        };
+        (presenter, worker)
+    }
+}
+
+#[cfg(test)]
+impl HeldWorker {
+    /// Waits until the worker sees a reset it was handed.
+    pub(crate) async fn reset_requested(&mut self) {
+        self.requested
+            .take()
+            .expect("a held worker takes one reset")
+            .await
+            .expect("the held worker saw no reset");
+    }
+
+    /// Ends the modal loop: the worker answers the reset with `result`.
+    pub(crate) fn answer(&self, result: anyhow::Result<()>) {
+        self.answer
+            .send(result)
+            .expect("the held worker is no longer waiting");
+    }
+
+    /// The stream and display of the reset the worker answered, if it did.
+    pub(crate) fn join(self) -> Option<(VideoFormat, meshrmm_protocol::DisplayId)> {
+        drop(self.answer);
+        self.thread.join().expect("the held worker panicked")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use meshrmm_protocol::{DesktopSession, DisplayId, PixelFormat, VideoStreamId};
@@ -812,39 +1009,61 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_stopped_worker_refuses_a_stream_reset() {
+    #[tokio::test]
+    async fn a_stopped_worker_refuses_a_stream_reset() {
         let presenter = presenter(false);
         assert!(
             presenter
                 .reset_stream(FORMAT, display(1), vec![display(1)])
+                .await
                 .is_err()
         );
         assert!(!presenter.shared.resetting.load(Ordering::Acquire));
         assert!(!presenter.shared.reset_pending());
     }
 
-    #[test]
-    fn a_reset_the_worker_does_not_take_times_out_and_is_withdrawn() {
-        // A modal message box on the worker thread blocks its loop.
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_the_worker_does_not_take_times_out_and_is_withdrawn() {
+        // A modal loop on the worker thread holds up its loop.
         let presenter = presenter(true);
         let error = presenter
-            .reset_stream_within(
-                FORMAT,
-                display(1),
-                vec![display(1)],
-                Duration::from_millis(50),
-            )
+            .reset_stream(FORMAT, display(1), vec![display(1)])
+            .await
             .unwrap_err();
-        assert!(error.to_string().contains("did not reset"), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "the Windows presentation thread did not reset the stream within 5000 ms"
+        );
         // The worker must not apply it once the caller has fallen back.
         assert!(!presenter.shared.reset_pending());
         assert!(!presenter.shared.resetting.load(Ordering::Acquire));
+        assert!(presenter.publish(frame(true), 0));
     }
 
-    #[test]
-    fn the_worker_applies_a_reset_while_frames_are_dropped() {
-        let presenter = presenter(true);
+    #[tokio::test]
+    async fn a_held_worker_holds_up_neither_frames_nor_the_runtime() {
+        // A current-thread runtime: the reset's wait must leave its one
+        // thread to the other tasks.
+        let (presenter, mut worker) = Presenter::held_for_test();
+        let reset = tokio::spawn(presenter.reset_stream(FORMAT, display(2), vec![display(2)]));
+        worker.reset_requested().await;
+        assert!(!presenter.publish(frame(true), 0));
+        presenter.set_cursor_shape(CursorShape::Pointer);
+        presenter.set_agent_pointer_display(Some(DisplayId(2)));
+        presenter.set_reconnect_status(None);
+        assert_eq!(presenter.poll_ended(), None);
+        assert_eq!(tokio::spawn(async { 7 }).await.unwrap(), 7);
+        assert!(!reset.is_finished());
+        // The modal loop ends.
+        worker.answer(Ok(()));
+        reset.await.unwrap().unwrap();
+        assert_eq!(worker.join(), Some((FORMAT, DisplayId(2))));
+        assert!(!presenter.shared.resetting.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn the_worker_applies_a_reset_while_frames_are_dropped() {
+        let (presenter, mut worker) = Presenter::held_for_test();
         assert!(presenter.publish(frame(true), 0));
         assert_eq!(presenter.first_presented_at(), None);
         let replacement = VideoFormat {
@@ -852,37 +1071,17 @@ mod tests {
             height: 1440,
             ..FORMAT
         };
-        std::thread::scope(|scope| {
-            let worker = scope.spawn(|| {
-                // Waits until the reset is handed over, as `run_worker` is
-                // woken for it, then takes it.
-                let shared = &presenter.shared;
-                let queued = shared.queued.lock().unwrap();
-                let (queued, _) = shared
-                    .ready
-                    .wait_timeout_while(queued, Duration::from_secs(5), |_| !shared.reset_pending())
-                    .unwrap();
-                // The queued frame belonged to the old stream.
-                assert!(queued.is_empty());
-                drop(queued);
-                let reset = shared.reset.lock().unwrap().take().unwrap();
-                // Frames that arrive during the reset are dropped, even
-                // keyframes: the caller requests one once it returns.
-                assert!(!presenter.publish(frame(true), 0));
-                assert!(!presenter.publish(frame(false), 0));
-                reset.reply.send(Ok(())).unwrap();
-                (reset.format, reset.display.id)
-            });
-            presenter
-                .reset_stream_within(
-                    replacement,
-                    display(2),
-                    vec![display(1), display(2)],
-                    Duration::from_secs(5),
-                )
-                .unwrap();
-            assert_eq!(worker.join().unwrap(), (replacement, DisplayId(2)));
-        });
+        let reset = presenter.reset_stream(replacement, display(2), vec![display(1), display(2)]);
+        worker.reset_requested().await;
+        // The queued frame belonged to the old stream.
+        assert!(presenter.shared.queued.lock().unwrap().is_empty());
+        // Frames that arrive during the reset are dropped, even keyframes:
+        // the caller requests one once it returns.
+        assert!(!presenter.publish(frame(true), 0));
+        assert!(!presenter.publish(frame(false), 0));
+        worker.answer(Ok(()));
+        reset.await.unwrap();
+        assert_eq!(worker.join(), Some((replacement, DisplayId(2))));
         assert!(!presenter.shared.resetting.load(Ordering::Acquire));
         // Only a keyframe of the new stream ends the recovery.
         assert!(!presenter.publish(frame(false), 0));
@@ -891,30 +1090,85 @@ mod tests {
         assert_eq!(presenter.shared.replaced_frames.load(Ordering::Relaxed), 4);
     }
 
-    #[test]
-    fn a_failed_reset_is_returned_to_the_caller() {
-        let presenter = presenter(true);
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let shared = &presenter.shared;
-                let queued = shared.queued.lock().unwrap();
-                let (queued, _) = shared
-                    .ready
-                    .wait_timeout_while(queued, Duration::from_secs(5), |_| !shared.reset_pending())
-                    .unwrap();
-                drop(queued);
-                let reset = shared.reset.lock().unwrap().take().unwrap();
-                reset
-                    .reply
-                    .send(Err(anyhow::anyhow!("no hardware decoder")))
-                    .unwrap();
-            });
-            let error = presenter
-                .reset_stream_within(FORMAT, display(1), vec![display(1)], Duration::from_secs(5))
-                .unwrap_err();
-            assert_eq!(error.to_string(), "no hardware decoder");
-        });
+    #[tokio::test]
+    async fn a_failed_reset_is_returned_to_the_caller() {
+        let (presenter, mut worker) = Presenter::held_for_test();
+        let reset = presenter.reset_stream(FORMAT, display(1), vec![display(1)]);
+        worker.reset_requested().await;
+        worker.answer(Err(anyhow::anyhow!("no hardware decoder")));
+        let error = reset.await.unwrap_err();
+        assert_eq!(error.to_string(), "no hardware decoder");
         assert!(!presenter.shared.resetting.load(Ordering::Acquire));
+    }
+
+    /// A worker thread that stays in a modal loop until `release` is sent
+    /// or dropped.
+    fn held_thread(shared: &Arc<Shared>) -> (JoinHandle<()>, std::sync::mpsc::SyncSender<()>) {
+        let (release, gate) = std::sync::mpsc::sync_channel(1);
+        let shared = Arc::clone(shared);
+        let thread = std::thread::spawn(move || {
+            let _ended = WorkerEnded(Arc::clone(&shared));
+            let _ = gate.recv();
+            // Its loop checks this once the modal loop returns.
+            assert!(shared.stopping.load(Ordering::Acquire));
+        });
+        (thread, release)
+    }
+
+    fn wait_until_ended(shared: &Shared) -> bool {
+        let ended = shared.worker_ended.lock().unwrap();
+        let (ended, _) = shared
+            .worker_ended_changed
+            .wait_timeout_while(ended, Duration::from_secs(10), |ended| !*ended)
+            .unwrap();
+        *ended
+    }
+
+    #[test]
+    fn stopping_a_held_worker_does_not_wait_for_it() {
+        let mut presenter = presenter(true);
+        let (thread, release) = held_thread(&presenter.shared);
+        presenter.worker = Some(thread);
+        let shared = Arc::clone(&presenter.shared);
+        let (stopped_tx, stopped) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            presenter.stop();
+            let _ = stopped_tx.send(());
+        });
+        stopped
+            .recv_timeout(Duration::from_secs(10))
+            .expect("stop waited for the held worker");
+        assert!(!*shared.worker_ended.lock().unwrap());
+        // The modal loop ends, and so does the thread.
+        release.send(()).unwrap();
+        assert!(wait_until_ended(&shared));
+    }
+
+    #[test]
+    fn retiring_a_worker_joins_one_that_ends_in_time() {
+        let shared = Arc::new(Shared::new(
+            test_sink(Default::default(), Default::default()),
+            DebugInfo::new("test"),
+        ));
+        shared.stopping.store(true, Ordering::Release);
+        let (thread, release) = held_thread(&shared);
+        release.send(()).unwrap();
+        assert!(retire_worker(&shared, thread, Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn retiring_a_worker_gives_up_on_one_held_past_the_limit() {
+        let shared = Arc::new(Shared::new(
+            test_sink(Default::default(), Default::default()),
+            DebugInfo::new("test"),
+        ));
+        shared.stopping.store(true, Ordering::Release);
+        let (thread, release) = held_thread(&shared);
+        assert!(!retire_worker(&shared, thread, Duration::from_millis(50)));
+        // Left to end by itself once its modal loop returns.
+        assert!(!*shared.worker_ended.lock().unwrap());
+        drop(release);
+        assert!(wait_until_ended(&shared));
     }
 
     #[test]

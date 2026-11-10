@@ -275,7 +275,7 @@ pub(super) fn install_control_handler(
     };
     channel.on_message(Box::new(move |message| {
         let handler = handler.clone();
-        Box::pin(async move { handler.handle(&message.data) })
+        Box::pin(async move { handler.handle(&message.data).await })
     }));
 }
 
@@ -330,14 +330,17 @@ struct Configuration {
 }
 
 impl ControlHandler {
-    fn handle(&self, data: &[u8]) {
+    async fn handle(&self, data: &[u8]) {
         match SessionMessage::decode(data) {
             Ok(SessionMessage::DisplayConfiguration {
                 displays,
                 active_display_id,
                 stream_id,
                 format,
-            }) => self.apply_display_configuration(displays, active_display_id, stream_id, format),
+            }) => {
+                self.apply_display_configuration(displays, active_display_id, stream_id, format)
+                    .await
+            }
             Ok(SessionMessage::CredentialState(state)) => {
                 if let Ok(mut current) = self.viewer_control.credentials.lock() {
                     *current = state;
@@ -422,7 +425,7 @@ impl ControlHandler {
         }
     }
 
-    fn apply_display_configuration(
+    async fn apply_display_configuration(
         &self,
         displays: Vec<Display>,
         active_display_id: DisplayId,
@@ -483,7 +486,7 @@ impl ControlHandler {
             stream_id,
             format,
         };
-        if self.reset_in_place(&configuration) {
+        if self.reset_in_place(&configuration).await {
             self.viewer_control
                 .send(SessionMessage::RequestKeyframe { stream_id });
             if let Some(display_id) = resumed_display {
@@ -497,7 +500,8 @@ impl ControlHandler {
             self.send_capabilities(&sink, &profiles, &configuration);
             return;
         }
-        self.start_presenter(configuration, &sink, resumed_display);
+        self.start_presenter(configuration, &sink, resumed_display)
+            .await;
     }
 
     /// The display to select again after a transport reconnect, if the
@@ -531,51 +535,82 @@ impl ControlHandler {
 
     /// Resets the active presenter for a replacement stream, keeping its
     /// window. False when it has to be replaced instead.
-    fn reset_in_place(&self, configuration: &Configuration) -> bool {
+    ///
+    /// A modal loop on the presenter's window thread, such as a drag of the
+    /// window, holds the reset up for as long as it runs, so it is awaited
+    /// with the presenter released: meanwhile the video channel publishes to
+    /// it, which drops the frames, and the session's checks read it. A
+    /// presenter they take away meanwhile is theirs to follow up.
+    async fn reset_in_place(&self, configuration: &Configuration) -> bool {
         let Configuration {
             sequence: configuration_sequence,
             stream_id,
             format,
             ..
         } = *configuration;
-        if self.capabilities_sent.load(Ordering::Acquire)
-            && let Ok(mut guard) = self.presenter.lock()
-            && let Some(active) = guard.as_mut()
-            && Presenter::can_reset_in_place(active.format, format)
-        {
-            match active.presenter.reset_stream(
+        if !self.capabilities_sent.load(Ordering::Acquire) {
+            return false;
+        }
+        let (previous_stream_id, reset) = {
+            let Ok(guard) = self.presenter.lock() else {
+                return false;
+            };
+            let Some(active) = guard.as_ref() else {
+                return false;
+            };
+            if !Presenter::can_reset_in_place(active.format, format) {
+                return false;
+            }
+            let reset = active.presenter.reset_stream(
                 format,
                 configuration.active_display.clone(),
                 configuration.displays.clone(),
-            ) {
-                Ok(()) => {
-                    let previous_stream_id = active.stream_id;
-                    active.stream_id = stream_id;
-                    active.format = format;
-                    active.profile = format.profile();
-                    tracing::info!(
-                        configuration_sequence,
-                        previous_stream_id = previous_stream_id.0,
-                        stream_id = stream_id.0,
-                        bitrate_bits_per_second = format.bitrate_bits_per_second,
-                        codec = ?format.codec,
-                        "reconfigured the video decoder in place for a replacement stream"
-                    );
-                    true
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        configuration_sequence,
-                        previous_stream_id = active.stream_id.0,
-                        stream_id = stream_id.0,
-                        "could not reconfigure the video decoder in place; replacing the presenter"
-                    );
-                    false
-                }
+            );
+            (active.stream_id, reset)
+        };
+        let result = reset.await;
+        // Only this handler replaces the presenter, and it waited here; the
+        // session's failure path and its end may have taken it meanwhile.
+        let Ok(mut guard) = self.presenter.lock() else {
+            return true;
+        };
+        let Some(active) = guard
+            .as_mut()
+            .filter(|active| active.stream_id == previous_stream_id)
+        else {
+            tracing::info!(
+                configuration_sequence,
+                previous_stream_id = previous_stream_id.0,
+                stream_id = stream_id.0,
+                "the presenter ended while it reset its stream"
+            );
+            return true;
+        };
+        match result {
+            Ok(()) => {
+                active.stream_id = stream_id;
+                active.format = format;
+                active.profile = format.profile();
+                tracing::info!(
+                    configuration_sequence,
+                    previous_stream_id = previous_stream_id.0,
+                    stream_id = stream_id.0,
+                    bitrate_bits_per_second = format.bitrate_bits_per_second,
+                    codec = ?format.codec,
+                    "reconfigured the video decoder in place for a replacement stream"
+                );
+                true
             }
-        } else {
-            false
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    configuration_sequence,
+                    previous_stream_id = previous_stream_id.0,
+                    stream_id = stream_id.0,
+                    "could not reconfigure the video decoder in place; replacing the presenter"
+                );
+                false
+            }
         }
     }
 
@@ -630,7 +665,7 @@ impl ControlHandler {
         );
     }
 
-    fn start_presenter(
+    async fn start_presenter(
         &self,
         configuration: Configuration,
         sink: &ControlSink,
@@ -643,13 +678,17 @@ impl ControlHandler {
             stream_id,
             format,
         } = configuration;
-        match Presenter::start(
-            format,
-            active_display.clone(),
-            displays,
-            sink.clone(),
-            self.debug.clone(),
-        ) {
+        // It waits for the window's thread to open the window.
+        let started = tokio::task::spawn_blocking({
+            let active_display = active_display.clone();
+            let sink = sink.clone();
+            let debug = self.debug.clone();
+            move || Presenter::start(format, active_display, displays, sink, debug)
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|started| started);
+        match started {
             Ok(new_presenter) => {
                 crate::launch_status::finish();
                 if let Ok(display) = self.pointer_display.lock() {
@@ -873,6 +912,137 @@ mod tests {
                 "{replacement:?}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    fn display(id: u32) -> Display {
+        Display {
+            session: meshrmm_protocol::DesktopSession::Console,
+            id: DisplayId(id),
+            name: format!("Display {id}"),
+            x: 0,
+            y: 0,
+            width: REPLACEMENT_FORMAT.width,
+            height: REPLACEMENT_FORMAT.height,
+            primary: id == 1,
+        }
+    }
+
+    #[cfg(windows)]
+    fn keyframe(stream_id: VideoStreamId) -> meshrmm_protocol::EncodedFrame {
+        meshrmm_protocol::EncodedFrame {
+            stream_id,
+            frame_id: 1,
+            capture_timestamp_us: 0,
+            encode_complete_timestamp_us: 0,
+            send_timestamp_us: 0,
+            keyframe: true,
+            data: vec![0, 0, 0, 1],
+        }
+    }
+
+    /// The control handler of a connection whose capabilities were sent,
+    /// showing stream 1 on `presenter`.
+    #[cfg(windows)]
+    fn streaming_handler(
+        presenter: Presenter,
+    ) -> (
+        ControlHandler,
+        Arc<Mutex<Option<ActivePresenter>>>,
+        mpsc::UnboundedReceiver<SessionMessage>,
+    ) {
+        let active = Arc::new(Mutex::new(Some(ActivePresenter {
+            stream_id: VideoStreamId(1),
+            format: CURRENT_FORMAT,
+            profile: CURRENT_FORMAT.profile(),
+            presenter,
+        })));
+        let (viewer_control, sent) = active_queue();
+        let handler = ControlHandler {
+            presenter: Arc::clone(&active),
+            viewer_control,
+            remote_text: ServiceInbox::default(),
+            presentation_failure: mpsc::unbounded_channel().0,
+            debug: DebugInfo::new("test"),
+            cursor_shape: Arc::new(Mutex::new(CursorShape::Default)),
+            pointer_display: Arc::new(Mutex::new(None)),
+            capabilities_sent: Arc::new(AtomicBool::new(true)),
+            supported_profiles: Arc::new(OnceLock::from(Arc::new(Vec::new()))),
+            configurations_seen: Arc::new(AtomicU64::new(1)),
+        };
+        (handler, active, sent)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_reset_held_by_the_window_thread_holds_up_neither_video_nor_control() {
+        // A current-thread runtime: while a modal loop, such as a drag of the
+        // window, holds the window thread, the reset's wait must leave the
+        // runtime's one thread and the presenter to the rest of the session.
+        let (held, mut worker) = Presenter::held_for_test();
+        let (handler, active, mut sent) = streaming_handler(held);
+        let configuration = SessionMessage::DisplayConfiguration {
+            displays: vec![display(1), display(2)],
+            active_display_id: DisplayId(2),
+            stream_id: VideoStreamId(2),
+            format: REPLACEMENT_FORMAT,
+        }
+        .encode()
+        .unwrap();
+        let configure = tokio::spawn({
+            let handler = handler.clone();
+            async move { handler.handle(&configuration).await }
+        });
+        worker.reset_requested().await;
+        {
+            let guard = active.try_lock().expect("the reset holds the presenter");
+            // The video channel's frames are dropped while it resets.
+            let active = guard.as_ref().unwrap();
+            assert!(!active.presenter.publish(keyframe(VideoStreamId(1)), 0));
+        }
+        let cursor = SessionMessage::CursorShape {
+            shape: CursorShape::Pointer,
+        };
+        handler.handle(&cursor.encode().unwrap()).await;
+        assert!(!configure.is_finished());
+
+        // The modal loop ends.
+        worker.answer(Ok(()));
+        configure.await.unwrap();
+        assert_eq!(worker.join(), Some((REPLACEMENT_FORMAT, DisplayId(2))));
+        {
+            let guard = active.try_lock().unwrap();
+            let active = guard.as_ref().unwrap();
+            assert_eq!(active.stream_id, VideoStreamId(2));
+            assert_eq!(active.format, REPLACEMENT_FORMAT);
+        }
+        assert_eq!(
+            sent.try_recv().unwrap(),
+            SessionMessage::RequestKeyframe {
+                stream_id: VideoStreamId(2)
+            }
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_the_window_thread_never_answers_leaves_the_presenter_to_be_replaced() {
+        let (held, _worker) = Presenter::held_for_test();
+        let (handler, active, _sent) = streaming_handler(held);
+        let configuration = Configuration {
+            sequence: 2,
+            displays: vec![display(1)],
+            active_display: display(1),
+            stream_id: VideoStreamId(2),
+            format: REPLACEMENT_FORMAT,
+        };
+        // The caller replaces the presenter, as it does for a failed reset.
+        assert!(!handler.reset_in_place(&configuration).await);
+        let guard = active.try_lock().unwrap();
+        let active = guard.as_ref().unwrap();
+        assert_eq!(active.stream_id, VideoStreamId(1));
+        // It takes frames again until it is replaced.
+        assert!(active.presenter.publish(keyframe(VideoStreamId(1)), 0));
     }
 
     #[test]
