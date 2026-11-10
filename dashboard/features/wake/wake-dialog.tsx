@@ -1,11 +1,11 @@
 import { CircleAlert, CircleCheck, LoaderCircle, X } from "lucide-react";
-import { type RefObject, useEffect, useId, useRef, useState } from "react";
+import { type RefObject, useEffect, useId, useMemo, useRef, useState } from "react";
 import { AuthenticationRequired, errorText } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
 import { useNow as useClock } from "../../lib/use-now";
 import type { Agent } from "../agents/types";
 import { useWorkspace } from "../workspace/workspace-context";
-import { NOT_ONLINE_HINT, type Wake, type WakeState, isSettling, relayText, wakeHeadline, wakeState, wakeTitle, wakeTone } from "./model";
+import { NOT_ONLINE_HINT, type Wake, type WakeState, isSettling, relayText, replaceWakes, wakeHeadline, wakeState, wakeTitle, wakeTone } from "./model";
 import { fetchWakes, wakeDevice, wakeDevices } from "./wake-api";
 
 // Relays report within a second or two; a wake still sending is read again
@@ -51,7 +51,7 @@ export function WakeDialog({ agents, returnFocus, onClose }: {
   const [error, setError] = useState<string | null>(null);
   const started = useRef(false);
   const now = useNow();
-  const ids = useRef(agents.map((agent) => agent.id));
+  const [ids] = useState(() => agents.map((agent) => agent.id));
 
   useEffect(() => {
     // Strict mode runs effects twice; each device is woken once.
@@ -59,10 +59,10 @@ export function WakeDialog({ agents, returnFocus, onClose }: {
     started.current = true;
     const run = async () => {
       try {
-        if (ids.current.length === 1) {
-          setWakes([await wakeDevice(authorizedFetch, ids.current[0])]);
+        if (ids.length === 1) {
+          setWakes([await wakeDevice(authorizedFetch, ids[0])]);
         } else {
-          const result = await wakeDevices(authorizedFetch, ids.current);
+          const result = await wakeDevices(authorizedFetch, ids);
           setWakes(result.wakes);
           setSkipped(result.skipped.length);
         }
@@ -71,22 +71,25 @@ export function WakeDialog({ agents, returnFocus, onClose }: {
       }
     };
     void run();
-  }, [authorizedFetch]);
+  }, [authorizedFetch, ids]);
 
-  useSettling(wakes, (fresh) => setWakes((current) => current?.map((wake) => fresh.find((candidate) => candidate.id === wake.id) ?? wake) ?? null));
+  useSettling(wakes, (fresh) => setWakes((current) => current && replaceWakes(current, fresh)));
 
-  const connected = new Set(inventory.agents.filter((agent) => agent.connected).map((agent) => agent.id));
+  // The clock re-renders the dialog every few seconds; these follow the
+  // inventory instead.
+  const connected = useMemo(() => new Set(inventory.agents.filter((agent) => agent.connected).map((agent) => agent.id)), [inventory.agents]);
+  const namesById = useMemo(() => new Map(agents.map((agent) => [agent.id, agent.name])), [agents]);
   // A device that came online is read again, so it stays woken if it goes
   // offline before the dialog closes.
   const cameOnline = (wakes ?? []).filter((wake) => wake.online_at === null && connected.has(wake.device_id)).map((wake) => wake.id).join(",");
   useEffect(() => {
     if (!cameOnline) return;
     fetchWakes(authorizedFetch, cameOnline.split(",")).then(
-      (fresh) => setWakes((current) => current?.map((wake) => fresh.find((candidate) => candidate.id === wake.id) ?? wake) ?? null),
+      (fresh) => setWakes((current) => current && replaceWakes(current, fresh)),
       () => {},
     );
   }, [authorizedFetch, cameOnline]);
-  const names = agents.map((agent) => agent.name);
+  const names = useMemo(() => agents.map((agent) => agent.name), [agents]);
   const single = agents.length === 1;
 
   return (
@@ -99,7 +102,7 @@ export function WakeDialog({ agents, returnFocus, onClose }: {
       {wakes && (
         <ul className="wake-list" aria-live="polite">
           {wakes.map((wake) => (
-            <WakeItem key={wake.id} wake={wake} name={wake.device_name ?? agents.find((agent) => agent.id === wake.device_id)?.name ?? "Deleted device"} state={wakeState(wake, connected.has(wake.device_id), now)} />
+            <WakeItem key={wake.id} wake={wake} name={wake.device_name ?? namesById.get(wake.device_id) ?? "Deleted device"} state={wakeState(wake, connected.has(wake.device_id), now)} />
           ))}
         </ul>
       )}

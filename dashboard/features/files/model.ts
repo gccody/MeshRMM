@@ -185,14 +185,6 @@ export function nameProblem(platform: DevicePlatform, name: string): string | nu
   return null;
 }
 
-// The rows to draw for a viewport: those visible plus `overscan` on each
-// side, within `total`.
-export function visibleRows(scrollTop: number, viewport: number, total: number, overscan = 10) {
-  const first = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - overscan);
-  const last = Math.min(total, Math.ceil((scrollTop + viewport) / ROW_HEIGHT) + overscan);
-  return { first, last: Math.max(first, last) };
-}
-
 // The listing pages rows `first` to `last` fall in.
 export function pagesFor(first: number, last: number) {
   const pages: number[] = [];

@@ -106,6 +106,12 @@ export function relayText(relay: WakeRelay) {
 // Whether a relay may still report.
 export const isSettling = (wake: Wake) => wake.status === "sending" || wake.relays.some((relay) => relay.status === "pending");
 
+// The wakes with any read again in place of their old copies.
+export function replaceWakes(current: readonly Wake[], fresh: readonly Wake[]) {
+  const byId = new Map(fresh.map((wake) => [wake.id, wake]));
+  return current.map((wake) => byId.get(wake.id) ?? wake);
+}
+
 // The chosen devices that can be woken: offline ones.
 export const wakeable = (agents: readonly Agent[]) => agents.filter((agent) => !agent.connected);
 

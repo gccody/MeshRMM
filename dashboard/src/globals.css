@@ -323,8 +323,8 @@ h1, h2, h3 { margin: 0; font-weight: 600; font-stretch: 88%; letter-spacing: -0.
 .company-filter { height: 36px; max-width: 230px; padding: 0 10px; display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--rule-strong); border-radius: 9px; color: var(--text); background: var(--raised); cursor: pointer; font-size: 13.5px; font-weight: 500; }
 .company-filter:hover, .company-filter[aria-expanded=true] { background: var(--hover); }
 .company-filter svg { flex: none; color: var(--text-3); }
-.company-filter span, .company-filter-menu span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.company-filter-menu { min-width: 240px; max-width: 300px; max-height: min(400px, 60vh); display: flex; flex-direction: column; }
+.company-filter span, .company-filter-menu span, .device-select-menu span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.company-filter-menu, .device-select-menu { min-width: 240px; max-width: 300px; max-height: min(400px, 60vh); display: flex; flex-direction: column; }
 .menu-search { height: 34px; margin-bottom: 4px; padding: 0 9px; display: flex; flex: none; align-items: center; gap: 8px; border: 1px solid var(--rule); border-radius: 7px; background: var(--well); }
 .menu-search:focus-within { border-color: var(--signal); box-shadow: 0 0 0 3px var(--signal-wash); }
 .menu-search input { width: 100%; min-width: 0; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 13.5px; }
@@ -332,8 +332,8 @@ h1, h2, h3 { margin: 0; font-weight: 600; font-stretch: 88%; letter-spacing: -0.
 .menu-search input::-webkit-search-cancel-button { filter: invert(.7); }
 .menu-options { min-height: 0; display: grid; overflow-y: auto; }
 .menu-empty { margin: 0; padding: 8px 10px; color: var(--text-3); font-size: 13px; }
-.company-filter-menu button[aria-pressed=true] svg { color: var(--signal-strong); }
-.company-filter-menu .invisible { visibility: hidden; }
+.company-filter-menu button[aria-pressed=true] svg, .device-select-menu button[aria-pressed=true] svg { color: var(--signal-strong); }
+.company-filter-menu .invisible, .device-select-menu .invisible { visibility: hidden; }
 .data-table, .run-table { width: 100%; border-collapse: collapse; }
 .data-table th, .run-table th { padding: 10px 16px; color: var(--text-3); font-size: 12.5px; font-weight: 500; text-align: left; border-bottom: 1px solid var(--rule); white-space: nowrap; }
 .data-table td, .run-table td { padding: 12px 16px; border-bottom: 1px solid var(--rule); font-size: 13.5px; vertical-align: middle; }
@@ -447,7 +447,8 @@ td.row-actions > * + * { margin-left: 6px; }
 .area-tabs a[aria-current=page] { color: var(--text); background: var(--raised); box-shadow: inset 0 -2px 0 var(--signal); }
 .area-tabs + .error-banner, .page-notice { margin-bottom: 16px; }
 .alert-filter-selects { display: flex; flex-wrap: wrap; gap: 8px; }
-.app-root .alert-filter-selects select { min-height: 36px; max-width: 210px; font-size: 13.5px; }
+.app-root .alert-filter-selects select, .alert-filter-selects .device-select-trigger { min-height: 36px; max-width: 210px; font-size: 13.5px; }
+.alert-filter-selects .device-select-trigger { width: auto; min-width: 150px; }
 .severity { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 600; white-space: nowrap; }
 .severity i { width: 8px; height: 8px; border-radius: 2px; background: currentColor; }
 .severity-info { color: var(--signal-strong); }
@@ -931,6 +932,19 @@ button.outcome-chip:hover { color: var(--text); background: var(--raised); }
 .device-picker-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
 .device-picker-tools .search-field { display: inline-flex; flex: 1 1 200px; width: auto; }
 .picker-list { max-height: 260px; padding-right: 4px; overflow-y: auto; }
+/* Windowed rows keep to DEVICE_ROW_HEIGHT (features/device-picker/model.ts): 54px and a 6px gap. */
+.device-picker-rows { display: block; }
+.settings-modal .device-picker-rows label { height: 54px; margin: 0 0 6px; overflow: hidden; }
+.device-picker-rows label > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.device-picker-rows label strong { overflow: hidden; text-overflow: ellipsis; }
+/* One device from many: a button like a select, opening a searchable menu. */
+.device-select-field { display: grid; gap: 6px; }
+.device-select-trigger { width: 100%; min-height: 38px; padding: 0 11px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border: 1px solid var(--rule-strong); border-radius: 8px; outline: 0; color: var(--text); background: var(--well); cursor: pointer; font-size: 14px; font-weight: 400; text-align: left; }
+.device-select-trigger:focus-visible, .device-select-trigger[aria-expanded=true] { border-color: var(--signal); box-shadow: 0 0 0 3px var(--signal-wash); }
+.device-select-trigger span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.device-select-trigger svg { flex: none; color: var(--text-3); }
+/* In a dialog, which scrolls, the menu opens in place rather than over it. */
+.settings-modal .device-select .popover { position: static; max-width: none; margin-top: 6px; }
 .settings-modal .picker-list label { padding: 7px 10px; }
 .weekday-choice { margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; border: 0; }
 .weekday-choice legend { margin-bottom: 6px; padding: 0; color: var(--text-2); font-size: 13px; font-weight: 500; }

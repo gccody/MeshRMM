@@ -355,9 +355,14 @@ export function coveredAgents(agents: readonly Agent[], target: JobTarget) {
 // it covers, skip for want of an interpreter, and find offline.
 export function jobPreview(agents: readonly Agent[], target: JobTarget, language: ScriptLanguage | null) {
   const covered = coveredAgents(agents, target);
-  const unsupported = language ? covered.filter((agent) => !runsOn(language, agent.platform)) : [];
-  const offline = covered.filter((agent) => !agent.connected && !unsupported.includes(agent));
-  return { devices: covered.length, skipped: unsupported.length, offline: offline.length };
+  // One pass: the skipped aren't counted again as offline.
+  let skipped = 0;
+  let offline = 0;
+  for (const agent of covered) {
+    if (language && !runsOn(language, agent.platform)) skipped++;
+    else if (!agent.connected) offline++;
+  }
+  return { devices: covered.length, skipped, offline };
 }
 
 // The preview in words.
