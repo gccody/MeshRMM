@@ -44,6 +44,8 @@ zip = { version = "9.5.0", default-features = false, features = ["deflate-flate2
 [target."cfg(windows)".dependencies]
 meshrmm-remote-screen = { version = "0.2.0", path = "windows/remote-screen" }
 windows-service = "0.8.1"
+# For `#[implement]`, which Windows Update's callbacks need.
+windows-core = "0.62.2"
 windows = { version = "0.62.2", features = [
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Display",

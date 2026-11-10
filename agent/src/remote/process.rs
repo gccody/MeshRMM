@@ -1,12 +1,16 @@
-//! Running a package manager or installer with a time limit, and reading
-//! what it wrote. Whatever it starts is stopped with it at the limit: a
-//! process group on macOS and Linux, a job object on Windows, which holds
-//! the program from before its first instruction. Output a lingering child
+//! Running a package manager, installer or update tool with a time limit,
+//! and reading what it wrote, for application runs and update scans and
+//! installs. Whatever it starts is stopped with it at the limit: a process
+//! group on macOS and Linux, a job object on Windows, which holds the
+//! program from before its first instruction. Output a lingering child
 //! holds open is read for a moment after the program exits; what was read
-//! by then is kept, and the readers stop.
+//! by then is kept, and the readers stop, so a child left running never
+//! holds up the caller.
 //!
 //! A scan or run sets a deadline for its thread with [`by`]: every program
-//! it runs is stopped by then at the latest, whatever its own limit.
+//! it runs is stopped by then at the latest, whatever its own limit. Work
+//! that isn't a program, such as Windows Update's, reads it with
+//! [`deadline`].
 use std::cell::Cell;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +44,12 @@ pub(crate) fn by<T>(deadline: Instant, work: impl FnOnce() -> T) -> T {
     let _restore = Restore(outer);
     DEADLINE.set(Some(outer.map_or(deadline, |outer| outer.min(deadline))));
     work()
+}
+
+/// The deadline [`by`] set for this thread, if any.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn deadline() -> Option<Instant> {
+    DEADLINE.get()
 }
 
 /// What a program wrote, and how it exited.
@@ -122,7 +132,7 @@ impl Reader {
         let stop = Arc::new(AtomicBool::new(false));
         let (writer, stopping) = (Arc::clone(&kept), Arc::clone(&stop));
         let spawned = std::thread::Builder::new()
-            .name("meshrmm-application-output".into())
+            .name("meshrmm-program-output".into())
             .spawn(move || {
                 let mut chunk = [0_u8; 16 * 1024];
                 while !stopping.load(Ordering::Relaxed) {

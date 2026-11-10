@@ -10,11 +10,19 @@
 //! (such as a servicing stack update) always is; once one says the computer
 //! must restart before anything else installs, the rest wait for the next
 //! install. Restarts are left to the caller.
+//!
+//! The search, the download and each install use Windows Update's
+//! asynchronous calls, checked on every second, so none outlasts the
+//! deadline the coordinator sets for the scan or install
+//! ([`crate::remote::process::by`]). Past it, Windows Update is asked to stop
+//! the job and given a minute to; one it doesn't stop is left to it, and
+//! Windows Update refuses to start another install while one runs.
 mod describe;
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use meshrmm_protocol::{
     PendingUpdate, UpdateCategory, UpdateInstallItem, UpdateItemOutcome, UpdateManager, UpdateScan,
     UpdateSeverity,
@@ -26,19 +34,233 @@ use windows::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, RegCloseKey, RegOpenKeyExW,
 };
 use windows::Win32::System::UpdateAgent::{
-    ISystemInformation, IUpdate, IUpdateCollection, IUpdateInstaller2, IUpdateSession,
+    IDownloadCompletedCallback, IDownloadCompletedCallback_Impl, IDownloadCompletedCallbackArgs,
+    IDownloadJob, IDownloadProgressChangedCallback, IDownloadProgressChangedCallback_Impl,
+    IDownloadProgressChangedCallbackArgs, IInstallationCompletedCallback,
+    IInstallationCompletedCallback_Impl, IInstallationCompletedCallbackArgs, IInstallationJob,
+    IInstallationProgressChangedCallback, IInstallationProgressChangedCallback_Impl,
+    IInstallationProgressChangedCallbackArgs, ISearchCompletedCallback,
+    ISearchCompletedCallback_Impl, ISearchCompletedCallbackArgs, ISearchJob, ISystemInformation,
+    IUpdate, IUpdateCollection, IUpdateInstaller, IUpdateInstaller2, IUpdateSession,
     SystemInformation, UpdateCollection, UpdateSession, irbNeverReboots, orcAborted, orcFailed,
     orcSucceeded, orcSucceededWithErrors, utDriver,
 };
-use windows::core::{BSTR, Interface, PCWSTR};
+use windows::Win32::System::Variant::VARIANT;
+use windows::core::{BSTR, IUnknown, Interface, PCWSTR, Ref, implement};
 
 use self::describe::{category_of_classification, error_message, knowledge_base, ole_date_unix_ms};
-use super::Progress;
+use super::{Progress, span};
 use crate::win32::wide;
 
+/// What scans and installs, for messages.
+pub(super) const SERVICE: &str = "Windows Update";
 /// What a search asks for: what Windows Update would offer.
 const CRITERIA: &str = "IsInstalled=0 and IsHidden=0";
 const CLIENT: &str = "MeshRMM";
+/// How often a search, download or install is checked on.
+const POLL: Duration = Duration::from_secs(1);
+/// How long Windows Update has to stop a job it was asked to stop.
+const ABORT_WAIT: Duration = Duration::from_secs(60);
+
+/// A search, download or install Windows Update works on for the Agent.
+trait Job {
+    fn completed(&self) -> windows::core::Result<bool>;
+    fn abort(&self) -> windows::core::Result<()>;
+    /// Lets go of its callbacks; this waits for the job to end.
+    fn clean_up(&self) -> windows::core::Result<()>;
+}
+
+macro_rules! job {
+    ($interface:ty) => {
+        impl Job for $interface {
+            fn completed(&self) -> windows::core::Result<bool> {
+                // SAFETY: a valid job object.
+                unsafe { self.IsCompleted() }.map(|completed| completed.as_bool())
+            }
+
+            fn abort(&self) -> windows::core::Result<()> {
+                // SAFETY: as above.
+                unsafe { self.RequestAbort() }
+            }
+
+            fn clean_up(&self) -> windows::core::Result<()> {
+                // SAFETY: as above.
+                unsafe { self.CleanUp() }
+            }
+        }
+    };
+}
+
+job!(ISearchJob);
+job!(IDownloadJob);
+job!(IInstallationJob);
+
+/// A job that didn't end in time.
+#[derive(Debug)]
+struct Stalled {
+    message: String,
+    /// Windows Update stopped it when asked.
+    stopped: bool,
+}
+
+/// Waits for `job` until `deadline`, checking every `poll`. Past it,
+/// Windows Update is asked to stop the job and given `abort_wait` to; `what`
+/// names the job for the message, as in "did not finish the search".
+fn wait(
+    job: &impl Job,
+    what: &str,
+    deadline: Option<Instant>,
+    poll: Duration,
+    abort_wait: Duration,
+) -> Result<(), Stalled> {
+    let started = Instant::now();
+    loop {
+        match job.completed() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => {
+                return Err(Stalled {
+                    message: format!("Windows Update lost {what}: {}", com_error(&error)),
+                    stopped: false,
+                });
+            }
+        }
+        let now = Instant::now();
+        let Some(deadline) = deadline.filter(|deadline| now >= *deadline) else {
+            std::thread::sleep(deadline.map_or(poll, |deadline| poll.min(deadline - now)));
+            continue;
+        };
+        let allowed = span(deadline.saturating_duration_since(started));
+        tracing::warn!(
+            what,
+            "asking Windows Update to stop work that ran out of time"
+        );
+        if let Err(error) = job.abort() {
+            tracing::warn!(error = %error, "Windows Update couldn't be asked to stop");
+        }
+        let asked = Instant::now();
+        let stopped = loop {
+            if job.completed().unwrap_or(false) {
+                break true;
+            }
+            if asked.elapsed() >= abort_wait {
+                break false;
+            }
+            std::thread::sleep(poll.min(abort_wait));
+        };
+        return Err(Stalled {
+            message: if stopped {
+                format!("Windows Update did not finish {what} within {allowed}, so it was stopped")
+            } else {
+                format!(
+                    "Windows Update did not finish {what} within {allowed}, and did not stop when asked"
+                )
+            },
+            stopped,
+        });
+    }
+}
+
+/// Waits for `job` (see [`wait`]) by the thread's deadline, then returns
+/// what `end` makes of it and lets the job go. A job Windows Update didn't
+/// stop is leaked rather than cleaned up, since cleaning up waits for it.
+fn finish<J: Job, T>(
+    job: J,
+    what: &str,
+    end: impl FnOnce(&J) -> windows::core::Result<T>,
+) -> anyhow::Result<windows::core::Result<T>> {
+    if let Err(stalled) = wait(
+        &job,
+        what,
+        crate::remote::process::deadline(),
+        POLL,
+        ABORT_WAIT,
+    ) {
+        if stalled.stopped {
+            let _ = job.clean_up();
+        } else {
+            std::mem::forget(job);
+        }
+        bail!(stalled.message);
+    }
+    let ended = end(&job);
+    let _ = job.clean_up();
+    Ok(ended)
+}
+
+/// Errs when the thread's deadline has passed, before more is asked of
+/// Windows Update.
+fn time_left(what: &str) -> anyhow::Result<()> {
+    if crate::remote::process::deadline().is_some_and(|deadline| Instant::now() >= deadline) {
+        bail!("There was no time left for Windows Update to finish {what}");
+    }
+    Ok(())
+}
+
+/// The callbacks Windows Update's asynchronous calls take. The Agent checks
+/// on the jobs itself, so they do nothing.
+#[implement(
+    ISearchCompletedCallback,
+    IDownloadProgressChangedCallback,
+    IDownloadCompletedCallback,
+    IInstallationProgressChangedCallback,
+    IInstallationCompletedCallback
+)]
+struct Unheeded;
+
+impl ISearchCompletedCallback_Impl for Unheeded_Impl {
+    fn Invoke(
+        &self,
+        _: Ref<ISearchJob>,
+        _: Ref<ISearchCompletedCallbackArgs>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+impl IDownloadProgressChangedCallback_Impl for Unheeded_Impl {
+    fn Invoke(
+        &self,
+        _: Ref<IDownloadJob>,
+        _: Ref<IDownloadProgressChangedCallbackArgs>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+impl IDownloadCompletedCallback_Impl for Unheeded_Impl {
+    fn Invoke(
+        &self,
+        _: Ref<IDownloadJob>,
+        _: Ref<IDownloadCompletedCallbackArgs>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+impl IInstallationProgressChangedCallback_Impl for Unheeded_Impl {
+    fn Invoke(
+        &self,
+        _: Ref<IInstallationJob>,
+        _: Ref<IInstallationProgressChangedCallbackArgs>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+impl IInstallationCompletedCallback_Impl for Unheeded_Impl {
+    fn Invoke(
+        &self,
+        _: Ref<IInstallationJob>,
+        _: Ref<IInstallationCompletedCallbackArgs>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+fn unheeded() -> IUnknown {
+    Unheeded.into()
+}
 
 /// COM, initialized on this thread until dropped.
 struct Com {
@@ -76,22 +298,28 @@ fn session() -> windows::core::Result<IUpdateSession> {
 }
 
 /// The updates Windows Update offers, as COM objects.
-fn search(session: &IUpdateSession) -> windows::core::Result<Vec<IUpdate>> {
+fn search(session: &IUpdateSession) -> anyhow::Result<Vec<IUpdate>> {
+    let couldnt = |error: windows::core::Error| {
+        anyhow::anyhow!("Windows Update couldn't search: {}", com_error(&error))
+    };
+    time_left("the search")?;
     // SAFETY: calls on valid COM objects with owned BSTRs.
     unsafe {
-        let searcher = session.CreateUpdateSearcher()?;
-        searcher.SetClientApplicationID(&BSTR::from(CLIENT))?;
-        let result = searcher.Search(&BSTR::from(CRITERIA))?;
-        let code = result.ResultCode()?;
+        let searcher = session.CreateUpdateSearcher().map_err(couldnt)?;
+        searcher
+            .SetClientApplicationID(&BSTR::from(CLIENT))
+            .map_err(couldnt)?;
+        let job = searcher
+            .BeginSearch(&BSTR::from(CRITERIA), &unheeded(), &VARIANT::default())
+            .map_err(couldnt)?;
+        let result = finish(job, "the search", |job| searcher.EndSearch(job))?.map_err(couldnt)?;
+        let code = result.ResultCode().map_err(couldnt)?;
         if code == orcFailed || code == orcAborted {
-            return Err(windows::core::Error::new(
-                windows::Win32::Foundation::E_FAIL,
-                "the search for updates did not complete",
-            ));
+            bail!("Windows Update couldn't search: the search for updates did not complete");
         }
-        let updates = result.Updates()?;
-        (0..updates.Count()?)
-            .map(|index| updates.get_Item(index))
+        let updates = result.Updates().map_err(couldnt)?;
+        (0..updates.Count().map_err(couldnt)?)
+            .map(|index| updates.get_Item(index).map_err(couldnt))
             .collect()
     }
 }
@@ -99,7 +327,9 @@ fn search(session: &IUpdateSession) -> windows::core::Result<Vec<IUpdate>> {
 pub(super) fn scan() -> UpdateScan {
     let _com = Com::new();
     let reboot_pending = reboot_pending();
-    let found = session().and_then(|session| search(&session));
+    let found = session()
+        .map_err(|error| anyhow::anyhow!("Windows Update couldn't start: {}", com_error(&error)))
+        .and_then(|session| search(&session));
     match found {
         Ok(updates) => UpdateScan {
             manager: Some(UpdateManager::WindowsUpdate),
@@ -110,10 +340,7 @@ pub(super) fn scan() -> UpdateScan {
         Err(error) => UpdateScan {
             manager: Some(UpdateManager::WindowsUpdate),
             reboot_pending,
-            error: Some(format!(
-                "Windows Update couldn't search: {}",
-                com_error(&error)
-            )),
+            error: Some(format!("{error:#}")),
             ..Default::default()
         },
     }
@@ -267,9 +494,7 @@ pub(super) fn install(
     let _com = Com::new();
     let session = session()
         .map_err(|error| anyhow::anyhow!("Windows Update couldn't start: {}", com_error(&error)))?;
-    let offered = search(&session).map_err(|error| {
-        anyhow::anyhow!("Windows Update couldn't search: {}", com_error(&error))
-    })?;
+    let offered = search(&session)?;
     let mut by_id = HashMap::new();
     for update in offered {
         // SAFETY: a valid update object.
@@ -324,14 +549,23 @@ pub(super) fn install(
     );
     let downloads = collection(ready.iter().map(|(_, object)| *object))
         .context("could not list the updates to download")?;
+    let couldnt = |error: windows::core::Error| {
+        anyhow::anyhow!("Windows Update couldn't download: {}", com_error(&error))
+    };
+    time_left("the download")?;
     // SAFETY: calls on valid COM objects.
     let downloaded = unsafe {
-        let downloader = session.CreateUpdateDownloader()?;
-        downloader.SetClientApplicationID(&BSTR::from(CLIENT))?;
-        downloader.SetUpdates(&downloads)?;
-        downloader.Download()
-    }
-    .map_err(|error| anyhow::anyhow!("Windows Update couldn't download: {}", com_error(&error)))?;
+        let downloader = session.CreateUpdateDownloader().map_err(couldnt)?;
+        downloader
+            .SetClientApplicationID(&BSTR::from(CLIENT))
+            .map_err(couldnt)?;
+        downloader.SetUpdates(&downloads).map_err(couldnt)?;
+        let callbacks = unheeded();
+        let job = downloader
+            .BeginDownload(&callbacks, &callbacks, &VARIANT::default())
+            .map_err(couldnt)?;
+        finish(job, "the download", |job| downloader.EndDownload(job))?.map_err(couldnt)?
+    };
     let mut installable = Vec::new();
     for (index, (update, object)) in ready.iter().enumerate() {
         // SAFETY: the index is within the downloaded collection.
@@ -372,6 +606,7 @@ pub(super) fn install(
     })?;
     let total = installable.len();
     let mut waiting_for_restart = false;
+    let mut out_of_time = false;
     for (position, (update, object)) in installable.into_iter().enumerate() {
         if waiting_for_restart {
             items.push(item(
@@ -381,23 +616,19 @@ pub(super) fn install(
             ));
             continue;
         }
+        if out_of_time {
+            items.push(item(
+                update,
+                Some("The install ran out of time before it got to this update".into()),
+                false,
+            ));
+            continue;
+        }
         progress.report(
             format!("Installing {} of {total}: {}", position + 1, update.title),
             Some(u8::try_from(position * 100 / total).unwrap_or(100)),
         );
-        // SAFETY: calls on valid COM objects.
-        let installed = unsafe {
-            collection([object]).and_then(|single| {
-                installer.SetUpdates(&single)?;
-                let result = installer.Install()?;
-                let update_result = result.GetUpdateResult(0)?;
-                Ok((
-                    update_result.ResultCode()?,
-                    update_result.HResult()?,
-                    update_result.RebootRequired()?.as_bool() || result.RebootRequired()?.as_bool(),
-                ))
-            })
-        };
+        let installed = install_one(&installer, object);
         match installed {
             Ok((code, hresult, reboot_required)) => {
                 let error = outcome(code, hresult);
@@ -413,7 +644,14 @@ pub(super) fn install(
             }
             Err(error) => {
                 tracing::warn!(id = update.id, error = %error, "Windows Update couldn't install an update");
-                items.push(item(update, Some(com_error(&error)), false));
+                items.push(item(update, Some(format!("{error:#}")), false));
+                // What's left would only find no time left either.
+                if crate::remote::process::deadline()
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    out_of_time = true;
+                    continue;
+                }
             }
         }
         // SAFETY: a valid installer.
@@ -423,9 +661,158 @@ pub(super) fn install(
     Ok(items)
 }
 
+/// Installs one update: its result code, `HRESULT` and whether the computer
+/// must restart.
+fn install_one(
+    installer: &IUpdateInstaller,
+    update: &IUpdate,
+) -> anyhow::Result<(
+    windows::Win32::System::UpdateAgent::OperationResultCode,
+    i32,
+    bool,
+)> {
+    let failed = |error: windows::core::Error| anyhow::anyhow!(com_error(&error));
+    time_left("installing it")?;
+    // SAFETY: calls on valid COM objects.
+    unsafe {
+        let single = collection([update]).map_err(failed)?;
+        installer.SetUpdates(&single).map_err(failed)?;
+        let callbacks = unheeded();
+        let job = installer
+            .BeginInstall(&callbacks, &callbacks, &VARIANT::default())
+            .map_err(failed)?;
+        let result =
+            finish(job, "installing it", |job| installer.EndInstall(job))?.map_err(failed)?;
+        let update_result = result.GetUpdateResult(0).map_err(failed)?;
+        Ok((
+            update_result.ResultCode().map_err(failed)?,
+            update_result.HResult().map_err(failed)?,
+            update_result.RebootRequired().map_err(failed)?.as_bool()
+                || result.RebootRequired().map_err(failed)?.as_bool(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    /// A search, download or install that ends after a number of checks,
+    /// when asked to stop, or never.
+    #[derive(Default)]
+    struct Fake {
+        checks: Cell<u32>,
+        ends_after: Option<u32>,
+        stops_when_asked: bool,
+        asked: Cell<u32>,
+        cleaned_up: Cell<bool>,
+    }
+
+    impl Job for Fake {
+        fn completed(&self) -> windows::core::Result<bool> {
+            self.checks.set(self.checks.get() + 1);
+            let ended = self
+                .ends_after
+                .is_some_and(|after| self.checks.get() > after);
+            Ok(ended || (self.stops_when_asked && self.asked.get() > 0))
+        }
+
+        fn abort(&self) -> windows::core::Result<()> {
+            self.asked.set(self.asked.get() + 1);
+            Ok(())
+        }
+
+        fn clean_up(&self) -> windows::core::Result<()> {
+            self.cleaned_up.set(true);
+            Ok(())
+        }
+    }
+
+    const POLL: Duration = Duration::from_millis(10);
+    const ABORT_WAIT: Duration = Duration::from_millis(200);
+
+    #[test]
+    fn jobs_that_end_in_time_are_waited_for() {
+        let job = Fake {
+            ends_after: Some(3),
+            ..Default::default()
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        assert!(wait(&job, "the search", Some(deadline), POLL, ABORT_WAIT).is_ok());
+        assert_eq!(job.asked.get(), 0);
+        // With no deadline, a job is waited for however long it takes.
+        let job = Fake {
+            ends_after: Some(20),
+            ..Default::default()
+        };
+        assert!(wait(&job, "the search", None, POLL, ABORT_WAIT).is_ok());
+    }
+
+    #[test]
+    fn jobs_past_the_deadline_are_asked_to_stop() {
+        let job = Fake {
+            stops_when_asked: true,
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let stalled = wait(
+            &job,
+            "the download",
+            Some(started + Duration::from_millis(300)),
+            POLL,
+            ABORT_WAIT,
+        )
+        .unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(job.asked.get(), 1);
+        assert!(stalled.stopped);
+        assert_eq!(
+            stalled.message,
+            "Windows Update did not finish the download within 1 minute, so it was stopped"
+        );
+    }
+
+    #[test]
+    fn jobs_that_wont_stop_are_left_after_a_while() {
+        let job = Fake::default();
+        let started = Instant::now();
+        let stalled = wait(
+            &job,
+            "the search",
+            Some(started + Duration::from_millis(300)),
+            POLL,
+            ABORT_WAIT,
+        )
+        .unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(300) + ABORT_WAIT);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(job.asked.get(), 1);
+        assert!(!stalled.stopped);
+        assert!(
+            stalled.message.contains("did not stop when asked"),
+            "{}",
+            stalled.message
+        );
+        // A deadline already gone asks at once.
+        let job = Fake::default();
+        assert!(wait(&job, "the search", Some(Instant::now()), POLL, ABORT_WAIT).is_err());
+        assert_eq!(job.asked.get(), 1);
+    }
+
+    #[test]
+    fn nothing_more_is_asked_of_windows_update_after_the_deadline() {
+        let message = crate::remote::process::by(Instant::now(), || {
+            time_left("the search").unwrap_err().to_string()
+        });
+        assert_eq!(
+            message,
+            "There was no time left for Windows Update to finish the search"
+        );
+        assert!(time_left("the search").is_ok());
+    }
 
     /// Searches this computer's real Windows Update and prints what it
     /// offers. Run it as an administrator: `cargo test -p meshrmm-agent
@@ -441,5 +828,25 @@ mod tests {
             assert_eq!(update.id.len(), 36, "{update:?}");
             assert!(!update.title.is_empty());
         }
+    }
+
+    /// Searches this computer's real Windows Update with too little time,
+    /// and checks the search is stopped rather than waited for: `cargo test
+    /// -p meshrmm-agent real_scan_stops_at_its_deadline -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "searches Windows Update over the network"]
+    fn real_scan_stops_at_its_deadline() {
+        let started = Instant::now();
+        let scan = crate::remote::process::by(Instant::now() + Duration::from_millis(500), scan);
+        println!("{:?} after {:?}", scan.error, started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_millis(500) + super::ABORT_WAIT + super::POLL * 5
+        );
+        let error = scan.error.expect("a search this short fails");
+        assert!(
+            error.starts_with("Windows Update did not finish the search"),
+            "{error}"
+        );
     }
 }

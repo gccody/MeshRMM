@@ -1,10 +1,8 @@
-//! Running an update tool with a time limit, and reading what it wrote.
-use std::io::Read;
+//! Running an update tool with a time limit, and reading what it wrote,
+//! through the process handling application runs use.
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
-
-use anyhow::{Context, bail};
+use std::process::Command;
+use std::time::Duration;
 
 /// What a tool wrote, and how it exited.
 #[derive(Debug)]
@@ -64,8 +62,11 @@ pub(crate) fn find(names: &[&str]) -> Option<PathBuf> {
 }
 
 /// Runs `program` with `args` and the C locale, so its output can be read,
-/// plus `environment`. Stops it after `timeout`. Any exit code is returned;
-/// only a tool that couldn't start or ran too long is an error.
+/// plus `environment`. Stops it and whatever it started after `timeout`, or
+/// at the thread's deadline if that's sooner (see
+/// [`crate::remote::process`]), and never waits on output that something it
+/// left running holds open. Any exit code is returned; only a tool that
+/// couldn't start or ran too long is an error.
 pub(crate) fn run(
     program: &Path,
     args: &[&str],
@@ -73,59 +74,23 @@ pub(crate) fn run(
     timeout: Duration,
 ) -> anyhow::Result<Output> {
     let mut command = Command::new(program);
-    command
-        .args(args)
-        .env("LC_ALL", "C")
-        .env("LANG", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(args).env("LC_ALL", "C").env("LANG", "C");
     for (name, value) in environment {
         command.env(name, value);
     }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("could not run {}", program.display()))?;
-    let mut stdout = child.stdout.take().context("no standard output")?;
-    let mut stderr = child.stderr.take().context("no standard error")?;
-    // Reading on other threads keeps a full pipe from stalling the tool.
-    let output = std::thread::spawn(move || {
-        let mut text = Vec::new();
-        let _ = stdout.read_to_end(&mut text);
-        text
-    });
-    let errors = std::thread::spawn(move || {
-        let mut text = Vec::new();
-        let _ = stderr.read_to_end(&mut text);
-        text
-    });
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if started.elapsed() > timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "{} took longer than {} minutes and was stopped",
-                program.display(),
-                timeout.as_secs().div_ceil(60)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let stdout = output.join().unwrap_or_default();
-    let stderr = errors.join().unwrap_or_default();
+    let ran = crate::remote::process::run(command, timeout)?;
     Ok(Output {
-        code: status.code(),
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        // Unix exit codes are 0 to 255.
+        code: ran.code.and_then(|code| i32::try_from(code).ok()),
+        stdout: ran.stdout,
+        stderr: ran.stderr,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     #[test]
@@ -153,5 +118,76 @@ mod tests {
             .stdout,
             "yes\n"
         );
+    }
+
+    /// Whether process `pid` has ended: gone, or a zombie its new parent
+    /// hasn't reaped yet.
+    fn ended(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .starts_with('Z')
+            })
+    }
+
+    #[test]
+    fn a_child_holding_the_output_is_stopped_with_the_tool() {
+        // The tool and a child it starts, which holds standard output open,
+        // both outlive the limit, as a package script's daemon might.
+        let pid_file =
+            std::env::temp_dir().join(format!("meshrmm-update-survivor-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+        let started = Instant::now();
+        let error = run(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                "sleep 60 & echo $! > \"$1\"; sleep 60",
+                "sh",
+                pid_file.to_str().unwrap(),
+            ],
+            &[],
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("was stopped"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(15));
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("the shell wrote its child's process ID")
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let _ = std::fs::remove_file(&pid_file);
+        let waited = Instant::now();
+        while !ended(pid) {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "the child is still running"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn a_child_left_holding_the_output_doesnt_hold_up_the_tool() {
+        // The tool exits; the child it left holds standard output.
+        let started = Instant::now();
+        let output = run(
+            Path::new("/bin/sh"),
+            &["-c", "echo before; sleep 60 & echo after"],
+            &[],
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(output.code, Some(0));
+        assert_eq!(output.stdout, "before\nafter\n");
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 }

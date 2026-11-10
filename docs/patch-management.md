@@ -61,6 +61,8 @@ already running answers any asked for meanwhile. Each scan is also an
 application scan ([application deployment](application-deployment.md)).
 
 A scan the Agent hasn't reported 45 minutes after it was asked for is lost.
+The Agent gives a scan 30 minutes ([below](#time-limits)), so it reports a
+failed scan first.
 
 ### Per platform
 
@@ -122,9 +124,11 @@ update's outcome is kept: Installed or Failed with the error. The install as
 a whole **succeeded** (every chosen update installed, or none was pending),
 was **partial**, or **failed** (nothing installed, or it couldn't start, such
 as when another program holds the package manager); one the Agent hasn't
-reported five hours after it started is **lost**. A device installs one
-thing at a time: a second install while one runs fails at once, and on the
-device page **Install** is refused (`409 install_running`).
+reported five hours after it started is **lost**; the Agent gives an install
+four hours ([below](#time-limits)), so it reports a failed install first. A
+device installs one thing at a time: a second install while one runs fails
+at once, and on the device page **Install** is refused (`409
+install_running`).
 
 | | Windows | macOS | Linux |
 |---|---|---|---|
@@ -155,6 +159,37 @@ device page **Install** is refused (`409 install_running`).
   session helpers, which isn't implemented. After the restart the Agent
   reconnects and scans within a few minutes, and the website shows the
   restart done.
+
+### Time limits
+
+A scan has 30 minutes and an install, with the scans before and after it, 4
+hours (`UPDATE_SCAN_TIMEOUT_SECONDS`, `UPDATE_INSTALL_TIMEOUT_SECONDS`).
+Each tool also has its own limit (such as 10 minutes for `apt-get update`
+and 3 hours for an install). By the deadline:
+
+- **macOS and Linux:** every tool still running is stopped with whatever it
+  started (it runs in its own process group), and output that something it
+  left behind holds open isn't waited for.
+- **Windows:** the search, download and installs use Windows Update's
+  asynchronous calls. Windows Update is asked to stop the one running and
+  given a minute to; the run fails with "Windows Update did not finish the
+  search within 30 minutes, so it was stopped" (or "… did not stop when
+  asked"). Updates the install didn't get to fail with "The install ran out
+  of time before it got to this update".
+
+A scan or install that still hasn't returned five minutes after its deadline
+(Windows Update not answering at all) is given up on: it is reported failed
+("Windows Update did not answer within 4 hours"), the scans asked for during
+an install are answered by a scan of their own, and the device takes the
+next scan or install. Its thread is left to finish, and until it does no
+other scan (for a scan) or install (for an install) starts: another one
+waits for it, up to its own deadline, and then fails with "Windows Update
+still hasn't finished an earlier install the Agent gave up on; restarting
+the computer ends it". So nothing installs while an install given up on
+might still be changing the computer, and at most one scan and one install
+are left behind. A scan still runs beside an install given up on; it
+changes nothing, and Windows Update and the package managers' locks keep the
+two apart.
 
 ## The website
 
@@ -255,8 +290,9 @@ reboot_error, created_at, completed_at, items}`. The event socket sends
   what to install, the restart), `schedule.rs` (when to scan) with
   `windows.rs` (WUA COM), `macos.rs`,
   `linux.rs` and `linux/` (`apt.rs`, `rpm.rs`, `pacman.rs`, `reboot.rs`),
-  and `process.rs` (tools with time limits). Restarts are
-  `power::schedule_restart`.
+  and `process.rs` (tools with time limits, through
+  `agent/src/remote/process.rs`, which application runs use too). Restarts
+  are `power::schedule_restart`.
 - Server: `server/src/updates/` (`store.rs` for status and pending lists,
   `runs.rs` for runs and their items, `mod.rs` for the engine, reports and
   events) and `server/src/api/updates.rs`. Jobs and policies gained update
@@ -288,7 +324,13 @@ reboot_error, created_at, completed_at, items}`. The event socket sends
 - `cargo test -p meshrmm-agent updates` runs the parsers of every platform's
   tool output and the schedule's arithmetic (`updates::schedule`: on time,
   overdue, after a restart, off, changed, the jitter, and 10,000 overdue
-  devices spread over the hour). The ignored `real_scan_is_plausible` tests scan the computer
-  they run on (as root or SYSTEM); `real_install_installs_the_chosen_updates`
+  devices spread over the hour), the time limits with stand-ins for the
+  update tools (a scan or install that never returns is given up on, the
+  next runs, and none of its kind starts while it might still be running),
+  Windows Update's job deadlines with stand-in jobs, and that a tool's
+  children are stopped with it and never hold it up. The ignored
+  `real_scan_is_plausible` tests scan the computer
+  they run on (as root or SYSTEM); `real_scan_stops_at_its_deadline` checks
+  Windows Update stops a search that runs out of time; `real_install_installs_the_chosen_updates`
   installs on a Linux test machine (`MESHRMM_TEST_INSTALL=ids|all`).
 - `npm test` in `dashboard` covers the updates model.

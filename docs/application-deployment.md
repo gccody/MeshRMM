@@ -415,8 +415,10 @@ application history. A deleted device's packages go with it; its runs stay.
   - `windows.rs`, `macos.rs` and `linux.rs`: the managers and installers;
   - `parse.rs`: the managers' output, tested on captured output in
     `fixtures/`;
-  - `download.rs`: installer downloads;
-  - `process.rs`: running with timeouts and the scan's or run's deadline.
+  - `download.rs`: installer downloads.
+
+  `agent/src/remote/process.rs`, shared with update scans and installs,
+  runs programs with timeouts and the scan's or run's deadline.
 - `server/src/applications/`:
   - `library.rs`: the library and its checks;
   - `store.rs`: devices' packages and the fleet's outdated ones;

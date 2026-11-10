@@ -29,10 +29,10 @@ use meshrmm_protocol::{
 use tokio::sync::mpsc;
 
 use crate::remote::config::{Config, ExecutionMode};
+use crate::remote::process;
 
 mod download;
 mod parse;
-mod process;
 
 #[cfg(target_os = "linux")]
 mod linux;
