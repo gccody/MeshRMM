@@ -96,6 +96,34 @@ pub fn attribute_key(raw: &str) -> String {
     strip_urn(raw).to_ascii_lowercase()
 }
 
+/// The most characters of the client's own text an error quotes. One path,
+/// filter, name or value in a request can be megabytes long, and an error
+/// that quoted all of it would send it back and write it to any log the
+/// error reaches.
+const MAX_QUOTED: usize = 64;
+
+/// `text` as an error quotes it: whole when it is at most [`MAX_QUOTED`]
+/// characters, otherwise its first [`MAX_QUOTED`] and `…` to show it was cut.
+/// Every error that quotes the client's text quotes it through this.
+pub fn excerpt(text: &str) -> String {
+    match text.char_indices().nth(MAX_QUOTED) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
+}
+
+/// Why a body isn't the JSON a request takes. serde's message can quote a
+/// whole string from the body, so only an excerpt of it is kept.
+fn body_error(error: &serde_json::Error) -> String {
+    let message = error.to_string();
+    if error.line() == 0 {
+        return excerpt(&message);
+    }
+    let position = format!(" at line {} column {}", error.line(), error.column());
+    let message = message.strip_suffix(&position).unwrap_or(&message);
+    format!("{}{position}", excerpt(message))
+}
+
 /// A SCIM error response.
 #[derive(Debug)]
 pub struct ScimError {
@@ -207,7 +235,7 @@ impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for ScimBody<T> {
             .map_err(|error| ScimError::new(error.status(), None, error.body_text()))?;
         serde_json::from_slice(&bytes)
             .map(Self)
-            .map_err(|error| ScimError::bad_request("invalidSyntax", error.to_string()))
+            .map_err(|error| ScimError::bad_request("invalidSyntax", body_error(&error)))
     }
 }
 

@@ -901,6 +901,92 @@ async fn a_patch_path_too_deep_for_any_attribute_is_refused() {
     }
 }
 
+#[tokio::test]
+async fn errors_quote_only_the_start_of_what_the_client_sent() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let scim = token(&app, &mut admin).await;
+        let created = scim.post("/Users", user("grace@example.com")).await;
+        assert_eq!(created.status, StatusCode::CREATED, "{name}");
+        let user_path = format!("/Users/{}", created.body["id"].as_str().unwrap());
+
+        // Half a megabyte of the client's text; a filter is at most 4096 bytes.
+        let long = "x".repeat(500_000);
+        let long_filter = "x".repeat(4000);
+        let patch = |operation: Value| scim.patch(&user_path, json!([operation]));
+        let refusals = [
+            (
+                patch(json!({ "op": "replace", "path": format!("emails[{long}"), "value": 1 }))
+                    .await,
+                "invalidPath",
+                "unbalanced brackets in emails[xxx",
+            ),
+            (
+                patch(json!({ "op": "replace", "path": format!("emails[type eq \"work\"]{long}"), "value": 1 }))
+                    .await,
+                "invalidPath",
+                "invalid path emails[type eq \"work\"]xxx",
+            ),
+            (
+                patch(json!({ "op": "replace", "path": format!("emails[{long_filter}]"), "value": 1 }))
+                    .await,
+                "invalidPath",
+                "expected an operator after xxx",
+            ),
+            (
+                patch(json!({ "op": long, "path": "displayName", "value": 1 })).await,
+                "invalidSyntax",
+                "unknown operation xxx",
+            ),
+            (
+                scim.patch(&user_path, json!(long)).await,
+                "invalidSyntax",
+                "invalid type: string \"xxx",
+            ),
+            (
+                scim.get(&format!("/Users?filter={}", encode(&long_filter)))
+                    .await,
+                "invalidFilter",
+                "expected an operator after xxx",
+            ),
+            (
+                scim.get(&format!(
+                    "/Groups?filter={}",
+                    encode(&format!("displayName {long_filter} \"a\""))
+                ))
+                .await,
+                "invalidFilter",
+                "the xxx",
+            ),
+            (
+                scim.get(&format!(
+                    "/Users?filter={}",
+                    encode(&format!("userName eq {long_filter}"))
+                ))
+                .await,
+                "invalidFilter",
+                "invalid value xxx",
+            ),
+            (
+                scim.post("/Groups", group("Technicians", &[&long])).await,
+                "invalidValue",
+                "these members aren't users here: xxx",
+            ),
+        ];
+        for (refused, scim_type, names) in refusals {
+            assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{name}: {names}");
+            assert_eq!(refused.body["scimType"], scim_type, "{name}: {names}");
+            let detail = refused.body["detail"].as_str().unwrap();
+            // What was wrong, and enough of the client's text to find it by.
+            assert!(detail.len() < 256, "{name}: {} bytes", detail.len());
+            assert!(detail.contains(names), "{name}: {detail}");
+            assert!(detail.contains("xxx…"), "{name}: {detail}");
+        }
+        app.finish().await;
+    }
+}
+
 /// `text` as a query parameter's value.
 fn encode(text: &str) -> String {
     text.bytes()
