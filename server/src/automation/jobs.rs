@@ -5,6 +5,9 @@
 //! script's interpreter, or has no update manager MeshRMM supports, is
 //! skipped; an online one is queued for the dispatcher; an offline one waits
 //! for its Agent to connect, or is missed at once if the job doesn't wait.
+//! Creating one is two steps: [`plan`] decides all that through the
+//! database's readers, and [`write`] only inserts it, inside the caller's
+//! transaction, so SQLite's one writer is held for the inserts alone.
 //! Each device's run, delivery or update run is an ordinary one carrying the
 //! job's ID, so its result, output and alerts work as for one started by
 //! hand. A wake job is the other way round: it skips online devices, and
@@ -14,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use meshrmm_protocol_types::{
     DevicePlatform, FileDeliveryDestination, RebootBehavior, RunAs, ScriptLanguage, UpdateCategory,
 };
-use sea_query::{Expr, ExprTrait, Order, Query};
+use sea_query::{Expr, ExprTrait, InsertStatement, Order, Query};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -33,6 +36,7 @@ use crate::{
     },
     http::ApiError,
     rbac::{Permission, Permissions},
+    realtime::AgentHub,
     time::{HOUR_MS, SECOND_MS},
     toolbox::{DELIVERY_WINDOW_MS, RUN_REPORT_GRACE_MS},
     updates::runs::{INSTALL_REPORT_WINDOW_MS, Install, SCAN_REPORT_WINDOW_MS},
@@ -521,6 +525,7 @@ pub struct NewJob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Created {
     pub id: String,
+    /// The devices written: those planned, less any deleted since.
     pub devices: i64,
 }
 
@@ -533,7 +538,9 @@ struct DeviceRow {
     supported: Option<bool>,
 }
 
-/// The devices `target` covers that are enrolled and not deleted, by name.
+/// The devices `target` covers that are enrolled and not deleted, in no
+/// particular order: the dispatcher starts a job's devices by ID, and the
+/// job's page sorts them by name.
 async fn resolve(executor: &mut impl Executor, target: &Target) -> db::Result<Vec<DeviceRow>> {
     let select = || {
         Query::select()
@@ -578,9 +585,6 @@ async fn resolve(executor: &mut impl Executor, target: &Target) -> db::Result<Ve
             rows = executor.fetch_all(&select).await?;
         }
     }
-    rows.sort_by(|left, right| {
-        (left.name.to_lowercase(), &left.id).cmp(&(right.name.to_lowercase(), &right.id))
-    });
     Ok(rows)
 }
 
@@ -601,22 +605,92 @@ async fn target_label(
     })
 }
 
-/// Creates a job and its devices, and records who started it. Devices
-/// without the script's interpreter are skipped; connected ones are queued;
-/// the others wait or are missed. Fails with `no_devices` if the target
-/// covers none.
-pub async fn create(
+/// From this many devices, planning a job copies the set of connected
+/// devices once, provided no more are connected than the job covers. A
+/// smaller job asks the hub about each of its devices instead, so a job on a
+/// few devices of a large fleet doesn't copy every connected device's ID
+/// under the hub's lock.
+const COPY_CONNECTED_FROM: usize = 1_000;
+
+/// How planning a job tells whether a device's Agent is connected.
+#[derive(Debug)]
+enum Connected<'a> {
+    /// The hub, asked about each device.
+    Ask(&'a AgentHub),
+    /// The connected devices, copied once.
+    Copied(HashSet<String>),
+}
+
+impl<'a> Connected<'a> {
+    /// For a job on `devices` devices: a copy when it covers at least
+    /// [`COPY_CONNECTED_FROM`] and at least as many as are connected, where
+    /// copying is no more work than the lookups it replaces.
+    fn new(hub: &'a AgentHub, devices: usize) -> Self {
+        if devices >= COPY_CONNECTED_FROM && devices >= hub.count() {
+            Self::Copied(hub.connected())
+        } else {
+            Self::Ask(hub)
+        }
+    }
+
+    fn contains(&self, device_id: &str) -> bool {
+        match self {
+            Self::Ask(hub) => hub.is_connected(device_id),
+            Self::Copied(connected) => connected.contains(device_id),
+        }
+    }
+}
+
+/// The devices of a planned job that start in the same state with the same
+/// detail.
+#[derive(Debug, Clone)]
+struct Group {
+    state: DeviceState,
+    detail: Option<String>,
+    device_ids: Vec<String>,
+}
+
+/// A job decided without writing anything: the devices its target covers,
+/// how each starts, and its label. [`plan`] makes it through the readers,
+/// which don't wait for the writer; [`write`] stores it.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    job: NewJob,
+    /// What happens to offline devices, and how long they are waited for.
+    offline: Offline,
+    wait_ms: i64,
+    label: String,
+    groups: Vec<Group>,
+    devices: usize,
+}
+
+impl Plan {
+    /// How many devices it covers.
+    pub fn devices(&self) -> usize {
+        self.devices
+    }
+}
+
+fn no_devices() -> ApiError {
+    ApiError::bad_request("there are no devices to run on").with_code("no_devices")
+}
+
+/// Plans `job`: the devices its target covers that are enrolled and not
+/// deleted, and for each whether it is skipped (it can't take the job),
+/// queued (its Agent is connected), or waits or is missed. It only reads, so
+/// callers pass the database itself rather than a transaction, and the
+/// writer stays free however many devices there are. Fails with
+/// `no_devices` if the target covers none.
+pub async fn plan(
     executor: &mut impl Executor,
-    job: &NewJob,
-    connected: &HashSet<String>,
-    now: i64,
-) -> Result<Created, ApiError> {
+    agents: &AgentHub,
+    job: NewJob,
+) -> Result<Plan, ApiError> {
     let devices = resolve(executor, &job.target).await?;
     if devices.is_empty() {
-        return Err(ApiError::bad_request("there are no devices to run on").with_code("no_devices"));
+        return Err(no_devices());
     }
     let label = target_label(executor, &job.target, &devices).await?;
-    let id = new_id();
     // A wake job is for offline devices; it never waits for them.
     let offline = if job.payload == Payload::Wake {
         Offline::Skip
@@ -628,39 +702,136 @@ pub async fn create(
     } else {
         0
     };
-    let (language, body, timeout_seconds, run_as, destination) = match &job.payload {
-        Payload::UpdateScan
-        | Payload::UpdateInstall { .. }
-        | Payload::Wake
-        | Payload::Applications(_) => (None, None, None, None, None),
-        Payload::Script {
-            language,
-            body,
-            timeout_seconds,
-            run_as,
-            ..
-        } => (
-            Some(language.as_str()),
-            Some(body.as_str()),
-            Some(*timeout_seconds),
-            Some(run_as.as_str()),
-            None,
-        ),
-        Payload::File { destination, .. } => (None, None, None, None, Some(destination.as_str())),
-    };
+    let count = devices.len();
+    let connected = Connected::new(agents, count);
+    // A few groups: one a state, and one for each reason devices are skipped.
+    let mut groups: Vec<Group> = Vec::new();
+    for row in devices {
+        let device = Device {
+            id: &row.id,
+            platform: DevicePlatform::parse(&row.platform),
+            updates_supported: row.supported.unwrap_or(true),
+        };
+        let (state, detail) = initial_state(&job, device, &connected);
+        let index = match groups
+            .iter()
+            .position(|group| group.state == state && group.detail == detail)
+        {
+            Some(index) => index,
+            None => {
+                groups.push(Group {
+                    state,
+                    detail,
+                    device_ids: Vec::new(),
+                });
+                groups.len() - 1
+            }
+        };
+        groups[index].device_ids.push(row.id);
+    }
+    Ok(Plan {
+        job,
+        offline,
+        wait_ms,
+        label,
+        groups,
+        devices: count,
+    })
+}
+
+/// A payload's own columns in its job's row.
+#[derive(Default)]
+struct Columns<'a> {
+    language: Option<&'a str>,
+    body: Option<&'a str>,
+    timeout_seconds: Option<i64>,
+    run_as: Option<&'a str>,
+    destination: Option<&'a str>,
+    categories: Option<&'a [UpdateCategory]>,
+    reboot: Option<&'a str>,
+    reboot_delay_minutes: Option<i64>,
+}
+
+impl<'a> Columns<'a> {
+    fn of(payload: &'a Payload) -> Self {
+        match payload {
+            Payload::Script {
+                language,
+                body,
+                timeout_seconds,
+                run_as,
+                ..
+            } => Self {
+                language: Some(language.as_str()),
+                body: Some(body.as_str()),
+                timeout_seconds: Some(*timeout_seconds),
+                run_as: Some(run_as.as_str()),
+                ..Self::default()
+            },
+            Payload::File { destination, .. } => Self {
+                destination: Some(destination.as_str()),
+                ..Self::default()
+            },
+            Payload::UpdateInstall {
+                categories,
+                reboot,
+                reboot_delay_minutes,
+            } => Self {
+                categories: Some(categories.as_slice()),
+                reboot: Some(reboot.as_str()),
+                reboot_delay_minutes: Some(i64::from(*reboot_delay_minutes)),
+                ..Self::default()
+            },
+            Payload::UpdateScan | Payload::Wake | Payload::Applications(_) => Self::default(),
+        }
+    }
+}
+
+/// Inserts those of `device_ids` that are still enrolled and not deleted
+/// into the job `job_id`, as `group` starts. The database leaves out a
+/// device deleted after planning rather than failing the job.
+fn insert_devices(job_id: &str, group: &Group, device_ids: &[String], now: i64) -> InsertStatement {
+    Query::insert()
+        .into_table(JobDevices::Table)
+        .columns([
+            JobDevices::JobId,
+            JobDevices::DeviceId,
+            JobDevices::State,
+            JobDevices::Detail,
+            JobDevices::UpdatedAt,
+        ])
+        .select_from(
+            Query::select()
+                .expr(Expr::val(job_id))
+                .column((Agents::Table, Agents::Id))
+                .expr(Expr::val(group.state.as_str()))
+                .expr(Expr::val(group.detail.clone()))
+                .expr(Expr::val(now))
+                .from(Agents::Table)
+                .and_where(Expr::col((Agents::Table, Agents::Id)).is_in(device_ids.iter().cloned()))
+                .and_where(Expr::col((Agents::Table, Agents::DeletionRequestedAt)).is_null())
+                .to_owned(),
+        )
+        .expect("as many values as columns")
+        .to_owned()
+}
+
+/// Writes a planned job as part of the caller's transaction, and records who
+/// started it: the job, its applications if it has them, its devices a
+/// chunk at a time, grouped by how they start, and the audit event. Nothing
+/// else is read or written unless devices were deleted since planning: they
+/// are left out, the counts are of the devices written, and a job on chosen
+/// devices is labelled by those left. If every device was deleted, the job
+/// is removed again and this fails with `no_devices`.
+pub async fn write(
+    executor: &mut impl Executor,
+    plan: &Plan,
+    now: i64,
+) -> Result<Created, ApiError> {
+    let job = &plan.job;
+    let id = new_id();
+    let columns = Columns::of(&job.payload);
     let (item_id, item_name) = job.payload.item();
-    let (categories, reboot, reboot_delay_minutes) = match &job.payload {
-        Payload::UpdateInstall {
-            categories,
-            reboot,
-            reboot_delay_minutes,
-        } => (
-            Some(categories.as_slice()),
-            Some(reboot.as_str()),
-            Some(i64::from(*reboot_delay_minutes)),
-        ),
-        _ => (None, None, None),
-    };
     executor
         .execute(
             &Query::insert()
@@ -692,18 +863,18 @@ pub async fn create(
                     job.payload.kind().as_str().into(),
                     item_id.into(),
                     item_name.as_str().into(),
-                    language.into(),
-                    body.into(),
-                    timeout_seconds.into(),
-                    run_as.into(),
-                    destination.into(),
-                    categories.and_then(Install::categories_text).into(),
-                    reboot.into(),
-                    reboot_delay_minutes.into(),
+                    columns.language.into(),
+                    columns.body.into(),
+                    columns.timeout_seconds.into(),
+                    columns.run_as.into(),
+                    columns.destination.into(),
+                    columns.categories.and_then(Install::categories_text).into(),
+                    columns.reboot.into(),
+                    columns.reboot_delay_minutes.into(),
                     job.target.kind().as_str().into(),
-                    label.as_str().into(),
-                    offline.as_str().into(),
-                    (now + wait_ms).into(),
+                    plan.label.as_str().into(),
+                    plan.offline.as_str().into(),
+                    (now + plan.wait_ms).into(),
                     job.requested_by_user_id.as_str().into(),
                     job.policy.as_ref().map(|(id, _)| id.as_str()).into(),
                     job.policy.as_ref().map(|(_, name)| name.as_str()).into(),
@@ -716,57 +887,56 @@ pub async fn create(
         crate::applications::jobs::save(executor, &id, spec).await?;
     }
     let mut counts: HashMap<DeviceState, i64> = HashMap::new();
-    for chunk in devices.chunks(INSERT_CHUNK) {
-        let mut insert = Query::insert();
-        insert.into_table(JobDevices::Table).columns([
-            JobDevices::JobId,
-            JobDevices::DeviceId,
-            JobDevices::State,
-            JobDevices::Detail,
-            JobDevices::UpdatedAt,
-        ]);
-        for row in chunk {
-            let device = Device {
-                id: &row.id,
-                platform: DevicePlatform::parse(&row.platform),
-                updates_supported: row.supported.unwrap_or(true),
-            };
-            let (state, detail) = initial_state(job, device, connected);
-            *counts.entry(state).or_default() += 1;
-            insert.values_panic([
-                id.as_str().into(),
-                device.id.into(),
-                state.as_str().into(),
-                detail.into(),
-                now.into(),
-            ]);
+    for group in &plan.groups {
+        for chunk in group.device_ids.chunks(INSERT_CHUNK) {
+            let written = executor
+                .execute(&insert_devices(&id, group, chunk, now))
+                .await?;
+            *counts.entry(group.state).or_default() += i64::try_from(written).unwrap_or(i64::MAX);
         }
-        executor.execute(&insert).await?;
     }
+    let devices = counts.values().sum::<i64>();
+    if devices == 0 {
+        // Every device was deleted since planning. Its applications go too.
+        executor
+            .execute(
+                &Query::delete()
+                    .from_table(Jobs::Table)
+                    .and_where(Expr::col(Jobs::Id).eq(id.as_str()))
+                    .to_owned(),
+            )
+            .await?;
+        return Err(no_devices());
+    }
+    let label = if usize::try_from(devices).is_ok_and(|devices| devices == plan.devices) {
+        plan.label.clone()
+    } else {
+        relabel(executor, plan, &id, devices).await?
+    };
     let mut metadata = json!({
         "kind": job.payload.kind().as_str(),
         "item_id": item_id,
         "item_name": item_name,
         "target": job.target.kind().as_str(),
         "target_label": label,
-        "devices": devices.len(),
-        "offline": offline.as_str(),
+        "devices": devices,
+        "offline": plan.offline.as_str(),
         "queued": counts.get(&DeviceState::Queued).copied().unwrap_or(0),
         "waiting": counts.get(&DeviceState::Waiting).copied().unwrap_or(0),
         "skipped": counts.get(&DeviceState::Skipped).copied().unwrap_or(0),
     });
-    if let Some(run_as) = run_as {
+    if let Some(run_as) = columns.run_as {
         metadata["run_as"] = run_as.into();
     }
-    if let Some(destination) = destination {
+    if let Some(destination) = columns.destination {
         metadata["destination"] = destination.into();
     }
-    if let Some(categories) = categories {
+    if let Some(categories) = columns.categories {
         metadata["categories"] = json!(categories);
     }
-    if let Some(reboot) = reboot {
+    if let Some(reboot) = columns.reboot {
         metadata["reboot"] = reboot.into();
-        metadata["reboot_delay_minutes"] = reboot_delay_minutes.into();
+        metadata["reboot_delay_minutes"] = columns.reboot_delay_minutes.into();
     }
     if let Payload::Applications(spec) = &job.payload {
         metadata["applications"] = spec.audit();
@@ -784,16 +954,57 @@ pub async fn create(
         metadata,
     )
     .await?;
-    Ok(Created {
-        id,
-        devices: devices.len() as i64,
-    })
+    Ok(Created { id, devices })
+}
+
+/// The label of a job written with fewer devices than planned. One on chosen
+/// devices is labelled by those left, as if the others had been deleted
+/// before planning; other targets name their companies or tags, or every
+/// device, whatever the count.
+async fn relabel(
+    executor: &mut impl Executor,
+    plan: &Plan,
+    job_id: &str,
+    devices: i64,
+) -> db::Result<String> {
+    if !matches!(plan.job.target, Target::Devices(_)) {
+        return Ok(plan.label.clone());
+    }
+    let label = if devices == 1 {
+        let (name,): (String,) = executor
+            .fetch_one(
+                &Query::select()
+                    .column((Agents::Table, Agents::Name))
+                    .from(JobDevices::Table)
+                    .inner_join(
+                        Agents::Table,
+                        Expr::col((Agents::Table, Agents::Id))
+                            .equals((JobDevices::Table, JobDevices::DeviceId)),
+                    )
+                    .and_where(Expr::col((JobDevices::Table, JobDevices::JobId)).eq(job_id))
+                    .to_owned(),
+            )
+            .await?;
+        name
+    } else {
+        format!("{devices} devices")
+    };
+    executor
+        .execute(
+            &Query::update()
+                .table(Jobs::Table)
+                .value(Jobs::TargetLabel, label.as_str())
+                .and_where(Expr::col(Jobs::Id).eq(job_id))
+                .to_owned(),
+        )
+        .await?;
+    Ok(label)
 }
 
 fn initial_state(
     job: &NewJob,
     device: Device<'_>,
-    connected: &HashSet<String>,
+    connected: &Connected<'_>,
 ) -> (DeviceState, Option<String>) {
     if job.payload == Payload::Wake {
         return if connected.contains(device.id) {
@@ -1562,5 +1773,38 @@ mod tests {
         assert_eq!(counts.total, 10);
         assert_eq!(counts.active(), 2);
         assert_eq!(counts.failures(), 1);
+    }
+
+    #[test]
+    fn only_jobs_on_many_devices_copy_the_connected_devices() {
+        let hub = AgentHub::default();
+        let _connections = (0..3)
+            .map(|index| hub.connect(&format!("device-{index}")))
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(Connected::new(&hub, 1), Connected::Ask(_)),
+            "a job on one device asks about it"
+        );
+        assert!(matches!(
+            Connected::new(&hub, COPY_CONNECTED_FROM - 1),
+            Connected::Ask(_)
+        ));
+        let Connected::Copied(copied) = Connected::new(&hub, COPY_CONNECTED_FROM) else {
+            panic!("a job on many devices copies the connected ones once");
+        };
+        assert_eq!(copied.len(), 3);
+        // With more connected than the job covers, asking is less work.
+        let _fleet = (0..=COPY_CONNECTED_FROM)
+            .map(|index| hub.connect(&format!("fleet-{index}")))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            Connected::new(&hub, COPY_CONNECTED_FROM),
+            Connected::Ask(_)
+        ));
+        for devices in [1, 2 * COPY_CONNECTED_FROM] {
+            let connected = Connected::new(&hub, devices);
+            assert!(connected.contains("device-0"), "{devices}");
+            assert!(!connected.contains("elsewhere"), "{devices}");
+        }
     }
 }

@@ -156,6 +156,42 @@ All of this state is in the database, so a server restart carries on with
 queued and waiting devices. Runs that were on a device when the server
 stopped report when it is back, or end up with no result.
 
+### Creating a job
+
+Creating a job reads much more than it writes: every device its target
+covers (for every device, the whole fleet), each one's platform and update
+support, and whether its Agent is connected. The server does all of that
+first, through the database's readers, without holding SQLite's one writer
+(`jobs::plan`), and then inserts the job in one transaction that writes and
+reads nothing else (`jobs::write`): the job, its applications, its devices
+400 to a statement, grouped by how they start, and the audit event. So
+starting a job on 100,000 devices holds up other writes only for its
+inserts, and the job still appears whole, since the dispatcher and the
+job's counts read only committed rows. The website's own reads for a job
+(the script, the file, the applications) and a policy's (its definition,
+its owner's access, its script) come before the transaction too.
+
+Things can change between planning and writing:
+
+- A device deleted in between is left out: each insert takes only the
+  devices that are still enrolled and not deleted. The job's counts and its
+  `job.start` audit event say what was written, and a job on chosen devices
+  is labelled by those left. If none is left, the job isn't created and
+  fails with `no_devices`, as one planned with none does.
+- An Agent that connects in between waits in the job, and is queued in a
+  moment: the step after a job is created queues its waiting devices whose
+  Agents are connected, a policy's firing leads to a full pass, and the
+  minute's full pass catches any other. One that disconnects in between is
+  queued, and when its turn comes the dispatcher finds it offline and makes
+  it wait again (or misses it, if the job skips offline devices), as for one
+  that disconnects later.
+- A script edited in between is as one edited just after the job started:
+  the job keeps the body it read.
+
+A job on fewer than 1,000 devices, or on fewer devices than are connected,
+asks whether each of its own devices is connected; a larger one copies the
+connected devices once.
+
 ## Policies
 
 **Jobs → Policies** lists the policies, their schedules, the next and last
@@ -241,7 +277,11 @@ uses a script, the script can't be deleted or unshared
 Firing claims the policy's due time and creates the job in one database
 transaction: the next time is written only together with the job, and only
 if the due time is still the one the pass read. A restart in the middle of a
-firing, or two passes at once, can't run a policy twice.
+firing, or two passes at once, can't run a policy twice. The job is planned
+just before that transaction (see [creating a job](#creating-a-job)), and the
+claim also needs the policy unchanged since: one saved, turned off or
+deleted in between starts nothing from what it was, and a saved one is
+planned again from what was saved.
 
 When the server was down at a policy's time:
 
@@ -328,8 +368,8 @@ should read the lists again.
 
 ## How it's built
 
-- `server/src/automation/`: `jobs.rs` (creating jobs, outcomes and counts,
-  who sees what), `dispatch.rs` (expiry, queueing connected devices, starting
+- `server/src/automation/`: `jobs.rs` (planning and writing jobs, outcomes
+  and counts, who sees what), `dispatch.rs` (expiry, queueing connected devices, starting
   runs and deliveries within the limits), `policies.rs` (policies, firing,
   enrollment), `schedule.rs` (triggers and time zones, with `chrono-tz`),
   and `mod.rs` (the engine's task, publishing changes, finishing jobs and
@@ -391,5 +431,8 @@ should read the lists again.
   each class's ceiling, small jobs beside large ones, wakes however full),
   file jobs, policies firing once across a restart, skipping a run while
   the last one's devices are queued, missed times, owners' access,
-  enrollment policies, alerts and failure notifications, and retention.
+  enrollment policies, alerts and failure notifications, and retention;
+  and that creating a job plans it without the writer and then only
+  inserts, leaves out devices deleted in between, and starts nothing from a
+  policy changed between planning its firing and claiming it.
 - `npm test` in `dashboard` covers the job and policy models.
