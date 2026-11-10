@@ -60,12 +60,14 @@ fn number(text: &str) -> Option<i64> {
 
 /// Unix milliseconds of `2026-11-09T09:38:10.5016551Z` (the Windows Event
 /// Log's) or `2026-11-09 09:38:10.123456-0800` (the macOS unified log's).
+/// Logs hold what programs wrote, so text that isn't a time, in any
+/// characters, is `None`.
 pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
     let text = text.trim();
     if text.len() < 19 {
         return None;
     }
-    let (date, rest) = text.split_at(10);
+    let (date, rest) = text.split_at_checked(10)?;
     let mut parts = date.split('-');
     let (year, month, day) = (
         number(parts.next()?)?,
@@ -73,7 +75,7 @@ pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
         number(parts.next()?)?,
     );
     let rest = rest.strip_prefix(['T', ' '])?;
-    let (clock, mut zone) = rest.split_at(8);
+    let (clock, mut zone) = rest.split_at_checked(8)?;
     let mut clock_parts = clock.split(':');
     let (hour, minute, second) = (
         number(clock_parts.next()?)?,
@@ -83,23 +85,24 @@ pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
     let mut millis = 0;
     if let Some(fraction) = zone.strip_prefix('.') {
         let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
-        let padded = format!("{:0<3}", &fraction[..digits.min(3)]);
+        let padded = format!("{:0<3}", fraction.get(..digits.min(3))?);
         millis = number(&padded)?;
-        zone = &fraction[digits..];
+        zone = fraction.get(digits..)?;
     }
     let offset_minutes = match zone {
         "" | "Z" => 0,
         _ => {
-            let sign = match zone.as_bytes()[0] {
-                b'+' => 1,
-                b'-' => -1,
-                _ => return None,
+            let (sign, digits) = if let Some(digits) = zone.strip_prefix('+') {
+                (1, digits)
+            } else {
+                (-1, zone.strip_prefix('-')?)
             };
-            let digits = zone[1..].replace(':', "");
+            let digits = digits.replace(':', "");
             if digits.len() != 4 {
                 return None;
             }
-            sign * (number(&digits[..2])? * 60 + number(&digits[2..])?)
+            let (hours, minutes) = digits.split_at_checked(2)?;
+            sign * (number(hours)? * 60 + number(minutes)?)
         }
     };
     let days = days_from_civil(year, month, day);
@@ -185,13 +188,13 @@ impl EventFilter {
 fn unescape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(at) = rest.find('&') {
-        out.push_str(&rest[..at]);
-        rest = &rest[at..];
-        let Some(end) = rest.find(';') else {
+    while let Some((before, after)) = rest.split_once('&') {
+        out.push_str(before);
+        let Some((entity, next)) = after.split_once(';') else {
+            out.push('&');
+            rest = after;
             break;
         };
-        let entity = &rest[1..end];
         let decoded = match entity {
             "lt" => Some('<'),
             "gt" => Some('>'),
@@ -209,11 +212,11 @@ fn unescape(text: &str) -> String {
         match decoded {
             Some(c) => {
                 out.push(c);
-                rest = &rest[end + 1..];
+                rest = next;
             }
             None => {
                 out.push('&');
-                rest = &rest[1..];
+                rest = after;
             }
         }
     }
@@ -225,17 +228,19 @@ fn unescape(text: &str) -> String {
 fn attribute(tag: &str, name: &str) -> Option<String> {
     let mut search = tag;
     loop {
-        let at = search.find(name)?;
-        let after = &search[at + name.len()..];
-        let boundary = at == 0 || search.as_bytes()[at - 1].is_ascii_whitespace();
-        if boundary && let Some(after) = after.strip_prefix('=') {
-            let quote = after.chars().next()?;
-            if quote == '\'' || quote == '"' {
-                let value = &after[1..];
-                return Some(unescape(&value[..value.find(quote)?]));
+        let (before, after) = search.split_once(name)?;
+        let boundary = before
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_ascii_whitespace());
+        if boundary && let Some(value) = after.strip_prefix('=') {
+            for quote in ['\'', '"'] {
+                if let Some(value) = value.strip_prefix(quote) {
+                    return Some(unescape(value.split_once(quote)?.0));
+                }
             }
         }
-        search = &search[at + name.len()..];
+        search = after;
     }
 }
 
@@ -244,11 +249,12 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
 fn start_tag<'a>(xml: &'a str, name: &str) -> Option<(&'a str, usize)> {
     let mut from = 0;
     loop {
-        let at = from + xml[from..].find(&format!("<{name}"))?;
+        let at = from + xml.get(from..)?.find(&format!("<{name}"))?;
         let after = at + 1 + name.len();
-        if xml[after..].starts_with(['>', ' ', '/', '\t', '\r', '\n']) {
-            let end = after + xml[after..].find('>')?;
-            return Some((&xml[at + 1..end], end + 1));
+        let rest = xml.get(after..)?;
+        if rest.starts_with(['>', ' ', '/', '\t', '\r', '\n']) {
+            let end = after + rest.find('>')?;
+            return Some((xml.get(at + 1..end)?, end + 1));
         }
         from = after;
     }
@@ -260,8 +266,15 @@ fn element_text(xml: &str, name: &str) -> Option<String> {
     if tag.ends_with('/') {
         return Some(String::new());
     }
-    let end = content + xml[content..].find(&format!("</{name}>"))?;
-    Some(unescape(&xml[content..end]))
+    let (text, _) = xml.get(content..)?.split_once(&format!("</{name}>"))?;
+    Some(unescape(text))
+}
+
+/// The provider named in a Windows event's XML, whose publisher formats
+/// its message.
+pub(crate) fn windows_provider(xml: &str) -> Option<String> {
+    let (provider, _) = start_tag(xml, "Provider")?;
+    attribute(provider, "Name")
 }
 
 fn windows_level(level: u8) -> Option<EventLevel> {
@@ -274,7 +287,7 @@ fn windows_level(level: u8) -> Option<EventLevel> {
 /// when the XML has it (`RenderingInfo`), else `message`, else its data.
 pub(crate) fn windows_event(xml: &str, message: Option<String>) -> Option<LogEvent> {
     let system_end = xml.find("</System>")?;
-    let system = &xml[..system_end];
+    let system = xml.get(..system_end)?;
     let (provider, _) = start_tag(system, "Provider")?;
     let mut sources = Vec::new();
     for name in ["Name", "EventSourceName"] {
@@ -292,23 +305,26 @@ pub(crate) fn windows_event(xml: &str, message: Option<String>) -> Option<LogEve
     let (time, _) = start_tag(system, "TimeCreated")?;
     let at_ms = parse_timestamp(&attribute(time, "SystemTime")?)?;
     let rendered = start_tag(xml, "RenderingInfo")
-        .and_then(|(_, content)| element_text(&xml[content..], "Message"));
+        .and_then(|(_, content)| element_text(xml.get(content..)?, "Message"));
     let message = rendered.or(message).unwrap_or_else(|| {
         let mut data = Vec::new();
         let mut rest = xml.get(system_end..).unwrap_or_default();
         while let Some((tag, content)) = start_tag(rest, "Data") {
-            if tag.ends_with('/') {
-                rest = &rest[content..];
-                continue;
-            }
-            let Some(end) = rest[content..].find("</Data>") else {
+            let Some(inside) = rest.get(content..) else {
                 break;
             };
-            let value = unescape(&rest[content..content + end]);
+            if tag.ends_with('/') {
+                rest = inside;
+                continue;
+            }
+            let Some((value, after)) = inside.split_once("</Data>") else {
+                break;
+            };
+            let value = unescape(value);
             if !value.is_empty() {
                 data.push(value);
             }
-            rest = &rest[content + end..];
+            rest = after;
         }
         data.join("; ")
     });
@@ -569,7 +585,9 @@ fn cpu_time(text: &str) -> Option<u64> {
     for part in clock.split(':') {
         seconds = seconds * 60.0 + part.parse::<f64>().ok()?;
     }
-    Some(days * 86_400_000 + (seconds * 1000.0).round() as u64)
+    // A time too long to count isn't one `ps` wrote.
+    days.checked_mul(86_400_000)?
+        .checked_add((seconds * 1000.0).round() as u64)
 }
 
 /// `ps -axo pid=,rss=,time=,comm=`: RSS in KiB, and the command, which on a
@@ -581,6 +599,7 @@ pub(crate) fn ps_processes(text: &str) -> Vec<ProcessSample> {
             let pid = fields.next()?.parse().ok()?;
             let rss = fields.next()?.parse::<u64>().ok()?;
             let cpu_ms = cpu_time(fields.next()?)?;
+            let memory_bytes = rss.checked_mul(1024)?;
             let command = fields.collect::<Vec<_>>().join(" ");
             if command.is_empty() {
                 return None;
@@ -594,7 +613,7 @@ pub(crate) fn ps_processes(text: &str) -> Vec<ProcessSample> {
                 pid,
                 names,
                 cpu_ms,
-                memory_bytes: rss * 1024,
+                memory_bytes,
             })
         })
         .collect()
@@ -606,7 +625,7 @@ pub(crate) fn ps_processes(text: &str) -> Vec<ProcessSample> {
 pub(crate) fn proc_stat(text: &str) -> Option<(u32, String, u64, u64)> {
     let open = text.find('(')?;
     let close = text.rfind(')')?;
-    let pid = text[..open].trim().parse().ok()?;
+    let pid = text.get(..open)?.trim().parse().ok()?;
     let comm = text.get(open + 1..close)?.to_owned();
     // Fields after the command, counting from state (field 3).
     let fields = text
@@ -614,7 +633,7 @@ pub(crate) fn proc_stat(text: &str) -> Option<(u32, String, u64, u64)> {
         .split_whitespace()
         .collect::<Vec<_>>();
     let field = |number: usize| fields.get(number - 3)?.parse::<u64>().ok();
-    Some((pid, comm, field(14)? + field(15)?, field(24)?))
+    Some((pid, comm, field(14)?.checked_add(field(15)?)?, field(24)?))
 }
 
 /// Whether a process called `name` is the one a monitor names: ignoring
@@ -642,7 +661,8 @@ pub(crate) fn ping_time_ms(output: &str) -> Option<f64> {
             .find("time=")
             .map(|at| at + 5)
             .or_else(|| line.find("time<").map(|at| at + 5))?;
-        let digits = line[at..]
+        let digits = line
+            .get(at..)?
             .chars()
             .take_while(|c| c.is_ascii_digit() || *c == '.')
             .collect::<String>();
@@ -658,33 +678,34 @@ fn der_item(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
         (usize::from(first), rest)
     } else {
         let count = usize::from(first & 0x7f);
-        if count == 0 || count > 4 || rest.len() < count {
+        if count == 0 || count > 4 {
             return None;
         }
-        let length = rest[..count]
+        let (length, rest) = rest.split_at_checked(count)?;
+        let length = length
             .iter()
             .fold(0usize, |length, byte| length << 8 | usize::from(*byte));
-        (length, &rest[count..])
+        (length, rest)
     };
-    if rest.len() < length {
-        return None;
-    }
-    Some((tag, &rest[..length], &rest[length..]))
+    let (content, rest) = rest.split_at_checked(length)?;
+    Some((tag, content, rest))
 }
 
 /// A UTCTime (`YYMMDDHHMMSSZ`) or GeneralizedTime (`YYYYMMDDHHMMSSZ`), in
-/// Unix milliseconds.
+/// Unix milliseconds. The server a monitor points at sends it, so anything
+/// else, in any characters, is `None`.
 fn der_time(tag: u8, content: &[u8]) -> Option<i64> {
     let text = std::str::from_utf8(content).ok()?.strip_suffix('Z')?;
     let (year, rest) = match tag {
         0x17 if text.len() == 12 => {
-            let year = number(&text[..2])?;
-            (
-                if year >= 50 { 1900 + year } else { 2000 + year },
-                &text[2..],
-            )
+            let (year, rest) = text.split_at_checked(2)?;
+            let year = number(year)?;
+            (if year >= 50 { 1900 + year } else { 2000 + year }, rest)
         }
-        0x18 if text.len() >= 14 => (number(&text[..4])?, &text[4..]),
+        0x18 if text.len() >= 14 => {
+            let (year, rest) = text.split_at_checked(4)?;
+            (number(year)?, rest)
+        }
         _ => return None,
     };
     let field = |at: usize| number(rest.get(at..at + 2)?);
@@ -969,5 +990,140 @@ mod tests {
         );
         assert_eq!(certificate_not_after(&utc[..20]), None);
         assert_eq!(certificate_not_after(b""), None);
+    }
+
+    /// Where a certificate's expiry is: the content of the first time of
+    /// that type and length that reads as it.
+    fn not_after_at(der: &[u8], tag: u8, length: u8) -> usize {
+        let expires = certificate_not_after(der);
+        assert!(expires.is_some());
+        der.windows(2)
+            .enumerate()
+            .filter(|(_, pair)| *pair == [tag, length])
+            .map(|(at, _)| at + 2)
+            .find(|at| {
+                der.get(*at..*at + usize::from(length))
+                    .and_then(|time| der_time(tag, time))
+                    == expires
+            })
+            .unwrap()
+    }
+
+    /// A server can present a certificate with anything in its times, and
+    /// the check then fails to read the expiry instead of panicking.
+    #[test]
+    fn certificates_with_unreadable_times_have_no_expiry() {
+        let e = "é".as_bytes();
+        for (der, tag, length) in [
+            (
+                include_bytes!("testdata/certificate-utctime.der").as_slice(),
+                0x17,
+                13,
+            ),
+            (
+                include_bytes!("testdata/certificate-generalized.der").as_slice(),
+                0x18,
+                15,
+            ),
+        ] {
+            let at = not_after_at(der, tag, length);
+            // A two-byte character across where the year ends, and inside
+            // each later field.
+            for offset in 1..usize::from(length) - 2 {
+                let mut forged = der.to_vec();
+                forged[at + offset..at + offset + 2].copy_from_slice(e);
+                assert_eq!(certificate_not_after(&forged), None, "at {offset}");
+            }
+            // Cut short anywhere.
+            for end in 0..der.len() {
+                let _ = certificate_not_after(&der[..end]);
+            }
+        }
+        for (tag, text) in [
+            (0x17, "2é123123595Z"),
+            (0x17, "26é12312359Z"),
+            (0x17, "é"),
+            (0x18, "202é123123595Z"),
+            (0x18, "2026é12312359Z"),
+            (0x17, "2612Z"),
+            (0x18, "2026Z"),
+            (0x17, "Z"),
+            (0x17, ""),
+            (0x18, ""),
+        ] {
+            assert_eq!(der_time(tag, text.as_bytes()), None, "{text}");
+        }
+        assert_eq!(der_time(0x17, &[0xff, b'Z']), None, "not UTF-8");
+    }
+
+    #[test]
+    fn unreadable_log_times_have_none() {
+        for text in [
+            // A two-byte character across where the date ends, where the
+            // clock ends, and in the zone.
+            "2026-11-0é09:38:10Z",
+            "2026-11-09T08:10:1é",
+            "2026-11-09T08:10:10+é12",
+            "2026-11-09T08:10:10.5é",
+            "éééééééééééééééééééé",
+            "2026-11-09T08:10",
+            "2026-11-09T08:10:10+08",
+            "",
+        ] {
+            assert_eq!(parse_timestamp(text), None, "{text}");
+        }
+        let line = r#"{"timestamp":"2026-11-0é01:38:10.501655-0800","messageType":"Error"}"#;
+        assert_eq!(unified_log_event(line), None);
+    }
+
+    #[test]
+    fn unreadable_windows_events_have_none() {
+        let xml = include_str!("testdata/windows-events.xml");
+        let first = xml.split("</Event>").next().unwrap();
+        // Cut short anywhere, or with a two-byte character anywhere.
+        for (at, _) in first.char_indices() {
+            let _ = windows_event(&first[..at], None);
+            let _ = windows_event(&format!("{}é{}", &first[..at], &first[at..]), None);
+        }
+        assert_eq!(
+            windows_provider(first).as_deref(),
+            Some("Service Control Manager")
+        );
+        assert_eq!(
+            windows_provider("<Provider EventSourceName='x' Name=\"a &amp; b\"/>").as_deref(),
+            Some("a & b")
+        );
+        for xml in [
+            "<Provider Name=éx'/>",
+            "<Provider Name='abc",
+            "<Provider Name=",
+            "<Provideré",
+            "<Provider",
+            "",
+        ] {
+            assert_eq!(windows_provider(xml), None, "{xml}");
+        }
+        assert_eq!(unescape("a &#xé; &é; &amp"), "a &#xé; &é; &amp");
+        assert_eq!(unescape("&lt;é&gt;"), "<é>");
+    }
+
+    #[test]
+    fn unreadable_tool_output_is_skipped() {
+        let max = u64::MAX;
+        // Memory or CPU time too large to count.
+        assert!(ps_processes(&format!("1 {max} 00:00:01 a\n")).is_empty());
+        assert!(ps_processes(&format!("1 1 {max}-00:00:01 a\n")).is_empty());
+        assert_eq!(cpu_time("213503982334601-00:00:00"), None);
+        assert_eq!(ps_processes("1 1 é\n2 2 00:00:01 é\n")[0].names, ["é"]);
+        assert_eq!(
+            proc_stat(&format!(
+                "77 (d) S 1 77 77 0 -1 0 0 0 0 0 {max} {max} 0 0 20 0 1 0 1 1 9"
+            )),
+            None
+        );
+        assert_eq!(proc_stat("1 ) (x S"), None);
+        assert_eq!(proc_stat("é (é) S"), None);
+        assert_eq!(proc_stat(""), None);
+        assert_eq!(ping_time_ms("time=é ms\ntime<"), None);
     }
 }

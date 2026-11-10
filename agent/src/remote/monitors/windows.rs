@@ -368,15 +368,6 @@ fn message(publisher: &Event, event: &Event) -> Option<String> {
     }
 }
 
-fn provider_name(xml: &str) -> Option<String> {
-    let start = xml.find("<Provider ")?;
-    let tag = &xml[start..start + xml[start..].find('>')?];
-    let at = tag.find(" Name=")? + 6;
-    let quote = tag[at..].chars().next()?;
-    let value = &tag[at + 1..];
-    Some(value[..value.find(quote)?].to_owned())
-}
-
 pub(super) fn events(
     log: &str,
     filter: &EventFilter,
@@ -422,8 +413,9 @@ pub(super) fn events(
             }
             anyhow::bail!("could not read the log: {}", error.message());
         }
-        let events = handles[..returned as usize]
+        let events = handles
             .iter()
+            .take(returned as usize)
             .map(|handle| Event(EVT_HANDLE(*handle)))
             .collect::<Vec<_>>();
         for event in events {
@@ -434,7 +426,7 @@ pub(super) fn events(
             let wants_message = !filter.message.is_empty() || found.len() < MESSAGES_LISTED;
             let text = wants_message
                 .then(|| {
-                    let provider = provider_name(&xml)?;
+                    let provider = parse::windows_provider(&xml)?;
                     let publisher = publishers.entry(provider.clone()).or_insert_with(|| {
                         // SAFETY: the metadata handle is closed on drop.
                         unsafe {

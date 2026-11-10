@@ -151,7 +151,7 @@ pub(super) fn cpu_percent(
                 .map_or(process.cpu_ms, |earlier| earlier.cpu_ms);
             process.cpu_ms.saturating_sub(before)
         })
-        .sum::<u64>() as f64;
+        .fold(0, u64::saturating_add) as f64;
     let available = elapsed.as_secs_f64() * 1000.0 * cores.max(1) as f64;
     if available <= 0.0 {
         return 0.0;
@@ -229,7 +229,7 @@ pub(super) fn judge_process(
             let megabytes = processes
                 .iter()
                 .map(|process| process.memory_bytes)
-                .sum::<u64>() as f64
+                .fold(0, u64::saturating_add) as f64
                 / (1024.0 * 1024.0);
             let megabytes = megabytes.round();
             let limit = threshold.megabytes.unwrap_or(u64::MAX) as f64;
