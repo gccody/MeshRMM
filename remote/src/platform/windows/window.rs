@@ -614,6 +614,9 @@ pub(super) unsafe fn pump_window_messages(window: HWND) -> bool {
         let _ = unsafe { TranslateMessage(&message) };
         unsafe { DispatchMessageW(&message) };
     }
+    if let Some(context) = unsafe { window_context(window) } {
+        context.release_unvouched();
+    }
     false
 }
 

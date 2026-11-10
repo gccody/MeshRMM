@@ -168,18 +168,56 @@ impl WindowContext {
         }
         let scan_code = ((lparam.0 >> 16) & 0xff) as u16;
         let extended = lparam.0 & (1 << 24) != 0;
-        self.send_key(scan_code, extended, pressed);
+        // Bit 30: the key was already down, so this press is an auto-repeat.
+        let repeat = lparam.0 & (1 << 30) != 0;
+        self.send_key(scan_code, extended, pressed, repeat);
     }
 
-    pub(super) fn send_key(&self, scan_code: u16, extended: bool, pressed: bool) {
+    pub(super) fn send_key(&self, scan_code: u16, extended: bool, pressed: bool, repeat: bool) {
         if scan_code == 0 {
             return;
         }
-        let input =
-            self.held
-                .borrow_mut()
-                .key(self.active_display_id(), scan_code, extended, pressed);
-        self.send(SessionMessage::Input(input));
+        let input = self.held.borrow_mut().key_event(
+            self.active_display_id(),
+            scan_code,
+            extended,
+            pressed,
+            repeat,
+        );
+        if let Some(input) = input {
+            self.send(SessionMessage::Input(input));
+        }
+    }
+
+    /// Releases the held keys the technician no longer holds, once the
+    /// window's messages are handled. Windows keeps some key-ups from the
+    /// window without taking its focus: those on its secure desktop after
+    /// Ctrl+Alt+Del, for one. A key the hook took is not in Windows' key
+    /// state, so the hook's word counts for it; Windows+L, the only way to
+    /// leave one down, locks the workstation, which releases everything.
+    pub(super) fn release_unvouched(&self) {
+        if !self.held.borrow().keys_held() {
+            return;
+        }
+        let released = self.held.borrow_mut().release_unheld(
+            self.active_display_id(),
+            |scan_code, extended| {
+                use windows::Win32::UI::Input::KeyboardAndMouse::{
+                    GetAsyncKeyState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW,
+                };
+                let scan = u32::from(scan_code) | if extended { 0xe000 } else { 0 };
+                let virtual_key = unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) };
+                // A key without a virtual key cannot be checked; its own
+                // key-up or the next focus loss releases it.
+                virtual_key == 0
+                    || keyboard_hook::holds(virtual_key)
+                    // Zero, too, while another desktop takes the input.
+                    || unsafe { GetAsyncKeyState(virtual_key as i32) } < 0
+            },
+        );
+        for input in released {
+            self.control.send_automatic(SessionMessage::Input(input));
+        }
     }
 
     /// Releases every key and button held on the device. The viewer does
