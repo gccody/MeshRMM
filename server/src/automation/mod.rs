@@ -2,8 +2,8 @@
 //! policies that start jobs on a schedule or when devices enroll. See
 //! docs/automation.md.
 //!
-//! The engine's task steps every few seconds, every second while devices
-//! are queued, and at once when woken. A step costs as much as what changed:
+//! The engine's task steps every few seconds, every second while queued
+//! devices could start, and at once when woken. A step costs as much as what changed:
 //! it queues the waiting parts of the devices whose Agent connected, fires
 //! the policies that are due and starts queued devices within the
 //! dispatcher's limits. At most once per [`SETTLE_SPACING_MS`] it also
@@ -44,7 +44,8 @@ use crate::{
 /// How often the engine looks for due policies and expired jobs when
 /// nothing wakes it.
 const IDLE_INTERVAL: Duration = Duration::from_secs(5);
-/// How soon it steps again while devices are queued.
+/// How soon it steps again while queued devices could start: the last pass
+/// stopped at the dispatcher's batch, not at a ceiling only a report frees.
 const BUSY_INTERVAL: Duration = Duration::from_secs(1);
 /// The least time between two recounts, however often the engine is woken:
 /// while thousands of Agents reconnect, their devices start as they connect
@@ -275,7 +276,7 @@ pub async fn step(state: &AppState, now: i64) -> anyhow::Result<Duration> {
 }
 
 /// A full pass of the engine at `now`, whatever was announced. Returns
-/// whether queued devices remain.
+/// whether queued devices could start straight away.
 pub async fn pass(state: &AppState, now: i64) -> anyhow::Result<bool> {
     let _one_at_a_time = state.automation.inner.passing.lock().await;
     full_pass(state, now).await
@@ -313,7 +314,7 @@ async fn full_pass(state: &AppState, now: i64) -> anyhow::Result<bool> {
 
 /// Queues the waiting parts of the devices that connected and of the
 /// connected devices of changed jobs, fires due policies and starts queued
-/// devices. Returns whether queued devices remain.
+/// devices. Returns whether queued devices could start straight away.
 async fn quick_pass(state: &AppState, now: i64) -> anyhow::Result<bool> {
     let engine = &state.automation;
     let (connected, changed_jobs) = {

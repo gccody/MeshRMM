@@ -1330,3 +1330,404 @@ async fn the_full_pass_catches_what_the_engine_was_not_told() {
         app.finish().await;
     }
 }
+
+/// Records a pending run of the dispatcher's `class` on each of
+/// `device_ids`, as if other jobs' runs awaited a report there.
+async fn hold(app: &App, class: automation::dispatch::Class, device_ids: &[String]) {
+    use meshrmm_server::db::tables::{ScriptRuns, UpdateRuns};
+    use sea_query::Query;
+    let now = now_ms();
+    for chunk in device_ids.chunks(100) {
+        let mut insert = Query::insert();
+        match class {
+            automation::dispatch::Class::Quick => {
+                insert.into_table(ScriptRuns::Table).columns([
+                    ScriptRuns::Id,
+                    ScriptRuns::DeviceId,
+                    ScriptRuns::ScriptId,
+                    ScriptRuns::ScriptName,
+                    ScriptRuns::Language,
+                    ScriptRuns::RequestedByUserId,
+                    ScriptRuns::Source,
+                    ScriptRuns::JobId,
+                    ScriptRuns::RunAs,
+                    ScriptRuns::TimeoutSeconds,
+                    ScriptRuns::CreatedAt,
+                ]);
+                for device_id in chunk {
+                    insert.values_panic([
+                        uuid::Uuid::new_v4().to_string().into(),
+                        device_id.as_str().into(),
+                        "held".into(),
+                        "Held".into(),
+                        "cmd".into(),
+                        "held".into(),
+                        "job".into(),
+                        "held".into(),
+                        "system".into(),
+                        3_600.into(),
+                        now.into(),
+                    ]);
+                }
+            }
+            automation::dispatch::Class::Long => {
+                insert.into_table(UpdateRuns::Table).columns([
+                    UpdateRuns::Id,
+                    UpdateRuns::DeviceId,
+                    UpdateRuns::Kind,
+                    UpdateRuns::RequestedByUserId,
+                    UpdateRuns::JobId,
+                    UpdateRuns::CreatedAt,
+                ]);
+                for device_id in chunk {
+                    insert.values_panic([
+                        uuid::Uuid::new_v4().to_string().into(),
+                        device_id.as_str().into(),
+                        "install".into(),
+                        "held".into(),
+                        "held".into(),
+                        now.into(),
+                    ]);
+                }
+            }
+        }
+        app.db().execute(&insert).await.unwrap();
+    }
+}
+
+/// Ends the runs [`hold`] recorded.
+async fn release(app: &App) {
+    use meshrmm_server::db::tables::{ScriptRuns, UpdateRuns};
+    use sea_query::{Expr, ExprTrait, Query};
+    app.db()
+        .execute(
+            &Query::delete()
+                .from_table(ScriptRuns::Table)
+                .and_where(Expr::col(ScriptRuns::JobId).eq("held"))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    app.db()
+        .execute(
+            &Query::delete()
+                .from_table(UpdateRuns::Table)
+                .and_where(Expr::col(UpdateRuns::JobId).eq("held"))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+}
+
+/// `count` stand-in device IDs that no job covers.
+fn others(prefix: &str, count: i64) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("{prefix}-{index}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn more_connected_agents_start_more_devices_a_pass() {
+    use automation::dispatch::{MIN_BATCH, limits};
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let mut agents = Vec::new();
+        for index in 0..32 {
+            agents.push(app.enroll(&mut admin, &format!("DESK-{index}")).await);
+        }
+        let mut connections = agents
+            .iter()
+            .map(|agent| app.state.agents.connect(&agent.device_id))
+            .collect::<Vec<_>>();
+        // The rest of a fleet of about 3,000, with nothing to run.
+        let _fleet = others("idle", 3_000)
+            .iter()
+            .map(|id| app.state.agents.connect(id))
+            .collect::<Vec<_>>();
+        let batch = limits(app.state.agents.count()).batch;
+        assert_eq!(batch, 30, "{name}");
+        assert!(batch > MIN_BATCH);
+        let script = create_script(&mut admin, "Inventory", "cmd", false).await;
+        let devices = agents
+            .iter()
+            .map(|agent| agent.device_id.clone())
+            .collect::<Vec<_>>();
+        start_job(
+            &mut admin,
+            json!({
+                "script_id": script, "run_as": "system", "target": "devices",
+                "device_ids": devices, "offline": "skip",
+            }),
+        )
+        .await;
+        let sent = |connections: &mut Vec<AgentConnection>| {
+            connections
+                .iter_mut()
+                .map(|connection| runs(connection).len())
+                .sum::<usize>()
+        };
+        let now = now_ms();
+        assert!(
+            pass(&app, now).await,
+            "{name}: it stopped at the batch with more to start"
+        );
+        assert_eq!(sent(&mut connections), 30, "{name}");
+        assert!(
+            !pass(&app, now + SECOND_MS).await,
+            "{name}: nothing is left to start"
+        );
+        assert_eq!(sent(&mut connections), 2, "{name}");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn long_jobs_leave_room_for_quick_ones_and_wakes_start_however_full() {
+    use automation::dispatch::{Class, MIN_IN_FLIGHT};
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "DESK").await;
+        let patching = app.enroll(&mut admin, "PATCHING").await;
+        let asleep = app.enroll(&mut admin, "ASLEEP").await;
+        meshrmm_server::updates::store::store_scan(
+            app.db(),
+            &patching.device_id,
+            serde_json::from_value(json!({
+                "scanned_at_unix_ms": 1, "manager": "windows_update",
+                "updates": [], "reboot_pending": false,
+            }))
+            .unwrap(),
+            now_ms(),
+        )
+        .await
+        .unwrap();
+        let mut desk_connection = app.state.agents.connect(&desk.device_id);
+        let mut patching_connection = app.state.agents.connect(&patching.device_id);
+        let script = create_script(&mut admin, "Inventory", "powershell", false).await;
+        let script_job = json!({
+            "script_id": script, "run_as": "system", "target": "devices",
+            "device_ids": [desk.device_id], "offline": "skip",
+        });
+
+        // A fleet-wide install holds every slot of its class, and another
+        // install waits behind it.
+        hold(&app, Class::Long, &others("installing", MIN_IN_FLIGHT)).await;
+        let install = start_job(
+            &mut admin,
+            json!({
+                "updates": { "action": "install", "categories": ["security"], "reboot": "never" },
+                "target": "devices", "device_ids": [patching.device_id], "offline": "skip",
+            }),
+        )
+        .await;
+        let first = start_job(&mut admin, script_job.clone()).await;
+        let now = now_ms();
+        assert!(
+            !pass(&app, now).await,
+            "{name}: the install waits for a report, not another pass"
+        );
+        assert!(started(&mut patching_connection).is_empty(), "{name}");
+        assert_eq!(
+            job(&mut admin, install["id"].as_str().unwrap()).await["devices"][0]["outcome"],
+            "queued"
+        );
+        assert_eq!(
+            runs(&mut desk_connection).len(),
+            1,
+            "{name}: the script starts at once"
+        );
+        assert_eq!(
+            job(&mut admin, first["id"].as_str().unwrap()).await["devices"][0]["outcome"],
+            "running"
+        );
+
+        // With both classes full, a wake job's device is still woken.
+        hold(&app, Class::Quick, &others("running", MIN_IN_FLIGHT)).await;
+        let second = start_job(&mut admin, script_job).await;
+        let policy = create_policy(
+            &mut admin,
+            json!({
+                "name": "Wake", "action": "wake", "target": "devices",
+                "device_ids": [asleep.device_id], "trigger": "daily", "time": "01:50",
+                "time_zone": "UTC", "offline": "skip",
+            }),
+        )
+        .await;
+        let woken = admin
+            .post(
+                &format!(
+                    "/v1/automation-policies/{}/run",
+                    policy["id"].as_str().unwrap()
+                ),
+                json!({}),
+            )
+            .await;
+        assert_eq!(woken.status, StatusCode::CREATED, "{:?}", woken.body);
+        let woken_id = woken.body["id"].as_str().unwrap();
+        assert_eq!(
+            job(&mut admin, woken_id).await["devices"][0]["outcome"],
+            "queued",
+            "{name}"
+        );
+        assert!(!pass(&app, now + SECOND_MS).await, "{name}");
+        let woken = job(&mut admin, woken_id).await;
+        assert_ne!(
+            woken["devices"][0]["outcome"], "queued",
+            "{name}: the wake started: {woken}"
+        );
+        assert!(woken["devices"][0]["wake_id"].is_string(), "{name}");
+        assert!(runs(&mut desk_connection).is_empty(), "{name}");
+        assert_eq!(
+            job(&mut admin, second["id"].as_str().unwrap()).await["devices"][0]["outcome"],
+            "queued"
+        );
+
+        // Once the runs report, both start.
+        release(&app).await;
+        assert!(!pass(&app, now + 2 * SECOND_MS).await, "{name}");
+        assert_eq!(runs(&mut desk_connection).len(), 1, "{name}");
+        assert_eq!(started(&mut patching_connection).len(), 1, "{name}");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_small_job_is_not_left_behind_a_large_one() {
+    use automation::dispatch::{Class, MIN_IN_FLIGHT};
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let mut fleet = Vec::new();
+        for index in 0..6 {
+            fleet.push(app.enroll(&mut admin, &format!("FLEET-{index}")).await);
+        }
+        let desk = app.enroll(&mut admin, "DESK").await;
+        let mut fleet_connections = fleet
+            .iter()
+            .map(|agent| app.state.agents.connect(&agent.device_id))
+            .collect::<Vec<_>>();
+        let mut desk_connection = app.state.agents.connect(&desk.device_id);
+        let script = create_script(&mut admin, "Inventory", "cmd", false).await;
+        let script_job = |devices: Vec<String>| {
+            json!({
+                "script_id": script, "run_as": "system", "target": "devices",
+                "device_ids": devices, "offline": "skip",
+            })
+        };
+        // One slot is free at a time, as when runs report one by one.
+        hold(&app, Class::Quick, &others("running", MIN_IN_FLIGHT - 1)).await;
+        let large = start_job(
+            &mut admin,
+            script_job(fleet.iter().map(|agent| agent.device_id.clone()).collect()),
+        )
+        .await;
+        let small = start_job(&mut admin, script_job(vec![desk.device_id.clone()])).await;
+
+        assert!(
+            !pass(&app, now_ms()).await,
+            "{name}: the class is full, so no hurry"
+        );
+        assert_eq!(
+            runs(&mut desk_connection).len(),
+            1,
+            "{name}: the small job takes the free slot"
+        );
+        assert!(
+            fleet_connections
+                .iter_mut()
+                .all(|connection| runs(connection).is_empty())
+        );
+        assert_eq!(
+            job(&mut admin, small["id"].as_str().unwrap()).await["devices"][0]["outcome"],
+            "running"
+        );
+        let large_id = large["id"].as_str().unwrap();
+        assert_eq!(job(&mut admin, large_id).await["counts"]["queued"], 6);
+
+        // The large one carries on once there's room.
+        release(&app).await;
+        pass(&app, now_ms()).await;
+        assert!(
+            fleet_connections
+                .iter_mut()
+                .all(|connection| runs(connection).len() == 1),
+            "{name}"
+        );
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn policies_skip_a_run_while_their_last_runs_devices_are_queued() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let agent = app.enroll(&mut admin, "DESK").await;
+        let mut connection = app.state.agents.connect(&agent.device_id);
+        // The device is at its limit, so its part stays queued.
+        hold(
+            &app,
+            automation::dispatch::Class::Quick,
+            &vec![agent.device_id.clone(); automation::dispatch::MAX_PER_DEVICE as usize],
+        )
+        .await;
+        let script = create_script(&mut admin, "Health check", "powershell", true).await;
+        let policy = create_policy(
+            &mut admin,
+            json!({
+                "name": "Every five minutes", "script_id": script, "run_as": "system",
+                "target": "all", "trigger": "interval", "interval_minutes": 5,
+                "offline": "wait", "catch_up_hours": 24,
+            }),
+        )
+        .await;
+        let id = policy["id"].as_str().unwrap().to_owned();
+        let next = policy["next_run_at"].as_i64().unwrap();
+        let queued = |jobs: &[Value]| {
+            jobs.iter()
+                .map(|job| job["counts"]["queued"].as_i64().unwrap())
+                .sum::<i64>()
+        };
+
+        pass(&app, next).await;
+        let fired = policy_jobs(&mut admin, &id).await;
+        assert_eq!(fired.len(), 1, "{name}");
+        assert_eq!(queued(&fired), 1, "{name}");
+        for run in 1..=3 {
+            pass(&app, next + run * 5 * MINUTE_MS).await;
+            let fired = policy_jobs(&mut admin, &id).await;
+            assert_eq!(fired.len(), 1, "{name}: run {run} is skipped");
+            assert_eq!(queued(&fired), 1, "{name}: and queues nothing more");
+        }
+        let listed = admin.get("/v1/automation-policies").await.body;
+        let problem = listed["policies"][0]["last_problem"].as_str().unwrap();
+        assert!(
+            problem.starts_with("Skipped its run at ")
+                && problem.ends_with(" because 1 device from its last run hadn't started yet"),
+            "{name}: {problem}"
+        );
+        assert_eq!(
+            listed["policies"][0]["next_run_at"],
+            next + 20 * MINUTE_MS,
+            "{name}: it keeps time"
+        );
+        assert_eq!(
+            audit_events(&app, "automation_policy.skip").await.len(),
+            3,
+            "{name}"
+        );
+        assert!(runs(&mut connection).is_empty(), "{name}");
+
+        // Once the device starts, the next run happens.
+        release(&app).await;
+        pass(&app, next + 16 * MINUTE_MS).await;
+        assert_eq!(runs(&mut connection).len(), 1, "{name}");
+        pass(&app, next + 20 * MINUTE_MS).await;
+        assert_eq!(policy_jobs(&mut admin, &id).await.len(), 2, "{name}");
+        let listed = admin.get("/v1/automation-policies").await.body;
+        assert_eq!(listed["policies"][0]["last_problem"], Value::Null, "{name}");
+        app.finish().await;
+    }
+}

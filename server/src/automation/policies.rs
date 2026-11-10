@@ -14,7 +14,10 @@
 //! the server was down runs when it starts if it is at most
 //! [`MISSED_GRACE_MS`] late; later than that, interval schedules still run
 //! once, and times of day are skipped until their next time. Missed times
-//! never run more than once.
+//! never run more than once. A run replaces its earlier jobs' waits for
+//! offline devices, but is skipped, and says why, while those jobs still
+//! have online devices queued, so a policy can't pile up jobs faster than
+//! the dispatcher starts them.
 use std::collections::HashMap;
 
 use meshrmm_protocol_types::{
@@ -1327,8 +1330,34 @@ pub async fn fire_due(state: &AppState, now: i64) -> anyhow::Result<bool> {
     Ok(fired)
 }
 
+/// How many devices are queued in the policy's unfinished jobs: online, and
+/// not started yet.
+async fn queued_devices(executor: &mut impl Executor, policy_id: &str) -> db::Result<i64> {
+    let (count,): (i64,) = executor
+        .fetch_one(
+            &Query::select()
+                .expr(Expr::cust("CAST(COUNT(*) AS BIGINT)"))
+                .from(JobDevices::Table)
+                .and_where(Expr::col(JobDevices::State).eq(DeviceState::Queued.as_str()))
+                .and_where(
+                    Expr::col(JobDevices::JobId).in_subquery(
+                        Query::select()
+                            .column(Jobs::Id)
+                            .from(Jobs::Table)
+                            .and_where(Expr::col(Jobs::PolicyId).eq(policy_id))
+                            .and_where(Expr::col(Jobs::FinishedAt).is_null())
+                            .to_owned(),
+                    ),
+                )
+                .to_owned(),
+        )
+        .await?;
+    Ok(count)
+}
+
 /// Fires the policy due at `due_at`, once: claiming the time and starting
-/// the job happen together. Returns whether a job started.
+/// the job happen together. A policy whose last run still has queued
+/// devices skips this run and says why. Returns whether a job started.
 async fn fire(state: &AppState, id: &str, due_at: i64, now: i64) -> anyhow::Result<bool> {
     let mut transaction = state.database.begin().await?;
     let Some(policy) = by_id(&mut transaction, id).await? else {
@@ -1359,6 +1388,24 @@ async fn fire(state: &AppState, id: &str, due_at: i64, now: i64) -> anyhow::Resu
         let problem = format!(
             "Missed its run at {} because the server wasn't running",
             crate::alerts::format_time(due_at)
+        );
+        record_problem(&mut transaction, &policy, &problem, Some(due_at), now).await?;
+        transaction.commit().await?;
+        return Ok(false);
+    }
+    // Online devices still waiting their turn from its last run: a new job
+    // would only queue them again behind it, and on a big fleet with a
+    // short interval the queue would grow faster than it drains.
+    let queued = queued_devices(&mut transaction, &policy.id).await?;
+    if queued > 0 {
+        let problem = format!(
+            "Skipped its run at {} because {} from its last run hadn't started yet",
+            crate::alerts::format_time(due_at),
+            if queued == 1 {
+                "1 device".to_owned()
+            } else {
+                format!("{queued} devices")
+            }
         );
         record_problem(&mut transaction, &policy, &problem, Some(due_at), now).await?;
         transaction.commit().await?;

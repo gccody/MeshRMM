@@ -126,6 +126,12 @@ impl AgentHub {
             .collect()
     }
 
+    /// How many devices have a connection, without copying them as
+    /// [`Self::connected`] does. It may count one that is closing.
+    pub fn count(&self) -> usize {
+        self.lock().len()
+    }
+
     /// Queues `message` for the device's connection. Returns whether there
     /// is one that accepted it; an Agent that is offline, or so far behind
     /// that its backlog is full, did not.
