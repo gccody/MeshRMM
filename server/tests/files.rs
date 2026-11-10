@@ -789,6 +789,7 @@ async fn uploads_resume_and_land_only_when_verified() {
         let server = app.serve().await;
         let mut admin = set_up(&app).await;
         let (agent, mut control) = enrolled(&app, &mut admin, &server).await;
+        let access = *app.state.presence.access_changes().borrow();
         let content: Vec<u8> = (0..600_000u32).map(|index| (index % 253) as u8).collect();
 
         let call = post(
@@ -978,6 +979,12 @@ async fn uploads_resume_and_land_only_when_verified() {
         let request = answer(&mut control, json!({ "reply": "upload", "received": 0 })).await;
         assert_eq!(request["operation"]["op"], "cancel_upload");
         assert_eq!(call.await.unwrap().status, 204, "{name}");
+        // No part of an upload is a change to anyone's access.
+        assert_eq!(
+            *app.state.presence.access_changes().borrow(),
+            access,
+            "{name}"
+        );
         app.finish().await;
     }
 }

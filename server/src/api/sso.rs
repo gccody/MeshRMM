@@ -701,7 +701,6 @@ pub async fn put_settings(
     .await?;
     let settings = view(&state, &mut transaction).await?;
     transaction.commit().await?;
-    state.presence.recheck_access();
     Ok(Json(settings))
 }
 
@@ -867,7 +866,6 @@ pub async fn delete_settings(
     )
     .await?;
     transaction.commit().await?;
-    state.presence.recheck_access();
     Ok(StatusCode::NO_CONTENT)
 }
 

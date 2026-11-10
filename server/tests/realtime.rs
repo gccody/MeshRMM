@@ -2,7 +2,7 @@
 //! WebSockets.
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{
     App, Received, apps, apps_with, quiet, receive, receive_close, receive_json, send_json,
@@ -245,6 +245,27 @@ async fn enrollments_are_announced_and_snapshots_converge() {
     }
 }
 
+/// How often an event socket checks its user's access by itself.
+const PERIODIC_RECHECK: Duration = Duration::from_secs(30);
+
+/// The generation event sockets, terminals and remote sessions watch to
+/// check their user's access again.
+fn access_generation(app: &App) -> u64 {
+    *app.state.presence.access_changes().borrow()
+}
+
+/// A socket opened at `opened` closed before its first periodic check, so
+/// the change's signal closed it.
+fn assert_signalled(opened: Instant) {
+    assert!(
+        opened.elapsed() < PERIODIC_RECHECK,
+        "closed only after {:?}",
+        opened.elapsed()
+    );
+}
+
+/// Opens an event socket for a new user who may only see devices, makes
+/// `change` as the administrator, and checks the socket closes at once.
 async fn assert_closes_for(
     app: &App,
     server: &common::Server,
@@ -254,9 +275,11 @@ async fn assert_closes_for(
     let email = format!("{}@example.com", common::random_hex(4));
     let (mut user, user_id) = user_with(app, admin, &email, &["devices.view"]).await;
     let mut events = user.events(server).await.unwrap();
+    let opened = Instant::now();
     receive_json(&mut events).await;
     change(admin, &user_id).await;
     assert_eq!(receive_close(&mut events).await, 4001, "{}", app.name);
+    assert_signalled(opened);
     assert!(user.get("/v1/agents").await.status.is_client_error());
 }
 
@@ -326,6 +349,223 @@ async fn the_event_socket_needs_the_website_and_permission_to_see_devices() {
         assert_eq!(viewer.get("/v1/agents").await.status, 403);
 
         assert!(matches!(receive(&mut events).await, Received::Gone));
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn only_changes_to_access_make_sockets_check_it_again() {
+    for app in apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let _connection = app.state.agents.connect(&desk.device_id);
+        let (viewer, viewer_id) =
+            user_with(&app, &mut admin, "viewer@example.com", &["devices.view"]).await;
+        let mut events = viewer.events(&server).await.unwrap();
+        let opened = Instant::now();
+        receive_json(&mut events).await;
+        let before = access_generation(&app);
+
+        // Everyday work doesn't change anyone's access.
+        let tag = admin
+            .post("/v1/tags", json!({ "name": "Servers", "color": "blue" }))
+            .await;
+        assert_eq!(tag.status, 201, "{name}: {:?}", tag.body);
+        let tagged = admin
+            .post(
+                "/v1/device-tags",
+                json!({ "device_ids": [desk.device_id], "add": [tag.body["id"]] }),
+            )
+            .await;
+        assert_eq!(tagged.status, 200, "{name}: {:?}", tagged.body);
+        let noted = admin
+            .put(
+                &format!("/v1/agents/{}/notes", desk.device_id),
+                json!({ "body": "Front desk PC", "revision": 0 }),
+            )
+            .await;
+        assert_eq!(noted.status, 200, "{name}: {:?}", noted.body);
+        let company = admin.post("/v1/companies", json!({ "name": "Acme" })).await;
+        assert_eq!(company.status, 201, "{name}: {:?}", company.body);
+        let moved = admin
+            .put(
+                &format!("/v1/agents/{}/company", desk.device_id),
+                json!({ "company_id": company.body["id"] }),
+            )
+            .await;
+        assert_eq!(moved.status, 204, "{name}: {:?}", moved.body);
+        let script = admin
+            .post(
+                "/v1/toolbox/scripts",
+                json!({ "name": "Date", "language": "powershell", "body": "Get-Date", "shared": false }),
+            )
+            .await;
+        assert_eq!(script.status, 201, "{name}: {:?}", script.body);
+        let run = admin
+            .post(
+                &format!("/v1/agents/{}/script-runs", desk.device_id),
+                json!({ "script_id": script.body["id"], "run_as": "user" }),
+            )
+            .await;
+        assert_eq!(run.status, 201, "{name}: {:?}", run.body);
+        // Nor does a stranger's request, even one that succeeds.
+        let stranger = app.browser().post("/v1/auth/sign-out", json!({})).await;
+        assert_eq!(stranger.status, 204, "{name}");
+        let reset = app
+            .browser()
+            .post(
+                "/v1/auth/password-reset",
+                json!({ "email": "viewer@example.com" }),
+            )
+            .await;
+        assert_eq!(reset.status, 202, "{name}: {:?}", reset.body);
+        assert_eq!(access_generation(&app), before, "{name}");
+
+        // Signing in can drop roles from SSO groups.
+        let signed_in = app
+            .browser()
+            .post(
+                "/v1/auth/sign-in",
+                json!({ "email": "viewer@example.com", "password": "a long enough password" }),
+            )
+            .await;
+        assert_eq!(signed_in.status, 200, "{name}: {:?}", signed_in.body);
+        assert!(access_generation(&app) > before, "{name}");
+
+        // A change to access is signalled, and the socket closes at once.
+        let role = admin.get(&format!("/v1/users/{viewer_id}")).await.body["roles"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let changed = admin
+            .patch(
+                &format!("/v1/roles/{role}"),
+                json!({ "permissions": ["scripts.run"] }),
+            )
+            .await;
+        assert_eq!(changed.status, 200, "{name}: {:?}", changed.body);
+        assert_eq!(receive_close(&mut events).await, 4001, "{name}");
+        assert_signalled(opened);
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn every_change_that_can_end_access_closes_sockets_at_once() {
+    for app in apps().await {
+        let server = app.serve().await;
+        let mut admin = set_up(&app).await;
+
+        assert_closes_for(&app, &server, &mut admin, async |admin, user_id| {
+            let response = admin
+                .patch(&format!("/v1/users/{user_id}"), json!({ "role_ids": [] }))
+                .await;
+            assert_eq!(response.status, 200, "{:?}", response.body);
+        })
+        .await;
+        assert_closes_for(&app, &server, &mut admin, async |admin, user_id| {
+            let response = admin.delete(&format!("/v1/users/{user_id}")).await;
+            assert_eq!(response.status, 204, "{:?}", response.body);
+        })
+        .await;
+        assert_closes_for(&app, &server, &mut admin, async |admin, user_id| {
+            let role = admin.get(&format!("/v1/users/{user_id}")).await.body["roles"][0]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let response = admin.delete(&format!("/v1/roles/{role}")).await;
+            assert_eq!(response.status, 204, "{:?}", response.body);
+        })
+        .await;
+        assert_closes_for(&app, &server, &mut admin, async |admin, user_id| {
+            let response = admin
+                .post(&format!("/v1/users/{user_id}/reset-two-factor"), json!({}))
+                .await;
+            assert_eq!(response.status, 204, "{:?}", response.body);
+        })
+        .await;
+        // The reset link is used by someone not signed in, often elsewhere.
+        assert_closes_for(&app, &server, &mut admin, async |admin, user_id| {
+            let reset = admin
+                .post(&format!("/v1/users/{user_id}/password-reset"), json!({}))
+                .await;
+            assert_eq!(reset.status, 200, "{:?}", reset.body);
+            let token = common::link_token(reset.body["link"].as_str().unwrap());
+            let done = app
+                .browser()
+                .post(
+                    "/v1/auth/password-reset/complete",
+                    json!({ "token": token, "password": "a brand new password" }),
+                )
+                .await;
+            assert_eq!(done.status, 204, "{:?}", done.body);
+        })
+        .await;
+
+        // The user's own changes from another browser.
+        for change in ["end that session", "change the password"] {
+            let email = format!("{}@example.com", common::random_hex(4));
+            let (mut user, _) = user_with(&app, &mut admin, &email, &["devices.view"]).await;
+            let mut other = app.browser();
+            let signed_in = other
+                .post(
+                    "/v1/auth/sign-in",
+                    json!({ "email": email, "password": "a long enough password" }),
+                )
+                .await;
+            assert_eq!(signed_in.status, 200, "{:?}", signed_in.body);
+            let mut events = user.events(&server).await.unwrap();
+            let opened = Instant::now();
+            receive_json(&mut events).await;
+            let response = if change == "end that session" {
+                let sessions = other.get("/v1/account/sessions").await.body;
+                let first = sessions
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|session| session["current"] == false)
+                    .unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                other.delete(&format!("/v1/account/sessions/{first}")).await
+            } else {
+                other
+                    .post(
+                        "/v1/account/password",
+                        json!({ "current_password": "a long enough password", "new_password": "a brand new password" }),
+                    )
+                    .await
+            };
+            assert_eq!(
+                response.status, 204,
+                "{}: {change}: {:?}",
+                app.name, response.body
+            );
+            assert_eq!(
+                receive_close(&mut events).await,
+                4001,
+                "{}: {change}",
+                app.name
+            );
+            assert_signalled(opened);
+            assert_eq!(user.get("/v1/agents").await.status, 401);
+        }
+
+        // Last, as it confines the administrator too: requiring a second
+        // factor confines a password session without one to enrolling.
+        assert_closes_for(&app, &server, &mut admin, async |admin, _| {
+            let response = admin
+                .patch(
+                    "/v1/settings/authentication",
+                    json!({ "require_two_factor": true }),
+                )
+                .await;
+            assert_eq!(response.status, 200, "{:?}", response.body);
+        })
+        .await;
         app.finish().await;
     }
 }

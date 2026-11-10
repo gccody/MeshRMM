@@ -76,8 +76,8 @@ the shell and everything it started, when:
   Terminals → Close idle terminals after** (5 minutes to 8 hours, 30 minutes
   by default). Output doesn't count, so a `tail -f` left alone is closed too;
 - the user signs out, is signed out, or loses the permission the terminal
-  needs (checked every 30 seconds and whenever a signed-in user changes
-  something);
+  needs (checked every 30 seconds, and at once after a change that can take
+  access away: see [architecture](architecture.md#access-changes));
 - the device goes offline, or its Agent restarts or updates. Automatic Agent
   updates wait while a terminal is open, as they do for remote sessions.
 

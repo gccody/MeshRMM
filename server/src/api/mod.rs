@@ -58,11 +58,21 @@ use crate::{
 };
 
 pub fn router(state: AppState) -> Router<AppState> {
-    Router::new()
-        .merge(auth_routes())
+    // What these routes change can end sessions or take permissions away, so
+    // open sockets check their user's access again after each successful
+    // write. A route that can change access belongs in one of them.
+    let access = Router::new()
+        .merge(sign_in_routes())
         .merge(account_routes())
         .merge(api_token_routes())
         .merge(administration_routes())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            recheck_access,
+        ));
+    Router::new()
+        .merge(access)
+        .merge(public_auth_routes())
         .merge(device_routes())
         .merge(toolbox_routes())
         .merge(remote_routes())
@@ -70,10 +80,6 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(monitor_routes())
         .merge(automation_routes())
         .merge(application_routes())
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            recheck_access,
-        ))
         .layer(middleware::from_fn_with_state(state, csrf::check))
         // Responses carry account data; browsers and proxies must not keep them.
         .layer(SetResponseHeaderLayer::if_not_present(
@@ -82,25 +88,34 @@ pub fn router(state: AppState) -> Router<AppState> {
         ))
 }
 
-fn auth_routes() -> Router<AppState> {
+/// Starting and ending sessions. A sign-in other than through SSO also drops
+/// the user's roles from SSO groups, and a completed password reset signs
+/// the user out everywhere.
+fn sign_in_routes() -> Router<AppState> {
     Router::new()
-        .route("/instance", get(instance::get))
         .route("/setup", post(setup::complete))
         .route("/auth/sign-in", post(sign_in::password))
         .route("/auth/sign-in/second-factor", post(sign_in::second_factor))
         .route("/auth/sign-out", post(sign_in::sign_out))
-        .route("/auth/passkey/options", post(passkeys::sign_in_options))
         .route("/auth/passkey", post(passkeys::sign_in))
-        .route("/auth/sso/start", get(sso::start))
-        .route("/auth/sso/callback", get(sso::callback))
-        .route("/auth/invitation", post(invitations::lookup))
         .route("/auth/invitation/accept", post(invitations::accept))
-        .route("/auth/password-reset", post(password_resets::request))
-        .route("/auth/password-reset/lookup", post(password_resets::lookup))
         .route(
             "/auth/password-reset/complete",
             post(password_resets::complete),
         )
+}
+
+/// What anyone may ask before signing in, which changes no one's access.
+/// The SSO callback is a `GET`, so it signals a sign-in itself.
+fn public_auth_routes() -> Router<AppState> {
+    Router::new()
+        .route("/instance", get(instance::get))
+        .route("/auth/passkey/options", post(passkeys::sign_in_options))
+        .route("/auth/sso/start", get(sso::start))
+        .route("/auth/sso/callback", get(sso::callback))
+        .route("/auth/invitation", post(invitations::lookup))
+        .route("/auth/password-reset", post(password_resets::request))
+        .route("/auth/password-reset/lookup", post(password_resets::lookup))
 }
 
 fn account_routes() -> Router<AppState> {
@@ -466,9 +481,12 @@ fn website_only_route(route: MethodRouter<AppState>) -> MethodRouter<AppState> {
     route.layer(middleware::from_fn(website_only))
 }
 
-/// What a signed-in user changes may end sessions or change permissions,
-/// and so may signing in (it can drop roles from SSO groups), so open event
-/// sockets and remote sessions check their own access again after either.
+/// After a successful write to a route that can change access, asks open
+/// event sockets, terminals and remote sessions to check their user's
+/// access again, unless the response says [`AccessUnchanged`]. The handler
+/// has committed by then. Each of those routes succeeds only for a session,
+/// a token, a password or a one-time link, so strangers can't make every
+/// socket check.
 async fn recheck_access(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -478,23 +496,20 @@ async fn recheck_access(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
     );
-    let signed_in = crate::auth::session::token(request.headers()).is_some()
-        || crate::api_tokens::bearer(request.headers()).is_some();
     let response = next.run(request).await;
-    let signs_in = response
-        .headers()
-        .get_all(header::SET_COOKIE)
-        .iter()
-        .any(|cookie| {
-            cookie
-                .as_bytes()
-                .starts_with(format!("{}=", crate::auth::session::COOKIE_NAME).as_bytes())
-        });
-    if change && (signed_in || signs_in) && response.status().is_success() {
+    if change
+        && response.status().is_success()
+        && response.extensions().get::<AccessUnchanged>().is_none()
+    {
         state.presence.recheck_access();
     }
     response
 }
+
+/// A response extension for a write that succeeded without changing
+/// anyone's access, such as signing out a browser that had no session.
+#[derive(Debug, Clone, Copy)]
+struct AccessUnchanged;
 
 /// The body of a response that signs the browser in.
 #[derive(Debug, Serialize)]

@@ -10,7 +10,7 @@ use serde_json::json;
 
 use webauthn_rs::prelude::{PasskeyAuthentication, PublicKeyCredential, RequestChallengeResponse};
 
-use super::{SignInResult, signed_in_response};
+use super::{AccessUnchanged, SignInResult, signed_in_response};
 use crate::{
     audit::{self, Actor, Target},
     auth::{
@@ -320,8 +320,9 @@ pub async fn sign_out(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let mut database = &state.database;
-    if let Some(user_id) = session::end(&mut database, &headers).await?
-        && let Some(user) = users::by_id(&mut database, &user_id).await?
+    let ended = session::end(&mut database, &headers).await?;
+    if let Some(user_id) = &ended
+        && let Some(user) = users::by_id(&mut database, user_id).await?
     {
         audit::record(
             &mut database,
@@ -332,9 +333,13 @@ pub async fn sign_out(
         )
         .await?;
     }
-    Ok((
+    let mut response = (
         StatusCode::NO_CONTENT,
         [(header::SET_COOKIE, session::clear_cookie())],
     )
-        .into_response())
+        .into_response();
+    if ended.is_none() {
+        response.extensions_mut().insert(AccessUnchanged);
+    }
+    Ok(response)
 }

@@ -184,7 +184,7 @@ task.
   publishers never queue behind each other's reads, and sockets that ask for
   a snapshot at the same time share one read of the fleet.
   Disabling a user or removing their `devices.view` permission closes their
-  sockets.
+  sockets at once (see [access changes](#access-changes)).
 - **Metrics**: the latest resource readings of each Agent, held in memory.
   Its writer task stores the finished minutes of every device together
   every 5 seconds, in one transaction. See
@@ -270,6 +270,37 @@ anyone.
 
 When no account exists, the server logs a one-time setup link. Without it
 nobody can create the first administrator.
+
+#### Access changes
+
+Open event sockets, terminals and remote sessions keep checking that their
+user may still use them, and close when the user is signed out, disabled or
+loses the permission they need. Each checks when presence's access
+generation is bumped (`Presence::recheck_access`), and event sockets and
+terminals also every 30 seconds.
+
+The generation is bumped only by changes that can take access away, after
+they are committed:
+
+- any successful write to the routes `server/src/api/mod.rs` groups as
+  changing access: signing in and out, setup, accepting an invitation and
+  completing a password reset; the account's own security (password, second
+  factors, passkeys, sessions); API tokens; and administration (users,
+  invitations, roles, instance, sign-in, SMTP, SCIM and SSO settings). A new
+  route in those groups signals by default. A write there that changed
+  nothing, such as signing out a browser without a session, says so with
+  `AccessUnchanged`;
+- an SSO sign-in (`GET /v1/auth/sso/callback`), which reads the user's
+  groups again;
+- SCIM requests that disable or delete a user, or change the members of, or
+  delete, a group that grants a role.
+
+Everything else (devices, tags, notes, companies, scripts, files, alerts,
+automation, applications) changes no one's access and doesn't signal, so a
+busy server doesn't make every open socket check its access for nothing.
+Deleting a device ends its remote session directly. A change made outside
+the server process, such as `meshrmm-server admin`, is caught by the
+30-second check.
 
 ## The Windows Agent
 

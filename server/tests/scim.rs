@@ -459,3 +459,95 @@ async fn scim_groups_grant_the_role_an_administrator_maps() {
         app.finish().await;
     }
 }
+
+/// A member of the group, signed in to the website with an open event
+/// socket, who may see devices only through the group's role.
+async fn member_watching(
+    app: &App,
+    admin: &mut Browser,
+    scim: &Scim<'_>,
+    server: &common::Server,
+    group_id: &str,
+) -> (common::Ws, std::time::Instant, String) {
+    let email = format!("{}@example.com", common::random_hex(4));
+    let (tech, tech_id) = common::add_user(app, admin, &email, &[]).await;
+    let added = scim
+        .patch(
+            &format!("/Groups/{group_id}"),
+            json!([{ "op": "Add", "path": "members", "value": [{ "value": tech_id }] }]),
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK, "{:?}", added.body);
+    let mut socket = tech.events(server).await.unwrap();
+    let opened = std::time::Instant::now();
+    common::receive_json(&mut socket).await;
+    (socket, opened, tech_id)
+}
+
+#[tokio::test]
+async fn losing_a_groups_role_closes_its_members_sockets_at_once() {
+    // Well before the socket's own check, every 30 seconds.
+    let prompt = std::time::Duration::from_secs(30);
+    for app in common::apps().await {
+        let name = app.name;
+        let server = app.serve().await;
+        let mut admin = common::set_up(&app).await;
+        let scim = token(&app, &mut admin).await;
+        let group = scim
+            .post(
+                "/Groups",
+                json!({
+                    "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+                    "displayName": "Technicians",
+                }),
+            )
+            .await;
+        assert_eq!(
+            group.status,
+            StatusCode::CREATED,
+            "{name}: {:?}",
+            group.body
+        );
+        let group_id = group.body["id"].as_str().unwrap().to_owned();
+        let map = async |admin: &mut Browser, role_id: Value| {
+            let mapped = admin
+                .patch(
+                    &format!("/v1/settings/scim/groups/{group_id}"),
+                    json!({ "role_id": role_id }),
+                )
+                .await;
+            assert_eq!(mapped.status, StatusCode::OK, "{name}: {:?}", mapped.body);
+        };
+        map(&mut admin, json!("technician")).await;
+
+        // The provider removes them from the group.
+        let (mut socket, opened, tech_id) =
+            member_watching(&app, &mut admin, &scim, &server, &group_id).await;
+        let removed = scim
+            .patch(
+                &format!("/Groups/{group_id}"),
+                json!([{ "op": "Remove", "path": "members", "value": [{ "value": tech_id }] }]),
+            )
+            .await;
+        assert_eq!(removed.status, StatusCode::OK, "{name}: {:?}", removed.body);
+        assert_eq!(common::receive_close(&mut socket).await, 4001, "{name}");
+        assert!(opened.elapsed() < prompt, "{name}");
+
+        // An administrator stops the group granting a role.
+        let (mut socket, opened, _) =
+            member_watching(&app, &mut admin, &scim, &server, &group_id).await;
+        map(&mut admin, Value::Null).await;
+        assert_eq!(common::receive_close(&mut socket).await, 4001, "{name}");
+        assert!(opened.elapsed() < prompt, "{name}");
+        map(&mut admin, json!("technician")).await;
+
+        // The provider deletes the group.
+        let (mut socket, opened, _) =
+            member_watching(&app, &mut admin, &scim, &server, &group_id).await;
+        let deleted = scim.delete(&format!("/Groups/{group_id}")).await;
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{name}");
+        assert_eq!(common::receive_close(&mut socket).await, 4001, "{name}");
+        assert!(opened.elapsed() < prompt, "{name}");
+        app.finish().await;
+    }
+}
