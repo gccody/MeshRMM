@@ -61,6 +61,18 @@ the same NAT (a Hyper-V or VMware virtual switch, say) are woken through
 other devices behind it, and devices on the office network through devices
 on the office network.
 
+A relay's subnet is taken by the relay's own prefix length, so the subnets
+that can hold one of the offline device's addresses are one per prefix
+length a relay may broadcast on (/8 to /30). Each stored IPv4 address
+keeps its subnet's first address as a number (`device_ip_addresses.network`,
+NULL for IPv6), and the server looks up, by an index on it, the devices
+that aren't deleted with an address on one of those subnets, then keeps the
+ones online at that moment and ranks them as above. What a wake reads
+follows the devices woken and their neighbours, however many devices are
+online elsewhere. A busy subnet is read a page of 400 addresses at a time,
+but all of it: ties are broken by name, so stopping early could change
+which relays win.
+
 ## What a relay sends
 
 The server sends each relay one `send_wake_packets` command over its
@@ -167,7 +179,10 @@ error, reported_at}]}`. A job's devices carry `wake_id`.
   report (and, at startup, those a restart interrupted), and marks devices
   that come online. The coordinator calls it when an Agent connects and when
   a relay reports.
-- Tables: `wake_requests` and `wake_relays`; `device_ip_addresses.kind`.
+- Tables: `wake_requests` and `wake_relays`; `device_ip_addresses.kind`
+  and `.network`, which `system_info` writes with each snapshot's
+  addresses, with the index `idx_device_ip_addresses_network` that
+  `wake::neighbours` looks relays up by.
 - Jobs: kind `wake`, joined to `wake_requests` by `job_id` and device;
   policies: action `wake`. See [automation](automation.md).
 - `server/src/api/wake.rs`; the website's `dashboard/features/wake/`.
@@ -180,7 +195,11 @@ error, reported_at}]}`. A job's devices carry `wake_id`.
 - `cargo test -p meshrmm-server wake` (unit tests of relay choice and
   plans) and `--test wake`: waking through a relay, devices coming online,
   no relay, failing relays, permissions, waking many, and wake policies and
-  their jobs.
+  their jobs; relays matching those chosen from every online device, on a
+  fleet made by hand and on random ones; a wake, and a wake job, costing
+  the same statements however many devices are online elsewhere; and
+  devices found under their latest addresses until deleted. `--test
+  query_plans` checks the lookup uses its index on both databases.
 - `dashboard/tests/wake.test.mjs`.
 - To see the packets on a network, capture on another computer there:
   `sudo tcpdump -i <interface> -X 'udp port 9 or udp port 7'`.

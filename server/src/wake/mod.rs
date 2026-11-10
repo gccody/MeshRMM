@@ -10,18 +10,25 @@
 //! any relay sent the packets and `failed` once none could. A device whose
 //! Agent connects within [`ONLINE_WINDOW_MS`] of being sent the packets
 //! counts as woken (`online_at`), which is how jobs tell that it worked.
+//!
+//! The relays are chosen from the devices the database finds on the
+//! subnets that hold the devices' last addresses ([`neighbours`], by
+//! `device_ip_addresses.network`), and of those, the ones online then, so
+//! the work follows the devices woken and their neighbours rather than the
+//! fleet. Planning reads everything before the request's transaction
+//! begins, and the packets are sent once it commits.
 pub mod relays;
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::Ipv4Addr,
     sync::Arc,
     time::Duration,
 };
 
 use meshrmm_protocol_types::{
-    AdapterKind, AgentCommand, MAX_WAKE_MAC_ADDRESSES, MAX_WAKE_PACKETS, SystemInfo, WakePacket,
-    WakePacketResult, clean_text, parse_mac,
+    AdapterKind, AgentCommand, MAX_WAKE_MAC_ADDRESSES, MAX_WAKE_PACKETS, MAX_WAKE_PREFIX_LENGTH,
+    MIN_WAKE_PREFIX_LENGTH, SystemInfo, WakePacket, WakePacketResult, clean_text, parse_mac,
 };
 use sea_query::{Cond, Expr, ExprTrait, LockType, Order, Query};
 use serde::Serialize;
@@ -54,6 +61,10 @@ const MAX_ERROR_CHARS: usize = 300;
 const CHANGE_BACKLOG: usize = 256;
 /// Rows per query.
 const CHUNK: usize = 400;
+/// The most addresses one statement reads when looking up the devices on a
+/// wake's subnets. A subnet with more is read in several pages, all of it:
+/// this bounds each statement, not what is read.
+pub const NEIGHBOURS_PAGE: usize = 400;
 
 /// Announces wake requests whose relays reported, for requests that wait
 /// for them.
@@ -249,84 +260,164 @@ fn last_addresses(info: &SystemInfo) -> Vec<Address> {
         .collect()
 }
 
-/// The relays that may wake devices: every online one with its last known
-/// addresses.
-async fn candidates(
-    executor: &mut impl Executor,
-    connected: &HashSet<String>,
-) -> db::Result<Vec<Candidate>> {
-    let ids = connected.iter().cloned().collect::<Vec<_>>();
-    let mut candidates = BTreeMap::new();
-    for chunk in ids.chunks(CHUNK) {
-        let rows: Vec<(String, String, Option<String>, Option<String>)> = executor
-            .fetch_all(
-                &Query::select()
-                    .columns([
-                        (Agents::Table, Agents::Id),
-                        (Agents::Table, Agents::Name),
-                        (Agents::Table, Agents::CompanyId),
-                    ])
-                    .column((DeviceSystemInfo::Table, DeviceSystemInfo::PublicIp))
-                    .from(Agents::Table)
-                    .left_join(
-                        DeviceSystemInfo::Table,
-                        Expr::col((DeviceSystemInfo::Table, DeviceSystemInfo::DeviceId))
-                            .equals((Agents::Table, Agents::Id)),
-                    )
-                    .and_where(Expr::col((Agents::Table, Agents::Id)).is_in(chunk.iter().cloned()))
-                    .and_where(Expr::col((Agents::Table, Agents::DeletionRequestedAt)).is_null())
-                    .to_owned(),
-            )
-            .await?;
-        for (device_id, name, company_id, public_ip) in rows {
-            candidates.insert(
-                device_id.clone(),
-                Candidate {
-                    device_id,
-                    name,
-                    public_ip,
-                    company_id,
-                    addresses: Vec::new(),
-                },
-            );
-        }
-        let addresses: Vec<(String, String, i64, String)> = executor
-            .fetch_all(
-                &Query::select()
-                    .columns([
-                        DeviceIpAddresses::DeviceId,
-                        DeviceIpAddresses::Address,
-                        DeviceIpAddresses::PrefixLength,
-                        DeviceIpAddresses::Kind,
-                    ])
-                    .from(DeviceIpAddresses::Table)
-                    .and_where(Expr::col(DeviceIpAddresses::DeviceId).is_in(chunk.iter().cloned()))
-                    .to_owned(),
-            )
-            .await?;
-        for (device_id, address, prefix_length, kind) in addresses {
-            let (Some(candidate), Ok(address), Ok(prefix_length)) = (
-                candidates.get_mut(&device_id),
-                address.parse::<Ipv4Addr>(),
-                u8::try_from(prefix_length),
-            ) else {
-                continue;
-            };
-            candidate.addresses.push(Address {
-                address,
-                prefix_length,
-                kind: AdapterKind::parse(&kind),
-            });
-        }
-    }
-    Ok(candidates.into_values().collect())
+/// Where a page of [`neighbours_query`] ended: its last row's network,
+/// prefix length, device, adapter and address, the order it pages in.
+pub type PageEnd = (i64, i64, String, String, String);
+
+/// One address on a subnet [`neighbours_query`] looks up, with its device.
+#[derive(sqlx::FromRow)]
+struct NeighbourRow {
+    network: i64,
+    prefix_length: i64,
+    device_id: String,
+    adapter: String,
+    address: String,
+    kind: String,
+    name: String,
+    company_id: Option<String>,
+    public_ip: Option<String>,
 }
 
-/// How to wake each of `targets` that is enrolled.
+/// A page of the addresses of devices that aren't deleted on the subnets
+/// starting at `networks` that a relay may broadcast on, each with its
+/// device's name, company and last public address, after `after`. Runs by
+/// `idx_device_ip_addresses_network`, in its order.
+pub fn neighbours_query(
+    networks: impl IntoIterator<Item = i64>,
+    after: Option<PageEnd>,
+) -> sea_query::SelectStatement {
+    let key = [
+        DeviceIpAddresses::Network,
+        DeviceIpAddresses::PrefixLength,
+        DeviceIpAddresses::DeviceId,
+        DeviceIpAddresses::Adapter,
+        DeviceIpAddresses::Address,
+    ];
+    let mut query = Query::select();
+    query
+        .columns(key.map(|column| (DeviceIpAddresses::Table, column)))
+        .column((DeviceIpAddresses::Table, DeviceIpAddresses::Kind))
+        .columns([
+            (Agents::Table, Agents::Name),
+            (Agents::Table, Agents::CompanyId),
+        ])
+        .column((DeviceSystemInfo::Table, DeviceSystemInfo::PublicIp))
+        .from(DeviceIpAddresses::Table)
+        .inner_join(
+            Agents::Table,
+            Expr::col((Agents::Table, Agents::Id))
+                .equals((DeviceIpAddresses::Table, DeviceIpAddresses::DeviceId)),
+        )
+        .left_join(
+            DeviceSystemInfo::Table,
+            Expr::col((DeviceSystemInfo::Table, DeviceSystemInfo::DeviceId))
+                .equals((DeviceIpAddresses::Table, DeviceIpAddresses::DeviceId)),
+        )
+        .and_where(
+            Expr::col((DeviceIpAddresses::Table, DeviceIpAddresses::Network)).is_in(networks),
+        )
+        .and_where(
+            Expr::col((DeviceIpAddresses::Table, DeviceIpAddresses::PrefixLength)).between(
+                i64::from(MIN_WAKE_PREFIX_LENGTH),
+                i64::from(MAX_WAKE_PREFIX_LENGTH),
+            ),
+        )
+        .and_where(Expr::col((Agents::Table, Agents::DeletionRequestedAt)).is_null())
+        .limit(NEIGHBOURS_PAGE as u64);
+    for column in key {
+        query.order_by((DeviceIpAddresses::Table, column), Order::Asc);
+    }
+    if let Some((network, prefix_length, device_id, adapter, address)) = after {
+        query.and_where(
+            Expr::tuple(key.map(|column| Expr::col((DeviceIpAddresses::Table, column)))).gt(
+                Expr::tuple([
+                    Expr::val(network),
+                    Expr::val(prefix_length),
+                    Expr::val(device_id),
+                    Expr::val(adapter),
+                    Expr::val(address),
+                ]),
+            ),
+        );
+    }
+    query
+}
+
+/// The devices that may relay packets to `addresses`: each one `online`
+/// says is, with its addresses on a subnet that holds one of them. Only the
+/// subnets that hold the addresses are read, by index, in pages of
+/// [`NEIGHBOURS_PAGE`] rows; the devices on them are read whole, however
+/// many, since any cut would change which of them rank first (ties go by
+/// name in Rust's lowercase, which neither database sorts by).
+pub async fn neighbours(
+    executor: &mut impl Executor,
+    addresses: &[Address],
+    online: impl Fn(&str) -> bool + Send,
+) -> db::Result<Vec<Candidate>> {
+    let networks = addresses
+        .iter()
+        .filter(|address| address.usable())
+        .flat_map(|address| relays::subnets_holding(address.address))
+        .map(|(network, _)| network)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut candidates: BTreeMap<String, Option<Candidate>> = BTreeMap::new();
+    for chunk in networks.chunks(CHUNK) {
+        let mut after = None;
+        loop {
+            let rows: Vec<NeighbourRow> = executor
+                .fetch_all(&neighbours_query(chunk.iter().copied(), after.take()))
+                .await?;
+            if rows.len() >= NEIGHBOURS_PAGE {
+                after = rows.last().map(|row| {
+                    (
+                        row.network,
+                        row.prefix_length,
+                        row.device_id.clone(),
+                        row.adapter.clone(),
+                        row.address.clone(),
+                    )
+                });
+            }
+            let full = after.is_some();
+            for row in rows {
+                let candidate = candidates.entry(row.device_id.clone()).or_insert_with(|| {
+                    online(&row.device_id).then(|| Candidate {
+                        device_id: row.device_id.clone(),
+                        name: row.name.clone(),
+                        public_ip: row.public_ip.clone(),
+                        company_id: row.company_id.clone(),
+                        addresses: Vec::new(),
+                    })
+                });
+                let (Some(candidate), Ok(address), Ok(prefix_length)) = (
+                    candidate,
+                    row.address.parse::<Ipv4Addr>(),
+                    u8::try_from(row.prefix_length),
+                ) else {
+                    continue;
+                };
+                candidate.addresses.push(Address {
+                    address,
+                    prefix_length,
+                    kind: AdapterKind::parse(&row.kind),
+                });
+            }
+            if !full {
+                break;
+            }
+        }
+    }
+    Ok(candidates.into_values().flatten().collect())
+}
+
+/// How to wake each of `targets` that is enrolled, through the devices
+/// `online` says are.
 async fn plans(
     executor: &mut impl Executor,
     targets: &[String],
-    connected: &HashSet<String>,
+    online: impl Fn(&str) -> bool + Send,
 ) -> db::Result<HashMap<String, Plan>> {
     let mut rows: Vec<TargetRow> = Vec::new();
     for chunk in targets.chunks(CHUNK) {
@@ -360,14 +451,31 @@ async fn plans(
                 .await?,
         );
     }
-    let candidates = candidates(executor, connected).await?;
-    Ok(rows
+    let targets = rows
         .into_iter()
         .map(|row| {
             let info = row
                 .details
                 .as_deref()
                 .and_then(|details| serde_json::from_str::<SystemInfo>(details).ok());
+            (row, info)
+        })
+        .collect::<Vec<_>>();
+    // Only the subnets of devices that get as far as choosing relays.
+    let wanted = targets
+        .iter()
+        .filter_map(|(_, info)| info.as_ref())
+        .filter(|info| !wake_addresses(info).is_empty())
+        .flat_map(last_addresses)
+        .collect::<Vec<_>>();
+    let candidates = if wanted.is_empty() {
+        Vec::new()
+    } else {
+        neighbours(executor, &wanted, online).await?
+    };
+    Ok(targets
+        .into_iter()
+        .map(|(row, info)| {
             let plan = plan(&row, info.as_ref(), &candidates);
             (row.id, plan)
         })
@@ -425,7 +533,7 @@ fn plan(row: &TargetRow, info: Option<&SystemInfo>, candidates: &[Candidate]) ->
                 );
                 format!("{network}/{}", address.prefix_length)
             })
-            .collect::<std::collections::BTreeSet<_>>()
+            .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>()
             .join(", ");
@@ -455,8 +563,12 @@ pub async fn start(
     targets: &[String],
     requester: Requester<'_>,
 ) -> db::Result<HashMap<String, String>> {
-    let connected = state.agents.connected();
-    let plans = plans(&mut &state.database, targets, &connected).await?;
+    // Everything is read before the transaction: on SQLite it holds the one
+    // writer connection.
+    let plans = plans(&mut &state.database, targets, |device_id| {
+        state.agents.is_connected(device_id)
+    })
+    .await?;
     let now = now_ms();
     let mut ids = HashMap::new();
     let mut packets: BTreeMap<String, (String, Vec<WakePacket>)> = BTreeMap::new();

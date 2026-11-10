@@ -452,10 +452,17 @@ CREATE TABLE device_ip_addresses (
   -- The adapter's kind: Wake-on-LAN relays broadcast from hardware adapters'
   -- subnets in preference to virtual ones'.
   kind TEXT NOT NULL CHECK (kind IN ('ethernet', 'wireless', 'virtual', 'other')),
+  -- For an IPv4 address, the first address of its subnet as a number, so the
+  -- devices that could relay Wake-on-LAN packets onto a subnet are found by
+  -- index. NULL for an IPv6 address.
+  network INTEGER CHECK (network IS NULL OR network BETWEEN 0 AND 4294967295),
   PRIMARY KEY (device_id, adapter, address)
 );
 
 CREATE INDEX idx_device_ip_addresses_address ON device_ip_addresses (address);
+-- The addresses on a subnet, in the order a wake's lookup pages through them.
+CREATE INDEX idx_device_ip_addresses_network
+  ON device_ip_addresses (network, prefix_length, device_id, adapter, address);
 
 -- The applications and packages installed on each device, from its snapshot.
 CREATE TABLE device_applications (
