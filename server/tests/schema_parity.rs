@@ -1,14 +1,42 @@
 //! The SQLite and PostgreSQL migrations must define the same tables, columns,
-//! nullability and named indexes, since one set of queries runs on both.
+//! nullability and named indexes (on the same table and key columns, unique
+//! and partial alike), since one set of queries runs on both.
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::{Connection, PgConnection, SqliteConnection};
 
 type Columns = BTreeSet<(String, String, bool)>;
 
-async fn sqlite_schema(url: &str) -> (Columns, BTreeSet<String>) {
+/// Each named index's table, whether it is unique, whether it is partial, and
+/// its key columns in order (`None` for an expression).
+#[derive(Debug, PartialEq, Eq)]
+struct Index {
+    table: String,
+    unique: bool,
+    partial: bool,
+    columns: Vec<Option<String>>,
+}
+
+type Indexes = BTreeMap<String, Index>;
+
+/// Collects one row per key column, ordered by index and position.
+fn indexes(rows: Vec<(String, String, bool, bool, Option<String>)>) -> Indexes {
+    let mut indexes = Indexes::new();
+    for (name, table, unique, partial, column) in rows {
+        let index = indexes.entry(name).or_insert_with(|| Index {
+            table,
+            unique,
+            partial,
+            columns: Vec::new(),
+        });
+        index.columns.push(column);
+    }
+    indexes
+}
+
+async fn sqlite_schema(url: &str) -> (Columns, Indexes) {
     let mut connection = SqliteConnection::connect(url).await.unwrap();
     let columns: Vec<(String, String, bool)> = sqlx::query_as(
         "SELECT m.name, p.name, p.\"notnull\" = 0 \
@@ -18,18 +46,21 @@ async fn sqlite_schema(url: &str) -> (Columns, BTreeSet<String>) {
     .fetch_all(&mut connection)
     .await
     .unwrap();
-    let indexes: Vec<(String,)> =
-        sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'")
-            .fetch_all(&mut connection)
-            .await
-            .unwrap();
-    (
-        columns.into_iter().collect(),
-        indexes.into_iter().map(|(name,)| name).collect(),
+    let index_columns: Vec<(String, String, bool, bool, Option<String>)> = sqlx::query_as(
+        "SELECT m.name, m.tbl_name, l.\"unique\" = 1, l.partial = 1, x.name \
+         FROM sqlite_master AS m \
+         JOIN pragma_index_list(m.tbl_name) AS l ON l.name = m.name \
+         JOIN pragma_index_xinfo(m.name) AS x \
+         WHERE m.type = 'index' AND m.name LIKE 'idx_%' AND x.key = 1 \
+         ORDER BY m.name, x.seqno",
     )
+    .fetch_all(&mut connection)
+    .await
+    .unwrap();
+    (columns.into_iter().collect(), indexes(index_columns))
 }
 
-async fn postgres_schema(url: &str) -> (Columns, BTreeSet<String>) {
+async fn postgres_schema(url: &str) -> (Columns, Indexes) {
     let mut connection = PgConnection::connect(url).await.unwrap();
     let columns: Vec<(String, String, bool)> = sqlx::query_as(
         "SELECT table_name::text, column_name::text, is_nullable = 'YES' \
@@ -39,15 +70,22 @@ async fn postgres_schema(url: &str) -> (Columns, BTreeSet<String>) {
     .fetch_all(&mut connection)
     .await
     .unwrap();
-    let indexes: Vec<(String,)> =
-        sqlx::query_as("SELECT indexname::text FROM pg_indexes WHERE schemaname = 'public' AND indexname LIKE 'idx_%'")
-            .fetch_all(&mut connection)
-            .await
-            .unwrap();
-    (
-        columns.into_iter().collect(),
-        indexes.into_iter().map(|(name,)| name).collect(),
+    let index_columns: Vec<(String, String, bool, bool, Option<String>)> = sqlx::query_as(
+        "SELECT c.relname::text, t.relname::text, i.indisunique, i.indpred IS NOT NULL, \
+         a.attname::text \
+         FROM pg_index AS i \
+         JOIN pg_class AS c ON c.oid = i.indexrelid \
+         JOIN pg_class AS t ON t.oid = i.indrelid \
+         JOIN pg_namespace AS n ON n.oid = c.relnamespace \
+         CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, position) \
+         LEFT JOIN pg_attribute AS a ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
+         WHERE n.nspname = 'public' AND c.relname LIKE 'idx_%' AND k.position <= i.indnkeyatts \
+         ORDER BY c.relname, k.position",
     )
+    .fetch_all(&mut connection)
+    .await
+    .unwrap();
+    (columns.into_iter().collect(), indexes(index_columns))
 }
 
 #[tokio::test]
@@ -77,7 +115,22 @@ async fn sqlite_and_postgres_schemas_match() {
         only_sqlite.is_empty() && only_postgres.is_empty(),
         "columns differ (table, column, nullable):\n only in SQLite: {only_sqlite:#?}\n only in PostgreSQL: {only_postgres:#?}"
     );
-    assert_eq!(sqlite_indexes, postgres_indexes, "named indexes differ");
+    let differing = sqlite_indexes
+        .keys()
+        .chain(postgres_indexes.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|name| sqlite_indexes.get(*name) != postgres_indexes.get(*name))
+        .map(|name| (name, sqlite_indexes.get(name), postgres_indexes.get(name)))
+        .collect::<Vec<_>>();
+    assert!(
+        differing.is_empty(),
+        "named indexes differ (name, SQLite, PostgreSQL):\n{differing:#?}"
+    );
+    assert!(
+        sqlite_indexes.len() > 50,
+        "the index query found too few indexes"
+    );
     assert!(
         sqlite_columns.len() > 100,
         "the schema query found too few columns"
