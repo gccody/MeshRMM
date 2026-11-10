@@ -27,6 +27,7 @@ getrandom = "0.3"
 hmac = "0.12.1"
 http = "1.4.0"
 httpdate = "1.0.3"
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 ipnet = { version = "2.12.2", features = ["serde"] }
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "ring", "rustls-native-certs", "smtp-transport", "tokio1-rustls"] }
 meshrmm-protocol-types.workspace = true
@@ -45,6 +46,7 @@ semver = "1.0.27"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+socket2 = { version = "0.6.5", features = ["all"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["derive", "macros", "migrate", "postgres", "runtime-tokio", "sqlite", "tls-rustls-ring-native-roots"] }
 subtle = "2.6.1"
 thiserror.workspace = true
@@ -63,11 +65,15 @@ webauthn-rs-proto = "0.5.5"
 webrtc-util = { version = "0.12.0", default-features = false, features = ["conn"] }
 zip = { version = "9.5.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["process"] }
+
 [dev-dependencies]
 figment = { version = "0.10.19", features = ["env", "test", "toml"] }
 http-body-util = "0.1"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 tempfile = "3"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tokio-tungstenite.workspace = true
 zip = { version = "9.5.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
