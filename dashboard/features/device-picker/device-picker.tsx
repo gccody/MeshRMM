@@ -4,6 +4,7 @@ import { useWindowedRows } from "../../lib/use-windowed-rows";
 import { type Agent, PLATFORM_LABELS } from "../agents/types";
 import { LANGUAGE_LABELS, type ScriptLanguage, runsOn } from "../toolbox/model";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useTags } from "../agents/use-devices";
 import { DEVICE_ROW_HEIGHT, searchDevices } from "./model";
 
 // A searchable list of devices to tick, noting those offline or without the
@@ -16,11 +17,12 @@ export function DevicePicker({ agents, chosen, onChange, language }: {
   language: ScriptLanguage | null;
 }) {
   const { inventory } = useWorkspace();
+  const tags = useTags(inventory.devices);
   const [query, setQuery] = useState("");
   // Typing stays quick while a large fleet is searched.
   const search = useDeferredValue(query);
   const chosenSet = useMemo(() => new Set(chosen), [chosen]);
-  const shown = useMemo(() => searchDevices(agents, search, inventory.tags), [agents, search, inventory.tags]);
+  const shown = useMemo(() => searchDevices(agents, search, tags), [agents, search, tags]);
   const scroller = useRef<HTMLDivElement>(null);
   const above = useRef<HTMLDivElement>(null);
   const below = useRef<HTMLDivElement>(null);

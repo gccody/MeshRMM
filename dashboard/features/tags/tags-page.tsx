@@ -6,6 +6,7 @@ import { DEFAULT_DEVICE_FILTERS, serializeDeviceFilters } from "../agents/device
 import type { Tag } from "../agents/types";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useDevices, useTags } from "../agents/use-devices";
 import { type TagSummary, matchesTagName } from "./model";
 import { TagChip } from "./tag-chip";
 import { GroupingTabs } from "../companies/area-tabs";
@@ -42,7 +43,9 @@ export function TagsPage() {
   const [summaries, setSummaries] = useState<ReadonlyMap<string, TagSummary>>(() => new Map());
   const [query, setQuery] = useState("");
   const opener = useRef<HTMLElement | null>(null);
-  const { agents, tags, hasData } = inventory;
+  const { hasData } = inventory;
+  const agents = useDevices(inventory.devices);
+  const tags = useTags(inventory.devices);
 
   // Policies and rules change rarely; reading them again whenever the tags
   // change keeps the counts current enough.

@@ -1,9 +1,10 @@
 import { ClipboardList, KeyRound, LoaderCircle, RefreshCw } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { AuthenticationRequired, errorText, expectJson } from "../../lib/http";
 import { formatDateTime } from "../../lib/format";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useDeviceNames } from "../agents/use-devices";
 import { AUDIT_CATEGORIES, type AuditEvent, type AuditPage, eventLabel, targetLabel } from "./model";
 
 const PAGE_SIZE = 50;
@@ -11,7 +12,7 @@ const PAGE_SIZE = 50;
 // What happened on this server, newest first.
 export function AuditPanel() {
   const { authorizedFetch, inventory } = useWorkspace();
-  const deviceNames = useMemo(() => new Map(inventory.agents.map((agent) => [agent.id, agent.name])), [inventory.agents]);
+  const deviceNames = useDeviceNames(inventory.devices);
   const [category, setCategory] = useState("");
   const [events, setEvents] = useState<AuditEvent[] | null>(null);
   const [next, setNext] = useState<string | undefined>();

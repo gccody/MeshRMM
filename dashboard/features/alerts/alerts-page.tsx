@@ -4,6 +4,7 @@ import { useSearchParams } from "react-router";
 import { useResource } from "../../lib/use-resource";
 import { DeviceSelect } from "../device-picker/device-select";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useCompanies, useDevices } from "../agents/use-devices";
 import { HeaderActions } from "../workspace/header-actions";
 import { fetchAlerts } from "./alerts-api";
 import { AlertTable } from "./alert-table";
@@ -52,7 +53,8 @@ export function AlertsPage() {
     setSearchParams(alertFilterParams({ ...filters, ...change }), { replace: true });
   };
 
-  const { companies, agents } = inventory;
+  const companies = useCompanies(inventory.devices);
+  const agents = useDevices(inventory.devices);
   const filtered = filters.state !== "active" || filters.severity || filters.company || filters.device;
 
   return (

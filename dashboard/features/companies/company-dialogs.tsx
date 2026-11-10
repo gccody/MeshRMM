@@ -4,6 +4,7 @@ import { AuthenticationRequired, errorText, expectJson, expectOk, jsonBody } fro
 import { ModalDialog } from "../../lib/modal-dialog";
 import type { Agent, Company } from "../agents/types";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useCompanies } from "../agents/use-devices";
 
 const MAX_NAME_LENGTH = 120;
 
@@ -78,7 +79,7 @@ export function MoveDeviceDialog({ agent, returnFocus, onClose }: {
   const [companyId, setCompanyId] = useState(agent.company_id ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const { companies } = inventory;
+  const companies = useCompanies(inventory.devices);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();

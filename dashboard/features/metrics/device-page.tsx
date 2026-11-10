@@ -18,6 +18,7 @@ import { DeviceApplications } from "../applications/device-applications";
 import { DeviceWake } from "../wake/device-wake";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useCompanies, useDevice, useDeviceReading, useTags } from "../agents/use-devices";
 import { MetricChart, type Series } from "./metric-chart";
 import {
   METRICS_RANGES,
@@ -79,8 +80,10 @@ export function DevicePage() {
     (id !== "updates" || canSeeUpdates) && (id !== "applications" || canSeeApplications) && (id !== "monitors" || canSeeMonitors);
   const tabs = TABS.filter(({ id }) => allowed(id));
   const tab: DeviceTab = isTab(requestedTab) && allowed(requestedTab) ? requestedTab : "usage";
-  const agent = inventory.agents.find((candidate) => candidate.id === deviceId);
-  const live = inventory.metrics.get(deviceId);
+  const agent = useDevice(inventory.devices, deviceId);
+  const live = useDeviceReading(inventory.devices, deviceId);
+  const companies = useCompanies(inventory.devices);
+  const tags = useTags(inventory.devices);
   const { data, loading, error } = useDeviceMetrics({ authorizedFetch, deviceId, range, latest: live });
 
   useEffect(() => {
@@ -146,7 +149,7 @@ export function DevicePage() {
             <p className="status-line">
               <Building2 size={15} aria-hidden="true" />
               <Link to={`/${serializeDeviceFilters({ ...DEFAULT_DEVICE_FILTERS, company: agent.company_id || NO_COMPANY })}`} className="back-link">
-                {companyName(inventory.companies, agent.company_id) ?? "No company"}
+                {companyName(companies, agent.company_id) ?? "No company"}
               </Link>
               {can("companies.manage") && <button ref={moveOpener} type="button" className="link-button" onClick={() => setMoving(true)} aria-haspopup="dialog">Move</button>}
             </p>
@@ -154,7 +157,7 @@ export function DevicePage() {
           {agent && (
             <p className="status-line device-page-tags">
               <Tag size={15} aria-hidden="true" />
-              {agent.tag_ids?.length ? <TagChips tags={tagsOf(agent.tag_ids, inventory.tags)} /> : <span>No tags</span>}
+              {agent.tag_ids?.length ? <TagChips tags={tagsOf(agent.tag_ids, tags)} /> : <span>No tags</span>}
               {can("devices.edit") && <button ref={tagOpener} type="button" className="link-button" onClick={() => setTagging(true)} aria-haspopup="dialog">Edit tags</button>}
             </p>
           )}

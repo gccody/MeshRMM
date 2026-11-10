@@ -3,6 +3,7 @@ import { type KeyboardEvent, useDeferredValue, useEffect, useId, useMemo, useRef
 import { usePopover } from "../../lib/use-popover";
 import type { Agent } from "../agents/types";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useTags } from "../agents/use-devices";
 import { matchDevices, moreMatchesText } from "./model";
 
 type Props = {
@@ -61,13 +62,14 @@ function DeviceSelectMenu({ id, label, agents, value, unknown, none, nameOf, dis
   onChoose: (id: string) => void;
 }) {
   const { inventory } = useWorkspace();
+  const tags = useTags(inventory.devices);
   const [query, setQuery] = useState("");
   // Typing stays quick while a large fleet is searched.
   const search = useDeferredValue(query);
   const list = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLInputElement>(null);
   useEffect(() => input.current?.focus(), []);
-  const { shown, total } = useMemo(() => matchDevices(agents, search, inventory.tags), [agents, search, inventory.tags]);
+  const { shown, total } = useMemo(() => matchDevices(agents, search, tags), [agents, search, tags]);
   const searching = Boolean(search.trim());
   const more = moreMatchesText(shown.length, total);
 

@@ -462,7 +462,7 @@ export const SAVE_PERMISSION: Record<PolicyAction, Permission> = {
 export function describeTarget(
   policy: Pick<Policy, "target" | "company_ids" | "device_ids"> & Partial<Pick<Policy, "tag_ids" | "tag_match">>,
   companyNames: ReadonlyMap<string, string>,
-  deviceNames: ReadonlyMap<string, string>,
+  deviceNames: { get(id: string): string | undefined },
   tags: readonly Tag[] = [],
 ) {
   if (policy.target === "all") return "All devices";

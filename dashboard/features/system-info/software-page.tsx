@@ -6,6 +6,7 @@ import { useResource } from "../../lib/use-resource";
 import { NO_COMPANY } from "../agents/device-filters";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useCompanies, useTags } from "../agents/use-devices";
 import {
   type FleetApplication,
   type InstalledOn,
@@ -26,6 +27,8 @@ const QUERY_DELAY_MS = 300;
 // version, across every device or one company's or tag's.
 export function SoftwarePage() {
   const { authorizedFetch, inventory } = useWorkspace();
+  const companies = useCompanies(inventory.devices);
+  const tags = useTags(inventory.devices);
   const [searchParams, setSearchParams] = useSearchParams();
   const filters = parseSoftwareFilters(searchParams);
   const [queryInput, setQueryInput] = useState(filters.query);
@@ -68,13 +71,13 @@ export function SoftwarePage() {
           <select aria-label="Company" value={filters.company} onChange={(event) => choose({ company: event.target.value })}>
             <option value="">Every company</option>
             <option value={NO_COMPANY}>No company</option>
-            {inventory.companies.map((company) => <option key={company.id} value={company.id}>{company.name}</option>)}
+            {companies.map((company) => <option key={company.id} value={company.id}>{company.name}</option>)}
           </select>
-          {(inventory.tags.length > 0 || filters.tag) && (
+          {(tags.length > 0 || filters.tag) && (
             <select aria-label="Tag" value={filters.tag} onChange={(event) => choose({ tag: event.target.value })}>
               <option value="">Every tag</option>
-              {filters.tag && !inventory.tags.some((tag) => tag.id === filters.tag) && <option value={filters.tag}>Unknown tag</option>}
-              {inventory.tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}
+              {filters.tag && !tags.some((tag) => tag.id === filters.tag) && <option value={filters.tag}>Unknown tag</option>}
+              {tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}
             </select>
           )}
         </div>

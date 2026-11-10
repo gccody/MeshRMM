@@ -5,6 +5,7 @@ import { ModalDialog } from "../../lib/modal-dialog";
 import { useNow as useClock } from "../../lib/use-now";
 import type { Agent } from "../agents/types";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useDeviceLookup } from "../agents/use-devices";
 import { NOT_ONLINE_HINT, type Wake, type WakeState, isSettling, relayText, replaceWakes, wakeHeadline, wakeState, wakeTitle, wakeTone } from "./model";
 import { fetchWakes, wakeDevice, wakeDevices } from "./wake-api";
 
@@ -77,11 +78,11 @@ export function WakeDialog({ agents, returnFocus, onClose }: {
 
   // The clock re-renders the dialog every few seconds; these follow the
   // inventory instead.
-  const connected = useMemo(() => new Set(inventory.agents.filter((agent) => agent.connected).map((agent) => agent.id)), [inventory.agents]);
+  const fleet = useDeviceLookup(inventory.devices);
   const namesById = useMemo(() => new Map(agents.map((agent) => [agent.id, agent.name])), [agents]);
   // A device that came online is read again, so it stays woken if it goes
   // offline before the dialog closes.
-  const cameOnline = (wakes ?? []).filter((wake) => wake.online_at === null && connected.has(wake.device_id)).map((wake) => wake.id).join(",");
+  const cameOnline = (wakes ?? []).filter((wake) => wake.online_at === null && fleet.get(wake.device_id)?.connected).map((wake) => wake.id).join(",");
   useEffect(() => {
     if (!cameOnline) return;
     fetchWakes(authorizedFetch, cameOnline.split(",")).then(
@@ -102,7 +103,7 @@ export function WakeDialog({ agents, returnFocus, onClose }: {
       {wakes && (
         <ul className="wake-list" aria-live="polite">
           {wakes.map((wake) => (
-            <WakeItem key={wake.id} wake={wake} name={wake.device_name ?? namesById.get(wake.device_id) ?? "Deleted device"} state={wakeState(wake, connected.has(wake.device_id), now)} />
+            <WakeItem key={wake.id} wake={wake} name={wake.device_name ?? namesById.get(wake.device_id) ?? "Deleted device"} state={wakeState(wake, Boolean(fleet.get(wake.device_id)?.connected), now)} />
           ))}
         </ul>
       )}

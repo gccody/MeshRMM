@@ -5,7 +5,7 @@ import { type AlertEvent, parseAlertEvent } from "../alerts/model.ts";
 import { type JobEvent, parseJobEvent } from "../automation/model.ts";
 import { type MetricsReading, parseMetricsEvent } from "../metrics/model.ts";
 import { type UpdateEvent, parseUpdateEvent } from "../updates/model.ts";
-import { applyInventoryDelta, parseAgentEvent, sortAgents, sortCompanies, sortTags } from "./model.ts";
+import { parseAgentEvent } from "./model.ts";
 import type { AgentDelta, AgentEvent, AgentSnapshot, Inventory } from "./types";
 
 const FIRST_RECONNECT_DELAY_MS = 1_000;
@@ -42,6 +42,13 @@ export const ACCESS_REVOKED_CLOSE_CODE = 4001;
 export type InventoryConnection = "connecting" | "live" | "reconnecting" | "offline";
 export type InventoryStatus = "loading" | "live" | "stale";
 
+// Where the stream puts the inventory: a snapshot replaces it, then each
+// change after it is applied in revision order.
+export type InventoryTarget = {
+  replace: (inventory: Inventory) => void;
+  apply: (change: AgentDelta) => void;
+};
+
 export type SocketLike = EventTarget & {
   readonly readyState: number;
   send(data: string): void;
@@ -66,7 +73,7 @@ type Options = {
   // compares only within one socket's life: -1 when a socket closes, and the
   // next socket's first snapshot applies whatever its revision.
   revision: { current: number };
-  onInventory: (update: (current: Inventory) => Inventory) => void;
+  inventory: InventoryTarget;
   // Devices' latest resource usage, which carries no revision.
   onMetrics?: (readings: MetricsReading[]) => void;
   // Alerts raised or changed, and the unresolved counts, for users who may
@@ -105,9 +112,6 @@ const INVENTORY_EVENTS: Record<AgentEvent["type"], true> = {
 // server. It changes nothing the page shows, but it takes its revision.
 type UnknownChange = { type: "unknown"; revision: number };
 type Change = AgentDelta | UnknownChange;
-
-const applyChange = (inventory: Inventory, change: Change) =>
-  change.type === "unknown" ? inventory : applyInventoryDelta(inventory, change);
 
 // Reports the connection state, or "offline" while the browser is, once per
 // change.
@@ -171,9 +175,9 @@ function reconnectBackoff(timers: Timers, random: () => number, stopped: () => b
 // snapshot, and a gap or an unreadable change asks the server for a new one
 // and holds later changes until it arrives, so a run of them asks once.
 // `apply` returns whether the event brought the inventory up to date.
-function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
+function eventSequencer({ revision, inventory, requestSnapshot, overflow }: {
   revision: { current: number };
-  onInventory: (update: (current: Inventory) => Inventory) => void;
+  inventory: InventoryTarget;
   requestSnapshot: () => void;
   overflow: () => void;
 }) {
@@ -196,7 +200,9 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
 
   const applySnapshot = (event: AgentSnapshot) => {
     if (synced && event.revision < revision.current) return keepNewerInventory();
-    let next: Inventory = { agents: sortAgents(event.agents), companies: sortCompanies(event.companies ?? []), tags: sortTags(event.tags ?? []) };
+    // The waiting changes that follow it, checked for a gap before the
+    // inventory is touched.
+    const changes: AgentDelta[] = [];
     let nextRevision = event.revision;
     for (const pending of pendingEvents.sort((left, right) => left.revision - right.revision)) {
       if (pending.revision <= nextRevision) continue;
@@ -206,14 +212,15 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
         requestSnapshot();
         return false;
       }
-      next = applyChange(next, pending);
+      if (pending.type !== "unknown") changes.push(pending);
       nextRevision = pending.revision;
     }
     pendingEvents = [];
     awaitingSnapshot = false;
     synced = true;
     revision.current = nextRevision;
-    onInventory(() => next);
+    inventory.replace({ agents: event.agents, companies: event.companies ?? [], tags: event.tags ?? [] });
+    for (const change of changes) inventory.apply(change);
     return true;
   };
 
@@ -231,7 +238,7 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
       return false;
     }
     revision.current = event.revision;
-    if (event.type !== "unknown") onInventory((inventory) => applyInventoryDelta(inventory, event));
+    if (event.type !== "unknown") inventory.apply(event);
     return true;
   };
 
@@ -254,9 +261,9 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
 type SocketEnd = "refused" | "revoked" | "dropped";
 
 // Handles one socket's events while it is the stream's current socket.
-function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onAlerts, onJobs, onUpdates, now, reportError, current, onHeard, onLive, onUnusable, onClose }: {
+function watchSocket(socket: SocketLike, { revision, inventory, onMetrics, onAlerts, onJobs, onUpdates, now, reportError, current, onHeard, onLive, onUnusable, onClose }: {
   revision: { current: number };
-  onInventory: (update: (current: Inventory) => Inventory) => void;
+  inventory: InventoryTarget;
   onMetrics?: (readings: MetricsReading[]) => void;
   onAlerts?: (event: AlertEvent) => void;
   onJobs?: (event: JobEvent) => void;
@@ -282,7 +289,7 @@ function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onA
   };
   const sequencer = eventSequencer({
     revision,
-    onInventory,
+    inventory,
     requestSnapshot,
     overflow: () => socket.close(1009, "too many pending device events"),
   });
@@ -370,7 +377,7 @@ function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onA
 export function inventoryStream({
   openSocket,
   revision,
-  onInventory,
+  inventory,
   onMetrics,
   onAlerts,
   onJobs,
@@ -420,7 +427,7 @@ export function inventoryStream({
 
   const listen = (nextSocket: SocketLike) => watchSocket(nextSocket, {
     revision,
-    onInventory,
+    inventory,
     onMetrics,
     onAlerts,
     onJobs,

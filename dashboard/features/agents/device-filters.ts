@@ -68,7 +68,7 @@ export function searchText(agent: Pick<Agent, "id" | "name" | "system" | "tag_id
 }
 
 // `tags` are the inventory's, whose names the search matches.
-export function filterAgents<T extends Pick<Agent, "id" | "name" | "connected" | "company_id" | "system" | "tag_ids">>(agents: T[], filters: DeviceFilters, tags: readonly Tag[] = []) {
+export function filterAgents<T extends Pick<Agent, "id" | "name" | "connected" | "company_id" | "system" | "tag_ids">>(agents: readonly T[], filters: DeviceFilters, tags: readonly Tag[] = []) {
   const { query, status, company, tagMatch } = filters;
   const search = query.trim().toLowerCase();
   return agents.filter((agent) => {

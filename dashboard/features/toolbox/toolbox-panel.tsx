@@ -24,7 +24,7 @@ import {
 import { type KeyboardEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import { AuthenticationRequired, type AuthorizedFetch, errorText } from "../../lib/http";
-import type { Agent } from "../agents/types";
+import { useDeviceNames } from "../agents/use-devices";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import {
@@ -58,7 +58,7 @@ type OpenDialog = (next: ToolboxDialog, event?: { currentTarget: HTMLElement }) 
 // The toolbox's scripts and library files, and the runs of those scripts.
 // Each item is private to the user who added it unless they share it.
 export function ToolboxPanel() {
-  const { authorizedFetch, inventory, can } = useWorkspace();
+  const { authorizedFetch, can } = useWorkspace();
   const access = toolboxAccess(can);
   const tabs = TABS.filter(({ id }) => access.tabs.includes(id));
   const [tab, setTab] = useState<Tab>(access.tabs[0] ?? "scripts");
@@ -176,7 +176,7 @@ export function ToolboxPanel() {
         </div>
 
         <div id="toolbox-runs" role="tabpanel" aria-labelledby="toolbox-tab-runs" hidden={tab !== "runs"}>
-          {tab === "runs" && <RunHistory version={runsVersion} agents={inventory.agents} onOpen={(run, event) => open({ kind: "run-details", run }, event)} />}
+          {tab === "runs" && <RunHistory version={runsVersion} onOpen={(run, event) => open({ kind: "run-details", run }, event)} />}
         </div>
       </section>
 
@@ -187,7 +187,6 @@ export function ToolboxPanel() {
         files={files}
         folders={folders}
         maxBytes={toolbox?.max_file_bytes ?? null}
-        agents={inventory.agents}
         returnFocus={opener}
         onClose={close}
         replaceScript={replaceScript}
@@ -351,11 +350,11 @@ function ToolboxList<T extends { id: string; folder: string; name: string }>({ l
 const formatWhen = (unixMs: number) =>
   new Date(unixMs).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 
-function RunHistory({ version, agents, onOpen }: { version: number; agents: Agent[]; onOpen: (run: ScriptRun, event: { currentTarget: HTMLElement }) => void }) {
-  const { authorizedFetch } = useWorkspace();
+function RunHistory({ version, onOpen }: { version: number; onOpen: (run: ScriptRun, event: { currentTarget: HTMLElement }) => void }) {
+  const { authorizedFetch, inventory } = useWorkspace();
   const [runs, setRuns] = useState<ScriptRun[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const names = useMemo(() => new Map(agents.map((agent) => [agent.id, agent.name])), [agents]);
+  const names = useDeviceNames(inventory.devices);
 
   useEffect(() => {
     let cancelled = false;

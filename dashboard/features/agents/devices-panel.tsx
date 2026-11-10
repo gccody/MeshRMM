@@ -1,7 +1,6 @@
-
 import { CircleAlert, X } from "lucide-react";
 import { useSearchParams } from "react-router";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MoveDeviceDialog } from "../companies/company-dialogs";
 import { EnrollmentModal } from "../enrollment/enrollment-modal";
 import { useInstallerDownload } from "../enrollment/use-installer-download";
@@ -15,7 +14,9 @@ import { WakeDialog } from "../wake/wake-dialog";
 import { type ActionErrorSource, listActionErrors } from "../workspace/action-errors";
 import { useWorkspace } from "../workspace/workspace-context";
 import { AgentOverview, type DeviceActions } from "./agent-overview";
+import { chosenAgents } from "./model";
 import type { Agent } from "./types";
+import { useCompanies, useDevices, useTags } from "./use-devices";
 import {
   type AgentStatusFilter,
   type CompanyFilter,
@@ -37,6 +38,11 @@ const QUERY_WRITE_DELAY_MS = 250;
 
 export function DevicesPanel() {
   const { account, authorizedFetch, can, inventory, remote, deleteAgent, deletingId, setDevicesSearch, actionErrors, reportActionError } = useWorkspace();
+  const { devices } = inventory;
+  // The list, but not the readings: those redraw only their own tiles.
+  const agents = useDevices(devices);
+  const companies = useCompanies(devices);
+  const deviceTags = useTags(devices);
   const installer = useInstallerDownload(authorizedFetch);
   const [isEnrolling, setIsEnrolling] = useState(false);
   // The control that opened the enrollment dialog gets focus back.
@@ -44,7 +50,8 @@ export function DevicesPanel() {
   const [searchParams, setSearchParams] = useSearchParams();
   // Filters replace the history entry, so Back leaves the page.
   const writeFilters = (next: DeviceFilters) => setSearchParams(new URLSearchParams(serializeDeviceFilters(next)), { replace: true });
-  const allowed: DeviceActions = {
+  // The same object until the account changes, so the tiles don't redraw.
+  const allowed = useMemo<DeviceActions>(() => ({
     connect: can("sessions.connect"),
     connectBackground: can("sessions.connect_background"),
     closeSession: can("sessions.connect") || can("sessions.close_any"),
@@ -57,7 +64,7 @@ export function DevicesPanel() {
     enroll: can("devices.enroll"),
     moveCompany: can("companies.manage"),
     editTags: can("devices.edit"),
-  };
+  }), [can]);
   // A connection the device's user must approve, waiting for its reason.
   const [pendingConnect, setPendingConnect] = useState<{ agent: Agent; background: boolean } | null>(null);
   // The device a script is about to run on, and the button that asked.
@@ -76,10 +83,32 @@ export function DevicesPanel() {
   // The devices whose tags are being edited, and the control that asked.
   const [tagging, setTagging] = useState<Agent[] | null>(null);
   const tagOpener = useRef<HTMLElement | null>(null);
-  const requestConnect = (agent: Agent, background: boolean) => {
-    if (account.connection_approval) setPendingConnect({ agent, background });
-    else void remote.connect(agent, background);
-  };
+
+  // The tiles' actions keep their identity, so a tile redraws only when its
+  // own device, reading or state changes.
+  const { connect, closeSession } = remote;
+  const approval = account.connection_approval;
+  const onRemote = useCallback((agent: Agent) => {
+    if (approval) setPendingConnect({ agent, background: false });
+    else void connect(agent, false);
+  }, [approval, connect]);
+  const onRemoteBackground = useCallback((agent: Agent) => {
+    if (approval) setPendingConnect({ agent, background: true });
+    else void connect(agent, true);
+  }, [approval, connect]);
+  const onCloseSession = useCallback((agent: Agent) => void closeSession(agent), [closeSession]);
+  const onDelete = useCallback((agent: Agent) => void deleteAgent(agent), [deleteAgent]);
+  const onRunScript = useCallback((agent: Agent, opener: HTMLElement) => { runScriptOpener.current = opener; setRunScriptOn(agent); }, []);
+  const onWake = useCallback((chosen: Agent[], opener: HTMLElement) => { wakeOpener.current = opener; setWaking(chosen); }, []);
+  const onMove = useCallback((agent: Agent, opener: HTMLElement) => { moveOpener.current = opener; setMoving(agent); }, []);
+  const onEditTags = useCallback((chosen: Agent[], opener: HTMLElement) => { tagOpener.current = opener; setTagging(chosen); }, []);
+  const onSelect = useCallback((agent: Agent, chosen: boolean) => setSelected((current) => {
+    const next = new Set(current);
+    if (chosen) next.add(agent.id);
+    else next.delete(agent.id);
+    return next;
+  }), []);
+
   const filters = parseDeviceFilters(searchParams);
   const { status, company, tags, tagMatch } = filters;
   // A stable key for the chosen tags, which the URL parses afresh each render.
@@ -112,16 +141,16 @@ export function DevicesPanel() {
   const changeCompany = (next: CompanyFilter) => writeFilters({ ...filters, query: queryInput, company: next });
   const changeTags = (next: string[], match: TagMatch) => writeFilters({ ...filters, query: queryInput, tags: next, tagMatch: match });
   const filteredAgents = useMemo(
-    () => filterAgents(inventory.agents, { query: queryInput, status, company, tags: tagKey ? tagKey.split(",") : [], tagMatch }, inventory.tags),
-    [inventory.agents, inventory.tags, queryInput, status, company, tagKey, tagMatch],
+    () => filterAgents(agents, { query: queryInput, status, company, tags: tagKey ? tagKey.split(",") : [], tagMatch }, deviceTags),
+    [agents, deviceTags, queryInput, status, company, tagKey, tagMatch],
   );
   // New devices join the company the page shows.
-  const enrollInto = company && company !== NO_COMPANY && inventory.companies.some((candidate) => candidate.id === company) ? company : "";
+  const enrollInto = company && company !== NO_COMPANY && companies.some((candidate) => candidate.id === company) ? company : "";
 
   return (
     <>
       {remote.sessionNotice && <div className="session-notice" role="status">{remote.sessionNotice}</div>}
-      {remote.launch && <ViewerLaunchNotice key={remote.launch.attempt} launch={remote.launch} offline={inventory.connection === "offline"} onRetry={() => remote.retryLaunch(inventory.agents)} onDismiss={remote.dismissLaunch} />}
+      {remote.launch && <ViewerLaunchNotice key={remote.launch.attempt} launch={remote.launch} offline={inventory.connection === "offline"} onRetry={() => remote.retryLaunch((id) => devices.get(id))} onDismiss={remote.dismissLaunch} />}
       {listActionErrors(actionErrors, DEVICE_ACTIONS).map(({ source, message }) => (
         <div key={source} className="error-banner" role="alert">
           <CircleAlert size={16} aria-hidden="true" /><span>{message}</span>
@@ -129,16 +158,13 @@ export function DevicesPanel() {
         </div>
       ))}
       <AgentOverview
-        agents={inventory.agents}
         filteredAgents={filteredAgents}
         inventory={inventory}
-        thumbnails={inventory.thumbnails}
-        metrics={inventory.metrics}
         onReconnect={inventory.reconnect}
         onRefresh={() => void inventory.refresh()}
         onAddDevice={(opener) => { enrollOpener.current = opener; installer.reset(enrollInto); setIsEnrolling(true); }}
-        companies={inventory.companies}
-        tags={inventory.tags}
+        companies={companies}
+        tags={deviceTags}
         query={queryInput}
         status={status}
         company={company}
@@ -154,30 +180,25 @@ export function DevicesPanel() {
         onCompanyChange={changeCompany}
         onTagsChange={changeTags}
         onClearFilters={() => { setQueryInput(""); writeFilters(DEFAULT_DEVICE_FILTERS); }}
-        onEditTags={(agents, opener) => { tagOpener.current = opener; setTagging(agents); }}
-        onMove={(agent, opener) => { moveOpener.current = opener; setMoving(agent); }}
-        onRemote={(agent) => requestConnect(agent, false)}
-        onRemoteBackground={(agent) => requestConnect(agent, true)}
-        onCloseSession={(agent) => void remote.closeSession(agent)}
-        onDelete={(agent) => void deleteAgent(agent)}
-        onRunScript={(agent, opener) => { runScriptOpener.current = opener; setRunScriptOn(agent); }}
-        onWake={(agents, opener) => { wakeOpener.current = opener; setWaking(agents); }}
+        onEditTags={onEditTags}
+        onMove={onMove}
+        onRemote={onRemote}
+        onRemoteBackground={onRemoteBackground}
+        onCloseSession={onCloseSession}
+        onDelete={onDelete}
+        onRunScript={onRunScript}
+        onWake={onWake}
         selection={{
           ids: selected,
-          onChange: (agent, chosen) => setSelected((current) => {
-            const next = new Set(current);
-            if (chosen) next.add(agent.id);
-            else next.delete(agent.id);
-            return next;
-          }),
-          onSelectAll: (agents) => setSelected((current) => new Set([...current, ...agents.map((agent) => agent.id)])),
+          onChange: onSelect,
+          onSelectAll: (shown) => setSelected((current) => new Set([...current, ...shown.map((agent) => agent.id)])),
           onClear: () => setSelected(new Set()),
           onStartJob: (kind, opener) => { jobOpener.current = opener; setStartingJob(kind); },
         }}
       />
       {startingJob && <StartJobModal
         kind={startingJob}
-        deviceIds={inventory.agents.filter((agent) => selected.has(agent.id)).map((agent) => agent.id)}
+        deviceIds={chosenAgents(selected, devices).map((agent) => agent.id)}
         onClose={() => setStartingJob(null)}
         returnFocus={jobOpener}
       />}
@@ -189,14 +210,13 @@ export function DevicesPanel() {
         command={installer.command}
         onClose={() => setIsEnrolling(false)}
         onPlatformChange={installer.setPlatform}
-        companies={inventory.companies}
+        companies={companies}
         companyId={installer.companyId}
         onCompanyChange={installer.setCompanyId}
         onSubmit={(event) => void installer.download(event)}
         returnFocus={enrollOpener}
       />}
       {runScriptOn && <RunScriptModal
-        agents={inventory.agents}
         initialAgentId={runScriptOn.id}
         onClose={() => setRunScriptOn(null)}
         returnFocus={runScriptOpener}
@@ -210,7 +230,7 @@ export function DevicesPanel() {
         onCancel={() => setPendingConnect(null)}
         onConnect={(reason) => {
           setPendingConnect(null);
-          void remote.connect(pendingConnect.agent, pendingConnect.background, reason);
+          void connect(pendingConnect.agent, pendingConnect.background, reason);
         }}
       />}
     </>

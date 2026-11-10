@@ -1,5 +1,5 @@
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AuthenticationRequired, type AuthorizedFetch, errorMessage } from "../../lib/http";
 import type { Agent } from "../agents/types";
 import { remoteViewerLink } from "./remote-link";
@@ -39,7 +39,7 @@ function useSessionClose({ authorizedFetch, reportError }: Options) {
   const [closingId, setClosingId] = useState<string | null>(null);
   const [sessionNotice, setSessionNotice] = useState<string | null>(null);
 
-  const closeSession = async (agent: Agent) => {
+  const closeSession = useCallback(async (agent: Agent) => {
     setClosingId(agent.id);
     reportError(null);
     setSessionNotice(null);
@@ -57,7 +57,7 @@ function useSessionClose({ authorizedFetch, reportError }: Options) {
     } finally {
       setClosingId(null);
     }
-  };
+  }, [authorizedFetch, reportError]);
 
   return { closingId, sessionNotice, setSessionNotice, closeSession };
 }
@@ -71,21 +71,17 @@ export function useRemoteHandoff({ authorizedFetch, reportError }: Options) {
   const attempts = useRef(0);
   const cancelWatch = useRef<(() => void) | null>(null);
 
-  const stopWatching = () => {
-    cancelWatch.current?.();
-    cancelWatch.current = null;
-  };
-
   useEffect(() => () => {
     attempts.current += 1;
     cancelWatch.current?.();
     cancelWatch.current = null;
   }, []);
 
-  const connect = async (agent: Agent, startInBackground = false, reason = "") => {
+  const connect = useCallback(async (agent: Agent, startInBackground = false, reason = "") => {
     setSessionNotice(null);
     if (!agent.connected) return;
-    stopWatching();
+    cancelWatch.current?.();
+    cancelWatch.current = null;
     const attempt = ++attempts.current;
     setLaunch({ attempt, agentId: agent.id, agentName: agent.name, background: startInBackground, reason, phase: "opening" });
     reportError(null);
@@ -105,7 +101,7 @@ export function useRemoteHandoff({ authorizedFetch, reportError }: Options) {
         reportError(requestError instanceof Error ? requestError.message : "The remote session could not be started.");
       }
     }
-  };
+  }, [authorizedFetch, reportError, setSessionNotice]);
 
   // Hides the launch notice and stops watching for the viewer.
   const dismissLaunch = useCallback(() => {
@@ -115,21 +111,24 @@ export function useRemoteHandoff({ authorizedFetch, reportError }: Options) {
   }, []);
 
   // Always a fresh handoff: tokens are single-use and expire after a minute.
-  const retryLaunch = (agents: Agent[]) => {
+  // `find` looks the device up in the inventory as it is now.
+  const retryLaunch = useCallback((find: (id: string) => Agent | undefined) => {
     if (!launch) return;
-    const agent = agents.find((candidate) => candidate.id === launch.agentId);
+    const agent = find(launch.agentId);
     if (!agent?.connected) {
       dismissLaunch();
       reportError(`${agent?.name ?? launch.agentName} is not online, so a remote session cannot start. Connect when it is back online.`);
       return;
     }
     void connect(agent, launch.background, launch.reason);
-  };
+  }, [connect, dismissLaunch, launch, reportError]);
 
   const opening = launch?.phase === "opening" ? launch : null;
-  return {
-    connectingId: opening?.agentId ?? null,
-    connectingBackgroundId: opening?.background ? opening.agentId : null,
+  const connectingId = opening?.agentId ?? null;
+  const connectingBackgroundId = opening?.background ? opening.agentId : null;
+  return useMemo(() => ({
+    connectingId,
+    connectingBackgroundId,
     closingId,
     sessionNotice,
     launch,
@@ -137,5 +136,5 @@ export function useRemoteHandoff({ authorizedFetch, reportError }: Options) {
     closeSession,
     dismissLaunch,
     retryLaunch,
-  };
+  }), [closeSession, closingId, connect, connectingBackgroundId, connectingId, dismissLaunch, launch, retryLaunch, sessionNotice]);
 }

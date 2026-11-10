@@ -1,4 +1,4 @@
-import { type KeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent, type ReactNode, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import {
   Building2,
@@ -30,38 +30,36 @@ import { usePopover } from "../../lib/use-popover";
 import { useGridRows, useWindowedRows } from "../../lib/use-windowed-rows";
 import { terminalPagePath } from "../terminal/model";
 import { filesPagePath } from "../files/model";
-import type { MetricsReading } from "../metrics/model";
 import { DeviceUsage } from "../metrics/usage-meter";
 import { HeaderActions } from "../workspace/header-actions";
 import { type TagMatch, matchesTagName, tagLookup } from "../tags/model";
 import { TagChip, TagChips } from "../tags/tag-chip";
 import { type AgentStatusFilter, type CompanyFilter, NO_COMPANY } from "./device-filters";
-import { companyName, matchesCompanyName } from "./model";
+import { chosenAgents, companyName, matchesCompanyName } from "./model";
+import type { DeviceStore } from "./device-store";
 import { ScreenPreview, useDeviceScreen } from "./device-thumbnail";
 import type { InventoryConnection, InventoryStatus } from "./inventory-stream";
 import type { ThumbnailStore } from "./thumbnails";
 import { type Agent, type Company, type Tag, hasBackgroundDesktop } from "./types";
+import { useDeviceCounts, useDeviceLookup, useDeviceReading, useDevicesUpdated } from "./use-devices";
 
 type InventoryState = {
+  devices: DeviceStore;
+  thumbnails: ThumbnailStore;
   status: InventoryStatus;
   connection: InventoryConnection;
-  lastUpdated: Date | null;
   error: string | null;
   isRefreshing: boolean;
 };
 
 type Props = {
-  agents: Agent[];
-  filteredAgents: Agent[];
+  filteredAgents: readonly Agent[];
   inventory: InventoryState;
-  thumbnails: ThumbnailStore;
-  // Each online device's latest resource usage.
-  metrics: ReadonlyMap<string, MetricsReading>;
   onReconnect: () => void;
   onRefresh: () => void;
   onAddDevice: (opener: HTMLElement) => void;
-  companies: Company[];
-  tags: Tag[];
+  companies: readonly Company[];
+  tags: readonly Tag[];
   query: string;
   status: AgentStatusFilter;
   company: CompanyFilter;
@@ -97,7 +95,7 @@ type Props = {
 export type DeviceSelection = {
   ids: ReadonlySet<string>;
   onChange: (agent: Agent, selected: boolean) => void;
-  onSelectAll: (agents: Agent[]) => void;
+  onSelectAll: (agents: readonly Agent[]) => void;
   onClear: () => void;
   onStartJob: (kind: "script" | "file", opener: HTMLElement) => void;
 };
@@ -143,7 +141,8 @@ const formatTime = (date: Date | null) =>
 
 // Explains why the wall may be out of date and offers to reconnect.
 function InventoryStrip({ inventory, onReconnect }: { inventory: InventoryState; onReconnect: () => void }) {
-  const { status, connection, lastUpdated, error } = inventory;
+  const { status, connection, error } = inventory;
+  const lastUpdated = useDevicesUpdated(inventory.devices);
   const offline = connection === "offline";
   const stale = status === "stale";
   // While offline, the failed requests only repeat that.
@@ -169,11 +168,8 @@ const FILTERS: { id: AgentStatusFilter; label: string }[] = [
 ];
 
 export function AgentOverview({
-  agents,
   filteredAgents,
   inventory,
-  thumbnails,
-  metrics,
   onReconnect,
   onRefresh,
   onAddDevice,
@@ -204,14 +200,18 @@ export function AgentOverview({
   onWake,
   selection,
 }: Props) {
-  const online = agents.filter((agent) => agent.connected).length;
-  const counts: Record<AgentStatusFilter, number> = { all: agents.length, online, offline: agents.length - online };
+  const { devices, thumbnails } = inventory;
+  const { total, online } = useDeviceCounts(devices);
+  const counts: Record<AgentStatusFilter, number> = { all: total, online, offline: total - online };
   const hasFilters = Boolean(query.trim() || status !== "all" || company || tagFilter.length);
   const hasData = inventory.status !== "loading";
   const stale = inventory.status === "stale";
   const browserOffline = inventory.connection === "offline";
   const selectable = allowed.runScripts || allowed.deliverFiles || allowed.wake || allowed.editTags;
-  const selectedCount = agents.filter((agent) => selection.ids.has(agent.id)).length;
+  // The chosen devices still in the inventory, found by ID.
+  const fleet = useDeviceLookup(devices);
+  const chosen = useMemo(() => chosenAgents(selection.ids, fleet), [fleet, selection.ids]);
+  const selectedCount = chosen.length;
   // Looked up by every tile drawn, so built once, not once a tile.
   const companyNames = useMemo(() => new Map(companies.map((candidate) => [candidate.id, candidate.name])), [companies]);
   const tagsFor = useMemo(() => tagLookup(tags), [tags]);
@@ -222,6 +222,10 @@ export function AgentOverview({
   const previewOpener = useRef<HTMLElement | null>(null);
   const previewed = previewId === null ? undefined : filteredAgents.find((agent) => agent.id === previewId);
   if (previewId !== null && !previewed) setPreviewId(null);
+  const onShowScreen = useCallback((agent: Agent, opener: HTMLElement) => {
+    previewOpener.current = opener;
+    setPreviewId(agent.id);
+  }, []);
 
   return (
     <>
@@ -241,7 +245,7 @@ export function AgentOverview({
       </HeaderActions>
 
       <InventoryStrip inventory={inventory} onReconnect={onReconnect} />
-      {selectable && selectedCount > 0 && <SelectionBar count={selectedCount} allowed={allowed} selection={selection} shown={filteredAgents} chosen={agents.filter((agent) => selection.ids.has(agent.id))} onWake={onWake} onEditTags={onEditTags} />}
+      {selectable && selectedCount > 0 && <SelectionBar count={selectedCount} allowed={allowed} selection={selection} shown={filteredAgents} chosen={chosen} onWake={onWake} onEditTags={onEditTags} />}
 
       {filteredAgents.length > 0 ? (
         <DeviceWall agents={filteredAgents} className={`device-wall${stale ? " stale" : ""}${selectedCount > 0 ? " selecting" : ""}`}>
@@ -252,21 +256,19 @@ export function AgentOverview({
               position={index + 1}
               setSize={filteredAgents.length}
               companyName={(agent.company_id && companyNames.get(agent.company_id)) || null}
-              tags={tagsFor(agent.tag_ids)}
-              reading={metrics.get(agent.id)}
-              store={thumbnails}
+              tagsFor={tagsFor}
+              devices={devices}
+              thumbnails={thumbnails}
               allowed={allowed}
               selected={selectable ? selection.ids.has(agent.id) : null}
               onSelect={selection.onChange}
-              state={{
-                stale,
-                browserOffline,
-                connecting: connectingId === agent.id,
-                background: connectingBackgroundId === agent.id,
-                deleting: deletingId === agent.id,
-                closing: closingId === agent.id,
-                anyClosing: closingId !== null,
-              }}
+              stale={stale}
+              browserOffline={browserOffline}
+              connecting={connectingId === agent.id}
+              background={connectingBackgroundId === agent.id}
+              deleting={deletingId === agent.id}
+              closing={closingId === agent.id}
+              anyClosing={closingId !== null}
               onRemote={onRemote}
               onRemoteBackground={onRemoteBackground}
               onCloseSession={onCloseSession}
@@ -275,7 +277,7 @@ export function AgentOverview({
               onWake={onWake}
               onMove={onMove}
               onEditTags={onEditTags}
-              onShowScreen={(opener) => { previewOpener.current = opener; setPreviewId(agent.id); }}
+              onShowScreen={onShowScreen}
             />
           )}
         </DeviceWall>
@@ -297,7 +299,7 @@ export function AgentOverview({
 // scrolls as easily as a few; the list's padding stands in for the rest.
 // Every tile is the same height, so every row is.
 function DeviceWall({ agents, className, children }: {
-  agents: Agent[];
+  agents: readonly Agent[];
   className: string;
   children: (agent: Agent, index: number) => ReactNode;
 }) {
@@ -316,8 +318,8 @@ function SelectionBar({ count, allowed, selection, shown, chosen, onWake, onEdit
   count: number;
   allowed: DeviceActions;
   selection: DeviceSelection;
-  shown: Agent[];
-  // The chosen devices still on the wall.
+  shown: readonly Agent[];
+  // The chosen devices still in the inventory.
   chosen: Agent[];
   onWake: (agents: Agent[], opener: HTMLElement) => void;
   onEditTags: (agents: Agent[], opener: HTMLElement) => void;
@@ -341,7 +343,7 @@ function SelectionBar({ count, allowed, selection, shown, chosen, onWake, onEdit
 
 // Shows every device, one company's, or those in none.
 function CompanyFilterMenu({ companies, company, onChange }: {
-  companies: Company[];
+  companies: readonly Company[];
   company: CompanyFilter;
   onChange: (company: CompanyFilter) => void;
 }) {
@@ -367,7 +369,7 @@ function CompanyFilterMenu({ companies, company, onChange }: {
 
 // The open company menu, with a search box that starts empty each time.
 function CompanyFilterList({ companies, company, onChoose }: {
-  companies: Company[];
+  companies: readonly Company[];
   company: CompanyFilter;
   onChoose: (company: CompanyFilter) => void;
 }) {
@@ -433,7 +435,7 @@ function tagFilterLabel(tags: readonly Tag[], chosen: readonly string[]) {
 
 // Shows the devices with any, or all, of chosen tags.
 function TagFilterMenu({ tags, chosen, match, onChange }: {
-  tags: Tag[];
+  tags: readonly Tag[];
   chosen: readonly string[];
   match: TagMatch;
   onChange: (tags: string[], match: TagMatch) => void;
@@ -453,7 +455,7 @@ function TagFilterMenu({ tags, chosen, match, onChange }: {
 // The open tags menu: tick several, and whether devices need any or all.
 // It stays open while choosing, and its search box starts empty each time.
 function TagFilterList({ tags, chosen, match, onChange }: {
-  tags: Tag[];
+  tags: readonly Tag[];
   chosen: readonly string[];
   match: TagMatch;
   onChange: (tags: string[], match: TagMatch) => void;
@@ -495,20 +497,29 @@ function TagFilterList({ tags, chosen, match, onChange }: {
   );
 }
 
-function DeviceTile({ agent, position, setSize, companyName, tags, reading, store, allowed, selected, onSelect, state, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript, onWake, onMove, onEditTags, onShowScreen }: {
+// Memoised, with props that keep their identity: a device's change, or its
+// reading, redraws its own tile and no other.
+const DeviceTile = memo(function DeviceTile({ agent, position, setSize, companyName, tagsFor, devices, thumbnails, allowed, selected, onSelect, stale, browserOffline, connecting, background, deleting, closing, anyClosing, onRemote, onRemoteBackground, onCloseSession, onDelete, onRunScript, onWake, onMove, onEditTags, onShowScreen }: {
   agent: Agent;
   // Where it is on the wall, which draws only some of its tiles.
   position: number;
   setSize: number;
   companyName: string | null;
-  tags: Tag[];
-  reading: MetricsReading | undefined;
-  store: ThumbnailStore;
+  tagsFor: (ids: readonly string[] | undefined) => Tag[];
+  // Where the tile reads its device's latest resource usage.
+  devices: DeviceStore;
+  thumbnails: ThumbnailStore;
   allowed: DeviceActions;
   // Whether it's chosen for a job; null when the user can't start jobs.
   selected: boolean | null;
   onSelect: (agent: Agent, selected: boolean) => void;
-  state: TileState;
+  stale: boolean;
+  browserOffline: boolean;
+  connecting: boolean;
+  background: boolean;
+  deleting: boolean;
+  closing: boolean;
+  anyClosing: boolean;
   onRemote: (agent: Agent) => void;
   onRemoteBackground: (agent: Agent) => void;
   onCloseSession: (agent: Agent) => void;
@@ -517,9 +528,13 @@ function DeviceTile({ agent, position, setSize, companyName, tags, reading, stor
   onWake: (agents: Agent[], opener: HTMLElement) => void;
   onMove: (agent: Agent, opener: HTMLElement) => void;
   onEditTags: (agents: Agent[], opener: HTMLElement) => void;
-  onShowScreen: (opener: HTMLElement) => void;
+  onShowScreen: (agent: Agent, opener: HTMLElement) => void;
 }) {
-  const thumbnail = useDeviceScreen(store, agent);
+  const thumbnail = useDeviceScreen(thumbnails, agent);
+  const reading = useDeviceReading(devices, agent.id);
+  const tags = useMemo(() => tagsFor(agent.tag_ids), [tagsFor, agent.tag_ids]);
+  const state: TileState = { stale, browserOffline, connecting, background, deleting, closing, anyClosing };
+  const showScreen = (opener: HTMLElement) => onShowScreen(agent, opener);
   const busy = state.connecting || state.deleting || state.closing;
   const reachable = agent.connected && !state.browserOffline && !busy;
   const connectActions = hasBackgroundDesktop(agent) ? allowed : { ...allowed, connectBackground: false };
@@ -567,7 +582,7 @@ function DeviceTile({ agent, position, setSize, companyName, tags, reading, stor
             allowed={allowed}
             state={state}
             hasScreen={Boolean(thumbnail)}
-            onShowScreen={onShowScreen}
+            onShowScreen={showScreen}
             onCloseSession={onCloseSession}
             onDelete={onDelete}
             onWake={onWake}
@@ -582,7 +597,7 @@ function DeviceTile({ agent, position, setSize, companyName, tags, reading, stor
       </div>
     </li>
   );
-}
+});
 
 // Terminals open in a tab of their own, so several devices' can stay open
 // side by side while the devices list stays here.

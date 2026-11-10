@@ -1,7 +1,7 @@
 import { X } from "lucide-react";
 import type { RefObject } from "react";
 import { ModalDialog } from "../../lib/modal-dialog";
-import type { Agent } from "../agents/types";
+import { useDevice } from "../agents/use-devices";
 import { useWorkspace } from "../workspace/workspace-context";
 import type { toolboxAccess } from "./access";
 import { FileDetailsModal, UploadFilesModal } from "./file-dialogs";
@@ -18,14 +18,13 @@ export type ToolboxDialog =
   | { kind: "file"; file: ToolboxFile }
   | { kind: "run-details"; run: ScriptRun };
 
-export function ToolboxDialogs({ dialog, access, scripts, files, folders, maxBytes, agents, returnFocus, onClose, replaceScript, replaceFile }: {
+export function ToolboxDialogs({ dialog, access, scripts, files, folders, maxBytes, returnFocus, onClose, replaceScript, replaceFile }: {
   dialog: ToolboxDialog | null;
   access: ReturnType<typeof toolboxAccess>;
   scripts: ToolboxScript[];
   files: ToolboxFile[];
   folders: string[];
   maxBytes: number | null;
-  agents: Agent[];
   returnFocus: RefObject<HTMLElement | null>;
   onClose: () => void;
   replaceScript: (saved: ToolboxScript | null, id: string | null) => void;
@@ -71,16 +70,16 @@ export function ToolboxDialogs({ dialog, access, scripts, files, folders, maxByt
         />
       )}
       {dialog?.kind === "run-details" && (
-        <RunDetailsModal run={dialog.run} agents={agents} onClose={onClose} returnFocus={returnFocus} />
+        <RunDetailsModal run={dialog.run} onClose={onClose} returnFocus={returnFocus} />
       )}
     </>
   );
 }
 
-function RunDetailsModal({ run: listed, agents, onClose, returnFocus }: { run: ScriptRun; agents: Agent[]; onClose: () => void; returnFocus: { current: HTMLElement | null } }) {
-  const { authorizedFetch } = useWorkspace();
+function RunDetailsModal({ run: listed, onClose, returnFocus }: { run: ScriptRun; onClose: () => void; returnFocus: { current: HTMLElement | null } }) {
+  const { authorizedFetch, inventory } = useWorkspace();
   const { run, error } = useScriptRun(authorizedFetch, listed);
-  const deviceName = agents.find((agent) => agent.id === listed.device_id)?.name ?? listed.device_id;
+  const deviceName = useDevice(inventory.devices, listed.device_id)?.name ?? listed.device_id;
   return (
     <ModalDialog className="settings-modal toolbox-modal" labelledBy="run-details-title" onClose={onClose} returnFocus={returnFocus}>
       <button type="button" className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>

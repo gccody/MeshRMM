@@ -31,6 +31,7 @@ import { formatBytes } from "../metrics/model";
 import { UsageBar } from "../metrics/usage-meter";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useDevice } from "../agents/use-devices";
 import { type Chosen, DeleteDialog, MoveDialog, NewFolderDialog, RenameDialog } from "./file-dialogs";
 import { FileList, type RowAction } from "./file-list";
 import { createDownload, createFolder, deleteEntries, listFolder, listRoots, moveEntries, renameEntry } from "./files-api";
@@ -102,7 +103,7 @@ export function FilesPage() {
   const [params, setParams] = useSearchParams();
   const deviceId = params.get("id") ?? "";
   const path = params.get("path") ?? "";
-  const agent = inventory.agents.find((candidate) => candidate.id === deviceId);
+  const agent = useDevice(inventory.devices, deviceId);
   const accounts = accountOptions(can);
   const requestedAccount = params.get("as");
   const account: FileAccount = accounts.find((option) => option === requestedAccount) ?? accounts[0] ?? "user";

@@ -28,7 +28,7 @@ type Props = {
   command: string | null;
   onClose: () => void;
   onPlatformChange: (platform: AgentPlatform) => void;
-  companies: Company[];
+  companies: readonly Company[];
   /** The company the device joins; "" for none. */
   companyId: string;
   onCompanyChange: (companyId: string) => void;
