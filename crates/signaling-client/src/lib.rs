@@ -65,6 +65,26 @@ impl ReconnectBackoff {
     }
 }
 
+/// `delay` shortened by up to half at random, so peers that lost the server
+/// at the same moment spread their retries out instead of arriving together.
+/// For loops that show no countdown: the viewer shows the delay it waits.
+pub fn jittered(delay: Duration) -> Duration {
+    let fraction = match getrandom::u64() {
+        // The top 53 bits, which an `f64` holds exactly, as a fraction of 1.
+        Ok(random) => (random >> 11) as f64 / (1_u64 << 53) as f64,
+        Err(error) => {
+            tracing::warn!(%error, "no random source for reconnect jitter");
+            1.0
+        }
+    };
+    scaled(delay, fraction)
+}
+
+/// `delay` scaled into `[delay / 2, delay]` by `fraction` in `[0, 1]`.
+fn scaled(delay: Duration, fraction: f64) -> Duration {
+    delay.mul_f64(0.5 + fraction.clamp(0.0, 1.0) / 2.0)
+}
+
 pub fn endpoint_url(
     server: &str,
     segments: &[&str],
@@ -124,19 +144,20 @@ pub async fn authenticated_websocket(url: Url, token: &str) -> anyhow::Result<(S
 /// Returns true when retrying a WebSocket with the same credentials cannot
 /// succeed because the server rejected or no longer recognizes the session.
 pub fn is_terminal_websocket_error(error: &anyhow::Error) -> bool {
-    if error.downcast_ref::<TerminalClose>().is_some() {
-        return true;
-    }
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<tokio_tungstenite::tungstenite::Error>()
-            .and_then(|error| match error {
-                tokio_tungstenite::tungstenite::Error::Http(response) => {
-                    Some(response.status().as_u16())
-                }
-                _ => None,
-            })
+    error.downcast_ref::<TerminalClose>().is_some()
+        || handshake_status(error)
             .is_some_and(|status| matches!(status, 400 | 401 | 403 | 404 | 410))
+}
+
+/// The HTTP status with which the server refused a WebSocket handshake.
+pub fn handshake_status(error: &anyhow::Error) -> Option<u16> {
+    error.chain().find_map(|cause| {
+        match cause.downcast_ref::<tokio_tungstenite::tungstenite::Error>()? {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                Some(response.status().as_u16())
+            }
+            _ => None,
+        }
     })
 }
 
@@ -235,6 +256,43 @@ mod tests {
         assert_eq!(backoff.delay_after(Some(seconds(5))), seconds(2));
         assert_eq!(backoff.delay_after(None), seconds(4));
         assert_eq!(backoff.delay_after(Some(seconds(3600))), seconds(1));
+    }
+
+    #[test]
+    fn jitter_stays_in_the_upper_half_of_the_delay() {
+        let delay = Duration::from_secs(120);
+        assert_eq!(scaled(delay, 0.0), Duration::from_secs(60));
+        assert_eq!(scaled(delay, 0.5), Duration::from_secs(90));
+        assert_eq!(scaled(delay, 1.0), delay);
+        // Out-of-range fractions are clamped rather than escaping the bounds.
+        assert_eq!(scaled(delay, -1.0), Duration::from_secs(60));
+        assert_eq!(scaled(delay, 2.0), delay);
+        assert_eq!(scaled(Duration::ZERO, 0.7), Duration::ZERO);
+        // The largest fraction `jittered` draws.
+        let largest = ((u64::MAX >> 11) as f64) / (1_u64 << 53) as f64;
+        assert!(largest < 1.0 && scaled(delay, largest) <= delay);
+        for _ in 0..1000 {
+            let jittered = jittered(delay);
+            assert!((Duration::from_secs(60)..=delay).contains(&jittered));
+        }
+    }
+
+    #[test]
+    fn handshake_status_reads_the_refusal_through_context() {
+        use tokio_tungstenite::tungstenite::{Error, http};
+        let refused = |status: u16| {
+            let response = http::Response::builder().status(status).body(None).unwrap();
+            anyhow::Error::new(Error::Http(Box::new(response)))
+                .context("signaling WebSocket handshake failed")
+        };
+        assert_eq!(handshake_status(&refused(401)), Some(401));
+        assert!(is_terminal_websocket_error(&refused(404)));
+        assert!(!is_terminal_websocket_error(&refused(503)));
+        assert_eq!(
+            handshake_status(&anyhow::Error::new(Error::ConnectionClosed)),
+            None
+        );
+        assert_eq!(handshake_status(&anyhow::anyhow!("timed out")), None);
     }
 }
 

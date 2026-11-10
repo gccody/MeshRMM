@@ -593,8 +593,9 @@ nothing to run by hand.
      `server.toml` alone.
 3. Check `https://rmm.example.com/healthz` and the log.
 
-The server restarts in a few seconds. Agents reconnect by themselves, and
-remote sessions that were open resume where the viewer and Agent can.
+The server restarts in a few seconds. Agents reconnect by themselves, each
+within about two minutes of the server coming back and spread out at random
+so they don't all arrive at once, and remote sessions that were open resume where the viewer and Agent can.
 
 Agents then update themselves from the server: each checks the server's update
 manifest when it starts and every six hours, and installs a newer build that

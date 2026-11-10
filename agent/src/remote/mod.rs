@@ -95,14 +95,14 @@ pub(crate) mod wallpaper;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use std::ops::ControlFlow;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use anyhow::Context;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use meshrmm_protocol::{AgentCommand, AgentSessionRequest, AgentStatusMessage, RemoteSessionId};
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-use meshrmm_signaling_client::SignalingConnection;
+use meshrmm_signaling_client::{SignalingConnection, jittered};
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use tokio::time::sleep;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -110,7 +110,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 use self::config::{Config, ExecutionMode};
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-use self::signaling::{agent_connection_url, authenticated_websocket};
+use self::signaling::{
+    ControlAttempt, ControlReconnect, agent_connection_url, authenticated_websocket,
+};
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 struct ActiveSession {
@@ -363,38 +365,58 @@ struct Coordinator {
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 impl Coordinator {
     async fn run(mut self) -> anyhow::Result<()> {
-        let mut retry_delay = Duration::from_secs(1);
+        let mut reconnect = ControlReconnect::new();
         loop {
             let url = agent_connection_url(&self.config.server, &self.config.device_id)?;
             tracing::info!(device_id = %self.config.device_id, url = %url, "connecting Agent to the server");
-            match authenticated_websocket(url, &self.config.agent_token).await {
+            let delay = match authenticated_websocket(url, &self.config.agent_token).await {
                 Ok((socket, _response)) => {
                     let mut socket = SignalingConnection::new(socket);
-                    retry_delay = Duration::from_secs(1);
+                    let connected_at = Instant::now();
                     tracing::info!(device_id = %self.config.device_id, "Agent signaling connected");
-                    match self.serve(&mut socket).await {
-                        Ok(true) => {
-                            self.end_sessions().await;
-                            return Ok(());
-                        }
-                        Ok(false) => tracing::warn!("Agent signaling disconnected"),
+                    let ended = self.serve(&mut socket).await;
+                    if matches!(ended, Ok(true)) {
+                        self.end_sessions().await;
+                        return Ok(());
+                    }
+                    let lasted = connected_at.elapsed();
+                    let delay = jittered(reconnect.delay_after(ControlAttempt::Connected(lasted)));
+                    // Jittered delays are often under a second.
+                    let (retry_ms, connected_seconds) =
+                        (delay.as_millis() as u64, lasted.as_secs());
+                    match ended {
                         Err(error) => {
-                            tracing::warn!(error = %error, "Agent signaling connection ended with an error")
+                            tracing::warn!(error = %error, retry_ms, connected_seconds, "Agent signaling connection ended with an error")
+                        }
+                        Ok(_) => {
+                            tracing::warn!(
+                                retry_ms,
+                                connected_seconds,
+                                "Agent signaling disconnected"
+                            )
                         }
                     }
+                    delay
                 }
                 Err(error) => {
-                    tracing::warn!(error = %error, retry_seconds = retry_delay.as_secs(), "Agent signaling connection failed");
+                    let attempt = ControlAttempt::failed(&error);
+                    let delay = jittered(reconnect.delay_after(attempt));
+                    let retry_ms = delay.as_millis() as u64;
+                    if matches!(attempt, ControlAttempt::Refused) {
+                        tracing::warn!(error = %error, retry_ms, "the server does not recognize this device's credential; retrying less often");
+                    } else {
+                        tracing::warn!(error = %error, retry_ms, "Agent signaling connection failed");
+                    }
+                    delay
                 }
-            }
+            };
             tokio::select! {
-                _ = sleep(retry_delay) => {},
+                _ = sleep(delay) => {},
                 () = self.link.stopped() => {
                     self.end_sessions().await;
                     return Ok(());
                 },
             }
-            retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
         }
     }
 
