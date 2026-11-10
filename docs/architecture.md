@@ -189,8 +189,9 @@ task.
   Its writer task stores the finished minutes of every device together
   every 5 seconds, in one transaction. See
   [devices](devices.md#resource-monitoring).
-- **Alerts**: the engine's task reads presence and the metrics, raises and
-  resolves alerts, and broadcasts them; event sockets of users who may see
+- **Alerts**: the engine's task reads presence and the metrics, keeping each
+  device's readings only as far back as the enabled CPU and memory rules
+  look, raises and resolves alerts, and broadcasts them; event sockets of users who may see
   alerts pass them on. See [alerts](alerts.md).
 - **Monitors**: the engine's task sends each connected Agent its monitors
   when they change, comparing what each was last sent: for the devices a

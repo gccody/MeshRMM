@@ -53,7 +53,11 @@ Its condition can't change after it's created.
 The loads are averages so that a brief spike or dip neither raises nor
 clears an alert. A load rule needs readings covering its whole window, from
 a connection that hasn't dropped: until then, and while the device is
-offline, its alerts stay as they are. A disk space rule judges the latest
+offline, its alerts stay as they are. The server keeps each device's
+readings only as far back as the longest window of the enabled CPU and
+memory rules, and none while there is no such rule, so a rule created,
+turned on or lengthened to look further back than that waits for its window
+to fill, as for a device that just connected. A disk space rule judges the latest
 reading, while the device is online. The update rules judge the device's
 latest scan, online or not, and say nothing about a device that never
 scanned.

@@ -22,8 +22,8 @@ use crate::{
 pub const MAX_NAME_LENGTH: usize = 120;
 /// The longest a device may be offline before a rule raises an alert.
 pub const MAX_OFFLINE_MINUTES: i64 = 7 * 24 * 60;
-/// The longest a load must be sustained; the engine keeps this much of each
-/// device's readings.
+/// The longest a load must be sustained; the engine keeps at most this much
+/// of each device's readings.
 pub const MAX_SUSTAINED_MINUTES: i64 = 60;
 /// The longest updates or a restart may be pending before a rule raises an
 /// alert.
