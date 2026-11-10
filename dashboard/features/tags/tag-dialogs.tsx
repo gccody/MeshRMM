@@ -4,6 +4,7 @@ import { AuthenticationRequired, errorText } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
 import { type Agent, TAG_COLORS, type Tag, type TagColor } from "../agents/types";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useTags } from "../agents/use-devices";
 import { MAX_TAG_NAME_CHARS, TAG_COLOR_LABELS, type TagSummary, matchesTagName, tagChanges, tagCoverage, tagNameProblem } from "./model";
 import { TagChip } from "./tag-chip";
 import { changeDeviceTags, createTag, updateTag } from "./tags-api";
@@ -46,7 +47,8 @@ export function TagDialog({ tag, returnFocus, onClose, onSaved }: {
   const [color, setColor] = useState<TagColor>(tag?.color ?? "blue");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const problem = tagNameProblem(name, inventory.tags, tag?.id ?? null);
+  const tags = useTags(inventory.devices);
+  const problem = tagNameProblem(name, tags, tag?.id ?? null);
   const unchanged = tag !== null && name.trim() === tag.name && color === tag.color;
 
   const submit = async (event: FormEvent) => {
@@ -100,7 +102,7 @@ export function TagDevicesDialog({ agents, returnFocus, onClose }: {
   const [query, setQuery] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const { tags } = inventory;
+  const tags = useTags(inventory.devices);
   const shown = tags.filter((tag) => matchesTagName(tag.name, query));
   const { add, remove } = tagChanges(agents, wanted);
   const one = agents.length === 1;

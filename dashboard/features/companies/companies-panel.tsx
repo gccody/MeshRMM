@@ -7,6 +7,7 @@ import { matchesCompanyName } from "../agents/model";
 import type { Company } from "../agents/types";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useCompanies, useDevices } from "../agents/use-devices";
 import { GroupingTabs } from "./area-tabs";
 import { CompanyDialog } from "./company-dialogs";
 
@@ -27,7 +28,9 @@ export function CompaniesPanel() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const opener = useRef<HTMLElement | null>(null);
-  const { agents, companies, hasData } = inventory;
+  const { hasData } = inventory;
+  const agents = useDevices(inventory.devices);
+  const companies = useCompanies(inventory.devices);
 
   const counts = useMemo(() => {
     const result = new Map<string, Counts>();

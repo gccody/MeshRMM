@@ -149,7 +149,7 @@ export class ThumbnailStore {
   }
 
   // Forgets devices that left the inventory.
-  retain(ids: ReadonlySet<string>) {
+  retain(ids: { has(id: string): boolean }) {
     for (const [id, entry] of this.#entries) {
       if (ids.has(id) || entry.listeners.size) continue;
       if (entry.thumbnail) this.#revokeUrl(entry.thumbnail.url);

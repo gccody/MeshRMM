@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { DeviceStore } from '../features/agents/device-store.ts';
 import { ACCESS_REVOKED_CLOSE_CODE, SILENT_SOCKET_MS, SNAPSHOT_ANSWER_MS, STALE_GRACE_MS, eventsSocketUrl, inventoryStatus, inventoryStream } from '../features/agents/inventory-stream.ts';
 
 class FakeSocket extends EventTarget {
@@ -72,7 +73,12 @@ function harness({ online, random = () => 0.5 } = {}) {
   const connections = [];
   const timers = fakeTimers();
   const revision = { current: -1 };
-  const state = { agents: [], companies: [], refused: 0, refusedAt: [], readings: [], alerts: [], jobs: [], updates: [], errors: [], failing: false };
+  const devices = new DeviceStore({ schedule: () => {} });
+  const state = {
+    get agents() { return devices.agents(); },
+    get companies() { return devices.companies(); },
+    refused: 0, refusedAt: [], readings: [], alerts: [], jobs: [], updates: [], errors: [], failing: false,
+  };
   const fail = name => {
     if (state.failing) throw new Error(`${name} listener failed`);
   };
@@ -83,9 +89,9 @@ function harness({ online, random = () => 0.5 } = {}) {
       return socket;
     },
     revision,
-    onInventory: update => {
-      fail('inventory');
-      ({ agents: state.agents, companies: state.companies } = update({ agents: state.agents, companies: state.companies }));
+    inventory: {
+      replace: inventory => { fail('inventory'); devices.replace(inventory); },
+      apply: change => { fail('inventory'); devices.apply(change); },
     },
     onMetrics: readings => { fail('metrics'); state.readings.push(...readings); },
     onAlerts: event => { fail('alerts'); state.alerts.push(event); },
@@ -101,7 +107,7 @@ function harness({ online, random = () => 0.5 } = {}) {
     random,
     reportError: error => { state.errors.push(error.message); },
   });
-  return { stream, sockets, connections, timers, revision, state };
+  return { stream, sockets, connections, timers, revision, state, devices };
 }
 
 // A socket the server never accepted closes without opening.
@@ -343,7 +349,7 @@ test('a socket’s first snapshot applies whatever revision the page last saw', 
 });
 
 test('a later snapshot overtaken by an HTTP load keeps the newer inventory without a refresh', () => {
-  const { sockets, state, revision, connections } = harness();
+  const { sockets, state, revision, connections, devices } = harness();
   const socket = sockets[0];
   socket.open();
   socket.receive({ type: 'snapshot', revision: 5, agents: [agent('a')], generated_at_unix_ms: 1 });
@@ -351,7 +357,7 @@ test('a later snapshot overtaken by an HTTP load keeps the newer inventory witho
   assert.deepEqual(socket.sent, ['refresh'], 'the gap asks for a snapshot');
   // The HTTP load answers first, with revision 9.
   revision.current = 9;
-  state.agents = [agent('a'), agent('b'), agent('c')];
+  devices.replace({ agents: [agent('a'), agent('b'), agent('c')], companies: [], tags: [] });
   socket.receive({ type: 'agent_upsert', revision: 8, agent: agent('z') });
   socket.receive({ type: 'snapshot', revision: 8, agents: [agent('a'), agent('c'), agent('z')], generated_at_unix_ms: 2 });
   assert.deepEqual(state.agents.map(item => item.id), ['a', 'b', 'c']);

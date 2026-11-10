@@ -6,6 +6,7 @@ import { usePopover } from "../../lib/use-popover";
 import type { Agent } from "../agents/types";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useDevice } from "../agents/use-devices";
 import {
   SHELL_LABELS,
   type TerminalAccount,
@@ -42,7 +43,7 @@ export function TerminalPage() {
   const { inventory, authorizedFetch, can, setPageTitle } = useWorkspace();
   const [searchParams] = useSearchParams();
   const deviceId = searchParams.get("id") ?? "";
-  const agent = inventory.agents.find((candidate) => candidate.id === deviceId);
+  const agent = useDevice(inventory.devices, deviceId);
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeKey, setActiveKey] = useState<number | null>(null);
   const nextKey = useRef(1);

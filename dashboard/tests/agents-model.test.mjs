@@ -1,13 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { DeviceStore } from "../features/agents/device-store.ts";
 import {
-  applyAgentDelta,
-  applyInventoryDelta,
   companyName,
   matchesCompanyName,
   parseAgentEvent,
   parseAgentList,
-  sortAgents,
 } from "../features/agents/model.ts";
 import {
   DEFAULT_IDLE_TIMEOUT_MINUTES,
@@ -17,26 +15,29 @@ import {
 } from "../features/session/idle-session.ts";
 
 test("sorts and applies live Agent events deterministically", () => {
-  const agents = sortAgents([
-    { id: "b", name: "Zulu", platform: "windows", connected: false },
-    { id: "a", name: "Alpha", platform: "windows", connected: true },
-  ]);
-  assert.deepEqual(agents.map((agent) => agent.id), ["a", "b"]);
+  const devices = new DeviceStore({ schedule: () => {} });
+  devices.replace({
+    agents: [
+      { id: "b", name: "Zulu", platform: "windows", connected: false },
+      { id: "a", name: "Alpha", platform: "windows", connected: true },
+    ],
+    companies: [],
+    tags: [],
+  });
+  assert.deepEqual(devices.agents().map((agent) => agent.id), ["a", "b"]);
 
-  const updated = applyAgentDelta(agents, {
+  devices.apply({
     type: "agent_upsert",
     revision: 2,
     agent: { id: "b", name: "Zulu", platform: "windows", connected: true },
   });
-  assert.deepEqual(updated.map((agent) => [agent.id, agent.connected]), [
+  assert.deepEqual(devices.agents().map((agent) => [agent.id, agent.connected]), [
     ["a", true],
     ["b", true],
   ]);
 
-  assert.deepEqual(
-    applyAgentDelta(updated, { type: "agent_deleted", revision: 3, agent_id: "a" }),
-    [{ id: "b", name: "Zulu", platform: "windows", connected: true }],
-  );
+  devices.apply({ type: "agent_deleted", revision: 3, agent_id: "a" });
+  assert.deepEqual(devices.agents(), [{ id: "b", name: "Zulu", platform: "windows", connected: true }]);
 });
 
 test("rejects malformed Agent API and event payloads", () => {
@@ -87,19 +88,21 @@ test("accepts a device's system summary and rejects a malformed one", () => {
 });
 
 test("applies company events and names a device's company", () => {
-  let inventory = { agents: [{ id: "a", name: "Alpha", platform: "windows", connected: true, company_id: "g" }], companies: [] };
-  inventory = applyInventoryDelta(inventory, { type: "company_upsert", revision: 1, company: { id: "g", name: "globex" } });
-  inventory = applyInventoryDelta(inventory, { type: "company_upsert", revision: 2, company: { id: "a", name: "Acme" } });
-  assert.deepEqual(inventory.companies.map((company) => company.name), ["Acme", "globex"]);
-  assert.equal(companyName(inventory.companies, inventory.agents[0].company_id), "globex");
+  const devices = new DeviceStore({ schedule: () => {} });
+  devices.replace({ agents: [{ id: "a", name: "Alpha", platform: "windows", connected: true, company_id: "g" }], companies: [], tags: [] });
+  const before = devices.agents();
+  devices.apply({ type: "company_upsert", revision: 1, company: { id: "g", name: "globex" } });
+  devices.apply({ type: "company_upsert", revision: 2, company: { id: "a", name: "Acme" } });
+  assert.deepEqual(devices.companies().map((company) => company.name), ["Acme", "globex"]);
+  assert.equal(companyName(devices.companies(), devices.agents()[0].company_id), "globex");
 
-  inventory = applyInventoryDelta(inventory, { type: "company_upsert", revision: 3, company: { id: "g", name: "Globex" } });
-  assert.equal(companyName(inventory.companies, "g"), "Globex");
-  inventory = applyInventoryDelta(inventory, { type: "company_deleted", revision: 4, company_id: "g" });
-  assert.deepEqual(inventory.companies, [{ id: "a", name: "Acme" }]);
-  assert.equal(companyName(inventory.companies, "g"), null);
-  assert.equal(companyName(inventory.companies, null), null);
-  assert.equal(inventory.agents.length, 1, "company events leave devices alone");
+  devices.apply({ type: "company_upsert", revision: 3, company: { id: "g", name: "Globex" } });
+  assert.equal(companyName(devices.companies(), "g"), "Globex");
+  devices.apply({ type: "company_deleted", revision: 4, company_id: "g" });
+  assert.deepEqual(devices.companies(), [{ id: "a", name: "Acme" }]);
+  assert.equal(companyName(devices.companies(), "g"), null);
+  assert.equal(companyName(devices.companies(), null), null);
+  assert.equal(devices.agents(), before, "company events leave devices alone");
 });
 
 test("matches company names to a search, ignoring case and spaces around it", () => {

@@ -4,6 +4,7 @@ import { AuthenticationRequired, errorText } from "../../lib/http";
 import { useResource } from "../../lib/use-resource";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useCompanies, useTags } from "../agents/use-devices";
 import { deleteRule, fetchChannels, fetchRules } from "./alerts-api";
 import { SeverityBadge } from "./alert-table";
 import { AlertAreaTabs } from "./area-tabs";
@@ -29,7 +30,9 @@ export function RulesPage() {
     return { rules: rules.sort(byName), channels };
   }, [authorizedFetch, canManage]);
   const { data, error, reload, setData } = useResource(load, "The alert rules could not be loaded.");
-  const companyNames = useMemo(() => new Map(inventory.companies.map((company) => [company.id, company.name])), [inventory.companies]);
+  const companies = useCompanies(inventory.devices);
+  const tags = useTags(inventory.devices);
+  const companyNames = useMemo(() => new Map(companies.map((company) => [company.id, company.name])), [companies]);
   const channelNames = useMemo(() => new Map((data?.channels?.channels ?? []).map((channel) => [channel.id, channel.name])), [data]);
 
   const open = (rule: AlertRule | null, button: HTMLElement) => {
@@ -103,7 +106,7 @@ export function RulesPage() {
                     {rule.problem && <span className="form-error"><CircleAlert size={14} aria-hidden="true" /> {rule.problem}</span>}
                   </td>
                   <td><SeverityBadge severity={rule.severity} /></td>
-                  <td>{scopeLabel(rule, companyNames, inventory.tags)}</td>
+                  <td>{scopeLabel(rule, companyNames, tags)}</td>
                   <td>{notifies(rule)}{rule.channel_ids.length > 0 && rule.notify_when === "remediation_failed" && <span>Only if self-healing fails</span>}{rule.channel_ids.length > 0 && rule.notify_on_resolve && <span>Also when resolved</span>}</td>
                   <td className="row-actions">
                     {canManage && <>

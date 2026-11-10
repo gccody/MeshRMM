@@ -1,60 +1,33 @@
-import { type Agent, type AgentDelta, type AgentEvent, type Company, type Inventory, PLATFORM_LABELS, type SystemSummary, TAG_COLORS, type Tag } from "./types.ts";
+import { type Agent, type AgentEvent, type Company, type Inventory, PLATFORM_LABELS, type SystemSummary, TAG_COLORS, type Tag } from "./types.ts";
 
 const PLATFORMS: string[] = Object.keys(PLATFORM_LABELS);
 
-export const EMPTY_INVENTORY: Inventory = { agents: [], companies: [], tags: [] };
+// Built once: localeCompare with options builds a collator each call.
+const NAMES = new Intl.Collator();
+const NAMES_IGNORING_CASE = new Intl.Collator(undefined, { sensitivity: "base" });
 
-export const sortAgents = (items: Agent[]) =>
-  [...items].sort(
-    (left, right) =>
-      Number(right.connected) - Number(left.connected) ||
-      left.name.localeCompare(right.name) ||
-      left.id.localeCompare(right.id),
-  );
+// The order the device list shows: online devices first, then by name, then
+// by ID. The server sorts by lowercased name, which the browser's collation
+// can order differently, so the browser sorts what it receives.
+export const compareAgents = (left: Agent, right: Agent) =>
+  Number(right.connected) - Number(left.connected) ||
+  NAMES.compare(left.name, right.name) ||
+  NAMES.compare(left.id, right.id);
 
-export const sortCompanies = (items: Company[]) =>
-  [...items].sort(
-    (left, right) =>
-      left.name.localeCompare(right.name, undefined, { sensitivity: "base" }) ||
-      left.id.localeCompare(right.id),
-  );
-
-export const sortTags = (items: Tag[]) =>
-  [...items].sort(
-    (left, right) =>
-      left.name.localeCompare(right.name, undefined, { sensitivity: "base" }) ||
-      left.id.localeCompare(right.id),
-  );
-
-export const applyAgentDelta = (items: Agent[], event: Extract<AgentDelta, { type: "agent_upsert" | "agent_deleted" }>) =>
-  event.type === "agent_upsert"
-    ? sortAgents([
-        ...items.filter((agent) => agent.id !== event.agent.id),
-        event.agent,
-      ])
-    : items.filter((agent) => agent.id !== event.agent_id);
-
-export const applyInventoryDelta = (inventory: Inventory, event: AgentDelta): Inventory => {
-  switch (event.type) {
-    case "agent_upsert":
-    case "agent_deleted":
-      return { ...inventory, agents: applyAgentDelta(inventory.agents, event) };
-    case "company_upsert":
-      return {
-        ...inventory,
-        companies: sortCompanies([
-          ...inventory.companies.filter((company) => company.id !== event.company.id),
-          event.company,
-        ]),
-      };
-    case "company_deleted":
-      return { ...inventory, companies: inventory.companies.filter((company) => company.id !== event.company_id) };
-    case "tag_upsert":
-      return { ...inventory, tags: sortTags([...inventory.tags.filter((tag) => tag.id !== event.tag.id), event.tag]) };
-    case "tag_deleted":
-      return { ...inventory, tags: inventory.tags.filter((tag) => tag.id !== event.tag_id) };
+// The chosen devices still in the inventory, in the list's order: found by
+// ID rather than by going through every device.
+export function chosenAgents(ids: Iterable<string>, devices: { get(id: string): Agent | undefined }) {
+  const chosen: Agent[] = [];
+  for (const id of ids) {
+    const agent = devices.get(id);
+    if (agent) chosen.push(agent);
   }
-};
+  return chosen.sort(compareAgents);
+}
+
+// Companies and tags: by name ignoring case, then by ID.
+export const compareByName = (left: Company | Tag, right: Company | Tag) =>
+  NAMES_IGNORING_CASE.compare(left.name, right.name) || NAMES.compare(left.id, right.id);
 
 const isText = (value: unknown) => value === null || value === undefined || typeof value === "string";
 

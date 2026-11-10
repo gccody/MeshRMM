@@ -1,11 +1,13 @@
 import { LoaderCircle, LogIn, LogOut, Menu, MonitorDown, RefreshCw, UserRound, X } from "lucide-react";
-import { type ReactNode, useCallback, useReducer, useState } from "react";
+import { type ReactNode, useCallback, useMemo, useReducer, useState } from "react";
 import { Link, Navigate, Outlet, useLocation } from "react-router";
 import { AuthenticationRequired, apiFetch, errorMessage } from "../../lib/http";
 import { usePopover } from "../../lib/use-popover";
+import type { DeviceStore } from "../agents/device-store";
 import { useAgentInventory } from "../agents/use-agent-inventory";
+import { useDeviceCounts } from "../agents/use-devices";
 import { topSeverity } from "../alerts/model";
-import { useAlertFeed } from "../alerts/use-alert-feed";
+import { type AlertFeed, useAlertCounts, useAlertFeed } from "../alerts/use-alert-feed";
 import { useJobFeed } from "../automation/use-job-feed";
 import { useUpdateFeed } from "../updates/use-update-feed";
 import type { InventoryConnection } from "../agents/inventory-stream";
@@ -121,7 +123,7 @@ function SignedInWorkspace({ account, view, title, setPageTitle }: {
     // changed; the account says which.
     onRefused: useCallback(() => void refresh().catch(() => {}), [refresh]),
   });
-  const { agents, hasData, status: inventoryStatus, connection, reset: resetInventory } = inventory;
+  const { devices, hasData, status: inventoryStatus, connection, reset: resetInventory } = inventory;
   const reportActionError = useCallback(
     (source: ActionErrorSource, message: string | null) => dispatchActionError({ source, message }),
     [],
@@ -147,7 +149,7 @@ function SignedInWorkspace({ account, view, title, setPageTitle }: {
     setIsNavOpen(false);
   }
 
-  const deleteAgent = async (agent: Agent) => {
+  const deleteAgent = useCallback(async (agent: Agent) => {
     const confirmed = window.confirm(
       `Delete ${agent.name}? The Agent will uninstall itself and remove its local files. If it is offline, cleanup will run the next time it connects.`,
     );
@@ -165,16 +167,12 @@ function SignedInWorkspace({ account, view, title, setPageTitle }: {
     } finally {
       setDeletingId(null);
     }
-  };
-
-  if (enrolling && view !== "account") return <Navigate to={VIEW_PATHS.account} replace />;
-  if (!canView(account, view) && view === "devices") {
-    const home = homeView(account);
-    if (home !== "devices") return <Navigate to={VIEW_PATHS[home]} replace />;
-  }
+  }, [authorizedFetch, reportActionError]);
 
   const instanceName = instance?.name ?? "MeshRMM";
-  const workspace: Workspace = {
+  // The same object until something in it changes, so pages re-render for
+  // what they read, not each time the shell does.
+  const workspace = useMemo<Workspace>(() => ({
     account,
     instanceName,
     can,
@@ -196,7 +194,13 @@ function SignedInWorkspace({ account, view, title, setPageTitle }: {
     settingsDraft,
     headerSlot,
     setPageTitle,
-  };
+  }), [account, actionErrors, alerts, authorizedFetch, can, deleteAgent, deletingId, devicesSearch, headerSlot, instanceName, inventory, jobs, refreshAccount, remote, reportActionError, setPageTitle, settings, settingsDraft, updates]);
+
+  if (enrolling && view !== "account") return <Navigate to={VIEW_PATHS.account} replace />;
+  if (!canView(account, view) && view === "devices") {
+    const home = homeView(account);
+    if (home !== "devices") return <Navigate to={VIEW_PATHS[home]} replace />;
+  }
 
   const status = inventoryStatus === "live" ? "Live"
     : inventoryStatus === "stale" ? CONNECTION_STATUS[connection]
@@ -211,10 +215,8 @@ function SignedInWorkspace({ account, view, title, setPageTitle }: {
             {visible.map((candidate) => (
               <NavItem key={candidate} view={candidate} current={navViewFor(view)} disabled={enrolling} search={candidate === "devices" ? devicesSearch : ""}>
                 {VIEW_COPY[candidate].title}
-                {candidate === "devices" && hasData ? <em>{agents.length}</em> : null}
-                {candidate === "alerts" && alerts.counts && alerts.counts.open > 0
-                  ? <em className={`alert-count ${topSeverity(alerts.counts) ?? ""}`} aria-label={`${alerts.counts.open} open`}>{alerts.counts.open}</em>
-                  : null}
+                {candidate === "devices" && hasData ? <DeviceCount devices={devices} /> : null}
+                {candidate === "alerts" ? <AlertCount feed={alerts} /> : null}
               </NavItem>
             ))}
           </div>
@@ -242,6 +244,18 @@ function SignedInWorkspace({ account, view, title, setPageTitle }: {
       </Frame>
     </WorkspaceContext.Provider>
   );
+}
+
+// The navigation's counts follow the store and the feed themselves, so a
+// device or alert event re-renders them, not the workspace.
+function DeviceCount({ devices }: { devices: DeviceStore }) {
+  return <em>{useDeviceCounts(devices).total}</em>;
+}
+
+function AlertCount({ feed }: { feed: AlertFeed }) {
+  const counts = useAlertCounts(feed);
+  if (!counts || counts.open <= 0) return null;
+  return <em className={`alert-count ${topSeverity(counts) ?? ""}`} aria-label={`${counts.open} open`}>{counts.open}</em>;
 }
 
 function Frame({ instanceName, status, statusState = "", navigation, navOpen = false, onNav, tools, children }: {

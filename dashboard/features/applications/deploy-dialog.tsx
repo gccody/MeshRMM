@@ -10,6 +10,7 @@ import { DEFAULT_WAIT_HOURS, MAX_WAIT_HOURS, type OfflineChoice, type TargetKind
 import type { TagMatch } from "../tags/model";
 import { TagTargetFields } from "../tags/tag-chip";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useCompanies, useDevices, useTags } from "../agents/use-devices";
 import { startApplicationJob } from "./applications-api";
 import type { RunRequest } from "./model";
 
@@ -27,6 +28,9 @@ export function DeployDialog({ title, intro, request, platforms, deviceIds, retu
   onClose: () => void;
 }) {
   const { authorizedFetch, inventory, can } = useWorkspace();
+  const agents = useDevices(inventory.devices);
+  const companies = useCompanies(inventory.devices);
+  const tags = useTags(inventory.devices);
   const navigate = useNavigate();
   const titleId = useId();
   const wide = can("jobs.run_wide");
@@ -41,18 +45,17 @@ export function DeployDialog({ title, intro, request, platforms, deviceIds, retu
   const [error, setError] = useState<string | null>(null);
 
   const covered = useMemo(
-    () => coveredAgents(inventory.agents, { kind: target, deviceIds: chosenDevices, companyIds: chosenCompanies, tagIds: chosenTags, tagMatch }),
-    [inventory.agents, target, chosenDevices, chosenCompanies, chosenTags, tagMatch],
+    () => coveredAgents(agents, { kind: target, deviceIds: chosenDevices, companyIds: chosenCompanies, tagIds: chosenTags, tagMatch }),
+    [agents, target, chosenDevices, chosenCompanies, chosenTags, tagMatch],
   );
   const { skipped, offline: offlineCount } = useMemo(() => platformCounts(covered, platforms), [covered, platforms]);
   // Chosen devices on other platforms stay listed so they can be unticked.
   // The list is made again only when those change, not on every tick.
-  const byId = useMemo(() => new Map(inventory.agents.map((agent) => [agent.id, agent])), [inventory.agents]);
   const otherChosen = chosenDevices.filter((id) => {
-    const agent = byId.get(id);
+    const agent = inventory.devices.get(id);
     return agent !== undefined && !platforms.includes(agent.platform);
   }).join(",");
-  const pickable = useMemo(() => devicesOn(inventory.agents, platforms, otherChosen ? otherChosen.split(",") : []), [inventory.agents, platforms, otherChosen]);
+  const pickable = useMemo(() => devicesOn(agents, platforms, otherChosen ? otherChosen.split(",") : []), [agents, platforms, otherChosen]);
   const problem = target === "devices" && !chosenDevices.length ? "Choose at least one device."
     : target === "companies" && !chosenCompanies.length ? "Choose at least one company."
     : target === "tags" && !chosenTags.length ? "Choose at least one tag."
@@ -100,20 +103,20 @@ export function DeployDialog({ title, intro, request, platforms, deviceIds, retu
             <legend>Devices</legend>
             <label><input type="radio" name="deploy-target" checked={target === "devices"} onChange={() => setTarget("devices")} /><span><strong>Chosen devices</strong>{chosenDevices.length ? `${chosenDevices.length} chosen` : "Choose them below."}</span></label>
             {wide && <>
-              <label><input type="radio" name="deploy-target" checked={target === "companies"} onChange={() => setTarget("companies")} disabled={!inventory.companies.length} /><span><strong>Whole companies</strong>{inventory.companies.length ? "Every device in the companies chosen below, as they are when the job starts." : "There are no companies yet."}</span></label>
-              <label><input type="radio" name="deploy-target" checked={target === "tags"} onChange={() => setTarget("tags")} disabled={!inventory.tags.length} /><span><strong>Tagged devices</strong>{inventory.tags.length ? "Every device with the tags chosen below, as they are when the job starts." : "There are no tags yet."}</span></label>
-              <label><input type="radio" name="deploy-target" checked={target === "all"} onChange={() => setTarget("all")} /><span><strong>Every device</strong>All {inventory.agents.length} devices.</span></label>
+              <label><input type="radio" name="deploy-target" checked={target === "companies"} onChange={() => setTarget("companies")} disabled={!companies.length} /><span><strong>Whole companies</strong>{companies.length ? "Every device in the companies chosen below, as they are when the job starts." : "There are no companies yet."}</span></label>
+              <label><input type="radio" name="deploy-target" checked={target === "tags"} onChange={() => setTarget("tags")} disabled={!tags.length} /><span><strong>Tagged devices</strong>{tags.length ? "Every device with the tags chosen below, as they are when the job starts." : "There are no tags yet."}</span></label>
+              <label><input type="radio" name="deploy-target" checked={target === "all"} onChange={() => setTarget("all")} /><span><strong>Every device</strong>All {agents.length} devices.</span></label>
             </>}
           </fieldset>
           {target === "devices" && <DevicePicker agents={pickable} chosen={chosenDevices} onChange={setChosenDevices} language={null} />}
-          {target === "tags" && <TagTargetFields tags={inventory.tags} chosen={chosenTags} match={tagMatch} onChange={(change) => {
+          {target === "tags" && <TagTargetFields tags={tags} chosen={chosenTags} match={tagMatch} onChange={(change) => {
             if (change.tagIds) setChosenTags(change.tagIds);
             if (change.tagMatch) setTagMatch(change.tagMatch);
           }} />}
           {target === "companies" && (
             <fieldset className="choice-list picker-list">
               <legend className="sr-only">Companies</legend>
-              {inventory.companies.map((company) => (
+              {companies.map((company) => (
                 <label key={company.id}>
                   <input type="checkbox" checked={chosenCompanies.includes(company.id)} onChange={(event) => setChosenCompanies((current) => event.target.checked ? [...current, company.id] : current.filter((id) => id !== company.id))} />
                   <strong>{company.name}</strong>

@@ -7,6 +7,7 @@ import { useResource } from "../../lib/use-resource";
 import { PLATFORM_LABELS } from "../agents/types";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useCompanies, useDeviceLookup, useTags } from "../agents/use-devices";
 import { BulkInstallDialog } from "./bulk-install-dialog";
 import {
   type DeviceUpdateSummary,
@@ -44,6 +45,9 @@ const TILES: { status: Exclude<FleetStatusFilter, "" | "pending">; label: string
 // company, tag, operating system and state, with installs on many devices.
 export function UpdatesPage() {
   const { authorizedFetch, inventory, can } = useWorkspace();
+  const fleet = useDeviceLookup(inventory.devices);
+  const companies = useCompanies(inventory.devices);
+  const tags = useTags(inventory.devices);
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const filters = parseFleetFilters(searchParams);
@@ -80,14 +84,13 @@ export function UpdatesPage() {
   // The live inventory knows best which devices are online, and which exist.
   const devices = useMemo(() => {
     if (!data) return null;
-    const agents = new Map(inventory.agents.map((agent) => [agent.id, agent]));
     return sortFleet(data
-      .filter((device) => !inventory.hasData || agents.has(device.device_id))
+      .filter((device) => !inventory.hasData || fleet.get(device.device_id))
       .map((device) => {
-        const agent = agents.get(device.device_id);
+        const agent = fleet.get(device.device_id);
         return agent ? { ...device, device_name: agent.name, company_id: agent.company_id ?? null, tag_ids: agent.tag_ids ?? [], connected: agent.connected } : device;
       }));
-  }, [data, inventory.agents, inventory.hasData]);
+  }, [data, fleet, inventory.hasData]);
   const shown = (devices ?? []).filter((device) => matchesFleetFilters(device, filters, now));
   const totals = useMemo(() => fleetTotals(devices ?? [], now), [devices, now]);
   const chosenDevices = (devices ?? []).filter((device) => chosen.has(device.device_id));
@@ -166,13 +169,13 @@ export function UpdatesPage() {
             <select aria-label="Company" value={filters.company} onChange={(event) => choose({ company: event.target.value })}>
               <option value="">Every company</option>
               <option value={NO_COMPANY_FILTER}>No company</option>
-              {inventory.companies.map((company) => <option key={company.id} value={company.id}>{company.name}</option>)}
+              {companies.map((company) => <option key={company.id} value={company.id}>{company.name}</option>)}
             </select>
-            {(inventory.tags.length > 0 || filters.tag) && (
+            {(tags.length > 0 || filters.tag) && (
               <select aria-label="Tag" value={filters.tag} onChange={(event) => choose({ tag: event.target.value })}>
                 <option value="">Every tag</option>
-                {filters.tag && !inventory.tags.some((tag) => tag.id === filters.tag) && <option value={filters.tag}>Unknown tag</option>}
-                {inventory.tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}
+                {filters.tag && !tags.some((tag) => tag.id === filters.tag) && <option value={filters.tag}>Unknown tag</option>}
+                {tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}
               </select>
             )}
             <select aria-label="Operating system" value={filters.platform} onChange={(event) => choose({ platform: event.target.value as FleetFilters["platform"] })}>

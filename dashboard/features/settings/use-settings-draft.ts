@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { isOpeningExternalLink } from "../session/viewer-launch";
 import {
   type GeneralSettings,
@@ -39,5 +39,5 @@ export function useSettingsDraft(settings: GeneralSettings | null) {
     return () => window.removeEventListener("beforeunload", warnBeforeUnload);
   }, [isDirty]);
 
-  return { draft, updateDraft, isDirty, settingsTab, setSettingsTab };
+  return useMemo(() => ({ draft, updateDraft, isDirty, settingsTab, setSettingsTab }), [draft, updateDraft, isDirty, settingsTab]);
 }

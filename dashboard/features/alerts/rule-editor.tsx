@@ -7,6 +7,7 @@ import { MonitorFields, useSharedScripts } from "../monitors/monitor-fields";
 import { RemediationFields } from "../monitors/remediation-fields";
 import { TagTargetFields } from "../tags/tag-chip";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useCompanies, useTags } from "../agents/use-devices";
 import { saveRule } from "./alerts-api";
 import {
   type AlertRule,
@@ -86,7 +87,8 @@ export function RuleEditor({ rule, channels, returnFocus, onClose, onSaved }: {
 
   const gigabytes = form.condition === "disk_space" && form.thresholdUnit === "gb";
   const thresholdLabel = form.condition === "disk_space" ? "Alert when free space is below" : "Alert when the average is above";
-  const { companies, tags } = inventory;
+  const companies = useCompanies(inventory.devices);
+  const tags = useTags(inventory.devices);
   const canRunScripts = can("scripts.run");
   const accessReason = scriptsRunReason(form.condition);
 

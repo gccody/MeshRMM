@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useEffectEvent, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useMemo, useState } from "react";
 import { useWorkspace } from "../workspace/workspace-context";
 import type { JobEvent } from "./model";
 
@@ -21,7 +21,7 @@ export function useJobFeed(): JobFeed {
       listeners.delete(listener);
     };
   }, [listeners]);
-  return { handle, subscribe };
+  return useMemo(() => ({ handle, subscribe }), [handle, subscribe]);
 }
 
 // Calls `listener` with each job event while the page is open.

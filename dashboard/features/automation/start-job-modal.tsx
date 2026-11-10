@@ -8,6 +8,7 @@ import type { TagMatch } from "../tags/model";
 import { TagTargetFields } from "../tags/tag-chip";
 import { fetchToolbox } from "../toolbox/toolbox-api";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useCompanies, useDevices, useTags } from "../agents/use-devices";
 import { startJob } from "./automation-api";
 import { DevicePicker } from "../device-picker/device-picker";
 import { DEFAULT_WAIT_HOURS, type Destination, type JobKind, MAX_WAIT_HOURS, type OfflineChoice, type TargetKind, jobPreview, previewText, waitHoursProblem } from "./model";
@@ -35,6 +36,9 @@ type Props = {
  */
 export function StartJobModal({ kind: initialKind, itemId, deviceIds, toolbox: givenToolbox, onClose, returnFocus }: Props) {
   const { authorizedFetch, inventory, can } = useWorkspace();
+  const agents = useDevices(inventory.devices);
+  const companies = useCompanies(inventory.devices);
+  const tags = useTags(inventory.devices);
   const navigate = useNavigate();
   const titleId = useId();
   const [loaded, setLoaded] = useState<Pick<Toolbox, "scripts" | "files"> | null>(null);
@@ -72,8 +76,8 @@ export function StartJobModal({ kind: initialKind, itemId, deviceIds, toolbox: g
   const file = toolbox?.files.find((candidate) => candidate.id === fileId);
   const language = kind === "script" ? script?.language ?? null : null;
   const preview = useMemo(
-    () => jobPreview(inventory.agents, { kind: target, deviceIds: chosenDevices, companyIds: chosenCompanies, tagIds: chosenTags, tagMatch }, language),
-    [inventory.agents, target, chosenDevices, chosenCompanies, chosenTags, tagMatch, language],
+    () => jobPreview(agents, { kind: target, deviceIds: chosenDevices, companyIds: chosenCompanies, tagIds: chosenTags, tagMatch }, language),
+    [agents, target, chosenDevices, chosenCompanies, chosenTags, tagMatch, language],
   );
   const waitProblem = offline === "wait" ? waitHoursProblem(waitHours) : null;
   const item = kind === "script" ? script : file;
@@ -175,20 +179,20 @@ export function StartJobModal({ kind: initialKind, itemId, deviceIds, toolbox: g
             <legend>Devices</legend>
             <label><input type="radio" name="job-target" checked={target === "devices"} onChange={() => setTarget("devices")} /><span><strong>Chosen devices</strong>{chosenDevices.length ? `${chosenDevices.length} chosen` : "Choose them below."}</span></label>
             {wide && <>
-              <label><input type="radio" name="job-target" checked={target === "companies"} onChange={() => setTarget("companies")} disabled={!inventory.companies.length} /><span><strong>Whole companies</strong>{inventory.companies.length ? "Every device in the companies chosen below, as they are when the job starts." : "There are no companies yet."}</span></label>
-              <label><input type="radio" name="job-target" checked={target === "tags"} onChange={() => setTarget("tags")} disabled={!inventory.tags.length} /><span><strong>Tagged devices</strong>{inventory.tags.length ? "Every device with the tags chosen below, as they are when the job starts." : "There are no tags yet."}</span></label>
-              <label><input type="radio" name="job-target" checked={target === "all"} onChange={() => setTarget("all")} /><span><strong>Every device</strong>All {inventory.agents.length} devices.</span></label>
+              <label><input type="radio" name="job-target" checked={target === "companies"} onChange={() => setTarget("companies")} disabled={!companies.length} /><span><strong>Whole companies</strong>{companies.length ? "Every device in the companies chosen below, as they are when the job starts." : "There are no companies yet."}</span></label>
+              <label><input type="radio" name="job-target" checked={target === "tags"} onChange={() => setTarget("tags")} disabled={!tags.length} /><span><strong>Tagged devices</strong>{tags.length ? "Every device with the tags chosen below, as they are when the job starts." : "There are no tags yet."}</span></label>
+              <label><input type="radio" name="job-target" checked={target === "all"} onChange={() => setTarget("all")} /><span><strong>Every device</strong>All {agents.length} devices.</span></label>
             </>}
           </fieldset>
-          {target === "devices" && <DevicePicker agents={inventory.agents} chosen={chosenDevices} onChange={setChosenDevices} language={language} />}
-          {target === "tags" && <TagTargetFields tags={inventory.tags} chosen={chosenTags} match={tagMatch} onChange={(change) => {
+          {target === "devices" && <DevicePicker agents={agents} chosen={chosenDevices} onChange={setChosenDevices} language={language} />}
+          {target === "tags" && <TagTargetFields tags={tags} chosen={chosenTags} match={tagMatch} onChange={(change) => {
             if (change.tagIds) setChosenTags(change.tagIds);
             if (change.tagMatch) setTagMatch(change.tagMatch);
           }} />}
           {target === "companies" && (
             <fieldset className="choice-list picker-list">
               <legend className="sr-only">Companies</legend>
-              {inventory.companies.map((company) => (
+              {companies.map((company) => (
                 <label key={company.id}>
                   <input type="checkbox" checked={chosenCompanies.includes(company.id)} onChange={(event) => setChosenCompanies((current) => event.target.checked ? [...current, company.id] : current.filter((id) => id !== company.id))} />
                   <strong>{company.name}</strong>

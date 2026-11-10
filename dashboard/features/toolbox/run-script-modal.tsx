@@ -3,7 +3,8 @@ import { LoaderCircle, Play, X } from "lucide-react";
 import { type FormEvent, type RefObject, useEffect, useMemo, useState } from "react";
 import { AuthenticationRequired } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
-import { type Agent, PLATFORM_LABELS } from "../agents/types";
+import { PLATFORM_LABELS } from "../agents/types";
+import { useDevice, useDevices } from "../agents/use-devices";
 import { DeviceSelect } from "../device-picker/device-select";
 import { useWorkspace } from "../workspace/workspace-context";
 import { type RunAs, type ScriptRun, type ToolboxScript, LANGUAGE_LABELS, RUN_AS_LABELS, groupByFolder, isRunFinished, runsOn } from "./model";
@@ -11,7 +12,6 @@ import { RunResult, useScriptRun } from "./run-result";
 import { fetchToolbox, runScript } from "./toolbox-api";
 
 type Props = {
-  agents: Agent[];
   /** The scripts to choose from; loaded when not given. */
   scripts?: ToolboxScript[];
   initialAgentId?: string;
@@ -21,8 +21,9 @@ type Props = {
 };
 
 /** Picks a script, a device and an account, runs it, and shows the result. */
-export function RunScriptModal({ agents, scripts: givenScripts, initialAgentId, initialScriptId, onClose, returnFocus }: Props) {
-  const { authorizedFetch } = useWorkspace();
+export function RunScriptModal({ scripts: givenScripts, initialAgentId, initialScriptId, onClose, returnFocus }: Props) {
+  const { authorizedFetch, inventory } = useWorkspace();
+  const agents = useDevices(inventory.devices);
   const [loadedScripts, setLoadedScripts] = useState<ToolboxScript[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const scripts = givenScripts ?? loadedScripts;
@@ -49,7 +50,7 @@ export function RunScriptModal({ agents, scripts: givenScripts, initialAgentId, 
 
   const folders = useMemo(() => groupByFolder(scripts ?? []), [scripts]);
   const script = scripts?.find((candidate) => candidate.id === scriptId);
-  const agent = useMemo(() => agents.find((candidate) => candidate.id === agentId), [agents, agentId]);
+  const agent = useDevice(inventory.devices, agentId);
   const compatible = !script || !agent || runsOn(script.language, agent.platform);
   const canRun = Boolean(script && agent?.connected && compatible && !starting);
 

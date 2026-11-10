@@ -10,6 +10,7 @@ import type { ToolboxScript } from "../toolbox/model";
 import { fetchToolbox } from "../toolbox/toolbox-api";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useCompanies, useDeviceNames, useTags } from "../agents/use-devices";
 import { AutomationAreaTabs } from "./area-tabs";
 import { deletePolicy, fetchPolicies, runPolicy, savePolicy } from "./automation-api";
 import { JobProgressBar } from "./job-progress";
@@ -60,8 +61,10 @@ export function PoliciesPage() {
     return { policies: policies.sort(byName), scripts, channels };
   }, [authorizedFetch]);
   const { data, error, reload, setData } = useResource(load, "The policies could not be loaded.");
-  const companyNames = useMemo(() => new Map(inventory.companies.map((company) => [company.id, company.name])), [inventory.companies]);
-  const deviceNames = useMemo(() => new Map(inventory.agents.map((agent) => [agent.id, agent.name])), [inventory.agents]);
+  const companies = useCompanies(inventory.devices);
+  const tags = useTags(inventory.devices);
+  const companyNames = useMemo(() => new Map(companies.map((company) => [company.id, company.name])), [companies]);
+  const deviceNames = useDeviceNames(inventory.devices);
 
   const replace = (saved: Policy) => setData((current) => ({
     ...current,
@@ -144,7 +147,7 @@ export function PoliciesPage() {
                   <tr key={policy.id} className={policy.enabled ? undefined : "row-disabled"}>
                     <td>
                       <strong>{policy.name}</strong>
-                      <span>{describePolicyAction(policy)} on {describeTarget(policy, companyNames, deviceNames, inventory.tags)}</span>
+                      <span>{describePolicyAction(policy)} on {describeTarget(policy, companyNames, deviceNames, tags)}</span>
                       <span>Runs with {policy.owned_by_you ? "your" : `${policy.owner}’s`} access</span>
                     </td>
                     <td>

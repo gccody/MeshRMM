@@ -8,6 +8,7 @@ import { CategoryChoice } from "../updates/bulk-install-dialog";
 import { TagTargetFields } from "../tags/tag-chip";
 import { RebootFields } from "../updates/reboot-fields";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useCompanies, useDevices, useTags } from "../agents/use-devices";
 import { ApplicationPolicyFields } from "../applications/policy-fields";
 import { savePolicy } from "./automation-api";
 import { DevicePicker } from "../device-picker/device-picker";
@@ -55,6 +56,9 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
   onSaved: (policy: Policy) => void;
 }) {
   const { authorizedFetch, inventory, can } = useWorkspace();
+  const agents = useDevices(inventory.devices);
+  const companies = useCompanies(inventory.devices);
+  const tags = useTags(inventory.devices);
   const titleId = useId();
   const zones = useMemo(() => timeZones(Intl.supportedValuesOf("timeZone")), []);
   // The actions the user may save: a policy runs with its saver's access.
@@ -184,14 +188,14 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
           <fieldset className="choice-list">
             <legend>Devices</legend>
             <label><input type="radio" name="policy-target" checked={draft.target === "all"} onChange={() => update({ target: "all" })} /><span><strong>Every device</strong>As they are each time it runs.</span></label>
-            <label><input type="radio" name="policy-target" checked={draft.target === "companies"} onChange={() => update({ target: "companies" })} disabled={!inventory.companies.length && draft.target !== "companies"} /><span><strong>Devices of chosen companies</strong>{inventory.companies.length ? "Choose them below." : "There are no companies yet."}</span></label>
-            {!enrolling && <label><input type="radio" name="policy-target" checked={draft.target === "tags"} onChange={() => update({ target: "tags" })} disabled={!inventory.tags.length && draft.target !== "tags"} /><span><strong>Devices with chosen tags</strong>{inventory.tags.length ? "The devices that have them each time it runs, including ones tagged later." : "There are no tags yet."}</span></label>}
+            <label><input type="radio" name="policy-target" checked={draft.target === "companies"} onChange={() => update({ target: "companies" })} disabled={!companies.length && draft.target !== "companies"} /><span><strong>Devices of chosen companies</strong>{companies.length ? "Choose them below." : "There are no companies yet."}</span></label>
+            {!enrolling && <label><input type="radio" name="policy-target" checked={draft.target === "tags"} onChange={() => update({ target: "tags" })} disabled={!tags.length && draft.target !== "tags"} /><span><strong>Devices with chosen tags</strong>{tags.length ? "The devices that have them each time it runs, including ones tagged later." : "There are no tags yet."}</span></label>}
             {!enrolling && <label><input type="radio" name="policy-target" checked={draft.target === "devices"} onChange={() => update({ target: "devices" })} /><span><strong>Chosen devices</strong>{draft.deviceIds.length ? `${draft.deviceIds.length} chosen` : "Choose them below."}</span></label>}
           </fieldset>
           {draft.target === "companies" && (
             <fieldset className="choice-list picker-list">
               <legend className="sr-only">Companies</legend>
-              {inventory.companies.map((company) => (
+              {companies.map((company) => (
                 <label key={company.id}>
                   <input type="checkbox" checked={draft.companyIds.includes(company.id)} onChange={(event) => toggle("companyIds", company.id, event.target.checked)} />
                   <strong>{company.name}</strong>
@@ -199,8 +203,8 @@ export function PolicyEditor({ policy, scripts, channels, returnFocus, onClose, 
               ))}
             </fieldset>
           )}
-          {draft.target === "tags" && <TagTargetFields tags={inventory.tags} chosen={draft.tagIds} match={draft.tagMatch} onChange={({ tagIds, tagMatch }) => update({ ...(tagIds && { tagIds }), ...(tagMatch && { tagMatch }) })} />}
-          {draft.target === "devices" && <DevicePicker agents={inventory.agents} chosen={draft.deviceIds} onChange={(deviceIds) => update({ deviceIds: [...deviceIds] })} language={isScript ? script?.language ?? null : null} />}
+          {draft.target === "tags" && <TagTargetFields tags={tags} chosen={draft.tagIds} match={draft.tagMatch} onChange={({ tagIds, tagMatch }) => update({ ...(tagIds && { tagIds }), ...(tagMatch && { tagMatch }) })} />}
+          {draft.target === "devices" && <DevicePicker agents={agents} chosen={draft.deviceIds} onChange={(deviceIds) => update({ deviceIds: [...deviceIds] })} language={isScript ? script?.language ?? null : null} />}
 
           {!enrolling && !isWake && (
             <fieldset className="choice-list">

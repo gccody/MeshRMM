@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyInventoryDelta, parseAgentEvent } from "../features/agents/model.ts";
+import { DeviceStore } from "../features/agents/device-store.ts";
+import { parseAgentEvent } from "../features/agents/model.ts";
 import { describeTagTarget, hasTags, tagChanges, tagCoverage, tagLookup, tagNameProblem, tagsOf } from "../features/tags/model.ts";
 
 const tags = [
@@ -9,14 +10,14 @@ const tags = [
 ];
 
 test("tag events keep the inventory's tags sorted by name", () => {
-  let inventory = { agents: [], companies: [], tags: [] };
-  inventory = applyInventoryDelta(inventory, { type: "tag_upsert", revision: 1, tag: tags[1] });
-  inventory = applyInventoryDelta(inventory, { type: "tag_upsert", revision: 2, tag: tags[0] });
-  assert.deepEqual(inventory.tags.map((tag) => tag.name), ["London", "Servers"]);
-  inventory = applyInventoryDelta(inventory, { type: "tag_upsert", revision: 3, tag: { ...tags[1], name: "app servers" } });
-  assert.deepEqual(inventory.tags.map((tag) => tag.name), ["app servers", "London"]);
-  inventory = applyInventoryDelta(inventory, { type: "tag_deleted", revision: 4, tag_id: "l" });
-  assert.deepEqual(inventory.tags.map((tag) => tag.id), ["s"]);
+  const devices = new DeviceStore({ schedule: () => {} });
+  devices.apply({ type: "tag_upsert", revision: 1, tag: tags[1] });
+  devices.apply({ type: "tag_upsert", revision: 2, tag: tags[0] });
+  assert.deepEqual(devices.tags().map((tag) => tag.name), ["London", "Servers"]);
+  devices.apply({ type: "tag_upsert", revision: 3, tag: { ...tags[1], name: "app servers" } });
+  assert.deepEqual(devices.tags().map((tag) => tag.name), ["app servers", "London"]);
+  devices.apply({ type: "tag_deleted", revision: 4, tag_id: "l" });
+  assert.deepEqual(devices.tags().map((tag) => tag.id), ["s"]);
   assert.deepEqual(parseAgentEvent({ type: "tag_upsert", revision: 5, tag: tags[0] }), { type: "tag_upsert", revision: 5, tag: tags[0] });
 });
 

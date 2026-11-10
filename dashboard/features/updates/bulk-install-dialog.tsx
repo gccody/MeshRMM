@@ -5,6 +5,7 @@ import { AuthenticationRequired, errorText } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
 import { DEFAULT_WAIT_HOURS, MAX_WAIT_HOURS, type OfflineChoice, waitHoursProblem } from "../automation/model";
 import { useWorkspace } from "../workspace/workspace-context";
+import { useDeviceLookup } from "../agents/use-devices";
 import { CATEGORIES, CATEGORY_LABELS, DEFAULT_REBOOT_DELAY_MINUTES, type DeviceUpdateSummary, type RebootBehavior, type UpdateCategory, describeSelection, rebootDelayProblem } from "./model";
 import { RebootFields } from "./reboot-fields";
 import { startUpdateJob } from "./updates-api";
@@ -29,8 +30,8 @@ export function BulkInstallDialog({ devices, returnFocus, onClose }: {
   const [waitHours, setWaitHours] = useState(String(DEFAULT_WAIT_HOURS));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const connected = new Set(inventory.agents.filter((agent) => agent.connected).map((agent) => agent.id));
-  const offlineCount = devices.filter((device) => !connected.has(device.device_id)).length;
+  const fleet = useDeviceLookup(inventory.devices);
+  const offlineCount = devices.filter((device) => !fleet.get(device.device_id)?.connected).length;
   const unsupported = devices.filter((device) => !device.supported).length;
   const pacman = devices.filter((device) => device.manager === "pacman").length;
   const problem = (reboot !== "never" ? rebootDelayProblem(delay) : null) ?? (offline === "wait" ? waitHoursProblem(waitHours) : null);
