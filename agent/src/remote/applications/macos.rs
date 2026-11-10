@@ -15,8 +15,8 @@ use meshrmm_protocol::{
     APPLICATION_SCAN_TIMEOUT_SECONDS, PackageKey, PackageRef, PackageSource, ScannedPackage,
 };
 
-use super::process::{self, Ran};
 use super::{Attempt, ITEM_TIMEOUT, Verdict, extension, parse};
+use crate::remote::process::{self, Ran};
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(APPLICATION_SCAN_TIMEOUT_SECONDS);
 /// Where Homebrew installs itself on Apple silicon and on Intel Macs.

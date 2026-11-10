@@ -21,8 +21,8 @@ use windows::Win32::System::Registry::{
     KEY_WOW64_64KEY, REG_SAM_FLAGS,
 };
 
-use super::process::{self, Ran};
 use super::{Attempt, ITEM_TIMEOUT, Verdict, extension, parse};
+use crate::remote::process::{self, Ran};
 use crate::remote::system_info::windows::registry::Key;
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(APPLICATION_SCAN_TIMEOUT_SECONDS);

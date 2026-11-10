@@ -34,6 +34,8 @@ use super::Progress;
 use super::process::{Output, run};
 
 const SOFTWAREUPDATE: &str = "/usr/sbin/softwareupdate";
+/// What scans and installs, for messages.
+pub(super) const SERVICE: &str = "softwareupdate";
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
 

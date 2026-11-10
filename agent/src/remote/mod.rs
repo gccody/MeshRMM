@@ -53,6 +53,8 @@ mod monitors;
 mod native_task;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod platform;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+mod process;
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 mod secure_attention;
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]

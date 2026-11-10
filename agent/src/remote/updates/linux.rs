@@ -21,6 +21,9 @@ use meshrmm_protocol::{
 use super::Progress;
 use super::process::{Output, find};
 
+/// What scans and installs, for messages.
+pub(super) const SERVICE: &str = "The package manager";
+
 pub(super) fn scan() -> UpdateScan {
     let Some(manager) = manager() else {
         return UpdateScan::default();
@@ -287,6 +290,7 @@ mod tests {
         let progress = Progress {
             run_id: "test".into(),
             sender,
+            given_up: Default::default(),
         };
         let items = install(
             manager,
