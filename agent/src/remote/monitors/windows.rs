@@ -3,7 +3,6 @@
 //! ICMP API for ping, so nothing depends on a tool's localized output.
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::net::ToSocketAddrs;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
@@ -34,6 +33,7 @@ use windows::core::{HSTRING, PCWSTR};
 use windows_service::service::{ServiceAccess, ServiceStartType, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use super::network;
 use super::parse::{self, EventFilter, LogRead, ProcessSample, ServiceStatus};
 
 const SERVICE_WAIT: Duration = Duration::from_secs(60);
@@ -461,12 +461,11 @@ pub(super) fn events(
 }
 
 pub(super) fn ping(host: &str, timeout: Duration) -> anyhow::Result<Option<f64>> {
-    let address = (host, 0)
-        .to_socket_addrs()
-        .map_err(|error| anyhow::anyhow!("could not look up “{host}”: {error}"))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("“{host}” has no address"))?;
-    let timeout_ms = timeout.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+    // The lookup counts against the timeout, which the echo has what's left of.
+    let deadline = Instant::now() + timeout;
+    let address = network::resolve(host, 0, deadline)?[0];
+    let left = deadline.saturating_duration_since(Instant::now());
+    let timeout_ms = left.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
     let data = [0x61u8; 32];
     // Room for the reply, its data, and an ICMP error.
     let mut reply = vec![0u8; std::mem::size_of::<ICMP_ECHO_REPLY>() + data.len() + 8 + 64];
