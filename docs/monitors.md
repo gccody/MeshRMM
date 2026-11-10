@@ -98,8 +98,11 @@ the Agent's.
   fleet doesn't check at once. At most 8 checks run at a time, 2 of them
   script checks; a check due while those are taken starts when one
   finishes or overruns, the one due longest first. A check that overruns its time limit by 5 seconds counts as
-  failing, and the monitor doesn't start again until it finishes. Monitors
-  keep running while the Agent is reconnecting.
+  failing, and the monitor doesn't start again until it finishes. A check
+  that breaks inside the Agent (a panic) or can't be started counts as
+  failing, saying so, and the monitor runs again at its next interval, with
+  what it remembered from its last finished check. Monitors keep running while the
+  Agent is reconnecting.
 - **Reporting.** The Agent reports at once a failure (every one, with its
   count), a change between passing and failing, a monitor's first result
   (also after its definition changes), the result Check now asks for, and

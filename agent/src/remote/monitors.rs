@@ -11,7 +11,9 @@
 //! monitor's timeout. A check due while the limits are reached waits,
 //! without the scheduler waking for it, until a check finishes or overruns;
 //! then the one due longest starts. A check that overruns counts as
-//! failing, and the monitor doesn't run again until it finishes.
+//! failing, and the monitor doesn't run again until it finishes. A check
+//! that breaks (panics), or whose thread can't start, counts as failing
+//! too, and the monitor runs again at its next interval.
 //!
 //! Results reach the coordinator through [`Monitors::next`], measured
 //! against what the server holds of each monitor (what it was last sent, or
@@ -587,28 +589,60 @@ struct Job {
     commands: mpsc::Sender<Command>,
 }
 
+impl Job {
+    /// Runs the check with `check` and sends [`Command::Done`] with what it
+    /// found. A check that panics fails, saying it broke, and keeps the
+    /// memory from before it: it may have stopped halfway through changing
+    /// it, and an event log check must look again from its last finished
+    /// check, not from this one. Either way the monitor is free to run
+    /// again, rather than marked running until the Agent restarts.
+    fn finish(self, check: impl FnOnce(&MonitorCheck, &Context, &mut Memory) -> Outcome) {
+        let Job {
+            run,
+            check: monitor,
+            context,
+            memory: before,
+            commands,
+        } = self;
+        let mut memory = before.clone();
+        // Unwind safe: the check only reads `monitor` and `context`, and
+        // the memory it may have left half changed is dropped on a panic.
+        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check(&monitor, &context, &mut memory)
+        }));
+        let (outcome, memory) = match checked {
+            Ok(outcome) => {
+                memory.checked_at_ms = Some(context.now_ms);
+                (outcome, memory)
+            }
+            Err(panic) => {
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+                tracing::error!(panic = message, "a monitor's check panicked");
+                let detail = match message {
+                    Some(message) => format!("The check itself broke: {message}"),
+                    None => "The check itself broke.".to_owned(),
+                };
+                (Outcome::failing(detail), before)
+            }
+        };
+        let _ = commands.send(Command::Done {
+            run,
+            checked_at_ms: context.now_ms,
+            outcome,
+            memory,
+        });
+    }
+}
+
 /// Runs a check on its own thread, which sends [`Command::Done`] when it
-/// finishes.
+/// finishes, even if the check panics.
 fn spawn_check(job: Job) -> std::io::Result<()> {
-    let Job {
-        run,
-        check,
-        context,
-        mut memory,
-        commands,
-    } = job;
     std::thread::Builder::new()
         .name("meshrmm-monitor-check".into())
-        .spawn(move || {
-            let outcome = checks::run(&check, &context, &mut memory);
-            memory.checked_at_ms = Some(context.now_ms);
-            let _ = commands.send(Command::Done {
-                run,
-                checked_at_ms: context.now_ms,
-                outcome,
-                memory,
-            });
-        })
+        .spawn(move || job.finish(checks::run))
         .map(drop)
 }
 
@@ -860,8 +894,11 @@ impl Scheduler {
             commands: self.commands.clone(),
         };
         if let Err(error) = (self.spawn)(job) {
+            // No run is left to finish, so the monitor is free to start
+            // again when it is next due.
             self.runs.remove(&run);
-            let memory = self.entries[id].memory.clone();
+            entry.running = None;
+            let memory = entry.memory.clone();
             self.record(
                 id,
                 checked_at_ms,
@@ -1437,6 +1474,131 @@ mod tests {
             }
         }
         assert_eq!(now, finishes, "c starts as a finishes");
+    }
+
+    thread_local! {
+        /// The checks [`keep`] started, for the test to finish.
+        static STARTED: std::cell::RefCell<Vec<Job>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Starts nothing, keeping the check for the test to finish with
+    /// [`Job::finish`], as its thread would.
+    fn keep(job: Job) -> std::io::Result<()> {
+        STARTED.with_borrow_mut(|started| started.push(job));
+        Ok(())
+    }
+
+    /// The one check started since the last call.
+    fn started() -> Job {
+        let mut started = STARTED.with_borrow_mut(std::mem::take);
+        assert_eq!(started.len(), 1);
+        started.remove(0)
+    }
+
+    #[test]
+    fn a_check_that_panics_fails_once_and_runs_again_with_its_memory() {
+        let outbox = outbox();
+        let now = Instant::now();
+        let (mut scheduler, receiver) = due_at(&outbox, vec![port_monitor("one", 1)], now);
+        scheduler.spawn = keep;
+        let remembered = Memory {
+            checked_at_ms: Some(5),
+            over_since_ms: Some(3),
+        };
+        scheduler.entries.get_mut("one").unwrap().memory = remembered.clone();
+        scheduler.step(None, now);
+        started().finish(|_, _, memory| {
+            // Halfway through changing what it remembers.
+            memory.checked_at_ms = Some(99);
+            memory.over_since_ms = None;
+            panic!("byte index 1 is not a char boundary");
+        });
+        scheduler.step(Some(receiver.try_recv().unwrap()), now);
+        let sent = results(&outbox);
+        assert_eq!(sent.len(), 1, "it is reported once");
+        assert!(!sent[0].passing);
+        assert_eq!(sent[0].failures, 1);
+        assert_eq!(
+            sent[0].detail,
+            "The check itself broke: byte index 1 is not a char boundary"
+        );
+        let entry = &scheduler.entries["one"];
+        assert!(entry.running.is_none() && scheduler.runs.is_empty());
+        assert_eq!(entry.memory, remembered, "nothing it changed is kept");
+
+        // Nothing more comes of it, not even an overrun, until it is next
+        // due; then it runs again, with what it remembered before.
+        let next = entry.due;
+        scheduler.step(None, next - Duration::from_millis(1));
+        assert!(running(&scheduler).is_empty());
+        assert!(results(&outbox).is_empty());
+        scheduler.step(None, next);
+        assert_eq!(running(&scheduler), ["one"]);
+        let job = started();
+        assert_eq!(job.memory, remembered);
+        // A panic that isn't a message says only that it broke.
+        job.finish(|_, _, _| std::panic::panic_any(7));
+        scheduler.step(Some(receiver.try_recv().unwrap()), next);
+        let sent = results(&outbox);
+        assert_eq!(
+            (sent[0].detail.as_str(), sent[0].failures),
+            ("The check itself broke.", 2)
+        );
+        assert_eq!(scheduler.entries["one"].memory, remembered);
+
+        // A check that finishes keeps what it remembers, and its time.
+        let again = scheduler.entries["one"].due;
+        scheduler.step(None, again);
+        let job = started();
+        let checked_at = job.context.now_ms;
+        job.finish(|_, _, memory| {
+            memory.over_since_ms = Some(42);
+            Outcome::passing("open")
+        });
+        scheduler.step(Some(receiver.try_recv().unwrap()), again);
+        assert!(results(&outbox)[0].passing);
+        assert_eq!(
+            scheduler.entries["one"].memory,
+            Memory {
+                checked_at_ms: Some(checked_at),
+                over_since_ms: Some(42),
+            }
+        );
+    }
+
+    fn refuse(_job: Job) -> std::io::Result<()> {
+        Err(std::io::Error::other("no threads left"))
+    }
+
+    #[test]
+    fn a_check_whose_thread_cant_start_fails_and_is_due_again() {
+        let outbox = outbox();
+        let now = Instant::now();
+        let (mut scheduler, _receiver) = due_at(&outbox, vec![port_monitor("one", 1)], now);
+        scheduler.spawn = refuse;
+        scheduler.step(None, now);
+        let sent = results(&outbox);
+        assert_eq!(sent.len(), 1);
+        assert!(!sent[0].passing);
+        assert_eq!(sent[0].detail, "Could not start the check: no threads left");
+        assert!(running(&scheduler).is_empty() && scheduler.runs.is_empty());
+
+        // The loop wakes for its next time, and tries again then.
+        let next = scheduler.entries["one"].due;
+        assert!(next > now);
+        assert_eq!(scheduler.wait(now), (next - now).min(IDLE_WAIT));
+        scheduler.step(None, next - Duration::from_millis(1));
+        assert!(results(&outbox).is_empty(), "not before it is due");
+        scheduler.step(None, next);
+        let sent = results(&outbox);
+        assert_eq!((sent.len(), sent[0].failures), (1, 2), "it tried again");
+
+        // Once a thread starts, the check runs.
+        scheduler.spawn = keep;
+        let again = scheduler.entries["one"].due;
+        scheduler.step(None, again);
+        assert_eq!(running(&scheduler), ["one"]);
+        started();
     }
 
     #[tokio::test]

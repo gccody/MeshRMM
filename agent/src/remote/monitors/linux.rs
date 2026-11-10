@@ -107,8 +107,8 @@ pub(super) fn processes(name: &str) -> anyhow::Result<Vec<ProcessSample>> {
         found.push(ProcessSample {
             pid,
             names,
-            cpu_ms: cpu_ticks * 1000 / ticks,
-            memory_bytes: rss * page,
+            cpu_ms: cpu_ticks.saturating_mul(1000) / ticks,
+            memory_bytes: rss.saturating_mul(page),
         });
     }
     Ok(found)
