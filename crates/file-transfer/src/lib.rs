@@ -26,13 +26,15 @@ use windows as native;
 pub use native::{available_space, mark_received};
 pub use rename::rename_no_replace;
 
+mod pick;
 mod receive;
 mod rename;
 mod send;
 mod sweep;
 mod worker;
 
-use receive::Incoming;
+pub use pick::PickCancel;
+use receive::{Incoming, Placement};
 use send::{AckWindow, send_paths};
 use sweep::{remove_batch, sweep_cache, sweep_transfer_folders};
 
@@ -437,11 +439,16 @@ fn valid_path(path: &str) -> anyhow::Result<PathBuf> {
     Ok(result)
 }
 
+/// Copies `paths` into Documents, which may be on another volume or a network share than
+/// the cache, through a verified staging folder there, as a transfer from this side to itself.
 fn commit_documents(paths: Vec<PathBuf>, documents: PathBuf) -> anyhow::Result<Vec<PathBuf>> {
-    // Documents may be redirected to another volume or a network share. Copy
-    // into a verified staging directory there instead of relying on rename.
     let transfer_id = id();
-    let mut receiver = Incoming::new(transfer_id, FileDestination::Documents, documents)?;
+    let mut receiver = Incoming::new(
+        transfer_id,
+        FileDestination::Documents,
+        documents,
+        Placement::Documents,
+    )?;
     let mut result = Vec::new();
     send_paths(
         transfer_id,
@@ -461,6 +468,8 @@ fn commit_documents(paths: Vec<PathBuf>, documents: PathBuf) -> anyhow::Result<V
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod worker_tests;
 
 #[cfg(test)]
 mod outgoing_tests {

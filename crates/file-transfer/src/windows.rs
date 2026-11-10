@@ -68,7 +68,12 @@ pub fn documents() -> anyhow::Result<PathBuf> {
         Ok(path)
     }
 }
-pub fn pick() -> anyhow::Result<Vec<PathBuf>> {
+/// Shows the shell's file dialog on this thread, which needs OLE set up,
+/// and waits until it closes. `cancel` closes it from another thread.
+pub fn pick(cancel: &crate::PickCancel) -> anyhow::Result<Vec<PathBuf>> {
+    if cancel.is_cancelled() {
+        return Ok(Vec::new());
+    }
     unsafe {
         let dialog: IFileOpenDialog =
             CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
@@ -79,13 +84,19 @@ pub fn pick() -> anyhow::Result<Vec<PathBuf>> {
         let selected = std::sync::Arc::new(Mutex::new(Vec::new()));
         let events: IFileDialogEvents = PickerEvents {
             selected: selected.clone(),
+            cancel: cancel.clone(),
+            closable: std::sync::atomic::AtomicBool::new(false),
         }
         .into();
         let customize: IFileDialogCustomize = dialog.cast()?;
         customize.AddPushButton(100, windows::core::w!("Send selected files / folders"))?;
         let cookie = dialog.Advise(&events)?;
         let result = dialog.Show(None);
+        cancel.closed();
         let _ = dialog.Unadvise(cookie);
+        if cancel.is_cancelled() {
+            return Ok(Vec::new());
+        }
         let chosen = selected.lock().unwrap().clone();
         if !chosen.is_empty() {
             return Ok(chosen);
@@ -433,6 +444,31 @@ pub fn drop_files(
 #[implement(IFileDialogEvents, IFileDialogControlEvents)]
 struct PickerEvents {
     selected: std::sync::Arc<Mutex<Vec<PathBuf>>>,
+    cancel: crate::PickCancel,
+    /// Whether `cancel` knows how to close the dialog.
+    closable: std::sync::atomic::AtomicBool,
+}
+impl PickerEvents {
+    /// Once the dialog has a window, lets `cancel` close it from another
+    /// thread by posting it WM_CLOSE, which cancels a dialog; a pick
+    /// cancelled before then closes it now.
+    fn make_closable(&self, dialog: Ref<IFileDialog>) -> windows::core::Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.closable.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let dialog = dialog.ok()?;
+        let window = unsafe { dialog.cast::<IOleWindow>()?.GetWindow()? };
+        self.closable.store(true, Ordering::Relaxed);
+        let window = window.0 as isize;
+        let open = self.cancel.closes_with(move || unsafe {
+            let _ = PostMessageW(Some(HWND(window as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0));
+        });
+        if !open {
+            unsafe { dialog.Close(ERROR_CANCELLED.to_hresult())? };
+        }
+        Ok(())
+    }
 }
 impl IFileDialogControlEvents_Impl for PickerEvents_Impl {
     fn OnButtonClicked(
@@ -491,11 +527,12 @@ impl IFileDialogEvents_Impl for PickerEvents_Impl {
     ) -> windows::core::Result<()> {
         Ok(())
     }
-    fn OnFolderChange(&self, _: Ref<IFileDialog>) -> windows::core::Result<()> {
-        Ok(())
+    /// Called first as the dialog opens on its starting folder.
+    fn OnFolderChange(&self, dialog: Ref<IFileDialog>) -> windows::core::Result<()> {
+        self.make_closable(dialog)
     }
-    fn OnSelectionChange(&self, _: Ref<IFileDialog>) -> windows::core::Result<()> {
-        Ok(())
+    fn OnSelectionChange(&self, dialog: Ref<IFileDialog>) -> windows::core::Result<()> {
+        self.make_closable(dialog)
     }
     fn OnShareViolation(
         &self,

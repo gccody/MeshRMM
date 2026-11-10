@@ -40,6 +40,12 @@ pub enum FileMessage {
     Finish {
         id: u64,
     },
+    /// The receiver applied the message. For a `Finish`: every file arrived,
+    /// matched its checksum, was written (handed to the operating system, not
+    /// flushed to the disk) and is in place, in Documents, on the clipboard or
+    /// with the drop target. A drop no app took is moved into Documents,
+    /// except across volumes: then it is verified in the cache, its copy to
+    /// Documents follows, and an `Error` for the transfer reports a failure.
     Ack {
         id: u64,
     },

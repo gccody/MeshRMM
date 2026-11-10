@@ -12,9 +12,9 @@ use super::send::send_file;
 use super::sweep::{sweep_batches, sweep_partials};
 use super::*;
 
-struct Sandbox(PathBuf);
+pub(super) struct Sandbox(pub(super) PathBuf);
 impl Sandbox {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let p = std::env::temp_dir().join(format!("meshrmm-transfer-test-{}", id()));
         fs::create_dir(&p).unwrap();
         Self(p)
@@ -53,7 +53,13 @@ fn transfers_nested_unicode_empty_files_and_folders_with_checksums() {
     fs::write(folder.join("zero.txt"), []).unwrap();
     let data: Vec<u8> = (0..1_000_000).map(|i| (i % 251) as u8).collect();
     fs::write(folder.join("large.bin"), &data).unwrap();
-    let mut receiver = Incoming::new(7, FileDestination::Documents, target.0.clone()).unwrap();
+    let mut receiver = Incoming::new(
+        7,
+        FileDestination::Documents,
+        target.0.clone(),
+        Placement::Documents,
+    )
+    .unwrap();
     let mut received = Vec::new();
     send_paths(7, vec![folder], FileDestination::Documents, |packet| {
         let bytes = meshrmm_protocol::SessionMessage::FileTransfer(packet.clone())
@@ -98,7 +104,13 @@ fn rejects_unsafe_paths_and_incomplete_or_corrupt_data() {
         assert!(valid_path(path).is_err(), "{path}");
     }
     let sandbox = Sandbox::new();
-    let mut receiver = Incoming::new(2, FileDestination::Documents, sandbox.0.clone()).unwrap();
+    let mut receiver = Incoming::new(
+        2,
+        FileDestination::Documents,
+        sandbox.0.clone(),
+        Placement::Documents,
+    )
+    .unwrap();
     let stage = receiver.stage.clone();
     receiver
         .accept(FileMessage::Totals {
@@ -195,7 +207,13 @@ fn rejects_windows_reserved_and_invalid_names() {
 #[test]
 fn receiver_requires_totals_and_enforces_them() {
     let sandbox = Sandbox::new();
-    let mut receiver = Incoming::new(1, FileDestination::Documents, sandbox.0.clone()).unwrap();
+    let mut receiver = Incoming::new(
+        1,
+        FileDestination::Documents,
+        sandbox.0.clone(),
+        Placement::Documents,
+    )
+    .unwrap();
     assert!(receiver.accept(entry("early", Some(1))).is_err());
     receiver.accept(totals(4, 2)).unwrap();
     assert!(receiver.accept(totals(4, 2)).is_err(), "totals twice");
@@ -204,7 +222,13 @@ fn receiver_requires_totals_and_enforces_them() {
         "file larger than the announced total"
     );
 
-    let mut receiver = Incoming::new(1, FileDestination::Documents, sandbox.0.clone()).unwrap();
+    let mut receiver = Incoming::new(
+        1,
+        FileDestination::Documents,
+        sandbox.0.clone(),
+        Placement::Documents,
+    )
+    .unwrap();
     receiver.accept(totals(4, 1)).unwrap();
     receiver.accept(entry("folder", None)).unwrap();
     assert!(
@@ -213,7 +237,13 @@ fn receiver_requires_totals_and_enforces_them() {
     );
 
     // A transfer that ends short of its announced bytes is incomplete.
-    let mut receiver = Incoming::new(1, FileDestination::Documents, sandbox.0.clone()).unwrap();
+    let mut receiver = Incoming::new(
+        1,
+        FileDestination::Documents,
+        sandbox.0.clone(),
+        Placement::Documents,
+    )
+    .unwrap();
     receiver.accept(totals(4, 1)).unwrap();
     receiver.accept(entry("short", Some(2))).unwrap();
     receiver
@@ -239,7 +269,8 @@ fn receiver_enforces_per_destination_limits() {
             display_id: meshrmm_protocol::DisplayId(1),
         },
     ] {
-        let mut receiver = Incoming::new(1, destination, sandbox.0.clone()).unwrap();
+        let mut receiver =
+            Incoming::new(1, destination, sandbox.0.clone(), Placement::Batch).unwrap();
         let error = receiver
             .accept(totals(CLIPBOARD_LIMIT_BYTES + 1, 1))
             .unwrap_err();
@@ -248,14 +279,26 @@ fn receiver_enforces_per_destination_limits() {
             "{error:#}"
         );
     }
-    let mut receiver = Incoming::new(1, FileDestination::Documents, sandbox.0.clone()).unwrap();
+    let mut receiver = Incoming::new(
+        1,
+        FileDestination::Documents,
+        sandbox.0.clone(),
+        Placement::Documents,
+    )
+    .unwrap();
     assert!(
         receiver
             .accept(totals(TRANSFER_LIMIT_BYTES + 1, 1))
             .is_err()
     );
     // Within the limit but beyond any disk this test runs on.
-    let mut receiver = Incoming::new(1, FileDestination::Documents, sandbox.0.clone()).unwrap();
+    let mut receiver = Incoming::new(
+        1,
+        FileDestination::Documents,
+        sandbox.0.clone(),
+        Placement::Documents,
+    )
+    .unwrap();
     let free = native::available_space(&sandbox.0).unwrap();
     assert!(free > 0);
     if free < TRANSFER_LIMIT_BYTES {
@@ -435,7 +478,13 @@ fn windowed_transfer_keeps_a_window_in_flight() {
     let receiver_in_flight = in_flight.clone();
     let documents = target.0.clone();
     let receiver = std::thread::spawn(move || {
-        let mut incoming = Incoming::new(1, FileDestination::Documents, documents).unwrap();
+        let mut incoming = Incoming::new(
+            1,
+            FileDestination::Documents,
+            documents,
+            Placement::Documents,
+        )
+        .unwrap();
         let mut received = Vec::new();
         for packet in packets {
             // A slow receiver lets the sender fill its window.
@@ -581,8 +630,12 @@ fn received_files_are_marked_as_downloaded() {
     fs::create_dir_all(folder.join("Contents")).unwrap();
     fs::write(folder.join("Contents").join("setup.exe"), "MZ").unwrap();
     assert!(received_mark(&folder.join("Contents").join("setup.exe")).is_none());
-    for destination in [FileDestination::Documents, FileDestination::Clipboard] {
-        let mut receiver = Incoming::new(1, destination.clone(), target.0.clone()).unwrap();
+    for (destination, placement) in [
+        (FileDestination::Documents, Placement::Documents),
+        (FileDestination::Clipboard, Placement::Batch),
+    ] {
+        let mut receiver =
+            Incoming::new(1, destination.clone(), target.0.clone(), placement).unwrap();
         let mut received = Vec::new();
         send_paths(1, vec![folder.clone()], destination, |message| {
             match message {
@@ -614,7 +667,13 @@ fn clipboard_batches_preserve_names_across_repeated_copies() {
     fs::write(&file, "file contents").unwrap();
     let mut completed = Vec::new();
     for id in [10, 11] {
-        let mut receiver = Incoming::new(id, FileDestination::Clipboard, target.0.clone()).unwrap();
+        let mut receiver = Incoming::new(
+            id,
+            FileDestination::Clipboard,
+            target.0.clone(),
+            Placement::Batch,
+        )
+        .unwrap();
         send_paths(id, vec![file.clone()], FileDestination::Clipboard, |m| {
             match m {
                 FileMessage::Begin { .. } => {}
@@ -640,7 +699,13 @@ fn preserves_existing_destination_and_cleans_cancelled_transfer() {
     let base = target.0.join("MeshRMM Transferred Files");
     fs::create_dir(&base).unwrap();
     fs::write(base.join("same.txt"), "original").unwrap();
-    let mut receiver = Incoming::new(3, FileDestination::Documents, target.0.clone()).unwrap();
+    let mut receiver = Incoming::new(
+        3,
+        FileDestination::Documents,
+        target.0.clone(),
+        Placement::Documents,
+    )
+    .unwrap();
     send_paths(3, vec![path], FileDestination::Documents, |m| {
         match m {
             FileMessage::Begin { .. } => {}

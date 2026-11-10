@@ -2,7 +2,7 @@ use anyhow::{Context, bail, ensure};
 use meshrmm_protocol::{FILE_CHUNK_BYTES, FileDestination, FileMessage};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -46,13 +46,88 @@ pub(super) fn move_unique(
     bail!("could not find a free name for {name:?}")
 }
 
+/// The transfer folder under `storage` (Documents or the cache), created if needed.
+fn transfer_folder(storage: &Path) -> anyhow::Result<PathBuf> {
+    let base = storage.join(TRANSFER_FOLDER);
+    fs::create_dir_all(&base)?;
+    ensure!(
+        !fs::symlink_metadata(&base)?.file_type().is_symlink(),
+        "transfer directory cannot be a link"
+    );
+    Ok(base)
+}
+
+/// Moves the files of a cache batch into Documents' transfer folder, each
+/// under a free name. Returns those that could not be moved because
+/// Documents is on another volume; they are still in the batch.
+pub(super) fn move_to_documents(
+    paths: &[PathBuf],
+    documents: &Path,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let base = transfer_folder(documents)?;
+    let mut left = Vec::new();
+    for path in paths {
+        if !left.is_empty() {
+            left.push(path.clone());
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("received file has no name")?;
+        match move_unique(path, &base, name, || format!("{}-{name}", crate::id())) {
+            Ok(_) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::CrossesDevices) =>
+            {
+                left.push(path.clone());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(left)
+}
+
+/// Where a transfer's files go once they are all verified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Placement {
+    /// Each top-level file or folder into the transfer folder, under a free name.
+    Documents,
+    /// Together into a new `transfer-*` batch folder, for the clipboard or a drop.
+    Batch,
+}
+
+/// Opens a new file for a received entry's bytes. The receiver only writes
+/// to it: received files are not flushed to the disk one by one (see
+/// [`Incoming`]). Tests replace it to count what reaches the file.
+pub(super) type CreateFile = fn(&Path) -> io::Result<Box<dyn Write + Send>>;
+
+fn create_file(path: &Path) -> io::Result<Box<dyn Write + Send>> {
+    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    Ok(Box::new(file))
+}
+
+/// A transfer being received into a `.partial-*` folder beside its
+/// destination. Each file is written once as its chunks arrive and hashed as
+/// it is written; when every file matched its checksum, the files are moved
+/// into place by renaming them within the same folder, never copied.
+///
+/// Files are handed to the operating system, not flushed to the disk: a
+/// session transfer is an interactive copy, like a file manager's, and the
+/// acknowledgement promises that every byte arrived, matched its checksum,
+/// was written, and is in place, not that it survives a power cut that
+/// follows (the files may then be short or empty and are sent again).
 pub(super) struct Incoming {
     pub(super) id: u64,
     pub(super) destination: FileDestination,
+    pub(super) placement: Placement,
     pub(super) stage: PathBuf,
     pub(super) base: PathBuf,
     roots: Vec<String>,
-    file: Option<(File, u64, Sha256)>,
+    create: CreateFile,
+    file: Option<(Box<dyn Write + Send>, u64, Sha256)>,
     pub(super) entries: usize,
     pub(super) received_bytes: u64,
     /// Sum of the file sizes announced so far; never above `total_bytes`.
@@ -62,25 +137,24 @@ pub(super) struct Incoming {
     pub(super) current_name: String,
 }
 impl Incoming {
+    /// Receives into the transfer folder under `storage`.
     pub(super) fn new(
         id: u64,
         destination: FileDestination,
-        documents: PathBuf,
+        storage: PathBuf,
+        placement: Placement,
     ) -> anyhow::Result<Self> {
-        let base = documents.join(TRANSFER_FOLDER);
-        fs::create_dir_all(&base)?;
-        ensure!(
-            !fs::symlink_metadata(&base)?.file_type().is_symlink(),
-            "transfer directory cannot be a link"
-        );
+        let base = transfer_folder(&storage)?;
         let stage = base.join(format!(".partial-{}-{}", id, crate::id()));
         fs::create_dir(&stage)?;
         Ok(Self {
             id,
             destination,
+            placement,
             stage,
             base,
             roots: Vec::new(),
+            create: create_file,
             file: None,
             entries: 0,
             received_bytes: 0,
@@ -89,6 +163,11 @@ impl Incoming {
             total_entries: 0,
             current_name: String::new(),
         })
+    }
+    /// Opens received files with `create`.
+    pub(super) fn creating_files_with(mut self, create: CreateFile) -> Self {
+        self.create = create;
+        self
     }
     pub(super) fn accept(&mut self, message: FileMessage) -> anyhow::Result<()> {
         match message {
@@ -138,10 +217,7 @@ impl Incoming {
                     ensure!(parent.is_dir(), "parent directory missing");
                 }
                 if let Some(size) = size {
-                    let file = OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&target)?;
+                    let file = (self.create)(&target)?;
                     mark_received(&target);
                     self.file = Some((file, size, Sha256::new()));
                 } else {
@@ -173,12 +249,13 @@ impl Incoming {
                     remaining == 0 && hash.finalize().as_slice() == sha256,
                     "file checksum or size mismatch"
                 );
-                file.sync_all()?;
+                drop(file);
             }
             _ => bail!("unexpected transfer packet"),
         }
         Ok(())
     }
+    /// Moves the verified files into place and returns where they are.
     pub(super) fn finish(&mut self) -> anyhow::Result<Vec<PathBuf>> {
         ensure!(
             self.file.is_none()
@@ -187,7 +264,7 @@ impl Incoming {
                 && self.received_bytes == self.total_bytes,
             "incomplete transfer"
         );
-        if self.destination != FileDestination::Documents {
+        if self.placement == Placement::Batch {
             let batch_name = || format!("transfer-{}", crate::id());
             let batch = move_unique(&self.stage, &self.base, &batch_name(), batch_name)?;
             return Ok(self.roots.iter().map(|root| batch.join(root)).collect());

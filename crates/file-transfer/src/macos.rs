@@ -34,21 +34,61 @@ pub fn documents() -> anyhow::Result<PathBuf> {
         ))
     })
 }
-pub fn pick() -> anyhow::Result<Vec<PathBuf>> {
-    main_thread(|mtm| {
+thread_local! {
+    /// Open panels on the main thread, by pick.
+    static PICKERS: std::cell::RefCell<std::collections::HashMap<u64, objc2::rc::Retained<NSOpenPanel>>> = std::cell::RefCell::default();
+}
+/// Shows an open panel and waits until it closes. The panel is modeless, so
+/// the main thread, which the worker's clipboard and progress calls also
+/// need, keeps running while it is open; `cancel` closes it.
+pub fn pick(cancel: &crate::PickCancel) -> anyhow::Result<Vec<PathBuf>> {
+    let (chosen, result) = std::sync::mpsc::sync_channel(1);
+    let id = crate::id();
+    let closer = cancel.clone();
+    main_thread(move |mtm| {
+        let close = move || {
+            dispatch2::DispatchQueue::main().exec_async(move || {
+                PICKERS.with(|panels| {
+                    if let Some(panel) = panels.borrow().get(&id) {
+                        // SAFETY: on the main thread; cancel: takes any sender.
+                        unsafe { panel.cancel(None) };
+                    }
+                });
+            });
+        };
+        if !closer.closes_with(close) {
+            return;
+        }
         let panel = NSOpenPanel::openPanel(mtm);
         panel.setCanChooseFiles(true);
         panel.setCanChooseDirectories(true);
         panel.setAllowsMultipleSelection(true);
         panel.setTitle(Some(&NSString::from_str("Send files and folders")));
-        if panel.runModal() != 1 {
-            return Ok(Vec::new());
-        }
-        Ok(panel
-            .URLs()
-            .iter()
-            .filter_map(|u| u.path().map(|s| PathBuf::from(s.to_string())))
-            .collect())
+        PICKERS.with(|panels| panels.borrow_mut().insert(id, panel.clone()));
+        let done = block2::RcBlock::new(move |response: objc2_app_kit::NSModalResponse| {
+            let panel = PICKERS.with(|panels| panels.borrow_mut().remove(&id));
+            // NSModalResponseOK
+            let paths = match panel {
+                Some(panel) if response == 1 => panel
+                    .URLs()
+                    .iter()
+                    .filter_map(|u| u.path().map(|s| PathBuf::from(s.to_string())))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let _ = chosen.send(paths);
+        });
+        objc2_app_kit::NSApplication::sharedApplication(mtm).activate();
+        panel.beginWithCompletionHandler(&done);
+    });
+    // A pick cancelled before its panel opened sends nothing.
+    let paths = result.recv().unwrap_or_default();
+    cancel.closed();
+    // A choice made as the pick was cancelled is not sent.
+    Ok(if cancel.is_cancelled() {
+        Vec::new()
+    } else {
+        paths
     })
 }
 pub fn paths_from_pasteboard(board: &NSPasteboard) -> Vec<PathBuf> {
@@ -98,15 +138,6 @@ pub fn set_clipboard_files(paths: &[PathBuf]) -> anyhow::Result<()> {
         Ok(())
     })
 }
-pub fn drop_files(
-    _: &[PathBuf],
-    _: meshrmm_protocol::DisplayId,
-    _: u16,
-    _: u16,
-) -> anyhow::Result<bool> {
-    Ok(false)
-}
-
 fn c_path(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     Ok(std::ffi::CString::new(path.as_os_str().as_bytes())?)

@@ -28,7 +28,8 @@ impl<'a> AckWindow<'a> {
     }
     /// A receiver rejects a transfer when it begins or learns its totals, so
     /// nothing follows those until they are accepted. A transfer is complete
-    /// once its finish is acknowledged.
+    /// once its finish is acknowledged; [`FileMessage::Ack`] says what that
+    /// promises.
     pub(super) fn settles(&self, message: &FileMessage) -> bool {
         matches!(
             message,
