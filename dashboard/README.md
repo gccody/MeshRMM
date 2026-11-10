@@ -28,6 +28,8 @@ origin as its API. Nothing runs on Node in production.
   enforces them regardless.
 - **Live devices.** `/v1/events` is a WebSocket authenticated by the cookie. It
   sends a snapshot, then revision-numbered changes (`features/agents/inventory-stream.ts`).
+  Revisions restart with the server, so the page compares them only within one
+  socket: each new socket's first snapshot applies whatever its revision.
 - **One bundle, one lazy chunk.** Every page hydrates from a single entry
   script (kept under 800 kB by `tests/prerender.test.mjs`). Only the
   [terminal](../docs/terminal.md)'s xterm.js is split out, loaded with

@@ -39,7 +39,9 @@ const globalTimers: Timers = {
 
 type Options = {
   openSocket: () => SocketLike;
-  // Shared with the HTTP inventory load so neither applies older data.
+  // Shared with the HTTP inventory load so neither applies older data. It
+  // compares only within one socket's life: -1 when a socket closes, and the
+  // next socket's first snapshot applies whatever its revision.
   revision: { current: number };
   onInventory: (update: (current: Inventory) => Inventory) => void;
   // Devices' latest resource usage, which carries no revision.
@@ -122,13 +124,24 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
   overflow: () => void;
 }) {
   let awaitingSnapshot = true;
+  // Revisions restart with the server, so until this socket's first snapshot
+  // applies, the revision the page holds may be another server's.
+  let synced = false;
   let pendingEvents: AgentDelta[] = [];
 
+  // An HTTP load overtook this socket's snapshot. The socket sends every
+  // change after its snapshot, so carry on from the newer inventory instead
+  // of asking again.
+  const keepNewerInventory = () => {
+    const pending = pendingEvents.sort((left, right) => left.revision - right.revision);
+    pendingEvents = [];
+    awaitingSnapshot = false;
+    for (const event of pending) applyDelta(event);
+    return !awaitingSnapshot;
+  };
+
   const applySnapshot = (event: AgentSnapshot) => {
-    if (event.revision < revision.current) {
-      requestSnapshot();
-      return false;
-    }
+    if (synced && event.revision < revision.current) return keepNewerInventory();
     let next: Inventory = { agents: sortAgents(event.agents), companies: sortCompanies(event.companies ?? []), tags: sortTags(event.tags ?? []) };
     let nextRevision = event.revision;
     for (const pending of pendingEvents.sort((left, right) => left.revision - right.revision)) {
@@ -144,6 +157,7 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
     }
     pendingEvents = [];
     awaitingSnapshot = false;
+    synced = true;
     revision.current = nextRevision;
     onInventory(() => next);
     return true;
@@ -261,6 +275,9 @@ export function inventoryStream({
     onLive: () => connection.setState("live"),
     onClose: (refused) => {
       socket = null;
+      // The server may have restarted its revisions; an HTTP load until the
+      // next socket must not be measured against the lost one's.
+      revision.current = -1;
       connection.setState("reconnecting");
       if (refused) onRefused();
       reconnect.schedule();
