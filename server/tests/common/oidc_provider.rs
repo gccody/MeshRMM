@@ -1,9 +1,13 @@
 //! A mock OpenID Connect provider on a loopback port: discovery, keys, a
 //! token endpoint that checks PKCE and the client secret, and userinfo. A
 //! test plays the user's part by approving the sign-in with [`approve`].
+//! It counts the requests for its discovery document and keys.
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 use axum::{
@@ -20,7 +24,6 @@ use sha2::{Digest, Sha256};
 
 pub const CLIENT_ID: &str = "meshrmm";
 pub const CLIENT_SECRET: &str = "provider secret";
-const KEY_ID: &str = "test-key";
 
 #[derive(Clone)]
 struct Approved {
@@ -29,13 +32,39 @@ struct Approved {
     redirect_uri: String,
 }
 
+/// A key the provider signs with, and its key ID.
+#[derive(Clone)]
+struct SigningKey {
+    id: String,
+    key: PKey<openssl::pkey::Private>,
+}
+
+impl SigningKey {
+    fn new(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            key: PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap(),
+        }
+    }
+}
+
+/// How many times each document was requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fetches {
+    pub discovery: usize,
+    pub keys: usize,
+}
+
 #[derive(Clone)]
 struct Shared {
     issuer: String,
-    key: PKey<openssl::pkey::Private>,
+    key: Arc<Mutex<SigningKey>>,
     codes: Arc<Mutex<HashMap<String, Approved>>>,
     tokens: Arc<Mutex<HashMap<String, Value>>>,
     userinfo: Arc<Mutex<Option<Value>>>,
+    discovery_fetches: Arc<AtomicUsize>,
+    key_fetches: Arc<AtomicUsize>,
+    discovery_down: Arc<AtomicBool>,
 }
 
 pub struct MockProvider {
@@ -88,10 +117,13 @@ impl MockProvider {
         let issuer = format!("http://{}", listener.local_addr().unwrap());
         let shared = Shared {
             issuer: issuer.clone(),
-            key: PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap(),
+            key: Arc::new(Mutex::new(SigningKey::new("test-key"))),
             codes: Arc::default(),
             tokens: Arc::default(),
             userinfo: Arc::default(),
+            discovery_fetches: Arc::default(),
+            key_fetches: Arc::default(),
+            discovery_down: Arc::default(),
         };
         let router = Router::new()
             .route("/.well-known/openid-configuration", get(discovery))
@@ -146,6 +178,34 @@ impl MockProvider {
             approved.claims["forged"] = json!(true);
         }
     }
+
+    /// ID tokens signed with a key the provider doesn't publish, under a
+    /// key ID it has never used.
+    pub fn unknown_key(&self) {
+        let mut codes = self.shared.codes.lock().unwrap();
+        for approved in codes.values_mut() {
+            approved.claims["unknown_key"] = json!(true);
+        }
+    }
+
+    /// Signs with a new key from now on and publishes only that one.
+    pub fn rotate_key(&self) {
+        let mut key = self.shared.key.lock().unwrap();
+        *key = SigningKey::new(&format!("{}-next", key.id));
+    }
+
+    /// Whether the discovery document fails to load.
+    pub fn set_discovery_down(&self, down: bool) {
+        self.shared.discovery_down.store(down, Ordering::SeqCst);
+    }
+
+    /// How many times the discovery document and keys were requested.
+    pub fn fetches(&self) -> Fetches {
+        Fetches {
+            discovery: self.shared.discovery_fetches.load(Ordering::SeqCst),
+            keys: self.shared.key_fetches.load(Ordering::SeqCst),
+        }
+    }
 }
 
 fn now() -> i64 {
@@ -161,7 +221,11 @@ fn random() -> String {
     b64(&bytes)
 }
 
-async fn discovery(State(shared): State<Shared>) -> Json<Value> {
+async fn discovery(State(shared): State<Shared>) -> Response {
+    shared.discovery_fetches.fetch_add(1, Ordering::SeqCst);
+    if shared.discovery_down.load(Ordering::SeqCst) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let issuer = &shared.issuer;
     Json(json!({
         "issuer": issuer,
@@ -174,30 +238,33 @@ async fn discovery(State(shared): State<Shared>) -> Json<Value> {
         "id_token_signing_alg_values_supported": ["RS256"],
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
     }))
+    .into_response()
 }
 
 async fn jwks(State(shared): State<Shared>) -> Json<Value> {
-    let rsa = shared.key.rsa().unwrap();
+    shared.key_fetches.fetch_add(1, Ordering::SeqCst);
+    let key = shared.key.lock().unwrap().clone();
+    let rsa = key.key.rsa().unwrap();
     Json(json!({
         "keys": [{
             "kty": "RSA",
             "use": "sig",
             "alg": "RS256",
-            "kid": KEY_ID,
+            "kid": key.id,
             "n": b64(&rsa.n().to_vec()),
             "e": b64(&rsa.e().to_vec()),
         }]
     }))
 }
 
-fn sign(key: &PKey<openssl::pkey::Private>, claims: &Value) -> String {
-    let header = json!({ "alg": "RS256", "typ": "JWT", "kid": KEY_ID });
+fn sign(key: &SigningKey, claims: &Value) -> String {
+    let header = json!({ "alg": "RS256", "typ": "JWT", "kid": key.id });
     let input = format!(
         "{}.{}",
         b64(header.to_string().as_bytes()),
         b64(claims.to_string().as_bytes())
     );
-    let mut signer = Signer::new(MessageDigest::sha256(), key).unwrap();
+    let mut signer = Signer::new(MessageDigest::sha256(), &key.key).unwrap();
     signer.update(input.as_bytes()).unwrap();
     format!("{input}.{}", b64(&signer.sign_to_vec().unwrap()))
 }
@@ -249,10 +316,16 @@ async fn token(
         .lock()
         .unwrap()
         .insert(access_token.clone(), approved.claims.clone());
+    let published = shared.key.lock().unwrap().clone();
     let key = if approved.claims.get("forged").is_some() {
-        PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap()
+        SigningKey {
+            key: PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap(),
+            ..published
+        }
+    } else if approved.claims.get("unknown_key").is_some() {
+        SigningKey::new(&random())
     } else {
-        shared.key.clone()
+        published
     };
     Json(json!({
         "access_token": access_token,

@@ -54,6 +54,8 @@ pub struct AppState {
     pub accounts: Arc<crate::auth::accounts::Accounts>,
     pub instance_key: InstanceKey,
     pub auth: Arc<AuthState>,
+    /// The SSO provider's metadata and signing keys, kept between sign-ins.
+    pub sso_discovery: Arc<crate::auth::oidc_discovery::DiscoveryCache>,
     pub storage: Storage,
     pub agents: AgentHub,
     pub presence: Presence,
