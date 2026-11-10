@@ -2,6 +2,7 @@ mod transform;
 mod upload;
 
 use super::frame_schedule::{Decoded, VideoPipeline};
+use super::renderer::PresentKind;
 use super::*;
 use crate::stream_reset::ResetPlan;
 use transform::{
@@ -262,13 +263,19 @@ impl VideoPipeline for WorkerPipeline {
         unsafe { self.presentation.renderer.ready_to_present() }
     }
 
-    unsafe fn present(&mut self, frame: DecodedFrame) -> anyhow::Result<()> {
+    unsafe fn present(&mut self, frame: DecodedFrame, overdue: bool) -> anyhow::Result<()> {
         let receive_to_decode_start_us = frame.decode_start_us.saturating_sub(frame.received_at_us);
         let render_start = monotonic_timestamp_us();
         unsafe {
-            self.presentation
-                .renderer
-                .present(&frame.texture, frame.subresource)?
+            self.presentation.renderer.present(
+                &frame.texture,
+                frame.subresource,
+                if overdue {
+                    PresentKind::Overdue
+                } else {
+                    PresentKind::Normal
+                },
+            )?
         };
         let presentation_us = monotonic_timestamp_us();
         self.first_presented.get_or_init(std::time::Instant::now);

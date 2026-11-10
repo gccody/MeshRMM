@@ -12,7 +12,7 @@ use super::*;
 /// How long a decoded picture waits for the swap chain before it is
 /// presented anyway. The swap chain signals once a refresh; this only
 /// covers one that stops signalling.
-const MAX_PRESENT_WAIT_US: u64 = 100_000;
+pub(super) const MAX_PRESENT_WAIT_US: u64 = 100_000;
 
 /// What the decoder made of a frame it was offered.
 pub(super) struct Decoded<P> {
@@ -39,7 +39,9 @@ pub(super) trait VideoPipeline {
     /// display to take the previous one.
     unsafe fn ready_to_present(&mut self) -> bool;
 
-    unsafe fn present(&mut self, picture: Self::Picture) -> anyhow::Result<()>;
+    /// Presents `picture`; `overdue` when it is presented because the
+    /// swap chain did not become ready in time.
+    unsafe fn present(&mut self, picture: Self::Picture, overdue: bool) -> anyhow::Result<()>;
 }
 
 /// The newest decoded picture that has not been presented yet.
@@ -100,12 +102,15 @@ impl<P> FrameSchedule<P> {
                 break;
             }
         }
-        let due = self.waiting.as_ref().is_some_and(|(_, since)| {
-            now_us.saturating_sub(*since) >= MAX_PRESENT_WAIT_US
-                || unsafe { video.ready_to_present() }
-        });
-        if due && let Some((picture, _)) = self.waiting.take() {
-            unsafe { video.present(picture)? };
+        let overdue = self
+            .waiting
+            .as_ref()
+            .is_some_and(|(_, since)| now_us.saturating_sub(*since) >= MAX_PRESENT_WAIT_US);
+        if self.waiting.is_some()
+            && (overdue || unsafe { video.ready_to_present() })
+            && let Some((picture, _)) = self.waiting.take()
+        {
+            unsafe { video.present(picture, overdue)? };
         }
         Ok(())
     }
@@ -213,7 +218,7 @@ mod tests {
             self.can_present
         }
 
-        unsafe fn present(&mut self, picture: u64) -> anyhow::Result<()> {
+        unsafe fn present(&mut self, picture: u64, _overdue: bool) -> anyhow::Result<()> {
             self.can_present = false;
             self.on_screen_pending = true;
             self.presented.push(picture);

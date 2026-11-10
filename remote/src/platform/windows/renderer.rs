@@ -5,8 +5,11 @@ use window::ClientLayout;
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::System::Threading::{WaitForMultipleObjects, WaitForSingleObjectEx};
 
+mod frame_latency;
 pub(super) mod shader;
 
+use frame_latency::FrameLatency;
+pub(super) use frame_latency::PresentKind;
 use shader::ShaderConversion;
 
 const SWAP_CHAIN_FLAGS: DXGI_SWAP_CHAIN_FLAG = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
@@ -22,11 +25,8 @@ pub(super) struct D3d11Renderer {
     /// display has taken a presented frame, so that presenting another
     /// would not wait for the display.
     frame_latency: HANDLE,
-    /// A signal of `frame_latency` was taken for the next present.
-    present_ready: bool,
-    /// Frames presented without taking a signal first. Each will still be
-    /// signalled; those signals are taken back before the next present.
-    untaken_signals: u32,
+    /// Which of its signals are taken, and what they answer.
+    latency: FrameLatency,
     /// Redrawn after a resize, since a static desktop sends no new frames.
     last_frame: Option<(ID3D11Texture2D, u32)>,
 }
@@ -128,8 +128,7 @@ impl D3d11Renderer {
             format,
             swap_chain,
             frame_latency,
-            present_ready: false,
-            untaken_signals: 0,
+            latency: FrameLatency::default(),
             last_frame: None,
         };
         unsafe { renderer.configure_output(&layout)? };
@@ -253,14 +252,17 @@ impl D3d11Renderer {
             "resized the viewer swap chain"
         );
         if let Some((texture, subresource)) = self.last_frame.clone() {
-            unsafe { self.present(&texture, subresource)? };
+            unsafe { self.present(&texture, subresource, PresentKind::Normal)? };
         }
         Ok(())
     }
 
     /// Whether a frame can be presented now without waiting for the display.
     pub(super) unsafe fn ready_to_present(&mut self) -> bool {
-        unsafe { self.wait_until_ready_to_present(None, 0) }
+        let frame_latency = self.frame_latency;
+        self.latency.take_available(|| unsafe {
+            WaitForSingleObjectEx(frame_latency, 0, false) == WAIT_OBJECT_0
+        })
     }
 
     /// Waits up to `timeout_ms` until a frame can be presented without
@@ -270,30 +272,31 @@ impl D3d11Renderer {
         wake: Option<HANDLE>,
         timeout_ms: u32,
     ) -> bool {
-        while !self.present_ready {
-            let result = match wake {
-                Some(wake) if !wake.is_invalid() => unsafe {
-                    WaitForMultipleObjects(&[self.frame_latency, wake], false, timeout_ms)
-                },
-                _ => unsafe { WaitForSingleObjectEx(self.frame_latency, timeout_ms, false) },
-            };
-            // Index 0 is the swap chain; a wake or timeout ends the wait.
-            if result != WAIT_OBJECT_0 {
-                return false;
-            }
-            if self.untaken_signals > 0 {
-                self.untaken_signals -= 1;
-            } else {
-                self.present_ready = true;
-            }
+        if unsafe { self.ready_to_present() } {
+            return true;
         }
-        true
+        let result = match wake {
+            Some(wake) if !wake.is_invalid() => unsafe {
+                WaitForMultipleObjects(&[self.frame_latency, wake], false, timeout_ms)
+            },
+            _ => unsafe { WaitForSingleObjectEx(self.frame_latency, timeout_ms, false) },
+        };
+        // Index 0 is the swap chain; a wake or timeout ends the wait.
+        if result == WAIT_OBJECT_0 {
+            self.latency.signalled();
+        }
+        unsafe { self.ready_to_present() }
     }
 
+    /// Presents `texture`. The worker presents once the frame latency
+    /// waitable allows it, so this does not wait for the display; a redraw
+    /// after a resize, or a picture that waited too long, may present
+    /// without that.
     pub(super) unsafe fn present(
         &mut self,
         texture: &ID3D11Texture2D,
         subresource: u32,
+        kind: PresentKind,
     ) -> anyhow::Result<()> {
         match &mut self.conversion {
             Conversion::VideoProcessor(processor) => unsafe {
@@ -304,13 +307,8 @@ impl D3d11Renderer {
             },
         }
         self.last_frame = Some((texture.clone(), subresource));
-        // The worker presents once the frame latency waitable allows it,
-        // so this does not wait for the display. A redraw after a resize
-        // may present without that; its signal is taken back later.
-        if !unsafe { self.ready_to_present() } {
-            self.untaken_signals = self.untaken_signals.saturating_add(1);
-        }
-        self.present_ready = false;
+        unsafe { self.ready_to_present() };
+        self.latency.presented(kind);
         // One-interval presentation avoids tearing. Flip-discard plus maximum
         // frame latency 1 prevents an additional multi-frame swap-chain queue.
         unsafe { self.swap_chain.Present(1, DXGI_PRESENT(0)) }

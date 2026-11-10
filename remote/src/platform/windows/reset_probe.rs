@@ -15,6 +15,7 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 
 use super::pipeline::{Decoder, Presentation};
+use super::renderer::PresentKind;
 use super::window::{ProbeState, probe_state, probe_toggle_chat};
 use super::*;
 use meshrmm_protocol::{DesktopSession, DisplayId, PixelFormat};
@@ -125,7 +126,11 @@ pub(super) unsafe fn present_synthetic(
         let presented =
             unsafe { synthetic_frame(&device, width, height, pixel_format, bind_flags) }.and_then(
                 |frame| {
-                    unsafe { presentation.renderer().present(&frame, 0) }?;
+                    unsafe {
+                        presentation
+                            .renderer()
+                            .present(&frame, 0, PresentKind::Normal)
+                    }?;
                     Ok(frame)
                 },
             );
@@ -704,7 +709,12 @@ impl ResetProbe {
         if let Some(layout) = unsafe { window::take_resize(window) } {
             unsafe { self.presentation.renderer().resize(&layout) }.unwrap();
         }
-        unsafe { self.presentation.renderer().present(&frame, 0) }.unwrap();
+        unsafe {
+            self.presentation
+                .renderer()
+                .present(&frame, 0, PresentKind::Normal)
+        }
+        .unwrap();
         unsafe { pump(window, Duration::from_millis(200)) };
         let restored = unsafe { probe_state(window) }.unwrap();
         unsafe { assert_pointer_corners(window, &self.sent, &restored) };
