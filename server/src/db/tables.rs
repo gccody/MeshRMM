@@ -370,6 +370,7 @@ pub enum DeviceIpAddresses {
     PrefixLength,
     MacAddress,
     Kind,
+    Network,
 }
 
 #[derive(Iden, Clone, Copy)]

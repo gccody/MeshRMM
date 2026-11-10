@@ -148,7 +148,9 @@ input.
   packages, application runs and their history, and what application jobs
   and policies do. See [application deployment](application-deployment.md).
 - `wake`: Wake-on-LAN requests, choosing the online devices that relay
-  them, and their reports. See [Wake-on-LAN](wake-on-lan.md).
+  them (looked up by index among the devices on the woken devices'
+  subnets, not read from every online device), and their reports. See
+  [Wake-on-LAN](wake-on-lan.md).
 - `terminals`: remote terminals that are being opened or are open, and the
   relay between each one's browser and Agent sockets. See
   [remote terminal](terminal.md).

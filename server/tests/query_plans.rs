@@ -7,7 +7,7 @@ mod common;
 use meshrmm_server::{
     applications::tables::{ApplicationRunItems, ApplicationRuns},
     db::tables::{AlertRemediations, Alerts, FileDeliveries, ScriptRuns, UpdateRuns},
-    maintenance,
+    maintenance, wake,
 };
 use sea_query::{
     DeleteStatement, Expr, ExprTrait, PostgresQueryBuilder, Query, QueryBuilder, SelectStatement,
@@ -266,6 +266,26 @@ fn statements() -> Vec<(&'static str, Statement, &'static [&'static str])> {
                     .to_owned(),
             ),
             &["idx_alerts_unresolved"],
+        ),
+        (
+            "a wake's lookup of the devices on its subnets",
+            // 10.0.0.0 and 192.168.1.0.
+            Statement::Select(wake::neighbours_query([0x0A00_0000, 0xC0A8_0100], None)),
+            &["idx_device_ip_addresses_network"],
+        ),
+        (
+            "a later page of a wake's lookup of the devices on its subnets",
+            Statement::Select(wake::neighbours_query(
+                [0x0A00_0000, 0xC0A8_0100],
+                Some((
+                    0x0A00_0000,
+                    24,
+                    "device".into(),
+                    "Ethernet".into(),
+                    "10.0.0.5".into(),
+                )),
+            )),
+            &["idx_device_ip_addresses_network"],
         ),
     ];
     statements.extend(

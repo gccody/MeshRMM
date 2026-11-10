@@ -10,9 +10,37 @@
 //! end, rather than a virtual switch, bridge or tunnel, then by company, and
 //! up to [`super::MAX_RELAYS`] are used. A subnet that is virtual at both
 //! ends, such as two hosts' identical container bridges, never counts.
+//!
+//! A relay's subnet is taken by the relay's own prefix length, so the
+//! subnets that can hold an address are those of every prefix length a
+//! relay may broadcast on: [`subnets_holding`] lists them, and
+//! `device_ip_addresses.network` (from [`network`]) lets the database find
+//! the devices with an address on them, rather than every online one being
+//! read to be tried here.
 use std::{collections::BTreeMap, net::Ipv4Addr};
 
-use meshrmm_protocol_types::{AdapterKind, directed_broadcast, wake_prefix_supported};
+use meshrmm_protocol_types::{
+    AdapterKind, MAX_WAKE_PREFIX_LENGTH, MIN_WAKE_PREFIX_LENGTH, directed_broadcast, subnet_mask,
+    wake_prefix_supported,
+};
+
+/// The first address of the IPv4 subnet `address` is on, as a number: what
+/// `device_ip_addresses.network` holds. `None` for an IPv6 address.
+pub fn network(address: &str, prefix_length: u8) -> Option<i64> {
+    let address = address.parse::<Ipv4Addr>().ok()?;
+    (prefix_length <= 32).then(|| i64::from(u32::from(address) & subnet_mask(prefix_length)))
+}
+
+/// Each subnet a relay may broadcast on that holds `address`: its first
+/// address, as [`network`] gives it, and its prefix length.
+pub fn subnets_holding(address: Ipv4Addr) -> impl Iterator<Item = (i64, u8)> {
+    (MIN_WAKE_PREFIX_LENGTH..=MAX_WAKE_PREFIX_LENGTH).map(move |prefix_length| {
+        (
+            i64::from(u32::from(address) & subnet_mask(prefix_length)),
+            prefix_length,
+        )
+    })
+}
 
 /// An IPv4 address on one of a device's adapters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,5 +300,35 @@ mod tests {
         assert!(choose(&target, &candidates, 3).is_empty());
         assert!(!lan("192.168.1.255").usable(), "a broadcast address");
         assert!(lan("192.168.1.1").usable());
+    }
+
+    #[test]
+    fn the_subnets_holding_an_address_are_those_a_relay_on_them_shares() {
+        let wanted: Ipv4Addr = "10.20.130.77".parse().unwrap();
+        let holding = subnets_holding(wanted).collect::<Vec<_>>();
+        assert_eq!(holding.len(), 23, "/8 to /30");
+        for relay in [
+            "10.20.130.1",
+            "10.20.131.9",
+            "10.21.0.4",
+            "10.20.130.78",
+            "11.0.0.1",
+        ] {
+            for prefix_length in 0..=32 {
+                let relay_address: Ipv4Addr = relay.parse().unwrap();
+                let shares = wake_prefix_supported(prefix_length)
+                    && directed_broadcast(relay_address, prefix_length)
+                        == directed_broadcast(wanted, prefix_length);
+                let network = network(relay, prefix_length).unwrap();
+                assert_eq!(
+                    holding.contains(&(network, prefix_length)),
+                    shares,
+                    "{relay}/{prefix_length}"
+                );
+            }
+        }
+        assert_eq!(network("192.168.1.140", 24), Some(0xC0A8_0100));
+        assert_eq!(network("fe80::1", 64), None);
+        assert_eq!(network("192.168.1.140", 64), None);
     }
 }
