@@ -122,7 +122,13 @@ revision-numbered changes: Agents going online and offline, updating,
 being enrolled, deleted, moved to another company, tagged or having their
 notes edited, and companies and tags being created, changed or deleted, as
 they happen. **Refresh** asks for a new
-snapshot; a snapshot never contacts an Agent. The server closes a user's
+snapshot; a snapshot never contacts an Agent. A tab that misses a change
+or can't read one sends one `refresh` and holds later changes until that
+snapshot arrives. It ignores messages it doesn't recognise, so a tab left
+open across a server upgrade doesn't ask for the whole fleet on each new
+kind of event; one with a revision only moves its revision on. A snapshot
+it can't read, or a change it fails to apply, replaces the socket after
+the reconnect wait instead. The server closes a user's
 socket when they sign out, are disabled, or lose `devices.view`.
 
 A tile names its device's company and shows its tags. The company menu

@@ -24,6 +24,14 @@ const MAX_PENDING_EVENTS = 1_000;
 // throttled timers can't make a healthy socket look dead; handlers that run
 // late only make it look fresher.
 export const SILENT_SOCKET_MS = 30_000;
+// The server answers `refresh` before anything newer it sends, or closes the
+// socket if it can't read the devices, so only messages it sent before
+// reading the request arrive in between; the snapshot itself arrives whole,
+// however long a large fleet takes to read and send. A message handled this
+// long after asking, with no snapshot yet, means the request went unread,
+// and the socket is replaced. A socket that went silent instead is replaced
+// on the tab's next wake, like any silent one.
+export const SNAPSHOT_ANSWER_MS = 30_000;
 // A short gap, such as a server restart, must not mark the inventory stale.
 export const STALE_GRACE_MS = 5_000;
 const SOCKET_OPEN = 1;
@@ -77,7 +85,29 @@ type Options = {
   timers?: Timers;
   // In [0, 1), for the reconnect jitter.
   random?: () => number;
+  // Where a listener's exception goes; the browser logs it as uncaught.
+  reportError?: (error: unknown) => void;
 };
+
+// The events the sequencer orders. Typed by AgentEvent, so a new one can't
+// be missed here.
+const INVENTORY_EVENTS: Record<AgentEvent["type"], true> = {
+  snapshot: true,
+  agent_upsert: true,
+  agent_deleted: true,
+  company_upsert: true,
+  company_deleted: true,
+  tag_upsert: true,
+  tag_deleted: true,
+};
+
+// A revision-numbered change of a type this page doesn't know, from a newer
+// server. It changes nothing the page shows, but it takes its revision.
+type UnknownChange = { type: "unknown"; revision: number };
+type Change = AgentDelta | UnknownChange;
+
+const applyChange = (inventory: Inventory, change: Change) =>
+  change.type === "unknown" ? inventory : applyInventoryDelta(inventory, change);
 
 // Reports the connection state, or "offline" while the browser is, once per
 // change.
@@ -138,8 +168,9 @@ function reconnectBackoff(timers: Timers, random: () => number, stopped: () => b
 }
 
 // Applies one socket's events in revision order. Deltas wait for its first
-// snapshot, and a gap asks the server for a new one. Returns whether the
-// event brought the inventory up to date.
+// snapshot, and a gap or an unreadable change asks the server for a new one
+// and holds later changes until it arrives, so a run of them asks once.
+// `apply` returns whether the event brought the inventory up to date.
 function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
   revision: { current: number };
   onInventory: (update: (current: Inventory) => Inventory) => void;
@@ -150,7 +181,7 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
   // Revisions restart with the server, so until this socket's first snapshot
   // applies, the revision the page holds may be another server's.
   let synced = false;
-  let pendingEvents: AgentDelta[] = [];
+  let pendingEvents: Change[] = [];
 
   // An HTTP load overtook this socket's snapshot. The socket sends every
   // change after its snapshot, so carry on from the newer inventory instead
@@ -175,7 +206,7 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
         requestSnapshot();
         return false;
       }
-      next = applyInventoryDelta(next, pending);
+      next = applyChange(next, pending);
       nextRevision = pending.revision;
     }
     pendingEvents = [];
@@ -186,7 +217,7 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
     return true;
   };
 
-  const applyDelta = (event: AgentDelta) => {
+  const applyDelta = (event: Change) => {
     if (awaitingSnapshot) {
       pendingEvents.push(event);
       if (pendingEvents.length > MAX_PENDING_EVENTS) overflow();
@@ -200,16 +231,21 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
       return false;
     }
     revision.current = event.revision;
-    onInventory((inventory) => applyInventoryDelta(inventory, event));
+    if (event.type !== "unknown") onInventory((inventory) => applyInventoryDelta(inventory, event));
     return true;
   };
 
-  return (event: AgentEvent | null) => {
-    if (!event) {
+  return {
+    apply: (event: AgentSnapshot | Change) => event.type === "snapshot" ? applySnapshot(event) : applyDelta(event),
+    // A change this page couldn't read, so the inventory lacks it. A
+    // snapshot already on its way covers it, since the server sends only
+    // newer changes after it.
+    broken() {
+      if (awaitingSnapshot) return;
+      awaitingSnapshot = true;
+      pendingEvents = [];
       requestSnapshot();
-      return false;
-    }
-    return event.type === "snapshot" ? applySnapshot(event) : applyDelta(event);
+    },
   };
 }
 
@@ -218,28 +254,99 @@ function eventSequencer({ revision, onInventory, requestSnapshot, overflow }: {
 type SocketEnd = "refused" | "revoked" | "dropped";
 
 // Handles one socket's events while it is the stream's current socket.
-function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onAlerts, onJobs, onUpdates, current, onHeard, onLive, onClose }: {
+function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onAlerts, onJobs, onUpdates, now, reportError, current, onHeard, onLive, onUnusable, onClose }: {
   revision: { current: number };
   onInventory: (update: (current: Inventory) => Inventory) => void;
   onMetrics?: (readings: MetricsReading[]) => void;
   onAlerts?: (event: AlertEvent) => void;
   onJobs?: (event: JobEvent) => void;
   onUpdates?: (event: UpdateEvent) => void;
+  now: () => number;
+  reportError: (error: unknown) => void;
   current: () => boolean;
   onHeard: () => void;
   onLive: () => void;
+  // The page can't carry on from this socket's events.
+  onUnusable: (reason: string) => void;
   onClose: (end: SocketEnd) => void;
 }) {
   let opened = false;
+  // When this page last sent `refresh`, until a snapshot arrives. Only one
+  // is outstanding: the snapshot answering it covers every gap found
+  // meanwhile, and each is a full read of the fleet.
+  let askedAt: number | null = null;
   const requestSnapshot = () => {
-    if (socket.readyState === SOCKET_OPEN) socket.send("refresh");
+    if (askedAt !== null || socket.readyState !== SOCKET_OPEN) return;
+    askedAt = now();
+    socket.send("refresh");
   };
-  const sequence = eventSequencer({
+  const sequencer = eventSequencer({
     revision,
     onInventory,
     requestSnapshot,
     overflow: () => socket.close(1009, "too many pending device events"),
   });
+
+  // A page's bug must cost neither a snapshot nor the events after it.
+  const deliver = <T>(listener: ((value: T) => void) | undefined, value: T) => {
+    try {
+      listener?.(value);
+    } catch (error) {
+      reportError(error);
+    }
+  };
+
+  const sequence = (event: AgentSnapshot | Change) => {
+    if (event.type === "snapshot") askedAt = null;
+    let upToDate;
+    try {
+      upToDate = sequencer.apply(event);
+    } catch (error) {
+      // The inventory and the revision it is held at may no longer agree,
+      // and the sequencer may be part way through. A new socket's snapshot
+      // rebuilds both from nothing, and one that fails every time waits out
+      // a growing backoff, where asking again would bring it straight back.
+      reportError(error);
+      onUnusable("website could not apply a device change");
+      return;
+    }
+    if (upToDate) onLive();
+  };
+
+  const handle = (data: string) => {
+    let event: unknown;
+    try {
+      event = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (!event || typeof event !== "object" || typeof (event as { type?: unknown }).type !== "string") return;
+    const message = event as Record<string, unknown>;
+    if (Object.hasOwn(INVENTORY_EVENTS, message.type as string)) {
+      const parsed = parseAgentEvent(message);
+      if (parsed) sequence(parsed);
+      // Asking again would bring the same unreadable snapshot straight
+      // back, so the socket is replaced after the reconnect wait instead.
+      else if (message.type === "snapshot") onUnusable("website could not read the device snapshot");
+      else sequencer.broken();
+      return;
+    }
+    const readings = parseMetricsEvent(message);
+    const alert = readings ? null : parseAlertEvent(message);
+    const job = readings || alert ? null : parseJobEvent(message);
+    const update = readings || alert || job ? null : parseUpdateEvent(message);
+    if (readings) deliver(onMetrics, readings);
+    else if (alert) deliver(onAlerts, alert);
+    else if (job) deliver(onJobs, job);
+    else if (update) deliver(onUpdates, update);
+    // A change of a type a newer server added: skipping its revision keeps
+    // the changes after it in order. Anything else unrecognised, like an
+    // unreadable reading, alert, job or update, carries no revision, so
+    // dropping it leaves the inventory whole.
+    else if (Number.isSafeInteger(message.revision) && (message.revision as number) >= 0) {
+      sequence({ type: "unknown", revision: message.revision as number });
+    }
+  };
 
   socket.addEventListener("open", () => {
     if (!current()) return;
@@ -249,21 +356,8 @@ function watchSocket(socket: SocketLike, { revision, onInventory, onMetrics, onA
     const data = (message as MessageEvent).data;
     if (!current()) return;
     onHeard();
-    if (typeof data !== "string") return;
-    try {
-      const event: unknown = JSON.parse(data);
-      const readings = parseMetricsEvent(event);
-      const alert = readings ? null : parseAlertEvent(event);
-      const job = readings || alert ? null : parseJobEvent(event);
-      const update = readings || alert || job ? null : parseUpdateEvent(event);
-      if (readings) onMetrics?.(readings);
-      else if (alert) onAlerts?.(alert);
-      else if (job) onJobs?.(job);
-      else if (update) onUpdates?.(update);
-      else if (sequence(parseAgentEvent(event))) onLive();
-    } catch {
-      requestSnapshot();
-    }
+    if (typeof data === "string") handle(data);
+    if (current() && askedAt !== null && now() - askedAt > SNAPSHOT_ANSWER_MS) onUnusable("website's snapshot request went unanswered");
   });
   socket.addEventListener("error", () => socket.close());
   socket.addEventListener("close", (event) => {
@@ -286,6 +380,7 @@ export function inventoryStream({
   online = true,
   timers = globalTimers,
   random = Math.random,
+  reportError = (error) => globalThis.reportError(error),
 }: Options) {
   let stopped = false;
   let socket: SocketLike | null = null;
@@ -316,6 +411,13 @@ export function inventoryStream({
     connection.setState("reconnecting");
   };
 
+  const drop = (dropped: SocketLike, reason: string) => {
+    lose();
+    // It is no longer the current socket, so its close event, whenever a
+    // dead connection sends one, is ignored.
+    dropped.close(1000, reason);
+  };
+
   const listen = (nextSocket: SocketLike) => watchSocket(nextSocket, {
     revision,
     onInventory,
@@ -323,6 +425,8 @@ export function inventoryStream({
     onAlerts,
     onJobs,
     onUpdates,
+    now: timers.now,
+    reportError,
     current: () => !stopped && socket === nextSocket,
     onHeard: () => {
       heardAt = timers.now();
@@ -335,6 +439,13 @@ export function inventoryStream({
       reconnect.reset();
       sessionCheckedAt = null;
       connection.setState("live");
+    },
+    // After the reconnect wait, which only a snapshot that applies
+    // restarts, so a snapshot that fails on every socket is sent at most
+    // every 30 s.
+    onUnusable: (reason) => {
+      drop(nextSocket, reason);
+      reconnect.schedule();
     },
     onClose: (end) => {
       lose();
@@ -374,11 +485,7 @@ export function inventoryStream({
         return;
       }
       if (!live || timers.now() - heardAt <= SILENT_SOCKET_MS) return;
-      const silent = socket;
-      lose();
-      // It is no longer the current socket, so its close event, whenever a
-      // dead connection sends one, is ignored.
-      silent.close(1000, "website replaced a silent socket");
+      drop(socket, "website replaced a silent socket");
       connect();
     },
     setOnline(next: boolean) {
