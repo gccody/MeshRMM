@@ -6,7 +6,9 @@ mod common;
 
 use std::{net::IpAddr, time::Duration};
 
-use common::{App, Ws, apps, receive_any_json, receive_json, send_json, set_up, user_with};
+use common::{
+    App, Browser, Ws, apps, receive_any_json, receive_json, send_json, set_up, user_with,
+};
 use meshrmm_protocol_types::{SystemInfo, applications_hash};
 use meshrmm_server::{
     db::Counts,
@@ -278,6 +280,7 @@ async fn agents_send_system_information_the_website_shows_and_searches() {
                 .map(|device| device["device_name"].as_str().unwrap().to_owned())
                 .collect();
             assert_eq!(names, expected, "{}: {query}", app.name);
+            assert_eq!(found.body["matching"], expected.len(), "{query}");
         }
         let found = admin.get(&search("serial=SER-2")).await;
         assert_eq!(found.body["devices"][0]["platform"], "linux");
@@ -299,6 +302,7 @@ async fn agents_send_system_information_the_website_shows_and_searches() {
                         { "version": "130.0", "devices": 1 }
                     ]
                 }],
+                "matching": 1,
                 "truncated": false
             }),
             "{}",
@@ -306,8 +310,20 @@ async fn agents_send_system_information_the_website_shows_and_searches() {
         );
         let popular = admin.get("/v1/software?limit=1").await;
         assert_eq!(popular.body["applications"][0]["name"], "Firefox");
+        assert_eq!(popular.body["matching"], 3, "{}", app.name);
         assert_eq!(popular.body["truncated"], true);
+        // The rest follow, with as many devices or fewer, by name.
+        let rest = admin.get("/v1/software?limit=5&offset=1").await;
+        let rest_names: Vec<_> = rest.body["applications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|application| application["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(rest_names, ["7-Zip", "VLC media player"], "{}", app.name);
+        assert_eq!(rest.body["truncated"], false);
         let installed = admin.get("/v1/software/devices?name=Firefox").await;
+        assert_eq!(installed.body["matching"], 2, "{}", app.name);
         let on: Vec<_> = installed.body["devices"]
             .as_array()
             .unwrap()
@@ -784,6 +800,546 @@ async fn seeing_system_information_needs_devices_view() {
             .await;
         assert_eq!(unknown.status, 404);
         assert_ne!(unknown.code(), "not_collected");
+        app.finish().await;
+    }
+}
+
+/// An application from `publisher`, installed by `source`.
+fn published(name: &str, version: Option<&str>, publisher: Option<&str>, source: &str) -> Value {
+    json!({ "name": name, "version": version, "publisher": publisher, "source": source })
+}
+
+/// Device `n` of a fleet added by [`add_devices`]: many share a name, and
+/// each has `Common`, every other one `Even`, and one of five tools.
+fn fleet_snapshot(n: usize) -> Value {
+    let mut applications = vec![application("Common", Some("1.0"))];
+    if n.is_multiple_of(2) {
+        applications.push(application("Even", Some("2.0")));
+    }
+    applications.push(application(&format!("Tool {}", n % 5), None));
+    snapshot(
+        &format!("SER-{n}"),
+        &format!("10.9.{}.{}", n / 200, n % 200 + 1),
+        applications,
+    )
+}
+
+fn fleet_id(n: usize) -> String {
+    format!("device-{n:04}")
+}
+
+fn fleet_name(n: usize) -> String {
+    format!("Device {}", n % 37)
+}
+
+/// Adds devices `first..first + count` to the database directly, each with
+/// its [`fleet_snapshot`].
+async fn add_devices(app: &App, first: usize, count: usize) {
+    let numbers = (first..first + count).collect::<Vec<_>>();
+    for chunk in numbers.chunks(100) {
+        let mut insert = sea_query::Query::insert();
+        insert.into_table(sea_query::Alias::new("agents")).columns(
+            [
+                "id",
+                "name",
+                "platform",
+                "auth_token_hash",
+                "created_at",
+                "updated_at",
+            ]
+            .map(sea_query::Alias::new),
+        );
+        for n in chunk {
+            insert.values_panic([
+                fleet_id(*n).into(),
+                fleet_name(*n).into(),
+                "windows".into(),
+                "a".repeat(64).into(),
+                1_800_000_000_000_i64.into(),
+                1_800_000_000_000_i64.into(),
+            ]);
+        }
+        app.db().execute(&insert).await.unwrap();
+    }
+    for n in numbers {
+        let (stored, _) = store(app, &fleet_id(n), &fleet_snapshot(n)).await;
+        assert!(matches!(stored, Some(Stored::Listed { .. })), "{stored:?}");
+    }
+}
+
+/// A successful answer's body.
+async fn get_json(browser: &mut Browser, path: &str) -> Value {
+    let response = browser.get(path).await;
+    assert_eq!(response.status, 200, "{path}: {:?}", response.body);
+    response.body
+}
+
+/// Every entry of `list` a route returns for `query`, a page of `limit` at
+/// a time from offset 0, and the `matching` each page said.
+async fn every_page(
+    browser: &mut Browser,
+    route: &str,
+    list: &str,
+    query: &str,
+    limit: usize,
+) -> (Vec<Value>, Vec<i64>) {
+    let mut entries = Vec::new();
+    let mut matching = Vec::new();
+    loop {
+        let page = get_json(
+            browser,
+            &format!("{route}?{query}&limit={limit}&offset={}", entries.len()),
+        )
+        .await;
+        matching.push(page["matching"].as_i64().unwrap());
+        let found = page[list].as_array().unwrap().clone();
+        assert!(found.len() <= limit, "{route}?{query}");
+        if found.is_empty() {
+            return (entries, matching);
+        }
+        entries.extend(found);
+    }
+}
+
+fn device_ids(devices: &[Value]) -> Vec<String> {
+    devices
+        .iter()
+        .map(|device| device["device_id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+type Matches = Box<dyn Fn(usize) -> bool>;
+
+#[tokio::test]
+async fn device_searches_come_a_page_at_a_time_at_the_same_cost_for_any_fleet() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        // Authenticating the browser's first request is its own work.
+        get_json(&mut admin, "/v1/system-info?limit=2").await;
+        let routes = [
+            "/v1/system-info?limit=2",
+            "/v1/system-info?model=dell&limit=2&offset=1",
+            "/v1/software?limit=2",
+            "/v1/software/devices?name=Common&limit=2",
+        ];
+        let mut costs = Vec::new();
+        for (first, count) in [(0, 3), (3, 250)] {
+            add_devices(&app, first, count).await;
+            // A session is marked seen at most once a minute, which adding
+            // the devices may have taken: that write happens here rather
+            // than in the requests measured.
+            get_json(&mut admin, "/v1/system-info?limit=1").await;
+            let mut cost = Vec::new();
+            for route in routes {
+                let before = app.db().counts();
+                let page = get_json(&mut admin, route).await;
+                cost.push(app.db().counts() - before);
+                let list = if route.starts_with("/v1/software?") {
+                    "applications"
+                } else {
+                    "devices"
+                };
+                assert_eq!(page[list].as_array().unwrap().len(), 2, "{name}: {route}");
+            }
+            costs.push(cost);
+        }
+        assert_eq!(costs[0], costs[1], "{name}: {routes:?}");
+        assert!(costs[0].iter().all(|cost| cost.writes == 0), "{name}");
+        let total = 253;
+
+        // Paging through the fleet sees each device once, by name then ID.
+        let (devices, matching) =
+            every_page(&mut admin, "/v1/system-info", "devices", "", 100).await;
+        assert!(
+            matching.iter().all(|count| *count == total),
+            "{name}: {matching:?}"
+        );
+        let mut expected: Vec<usize> = (0..253).collect();
+        expected.sort_by_key(|n| (fleet_name(*n).to_lowercase(), fleet_id(*n)));
+        let expected_ids: Vec<String> = expected.iter().map(|n| fleet_id(*n)).collect();
+        assert_eq!(device_ids(&devices), expected_ids, "{name}");
+        for device in &devices {
+            let n: usize = device["device_id"].as_str().unwrap()[7..].parse().unwrap();
+            assert_eq!(device["device_name"], fleet_name(n));
+            assert_eq!(device["hardware"]["serial_number"], format!("SER-{n}"));
+            assert_eq!(
+                device["network"]["adapters"][0]["mac_address"],
+                "00:15:5D:01:02:03"
+            );
+            assert_eq!(
+                device["application_count"],
+                if n.is_multiple_of(2) { 3 } else { 2 },
+                "{name}"
+            );
+        }
+
+        // A filter is counted and paged before the page is cut, so every
+        // page is full until the last and none misses a match.
+        let filters: [(&str, usize, Matches); 4] = [
+            (
+                "serial=ser-1",
+                7,
+                Box::new(|n| format!("ser-{n}").contains("ser-1")),
+            ),
+            ("application=EVEN", 50, Box::new(|n| n.is_multiple_of(2))),
+            (
+                "application=tool%203&q=device%203",
+                3,
+                Box::new(|n| n % 5 == 3 && fleet_name(n).to_lowercase().contains("device 3")),
+            ),
+            ("ip=10.9.1.", 40, Box::new(|n| n >= 200)),
+        ];
+        for (query, limit, matches) in filters {
+            let (found, matching) =
+                every_page(&mut admin, "/v1/system-info", "devices", query, limit).await;
+            let wanted: Vec<String> = expected
+                .iter()
+                .filter(|n| matches(**n))
+                .map(|n| fleet_id(*n))
+                .collect();
+            assert!(!wanted.is_empty(), "{query}");
+            assert_eq!(device_ids(&found), wanted, "{name}: {query}");
+            assert!(
+                matching.iter().all(|count| *count == wanted.len() as i64),
+                "{name}: {query}: {matching:?}"
+            );
+        }
+
+        // At most 200 a page; 0 counts only.
+        let biggest = get_json(&mut admin, "/v1/system-info?limit=500").await;
+        assert_eq!(biggest["devices"].as_array().unwrap().len(), 200, "{name}");
+        let counted = get_json(&mut admin, "/v1/system-info?limit=0&application=even").await;
+        assert_eq!(counted["devices"], json!([]));
+        assert_eq!(counted["matching"], 127, "{name}");
+        let past = get_json(&mut admin, "/v1/system-info?offset=253").await;
+        assert_eq!(past["devices"], json!([]));
+        assert_eq!(past["matching"], total);
+        for refused in [
+            "/v1/system-info?page=2",
+            "/v1/system-info?limit=-1",
+            "/v1/software?page=2",
+            "/v1/software/devices?name=Common&page=2",
+        ] {
+            assert_eq!(admin.get(refused).await.status, 400, "{refused}");
+        }
+
+        // The software and the devices that have it page the same way.
+        let (applications, matching) =
+            every_page(&mut admin, "/v1/software", "applications", "", 2).await;
+        let names: Vec<_> = applications
+            .iter()
+            .map(|application| application["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Common", "Even", "Tool 0", "Tool 1", "Tool 2", "Tool 3", "Tool 4"
+            ],
+            "{name}"
+        );
+        assert!(matching.iter().all(|count| *count == 7), "{name}");
+        assert_eq!(applications[0]["devices"], total);
+        assert_eq!(applications[1]["devices"], 127);
+        let (copies, matching) = every_page(
+            &mut admin,
+            "/v1/software/devices",
+            "devices",
+            "name=Common",
+            60,
+        )
+        .await;
+        assert_eq!(device_ids(&copies), expected_ids, "{name}");
+        assert!(matching.iter().all(|count| *count == total), "{name}");
+        app.finish().await;
+    }
+}
+
+/// The application count stored on the device's row, and the ones the
+/// device's snapshot and the device search show.
+async fn application_counts(app: &App, admin: &mut Browser, id: &str) -> [i64; 3] {
+    let (stored,): (i64,) = app
+        .db()
+        .fetch_one(
+            &sea_query::Query::select()
+                .column(sea_query::Alias::new("application_count"))
+                .from(sea_query::Alias::new("device_system_info"))
+                .and_where(sea_query::Expr::col("device_id").eq(id))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    let snapshot = get_json(admin, &format!("/v1/agents/{id}/system-info")).await;
+    let found = get_json(admin, "/v1/system-info?q=desk").await;
+    [
+        stored,
+        snapshot["application_count"].as_i64().unwrap(),
+        found["devices"][0]["application_count"].as_i64().unwrap(),
+    ]
+}
+
+#[tokio::test]
+async fn each_device_keeps_its_application_count_with_its_list() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let id = desk.device_id.as_str();
+        // A first list, with one application from two sources.
+        let first = snapshot(
+            "SER-1",
+            "10.1.2.3",
+            vec![
+                application("7-Zip", Some("23.01")),
+                published("Runtime", Some("1"), None, "windows"),
+                published("Runtime", Some("1"), None, "windows_user"),
+            ],
+        );
+        store(&app, id, &first).await;
+        assert_eq!(
+            application_counts(&app, &mut admin, id).await,
+            [3; 3],
+            "{name}"
+        );
+        let second = snapshot(
+            "SER-1",
+            "10.1.2.3",
+            vec![
+                application("7-Zip", Some("24.08")),
+                application("VLC", None),
+            ],
+        );
+        store(&app, id, &second).await;
+        assert_eq!(
+            application_counts(&app, &mut admin, id).await,
+            [2; 3],
+            "{name}"
+        );
+        // A snapshot naming the stored list leaves the count alone, and one
+        // naming another list keeps the stored one's.
+        let (stored, _) = store(&app, id, &unchanged("SER-2", &hash_of(&second))).await;
+        assert_eq!(stored, Some(Stored::Unchanged));
+        assert_eq!(
+            application_counts(&app, &mut admin, id).await,
+            [2; 3],
+            "{name}"
+        );
+        store(&app, id, &unchanged("SER-3", "another list")).await;
+        assert_eq!(
+            application_counts(&app, &mut admin, id).await,
+            [2; 3],
+            "{name}"
+        );
+        // An empty list replaces it.
+        store(&app, id, &snapshot("SER-4", "10.1.2.3", vec![])).await;
+        assert_eq!(
+            application_counts(&app, &mut admin, id).await,
+            [0; 3],
+            "{name}"
+        );
+        // A device first stored from a snapshot naming a list has none.
+        let laptop = app.enroll(&mut admin, "Laptop").await;
+        store(&app, &laptop.device_id, &unchanged("SER-5", "a list")).await;
+        let found = get_json(&mut admin, "/v1/system-info?q=laptop").await;
+        assert_eq!(found["devices"][0]["application_count"], 0, "{name}");
+        app.finish().await;
+    }
+}
+
+type NameCounts = Vec<(String, i64)>;
+type VersionCounts = Vec<(String, String, String, i64)>;
+
+/// The fleet's software summary, sorted.
+async fn software_summary(app: &App) -> (NameCounts, VersionCounts) {
+    use sea_query::{Alias, Query};
+    let mut names: NameCounts = app
+        .db()
+        .fetch_all(
+            &Query::select()
+                .columns([Alias::new("name"), Alias::new("devices")])
+                .from(Alias::new("software_names"))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    let mut versions: VersionCounts = app
+        .db()
+        .fetch_all(
+            &Query::select()
+                .columns(["name", "version", "publisher", "devices"].map(Alias::new))
+                .from(Alias::new("software_versions"))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    names.sort();
+    versions.sort();
+    (names, versions)
+}
+
+/// What the summary must be: the devices' rows grouped afresh.
+async fn grouped_applications(app: &App) -> (NameCounts, VersionCounts) {
+    use sea_query::{Alias, Expr, Query};
+    let mut names: NameCounts = app
+        .db()
+        .fetch_all(
+            &Query::select()
+                .column(Alias::new("name"))
+                .expr(Expr::cust("COUNT(DISTINCT device_id)"))
+                .from(Alias::new("device_applications"))
+                .group_by_col(Alias::new("name"))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    let mut versions: VersionCounts = app
+        .db()
+        .fetch_all(
+            &Query::select()
+                .column(Alias::new("name"))
+                .expr(Expr::cust("COALESCE(version, '')"))
+                .expr(Expr::cust("COALESCE(publisher, '')"))
+                .expr(Expr::cust("COUNT(DISTINCT device_id)"))
+                .from(Alias::new("device_applications"))
+                .group_by_col(Alias::new("name"))
+                .group_by_col(Alias::new("version"))
+                .group_by_col(Alias::new("publisher"))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    names.sort();
+    versions.sort();
+    (names, versions)
+}
+
+/// The summary is the grouping, and the fleet's software read from it is
+/// what the same read of the devices' own rows finds.
+async fn assert_summary(app: &App, admin: &mut Browser, step: &str) {
+    let summary = software_summary(app).await;
+    assert_eq!(
+        summary,
+        grouped_applications(app).await,
+        "{}: {step}",
+        app.name
+    );
+    // Every device here is in no company, so the company filter reads the
+    // same devices from their rows.
+    for query in ["", "q=fire&", "q=E&limit=2&offset=1&"] {
+        let whole = get_json(admin, &format!("/v1/software?{query}")).await;
+        let scoped = get_json(admin, &format!("/v1/software?{query}company=none")).await;
+        assert_eq!(whole, scoped, "{}: {step}: {query}", app.name);
+    }
+}
+
+#[tokio::test]
+async fn the_fleet_software_summary_is_always_the_grouping_of_the_lists() {
+    for app in apps().await {
+        let mut admin = set_up(&app).await;
+        let a = app.enroll(&mut admin, "A").await;
+        let b = app.enroll(&mut admin, "B").await;
+        let c = app.enroll(&mut admin, "C").await;
+        let a_list = vec![
+            published("7-Zip", Some("23.01"), Some("Igor Pavlov"), "windows"),
+            published("Firefox", Some("130.0"), Some("Mozilla"), "windows"),
+            published("Notepad++", None, None, "windows"),
+        ];
+        store(
+            &app,
+            &a.device_id,
+            &snapshot("A", "10.0.0.1", a_list.clone()),
+        )
+        .await;
+        // Side-by-side versions, and one version from two sources.
+        let b_snapshot = snapshot(
+            "B",
+            "10.0.0.2",
+            vec![
+                published("Firefox", Some("130.0"), Some("Mozilla"), "windows"),
+                published("Firefox", Some("131.0"), Some("Mozilla"), "windows_user"),
+                published("Runtime", Some("8.0"), Some("Microsoft"), "windows"),
+                published("Runtime", Some("8.0"), Some("Microsoft"), "windows_user"),
+            ],
+        );
+        store(&app, &b.device_id, &b_snapshot).await;
+        store(
+            &app,
+            &c.device_id,
+            &snapshot(
+                "C",
+                "10.0.0.3",
+                vec![
+                    published("7-Zip", Some("23.01"), Some("Igor Pavlov"), "windows"),
+                    published("Runtime", Some("6.0"), None, "windows"),
+                ],
+            ),
+        )
+        .await;
+        assert_summary(&app, &mut admin, "first lists").await;
+        let (names, _) = software_summary(&app).await;
+        assert!(names.contains(&("Firefox".into(), 2)), "{names:?}");
+
+        // An update, a removal and an install.
+        store(
+            &app,
+            &a.device_id,
+            &snapshot(
+                "A",
+                "10.0.0.1",
+                vec![
+                    published("7-Zip", Some("24.08"), Some("Igor Pavlov"), "windows"),
+                    published("Firefox", Some("130.0"), Some("Mozilla"), "windows"),
+                    published("VLC", Some("3.0.21"), None, "windows"),
+                ],
+            ),
+        )
+        .await;
+        assert_summary(&app, &mut admin, "a changed list").await;
+
+        // A list named instead of sent, and one replaced with an empty one.
+        store(&app, &b.device_id, &unchanged("B", &hash_of(&b_snapshot))).await;
+        assert_summary(&app, &mut admin, "an unchanged list").await;
+        store(&app, &c.device_id, &snapshot("C", "10.0.0.3", vec![])).await;
+        assert_summary(&app, &mut admin, "an empty list").await;
+
+        // One copy of two going, and a publisher changing.
+        store(
+            &app,
+            &b.device_id,
+            &snapshot(
+                "B",
+                "10.0.0.2",
+                vec![
+                    published("Firefox", Some("131.0"), None, "windows_user"),
+                    published("Runtime", Some("8.0"), Some("Microsoft"), "windows"),
+                ],
+            ),
+        )
+        .await;
+        assert_summary(&app, &mut admin, "a copy removed").await;
+
+        // A deleted device's applications leave the counts, and a device
+        // enrolled again in its place adds them back.
+        let deleted = admin.delete(&format!("/v1/agents/{}", a.device_id)).await;
+        assert_eq!(deleted.status, 204, "{:?}", deleted.body);
+        assert_summary(&app, &mut admin, "a device deleted").await;
+        let (names, _) = software_summary(&app).await;
+        assert!(!names.iter().any(|(name, _)| name == "VLC"), "{names:?}");
+        let again = app.enroll(&mut admin, "A").await;
+        store(&app, &again.device_id, &snapshot("A", "10.0.0.1", a_list)).await;
+        assert_summary(&app, &mut admin, "a device enrolled again").await;
+        system_info::forget(app.db(), &b.device_id).await.unwrap();
+        assert_summary(&app, &mut admin, "a device's rows removed").await;
+        system_info::forget(app.db(), &again.device_id)
+            .await
+            .unwrap();
+        system_info::forget(app.db(), &c.device_id).await.unwrap();
+        assert_eq!(
+            software_summary(&app).await,
+            (vec![], vec![]),
+            "{}",
+            app.name
+        );
         app.finish().await;
     }
 }

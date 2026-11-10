@@ -158,15 +158,20 @@ user's, or any token while tokens are turned off doesn't.
 
 ## Lists
 
-Lists come in one of three shapes, each documented with its route:
+Lists come in one of four shapes, each documented with its route:
 
 - **Everything at once**, small enough not to page: devices
   (`/v1/agents`), tags, companies, rules, channels, policies, the toolbox.
 - **The newest, up to `limit`**: jobs, script runs, update runs, alerts,
   application changes and wake requests take `limit` (each with its default
   and maximum, such as 50 and 200 for jobs) and return the newest first.
-  Alerts and software searches add `truncated: true` when more matched;
-  narrow the filters to see the rest.
+  Alerts add `truncated: true` when more matched; narrow the filters to see
+  the rest.
+- **Pages with an offset**: the fleet's updates (`/v1/updates/devices`),
+  the device search (`/v1/system-info`) and the software searches
+  (`/v1/software`, `/v1/software/devices`) take `limit` and `offset` and say
+  how many match in `matching`; ask from the next offset until you have
+  that many.
 - **Pages with a cursor**: the audit log returns `{events, next}`; pass
   `next` as `before` for the next page, until `next` is missing.
 
@@ -203,7 +208,8 @@ curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" "$MESHRMM/v1/software?q=fire
 
 `404 not_collected` means the device hasn't sent its first snapshot yet.
 `POST /v1/agents/{id}/system-info/refresh` asks an online device for a new
-one.
+one. `GET /v1/system-info`, `/v1/software` and `/v1/software/devices` answer
+a page at a time, with how many match.
 
 ### Scripts and jobs
 

@@ -1,6 +1,7 @@
 // Operating system updates as the server sends them, and how the website
 // words, sorts and filters them. See docs/patch-management.md. Imports carry
 // the .ts extension so node:test can load this module directly.
+import { type PagedList, applyPage } from "../../lib/paged-list.ts";
 import type { DevicePlatform } from "../agents/types.ts";
 
 export type UpdateManager = "windows_update" | "softwareupdate" | "apt" | "dnf" | "yum" | "pacman";
@@ -424,18 +425,9 @@ export function fleetPagePath(filters: FleetFilters, offset: number, limit = FLE
 // The filters a list is loaded for, as one string to compare.
 export const fleetKey = (filters: FleetFilters) => fleetPagePath(filters, 0, 0);
 
-// The pages loaded so far for one set of filters (`key`), with the newest
-// counts. Requests are numbered as they're sent: `listTicket` is the one
-// whose first page the list starts with, `countsTicket` the one whose
-// counts it shows.
-export type FleetList = {
-  key: string;
-  devices: DeviceUpdateSummary[];
-  matching: number;
-  totals: FleetTotals;
-  listTicket: number;
-  countsTicket: number;
-};
+// The pages of devices loaded so far for one set of filters, with the
+// fleet's totals from the answer whose counts the list shows.
+export type FleetList = PagedList<DeviceUpdateSummary> & { totals: FleetTotals };
 
 // The server's answer to request `ticket` for the filters `key`: a page
 // from `offset`, or the counts alone.
@@ -443,29 +435,21 @@ export type FleetAnswer =
   | { kind: "page"; key: string; ticket: number; offset: number; page: FleetPage }
   | { kind: "counts"; key: string; ticket: number; page: FleetPage };
 
-// The list after an answer, while the page wants the filters `wanted`. A
-// newer request's answer always wins: an older one changes nothing it
-// already shows. A page for other filters than those wanted is dropped,
-// and a further page joins only the list it was asked for; the fleet's
-// totals are the same whatever the filters.
+const deviceId = (device: DeviceUpdateSummary) => device.device_id;
+
+// The list after an answer, while the page wants the filters `wanted`, as
+// `applyPage` joins pages; the fleet's totals are the same whatever the
+// filters, so the newest answer's are shown.
 export function applyFleetAnswer(list: FleetList | null, answer: FleetAnswer, wanted: string): FleetList | null {
   const { page, ticket } = answer;
-  const withCounts = (current: FleetList): FleetList => ticket > current.countsTicket
-    ? { ...current, totals: page.totals, matching: answer.key === current.key ? page.matching : current.matching, countsTicket: ticket }
-    : current;
-  if (answer.kind === "counts") return list && withCounts(list);
-  if (answer.key !== wanted) return list;
-  if (answer.offset === 0) {
-    if (list && list.key === answer.key && ticket < list.listTicket) return list;
-    const fresh = { key: answer.key, devices: page.devices, matching: page.matching, totals: page.totals, listTicket: ticket, countsTicket: ticket };
-    if (!list || list.countsTicket < ticket) return fresh;
-    return { ...fresh, totals: list.totals, countsTicket: list.countsTicket, matching: list.key === answer.key ? list.matching : page.matching };
+  if (answer.kind === "counts") {
+    return list && ticket > list.countsTicket
+      ? { ...list, totals: page.totals, matching: answer.key === list.key ? page.matching : list.matching, countsTicket: ticket }
+      : list;
   }
-  if (!list || list.key !== answer.key || ticket < list.listTicket) return list;
-  // The fleet may have moved between pages: a device already loaded stays
-  // where it is.
-  const loaded = new Set(list.devices.map((device) => device.device_id));
-  return withCounts({ ...list, devices: [...list.devices, ...page.devices.filter((device) => !loaded.has(device.device_id))] });
+  const next = applyPage(list, { key: answer.key, ticket, offset: answer.offset, items: page.devices, matching: page.matching }, wanted, deviceId);
+  if (!next || next === list) return list;
+  return { ...next, totals: next.countsTicket === ticket || !list ? page.totals : list.totals };
 }
 
 // A device's summary from the socket in place of the loaded copy. A
@@ -473,11 +457,11 @@ export function applyFleetAnswer(list: FleetList | null, answer: FleetAnswer, wa
 // when the next page or the next load asks.
 export function patchFleetRow(list: FleetList | null, changed: DeviceUpdateSummary): FleetList | null {
   if (!list) return list;
-  const index = list.devices.findIndex((device) => device.device_id === changed.device_id);
+  const index = list.items.findIndex((device) => device.device_id === changed.device_id);
   if (index === -1) return list;
-  const devices = [...list.devices];
-  devices[index] = changed;
-  return { ...list, devices };
+  const items = [...list.items];
+  items[index] = changed;
+  return { ...list, items };
 }
 
 // Chosen devices by ID, with the summary they were chosen with, so the

@@ -21,7 +21,7 @@ use crate::{
         self, ChangeRecord, Snapshot,
         changes::StoredApplication,
         search::{
-            self, CompanyFilter, DeviceFilter, DeviceMatch, FleetApplication, InstalledOn, Scope,
+            self, CompanyFilter, DeviceFilter, DevicePage, InstalledPage, Scope, SoftwarePage,
         },
     },
 };
@@ -29,9 +29,13 @@ use crate::{
 /// The most application changes one request returns.
 const MAX_CHANGES: u64 = 1000;
 const DEFAULT_CHANGES: u64 = 200;
-/// The most applications the fleet search returns.
-const MAX_SOFTWARE: usize = 500;
-const DEFAULT_SOFTWARE: usize = 200;
+/// The most applications one page of the fleet search returns.
+const MAX_SOFTWARE: u64 = 500;
+const DEFAULT_SOFTWARE: u64 = 200;
+/// The most devices one page returns: a device search's snapshots are
+/// several KiB each.
+const MAX_DEVICES: u64 = 200;
+const DEFAULT_DEVICES: u64 = 100;
 
 /// The active device named by a path.
 async fn device(state: &AppState, id: &str) -> Result<String, ApiError> {
@@ -189,22 +193,21 @@ pub struct DeviceParameters {
     application: Option<String>,
     company: Option<String>,
     tag: Option<String>,
+    /// 0 for only the count.
+    limit: Option<u64>,
+    offset: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct DeviceList {
-    devices: Vec<DeviceMatch>,
-}
-
-/// `GET /v1/system-info?q=&os=&model=&serial=&ip=&application=&company=&tag=`:
-/// the snapshots of the enrolled devices that match every given filter, by
-/// device name. Each text matches anywhere, ignoring case; `q` matches the
-/// name, operating system, model, serial number, IP addresses or host name.
+/// `GET /v1/system-info?q=&os=&model=&serial=&ip=&application=&company=&tag=&limit=&offset=`:
+/// a page of the snapshots of the enrolled devices that match every given
+/// filter, by device name, and how many devices match. Each text matches
+/// anywhere, ignoring case; `q` matches the name, operating system, model,
+/// serial number, IP addresses or host name.
 pub async fn search_devices(
     State(state): State<AppState>,
     actor: Authorized,
     query: Result<Query<DeviceParameters>, QueryRejection>,
-) -> Result<Json<DeviceList>, ApiError> {
+) -> Result<Json<DevicePage>, ApiError> {
     actor.require(Permission::DevicesView)?;
     let parameters = parameters(query)?;
     let filter = DeviceFilter {
@@ -216,9 +219,16 @@ pub async fn search_devices(
         application: search_text(parameters.application, "application")?,
         scope: scope(parameters.company, parameters.tag)?,
     };
-    Ok(Json(DeviceList {
-        devices: search::devices(&state.database, &filter).await?,
-    }))
+    let limit = parameters.limit.unwrap_or(DEFAULT_DEVICES).min(MAX_DEVICES);
+    Ok(Json(
+        search::devices(
+            &state.database,
+            &filter,
+            limit,
+            parameters.offset.unwrap_or(0),
+        )
+        .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,24 +237,19 @@ pub struct SoftwareParameters {
     q: Option<String>,
     company: Option<String>,
     tag: Option<String>,
-    limit: Option<usize>,
+    limit: Option<u64>,
+    offset: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct SoftwareList {
-    applications: Vec<FleetApplication>,
-    /// More applications matched than were returned.
-    truncated: bool,
-}
-
-/// `GET /v1/software?q=&company=&tag=&limit=`: the applications on enrolled
-/// devices whose name contains `q`, by name, with how many devices have each
-/// version; without `q`, those on the most devices.
+/// `GET /v1/software?q=&company=&tag=&limit=&offset=`: a page of the
+/// applications on enrolled devices whose name contains `q`, by name, with
+/// how many devices have each version; without `q`, those on the most
+/// devices. Says how many matched, and `truncated` when more follow.
 pub async fn software(
     State(state): State<AppState>,
     actor: Authorized,
     query: Result<Query<SoftwareParameters>, QueryRejection>,
-) -> Result<Json<SoftwareList>, ApiError> {
+) -> Result<Json<SoftwarePage>, ApiError> {
     actor.require(Permission::DevicesView)?;
     let parameters = parameters(query)?;
     let query = search_text(parameters.q, "q")?;
@@ -253,12 +258,16 @@ pub async fn software(
         .limit
         .unwrap_or(DEFAULT_SOFTWARE)
         .clamp(1, MAX_SOFTWARE);
-    let (applications, truncated) =
-        search::software(&state.database, query.as_deref(), &scope, limit).await?;
-    Ok(Json(SoftwareList {
-        applications,
-        truncated,
-    }))
+    Ok(Json(
+        search::software(
+            &state.database,
+            query.as_deref(),
+            &scope,
+            limit,
+            parameters.offset.unwrap_or(0),
+        )
+        .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -271,21 +280,19 @@ pub struct InstalledParameters {
     unversioned: bool,
     company: Option<String>,
     tag: Option<String>,
+    /// 0 for only the count.
+    limit: Option<u64>,
+    offset: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct InstalledList {
-    devices: Vec<InstalledOn>,
-}
-
-/// `GET /v1/software/devices?name=&version=&unversioned=&company=&tag=`: the
-/// enrolled devices that have the application named exactly `name`, in
-/// `version` if given, by device name.
+/// `GET /v1/software/devices?name=&version=&unversioned=&company=&tag=&limit=&offset=`:
+/// a page of the copies of the application named exactly `name` on enrolled
+/// devices, in `version` if given, by device name, and how many there are.
 pub async fn software_devices(
     State(state): State<AppState>,
     actor: Authorized,
     query: Result<Query<InstalledParameters>, QueryRejection>,
-) -> Result<Json<InstalledList>, ApiError> {
+) -> Result<Json<InstalledPage>, ApiError> {
     actor.require(Permission::DevicesView)?;
     let parameters = parameters(query)?;
     if parameters.name.is_empty() || parameters.name.chars().count() > 256 {
@@ -302,9 +309,18 @@ pub async fn software_devices(
         (None, false) => None,
     };
     let scope = scope(parameters.company, parameters.tag)?;
-    Ok(Json(InstalledList {
-        devices: search::installed_on(&state.database, &parameters.name, version, &scope).await?,
-    }))
+    let limit = parameters.limit.unwrap_or(DEFAULT_DEVICES).min(MAX_DEVICES);
+    Ok(Json(
+        search::installed_on(
+            &state.database,
+            &parameters.name,
+            version,
+            &scope,
+            limit,
+            parameters.offset.unwrap_or(0),
+        )
+        .await?,
+    ))
 }
 
 #[cfg(test)]

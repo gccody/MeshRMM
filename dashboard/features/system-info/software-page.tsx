@@ -1,30 +1,38 @@
 import { ChevronDown, ChevronRight, CircleAlert, LoaderCircle, PackageSearch, RefreshCw, Search } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router";
-import { AuthenticationRequired, errorText } from "../../lib/http";
-import { useResource } from "../../lib/use-resource";
+import { ShowMore } from "../../lib/show-more";
+import { usePagedList } from "../../lib/use-paged-list";
+import { SEARCH_DELAY_MS } from "../../lib/use-settled";
 import { NO_COMPANY } from "../agents/device-filters";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
 import { useCompanies, useTags } from "../agents/use-devices";
 import {
   type FleetApplication,
-  type InstalledOn,
   MAX_SOFTWARE_QUERY_LENGTH,
+  SOFTWARE_PAGE_SIZE,
   type SoftwareFilters,
+  applicationName,
+  copyId,
   formatDate,
   installedOnParams,
   parseSoftwareFilters,
+  softwareKey,
   softwareParams,
   sourceLabel,
 } from "./model";
 import { fetchInstalledOn, fetchSoftware } from "./system-info-api";
 
-// Typing reaches the address and the server after a pause.
-const QUERY_DELAY_MS = 300;
+const APPLICATION_MESSAGES = { first: "The applications could not be loaded.", more: "More applications could not be loaded." };
+const COPY_MESSAGES = { first: "The devices could not be loaded.", more: "More devices could not be loaded." };
+
+const count = (number: number, one: string, many: string) => `${number} ${number === 1 ? one : many}`;
 
 // `/software`: which devices have an application installed, and in which
-// version, across every device or one company's or tag's.
+// version, across every device or one company's or tag's. The server
+// searches, orders and counts the applications and sends them a page at a
+// time, and an opened application's devices the same way.
 export function SoftwarePage() {
   const { authorizedFetch, inventory } = useWorkspace();
   const companies = useCompanies(inventory.devices);
@@ -44,17 +52,21 @@ export function SoftwarePage() {
     if (filters.query !== queryInput) setQueryInput(filters.query);
   }
 
+  // Typing reaches the address, and so the server, after a pause.
   useEffect(() => {
     if (queryInput === filters.query) return;
-    const timer = window.setTimeout(() => choose({ query: queryInput }), QUERY_DELAY_MS);
+    const timer = window.setTimeout(() => choose({ query: queryInput }), SEARCH_DELAY_MS);
     return () => window.clearTimeout(timer);
     // choose changes with the address, which this effect already follows.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queryInput, filters.query, filters.company, filters.tag]);
 
-  const params = softwareParams(filters).toString();
-  const load = useCallback(() => fetchSoftware(authorizedFetch, new URLSearchParams(params)), [authorizedFetch, params]);
-  const { data, error, reload } = useResource(load, "The applications could not be loaded.");
+  const key = softwareKey(filters);
+  const fetchPage = useCallback(async (offset: number) => {
+    const page = await fetchSoftware(authorizedFetch, parseSoftwareFilters(new URLSearchParams(key)), offset);
+    return { items: page.applications, matching: page.matching };
+  }, [authorizedFetch, key]);
+  const { list, error, reload, showMore, loadingMore, remaining, current } = usePagedList(key, fetchPage, applicationName, APPLICATION_MESSAGES);
   const searching = Boolean(filters.query.trim());
 
   return (
@@ -81,11 +93,11 @@ export function SoftwarePage() {
             </select>
           )}
         </div>
-        {!data ? (
+        {!list ? (
           error
             ? <div className="empty-state"><CircleAlert size={22} aria-hidden="true" /><strong>{error}</strong><button type="button" className="secondary-button" onClick={reload}><RefreshCw size={16} /> Try again</button></div>
             : <div className="empty-state"><LoaderCircle size={22} className="spin" aria-hidden="true" /><strong>Loading applications…</strong></div>
-        ) : data.applications.length === 0 ? (
+        ) : list.items.length === 0 && remaining === 0 ? (
           <div className="empty-state">
             <PackageSearch size={22} aria-hidden="true" />
             <strong>{searching ? "No matching applications" : "No applications yet"}</strong>
@@ -96,12 +108,12 @@ export function SoftwarePage() {
         ) : (
           <>
             {error && <p className="table-message form-error" role="alert"><CircleAlert size={16} aria-hidden="true" />{error}</p>}
-            {!searching && <p className="table-message field-help">The applications on the most devices. Search to find any other.</p>}
+            {!searching && <p className="table-message field-help">The applications on the most devices first.</p>}
             <div className="table-scroll">
-              <table className="data-table fleet-software">
+              <table className="data-table fleet-software" aria-busy={!current}>
                 <thead><tr><th scope="col">Application</th><th scope="col">Versions</th><th scope="col">Devices</th></tr></thead>
                 <tbody>
-                  {data.applications.map((application) => (
+                  {list.items.map((application) => (
                     <FleetRow
                       key={application.name}
                       application={application}
@@ -114,7 +126,13 @@ export function SoftwarePage() {
                 </tbody>
               </table>
             </div>
-            {data.truncated && <p className="panel-footer field-help">Showing the first {data.applications.length}. Search to narrow the list.</p>}
+            <div className="panel-footer fleet-footer">
+              <span className="field-help">
+                {count(list.matching, "application", "applications")}
+                {remaining > 0 && ` · ${list.items.length} loaded`}
+              </span>
+              <ShowMore remaining={remaining} pageSize={SOFTWARE_PAGE_SIZE} loading={loadingMore} disabled={!current} onShowMore={() => void showMore()} />
+            </div>
           </>
         )}
       </section>
@@ -163,38 +181,46 @@ function FleetRow({ application, company, tag, open, onToggle }: {
   );
 }
 
+// The devices that have one application, a page at a time.
 function InstalledDevices({ name, company, tag }: { name: string; company: string; tag: string }) {
   const { authorizedFetch } = useWorkspace();
-  const [state, setState] = useState<{ devices: InstalledOn[] | null; error: string | null }>({ devices: null, error: null });
+  const key = installedOnParams(name, undefined, company, tag).toString();
+  const fetchPage = useCallback(async (offset: number) => {
+    const page = await fetchInstalledOn(authorizedFetch, new URLSearchParams(key), offset);
+    return { items: page.devices, matching: page.matching };
+  }, [authorizedFetch, key]);
+  const { list, error, showMore, loadingMore, remaining, current } = usePagedList(key, fetchPage, copyId, COPY_MESSAGES);
 
-  useEffect(() => {
-    let cancelled = false;
-    fetchInstalledOn(authorizedFetch, installedOnParams(name, undefined, company, tag)).then(
-      (devices) => !cancelled && setState({ devices, error: null }),
-      (error: unknown) => {
-        if (!cancelled && !(error instanceof AuthenticationRequired)) setState({ devices: null, error: errorText(error, "The devices could not be loaded.") });
-      },
-    );
-    return () => {
-      cancelled = true;
-    };
-  }, [authorizedFetch, name, company, tag]);
-
-  if (state.error) return <p className="form-error" role="alert"><CircleAlert size={16} aria-hidden="true" />{state.error}</p>;
-  if (!state.devices) return <p className="page-status" role="status"><LoaderCircle size={16} className="spin" aria-hidden="true" /> Loading devices…</p>;
+  if (!list) {
+    return error
+      ? <p className="form-error" role="alert"><CircleAlert size={16} aria-hidden="true" />{error}</p>
+      : <p className="page-status" role="status"><LoaderCircle size={16} className="spin" aria-hidden="true" /> Loading devices…</p>;
+  }
   return (
-    <table className="data-table nested-table">
-      <thead><tr><th scope="col">Device</th><th scope="col">Version</th><th scope="col">Installed</th><th scope="col">Source</th></tr></thead>
-      <tbody>
-        {state.devices.map((device, index) => (
-          <tr key={`${device.device_id}-${device.version}-${index}`}>
-            <td><Link to={`/device?${new URLSearchParams({ id: device.device_id, tab: "software", q: name })}`}>{device.device_name}</Link></td>
-            <td className="mono">{device.version ?? "—"}{device.architecture && <span className="badge badge-muted">{device.architecture}</span>}</td>
-            <td className="numeric">{formatDate(device.installed_at)}</td>
-            <td>{sourceLabel(device.source)}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <>
+      {error && <p className="form-error" role="alert"><CircleAlert size={16} aria-hidden="true" />{error}</p>}
+      <table className="data-table nested-table" aria-busy={!current}>
+        <thead><tr><th scope="col">Device</th><th scope="col">Version</th><th scope="col">Installed</th><th scope="col">Source</th></tr></thead>
+        <tbody>
+          {list.items.map((device) => (
+            <tr key={copyId(device)}>
+              <td><Link to={`/device?${new URLSearchParams({ id: device.device_id, tab: "software", q: name })}`}>{device.device_name}</Link></td>
+              <td className="mono">{device.version ?? "—"}{device.architecture && <span className="badge badge-muted">{device.architecture}</span>}</td>
+              <td className="numeric">{formatDate(device.installed_at)}</td>
+              <td>{sourceLabel(device.source)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {(remaining > 0 || list.matching > SOFTWARE_PAGE_SIZE) && (
+        <div className="panel-footer fleet-footer">
+          <span className="field-help">
+            {count(list.matching, "copy", "copies")}
+            {remaining > 0 && ` · ${list.items.length} loaded`}
+          </span>
+          <ShowMore remaining={remaining} pageSize={SOFTWARE_PAGE_SIZE} loading={loadingMore} disabled={!current} onShowMore={() => void showMore()} />
+        </div>
+      )}
+    </>
   );
 }

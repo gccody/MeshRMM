@@ -3,7 +3,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
 import { formatDateTime, formatRelative } from "../../lib/format";
 import { AuthenticationRequired, errorText } from "../../lib/http";
+import { remainingItems } from "../../lib/paged-list";
+import { ShowMore } from "../../lib/show-more";
 import { useNow } from "../../lib/use-now";
+import { useSettled } from "../../lib/use-settled";
 import { PLATFORM_LABELS } from "../agents/types";
 import { HeaderActions } from "../workspace/header-actions";
 import { useWorkspace } from "../workspace/workspace-context";
@@ -36,26 +39,12 @@ import {
 import { fetchFleetPage, startUpdateJob } from "./updates-api";
 import { useUpdateEvents } from "./use-update-feed";
 
-// The search asks the server this long after the last keystroke.
-const QUERY_DELAY_MS = 300;
-
 const TILES: { status: Exclude<FleetStatusFilter, "" | "pending">; label: string; empty: string }[] = [
   { status: "security", label: "Security updates pending", empty: "No device" },
   { status: "failed", label: "Last install failed", empty: "No device" },
   { status: "reboot", label: "Restart pending", empty: "No device" },
   { status: "stale", label: "Not scanned in 3 days", empty: "Every device" },
 ];
-
-// `value` once it has stayed the same for `delayMs`.
-function useSettled<T>(value: T, delayMs: number) {
-  const [settled, setSettled] = useState(value);
-  useEffect(() => {
-    if (Object.is(settled, value)) return;
-    const timer = window.setTimeout(() => setSettled(value), delayMs);
-    return () => window.clearTimeout(timer);
-  }, [value, settled, delayMs]);
-  return settled;
-}
 
 // `/updates`: the devices' pending updates at a glance, most urgent first,
 // filtered by company, tag, operating system and state, with installs on
@@ -69,7 +58,7 @@ export function UpdatesPage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const filters = useMemo(() => parseFleetFilters(searchParams), [searchParams]);
-  const query = useSettled(filters.query.trim(), QUERY_DELAY_MS);
+  const query = useSettled(filters.query.trim());
   const { company, tag, platform, status } = filters;
   const requested = useMemo<FleetFilters>(() => ({ query, company, tag, platform, status }), [query, company, tag, platform, status]);
   const key = fleetKey(requested);
@@ -155,17 +144,17 @@ export function UpdatesPage() {
     return agent ? { ...device, device_name: agent.name, company_id: agent.company_id ?? null, tag_ids: agent.tag_ids ?? [], connected: agent.connected } : device;
   }, [fleet]);
   const present = useCallback((device: DeviceUpdateSummary) => !inventory.hasData || Boolean(fleet.get(device.device_id)), [fleet, inventory.hasData]);
-  const devices = useMemo(() => (list ? list.devices.filter(present).map(live) : null), [list, present, live]);
+  const devices = useMemo(() => (list ? list.items.filter(present).map(live) : null), [list, present, live]);
   // A chosen device keeps the summary it was chosen with until a newer one
   // is loaded or heard.
   const chosenDevices = useMemo(() => {
-    const loaded = new Map((list?.devices ?? []).map((device) => [device.device_id, device]));
+    const loaded = new Map((list?.items ?? []).map((device) => [device.device_id, device]));
     return [...chosen.values()].map((device) => loaded.get(device.device_id) ?? device).filter(present).map(live);
   }, [chosen, list, present, live]);
   const shown = devices ?? [];
   const allShownChosen = shown.length > 0 && shown.every((device) => chosen.has(device.device_id));
   const filtered = Boolean(filters.query.trim() || filters.company || filters.tag || filters.platform || filters.status);
-  const remaining = list ? Math.max(0, list.matching - list.devices.length) : 0;
+  const remaining = remainingItems(list);
 
   const toggle = (device: DeviceUpdateSummary, checked: boolean) => setChosen((current) => chooseDevices(current, [device], checked));
   const chooseShown = (checked: boolean) => setChosen((current) => chooseDevices(current, shown, checked));
@@ -173,7 +162,7 @@ export function UpdatesPage() {
   const showMore = async () => {
     if (!list) return;
     setLoadingMore(true);
-    await ask("page", list.devices.length);
+    await ask("page", list.items.length);
     setLoadingMore(false);
   };
 
@@ -291,13 +280,9 @@ export function UpdatesPage() {
             <div className="panel-footer fleet-footer">
               <span className="field-help">
                 {filtered ? `${list.matching} of ${deviceCount(list.totals.devices)}` : deviceCount(list.totals.devices)}
-                {remaining > 0 && ` · ${list.devices.length} loaded`}
+                {remaining > 0 && ` · ${list.items.length} loaded`}
               </span>
-              {remaining > 0 && (
-                <button type="button" className="secondary-button" disabled={loadingMore || list.key !== key} onClick={() => void showMore()}>
-                  {loadingMore && <LoaderCircle size={15} className="spin" />} Show {Math.min(FLEET_PAGE_SIZE, remaining)} more
-                </button>
-              )}
+              <ShowMore remaining={remaining} pageSize={FLEET_PAGE_SIZE} loading={loadingMore} disabled={list.key !== key} onShowMore={() => void showMore()} />
             </div>
           </>
         )}

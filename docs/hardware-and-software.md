@@ -102,11 +102,29 @@ for what each platform can't report.
 - `device_ip_addresses`: each adapter's addresses, prefix lengths, MAC and
   kind, which [Wake-on-LAN](wake-on-lan.md) chooses relays by;
 - `device_applications`: the applications, rewritten only when the list
-  changed, with the list's hash in `device_system_info`;
+  changed, with the list's hash and how many rows it has in
+  `device_system_info`;
+- `software_names` and `software_versions`: how many devices have each
+  application, and each version of it from each publisher, so the fleet's
+  software is read without grouping every device's list (below);
 - `device_application_changes`: what was installed, removed or updated
   between two lists, kept for 90 days. The same name, source and
   architecture is one application, and one version replacing another is an
   update. A device's first list is where its history starts.
+
+The two counts tables change in the transaction that changes a device's
+rows in `device_applications`, by what the device starts or stops having:
+when a new list replaces its stored one, and when its rows are removed
+(deleting the device). Nothing else writes those rows, so the counts are
+always their grouping; a count that reaches 0 is removed. A device counts
+once for an application however many copies it lists, and a version's count
+adds up its publishers'. An application on every device has one row that
+every changed list naming it adds to or takes from: each list touches only
+what changed, an unchanged list nothing, and on PostgreSQL two devices'
+changes to the same application wait for each other's short transaction
+(in key order, so they never deadlock). SQLite stores one snapshot at a time
+anyway. A deleted device's applications leave the counts when its rows are
+removed, just after it is marked deleted.
 
 A snapshot that names its list (`applications_unchanged`) does no
 application work: when the hash is the one stored, the list and its history
@@ -135,8 +153,11 @@ deletes everything it sent.
   this summary (`system` on each device), so it updates live.
 - **Software** (`/software`): the applications on the most devices, or those
   whose name matches a search, with how many devices have each version,
-  optionally for one company and one [tag](devices.md#tags). Opening an application lists its devices, each
-  linking to the device's Software tab.
+  optionally for one company and one [tag](devices.md#tags), and how many
+  applications match. Opening an application lists its devices, each
+  linking to the device's Software tab. Both lists load 100 at a time, with
+  **Show more** for the next; the search asks the server 300 ms after the
+  last keystroke, and only the newest search's answer is shown.
 
 ## API
 
@@ -146,13 +167,16 @@ deletes everything it sent.
 | `POST /v1/agents/{id}/system-info/refresh` | Asks the online Agent for a new snapshot: 202, or 409 `device_offline`. |
 | `GET /v1/agents/{id}/applications` | The applications, by name. |
 | `GET /v1/agents/{id}/application-changes?limit=` | Changes, newest first (200 by default, at most 1,000). |
-| `GET /v1/system-info?q=&os=&model=&serial=&ip=&application=&company=&tag=` | The snapshots of the devices matching every filter given. Each matches anywhere in its field, ignoring case: `q` any of the name, operating system, model, serial number, IP addresses and host name; `model` the model or manufacturer; `ip` an adapter's or the public address; `application` an installed application's name. `company` is a company's ID or `none`; `tag` a tag's ID. |
-| `GET /v1/software?q=&company=&tag=&limit=` | Applications by name with device counts per version, or without `q` those on the most devices; `truncated` when more matched. |
-| `GET /v1/software/devices?name=&version=&unversioned=&company=&tag=` | The devices that have the application named exactly `name`, in one version if given. |
+| `GET /v1/system-info?q=&os=&model=&serial=&ip=&application=&company=&tag=&limit=&offset=` | `{devices, matching}`: a page of the snapshots of the devices matching every filter given, by name then ID, each as `GET /v1/agents/{id}/system-info` returns it with the device's name, platform and company, and how many devices match. Each filter matches anywhere in its field, ignoring case: `q` any of the name, operating system, model, serial number, IP addresses and host name; `model` the model or manufacturer; `ip` an adapter's or the public address; `application` an installed application's name. `company` is a company's ID or `none`; `tag` a tag's ID. 100 devices a page by default, at most 200; `limit=0` counts only. |
+| `GET /v1/software?q=&company=&tag=&limit=&offset=` | `{applications, matching, truncated}`: a page of applications by name with device counts per version, or without `q` those on the most devices; how many match, and `truncated` when more follow. 200 a page by default, at most 500. Without a company or tag it reads the counts tables; with one, those devices' own rows. |
+| `GET /v1/software/devices?name=&version=&unversioned=&company=&tag=&limit=&offset=` | `{devices, matching}`: a page of the copies of the application named exactly `name`, in one version if given, by device name, and how many there are. A device with two versions has two. 100 a page by default, at most 200. |
 
 Patching uses the operating system's `id`, `id_like` and `package_managers`;
 Wake-on-LAN uses the adapters' MAC addresses and subnets, which
-`/v1/system-info` returns for every device at once.
+`/v1/system-info` returns for the fleet a page at a time. Filtering,
+counting and paging are the database's, so a page reads only its own
+devices' snapshots; the `application` filter reads the rows of the
+application names that match.
 
 Every route needs `devices.view`, refreshing included: it only makes the
 Agent collect again, so it isn't audited.
@@ -162,5 +186,11 @@ Agent collect again, so it isn't audited.
 `cargo test -p meshrmm-server --test system_info` exercises snapshots over a
 real control connection, refreshes, change tracking, searches and
 permissions; `cargo test -p meshrmm-agent system_info` collects the real
-computer's snapshot and checks the parsers. The website's are in
-`dashboard/tests/system-info.test.mjs`.
+computer's snapshot and checks the parsers. It also pages through more
+devices than a page, checks that a page costs the same statements for any
+fleet, and compares the counts tables with a fresh grouping of the rows
+after installs, removals, updates, deletions and enrolments; `--test
+query_plans` shows that the device search without an `application` filter
+and the whole fleet's software don't read `device_applications`. The
+website's are in `dashboard/tests/system-info.test.mjs` and
+`dashboard/tests/paged-list.test.mjs`.
