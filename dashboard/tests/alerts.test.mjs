@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { reloadGate } from "../lib/reload-gate.ts";
 import {
   ALERT_PAGE_LIMIT,
   DEFAULT_ALERT_FILTERS,
+  alertEventEffect,
   alertFilterParams,
-  applyAlertChange,
   applyAlertChanges,
   channelForm,
   channelFormProblem,
@@ -91,14 +92,6 @@ test("lists keep open alerts first and follow changes within their filters", () 
     alert("resolved", { state: "resolved", raised_at: 99 }),
   ]);
   assert.deepEqual(sorted.map(({ id }) => id), ["new-open", "old-open", "acked", "resolved"]);
-
-  const list = [alert("a"), alert("b", { raised_at: 50 })];
-  const resolved = applyAlertChange(list, alert("a", { state: "resolved" }), active);
-  assert.deepEqual(resolved.map(({ id }) => id), ["b"], "a resolved alert leaves the active list");
-  const raised = applyAlertChange(list, alert("c", { raised_at: 200 }), active);
-  assert.deepEqual(raised.map(({ id }) => id), ["c", "a", "b"]);
-  const all = applyAlertChange(list, alert("a", { state: "resolved" }), { ...active, state: "all" });
-  assert.deepEqual(all.map(({ id }) => id), ["b", "a"]);
 });
 
 // The order the server lists alerts in, checked pairwise.
@@ -289,4 +282,87 @@ test("the channel form keeps, replaces or removes a webhook's secret", () => {
   assert.equal(saved.secretMode, "keep");
   assert.equal("webhook_secret" in channelInput(saved), false, "a kept secret isn't sent");
   assert.equal(channelInput({ ...saved, secretMode: "remove" }).webhook_secret, null);
+});
+
+const upsert = (alert) => ({ type: "alert_upsert", alert, counts });
+const deviceFilters = { ...DEFAULT_ALERT_FILTERS, state: "all", device: "d1" };
+
+test("only the counts read a device's list again, and only its own alerts are merged", () => {
+  assert.deepEqual(alertEventEffect({ type: "alert_counts", counts }, deviceFilters), { change: null, read: true }, "counts name no device, so any may have changed");
+  const other = alert("x", { device_id: "d2" });
+  assert.deepEqual(alertEventEffect(upsert(other), deviceFilters), { change: null, read: false }, "another device's alert is ignored");
+  const own = alert("a", { device_id: "d1", state: "resolved" });
+  assert.deepEqual(alertEventEffect(upsert(own), deviceFilters), { change: own, read: false }, "the device's own alert is merged, not read");
+  assert.deepEqual(alertEventEffect(upsert(other), DEFAULT_ALERT_FILTERS), { change: other, read: false }, "the Alerts page with no device takes every alert");
+  assert.deepEqual(alertEventEffect({ type: "monitor_update", device_id: "d1", states: [] }, deviceFilters), { change: null, read: false });
+});
+
+test("a fleet-wide alert storm leaves a device's list as it was and unread, while its own alerts change it in place", () => {
+  // The device's 20 shown alerts: 5 open, raised at 10..6, then 15 resolved,
+  // raised at 200..186; more resolved ones match.
+  const shown = {
+    alerts: [
+      ...Array.from({ length: 5 }, (_, i) => alert(`o${i}`, { raised_at: 10 - i })),
+      ...Array.from({ length: 15 }, (_, i) => alert(`r${i}`, { raised_at: 200 - i, state: "resolved" })),
+    ],
+    counts,
+    truncated: true,
+  };
+  let list = shown;
+  let reads = 0;
+  const handle = (events) => {
+    const changes = [];
+    for (const event of events) {
+      const { change, read } = alertEventEffect(event, deviceFilters);
+      if (change) changes.push(change);
+      if (read) reads++;
+    }
+    list = applyAlertChanges(list, changes, deviceFilters, 20);
+    if (needsRefill(list, 20)) reads++;
+  };
+
+  handle(Array.from({ length: 5_000 }, (_, i) => upsert(alert(`storm${i}`, { device_id: `d${i + 2}`, raised_at: 1_000 + i }))));
+  assert.equal(list, shown, "other devices' alerts change nothing");
+  assert.equal(reads, 0, "and read nothing");
+
+  handle([upsert(alert("new", { raised_at: 500 }))]);
+  assert.deepEqual(ids(list).slice(0, 2), ["new", "o0"], "the device's new alert shows at once, unresolved first");
+  assert.equal(list.alerts.length, 20, "at most 20");
+  assert.equal(reads, 0);
+
+  handle([upsert(alert("o0", { raised_at: 10, state: "resolved" }))]);
+  assert.equal(list.alerts.some(({ id }) => id === "o0"), false, "resolved, it sorts among the resolved alerts never loaded, so it leaves");
+  assert.equal(list.alerts.filter(({ state }) => state !== "resolved").length, 5, "the unresolved count drops by the one resolved");
+  assert.equal(reads, 1, "and the list is read once to fill the gap");
+});
+
+test("a device page reads its list at most once per interval while counts pour in, and nothing while hidden", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
+  let hidden = false;
+  let reads = 0;
+  const gate = reloadGate({ reload: async () => { reads++; }, intervalMs: 2_000, hidden: () => hidden });
+  const pour = (count) => {
+    for (let i = 0; i < count; i++) {
+      for (const event of [{ type: "alert_counts", counts }, upsert(alert(`x${i}`, { device_id: "d2" }))]) {
+        if (alertEventEffect(event, deviceFilters).read) gate.request();
+      }
+      t.mock.timers.tick(2);
+    }
+  };
+
+  pour(1_000);
+  await flush();
+  assert.equal(reads, 1, "two seconds of counts, one read");
+
+  hidden = true;
+  pour(5_000);
+  await flush();
+  assert.equal(reads, 1, "a hidden tab reads nothing");
+  hidden = false;
+  gate.shown();
+  t.mock.timers.tick(2_000);
+  await flush();
+  assert.equal(reads, 2, "and one read catches up once it's shown");
+  gate.stop();
 });
