@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  ALERT_PAGE_LIMIT,
   DEFAULT_ALERT_FILTERS,
   alertFilterParams,
   applyAlertChange,
+  applyAlertChanges,
   channelForm,
   channelFormProblem,
   channelInput,
   matchesAlertFilters,
+  needsRefill,
   parseAlertEvent,
   parseAlertFilters,
   resolutionLabel,
@@ -96,6 +99,101 @@ test("lists keep open alerts first and follow changes within their filters", () 
   assert.deepEqual(raised.map(({ id }) => id), ["c", "a", "b"]);
   const all = applyAlertChange(list, alert("a", { state: "resolved" }), { ...active, state: "all" });
   assert.deepEqual(all.map(({ id }) => id), ["b", "a"]);
+});
+
+// The order the server lists alerts in, checked pairwise.
+const assertSorted = (alerts) => {
+  for (let i = 1; i < alerts.length; i++) {
+    assert.deepEqual(sortAlerts([alerts[i], alerts[i - 1]]).map(({ id }) => id), [alerts[i - 1].id, alerts[i].id], `rows ${i - 1} and ${i}`);
+  }
+};
+
+// The server's first `count` open alerts, newest first, raised at `top`,
+// `top - 1`, ...
+const page = (count, top, truncated) => ({
+  alerts: Array.from({ length: count }, (_, index) => alert(`p${index}`, { raised_at: top - index })),
+  counts,
+  truncated,
+});
+
+const ids = (list) => list.alerts.map(({ id }) => id);
+
+test("an alert storm keeps a full list at its limit, sorted, and says more match", () => {
+  const active = DEFAULT_ALERT_FILTERS;
+  let list = page(ALERT_PAGE_LIMIT, 10_000, true);
+  // A site goes offline: thousands of alerts are raised, a frame's worth at
+  // a time, each newer than any loaded, while loaded ones resolve or are
+  // acknowledged.
+  let raised = 0;
+  for (let frame = 0; frame < 250; frame++) {
+    const batch = [];
+    for (let i = 0; i < 20; i++) batch.push(alert(`storm${raised}`, { raised_at: 20_000 + raised++ }));
+    const loaded = frame % ALERT_PAGE_LIMIT;
+    batch.push(alert(`p${loaded}`, { raised_at: 10_000 - loaded, state: frame % 2 ? "resolved" : "acknowledged" }));
+    list = applyAlertChanges(list, batch, active, ALERT_PAGE_LIMIT);
+    assert.ok(list.alerts.length <= ALERT_PAGE_LIMIT, `frame ${frame} holds ${list.alerts.length}`);
+  }
+  assert.equal(list.alerts.length, ALERT_PAGE_LIMIT);
+  assert.equal(list.truncated, true, "the page says more match");
+  assertSorted(list.alerts);
+  assert.deepEqual(ids(list), Array.from({ length: ALERT_PAGE_LIMIT }, (_, i) => `storm${4_999 - i}`), "the newest of the 5,000 raised");
+  assert.equal(list.counts, counts, "the rest of the answer is kept");
+
+  // The whole storm in one batch, into a short complete list, ends the same.
+  const storm = Array.from({ length: 5_000 }, (_, i) => alert(`storm${i}`, { raised_at: 20_000 + i }));
+  const once = applyAlertChanges(page(3, 100, false), storm, active, ALERT_PAGE_LIMIT);
+  assert.equal(once.alerts.length, ALERT_PAGE_LIMIT);
+  assert.equal(once.truncated, true, "a complete list that overflows says more match");
+  assert.deepEqual(ids(once), ids(list));
+});
+
+test("a truncated list takes only changes that belong among its loaded alerts", () => {
+  const active = DEFAULT_ALERT_FILTERS;
+  // p0..p4, raised at 100..96; more match after p4.
+  const list = page(5, 100, true);
+
+  const between = applyAlertChanges(list, [alert("n", { raised_at: 98.5 })], active, 5);
+  assert.deepEqual(ids(between), ["p0", "p1", "n", "p2", "p3"], "in its sorted place, pushing the last out");
+  assert.equal(between.truncated, true);
+
+  const older = applyAlertChanges(list, [alert("old", { raised_at: 1 })], active, 5);
+  assert.equal(older, list, "an alert past the loaded ones may have others before it, so it stays out");
+
+  const acknowledged = applyAlertChanges(list, [alert("p1", { raised_at: 99, state: "acknowledged" })], active, 5);
+  assert.deepEqual(ids(acknowledged), ["p0", "p2", "p3", "p4"], "an alert that moves past the loaded ones leaves");
+  assert.equal(needsRefill(acknowledged, 5), true, "and the list should be read again to fill it");
+  assert.equal(needsRefill(list, 5), false);
+
+  const resolved = applyAlertChanges(list, [alert("p2", { raised_at: 98, state: "resolved" })], active, 5);
+  assert.deepEqual(ids(resolved), ["p0", "p1", "p3", "p4"], "an alert that leaves the filters leaves the list");
+
+  const severity = applyAlertChanges(list, [alert("n", { raised_at: 200, severity: "critical" })], { ...active, severity: "warning" }, 5);
+  assert.equal(severity, list, "an alert outside the filters stays out");
+
+  const updated = applyAlertChanges(list, [alert("p3", { raised_at: 97, occurrences: 4 })], active, 5);
+  assert.deepEqual(ids(updated), ids(list), "a changed alert is replaced where it is");
+  assert.equal(updated.alerts[3].occurrences, 4);
+
+  const twice = applyAlertChanges(list, [alert("p0", { state: "acknowledged" }), alert("p0", { occurrences: 9 })], active, 5);
+  assert.deepEqual(ids(twice), ids(list), "the last change of an alert counts");
+  assert.equal(twice.alerts[0].occurrences, 9);
+
+  const emptied = applyAlertChanges(list, list.alerts.map((row) => ({ ...row, state: "resolved" })), active, 5);
+  assert.deepEqual(emptied.alerts, []);
+  assert.equal(applyAlertChanges(emptied, [alert("n", { raised_at: 500 })], active, 5), emptied, "an emptied truncated list waits to be read again");
+  assert.equal(needsRefill(emptied, 5), true);
+});
+
+test("a complete list takes every matching change, up to its limit", () => {
+  const active = DEFAULT_ALERT_FILTERS;
+  const list = page(2, 100, false);
+  const older = applyAlertChanges(list, [alert("old", { raised_at: 1 })], active, 3);
+  assert.deepEqual(ids(older), ["p0", "p1", "old"]);
+  assert.equal(older.truncated, false);
+  const full = applyAlertChanges(older, [alert("older", { raised_at: 0 })], active, 3);
+  assert.deepEqual(ids(full), ["p0", "p1", "old"], "past the limit, the last are dropped");
+  assert.equal(full.truncated, true);
+  assert.equal(applyAlertChanges(list, [], active, 3), list, "no changes, the same list");
 });
 
 test("resolutions say who or what resolved the alert", () => {
