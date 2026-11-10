@@ -255,6 +255,41 @@ fn statements() -> Vec<(&'static str, Statement, &'static [&'static str])> {
             &["idx_alerts_remediation"],
         ),
         (
+            "self-healing's alerts running with no attempt running",
+            Statement::Select(
+                Query::select()
+                    .column(Alerts::Id)
+                    .from(Alerts::Table)
+                    .and_where(Expr::col(Alerts::RemediationState).eq("running"))
+                    .and_where(Expr::col(Alerts::State).ne("resolved"))
+                    .and_where(
+                        Expr::exists(
+                            Query::select()
+                                .expr(Expr::val(1))
+                                .from(AlertRemediations::Table)
+                                .and_where(
+                                    Expr::col((
+                                        AlertRemediations::Table,
+                                        AlertRemediations::AlertId,
+                                    ))
+                                    .equals((Alerts::Table, Alerts::Id)),
+                                )
+                                .and_where(
+                                    Expr::col((
+                                        AlertRemediations::Table,
+                                        AlertRemediations::Status,
+                                    ))
+                                    .eq("running"),
+                                )
+                                .to_owned(),
+                        )
+                        .not(),
+                    )
+                    .to_owned(),
+            ),
+            &["idx_alerts_remediation"],
+        ),
+        (
             "the alert engine's unresolved alerts",
             Statement::Select(
                 Query::select()

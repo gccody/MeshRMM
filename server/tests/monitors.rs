@@ -955,6 +955,481 @@ async fn lost_runs_and_late_answers_move_self_healing_on() {
     }
 }
 
+/// Runs `statements` on the app's database over a connection of its own.
+async fn run_sql(app: &App, statements: &[&'static str]) {
+    use sqlx::Connection;
+    let url = app.state.config.database_url();
+    if app.name == "sqlite" {
+        let mut connection = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        for statement in statements {
+            sqlx::raw_sql(*statement)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        connection.close().await.unwrap();
+    } else {
+        let mut connection = sqlx::PgConnection::connect(&url).await.unwrap();
+        for statement in statements {
+            sqlx::raw_sql(*statement)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        connection.close().await.unwrap();
+    }
+}
+
+/// Makes the database refuse new self-healing attempts, as a write failing
+/// under load would, or accept them again.
+async fn refuse_attempts(app: &App, refuse: bool) {
+    let statements: &[&'static str] = match (app.name, refuse) {
+        ("sqlite", true) => &[
+            "CREATE TRIGGER refuse_attempts BEFORE INSERT ON alert_remediations \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        ],
+        ("sqlite", false) => &["DROP TRIGGER refuse_attempts"],
+        (_, true) => &[
+            "CREATE FUNCTION refuse_attempts() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$",
+            "CREATE TRIGGER refuse_attempts BEFORE INSERT ON alert_remediations \
+             FOR EACH ROW EXECUTE FUNCTION refuse_attempts()",
+        ],
+        (_, false) => &[
+            "DROP TRIGGER refuse_attempts ON alert_remediations",
+            "DROP FUNCTION refuse_attempts()",
+        ],
+    };
+    run_sql(app, statements).await;
+}
+
+/// The self-healing script runs on record.
+async fn remediation_runs(app: &App) -> usize {
+    use meshrmm_server::db::tables::ScriptRuns;
+    use sea_query::{Expr, ExprTrait, Query};
+    let runs: Vec<(String,)> = app
+        .db()
+        .fetch_all(
+            &Query::select()
+                .column(ScriptRuns::Id)
+                .from(ScriptRuns::Table)
+                .and_where(Expr::col(ScriptRuns::Source).eq("remediation"))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    runs.len()
+}
+
+#[tokio::test]
+async fn an_attempt_that_fails_to_start_leaves_nothing_claimed() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let agent = app.enroll_on(&mut admin, "Web", "linux").await;
+        let device = agent.device_id.as_str();
+        let mut connection = app.state.agents.connect(device);
+        let script = create_script(&mut admin, "Restart web", true).await;
+        let rule = create_rule(
+            &mut admin,
+            service_rule(
+                "Web server",
+                json!({ "remediation": { "action": "script", "script_id": script, "attempts": 2, "retry_minutes": 1 } }),
+            ),
+        )
+        .await;
+        let rule_id = rule["id"].as_str().unwrap().to_owned();
+
+        // Recording the first attempt fails: the alert isn't left running
+        // an attempt nothing records, nor its script's run created.
+        refuse_attempts(&app, true).await;
+        monitors::reported(&app.state, device, vec![result(&rule_id, false, 1, "down")]).await;
+        let open = alerts_until(&mut admin, "", 1).await;
+        let alert_id = open[0]["id"].as_str().unwrap().to_owned();
+        assert_eq!(open[0]["remediation_state"], "waiting", "{name}");
+        assert_eq!(open[0]["remediation_attempts"], 0);
+        assert!(remediations(&mut admin, &alert_id).await.is_empty());
+        assert_eq!(remediation_runs(&app).await, 0, "{name}");
+        quiet_agent(&mut connection).await;
+
+        // The next evaluation makes it.
+        refuse_attempts(&app, false).await;
+        alerts::evaluate(&app.state, now_ms()).await.unwrap();
+        let run = match next_action(&mut connection).await {
+            AgentCommand::RunScript { run } => run,
+            other => panic!("expected a script run, got {other:?}"),
+        };
+        let attempts = remediations(&mut admin, &alert_id).await;
+        assert_eq!(attempts.len(), 1, "{name}: {attempts:?}");
+        assert_eq!(attempts[0]["attempt"], 1);
+        assert_eq!(attempts[0]["status"], "running");
+        assert_eq!(attempts[0]["script_run_id"], run.run_id.as_str());
+        let open = alerts_until(&mut admin, "", 1).await;
+        assert_eq!(open[0]["remediation_state"], "running");
+        assert_eq!(open[0]["remediation_attempts"], 1);
+        assert_eq!(remediation_runs(&app).await, 1);
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn self_healing_left_running_with_no_attempt_running_moves_on_once() {
+    use meshrmm_server::db::tables::AlertRemediations;
+    use sea_query::{Expr, ExprTrait, Query};
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let agent = app.enroll_on(&mut admin, "Web", "linux").await;
+        let device = agent.device_id.as_str();
+        let mut connection = app.state.agents.connect(device);
+        let mut hook = Webhook::start().await;
+        let channel = create_webhook(&mut admin, &hook.url).await;
+        let rule = create_rule(
+            &mut admin,
+            service_rule(
+                "Web server",
+                json!({ "channel_ids": [channel], "notify_when": "remediation_failed",
+                    "remediation": { "action": "restart_service", "attempts": 2, "retry_minutes": 5 } }),
+            ),
+        )
+        .await;
+        let rule_id = rule["id"].as_str().unwrap().to_owned();
+        monitors::reported(&app.state, device, vec![result(&rule_id, false, 1, "down")]).await;
+        let alert_id = alerts_until(&mut admin, "", 1).await[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        action_of(next_action(&mut connection).await);
+
+        // An attempt running within its time is left alone.
+        alerts::evaluate(&app.state, now_ms() + 4 * MINUTE_MS)
+            .await
+            .unwrap();
+        quiet_agent(&mut connection).await;
+        assert_eq!(
+            remediations(&mut admin, &alert_id).await[0]["status"],
+            "running",
+            "{name}"
+        );
+        assert_eq!(
+            alerts_until(&mut admin, "", 1).await[0]["remediation_state"],
+            "running"
+        );
+
+        // The alert claimed its first attempt but the attempt was never
+        // recorded, as when the server stopped between the two: the next
+        // evaluation records it as failed, saying so, and the alert waits
+        // for its next attempt.
+        app.db()
+            .execute(
+                &Query::delete()
+                    .from_table(AlertRemediations::Table)
+                    .and_where(Expr::col(AlertRemediations::AlertId).eq(alert_id.as_str()))
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        alerts::evaluate(&app.state, now_ms()).await.unwrap();
+        let attempts = remediations(&mut admin, &alert_id).await;
+        assert_eq!(attempts.len(), 1, "{name}: {attempts:?}");
+        assert_eq!(attempts[0]["attempt"], 1);
+        assert_eq!(attempts[0]["status"], "failed");
+        assert_eq!(attempts[0]["action"], "restart_service");
+        assert_eq!(attempts[0]["target"], "nginx");
+        assert!(
+            attempts[0]["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("It never started"),
+            "{attempts:?}"
+        );
+        let open = alerts_until(&mut admin, "", 1).await;
+        assert_eq!(open[0]["remediation_state"], "waiting", "{name}");
+        assert_eq!(open[0]["remediation_attempts"], 1);
+        assert!(is_check(&next_action(&mut connection).await, &rule_id));
+        // Once: another evaluation leaves it be.
+        alerts::evaluate(&app.state, now_ms()).await.unwrap();
+        quiet_agent(&mut connection).await;
+        assert_eq!(remediations(&mut admin, &alert_id).await.len(), 1);
+        hook.quiet().await;
+
+        // The next attempt follows after the rule's wait.
+        alerts::evaluate(&app.state, now_ms() + 6 * MINUTE_MS)
+            .await
+            .unwrap();
+        action_of(next_action(&mut connection).await);
+        assert_eq!(remediations(&mut admin, &alert_id).await.len(), 2);
+
+        // Its failure was recorded but the alert never moved on, as when the
+        // server stopped between the two: the next evaluation moves it on,
+        // keeping the attempt as it was recorded.
+        app.db()
+            .execute(
+                &Query::update()
+                    .table(AlertRemediations::Table)
+                    .value(AlertRemediations::Status, "failed")
+                    .value(AlertRemediations::Detail, "Job for nginx.service failed.")
+                    .value(AlertRemediations::FinishedAt, now_ms() + 6 * MINUTE_MS)
+                    .and_where(Expr::col(AlertRemediations::AlertId).eq(alert_id.as_str()))
+                    .and_where(Expr::col(AlertRemediations::Attempt).eq(2))
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        alerts::evaluate(&app.state, now_ms() + 6 * MINUTE_MS)
+            .await
+            .unwrap();
+        let attempts = remediations(&mut admin, &alert_id).await;
+        assert_eq!(attempts.len(), 2, "{name}: {attempts:?}");
+        assert_eq!(attempts[1]["detail"], "Job for nginx.service failed.");
+        assert_eq!(
+            alerts_until(&mut admin, "", 1).await[0]["remediation_state"],
+            "waiting",
+            "{name}"
+        );
+        assert!(is_check(&next_action(&mut connection).await, &rule_id));
+        hook.quiet().await;
+
+        // That was the last attempt: after the wait, the channels hear
+        // self-healing failed, once.
+        alerts::evaluate(&app.state, now_ms() + 12 * MINUTE_MS)
+            .await
+            .unwrap();
+        let failed = hook.next().await;
+        assert_eq!(
+            failed["event"], "alert.remediation_failed",
+            "{name}: {failed}"
+        );
+        assert_eq!(failed["last_attempt"]["attempt"], 2, "{failed}");
+        let open = alerts_until(&mut admin, "", 1).await;
+        assert_eq!(open[0]["remediation_state"], "failed");
+        assert_eq!(open[0]["remediation_attempts"], 2);
+        alerts::evaluate(&app.state, now_ms() + 30 * MINUTE_MS)
+            .await
+            .unwrap();
+        hook.quiet().await;
+        no_action(&mut connection).await;
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_script_attempt_whose_run_is_gone_fails_and_self_healing_follows() {
+    use meshrmm_server::db::tables::ScriptRuns;
+    use sea_query::{Expr, ExprTrait, Query};
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let agent = app.enroll_on(&mut admin, "Web", "linux").await;
+        let device = agent.device_id.as_str();
+        let mut connection = app.state.agents.connect(device);
+        let mut hook = Webhook::start().await;
+        let channel = create_webhook(&mut admin, &hook.url).await;
+        let script = create_script(&mut admin, "Restart web", true).await;
+        let rule = create_rule(
+            &mut admin,
+            service_rule(
+                "Web server",
+                json!({ "channel_ids": [channel], "notify_when": "remediation_failed",
+                    "remediation": { "action": "script", "script_id": script, "attempts": 1, "retry_minutes": 1 } }),
+            ),
+        )
+        .await;
+        let rule_id = rule["id"].as_str().unwrap().to_owned();
+        monitors::reported(&app.state, device, vec![result(&rule_id, false, 1, "down")]).await;
+        let alert_id = alerts_until(&mut admin, "", 1).await[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let run = match next_action(&mut connection).await {
+            AgentCommand::RunScript { run } => run,
+            other => panic!("expected a script run, got {other:?}"),
+        };
+
+        // Within the run's time limit, the attempt is left alone.
+        alerts::evaluate(&app.state, now_ms() + MINUTE_MS)
+            .await
+            .unwrap();
+        quiet_agent(&mut connection).await;
+        assert_eq!(
+            remediations(&mut admin, &alert_id).await[0]["status"],
+            "running",
+            "{name}"
+        );
+
+        // The run is gone from the history: the attempt is lost, and the
+        // alert waits for the verdict.
+        app.db()
+            .execute(
+                &Query::delete()
+                    .from_table(ScriptRuns::Table)
+                    .and_where(Expr::col(ScriptRuns::Id).eq(run.run_id.as_str()))
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        alerts::evaluate(&app.state, now_ms() + MINUTE_MS)
+            .await
+            .unwrap();
+        let attempts = remediations(&mut admin, &alert_id).await;
+        assert_eq!(attempts.len(), 1, "{name}: {attempts:?}");
+        assert_eq!(attempts[0]["status"], "lost");
+        assert_eq!(attempts[0]["detail"], "The script's run is gone");
+        assert_eq!(
+            alerts_until(&mut admin, "", 1).await[0]["remediation_state"],
+            "waiting"
+        );
+        assert!(is_check(&next_action(&mut connection).await, &rule_id));
+        hook.quiet().await;
+
+        // It was the only attempt: after the wait, the channels hear
+        // self-healing failed, once.
+        alerts::evaluate(&app.state, now_ms() + 3 * MINUTE_MS)
+            .await
+            .unwrap();
+        let failed = hook.next().await;
+        assert_eq!(
+            failed["event"], "alert.remediation_failed",
+            "{name}: {failed}"
+        );
+        assert_eq!(failed["last_attempt"]["status"], "lost", "{failed}");
+        assert_eq!(
+            alerts_until(&mut admin, "", 1).await[0]["remediation_state"],
+            "failed"
+        );
+        alerts::evaluate(&app.state, now_ms() + 10 * MINUTE_MS)
+            .await
+            .unwrap();
+        hook.quiet().await;
+        quiet_agent(&mut connection).await;
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_result_and_an_evaluation_together_end_an_attempt_once() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let agent = app.enroll_on(&mut admin, "Web", "linux").await;
+        let device = agent.device_id.as_str();
+        let mut connection = app.state.agents.connect(device);
+        let mut hook = Webhook::start().await;
+        let channel = create_webhook(&mut admin, &hook.url).await;
+        let rule = create_rule(
+            &mut admin,
+            service_rule(
+                "Web server",
+                json!({ "channel_ids": [channel], "notify_when": "remediation_failed",
+                    "remediation": { "action": "restart_service", "attempts": 1, "retry_minutes": 10 } }),
+            ),
+        )
+        .await;
+        let rule_id = rule["id"].as_str().unwrap().to_owned();
+        let script = create_script(&mut admin, "Restart web", true).await;
+        let scripted = create_rule(
+            &mut admin,
+            service_rule(
+                "Web script",
+                json!({ "remediation": { "action": "script", "script_id": script, "attempts": 1, "retry_minutes": 5 } }),
+            ),
+        )
+        .await;
+        let scripted_id = scripted["id"].as_str().unwrap().to_owned();
+
+        // An action answered just as the evaluation finds it lost. The wait
+        // is longer than that evaluation is ahead, so whichever ends the
+        // attempt, the alert then waits.
+        monitors::reported(&app.state, device, vec![result(&rule_id, false, 1, "down")]).await;
+        let alert_id = alerts_until(&mut admin, "", 1).await[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let action = action_of(next_action(&mut connection).await);
+        tokio::join!(
+            async {
+                alerts::evaluate(&app.state, now_ms() + 6 * MINUTE_MS)
+                    .await
+                    .unwrap()
+            },
+            monitors::remediation::action_reported(
+                &app.state,
+                device,
+                MonitorActionResult {
+                    action_id: action.action_id,
+                    succeeded: false,
+                    detail: "Job for nginx.service failed.".into(),
+                },
+            ),
+        );
+        let attempts = remediations(&mut admin, &alert_id).await;
+        assert_eq!(attempts.len(), 1, "{name}: {attempts:?}");
+        assert!(
+            ["lost", "failed"].contains(&attempts[0]["status"].as_str().unwrap()),
+            "{attempts:?}"
+        );
+        let open = alerts_until(&mut admin, "", 1).await;
+        assert_eq!(open[0]["remediation_state"], "waiting", "{name}");
+        assert_eq!(open[0]["remediation_attempts"], 1);
+        assert!(is_check(&next_action(&mut connection).await, &rule_id));
+        quiet_agent(&mut connection).await;
+
+        // A script's result reported just as the evaluation looks at its run.
+        monitors::reported(
+            &app.state,
+            device,
+            vec![result(&scripted_id, false, 1, "down")],
+        )
+        .await;
+        let open = alerts_until(&mut admin, "", 2).await;
+        let scripted_alert = alert_of(&open, &scripted_id)["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let run = match next_action(&mut connection).await {
+            AgentCommand::RunScript { run } => run,
+            other => panic!("expected a script run, got {other:?}"),
+        };
+        let path = format!("script-runs/{}/result", run.run_id);
+        let (reported, ()) = tokio::join!(
+            agent.report(
+                &path,
+                json!({ "status": "completed", "ran_as": "root", "exit_code": 1, "stdout": "", "stderr": "no" }),
+            ),
+            async { alerts::evaluate(&app.state, now_ms()).await.unwrap() },
+        );
+        assert_eq!(reported.status, StatusCode::NO_CONTENT);
+        let attempts = remediations(&mut admin, &scripted_alert).await;
+        assert_eq!(attempts.len(), 1, "{name}: {attempts:?}");
+        assert_eq!(attempts[0]["status"], "failed");
+        assert_eq!(attempts[0]["detail"], "Exited with code 1");
+        let open = alerts_until(&mut admin, "", 2).await;
+        assert_eq!(
+            alert_of(&open, &scripted_id)["remediation_state"],
+            "waiting"
+        );
+        assert_eq!(alert_of(&open, &scripted_id)["remediation_attempts"], 1);
+        assert!(is_check(&next_action(&mut connection).await, &scripted_id));
+        quiet_agent(&mut connection).await;
+
+        // The first rule's channels hear its self-healing failed once.
+        hook.quiet().await;
+        alerts::evaluate(&app.state, now_ms() + 20 * MINUTE_MS)
+            .await
+            .unwrap();
+        let failed = hook.next().await;
+        assert_eq!(
+            failed["event"], "alert.remediation_failed",
+            "{name}: {failed}"
+        );
+        alerts::evaluate(&app.state, now_ms() + 40 * MINUTE_MS)
+            .await
+            .unwrap();
+        hook.quiet().await;
+        app.finish().await;
+    }
+}
+
 #[tokio::test]
 async fn self_healing_takes_credit_only_for_what_it_fixed() {
     for app in apps().await {
