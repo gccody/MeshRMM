@@ -93,6 +93,13 @@ fn storable(text: &str) -> String {
 /// information snapshot at its limit, with room for the message around it.
 const MAX_CONTROL_MESSAGE_BYTES: usize = MAX_SYSTEM_INFO_BYTES + 64 * 1024;
 
+/// The control connection's read buffer, which every connected Agent holds
+/// (tungstenite's default is 128 KiB). A metrics report, sent every few
+/// seconds, fits in one read; a larger message, such as a system
+/// information snapshot, grows the buffer to its size and arrives over
+/// several reads, so this bounds each read, not the message.
+const CONTROL_READ_BUFFER_BYTES: usize = 4 * 1024;
+
 /// `GET /v1/agents/{id}/connect`: the Agent's control connection, which it
 /// keeps open while it runs. See [`coordinator`].
 pub async fn connect(
@@ -105,6 +112,7 @@ pub async fn connect(
     let agent = agents::authenticate(&state, &headers, &id).await?;
     Ok(upgrade
         .max_message_size(MAX_CONTROL_MESSAGE_BYTES)
+        .read_buffer_size(CONTROL_READ_BUFFER_BYTES)
         .on_upgrade(move |socket| {
             coordinator::serve(state, agent.device_id, agent.deletion_requested, ip, socket)
         }))
