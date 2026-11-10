@@ -120,12 +120,17 @@ pub async fn refresh(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     actor.require(Permission::DevicesView)?;
     let id = device(&state, &id).await?;
-    if !state.agents.send(&id, AgentCommand::CollectSystemInfo) {
-        return Err(ApiError::conflict(
-            "the device is offline; it sends its system information when it next connects, if what the server has is old",
-        )
-        .with_code("device_offline"));
-    }
+    state
+        .agents
+        .send(&id, AgentCommand::CollectSystemInfo)
+        .map_err(|unsent| {
+            unsent.answer(
+                ApiError::conflict(
+                    "the device is offline; it sends its system information when it next connects, if what the server has is old",
+                )
+                .with_code("device_offline"),
+            )
+        })?;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({ "device_id": id, "status": "requested" })),

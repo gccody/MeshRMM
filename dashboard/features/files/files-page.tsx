@@ -670,6 +670,7 @@ function FolderProblem({ problem, platform, account, parent, other, onUp, onRetr
   const title = problem.code === "access_denied" ? "Access denied"
     : problem.code === "not_found" ? "Not found"
     : problem.code === "device_offline" || problem.code === "device_disconnected" ? "The device is offline"
+    : problem.code === "device_busy" ? "The device is busy"
     : problem.code === "no_user" ? "Nobody is signed in"
     : "The folder couldn’t be shown";
   return (

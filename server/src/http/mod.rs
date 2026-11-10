@@ -200,6 +200,19 @@ impl ApiError {
         .with_retry_after(BUSY_RETRY_SECONDS)
     }
 
+    /// The device is connected, but so far behind on what it was sent that
+    /// it can't take more yet: the request did nothing, recorded nothing,
+    /// and may be sent again shortly. Not `device_offline`, which the
+    /// website shows as a device that isn't there.
+    pub fn device_busy() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the device is connected but busy; try again in a moment",
+        )
+        .with_code("device_busy")
+        .with_retry_after(BUSY_RETRY_SECONDS)
+    }
+
     pub fn with_code(mut self, code: &'static str) -> Self {
         self.code = Some(code);
         self

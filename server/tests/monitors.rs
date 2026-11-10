@@ -1073,6 +1073,104 @@ async fn an_attempt_that_fails_to_start_leaves_nothing_claimed() {
 }
 
 #[tokio::test]
+async fn an_attempt_for_a_device_too_far_behind_waits_and_is_not_charged() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let agent = app.enroll_on(&mut admin, "Web", "linux").await;
+        let device = agent.device_id.as_str();
+        let mut connection = app.state.agents.connect(device);
+        let script = create_script(&mut admin, "Restart web", true).await;
+        let rule = create_rule(
+            &mut admin,
+            service_rule(
+                "Web server",
+                json!({ "remediation": { "action": "script", "script_id": script, "attempts": 2, "retry_minutes": 1 } }),
+            ),
+        )
+        .await;
+        let rule_id = rule["id"].as_str().unwrap().to_owned();
+
+        // The device is connected but can't take the attempt now: nothing is
+        // claimed, recorded or failed, and the alert waits.
+        let queued = common::fill_backlog(&app, device);
+        monitors::reported(&app.state, device, vec![result(&rule_id, false, 1, "down")]).await;
+        let open = alerts_until(&mut admin, "", 1).await;
+        let alert_id = open[0]["id"].as_str().unwrap().to_owned();
+        assert_eq!(open[0]["remediation_state"], "waiting", "{name}");
+        assert_eq!(open[0]["remediation_attempts"], 0, "{name}");
+        assert!(remediations(&mut admin, &alert_id).await.is_empty());
+        assert_eq!(remediation_runs(&app).await, 0, "{name}");
+        // An evaluation before the wait is over doesn't try again.
+        alerts::evaluate(&app.state, now_ms()).await.unwrap();
+        assert!(remediations(&mut admin, &alert_id).await.is_empty());
+
+        // Once it caught up, the next evaluation past the wait makes it.
+        common::drain_backlog(&mut connection, queued).await;
+        quiet_agent(&mut connection).await;
+        alerts::evaluate(&app.state, now_ms() + MINUTE_MS)
+            .await
+            .unwrap();
+        let run = match next_action(&mut connection).await {
+            AgentCommand::RunScript { run } => run,
+            other => panic!("expected a script run, got {other:?}"),
+        };
+        let attempts = remediations(&mut admin, &alert_id).await;
+        assert_eq!(attempts.len(), 1, "{name}: {attempts:?}");
+        assert_eq!(attempts[0]["attempt"], 1);
+        assert_eq!(attempts[0]["status"], "running");
+        assert_eq!(attempts[0]["script_run_id"], run.run_id.as_str());
+        assert_eq!(remediation_runs(&app).await, 1);
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_device_too_far_behind_is_busy_and_gets_its_monitors_later() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let agent = app.enroll_on(&mut admin, "Web", "linux").await;
+        let device = agent.device_id.as_str();
+        let rule = create_rule(&mut admin, service_rule("Web server", json!({}))).await;
+        let rule_id = rule["id"].as_str().unwrap().to_owned();
+        let mut connection = app.state.agents.connect(device);
+        monitors::greeting(&app.state, device).await.unwrap();
+
+        // Checking now is busy, not offline, and isn't audited.
+        let check_path = format!("/v1/agents/{device}/monitors/check");
+        let queued = common::fill_backlog(&app, device);
+        common::assert_device_busy(&admin.post(&check_path, json!({})).await, name);
+        assert!(audit_events(&app, "monitor.check").await.is_empty());
+
+        // The device reports a monitor it wasn't sent, so it is sent its
+        // monitors again although they didn't change; that waits until it
+        // can take them, rather than being dropped.
+        monitors::reported(
+            &app.state,
+            device,
+            vec![result("00000000000000000000000000000000", true, 0, "")],
+        )
+        .await;
+        monitors::sync(&app.state).await.unwrap();
+        common::drain_backlog(&mut connection, queued).await;
+        monitors::sync(&app.state).await.unwrap();
+        assert_eq!(
+            monitors_sent(&mut connection, Duration::from_secs(10)).await,
+            sorted(&[rule_id.as_str()]),
+            "{name}"
+        );
+
+        let checked = admin.post(&check_path, json!({})).await;
+        assert_eq!(checked.status, StatusCode::ACCEPTED, "{name}");
+        drop(connection);
+        let offline = admin.post(&check_path, json!({})).await;
+        assert_eq!(offline.code(), "device_offline", "{name}");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
 async fn self_healing_left_running_with_no_attempt_running_moves_on_once() {
     use meshrmm_server::db::tables::AlertRemediations;
     use sea_query::{Expr, ExprTrait, Query};

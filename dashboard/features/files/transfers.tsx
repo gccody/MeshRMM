@@ -74,7 +74,9 @@ const hashOf = async (file: File, onProgress: (bytes: number) => void, signal: A
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 };
 
-const offlineCodes = new Set(["device_offline", "device_disconnected", "device_timeout", "network"]);
+// Failures an upload resumes after on its own, a few times, while the device
+// is online: it went away, or is connected but too busy to take more yet.
+const interruptedCodes = new Set(["device_offline", "device_disconnected", "device_timeout", "device_busy", "network"]);
 
 // The queue of uploads and the downloads started from the page, and what
 // each is doing.
@@ -160,7 +162,7 @@ export function useTransfers({ authorizedFetch, deviceId, platform, connected, o
         update(key, { state: "failed", error: errorText(error, "The file arrived damaged.") });
       } else if (code === "too_many_transfers") {
         update(key, { state: "queued" });
-      } else if (code && offlineCodes.has(code) || code === "incomplete" || code === "upload_interrupted") {
+      } else if (code && interruptedCodes.has(code) || code === "incomplete" || code === "upload_interrupted") {
         const tries = resumes.current.get(key) ?? 0;
         if (latest.current.connected && tries < AUTOMATIC_RESUMES) {
           resumes.current.set(key, tries + 1);

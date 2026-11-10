@@ -570,8 +570,8 @@ pub async fn ask(
             operation,
         },
     };
-    if !state.agents.send(device_id, command) {
-        return Err(device_offline());
+    if let Err(unsent) = state.agents.send(device_id, command) {
+        return Err(unsent.answer(device_offline()));
     }
     let answer = tokio::time::timeout(wait, answer).await;
     drop(request);

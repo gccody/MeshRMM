@@ -156,6 +156,7 @@ const CLOSE_MESSAGES: Record<number, string> = {
   4008: "Closed for lack of input",
   4009: "The device disconnected",
   4010: "This terminal has ended or is open elsewhere",
+  4503: "The device is connected but busy; try again in a moment",
 };
 
 // Why the socket closed: the server's own words when it gave some.

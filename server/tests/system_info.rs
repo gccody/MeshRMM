@@ -804,6 +804,26 @@ async fn seeing_system_information_needs_devices_view() {
     }
 }
 
+#[tokio::test]
+async fn a_refresh_for_a_device_too_far_behind_is_busy_not_offline() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "Desk").await;
+        let path = format!("/v1/agents/{}/system-info/refresh", desk.device_id);
+        let mut connection = app.state.agents.connect(&desk.device_id);
+        let queued = common::fill_backlog(&app, &desk.device_id);
+        common::assert_device_busy(&admin.post(&path, json!({})).await, name);
+        common::drain_backlog(&mut connection, queued).await;
+        let refreshed = admin.post(&path, json!({})).await;
+        assert_eq!(refreshed.status, 202, "{name}: {:?}", refreshed.body);
+        drop(connection);
+        let offline = admin.post(&path, json!({})).await;
+        assert_eq!(offline.code(), "device_offline", "{name}");
+        app.finish().await;
+    }
+}
+
 /// An application from `publisher`, installed by `source`.
 fn published(name: &str, version: Option<&str>, publisher: Option<&str>, source: &str) -> Value {
     json!({ "name": name, "version": version, "publisher": publisher, "source": source })

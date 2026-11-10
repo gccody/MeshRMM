@@ -13,7 +13,7 @@ use crate::{
     db::tables::RemoteSessions,
     http::{ApiError, AppState},
     rbac::Permission,
-    realtime::ToAgent,
+    realtime::{ToAgent, Unsent},
     secrets::new_token,
     time::now_ms,
 };
@@ -314,6 +314,14 @@ impl SessionActor {
             }
             Err(error) => return (Err(error), Next::Continue),
         }
+        // A place for the new request is held before the Agent's side is
+        // replaced, so an Agent too far behind to take it now keeps the
+        // session as it was. An offline one gets it when it reconnects.
+        let place = match self.state.agents.reserve(&self.record.device_id) {
+            Ok(place) => Some(place),
+            Err(Unsent::Offline) => None,
+            Err(Unsent::Full) => return (Err(ApiError::device_busy()), Next::Continue),
+        };
         let expires_at = now_ms() + self.record.idle_timeout_ms;
         let mut record = self.record.clone();
         record.agent_request.expires_at_unix_ms = unix_ms(expires_at);
@@ -347,7 +355,7 @@ impl SessionActor {
         self.expires_at = expires_at;
         self.close_peer(Role::Agent, 4000, "superseded peer connection");
         let request = ToAgent::Session(self.record.agent_request.clone());
-        if !self.state.agents.send(&self.record.device_id, request) {
+        if !place.is_some_and(|place| place.send(request)) {
             // The Agent gets the new request when it reconnects.
             return (Err(device_offline()), Next::Continue);
         }
@@ -399,7 +407,10 @@ impl SessionActor {
         for role in [Role::Client, Role::Agent] {
             self.close_peer(role, 4001, reason);
         }
-        self.state.agents.send(
+        // Only sooner: the Agent's socket was closed above and the session's
+        // row is gone, so its side, refused when it tries to reconnect, ends
+        // itself even if this isn't queued.
+        let _ = self.state.agents.send(
             &self.record.device_id,
             AgentCommand::EndSession {
                 session_id: RemoteSessionId::new(self.record.session_id.as_str()),

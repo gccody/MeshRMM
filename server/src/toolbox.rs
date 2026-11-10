@@ -30,6 +30,7 @@ use crate::{
     },
     http::{ApiError, AppState},
     rbac::{Permission, Permissions},
+    realtime::{Reserved, Unsent},
     time::{MINUTE_MS, SECOND_MS, now_ms},
     users::new_id,
 };
@@ -441,6 +442,17 @@ fn device_not_found() -> ApiError {
     ApiError::not_found("Device not found")
 }
 
+/// Holds a place for a run or delivery in the device's backlog before it
+/// is recorded, so a device too far behind to take it records nothing.
+/// An offline device has none, and gets a run or delivery that failed.
+fn hold_place(state: &AppState, device_id: &str) -> Result<Option<Reserved>, ApiError> {
+    match state.agents.reserve(device_id) {
+        Ok(place) => Ok(Some(place)),
+        Err(Unsent::Offline) => Ok(None),
+        Err(Unsent::Full) => Err(ApiError::device_busy()),
+    }
+}
+
 fn unix_ms(value: i64) -> u64 {
     u64::try_from(value).unwrap_or_default()
 }
@@ -472,6 +484,7 @@ pub async fn start_script_run(
         ))
         .with_code("language_unsupported"));
     }
+    let place = hold_place(state, device_id)?;
     let run_id = new_id();
     let now = now_ms();
     insert_run(
@@ -517,7 +530,7 @@ pub async fn start_script_run(
             timeout_seconds,
         },
     };
-    if !state.agents.send(device_id, command) {
+    if !place.is_some_and(|place| place.send(command)) {
         fail_pending(state, ScriptRuns::Table, &run_id, OFFLINE_RUN).await?;
         return Err(ApiError::conflict(OFFLINE_RUN).with_code("device_offline"));
     }
@@ -558,6 +571,7 @@ pub async fn start_file_delivery(
     if !agents::is_active(&mut transaction, device_id).await? {
         return Err(device_not_found());
     }
+    let place = hold_place(state, device_id)?;
     let delivery_id = new_id();
     let now = now_ms();
     insert_delivery(
@@ -599,7 +613,7 @@ pub async fn start_file_delivery(
             destination,
         },
     };
-    if !state.agents.send(device_id, command) {
+    if !place.is_some_and(|place| place.send(command)) {
         fail_pending(state, FileDeliveries::Table, &delivery_id, OFFLINE_DELIVERY).await?;
         return Err(ApiError::conflict(OFFLINE_DELIVERY).with_code("device_offline"));
     }

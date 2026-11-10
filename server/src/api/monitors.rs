@@ -65,9 +65,9 @@ pub async fn check(
         }
         rule_ids.push(rule_id);
     }
-    if !monitors::check_now(&state, &id, rule_ids.clone()) {
-        return Err(ApiError::conflict("The device is offline").with_code("device_offline"));
-    }
+    monitors::check_now(&state, &id, rule_ids.clone()).map_err(|unsent| {
+        unsent.answer(ApiError::conflict("The device is offline").with_code("device_offline"))
+    })?;
     audit::record(
         &mut &state.database,
         &actor.actor(),
