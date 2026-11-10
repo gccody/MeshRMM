@@ -74,12 +74,10 @@ pub async fn sweep(state: &AppState, now: i64) -> anyhow::Result<()> {
     let lost = runs::sweep_lost(&mut &state.database, now).await?;
     for (run_id, device_id, action) in &lost {
         tracing::info!(run_id, device_id, "an application run never reported");
+        state.automation.device_changed(device_id);
         if matches!(action, Action::Install | Action::Update) {
             crate::alerts::applications::run_finished(state, run_id).await;
         }
-    }
-    if !lost.is_empty() {
-        state.automation.wake();
     }
     Ok(())
 }
@@ -116,7 +114,7 @@ pub async fn activity_reported(
         }
     }
     if !lost.is_empty() {
-        state.automation.wake();
+        state.automation.device_changed(device_id);
         state.alerts.wake();
     }
 }
@@ -140,7 +138,7 @@ pub async fn scan_reported(
     }
     tracing::debug!(device_id, "stored a device's application scan");
     match runs::finish_scans(&mut &state.database, device_id, &run_ids, now).await {
-        Ok(finished) if !finished.is_empty() => state.automation.wake(),
+        Ok(finished) if !finished.is_empty() => state.automation.device_changed(device_id),
         Ok(_) => {}
         Err(error) => {
             tracing::warn!(device_id, %error, "could not finish a device's application scans");
@@ -190,7 +188,7 @@ pub async fn result_reported(
     }
     tracing::info!(device_id, run_id, failed, "recorded an application run");
     // A job's counts changed, and the device may take its next run.
-    state.automation.wake();
+    state.automation.device_changed(device_id);
     if failed {
         crate::alerts::applications::run_finished(state, run_id).await;
     }

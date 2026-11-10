@@ -27,7 +27,8 @@ use crate::{
     db::{
         self, Executor,
         tables::{
-            AutomationPolicyDevices, FileDeliveries, JobDevices, Jobs, ScriptRuns, UpdateRuns,
+            Agents, AutomationPolicyDevices, FileDeliveries, JobDevices, Jobs, ScriptRuns,
+            UpdateRuns,
         },
     },
     http::AppState,
@@ -55,32 +56,45 @@ const EXPIRED: &str = "The device didn't connect before the job expired";
 const DELETED: &str = "The device was deleted";
 const FILE_GONE: &str = "The file was deleted from the toolbox before it was sent";
 
-/// Misses the waiting devices of jobs that expired by `now`, and of devices
-/// that were deleted. Returns how many it missed.
-pub async fn expire(state: &AppState, now: i64) -> db::Result<u64> {
+/// Misses the waiting devices of the unfinished jobs that expired by `now`,
+/// or of those that expired after `since`, so each step looks only at the
+/// jobs that expired since the last. Returns the jobs.
+pub async fn expire(state: &AppState, since: Option<i64>, now: i64) -> db::Result<Vec<String>> {
     let database = &state.database;
-    let expired = database
-        .execute(
-            &Query::update()
-                .table(JobDevices::Table)
-                .value(JobDevices::State, DeviceState::Missed.as_str())
-                .value(JobDevices::Detail, EXPIRED)
-                .value(JobDevices::UpdatedAt, now)
-                .and_where(Expr::col(JobDevices::State).eq(DeviceState::Waiting.as_str()))
-                .and_where(
-                    Expr::col(JobDevices::JobId).in_subquery(
-                        Query::select()
-                            .column(Jobs::Id)
-                            .from(Jobs::Table)
-                            .and_where(Expr::col(Jobs::ExpiresAt).lte(now))
-                            .and_where(Expr::col(Jobs::FinishedAt).is_null())
-                            .to_owned(),
-                    ),
-                )
-                .to_owned(),
-        )
-        .await?;
-    let deleted = database
+    let mut select = Query::select();
+    select
+        .column(Jobs::Id)
+        .from(Jobs::Table)
+        .and_where(Expr::col(Jobs::FinishedAt).is_null())
+        .and_where(Expr::col(Jobs::ExpiresAt).lte(now));
+    if let Some(since) = since {
+        select.and_where(Expr::col(Jobs::ExpiresAt).gt(since));
+    }
+    let expired: Vec<(String,)> = database.fetch_all(&select).await?;
+    let expired = expired.into_iter().map(|(id,)| id).collect::<Vec<_>>();
+    for chunk in expired.chunks(QUEUE_CHUNK) {
+        database
+            .execute(
+                &Query::update()
+                    .table(JobDevices::Table)
+                    .value(JobDevices::State, DeviceState::Missed.as_str())
+                    .value(JobDevices::Detail, EXPIRED)
+                    .value(JobDevices::UpdatedAt, now)
+                    .and_where(Expr::col(JobDevices::JobId).is_in(chunk.iter().cloned()))
+                    .and_where(Expr::col(JobDevices::State).eq(DeviceState::Waiting.as_str()))
+                    .to_owned(),
+            )
+            .await?;
+    }
+    Ok(expired)
+}
+
+/// Misses the waiting and queued parts of devices that were deleted. Their
+/// deletion misses them at once; this is for a server that stopped first.
+/// Returns how many.
+pub async fn miss_deleted(state: &AppState, now: i64) -> db::Result<u64> {
+    state
+        .database
         .execute(
             &Query::update()
                 .table(JobDevices::Table)
@@ -91,14 +105,88 @@ pub async fn expire(state: &AppState, now: i64) -> db::Result<u64> {
                     Expr::col(JobDevices::State)
                         .is_in([DeviceState::Waiting.as_str(), DeviceState::Queued.as_str()]),
                 )
-                .and_where(Expr::col(JobDevices::DeviceId).not_in_subquery(crate::agents::active()))
+                // Looks up the agent of each waiting or queued part, rather
+                // than reading every agent.
+                .and_where(
+                    Expr::exists(
+                        crate::agents::active()
+                            .and_where(
+                                Expr::col((Agents::Table, Agents::Id))
+                                    .equals((JobDevices::Table, JobDevices::DeviceId)),
+                            )
+                            .to_owned(),
+                    )
+                    .not(),
+                )
                 .to_owned(),
         )
-        .await?;
-    Ok(expired + deleted)
+        .await
 }
 
-/// Queues the waiting devices whose Agent is connected. Returns how many.
+/// The most devices or jobs one statement names.
+pub const QUEUE_CHUNK: usize = 500;
+
+/// Queues the waiting parts of these devices, whose Agent connected, in
+/// jobs that haven't expired. Returns the devices with parts queued.
+pub async fn queue_devices(
+    state: &AppState,
+    device_ids: &[String],
+    now: i64,
+) -> db::Result<Vec<String>> {
+    let mut queued = Vec::new();
+    for chunk in device_ids.chunks(QUEUE_CHUNK) {
+        let updated = state
+            .database
+            .execute(
+                &Query::update()
+                    .table(JobDevices::Table)
+                    .value(JobDevices::State, DeviceState::Queued.as_str())
+                    .value(JobDevices::UpdatedAt, now)
+                    .and_where(Expr::col(JobDevices::State).eq(DeviceState::Waiting.as_str()))
+                    .and_where(Expr::col(JobDevices::DeviceId).is_in(chunk.iter().cloned()))
+                    // Expired jobs' waiting devices are missed, not started.
+                    .and_where(
+                        Expr::col(JobDevices::JobId).in_subquery(
+                            Query::select()
+                                .column(Jobs::Id)
+                                .from(Jobs::Table)
+                                .and_where(Expr::col(Jobs::FinishedAt).is_null())
+                                .and_where(Expr::col(Jobs::ExpiresAt).gt(now))
+                                .to_owned(),
+                        ),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        if updated > 0 {
+            queued.extend(chunk.iter().cloned());
+        }
+    }
+    Ok(queued)
+}
+
+/// The devices waiting in these jobs.
+pub async fn waiting_devices(state: &AppState, job_ids: &[String]) -> db::Result<Vec<String>> {
+    let mut devices = Vec::new();
+    for chunk in job_ids.chunks(QUEUE_CHUNK) {
+        let rows: Vec<(String,)> = state
+            .database
+            .fetch_all(
+                &Query::select()
+                    .column(JobDevices::DeviceId)
+                    .from(JobDevices::Table)
+                    .and_where(Expr::col(JobDevices::JobId).is_in(chunk.iter().cloned()))
+                    .and_where(Expr::col(JobDevices::State).eq(DeviceState::Waiting.as_str()))
+                    .to_owned(),
+            )
+            .await?;
+        devices.extend(rows.into_iter().map(|(id,)| id));
+    }
+    Ok(devices)
+}
+
+/// Queues every waiting device whose Agent is connected, for what the steps
+/// missed. Returns how many.
 pub async fn queue_connected(state: &AppState, now: i64) -> db::Result<u64> {
     let database = &state.database;
     let waiting: Vec<(String,)> = database
@@ -362,6 +450,8 @@ pub async fn dispatch(state: &AppState, now: i64) -> anyhow::Result<bool> {
         let Some(job) = jobs.get(&row.job_id) else {
             continue;
         };
+        // Its counts may change below.
+        state.automation.recount(&job.id);
         if Kind::parse(&job.kind) == Some(Kind::Wake) {
             wakes
                 .entry(&job.id)
@@ -745,13 +835,28 @@ async fn unqueue(
 }
 
 /// Misses the device's queued and waiting parts of jobs, now it is deleted,
-/// and takes it out of the policies that chose it.
+/// and takes it out of the policies that chose it. Returns the jobs whose
+/// parts it missed.
 pub async fn device_removed(
     executor: &mut impl Executor,
     device_id: &str,
     now: i64,
-) -> db::Result<u64> {
-    let missed = executor
+) -> db::Result<Vec<String>> {
+    let unstarted = || {
+        Expr::col(JobDevices::State)
+            .is_in([DeviceState::Waiting.as_str(), DeviceState::Queued.as_str()])
+    };
+    let jobs: Vec<(String,)> = executor
+        .fetch_all(
+            &Query::select()
+                .column(JobDevices::JobId)
+                .from(JobDevices::Table)
+                .and_where(Expr::col(JobDevices::DeviceId).eq(device_id))
+                .and_where(unstarted())
+                .to_owned(),
+        )
+        .await?;
+    executor
         .execute(
             &Query::update()
                 .table(JobDevices::Table)
@@ -759,10 +864,7 @@ pub async fn device_removed(
                 .value(JobDevices::Detail, DELETED)
                 .value(JobDevices::UpdatedAt, now)
                 .and_where(Expr::col(JobDevices::DeviceId).eq(device_id))
-                .and_where(
-                    Expr::col(JobDevices::State)
-                        .is_in([DeviceState::Waiting.as_str(), DeviceState::Queued.as_str()]),
-                )
+                .and_where(unstarted())
                 .to_owned(),
         )
         .await?;
@@ -774,7 +876,7 @@ pub async fn device_removed(
                 .to_owned(),
         )
         .await?;
-    Ok(missed)
+    Ok(jobs.into_iter().map(|(id,)| id).collect())
 }
 
 #[cfg(test)]

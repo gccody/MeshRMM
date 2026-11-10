@@ -223,7 +223,7 @@ pub async fn start(
     )
     .await?;
     transaction.commit().await?;
-    state.automation.wake();
+    state.automation.job_changed(&created.id);
     let detail = detail(&state, &actor, &created.id).await?;
     Ok((StatusCode::CREATED, Json(detail)))
 }
@@ -324,6 +324,6 @@ pub async fn cancel(
     )
     .await?;
     transaction.commit().await?;
-    state.automation.wake();
+    state.automation.job_changed(&id);
     Ok(Json(detail(&state, &actor, &id).await?))
 }

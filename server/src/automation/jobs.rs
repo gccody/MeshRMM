@@ -991,6 +991,44 @@ pub async fn unfinished(executor: &mut impl Executor) -> db::Result<Vec<String>>
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
+/// The unfinished jobs these devices are waiting, queued or started in.
+pub async fn unfinished_of_devices(
+    executor: &mut impl Executor,
+    device_ids: &[String],
+) -> db::Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for chunk in device_ids.chunks(500) {
+        let rows: Vec<(String,)> = executor
+            .fetch_all(
+                &Query::select()
+                    .distinct()
+                    .column((JobDevices::Table, JobDevices::JobId))
+                    .from(JobDevices::Table)
+                    .inner_join(
+                        Jobs::Table,
+                        Expr::col((Jobs::Table, Jobs::Id))
+                            .equals((JobDevices::Table, JobDevices::JobId)),
+                    )
+                    // Naming the states lets the lookup use the index on
+                    // (state, device_id).
+                    .and_where(Expr::col((JobDevices::Table, JobDevices::State)).is_in([
+                        DeviceState::Waiting.as_str(),
+                        DeviceState::Queued.as_str(),
+                        DeviceState::Started.as_str(),
+                    ]))
+                    .and_where(
+                        Expr::col((JobDevices::Table, JobDevices::DeviceId))
+                            .is_in(chunk.iter().cloned()),
+                    )
+                    .and_where(Expr::col((Jobs::Table, Jobs::FinishedAt)).is_null())
+                    .to_owned(),
+            )
+            .await?;
+        ids.extend(rows.into_iter().map(|(id,)| id));
+    }
+    Ok(ids)
+}
+
 async fn with_counts(
     executor: &mut impl Executor,
     rows: Vec<JobRow>,

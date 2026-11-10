@@ -1154,3 +1154,178 @@ async fn maintenance_purges_old_jobs() {
         app.finish().await;
     }
 }
+
+async fn step(app: &App, now: i64) {
+    automation::step(&app.state, now).await.unwrap();
+}
+
+/// Marks a device deleted without telling the engine, as if the server had
+/// stopped in between.
+async fn mark_deleted(app: &App, device_id: &str) {
+    use meshrmm_server::db::tables::Agents;
+    use sea_query::{Expr, ExprTrait, Query};
+    app.db()
+        .execute(
+            &Query::update()
+                .table(Agents::Table)
+                .value(Agents::DeletionRequestedAt, now_ms())
+                .and_where(Expr::col(Agents::Id).eq(device_id))
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn agents_that_reconnect_together_start_without_full_passes() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let mut agents = Vec::new();
+        for index in 0..10 {
+            agents.push(app.enroll(&mut admin, &format!("DESK-{index}")).await);
+        }
+        let script = create_script(&mut admin, "Inventory", "cmd", false).await;
+        let devices = agents
+            .iter()
+            .map(|agent| agent.device_id.clone())
+            .collect::<Vec<_>>();
+        let started = start_job(
+            &mut admin,
+            json!({
+                "script_id": script, "run_as": "system", "target": "devices",
+                "device_ids": devices, "offline": "wait", "wait_hours": 24,
+            }),
+        )
+        .await;
+        let id = started["id"].as_str().unwrap().to_owned();
+        // A restart's first pass, with every device offline.
+        let now = now_ms();
+        pass(&app, now).await;
+        let engine = &app.state.automation;
+        let full = engine.full_passes();
+        let recounted = engine.jobs_recounted();
+
+        // The Agents reconnect within a quarter of a second, and each starts
+        // its run as it connects.
+        let mut connections = Vec::new();
+        for (index, agent) in agents.iter().enumerate() {
+            let mut connection = app.state.agents.connect(&agent.device_id);
+            engine.device_connected(&agent.device_id);
+            step(&app, now + 25 * index as i64 + 1).await;
+            assert_eq!(runs(&mut connection).len(), 1, "{name}: device {index}");
+            connections.push((agent, connection));
+        }
+        assert_eq!(engine.full_passes(), full, "{name}: no full pass");
+        assert_eq!(
+            engine.jobs_recounted(),
+            recounted,
+            "{name}: and no recount within a second of the last"
+        );
+        step(&app, now + SECOND_MS).await;
+        assert_eq!(
+            engine.jobs_recounted(),
+            recounted + 1,
+            "{name}: the job is recounted once for them all"
+        );
+        assert_eq!(job(&mut admin, &id).await["counts"]["running"], 10);
+
+        // The job finishes on the first recount after its last device reports.
+        let ran = automation::jobs::devices(&mut app.db(), &id, now_ms())
+            .await
+            .unwrap();
+        for device in &ran {
+            let agent = agents
+                .iter()
+                .find(|agent| agent.device_id == device.device_id)
+                .unwrap();
+            let reported = agent
+                .report(
+                    &format!("script-runs/{}/result", device.run_id.as_ref().unwrap()),
+                    report("completed", Some(0)),
+                )
+                .await;
+            assert_eq!(reported.status, StatusCode::NO_CONTENT, "{name}");
+        }
+        step(&app, now + SECOND_MS + 500).await;
+        assert!(
+            job(&mut admin, &id).await["finished_at_unix_ms"].is_null(),
+            "{name}: reports within a second wait for the next recount"
+        );
+        step(&app, now + 2 * SECOND_MS).await;
+        let finished = job(&mut admin, &id).await;
+        assert!(finished["finished_at_unix_ms"].is_i64(), "{name}");
+        assert_eq!(finished["counts"]["succeeded"], 10);
+        assert_eq!(engine.full_passes(), full, "{name}: still no full pass");
+        drop(connections);
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn the_full_pass_catches_what_the_engine_was_not_told() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let quiet = app.enroll(&mut admin, "QUIET").await;
+        let deleted = app.enroll(&mut admin, "DELETED").await;
+        let lost = app.enroll(&mut admin, "LOST").await;
+        let script = create_script(&mut admin, "Inventory", "cmd", false).await;
+        let started = start_job(
+            &mut admin,
+            json!({
+                "script_id": script, "run_as": "system", "target": "devices",
+                "device_ids": [quiet.device_id, deleted.device_id, lost.device_id],
+                "offline": "wait", "wait_hours": 24,
+            }),
+        )
+        .await;
+        let id = started["id"].as_str().unwrap().to_owned();
+        let now = now_ms();
+        pass(&app, now).await;
+        let engine = &app.state.automation;
+        let full = engine.full_passes();
+        let outcome = |job: &Value, device: &common::Agent| {
+            job["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|part| part["device_id"] == device.device_id.as_str())
+                .unwrap()
+                .clone()
+        };
+
+        // A device deleted while it waits misses the job at once.
+        admin
+            .delete(&format!("/v1/agents/{}", deleted.device_id))
+            .await;
+        step(&app, now + SECOND_MS).await;
+        let after = job(&mut admin, &id).await;
+        assert_eq!(outcome(&after, &deleted)["outcome"], "missed", "{name}");
+        assert_eq!(
+            outcome(&after, &deleted)["detail"],
+            "The device was deleted"
+        );
+        assert_eq!(after["counts"]["missed"], 1, "{name}: and is counted");
+
+        // An Agent whose connection the engine wasn't told of, and a device
+        // deleted while the server was stopping, wait for the full pass.
+        let mut connection = app.state.agents.connect(&quiet.device_id);
+        mark_deleted(&app, &lost.device_id).await;
+        step(&app, now + 10 * SECOND_MS).await;
+        assert!(runs(&mut connection).is_empty(), "{name}");
+        assert_eq!(engine.full_passes(), full, "{name}");
+        step(&app, now + automation::RECONCILE_INTERVAL_MS).await;
+        assert_eq!(engine.full_passes(), full + 1, "{name}");
+        assert_eq!(
+            runs(&mut connection).len(),
+            1,
+            "{name}: the quiet device runs"
+        );
+        let after = job(&mut admin, &id).await;
+        assert_eq!(outcome(&after, &quiet)["outcome"], "running", "{name}");
+        assert_eq!(outcome(&after, &lost)["outcome"], "missed", "{name}");
+        assert_eq!(outcome(&after, &lost)["detail"], "The device was deleted");
+        app.finish().await;
+    }
+}

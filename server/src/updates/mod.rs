@@ -105,14 +105,12 @@ pub async fn sweep(state: &AppState, now: i64) -> anyhow::Result<()> {
     let lost = runs::sweep_lost(&mut &state.database, now).await?;
     for (run_id, device_id, kind) in &lost {
         tracing::info!(run_id, device_id, "an update run never reported");
+        state.automation.device_changed(device_id);
         publish_run(state, run_id).await;
         publish_device(state, device_id).await;
         if *kind == runs::Kind::Install {
             crate::alerts::update_install_finished(state, run_id).await;
         }
-    }
-    if !lost.is_empty() {
-        state.automation.wake();
     }
     Ok(())
 }
@@ -247,7 +245,7 @@ pub async fn scan_reported(
         publish_run(state, run_id).await;
     }
     if !finished.is_empty() {
-        state.automation.wake();
+        state.automation.device_changed(device_id);
     }
     publish_device(state, device_id).await;
     // Pending updates and restarts are what some alert rules watch.
@@ -305,7 +303,7 @@ pub async fn install_reported(
     tracing::info!(device_id, run_id, failed, "recorded an update install");
     publish_run(state, run_id).await;
     publish_device(state, device_id).await;
-    state.automation.wake();
+    state.automation.device_changed(device_id);
     if failed {
         crate::alerts::update_install_finished(state, run_id).await;
     }
