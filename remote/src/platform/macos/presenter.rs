@@ -49,6 +49,15 @@ impl Shared {
     }
 }
 
+/// Lets frames through again when dropped, as a reset ends, answered or not.
+struct Resetting(Arc<Shared>);
+
+impl Drop for Resetting {
+    fn drop(&mut self) {
+        self.0.resetting.store(false, Ordering::Release);
+    }
+}
+
 pub struct Presenter {
     shared: Arc<Shared>,
     stopped: bool,
@@ -177,12 +186,19 @@ impl Presenter {
         current.codec == next.codec && current.pixel_format == next.pixel_format
     }
 
+    /// Moves the window to a replacement stream. The main thread applies it,
+    /// so a busy main thread holds the reset up and it may time out.
+    ///
+    /// The reset is handed to the main thread before this returns; the
+    /// future only waits for the answer and borrows nothing, so the caller
+    /// can release the presenter first. Frames published meanwhile are
+    /// dropped.
     pub fn reset_stream(
         &self,
         format: VideoFormat,
         display: Display,
         displays: Vec<Display>,
-    ) -> anyhow::Result<()> {
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
         self.shared.resetting.store(true, Ordering::Release);
         self.shared.recovering.store(true, Ordering::Release);
         if let Ok(mut queued) = self.shared.queued.lock() {
@@ -193,7 +209,8 @@ impl Presenter {
         }
 
         let id = self.shared.id;
-        let (reset_tx, reset_rx) = std::sync::mpsc::sync_channel(1);
+        let resetting = Resetting(Arc::clone(&self.shared));
+        let (reset_tx, reset_rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
         DispatchQueue::main().exec_async(move || {
             let result = UI.with(|state| {
                 let mut state = state
@@ -213,12 +230,16 @@ impl Presenter {
             });
             let _ = reset_tx.send(result);
         });
-        let result = reset_rx
-            .recv_timeout(Duration::from_secs(5))
-            .context("macOS main thread did not reset the video decoder")
-            .and_then(|result| result);
-        self.shared.resetting.store(false, Ordering::Release);
-        result
+        async move {
+            let _resetting = resetting;
+            tokio::time::timeout(Duration::from_secs(5), reset_rx)
+                .await
+                .context("macOS main thread did not reset the video decoder")
+                .and_then(|answer| {
+                    answer.context("macOS main thread did not reset the video decoder")
+                })
+                .and_then(|result| result)
+        }
     }
 
     pub fn set_agent_pointer_display(&self, display_id: Option<meshrmm_protocol::DisplayId>) {

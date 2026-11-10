@@ -19,7 +19,7 @@ use crate::clipboard::ClipboardSync;
 
 const CLIPBOARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct ServiceInbox {
     senders: HashMap<&'static str, mpsc::Sender<SessionMessage>>,
     pub(super) routes: HashMap<&'static str, Arc<ServiceRoute>>,
