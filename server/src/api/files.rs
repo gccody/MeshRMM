@@ -53,6 +53,44 @@ fn unexpected() -> ApiError {
     )
 }
 
+/// Asks the device for the change `action` and returns its answer. A change
+/// the device doesn't confirm, because it didn't answer in time or
+/// disconnected while it worked, is recorded as asked for, with what was
+/// asked (`asked`), `result` `unconfirmed` and the `error`: the device may
+/// have made it, or may still. One it confirms is recorded by the caller,
+/// with what it did.
+async fn ask_change(
+    state: &AppState,
+    actor: &Authorized,
+    device_id: &str,
+    run_as: RunAs,
+    operation: FileOperation,
+    action: &str,
+    mut asked: serde_json::Value,
+) -> Result<FileReply, ApiError> {
+    let answer = files::ask(state, actor, device_id, run_as, operation).await;
+    if let Err(error) = &answer
+        && files::unconfirmed(error)
+    {
+        asked["run_as"] = run_as.as_str().into();
+        asked["result"] = "unconfirmed".into();
+        asked["error"] = error.code().into();
+        relay::record(state, &actor.actor(), device_id, action, asked).await;
+    }
+    answer
+}
+
+/// The audit log's view of the paths a change names.
+fn asked_paths(paths: &[String]) -> serde_json::Value {
+    json!({
+        "paths": paths.iter().take(AUDITED_PATHS).collect::<Vec<_>>(),
+        "count": paths.len(),
+    })
+}
+
+/// The most paths an audit event lists.
+const AUDITED_PATHS: usize = 100;
+
 fn check_paths(paths: &[String]) -> Result<(), ApiError> {
     if paths.is_empty() || paths.len() > MAX_FILE_BATCH {
         return Err(ApiError::bad_request(format!(
@@ -178,9 +216,20 @@ pub async fn create_folder(
 ) -> Result<(StatusCode, Json<EntryView>), ApiError> {
     files::require(&actor, Permission::FilesManage, request.run_as)?;
     let device_id = device(&state, &id).await?;
+    let asked = json!({ "path": request.path });
     let operation = FileOperation::CreateFolder { path: request.path };
-    let view =
-        entry_view(files::ask(&state, &actor, &device_id, request.run_as, operation).await?)?;
+    let view = entry_view(
+        ask_change(
+            &state,
+            &actor,
+            &device_id,
+            request.run_as,
+            operation,
+            "files.create_folder",
+            asked,
+        )
+        .await?,
+    )?;
     relay::record(
         &state,
         &actor.actor(),
@@ -211,12 +260,24 @@ pub async fn rename(
 ) -> Result<Json<EntryView>, ApiError> {
     files::require(&actor, Permission::FilesManage, request.run_as)?;
     let device_id = device(&state, &id).await?;
+    // Not `name`, which the audit log reads as the target's.
+    let asked = json!({ "path": request.path, "new_name": request.name });
     let operation = FileOperation::Rename {
         path: request.path.clone(),
         name: request.name,
     };
-    let view =
-        entry_view(files::ask(&state, &actor, &device_id, request.run_as, operation).await?)?;
+    let view = entry_view(
+        ask_change(
+            &state,
+            &actor,
+            &device_id,
+            request.run_as,
+            operation,
+            "files.rename",
+            asked,
+        )
+        .await?,
+    )?;
     relay::record(
         &state,
         &actor.actor(),
@@ -231,9 +292,9 @@ pub async fn rename(
 /// The audit log's view of a batch: what was done, and why the rest wasn't.
 fn batch_metadata(batch: &FileBatch) -> serde_json::Value {
     json!({
-        "paths": batch.done.iter().take(100).collect::<Vec<_>>(),
+        "paths": batch.done.iter().take(AUDITED_PATHS).collect::<Vec<_>>(),
         "count": batch.done.len(),
-        "failed": batch.failed.iter().take(100).map(|failure| json!({
+        "failed": batch.failed.iter().take(AUDITED_PATHS).map(|failure| json!({
             "path": failure.path,
             "code": failure.error.code.as_str(),
         })).collect::<Vec<_>>(),
@@ -260,12 +321,22 @@ pub async fn move_entries(
     files::require(&actor, Permission::FilesManage, request.run_as)?;
     check_paths(&request.paths)?;
     let device_id = device(&state, &id).await?;
+    let mut asked = asked_paths(&request.paths);
+    asked["destination"] = request.destination.clone().into();
     let operation = FileOperation::Move {
         paths: request.paths,
         destination: request.destination.clone(),
     };
-    let FileReply::Batch(batch) =
-        files::ask(&state, &actor, &device_id, request.run_as, operation).await?
+    let FileReply::Batch(batch) = ask_change(
+        &state,
+        &actor,
+        &device_id,
+        request.run_as,
+        operation,
+        "files.move",
+        asked,
+    )
+    .await?
     else {
         return Err(unexpected());
     };
@@ -299,12 +370,22 @@ pub async fn delete(
     files::require(&actor, Permission::FilesManage, request.run_as)?;
     check_paths(&request.paths)?;
     let device_id = device(&state, &id).await?;
+    let mut asked = asked_paths(&request.paths);
+    asked["trash"] = request.trash.into();
     let operation = FileOperation::Delete {
         paths: request.paths,
         trash: request.trash,
     };
-    let FileReply::Batch(batch) =
-        files::ask(&state, &actor, &device_id, request.run_as, operation).await?
+    let FileReply::Batch(batch) = ask_change(
+        &state,
+        &actor,
+        &device_id,
+        request.run_as,
+        operation,
+        "files.delete",
+        asked,
+    )
+    .await?
     else {
         return Err(unexpected());
     };
@@ -590,7 +671,22 @@ pub async fn finish_upload(
         sha256: sha256.clone(),
         overwrite: upload.overwrite,
     };
-    let finished = files::ask(&state, &actor, &upload.device_id, upload.run_as, operation).await;
+    let asked = json!({
+        "path": upload.path,
+        "size": upload.size,
+        "sha256": sha256,
+        "overwrite": upload.overwrite,
+    });
+    let finished = ask_change(
+        &state,
+        &actor,
+        &upload.device_id,
+        upload.run_as,
+        operation,
+        "files.upload",
+        asked,
+    )
+    .await;
     if let Err(error) = &finished
         && error.code() == Some("checksum_mismatch")
     {

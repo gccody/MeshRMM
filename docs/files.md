@@ -99,7 +99,9 @@ With `files.manage`:
 - **Copy path** copies the chosen entry's path, or the folder's.
 
 A move or delete of many entries does what it can and reports each one it
-couldn't, such as one in use or denied, so you can try those again.
+couldn't, such as one in use or denied, so you can try those again. One
+that runs out of time stops between entries and says which it didn't get
+to (see [Waiting for the device](#waiting-for-the-device)).
 
 ## Downloads
 
@@ -239,6 +241,15 @@ device, with `run_as`:
   `files.move` (`paths` moved, `destination`, the `failed` ones with their
   code) and `files.delete` (`paths` deleted, `trash`, the `failed` ones).
   A move or delete that did nothing isn't recorded.
+- A change the device never confirms, because it didn't answer in time or
+  disconnected while it worked, is recorded under the same action with what
+  was asked for: `files.create_folder` (`path`), `files.rename` (`path`,
+  `new_name`), `files.move` (the `paths` asked for, their `count`,
+  `destination`), `files.delete` (`paths`, `count`, `trash`) or
+  `files.upload` (`path`, `size`, `sha256`, `overwrite`), with `result`
+  `unconfirmed` and the `error` (`device_timeout` or `device_disconnected`).
+  The device may have made it, or may still. One the device says it didn't
+  start (`timed_out`) isn't recorded.
 
 ## Errors
 
@@ -246,15 +257,54 @@ The Agent's refusals reach the website with a code and a sentence that names
 the path: `not_found`, `access_denied`, `already_exists`, `not_a_directory`,
 `is_a_directory`, `invalid_path`, `invalid_name`, `invalid_move`, `no_user`,
 `too_large`, `no_space`, `checksum_mismatch`, `offset_mismatch`, `changed`,
-`trash_unavailable`, `busy` and `failed`. A device that is offline is
-`device_offline`; one that disconnects while it works on a request,
-`device_disconnected`; one that doesn't answer in time (30 seconds, two
-minutes for moves, deletes, finishing an upload and preparing a download),
-`device_timeout`. The page shows a folder it can't open with what to do:
+`trash_unavailable`, `busy`, `timed_out` and `failed`. A device that is
+offline is `device_offline`; one that disconnects while it works on a
+request, `device_disconnected`; one that doesn't answer in time,
+`device_timeout`. Both of those leave unknown whether the device did what
+was asked, so a change is recorded as unconfirmed (see [Audit](#audit)).
+See [Waiting for the device](#waiting-for-the-device) for `timed_out` and
+the Agent's `busy`. The page shows a folder it can't open with what to do:
 go up, try again, or switch accounts (access denied as the user, or nobody
 signed in). On a Mac, root is still kept out of some folders (Desktop,
 Documents, Downloads, other apps' data) unless the MeshRMM Agent has **Full
 Disk Access**; the page says so when that's the cause.
+
+## Waiting for the device
+
+The server waits 30 seconds for an answer, or two minutes for moves,
+deletes, finishing an upload and preparing a download, then answers the
+website `device_timeout` and forgets the request. It sends that wait with
+the request, `timeout_ms`, as a length of time rather than a time of day,
+since the two computers' clocks differ; the Agent counts it from the
+request's arrival on its monotonic clock, and answers 5 seconds before it
+ends (a quarter of the wait, for one shorter than 20 seconds), so its
+answer arrives while the server still waits.
+
+- The Agent runs four operations at once; more wait their turn. One whose
+  time runs out while it waits isn't started, and answers `timed_out`
+  (504): nothing was changed.
+- A move or delete checks its time before each entry, and stops there: its
+  answer lists what it did as `done`, and every entry it didn't get to as
+  `failed` with `timed_out`, untouched. A move to another volume, a copy
+  then a delete, also checks before each entry it copies and each 16 MB of
+  a file. One that stops while it copies removes its partial copy and keeps
+  the original. Once the copy is whole, the original is deleted however
+  long that takes, so running out of time never leaves neither, nor a
+  half-deleted original beside its copy. A folder being deleted is deleted
+  in one go,
+  by the standard library's removal, which a link swapped in part way
+  can't turn on what it points to; so one large folder can outlast the
+  wait, and is then `device_timeout`. Preparing a download stops
+  measuring at its time, `timed_out`.
+- One system call can't be stopped. A rename, listing or delete on a drive
+  or network folder that stops answering may never return. Five seconds
+  after the server stopped waiting for it, it stops holding its turn, so
+  the file browser keeps working; its thread can't be ended, so it's left
+  behind, and whatever it answers when it returns is dropped. While eight
+  are left behind, the Agent refuses new requests with `busy` (429), and
+  one more that doesn't return keeps its turn: the Agent never has more
+  than twelve threads working on files. Those left behind end when they
+  return, or when the Agent restarts.
 
 ## How it works
 
@@ -338,9 +388,12 @@ and `files/` (`account`, `listing`, `operations`, `uploads`, `transfer`,
   listings and changes through a stand-in Agent, who may do what as whom,
   API tokens, downloads streamed, checked, resumed and aborted, archives,
   uploads interrupted and resumed, checksum and disk-full failures, the
-  transfer limits and the audit log.
+  transfer limits, the wait each request carries, and the audit log,
+  unconfirmed changes included.
 - `cargo test -p meshrmm-agent files` reads, sorts and pages real folders,
   creates, renames, moves and deletes, writes and checks uploads, and builds
-  ZIP archives that unpack.
+  ZIP archives that unpack; requests whose time runs out before their turn,
+  batches and a copy to another volume stopped at their deadline, and
+  operations that never return, left behind up to the bound.
 - `npm test` in `dashboard` covers paths on each platform, the listing's
   windowing, folder uploads and the SHA-256 the browser computes.

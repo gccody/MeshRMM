@@ -51,6 +51,11 @@ pub struct FileRequest {
     /// on the device in a while, when company policy shows one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notification: Option<String>,
+    /// How long the server waits for the answer, in milliseconds. The Agent
+    /// measures it from when the request arrives, on its monotonic clock
+    /// (not a time of day: the two computers' clocks differ), and doesn't
+    /// start, or stops between entries, what it couldn't answer in time.
+    pub timeout_ms: u64,
     pub operation: FileOperation,
 }
 
@@ -314,8 +319,12 @@ pub enum FileErrorCode {
     Changed,
     /// The entry can't go to a Recycle Bin or Trash; delete it permanently.
     TrashUnavailable,
-    /// The Agent is busy with as many transfers as it runs at once.
+    /// The Agent is busy with as many transfers as it runs at once, or with
+    /// as many file operations that never returned as it leaves behind.
     Busy,
+    /// The Agent ran out of the time the server waits: it didn't start the
+    /// operation, or stopped an entry of a move or delete before its end.
+    TimedOut,
     /// A folder can't go into itself, and the like.
     InvalidMove,
     Failed,
@@ -339,6 +348,7 @@ impl FileErrorCode {
             Self::Changed => "changed",
             Self::TrashUnavailable => "trash_unavailable",
             Self::Busy => "busy",
+            Self::TimedOut => "timed_out",
             Self::InvalidMove => "invalid_move",
             Self::Failed => "failed",
         }
@@ -532,6 +542,7 @@ mod tests {
             request_id: "r1".into(),
             run_as: RunAs::System,
             notification: None,
+            timeout_ms: 30_000,
             operation: FileOperation::List {
                 path: "C:\\Users".into(),
                 offset: 0,
@@ -547,12 +558,13 @@ mod tests {
         assert_eq!(json["operation"]["op"], "list");
         assert_eq!(json["operation"]["sort"], "modified");
         assert!(json.get("notification").is_none());
+        assert_eq!(json["timeout_ms"], 30_000);
         assert_eq!(
             serde_json::from_value::<FileRequest>(json).unwrap(),
             request
         );
         let roots: FileRequest = serde_json::from_str(
-            r#"{"request_id":"r2","run_as":"user","operation":{"op":"roots"}}"#,
+            r#"{"request_id":"r2","run_as":"user","timeout_ms":5,"operation":{"op":"roots"}}"#,
         )
         .unwrap();
         assert_eq!(roots.operation, FileOperation::Roots);
