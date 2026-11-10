@@ -138,8 +138,9 @@ to its user's `~/.local/state/meshrmm/agent-session-helper.log`.
 
 ## Updates
 
-The coordinator updates the Agent as the other platforms do: every six
-hours, and postponed while a remote session is live, it downloads a newer
+The coordinator updates the Agent as the other platforms do: on the
+[spread-out six-hour schedule](devices.md#agent-updates), and postponed while
+a remote session is live, it downloads a newer
 `agent-linux-x64` or `agent-linux-arm64` release and checks its SHA-256 and
 [release signature](releases.md#release-signatures). It stages the release
 beside the installed executable and starts its `--apply-update` in a

@@ -18,7 +18,10 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use crate::private_directory;
 use crate::remote::config::Config;
 use crate::service::service_name_for_path;
-use crate::update_policy::{MAX_ATTEMPTS_PER_VERSION, UpdateAttempts, read_attempts};
+use crate::update_policy::{
+    MAX_ATTEMPTS_PER_VERSION, NEXT_CHECK_FILE, NextCheck, UpdateAttempts, read_attempts,
+    read_next_check, unix_seconds,
+};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -46,17 +49,16 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
     let manifest_bytes = download(&http, &config.update_manifest_url, MAX_MANIFEST_BYTES)
         .context("failed to download the Agent update manifest")?;
     let manifest = UpdateManifest::parse(&manifest_bytes)?;
+    let config_directory = config
+        .config_path
+        .parent()
+        .context("Agent configuration has no parent directory")?;
     let Some(release) = manifest.newer_release(TARGET, CURRENT_VERSION)? else {
         return Ok(None);
     };
 
-    let update_directory = prepare_update_directory(
-        config
-            .config_path
-            .parent()
-            .context("Agent configuration has no parent directory")?,
-    )
-    .context("failed to prepare a private Agent update directory")?;
+    let update_directory = prepare_update_directory(config_directory)
+        .context("failed to prepare a private Agent update directory")?;
     let attempts_path = update_directory.join(ATTEMPTS_FILE);
     let previous = read_attempts(&attempts_path);
     let Some(attempt) = UpdateAttempts::next(previous.as_ref(), &release.version, unix_seconds())
@@ -78,6 +80,9 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
     );
     let executable = download(&http, &release.url, MAX_UPDATE_BYTES)
         .context("failed to download the Agent update")?;
+    // Only a complete download uses an attempt, so one cut short is retried on the backoff.
+    crate::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)
+        .context("failed to record the Agent update attempt")?;
     release.verify(&executable)?;
     if !executable.starts_with(b"MZ") {
         bail!("downloaded Agent update is not a Windows executable");
@@ -94,10 +99,6 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
             })
         })
         .and_then(|_| {
-            crate::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)
-                .context("failed to record the Agent update attempt")
-        })
-        .and_then(|()| {
             let mut command = Command::new(&helper);
             command
                 .arg("--apply-agent-update")
@@ -128,6 +129,22 @@ pub fn check_and_schedule(config: &Config) -> anyhow::Result<Option<String>> {
         "started the Agent update helper"
     );
     Ok(Some(release.version))
+}
+
+/// When the last successful check said the next one is due.
+pub fn scheduled_check(config_directory: &Path) -> Option<NextCheck> {
+    read_next_check(&config_directory.join("updates").join(NEXT_CHECK_FILE))
+}
+
+/// Writes when the next check is due, so a restart keeps its place in the schedule.
+pub fn record_next_check(config_directory: &Path, next: &NextCheck) {
+    let updates = config_directory.join("updates");
+    let written = private_directory::secure(&updates).and_then(|()| {
+        crate::installer::replace_file(&updates.join(NEXT_CHECK_FILE), &serde_json::to_vec(next)?)
+    });
+    if let Err(error) = written {
+        tracing::warn!(error = ?error, "could not record when the next Agent update check is due");
+    }
 }
 
 /// Runs as a copy of the previous Agent after the service that staged the update stops. Whatever
@@ -537,13 +554,6 @@ fn unique_suffix() -> String {
             .unwrap_or_default()
             .as_millis()
     )
-}
-
-fn unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]

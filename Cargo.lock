@@ -2958,6 +2958,7 @@ dependencies = [
  "clap",
  "dispatch2",
  "futures-util",
+ "getrandom 0.3.4",
  "jpeg-encoder",
  "libc",
  "libloading",

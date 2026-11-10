@@ -20,6 +20,7 @@ meshrmm-clipboard = { path = "../crates/clipboard" }
 bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+getrandom = "0.3.4"
 meshrmm-log-file.workspace = true
 meshrmm-protocol.workspace = true
 meshrmm-self-update.workspace = true

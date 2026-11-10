@@ -206,8 +206,35 @@ how relays are chosen and what the sleeping computer needs.
 
 ## Agent updates
 
-The service checks the server's update manifest when it starts and every six
-hours after. For a newer release it:
+The service checks the server's update manifest about every six hours. Every
+Agent of a server gets the same release, so the checks are spread out, and
+after each successful check the Agent writes when the next one is due to
+`updates/next-check.json` in its configuration directory (with the build
+that wrote it), so a restart keeps its place in the schedule:
+
+- The first start of a newly installed or updated build, one that finds no
+  record of its own, checks 30 to 90 seconds after it starts, since its
+  installer may be older than the server's release. Its next check then
+  falls anywhere from about half an hour to six and a half hours later, so
+  devices installed or updated together do not stay together.
+- A restart before the recorded time checks at that time, but no sooner than
+  30 to 90 seconds after the start.
+- A restart that finds the time passed, because the device was off or
+  asleep, checks 1 to 30 minutes after the start, at a point picked at
+  random on each start. A device that is never up for long still checks, and
+  devices that come back together, as when a site's power returns after an
+  outage, check apart. A recorded time more than six and a half hours ahead
+  means the clock was changed, and is treated as passed.
+- Each later interval is lengthened or shortened by up to 10 percent at
+  random, so devices do not stay in step.
+- A check that fails is retried after about 2 minutes, then 4, 8 and so on
+  up to about an hour, each shortened by up to half at random, until one
+  succeeds; then the six-hour schedule resumes. A retry is not recorded, so
+  a restart during one finds the check overdue.
+- A check that falls due during a remote session waits for it to end,
+  checking again every 5 minutes, for at most 24 hours.
+
+For a newer release it:
 
 1. checks the manifest entry's release signature and downloads the build;
 2. checks the build's SHA-256;
@@ -216,7 +243,12 @@ hours after. For a newer release it:
 4. restores and starts the previous binary if the new service does not reach
    `Running`.
 
-A check that fails is logged and does not disconnect the Agent. The version
+A check that fails is logged and does not disconnect the Agent. A release is
+tried at most three times in 24 hours, so one that installs and then rolls
+back is not reinstalled in a loop. An attempt counts once the build has
+downloaded in full: a download cut short is retried on the failed-check
+backoff without using one, while a build that fails its checks uses one
+each time. Attempts are kept in `updates/update-attempts.json`. The version
 compared is the one compiled in from `release.json`, not Cargo's package
 version. See [releases](releases.md#release-signatures) for what the
 signature covers.

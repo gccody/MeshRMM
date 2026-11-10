@@ -21,9 +21,11 @@ use meshrmm_self_update::{AGENT_MACOS, CURRENT_VERSION, UpdateManifest, macos};
 use super::installer::{APP, BUNDLE_IDENTIFIER, DAEMON_LABEL, HELPER_LABEL, SUPPORT_DIRECTORY};
 use crate::remote::config::Config;
 use crate::remote::service_link::ServiceLink;
-use crate::update_policy::{UpdateAttempts, UpdateSchedule, read_attempts};
+use crate::update_policy::{
+    NEXT_CHECK_FILE, NextCheck, UpdateAttempts, UpdateSchedule, random_bits, read_attempts,
+    read_next_check, unix_seconds,
+};
 
-const FIRST_CHECK_DELAY: Duration = Duration::from_secs(60);
 const SCHEDULE_TICK: Duration = Duration::from_secs(30);
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
@@ -36,20 +38,38 @@ const ATTEMPTS_FILE: &str = "update-attempts.json";
 /// Checks for updates until one is staged, then stops the coordinator so the
 /// new Agent can replace it.
 pub(crate) async fn run(config: Config, link: Arc<ServiceLink>) {
-    tokio::time::sleep(FIRST_CHECK_DELAY).await;
-    let mut schedule = UpdateSchedule::new(Instant::now());
+    let record = updates_directory()
+        .ok()
+        .and_then(|updates| read_next_check(&updates.join(NEXT_CHECK_FILE)));
+    let mut schedule = UpdateSchedule::new(
+        Instant::now(),
+        unix_seconds(),
+        record.as_ref(),
+        random_bits(),
+    );
     loop {
         if schedule.due(Instant::now(), link.session_active()) {
             let check_config = config.clone();
-            match tokio::task::spawn_blocking(move || stage(&check_config)).await {
+            let succeeded = match tokio::task::spawn_blocking(move || stage(&check_config)).await {
                 Ok(Ok(Some(version))) => {
                     tracing::info!(%version, "stopping the Agent to install an update");
                     link.stop_for_update(version);
                     return;
                 }
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => tracing::warn!(error = ?error, "Agent update check failed"),
-                Err(error) => tracing::warn!(%error, "Agent update check stopped"),
+                Ok(Ok(None)) => true,
+                Ok(Err(error)) => {
+                    tracing::warn!(error = ?error, "Agent update check failed");
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Agent update check stopped");
+                    false
+                }
+            };
+            if let Some(next) =
+                schedule.checked(Instant::now(), unix_seconds(), succeeded, random_bits())
+            {
+                record_next_check(&next);
             }
         }
         tokio::time::sleep(SCHEDULE_TICK).await;
@@ -100,7 +120,6 @@ fn stage(config: &Config) -> anyhow::Result<Option<String>> {
         tracing::warn!(version = %release.version, "skipping an Agent update that already failed repeatedly");
         return Ok(None);
     };
-    super::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)?;
     tracing::info!(version = %release.version, "downloading an Agent update");
     let archive = read_limited(
         http.get(&release.url)
@@ -110,6 +129,8 @@ fn stage(config: &Config) -> anyhow::Result<Option<String>> {
             .into_reader(),
         MAX_UPDATE_BYTES,
     )?;
+    // Only a complete download uses an attempt, so one cut short is retried on the backoff.
+    super::installer::replace_file(&attempts_path, &serde_json::to_vec(&attempt)?)?;
     release.verify(&archive)?;
     let staging = updates.join(format!("agent-{}-{}", release.version, std::process::id()));
     let _ = std::fs::remove_dir_all(&staging);
@@ -132,6 +153,16 @@ fn stage(config: &Config) -> anyhow::Result<Option<String>> {
     }
     start_installer(&app, &staging)?;
     Ok(Some(release.version))
+}
+
+/// Writes when the next check is due, so a restart keeps its place in the schedule.
+fn record_next_check(next: &NextCheck) {
+    let written = updates_directory().and_then(|updates| {
+        super::installer::replace_file(&updates.join(NEXT_CHECK_FILE), &serde_json::to_vec(next)?)
+    });
+    if let Err(error) = written {
+        tracing::warn!(error = ?error, "could not record when the next Agent update check is due");
+    }
 }
 
 fn read_limited(reader: impl Read, limit: u64) -> anyhow::Result<Vec<u8>> {
@@ -261,12 +292,6 @@ fn command(program: &str, arguments: &[&std::ffi::OsStr]) -> anyhow::Result<()> 
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())
-}
-
-fn unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 #[cfg(test)]
