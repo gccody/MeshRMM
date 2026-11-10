@@ -456,6 +456,17 @@ pub async fn list(
     Ok(runs)
 }
 
+/// The devices that have a pending run of `kind`: those [`pending`] finds
+/// one on.
+pub fn pending_devices(kind: Kind) -> sea_query::SelectStatement {
+    Query::select()
+        .column(UpdateRuns::DeviceId)
+        .from(UpdateRuns::Table)
+        .and_where(Expr::col(UpdateRuns::Kind).eq(kind.as_str()))
+        .and_where(Expr::col(UpdateRuns::Status).eq("pending"))
+        .to_owned()
+}
+
 /// The device's pending run of `kind`, if any.
 pub async fn pending(
     executor: &mut impl Executor,

@@ -440,6 +440,22 @@ pub async fn list(
     Ok(runs)
 }
 
+/// The devices that have a pending scan, or (with `scan` false) a pending
+/// install, update or uninstall: those [`pending`] finds one on.
+pub fn pending_devices(scan: bool) -> sea_query::SelectStatement {
+    let action = Expr::col(ApplicationRuns::Action);
+    Query::select()
+        .column(ApplicationRuns::DeviceId)
+        .from(ApplicationRuns::Table)
+        .and_where(if scan {
+            action.eq(Action::Scan.as_str())
+        } else {
+            action.ne(Action::Scan.as_str())
+        })
+        .and_where(Expr::col(ApplicationRuns::Status).eq("pending"))
+        .to_owned()
+}
+
 /// The device's pending scan, or (with `scan` false) its pending install,
 /// update or uninstall, if any.
 pub async fn pending(
