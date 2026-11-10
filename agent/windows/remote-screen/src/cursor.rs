@@ -6,11 +6,47 @@ use windows::Win32::Graphics::Gdi::{
     BitBlt, CAPTUREBLT, DeleteObject, GetDC, HDC, HGDIOBJ, ReleaseDC, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CURSOR_SHOWING, CURSORINFO, DI_NORMAL, DrawIconEx, GetCursorInfo, GetIconInfo, HICON, ICONINFO,
+    CURSOR_SHOWING, CURSORINFO, CURSORINFO_FLAGS, DI_NORMAL, DrawIconEx, GetCursorInfo,
+    GetIconInfo, HICON, ICONINFO,
 };
 use windows::core::Interface;
 
 use crate::Error;
+
+/// Whether Windows is drawing its pointer, which is the only time Desktop
+/// Duplication can bake one into the image it reports without a separate
+/// pointer (a window drag, pointer trails, the Magnifier). Hidden is
+/// reported as flags 0: while typing, after `ShowCursor(FALSE)` or
+/// `SetCursor(NULL)`, as full-screen video does.
+pub(crate) fn system_pointer_drawn() -> bool {
+    let mut cursor = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    // Safety: cursor is a valid CURSORINFO with cbSize set.
+    let flags = unsafe { GetCursorInfo(&mut cursor) }
+        .ok()
+        .map(|()| cursor.flags);
+    pointer_drawn(flags)
+}
+
+/// Only a pointer Windows reports as hidden counts as not drawn. A pointer
+/// suppressed for touch or pen input, or an unreadable state, might be.
+fn pointer_drawn(flags: Option<CURSORINFO_FLAGS>) -> bool {
+    flags != Some(CURSORINFO_FLAGS(0))
+}
+
+/// Whether to replace the duplicated image with a GDI copy, which never
+/// contains the system pointer, so a viewer that draws its own pointer does
+/// not see a second one baked in. With no separate DXGI pointer and no
+/// system pointer drawn, there is nothing to remove.
+pub(crate) fn needs_cursor_free_copy(
+    capture_cursor: bool,
+    separate_cursor_visible: bool,
+    system_pointer_drawn: bool,
+) -> bool {
+    !capture_cursor && !separate_cursor_visible && system_pointer_drawn
+}
 
 /// Draw at the physical desktop position, accounting for the cursor's hotspot.
 /// Windows handles color, alpha and monochrome AND/XOR cursor masks for us.
@@ -141,23 +177,35 @@ impl CursorCompositor {
         Ok(())
     }
 
+    /// `system_pointer_drawn` is whether Windows drew its pointer at any
+    /// point while the cached desktop could have been composed.
     pub fn compose(
         &self,
         context: &ID3D11DeviceContext,
         capture_cursor: bool,
         separate_cursor_visible: bool,
+        system_pointer_drawn: bool,
     ) -> Result<&ID3D11Texture2D, Error> {
         // DXGI may bake the pointer into the desktop during window dragging.
         // Skipping DrawIconEx cannot hide that pointer. GDI desktop capture
         // excludes the system cursor, so refresh this surface from the desktop
-        // when a hidden cursor could be embedded in the duplicated image.
-        let refresh_desktop = !capture_cursor && !separate_cursor_visible;
+        // when a drawn cursor could be embedded in the duplicated image. The
+        // copy costs a full-screen GDI read per frame, so a merely hidden
+        // pointer uses the duplicated image.
+        let refresh_desktop = needs_cursor_free_copy(
+            capture_cursor,
+            separate_cursor_visible,
+            system_pointer_drawn,
+        );
         let draw_pointer = capture_cursor && separate_cursor_visible;
         if !refresh_desktop && !draw_pointer {
             return Ok(&self.desktop);
         }
         unsafe {
-            context.CopyResource(&self.texture, &self.desktop);
+            // The GDI copy overwrites the whole surface.
+            if !refresh_desktop {
+                context.CopyResource(&self.texture, &self.desktop);
+            }
             let dc = self.surface.GetDC(false)?;
             let drawn = if refresh_desktop {
                 self.copy_cursor_free_desktop(dc)
@@ -177,9 +225,54 @@ impl CursorCompositor {
 mod tests {
     use super::*;
 
+    /// What DXGI and `GetCursorInfo` reported in each state on a real desktop
+    /// (Windows 11 26200, NVIDIA RTX 3080), and whether a pointer was baked
+    /// into the duplicated image there.
+    #[test]
+    fn only_a_drawn_pointer_without_a_separate_one_needs_the_cursor_free_copy() {
+        const HIDDEN: Option<CURSORINFO_FLAGS> = Some(CURSORINFO_FLAGS(0));
+        const SHOWING: Option<CURSORINFO_FLAGS> = Some(CURSOR_SHOWING);
+        // (state, DXGI pointer visible, GetCursorInfo flags, baked in, copy)
+        let states = [
+            ("visible pointer", true, SHOWING, false, false),
+            ("hidden while typing", false, HIDDEN, false, false),
+            ("hidden by ShowCursor(FALSE)", false, HIDDEN, false, false),
+            ("hidden by SetCursor(NULL)", false, HIDDEN, false, false),
+            ("window drag", false, SHOWING, true, true),
+            ("pointer trails", false, SHOWING, true, true),
+            ("Magnifier", false, SHOWING, true, true),
+            // DXGI reports no pointer for an output the pointer is not on.
+            // Nothing is baked in, but this check cannot tell it from a drag.
+            ("pointer on another output", false, SHOWING, false, true),
+            // Neither observed: assumed drawn, and possibly baked in.
+            (
+                "suppressed for touch or pen",
+                false,
+                Some(CURSORINFO_FLAGS(2)),
+                true,
+                true,
+            ),
+            ("GetCursorInfo failed", false, None, true, true),
+        ];
+        for (state, separate, flags, baked, copy) in states {
+            let drawn = pointer_drawn(flags);
+            assert_eq!(
+                needs_cursor_free_copy(false, separate, drawn),
+                copy,
+                "{state}"
+            );
+            assert!(
+                copy || !baked,
+                "{state}: a baked pointer must be copied away"
+            );
+            // A viewer that wants the pointer never loses it to the copy.
+            assert!(!needs_cursor_free_copy(true, separate, drawn), "{state}");
+        }
+    }
+
     #[test]
     #[ignore = "requires an interactive Windows desktop and D3D11 device"]
-    fn hidden_embedded_cursor_refreshes_pixels_instead_of_reusing_dxgi_frame() {
+    fn a_drawn_pointer_is_replaced_by_gdi_pixels_and_a_hidden_one_is_not() {
         use windows::Win32::Graphics::Gdi::GetPixel;
 
         let (device, context) = windows_capture::d3d11::create_d3d_device().unwrap();
@@ -207,15 +300,20 @@ mod tests {
                 .unwrap();
             let staging = staging.unwrap();
             // Include a visibility change with no new DXGI frame, then a
-            // return to the normal separate-pointer capture path.
-            for (capture, separate, expected_pixel) in [
-                (true, false, &marker[..3]),
-                (false, false, &expected[..]),
-                (false, true, &marker[..3]),
-                (false, false, &expected[..]),
-                (true, false, &marker[..3]),
+            // return to the normal separate-pointer capture path. A hidden
+            // system pointer cannot be baked in, so the DXGI pixels stay.
+            for (capture, separate, drawn, expected_pixel) in [
+                (true, false, true, &marker[..3]),
+                (false, false, true, &expected[..]),
+                (false, false, false, &marker[..3]),
+                (false, true, true, &marker[..3]),
+                (false, false, true, &expected[..]),
+                (false, false, false, &marker[..3]),
+                (true, false, true, &marker[..3]),
             ] {
-                let output = compositor.compose(&context, capture, separate).unwrap();
+                let output = compositor
+                    .compose(&context, capture, separate, drawn)
+                    .unwrap();
                 context.CopyResource(&staging, output);
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 context
@@ -225,9 +323,71 @@ mod tests {
                 context.Unmap(&staging, 0);
                 assert_eq!(
                     actual, expected_pixel,
-                    "capture={capture}, separate={separate}"
+                    "capture={capture}, separate={separate}, drawn={drawn}"
                 );
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop with nothing above a new topmost window \
+                at the pointer; nudges the pointer one pixel and puts it back"]
+    fn a_pointer_an_application_hides_reads_as_not_drawn() {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        use windows::core::w;
+
+        // Mouse input reaches the window, and with it the thread's cursor
+        // state, only when the pointer moves.
+        let settle = |at: POINT| unsafe {
+            SetCursorPos(at.x + 1, at.y).unwrap();
+            SetCursorPos(at.x, at.y).unwrap();
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            let mut message = MSG::default();
+            while std::time::Instant::now() < until {
+                while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        unsafe {
+            let mut at = POINT::default();
+            GetCursorPos(&mut at).unwrap();
+            // A STATIC window shows the arrow on this thread, which owns the
+            // ShowCursor count Windows applies while the pointer is over it.
+            let window = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                None,
+                // SS_NOTIFY: a STATIC window is otherwise transparent to the mouse.
+                WS_POPUP | WS_VISIBLE | WINDOW_STYLE(0x100),
+                at.x - 50,
+                at.y - 50,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            settle(at);
+            let covered = GetAncestor(WindowFromPoint(at), GA_ROOT) != window;
+            let mut drawn = Vec::new();
+            if !covered {
+                drawn.push(system_pointer_drawn());
+                ShowCursor(false);
+                settle(at);
+                drawn.push(system_pointer_drawn());
+                ShowCursor(true);
+                settle(at);
+                drawn.push(system_pointer_drawn());
+            }
+            DestroyWindow(window).unwrap();
+            assert!(!covered, "another window covers the pointer");
+            assert_eq!(drawn, [true, false, true]);
         }
     }
 }
