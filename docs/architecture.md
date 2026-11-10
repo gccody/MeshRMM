@@ -150,7 +150,12 @@ input.
   Agent opened. See [file browser](files.md).
 - `maintenance`: the periodic task that purges expired tokens, old runs,
   resolved alerts, old application changes, old update runs, old wake
-  requests and leftover partial files.
+  requests and leftover partial files. It deletes each table's due rows in
+  batches of 2,000 (100 for script runs and update installs), each its own
+  short statement with a pause after it, so other writers never wait long
+  for the database. It runs until nothing is due. A table that fails is
+  logged and tried again at the next run, and the other tables are still
+  purged.
 - `admin`: the `meshrmm-server admin` commands for locked-out operators.
 
 ### Realtime

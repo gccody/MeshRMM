@@ -7,6 +7,7 @@ mod common;
 use meshrmm_server::{
     applications::tables::{ApplicationRunItems, ApplicationRuns},
     db::tables::{AlertRemediations, Alerts, FileDeliveries, ScriptRuns, UpdateRuns},
+    maintenance,
 };
 use sea_query::{
     DeleteStatement, Expr, ExprTrait, PostgresQueryBuilder, Query, QueryBuilder, SelectStatement,
@@ -40,7 +41,7 @@ fn statements() -> Vec<(&'static str, Statement, &'static [&'static str])> {
             .and_where(Expr::col(ApplicationRuns::CompletedAt).lt(NOW))
             .to_owned()
     };
-    vec![
+    let mut statements: Vec<(&str, Statement, &[&str])> = vec![
         (
             "the dispatcher's count of each device's pending runs",
             Statement::Select(
@@ -266,8 +267,101 @@ fn statements() -> Vec<(&'static str, Statement, &'static [&'static str])> {
             ),
             &["idx_alerts_unresolved"],
         ),
-    ]
+    ];
+    statements.extend(
+        maintenance::batch_statements(NOW)
+            .into_iter()
+            .map(|(table, delete)| {
+                let (_, query, indexes) = PURGE_INDEXES
+                    .iter()
+                    .find(|(purged, ..)| *purged == table)
+                    .unwrap_or_else(|| panic!("no index is listed for purging {table}"));
+                (*query, Statement::Delete(delete), *indexes)
+            }),
+    );
+    statements
 }
+
+/// Each table the maintenance task purges, and the index its batches find
+/// their rows by.
+const PURGE_INDEXES: &[(&str, &str, &[&str])] = &[
+    (
+        "user_sessions",
+        "the purge of expired sessions",
+        &["idx_user_sessions_expiry"],
+    ),
+    (
+        "api_tokens",
+        "the purge of expired API tokens",
+        &["idx_api_tokens_expiry"],
+    ),
+    (
+        "invitations",
+        "the purge of expired invitations",
+        &["idx_invitations_expiry"],
+    ),
+    (
+        "password_resets",
+        "the purge of expired password resets",
+        &["idx_password_resets_expiry"],
+    ),
+    (
+        "agent_install_tokens",
+        "the purge of expired installers",
+        &["idx_agent_install_tokens_expiry"],
+    ),
+    (
+        "remote_handoffs",
+        "the purge of expired remote handoffs",
+        &["idx_remote_handoffs_expiry"],
+    ),
+    (
+        "remote_sessions",
+        "the purge of expired remote sessions",
+        &["idx_remote_sessions_expiry"],
+    ),
+    (
+        "script_runs",
+        "the purge of old script runs",
+        &["idx_script_runs_created"],
+    ),
+    (
+        "file_deliveries",
+        "the purge of old file deliveries",
+        &["idx_file_deliveries_created"],
+    ),
+    (
+        "device_metrics",
+        "the purge of old resource usage",
+        &["idx_device_metrics_minute"],
+    ),
+    (
+        "alerts",
+        "the purge of old resolved alerts",
+        &["idx_alerts_resolved"],
+    ),
+    (
+        "device_application_changes",
+        "the purge of old application changes",
+        &["idx_device_application_changes_observed"],
+    ),
+    (
+        "job_devices",
+        "the purge of old jobs' devices",
+        &["idx_jobs_created"],
+    ),
+    ("jobs", "the purge of old jobs", &["idx_jobs_created"]),
+    (
+        "update_runs",
+        "the purge of old update runs",
+        &["idx_update_runs_created"],
+    ),
+    (
+        "wake_requests",
+        "the purge of old wake requests",
+        &["idx_wake_requests_created"],
+    ),
+];
 
 async fn sqlite_plan(connection: &mut SqliteConnection, statement: &Statement) -> String {
     let (sql, values) = statement.render(SqliteQueryBuilder);

@@ -1139,10 +1139,11 @@ async fn maintenance_purges_old_jobs() {
             json!({ "script_id": script, "run_as": "user", "target": "devices", "device_ids": [agent.device_id], "offline": "skip" }),
         )
         .await;
-        let purged = meshrmm_server::maintenance::purge(app.db(), now_ms() + 31 * 24 * HOUR_MS)
-            .await
-            .unwrap();
-        assert_eq!(purged.jobs, 1, "{}", app.name);
+        let purged =
+            meshrmm_server::maintenance::purge(app.db(), now_ms() + 31 * 24 * HOUR_MS).await;
+        assert_eq!(purged.failed, Vec::<String>::new(), "{}", app.name);
+        assert_eq!(purged.rows("jobs"), 1, "{}", app.name);
+        assert_eq!(purged.rows("job_devices"), 1, "{}", app.name);
         let id = started["id"].as_str().unwrap();
         // Sessions expired too, so the database says.
         assert!(
