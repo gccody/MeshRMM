@@ -71,6 +71,8 @@ export function useAgentInventory({ enabled, authorizedFetch, onRefused, onAlert
     try {
       const data = await fetchAgentList(authorizedFetch);
       setError(null);
+      // The open socket already applied newer data. While it is down the
+      // revision is -1, so a restarted server's list applies.
       if (data.revision < revision.current) return true;
       revision.current = data.revision;
       setInventory({ agents: sortAgents(data.agents), companies: sortCompanies(data.companies), tags: sortTags(data.tags) });

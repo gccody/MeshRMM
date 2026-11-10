@@ -183,13 +183,53 @@ test('companies arrive in the snapshot and change in order with devices', () => 
   assert.equal(state.agents[0].company_id, null);
 });
 
-test('a snapshot older than the loaded inventory is refused and requested again', () => {
+test('after a server restart, the new socket’s lower-revision snapshot applies without a refresh', () => {
+  const { sockets, state, revision, connections, timers } = harness();
+  sockets[0].open();
+  sockets[0].receive({ type: 'snapshot', revision: 80_000, agents: [agent('a')], generated_at_unix_ms: 1 });
+  sockets[0].close(1012, 'service restart');
+  assert.equal(revision.current, -1, 'an HTTP load while the socket is down applies');
+  timers.fire();
+  sockets[1].open();
+  sockets[1].receive({ type: 'snapshot', revision: 100, agents: [agent('a'), agent('b')], generated_at_unix_ms: 2 });
+  assert.deepEqual(state.agents.map(item => item.id), ['a', 'b']);
+  assert.equal(revision.current, 100);
+  assert.deepEqual(sockets[1].sent, []);
+  assert.deepEqual(connections, ['connecting', 'live', 'reconnecting', 'live']);
+  sockets[1].receive({ type: 'agent_deleted', revision: 101, agent_id: 'a' });
+  assert.deepEqual(state.agents.map(item => item.id), ['b']);
+});
+
+test('a socket’s first snapshot applies whatever revision the page last saw', () => {
   const { sockets, state, revision } = harness();
   revision.current = 10;
   sockets[0].open();
   sockets[0].receive({ type: 'snapshot', revision: 9, agents: [agent('a')], generated_at_unix_ms: 1 });
-  assert.deepEqual(state.agents, []);
-  assert.deepEqual(sockets[0].sent, ['refresh']);
+  assert.deepEqual(state.agents.map(item => item.id), ['a']);
+  assert.equal(revision.current, 9);
+  assert.deepEqual(sockets[0].sent, []);
+});
+
+test('a later snapshot overtaken by an HTTP load keeps the newer inventory without a refresh', () => {
+  const { sockets, state, revision, connections } = harness();
+  const socket = sockets[0];
+  socket.open();
+  socket.receive({ type: 'snapshot', revision: 5, agents: [agent('a')], generated_at_unix_ms: 1 });
+  socket.receive({ type: 'agent_upsert', revision: 7, agent: agent('c') });
+  assert.deepEqual(socket.sent, ['refresh'], 'the gap asks for a snapshot');
+  // The HTTP load answers first, with revision 9.
+  revision.current = 9;
+  state.agents = [agent('a'), agent('b'), agent('c')];
+  socket.receive({ type: 'agent_upsert', revision: 8, agent: agent('z') });
+  socket.receive({ type: 'snapshot', revision: 8, agents: [agent('a'), agent('c'), agent('z')], generated_at_unix_ms: 2 });
+  assert.deepEqual(state.agents.map(item => item.id), ['a', 'b', 'c']);
+  assert.equal(revision.current, 9);
+  assert.deepEqual(socket.sent, ['refresh'], 'the older snapshot is not asked for again');
+  assert.deepEqual(connections, ['connecting', 'live']);
+  socket.receive({ type: 'agent_upsert', revision: 9, agent: agent('y') });
+  socket.receive({ type: 'agent_deleted', revision: 10, agent_id: 'b' });
+  assert.deepEqual(state.agents.map(item => item.id), ['a', 'c']);
+  assert.equal(revision.current, 10);
 });
 
 test('an unreadable message asks for a snapshot', () => {
