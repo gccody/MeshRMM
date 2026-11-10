@@ -1731,3 +1731,382 @@ async fn policies_skip_a_run_while_their_last_runs_devices_are_queued() {
         app.finish().await;
     }
 }
+
+/// Enrolls `count` Windows devices called `prefix-N` straight into the
+/// database, for jobs larger than enrolling each one allows. Returns their IDs.
+async fn fleet(app: &App, prefix: &str, count: usize) -> Vec<String> {
+    use meshrmm_server::db::tables::Agents;
+    use sea_query::Query;
+    let ids = (0..count)
+        .map(|_| uuid::Uuid::new_v4().to_string())
+        .collect::<Vec<_>>();
+    for (chunk_index, chunk) in ids.chunks(400).enumerate() {
+        let mut insert = Query::insert();
+        insert.into_table(Agents::Table).columns([
+            Agents::Id,
+            Agents::Name,
+            Agents::Platform,
+            Agents::AuthTokenHash,
+            Agents::CreatedAt,
+            Agents::UpdatedAt,
+        ]);
+        for (index, id) in chunk.iter().enumerate() {
+            insert.values_panic([
+                id.as_str().into(),
+                format!("{prefix}-{}", chunk_index * 400 + index).into(),
+                "windows".into(),
+                "0".repeat(64).into(),
+                0.into(),
+                0.into(),
+            ]);
+        }
+        app.db().execute(&insert).await.unwrap();
+    }
+    ids
+}
+
+/// An update scan on `target` that waits for offline devices.
+fn update_scan(target: automation::jobs::Target) -> automation::jobs::NewJob {
+    automation::jobs::NewJob {
+        payload: automation::jobs::Payload::UpdateScan,
+        target,
+        offline: automation::jobs::Offline::Wait,
+        wait_ms: HOUR_MS,
+        requested_by_user_id: "tester".to_owned(),
+        policy: None,
+        actor: meshrmm_server::audit::Actor {
+            user_id: None,
+            label: "tester".to_owned(),
+            ip: None,
+            api_token: None,
+        },
+    }
+}
+
+/// Writes a planned job in a transaction of its own.
+async fn write_job(
+    app: &App,
+    plan: &automation::jobs::Plan,
+) -> Result<automation::jobs::Created, meshrmm_server::http::ApiError> {
+    let mut transaction = app.db().begin().await.unwrap();
+    let created = automation::jobs::write(&mut transaction, plan, now_ms()).await;
+    transaction.commit().await.unwrap();
+    created
+}
+
+/// How many jobs there are, finished or not.
+async fn job_rows(app: &App) -> i64 {
+    use meshrmm_server::db::tables::Jobs;
+    use sea_query::{Expr, Query};
+    let (count,): (i64,) = app
+        .db()
+        .fetch_one(
+            &Query::select()
+                .expr(Expr::cust("CAST(COUNT(*) AS BIGINT)"))
+                .from(Jobs::Table)
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    count
+}
+
+#[tokio::test]
+async fn jobs_are_planned_without_the_writer_and_written_with_inserts_alone() {
+    use automation::jobs::{self, Target};
+    use meshrmm_server::db::Backend;
+    for app in apps().await {
+        let name = app.name;
+        let devices = fleet(&app, "FLEET", 1_000).await;
+
+        // Planning only reads, so it goes on while another transaction holds
+        // SQLite's one writer; writing the job waits for that one to end.
+        let before = app.db().counts();
+        let held = app.db().begin().await.unwrap();
+        let plan = jobs::plan(&mut app.db(), &app.state.agents, update_scan(Target::All))
+            .await
+            .unwrap();
+        let planning = app.db().counts() - before;
+        assert_eq!(plan.devices(), 1_000, "{name}");
+        assert_eq!(
+            (planning.statements, planning.writes, planning.transactions),
+            (1, 0, 1),
+            "{name}: one read, and only the held transaction began"
+        );
+        let state = app.state.clone();
+        let writing = tokio::spawn(async move {
+            let mut transaction = state.database.begin().await.unwrap();
+            let before = state.database.counts();
+            let created = jobs::write(&mut transaction, &plan, now_ms()).await;
+            let counts = state.database.counts() - before;
+            transaction.commit().await.unwrap();
+            (created, counts)
+        });
+        if app.db().backend() == Backend::Sqlite {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(!writing.is_finished(), "{name}: the write waits its turn");
+        }
+        held.rollback().await.unwrap();
+        let (created, written) = writing.await.unwrap();
+        let created = created.unwrap();
+        assert_eq!(created.devices, 1_000, "{name}");
+        // The job, a statement for each 400 devices, and the audit event:
+        // nothing is read, and only the devices' inserts grow with them.
+        assert_eq!(
+            (written.statements, written.writes),
+            (1 + 3 + 1, 1 + 3 + 1),
+            "{name}"
+        );
+        let job = jobs::get(&mut app.db(), &created.id, now_ms())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.counts.waiting, 1_000, "{name}");
+        assert_eq!(job.target_label, "All devices");
+
+        // Chosen devices are read 500 at a time; still nothing is written.
+        let before = app.db().counts();
+        jobs::plan(
+            &mut app.db(),
+            &app.state.agents,
+            update_scan(Target::Devices(devices)),
+        )
+        .await
+        .unwrap();
+        let planning = app.db().counts() - before;
+        assert_eq!((planning.statements, planning.writes), (2, 0), "{name}");
+        app.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn devices_deleted_after_planning_are_left_out_of_the_job() {
+    use automation::jobs::{self, Target};
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let desk = app.enroll(&mut admin, "DESK").await;
+        let laptop = app.enroll(&mut admin, "LAPTOP").await;
+        let spare = app.enroll(&mut admin, "SPARE").await;
+        let connection = app.state.agents.connect(&desk.device_id);
+        let chosen = |agents: &[&common::Agent]| {
+            update_scan(Target::Devices(
+                agents.iter().map(|agent| agent.device_id.clone()).collect(),
+            ))
+        };
+
+        // Three planned, one deleted before the write: the job is for two.
+        let plan = jobs::plan(
+            &mut app.db(),
+            &app.state.agents,
+            chosen(&[&desk, &laptop, &spare]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.devices(), 3, "{name}");
+        mark_deleted(&app, &spare.device_id).await;
+        let created = write_job(&app, &plan).await.unwrap();
+        assert_eq!(created.devices, 2, "{name}");
+        let written = jobs::get(&mut app.db(), &created.id, now_ms())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                written.counts.total,
+                written.counts.queued,
+                written.counts.waiting
+            ),
+            (2, 1, 1),
+            "{name}"
+        );
+        assert_eq!(written.target_label, "2 devices", "{name}");
+        let started = audit_events(&app, "job.start").await;
+        assert_eq!(started[0].metadata["devices"], 2, "{name}");
+        assert_eq!(started[0].metadata["queued"], 1, "{name}");
+        assert_eq!(started[0].metadata["waiting"], 1, "{name}");
+        assert_eq!(started[0].metadata["target_label"], "2 devices");
+        pass(&app, now_ms()).await;
+        let shown = job(&mut admin, &created.id).await;
+        assert_eq!(
+            outcomes(&shown),
+            [
+                ("DESK".to_owned(), "running".to_owned()),
+                ("LAPTOP".to_owned(), "waiting".to_owned()),
+            ],
+            "{name}: the job runs on the devices left"
+        );
+
+        // One left: the job is named after it.
+        let plan = jobs::plan(&mut app.db(), &app.state.agents, chosen(&[&desk, &laptop]))
+            .await
+            .unwrap();
+        mark_deleted(&app, &laptop.device_id).await;
+        let created = write_job(&app, &plan).await.unwrap();
+        assert_eq!(created.devices, 1, "{name}");
+        let written = jobs::get(&mut app.db(), &created.id, now_ms())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(written.target_label, "DESK", "{name}");
+
+        // None left: no devices, and nothing is written.
+        let plan = jobs::plan(&mut app.db(), &app.state.agents, chosen(&[&desk]))
+            .await
+            .unwrap();
+        mark_deleted(&app, &desk.device_id).await;
+        let jobs_before = job_rows(&app).await;
+        let error = write_job(&app, &plan).await.unwrap_err();
+        assert_eq!(error.code(), Some("no_devices"), "{name}");
+        assert_eq!(job_rows(&app).await, jobs_before, "{name}");
+        assert_eq!(audit_events(&app, "job.start").await.len(), 2, "{name}");
+        // Planned now, it fails the same way, before anything is written.
+        let error = jobs::plan(&mut app.db(), &app.state.agents, chosen(&[&desk]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some("no_devices"), "{name}");
+        drop(connection);
+        app.finish().await;
+    }
+}
+
+/// The policy `id` as the policies page lists it.
+async fn listed_policy(admin: &mut Browser, id: &str) -> Value {
+    admin.get("/v1/automation-policies").await.body["policies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|policy| policy["id"] == id)
+        .unwrap()
+        .clone()
+}
+
+#[tokio::test]
+async fn a_policy_changed_after_planning_its_firing_does_not_start_its_old_job() {
+    use automation::policies::{Fired, plan_firing, write_firing};
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        app.enroll(&mut admin, "DESK").await;
+        let script = create_script(&mut admin, "Health check", "powershell", true).await;
+        let body = |policy: &str, run_as: &str, enabled: bool| {
+            json!({
+                "name": policy, "enabled": enabled, "script_id": script, "run_as": run_as,
+                "target": "all", "trigger": "interval", "interval_minutes": 5,
+                "offline": "wait", "catch_up_hours": 24,
+            })
+        };
+        let mut created = Vec::new();
+        for policy in ["Edited", "Disabled", "Deleted", "Raced"] {
+            let policy = create_policy(&mut admin, body(policy, "system", true)).await;
+            created.push((
+                policy["id"].as_str().unwrap().to_owned(),
+                policy["next_run_at"].as_i64().unwrap(),
+            ));
+        }
+        let [edited, disabled, deleted, raced] = created.try_into().unwrap();
+
+        // Saved in between: nothing is written, and the firing is planned
+        // again from what was saved.
+        let (id, due) = &edited;
+        let firing = plan_firing(&app.state, id, *due, *due)
+            .await
+            .unwrap()
+            .unwrap();
+        let saved = admin
+            .put(
+                &format!("/v1/automation-policies/{id}"),
+                body("Edited", "user", true),
+            )
+            .await;
+        assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
+        // Due at the same time still, so only the save tells them apart.
+        set_next_run(&app, id, *due).await;
+        assert_eq!(
+            write_firing(&app.state, &firing).await.unwrap(),
+            Fired::Changed,
+            "{name}"
+        );
+        assert!(policy_jobs(&mut admin, id).await.is_empty(), "{name}");
+        let firing = plan_firing(&app.state, id, *due, *due)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            write_firing(&app.state, &firing).await.unwrap(),
+            Fired::Claimed { started: true },
+            "{name}"
+        );
+        let fired = policy_jobs(&mut admin, id).await;
+        assert_eq!(fired.len(), 1, "{name}");
+        assert_eq!(fired[0]["run_as"], "user", "{name}: as saved");
+
+        // Turned off or deleted in between: not due, and nothing starts.
+        let (id, due) = &disabled;
+        let firing = plan_firing(&app.state, id, *due, *due)
+            .await
+            .unwrap()
+            .unwrap();
+        let saved = admin
+            .put(
+                &format!("/v1/automation-policies/{id}"),
+                body("Disabled", "system", false),
+            )
+            .await;
+        assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
+        assert_eq!(
+            write_firing(&app.state, &firing).await.unwrap(),
+            Fired::NotDue,
+            "{name}"
+        );
+        assert!(policy_jobs(&mut admin, id).await.is_empty(), "{name}");
+        let (id, due) = &deleted;
+        let firing = plan_firing(&app.state, id, *due, *due)
+            .await
+            .unwrap()
+            .unwrap();
+        let removed = admin.delete(&format!("/v1/automation-policies/{id}")).await;
+        assert_eq!(removed.status, StatusCode::NO_CONTENT, "{name}");
+        assert_eq!(
+            write_firing(&app.state, &firing).await.unwrap(),
+            Fired::NotDue,
+            "{name}"
+        );
+        assert!(policy_jobs(&mut admin, id).await.is_empty(), "{name}");
+
+        // Two passes plan the same firing: only the first claims it.
+        let (id, due) = &raced;
+        let first = plan_firing(&app.state, id, *due, *due)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = plan_firing(&app.state, id, *due, *due + 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            write_firing(&app.state, &first).await.unwrap(),
+            Fired::Claimed { started: true },
+            "{name}"
+        );
+        assert_eq!(
+            write_firing(&app.state, &second).await.unwrap(),
+            Fired::NotDue,
+            "{name}"
+        );
+        assert!(
+            plan_firing(&app.state, id, *due, *due + 2)
+                .await
+                .unwrap()
+                .is_none(),
+            "{name}: claimed"
+        );
+        assert_eq!(policy_jobs(&mut admin, id).await.len(), 1, "{name}");
+        assert_eq!(
+            listed_policy(&mut admin, id).await["next_run_at"],
+            *due + 5 * MINUTE_MS,
+            "{name}"
+        );
+        app.finish().await;
+    }
+}

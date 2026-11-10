@@ -10,7 +10,10 @@
 //! so everyone who manages policies can see what each one runs.
 //!
 //! Firing claims the due time in the same transaction that creates the job,
-//! so a restart (or a second pass) can't fire it twice. A firing missed while
+//! so a restart (or a second pass) can't fire it twice. The job is planned
+//! before that transaction, through the database's readers; the claim holds
+//! only if the policy hasn't been saved since, and otherwise the firing is
+//! planned again from what was saved. A firing missed while
 //! the server was down runs when it starts if it is at most
 //! [`MISSED_GRACE_MS`] late; later than that, interval schedules still run
 //! once, and times of day are skipped until their next time. Missed times
@@ -977,7 +980,7 @@ pub async fn save(
         ),
         _ => (None, None, None),
     };
-    let values: [(AutomationPolicies, sea_query::Value); 22] = [
+    let values: [(AutomationPolicies, sea_query::Value); 21] = [
         (AutomationPolicies::Name, policy.name.as_str().into()),
         (AutomationPolicies::Enabled, policy.enabled.into()),
         (
@@ -1017,15 +1020,18 @@ pub async fn save(
         (AutomationPolicies::OwnerUserId, owner_user_id.into()),
         (AutomationPolicies::NextRunAt, next_run(policy, now).into()),
         (AutomationPolicies::IntervalAnchorAt, now.into()),
-        (AutomationPolicies::UpdatedAt, now.into()),
     ];
     if create {
         let (mut columns, mut row): (Vec<_>, Vec<_>) = values
             .into_iter()
             .map(|(column, value)| (column, Expr::val(value)))
             .unzip();
-        columns.extend([AutomationPolicies::Id, AutomationPolicies::CreatedAt]);
-        row.extend([Expr::val(id), Expr::val(now)]);
+        columns.extend([
+            AutomationPolicies::Id,
+            AutomationPolicies::CreatedAt,
+            AutomationPolicies::UpdatedAt,
+        ]);
+        row.extend([Expr::val(id), Expr::val(now), Expr::val(now)]);
         executor
             .execute(
                 &Query::insert()
@@ -1041,6 +1047,16 @@ pub async fn save(
                 &Query::update()
                     .table(AutomationPolicies::Table)
                     .values(values.map(|(column, value)| (column, Expr::val(value))))
+                    // Later than the last save even within its millisecond,
+                    // so a firing planned before this save can tell.
+                    .value(
+                        AutomationPolicies::UpdatedAt,
+                        Expr::case(
+                            Expr::col(AutomationPolicies::UpdatedAt).gte(now),
+                            Expr::col(AutomationPolicies::UpdatedAt).add(1),
+                        )
+                        .finally(now),
+                    )
                     // Saving clears an old problem; firing says if it remains.
                     .value(AutomationPolicies::LastProblem, Option::<String>::None)
                     .value(AutomationPolicies::LastProblemAt, Option::<i64>::None)
@@ -1179,31 +1195,79 @@ pub enum Starter<'a> {
     User { user_id: &'a str, actor: Actor },
 }
 
-/// Starts a job of the policy on `target`, after misses the waiting devices
-/// of its earlier jobs if `supersede`. Returns the job's ID, or why it
-/// didn't start.
-async fn start_job(
-    executor: &mut impl Executor,
+const NO_DEVICES: &str = "There were no devices to run on";
+
+/// A job of a policy as planned through the readers, or why it can't start.
+#[derive(Debug)]
+enum Prepared {
+    Job(Box<jobs::Plan>),
+    /// Its target covers no devices. Its earlier jobs still stop waiting.
+    NoDevices,
+    /// Its owner lost the access it runs with, or its script or
+    /// applications are gone.
+    Problem(String),
+}
+
+/// Plans a job of the policy on `target` through the readers, outside any
+/// transaction: checks that the policy can run (for its own runs, that its
+/// owner still has the access it runs with), builds what the job sends, and
+/// plans its devices. A role, script or library change that lands after
+/// this is as one that lands just after the job is created.
+async fn prepare(
     state: &AppState,
     policy: &Policy,
     target: Target,
     starter: Starter<'_>,
-    supersede: bool,
-    now: i64,
-) -> Result<Result<String, String>, ApiError> {
+) -> Result<Prepared, ApiError> {
+    let mut database = &state.database;
     if matches!(starter, Starter::Policy)
-        && let Some(problem) = problem(executor, policy).await?
+        && let Some(problem) = problem(&mut database, policy).await?
     {
-        return Ok(Err(problem));
+        return Ok(Prepared::Problem(problem));
     }
-    let Some(payload) = payload(executor, policy).await? else {
-        return Ok(Err(
+    let Some(payload) = payload(&mut database, policy).await? else {
+        return Ok(Prepared::Problem(
             if matches!(policy.action, Action::Applications { .. }) {
                 "Its applications are no longer in the library".to_owned()
             } else {
                 "Its script was deleted or is no longer shared".to_owned()
             },
         ));
+    };
+    let (requested_by_user_id, actor) = match starter {
+        Starter::Policy => (policy.owner_user_id.clone(), policy.actor()),
+        Starter::User { user_id, actor } => (user_id.to_owned(), actor),
+    };
+    let job = NewJob {
+        payload,
+        target,
+        offline: policy.offline,
+        wait_ms: policy.catch_up_hours * HOUR_MS,
+        requested_by_user_id,
+        policy: Some((policy.id.clone(), policy.name.clone())),
+        actor,
+    };
+    match jobs::plan(&mut database, &state.agents, job).await {
+        Ok(plan) => Ok(Prepared::Job(Box::new(plan))),
+        Err(error) if error.code() == Some("no_devices") => Ok(Prepared::NoDevices),
+        Err(error) => Err(error),
+    }
+}
+
+/// Writes a prepared job of the policy, after missing the waiting devices of
+/// its earlier jobs if `supersede`, and notes it as the policy's last run.
+/// Returns the job's ID, or why it didn't start.
+async fn start_job(
+    executor: &mut impl Executor,
+    policy: &Policy,
+    prepared: &Prepared,
+    supersede: bool,
+    now: i64,
+) -> Result<Result<String, String>, ApiError> {
+    let plan = match prepared {
+        Prepared::Problem(problem) => return Ok(Err(problem.clone())),
+        Prepared::Job(plan) => Some(plan),
+        Prepared::NoDevices => None,
     };
     if supersede {
         executor
@@ -1228,20 +1292,10 @@ async fn start_job(
             )
             .await?;
     }
-    let (requested_by_user_id, actor) = match starter {
-        Starter::Policy => (policy.owner_user_id.clone(), policy.actor()),
-        Starter::User { user_id, actor } => (user_id.to_owned(), actor),
+    let Some(plan) = plan else {
+        return Ok(Err(NO_DEVICES.to_owned()));
     };
-    let job = NewJob {
-        payload,
-        target,
-        offline: policy.offline,
-        wait_ms: policy.catch_up_hours * HOUR_MS,
-        requested_by_user_id,
-        policy: Some((policy.id.clone(), policy.name.clone())),
-        actor,
-    };
-    match jobs::create(executor, &job, &state.agents.connected(), now).await {
+    match jobs::write(executor, plan, now).await {
         Ok(created) => {
             executor
                 .execute(
@@ -1257,9 +1311,8 @@ async fn start_job(
                 .await?;
             Ok(Ok(created.id))
         }
-        Err(error) if error.code() == Some("no_devices") => {
-            Ok(Err("There were no devices to run on".to_owned()))
-        }
+        // Every planned device was deleted before the write.
+        Err(error) if error.code() == Some("no_devices") => Ok(Err(NO_DEVICES.to_owned())),
         Err(error) => Err(error),
     }
 }
@@ -1355,43 +1408,118 @@ async fn queued_devices(executor: &mut impl Executor, policy_id: &str) -> db::Re
     Ok(count)
 }
 
-/// Fires the policy due at `due_at`, once: claiming the time and starting
-/// the job happen together. A policy whose last run still has queued
-/// devices skips this run and says why. Returns whether a job started.
-async fn fire(state: &AppState, id: &str, due_at: i64, now: i64) -> anyhow::Result<bool> {
-    let mut transaction = state.database.begin().await?;
-    let Some(policy) = by_id(&mut transaction, id).await? else {
-        return Ok(false);
+/// How many times a firing is planned again when its policy is saved, or its
+/// last run's devices start, between planning and claiming. Past that, the
+/// next pass tries again.
+const FIRE_ATTEMPTS: usize = 3;
+
+/// A policy's firing as planned through the readers: what claiming its due
+/// time will do. [`write_firing`] claims the time and does it.
+pub struct Firing {
+    policy: Policy,
+    due_at: i64,
+    now: i64,
+    step: Step,
+}
+
+enum Step {
+    /// Later than a schedule that doesn't catch up allows: say so.
+    Missed,
+    /// Its last run still has devices queued: skip, if they still are.
+    Busy,
+    Start(Prepared),
+}
+
+/// How claiming a planned firing went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fired {
+    /// The due time is claimed; whether a job started.
+    Claimed { started: bool },
+    /// Another pass claimed it first, or the policy was deleted, turned off
+    /// or given another time.
+    NotDue,
+    /// The policy was saved, or its last run's queued devices started, since
+    /// planning: nothing was written, and the firing is to be planned again.
+    Changed,
+}
+
+/// Plans the firing of the policy `id` due at `due_at`, through the readers:
+/// its job, unless the time was missed or its last run's devices are still
+/// queued. `None` when the policy isn't due then.
+pub async fn plan_firing(
+    state: &AppState,
+    id: &str,
+    due_at: i64,
+    now: i64,
+) -> anyhow::Result<Option<Firing>> {
+    let Some(policy) = by_id(&mut &state.database, id).await? else {
+        return Ok(None);
     };
     if !policy.enabled || policy.next_run_at != Some(due_at) {
-        return Ok(false);
+        return Ok(None);
     }
+    let step = if now - due_at > MISSED_GRACE_MS && !policy.trigger.catches_up_late() {
+        Step::Missed
+    } else if queued_devices(&mut &state.database, &policy.id).await? > 0 {
+        Step::Busy
+    } else {
+        Step::Start(
+            prepare(state, &policy, policy.target.clone(), Starter::Policy)
+                .await
+                .map_err(failed)?,
+        )
+    };
+    Ok(Some(Firing {
+        policy,
+        due_at,
+        now,
+        step,
+    }))
+}
+
+/// Claims a planned firing's due time and does what was planned, together
+/// in one transaction, so a firing is claimed once and only with its job.
+/// The claim holds only while the policy is enabled, still due then and not
+/// saved since planning (its `updated_at` is unchanged), so a job never
+/// starts from an old definition; whether the last run's devices are still
+/// queued is checked again inside.
+pub async fn write_firing(state: &AppState, firing: &Firing) -> anyhow::Result<Fired> {
+    let Firing {
+        policy,
+        due_at,
+        now,
+        step,
+    } = firing;
+    let (due_at, now) = (*due_at, *now);
     let anchor = policy.interval_anchor_at.unwrap_or(due_at);
     let next = policy
         .trigger
         .next_after(std::cmp::max(now, due_at), anchor);
+    let mut transaction = state.database.begin().await?;
     let claimed = transaction
         .execute(
             &Query::update()
                 .table(AutomationPolicies::Table)
                 .value(AutomationPolicies::NextRunAt, next)
-                .and_where(Expr::col(AutomationPolicies::Id).eq(id))
+                .and_where(Expr::col(AutomationPolicies::Id).eq(policy.id.as_str()))
                 .and_where(Expr::col(AutomationPolicies::NextRunAt).eq(due_at))
                 .and_where(Expr::col(AutomationPolicies::Enabled).eq(true))
+                .and_where(Expr::col(AutomationPolicies::UpdatedAt).eq(policy.updated_at))
                 .to_owned(),
         )
         .await?;
     if claimed != 1 {
-        return Ok(false);
+        transaction.rollback().await?;
+        return Ok(still_due(state, &policy.id, due_at).await?);
     }
-    if now - due_at > MISSED_GRACE_MS && !policy.trigger.catches_up_late() {
+    if matches!(step, Step::Missed) {
         let problem = format!(
             "Missed its run at {} because the server wasn't running",
             crate::alerts::format_time(due_at)
         );
-        record_problem(&mut transaction, &policy, &problem, Some(due_at), now).await?;
+        record_problem(&mut transaction, policy, &problem, Some(due_at), now).await?;
         transaction.commit().await?;
-        return Ok(false);
+        return Ok(Fired::Claimed { started: false });
     }
     // Online devices still waiting their turn from its last run: a new job
     // would only queue them again behind it, and on a big fleet with a
@@ -1407,34 +1535,72 @@ async fn fire(state: &AppState, id: &str, due_at: i64, now: i64) -> anyhow::Resu
                 format!("{queued} devices")
             }
         );
-        record_problem(&mut transaction, &policy, &problem, Some(due_at), now).await?;
+        record_problem(&mut transaction, policy, &problem, Some(due_at), now).await?;
         transaction.commit().await?;
-        return Ok(false);
+        return Ok(Fired::Claimed { started: false });
     }
-    let target = policy.target.clone();
-    let started = match start_job(
-        &mut transaction,
-        state,
-        &policy,
-        target,
-        Starter::Policy,
-        true,
-        now,
-    )
-    .await
-    .map_err(failed)?
+    let Step::Start(prepared) = step else {
+        // They started since planning, so the policy runs after all.
+        transaction.rollback().await?;
+        return Ok(Fired::Changed);
+    };
+    let started = match start_job(&mut transaction, policy, prepared, true, now)
+        .await
+        .map_err(failed)?
     {
         Ok(job_id) => {
-            tracing::info!(policy_id = id, job_id, "an automation policy started a job");
+            tracing::info!(
+                policy_id = policy.id,
+                job_id,
+                "an automation policy started a job"
+            );
             true
         }
         Err(problem) => {
-            record_problem(&mut transaction, &policy, &problem, Some(due_at), now).await?;
+            record_problem(&mut transaction, policy, &problem, Some(due_at), now).await?;
             false
         }
     };
     transaction.commit().await?;
-    Ok(started)
+    Ok(Fired::Claimed { started })
+}
+
+/// Why a firing's claim found nothing to claim: if the policy is still
+/// enabled and due then, only a save since planning can have stopped it.
+async fn still_due(state: &AppState, id: &str, due_at: i64) -> db::Result<Fired> {
+    let row: Option<(bool, Option<i64>)> = state
+        .database
+        .fetch_optional(
+            &Query::select()
+                .columns([AutomationPolicies::Enabled, AutomationPolicies::NextRunAt])
+                .from(AutomationPolicies::Table)
+                .and_where(Expr::col(AutomationPolicies::Id).eq(id))
+                .to_owned(),
+        )
+        .await?;
+    Ok(match row {
+        Some((true, Some(next_run_at))) if next_run_at == due_at => Fired::Changed,
+        _ => Fired::NotDue,
+    })
+}
+
+/// Fires the policy due at `due_at`, once: its job is planned through the
+/// readers, then the time is claimed and the job written together, and
+/// planned again if the policy changed in between. A policy whose last run
+/// still has queued devices skips this run and says why. Returns whether a
+/// job started.
+async fn fire(state: &AppState, id: &str, due_at: i64, now: i64) -> anyhow::Result<bool> {
+    for _ in 0..FIRE_ATTEMPTS {
+        let Some(firing) = plan_firing(state, id, due_at, now).await? else {
+            return Ok(false);
+        };
+        match write_firing(state, &firing).await? {
+            Fired::Claimed { started } => return Ok(started),
+            Fired::NotDue => return Ok(false),
+            Fired::Changed => {}
+        }
+    }
+    Ok(false)
 }
 
 /// Starts a job of the policy now, as `user_id`. The schedule is unchanged.
@@ -1445,23 +1611,36 @@ pub async fn run_now(
     actor: Actor,
     now: i64,
 ) -> Result<String, ApiError> {
-    let mut transaction = state.database.begin().await?;
-    let started = start_job(
-        &mut transaction,
+    let cannot_run =
+        |problem: &str| ApiError::conflict(problem.to_owned()).with_code("policy_cannot_run");
+    let prepared = prepare(
         state,
         policy,
         policy.target.clone(),
         Starter::User { user_id, actor },
+    )
+    .await?;
+    // Nothing is written for a job that can't start.
+    match &prepared {
+        Prepared::Job(_) => {}
+        Prepared::NoDevices => return Err(cannot_run(NO_DEVICES)),
+        Prepared::Problem(problem) => return Err(cannot_run(problem)),
+    }
+    let mut transaction = state.database.begin().await?;
+    match start_job(
+        &mut transaction,
+        policy,
+        &prepared,
         policy.trigger.scheduled(),
         now,
     )
-    .await?;
-    match started {
+    .await?
+    {
         Ok(job_id) => {
             transaction.commit().await?;
             Ok(job_id)
         }
-        Err(problem) => Err(ApiError::conflict(problem).with_code("policy_cannot_run")),
+        Err(problem) => Err(cannot_run(&problem)),
     }
 }
 
@@ -1479,21 +1658,21 @@ pub async fn device_enrolled(state: &AppState, device_id: &str, now: i64) -> any
             && (policy.trigger == Trigger::Enroll || policy.action.installs_applications())
             && policy.target.covers(&device)
     }) {
-        let mut transaction = state.database.begin().await?;
         let mut enrolling = policy.clone();
         // A device that just enrolled connects in a moment.
         enrolling.offline = Offline::Wait;
-        match start_job(
-            &mut transaction,
+        let prepared = prepare(
             state,
             &enrolling,
             Target::Devices(vec![device_id.to_owned()]),
             Starter::Policy,
-            false,
-            now,
         )
         .await
-        .map_err(failed)?
+        .map_err(failed)?;
+        let mut transaction = state.database.begin().await?;
+        match start_job(&mut transaction, &enrolling, &prepared, false, now)
+            .await
+            .map_err(failed)?
         {
             Ok(job_id) => {
                 tracing::info!(

@@ -126,7 +126,9 @@ pub async fn start(
             "offline devices can be waited for 1 to {MAX_WAIT_HOURS} hours"
         )));
     }
-    let mut transaction = state.database.begin().await?;
+    // Everything but the job's own rows is read before the transaction, so
+    // SQLite's writer is held only while the job is inserted.
+    let mut database = &state.database;
     let payload = match (
         request.script_id,
         request.file_id,
@@ -135,7 +137,7 @@ pub async fn start(
     ) {
         (None, None, None, Some(applications)) => {
             actor.require(Permission::ApplicationsDeploy)?;
-            let spec = crate::applications::jobs::build(&mut transaction, applications).await?;
+            let spec = crate::applications::jobs::build(&mut database, applications).await?;
             if let Some(reason) = spec.all_pinned() {
                 return Err(crate::applications::jobs::pinned(reason));
             }
@@ -174,7 +176,7 @@ pub async fn start(
                 .run_as
                 .ok_or_else(|| jobs::invalid("choose the account the script runs as"))?;
             let script =
-                toolbox::visible_script(&mut transaction, &user, &parse_id(&script_id, "script")?)
+                toolbox::visible_script(&mut database, &user, &parse_id(&script_id, "script")?)
                     .await?
                     .ok_or_else(|| ApiError::not_found("Script not found"))?;
             Payload::Script {
@@ -191,7 +193,7 @@ pub async fn start(
             let destination = request
                 .destination
                 .ok_or_else(|| jobs::invalid("choose where the file goes"))?;
-            let file = toolbox::visible_file(&mut transaction, &user, &parse_id(&file_id, "file")?)
+            let file = toolbox::visible_file(&mut database, &user, &parse_id(&file_id, "file")?)
                 .await?
                 .ok_or_else(|| ApiError::not_found("File not found"))?;
             Payload::File {
@@ -206,10 +208,10 @@ pub async fn start(
             ));
         }
     };
-    let now = now_ms();
-    let created = jobs::create(
-        &mut transaction,
-        &NewJob {
+    let plan = jobs::plan(
+        &mut database,
+        &state.agents,
+        NewJob {
             payload,
             target,
             offline: request.offline,
@@ -218,10 +220,10 @@ pub async fn start(
             policy: None,
             actor: user.actor.clone(),
         },
-        &state.agents.connected(),
-        now,
     )
     .await?;
+    let mut transaction = state.database.begin().await?;
+    let created = jobs::write(&mut transaction, &plan, now_ms()).await?;
     transaction.commit().await?;
     state.automation.job_changed(&created.id);
     let detail = detail(&state, &actor, &created.id).await?;
