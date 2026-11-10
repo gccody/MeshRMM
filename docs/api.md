@@ -289,7 +289,8 @@ curl -fsS -H "Authorization: Bearer $MESHRMM_TOKEN" -H "Content-Type: applicatio
   "$MESHRMM/v1/agents/$DEVICE/updates/install"
 ```
 
-`GET /v1/updates/devices` summarizes every device; a job with
+`GET /v1/updates/devices` pages the devices' summaries, most urgent first,
+with filters and the fleet's totals; a job with
 `"updates": {"action": "install", …}` installs on many.
 
 ### Applications

@@ -927,7 +927,24 @@ CREATE TABLE device_update_status (
   reboot_pending_since INTEGER,
   -- Identifies the pending updates stored from the last scan that worked, so
   -- an unchanged list isn't rewritten. NULL before one is stored.
-  pending_hash TEXT
+  pending_hash TEXT,
+  -- What device_pending_updates holds for the device, written with it, so
+  -- the Updates page counts, filters and orders the fleet without reading
+  -- every pending update: how many, how many are security and critical
+  -- updates, and when a scan first listed the oldest.
+  pending_count INTEGER NOT NULL DEFAULT 0,
+  security_count INTEGER NOT NULL DEFAULT 0,
+  critical_count INTEGER NOT NULL DEFAULT 0,
+  oldest_pending_at INTEGER,
+  -- The device's latest install in update_runs, written with it when it
+  -- starts, finishes, is lost or discarded, so the Updates page shows and
+  -- counts failed installs without reading the runs. NULL before the first.
+  last_install_id TEXT,
+  last_install_status TEXT CHECK (last_install_status IS NULL OR last_install_status IN ('pending', 'succeeded', 'partial', 'failed', 'lost')),
+  last_install_created_at INTEGER,
+  last_install_completed_at INTEGER,
+  last_install_installed INTEGER NOT NULL DEFAULT 0,
+  last_install_failed INTEGER NOT NULL DEFAULT 0
 );
 
 -- The updates each device's latest scan found pending. first_seen_at is

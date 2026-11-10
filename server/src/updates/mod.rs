@@ -17,7 +17,7 @@
 pub mod runs;
 pub mod store;
 
-use std::{collections::HashSet, time::Duration};
+use std::time::Duration;
 
 use meshrmm_protocol_types::{
     AgentCommand, LastUpdateScan, UpdateInstallResult, UpdateInstallStatus, UpdateScan,
@@ -114,7 +114,7 @@ pub async fn pass(state: &AppState, now: i64) -> anyhow::Result<()> {
 
 /// Marks runs the Agent never reported as lost.
 pub async fn sweep(state: &AppState, now: i64) -> anyhow::Result<()> {
-    let lost = runs::sweep_lost(&mut &state.database, now).await?;
+    let lost = runs::sweep_lost(&state.database, now).await?;
     for (run_id, device_id, kind) in &lost {
         tracing::info!(run_id, device_id, "an update run never reported");
         state.automation.device_changed(device_id);
@@ -305,20 +305,12 @@ pub async fn publish_device(state: &AppState, device_id: &str) {
     if !state.updates.heard() {
         return;
     }
-    // The summary asks only whether this device is connected.
-    let connected = if state.agents.is_connected(device_id) {
-        HashSet::from([device_id.to_owned()])
-    } else {
-        HashSet::new()
-    };
-    match store::summaries(&mut &state.database, Some(device_id), &connected).await {
-        Ok(summaries) => {
-            if let Some(device) = summaries.into_iter().next() {
-                state.updates.publish(UpdatesEvent::DeviceUpdates {
-                    device: Box::new(device),
-                });
-            }
-        }
+    let connected = state.agents.is_connected(device_id);
+    match store::summary(&mut &state.database, device_id, connected).await {
+        Ok(Some(device)) => state.updates.publish(UpdatesEvent::DeviceUpdates {
+            device: Box::new(device),
+        }),
+        Ok(None) => {}
         Err(error) => tracing::warn!(device_id, %error, "could not summarize a device's updates"),
     }
 }

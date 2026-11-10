@@ -204,7 +204,9 @@ export const DEFAULT_REBOOT_DELAY_MINUTES = 5;
 // The delays the website offers, in minutes.
 export const REBOOT_DELAYS = [1, 5, 15, 30, 60, 120, 240, 480, 1440] as const;
 
-// A device whose last scan is older than this is shown as not scanned recently.
+// A device whose last scan is older than this shows its last scan as old.
+// The server's "Not scanned recently" filter and tile use the same
+// threshold (updates::store::STALE_SCAN_MS).
 export const STALE_SCAN_MS = 3 * 24 * 60 * 60_000;
 
 const CATEGORY_ORDER = new Map(CATEGORIES.map((category, index) => [category, index]));
@@ -395,60 +397,116 @@ export function fleetFilterParams(filters: FleetFilters) {
 export const isStale = (device: Pick<DeviceUpdateSummary, "received_at" | "supported">, now: number) =>
   device.supported && (device.received_at === null || now - device.received_at > STALE_SCAN_MS);
 
-export const lastInstallFailed = (device: Pick<DeviceUpdateSummary, "last_install">) =>
-  device.last_install !== null && (device.last_install.status === "failed" || device.last_install.status === "partial" || device.last_install.status === "lost");
+// How many devices the fleet has, and how many are in each state.
+export type FleetTotals = { devices: number; pending: number; security: number; failed: number; reboot: number; stale: number };
 
-export function matchesFleetStatus(device: DeviceUpdateSummary, status: FleetStatusFilter, now: number) {
-  switch (status) {
-    case "": return true;
-    case "pending": return device.pending > 0;
-    case "security": return device.security > 0 || device.critical > 0;
-    case "failed": return lastInstallFailed(device);
-    case "reboot": return device.reboot_pending;
-    case "stale": return isStale(device, now);
+// GET /v1/updates/devices: a page of the devices the filters match, most
+// urgent first, how many match, and the whole fleet's totals.
+export type FleetPage = { devices: DeviceUpdateSummary[]; matching: number; totals: FleetTotals };
+
+export const FLEET_PAGE_SIZE = 100;
+
+// GET /v1/updates/devices's address for the filters' page from `offset`;
+// a `limit` of 0 asks for the counts alone.
+export function fleetPagePath(filters: FleetFilters, offset: number, limit = FLEET_PAGE_SIZE) {
+  const params = new URLSearchParams();
+  const query = filters.query.trim();
+  if (query) params.set("query", query);
+  if (filters.company) params.set("company", filters.company);
+  if (filters.tag) params.set("tag", filters.tag);
+  if (filters.platform) params.set("platform", filters.platform);
+  if (filters.status) params.set("status", filters.status);
+  params.set("limit", String(limit));
+  if (offset > 0) params.set("offset", String(offset));
+  return `/v1/updates/devices?${params}`;
+}
+
+// The filters a list is loaded for, as one string to compare.
+export const fleetKey = (filters: FleetFilters) => fleetPagePath(filters, 0, 0);
+
+// The pages loaded so far for one set of filters (`key`), with the newest
+// counts. Requests are numbered as they're sent: `listTicket` is the one
+// whose first page the list starts with, `countsTicket` the one whose
+// counts it shows.
+export type FleetList = {
+  key: string;
+  devices: DeviceUpdateSummary[];
+  matching: number;
+  totals: FleetTotals;
+  listTicket: number;
+  countsTicket: number;
+};
+
+// The server's answer to request `ticket` for the filters `key`: a page
+// from `offset`, or the counts alone.
+export type FleetAnswer =
+  | { kind: "page"; key: string; ticket: number; offset: number; page: FleetPage }
+  | { kind: "counts"; key: string; ticket: number; page: FleetPage };
+
+// The list after an answer, while the page wants the filters `wanted`. A
+// newer request's answer always wins: an older one changes nothing it
+// already shows. A page for other filters than those wanted is dropped,
+// and a further page joins only the list it was asked for; the fleet's
+// totals are the same whatever the filters.
+export function applyFleetAnswer(list: FleetList | null, answer: FleetAnswer, wanted: string): FleetList | null {
+  const { page, ticket } = answer;
+  const withCounts = (current: FleetList): FleetList => ticket > current.countsTicket
+    ? { ...current, totals: page.totals, matching: answer.key === current.key ? page.matching : current.matching, countsTicket: ticket }
+    : current;
+  if (answer.kind === "counts") return list && withCounts(list);
+  if (answer.key !== wanted) return list;
+  if (answer.offset === 0) {
+    if (list && list.key === answer.key && ticket < list.listTicket) return list;
+    const fresh = { key: answer.key, devices: page.devices, matching: page.matching, totals: page.totals, listTicket: ticket, countsTicket: ticket };
+    if (!list || list.countsTicket < ticket) return fresh;
+    return { ...fresh, totals: list.totals, countsTicket: list.countsTicket, matching: list.key === answer.key ? list.matching : page.matching };
   }
+  if (!list || list.key !== answer.key || ticket < list.listTicket) return list;
+  // The fleet may have moved between pages: a device already loaded stays
+  // where it is.
+  const loaded = new Set(list.devices.map((device) => device.device_id));
+  return withCounts({ ...list, devices: [...list.devices, ...page.devices.filter((device) => !loaded.has(device.device_id))] });
 }
 
-export function matchesFleetFilters(device: DeviceUpdateSummary, filters: FleetFilters, now: number) {
-  const query = filters.query.trim().toLowerCase();
-  const company = !filters.company
-    || (filters.company === NO_COMPANY_FILTER ? device.company_id === null : device.company_id === filters.company);
-  return (!query || device.device_name.toLowerCase().includes(query))
-    && company
-    && (!filters.tag || (device.tag_ids ?? []).includes(filters.tag))
-    && (!filters.platform || device.platform === filters.platform)
-    && matchesFleetStatus(device, filters.status, now);
+// A device's summary from the socket in place of the loaded copy. A
+// device not loaded stays out: where it belongs is for the server to say
+// when the next page or the next load asks.
+export function patchFleetRow(list: FleetList | null, changed: DeviceUpdateSummary): FleetList | null {
+  if (!list) return list;
+  const index = list.devices.findIndex((device) => device.device_id === changed.device_id);
+  if (index === -1) return list;
+  const devices = [...list.devices];
+  devices[index] = changed;
+  return { ...list, devices };
 }
 
-// How many devices are in each state, for the page's tiles.
-export function fleetTotals(devices: readonly DeviceUpdateSummary[], now: number) {
-  return {
-    devices: devices.length,
-    pending: devices.filter((device) => matchesFleetStatus(device, "pending", now)).length,
-    security: devices.filter((device) => matchesFleetStatus(device, "security", now)).length,
-    failed: devices.filter((device) => matchesFleetStatus(device, "failed", now)).length,
-    reboot: devices.filter((device) => matchesFleetStatus(device, "reboot", now)).length,
-    stale: devices.filter((device) => matchesFleetStatus(device, "stale", now)).length,
-  };
-}
+// Chosen devices by ID, with the summary they were chosen with, so the
+// selection outlives the pages and filters it was made in.
+export type ChosenDevices = ReadonlyMap<string, DeviceUpdateSummary>;
 
-// The most urgent first: security updates, then any pending, then by name.
-export function sortFleet(devices: readonly DeviceUpdateSummary[]) {
-  return [...devices].sort((left, right) =>
-    (right.security + right.critical) - (left.security + left.critical)
-    || right.pending - left.pending
-    || left.device_name.localeCompare(right.device_name, undefined, { sensitivity: "base" })
-    || left.device_id.localeCompare(right.device_id));
-}
-
-// A device's summary from the socket in place of the list's copy.
-export function applySummaryUpdate(devices: readonly DeviceUpdateSummary[], changed: DeviceUpdateSummary) {
-  const index = devices.findIndex((device) => device.device_id === changed.device_id);
-  if (index === -1) return [...devices, changed];
-  const next = [...devices];
-  next[index] = changed;
+// The choice with `devices` chosen, or not.
+export function chooseDevices(chosen: ChosenDevices, devices: readonly DeviceUpdateSummary[], checked: boolean): ChosenDevices {
+  const next = new Map(chosen);
+  for (const device of devices) {
+    if (checked) next.set(device.device_id, device);
+    else next.delete(device.device_id);
+  }
   return next;
 }
+
+// The chosen devices with the newer summaries among `devices`; the same
+// choice when none of them is chosen.
+export function refreshChosen(chosen: ChosenDevices, devices: readonly DeviceUpdateSummary[]): ChosenDevices {
+  const changed = devices.filter((device) => chosen.has(device.device_id));
+  if (!changed.length) return chosen;
+  const next = new Map(chosen);
+  for (const device of changed) next.set(device.device_id, device);
+  return next;
+}
+
+// How long to wait before reading the counts again, the last read having
+// been at `lastAt`: at most once every `intervalMs` while changes arrive.
+export const countsRefreshDelay = (lastAt: number, now: number, intervalMs = 10_000) => Math.max(0, lastAt + intervalMs - now);
 
 // A run from the socket in place of the history's copy, newest first. The
 // event leaves out an install's updates, so the copy's are kept.

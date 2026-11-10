@@ -8,9 +8,10 @@ use meshrmm_protocol_types::{
 use sea_query::{Expr, ExprTrait, Order, Query};
 use serde::{Deserialize, Serialize};
 
+use super::store;
 use crate::{
     db::{
-        self, Executor,
+        self, Database, Executor,
         tables::{Agents, UpdateRunItems, UpdateRuns, Users},
     },
     time::{MINUTE_MS, SECOND_MS},
@@ -131,6 +132,8 @@ pub struct NewRun<'a> {
     pub created_at: i64,
 }
 
+/// Records a run. An install becomes the device's latest on its status
+/// row, in the same transaction when `executor` is one.
 pub async fn insert(executor: &mut impl Executor, run: &NewRun<'_>) -> db::Result<()> {
     let install = run.install;
     executor
@@ -175,6 +178,9 @@ pub async fn insert(executor: &mut impl Executor, run: &NewRun<'_>) -> db::Resul
                 .to_owned(),
         )
         .await?;
+    if run.kind == Kind::Install {
+        store::install_started(executor, run.device_id, run.id, run.created_at).await?;
+    }
     Ok(())
 }
 
@@ -198,8 +204,23 @@ pub fn command(id: &str, kind: Kind, install: Option<&Install>) -> AgentCommand 
     }
 }
 
-/// Removes a pending run the Agent never got.
+/// Removes a pending run the Agent never got. A removed install's device
+/// has the install before it as its latest again, in the same transaction
+/// when `executor` is one.
 pub async fn discard(executor: &mut impl Executor, id: &str) -> db::Result<()> {
+    let run: Option<(String, String)> = executor
+        .fetch_optional(
+            &Query::select()
+                .columns([UpdateRuns::DeviceId, UpdateRuns::Kind])
+                .from(UpdateRuns::Table)
+                .and_where(Expr::col(UpdateRuns::Id).eq(id))
+                .and_where(Expr::col(UpdateRuns::Status).eq("pending"))
+                .to_owned(),
+        )
+        .await?;
+    let Some((device_id, kind)) = run else {
+        return Ok(());
+    };
     executor
         .execute(
             &Query::delete()
@@ -209,6 +230,9 @@ pub async fn discard(executor: &mut impl Executor, id: &str) -> db::Result<()> {
                 .to_owned(),
         )
         .await?;
+    if kind == Kind::Install.as_str() {
+        store::install_discarded(executor, &device_id, id).await?;
+    }
     Ok(())
 }
 
@@ -558,7 +582,8 @@ pub async fn finish_scans(
     Ok(finished)
 }
 
-/// Records how the device's pending install went. Returns whether it was
+/// Records how the device's pending install went, and on the device's
+/// status row while it is its latest install. Returns whether it was
 /// pending.
 pub async fn finish_install(
     executor: &mut impl Executor,
@@ -607,6 +632,18 @@ pub async fn finish_install(
     if updated != 1 {
         return Ok(false);
     }
+    store::install_ended(
+        executor,
+        device_id,
+        run_id,
+        status,
+        now,
+        (
+            count(UpdateItemOutcome::Installed),
+            count(UpdateItemOutcome::Failed),
+        ),
+    )
+    .await?;
     let mut seen = std::collections::HashSet::new();
     let items = result
         .items
@@ -640,13 +677,11 @@ pub async fn finish_install(
     Ok(true)
 }
 
-/// Marks runs the Agent never reported as lost. Returns them, with their
-/// devices and kinds.
-pub async fn sweep_lost(
-    executor: &mut impl Executor,
-    now: i64,
-) -> db::Result<Vec<(String, String, Kind)>> {
-    let pending: Vec<(String, String, String, i64)> = executor
+/// Marks runs the Agent never reported as lost, each lost install with its
+/// device's status row in one transaction. Returns them, with their devices
+/// and kinds.
+pub async fn sweep_lost(database: &Database, now: i64) -> db::Result<Vec<(String, String, Kind)>> {
+    let pending: Vec<(String, String, String, i64)> = database
         .fetch_all(
             &Query::select()
                 .columns([
@@ -668,7 +703,8 @@ pub async fn sweep_lost(
         if created_at + kind.report_window_ms() >= now {
             continue;
         }
-        let updated = executor
+        let mut transaction = database.begin().await?;
+        let updated = transaction
             .execute(
                 &Query::update()
                     .table(UpdateRuns::Table)
@@ -682,6 +718,10 @@ pub async fn sweep_lost(
                     .to_owned(),
             )
             .await?;
+        if updated == 1 && kind == Kind::Install {
+            store::install_ended(&mut transaction, &device_id, &id, "lost", now, (0, 0)).await?;
+        }
+        transaction.commit().await?;
         if updated == 1 {
             lost.push((id, device_id, kind));
         }

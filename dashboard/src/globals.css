@@ -1008,6 +1008,7 @@ button.outcome-chip:hover { color: var(--text); background: var(--raised); }
 .update-tile small { color: var(--text-3); font-size: 12.5px; }
 .update-tile.attention strong { color: var(--warn); }
 .update-tile[aria-pressed=true] { border-color: var(--signal); background: var(--signal-wash); }
+.fleet-footer { flex-wrap: wrap; align-items: center; gap: 8px 16px; }
 .toolbar-filters { display: flex; flex-wrap: wrap; gap: 8px; }
 .app-root .toolbar-filters select { min-height: 36px; max-width: 200px; font-size: 13.5px; }
 .data-table td > strong.numeric-strong { display: inline; margin-right: 4px; font-variant-numeric: tabular-nums; }
