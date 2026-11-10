@@ -677,7 +677,9 @@ handshake again.
 - The server logs to standard error: `journalctl -u meshrmm-server` or
   `docker logs meshrmm`. Set `log.format = "json"` for a log collector, and
   `log.level` to a tracing filter such as `meshrmm_server=debug,info` to
-  investigate a problem.
+  investigate a problem. If whatever reads standard error falls behind, the
+  server drops lines rather than wait for it, and logs how many it dropped
+  once it catches up.
 - **Audit** in the website lists sign-ins, account and role changes, setting
   changes, enrollments, remote sessions, script runs and file deliveries,
   and names the API token when someone acted with one.

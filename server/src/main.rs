@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use meshrmm_server::config::{self, Config, LogFormat};
-use tracing_subscriber::EnvFilter;
+use meshrmm_server::config::{self, Config};
 
 #[derive(Parser)]
 #[command(
@@ -54,7 +53,9 @@ fn main() -> anyhow::Result<()> {
         None => (PathBuf::from(config::DEFAULT_CONFIG_PATH), false),
     };
     let config = Config::load(&path, required)?;
-    init_logging(&config);
+    // Logs go to stderr, so admin commands' stdout carries only their result. Every
+    // return from here on drops this, which writes the lines still queued first.
+    let _logging = meshrmm_server::logging::init(&config.log)?;
     meshrmm_server::install_crypto_provider();
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async {
@@ -87,22 +88,4 @@ async fn admin(config: Config, command: Admin) -> anyhow::Result<()> {
     state.database.close().await;
     println!("{}", result?);
     Ok(())
-}
-
-fn init_logging(config: &Config) {
-    let filter = EnvFilter::try_new(&config.log.level).unwrap_or_else(|error| {
-        eprintln!(
-            "log.level {:?} is invalid ({error}); using info",
-            config.log.level
-        );
-        EnvFilter::new("info")
-    });
-    // Logs go to stderr, so admin commands' stdout carries only their result.
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr);
-    match config.log.format {
-        LogFormat::Text => builder.init(),
-        LogFormat::Json => builder.json().init(),
-    }
 }

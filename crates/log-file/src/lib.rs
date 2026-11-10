@@ -6,6 +6,13 @@
 //!
 //! Renames keep a rotated file's permissions, and a new log inherits its
 //! folder's, as the first log did.
+//!
+//! [`AsyncLog`] writes a log on its own thread, so a stalled log never stalls
+//! the threads that log.
+mod async_log;
+
+pub use async_log::{AsyncLog, Record};
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
