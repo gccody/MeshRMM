@@ -20,8 +20,8 @@ import {
   stemLength,
   trashName,
   typeLabel,
-  visibleRows,
 } from "../features/files/model.ts";
+import { windowRows } from "../lib/windowing.ts";
 import { emptyFolders, fromFileList } from "../features/files/picked.ts";
 
 test("Windows paths split into drives, shares and folders", () => {
@@ -97,10 +97,10 @@ test("accounts follow the permissions, and errors say the way on", () => {
 });
 
 test("only the rows on screen are drawn, and their pages loaded", () => {
-  assert.deepEqual(visibleRows(0, ROW_HEIGHT * 20, 50_000), { first: 0, last: 30 });
-  assert.deepEqual(visibleRows(ROW_HEIGHT * 1000, ROW_HEIGHT * 20, 50_000), { first: 990, last: 1030 });
-  assert.deepEqual(visibleRows(ROW_HEIGHT * 49_990, ROW_HEIGHT * 20, 50_000), { first: 49_980, last: 50_000 });
-  assert.deepEqual(visibleRows(0, 600, 0), { first: 0, last: 0 });
+  assert.deepEqual(windowRows(0, ROW_HEIGHT * 20, 50_000, ROW_HEIGHT), { first: 0, last: 30 });
+  assert.deepEqual(windowRows(ROW_HEIGHT * 1000, ROW_HEIGHT * 20, 50_000, ROW_HEIGHT), { first: 990, last: 1030 });
+  assert.deepEqual(windowRows(ROW_HEIGHT * 49_990, ROW_HEIGHT * 20, 50_000, ROW_HEIGHT), { first: 49_980, last: 50_000 });
+  assert.deepEqual(windowRows(0, 600, 0, ROW_HEIGHT), { first: 0, last: 0 });
   assert.deepEqual(pagesFor(0, 30), [0]);
   assert.deepEqual(pagesFor(PAGE_SIZE - 5, PAGE_SIZE + 5), [0, 1]);
   assert.deepEqual(pagesFor(49_980, 50_000), [99]);

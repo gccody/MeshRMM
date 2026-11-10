@@ -4,6 +4,7 @@ import { type FormEvent, type RefObject, useEffect, useMemo, useState } from "re
 import { AuthenticationRequired } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
 import { type Agent, PLATFORM_LABELS } from "../agents/types";
+import { DeviceSelect } from "../device-picker/device-select";
 import { useWorkspace } from "../workspace/workspace-context";
 import { type RunAs, type ScriptRun, type ToolboxScript, LANGUAGE_LABELS, RUN_AS_LABELS, groupByFolder, isRunFinished, runsOn } from "./model";
 import { RunResult, useScriptRun } from "./run-result";
@@ -46,10 +47,9 @@ export function RunScriptModal({ agents, scripts: givenScripts, initialAgentId, 
     return () => { cancelled = true; };
   }, [authorizedFetch, givenScripts]);
 
-  const sortedAgents = useMemo(() => [...agents].sort((left, right) => left.name.localeCompare(right.name)), [agents]);
   const folders = useMemo(() => groupByFolder(scripts ?? []), [scripts]);
   const script = scripts?.find((candidate) => candidate.id === scriptId);
-  const agent = agents.find((candidate) => candidate.id === agentId);
+  const agent = useMemo(() => agents.find((candidate) => candidate.id === agentId), [agents, agentId]);
   const compatible = !script || !agent || runsOn(script.language, agent.platform);
   const canRun = Boolean(script && agent?.connected && compatible && !starting);
 
@@ -98,16 +98,19 @@ export function RunScriptModal({ agents, scripts: givenScripts, initialAgentId, 
             {script?.description && <small className="field-help">{script.description}</small>}
             {!compatible && script && agent && <p role="alert" className="installer-error">{`${LANGUAGE_LABELS[script.language]} scripts don't run on ${PLATFORM_LABELS[agent.platform]}.`}</p>}
             {loadError && <p role="alert" className="installer-error">{loadError}</p>}
-            <label htmlFor="run-device">Device
-              <select id="run-device" value={agentId} onChange={(event) => setAgentId(event.target.value)}>
-                <option value="" disabled>Choose a device</option>
-                {sortedAgents.map((candidate) => (
-                  <option key={candidate.id} value={candidate.id} disabled={!candidate.connected || (script && !runsOn(script.language, candidate.platform))}>
-                    {candidate.name} ({PLATFORM_LABELS[candidate.platform]}{candidate.connected ? "" : ", offline"})
-                  </option>
-                ))}
-              </select>
-            </label>
+            <div className="device-select-field">
+              <label htmlFor="run-device">Device</label>
+              <DeviceSelect
+                id="run-device"
+                label="Device"
+                agents={agents}
+                value={agentId}
+                onChange={setAgentId}
+                placeholder="Choose a device"
+                describe={(candidate) => `${PLATFORM_LABELS[candidate.platform]}${candidate.connected ? "" : ", offline"}`}
+                disabled={(candidate) => !candidate.connected || Boolean(script && !runsOn(script.language, candidate.platform))}
+              />
+            </div>
             <fieldset className="run-as-choice">
               <legend>Run as</legend>
               {(["user", "system"] as const).map((choice) => (

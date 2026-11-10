@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { outcomeLabel, policyDraft, policyDraftProblem, policyInput } from "../features/automation/model.ts";
-import { isSettling, relayText, wakeHeadline, wakeState, wakeTitle, wakeTone, wakeable } from "../features/wake/model.ts";
+import { isSettling, relayText, replaceWakes, wakeHeadline, wakeState, wakeTitle, wakeTone, wakeable } from "../features/wake/model.ts";
 
 const NOW = 1_800_000_000_000;
 
@@ -52,6 +52,18 @@ test("only offline devices are woken, and the dialog names them", () => {
   assert.deepEqual(wakeable(agents).map((agent) => agent.id), ["b"]);
   assert.equal(wakeTitle(["Office PC"]), "Wake Office PC");
   assert.equal(wakeTitle(["A", "B", "C"]), "Wake 3 devices");
+});
+
+test("wakes read again replace their old copies in place", () => {
+  const current = Array.from({ length: 10_000 }, (_, index) => wake({ id: `w${index}`, status: "sending" }));
+  const fresh = current.filter((_, index) => index % 2 === 0).map((old) => ({ ...old, status: "sent" }));
+  const next = replaceWakes(current, [...fresh].reverse());
+  assert.equal(next.length, 10_000);
+  assert.deepEqual(next.map((item) => item.id), current.map((item) => item.id));
+  assert.equal(next.filter((item) => item.status === "sent").length, 5_000);
+  assert.equal(next[1], current[1]);
+  assert.equal(next[2], fresh[1]);
+  assert.deepEqual(replaceWakes(current.slice(0, 2), [wake({ id: "other" })]), current.slice(0, 2));
 });
 
 test("wake jobs word their outcomes as coming online", () => {

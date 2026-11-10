@@ -1,8 +1,9 @@
 import { ArrowDown, ArrowUp, File as FileIcon, FileQuestion, Folder, FolderSymlink, Link2, MoreHorizontal } from "lucide-react";
-import { type DragEvent, type KeyboardEvent, type MouseEvent, type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { type DragEvent, type KeyboardEvent, type MouseEvent, type ReactNode, useEffect, useRef, useState } from "react";
 import { usePopover } from "../../lib/use-popover";
+import { useWindowedRows } from "../../lib/use-windowed-rows";
 import { formatBytes } from "../metrics/model";
-import { type FileEntry, type FileSort, ROW_HEIGHT, typeLabel, visibleRows } from "./model";
+import { type FileEntry, type FileSort, ROW_HEIGHT, typeLabel } from "./model";
 import { draggingFiles } from "./picked";
 
 export type RowAction = {
@@ -60,44 +61,13 @@ export function FileList(props: Props) {
   const scroller = useRef<HTMLDivElement>(null);
   const above = useRef<HTMLTableRowElement>(null);
   const below = useRef<HTMLTableRowElement>(null);
-  // Where the list is scrolled to, in the listing it was scrolled in.
-  const [scroll, setView] = useState({ key: listKey, top: 0, height: 600 });
-  const view = scroll.key === listKey ? scroll : { ...scroll, top: 0 };
-  const [dropTarget, setDropTarget] = useState<number | "list" | null>(null);
-  const frame = useRef(0);
-  const { first, last } = visibleRows(view.top, view.height, total);
-
-  useLayoutEffect(() => {
-    const node = scroller.current;
-    if (!node) return;
-    const observer = new ResizeObserver(() => setView((current) => ({ ...current, height: node.clientHeight })));
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, []);
-
   // A new listing starts at the top.
-  useLayoutEffect(() => {
-    if (scroller.current) scroller.current.scrollTop = 0;
-  }, [listKey]);
-
-  // The space of the rows not drawn, set directly: the site's content
-  // security policy keeps style attributes out of the markup.
-  useLayoutEffect(() => {
-    if (above.current) above.current.style.height = `${first * ROW_HEIGHT}px`;
-    if (below.current) below.current.style.height = `${Math.max(0, total - last) * ROW_HEIGHT}px`;
-  }, [first, last, total]);
+  const { first, last, onScroll } = useWindowedRows({ scroller, above, below }, total, ROW_HEIGHT, listKey);
+  const [dropTarget, setDropTarget] = useState<number | "list" | null>(null);
 
   useEffect(() => {
     onVisible(first, last);
   }, [first, last, onVisible, listKey]);
-
-  const scrolled = () => {
-    cancelAnimationFrame(frame.current);
-    frame.current = requestAnimationFrame(() => {
-      const node = scroller.current;
-      if (node) setView({ key: listKey, top: node.scrollTop, height: node.clientHeight });
-    });
-  };
 
   const focusRow = (index: number) => {
     const node = scroller.current;
@@ -196,7 +166,7 @@ export function FileList(props: Props) {
     <div
       ref={scroller}
       className={`file-list${dropTarget === "list" ? " drop-target" : ""}`}
-      onScroll={scrolled}
+      onScroll={onScroll}
       onDragOver={dragOver}
       onDragLeave={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null);

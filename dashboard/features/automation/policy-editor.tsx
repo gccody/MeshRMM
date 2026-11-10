@@ -10,7 +10,7 @@ import { RebootFields } from "../updates/reboot-fields";
 import { useWorkspace } from "../workspace/workspace-context";
 import { ApplicationPolicyFields } from "../applications/policy-fields";
 import { savePolicy } from "./automation-api";
-import { DevicePicker } from "./device-picker";
+import { DevicePicker } from "../device-picker/device-picker";
 import {
   ACTION_LABELS,
   MAX_WAIT_HOURS,

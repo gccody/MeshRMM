@@ -1,5 +1,5 @@
 import { LoaderCircle, Play, Send, X } from "lucide-react";
-import { type FormEvent, type RefObject, useEffect, useId, useState } from "react";
+import { type FormEvent, type RefObject, useEffect, useId, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import { AuthenticationRequired, errorText } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
@@ -9,7 +9,7 @@ import { TagTargetFields } from "../tags/tag-chip";
 import { fetchToolbox } from "../toolbox/toolbox-api";
 import { useWorkspace } from "../workspace/workspace-context";
 import { startJob } from "./automation-api";
-import { DevicePicker } from "./device-picker";
+import { DevicePicker } from "../device-picker/device-picker";
 import { DEFAULT_WAIT_HOURS, type Destination, type JobKind, MAX_WAIT_HOURS, type OfflineChoice, type TargetKind, jobPreview, previewText, waitHoursProblem } from "./model";
 
 const DESTINATION_HELP: Record<Destination, { label: string; detail: string }> = {
@@ -71,8 +71,10 @@ export function StartJobModal({ kind: initialKind, itemId, deviceIds, toolbox: g
   const script = toolbox?.scripts.find((candidate) => candidate.id === scriptId);
   const file = toolbox?.files.find((candidate) => candidate.id === fileId);
   const language = kind === "script" ? script?.language ?? null : null;
-  const chosen = { kind: target, deviceIds: chosenDevices, companyIds: chosenCompanies, tagIds: chosenTags, tagMatch };
-  const preview = jobPreview(inventory.agents, chosen, language);
+  const preview = useMemo(
+    () => jobPreview(inventory.agents, { kind: target, deviceIds: chosenDevices, companyIds: chosenCompanies, tagIds: chosenTags, tagMatch }, language),
+    [inventory.agents, target, chosenDevices, chosenCompanies, chosenTags, tagMatch, language],
+  );
   const waitProblem = offline === "wait" ? waitHoursProblem(waitHours) : null;
   const item = kind === "script" ? script : file;
   const problem = !item ? (kind === "script" ? "Choose a script." : "Choose a file.")

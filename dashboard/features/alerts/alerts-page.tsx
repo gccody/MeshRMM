@@ -2,6 +2,7 @@ import { BellOff, CircleAlert, LoaderCircle, RefreshCw, X } from "lucide-react";
 import { useCallback, useState } from "react";
 import { useSearchParams } from "react-router";
 import { useResource } from "../../lib/use-resource";
+import { DeviceSelect } from "../device-picker/device-select";
 import { useWorkspace } from "../workspace/workspace-context";
 import { HeaderActions } from "../workspace/header-actions";
 import { fetchAlerts } from "./alerts-api";
@@ -83,11 +84,7 @@ export function AlertsPage() {
               <option value={NO_COMPANY_FILTER}>No company</option>
               {companies.map((company) => <option key={company.id} value={company.id}>{company.name}</option>)}
             </select>
-            <select aria-label="Device" value={filters.device} onChange={(event) => choose({ device: event.target.value })}>
-              <option value="">Every device</option>
-              {filters.device && !agents.some((agent) => agent.id === filters.device) && <option value={filters.device}>This device</option>}
-              {agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
-            </select>
+            <DeviceSelect label="Device" agents={agents} value={filters.device} onChange={(device) => choose({ device })} none="Every device" />
           </div>
         </div>
         {!data ? (

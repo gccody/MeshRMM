@@ -1,10 +1,11 @@
 import { LoaderCircle, Rocket, X } from "lucide-react";
-import { type FormEvent, type RefObject, useId, useState } from "react";
+import { type FormEvent, type RefObject, useId, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import { AuthenticationRequired, errorText } from "../../lib/http";
 import { ModalDialog } from "../../lib/modal-dialog";
 import type { DevicePlatform } from "../agents/types";
-import { DevicePicker } from "../automation/device-picker";
+import { DevicePicker } from "../device-picker/device-picker";
+import { devicesOn, platformCounts } from "../device-picker/model";
 import { DEFAULT_WAIT_HOURS, MAX_WAIT_HOURS, type OfflineChoice, type TargetKind, coveredAgents, waitHoursProblem } from "../automation/model";
 import type { TagMatch } from "../tags/model";
 import { TagTargetFields } from "../tags/tag-chip";
@@ -39,9 +40,19 @@ export function DeployDialog({ title, intro, request, platforms, deviceIds, retu
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const covered = coveredAgents(inventory.agents, { kind: target, deviceIds: chosenDevices, companyIds: chosenCompanies, tagIds: chosenTags, tagMatch });
-  const skipped = covered.filter((agent) => !platforms.includes(agent.platform)).length;
-  const offlineCount = covered.filter((agent) => !agent.connected && platforms.includes(agent.platform)).length;
+  const covered = useMemo(
+    () => coveredAgents(inventory.agents, { kind: target, deviceIds: chosenDevices, companyIds: chosenCompanies, tagIds: chosenTags, tagMatch }),
+    [inventory.agents, target, chosenDevices, chosenCompanies, chosenTags, tagMatch],
+  );
+  const { skipped, offline: offlineCount } = useMemo(() => platformCounts(covered, platforms), [covered, platforms]);
+  // Chosen devices on other platforms stay listed so they can be unticked.
+  // The list is made again only when those change, not on every tick.
+  const byId = useMemo(() => new Map(inventory.agents.map((agent) => [agent.id, agent])), [inventory.agents]);
+  const otherChosen = chosenDevices.filter((id) => {
+    const agent = byId.get(id);
+    return agent !== undefined && !platforms.includes(agent.platform);
+  }).join(",");
+  const pickable = useMemo(() => devicesOn(inventory.agents, platforms, otherChosen ? otherChosen.split(",") : []), [inventory.agents, platforms, otherChosen]);
   const problem = target === "devices" && !chosenDevices.length ? "Choose at least one device."
     : target === "companies" && !chosenCompanies.length ? "Choose at least one company."
     : target === "tags" && !chosenTags.length ? "Choose at least one tag."
@@ -94,7 +105,7 @@ export function DeployDialog({ title, intro, request, platforms, deviceIds, retu
               <label><input type="radio" name="deploy-target" checked={target === "all"} onChange={() => setTarget("all")} /><span><strong>Every device</strong>All {inventory.agents.length} devices.</span></label>
             </>}
           </fieldset>
-          {target === "devices" && <DevicePicker agents={inventory.agents.filter((agent) => platforms.includes(agent.platform) || chosenDevices.includes(agent.id))} chosen={chosenDevices} onChange={setChosenDevices} language={null} />}
+          {target === "devices" && <DevicePicker agents={pickable} chosen={chosenDevices} onChange={setChosenDevices} language={null} />}
           {target === "tags" && <TagTargetFields tags={inventory.tags} chosen={chosenTags} match={tagMatch} onChange={(change) => {
             if (change.tagIds) setChosenTags(change.tagIds);
             if (change.tagMatch) setTagMatch(change.tagMatch);
