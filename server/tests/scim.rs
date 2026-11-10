@@ -551,3 +551,73 @@ async fn losing_a_groups_role_closes_its_members_sockets_at_once() {
         app.finish().await;
     }
 }
+
+#[tokio::test]
+async fn scim_changes_apply_to_the_members_next_request() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let scim = token(&app, &mut admin).await;
+        let (mut tech, tech_id) = common::add_user(&app, &mut admin, "tech@example.com", &[]).await;
+        let group = scim
+            .post(
+                "/Groups",
+                json!({
+                    "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+                    "displayName": "Technicians",
+                    "members": [{ "value": tech_id }],
+                }),
+            )
+            .await;
+        assert_eq!(
+            group.status,
+            StatusCode::CREATED,
+            "{name}: {:?}",
+            group.body
+        );
+        let group_id = group.body["id"].as_str().unwrap().to_owned();
+        let mapped = admin
+            .patch(
+                &format!("/v1/settings/scim/groups/{group_id}"),
+                json!({ "role_id": "technician" }),
+            )
+            .await;
+        assert_eq!(mapped.status, StatusCode::OK, "{name}: {:?}", mapped.body);
+        assert_eq!(
+            tech.get("/v1/agents").await.status,
+            StatusCode::OK,
+            "{name}"
+        );
+        assert_eq!(
+            tech.get("/v1/agents").await.status,
+            StatusCode::OK,
+            "{name}"
+        );
+
+        // The provider renames the user.
+        let renamed = scim
+            .patch(
+                &format!("/Users/{tech_id}"),
+                json!([{ "op": "Replace", "path": "displayName", "value": "Tess Tech" }]),
+            )
+            .await;
+        assert_eq!(renamed.status, StatusCode::OK, "{name}: {:?}", renamed.body);
+        let account = tech.get("/v1/account").await;
+        assert_eq!(account.body["user"]["display_name"], "Tess Tech", "{name}");
+
+        // The provider takes the user out of the group.
+        let removed = scim
+            .patch(
+                &format!("/Groups/{group_id}"),
+                json!([{ "op": "Remove", "path": "members", "value": [{ "value": tech_id }] }]),
+            )
+            .await;
+        assert_eq!(removed.status, StatusCode::OK, "{name}: {:?}", removed.body);
+        assert_eq!(
+            tech.get("/v1/agents").await.status,
+            StatusCode::FORBIDDEN,
+            "{name}"
+        );
+        app.finish().await;
+    }
+}

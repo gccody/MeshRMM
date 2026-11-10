@@ -16,7 +16,7 @@ use crate::{
         tables::{UserOidcGroups, UserSessions, Users},
     },
     http::{ApiError, AppState, client_ip::ClientIp},
-    rbac::{self, Permission, Permissions, Role},
+    rbac::{Permission, Permissions, Role},
     secrets::{new_token, token_hash},
     settings,
     time::{HOUR_MS, MINUTE_MS, SECOND_MS, now_ms},
@@ -267,13 +267,19 @@ impl FromRequestParts<AppState> for SignedIn {
 
 /// The live session `token` names. `touch` counts the request as activity,
 /// which a check that the user is still signed in should not.
+///
+/// The session row is read every time, so an ended or expired session stops
+/// working at once. The settings come from [`settings::Cache`] and the user,
+/// their roles and second factors from [`Accounts`](crate::auth::accounts::Accounts),
+/// so a warm request runs that one statement (and, once a minute, the
+/// `last_seen_at` write).
 pub async fn load(
     state: &AppState,
     token: &str,
     ip: IpAddr,
     touch: bool,
 ) -> Result<SignedIn, ApiError> {
-    let mut database = &state.database;
+    let database = &state.database;
     let session: SessionRow = database
         .fetch_optional(
             &Query::select()
@@ -291,7 +297,7 @@ pub async fn load(
         )
         .await?
         .ok_or_else(unauthenticated)?;
-    let settings = settings::load(&mut database).await?;
+    let settings = state.settings.get(database).await?;
     let now = now_ms();
     let idle_ms = settings.dashboard_idle_timeout_minutes * MINUTE_MS;
     if now >= session.expires_at || now >= session.last_seen_at + idle_ms {
@@ -305,9 +311,11 @@ pub async fn load(
             .await?;
         return Err(unauthenticated());
     }
-    let user = users::by_id(&mut database, &session.user_id)
+    let account = state
+        .accounts
+        .get(database, &session.user_id)
         .await?
-        .filter(|user| !user.disabled)
+        .filter(|account| !account.user.disabled)
         .ok_or_else(unauthenticated)?;
     if touch && now - session.last_seen_at >= TOUCH_INTERVAL_MS {
         database
@@ -320,8 +328,7 @@ pub async fn load(
             )
             .await?;
     }
-    let roles = rbac::user_roles(&mut database, &user.id).await?;
-    let second_factors = users::second_factors(&mut database, &user.id).await?;
+    let second_factors = account.second_factors;
     let two_factor_enabled = second_factors.any();
     Ok(SignedIn {
         must_enroll_two_factor: settings.require_two_factor
@@ -331,9 +338,9 @@ pub async fn load(
         auth_method: session.auth_method,
         session_created_at: session.created_at,
         session_expires_at: session.expires_at,
-        permissions: rbac::permissions_of(&roles),
-        roles,
-        user,
+        permissions: account.permissions.clone(),
+        roles: account.roles.clone(),
+        user: account.user.clone(),
         two_factor_enabled,
         second_factors,
         idle_timeout_minutes: settings.dashboard_idle_timeout_minutes,

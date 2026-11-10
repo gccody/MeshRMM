@@ -298,3 +298,43 @@ async fn required_two_factor_confines_new_users_to_enrollment() {
         app.finish().await;
     }
 }
+
+#[tokio::test]
+async fn an_authenticator_app_shows_on_the_next_request() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let two_factor = async |admin: &mut Browser| -> Value {
+            admin.get("/v1/account").await.body["two_factor"].clone()
+        };
+        let before = two_factor(&mut admin).await;
+        assert_eq!(
+            (&before["enabled"], &before["totp"]),
+            (&json!(false), &json!(false)),
+            "{name}"
+        );
+        // Asked twice, so the account is kept when the app is added.
+        two_factor(&mut admin).await;
+        enroll(&mut admin, ADMIN_PASSWORD).await;
+        let added = two_factor(&mut admin).await;
+        assert_eq!(
+            (&added["enabled"], &added["totp"]),
+            (&json!(true), &json!(true)),
+            "{name}"
+        );
+        let off = admin
+            .post(
+                "/v1/account/two-factor/totp/disable",
+                json!({ "password": ADMIN_PASSWORD }),
+            )
+            .await;
+        assert_eq!(off.status, StatusCode::NO_CONTENT, "{name}: {:?}", off.body);
+        let removed = two_factor(&mut admin).await;
+        assert_eq!(
+            (&removed["enabled"], &removed["totp"]),
+            (&json!(false), &json!(false)),
+            "{name}"
+        );
+        app.finish().await;
+    }
+}

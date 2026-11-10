@@ -440,3 +440,45 @@ async fn registration_prompts_belong_to_one_user_and_one_use() {
         app.finish().await;
     }
 }
+
+#[tokio::test]
+async fn a_passkey_shows_on_the_next_request() {
+    for app in common::apps().await {
+        let name = app.name;
+        let mut admin = common::set_up(&app).await;
+        let passkeys = async |admin: &mut Browser| -> (Value, Value) {
+            let two_factor = admin.get("/v1/account").await.body["two_factor"].clone();
+            (
+                two_factor["enabled"].clone(),
+                two_factor["passkeys"].clone(),
+            )
+        };
+        assert_eq!(
+            passkeys(&mut admin).await,
+            (json!(false), json!(0)),
+            "{name}"
+        );
+        // Asked twice, so the account is kept when the passkey is added.
+        passkeys(&mut admin).await;
+        let (_, added) = add_passkey(&mut admin, ADMIN_PASSWORD, "Phone").await;
+        assert_eq!(
+            passkeys(&mut admin).await,
+            (json!(true), json!(1)),
+            "{name}"
+        );
+        let id = added["passkey"]["id"].as_str().unwrap();
+        let removed = admin
+            .post(
+                &format!("/v1/account/passkeys/{id}/remove"),
+                json!({ "password": ADMIN_PASSWORD }),
+            )
+            .await;
+        assert_eq!(removed.status, StatusCode::NO_CONTENT, "{name}");
+        assert_eq!(
+            passkeys(&mut admin).await,
+            (json!(false), json!(0)),
+            "{name}"
+        );
+        app.finish().await;
+    }
+}

@@ -330,6 +330,7 @@ async fn update(
     if !changes.is_empty() {
         values.push((Users::UpdatedAt, now_ms().into()));
     }
+    let changed = !changes.is_empty() || !user.scim_managed;
     transaction
         .execute(
             &Sql::update()
@@ -357,7 +358,9 @@ async fn update(
     }
     let resource = load(&mut transaction, state, id).await?;
     transaction.commit().await?;
-    if disabling {
+    // Disabling ends access, and authentication keeps the user's row until
+    // access changes, so any change to it signals.
+    if changed {
         state.presence.recheck_access();
     }
     Ok(resource)

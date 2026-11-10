@@ -509,7 +509,11 @@ meshrmm-server admin reset-password you@example.com             # also re-enable
 meshrmm-server admin reset-two-factor you@example.com
 ```
 
-Each prints a link to open in the browser. With systemd, run them as the
+Each prints a link to open in the browser. A running server can't be told
+of what they change, so it may take up to 30 seconds to notice (an
+account's API tokens working again after `reset-password` re-enabled it,
+for example); signing in with the link applies it at once, and the sessions
+`reset-two-factor` ends stop working at once. With systemd, run them as the
 `meshrmm` user (`sudo -u meshrmm meshrmm-server admin ...`); with Docker, use
 `docker exec meshrmm meshrmm-server admin ...`.
 

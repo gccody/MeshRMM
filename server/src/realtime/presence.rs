@@ -585,7 +585,10 @@ impl Presence {
         state.updating.keys().cloned().collect()
     }
 
-    /// Asks event sockets to check their user's access again.
+    /// Asks event sockets to check their user's access again. The cached
+    /// accounts authentication reads ([`crate::auth::accounts`]) are valid
+    /// only for the generation they were loaded in, so this also makes the
+    /// next request, and every check it wakes, read users afresh.
     pub fn recheck_access(&self) {
         self.inner.access.send_modify(|generation| *generation += 1);
     }

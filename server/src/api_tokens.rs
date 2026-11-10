@@ -22,9 +22,7 @@ use crate::{
     http::{ApiError, AppState},
     rbac::{self, Permission, Permissions},
     secrets::{new_token, token_hash},
-    settings,
     time::{DAY_MS, MINUTE_MS, now_ms},
-    users,
 };
 
 /// Every token starts with this, so secret scanners can recognize one.
@@ -224,6 +222,10 @@ fn refused(message: &'static str, code: &'static str) -> ApiError {
 /// Authenticates a request carrying `secret`. Unknown tokens count against
 /// the client address like failed sign-ins; once it has used them all,
 /// every token from it is refused until the oldest failure ages out.
+///
+/// The token's row is read every time, so a revoked or expired token stops
+/// at once; its user, roles and settings come from the caches on
+/// [`AppState`], which every access change empties.
 pub async fn authenticate(
     state: &AppState,
     secret: &str,
@@ -233,7 +235,7 @@ pub async fn authenticate(
     let key = ip_key(ip);
     limits.check(&key).map_err(ApiError::rate_limited)?;
     let mut database = &state.database;
-    let settings = settings::load(&mut database).await?;
+    let settings = state.settings.get(database).await?;
     if !settings.api_tokens_enabled {
         return Err(refused(
             "API tokens are turned off on this server",
@@ -252,9 +254,11 @@ pub async fn authenticate(
     if token.expired(now) {
         return Err(refused("the API token has expired", "token_expired"));
     }
-    let user = users::by_id(&mut database, &token.user.id)
+    let account = state
+        .accounts
+        .get(database, &token.user.id)
         .await?
-        .filter(|user| !user.disabled)
+        .filter(|account| !account.user.disabled)
         .ok_or_else(|| refused("the API token's user is disabled", "user_disabled"))?;
     if token
         .last_used_at
@@ -273,19 +277,18 @@ pub async fn authenticate(
             )
             .await?;
     }
-    let roles = rbac::user_roles(&mut database, &user.id).await?;
-    let held = rbac::permissions_of(&roles);
+    let held = &account.permissions;
     let permissions = match &token.permissions {
         Some(scope) => held.intersection(scope).copied().collect(),
-        None => held,
+        None => held.clone(),
     };
     // A scoped token isn't the Administrator role, which also stands for
     // permissions no list names.
     let administrator =
-        token.permissions.is_none() && roles.iter().any(rbac::Role::is_administrator);
+        token.permissions.is_none() && account.roles.iter().any(rbac::Role::is_administrator);
     Ok(Authorized::for_token(
-        user,
-        roles,
+        account.user.clone(),
+        account.roles.clone(),
         permissions,
         administrator,
         ip,

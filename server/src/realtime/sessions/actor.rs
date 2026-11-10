@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use super::{
     Identity, Message, PeerOut, Record, Refusal, Role, Sessions, delete, device_offline, ended,
-    token_matches, unauthorized, unix_ms, user_permissions,
+    token_matches, unauthorized, unix_ms,
 };
 use crate::{
     agents,
@@ -16,7 +16,6 @@ use crate::{
     realtime::ToAgent,
     secrets::new_token,
     time::now_ms,
-    users,
 };
 
 #[derive(Debug)]
@@ -366,13 +365,18 @@ impl SessionActor {
         if !agents::is_active(&mut database, &self.record.device_id).await? {
             return Ok(Some("the device was removed"));
         }
-        let Some(user) = users::by_id(&mut database, &self.record.user_id)
+        // This runs after an access change, which made every cached account
+        // stale, so the user is read afresh (once for all their sessions).
+        let Some(account) = self
+            .state
+            .accounts
+            .get(&self.state.database, &self.record.user_id)
             .await?
-            .filter(|user| !user.disabled)
+            .filter(|account| !account.user.disabled)
         else {
             return Ok(Some("the technician's account was disabled"));
         };
-        let permissions = user_permissions(&mut database, &user.id).await?;
+        let permissions = &account.permissions;
         let mut required = vec![Permission::SessionsConnect];
         if self.record.agent_request.start_in_background {
             required.push(Permission::SessionsConnectBackground);

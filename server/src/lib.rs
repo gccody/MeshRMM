@@ -45,7 +45,7 @@ use anyhow::Context;
 use axum_server::Handle;
 
 use crate::{
-    auth::AuthState,
+    auth::{AuthState, accounts::Accounts},
     config::Config,
     db::Database,
     downloads::Downloads,
@@ -81,9 +81,11 @@ pub async fn prepare(config: Config) -> anyhow::Result<AppState> {
     );
     let agents = AgentHub::default();
     let idle = Duration::from_secs(config.remote.idle_timeout_seconds);
+    let presence = Presence::new(database.clone(), agents.clone(), UPDATE_GRACE);
     Ok(AppState {
         config: Arc::new(config),
-        presence: Presence::new(database.clone(), agents.clone(), UPDATE_GRACE),
+        accounts: Arc::new(Accounts::new(presence.access_changes())),
+        presence,
         metrics: Metrics::new(database.clone()),
         alerts: alerts::Engine::default(),
         monitors: monitors::Engine::default(),

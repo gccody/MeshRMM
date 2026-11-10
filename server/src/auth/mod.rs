@@ -1,5 +1,6 @@
 //! Signing in: passwords, second factors, passkeys, SSO, sessions and the
 //! limits on guessing.
+pub mod accounts;
 pub mod ceremonies;
 pub mod limits;
 pub mod oidc;
