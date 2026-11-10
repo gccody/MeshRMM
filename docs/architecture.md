@@ -205,6 +205,17 @@ task.
   Listings and changes are answered over the control connection, file
   contents never. See [file browser](files.md).
 
+An Agent that loses its control connection, or cannot open it, tries again
+after 1 second, doubling the wait to at most 2 minutes, and starts over only
+once a connection has lasted 20 seconds, so an Agent the server accepts and
+then drops (superseded by another machine with the same device ID, say)
+does not reconnect every second. Each wait is cut by up to half at random,
+so a fleet that lost a restarting server together spreads its reconnects
+out. A server that answers the handshake with 401, 403 or 404 does not know
+the device's credential; the Agent keeps asking, in case the device is
+restored, from every 2 minutes growing to once an hour
+(`agent/src/remote/signaling.rs`).
+
 ### Sign-in and permissions
 
 The website and the API share one origin, so the website uses an HttpOnly

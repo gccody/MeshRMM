@@ -6,7 +6,7 @@
 
 use anyhow::bail;
 use rustls::{ClientConfig, RootCertStore, crypto::CryptoProvider, version::TLS13};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// The ring provider reduced to TLS 1.3 cipher suites. rustls offers a
 /// protocol version only when a cipher suite for it is available, so clients
@@ -31,7 +31,19 @@ pub fn tls13_client_config(roots: RootCertStore) -> anyhow::Result<Arc<ClientCon
 
 /// The WebSocket client configuration: the operating system's root
 /// certificates, as tokio-tungstenite's default connector used, and TLS 1.3.
+/// Built once per process, because its session cache lets a reconnect resume
+/// the previous TLS session instead of a full handshake. A failed build is not
+/// kept, so the next connection tries the roots again.
 pub(crate) fn websocket_client_config() -> anyhow::Result<Arc<ClientConfig>> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    if let Some(config) = CONFIG.get() {
+        return Ok(Arc::clone(config));
+    }
+    let config = native_roots_config()?;
+    Ok(Arc::clone(CONFIG.get_or_init(|| config)))
+}
+
+fn native_roots_config() -> anyhow::Result<Arc<ClientConfig>> {
     let native = rustls_native_certs::load_native_certs();
     if !native.errors.is_empty() {
         tracing::warn!(errors = ?native.errors, "some native root certificates could not be loaded");
@@ -126,7 +138,9 @@ mod tests {
     }
 
     #[test]
-    fn websocket_config_loads_the_system_roots() {
-        websocket_client_config().unwrap();
+    fn websocket_config_loads_the_system_roots_once() {
+        let first = websocket_client_config().unwrap();
+        // The same configuration, and with it the same session cache.
+        assert!(Arc::ptr_eq(&first, &websocket_client_config().unwrap()));
     }
 }

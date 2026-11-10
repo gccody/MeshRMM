@@ -17,7 +17,9 @@ enrollment request, and both update checks and downloads. A server, or the
 proxy in front of it, that offers only TLS 1.2 cannot be reached; see
 [running a MeshRMM server](self-hosting.md#tls).
 `meshrmm_signaling_client::tls` holds the shared settings. The WebSocket
-client trusts the operating system's root certificates, and the Agent's ureq
+client trusts the operating system's root certificates, loaded once per
+process into one configuration whose session cache lets a reconnect resume
+its TLS session, and the Agent's ureq
 and the viewer's reqwest clients verify certificates through the operating
 system. There is no certificate pinning. Handshake tests against local
 TLS 1.2-only servers cover each client.

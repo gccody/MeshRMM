@@ -3245,6 +3245,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "getrandom 0.3.4",
  "rcgen 0.13.2",
  "rustls",
  "rustls-native-certs",

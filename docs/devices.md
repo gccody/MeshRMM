@@ -234,6 +234,12 @@ offline one does the same the next time it connects. The server removes the
 device's thumbnail, and uninstalling removes any
 [saved credentials](credential-autofill.md).
 
+An Agent whose credential the server does not recognize at all, as after
+the server's database is restored from a backup older than the device, is
+not told to uninstall. It keeps trying to connect, every few minutes at first
+and then about once an hour, so restoring the device's record brings it back
+online.
+
 ## Logs and settings
 
 - The Agent logs to `%ProgramData%\MeshRMM\Agent\agent.log`. A log is rotated
