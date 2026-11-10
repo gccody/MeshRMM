@@ -21,8 +21,8 @@ use windows::core::Interface;
 
 use crate::converter::{self, SURFACE_COUNT};
 use crate::encoder::{
-    self, Error, MediaFoundationRuntime, OutputFramer, VideoEncoder, make_video_type,
-    set_optional_initial_codec_value, set_required_runtime_codec_value,
+    self, Error, MediaFoundationRuntime, OnPlatform, OutputFramer, Transform, VideoEncoder,
+    make_video_type, set_optional_initial_codec_value, set_required_runtime_codec_value,
 };
 use crate::{EncodedAccessUnit, VideoCodec, VideoPixelFormat};
 
@@ -127,9 +127,15 @@ impl StagingPool {
     }
 }
 
-/// Microsoft's synchronous H.264 encoder, fed from [`StagingPool`] copies.
-pub(crate) struct SoftwareH264Encoder {
-    transform: IMFTransform,
+/// Microsoft's synchronous H.264 encoder, fed from [`StagingPool`] copies,
+/// on COM and, outside Safe Mode, Media Foundation. COM, entered first, is
+/// left last.
+pub(crate) type SoftwareH264Encoder =
+    OnPlatform<SoftwareEncoder, (Option<MediaFoundationRuntime>, ComApartment)>;
+
+/// Fields drop in declaration order: the transform is ended first.
+pub(crate) struct SoftwareEncoder {
+    transform: Transform,
     codec_api: ICodecAPI,
     output_info: MFT_OUTPUT_STREAM_INFO,
     context: ID3D11DeviceContext,
@@ -138,14 +144,11 @@ pub(crate) struct SoftwareH264Encoder {
     grayscale: bool,
     frame_duration_100ns: i64,
     output: OutputFramer,
-    // Dropped after the transform, in declaration order.
-    _runtime: Option<MediaFoundationRuntime>,
-    _com: ComApartment,
 }
 
 /// COM on the capture thread for the encoder's lifetime. Media Foundation
 /// does not initialize it, and Safe Mode skips Media Foundation.
-struct ComApartment(bool);
+pub(crate) struct ComApartment(bool);
 
 impl ComApartment {
     fn enter() -> Result<Self, Error> {
@@ -177,6 +180,7 @@ impl SoftwareH264Encoder {
         bitrate_bits_per_second: u32,
         grayscale: bool,
     ) -> Result<Self, Error> {
+        let com = ComApartment::enter()?;
         // Safe Mode disables the Media Foundation platform: MFStartup fails,
         // and with it everything that needs its work queues. The software
         // encoder transform and the media types, samples and buffers that
@@ -186,13 +190,34 @@ impl SoftwareH264Encoder {
             Err(Error::Startup(error)) if error.code() == MF_E_DISABLED_IN_SAFEMODE => None,
             Err(error) => return Err(error),
         };
-        let _com = ComApartment::enter()?;
+        let encoder = SoftwareEncoder::new(
+            device,
+            width,
+            height,
+            frames_per_second,
+            bitrate_bits_per_second,
+            grayscale,
+        )?;
+        Ok(OnPlatform::hold((runtime, com), encoder))
+    }
+}
+
+impl SoftwareEncoder {
+    fn new(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        frames_per_second: u32,
+        bitrate_bits_per_second: u32,
+        grayscale: bool,
+    ) -> Result<Self, Error> {
         let context = unsafe { device.GetImmediateContext() }.map_err(Error::Configuration)?;
         // Safety: the transform and its interfaces stay on this capture thread.
         unsafe {
-            let transform: IMFTransform =
+            let transform = Transform::new(
                 CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
-                    .map_err(|_| Error::SoftwareEncoderUnavailable)?;
+                    .map_err(|_| Error::SoftwareEncoderUnavailable)?,
+            );
             let codec_api: ICodecAPI = transform.cast().map_err(Error::Configuration)?;
 
             // Rate control applies only when set before the output type.
@@ -281,8 +306,6 @@ impl SoftwareH264Encoder {
                 grayscale,
                 frame_duration_100ns: 10_000_000_i64 / i64::from(frames_per_second.max(1)),
                 output,
-                _runtime: runtime,
-                _com,
             })
         }
     }
@@ -340,7 +363,7 @@ impl SoftwareH264Encoder {
     }
 }
 
-impl VideoEncoder for SoftwareH264Encoder {
+impl VideoEncoder for SoftwareEncoder {
     fn poll(&mut self) -> Result<Vec<EncodedAccessUnit>, Error> {
         // Output is drained as each frame is submitted.
         Ok(Vec::new())
@@ -398,21 +421,6 @@ impl VideoEncoder for SoftwareH264Encoder {
             bits_per_second.into(),
             "dynamic bitrate",
         )
-    }
-}
-
-impl Drop for SoftwareH264Encoder {
-    fn drop(&mut self) {
-        // Safety: these messages terminate the transform owned by this object.
-        unsafe {
-            let _ = self
-                .transform
-                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-            let _ = self
-                .transform
-                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-        }
     }
 }
 
