@@ -465,6 +465,129 @@ async fn the_dispatcher_limits_each_devices_runs_and_files_are_delivered() {
     }
 }
 
+/// The script runs and update installs queued for a stand-in Agent
+/// connection.
+fn started(connection: &mut AgentConnection) -> Vec<AgentCommand> {
+    let mut commands = Vec::new();
+    while let Ok(message) = connection.commands.try_recv() {
+        if let meshrmm_server::realtime::ToAgent::Command(
+            command @ (AgentCommand::RunScript { .. } | AgentCommand::InstallUpdates { .. }),
+        ) = message
+        {
+            commands.push(command);
+        }
+    }
+    commands
+}
+
+#[tokio::test]
+async fn devices_that_cannot_start_yet_do_not_hold_up_later_jobs() {
+    for app in apps().await {
+        let name = app.name;
+        let mut admin = set_up(&app).await;
+        let script = create_script(&mut admin, "Inventory", "powershell", false).await;
+        let mut busy = Vec::new();
+        let mut patching = Vec::new();
+        for index in 0..3 {
+            busy.push(app.enroll(&mut admin, &format!("BUSY-{index}")).await);
+            let agent = app.enroll(&mut admin, &format!("PATCHING-{index}")).await;
+            meshrmm_server::updates::store::store_scan(
+                app.db(),
+                &agent.device_id,
+                serde_json::from_value(json!({
+                    "scanned_at_unix_ms": 1, "manager": "windows_update",
+                    "updates": [], "reboot_pending": false,
+                }))
+                .unwrap(),
+                now_ms(),
+            )
+            .await
+            .unwrap();
+            patching.push(agent);
+        }
+        let free = app.enroll(&mut admin, "FREE").await;
+        let ids = |agents: &[common::Agent]| {
+            agents
+                .iter()
+                .map(|agent| agent.device_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let (busy, patching) = (ids(&busy), ids(&patching));
+        let mut connections = busy
+            .iter()
+            .chain(&patching)
+            .map(|id| app.state.agents.connect(id))
+            .collect::<Vec<_>>();
+        let mut free_connection = app.state.agents.connect(&free.device_id);
+        let script_job = |devices: &[String]| {
+            json!({
+                "script_id": script, "run_as": "system", "target": "devices",
+                "device_ids": devices, "offline": "skip",
+            })
+        };
+        let install_job = json!({
+            "updates": { "action": "install", "categories": ["security"], "reboot": "never" },
+            "target": "devices", "device_ids": patching, "offline": "skip",
+        });
+
+        // The busy devices take as many runs as they may, and the others
+        // start installing.
+        for _ in 0..automation::dispatch::MAX_PER_DEVICE {
+            start_job(&mut admin, script_job(&busy)).await;
+        }
+        start_job(&mut admin, install_job.clone()).await;
+        pass(&app, now_ms()).await;
+        let sent = connections.iter_mut().map(started).collect::<Vec<_>>();
+        assert!(
+            sent[..3]
+                .iter()
+                .all(|commands| commands.len() == automation::dispatch::MAX_PER_DEVICE as usize),
+            "{name}: {sent:?}"
+        );
+        assert!(sent[3..].iter().all(|commands| commands.len() == 1));
+
+        // More than a pass reads of parts that can't start yet: runs on the
+        // busy devices, then installs on the installing ones.
+        for _ in 0..34 {
+            start_job(&mut admin, script_job(&busy)).await;
+        }
+        for _ in 0..34 {
+            start_job(&mut admin, install_job.clone()).await;
+        }
+        assert!(
+            !pass(&app, now_ms()).await,
+            "{name}: nothing queued can start, so there's no hurry"
+        );
+        assert!(
+            connections
+                .iter_mut()
+                .all(|connection| started(connection).is_empty())
+        );
+
+        // A later job on another device starts in the next pass.
+        let later = start_job(
+            &mut admin,
+            script_job(std::slice::from_ref(&free.device_id)),
+        )
+        .await;
+        assert!(
+            !pass(&app, now_ms()).await,
+            "{name}: it started all that it could"
+        );
+        assert_eq!(started(&mut free_connection).len(), 1, "{name}");
+        assert_eq!(
+            job(&mut admin, later["id"].as_str().unwrap()).await["devices"][0]["outcome"],
+            "running"
+        );
+        assert!(
+            connections
+                .iter_mut()
+                .all(|connection| started(connection).is_empty())
+        );
+        app.finish().await;
+    }
+}
+
 /// Moves a job's runs into the past.
 async fn backdate_runs(app: &App, job_id: &str, by_ms: i64) {
     use meshrmm_server::db::tables::ScriptRuns;

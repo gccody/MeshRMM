@@ -97,6 +97,12 @@ per-device limit stays well under the eight scripts an Agent runs at a time,
 leaving room for runs started by hand. A run or delivery counts against the
 limits until it reports or has no result.
 
+A queued device that can't start yet doesn't hold up the others: one at its
+limit, one installing updates (for an update install job) or one running an
+application install, update or uninstall (for an application job) is passed
+over, and the devices queued after it start in its place. It starts once its
+runs report, or have no result.
+
 Waiting devices are queued as soon as their Agent connects. A device that
 disconnects between being queued and being started waits again (or is
 missed, if the job skips offline devices); a run that never reached its

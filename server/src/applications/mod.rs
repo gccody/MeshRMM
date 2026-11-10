@@ -324,6 +324,11 @@ pub async fn busy(executor: &mut impl Executor, device_id: &str) -> crate::db::R
     Ok(runs::pending(executor, device_id, false).await?.is_some())
 }
 
+/// The devices [`busy`] is true of.
+pub fn busy_devices() -> sea_query::SelectStatement {
+    runs::pending_devices(false)
+}
+
 /// The device was deleted: its scan goes with it; its runs stay in the
 /// history.
 pub async fn device_removed(state: &AppState, device_id: &str) {

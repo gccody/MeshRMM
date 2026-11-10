@@ -6,17 +6,21 @@
 //! jobs' runs and deliveries await a report, and while the device has fewer
 //! than [`MAX_PER_DEVICE`] of its own. So a job on a thousand devices reaches
 //! them over a minute or so instead of all at once, and its results trickle
-//! in rather than arriving together. Waiting devices are queued when their
-//! Agent connects, and missed when the job expires first. A wake job's
-//! queued devices are offline ones: they are woken together, through the
-//! relays the wake requests pick, and don't count against the limits.
+//! in rather than arriving together. A queued device that can't start yet,
+//! because it is at its limit, installing updates or busy with applications,
+//! is left out of the pass rather than holding up the devices queued after
+//! it, and starts on a pass after its runs report. Waiting devices are
+//! queued when their Agent connects, and missed when the job expires first.
+//! A wake job's queued devices are offline ones: they are woken together,
+//! through the relays the wake requests pick, and don't count against the
+//! limits.
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use meshrmm_protocol_types::{
     AgentCommand, FileDeliveryDestination, FileDeliveryRequest, RebootBehavior, RunAs,
     ScriptLanguage, ScriptRunRequest,
 };
-use sea_query::{Expr, ExprTrait, Order, Query};
+use sea_query::{Cond, Expr, ExprTrait, Order, Query};
 
 use super::jobs::{DeviceState, Kind, Offline};
 use crate::{
@@ -38,6 +42,9 @@ use crate::{
 
 /// The most devices started per pass.
 pub const DISPATCH_BATCH: u64 = 25;
+/// The most queued devices a pass reads, leaving room for devices that
+/// reach their limit during the pass.
+const DISPATCH_PAGE: u64 = DISPATCH_BATCH * 4;
 /// The most jobs' runs and deliveries awaiting a report at once.
 pub const MAX_IN_FLIGHT: i64 = 500;
 /// The most of a device's job runs and deliveries awaiting a report at once,
@@ -161,13 +168,9 @@ fn awaiting_update_run(now: i64) -> sea_query::SimpleExpr {
         )
 }
 
-/// How many of the jobs' runs, deliveries and update runs await a report,
-/// in all and on each of `devices`.
-async fn in_flight(
-    state: &AppState,
-    devices: &[String],
-    now: i64,
-) -> db::Result<(i64, HashMap<String, i64>)> {
+/// How many of the jobs' runs, deliveries, update runs and application runs
+/// await a report, in all and on each device that has any.
+async fn in_flight(state: &AppState, now: i64) -> db::Result<(i64, HashMap<String, i64>)> {
     let database = &state.database;
     let mut total = 0;
     let mut per_device: HashMap<String, i64> = HashMap::new();
@@ -204,7 +207,6 @@ async fn in_flight(
                 .to_owned(),
         )
         .await?;
-    let wanted = devices.iter().collect::<HashSet<_>>();
     let applications = crate::applications::runs::awaiting(&mut &state.database, now).await?;
     for (device_id, count) in runs
         .into_iter()
@@ -213,9 +215,7 @@ async fn in_flight(
         .chain(applications)
     {
         total += count;
-        if wanted.contains(&device_id) {
-            *per_device.entry(device_id).or_default() += count;
-        }
+        *per_device.entry(device_id).or_default() += count;
     }
     Ok((total, per_device))
 }
@@ -247,10 +247,48 @@ struct JobRow {
     policy_name: Option<String>,
 }
 
+/// The SQL that is true of a queued device's part that could start now, as
+/// far as the database can tell before the pass starts anything: a wake, or
+/// a device that isn't at its limit and isn't running what the job's kind
+/// waits for. [`start`] checks the last two again.
+fn startable(per_device: &HashMap<String, i64>) -> Cond {
+    let device = || Expr::col((JobDevices::Table, JobDevices::DeviceId));
+    let kind = || Expr::col((Jobs::Table, Jobs::Kind));
+    let at_limit = per_device
+        .iter()
+        .filter(|(_, count)| **count >= MAX_PER_DEVICE)
+        .map(|(device_id, _)| device_id.clone())
+        .collect::<Vec<_>>();
+    let mut free = Cond::all()
+        .add(
+            kind()
+                .ne(Kind::UpdateInstall.as_str())
+                .or(device().not_in_subquery(update_runs::pending_devices(UpdateKind::Install))),
+        )
+        .add(
+            kind()
+                .is_not_in(
+                    [Kind::AppInstall, Kind::AppUpdate, Kind::AppUninstall].map(Kind::as_str),
+                )
+                .or(device().not_in_subquery(crate::applications::busy_devices())),
+        );
+    // Each has MAX_PER_DEVICE of the runs in flight, so the list stays short.
+    if !at_limit.is_empty() {
+        free = free.add(device().is_not_in(at_limit));
+    }
+    Cond::any().add(kind().eq(Kind::Wake.as_str())).add(free)
+}
+
 /// Starts queued devices' runs and deliveries, within the limits. Returns
-/// whether queued devices remain that it could start soon.
+/// whether another pass straight away could start more: it stopped at a
+/// limit, or more queued devices may be ready than it read. Devices that
+/// can't start yet are started on a pass after their runs report, which
+/// wakes the engine.
 pub async fn dispatch(state: &AppState, now: i64) -> anyhow::Result<bool> {
     let database = &state.database;
+    let (mut total, mut per_device) = in_flight(state, now).await?;
+    // Only parts that could start, so those that can't don't keep the ones
+    // queued after them from being read.
     let queued: Vec<QueuedRow> = database
         .fetch_all(
             &Query::select()
@@ -268,21 +306,17 @@ pub async fn dispatch(state: &AppState, now: i64) -> anyhow::Result<bool> {
                     Expr::col((JobDevices::Table, JobDevices::State))
                         .eq(DeviceState::Queued.as_str()),
                 )
+                .cond_where(startable(&per_device))
                 .order_by((Jobs::Table, Jobs::CreatedAt), Order::Asc)
                 .order_by((JobDevices::Table, JobDevices::JobId), Order::Asc)
                 .order_by((JobDevices::Table, JobDevices::DeviceId), Order::Asc)
-                .limit(DISPATCH_BATCH * 4)
+                .limit(DISPATCH_PAGE)
                 .to_owned(),
         )
         .await?;
     if queued.is_empty() {
         return Ok(false);
     }
-    let devices = queued
-        .iter()
-        .map(|row| row.device_id.clone())
-        .collect::<Vec<_>>();
-    let (mut total, mut per_device) = in_flight(state, &devices, now).await?;
     let job_ids = queued
         .iter()
         .map(|row| row.job_id.clone())
@@ -318,7 +352,6 @@ pub async fn dispatch(state: &AppState, now: i64) -> anyhow::Result<bool> {
         .map(|job| (job.id.clone(), job))
         .collect::<HashMap<_, _>>();
     let mut started = 0;
-    let mut held_back = false;
     let mut full = false;
     let mut wakes: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for row in &queued {
@@ -337,9 +370,9 @@ pub async fn dispatch(state: &AppState, now: i64) -> anyhow::Result<bool> {
             started += 1;
             continue;
         }
+        // It reached its limit earlier in this pass.
         let busy = per_device.entry(row.device_id.clone()).or_default();
         if *busy >= MAX_PER_DEVICE {
-            held_back = true;
             continue;
         }
         if start(state, job, &row.device_id, now).await? {
@@ -353,9 +386,9 @@ pub async fn dispatch(state: &AppState, now: i64) -> anyhow::Result<bool> {
             start_wakes(state, job, &devices, now).await?;
         }
     }
-    // Devices held back wait for their runs to finish; anything past the
-    // batch is next.
-    Ok(full || queued.len() as u64 >= DISPATCH_BATCH * 4 || (held_back && started > 0))
+    // Devices that reached their limit in this pass are left out of the next
+    // one, so a full page may have more behind it that can start.
+    Ok(full || queued.len() as u64 >= DISPATCH_PAGE)
 }
 
 /// Wakes a wake job's queued devices that are still offline, and skips
