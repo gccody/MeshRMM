@@ -6,8 +6,13 @@
 //! skipped; an online one is queued for the dispatcher; an offline one waits
 //! for its Agent to connect, or is missed at once if the job doesn't wait.
 //! Creating one is two steps: [`plan`] decides all that through the
-//! database's readers, and [`write`] only inserts it, inside the caller's
-//! transaction, so SQLite's one writer is held for the inserts alone.
+//! database's readers, and [`create`] only inserts it, so SQLite's one
+//! writer is held for the inserts alone. A job on more devices than
+//! [`DEVICES_PER_TRANSACTION`] is written in several short transactions
+//! rather than one long one: its row, marked as being created; its devices,
+//! that many to a transaction; and the one that clears the mark and records
+//! its start. Until then nothing starts, queues, counts or shows it, and one
+//! whose creation stopped part-way is removed ([`discard_abandoned`]).
 //! Each device's run, delivery or update run is an ordinary one carrying the
 //! job's ID, so its result, output and alerts work as for one started by
 //! hand. A wake job is the other way round: it skips online devices, and
@@ -29,7 +34,7 @@ use sea_query::{Expr, ExprTrait, InsertStatement, Order, Query};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::dispatch::QUEUE_CHUNK;
+use super::{Creating, Engine, dispatch::QUEUE_CHUNK};
 use crate::{
     applications::{
         jobs::RunAction,
@@ -37,13 +42,13 @@ use crate::{
     },
     audit::{self, Actor, Target as AuditTarget},
     db::{
-        self, Executor,
+        self, Database, Executor, Transaction,
         tables::{
             Agents, DeviceUpdateStatus, FileDeliveries, JobDevices, Jobs, ScriptRuns, UpdateRuns,
             Users, WakeRequests,
         },
     },
-    http::ApiError,
+    http::{ApiError, AppState},
     rbac::{Permission, Permissions},
     realtime::AgentHub,
     time::{HOUR_MS, SECOND_MS},
@@ -57,6 +62,17 @@ pub const MAX_WAIT_HOURS: i64 = 7 * 24;
 pub const DEFAULT_WAIT_HOURS: i64 = 24;
 /// Rows written per statement.
 const INSERT_CHUNK: usize = 400;
+/// The most devices of a job one transaction writes. A job on more is
+/// created in several transactions, this many devices to each, so SQLite's
+/// one writer, which Agents' check-ins, results and sign-ins wait for, is
+/// held for one of them at a time rather than for the whole job. Measured on
+/// a debug build, a job on 100,000 devices in one transaction held it for
+/// about 5 seconds (PostgreSQL's transaction, 2.5); 1,000 devices took about
+/// 10 milliseconds on either, 2,000 about 40 and 5,000 a quarter to half a
+/// second, while a 100,000-device job took about as long in all in
+/// transactions of 1,000 as of 2,000. A job on at most this many devices is
+/// written in one transaction.
+pub const DEVICES_PER_TRANSACTION: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -802,7 +818,7 @@ pub struct NewJob {
     pub actor: Actor,
 }
 
-/// A created job, before the dispatcher starts anything.
+/// A created job, before the dispatcher starts anything: its creation ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Created {
     pub id: String,
@@ -950,6 +966,12 @@ impl Plan {
     pub fn devices(&self) -> usize {
         self.devices
     }
+
+    /// Whether it is written in several transactions: it covers more devices
+    /// than one writes.
+    pub fn batched(&self) -> bool {
+        self.devices > DEVICES_PER_TRANSACTION
+    }
 }
 
 fn no_devices() -> ApiError {
@@ -1009,6 +1031,13 @@ pub async fn plan(
             }
         };
         groups[index].device_ids.push(row.id);
+    }
+    // In ID order, each transaction of a job's devices adds to one stretch
+    // of each index on `job_devices`, rather than to pages all over them:
+    // SQLite writes back each page a transaction changed when it checkpoints,
+    // so random IDs had every batch rewrite most of the indexes.
+    for group in &mut groups {
+        group.device_ids.sort_unstable();
     }
     Ok(Plan {
         job,
@@ -1097,20 +1126,35 @@ fn insert_devices(job_id: &str, group: &Group, device_ids: &[String], now: i64) 
         .to_owned()
 }
 
-/// Writes a planned job as part of the caller's transaction, and records who
-/// started it: the job, its applications if it has them, its devices a
-/// chunk at a time, grouped by how they start, and the audit event. Nothing
-/// else is read or written unless devices were deleted since planning: they
-/// are left out, the counts are of the devices written, and a job on chosen
-/// devices is labelled by those left. If every device was deleted, the job
-/// is removed again and this fails with `no_devices`.
-pub async fn write(
-    executor: &mut impl Executor,
-    plan: &Plan,
+/// A job being created: its row is written, marked as being created
+/// (`jobs.creating`), by [`draft`]; its devices next, by
+/// [`Draft::write_devices`]; and [`Draft::finish`] clears the mark. While it
+/// is marked, nothing starts, queues, counts or shows the job; while the
+/// draft lives, the engine knows this server is creating it, and once it is
+/// gone a job still marked is removed ([`discard_abandoned`]).
+#[derive(Debug)]
+pub struct Draft<'a> {
+    plan: &'a Plan,
+    id: String,
     now: i64,
-) -> Result<Created, ApiError> {
+    /// The devices written so far, by how they start.
+    counts: HashMap<DeviceState, i64>,
+    _creating: Creating,
+}
+
+/// Writes the row of a planned job as part of the caller's transaction,
+/// marked as being created, with its applications if it has them.
+pub async fn draft<'a>(
+    executor: &mut impl Executor,
+    engine: &Engine,
+    plan: &'a Plan,
+    now: i64,
+) -> db::Result<Draft<'a>> {
     let job = &plan.job;
     let id = new_id();
+    // Held before the row exists, so the engine never takes the job for one
+    // whose creation stopped.
+    let creating = engine.hold_creation(&id);
     let columns = Columns::of(&job.payload);
     let (item_id, item_name) = job.payload.item();
     executor
@@ -1138,6 +1182,7 @@ pub async fn write(
                     Jobs::PolicyId,
                     Jobs::PolicyName,
                     Jobs::CreatedAt,
+                    Jobs::Creating,
                 ])
                 .values_panic([
                     id.as_str().into(),
@@ -1160,6 +1205,7 @@ pub async fn write(
                     job.policy.as_ref().map(|(id, _)| id.as_str()).into(),
                     job.policy.as_ref().map(|(_, name)| name.as_str()).into(),
                     now.into(),
+                    true.into(),
                 ])
                 .to_owned(),
         )
@@ -1167,75 +1213,300 @@ pub async fn write(
     if let Payload::Applications(spec) = &job.payload {
         crate::applications::jobs::save(executor, &id, spec).await?;
     }
-    let mut counts: HashMap<DeviceState, i64> = HashMap::new();
-    for group in &plan.groups {
-        for chunk in group.device_ids.chunks(INSERT_CHUNK) {
-            let written = executor
-                .execute(&insert_devices(&id, group, chunk, now))
-                .await?;
-            *counts.entry(group.state).or_default() += i64::try_from(written).unwrap_or(i64::MAX);
-        }
+    Ok(Draft {
+        plan,
+        id,
+        now,
+        counts: HashMap::new(),
+        _creating: creating,
+    })
+}
+
+impl Draft<'_> {
+    pub fn id(&self) -> &str {
+        &self.id
     }
-    let devices = counts.values().sum::<i64>();
-    if devices == 0 {
-        // Every device was deleted since planning. Its applications go too.
-        executor
+
+    /// Writes the job's devices, grouped by how they start, a statement for
+    /// each [`INSERT_CHUNK`]. A job that isn't [`batched`](Plan::batched)
+    /// has them written in `transaction`, the one that wrote its row, which
+    /// is returned to finish it in. Otherwise `transaction` is committed, so
+    /// the job is stored marked as being created, its devices are written
+    /// [`DEVICES_PER_TRANSACTION`] to a transaction of their own, and a new
+    /// transaction is returned to finish it in. Each batch's insert leaves
+    /// out the devices deleted since planning, as the planned job's would.
+    pub async fn write_devices(
+        &mut self,
+        state: &AppState,
+        transaction: Transaction,
+    ) -> db::Result<Transaction> {
+        let plan = self.plan;
+        let batched = plan.batched();
+        let mut batch = if batched {
+            transaction.commit().await?;
+            state.database.begin().await?
+        } else {
+            transaction
+        };
+        // Devices in this transaction so far. A statement takes what is left
+        // of its group, up to a chunk and what fits in the transaction.
+        let mut devices = 0;
+        for group in &plan.groups {
+            let mut rest = group.device_ids.as_slice();
+            while !rest.is_empty() {
+                if devices == DEVICES_PER_TRANSACTION {
+                    batch.commit().await?;
+                    state.automation.devices_written(&self.id, devices).await;
+                    batch = state.database.begin().await?;
+                    devices = 0;
+                }
+                let take = rest
+                    .len()
+                    .min(INSERT_CHUNK)
+                    .min(DEVICES_PER_TRANSACTION - devices);
+                let (chunk, after) = rest.split_at(take);
+                self.insert(&mut batch, group, chunk).await?;
+                devices += take;
+                rest = after;
+            }
+        }
+        if !batched {
+            return Ok(batch);
+        }
+        batch.commit().await?;
+        state.automation.devices_written(&self.id, devices).await;
+        state.database.begin().await
+    }
+
+    async fn insert(
+        &mut self,
+        executor: &mut impl Executor,
+        group: &Group,
+        device_ids: &[String],
+    ) -> db::Result<()> {
+        let written = executor
+            .execute(&insert_devices(&self.id, group, device_ids, self.now))
+            .await?;
+        *self.counts.entry(group.state).or_default() += i64::try_from(written).unwrap_or(i64::MAX);
+        Ok(())
+    }
+
+    /// Ends the job's creation as part of the caller's transaction: clears
+    /// its mark and records who started it, with its counts, in the audit
+    /// log. Nothing else is read or written unless devices were deleted
+    /// since planning: they were left out, the counts are of the devices
+    /// written, and a job on chosen devices is labelled by those left. If
+    /// every device was deleted, the job is removed and this fails with
+    /// `no_devices`.
+    pub async fn finish(self, executor: &mut impl Executor) -> Result<Created, ApiError> {
+        let Self {
+            plan, id, counts, ..
+        } = self;
+        let job = &plan.job;
+        let devices = counts.values().sum::<i64>();
+        if devices == 0 {
+            // Every device was deleted since planning. Its applications go too.
+            executor
+                .execute(
+                    &Query::delete()
+                        .from_table(Jobs::Table)
+                        .and_where(Expr::col(Jobs::Id).eq(id.as_str()))
+                        .to_owned(),
+                )
+                .await?;
+            return Err(no_devices());
+        }
+        let label = if usize::try_from(devices).is_ok_and(|devices| devices == plan.devices) {
+            plan.label.clone()
+        } else {
+            relabel(executor, plan, &id, devices).await?
+        };
+        let cleared = executor
             .execute(
-                &Query::delete()
-                    .from_table(Jobs::Table)
+                &Query::update()
+                    .table(Jobs::Table)
+                    .value(Jobs::Creating, false)
+                    .value(Jobs::TargetLabel, label.as_str())
                     .and_where(Expr::col(Jobs::Id).eq(id.as_str()))
+                    .and_where(Expr::col(Jobs::Creating))
                     .to_owned(),
             )
             .await?;
-        return Err(no_devices());
+        if cleared != 1 {
+            // Only a job this server isn't creating is removed, so another
+            // server on the same database took it for one whose creation
+            // stopped.
+            tracing::error!(job_id = id, "a job was removed while it was being created");
+            return Err(ApiError::internal());
+        }
+        let columns = Columns::of(&job.payload);
+        let (item_id, item_name) = job.payload.item();
+        let mut metadata = json!({
+            "kind": job.payload.kind().as_str(),
+            "item_id": item_id,
+            "item_name": item_name,
+            "target": job.target.kind().as_str(),
+            "target_label": label,
+            "devices": devices,
+            "offline": plan.offline.as_str(),
+            "queued": counts.get(&DeviceState::Queued).copied().unwrap_or(0),
+            "waiting": counts.get(&DeviceState::Waiting).copied().unwrap_or(0),
+            "skipped": counts.get(&DeviceState::Skipped).copied().unwrap_or(0),
+        });
+        if let Some(run_as) = columns.run_as {
+            metadata["run_as"] = run_as.into();
+        }
+        if let Some(destination) = columns.destination {
+            metadata["destination"] = destination.into();
+        }
+        if let Some(categories) = columns.categories {
+            metadata["categories"] = json!(categories);
+        }
+        if let Some(reboot) = columns.reboot {
+            metadata["reboot"] = reboot.into();
+            metadata["reboot_delay_minutes"] = columns.reboot_delay_minutes.into();
+        }
+        if let Payload::Applications(spec) = &job.payload {
+            metadata["applications"] = spec.audit();
+        }
+        if let Some((policy_id, policy_name)) = &job.policy {
+            metadata["policy_id"] = policy_id.as_str().into();
+            metadata["policy_name"] = policy_name.as_str().into();
+            metadata["requested_by_user_id"] = job.requested_by_user_id.as_str().into();
+        }
+        audit::record(
+            executor,
+            &job.actor,
+            "job.start",
+            AuditTarget::job(&id),
+            metadata,
+        )
+        .await?;
+        Ok(Created { id, devices })
     }
-    let label = if usize::try_from(devices).is_ok_and(|devices| devices == plan.devices) {
-        plan.label.clone()
-    } else {
-        relabel(executor, plan, &id, devices).await?
-    };
-    let mut metadata = json!({
-        "kind": job.payload.kind().as_str(),
-        "item_id": item_id,
-        "item_name": item_name,
-        "target": job.target.kind().as_str(),
-        "target_label": label,
-        "devices": devices,
-        "offline": plan.offline.as_str(),
-        "queued": counts.get(&DeviceState::Queued).copied().unwrap_or(0),
-        "waiting": counts.get(&DeviceState::Waiting).copied().unwrap_or(0),
-        "skipped": counts.get(&DeviceState::Skipped).copied().unwrap_or(0),
-    });
-    if let Some(run_as) = columns.run_as {
-        metadata["run_as"] = run_as.into();
+}
+
+/// Creates a planned job: [`draft`], [`Draft::write_devices`] and
+/// [`Draft::finish`], in one transaction unless the job is
+/// [`batched`](Plan::batched). If a later transaction of a batched job
+/// fails, the job is removed again and the error returned.
+pub async fn create(state: &AppState, plan: &Plan, now: i64) -> Result<Created, ApiError> {
+    let mut transaction = state.database.begin().await?;
+    let mut draft = draft(&mut transaction, &state.automation, plan, now).await?;
+    let id = draft.id.clone();
+    let created = async {
+        let mut transaction = draft.write_devices(state, transaction).await?;
+        let created = draft.finish(&mut transaction).await;
+        // A job whose every device was deleted is removed with that.
+        if created.is_ok() || created.as_ref().err().and_then(ApiError::code) == Some("no_devices")
+        {
+            transaction.commit().await?;
+        }
+        created
     }
-    if let Some(destination) = columns.destination {
-        metadata["destination"] = destination.into();
+    .await;
+    if created.is_err() && plan.batched() {
+        abandon(state, &id).await;
     }
-    if let Some(categories) = columns.categories {
-        metadata["categories"] = json!(categories);
+    created
+}
+
+/// Removes a job whose creation failed, now, or on the engine's next full
+/// pass if that fails too.
+pub async fn abandon(state: &AppState, job_id: &str) {
+    if let Err(error) = discard(&state.database, job_id).await {
+        tracing::warn!(
+            job_id,
+            %error,
+            "could not remove a job whose creation failed; the engine will"
+        );
     }
-    if let Some(reboot) = columns.reboot {
-        metadata["reboot"] = reboot.into();
-        metadata["reboot_delay_minutes"] = columns.reboot_delay_minutes.into();
+}
+
+/// Removes the job `job_id` if it is still marked as being created: its
+/// devices [`DEVICES_PER_TRANSACTION`] to a transaction, then the job with
+/// its applications. Each transaction takes the job's row first, so one
+/// whose creation ends meanwhile is waited for and then kept. Returns
+/// whether the job was removed.
+pub async fn discard(database: &Database, job_id: &str) -> db::Result<bool> {
+    loop {
+        let mut transaction = database.begin().await?;
+        let marked = transaction
+            .execute(
+                &Query::update()
+                    .table(Jobs::Table)
+                    .value(Jobs::Creating, true)
+                    .and_where(Expr::col(Jobs::Id).eq(job_id))
+                    .and_where(Expr::col(Jobs::Creating))
+                    .to_owned(),
+            )
+            .await?;
+        if marked == 0 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let deleted = transaction
+            .execute(
+                &Query::delete()
+                    .from_table(JobDevices::Table)
+                    .and_where(Expr::col(JobDevices::JobId).eq(job_id))
+                    .and_where(
+                        Expr::col(JobDevices::DeviceId).in_subquery(
+                            Query::select()
+                                .column(JobDevices::DeviceId)
+                                .from(JobDevices::Table)
+                                .and_where(Expr::col(JobDevices::JobId).eq(job_id))
+                                .limit(DEVICES_PER_TRANSACTION as u64)
+                                .to_owned(),
+                        ),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        if deleted == 0 {
+            transaction
+                .execute(
+                    &Query::delete()
+                        .from_table(Jobs::Table)
+                        .and_where(Expr::col(Jobs::Id).eq(job_id))
+                        .to_owned(),
+                )
+                .await?;
+            transaction.commit().await?;
+            return Ok(true);
+        }
+        transaction.commit().await?;
     }
-    if let Payload::Applications(spec) = &job.payload {
-        metadata["applications"] = spec.audit();
+}
+
+/// The jobs marked as being created, from their own index: none, or the
+/// few being created now.
+pub fn creating_query() -> sea_query::SelectStatement {
+    Query::select()
+        .column((Jobs::Table, Jobs::Id))
+        .from(Jobs::Table)
+        .and_where(Expr::col((Jobs::Table, Jobs::Creating)))
+        .to_owned()
+}
+
+/// Removes the jobs whose creation stopped part-way: those marked as being
+/// created that this server isn't creating, because the server stopped, or
+/// the request or policy firing creating it ended, between its
+/// transactions. After a restart that is every job still marked. Returns
+/// how many it removed.
+pub async fn discard_abandoned(state: &AppState) -> db::Result<usize> {
+    let marked: Vec<(String,)> = state.database.fetch_all(&creating_query()).await?;
+    let mut discarded = 0;
+    for (id,) in marked {
+        if state.automation.is_creating(&id) {
+            continue;
+        }
+        if discard(&state.database, &id).await? {
+            tracing::warn!(job_id = id, "removed a job whose creation stopped part-way");
+            discarded += 1;
+        }
     }
-    if let Some((policy_id, policy_name)) = &job.policy {
-        metadata["policy_id"] = policy_id.as_str().into();
-        metadata["policy_name"] = policy_name.as_str().into();
-        metadata["requested_by_user_id"] = job.requested_by_user_id.as_str().into();
-    }
-    audit::record(
-        executor,
-        &job.actor,
-        "job.start",
-        AuditTarget::job(&id),
-        metadata,
-    )
-    .await?;
-    Ok(Created { id, devices })
+    Ok(discarded)
 }
 
 /// The label of a job written with fewer devices than planned. One on chosen
@@ -1251,7 +1522,7 @@ async fn relabel(
     if !matches!(plan.job.target, Target::Devices(_)) {
         return Ok(plan.label.clone());
     }
-    let label = if devices == 1 {
+    Ok(if devices == 1 {
         let (name,): (String,) = executor
             .fetch_one(
                 &Query::select()
@@ -1269,17 +1540,7 @@ async fn relabel(
         name
     } else {
         format!("{devices} devices")
-    };
-    executor
-        .execute(
-            &Query::update()
-                .table(Jobs::Table)
-                .value(Jobs::TargetLabel, label.as_str())
-                .and_where(Expr::col(Jobs::Id).eq(job_id))
-                .to_owned(),
-        )
-        .await?;
-    Ok(label)
+    })
 }
 
 fn initial_state(
@@ -1338,6 +1599,13 @@ struct JobRow {
     finished_at: Option<i64>,
 }
 
+/// The SQL that is true of a job whose creation ended: every job but those
+/// whose devices are still being written. Whatever starts, queues, counts,
+/// finishes or shows jobs reads only these.
+pub fn created() -> Expr {
+    Expr::col((Jobs::Table, Jobs::Creating)).not()
+}
+
 fn job_select() -> sea_query::SelectStatement {
     Query::select()
         .columns([
@@ -1372,6 +1640,8 @@ fn job_select() -> sea_query::SelectStatement {
             Users::Table,
             Expr::col((Users::Table, Users::Id)).equals((Jobs::Table, Jobs::RequestedByUserId)),
         )
+        // Shown, counted and finished only once created.
+        .and_where(created())
         .to_owned()
 }
 
@@ -1480,6 +1750,7 @@ pub async fn unfinished(executor: &mut impl Executor) -> db::Result<Vec<String>>
                 .column(Jobs::Id)
                 .from(Jobs::Table)
                 .and_where(Expr::col(Jobs::FinishedAt).is_null())
+                .and_where(created())
                 .to_owned(),
         )
         .await?;
@@ -1516,6 +1787,7 @@ pub async fn unfinished_of_devices(
                             .is_in(chunk.iter().cloned()),
                     )
                     .and_where(Expr::col((Jobs::Table, Jobs::FinishedAt)).is_null())
+                    .and_where(created())
                     .to_owned(),
             )
             .await?;

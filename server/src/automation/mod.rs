@@ -11,9 +11,12 @@
 //! recounts the jobs whose devices changed, marking those with nothing left
 //! to do as finished. Every [`RECONCILE_INTERVAL_MS`], after a restart and
 //! when a policy fires, it makes a full pass instead, which looks at every
-//! waiting device and recounts every unfinished job. The website's event
-//! socket gets each job whose counts changed. Everything the engine decides
-//! is in the database, so a restart picks up where it left off.
+//! waiting device and recounts every unfinished job, and first removes the
+//! jobs whose creation stopped part-way: those still marked as being created
+//! that this server isn't creating, which after a restart is all of them.
+//! The website's event socket gets each job whose counts changed.
+//! Everything the engine decides is in the database, so a restart picks up
+//! where it left off.
 pub mod dispatch;
 pub mod jobs;
 pub mod policies;
@@ -54,10 +57,11 @@ pub const SETTLE_SPACING_MS: i64 = SECOND_MS;
 /// How often a full pass looks at every waiting device and unfinished job.
 /// Steps act on every change announced to the engine, so this only catches
 /// what wasn't announced: an Agent that connected while a policy was
-/// creating its job, a change by a server that stopped before announcing
-/// it, and runs that passed their report deadline unreported. Those wait at
-/// most a minute, and the full pass, whose cost grows with the fleet, runs
-/// once a minute rather than once per Agent.
+/// creating its job, a job whose creation stopped part-way, a change by a
+/// server that stopped before announcing it, and runs that passed their
+/// report deadline unreported. Those wait at most a minute, and the full
+/// pass, whose cost grows with the fleet, runs once a minute rather than
+/// once per Agent.
 pub const RECONCILE_INTERVAL_MS: i64 = MINUTE_MS;
 /// Changes a subscriber may fall behind by before it misses some.
 const EVENT_BACKLOG: usize = 256;
@@ -87,6 +91,11 @@ struct Inner {
     /// by job, with when that first happened. Kept in memory: a restart
     /// gives them their retries again.
     wake_failures: Mutex<HashMap<String, HashMap<String, i64>>>,
+    /// The jobs this server is creating: a job marked as being created that
+    /// isn't one of them stopped part-way, and is removed.
+    creating: Mutex<HashSet<String>>,
+    /// Where creations pause after each transaction of devices, for tests.
+    pause: Mutex<Option<Pause>>,
 }
 
 #[derive(Debug, Default)]
@@ -157,6 +166,8 @@ impl Default for Engine {
                 full_passes: AtomicU64::new(0),
                 recounted: AtomicU64::new(0),
                 wake_failures: Mutex::default(),
+                creating: Mutex::default(),
+                pause: Mutex::default(),
             }),
         }
     }
@@ -277,6 +288,135 @@ impl Engine {
     }
 }
 
+impl Engine {
+    /// Notes that this server is creating the job `job_id` until the
+    /// returned guard is dropped.
+    pub(crate) fn hold_creation(&self, job_id: &str) -> Creating {
+        self.creating().insert(job_id.to_owned());
+        Creating {
+            engine: self.clone(),
+            job_id: job_id.to_owned(),
+        }
+    }
+
+    /// Whether this server is creating the job.
+    pub(crate) fn is_creating(&self, job_id: &str) -> bool {
+        self.creating().contains(job_id)
+    }
+
+    fn creating(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        // Nothing panics while holding the lock, so a poisoned one is whole.
+        self.inner
+            .creating
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Pauses every job created in several transactions after each
+    /// transaction of its devices, until [`CreationPause::resume`], while
+    /// the returned pause lives: tests look at a job half created with it.
+    pub fn pause_creation(&self) -> CreationPause {
+        let (sender, batches) = tokio::sync::mpsc::unbounded_channel();
+        let resume = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.pause_slot() = Some(Pause {
+            batches: sender,
+            resume: Arc::clone(&resume),
+        });
+        CreationPause {
+            engine: self.clone(),
+            batches,
+            resume,
+        }
+    }
+
+    /// A transaction of `devices` of the job's devices was committed: waits
+    /// for a test's pause, if there is one.
+    pub(crate) async fn devices_written(&self, job_id: &str, devices: usize) {
+        let Some(pause) = self.pause_slot().clone() else {
+            return;
+        };
+        let batch = Batch {
+            job_id: job_id.to_owned(),
+            devices,
+        };
+        if pause.batches.send(batch).is_ok() {
+            // Closed when the pause ends, which lets it go on.
+            if let Ok(permit) = pause.resume.acquire().await {
+                permit.forget();
+            }
+        }
+    }
+
+    fn pause_slot(&self) -> std::sync::MutexGuard<'_, Option<Pause>> {
+        // Nothing panics while holding the lock, so a poisoned one is whole.
+        self.inner
+            .pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// This server creating a job, until it is dropped.
+#[derive(Debug)]
+pub struct Creating {
+    engine: Engine,
+    job_id: String,
+}
+
+impl Drop for Creating {
+    fn drop(&mut self) {
+        self.engine.creating().remove(&self.job_id);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Pause {
+    batches: tokio::sync::mpsc::UnboundedSender<Batch>,
+    resume: Arc<tokio::sync::Semaphore>,
+}
+
+/// A transaction of a job's devices, committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Batch {
+    pub job_id: String,
+    /// The planned devices it covered: at most
+    /// [`jobs::DEVICES_PER_TRANSACTION`]. Those deleted since planning were
+    /// left out.
+    pub devices: usize,
+}
+
+/// Job creations paused after each transaction of devices
+/// ([`Engine::pause_creation`]). Dropping it lets them all go on.
+#[derive(Debug)]
+pub struct CreationPause {
+    engine: Engine,
+    batches: tokio::sync::mpsc::UnboundedReceiver<Batch>,
+    resume: Arc<tokio::sync::Semaphore>,
+}
+
+impl CreationPause {
+    /// The next transaction of devices committed; its creation waits for
+    /// [`resume`](Self::resume).
+    pub async fn next(&mut self) -> Batch {
+        self.batches
+            .recv()
+            .await
+            .expect("the engine keeps the pause")
+    }
+
+    /// Lets one paused creation write its next transaction.
+    pub fn resume(&self) {
+        self.resume.add_permits(1);
+    }
+}
+
+impl Drop for CreationPause {
+    fn drop(&mut self) {
+        self.engine.pause_slot().take();
+        self.resume.close();
+    }
+}
+
 /// Runs the engine until the returned task is aborted.
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -343,6 +483,8 @@ async fn full_pass(state: &AppState, now: i64) -> anyhow::Result<bool> {
         pending.reconciled_at = Some(now);
     }
     let passed = async {
+        // First, so a policy whose firing stopped part-way fires again now.
+        jobs::discard_abandoned(state).await?;
         policies::fire_due(state, now).await?;
         dispatch::expire(state, None, now).await?;
         dispatch::miss_deleted(state, now).await?;

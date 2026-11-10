@@ -1819,15 +1819,12 @@ fn update_scan(target: automation::jobs::Target) -> automation::jobs::NewJob {
     }
 }
 
-/// Writes a planned job in a transaction of its own.
+/// Writes a planned job, as the website does.
 async fn write_job(
     app: &App,
     plan: &automation::jobs::Plan,
 ) -> Result<automation::jobs::Created, meshrmm_server::http::ApiError> {
-    let mut transaction = app.db().begin().await.unwrap();
-    let created = automation::jobs::write(&mut transaction, plan, now_ms()).await;
-    transaction.commit().await.unwrap();
-    created
+    automation::jobs::create(&app.state, plan, now_ms()).await
 }
 
 /// How many jobs there are, finished or not.
@@ -1991,12 +1988,9 @@ async fn jobs_are_planned_without_the_writer_and_written_with_inserts_alone() {
         );
         let state = app.state.clone();
         let writing = tokio::spawn(async move {
-            let mut transaction = state.database.begin().await.unwrap();
             let before = state.database.counts();
-            let created = jobs::write(&mut transaction, &plan, now_ms()).await;
-            let counts = state.database.counts() - before;
-            transaction.commit().await.unwrap();
-            (created, counts)
+            let created = jobs::create(&state, &plan, now_ms()).await;
+            (created, state.database.counts() - before)
         });
         if app.db().backend() == Backend::Sqlite {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2006,11 +2000,12 @@ async fn jobs_are_planned_without_the_writer_and_written_with_inserts_alone() {
         let (created, written) = writing.await.unwrap();
         let created = created.unwrap();
         assert_eq!(created.devices, 1_000, "{name}");
-        // The job, a statement for each 400 devices, and the audit event:
-        // nothing is read, and only the devices' inserts grow with them.
+        // One transaction: the job, a statement for each 400 devices, the
+        // clearing of its mark and the audit event. Nothing is read, and only
+        // the devices' inserts grow with them.
         assert_eq!(
-            (written.statements, written.writes),
-            (1 + 3 + 1, 1 + 3 + 1),
+            (written.statements, written.writes, written.transactions),
+            (1 + 3 + 2, 1 + 3 + 2, 1),
             "{name}"
         );
         let job = jobs::get(&mut app.db(), &created.id, now_ms())

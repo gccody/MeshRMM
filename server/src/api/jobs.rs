@@ -222,9 +222,9 @@ pub async fn start(
         },
     )
     .await?;
-    let mut transaction = state.database.begin().await?;
-    let created = jobs::write(&mut transaction, &plan, now_ms()).await?;
-    transaction.commit().await?;
+    // In several short transactions for a job on many devices; it is shown
+    // and started only once the last one ends, and removed if one fails.
+    let created = jobs::create(&state, &plan, now_ms()).await?;
     state.automation.job_changed(&created.id);
     let detail = detail(&state, &actor, &created.id).await?;
     Ok((StatusCode::CREATED, Json(detail)))
