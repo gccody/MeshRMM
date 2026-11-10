@@ -372,8 +372,12 @@ impl CaptureControl {
         // request recovery without destabilizing the encoder.
         // A queued adjustment from before a preset change must
         // never raise the encoder above the new quality ceiling.
-        let value = value.min(self.quality_ceiling.load(Ordering::Acquire));
-        if let Err(error) = lock_streamer(&self.streamer)?.set_adaptive_bitrate(value) {
+        // A restart of capture carries on at this rate.
+        let ceiling = self.quality_ceiling.load(Ordering::Acquire);
+        let value = value.min(ceiling);
+        let mut streamer = lock_streamer(&self.streamer)?;
+        streamer.set_congestion_bitrate((value < ceiling).then_some(value));
+        if let Err(error) = streamer.set_adaptive_bitrate(value) {
             tracing::warn!(error = %error, "could not set bitrate while the desktop is changing");
         }
         Ok(())
@@ -419,10 +423,11 @@ impl CaptureControl {
         headless_resolution: Option<HeadlessResolution>,
     ) -> anyhow::Result<()> {
         let value = quality.bitrate(self.configured_maximum_bitrate);
-        self.quality_ceiling.store(value, Ordering::Release);
+        let previous_ceiling = self.quality_ceiling.swap(value, Ordering::AcqRel);
         // Recreate the encoder with its static bitrate settings.
         // Live CodecAPI updates may be ignored, rejected, or even
         // terminate HEVC encoders after the call reports success.
+        // A rate the network holds the session to stays in force.
         lock_streamer(&self.streamer)?.set_bitrate(value);
         let mut capture_changed = lock_streamer(&self.streamer)?.set_quality(quality);
         if let Some(resolution) = headless_resolution {
@@ -432,7 +437,7 @@ impl CaptureControl {
         if self.capture_running
             && !capture_changed
             && candidates.first() == Some(&self.active_profile)
-            && self.format.bitrate_bits_per_second == value
+            && previous_ceiling == value
         {
             // Echo the settled configuration even when no
             // restart is needed. The viewer deliberately does
