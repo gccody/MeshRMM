@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::{
+    excerpt,
     filter::{self, Filter},
     strip_urn,
 };
@@ -98,16 +99,26 @@ fn parse_path(raw: &str) -> Result<Path, PatchError> {
     let close = raw
         .rfind(']')
         .filter(|close| *close > open)
-        .ok_or_else(|| invalid("invalidPath", format!("unbalanced brackets in {raw}")))?;
+        .ok_or_else(|| {
+            invalid(
+                "invalidPath",
+                format!("unbalanced brackets in {}", excerpt(raw)),
+            )
+        })?;
     let filter = filter::parse(&raw[open + 1..close])
-        .map_err(|error| invalid("invalidPath", format!("{raw}: {error}")))?;
+        .map_err(|error| invalid("invalidPath", format!("{}: {error}", excerpt(raw))))?;
     // The filtered attribute and its sub-attribute are one name each.
     let attribute = names(strip_urn(&raw[..open]), 1)?.remove(0);
     let rest = &raw[close + 1..];
     let sub_attribute = match rest.strip_prefix('.') {
         Some(sub) => Some(names(sub, 1)?.remove(0)),
         None if rest.is_empty() => None,
-        None => return Err(invalid("invalidPath", format!("invalid path {raw}"))),
+        None => {
+            return Err(invalid(
+                "invalidPath",
+                format!("invalid path {}", excerpt(raw)),
+            ));
+        }
     };
     Ok(Path::Value {
         attribute,
@@ -141,7 +152,7 @@ pub fn apply(resource: &mut Value, operations: &[Operation]) -> Result<(), Patch
             other => {
                 return Err(invalid(
                     "invalidSyntax",
-                    format!("unknown operation {other}"),
+                    format!("unknown operation {}", excerpt(other)),
                 ));
             }
         };

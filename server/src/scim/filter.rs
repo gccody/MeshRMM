@@ -9,7 +9,7 @@
 //! `members[value eq "id"]`. Strings compare without case, except IDs.
 use serde_json::Value;
 
-use super::attribute_key;
+use super::{attribute_key, excerpt};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
@@ -193,7 +193,10 @@ impl Parser {
                 }
                 let path = split_path(&attribute);
                 let Some(Token::Word(op)) = self.next() else {
-                    return Err(format!("expected an operator after {attribute}"));
+                    return Err(format!(
+                        "expected an operator after {}",
+                        excerpt(&attribute)
+                    ));
                 };
                 let op = match op.to_ascii_lowercase().as_str() {
                     "pr" => return Ok(Filter::Present(path)),
@@ -202,7 +205,9 @@ impl Parser {
                     "co" => Op::Co,
                     "sw" => Op::Sw,
                     "ew" => Op::Ew,
-                    other => return Err(format!("the {other} operator isn't supported")),
+                    other => {
+                        return Err(format!("the {} operator isn't supported", excerpt(other)));
+                    }
                 };
                 let value = match self.next() {
                     Some(Token::Text(text)) => Value::String(text),
@@ -213,7 +218,7 @@ impl Parser {
                         _ => word
                             .parse::<serde_json::Number>()
                             .map(Value::Number)
-                            .map_err(|_| format!("invalid value {word}"))?,
+                            .map_err(|_| format!("invalid value {}", excerpt(&word)))?,
                     },
                     _ => return Err("expected a value".into()),
                 };

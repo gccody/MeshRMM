@@ -1,6 +1,7 @@
 //! Best-effort bounded logging: a stalled log must not stall the threads that log.
 //! Records queue for one writer thread, and a full queue drops them, counted, rather
-//! than block; the writer reports the count in the log once it catches up.
+//! than block; the writer reports the count in the log once it catches up, in the log's
+//! format when [`AsyncLog::with_notices`] supplies one.
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
@@ -16,6 +17,26 @@ enum Message {
     Flush(mpsc::SyncSender<()>),
 }
 
+/// A line the writer adds to the log itself, saying how many records it dropped or lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    /// Always `WARN`.
+    pub level: &'static str,
+    /// What happened, with the count in it, such as "dropped 3 log records while logging was
+    /// congested".
+    pub message: String,
+    /// How many records were dropped or lost.
+    pub count: u64,
+}
+
+/// Writes a [`Notice`] as one line of the log, ending in a newline.
+type FormatNotice = Box<dyn Fn(&Notice) -> Vec<u8> + Send>;
+
+/// A notice as plain text: `WARN dropped 3 log records while logging was congested`.
+fn text_notice(notice: &Notice) -> Vec<u8> {
+    format!("{} {}\n", notice.level, notice.message).into_bytes()
+}
+
 #[derive(Clone)]
 pub struct AsyncLog {
     sender: mpsc::SyncSender<Message>,
@@ -25,9 +46,20 @@ impl AsyncLog {
     /// Opens the log with `open` and writes it on a background thread, queueing up to
     /// `capacity` records for it. After a write error the thread counts the records it cannot
     /// write and calls `open` again, backing off between attempts, until the log is writable.
+    /// It reports the records it dropped or lost as plain text.
     pub fn new<W: Write + Send + 'static>(
         capacity: usize,
+        open: impl FnMut() -> io::Result<W> + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::with_notices(capacity, open, text_notice)
+    }
+
+    /// As [`AsyncLog::new`], but the counts of dropped and lost records are written as
+    /// `format_notice` writes them, so they match the format of the log's other records.
+    pub fn with_notices<W: Write + Send + 'static>(
+        capacity: usize,
         mut open: impl FnMut() -> io::Result<W> + Send + 'static,
+        format_notice: impl Fn(&Notice) -> Vec<u8> + Send + 'static,
     ) -> io::Result<Self> {
         let file = open()?;
         let (sender, receiver) = mpsc::sync_channel::<Message>(capacity);
@@ -39,6 +71,7 @@ impl AsyncLog {
             retry_delay: FIRST_RETRY,
             congested: dropped.clone(),
             lost: 0,
+            format_notice: Box::new(format_notice),
         };
         std::thread::Builder::new()
             .name("meshrmm-log".into())
@@ -87,6 +120,7 @@ struct Writer<W, F> {
     congested: Arc<AtomicU64>,
     /// Records this thread could not write.
     lost: u64,
+    format_notice: FormatNotice,
 }
 
 impl<W: Write, F: FnMut() -> io::Result<W>> Writer<W, F> {
@@ -100,16 +134,18 @@ impl<W: Write, F: FnMut() -> io::Result<W>> Writer<W, F> {
         let lost = std::mem::take(&mut self.lost);
         let mut notice = Vec::new();
         if congested > 0 {
-            let _ = writeln!(
-                notice,
-                "WARN dropped {congested} log records while logging was congested"
-            );
+            notice.extend((self.format_notice)(&Notice {
+                level: "WARN",
+                message: format!("dropped {congested} log records while logging was congested"),
+                count: congested,
+            }));
         }
         if lost > 0 {
-            let _ = writeln!(
-                notice,
-                "WARN lost {lost} log records while the log could not be written"
-            );
+            notice.extend((self.format_notice)(&Notice {
+                level: "WARN",
+                message: format!("lost {lost} log records while the log could not be written"),
+                count: lost,
+            }));
         }
         let result = file
             .write_all(&notice)
@@ -326,6 +362,7 @@ mod tests {
             retry_delay: FIRST_RETRY,
             congested: Arc::new(AtomicU64::new(0)),
             lost: 0,
+            format_notice: Box::new(text_notice),
         };
         for _ in 0..100 {
             writer.write(b"record\n");
@@ -337,5 +374,43 @@ mod tests {
             writer.back_off();
         }
         assert_eq!(writer.retry_delay, MAX_RETRY);
+    }
+
+    #[test]
+    fn notices_are_written_as_the_log_formats_them() {
+        let file = SharedWriter::default();
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = Writer {
+            open: once(file.clone()),
+            file: Some(file.clone()),
+            retry_at: Instant::now(),
+            retry_delay: FIRST_RETRY,
+            congested: Arc::new(AtomicU64::new(3)),
+            lost: 2,
+            format_notice: Box::new({
+                let notices = notices.clone();
+                move |notice: &Notice| {
+                    notices.lock().unwrap().push(notice.clone());
+                    format!("<{} {}>\n", notice.level, notice.count).into_bytes()
+                }
+            }),
+        };
+        writer.write(b"record\n");
+        assert_eq!(file.text(), "<WARN 3>\n<WARN 2>\nrecord\n");
+        assert_eq!(
+            *notices.lock().unwrap(),
+            [
+                Notice {
+                    level: "WARN",
+                    message: "dropped 3 log records while logging was congested".into(),
+                    count: 3,
+                },
+                Notice {
+                    level: "WARN",
+                    message: "lost 2 log records while the log could not be written".into(),
+                    count: 2,
+                },
+            ]
+        );
     }
 }

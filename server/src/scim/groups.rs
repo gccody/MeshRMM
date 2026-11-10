@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 
 use super::{
     GROUP_SCHEMA, ListQuery, Projection, ScimBody, ScimClient, ScimError, Whose, base_url,
-    ensure_administrator_remains,
+    ensure_administrator_remains, excerpt,
     filter::{self, Filter},
     list_page, meta,
     patch::{Operation, PatchRequest},
@@ -456,7 +456,10 @@ async fn check(
     if !unknown.is_empty() {
         return Err(ScimError::bad_request(
             "invalidValue",
-            format!("these members aren't users here: {}", unknown.join(", ")),
+            format!(
+                "these members aren't users here: {}",
+                excerpt(&unknown.join(", "))
+            ),
         ));
     }
     Ok(())

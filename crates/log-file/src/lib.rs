@@ -11,7 +11,7 @@
 //! the threads that log.
 mod async_log;
 
-pub use async_log::{AsyncLog, Record};
+pub use async_log::{AsyncLog, Notice, Record};
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
