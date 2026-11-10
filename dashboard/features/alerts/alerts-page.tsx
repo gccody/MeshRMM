@@ -1,12 +1,10 @@
 import { BellOff, CircleAlert, LoaderCircle, RefreshCw, X } from "lucide-react";
-import { useCallback, useState } from "react";
+import { useState } from "react";
 import { useSearchParams } from "react-router";
-import { useResource } from "../../lib/use-resource";
 import { DeviceSelect } from "../device-picker/device-select";
 import { useWorkspace } from "../workspace/workspace-context";
 import { useCompanies, useDevices } from "../agents/use-devices";
 import { HeaderActions } from "../workspace/header-actions";
-import { fetchAlerts } from "./alerts-api";
 import { AlertTable } from "./alert-table";
 import { AlertAreaTabs } from "./area-tabs";
 import {
@@ -16,10 +14,9 @@ import {
   SEVERITY_LABELS,
   type StateFilter,
   alertFilterParams,
-  applyAlertChange,
   parseAlertFilters,
 } from "./model";
-import { useAlertEvents } from "./use-alert-feed";
+import { useLiveAlerts } from "./use-live-alerts";
 
 const STATES: { id: StateFilter; label: string }[] = [
   { id: "active", label: "Active" },
@@ -30,24 +27,16 @@ const STATES: { id: StateFilter; label: string }[] = [
 ];
 
 // `/alerts`: alerts the rules raised, open ones first, filtered by state,
-// severity, company and device. The event socket keeps the list current.
+// severity, company and device. The event socket keeps the list current;
+// it holds the first ALERT_PAGE_LIMIT, and says when more match.
 export function AlertsPage() {
-  const { authorizedFetch, inventory } = useWorkspace();
+  const { inventory } = useWorkspace();
   const [searchParams, setSearchParams] = useSearchParams();
   const filters = parseAlertFilters(searchParams);
   const query = alertFilterParams(filters).toString();
   const [actionError, setActionError] = useState<string | null>(null);
 
-  const load = useCallback(() => fetchAlerts(authorizedFetch, query), [authorizedFetch, query]);
-  const { data, error, reload, setData } = useResource(load, "The alerts could not be loaded.");
-
-  useAlertEvents((event) => {
-    if (event.type === "alert_upsert") {
-      setData((current) => ({ ...current, alerts: applyAlertChange(current.alerts, event.alert, filters) }));
-    } else if (event.type === "alert_counts") {
-      reload();
-    }
-  });
+  const { data, error, reload, apply } = useLiveAlerts(query);
 
   const choose = (change: Partial<AlertFilters>) => {
     setSearchParams(alertFilterParams({ ...filters, ...change }), { replace: true });
@@ -89,7 +78,7 @@ export function AlertsPage() {
             <DeviceSelect label="Device" agents={agents} value={filters.device} onChange={(device) => choose({ device })} none="Every device" />
           </div>
         </div>
-        {!data ? (
+        {!data || (data.truncated && data.alerts.length === 0) ? (
           error
             ? <div className="empty-state"><CircleAlert size={22} aria-hidden="true" /><strong>{error}</strong><button type="button" className="secondary-button" onClick={reload}><RefreshCw size={16} /> Try again</button></div>
             : <div className="empty-state"><LoaderCircle size={22} className="spin" aria-hidden="true" /><strong>Loading alerts…</strong></div>
@@ -110,7 +99,7 @@ export function AlertsPage() {
               showDevice
               label="Alerts"
               onError={setActionError}
-              onChanged={(alert) => setData((current) => ({ ...current, alerts: applyAlertChange(current.alerts, alert, filters) }))}
+              onChanged={apply}
             />
             {data.truncated && <p className="panel-footer field-help">Showing the newest {data.alerts.length}. Narrow the filters to see others.</p>}
           </>

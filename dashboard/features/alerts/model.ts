@@ -287,11 +287,13 @@ const STATE_ORDER: Record<AlertState, number> = { open: 0, acknowledged: 1, reso
 
 // Open first, then acknowledged, then resolved; newest first within each,
 // as the server lists them.
+export const compareAlerts = (left: Alert, right: Alert) =>
+  STATE_ORDER[left.state] - STATE_ORDER[right.state]
+  || right.raised_at - left.raised_at
+  || (right.id < left.id ? -1 : right.id > left.id ? 1 : 0);
+
 export function sortAlerts(alerts: readonly Alert[]) {
-  return [...alerts].sort((left, right) =>
-    STATE_ORDER[left.state] - STATE_ORDER[right.state]
-    || right.raised_at - left.raised_at
-    || (right.id < left.id ? -1 : right.id > left.id ? 1 : 0));
+  return [...alerts].sort(compareAlerts);
 }
 
 // Applies a changed alert to a list with these filters.
@@ -299,6 +301,44 @@ export function applyAlertChange(alerts: readonly Alert[], changed: Alert, filte
   const others = alerts.filter((alert) => alert.id !== changed.id);
   return sortAlerts(matchesAlertFilters(changed, filters) ? [...others, changed] : others);
 }
+
+// How many alerts the Alerts page asks for, and so the most it holds.
+export const ALERT_PAGE_LIMIT = 200;
+
+// A list as the server sends it: its first alerts for some filters, and
+// whether more match than it holds.
+export type BoundedAlerts = { alerts: Alert[]; truncated: boolean };
+
+// The list after changed alerts (the last of each ID counts), as the server
+// would list them, holding no more than `limit`. An alert that no longer
+// matches the filters leaves. A truncated list holds every match up to its
+// last alert and none after, so a change belongs in it only if it sorts
+// before that alert; one that would land among the alerts never loaded
+// leaves, and anything pushed past `limit` is dropped, which makes the list
+// truncated. The list is returned as it was if nothing in it changed.
+export function applyAlertChanges<L extends BoundedAlerts>(list: L, changes: Iterable<Alert>, filters: AlertFilters, limit: number): L {
+  const latest = new Map<string, Alert>();
+  for (const alert of changes) latest.set(alert.id, alert);
+  if (!latest.size) return list;
+  const kept = list.alerts.filter((alert) => !latest.has(alert.id));
+  const last = kept.at(-1);
+  const entering = [...latest.values()]
+    .filter((alert) => matchesAlertFilters(alert, filters) && (!list.truncated || (last !== undefined && compareAlerts(alert, last) < 0)))
+    .sort(compareAlerts);
+  if (!entering.length && kept.length === list.alerts.length) return list;
+  const merged: Alert[] = [];
+  let i = 0;
+  let j = 0;
+  while (merged.length < limit && (i < kept.length || j < entering.length)) {
+    merged.push(j < entering.length && (i === kept.length || compareAlerts(entering[j], kept[i]) < 0) ? entering[j++] : kept[i++]);
+  }
+  const dropped = i < kept.length || j < entering.length;
+  return { ...list, alerts: merged, truncated: list.truncated || dropped };
+}
+
+// Whether a truncated list holds fewer alerts than the server would send,
+// after alerts left it, so it should be read again.
+export const needsRefill = (list: BoundedAlerts, limit: number) => list.truncated && list.alerts.length < limit;
 
 // "Resolved by ada@example.com", "Resolved: the condition passed".
 export function resolutionLabel(alert: Pick<Alert, "resolution" | "resolved_by">) {
