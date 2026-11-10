@@ -220,7 +220,15 @@ async fn terminals_relay_both_ways_and_record_their_life() {
         assert_eq!(close["account"], "root");
         assert_eq!(close["program"], "/bin/bash");
         assert!(close["duration_ms"].is_u64());
-        assert_eq!(app.state.terminals.count_on(&agent.device_id), 0);
+        // The relay forgets the terminal just after recording that it closed.
+        let deadline = tokio::time::Instant::now() + SOCKET_WAIT;
+        while app.state.terminals.count_on(&agent.device_id) != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{name}: the closed terminal is still counted"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         // Closing the browser's socket tells the Agent to end the shell.
         let mut terminal = start(
