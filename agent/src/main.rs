@@ -27,6 +27,8 @@ mod remote;
 mod service;
 #[cfg(windows)]
 mod tray;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod update_files;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod update_policy;
 #[cfg(windows)]
@@ -76,7 +78,7 @@ fn main() -> anyhow::Result<()> {
                 let result = macos_updater::apply(
                     std::path::Path::new(app),
                     coordinator
-                        .parse()
+                        .parse::<u32>()
                         .map_err(|_| anyhow::anyhow!("invalid coordinator process ID"))?,
                 );
                 if let Err(error) = &result {
@@ -105,7 +107,7 @@ fn main() -> anyhow::Result<()> {
                 let result = linux_updater::apply(
                     std::path::Path::new(staged),
                     coordinator
-                        .parse()
+                        .parse::<u32>()
                         .map_err(|_| anyhow::anyhow!("invalid coordinator process ID"))?,
                 );
                 if let Err(error) = &result {

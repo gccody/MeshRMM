@@ -242,24 +242,25 @@ fn install_app() -> anyhow::Result<()> {
         }
     }
     secure_bundle(&staged)?;
-    if let Err(error) = forget_lost_permissions(&staged) {
+    if let Err(error) = forget_lost_permissions(Path::new(APP), &staged) {
         eprintln!("{error:#}");
     }
     let _ = std::fs::remove_dir_all(APP);
     std::fs::rename(&staged, APP).with_context(|| format!("could not install {APP}"))
 }
 
-/// Makes macOS forget the installed Agent's privacy permissions when
-/// `replacement` can't keep them. macOS grants them to a code signature's
-/// designated requirement. Developer ID builds share their team's, so updates
-/// keep the permissions. An ad-hoc build's is its own hash: the permissions
-/// of the build it replaces would stay switched on in System Settings without
-/// applying to it, and macOS would ask for them again every time the Agent
-/// tried to capture the screen.
-pub(crate) fn forget_lost_permissions(replacement: &Path) -> anyhow::Result<()> {
+/// Makes macOS forget the privacy permissions granted to the `previous`
+/// bundle when its `replacement` can't keep them. macOS grants them to a code
+/// signature's designated requirement. Developer ID builds share their team's,
+/// so updates keep the permissions. An ad-hoc build's is its own hash: the
+/// permissions of the build it replaces would stay switched on in System
+/// Settings without applying to it, and macOS would ask for them again every
+/// time the Agent tried to capture the screen. The permissions still apply to
+/// `previous`, so an update only forgets them once it keeps its replacement.
+pub(crate) fn forget_lost_permissions(previous: &Path, replacement: &Path) -> anyhow::Result<()> {
     use meshrmm_self_update::macos::designated_requirement;
 
-    let installed = designated_requirement(Path::new(APP));
+    let installed = designated_requirement(previous);
     if installed.is_none() || installed == designated_requirement(replacement) {
         return Ok(());
     }

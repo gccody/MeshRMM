@@ -7,7 +7,8 @@
 //! that process waits for the coordinator to stop, swaps the executable,
 //! restarts the service, and puts the previous executable back if the new
 //! coordinator does not stay up or does not connect to the server within
-//! [`CONFIRM_TIMEOUT`].
+//! [`CONFIRM_TIMEOUT`]. See [`crate::update_files`] for how the swap, and the
+//! removal of what earlier updates left, work.
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -20,6 +21,7 @@ use meshrmm_self_update::{CURRENT_VERSION, UpdateManifest};
 use super::installer::{EXECUTABLE, INSTALL_DIRECTORY, SERVICE, systemctl};
 use crate::remote::config::Config;
 use crate::remote::service_link::ServiceLink;
+use crate::update_files::{self, InstallLock};
 use crate::update_policy::{
     CONFIRM_TIMEOUT, Confirmation, NEXT_CHECK_FILE, NextCheck, UpdateAttempts, UpdateSchedule,
     random_bits, read_attempts, read_next_check, unix_seconds,
@@ -30,10 +32,15 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
 /// The coordinator ends remote sessions and runs their close actions first.
 const COORDINATOR_EXIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the installer waits for the coordinator's lock once the coordinator has exited.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the new coordinator must keep running before the installer waits for it to connect,
 /// so one that crashes at once is rolled back without waiting for [`CONFIRM_TIMEOUT`].
 const HEALTHY_AFTER: Duration = Duration::from_secs(15);
 const ATTEMPTS_FILE: &str = "update-attempts.json";
+/// A staged release beside the installed Agent is named this and its version. After the swap
+/// the name holds the previous build, and after a rollback the failed one.
+const STAGED_PREFIX: &str = "meshrmm-agent-";
 
 /// This build's release target.
 #[cfg(target_arch = "x86_64")]
@@ -44,6 +51,14 @@ const TARGET: &str = meshrmm_self_update::AGENT_LINUX_ARM64;
 /// Checks for updates until one is staged, then stops the coordinator so the
 /// new Agent can replace it.
 pub(crate) async fn run(config: Config, link: Arc<ServiceLink>) {
+    let _ = tokio::task::spawn_blocking(|| {
+        if let Err(error) = updates_directory().and_then(|updates| {
+            remove_leftovers_unless_installing(&updates, Path::new(INSTALL_DIRECTORY))
+        }) {
+            tracing::warn!(error = ?error, "could not remove what earlier Agent updates left");
+        }
+    })
+    .await;
     let record = updates_directory()
         .ok()
         .and_then(|updates| read_next_check(&updates.join(NEXT_CHECK_FILE)));
@@ -106,12 +121,37 @@ pub(crate) async fn run(config: Config, link: Arc<ServiceLink>) {
 struct Staged {
     version: String,
     executable: std::path::PathBuf,
+    /// Taken before staging; see [`crate::update_files`].
+    lock: InstallLock,
 }
 
 impl Staged {
     /// Starts its installer, which waits for the coordinator to stop.
     fn start(self) -> anyhow::Result<()> {
-        start_installer(&self.executable)
+        start_installer(&self.executable)?;
+        // Released as this process exits, which the installer waits for.
+        self.lock.hold_until_exit();
+        Ok(())
+    }
+}
+
+/// Removes the staged releases and swapped-out builds earlier updates left in
+/// `install_directory`, unless an installer holds the lock in `updates` and so may still need
+/// them.
+fn remove_leftovers_unless_installing(
+    updates: &Path,
+    install_directory: &Path,
+) -> anyhow::Result<()> {
+    if let Some(_lock) = InstallLock::try_take(updates)? {
+        remove_leftovers(install_directory);
+    }
+    Ok(())
+}
+
+fn remove_leftovers(install_directory: &Path) {
+    let removed = update_files::remove_leftovers(install_directory, STAGED_PREFIX);
+    if removed > 0 {
+        tracing::info!(removed, "removed files left by earlier Agent updates");
     }
 }
 
@@ -145,6 +185,10 @@ fn stage(config: &Config) -> anyhow::Result<Option<Staged>> {
         tracing::warn!(version = %release.version, "skipping an Agent update that already failed repeatedly");
         return Ok(None);
     };
+    // Held until the installer takes over, so nothing removes what is staged meanwhile.
+    let lock =
+        InstallLock::try_take(&updates)?.context("an Agent update is still being installed")?;
+    remove_leftovers(Path::new(INSTALL_DIRECTORY));
     tracing::info!(version = %release.version, "downloading an Agent update");
     let executable = read_limited(
         http.get(&release.url)
@@ -159,12 +203,13 @@ fn stage(config: &Config) -> anyhow::Result<Option<Staged>> {
     release.verify(&executable)?;
     // Beside the installed Agent, so the swap is a rename on one file system
     // and the new file gets the folder's SELinux label.
-    let staged = Path::new(INSTALL_DIRECTORY).join(format!("meshrmm-agent-{}", release.version));
+    let staged = Path::new(INSTALL_DIRECTORY).join(format!("{STAGED_PREFIX}{}", release.version));
     super::installer::replace_file(&staged, &executable)?;
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
     Ok(Some(Staged {
         version: release.version,
         executable: staged,
+        lock,
     }))
 }
 
@@ -226,37 +271,54 @@ fn start_installer(staged: &Path) -> anyhow::Result<()> {
 }
 
 /// Entry point of `--apply-update <staged executable> <coordinator pid>`.
-pub fn apply(staged: &Path, coordinator: libc::pid_t) -> anyhow::Result<()> {
-    let deadline = Instant::now() + COORDINATOR_EXIT_TIMEOUT;
-    // SAFETY: signal 0 only checks that the process exists.
-    while unsafe { libc::kill(coordinator, 0) } == 0 {
-        if Instant::now() >= deadline {
-            // SAFETY: as above; SIGKILL ends the stuck coordinator.
-            unsafe { libc::kill(coordinator, libc::SIGKILL) };
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    // Before the new build starts, so only its own connection confirms it, and it holds back
-    // updates of its own meanwhile.
-    let confirmation = match updates_directory().and_then(|updates| {
-        Confirmation::begin(&updates, CURRENT_VERSION, Instant::now(), unix_seconds())
-    }) {
-        Ok(confirmation) => confirmation,
+pub fn apply(staged: &Path, coordinator: u32) -> anyhow::Result<()> {
+    let updates = updates_directory()?;
+    let lock = InstallLock::queue(&updates)?;
+    update_files::wait_for_coordinator(
+        coordinator,
+        COORDINATOR_EXIT_TIMEOUT,
+        Instant::now,
+        std::thread::sleep,
+        || update_files::process_exists(coordinator),
+        main_pid,
+        || {
+            if let Err(error) = systemctl(&["kill", "--signal=SIGKILL", SERVICE]) {
+                tracing::warn!(error = ?error, "could not end the Agent");
+            }
+        },
+    );
+    let _lock = match lock.wait(LOCK_TIMEOUT) {
+        Ok(lock) => lock,
         Err(error) => {
             restart();
-            return Err(error).context("could not prepare to confirm the Agent update");
+            return Err(error);
         }
     };
-    let previous = Path::new(INSTALL_DIRECTORY).join("meshrmm-agent.previous");
-    let _ = std::fs::remove_file(&previous);
-    if let Err(error) = std::fs::rename(EXECUTABLE, &previous) {
-        drop(confirmation);
-        restart();
-        return Err(error).context("could not set the installed Agent aside");
+    let result = install(staged, &updates);
+    // The staged path holds the new build if it was never installed, the previous one once the
+    // update is committed, and the failed one after a rollback.
+    match std::fs::remove_file(staged) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!(%error, "could not remove the staged Agent");
+        }
+        _ => {}
     }
-    if let Err(error) = std::fs::rename(staged, EXECUTABLE) {
-        let _ = std::fs::rename(&previous, EXECUTABLE);
+    result
+}
+
+/// Swaps the staged build in, and back out unless it proves it works.
+fn install(staged: &Path, updates: &Path) -> anyhow::Result<()> {
+    // Before the new build starts, so only its own connection confirms it, and it holds back
+    // updates of its own meanwhile.
+    let confirmation =
+        match Confirmation::begin(updates, CURRENT_VERSION, Instant::now(), unix_seconds()) {
+            Ok(confirmation) => confirmation,
+            Err(error) => {
+                restart();
+                return Err(error).context("could not prepare to confirm the Agent update");
+            }
+        };
+    if let Err(error) = update_files::exchange(staged, Path::new(EXECUTABLE)) {
         drop(confirmation);
         restart();
         return Err(error).context("could not install the Agent update");
@@ -275,7 +337,6 @@ pub fn apply(staged: &Path, coordinator: libc::pid_t) -> anyhow::Result<()> {
                 release_version = CURRENT_VERSION,
                 "Agent update installed: the updated Agent connected to the server"
             );
-            let _ = std::fs::remove_file(&previous);
             return Ok(());
         }
         "did not connect to the server in time"
@@ -284,10 +345,8 @@ pub fn apply(staged: &Path, coordinator: libc::pid_t) -> anyhow::Result<()> {
         failure,
         "the updated Agent did not prove it works; restoring the previous Agent"
     );
-    let failed = Path::new(INSTALL_DIRECTORY).join("meshrmm-agent.failed");
-    let _ = std::fs::rename(EXECUTABLE, &failed);
-    let restored =
-        std::fs::rename(&previous, EXECUTABLE).context("could not restore the previous Agent");
+    let restored = update_files::exchange(staged, Path::new(EXECUTABLE))
+        .context("could not restore the previous Agent");
     drop(confirmation);
     restart();
     restored?;
@@ -324,5 +383,40 @@ mod tests {
     fn reads_downloads_up_to_the_limit() {
         assert_eq!(read_limited(&b"abc"[..], 3).unwrap(), b"abc");
         assert!(read_limited(&b"abcd"[..], 3).is_err());
+    }
+
+    #[test]
+    fn removes_what_earlier_updates_left_unless_an_installer_runs() {
+        let root = std::env::temp_dir().join(format!(
+            "meshrmm-linux-update-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let updates = root.join("updates");
+        let install = root.join("opt");
+        std::fs::create_dir_all(&updates).unwrap();
+        std::fs::create_dir_all(&install).unwrap();
+        for name in [
+            "meshrmm-agent",
+            &format!("{STAGED_PREFIX}1.2.3"),
+            &format!("{STAGED_PREFIX}1.2.4.new"),
+        ] {
+            std::fs::write(install.join(name), name).unwrap();
+        }
+        let names = || {
+            let mut names = std::fs::read_dir(&install)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        // An installer that runs, or waits for its build to connect, may still need them.
+        let installer = InstallLock::try_take(&updates).unwrap().unwrap();
+        remove_leftovers_unless_installing(&updates, &install).unwrap();
+        assert_eq!(names().len(), 3);
+        drop(installer);
+        remove_leftovers_unless_installing(&updates, &install).unwrap();
+        assert_eq!(names(), ["meshrmm-agent"]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
