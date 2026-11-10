@@ -44,6 +44,7 @@ mod capture;
 mod child;
 mod command_writer;
 mod events;
+mod held_input;
 mod input_controller;
 mod launch;
 mod services;
@@ -58,6 +59,7 @@ pub use child::run_child;
 use child::*;
 use command_writer::*;
 use events::*;
+use held_input::*;
 use input_controller::*;
 use launch::*;
 use services::*;
@@ -329,7 +331,7 @@ pub struct DesktopCaptureStreamer {
     chat_route: InputRoute,
     clipboard_route: InputRoute,
     file_route: InputRoute,
-    input_route: InputRoute,
+    input_route: DeviceInputRoute,
     preferred_desktop: Option<DesktopTarget>,
     cursor: HelperCursor,
     clipboard: HelperClipboard,
@@ -375,7 +377,7 @@ impl DesktopCaptureStreamer {
             chat_route: Arc::new(Mutex::new(None)),
             clipboard_route: Arc::new(Mutex::new(None)),
             file_route: Arc::new(Mutex::new(None)),
-            input_route: Arc::new(Mutex::new(None)),
+            input_route: DeviceInputRoute::default(),
             preferred_desktop: None,
             cursor: Arc::new(Mutex::new((CursorShape::Default, false, None))),
             clipboard: Arc::new(ClipboardEvents::default()),

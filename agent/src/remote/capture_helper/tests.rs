@@ -7,6 +7,8 @@ mod chat_tests;
 mod credential_tests;
 mod headless_tests;
 #[cfg(test)]
+mod held_input_tests;
+#[cfg(test)]
 mod isolation_tests;
 #[cfg(test)]
 mod service_command_tests;

@@ -1,6 +1,7 @@
 //! The window procedures of the viewer window and its video child.
 
 use super::*;
+use windows::Win32::System::RemoteDesktop::WTSUnRegisterSessionNotification;
 
 pub(super) unsafe extern "system" fn window_proc(
     window: HWND,
@@ -47,7 +48,10 @@ pub(super) unsafe extern "system" fn window_proc(
             if let Some(context) = context {
                 // The worker resizes the swap chain after the message pump
                 // returns, which is after a border drag ends.
-                if wparam.0 != SIZE_MINIMIZED as usize {
+                if wparam.0 == SIZE_MINIMIZED as usize {
+                    // A minimised window has no keyboard to vouch for.
+                    context.release_input();
+                } else {
                     context.resize_pending.set(true);
                 }
                 context.layout_toolbar(window);
@@ -86,7 +90,8 @@ pub(super) unsafe extern "system" fn window_proc(
         keyboard_hook::WM_SYSTEM_SHORTCUT_KEY => {
             if let Some(context) = context {
                 let (scan_code, extended, pressed) = keyboard_hook::unpack(wparam);
-                context.send_key(scan_code, extended, pressed);
+                // The hook passes on a repeat only of a key it took.
+                context.send_key(scan_code, extended, pressed, false);
             }
             LRESULT(0)
         }
@@ -104,8 +109,21 @@ pub(super) unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
+        WM_WTSSESSION_CHANGE => {
+            if crate::input::releases_on_session_change(wparam.0 as u32) {
+                // The workstation locked, or the session left its screen:
+                // the keys go elsewhere while the window keeps its focus.
+                keyboard_hook::forget();
+                if let Some(context) = context {
+                    context.annotator.borrow_mut().finish();
+                    context.release_input();
+                }
+            }
+            LRESULT(0)
+        }
         WM_CLOSE => unsafe { close(context, window) },
         WM_DESTROY => {
+            let _ = unsafe { WTSUnRegisterSessionNotification(window) };
             keyboard_hook::remove();
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
