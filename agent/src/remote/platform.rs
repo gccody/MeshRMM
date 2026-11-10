@@ -44,11 +44,11 @@ pub trait ScreenStreamer: Send {
     }
     fn poll_ended(&mut self) -> Option<anyhow::Result<()>>;
     fn request_keyframe(&self) -> anyhow::Result<()>;
-    /// Configure the bitrate for the next start; preset changes restart capture.
-    /// Clears any congestion limit.
+    /// Configure the quality ceiling for later starts; preset changes restart
+    /// capture. A congestion bitrate stays in force (see `StartBitrate`).
     fn set_bitrate(&mut self, bits_per_second: u32);
-    /// Cap the bitrate of later starts below the configured bitrate while the
-    /// connection is congested.
+    /// The rate the network allows, which later starts use instead of the
+    /// ceiling while it is below it; None starts them at the ceiling.
     fn set_congestion_bitrate(&mut self, bits_per_second: Option<u32>);
     /// Configure capture color/rate; return whether a restart is required.
     fn set_quality(&mut self, quality: QualityPreset) -> bool;
@@ -147,8 +147,7 @@ pub struct PlatformScreenStreamer {
     outline_dragging: Option<super::drag_windows::ConsoleOutlineDragging>,
     frames_per_second: u32,
     quality: QualityPreset,
-    bitrate_bits_per_second: u32,
-    congestion_bitrate_bits_per_second: Option<u32>,
+    bitrate: super::bitrate::StartBitrate,
     codec: Codec,
     chroma: ChromaMode,
     capture_cursor: bool,
@@ -206,8 +205,7 @@ impl PlatformScreenStreamer {
             outline_dragging: None,
             frames_per_second,
             quality: QualityPreset::BestQuality,
-            bitrate_bits_per_second,
-            congestion_bitrate_bits_per_second: None,
+            bitrate: super::bitrate::StartBitrate::new(bitrate_bits_per_second),
             codec: Codec::H264,
             chroma: ChromaMode::Yuv420,
             capture_cursor: true,
@@ -262,11 +260,7 @@ impl ScreenStreamer for PlatformScreenStreamer {
         let config = meshrmm_remote_screen::StreamConfig {
             frames_per_second: self.quality.frames_per_second(self.frames_per_second),
             grayscale: self.quality.grayscale(),
-            bitrate_bits_per_second: self
-                .congestion_bitrate_bits_per_second
-                .map_or(self.bitrate_bits_per_second, |limit| {
-                    limit.min(self.bitrate_bits_per_second)
-                }),
+            bitrate_bits_per_second: self.bitrate.bits_per_second(),
             codec: remote_screen_codec(self.codec),
             pixel_format: remote_screen_pixel_format(self.chroma),
             capture_cursor: self.capture_cursor,
@@ -391,12 +385,11 @@ impl ScreenStreamer for PlatformScreenStreamer {
     }
 
     fn set_bitrate(&mut self, bits_per_second: u32) {
-        self.bitrate_bits_per_second = bits_per_second.max(1);
-        self.congestion_bitrate_bits_per_second = None;
+        self.bitrate.set_ceiling(bits_per_second);
     }
 
     fn set_congestion_bitrate(&mut self, bits_per_second: Option<u32>) {
-        self.congestion_bitrate_bits_per_second = bits_per_second.map(|value| value.max(1));
+        self.bitrate.adapt(bits_per_second);
     }
 
     fn set_quality(&mut self, quality: QualityPreset) -> bool {

@@ -61,8 +61,7 @@ fn on_main<T: Send + 'static>(
 pub struct PlatformScreenStreamer {
     frames_per_second: u32,
     quality: QualityPreset,
-    bitrate_bits_per_second: u32,
-    congestion_bitrate_bits_per_second: Option<u32>,
+    bitrate: crate::remote::bitrate::StartBitrate,
     codec: Codec,
     capture_cursor: bool,
     next_frame_id: Arc<AtomicU64>,
@@ -99,8 +98,7 @@ impl PlatformScreenStreamer {
         Ok(Self {
             frames_per_second,
             quality: QualityPreset::BestQuality,
-            bitrate_bits_per_second,
-            congestion_bitrate_bits_per_second: None,
+            bitrate: crate::remote::bitrate::StartBitrate::new(bitrate_bits_per_second),
             codec: Codec::H264,
             capture_cursor: true,
             next_frame_id: Arc::new(AtomicU64::new(1)),
@@ -111,11 +109,7 @@ impl PlatformScreenStreamer {
     fn settings(&self) -> StreamSettings {
         StreamSettings {
             frames_per_second: self.quality.frames_per_second(self.frames_per_second),
-            bitrate_bits_per_second: self
-                .congestion_bitrate_bits_per_second
-                .map_or(self.bitrate_bits_per_second, |limit| {
-                    limit.min(self.bitrate_bits_per_second)
-                }),
+            bitrate_bits_per_second: self.bitrate.bits_per_second(),
             codec: self.codec,
             capture_cursor: self.capture_cursor,
             grayscale: self.quality.grayscale(),
@@ -199,12 +193,11 @@ impl ScreenStreamer for PlatformScreenStreamer {
     }
 
     fn set_bitrate(&mut self, bits_per_second: u32) {
-        self.bitrate_bits_per_second = bits_per_second.max(1);
-        self.congestion_bitrate_bits_per_second = None;
+        self.bitrate.set_ceiling(bits_per_second);
     }
 
     fn set_congestion_bitrate(&mut self, bits_per_second: Option<u32>) {
-        self.congestion_bitrate_bits_per_second = bits_per_second.map(|value| value.max(1));
+        self.bitrate.adapt(bits_per_second);
     }
 
     fn set_quality(&mut self, quality: QualityPreset) -> bool {

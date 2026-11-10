@@ -172,8 +172,11 @@ impl LocalScreen {
         }
     }
 
-    pub(crate) fn set_bitrate(&self, bits_per_second: u32) -> anyhow::Result<()> {
-        if let Some(running) = &self.running {
+    /// Changes the running encoder's bitrate, and the bitrate a capture
+    /// restarted for the pointer starts at.
+    pub(crate) fn set_bitrate(&mut self, bits_per_second: u32) -> anyhow::Result<()> {
+        if let Some(running) = &mut self.running {
+            running.settings.bitrate_bits_per_second = bits_per_second.max(1);
             running.encoder.set_bitrate(bits_per_second.max(1));
         }
         Ok(())
