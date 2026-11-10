@@ -709,9 +709,11 @@ async fn wake_jobs_store_what_the_old_reading_said() {
                         &format!("AA:00:00:00:00:1{index}"),
                         &format!("192.168.1.{}", 10 + index)
                     ),
+                    None,
                 )
                 .await
                 .unwrap()
+                .is_some()
             );
         }
         let mut relay = app.state.agents.connect(&id("RELAY"));
