@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use meshrmm_protocol::EncodedFrame;
@@ -10,22 +10,52 @@ use tokio::sync::Notify;
 /// the maximum queued media below 250 ms at 60 FPS.
 pub const MAX_ENCODED_FRAME_QUEUE: usize = 15;
 
+/// The most frames the queue holds past [`MAX_ENCODED_FRAME_QUEUE`] while
+/// they fit in its byte budget (see [`LatestFrameSlot::set_byte_budget`]).
+const MAX_SMALL_FRAME_QUEUE: usize = MAX_ENCODED_FRAME_QUEUE * 16;
+
+#[derive(Default)]
+struct Queue {
+    frames: VecDeque<Arc<EncodedFrame>>,
+    bytes: usize,
+}
+
+impl Queue {
+    fn pop_front(&mut self) -> Option<Arc<EncodedFrame>> {
+        let frame = self.frames.pop_front()?;
+        self.bytes -= frame.data.len();
+        Some(frame)
+    }
+
+    fn clear(&mut self) -> usize {
+        let dropped = self.frames.len();
+        self.frames.clear();
+        self.bytes = 0;
+        dropped
+    }
+}
+
 pub struct LatestFrameSlot {
-    frames: Mutex<VecDeque<Arc<EncodedFrame>>>,
+    queue: Mutex<Queue>,
     keyframe: Mutex<Option<Arc<EncodedFrame>>>,
     changed: Notify,
     keyframe_changed: Notify,
     dropped: AtomicU64,
+    byte_budget: AtomicUsize,
 }
 
 impl Default for LatestFrameSlot {
     fn default() -> Self {
         Self {
-            frames: Mutex::new(VecDeque::with_capacity(MAX_ENCODED_FRAME_QUEUE)),
+            queue: Mutex::new(Queue {
+                frames: VecDeque::with_capacity(MAX_ENCODED_FRAME_QUEUE),
+                bytes: 0,
+            }),
             keyframe: Mutex::new(None),
             changed: Notify::new(),
             keyframe_changed: Notify::new(),
             dropped: AtomicU64::new(0),
+            byte_budget: AtomicUsize::new(0),
         }
     }
 }
@@ -34,6 +64,12 @@ impl LatestFrameSlot {
     /// Publishes directly from the capture callback. Keeping this operation
     /// synchronous preserves encoder output order and avoids spawning one
     /// Tokio task per video frame.
+    ///
+    /// A full queue is dropped whole, breaking the predictive chain, unless
+    /// all of it still fits in the byte budget: frames made while the sender
+    /// paces out a large keyframe are usually tiny re-encodes of a static
+    /// screen, and sending them keeps the stream going from that keyframe
+    /// for less than it costs to send another.
     pub fn publish(&self, frame: EncodedFrame) {
         let frame = Arc::new(frame);
         if frame.keyframe {
@@ -42,27 +78,37 @@ impl LatestFrameSlot {
             }
             self.keyframe_changed.notify_waiters();
         }
-        let Ok(mut frames) = self.frames.lock() else {
+        let Ok(mut queue) = self.queue.lock() else {
             return;
         };
-        if frames.len() >= MAX_ENCODED_FRAME_QUEUE {
-            self.dropped
-                .fetch_add(frames.len() as u64, Ordering::Relaxed);
-            frames.clear();
+        if queue.frames.len() >= MAX_ENCODED_FRAME_QUEUE
+            && (queue.frames.len() >= MAX_SMALL_FRAME_QUEUE
+                || queue.bytes + frame.data.len() > self.byte_budget.load(Ordering::Relaxed))
+        {
+            let dropped = queue.clear();
+            self.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
         }
-        frames.push_back(frame);
-        drop(frames);
+        queue.bytes += frame.data.len();
+        queue.frames.push_back(frame);
+        drop(queue);
         self.changed.notify_one();
+    }
+
+    /// The most bytes of encoded frames the queue may hold past
+    /// [`MAX_ENCODED_FRAME_QUEUE`] frames: what the sender sends in a short
+    /// time, so holding them adds little latency.
+    pub fn set_byte_budget(&self, bytes: usize) {
+        self.byte_budget.store(bytes, Ordering::Relaxed);
     }
 
     pub async fn next(&self) -> Arc<EncodedFrame> {
         loop {
             let notified = self.changed.notified();
             if let Some(frame) = self
-                .frames
+                .queue
                 .lock()
                 .ok()
-                .and_then(|mut frames| frames.pop_front())
+                .and_then(|mut queue| queue.pop_front())
             {
                 return frame;
             }
@@ -81,31 +127,31 @@ impl LatestFrameSlot {
     /// The retained IDR can paint a newly initialized decoder immediately,
     /// even when the Windows login desktop is completely static.
     pub fn clear_pending(&self) {
-        if let Ok(mut frames) = self.frames.lock() {
-            frames.clear();
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.clear();
         }
     }
 
     pub fn len(&self) -> usize {
-        self.frames.lock().map_or(0, |frames| frames.len())
+        self.queue.lock().map_or(0, |queue| queue.frames.len())
     }
 
     pub fn drop_pending(&self) -> usize {
-        self.frames.lock().map_or(0, |mut frames| {
-            let dropped = frames.len();
-            frames.clear();
+        self.queue.lock().map_or(0, |mut queue| {
+            let dropped = queue.clear();
             self.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
             dropped
         })
     }
 
     pub fn discard_through(&self, frame_id: u64) {
-        if let Ok(mut frames) = self.frames.lock() {
-            while frames
+        if let Ok(mut queue) = self.queue.lock() {
+            while queue
+                .frames
                 .front()
                 .is_some_and(|frame| frame.frame_id <= frame_id)
             {
-                frames.pop_front();
+                queue.pop_front();
             }
         }
     }
@@ -204,5 +250,46 @@ mod tests {
             slot.next().await.frame_id,
             MAX_ENCODED_FRAME_QUEUE as u64 + 1
         );
+    }
+
+    fn sized(frame_id: u64, bytes: usize) -> EncodedFrame {
+        EncodedFrame {
+            data: vec![0; bytes],
+            ..frame(frame_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn frames_that_fit_the_byte_budget_are_kept_past_the_frame_limit() {
+        // Three seconds of 250-byte re-encodes of a static screen at 30 FPS,
+        // made while a keyframe was being sent, within a 30 kB budget.
+        let slot = LatestFrameSlot::default();
+        slot.set_byte_budget(30_000);
+        for frame_id in 1..=90 {
+            slot.publish(sized(frame_id, 250));
+        }
+        assert_eq!((slot.len(), slot.dropped()), (90, 0));
+        for frame_id in 1..=90 {
+            assert_eq!(slot.next().await.frame_id, frame_id);
+        }
+
+        // Ordinary frames still drop the whole queue at the frame limit, as
+        // do small ones past the budget or past the larger frame limit.
+        for (bytes, budget, limit) in [
+            (12_000, 30_000, MAX_ENCODED_FRAME_QUEUE),
+            (250, 3_000, MAX_ENCODED_FRAME_QUEUE),
+            (1, usize::MAX, MAX_SMALL_FRAME_QUEUE),
+        ] {
+            let slot = LatestFrameSlot::default();
+            slot.set_byte_budget(budget);
+            for frame_id in 1..=limit as u64 + 1 {
+                slot.publish(sized(frame_id, bytes));
+            }
+            assert_eq!(
+                (slot.len(), slot.dropped()),
+                (1, limit as u64),
+                "{bytes} B frames, {budget} B budget"
+            );
+        }
     }
 }
