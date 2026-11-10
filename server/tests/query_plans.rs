@@ -365,6 +365,11 @@ fn statements() -> Vec<(&'static str, Statement, &'static [&'static str])> {
             Statement::Select(search::installed_count_query("Firefox", None, &scope)),
             &["idx_device_applications_name"][..],
         ),
+        (
+            "the full pass's look for jobs whose creation stopped",
+            Statement::Select(meshrmm_server::automation::jobs::creating_query()),
+            &["idx_jobs_creating"][..],
+        ),
     ]);
     statements.extend(
         maintenance::batch_statements(NOW)

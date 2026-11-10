@@ -28,6 +28,12 @@
 //! offline ones: they are woken together, through the relays the wake
 //! requests pick, on the next pass however full the dispatcher is, since
 //! they hold no run.
+//!
+//! A job still being created is left alone: no pass starts, queues, wakes or
+//! expires its devices until its last transaction clears its mark and
+//! announces it. Only a deleted device's parts are missed in it as in any
+//! other job ([`device_removed`], [`miss_deleted`]), as its later batches
+//! leave the device out.
 use std::collections::HashMap;
 
 use meshrmm_protocol_types::{
@@ -177,6 +183,7 @@ pub async fn expire(state: &AppState, since: Option<i64>, now: i64) -> db::Resul
         .column(Jobs::Id)
         .from(Jobs::Table)
         .and_where(Expr::col(Jobs::FinishedAt).is_null())
+        .and_where(jobs::created())
         .and_where(Expr::col(Jobs::ExpiresAt).lte(now));
     if let Some(since) = since {
         select.and_where(Expr::col(Jobs::ExpiresAt).gt(since));
@@ -202,6 +209,8 @@ pub async fn expire(state: &AppState, since: Option<i64>, now: i64) -> db::Resul
 
 /// Misses the waiting and queued parts of devices that were deleted. Their
 /// deletion misses them at once; this is for a server that stopped first.
+/// It covers jobs still being created too: a deleted device has nothing to
+/// wait for in any job, and nothing else is changed.
 /// Returns how many.
 pub async fn miss_deleted(state: &AppState, now: i64) -> db::Result<u64> {
     state
@@ -255,6 +264,7 @@ pub async fn queue_devices(
                         .column(Jobs::Id)
                         .from(Jobs::Table)
                         .and_where(Expr::col(Jobs::FinishedAt).is_null())
+                        .and_where(jobs::created())
                         .and_where(Expr::col(Jobs::ExpiresAt).gt(now))
                         .to_owned(),
                 ),
@@ -319,8 +329,20 @@ pub async fn waiting_devices(state: &AppState, job_ids: &[String]) -> db::Result
     Ok(devices)
 }
 
+/// The SQL that is true of a part in an unfinished job whose creation ended.
+fn in_created_job() -> sea_query::SimpleExpr {
+    Expr::col(JobDevices::JobId).in_subquery(
+        Query::select()
+            .column(Jobs::Id)
+            .from(Jobs::Table)
+            .and_where(Expr::col(Jobs::FinishedAt).is_null())
+            .and_where(jobs::created())
+            .to_owned(),
+    )
+}
+
 /// Queues every waiting device whose Agent is connected, for what the steps
-/// missed. Returns how many.
+/// missed, in jobs whose creation ended. Returns how many.
 pub async fn queue_connected(state: &AppState, now: i64) -> db::Result<u64> {
     let database = &state.database;
     let waiting: Vec<(String,)> = database
@@ -330,6 +352,7 @@ pub async fn queue_connected(state: &AppState, now: i64) -> db::Result<u64> {
                 .column(JobDevices::DeviceId)
                 .from(JobDevices::Table)
                 .and_where(Expr::col(JobDevices::State).eq(DeviceState::Waiting.as_str()))
+                .and_where(in_created_job())
                 .to_owned(),
         )
         .await?;
@@ -349,6 +372,7 @@ pub async fn queue_connected(state: &AppState, now: i64) -> db::Result<u64> {
                     .value(JobDevices::UpdatedAt, now)
                     .and_where(Expr::col(JobDevices::State).eq(DeviceState::Waiting.as_str()))
                     .and_where(Expr::col(JobDevices::DeviceId).is_in(chunk.iter().cloned()))
+                    .and_where(in_created_job())
                     .to_owned(),
             )
             .await?;
@@ -611,6 +635,7 @@ pub fn ready_jobs(kinds: &[Kind], at_limit: &[String]) -> sea_query::SelectState
         .columns(JOB_COLUMNS.map(|column| (Jobs::Table, column)))
         .from(Jobs::Table)
         .and_where(Expr::col((Jobs::Table, Jobs::FinishedAt)).is_null())
+        .and_where(jobs::created())
         .and_where(
             Expr::col((Jobs::Table, Jobs::Kind)).is_in(kinds.iter().map(|kind| kind.as_str())),
         )
@@ -1328,6 +1353,8 @@ async fn unqueue(
 /// Misses the device's queued and waiting parts of jobs, now it is deleted,
 /// and takes it out of the policies that chose it. Returns the jobs whose
 /// parts it missed.
+/// Jobs still being created are covered too: their batches written before
+/// the deletion hold the device, and those after leave it out.
 pub async fn device_removed(
     executor: &mut impl Executor,
     device_id: &str,

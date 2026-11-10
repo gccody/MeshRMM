@@ -843,6 +843,11 @@ CREATE TABLE jobs (
   policy_id TEXT,
   policy_name TEXT,
   created_at INTEGER NOT NULL,
+  -- Its devices are still being written, a batch per transaction. Until it
+  -- is cleared, in the transaction that records the job's start, nothing
+  -- starts, queues, counts or shows the job; one whose creation stopped (its
+  -- server stopped, or a write failed) is removed.
+  creating INTEGER NOT NULL DEFAULT 0 CHECK (creating IN (0, 1)),
   -- When the last device finished, ran out of time or was cancelled.
   finished_at INTEGER
 );
@@ -850,6 +855,7 @@ CREATE TABLE jobs (
 CREATE INDEX idx_jobs_created ON jobs (created_at);
 CREATE INDEX idx_jobs_policy ON jobs (policy_id, created_at);
 CREATE INDEX idx_jobs_finished ON jobs (finished_at);
+CREATE INDEX idx_jobs_creating ON jobs (id) WHERE creating;
 
 -- Each device a job covers. 'queued': online, its run starts soon;
 -- 'waiting': offline, it runs when the device connects; 'started': its run or

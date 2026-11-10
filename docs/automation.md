@@ -180,14 +180,35 @@ Creating a job reads much more than it writes: every device its target
 covers (for every device, the whole fleet), each one's platform and update
 support, and whether its Agent is connected. The server does all of that
 first, through the database's readers, without holding SQLite's one writer
-(`jobs::plan`), and then inserts the job in one transaction that writes and
-reads nothing else (`jobs::write`): the job, its applications, its devices
-400 to a statement, grouped by how they start, and the audit event. So
-starting a job on 100,000 devices holds up other writes only for its
-inserts, and the job still appears whole, since the dispatcher and the
-job's counts read only committed rows. The website's own reads for a job
-(the script, the file, the applications) and a policy's (its definition,
-its owner's access, its script) come before the transaction too.
+(`jobs::plan`), and then only inserts (`jobs::create`): the job, its
+applications, its devices 400 to a statement, grouped by how they start,
+and the audit event. A job on up to 1,000 devices
+(`jobs::DEVICES_PER_TRANSACTION`) is inserted in one transaction. A larger
+one is inserted in several short ones, so SQLite's one writer, which
+Agents' check-ins, results and sign-ins wait for, is never held for the
+whole job: one stores the job marked as being created (`jobs.creating`),
+each of the next ones 1,000 of its devices, and the last clears the mark
+and records the `job.start` audit event. A job on 100,000 devices took the
+writer for about 5 seconds in one transaction; in batches no transaction
+holds it for more than about BATCH_MS. The request still returns the whole
+job, with its counts, once the last transaction ends. The website's own
+reads for a job (the script, the file, the applications) and a policy's
+(its definition, its owner's access, its script) come before the
+transactions too.
+
+Until its mark is cleared, a job is left alone: the dispatcher starts,
+queues, wakes and expires none of its devices, it isn't counted, finished
+or notified about, the job lists and its page don't show it (`404`, so it
+can't be cancelled either), and a policy's check for its own queued
+devices and the waits a new run replaces leave it out. Only a deleted
+device's unstarted part is missed in it, as in any job; later batches
+leave the device out. A creation that stops part-way, because the server
+stopped, the request ended or a write failed, leaves a job still marked
+that this server isn't creating: the request that failed removes it at
+once, and otherwise the engine's next full pass does (the first after a
+restart, then every minute), its devices 1,000 to a transaction. A
+policy's firing claims its time only in the last transaction, so one that
+stops part-way fires again on that pass, once.
 
 Things can change between planning and writing:
 
@@ -292,14 +313,17 @@ uses a script, the script can't be deleted or unshared
 
 ### Restarts and missed times
 
-Firing claims the policy's due time and creates the job in one database
-transaction: the next time is written only together with the job, and only
-if the due time is still the one the pass read. A restart in the middle of a
-firing, or two passes at once, can't run a policy twice. The job is planned
-just before that transaction (see [creating a job](#creating-a-job)), and the
-claim also needs the policy unchanged since: one saved, turned off or
-deleted in between starts nothing from what it was, and a saved one is
-planned again from what was saved.
+Firing claims the policy's due time in the database transaction that ends
+the job's creation (the only one for a job on up to 1,000 devices): the
+next time is written only together with the job, and only if the due time
+is still the one the pass read. A restart in the middle of a firing, or two
+passes at once, can't run a policy twice, and a firing that stops while a
+larger job is written isn't lost: the policy is still due, and the next
+full pass removes the half-made job and fires it. The job is planned just
+before (see [creating a job](#creating-a-job)), and the claim also needs the
+policy unchanged since: one saved, turned off or deleted in between starts
+nothing from what it was (a job already part-written is removed), and a
+saved one is planned again from what was saved.
 
 When the server was down at a policy's time:
 
@@ -488,6 +512,16 @@ should read the lists again.
   starts its devices. A connected device whose command backlog is full
   stays queued and starts once it has room, while one that went offline is
   still missed.
+- `cargo test -p meshrmm-server --test job_creation`, on SQLite and
+  PostgreSQL, pauses the creation of a job on 2,500 devices between its
+  transactions: each writes at most 1,000 devices, and the counts and
+  audit event are of the whole job. While it is paused, passes start,
+  queue and remove nothing of it, the lists, its page and cancelling don't
+  find it, and an Agent that connects then starts once afterwards. A
+  creation stopped part-way is removed by a restarted server, and a policy
+  firing stopped part-way fires once on the next pass. A device deleted
+  during creation is missed or left out, and a policy deleted during its
+  firing starts nothing.
 - `cargo test -p meshrmm-server --test job_outcomes` keeps the old way of
   working out each device's outcome, by joining it to its run, and checks
   that the stored outcomes and the counts say the same for a job of each
