@@ -132,7 +132,8 @@ input.
   change log and their searches. See
   [hardware and software](hardware-and-software.md).
 - `alerts`: alert rules, the engine that judges them and the alerts they
-  raise. `notifications`: email and webhook channels. See
+  raise. `notifications`: email and webhook channels, each with a bounded
+  queue and one worker that delivers it in order. See
   [alerts](alerts.md).
 - `monitors`: monitor rules' settings, sending each Agent the monitors that
   apply to it, taking in their results, and self-healing (`remediation`).

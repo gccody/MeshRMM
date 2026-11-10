@@ -55,6 +55,7 @@ pub struct AppState {
     pub alerts: crate::alerts::Engine,
     pub monitors: crate::monitors::Engine,
     pub automation: crate::automation::Engine,
+    pub notifications: crate::notifications::queue::Queues,
     pub updates: crate::updates::Engine,
     pub wake: crate::wake::Engine,
     pub sessions: Sessions,

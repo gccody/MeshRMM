@@ -203,6 +203,35 @@ Channels are generic: `notifications::dispatch` takes channel IDs and a
 `Notification` (an event name, a summary, an email body and the webhook's
 data), so other features can notify the same channels.
 
+### Delivery
+
+`notifications::dispatch` only queues: each channel has one queue and, while
+something is in it, one worker, so an event that raises an alert on many
+devices at once (a site's internet going down, say) costs a few connections
+rather than one per device.
+
+- **Order**: a channel's notifications are delivered in the order they were
+  dispatched. A channel that is turned off or deleted drops what is waiting.
+- **Bound**: a channel holds at most 10,000 notifications, waiting or being
+  delivered. Beyond that new ones are dropped, the server logs it once, and
+  the channel's last delivery error says how many were dropped (for example
+  "25 notifications were dropped because 10000 were already waiting") until
+  a later delivery replaces it.
+- **Email**: a channel waits a second before sending, so a burst arrives
+  together. Then it takes everything waiting, looks up the recipients once
+  and sends over one SMTP connection. Up to 20 notifications go out as one
+  email each, as usual; more than 20 become one digest for each recipient,
+  titled with how many (`37 alerts raised on Acme IT`, or `37 notifications
+  on Acme IT` when they differ) and listing each one's summary, up to 300
+  and then how many more.
+- **Webhooks**: still one `POST` per notification, with at most 4 open per
+  channel; the rest wait. They start in order, so up to 4 may arrive out of
+  order. A delivery waiting for its retry gives its place to the next one,
+  so it arrives after those dispatched later.
+- **Last delivery**: a channel's last delivery time and error are written
+  once a batch, and at most once a second while a burst is delivered. The
+  error is the latest failure in that time, if any.
+
 ## Permissions and audit
 
 | Permission | Allows |

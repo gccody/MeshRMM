@@ -3,11 +3,18 @@
 //!
 //! A channel is an email to chosen users and everyone holding chosen roles,
 //! sent through the server's SMTP settings, or a webhook: a signed JSON POST
-//! to a URL. Whatever notifies (alert rules today) names its channels and
-//! hands [`dispatch`] a [`Notification`]; delivery happens in the background,
-//! a webhook is retried a few times, and each channel keeps how its last
-//! delivery went. Deliveries waiting for a retry are lost if the server stops.
+//! to a URL. Whatever notifies (alert rules and automation policies) names
+//! its channels and hands [`dispatch`] a [`Notification`], which only queues
+//! it. Each channel has one queue and, while it has something to deliver, one
+//! worker ([`queue`]), so a burst can't open more than a few connections:
+//! notifications are delivered in the order they were dispatched, up to
+//! [`queue::MAX_WAITING`] wait and later ones are dropped, an email channel
+//! sends many waiting notifications as one digest, and a webhook channel
+//! keeps a few requests open at once and retries failed ones a few times.
+//! Each channel keeps how its last deliveries went. Notifications waiting,
+//! or waiting for a retry, are lost if the server stops.
 pub mod email;
+pub mod queue;
 pub mod webhook;
 
 use std::sync::Arc;
@@ -115,74 +122,17 @@ pub async fn by_id(executor: &mut impl Executor, id: &str) -> db::Result<Option<
         .await
 }
 
-/// Sends `notification` to each of `channel_ids` that is turned on, in the
-/// background.
-pub fn dispatch(state: &AppState, channel_ids: Vec<String>, notification: Notification) {
+/// Queues `notification` for each of `channel_ids`; each channel's worker
+/// delivers it if the channel is turned on. See [`queue`].
+pub fn dispatch(state: &AppState, mut channel_ids: Vec<String>, notification: Notification) {
+    channel_ids.sort_unstable();
+    channel_ids.dedup();
     if channel_ids.is_empty() {
         return;
     }
-    let state = state.clone();
-    tokio::spawn(async move {
-        let channels: db::Result<Vec<Channel>> = state
-            .database
-            .fetch_all(
-                &select()
-                    .and_where(Expr::col(NotificationChannels::Id).is_in(channel_ids))
-                    .and_where(Expr::col(NotificationChannels::Enabled).eq(true))
-                    .to_owned(),
-            )
-            .await;
-        let channels = match channels {
-            Ok(channels) => channels,
-            Err(error) => {
-                tracing::warn!(%error, event = notification.event, "could not read notification channels");
-                return;
-            }
-        };
-        let notification = Arc::new(notification);
-        for channel in channels {
-            tokio::spawn(deliver_with_retries(
-                state.clone(),
-                channel,
-                notification.clone(),
-            ));
-        }
-    });
-}
-
-async fn deliver_with_retries(state: AppState, channel: Channel, notification: Arc<Notification>) {
-    let delays = match channel.kind() {
-        Some(Kind::Webhook) => webhook::RETRY_DELAYS.as_slice(),
-        _ => &[],
-    };
-    let mut attempt = 0;
-    loop {
-        let outcome = attempt_delivery(&state, &channel, &notification).await;
-        let retry = match &outcome {
-            Ok(()) => None,
-            Err(failure) if failure.retry => delays.get(attempt),
-            Err(_) => None,
-        };
-        let Some(delay) = retry else {
-            if let Err(failure) = &outcome {
-                tracing::warn!(
-                    channel_id = channel.id,
-                    event = notification.event,
-                    error = failure.message,
-                    "could not deliver a notification"
-                );
-            }
-            record(&state.database, &channel.id, outcome.map_err(|f| f.message)).await;
-            return;
-        };
-        tracing::info!(
-            channel_id = channel.id,
-            error = outcome.err().map(|f| f.message),
-            retry_in_seconds = delay.as_secs(),
-            "a notification delivery failed; retrying"
-        );
-        tokio::time::sleep(*delay).await;
-        attempt += 1;
+    let notification = Arc::new(notification);
+    for channel_id in state.notifications.push(&channel_ids, &notification) {
+        tokio::spawn(queue::run(state.clone(), channel_id));
     }
 }
 
@@ -229,7 +179,7 @@ async fn attempt_delivery(
     notification: &Notification,
 ) -> Result<(), Failure> {
     match channel.kind() {
-        Some(Kind::Email) => email::send(state, &channel.id, notification).await,
+        Some(Kind::Email) => email::send(state, &channel.id, &[notification]).await,
         Some(Kind::Webhook) => {
             let url = channel
                 .webhook_url
@@ -257,7 +207,7 @@ async fn attempt_delivery(
     }
 }
 
-/// Keeps how the channel's latest delivery went, for the website.
+/// Keeps how the channel's latest deliveries went, for the website.
 async fn record(database: &Database, channel_id: &str, outcome: Result<(), String>) {
     let recorded = database
         .execute(

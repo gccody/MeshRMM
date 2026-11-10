@@ -95,7 +95,9 @@ pub async fn request(
 async fn email_reset(state: &AppState, email: &str, ip: std::net::IpAddr) -> anyhow::Result<()> {
     let mut database = &state.database;
     let settings = settings::load(&mut database).await?;
-    let Some(smtp) = mail::Smtp::from_settings(&settings, &state.instance_key)? else {
+    let Some(smtp) =
+        mail::Smtp::from_settings(&settings, &state.instance_key, &mail::hello_name(state))?
+    else {
         return Ok(());
     };
     let Some(user) = users::by_email(&mut database, email)
@@ -122,8 +124,7 @@ async fn email_reset(state: &AppState, email: &str, ip: std::net::IpAddr) -> any
         &link,
         SELF_SERVICE_RESET_TTL_MS / HOUR_MS,
     );
-    smtp.send(&mail::hello_name(state), &user.email, &subject, body)
-        .await
+    smtp.send(&user.email, &subject, body).await
 }
 
 #[derive(Debug, Deserialize)]
